@@ -131,6 +131,51 @@ def test_osworld_archive_disabled_has_no_recorder_or_io(monkeypatch):
     assert archive.create_capture({}, {}, {}) is None
 
 
+def test_osworld_directory_capture_saves_real_images_and_executed_actions(tmp_path, monkeypatch):
+    load_env(monkeypatch)
+    root = tmp_path / "rollout_result/run/sessions"
+    for name, value in {
+        "CUA_ARCHIVE_ENABLE": "1",
+        "CUA_ARCHIVE_BACKEND": "directory",
+        "CUA_ARCHIVE_DIR": str(root),
+        "CUA_ARCHIVE_MAX_BYTES": "1000000",
+        "CUA_ARCHIVE_PER_TASK_LIMIT": "2",
+        "OSWORLD_RUN_TAG": "run",
+        "RELAX_SESSION_ID": "session",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("CUA_ARCHIVE_URL", raising=False)
+    cap = archive.create_capture({"id": "task", "instruction": "Open settings"}, {}, {})
+    assert cap is not None and cap.recorder.trajectory_id
+    obs = SimpleNamespace(screenshot_valid=True, screenshot_bytes=image(), exec_ok=True, exec_result={})
+    cap.observe(obs, 0)
+    cap.before_predict(0)
+    scaled = "data:image/png;base64," + base64.b64encode(image(16)).decode()
+    cid = cap.model_start(
+        {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": scaled}}]}]},
+        "model",
+        0,
+    )
+    cap.model_result(cid, json.dumps({"choices": [{"message": {"role": "assistant", "content": "click"}}]}), 200)
+    cap.parsed([{"parse_attempt": 0, "accepted_for_execution": True}])
+    aid = cap.action_start("pyautogui.click(1, 2)")
+    cap.action_result(aid, obs)
+    cap.finish(1, None, "agent_done")
+    store = ArchiveStore(root, allow_shared_filesystem=True)
+    try:
+        [trajectory] = store.retained()
+        assert trajectory["session_id"] == "session"
+        assert trajectory["actions"][0]["payload"] == {"code": "pyautogui.click(1, 2)"}
+        directory = root / "assets/task" / trajectory["trajectory_id"]
+        assert len(list((directory / "screenshots").glob("*.png"))) == 2
+        assert len(list((directory / "model_inputs/000000").glob("*.png"))) == 1
+        for asset in directory.rglob("*.png"):
+            with Image.open(asset) as picture:
+                assert picture.size in [(32, 32), (16, 16)]
+    finally:
+        store.close()
+
+
 def test_osworld_actual_model_hook_records_transport_retry_without_changing_payload(capture, monkeypatch):
     from copy import deepcopy
 

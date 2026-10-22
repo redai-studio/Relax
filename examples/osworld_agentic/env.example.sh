@@ -23,8 +23,8 @@ export NEX_API_KEY="${NEX_API_KEY:-}"
 # Configure ClearML on all training nodes (clearml-init or your secret manager).
 # Do not add its credentials to the committed template or runtime-env JSON.
 
-# Optional CUA archive. Start the standalone writer on local disk first.
-# Every Agent reads these settings from env.local.sh; disabled when unset.
-# export CUA_ARCHIVE_ENABLE=1
-# export CUA_ARCHIVE_URL="http://archive-host:port"
-# export CUA_ARCHIVE_TOKEN="${CUA_ARCHIVE_TOKEN:-}"
+# The training script saves successful trajectories and images directly under
+# rollout_result/<run_tag>/sessions/. No writer URL or token is needed.
+# Configure with --no-save-trajectories, --trajectory-max-bytes,
+# --trajectory-per-task-limit and --trajectory-task-limits (JSON file).
+# Defaults: enabled, 10 GiB per run, up to 5 trajectories per task.

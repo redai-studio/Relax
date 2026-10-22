@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from relax.agentic.archive.client import Recorder
+from relax.agentic.archive.directory import DirectoryTransport
 from relax.agentic.archive.export import convert_sft, export_archive
 from relax.agentic.archive.schema import encode
 from relax.agentic.archive.server import make_server
@@ -106,6 +107,214 @@ def candidate(store, task="task", path="settings", *, status="success", errors=0
         final_observation_id="o0",
     )
     return tid, outcome
+
+
+class DirectStore:
+    """Exercise complete candidates over the same transport used by Agents."""
+
+    def __init__(self, root, **kwargs):
+        self.transport = DirectoryTransport(root, **kwargs)
+
+    def begin(self, meta):
+        return self.transport("begin", {"metadata": meta})["trajectory_id"]
+
+    def append(self, tid, event):
+        self.transport("event", {"trajectory_id": tid, "event": event})
+
+    def finish(self, tid, outcome):
+        return self.transport("finish", {"trajectory_id": tid, "outcome": outcome})
+
+
+def _direct_producer(root, index):
+    store = DirectStore(root, max_bytes=100_000, per_task_limit=1, task_limits={"task": 2})
+    tid, outcome = candidate(store, path=f"button-{index}")
+    store.finish(tid, outcome)
+
+
+def test_archive_direct_processes_share_quota_assets_and_export(tmp_path):
+    root = tmp_path / "sessions"
+    processes = [
+        multiprocessing.get_context("spawn").Process(target=_direct_producer, args=(root, i)) for i in range(4)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(30)
+            assert process.exitcode == 0
+        store = ArchiveStore(root, allow_shared_filesystem=True)
+        try:
+            assert len(store.retained()) == 2  # Override, not one quota per producer.
+            assert store.task_limits == {"task": 2}
+            assert len(list((root / "assets/task").iterdir())) == 2
+            assert len(list((root / "assets").rglob("*.png"))) == 4
+            assert not list((root / "staging").iterdir())
+            assert store.usage() <= 100_000
+            manifest = export_archive(store, tmp_path / "export")
+            assert manifest["trajectories_selected"] == manifest["sft_samples"] == 2
+        finally:
+            store.close()
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+
+
+def _direct_pending_producer(root, index, barrier):
+    recorder = Recorder("", metadata(str(index)), transport=DirectoryTransport(root, 6000))
+    recorder.event("incomplete", reason="x" * 3000)
+    barrier.wait(timeout=20)  # Leave all successful candidates in progress together.
+
+
+def test_archive_direct_capacity_counts_all_processes_in_progress(tmp_path):
+    root = tmp_path / "sessions"
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(3)
+    processes = [context.Process(target=_direct_pending_producer, args=(root, i, barrier)) for i in range(3)]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(30)
+            assert process.exitcode == 0
+        store = ArchiveStore(root, allow_shared_filesystem=True)
+        try:
+            assert store.usage() <= 6000
+            assert len(list((root / "staging").iterdir())) == 1
+            assert store.recover() == 1
+        finally:
+            store.close()
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+
+
+def test_archive_direct_lock_timeout_leaves_other_active_candidate(store):
+    active = store.begin(metadata())
+    transport = DirectoryTransport(store.root, 1_000_000, lock_timeout=0.01)
+    recorder = Recorder("", metadata("other"), transport=transport)
+    assert recorder.trajectory_id is None
+    assert "owned by another process" in recorder.reason
+    assert store._path(active).exists()
+
+
+def test_archive_direct_shared_filesystem_opt_in_and_fixed_task_config(tmp_path, monkeypatch):
+    from relax.agentic.archive import store as module
+
+    monkeypatch.setattr(module, "filesystem_type", lambda p: "nfs")
+    root = tmp_path / "shared"
+    transport = DirectoryTransport(root, 10000, task_limits={"disabled": 0})
+    recorder = Recorder("", metadata("disabled"), transport=transport)
+    assert recorder.trajectory_id is None and "task disabled" in recorder.reason
+    other = Recorder("", metadata("enabled"), transport=transport)
+    assert other.trajectory_id is not None
+    conflicting = Recorder("", metadata(), transport=DirectoryTransport(root, 10000))
+    assert conflicting.trajectory_id is None and "task limits differ" in conflicting.reason
+    other.abort()
+
+
+def test_archive_task_images_follow_observation_and_call_order(tmp_path):
+    from urllib.parse import quote
+
+    root = tmp_path / "archive"
+    store = ArchiveStore(root, 1_000_000, new_asset_layout="task")
+    try:
+        task = "task /中文"
+        identity = store.begin(metadata(task))
+        for i in range(3):
+            store.append(
+                identity,
+                {
+                    "kind": "observation",
+                    "data": {
+                        "observation_id": f"o{i}",
+                        "step": 0,
+                        "screenshot": png(),
+                        "valid": True,
+                    },
+                },
+            )
+        jpeg = BytesIO()
+        Image.new("RGB", (8, 8), "blue").save(jpeg, format="JPEG")
+        jpeg_uri = "data:image/png;base64," + base64.b64encode(jpeg.getvalue()).decode()
+        for i in range(2):
+            store.append(
+                identity,
+                {
+                    "kind": "model_call",
+                    "data": {
+                        "call_id": f"c{i}",
+                        "step": 0,
+                        "request": {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "image_url", "image_url": {"url": png()}},
+                                        {"type": "image_url", "image_url": {"url": jpeg_uri}},
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                },
+            )
+        images = root / "assets" / quote(task, safe="") / identity
+        shots = sorted((images / "screenshots").glob("*.png"))
+        assert [p.name.split("-", 1)[0] for p in shots] == ["000000", "000001", "000002"]
+        for call in ("000000", "000001"):
+            files = sorted((images / "model_inputs" / call).iterdir())
+            assert [p.name.split("-", 1)[0] for p in files] == ["000000", "000001"]
+            assert [p.suffix for p in files] == [".png", ".jpg"]
+            assert files[1].read_bytes() == jpeg.getvalue()
+        store.verify_assets(store._events(store._path(identity)))
+        store.abort(identity)
+        assert not list((root / "assets").iterdir())
+    finally:
+        store.close()
+
+
+def test_archive_task_layout_deduplicates_content_and_removes_evicted_images(tmp_path):
+    store = ArchiveStore(tmp_path / "archive", 1_000_000, 1, new_asset_layout="task")
+    try:
+        first, outcome = candidate(store, errors=1)
+        assert store.finish(first, outcome)["retained"]
+        duplicate, outcome = candidate(store, errors=1)
+        assert store.finish(duplicate, outcome)["reason"] == "duplicate_path"
+        assert not (store.root / "assets/task" / duplicate).exists()
+        better, outcome = candidate(store, path="shorter")
+        assert store.finish(better, outcome)["retained"]
+        assert not (store.root / "assets/task" / first).exists()
+        assert (store.root / "assets/task" / better).is_dir()
+        store.verify_assets(store.retained()[0])
+        assert store.usage() <= store.max_bytes
+    finally:
+        store.close()
+
+
+def test_archive_directory_keeps_existing_flat_layout(tmp_path):
+    root = tmp_path / "archive"
+    old = ArchiveStore(root, 1_000_000)
+    old.close()
+    direct = DirectStore(root, max_bytes=1_000_000)
+    identity, outcome = candidate(direct)
+    assert direct.finish(identity, outcome)["retained"]
+    with (root / "archive.json").open() as handle:
+        assert json.load(handle).get("asset_layout", "flat") == "flat"
+    assert len(list((root / "assets").iterdir())) == 1
+    assert next((root / "assets").iterdir()).is_file()
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["../escape", "/absolute", "task/../image.png", "a/" + "0" * 32 + "/screenshots/000000-" + "0" * 64 + ".png/.."],
+)
+def test_archive_asset_references_reject_escaping_paths(store, key):
+    with pytest.raises(ValueError, match="invalid asset reference"):
+        store.verify_assets({"image": "asset://" + key})
 
 
 @pytest.fixture

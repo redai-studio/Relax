@@ -8,7 +8,7 @@ This recipe trains Qwen3-VL-8B-Thinking with GRPO, Relax resident agentic rollou
 
 ## Files and configuration
 
-- [CUA success archive](ARCHIVE.en.md): optional bounded storage and offline full-trajectory/multimodal SFT export, disabled by default.
+- [CUA success archive](ARCHIVE.en.md): direct storage of successful trajectories and images, enabled by the training script with capacity limits, task quotas and offline multimodal SFT export; no standalone service required.
 - `env.example.sh`: public deployment template without real endpoints or credentials.
 - `env.local.sh`: private copy of the template, ignored by Git; never commit it.
 - `scripts/run-qwen3vl-8B-osworld-8xgpu.sh`: authoritative training configuration and submission script.

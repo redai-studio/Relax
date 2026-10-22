@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 
@@ -26,6 +27,39 @@ def asset_ids(value: Any) -> set[str]:
     if isinstance(value, list):
         return set().union(*(asset_ids(v) for v in value)) if value else set()
     return set()
+
+
+def asset_digest(key: str) -> str:
+    """Validate an archive-relative image path and return its content hash."""
+    if re.fullmatch(r"[a-f0-9]{64}", key):
+        return key
+    parts = key.split("/")
+    if (
+        len(parts) not in (4, 5)
+        or any(p in ("", ".", "..") for p in parts)
+        or not re.fullmatch(r"[A-Za-z0-9_.%\-]+", parts[0])
+        or not re.fullmatch(r"[a-f0-9]{32}", parts[1])
+        or (len(parts) == 4 and parts[2] != "screenshots")
+        or (
+            len(parts) == 5
+            and (parts[2] not in ("model_inputs", "events") or not re.fullmatch(r"[0-9]{6,}", parts[3]))
+        )
+    ):
+        raise ValueError("invalid asset reference")
+    match = re.fullmatch(r"[0-9]{6,}-([a-f0-9]{64})\.[a-z0-9]{1,10}", parts[-1])
+    if match is None:
+        raise ValueError("invalid asset reference")
+    return match[1]
+
+
+def _content_identity(value: Any) -> Any:
+    if isinstance(value, str) and value.startswith(ASSET_PREFIX):
+        return ASSET_PREFIX + asset_digest(value[len(ASSET_PREFIX) :])
+    if isinstance(value, dict):
+        return {k: _content_identity(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_content_identity(v) for v in value]
+    return value
 
 
 def materialize(events: list[dict]) -> dict:
@@ -151,7 +185,7 @@ def path_fingerprint(trajectory: dict) -> str:
         }
         for a in trajectory["actions"]
     ]
-    return hashlib.sha256(encode([task_key(trajectory), path])).hexdigest()
+    return hashlib.sha256(encode([task_key(trajectory), _content_identity(path)])).hexdigest()
 
 
 def quality(trajectory: dict) -> tuple:

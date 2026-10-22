@@ -1,36 +1,63 @@
-# CUA successful trajectory archive
+# CUA successful trajectory and image storage
 
-Disabled by default. Each complete task attempt is one candidate trajectory. OSWorld captures actual model requests, environment actions and evaluator evidence independently of rewards, advantages, sample filtering and SessionOutput. Other recipes create no archive, threads or extra I/O automatically.
+The OSWorld training script saves complete successful trajectories and images directly under each run's output directory by default. No standalone writer, URL or token is required. Capture does not change rewards, advantages, sample filtering or SessionOutput. Other recipes do not enable capture automatically.
 
-## Deployment and enablement
+## Training options
 
-One standalone HTTP process owns the archive. Agents on all training nodes connect to that process; its budget covers the **whole library**, not each node. No Ray service or training argument parser changes are required. The writer does not create sandboxes or call models.
-
-Choose a dedicated directory on local persistent storage on a host reachable by all Agents. Substitute actual paths and addresses:
+After configuring MODEL_DIR, DATA_DIR, SAVE_DIR and private Nex settings, run:
 
 ```bash
-export CUA_ARCHIVE_TOKEN='replace-with-a-private-token'
+bash examples/osworld_agentic/scripts/run-qwen3vl-8B-osworld-8xgpu.sh \
+  --save-trajectories \
+  --trajectory-max-bytes 10737418240 \
+  --trajectory-per-task-limit 5 \
+  --trajectory-task-limits /path/to/task-limits.json
+```
+
+Saving is enabled by default; use `--no-save-trajectories` to disable it. The defaults are 10 GiB and at most 5 trajectories per task. The optional override file is a JSON object such as `{"task-id-a": 2, "task-id-b": 0}`. Keys are actual task IDs and values are nonnegative integers; 0 skips capture for that task. The default quota must be at least 1 and the budget at least 1024 bytes. These options belong to the OSWorld script, not the framework training parser.
+
+Each run has this layout:
+
+```text
+rollout_result/<run_tag>/
+├── train/*.jsonl
+├── reward_dump.jsonl
+└── sessions/
+    ├── archive.json
+    ├── staging/<trajectory_id>.jsonl
+    ├── trajectories/<trajectory_id>.jsonl
+    └── assets/<task_id>/<trajectory_id>/
+        ├── screenshots/000000-<sha256>.png
+        ├── screenshots/000001-<sha256>.png
+        └── model_inputs/000000/000000-<sha256>.png
+```
+
+The trajectory header contains `session_id`, `task_id` and the complete task configuration, linking it to `reward_dump.jsonl`. New runs group images by task and trajectory, with image extensions so they can be opened directly. Special task ID characters are escaped into safe directory names; unusually long or special IDs use hashed directory names. The original ID remains in the trajectory header.
+
+The six-digit sequence in `screenshots/` follows observation order: `000000` is the initial screenshot, followed by observations after actual actions. A single model turn may execute several actions, so screenshot indices are not environment turn numbers. Action events still link before/after images through `before_observation_id` and `after_observation_id`; `outcome.final_observation_id` identifies the final screenshot.
+
+`model_inputs/000000/` contains images for the first actual model request. Later requests, parsing retries and transport retries receive successive indices. Images within a request follow traversal order, including historical images; this is not desktop observation order. These are the actual cropped or resized inputs, not replacement desktop screenshots. Original bytes are preserved, with extensions detected from the image format: `.png` for PNG and `.jpg` for JPEG. Images attached to other event types use `events/<event_index>/`.
+
+The `asset_layout` field in `archive.json` records the layout. New runs use `task`; existing libraries without this field retain the legacy `assets/<sha256>` layout and remain readable and exportable. Historical images are not rearranged during a running experiment.
+
+**Long-term retention still requires a complete trajectory with evaluator score exactly 1.** Failed, partial, incomplete, duplicate or lower-priority candidates are removed; their temporary images are not a permanent screenshot log. Changes apply to new launches. Images from historical candidates whose capture was abandoned cannot be recovered this way.
+
+A single node can use a local output directory. Multiple nodes must access the same directory at the same path, on a filesystem with reliable cross-node `flock`, atomic rename and close-to-open visibility. Separate node-local directories do not provide a global budget. Each write briefly holds the common `.owner.lock` while checking total usage, deduplication and task quotas; model calls hold no archive lock. Lock acquisition times out after 30 seconds. Lock timeouts, disk errors and unsupported images abandon the candidate without stopping training. The lock deadline does not bound filesystem I/O itself. Synchronous shared-filesystem writes add latency; assess it for the actual concurrency and filesystem.
+
+Budget and quotas are fixed in each run's `archive.json`. Agents sharing that directory must use identical settings; do not change them while running. Each new run_tag has its own directory and budget, excluding other runs, training JSONL and manually exported copies. Launcher settings take precedence when Agents reload an older `env.local.sh`; old writer URLs and tokens are unused in directory mode.
+
+## Standalone HTTP writer compatibility
+
+The public HTTP API remains available, but the official OSWorld training script selects directory mode. Custom Agent invocations can explicitly set `CUA_ARCHIVE_BACKEND=http`, `CUA_ARCHIVE_ENABLE=1`, `CUA_ARCHIVE_URL` and `CUA_ARCHIVE_TOKEN`. The HTTP writer still requires local Linux ext2/3/4, XFS, Btrfs, tmpfs or overlay storage, and rejects shared storage. Non-loopback listeners require a token.
+
+```bash
 python -m relax.agentic.archive.server \
   --archive-dir /local-disk/cua-library \
   --max-bytes 10737418240 --per-task-limit 5 \
   --host 0.0.0.0 --port 8765
 ```
 
-The required byte budget above is 10 GiB; the per-task limit defaults to 5. A non-loopback listener requires a token. Use HTTP only within a trusted private network, or put an HTTPS reverse proxy in front. Do not commit credentials or include them in logs.
-
-Add these settings to OSWorld's private `env.local.sh`, readable on every Agent node:
-
-```bash
-export CUA_ARCHIVE_ENABLE=1
-export CUA_ARCHIVE_URL='http://actual-archive-host:8765'
-export CUA_ARCHIVE_TOKEN='same-private-token-as-the-writer'
-```
-
-Use the existing OSWorld training entrypoint. `run_agent_app.sh` already reads that file; no credentials need to enter logged Ray runtime-env JSON. Unset `CUA_ARCHIVE_ENABLE` or set it to `0` to disable capture.
-
-The server serializes requests and reserves event and new asset bytes before writing. Client RPCs have a five-second timeout and no automatic retries. Connection failures, unsupported data or disk errors abandon that candidate with a logged reason without changing training results. Synchronous capture adds boundary latency. Ingress is bounded to min(twice the library budget, 64 MiB) per request; larger candidates are rejected explicitly.
-
-Supported storage: Linux local ext2/3/4, XFS, Btrfs, tmpfs and overlay. Startup checks mountinfo and rejects NFS, shared FUSE mounts and unknown types. tmpfs and ephemeral container layers are suitable for tests, not durable archives. Multiple nodes must not open the same directory directly. Separate servers on separate nodes have separate budgets, never a global quota.
+Supply the token through private configuration before starting. HTTP requests time out after five seconds without retries. Each request is limited to min(twice the budget, 64 MiB). Do not use an HTTP writer and direct Agent writes on the same library concurrently.
 
 ## Records, admission and capacity
 
@@ -39,25 +66,26 @@ The public implementation in `relax/agentic/archive/` imports no OSWorld code. `
 - `archive.json`: schema, byte budget and task quota; restart cannot silently change them.
 - `staging/<trajectory_id>.jsonl`: incrementally written trajectory, observation, model_call, call_result/call_parse, action/action_result and outcome events. Incomplete files are never exported.
 - `trajectories/<trajectory_id>.jsonl`: validated candidates atomically renamed from staging into the retained library.
-- `assets/<sha256>`: unique image bytes. Filenames have no extension; PIL detects the format from content.
+- `assets/<task_id>/<trajectory_id>/`: ordered screenshots and model input images for new training runs. Existing libraries and default HTTP libraries still use `assets/<sha256>`.
 
-Stable run, Session, trajectory, observation, call and action IDs preserve associations. A step may contain several calls, and a call may lead to several ordered actions. Actual request payloads and raw HTTP replies are recorded. Observations include screenshots and fields returned by the environment. Inline model images are externalized, including resized/cropped inputs and historical images, rather than replaced with desktop screenshots. `asset://<hash>` can be reconstructed as bytes or a data URI. `observation_ids` identifies the environment observation at request time; `model_input_asset_ids` enumerates actual input resources. Unknown crop-to-original mappings are not invented.
+Stable run, Session, trajectory, observation, call and action IDs preserve associations. A step may contain several calls, and a call may lead to several ordered actions. Actual request payloads and raw HTTP replies are recorded. Observations include screenshots and fields returned by the environment. Inline model images are externalized, including resized/cropped inputs and historical images, rather than replaced with desktop screenshots. `asset://<relative_path>` identifies an image under `assets/`, which can be reconstructed as bytes or a data URI. Legacy hash references remain supported. `observation_ids` identifies the environment observation at request time; `model_input_asset_ids` enumerates actual input resources. Unknown crop-to-original mappings are not invented.
 
 Task quotas use `(task_source, task_version, task_id)`; OSWorld task versions hash the full task configuration. Admission requires explicit success, no evaluation error, complete associations and verified resources. The public layer has no reward threshold. The OSWorld archive conservatively maps evaluator `1` to success, `0` to failure, `(0,1)` to partial, and other/non-finite/missing/error results to unknown. This does not alter training rewards or success metrics. Advantages are never used for admission.
 
 Exact behavior deduplication hashes the task key, ordered action types and full parameters, before/after screenshot hashes and observation fields. It excludes record IDs, timestamps, scores and reasoning text. For the same path, retain the better record. Deterministic priority is: fewer known execution errors, fewer environment steps, fewer actions, fewer model calls, fewer actions with unknown execution status, then trajectory ID. There is no semantic similarity model.
 
-The budget counts logical bytes of every file inside the library, including retained records, staging, unique assets and configuration. It does not measure allocation blocks, filesystem metadata or free disk space. Repeated images have one file. Every serialized write reserves all additional event and image bytes before mutation.
+The budget counts logical bytes of every file inside the library, including retained records, staging, image files and configuration. It does not measure allocation blocks, filesystem metadata or free disk space. The new layout retains an ordered file for each image occurrence rather than sharing files across trajectories; all copies count toward the budget. The legacy flat layout still deduplicates image files by content. Complete trajectory deduplication still compares content hashes and is independent of task directories, trajectory IDs and file indices. Every serialized write reserves all additional event and image bytes before mutation.
 
 Under pressure, evict lower-priority extras from tasks with multiple retained trajectories, favoring task coverage. Never evict a task's last representative or another live staging candidate. Reject the candidate if capacity remains insufficient and log the reason. GC checks both staging and retained references, keeping shared assets. Consequently, a full archive with only unique representatives or active staging may reject a new task. Evictions already performed are not rolled back if a subsequent candidate write fails. ENOSPC is handled separately.
 
 ## Recovery
 
-A local exclusive owner lock prevents simultaneous servers, recovery or offline export. Restart keeps staging charged against capacity; no heartbeat timeout is used to guess that a Session is dead. Only after **all Agents, training and the archive server have stopped**, explicitly clean abandoned candidates:
+Direct writes hold the owner lock during each operation; the HTTP writer holds it for its lifetime. Offline export holds the lock for the complete snapshot and blocks Agent writes, so do not export during training. Restart leaves staging charged against capacity without guessing that an inactive Session is dead. Stop training, all Agents and any HTTP writer before explicit cleanup. Replace the example paths below with actual paths:
 
 ```bash
 python -m relax.agentic.archive.export recover \
-  --archive-dir /local-disk/cua-library --confirm-no-active-sessions
+  --archive-dir /data/outputs/rollout_result/example-run/sessions \
+  --shared-filesystem --confirm-no-active-sessions
 ```
 
 This command acquires the owner lock, removes only this library's staging and collects unreferenced assets. The flag is the operator's confirmation that no Agents remain active, including temporarily idle ones. Export ignores staging even without cleanup.
@@ -68,7 +96,8 @@ Stop the archive server after training, then run:
 
 ```bash
 python -m relax.agentic.archive.export export \
-  --archive-dir /local-disk/cua-library --output-dir /data/cua-export-001
+  --archive-dir /data/outputs/rollout_result/example-run/sessions \
+  --shared-filesystem --output-dir /data/cua-export-001
 ```
 
 The output directory must not exist. Export holds exclusive ownership throughout, preventing eviction while copying assets. It writes `manifest.json`, `trajectories.jsonl`, `samples.jsonl` and the referenced `assets/`. The manifest includes schema/export versions, sources, selected/skipped/duplicate/missing counts, reasons and supervision rules. A failed partial export has no manifest; choose a fresh directory instead of overwriting it.

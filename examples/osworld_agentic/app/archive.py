@@ -16,6 +16,7 @@ import uuid
 from typing import Any, Callable
 
 from relax.agentic.archive.client import Recorder
+from relax.agentic.archive.directory import DirectoryTransport
 from relax.agentic.archive.schema import encode
 from relax.utils.logging_utils import get_logger
 
@@ -43,8 +44,19 @@ def create_capture(task: dict, config: dict, metadata: dict) -> OSWorldCapture |
         return None
     try:
         task_version = hashlib.sha256(encode(task)).hexdigest()
+        transport = None
+        backend = os.environ.get("CUA_ARCHIVE_BACKEND", "http")
+        if backend == "directory":
+            transport = DirectoryTransport(
+                os.environ["CUA_ARCHIVE_DIR"],
+                int(os.environ["CUA_ARCHIVE_MAX_BYTES"]),
+                int(os.environ.get("CUA_ARCHIVE_PER_TASK_LIMIT", "5")),
+                json.loads(os.environ.get("CUA_ARCHIVE_TASK_LIMITS", "{}")),
+            )
+        elif backend != "http":
+            raise ValueError(f"Unknown archive backend: {backend}")
         recorder = Recorder(
-            os.environ["CUA_ARCHIVE_URL"],
+            os.environ.get("CUA_ARCHIVE_URL", ""),
             {
                 "run_id": os.environ["OSWORLD_RUN_TAG"],
                 "session_id": os.environ["RELAX_SESSION_ID"],
@@ -60,6 +72,7 @@ def create_capture(task: dict, config: dict, metadata: dict) -> OSWorldCapture |
                 "started_at": time.time(),
             },
             os.environ.get("CUA_ARCHIVE_TOKEN", ""),
+            transport=transport,
         )
         return OSWorldCapture(recorder)
     except Exception:

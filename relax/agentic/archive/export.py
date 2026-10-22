@@ -121,7 +121,8 @@ def export_archive(store: ArchiveStore, destination: str | Path) -> dict:
             for key in asset_ids(trajectory):
                 target = destination / "assets" / key
                 if not target.exists():
-                    shutil.copyfile(store.root / "assets" / key, target)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(store.asset_path(key), target)
             full.write(encode(relative_assets(trajectory)) + b"\n")
             for sample in sft_samples(trajectory, sft_skipped):
                 samples.write(encode(relative_assets(sample)) + b"\n")
@@ -144,7 +145,7 @@ def export_archive(store: ArchiveStore, destination: str | Path) -> dict:
         "sft_policy": "selected parsed calls only; no retry/correction trajectories or known execution failures; "
         "RPC completion plus successful evaluator may qualify, without claiming semantic action success",
         "supervision": "messages[*].learn=false except the final assistant reply; tools and template kwargs preserved",
-        "snapshot": "exclusive archive owner lock held for the entire export; server must be stopped",
+        "snapshot": "exclusive archive owner lock held for the entire export; all Agents and writers must be stopped",
         "incomplete_staging_excluded": len(list((store.root / "staging").glob("*.jsonl"))),
     }
     (destination / "manifest.json").write_bytes(encode(manifest))
@@ -183,9 +184,13 @@ def main() -> None:
     export = sub.add_parser("export")
     export.add_argument("--archive-dir", required=True)
     export.add_argument("--output-dir", required=True)
+    export.add_argument("--shared-filesystem", action="store_true", help="Use the direct-write shared filesystem lock")
     recover = sub.add_parser("recover")
     recover.add_argument("--archive-dir", required=True)
     recover.add_argument("--confirm-no-active-sessions", action="store_true", required=True)
+    recover.add_argument(
+        "--shared-filesystem", action="store_true", help="Use the direct-write shared filesystem lock"
+    )
     convert = sub.add_parser("convert-sft")
     convert.add_argument("--samples", required=True)
     convert.add_argument("--output", required=True)
@@ -193,7 +198,7 @@ def main() -> None:
     if args.command == "convert-sft":
         convert_sft(args.samples, args.output)
         return
-    store = ArchiveStore(args.archive_dir)
+    store = ArchiveStore(args.archive_dir, allow_shared_filesystem=args.shared_filesystem)
     try:
         if args.command == "export":
             logger.info("Archive export: %s", export_archive(store, args.output_dir))

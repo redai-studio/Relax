@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 from relax.utils.logging_utils import get_logger
 
@@ -18,9 +18,18 @@ logger = get_logger(__name__)
 
 
 class Recorder:
-    def __init__(self, endpoint: str, metadata: dict, token: str = "", timeout: float = 5.0) -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        metadata: dict,
+        token: str = "",
+        timeout: float = 5.0,
+        *,
+        transport: Callable[[str, dict], dict] | None = None,
+    ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.token, self.timeout = token, timeout
+        self.transport = transport
         self.trajectory_id: str | None = None
         self.reason: str | None = None
         result = self._send("begin", {"metadata": metadata})
@@ -28,6 +37,8 @@ class Recorder:
             self.trajectory_id = result["trajectory_id"]
 
     def _rpc(self, operation: str, payload: dict) -> dict:
+        if self.transport is not None:
+            return self.transport(operation, payload)
         request = urllib.request.Request(
             self.endpoint + "/" + operation,
             data=encode(payload),
