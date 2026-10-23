@@ -135,6 +135,23 @@ def get_responses(
         logits = logits.view(-1, logits.size(-1))
 
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    if (
+        is_sft_mode(args)
+        and not getattr(args, "sft_chunked_logits", False)
+        and cp_size == 1
+        and qkv_format == "thd"
+        and total_lengths == response_lengths
+    ):
+        padding_length = logits.size(0) - sum(total_lengths)
+        chunks = torch.split(logits, [*total_lengths, padding_length], dim=0)
+        for i, tokens in enumerate(unconcat_tokens):
+            logits_chunk = chunks[i]
+            tokens_chunk = F.pad(tokens, (0, 1), value=0)[1:]
+            if apply_temperature and args.rollout_temperature != 1.0:
+                logits_chunk = logits_chunk / args.rollout_temperature
+            yield logits_chunk, tokens_chunk
+        return
+
     end = 0
     seq_start = 0
     for i, (tokens, total_length, response_length) in enumerate(
