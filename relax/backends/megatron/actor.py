@@ -2836,9 +2836,14 @@ class MegatronTrainRayActor(TrainRayActor):
             from megatron.training.async_utils import maybe_finalize_async_save
 
             maybe_finalize_async_save(blocking=True)
-
-        if self.args.async_save and dist.get_rank(group=get_gloo_group()) == 0:
-            rotate_ckpt(self.args, global_step=rollout_id)
+            if not self._is_standard_dpo() and dist.get_rank(group=get_gloo_group()) == 0:
+                # Only Megatron's successful finalizer advances this tracker.
+                tracker_path = os.path.join(self.args.save, "latest_checkpointed_iteration.txt")
+                if os.path.isfile(tracker_path):
+                    with open(tracker_path, encoding="utf-8") as tracker:
+                        completed_step = tracker.read().strip()
+                    if completed_step.isdigit() and int(completed_step) < rollout_id:
+                        rotate_ckpt(self.args, global_step=int(completed_step))
 
         dist.barrier(group=get_gloo_group())
 
@@ -2863,10 +2868,11 @@ class MegatronTrainRayActor(TrainRayActor):
             # the checkpoint before rank 0's identity sidecar is durable,
             # otherwise a concurrent resume could miss the file.
             dist.barrier(group=get_gloo_group())
-        # A synchronous save has committed before returning. Prune afterwards
-        # so max_actor_ckpt_to_keep includes the newly written checkpoint.
-        if not self.args.async_save and dist.get_rank(group=get_gloo_group()) == 0:
-            rotate_ckpt(self.args, global_step=rollout_id)
+        # Async saves commit at finalization, not when save() returns. Keep
+        # the previous recovery point until then, including DPO's sidecar.
+        if not self.args.async_save or force_sync or self._is_standard_dpo():
+            if dist.get_rank(group=get_gloo_group()) == 0:
+                rotate_ckpt(self.args, global_step=rollout_id)
 
         if self.args.save_hf is not None and self.role == "actor":
             from relax.backends.megatron.model import save_hf_model
