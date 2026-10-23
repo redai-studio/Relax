@@ -8,6 +8,7 @@ import pytest
 from relax.core import inference_recovery
 from relax.core.inference_recovery import configure_recovery
 from relax.core.registry import process_role
+from relax.utils.env import Envs, known_env_names, validate_env
 
 
 def role_config(*, hybrid=False):
@@ -38,7 +39,7 @@ def constructor(monkeypatch):
     return constructor
 
 
-@pytest.mark.parametrize("flag", [None, "0", "1", "true", "false", "TRUE", " FALSE "])
+@pytest.mark.parametrize("flag", [None, "", " ", "0", "1", "true", "false", "TRUE", " FALSE ", "on", "off"])
 @pytest.mark.parametrize(
     "fully_async,hybrid,colocate",
     [(True, False, False), (True, True, True), (False, True, True), (False, False, True)],
@@ -56,7 +57,7 @@ def test_recovery_mode_defaults_and_overrides_keep_original_roles(
     if colocate and not hybrid:
         config.offload_train = config.offload_rollout = True
     roles_before = list(process_role(config))
-    enabled = flag.strip().lower() in ("1", "true") if flag is not None else fully_async or hybrid
+    enabled = flag.strip().lower() in ("1", "true", "on") if flag and flag.strip() else fully_async or hybrid
 
     state = configure_recovery(config)
 
@@ -80,27 +81,58 @@ def test_default_true_on_policy_recovery_does_not_add_forward_receiver(monkeypat
     constructor.options.return_value.remote.assert_called_once_with(False, max_attempts=3)
 
 
-@pytest.mark.parametrize("budget", ["0", "1", "5"])
-def test_recovery_budget_env_is_passed_to_state(monkeypatch, constructor, budget):
+@pytest.mark.parametrize("budget,expected", [("", 3), (" ", 3), ("0", 0), ("1", 1), ("5", 5)])
+def test_recovery_budget_env_is_passed_to_state(monkeypatch, constructor, budget, expected):
     monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", "1")
     monkeypatch.setenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", budget)
     config = role_config(hybrid=True)
 
     configure_recovery(config)
 
-    constructor.options.return_value.remote.assert_called_once_with(False, max_attempts=int(budget))
+    constructor.options.return_value.remote.assert_called_once_with(False, max_attempts=expected)
 
 
-@pytest.mark.parametrize("budget", ["-1", "1.5", "bad", ""])
+@pytest.mark.parametrize("budget", ["-1", "1.5", "bad"])
 def test_invalid_recovery_budget_fails_before_creating_state(monkeypatch, constructor, budget):
     monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", "1")
     monkeypatch.setenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", budget)
     config = role_config(hybrid=True)
 
-    with pytest.raises(ValueError, match="RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer"):
+    with pytest.raises(ValueError, match="RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS"):
         configure_recovery(config)
 
     constructor.options.assert_not_called()
+
+
+@pytest.mark.parametrize("flag", ["tru", "2"])
+def test_invalid_recovery_switch_fails_before_creating_state(monkeypatch, constructor, flag):
+    monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", flag)
+    with pytest.raises(ValueError, match="RELAX_ENABLE_INFERENCE_RECOVERY"):
+        configure_recovery(role_config(hybrid=True))
+    constructor.options.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "name,default,raw,expected",
+    [
+        ("RELAX_ENABLE_INFERENCE_RECOVERY", None, "true", True),
+        ("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", 3, "5", 5),
+        ("RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT", 180.0, "2.5", 2.5),
+    ],
+)
+def test_recovery_env_registered_with_typed_defaults(monkeypatch, name, default, raw, expected):
+    assert name in known_env_names()
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(Envs, name) == default
+    monkeypatch.setenv(name, " ")
+    assert getattr(Envs, name) == default
+    monkeypatch.setenv(name, raw)
+    assert getattr(Envs, name) == expected
+
+
+def test_startup_validation_rejects_invalid_budget_even_when_recovery_disabled():
+    with pytest.raises(ValueError, match="RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS"):
+        validate_env({"RELAX_ENABLE_INFERENCE_RECOVERY": "false", "RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS": "bad"})
 
 
 @pytest.mark.parametrize("flag", ["0", "false"])

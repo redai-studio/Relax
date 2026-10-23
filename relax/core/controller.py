@@ -198,7 +198,7 @@ class Controller:
         self._inference_recovery = configure_recovery(config)
         self._health_manager = HealthManager(check_interval=1.0, config=config)
         self._inference_recovery_timeout = _require_positive_timeout(
-            float(os.environ.get("RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT", "180")),
+            Envs.RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT,
             "RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT",
         )
         if not hasattr(self, "_training_wait_done"):

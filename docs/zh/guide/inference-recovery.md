@@ -13,7 +13,7 @@ Relax 支持在 Rollout 或独立 ActorFwd 运行时抛出异常后，仅重建�
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
 | `RELAX_ENABLE_INFERENCE_RECOVERY` | 按训练模式决定 | `true` 或 `1` 开启，`false` 或 `0` 关闭，同时控制 Rollout 和独立 ActorFwd 的局部恢复。 |
-| `RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS` | `3` | 非负整数。Rollout 和 ActorFwd 共用的累计局部恢复尝试次数；`0` 表示第一次故障就转全局重启。负数或非整数在启用恢复时会报错。 |
+| `RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS` | `3` | 非负整数。Rollout 和 ActorFwd 共用的累计局部恢复尝试次数；`0` 表示第一次故障就转全局重启。负数在启用恢复时报错，非整数由启动时的环境校验拒绝。 |
 | `RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT` | `180` | 正数，单位秒。等待旧工作退出的时间上限，也用于局部恢复与全局重启的交接；不是整个恢复过程的总超时。 |
 
 | 训练模式 | 未设置开关时 | 可局部恢复的角色 |
@@ -23,6 +23,8 @@ Relax 支持在 Rollout 或独立 ActorFwd 运行时抛出异常后，仅重建�
 | colocate（不含 hybrid） | 关闭，需要显式设为 `true` 或 `1` | Rollout |
 
 开关值忽略大小写和首尾空白，例如 `TRUE` 与 `true` 等效。显式设为 `true` 或 `1` 时，如果配置不受支持，启动会报 `Unsupported inference recovery configuration`，列出冲突字段。未设置开关时，不支持的配置会保留原行为。设为 `false` 或 `0` 时关闭本功能，跳过局部恢复的配置检查。
+
+这三个变量遵循统一的环境配置规则：空值等同于未设置，使用默认值；开关还接受 `on`/`off`、`yes`/`no`、`t`/`f`、`y`/`n`。非法布尔值或无法转换为声明类型的数值会在启动校验时报错，即使局部恢复已关闭。
 
 ### 启用与关闭
 
