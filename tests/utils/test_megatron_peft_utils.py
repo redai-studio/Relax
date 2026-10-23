@@ -31,6 +31,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
+    scope_target_modules_to_region,
     write_hf_peft_adapter,
 )
 
@@ -50,6 +51,31 @@ def test_exclude_frozen_lora_target_modules_keeps_vision_merger() -> None:
     targets = exclude_frozen_lora_target_modules(ToyModel(), ["linear_fc1"], [r"^(vision_model|visual)\.(?!merger\.)"])
 
     assert targets == ["decoder.linear_fc1", "vision_model.merger.linear_fc1"]
+
+
+def test_canonical_targets_preserve_projection_aliases_and_language_scope(monkeypatch) -> None:
+    matcher = types.ModuleType("megatron.bridge.peft.utils")
+    from fnmatch import fnmatchcase
+
+    matcher.wildcard_match = lambda pattern, name: fnmatchcase(name, pattern)
+    monkeypatch.setitem(sys.modules, matcher.__name__, matcher)
+    model = torch.nn.Module()
+    for region in ("language_model", "visual"):
+        module = torch.nn.Module()
+        module.linear_qkv = torch.nn.Linear(2, 6)
+        module.linear_fc1 = torch.nn.Linear(2, 4)
+        model.add_module(region, module)
+    targets = ["linear_q", "linear_k", "linear_v", "linear_fc1_gate", "linear_fc1_up"]
+    expected = [f"language_model.{target}" for target in targets]
+    assert scope_target_modules_to_region(model, targets, "language") == expected
+    assert scope_target_modules_to_region(model, ["*.linear_q", "*.linear_fc1_gate"], "language") == [
+        "language_model.linear_q",
+        "language_model.linear_fc1_gate",
+    ]
+    assert exclude_frozen_lora_target_modules(model, targets, [r"^visual\."]) == expected
+    ordinary_targets = [name for name, _ in model.named_modules() if name.startswith("language_model")]
+    assert scope_target_modules_to_region(model, ["*"], "language") == ordinary_targets
+    assert exclude_frozen_lora_target_modules(model, ["*"], [r"^visual"]) == ordinary_targets
 
 
 class TestBuildLoraPeft:
@@ -86,6 +112,19 @@ class TestBuildLoraPeft:
         with pytest.raises(ValueError, match="RELAX_LORA_SHARE_EXPERT_ADAPTERS"):
             build_lora_peft(args)
 
+    def test_sequence_contrast_uses_canonical_adapters(self, monkeypatch):
+        self._install_create_peft_stub(monkeypatch)
+        args = Namespace(
+            task_type="seq_contrast",
+            lora_rank=64,
+            lora_alpha=128,
+            lora_target_modules=["linear_q", "linear_k", "linear_v"],
+            lora_dropout=0.05,
+        )
+        assert build_lora_peft(args)["type"] == "canonical_lora"
+        args.task_type = "causal_lm"
+        assert "type" not in build_lora_peft(args)
+
 
 class TestConvertMegatronToHfTargetModules:
     def test_convert_megatron_to_hf_expands_fused_modules(self):
@@ -119,6 +158,10 @@ class TestIsLoraAdapterParam:
         [
             "decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight",
             "decoder.layers.0.self_attention.linear_qkv.adapter.linear_out.weight",
+            "decoder.layers.0.self_attention.linear_qkv.adapter.adapter_q.linear_in.weight",
+            "decoder.layers.0.self_attention.linear_qkv.adapter.adapter_k.linear_out.weight",
+            "decoder.layers.0.mlp.linear_fc1.adapter.adapter_gate.linear_in.weight",
+            "decoder.layers.0.mlp.linear_fc1.adapter.adapter_up.linear_out.weight",
             "base_model.model.layers.0.self_attn.q_proj.lora_A.weight",
             "base_model.model.layers.0.self_attn.q_proj.lora_B.weight",
         ],
@@ -132,6 +175,8 @@ class TestIsLoraAdapterParam:
             "decoder.layers.0.self_attention.linear_qkv.to_wrap.weight",
             "decoder.layers.0.mlp.linear_fc1.weight",
             "embedding.word_embeddings.weight",
+            "decoder.layers.0.mlp.adapter_gate.linear_in.weight",
+            "decoder.layers.0.mlp.adapter.adapter_other.linear_in.weight",
         ],
     )
     def test_is_lora_adapter_param_rejects_base_weights(self, name):
@@ -150,6 +195,42 @@ class TestIsLoraAdapterParam:
 
 
 class TestWriteHfPeftAdapter:
+    def test_rejects_colliding_wrapped_and_unwrapped_keys(self, tmp_path):
+        with pytest.raises(ValueError, match="Duplicate PEFT adapter key"):
+            write_hf_peft_adapter(
+                {"x.lora_A.weight": torch.zeros(2, 2), "base_model.model.x.lora_A.weight": torch.ones(2, 2)},
+                tmp_path,
+                lora_rank=2,
+                lora_alpha=4,
+                target_modules=["x"],
+                lora_dropout=0.0,
+            )
+
+    @pytest.mark.parametrize("with_wrapper_prefix", [False, True])
+    def test_bridge_keys_load_into_real_peft_model(self, tmp_path, with_wrapper_prefix):
+        peft = pytest.importorskip("peft")
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+
+        config = Qwen2Config(
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            vocab_size=32,
+        )
+        names = ("model.layers.0.self_attn.q_proj.lora_A.weight", "model.layers.0.self_attn.q_proj.lora_B.weight")
+        expected = {names[0]: torch.randn(2, 16), names[1]: torch.randn(16, 2)}
+        merged = {f"base_model.model.{k}" if with_wrapper_prefix else k: v for k, v in expected.items()}
+        adapter = tmp_path / "adapter"
+        write_hf_peft_adapter(merged, adapter, lora_rank=2, lora_alpha=4, target_modules=["q_proj"], lora_dropout=0.0)
+        model = peft.PeftModel.from_pretrained(Qwen2ForCausalLM(config), adapter)
+        actual = {k: v for k, v in model.named_parameters() if "lora_" in k}
+        assert len(actual) == 2
+        for key, value in actual.items():
+            hf_key = key.removeprefix("base_model.model.").replace(".default.weight", ".weight")
+            torch.testing.assert_close(value, expected[hf_key], rtol=0, atol=0)
+
     def test_write_hf_peft_adapter_round_trip(self, tmp_path):
         """Writes a loadable HF-PEFT dir: config JSON + safetensors with same
         tensors."""

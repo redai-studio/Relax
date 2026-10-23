@@ -1156,6 +1156,14 @@ def _add_sft_token_lengths(args: Namespace, rollout_data: dict[str, Any]) -> Non
 
 
 def post_process_rollout_data(args, rollout_data):
+    from relax.engine.sft.runtime import is_sequence_contrast_mode
+
+    if is_sequence_contrast_mode(args):
+        from relax.utils.training.retrieval_utils import expand_retrieval_rollout_data
+
+        expanded = expand_retrieval_rollout_data(rollout_data)
+        rollout_data.clear()
+        rollout_data.update(expanded)
     _add_sft_token_lengths(args, rollout_data)
     # move tokens/loss_masks to GPU in-place as a list of tensors (downstream
     # code in this module expects lists of sequence tensors for packing)

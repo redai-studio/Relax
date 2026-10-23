@@ -64,6 +64,11 @@ def is_sft_mode(args: Namespace) -> bool:
     return getattr(args, "loss_type", None) == "sft"
 
 
+def is_sequence_contrast_mode(args: Namespace) -> bool:
+    """Return whether offline SFT uses sequence-pair InfoNCE."""
+    return is_sft_mode(args) and getattr(args, "task_type", "causal_lm") == "seq_contrast"
+
+
 def is_dpo_mode(args: Namespace) -> bool:
     """Return whether the normalized training objective is DPO."""
     return getattr(args, "loss_type", None) == "dpo"
@@ -184,7 +189,7 @@ def should_skip_mtp_only_weight_management(
 def should_bypass_main_output_layer(args: Namespace) -> bool:
     """Return whether training needs hidden states instead of main language-
     model logits."""
-    return getattr(args, "mtp_only_training", False) or should_use_sft_chunked(args)
+    return getattr(args, "mtp_only_training", False) or should_use_sft_chunked(args) or is_sequence_contrast_mode(args)
 
 
 def should_use_sft_chunked(args: Namespace) -> bool:

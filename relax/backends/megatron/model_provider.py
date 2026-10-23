@@ -25,6 +25,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from relax.engine.sft.runtime import is_sequence_contrast_mode
 from relax.utils.device import is_npu_available, make_current_torch_device
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -518,6 +519,9 @@ def get_model_provider_func(
                 )
                 provider.apply_dsa_kernel_fusion = want_fusion
 
+        if is_sequence_contrast_mode(args):
+            provider.freeze_vision_model = True
+            provider.freeze_vision_projection = True
         _validate_linear_cp_mode(args, provider)
         provider.finalize()
 
@@ -539,6 +543,10 @@ def get_model_provider_func(
             model = _call_model_provider(original_provide, *p_args, **p_kwargs)
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
+            if is_sequence_contrast_mode(args):
+                from relax.utils.training.retrieval_utils import freeze_retrieval_unused_heads
+
+                freeze_retrieval_unused_heads(model)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
             install_reward_model_head_in_provider(model, args, role, post_process, stash_lm_head=True)
 

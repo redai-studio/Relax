@@ -18,6 +18,9 @@ def configure_sft_data_pipeline(args: Namespace) -> None:
         args.sft_async_prepack = bool(
             is_sft
             and lookahead
+            # Retrieval pairs are packed by their task-specific forward path;
+            # the generic prepacker cannot concatenate anchor/positive dicts.
+            and getattr(args, "task_type", "causal_lm") != "seq_contrast"
             and "image" not in (getattr(args, "multimodal_keys", None) or {})
             and args.distributed_backend == "nccl"
             and args.qkv_format == "thd"

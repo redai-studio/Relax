@@ -86,6 +86,7 @@ def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> fl
 
 def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
     """Dense transformer: Qwen2, Qwen3, LLaMA, Mistral, etc."""
+    config = getattr(config, "text_config", config)
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
     num_hidden_layers = config.num_hidden_layers

@@ -158,7 +158,11 @@ def is_lora_adapter_param(name: str) -> bool:
     - Megatron-Bridge: ``...adapter.linear_in.weight`` / ``...adapter.linear_out.weight``
     - Standard PEFT:   ``...lora_A.weight`` / ``...lora_B.weight``
     """
-    return ".lora_A." in name or ".lora_B." in name or ".adapter.linear_in." in name or ".adapter.linear_out." in name
+    return (
+        ".lora_A." in name
+        or ".lora_B." in name
+        or re.search(r"\.adapter(?:\.adapter_(?:q|k|v|gate|up))?\.linear_(?:in|out)\.", name) is not None
+    )
 
 
 _LORA_TENSOR_SUFFIXES = (
@@ -313,6 +317,23 @@ def install_gdn_gate_mask_hooks(model) -> int:
     return masked
 
 
+def _lora_target_aliases(full_name: str, target_modules: list[str]) -> tuple[str, ...]:
+    """Expose explicitly requested canonical projections of a fused module.
+
+    Broad wildcard targets keep ordinary fused LoRA's existing module list.
+    """
+    parent, _, leaf = full_name.rpartition(".")
+    split_names = {
+        "linear_qkv": ("linear_q", "linear_k", "linear_v"),
+        "linear_fc1": ("linear_fc1_gate", "linear_fc1_up"),
+    }.get(leaf, ())
+    requested_leaves = {target.rsplit(".", 1)[-1] for target in target_modules}
+    return (
+        full_name,
+        *(f"{parent}.{name}" if parent else name for name in split_names if name in requested_leaves),
+    )
+
+
 def scope_target_modules_to_region(model, target_modules: list[str], scope: str) -> list[str]:
     """Narrow LoRA target modules to a model region (language / vision / all).
 
@@ -348,12 +369,12 @@ def scope_target_modules_to_region(model, target_modules: list[str], scope: str)
     for full_name, _module in model.named_modules():
         if not full_name:
             continue  # skip the unnamed root module
-        leaf = full_name.rsplit(".", 1)[-1]
-        if not any(leaf == t or wildcard_match(t, full_name) for t in target_modules):
-            continue
         is_vision = any(tok in full_name for tok in VISION_REGION_TOKENS)
         if is_vision == want_vision:
-            scoped.append(full_name)
+            for alias in _lora_target_aliases(full_name, target_modules):
+                leaf = alias.rsplit(".", 1)[-1]
+                if any(leaf == target or wildcard_match(target, alias) for target in target_modules):
+                    scoped.append(alias)
 
     return scoped or [_LORA_NO_MATCH_SENTINEL]
 
@@ -373,14 +394,12 @@ def exclude_frozen_lora_target_modules(model, target_modules: list[str], freeze_
     for full_name, _module in model.named_modules():
         if not full_name:
             continue
-        leaf = full_name.rsplit(".", 1)[-1]
-        if not any(
-            leaf == target or full_name == target or fnmatchcase(full_name, target) for target in target_modules
-        ):
-            continue
         if any(re.search(pattern, full_name) for pattern in patterns):
             continue
-        filtered.append(full_name)
+        for alias in _lora_target_aliases(full_name, target_modules):
+            leaf = alias.rsplit(".", 1)[-1]
+            if any(leaf == target or fnmatchcase(alias, target) for target in target_modules):
+                filtered.append(alias)
 
     return filtered or [_LORA_NO_MATCH_SENTINEL]
 
@@ -426,7 +445,12 @@ def _lora_module_key(adapter_param_name: str) -> str:
     ``linear_in``/``linear_out`` (and every packed expert) map to a single
     module. Used to count *modules* rather than *params*.
     """
-    name = adapter_param_name.replace(".adapter.linear_in.weight", "").replace(".adapter.linear_out.weight", "")
+    name = re.sub(
+        r"(\.adapter\.adapter_(?:q|k|v|gate|up))\.linear_(?:in|out)\.weight\d*$",
+        r"\1",
+        adapter_param_name,
+    )
+    name = name.replace(".adapter.linear_in.weight", "").replace(".adapter.linear_out.weight", "")
     name = re.sub(r"\.lora_[AB]\.weight\d*$", "", name)
     return name
 
@@ -520,8 +544,14 @@ def write_hf_peft_adapter(
     with open(adapter_dir / "adapter_config.json", "w") as f:
         json.dump(config_dict, f)
 
-    # safetensors requires contiguous CPU tensors.
-    state = {name: t.contiguous() for name, t in merged.items()}
+    # Bridge yields unwrapped HF names; PEFT's loader expects its wrapper prefix.
+    # FSDP/get_peft_model_state_dict already supplies that prefix.
+    state = {}
+    for name, tensor in merged.items():
+        key = name if name.startswith("base_model.model.") else f"base_model.model.{name}"
+        if key in state:
+            raise ValueError(f"Duplicate PEFT adapter key after prefix normalization: {key}")
+        state[key] = tensor.contiguous()
     save_file(state, str(adapter_dir / "adapter_model.safetensors"))
     return str(adapter_dir)
 
@@ -638,6 +668,10 @@ def build_lora_peft(args):
         "dropout": args.lora_dropout,
         "bias": "none",
     }
+    if getattr(args, "task_type", None) == "seq_contrast":
+        # Preserve the reference's independent Q/K/V and gate/up adapters.
+        # Other tasks retain Bridge's existing fused-LoRA default.
+        peft_config["type"] = "canonical_lora"
     # Megatron-Bridge defaults to Xavier A initialization and one adapter
     # shared by all local experts.  Some external PEFT baselines use Kaiming
     # initialization and one adapter per expert instead.  Keep Relax defaults

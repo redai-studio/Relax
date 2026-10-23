@@ -243,3 +243,49 @@ def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
     assert args.dynamic_context_parallel is True
     assert args.eval_interval == 10
     assert args.eval_size == 0.1
+
+
+def _contrast_args():
+    args = _opd_args()
+    vars(args).update(
+        loss_type="sft",
+        task_type="seq_contrast",
+        use_opd=False,
+        custom_dataset_class_path="relax.engine.sft.dataset.retrieval.NLIPairDataset",
+        prompt_data=["/pairs.jsonl"],
+        n_samples_per_prompt=1,
+        rollout_batch_size=32,
+        global_batch_size=32,
+        qkv_format="thd",
+        use_dynamic_batch_size=True,
+        max_tokens_per_gpu=4096,
+        use_gloo_process_groups=True,
+        sft_oversize_strategy="keep",
+        sft_chunked_logits=False,
+        sft_oversize_custom_function_path=None,
+    )
+    return args
+
+
+def test_seq_contrast_parser_and_shared_offline_validation(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    parsed = parser.parse_args(["--task-type", "seq_contrast", "--contrastive-temperature", "0.07"])
+    assert parsed.task_type == "seq_contrast"
+    assert parsed.contrastive_temperature == 0.07
+    args = _contrast_args()
+    arguments_module.slime_validate_args(args)
+    assert args.compute_advantages_and_returns is False
+    assert args.balance_data is True
+    assert args.use_critic is False
+
+
+@pytest.mark.parametrize("override", ["context_parallel_size: 2", "sft_train_data_prefetch: true", "eval_size: 0"])
+def test_seq_contrast_yaml_cannot_bypass_retrieval_contract(arguments_module, tmp_path, override):
+    args = _contrast_args()
+    config = tmp_path / "override.yaml"
+    config.write_text(override)
+    args.custom_config_path = str(config)
+    with pytest.raises(ValueError, match="seq_contrast"):
+        arguments_module.slime_validate_args(args)

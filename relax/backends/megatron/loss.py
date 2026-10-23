@@ -15,7 +15,7 @@ from relax.algorithms import get_algorithm
 from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
 from relax.algorithms.policy import compute_policy_loss_for
 from relax.algorithms.spec import ALGORITHM_SPECS
-from relax.engine.sft.runtime import is_sft_mode
+from relax.engine.sft.runtime import is_sequence_contrast_mode, is_sft_mode
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -1527,6 +1527,34 @@ def get_sequence_classification_outputs(
     return torch.stack(local_logits, dim=0), local_indices
 
 
+def sequence_contrast_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    hidden_states: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute InfoNCE while preserving the shared sample-sum loss contract."""
+    from relax.utils.training.retrieval_utils import (
+        retrieval_infonce,
+        scale_for_megatron_sample_mean,
+        select_retrieval_features,
+    )
+
+    features = select_retrieval_features(
+        hidden_states,
+        batch["unconcat_tokens"],
+        args.retrieval_emb_token_id,
+        padded_total_lengths=batch.get("padded_total_lengths"),
+    )
+    group = mpu.get_data_parallel_group(with_context_parallel=False)
+    mean_loss = retrieval_infonce(
+        features[::2], features[1::2], temperature=args.contrastive_temperature, process_group=group
+    )
+    global_pairs = int(batch.get("dynamic_global_batch_size", args.global_batch_size))
+    loss = scale_for_megatron_sample_mean(mean_loss, global_pairs=global_pairs, dp_size=dist.get_world_size(group))
+    return loss, {"loss": loss.detach()}
+
+
 def sequence_classification_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1677,6 +1705,8 @@ def loss_function(
     # normalizer is correct even when CP differs across micro-batches (dynamic CP).
     # Under static CP it equals the old full-sample count distributed across ranks,
     # so the final loss/grad/metric are unchanged after all-reduce.
+    if is_sequence_contrast_mode(args) and num_microbatches != 1:
+        raise ValueError("seq_contrast requires one complete contrastive microbatch per optimizer update")
     num_tokens = get_cp_local_num_tokens(
         batch["total_lengths"],
         batch["response_lengths"],
@@ -1714,7 +1744,9 @@ def loss_function(
             case "rm":
                 func = reward_model_loss_function
             case "sft":
-                if getattr(args, "task_type", "causal_lm") == "seq_cls":
+                if is_sequence_contrast_mode(args):
+                    func = sequence_contrast_loss_function
+                elif getattr(args, "task_type", "causal_lm") == "seq_cls":
                     func = sequence_classification_loss_function
                 elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
                     # Bind lm_head_forward so chunked path matches the standard

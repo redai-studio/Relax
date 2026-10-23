@@ -2,7 +2,7 @@
 
 from argparse import Namespace
 
-from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
+from relax.engine.sft.runtime import is_preference_mode, is_sequence_contrast_mode, is_sft_mode
 from relax.utils.data.image_refs import sft_multimodal_data_fields
 from relax.utils.env import Envs
 
@@ -52,6 +52,9 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         if getattr(args, "task_type", "causal_lm") == "seq_cls":
             fields.append("classification_labels")
         fields.extend(sft_multimodal_data_fields(args))
+        if is_sequence_contrast_mode(args) and "multimodal_train_inputs" not in fields:
+            # One TQ row retains both tokenized branches even for text-only PT.
+            fields.append("multimodal_train_inputs")
         return fields
 
     from relax.algorithms import algorithm_needs_critic
