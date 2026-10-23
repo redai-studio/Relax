@@ -1,10 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import os
 import threading
 import time
 from argparse import Namespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import ray
 import requests
@@ -260,6 +261,38 @@ class Service:
         """Trigger a fully asynchronous weight receive for Actor FWD
         service."""
         return await self.handle.recv_weight_fully_async.remote()
+
+    def rebuild_for_recovery(self, check_current: Callable[[], None]) -> None:
+        """Replace only an idle inference role, preserving its placement
+        group."""
+        from ray.util.state import get_actor
+
+        from relax.utils.async_utils import run
+
+        check_current()
+        self._stop_heartbeat_thread()
+        children = run(asyncio.wait_for(self.handle.stop_for_recovery.remote(), timeout=90))
+        identities = [child._actor_id.hex() for child in children]
+        for child in children:
+            ray.kill(child, no_restart=True)
+        deadline = time.monotonic() + 30
+        while identities:
+            identities = [
+                identity for identity in identities if (actor := get_actor(identity)) is None or actor.state != "DEAD"
+            ]
+            if identities and time.monotonic() >= deadline:
+                raise RuntimeError(f"Old inference actors have not exited: {identities}")
+            if identities:
+                time.sleep(0.1)
+        check_current()
+        serve.delete(self.role)
+        if str(self.role) == "rollout":
+            # The owned router died with the old Manager. Never reuse its endpoint.
+            self.config.sglang_router_ip = None
+            self.config.sglang_router_port = None
+        check_current()
+        self._deploy(self.pgs)
+        self._task_ref = None
 
     def restart(self) -> None:
         """Restart this service in-place: reuse placement groups and dynamic

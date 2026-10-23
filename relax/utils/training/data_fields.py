@@ -103,3 +103,35 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
 
         consume_opd_train_data(fields, args)
     return fields
+
+
+def build_async_train_data_fields(args: Namespace) -> list[str]:
+    """Fields consumed by the pure fully-async Megatron training RPC."""
+    data_fields = [
+        "tokens",
+        "total_lengths",
+        "response_lengths",
+        "loss_masks",
+        "advantages",
+        "returns",
+        "rollout_log_probs",
+        "rewards",
+        "sample_indices",
+        "sample_index_mask_sums",
+        "group_index",
+    ]
+    # In true on-policy mode, actor_fwd is absent and old_log_probs is
+    # recomputed inline from the train forward (see policy_loss_function).
+    if args.advantage_estimator == "score_centering":
+        data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+    if not getattr(args, "true_on_policy_mode", False):
+        data_fields.append("log_probs")
+    if args.kl_coef != 0 or args.use_kl_loss:
+        data_fields.append("ref_log_probs")
+    if args.multimodal_keys is not None:
+        data_fields.append("multimodal_train_inputs")
+    if args.use_opd:
+        from relax.utils.opd.opd_utils import consume_opd_train_data
+
+        consume_opd_train_data(data_fields, args)
+    return data_fields

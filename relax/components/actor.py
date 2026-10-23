@@ -11,6 +11,7 @@ from ray import serve
 
 from relax.components.background_loop import BackgroundLoopRunner
 from relax.components.base import Base
+from relax.core.inference_recovery import RecoveryGate, wait_all
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import (
@@ -22,6 +23,7 @@ from relax.engine.sft.runtime import (
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 from relax.utils.tq.lifecycle import attach_tq_client
+from relax.utils.training.data_fields import build_async_train_data_fields, build_data_fields
 
 
 app = FastAPI()
@@ -66,6 +68,7 @@ class Actor(Base):
         self._lock = threading.RLock()
         self.healthy = healthy
         self.role = role
+        self._recovery = RecoveryGate(config, role)
         self.genrm_manager = None  # Set later via set_genrm_manager if genRM is enabled
 
         # Threading primitives so the training loop doesn't block the Serve/FastAPI thread
@@ -126,6 +129,21 @@ class Actor(Base):
         if (not self.config.fully_async or self.config.hybrid) and not is_offline_mode(self.config):
             self.actor_model.update_weights()
 
+    def rebind_rollout_manager(self, rollout_manager: Any) -> None:
+        """Replace the inference target while the original training workers are
+        idle."""
+        self.rollout_manager = rollout_manager
+        wait_all(self.actor_model.async_inference_call("set_rollout_manager", rollout_manager))
+
+    def recovery_update_weights_colocate(self) -> None:
+        wait_all(self.actor_model.async_inference_call("recovery_update_weights_colocate"))
+
+    def recovery_update_weights_hybrid(self) -> None:
+        wait_all(self.actor_model.async_inference_call("recovery_update_weights_hybrid"))
+
+    def reset_inference_transport(self, role: str) -> None:
+        wait_all(self.actor_model.async_inference_call("reset_inference_transport", role))
+
     def set_barriers(
         self,
         *,
@@ -154,7 +172,14 @@ class Actor(Base):
         self._logger.info("Teacher manager set on Actor for coordinated offload/onload")
 
     def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False) -> None:
-        self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        if self._recovery.state is not None:
+            wait_all(
+                self.actor_model.async_inference_call(
+                    "update_weights_fully_async", self.step, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+                )
+            )
+        else:
+            self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
 
     async def run(self) -> None:
         await self._loop_runner.run(self._background_run, before_start=self._reset_consumption)
@@ -189,24 +214,36 @@ class Actor(Base):
                     if not self._wait_for_rollout_data():
                         continue
 
-                self._logger.info(f"Actor training step {local_step}/{self.config.num_rollout}")
-                did_train = self._execute_training()
-
-                self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
-
-                if did_train:
-                    for partition_id in sft_partition_ids(self.config, local_step):
-                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
-                    self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
-
+                fields = ()
+                if self._recovery.state is not None:
+                    fields = (
+                        build_async_train_data_fields(self.config)
+                        if self.config.fully_async and not getattr(self.config, "hybrid", False)
+                        else build_data_fields(self.config, consumer="actor")
+                    )
+                local_step = self._recovery.admit(local_step, self.data_system_client, fields, self._stop_event)
+                if local_step is None:
+                    break
+                self.step = local_step
                 try:
-                    self.healthy.update_heartbeat.remote("actor", local_step + 1)
-                except Exception:
-                    pass
-
-                # increment step with lock
-                with self._lock:
-                    self.step += 1
+                    self._logger.info(f"Actor training step {local_step}/{self.config.num_rollout}")
+                    did_train = self._execute_training()
+                    self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
+                    if did_train:
+                        for partition_id in sft_partition_ids(self.config, local_step):
+                            run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+                        self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
+                    try:
+                        self.healthy.update_heartbeat.remote("actor", local_step + 1)
+                    except Exception:
+                        pass
+                    with self._lock:
+                        self.step = local_step + 1
+                except Exception as exc:
+                    self._recovery.fail(exc)
+                    raise
+                finally:
+                    self._recovery.leave()
 
         except Exception as e:
             error_msg = f"Actor training failed at step {self.step}: {type(e).__name__}: {str(e)}"
@@ -235,6 +272,20 @@ class Actor(Base):
             True if data is ready and training can proceed,
             False if should continue waiting (caller should skip this iteration)
         """
+        if self._recovery.state is not None:
+            if ray.get(self._recovery.state.snapshot.remote())["paused"]:
+                time.sleep(0.05)
+                return False
+            if self.config.offload_rollout and self._rollout_barrier is not None:
+                try:
+                    if ray.get(self.rollout_manager.get_status.remote()) == "onload":
+                        time.sleep(0.05)
+                        return False
+                except Exception:
+                    if not ray.get(self._recovery.state.snapshot.remote())["paused"]:
+                        raise
+                    return False
+            return True
         partition_list = run(self.data_system_client.async_get_partition_list())
         if not partition_list or not all(
             partition_id in partition_list for partition_id in sft_partition_ids(self.config, self.step)
@@ -298,13 +349,25 @@ class Actor(Base):
         # Use appropriate training method based on mode
         if self.config.hybrid:
             # hybrid mode: actor handles ref/actor_fwd/adv internally
-            ray.get(self.actor_model.train_hybrid(self.step))
+            refs = self.actor_model.train_hybrid(self.step)
+            if self._recovery.state is not None:
+                wait_all(refs)
+            else:
+                ray.get(refs)
         elif self.config.fully_async:
-            ray.get(self.actor_model.train_fully_async(self.step))
+            refs = self.actor_model.train_fully_async(self.step)
+            if self._recovery.state is not None:
+                wait_all(refs)
+            else:
+                ray.get(refs)
             # Save model checkpoint if needed
             self._maybe_save_model()
         else:
-            ray.get(self.actor_model.async_train(self.step))
+            refs = self.actor_model.async_train(self.step)
+            if self._recovery.state is not None:
+                wait_all(refs)
+            else:
+                ray.get(refs)
         return True
 
     def _maybe_save_model(self) -> None:

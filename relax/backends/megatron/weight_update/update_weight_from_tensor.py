@@ -440,6 +440,11 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
         # int4/fp4 post_process
+        defer_generation = (
+            getattr(self.args, "inference_recovery", False)
+            and self.args.colocate
+            and not getattr(self.args, "hybrid", False)
+        )
         if self._route_experts:
             self._routed_engine_call(
                 all_engines,
@@ -448,7 +453,8 @@ class UpdateWeightFromTensor:
                 post_process_quantization=True,
             )
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
-            self._routed_engine_call(all_engines, "continue_generation")
+            if not defer_generation:
+                self._routed_engine_call(all_engines, "continue_generation")
         elif rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
@@ -457,7 +463,10 @@ class UpdateWeightFromTensor:
                     rollout_engines=all_engines,
                 )
             ray.get([engine.end_weight_update.remote() for engine in all_engines])
-            ray.get([engine.continue_generation.remote() for engine in all_engines])
+            # Recovery-enabled colocate remains paused until the Manager has
+            # restored every server's KV cache and CUDA graphs.
+            if not defer_generation:
+                ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
 
     def _routed_engine_call(self, engines: Sequence[ActorHandle], method: str, **kwargs) -> None:

@@ -11,6 +11,7 @@ from tensordict import TensorDict
 
 from relax.algorithms.advantages import compute_advantages_and_returns
 from relax.components.base import Base
+from relax.core.inference_recovery import RecoveryGate
 from relax.utils.async_utils import run as run_
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
@@ -32,6 +33,8 @@ class Advantages(Base):
         self.config = config
         self._lock = threading.RLock()
         self.healthy = healthy
+        self.role = role
+        self._recovery = RecoveryGate(config, role)
 
         self.data_system_client = attach_tq_client(
             self.config.tq_config,
@@ -48,72 +51,68 @@ class Advantages(Base):
         # probe and triggering a false-positive "event loop unresponsive" kill.
         await asyncio.to_thread(self._run_blocking)
 
+    def _advantage_fields(self) -> list[str]:
+        fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs", "rewards"]
+        if not getattr(self.config, "true_on_policy_mode", False):
+            fields.append("log_probs")
+        if self.config.kl_coef != 0 or self.config.use_kl_loss:
+            fields.append("ref_log_probs")
+        consume_opd_advantage_data(fields, self.config)
+        return fields
+
     def _run_blocking(self) -> None:
-        step = self.step
         self.data_system_client.reset_consumption(
-            partition_id=f"train_{self.step}",
-            task_name="compute_advantages_and_returns",
+            partition_id=f"train_{self.step}", task_name="compute_advantages_and_returns"
         )
+        fields = self._advantage_fields()
         try:
-            while step < self.config.num_rollout:
-                self._logger.info(
-                    f"Start to got rollout_id: {step} data from transfer queue for compute advantages and returns."
-                )
-                # On the fully-async dynamic-batch path the partition is not
-                # pre-allocated to global_batch_size, so the tensor-wide .all()
-                # consumption check is unreliable — use the producer-driven drained
-                # predicate (production_completed AND all inserted samples consumed).
-                _stream_drain = getattr(self.config, "fully_async", False) and getattr(
-                    self.config, "use_dynamic_batch_size", False
-                )
-                _drain_check = (
-                    self.data_system_client.async_check_stream_drained
-                    if _stream_drain
-                    else self.data_system_client.async_check_consumption_status
-                )
-
-                while not run_(_drain_check("compute_advantages_and_returns", f"train_{step}")):
-                    adv_data_fields = [
-                        "tokens",
-                        "total_lengths",
-                        "response_lengths",
-                        "loss_masks",
-                        "rollout_log_probs",
-                        "rewards",
-                    ]
-                    # log_probs is only needed for KL divergence; in true on-policy mode
-                    # the actor_fwd role is absent and log_probs is not produced upstream.
-                    if not getattr(self.config, "true_on_policy_mode", False):
-                        adv_data_fields.append("log_probs")
-                    if self.config.kl_coef != 0 or self.config.use_kl_loss:
-                        adv_data_fields.append("ref_log_probs")
-                    consume_opd_advantage_data(adv_data_fields, self.config)
-                    batch_meta = run_(
-                        self.data_system_client.async_get_meta(
-                            data_fields=adv_data_fields,
-                            batch_size=self.config.global_batch_size // self.config.num_iters_per_train_update,
-                            partition_id=f"train_{step}",
-                            task_name="compute_advantages_and_returns",
-                        )  # type: ignore
-                    )
-
-                    if batch_meta.size == 0:
-                        continue
-                    rollout_data = run_(self.data_system_client.async_get_data(batch_meta))
-                    self._logger.info(
-                        f"Successfully got rollout_id: {step} data from transfer queue for compute advantages and returns."
-                    )
-                    advantages_and_returns = self.compute_advantages_and_returns(rollout_data)
-                    advantages_and_returns = TensorDict(advantages_and_returns, batch_size=[len(batch_meta.samples)])
-                    run_(self.data_system_client.async_put(data=advantages_and_returns, metadata=batch_meta))
-                self._logger.info(f"Successfully run compute advantages and returns for step {step}.")
-                step += 1
+            while self.step < self.config.num_rollout:
+                step = self._recovery.admit(self.step, self.data_system_client, fields)
+                if step is None:
+                    break
+                self.step = step
+                try:
+                    self._compute_partition(step, fields)
+                    self.step = step + 1
+                except Exception as exc:
+                    self._recovery.fail(exc)
+                    raise
+                finally:
+                    self._recovery.leave()
         except Exception as e:
             error_msg = f"Advantage computation failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
             self.healthy.report_error.remote("advantage", error_msg)
-            if not getattr(self.config, "use_health_check", False):
+            if self._recovery.state is not None or not getattr(self.config, "use_health_check", False):
                 raise
+
+    def _compute_partition(self, step: int, fields: list[str]) -> None:
+        self._logger.info(f"Getting rollout_id: {step} data for compute advantages and returns.")
+        # Dynamic streams use producer completion rather than preallocated consumption bits.
+        stream_drain = getattr(self.config, "fully_async", False) and getattr(
+            self.config, "use_dynamic_batch_size", False
+        )
+        drain_check = (
+            self.data_system_client.async_check_stream_drained
+            if stream_drain
+            else self.data_system_client.async_check_consumption_status
+        )
+        while not run_(drain_check("compute_advantages_and_returns", f"train_{step}")):
+            batch_meta = run_(
+                self.data_system_client.async_get_meta(
+                    data_fields=fields,
+                    batch_size=self.config.global_batch_size // self.config.num_iters_per_train_update,
+                    partition_id=f"train_{step}",
+                    task_name="compute_advantages_and_returns",
+                )
+            )
+            if batch_meta.size == 0:
+                continue
+            rollout_data = run_(self.data_system_client.async_get_data(batch_meta))
+            advantages_and_returns = self.compute_advantages_and_returns(rollout_data)
+            advantages_and_returns = TensorDict(advantages_and_returns, batch_size=[len(batch_meta.samples)])
+            run_(self.data_system_client.async_put(data=advantages_and_returns, metadata=batch_meta))
+        self._logger.info(f"Successfully run compute advantages and returns for step {step}.")
 
     def compute_advantages_and_returns(self, rollout_data: Dict[str, Any]) -> Dict[str, Any] | None:
         """Compute advantages and returns based on
