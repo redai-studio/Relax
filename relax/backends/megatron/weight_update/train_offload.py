@@ -383,6 +383,12 @@ class MegatronTrainStateOffloader:
                     "offload. Pass --selective-offload to select it explicitly and silence this warning."
                 )
 
+        if self.enabled and not self.uses_tms and getattr(args, "optimizer", "adam") == "sgd":
+            raise ValueError(
+                "SGD does not support selective train-state offload; use a working "
+                "torch_memory_saver configuration or disable train-state offload."
+            )
+
         self._strategy: _OffloadStrategy = (
             _TmsOffloadStrategy() if self.uses_tms else _SelectiveOffloadStrategy(model, optimizer, args)
         )
