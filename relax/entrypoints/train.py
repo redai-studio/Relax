@@ -32,6 +32,7 @@ logger = get_logger(__name__)
 # Global reference so signal handlers / atexit can reach the controller.
 _ctrl: Controller | None = None
 _shutdown_done = False
+_training_completed = False
 _kernel_cache_heartbeat = None
 _SHUTDOWN_TIMEOUT_SEC = 60
 _NORMAL_SHUTDOWN_TIMEOUT_SEC = 1800
@@ -91,6 +92,21 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                 logger.warning(f"Controller shutdown error during {sig_name}: {e}")
 
         if ray.is_initialized():
+            # Only the successful return of the training loop closes trackers.
+            if (
+                sig is None
+                and exit_code == 0
+                and getattr(_ctrl, "_metrics_service_enabled", False)
+                and _training_completed
+            ):
+                try:
+                    result = serve.get_app_handle("metrics").finish_tracking.remote().result(timeout_s=600)
+                    if result.get("status") != "success":
+                        logger.warning(f"Tracking finalization reported an error: {result}")
+                except Exception as error:
+                    # Tracking must not prevent GPU/Serve cleanup. Only normal
+                    # completion closes tracking tasks as successful.
+                    logger.warning(f"Tracking finalization failed: {error}")
             try:
                 serve.shutdown()
                 if _kernel_cache_heartbeat is not None:
@@ -111,7 +127,7 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
 
 
 def main(args):
-    global _ctrl, _kernel_cache_heartbeat
+    global _ctrl, _kernel_cache_heartbeat, _training_completed
 
     # Startup failures need the same cleanup as failures in the training loop.
     signal.signal(signal.SIGTERM, _graceful_shutdown)
@@ -155,6 +171,7 @@ def main(args):
         _ctrl = Controller.__new__(Controller)
         _ctrl.__init__(args, runtime_env)
         _ctrl.training_loop()
+        _training_completed = True
     except Exception as e:
         logger.exception(f"Training startup or loop failed with error: {e}")
         _graceful_shutdown(exit_code=1)

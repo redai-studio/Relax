@@ -14,20 +14,21 @@ import torch
 
 from relax.engine.sft.image import ImageBatchSampler
 from relax.engine.sft.runtime import sft_partition_id
+from relax.utils.tq import lifecycle as tq_lifecycle
 
 
 @pytest.fixture
 def producer(monkeypatch):
-    queue = ModuleType("transfer_queue")
-    queue.init = MagicMock()
-    queue.get_client = MagicMock()
+    client = SimpleNamespace(async_get_partition_list=AsyncMock(return_value=[]), async_put=AsyncMock())
+    attach = MagicMock(return_value=client)
+    monkeypatch.setattr(tq_lifecycle, "attach_tq_client", attach)
+    monkeypatch.setattr(tq_lifecycle, "detach_tq_client", MagicMock())
     ray = ModuleType("ray")
     ray.serve = SimpleNamespace(deployment=lambda cls: cls)
     path = Path(__file__).resolve().parents[2] / "relax/components/image_sft.py"
     spec = importlib.util.spec_from_file_location("_image_sft_cpu_test", path)
     module = importlib.util.module_from_spec(spec)
     with monkeypatch.context() as imports:
-        imports.setitem(sys.modules, "transfer_queue", queue)
         imports.setitem(sys.modules, "ray", ray)
         spec.loader.exec_module(module)
 
@@ -44,11 +45,18 @@ def producer(monkeypatch):
         sft_tq_timeout_minutes=1e-10,
         tq_config={},
     )
-    client = SimpleNamespace(async_get_partition_list=AsyncMock(return_value=[]), async_put=AsyncMock())
-    queue.get_client.return_value = client
     instance = module.ImageSFT(MagicMock(), None, 0, config, "sft")
     instance._logger_instance = MagicMock()
-    return instance
+    attach.assert_called_once_with(config.tq_config, role="sft")
+    yield instance
+    instance.__del__()
+
+
+def test_image_sft_teardown_detaches_worker_client_once(producer):
+    producer.__del__()
+    producer.__del__()
+    tq_lifecycle.detach_tq_client.assert_called_once()
+    assert producer.data_system_client is None
 
 
 @pytest.mark.parametrize("max_staleness", [0, 1])

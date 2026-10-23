@@ -6,6 +6,7 @@ from __future__ import annotations
 from argparse import Namespace
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Event
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -174,6 +175,7 @@ class SFTImagePrefetch:
         partition_id: str,
         task_name: str,
         sampling_config: dict,
+        cancel_event: Event | None = None,
     ) -> tuple[list, float]:
         """Background SFT prefetch with the rank-side pixel rebuild.
 
@@ -184,7 +186,7 @@ class SFTImagePrefetch:
         worker process. No collectives and no GPU work happen here; the main
         thread re-attaches the finished tensors in ``resolve``.
         """
-        prefetched = self.fetch_data(
+        fetch_kwargs = dict(
             data_fields=data_fields,
             batch_size=batch_size,
             partition_id=partition_id,
@@ -192,6 +194,14 @@ class SFTImagePrefetch:
             sampling_config=sampling_config,
             batch_index=0,
         )
+        if cancel_event is None:
+            prefetched = self.fetch_data(**fetch_kwargs)
+        else:
+            from relax.utils.data.stream_dataloader import _prefetch_data_from_transfer_queue
+
+            prefetched = _prefetch_data_from_transfer_queue(
+                tq_client=None, fetch_data=self.fetch_data, cancel_event=cancel_event, **fetch_kwargs
+            )
         raw_batch = prefetched[0][0]
         if raw_batch is None or not self.owns_vision(model):
             return prefetched

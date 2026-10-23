@@ -33,7 +33,6 @@ from typing import Any
 
 import ray
 import torch.nn.functional as F
-import transfer_queue as tq
 from ray import serve
 from transformers import AutoConfig, AutoTokenizer
 
@@ -58,6 +57,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.training.eval_config import build_named_prompt_data_configs
 from relax.utils.utils import dict_to_tensordict
 
@@ -168,6 +168,7 @@ def _create_sft_train_dataset(
     if dataset_cls is None:
         return SFTStreamingDataset(
             path=config.prompt_data,
+            line_offsets_cache=getattr(config, "_sft_line_offsets_cache", None),
             tokenizer=tokenizer,
             processor_pool=processor_pool,
             capacity=capacity,
@@ -361,8 +362,10 @@ class _SFTBatchProducerActor:
         if self._dataset is not None:
             return self._state()
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role="sft_batch_producer",
+        )
 
         prepare_model_maybe_update_args(self.config, completeness="metadata")
         prefetch_num_workers = (
@@ -509,16 +512,41 @@ class _SFTBatchProducerActor:
             "samples": len(samples),
         }
 
+    def _release_tq_client(self) -> None:
+        """Detach this shard's TQ client on teardown.
+
+        Release the Mooncake segment without waiting for the master-side TTL.
+        """
+        if getattr(self, "data_system_client", None) is None:
+            return
+        try:
+            detach_tq_client()
+        except Exception as exc:
+            self._logger.warning(f"SFT remote batch producer TQ detach failed: {exc}")
+            return
+        self.data_system_client = None
+
+    def __del__(self) -> None:
+        # Forced termination skips destructors; segment cleanup then relies on TTL.
+        try:
+            self._release_tq_client()
+        except Exception:  # destructor must never raise (interpreter shutdown)
+            return
+
     async def stop(self) -> None:
-        if self._dataset is not None:
-            self._dataset.stop()
-        if self._processor_pool is not None:
-            close = getattr(self._processor_pool, "close", None)
-            shutdown = getattr(self._processor_pool, "shutdown", None)
-            if callable(close):
-                close()
-            elif callable(shutdown):
-                shutdown()
+        try:
+            if self._dataset is not None:
+                self._dataset.stop()
+            if self._processor_pool is not None:
+                close = getattr(self._processor_pool, "close", None)
+                shutdown = getattr(self._processor_pool, "shutdown", None)
+                if callable(close):
+                    close()
+                elif callable(shutdown):
+                    shutdown()
+        finally:
+            # Detach even if local worker cleanup fails.
+            self._release_tq_client()
 
 
 @serve.deployment
@@ -531,8 +559,10 @@ class SFT(Base):
         self.healthy = healthy
         self.step = getattr(config, "start_rollout_id", 0)
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role=self.role,
+        )
 
         self._dataset: Any | None = None
         self._eval_dataset: Any | None = None
@@ -543,6 +573,7 @@ class SFT(Base):
         self._processor_pool: ProcessorPool | None = None
         self._stop_event = asyncio.Event()
         self._run_task: asyncio.Task | None = None
+        self._init_task: asyncio.Task | None = None
 
     def _should_use_remote_batch_producer(self) -> bool:
         num_shards = sft_tq_num_shards(self.config)
@@ -1191,10 +1222,15 @@ class SFT(Base):
                 return
 
     async def run(self) -> None:
-        if self._run_task is not None:
+        if self._run_task is not None or self._stop_event.is_set():
             return
-        self._init_data_pipeline()
-        self._run_task = asyncio.create_task(self._async_run())
+        if self._init_task is None:
+            self._init_task = asyncio.create_task(asyncio.to_thread(self._init_data_pipeline))
+        # Requests may overlap or be cancelled while the initialization thread
+        # is still running. Share its outcome and keep ownership until stop().
+        await asyncio.shield(self._init_task)
+        if self._run_task is None and not self._stop_event.is_set():
+            self._run_task = asyncio.create_task(self._async_run())
 
     async def _async_run(self) -> None:
         try:
@@ -1213,6 +1249,11 @@ class SFT(Base):
 
     async def stop(self) -> None:
         self._stop_event.set()
+        if self._init_task is not None:
+            try:
+                await asyncio.shield(self._init_task)
+            except Exception as exc:
+                self._logger.warning(f"SFT initialization failed before shutdown: {exc}")
         for producer in getattr(self, "_batch_producers", []):
             try:
                 await _ray_get_many_async([producer.stop.remote()])

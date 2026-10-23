@@ -16,13 +16,13 @@ def sized_dataset(monkeypatch):
     module = ModuleType("relax.engine.sft.dataset.streaming")
 
     class SizedDataset:
-        def __init__(self, path: int, prefetch_max_cached: int) -> None:
+        def __init__(self, path: int, **kwargs) -> None:
             self.size = path
 
         def __len__(self) -> int:
             return self.size
 
-    module.SFTStreamingDataset = SizedDataset
+    module._build_reader = SizedDataset
     monkeypatch.setitem(sys.modules, module.__name__, module)
 
 

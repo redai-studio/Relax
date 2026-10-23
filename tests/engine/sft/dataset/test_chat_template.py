@@ -120,6 +120,42 @@ def test_render_uses_assistant_mask_when_template_supports_it():
     assert "relax_thread=" in call_kwargs["chat_template"]
 
 
+@pytest.mark.parametrize("ignore_empty_think", [False, True])
+def test_non_chatml_generation_template_keeps_native_mask(ignore_empty_think):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(WordLevel({"<unk>": 0, "QUESTION": 1, "ANSWER": 2}, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+    tokenizer.chat_template = (
+        "{% for message in messages %}"
+        "{{ '<|start_header_id|>' + message.role + '<|end_header_id|>' }}"
+        "{% if message.role == 'assistant' %}{% generation %}"
+        "{{ message.content + '<|eot_id|>' }}{% endgeneration %}"
+        "{% else %}{{ message.content + '<|eot_id|>' }}{% endif %}{% endfor %}"
+    )
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="QUESTION", learn=False),
+            CanonicalMessage(role="assistant", content="ANSWER", learn=True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    expected = tokenizer.apply_chat_template(
+        _to_chat_messages(sample),
+        return_dict=True,
+        return_tensors="pt",
+        return_assistant_tokens_mask=True,
+    )
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer, ignore_empty_think=ignore_empty_think)
+    assert ids.tolist() == expected["input_ids"].squeeze(0).tolist()
+    assert mask.tolist() == torch.as_tensor(expected["assistant_masks"]).squeeze().tolist()
+    assert "ANSWER" in tokenizer.decode(ids[mask.bool()])
+
+
 def test_render_falls_back_when_no_generation_marker(capsys):
     tok = _mock_tokenizer_without_generation_marker()
     sample = _make_sample()
@@ -688,3 +724,39 @@ def test_deepseek_embedded_reasoning_does_not_gain_non_thinking_prefix():
     assert rendered.count("<think>") == rendered.count("</think>") == 1
     assert _learned_text(input_ids, loss_mask) == "REASON</think>ANSWER<｜end▁of▁sentence｜>"
     assert render_to_text(sample, tokenizer=tok, apply_chat_template_kwargs=kwargs) == rendered
+
+
+@pytest.mark.parametrize("excluded_last", [False, True])
+@pytest.mark.parametrize("last_turn_only", [False, True])
+def test_native_generation_mask_respects_message_exclusions(excluded_last, last_turn_only):
+    class NativeTokenizer(_FakeFastTokenizerNoGenerationMarker):
+        chat_template = "{% generation %}{{ message.content }}{% endgeneration %}"
+
+        def apply_chat_template(self, messages, **kwargs):
+            if not kwargs.get("return_assistant_tokens_mask"):
+                return super().apply_chat_template(messages, **kwargs)
+            text = self._render(messages)
+            native = [0] * len(text)
+            cursor = 0
+            for message in messages:
+                rendered = self._render([message])
+                if message["role"] == "assistant":
+                    # Two native generation blocks per message, with a gap.
+                    start = cursor + len("<|im_start|>assistant\n")
+                    end = cursor + len(rendered) - len("<|im_end|>\n")
+                    for i in range(start, end):
+                        native[i] = int(text[i] != "|")
+                cursor += len(rendered)
+            return {"input_ids": torch.tensor([[ord(c) for c in text]]), "assistant_masks": [native]}
+
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="Q", learn=False),
+            CanonicalMessage(role="assistant", content="first|reply", learn=excluded_last),
+            CanonicalMessage(role="assistant", content="second|reply", learn=not excluded_last),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    ids, mask = render_with_loss_mask(sample, tokenizer=NativeTokenizer(), last_turn_only=last_turn_only)
+    learned = "".join(chr(i) for i, keep in zip(ids.tolist(), mask.tolist()) if keep)
+    assert learned == ("firstreply" if excluded_last else "secondreply")

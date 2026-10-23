@@ -179,3 +179,11 @@ def test_i2i_sft_preserves_native_checkpoint_and_image_batching(arguments_module
     assert not args.no_load_optim
     assert not args.no_load_rng
     assert not args.finetune
+
+
+@pytest.mark.parametrize("cli,expected", [([], "balanced"), (["--sft-packing-strategy", "binpack"], "binpack")])
+def test_sft_packing_preserves_default_and_archived_recipe(arguments_module, cli, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    assert parser.parse_args(cli).sft_packing_strategy == expected

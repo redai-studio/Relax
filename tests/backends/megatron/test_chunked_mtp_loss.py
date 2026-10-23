@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 """Unit tests for the chunked-MTP-loss patch
-(megatron_patch/chunked_mtp_loss_patch.py).
+(models/common/chunked_mtp_loss.py).
 
 The patch computes each MTP prediction depth's head + cross-entropy in sequence
 chunks so the full ``[S, V/TP]`` per-depth logits never materialize (fixes the
@@ -28,9 +28,18 @@ import torch.nn.functional as F
 try:
     from megatron.core.transformer import multi_token_prediction as _mtp_mod
 
-    from relax.backends.megatron.megatron_patch import chunked_mtp_loss_patch as _patch
+    from relax.models.common import chunked_mtp_loss as _patch
 except Exception as exc:  # pragma: no cover
     pytest.skip(f"megatron/relax unavailable: {exc}", allow_module_level=True)
+
+
+def _native_process_mtp_loss(*args, **kwargs):
+    previous = _patch._chunked_mtp_enabled
+    _patch._chunked_mtp_enabled = lambda: False
+    try:
+        return _mtp_mod.process_mtp_loss(*args, **kwargs)
+    finally:
+        _patch._chunked_mtp_enabled = previous
 
 
 S, B, H, V, LAYERS = 16, 2, 8, 32, 2
@@ -137,7 +146,7 @@ def test_chunked_mtp_matches_original(chunk_size, monkeypatch):
     cfg = _make_config()
 
     # original (unchunked): the captured upstream impl. Force chunk irrelevant.
-    _, ref = _run_and_capture(_patch._ORIG_PROCESS_MTP_LOSS, head=head, config=cfg, monkeypatch=monkeypatch)
+    _, ref = _run_and_capture(_native_process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch)
     # patched (chunked) at this chunk size.
     _, got = _run_and_capture(
         _patch.process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, chunk_size=chunk_size
@@ -154,7 +163,7 @@ def test_scale_logits_fn_per_chunk(monkeypatch):
     cfg = _make_config()
     sfn = lambda x: 0.5 * x  # noqa: E731
     _, ref = _run_and_capture(
-        _patch._ORIG_PROCESS_MTP_LOSS, head=head, config=cfg, monkeypatch=monkeypatch, scale_logits_fn=sfn
+        _native_process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, scale_logits_fn=sfn
     )
     _, got = _run_and_capture(
         _patch.process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, chunk_size=3, scale_logits_fn=sfn
@@ -167,7 +176,7 @@ def test_calculate_per_token_loss_branch(monkeypatch):
     """The per-token-loss normalization branch is preserved under chunking."""
     head = _FakeHead(H, V)
     cfg = _make_config(calculate_per_token_loss=True)
-    _, ref = _run_and_capture(_patch._ORIG_PROCESS_MTP_LOSS, head=head, config=cfg, monkeypatch=monkeypatch)
+    _, ref = _run_and_capture(_native_process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch)
     _, got = _run_and_capture(_patch.process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, chunk_size=3)
     for g, r in zip(got, ref):
         assert torch.equal(g, r)
@@ -199,7 +208,7 @@ def test_is_training_logging_matches(monkeypatch):
         _patch.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["ref"]), raising=False
     )
     _, ref = _run_and_capture(
-        _patch._ORIG_PROCESS_MTP_LOSS, head=head, config=cfg, monkeypatch=monkeypatch, is_training=True
+        _native_process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, is_training=True
     )
     monkeypatch.setattr(_mtp_mod.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["got"]))
     monkeypatch.setattr(
@@ -252,121 +261,36 @@ def test_token_aware_tracker_api_receives_scaled_sum_and_count(monkeypatch):
     assert seen["kwargs"]["total"] is total
 
 
-def test_fuse_linear_delegates(monkeypatch):
-    """fuse_linear_cross_entropy=True delegates to the original (never
-    chunks)."""
-    head = _FakeHead(H, V)
-    cfg = _make_config(fuse_linear=True)
-    called = {"orig": 0, "args": None}
+@pytest.mark.parametrize("enabled,fused", [(False, False), (True, True), (True, False)])
+def test_static_dispatch_retains_native_fallback(monkeypatch, enabled, fused):
+    import ast
+    import inspect
+    import textwrap
 
-    # Pure spy (does NOT call the real upstream body — the fused Blackwell path can't
-    # run with a plain mock head). We only assert the patch DELEGATED without chunking.
-    def spy_orig(*a, **k):
-        called["orig"] += 1
-        called["args"] = (a, k)
-        return a[0]  # return hidden_states unchanged
-
-    monkeypatch.setattr(_patch, "_ORIG_PROCESS_MTP_LOSS", spy_orig)
-    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: True)
-    hidden = torch.randn(S * (1 + LAYERS), B, H)
-    labels = torch.randint(0, V, (B, S))
-    loss_mask = torch.ones(B, S)
-    _patch.process_mtp_loss(hidden, labels, loss_mask, head, None, None, False, _stub_clml, cfg)
-    assert called["orig"] == 1, "fuse_linear=True must delegate to the original, not chunk"
-
-
-def test_gate_off_delegates(monkeypatch):
-    """When the chunked-MTP gate is off, the patched fn delegates to the
-    original."""
-    head = _FakeHead(H, V)
-    cfg = _make_config()
-    called = {"orig": 0}
-    orig = _patch._ORIG_PROCESS_MTP_LOSS
-
-    def spy_orig(*a, **k):
-        called["orig"] += 1
-        return orig(*a, **k)
-
-    monkeypatch.setattr(_patch, "_ORIG_PROCESS_MTP_LOSS", spy_orig)
-    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: False)
-    monkeypatch.setattr(_mtp_mod, "MTPLossAutoScaler", types.SimpleNamespace(apply=staticmethod(lambda hs, loss: hs)))
-    hidden = torch.randn(S * (1 + LAYERS), B, H)
-    labels = torch.randint(0, V, (B, S))
-    loss_mask = torch.ones(B, S)
-    _patch.process_mtp_loss(hidden, labels, loss_mask, head, None, None, False, _stub_clml, cfg)
-    assert called["orig"] == 1
-
-
-def test_new_megatron_kwargs_are_accepted_and_version_filtered(monkeypatch):
-    """New caller keywords must be filtered before delegating to old
-    Megatron."""
-    head = _FakeHead(H, V)
-    cfg = _make_config()
-    called = {}
-
-    def old_style_orig(*args, cp_group=None, packed_seq_params=None, scale_logits_fn=None):
-        called.update(
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            scale_logits_fn=scale_logits_fn,
-        )
-        return args[0]
-
-    monkeypatch.setattr(_patch, "_ORIG_PROCESS_MTP_LOSS", old_style_orig)
-    monkeypatch.setattr(
-        _patch,
-        "_ORIG_PROCESS_MTP_LOSS_PARAMETERS",
-        {"cp_group", "packed_seq_params", "scale_logits_fn"},
+    source = textwrap.dedent(inspect.getsource(_mtp_mod.process_mtp_loss))
+    tree = ast.parse(source)
+    function = tree.body[0]
+    branch = next(
+        (
+            node
+            for node in function.body
+            if isinstance(node, ast.If) and "_chunked_mtp_enabled" in ast.unparse(node.test)
+        ),
+        None,
     )
-    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: False)
-    hidden = torch.randn(S * (1 + LAYERS), B, H)
-    labels = torch.randint(0, V, (B, S))
-    result = _patch.process_mtp_loss(
-        hidden,
-        labels,
-        torch.ones(B, S),
-        head,
-        None,
-        None,
-        False,
-        _stub_clml,
-        cfg,
-        tp_group=object(),
-        input_ids=torch.ones(B, S, dtype=torch.long),
-        sequence_roll_context=object(),
+    if branch is None:
+        pytest.skip("Requires image-built static chunked MTP dispatch")
+    # Execute the real dispatch condition with independent results for each path.
+    branch = ast.If(test=branch.test, body=[ast.Return(ast.Constant("chunked"))], orelse=[])
+    function = ast.FunctionDef(
+        name="dispatch",
+        args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+        body=[branch, ast.Return(ast.Constant("native"))],
+        decorator_list=[],
     )
-    assert result is hidden
-    assert called == {"cp_group": None, "packed_seq_params": None, "scale_logits_fn": None}
-
-
-def test_chunked_mtp_delegates_sequence_roll_context(monkeypatch):
-    """A gate-off call must retain the context needed by upstream packed CP
-    rolls."""
-    seen = {}
-
-    def upstream(*args, **kwargs):
-        seen.update(kwargs)
-        return args[0]
-
-    monkeypatch.setattr(_patch, "_ORIG_PROCESS_MTP_LOSS", upstream)
-    monkeypatch.setattr(_patch, "_ORIG_PROCESS_MTP_LOSS_PARAMETERS", {"sequence_roll_context"})
-    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: False)
-    context = object()
-    hidden = torch.randn(S * (1 + LAYERS), B, H)
-    result = _patch.process_mtp_loss(
-        hidden,
-        torch.zeros(B, S, dtype=torch.long),
-        None,
-        _FakeHead(H, V),
-        None,
-        None,
-        False,
-        _stub_clml,
-        _make_config(),
-        sequence_roll_context=context,
-    )
-    assert result is hidden
-    assert seen["sequence_roll_context"] is context
+    scope = {"_chunked_mtp_enabled": lambda: enabled, "config": _make_config(fuse_linear=fused)}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "dispatch", "exec"), scope)
+    assert scope["dispatch"]() == ("chunked" if enabled and not fused else "native")
 
 
 @pytest.mark.parametrize("batched_roll", [False, True])
@@ -554,7 +478,7 @@ def test_sequence_parallel_gathers_hidden_once(monkeypatch):
         "MTPLossAutoScaler",
         types.SimpleNamespace(apply=staticmethod(lambda hs, loss: captured_ref.append(loss.detach().clone()) or hs)),
     )
-    _patch._ORIG_PROCESS_MTP_LOSS(
+    _native_process_mtp_loss(
         full_hidden,
         labels,
         loss_mask,
@@ -616,10 +540,8 @@ def test_sequence_parallel_gathers_hidden_once(monkeypatch):
         assert torch.equal(g, r), f"SP depth {d}: chunked != unchunked (max|Δ|={(g - r).abs().max()})"
 
 
-def test_patch_replaces_both_bindings():
-    """The patch swapped process_mtp_loss in both the source and gpt_model
-    modules."""
-    import megatron.core.models.gpt.gpt_model as gpt_mod
+def test_static_mcore_bindings_are_not_replaced():
+    from megatron.core.models.gpt import gpt_model as gpt_mod
 
-    assert _mtp_mod.process_mtp_loss is _patch.process_mtp_loss
-    assert gpt_mod.process_mtp_loss is _patch.process_mtp_loss
+    assert _mtp_mod.process_mtp_loss is not _patch.process_mtp_loss
+    assert gpt_mod.process_mtp_loss is _mtp_mod.process_mtp_loss

@@ -4,20 +4,21 @@
 
 ## 概述
 
-Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。GRPO、RLOO、CISPO、GSPO 与 SAPO 共享 Actor/Rollout 服务拓扑；RLOO 仅支持同步固定批量，PPO 还需要 Critic 与 Advantages 服务，应分别遵守专用配置。
+Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。GRPO、Score Centering、RLOO、CISPO、GSPO 与 SAPO 共享 Actor/Rollout 服务拓扑；RLOO 仅支持同步固定批量，PPO 还需要 Critic 与 Advantages 服务，应分别遵守专用配置。
 
 ## 支持的算法
 
-| 算法                     | 启用参数                                             | 推荐场景                    |
-| ------------------------ | ---------------------------------------------------- | --------------------------- |
-| **PPO**                  | `--advantage-estimator ppo`                          | Actor-Critic、token 级 GAE  |
-| **GRPO**                 | `--advantage-estimator grpo`                         | 默认、大多数场景            |
-| **REINFORCE++**          | `--advantage-estimator reinforce_plus_plus`          | token KL-to-go 与全局归一化 |
-| **REINFORCE++-baseline** | `--advantage-estimator reinforce_plus_plus_baseline` | group baseline 与独立 k2 KL |
-| **RLOO**                 | `--advantage-estimator rloo`                         | 无偏基线、非裁剪 REINFORCE  |
-| **CISPO**                | `--advantage-estimator cispo`                        | 保留梯度方向、需要更高精度  |
-| **GSPO**                 | `--advantage-estimator gspo`                         | 序列级约束、稳定训练        |
-| **SAPO**                 | `--advantage-estimator sapo`                         | 平滑优化、soft 信任域       |
+| 算法                      | 启用参数                                             | 推荐场景                                                   |
+| ------------------------- | ---------------------------------------------------- | ---------------------------------------------------------- |
+| **PPO**                   | `--advantage-estimator ppo`                          | Actor-Critic、token 级 GAE                                 |
+| **GRPO**                  | `--advantage-estimator grpo`                         | 默认、大多数场景                                           |
+| **Score Centering（SC）** | `--advantage-estimator score_centering`              | 文本训练中校正 rollout 与训练分布不一致时的平均 score 漂移 |
+| **REINFORCE++**           | `--advantage-estimator reinforce_plus_plus`          | token KL-to-go 与全局归一化                                |
+| **REINFORCE++-baseline**  | `--advantage-estimator reinforce_plus_plus_baseline` | group baseline 与独立 k2 KL                                |
+| **RLOO**                  | `--advantage-estimator rloo`                         | 无偏基线、非裁剪 REINFORCE                                 |
+| **CISPO**                 | `--advantage-estimator cispo`                        | 保留梯度方向、需要更高精度                                 |
+| **GSPO**                  | `--advantage-estimator gspo`                         | 序列级约束、稳定训练                                       |
+| **SAPO**                  | `--advantage-estimator sapo`                         | 平滑优化、soft 信任域                                      |
 
 ## 选择建议
 
@@ -34,6 +35,14 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 - 默认算法，特性平衡，大多数场景可用
 - 对超出信任域的 token 直接置零梯度
 - 适合大多数强化学习场景
+
+### Score Centering（SC）
+
+SC 从 sampled-token 的 score 中减去生成分布下的平均 score，修正 rollout 分布与当前训练分布不一致时的策略梯度漂移。这里的 score 指 `∇θ log pθ`，不是 reward；实现记录生成时的 top-K 候选概率，并近似未记录的尾部贡献。
+
+**默认 SC 使用组内减均值、不除标准差的 advantage 模式。** 这与[原作者实现的默认 `group_centered` 配置](https://github.com/martin-marek/score-centering/blob/7c56e9ee2972aa57f446cf564de1a1658d14b321/train_rl.py#L53-L58)一致：[原实现](https://github.com/martin-marek/score-centering/blob/7c56e9ee2972aa57f446cf564de1a1658d14b321/losses.py#L107-L124)保持对齐。Relax 的 `score_centering` 预设据此采用 `group_mean`。
+
+可从现有 text-only Megatron GRPO recipe 切换，包含原生单轮、文本 Agentic/自定义多轮与 partial rollout；文本工具调用及工具返回仍属于 text-only 范围。沿用 recipe 的 Colocate、Hybrid、Fully Async 和 TP/DP/PP/CP 配置，工具观测 token 沿用现有 loss mask。自定义生成或数据转换函数须保留 sampled log-q 以及对齐的 `rollout_topk_token_ids`、`rollout_topk_log_probs`；当前 FSDP diffusion 训练入口不属于该文本 token loss 路径。
 
 ### REINFORCE++ 两个变体
 
@@ -101,6 +110,52 @@ python3 -m relax.entrypoints.train \
     ...
 ```
 
+### 示例：在现有文本 GRPO recipe 中启用 SC
+
+保留现有模型、数据、reward、资源和启动方式，将算法参数块替换为以下配置，并在启动命令中传入 `"${SC_ARGS[@]}"`：
+
+```bash
+SC_ARGS=(
+   --loss-type policy_loss
+   --advantage-estimator score_centering
+   --calculate-per-token-loss
+   --n-samples-per-prompt 8
+   --rollout-temperature 1.0
+   --rollout-top-p 1.0
+   --rollout-top-k -1
+   --rollout-top-logprobs-num 128
+   --score-centering-is none
+   --kl-coef 0
+)
+```
+
+上例从无过滤采样开始，`8` 是示例组大小，最低要求为 `2`。同时移除原 recipe 中的 `--normalize-advantages`、`--disable-rewards-normalization`、OPD 和旧外层 TIS 配置，避免其他参数块覆盖上述设置。`--eps-clip` 与 `--eps-clip-high` 不参与 SC 计算。
+
+需要内部 importance weighting 时，将 `--score-centering-is none` 改为 `--score-centering-is tis --score-centering-tis-clip 2.0`，或 `--score-centering-is mis --score-centering-mis-low 0.5 --score-centering-mis-high 5.0`；不额外开启 `--use-tis`。
+
+### 示例：运行八卡 Countdown 四组对照
+
+使用 [Qwen3-0.6B 八卡脚本](score-centering/run-qwen3-0.6B-8xgpu.sh)，按[实验记录中的准备步骤](score-centering/EXPERIMENT.md)准备 BF16/FP8 模型和 Countdown 数据，并包含其中列出的 SGD 兼容及 BF16 导出修复。从仓库根目录向专用八卡 Ray 集群提交 SC：
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/countdown-data \
+SAVE_DIR=/path/to/checkpoints \
+RAY_ADDRESS=http://ray-head:8265 \
+USE_SC=1 USE_TIS=0 \
+bash scripts/entrypoint/ray-job.sh \
+  examples/algorithms/score-centering/run-qwen3-0.6B-8xgpu.sh
+```
+
+| USE_SC | USE_TIS | 算法                  |
+| ------ | ------- | --------------------- |
+| 0      | 0       | 原生 RLOO（脚本默认） |
+| 0      | 1       | 原生 RLOO + TIS       |
+| 1      | 0       | SC                    |
+| 1      | 1       | SC + 内部 TIS         |
+
+四组共用数据和训练设置：BF16 trainer、FP8 sampler、SGD lr=0.01，默认 400 步；SC 不要求使用 SGD。`RAY_ADDRESS` 填 Ray Jobs HTTP 地址。在线验证使用 FP8 sampler。每次独立运行应更换 `EXP_NAME`；当前 SGD 完整优化器恢复的限制见实验记录。
+
 ### 示例：运行 RLOO（文本）
 
 ```bash
@@ -156,13 +211,54 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 
 ### 通用参数
 
-| 参数                    | 默认值               | 说明                                                                                                            |
-| ----------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `--advantage-estimator` | `grpo`               | 算法类型：`grpo`, `cispo`, `gspo`, `sapo`, `ppo`, `rloo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` |
-| `--eps-clip`            | `0.2`                | 下方裁剪边距（ratio 下界 = `1 - eps_clip`）                                                                     |
-| `--eps-clip-high`       | 与 `--eps-clip` 相同 | 上方裁剪边距（ratio 上界 = `1 + eps_clip_high`）                                                                |
-| `--clip-grad`           | —                    | 梯度裁剪范数，CISPO 下推荐设为 `1.0`                                                                            |
-| `--kl-coef`             | `0.0`                | KL 惩罚系数；当前同步 PPO 会将非零值重置为 `0.0`，REINFORCE++ 等算法可使用                                      |
+| 参数                    | 默认值               | 说明                                                                                                                                   |
+| ----------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `--advantage-estimator` | `grpo`               | 算法类型包括：`grpo`, `score_centering`, `cispo`, `gspo`, `sapo`, `ppo`, `rloo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` |
+| `--eps-clip`            | `0.2`                | 下方裁剪边距（ratio 下界 = `1 - eps_clip`）                                                                                            |
+| `--eps-clip-high`       | 与 `--eps-clip` 相同 | 上方裁剪边距（ratio 上界 = `1 + eps_clip_high`）                                                                                       |
+| `--clip-grad`           | —                    | 梯度裁剪范数，CISPO 下推荐设为 `1.0`                                                                                                   |
+| `--kl-coef`             | `0.0`                | KL 惩罚系数；当前同步 PPO 会将非零值重置为 `0.0`，REINFORCE++ 等算法可使用                                                             |
+
+### Score Centering 新增参数
+
+以下默认值来自参数解析器；`score_centering` 是 `--advantage-estimator` 的新增取值，下面五项是新增配置参数。
+
+| 参数                         | 默认值 | 说明                                                                                      |
+| ---------------------------- | ------ | ----------------------------------------------------------------------------------------- |
+| `--rollout-top-logprobs-num` | `128`  | 手动设置每个生成位置记录的候选数量 K，要求 `1 ≤ K ≤ 模型真实词表大小`；一次运行中保持固定 |
+| `--score-centering-is`       | `none` | 内部 importance weighting：`none`、`tis` 或 `mis`，同时作用于 sampled 项与中心化修正项    |
+| `--score-centering-tis-clip` | `2.0`  | TIS 权重上限 c，须为有限正数；权重为 `min(r, c)`                                          |
+| `--score-centering-mis-low`  | `0.5`  | MIS 权重保留区间下界 l                                                                    |
+| `--score-centering-mis-high` | `5.0`  | MIS 权重保留区间上界 u；上下界须有限且满足 `0 < l ≤ u`                                    |
+
+这里 `r = pθ(a|h) / q(a|h)`，分母 q 始终来自实际生成调用。`none` 的 sampled weight 为 1；`mis` 在 `l ≤ r ≤ u` 时保留权重 r，否则设为 0。MIS 的 sampled weight 为 0 时仍保留中心化修正项，不删除该 token，也不改变有效 token 分母。
+
+`--rollout-top-logprobs-num` 控制 SC 的候选记录量，现有 `--rollout-top-k` 控制采样过滤，两者独立。增大 K 会增加存储、传输与评分开销，并减少依赖尾部近似的范围，不保证训练收益单调提高。尾部概率计算使用固定 `1e-6` floor，没有额外 epsilon 参数。
+
+固定 K 的候选记录加尾部近似不等于完整截断 support replay。生成端的 support 信息仅用于恢复真实 behavior q；训练端仍在完整模型词表上计算 p，不按生成 support 重放过滤或重新归一化。
+
+SC 还需遵守以下已有参数约束：
+
+| 配置                                                          | SC 要求                                                         |
+| ------------------------------------------------------------- | --------------------------------------------------------------- |
+| `--loss-type`                                                 | 使用 `policy_loss`                                              |
+| `--n-samples-per-prompt`                                      | 至少为 `2`，按完整 prompt group 处理 reward                     |
+| `--calculate-per-token-loss`                                  | 必须开启，按全局有效 response token 数归一化                    |
+| reward / advantage normalization                              | 保持 reward normalization 开启；不启用 `--normalize-advantages` |
+| `--kl-coef`                                                   | 必须为 `0`；普通 reference-KL loss 与 entropy 正则可独立使用    |
+| `--use-opd`、`--opd-fkl-entropy-gate`                         | 首期互斥，包含 advantage 注入、独立 OPD loss 和 EOPD            |
+| `--use-tis`、`--custom-tis-function-path`、`--use-opsm`       | 不可与 SC 同时启用；使用 SC 内部 IS 参数                        |
+| `--use-unbiased-kl`、`--custom-pg-loss-reducer-function-path` | 当前不支持与 SC 组合                                            |
+| `--get-mismatch-metrics`                                      | 仅增加诊断，不额外乘权或修改 loss mask                          |
+| `--use-rollout-logprobs`                                      | 不改变 SC 的 behavior q 来源                                    |
+
+OPD 通过修改 advantage 注入的蒸馏信号也会被 SC 中心化，尤其 top-K OPD 的更新可能因此抵消。独立 OPD loss 不必然被中心化，但首期同样不开放组合。OPD 关闭时，其默认 `opd_kl_coef=1.0` 不生效，无需为启用 SC 单独改成 0。
+
+生成端必须返回实际采样分布的概率，支持普通列表和 `RELAX_FORCE_LOGPROBS_BASE64=1` 的编码字段。当前采集路径要求每次调用的温度与 `--rollout-temperature` 一致，且有限、不小于 `1e-6`；非 1 温度下应保持 `SGLANG_RETURN_ORIGINAL_LOGPROB=0`。
+
+使用 top-p/min-p 过滤时还需设置有限的 sampling top-k，以取得 SGLang 的 support 信息。`top_p < 1` 还要求显式设置 `--sglang-sampling-backend pytorch`；SGLang v0.5.17 的 FlashInfer min-p 分支依次归一化 top-k/top-p，但返回的 support 按原始概率联合过滤，二者可能不一致。该分支由 batch 内任意请求的 min-p 开启，因此单个请求的 `min_p=0` 也不能规避；可改用 PyTorch 后端，或保持 `top_p=1`。`top_p=1` 下仍支持 FlashInfer 的有限 top-k 和 min-p。
+
+当前不接受 speculative decoding、`sglang_rl_on_policy_target`，以及 Ascend backend 的过滤采样，因为对应接口不能提供此路径所需的 behavior q。Relax 的 `--true-on-policy-mode` 仍可使用。
 
 ### RLOO 专用约束与指标
 
@@ -288,6 +384,7 @@ examples/algorithms/
 
 - [Relax 算法文档](../../docs/en/examples/algorithms.md)
 - [GRPO - DeepSeekMath](https://arxiv.org/abs/2402.03300)
+- [SC - Score Centering Stabilizes Off-policy Reinforcement Learning](https://arxiv.org/abs/2609.20807)
 - [CISPO - MiniMax-M1](https://arxiv.org/abs/2506.13585)
 - [PPO - Proximal Policy Optimization](https://arxiv.org/abs/1707.06347)
 - [REINFORCE++ - Simple Efficient Alignment](https://arxiv.org/abs/2501.03262)

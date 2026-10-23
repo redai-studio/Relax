@@ -31,7 +31,10 @@ from relax.utils.device import device_module  # noqa
 
 
 try:
-    import deep_ep
+    try:
+        import _relax_hybrid_ep as deep_ep
+    except ImportError:
+        import deep_ep
     from torch_memory_saver import torch_memory_saver
 
     old_init = deep_ep.Buffer.__init__
@@ -77,5 +80,3 @@ except ImportError:
     pass
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
-
-from . import megatron_patch  # noqa: F401, E402

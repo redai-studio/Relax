@@ -210,7 +210,7 @@ gh run view <run-id> -R redai-studio/Relax --json status,conclusion,headBranch,h
 - `headBranch` == `$VALIDATE_BRANCH`
 - `headSha` == `$SOURCE_SHA`
 - `conclusion` == `success`
-- `Pre-commit Checks`、`Lint`、`Tests (Python 3.10)` / `3.11` / `3.12` 全部成功
+- 所有 required CI 均成功
 
 失败处置：
 

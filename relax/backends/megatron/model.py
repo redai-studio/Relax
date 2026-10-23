@@ -43,7 +43,7 @@ from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_bridge_utils import patch_megatron_model
 from relax.utils.megatron_peft_utils import is_lora_enabled
-from relax.utils.memory_utils import available_memory, clear_memory
+from relax.utils.memory_utils import available_memory, clear_memory, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
@@ -1153,6 +1153,8 @@ def train_one_step(
                     "advantages",
                     "returns",
                     "rollout_log_probs",
+                    "rollout_topk_token_ids",
+                    "rollout_topk_log_probs",
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     *_opd_keys,
@@ -1251,7 +1253,11 @@ def train_one_step(
                 # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
                 # calls. This gate MUST match _chunked_mtp_enabled() in that patch.
                 mtp_enabled = getattr(args, "enable_mtp_training", False)
-                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False)
+                head_config = get_model_config(model)
+                fused_linear = (
+                    head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
+                )
+                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False) and not fused_linear
                 mtp_output_layer_calls = (
                     0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
@@ -1606,24 +1612,35 @@ def train(
             f"num_microbatches length {num_steps_per_rollout}."
         )
 
+    memory_ranks = {
+        "global_rank": torch.distributed.get_rank(group=torch.distributed.group.WORLD),
+        "tp_rank": mpu.get_tensor_model_parallel_rank(),
+        "pp_rank": mpu.get_pipeline_model_parallel_rank(),
+        "ep_rank": mpu.get_expert_model_parallel_rank(),
+        "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
+        "cp_rank": mpu.get_context_parallel_rank(),
+    }
+    memory_role = getattr(model[0], "role", "actor")
+
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
-        # Run training step.
-        with timer(f"train_micro_batch_{step_id}", keep=False):
-            loss_dict, grad_norm = train_one_step(
-                args,
-                rollout_id,
-                step_id,
-                step_data_iterator,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                num_microbatches[step_id],
-                global_batch_sizes[step_id],
-            )
-        if keep_forward_pre_hook_disabled:
-            force_param_sync(model)
+        # Cover all micro-batches, the optimizer, and post-step parameter gather.
+        with log_step_peak_memory(rollout_id, rollout_id * num_steps_per_rollout + step_id, memory_ranks, memory_role):
+            with timer(f"train_micro_batch_{step_id}", keep=False):
+                loss_dict, grad_norm = train_one_step(
+                    args,
+                    rollout_id,
+                    step_id,
+                    step_data_iterator,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    num_microbatches[step_id],
+                    global_batch_sizes[step_id],
+                )
+            if keep_forward_pre_hook_disabled:
+                force_param_sync(model)
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent

@@ -19,6 +19,7 @@ from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
+from relax.utils.data.packing import get_binpack_partitions
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
@@ -298,9 +299,17 @@ def _get_seqlen_partitions_with_dummy_padding(
     seqlens: list[int],
     num_partitions: int,
     capacity: int,
+    packing_strategy: str = "balanced",
 ) -> tuple[list[list[int]], set[int]]:
-    real_partition_count = min(len(seqlens), num_partitions)
-    partitions = _get_capacity_safe_balanced_partitions(seqlens, real_partition_count, capacity)
+    if packing_strategy == "binpack":
+        partitions = get_binpack_partitions(seqlens, capacity)
+    else:
+        real_partition_count = min(len(seqlens), num_partitions)
+        partitions = _get_capacity_safe_balanced_partitions(seqlens, real_partition_count, capacity)
+    real_partition_count = len(partitions)
+    assert real_partition_count <= num_partitions, (
+        f"{real_partition_count} partitions > num_partitions={num_partitions}"
+    )
     dummy_offsets: set[int] = set()
     if real_partition_count < num_partitions:
         shortest_partition = min(partitions, key=lambda partition: sum(seqlens[index] for index in partition))
@@ -777,6 +786,8 @@ def get_batch(
             "log_probs",
             "ref_log_probs",
             "rollout_log_probs",
+            "rollout_topk_token_ids",
+            "rollout_topk_log_probs",
             "advantages",
             "teacher_log_probs",
             "opd_reverse_kl",
@@ -1219,6 +1230,7 @@ def get_data_iterator(
         assert _max_tokens is not None
         micro_batch_token_capacity = _get_micro_batch_token_capacity(args, _max_tokens, cp_size)
         # calculate the number of mirobatches for each step
+        packing_strategy = getattr(args, "sft_packing_strategy", "balanced")
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples
         num_microbatches = []
@@ -1226,7 +1238,12 @@ def get_data_iterator(
         for i in range(num_steps_per_rollout):
             start = step_offsets[i]
             end = step_offsets[i + 1]
-            num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], micro_batch_token_capacity))
+            if packing_strategy == "binpack":
+                num_microbatches.append(len(get_binpack_partitions(samples[start:end], micro_batch_token_capacity)))
+            else:
+                num_microbatches.append(
+                    get_minimum_num_micro_batch_size(samples[start:end], micro_batch_token_capacity)
+                )
 
         required_num_microbatches = torch.tensor(
             num_microbatches, dtype=torch.int, device=device_utils.make_current_torch_device()
@@ -1251,7 +1268,7 @@ def get_data_iterator(
             end = step_offsets[i + 1]
             step_samples = samples[start:end]
             partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(
-                step_samples, num_mbs, micro_batch_token_capacity
+                step_samples, num_mbs, micro_batch_token_capacity, packing_strategy=packing_strategy
             )
             base_offset = len(micro_batch_indices)
             micro_batch_indices.extend([[idx + start for idx in partition] for partition in partitions])
@@ -1358,6 +1375,8 @@ def log_rollout_data(
                 "sample_indices",
                 "sample_index_mask_sums",
                 "rollout_routed_experts",
+                "rollout_topk_token_ids",
+                "rollout_topk_log_probs",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
                 "packed_seq_params",

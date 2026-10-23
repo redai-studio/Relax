@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import warnings
@@ -41,7 +42,7 @@ logger = get_logger(__name__)
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps'
+    'TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps'
 )
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
@@ -79,6 +80,14 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _nonnegative_finite_float(value: str) -> float:
+    """argparse type for bounded auxiliary-loss coefficients."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a finite non-negative float, got {value!r}")
     return parsed
 
 
@@ -243,6 +252,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=1,
                 help="Fully async pipeline num of iters every global batch.",
             )
+            # ── RDMA transport (MooncakeStore backend) ──────────────────────────
+            # The default selects the existing SimpleStorage data path. These
+            # expose *intent* only; Mooncake internals (endpoint,
+            # buffer, segment, timeout, master strategy) are handled via internal
+            # defaults / deployment environment, not CLI flags.
+            parser.add_argument(
+                "--tq-rdma-mode",
+                choices=["off", "auto", "required"],
+                default="off",
+                help=(
+                    "TransferQueue data-plane transport. 'off' (default) uses "
+                    "SimpleStorage/ZMQ with bounded worker attach and cleanup. "
+                    "'auto' attempts MooncakeStore over host RDMA and falls back "
+                    "to SimpleStorage when it is unavailable (with a WARNING). "
+                    "'required' fails fast instead of falling back."
+                ),
+            )
+            parser.add_argument(
+                "--tq-rdma-device",
+                type=str,
+                default="",
+                help=(
+                    "RDMA device name for MooncakeStore (e.g. mlx5_bond_0). Empty "
+                    "(default) lets Mooncake auto-select. On multi-NIC hosts the "
+                    "auto-selected device may fail cross-node; specify explicitly if "
+                    "needed."
+                ),
+            )
             return parser
 
         def add_cluster_arguments(parser):
@@ -330,6 +367,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="thd",
                 help="The qkv layout for Megatron backend.",
             )
+            qsa_coeff_option = "--qsa-indexer-loss-coeff"
+            if qsa_coeff_option in parser._option_string_actions:
+                # Megatron registers TransformerConfig fields on newer revisions.
+                qsa_coeff_action = parser._option_string_actions[qsa_coeff_option]
+                qsa_coeff_action.type = _nonnegative_finite_float
+                qsa_coeff_action.default = 0.0
+            else:
+                parser.add_argument(
+                    qsa_coeff_option,
+                    type=_nonnegative_finite_float,
+                    default=0.0,
+                    help="QSA Stage-2 indexer KL coefficient; positive values require the opt-in selected-ID sparse backend.",
+                )
             parser.add_argument(
                 "--true-on-policy-mode",
                 action="store_true",
@@ -639,6 +689,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-wholepack",
+                action="store_true",
+                help="Enable the reviewed 64-GPU Qwen3.5 wholepack scheduling policy explicitly.",
+            )
+            parser.add_argument(
+                "--sft-packing-strategy",
+                choices=["balanced", "binpack"],
+                default="balanced",
+                help="Dynamic SFT microbatch packing algorithm; binpack preserves the archived SFT recipe.",
+            )
+            parser.add_argument(
                 "--sft-max-in-flight-steps",
                 type=int,
                 default=None,
@@ -688,19 +749,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=["sft", "cpt"],
                 default="sft",
                 help=(
-                    "Use cpt for text-only continued pretraining: raw text plus tokenizer EOS, "
+                    "Use cpt for continued pretraining: raw text plus tokenizer EOS, "
                     "no chat template, and a CPT loss mask (see --sft-cpt-template). Requires --loss-type sft. "
                     "Read text from --input-key (or text/messages when the default input key is absent)."
                 ),
             )
             parser.add_argument(
                 "--sft-cpt-template",
-                choices=["raw", "qwen3_5"],
+                choices=["raw", "qwen3_5", "multimodal"],
                 default="raw",
                 help=(
                     "CPT text preprocessing. raw preserves text and supervises all tokens; "
                     "qwen3_5 matches ms-swift Qwen3.5 generation preprocessing and "
-                    "all+ignore_empty_think masks. Requires --sft-training-mode cpt."
+                    "all+ignore_empty_think masks; multimodal preserves the chat/processor layout and supervises text tokens. Requires --sft-training-mode cpt."
                 ),
             )
             parser.add_argument(
@@ -853,6 +914,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--rollout-top-k", type=int, default=-1, help="the top-k for the inference engine during rollout."
+            )
+            parser.add_argument(
+                "--rollout-top-logprobs-num",
+                type=_positive_int,
+                default=128,
+                help="Number of behavior-policy candidates recorded for score centering; does not change sampling.",
             )
             parser.add_argument(
                 "--rollout-max-context-len",
@@ -1958,10 +2025,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Advantage estimator to use. The choices come from the algorithm registry in "
                     "relax/algorithms/spec.py. Note: on-policy distillation (OPD) is orthogonal "
-                    "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator. "
+                    "to most advantage estimators; score_centering cannot be combined with OPD. "
                     "'rloo' uses a leave-one-out baseline with an unclipped REINFORCE loss (sync only)."
                 ),
             )
+            parser.add_argument(
+                "--score-centering-is",
+                choices=["none", "tis", "mis"],
+                default="none",
+                help="Importance weighting applied inside both score-centering terms.",
+            )
+            parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
+            parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
+            parser.add_argument("--score-centering-mis-high", type=float, default=5.0)
             parser.add_argument(
                 "--sapo-tau-pos",
                 type=float,
@@ -2397,6 +2473,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Number of rollout steps after which to dump the memory snapshot. "
                 "For example, --memory-snapshot-num-steps 3 dumps after step 2 (0-indexed).",
+            )
+            parser.add_argument(
+                "--profile-output-dir",
+                type=str,
+                default="traces",
+                help="Root directory for profiler outputs. Experiment name and trace type are appended.",
             )
             parser.add_argument(
                 "--profile-target",
@@ -3258,9 +3340,12 @@ def _validate_cpt_args(args) -> None:
         "--custom-dataset-class": getattr(args, "custom_dataset_class_path", None),
         "--sft-oversize-strategy custom": getattr(args, "sft_oversize_strategy", None) == "custom",
     }
+    if getattr(args, "sft_cpt_template", "raw") == "multimodal":
+        for name in ("--multimodal-keys", "--conversation-key-map", "--apply-chat-template-kwargs"):
+            incompatible.pop(name)
     enabled = [name for name, value in incompatible.items() if value]
     if enabled:
-        raise ValueError(f"Text-only CPT does not support: {', '.join(enabled)}.")
+        raise ValueError(f"Selected CPT template does not support: {', '.join(enabled)}.")
 
 
 def _normalize_sft_max_in_flight_steps(args, is_offline: bool) -> None:
@@ -3581,6 +3666,47 @@ def _assert_spec_implementations_resolve(spec) -> None:
             )
 
 
+def _validate_score_centering_args(args: argparse.Namespace) -> None:
+    if args.advantage_estimator != "score_centering":
+        return
+    if args.loss_type != "policy_loss":
+        raise ValueError("score_centering requires --loss-type policy_loss.")
+    if getattr(args, "multimodal_keys", None):
+        raise ValueError("score_centering currently accepts text-only training inputs.")
+    if getattr(args, "train_backend", None) == "fsdp":
+        raise ValueError(
+            "score_centering requires a text token policy-loss backend; the current FSDP backend trains diffusion."
+        )
+    if getattr(args, "use_opd", False) or getattr(args, "opd_fkl_entropy_gate", False):
+        raise ValueError(
+            "score_centering and OPD cannot be enabled together: centering the advantage-injected distillation "
+            "signal can cancel its update. This release also excludes standalone OPD loss and EOPD."
+        )
+    for flag in (
+        "use_tis",
+        "custom_tis_function_path",
+        "use_opsm",
+        "use_unbiased_kl",
+        "custom_pg_loss_reducer_function_path",
+    ):
+        if getattr(args, flag, False):
+            raise ValueError(f"score_centering is incompatible with --{flag.replace('_', '-')}.")
+    if not math.isfinite(args.rollout_temperature) or args.rollout_temperature <= 0:
+        raise ValueError("score_centering requires a finite positive --rollout-temperature.")
+    if not isinstance(args.rollout_top_logprobs_num, int) or args.rollout_top_logprobs_num < 1:
+        raise ValueError("--rollout-top-logprobs-num must be a positive integer.")
+    if args.score_centering_is not in ("none", "tis", "mis"):
+        raise ValueError("--score-centering-is must be none, tis, or mis.")
+    if not math.isfinite(args.score_centering_tis_clip) or args.score_centering_tis_clip <= 0:
+        raise ValueError("--score-centering-tis-clip must be finite and positive.")
+    if not (
+        math.isfinite(args.score_centering_mis_low)
+        and math.isfinite(args.score_centering_mis_high)
+        and 0 < args.score_centering_mis_low <= args.score_centering_mis_high
+    ):
+        raise ValueError("Score-centering MIS bounds must be finite and satisfy 0 < low <= high.")
+
+
 def validate_algorithm_args(args) -> None:
     """Apply the constraints the algorithm registry declares for this run.
 
@@ -3602,6 +3728,7 @@ def validate_algorithm_args(args) -> None:
     _assert_spec_implementations_resolve(spec)
 
     args.use_critic = spec.needs_critic
+    _validate_score_centering_args(args)
 
     if not spec.supports_context_parallel and (
         getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "dynamic_context_parallel", False)
@@ -4201,7 +4328,7 @@ def slime_validate_args(args):
         if args.use_rollout_logprobs:
             assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
-        if args.get_mismatch_metrics:
+        if args.get_mismatch_metrics and args.advantage_estimator != "score_centering":
             assert args.custom_tis_function_path is not None, (
                 "custom_tis_function_path must be set when get_mismatch_metrics is set"
             )

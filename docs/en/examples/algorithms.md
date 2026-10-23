@@ -2,7 +2,7 @@
 
 Relax supports multiple policy gradient algorithms, all selected via the `--advantage-estimator` flag. This document covers PPO and the primary GRPO-family algorithms (for On-Policy Distillation, see the [dedicated page](./on-policy-distillation.md)).
 
-GRPO, RLOO, CISPO, GSPO, SAPO, and M2PO share the same actor/rollout service topology, although RLOO is synchronous-only and enforces fixed batch invariants. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
+GRPO, Score Centering, RLOO, CISPO, GSPO, SAPO, and M2PO share the same actor/rollout service topology, although RLOO is synchronous-only and enforces fixed batch invariants. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
 
 REINFORCE++ and REINFORCE++-baseline also reuse the GRPO service topology, but
 their return, global normalization and KL contracts are algorithm-specific.
@@ -44,6 +44,76 @@ DATA_DIR=/path/to/data \
 EXP_DIR=/path/to/exp \
 bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 ```
+
+---
+
+## Score Centering (SC)
+
+Score Centering corrects policy-gradient drift when the rollout distribution differs from the training distribution, for example when the sampler uses lower precision. Here, the score means the gradient of the policy log-probability, not the reward. SC subtracts the expected score under the generation distribution; it does not make rollout and training log-probabilities identical.
+
+Relax records generation-time top-K candidate IDs and probabilities, scores the same candidates in the trainer, and approximates the unrecorded tail. The default advantage is the response reward minus the prompt group's mean reward, without division by the group standard deviation. Unlike RLOO, this mean includes the current response. The loss uses score centering rather than PPO clipping.
+
+### Configuration
+
+For an existing text-only Megatron recipe, replace its algorithm arguments with the following block and pass `"${SC_ARGS[@]}"` to the training command:
+
+```bash
+SC_ARGS=(
+   --loss-type policy_loss
+   --advantage-estimator score_centering
+   --calculate-per-token-loss
+   --n-samples-per-prompt 8
+   --rollout-temperature 1.0
+   --rollout-top-p 1.0
+   --rollout-top-k -1
+   --rollout-top-logprobs-num 128
+   --score-centering-is none
+   --kl-coef 0
+)
+```
+
+Keep reward normalization enabled and remove `--disable-rewards-normalization`, `--normalize-advantages`, OPD, and outer TIS settings from the original recipe. SC requires at least two responses per prompt and global valid-token loss normalization. `--eps-clip` and `--eps-clip-high` do not control this loss. Reference-policy KL loss and entropy regularization remain separate options.
+
+| Parameter | Parser default | Description |
+|---|---|---|
+| `--rollout-top-logprobs-num` | `128` | Candidate count K, from 1 to the real vocabulary size; larger values increase collection, transfer, and scoring costs without changing sampling top-k |
+| `--score-centering-is` | `none` | Internal importance weighting: `none`, `tis`, or `mis`, applied to both the sampled and centering terms |
+| `--score-centering-tis-clip` | `2.0` | Positive finite weight upper bound for TIS |
+| `--score-centering-mis-low` | `0.5` | Lower bound of the MIS retained-weight interval |
+| `--score-centering-mis-high` | `5.0` | Upper bound of the MIS interval; bounds must satisfy `0 < low <= high` |
+
+To combine SC with TIS, use `--score-centering-is tis --score-centering-tis-clip 2.0`. Do not also enable `--use-tis` or `--custom-tis-function-path`. SC also rejects `--use-opsm`, `--use-unbiased-kl`, and a custom policy-loss reducer.
+
+Custom rollout functions must preserve the sampled behavior log-probabilities and aligned `rollout_topk_token_ids` / `rollout_topk_log_probs`, including loss masks for tool observations. Returned probabilities must reflect the actual sampling temperature and filters. Top-p/min-p filtering requires a finite sampling top-k; `top_p < 1` additionally requires `--sglang-sampling-backend pytorch`. Non-unit temperature requires `SGLANG_RETURN_ORIGINAL_LOGPROB=0`. Speculative decoding, `sglang_rl_on_policy_target`, and filtered sampling on the Ascend backend are not supported by this capture path. SC uses the Megatron text-token policy loss, not the FSDP diffusion training path.
+
+### Diagnostics
+
+SC reports token-mask-aware means under `train/`:
+
+- `sc_rollout_head_mass` / `sc_train_head_mass`: probability mass covered by the recorded candidates in each distribution.
+- `sc_tail_ratio` / `sc_tail_floor_fraction`: tail-mass ratio and the fraction of positions where either tail is below the fixed `1e-6` numerical floor.
+- `sc_correction`: the signed scalar centering term; its magnitude alone does not measure training quality.
+- `sc_importance_weight`, `sc_is_clip_fraction`, and `sc_zero_weight_fraction`: internal weighting diagnostics. With `--score-centering-is none`, these are 1, 0, and 0.
+
+`--get-mismatch-metrics` adds mismatch diagnostics without applying extra TIS weighting. Interpret these alongside validation reward, response length, truncation rate, and gradient norm; successful SC does not require mismatch to converge to zero.
+
+### Quick Start
+
+Use the eight-GPU [Qwen3-0.6B Countdown script](../../../examples/algorithms/score-centering/run-qwen3-0.6B-8xgpu.sh). First prepare the BF16 model, its FP8 conversion, and Countdown JSONL data following the [setup instructions](../../../examples/algorithms/score-centering/EXPERIMENT.md); this recipe also requires the SGD and BF16 export fixes listed there. Submit from the repository root to a dedicated Ray cluster with eight GPUs:
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/countdown-data \
+SAVE_DIR=/path/to/checkpoints \
+RAY_ADDRESS=http://ray-head:8265 \
+USE_SC=1 USE_TIS=0 \
+bash scripts/entrypoint/ray-job.sh \
+  examples/algorithms/score-centering/run-qwen3-0.6B-8xgpu.sh
+```
+
+`RAY_ADDRESS` is the Ray Jobs HTTP address. `USE_SC=1 USE_TIS=0` selects SC; set `USE_TIS=1` for SC with internal TIS. Setting `USE_SC=0` selects native RLOO, with optional native TIS controlled by the same switch. The script defaults to `USE_SC=0 USE_TIS=0`, so explicitly set both switches when selecting an experiment.
+
+This recipe uses a BF16 trainer, an FP8 sampler, SGD with learning rate 0.01, and 400 updates. These are experiment settings; SC does not require SGD. Online evaluation uses the FP8 sampler. Use a new `EXP_NAME` for each independent run; full SGD optimizer resume is currently limited as described in the setup instructions.
 
 ---
 
@@ -370,6 +440,7 @@ M2PO_ARGS=(
 |-----------|----------------------|-------------|---------------|
 | **PPO** | Critic values + GAE | PPO-Clip (hard clip) | Disabled in the current synchronous topology |
 | **GRPO** | Group-relative reward | PPO-Clip (hard clip) | Optional KL loss |
+| **Score Centering** | Group-mean-centered reward, without group-standard-deviation scaling | Centered score with optional internal TIS/MIS | Reward-side KL disabled; optional direct KL loss |
 | **REINFORCE++** | Token KL-to-go return + global token normalization | PPO-Clip (hard clip) | k1 KL in shaped reward |
 | **REINFORCE++-baseline** | Inclusive group mean + global token normalization | PPO-Clip (hard clip) | Separate k2 KL loss |
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
