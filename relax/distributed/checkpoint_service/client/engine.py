@@ -266,14 +266,35 @@ class CheckpointEngineClient:
         )
         if not self.need_update_ref and self.role == "reference":
             return
-        response = await self._http_client.get(
-            f"{self.coordinator_url}/get_model_update_group_ranks",
-            params={"role": self.role, "rank": self.rank, "need_update_ref": self.need_update_ref},
-        )
-        response.raise_for_status()
-        data = response.json()
+        managed = self.role == "actor" and getattr(self._backend, "managed_lora_publication_enabled", False) is True
+        if managed:
+            from relax.engine.lora_versions.training import agree_training_error
+
+        error = None
+        data = None
+        try:
+            response = await self._http_client.get(
+                f"{self.coordinator_url}/get_model_update_group_ranks",
+                params={"role": self.role, "rank": self.rank, "need_update_ref": self.need_update_ref},
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            if not managed:
+                raise
+            error = exc
+        if managed:
+            agree_training_error(error, "actor_fwd topology lookup")
         logger.info(f"Topology data for actor_fwd_ref weight update: {data}")
-        self._backend.init_process_groups_for_actor_fwd_ref(data)
+        error = None
+        try:
+            self._backend.init_process_groups_for_actor_fwd_ref(data)
+        except Exception as exc:
+            if not managed:
+                raise
+            error = exc
+        if managed:
+            agree_training_error(error, "actor_fwd weight group initialization")
         logger.info(f"Weights updated for actor_fwd_ref weight update, role: {self.role}.")
 
     async def recv_weight_fully_async(self):
@@ -284,12 +305,35 @@ class CheckpointEngineClient:
     async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> list[str]:
         """Update rollout weights; rank 0 returns the actual recipient Actor
         IDs."""
-        response = await self._http_client.get(f"{self.coordinator_url}/topology")
-        response.raise_for_status()
-        data = response.json()
-        logger.info(f"get topology: {data}")
-        if not actor_fwd_only:
-            self._backend.init_process_group_for_rollout(data)
+        managed = getattr(self._backend, "managed_lora_publication_enabled", False) is True
+        if managed:
+            if not actor_fwd_only and not self._backend._lora_sync.base_sync_done:
+                from relax.engine.lora_versions.training import agree_training_error
+
+                error = None
+                data = None
+                try:
+                    response = await self._http_client.get(f"{self.coordinator_url}/topology")
+                    response.raise_for_status()
+                    data = response.json()
+                    self._backend.validate_lora_base_recipients(data)
+                except Exception as exc:
+                    error = exc
+                agree_training_error(error, "base topology lookup")
+                error = None
+                try:
+                    self._backend.init_process_group_for_rollout(data)
+                    self._backend.validate_lora_base_recipients()
+                except Exception as exc:
+                    error = exc
+                agree_training_error(error, "base weight group initialization")
+        else:
+            response = await self._http_client.get(f"{self.coordinator_url}/topology")
+            response.raise_for_status()
+            data = response.json()
+            logger.info(f"get topology: {data}")
+            if not actor_fwd_only:
+                self._backend.init_process_group_for_rollout(data)
         self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
         logger.info("Weights updated for rollout role.")
         # Adapter delta-skip can't confirm a replacement got base+adapter; keep existing behavior.
