@@ -21,6 +21,7 @@ logger = get_logger(__name__)
 
 __all__ = [
     "resolve_block_classes",
+    "resolve_fine_grained_modules",
     "fsdp2_wrap",
     "upcast_trainable_params",
     "offload_module_to_cpu",
@@ -56,6 +57,17 @@ def resolve_block_classes(model: torch.nn.Module) -> List[Type[torch.nn.Module]]
                     seen.add(cls)
                     classes.append(cls)
     return classes
+
+
+def resolve_fine_grained_modules(model: torch.nn.Module) -> List[torch.nn.Module]:
+    """Resolve explicitly marked inner FSDP boundaries.
+
+    Model policies may set ``_fsdp_fine_grained`` on selected submodules. These
+    modules are nested inside the transformer block boundary and must be
+    sharded before their parents. Instance markers avoid sharding every module
+    of a broad class such as ``Linear``.
+    """
+    return [module for module in model.modules() if getattr(module, "_fsdp_fine_grained", False)]
 
 
 @torch.no_grad()
@@ -135,6 +147,7 @@ def fsdp2_wrap(
         logger.info(f"fsdp2_wrap: promoted {promoted} trainable param(s) to {master_dtype} optimizer masters")
 
     block_classes = tuple(resolve_block_classes(model))
+    fine_grained_modules = resolve_fine_grained_modules(model)
     shard_targets: tuple = block_classes
     if block_classes and activation_checkpointing:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -153,13 +166,17 @@ def fsdp2_wrap(
         # After AC the blocks are wrapped, so shard the CheckpointWrappers.
         shard_targets = (CheckpointWrapper,)
 
+    for module in fine_grained_modules:
+        fully_shard(module, **kwargs)
     if block_classes:
         for module in model.modules():
             if isinstance(module, shard_targets):
                 fully_shard(module, **kwargs)
     fully_shard(model, **kwargs)
     logger.info(
-        f"FSDP2 wrapped model; block classes: {[c.__name__ for c in block_classes]}; "
+        f"FSDP2 wrapped model; fine-grained modules: {len(fine_grained_modules)} "
+        f"({sorted({type(m).__name__ for m in fine_grained_modules})}); "
+        f"block classes: {[c.__name__ for c in block_classes]}; "
         f"activation_checkpointing={activation_checkpointing}, cpu_offload={cpu_offload}, "
         f"master_dtype={master_dtype}"
     )
