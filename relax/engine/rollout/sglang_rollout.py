@@ -26,6 +26,7 @@ from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
+from relax.engine.rollout.source_mixture import validate_source_mixture_batch
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -958,6 +959,7 @@ async def generate_rollout_async(
     )
 
     metric_gatherer = MetricGatherer()
+    source_mixture = bool(getattr(args, "rollout_source_mixture", None))
 
     # Backfill debt for the previous step = the deficit it recorded at close
     # (rollout_batch_size - committed_current), NOT the buffer carryover size. Known up
@@ -1037,10 +1039,16 @@ async def generate_rollout_async(
                 ref = state.prefetched_samples_ref
                 state.prefetched_samples_ref = None
                 logger.info(f"Rollout step {rollout_id}: using pre-fetched data from previous step")
+            elif source_mixture:
+                ref = data_source.get_samples.remote(
+                    args.over_sampling_batch_size + num_old_samples, rollout_id=rollout_id
+                )
             else:
                 ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
 
             samples = await loop.run_in_executor(None, ray.get, ref)
+            if source_mixture:
+                validate_source_mixture_batch(args, samples, rollout_id)
 
             get_samples_times.append(monotonic() - _t_get_samples)
             state.submit_generate_tasks(samples)
@@ -1066,7 +1074,14 @@ async def generate_rollout_async(
             # "filtered out" and lost. It is carried to the resume buffer below and
             # finished under the next weight version. Only completed groups are filtered.
             group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
-            if not group_aborted:
+            if source_mixture:
+                if group_aborted:
+                    raise RuntimeError(
+                        "Source-mixture batch contains an aborted group; refusing a partial training batch."
+                    )
+                if not call_dynamic_filter(dynamic_filter, args, group).keep:
+                    raise RuntimeError("Source-mixture batch cannot drop generated groups or change source quotas.")
+            elif not group_aborted:
                 dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
                 if not dynamic_filter_output.keep:
                     metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
@@ -1114,6 +1129,14 @@ async def generate_rollout_async(
         )  # Samples per batch to transfer
         # in fully async mode, we transfer all remaining samples when we reach the target size
         if len(batch_to_transfer) >= transfer_batch_size:
+            if source_mixture:
+                # The supported mode has exactly one full Global Batch per rollout.
+                # Completion order may vary; validate all members before the first PUT.
+                counts = validate_source_mixture_batch(args, batch_to_transfer, rollout_id, completed=True)
+                logger.info(
+                    f"Source mixture batch={rollout_id} total={len(batch_to_transfer)} "
+                    f"sources={counts} quota_check=PASS"
+                )
             if total_transfer_samples <= num_old_samples:
                 n = len(batch_to_transfer)
                 # is_last: this backfill closes the previous partition's debt.
@@ -1531,6 +1554,12 @@ def generate_rollout(
     _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
     if not args.fully_async and not _lora_adapter_mode:
         state = GenerateState(args)
-        state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
+        if getattr(args, "rollout_source_mixture", None):
+            if rollout_id + 1 < args.num_rollout:
+                state.prefetched_samples_ref = data_buffer.get_samples.remote(
+                    args.over_sampling_batch_size, rollout_id=rollout_id + 1
+                )
+        else:
+            state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
         logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
     return output
