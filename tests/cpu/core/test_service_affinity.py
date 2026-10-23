@@ -175,14 +175,15 @@ def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path,
     config_path.write_text("enabled: true\n")
     deployment_cls = MagicMock()
     deployment = deployment_cls.options.return_value
-    service = object.__new__(Service)
-    service.cls = deployment_cls
-    service.config = Namespace(autoscaler_config=str(config_path), enable_affinity=True)
-    service.runtime_env = {"env_vars": {"A": "B"}}
-    service.healthy = MagicMock()
-    service.num_gpus = 0
-    service.role = "rollout" if has_data_source else "actor"
-    service.data_source = MagicMock() if has_data_source else None
+    service = Service(
+        deployment_cls,
+        role="rollout" if has_data_source else "actor",
+        healthy=MagicMock(),
+        config=Namespace(autoscaler_config=str(config_path), enable_affinity=True),
+        runtime_env={"env_vars": {"A": "B"}},
+        data_source=MagicMock() if has_data_source else None,
+        defer_deploy=True,
+    )
 
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
         service._deploy(None)
@@ -196,14 +197,13 @@ def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path,
 
 def test_service_deploy_is_unconstrained_without_autoscaler():
     deployment_cls = MagicMock()
-    service = object.__new__(Service)
-    service.cls = deployment_cls
-    service.config = Namespace(autoscaler_config=None, enable_affinity=True)
-    service.runtime_env = None
-    service.healthy = MagicMock()
-    service.num_gpus = 0
-    service.role = "actor"
-    service.data_source = None
+    service = Service(
+        deployment_cls,
+        role="actor",
+        healthy=MagicMock(),
+        config=Namespace(autoscaler_config=None, enable_affinity=True),
+        defer_deploy=True,
+    )
 
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
         service._deploy(None)

@@ -107,7 +107,9 @@ def test_global_restart_cleans_both_router_owners(
     controller._restart_consumed_event.set()
     controller._restart_lock = threading.RLock()
     # Exercise the public recovery wrapper and the actual global teardown.
-    controller._restart_serve = lambda role: controller._run_global_restart()
+    controller._inference_recovery = None
+    controller._local_recovery_thread = None
+    controller._restart_serve = lambda role, worker: controller._run_global_restart()
 
     if manager_pending:
         wait_for = asyncio.wait_for

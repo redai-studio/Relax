@@ -77,8 +77,9 @@ def test_legacy_ipc_wait_does_not_add_collectives(module):
 
 
 @pytest.mark.parametrize("fail_load", [False, True, "conversion", "dispatch"])
+@pytest.mark.parametrize("mode", ["disabled", "colocate", "hybrid"])
 @pytest.mark.parametrize("automatic_bf16", [False, True])
-def test_routed_update_publishes_version_only_after_all_loads(module, fail_load, automatic_bf16):
+def test_routed_update_publishes_version_only_after_all_loads(module, fail_load, mode, automatic_bf16):
     from types import SimpleNamespace
 
     events = []
@@ -97,6 +98,7 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
         )
     updater = object.__new__(module.UpdateWeightFromTensor)
     updater._route_experts = True
+    updater.args = SimpleNamespace(inference_recovery=mode != "disabled", colocate=True, hybrid=mode == "hybrid")
     updater._auto_expert_routing = automatic_bf16
     updater.lora_enabled = updater.lora_merge_mode = False
     updater.rollout_engines, updater.distributed_rollout_engines = [engine], []
@@ -148,7 +150,7 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
                 assert completed_reads == [True]
         else:
             updater.update_weights()
-            assert [name for name, _ in events] == [
+            expected = [
                 "pause_generation",
                 "flush_cache",
                 "begin_weight_update" if automatic_bf16 else "post_process_weights",
@@ -158,6 +160,9 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
                 "update_weight_version",
                 "continue_generation",
             ]
+            if mode == "colocate":
+                expected.remove("continue_generation")
+            assert [name for name, _ in events] == expected
             if not automatic_bf16:
                 assert events[2][1]["restore_weights_before_load"] is True
                 assert events[5][1]["post_process_quantization"] is True
