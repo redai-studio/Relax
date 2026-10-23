@@ -3,6 +3,7 @@
 """CPU regressions for startup failure propagation and bounded cleanup."""
 
 import ast
+import asyncio
 import concurrent.futures
 import os
 import signal
@@ -13,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import yaml
@@ -386,7 +387,8 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
     assert call.kwargs["args"] == (1,)
 
 
-def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
+@pytest.mark.parametrize("mode", ["missing_config", "text_sft", "i2i", "i2i_stop_failure"])
+def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
     methods = [
@@ -399,7 +401,13 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
         sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
     )
     stop_teacher = Mock()
-    ns = {"logger": Mock(), "ROLES": SimpleNamespace(rollout="rollout"), "shutdown_managed_opd_teacher": stop_teacher}
+    ns = {
+        "logger": Mock(),
+        "ROLES": SimpleNamespace(rollout="rollout", sft="sft"),
+        "shutdown_managed_opd_teacher": stop_teacher,
+        "asyncio": asyncio,
+        "run": asyncio.run,
+    }
     exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
     teacher = object()
     partial_controller = SimpleNamespace(
@@ -409,9 +417,23 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
         _cleanup_s3_model_weights_after_init=Mock(),
     )
     partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
+    stop_image = AsyncMock(side_effect=RuntimeError("producer unavailable") if mode == "i2i_stop_failure" else None)
+    if mode != "missing_config":
+        partial_controller.config = SimpleNamespace(
+            loss_type="sft", generation_task="i2i" if mode.startswith("i2i") else "t2i"
+        )
+        partial_controller.serve_dict["sft"] = SimpleNamespace(
+            handle=SimpleNamespace(stop=SimpleNamespace(remote=stop_image))
+        )
     ns["shutdown"](partial_controller)
+    if mode.startswith("i2i"):
+        stop_image.assert_awaited_once()
+    else:
+        stop_image.assert_not_called()
     stop_teacher.assert_called_once_with(teacher)
     stop_routers.assert_called_once()
+    partial_controller._shutdown_agentic_rollout_services.assert_called_once()
+    partial_controller._cleanup_s3_model_weights_after_init.assert_called_once_with(force=True)
 
 
 @pytest.mark.parametrize("health", [False, True])

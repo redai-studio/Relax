@@ -346,6 +346,8 @@ class Controller:
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
         dp_size = compute_dp_size(self.config)
+        from relax.engine.sft.runtime import is_i2i_sft
+
         required_node_resources = with_control_plane_affinity(self.config).get("resources", {})
         required_node_resource = next(iter(required_node_resources), None)
         use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)
@@ -360,6 +362,8 @@ class Controller:
                 balance_unit_multiplier=self.config.n_samples_per_prompt,
             )
             logger.info("Using IdentityWindowSampler (fully_async + dynamic batch)")
+        elif is_i2i_sft(self.config):
+            sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")
         elif algo_key == "sft":
             from relax.utils.data.wholepack import WholepackSampler, config_contract, enabled
 
@@ -1158,7 +1162,9 @@ class Controller:
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
             raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
-        algo: dict = ALGOS.get(algo_key).copy()
+        from relax.core.registry import resolve_algorithm
+
+        algo: dict = resolve_algorithm(self.config)
         ROLES = process_role(self.config)
 
         # Fail-fast on missing SFT producer role; without this the train
@@ -1438,6 +1444,18 @@ class Controller:
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 
+        from relax.engine.sft.runtime import is_i2i_sft
+
+        if is_i2i_sft(getattr(self, "config", None)) and ROLES.sft in self.serve_dict:
+
+            async def stop_image_producer() -> None:
+                await asyncio.wait_for(self.serve_dict[ROLES.sft].handle.stop.remote(), timeout=10)
+
+            try:
+                run(stop_image_producer())
+            except Exception as exc:
+                logger.warning(f"Image SFT producer shutdown failed: {exc}")
+
         self._dispose_rollout_manager()
 
         shutdown_managed_opd_teacher(self._teacher_manager)
@@ -1539,7 +1557,9 @@ class Controller:
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
             raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
-        algo: dict = ALGOS.get(algo_key).copy()
+        from relax.core.registry import resolve_algorithm
+
+        algo: dict = resolve_algorithm(self.config)
         # Include dynamically added optional roles.
         register_extra_roles(self.config, algo)
         cls = algo.get(role)

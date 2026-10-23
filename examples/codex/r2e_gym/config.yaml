@@ -1,0 +1,44 @@
+codex:
+  timeout_s: 7200
+
+apptainer:
+  executable: apptainer
+  memory: 4G
+  memory_swap: 4G
+  pids_limit: 512
+  runtime_mount: /opt/relax-codex-runtime
+  reward_timeout_s: 60
+  setup:
+    train: |
+      mkdir -p /root/.local/bin
+      ln -s /testbed/.venv /root/.venv
+      ln -s /testbed/.venv/bin/python /root/.local/bin/python
+      ln -s /testbed/.venv/bin/python /root/.local/bin/python3
+      find /testbed/.venv/bin -type f -executable -exec ln -sf {} /root/.local/bin/ \;
+      uv pip install --no-index --find-links /r2e_wheels chardet==5.2.0
+      mv /testbed/run_tests.sh /root/run_tests.sh
+      chmod +x /root/run_tests.sh
+      find /r2e_tests -name '*.pyc' -delete
+      find /r2e_tests -name '__pycache__' -exec rm -rf {} +
+      mv /r2e_tests /root/r2e_tests
+      ln -s /root/r2e_tests /testbed/r2e_tests
+    eval: |
+      ln -s /opt/miniconda3/envs/testbed /root/.venv
+      chmod +x /run_tests.sh
+      /root/.venv/bin/python -m pip install --no-index --find-links /r2e_wheels chardet==5.2.0
+  test_script:
+    train: /root/run_tests.sh
+    eval: /run_tests.sh
+  command: |
+    export PIP_NO_INDEX=1
+    set +e
+    timeout --foreground --kill-after=5s "${CODEX_R2E_TIMEOUT}" "${CODEX_R2E_RUNTIME_MOUNT}/codex" exec \
+      -c "model_providers.relax.base_url=\"${RELAX_CODEX_BASE_URL}\"" \
+      --ephemeral \
+      --strict-config \
+      --skip-git-repo-check \
+      -
+    timeout --foreground --kill-after=5s "${CODEX_R2E_VERIFIER_TIMEOUT}" bash "${CODEX_R2E_TEST_SCRIPT}" > "${CODEX_R2E_TEST_LOG}" 2>&1
+    verifier_status=$?
+    if [ "${verifier_status}" -ge 124 ]; then exit "${verifier_status}"; fi
+    exit 0

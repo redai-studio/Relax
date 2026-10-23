@@ -757,6 +757,60 @@ class TestStreamingDataset:
         assert len(samples) == 5
         assert all(s is not None for s in samples)
 
+    @pytest.mark.parametrize("batch_size", [8, 64, 100, 128, 150, 200])
+    def test_streaming_dataset_no_prefetch_preserves_epoch_order(self, tmp_path, mock_tokenizer, batch_size):
+        from relax.utils.data.streaming_dataset import IndexManager, StreamingDataset
+
+        data = [{"text": f"Sample {i}"} for i in range(batch_size * 3)]
+        path = tmp_path / "data.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in data))
+        dataset = StreamingDataset(str(path), mock_tokenizer, processor=None, max_length=None)
+        dataset.shuffle(0)
+        order = list(dataset.index_manager.indices)
+
+        prompts = []
+        for batch_id in range(3):
+            samples, crossed = dataset.get_batch(batch_size)
+            prompts.extend(sample.prompt for sample in samples)
+            assert crossed is False
+            assert dataset.index_manager.position == (batch_id + 1) * batch_size
+            assert dataset.index_manager.current_epoch == 0
+
+        assert prompts == [data[idx]["text"] for idx in order]
+        assert len(set(prompts)) == len(data)
+
+        expected_manager = IndexManager(len(data))
+        expected_manager.shuffle(1)
+        samples, crossed = dataset.get_batch(1)
+        assert crossed is True
+        assert samples[0].prompt == data[expected_manager.indices[0]]["text"]
+        assert dataset.index_manager.position == 1
+
+    def test_streaming_dataset_no_prefetch_refills_filtered_samples(self, jsonl_file, mock_tokenizer):
+        from relax.utils.data.streaming_dataset import StreamingDataset
+
+        filepath, data = jsonl_file
+        dataset = StreamingDataset(filepath, mock_tokenizer, processor=None, max_length=5)
+        dataset.shuffle(0)
+        order = list(dataset.index_manager.indices)
+        filtered = {order[pos] for pos in (1, 4, 9, 13, 18)}
+        filtered_prompts = {data[idx]["text"] for idx in filtered}
+        mock_tokenizer.side_effect = lambda text, **kwargs: {"input_ids": [1] * (6 if text in filtered_prompts else 5)}
+        valid_indices = [idx for idx in order if idx not in filtered]
+
+        first, crossed = dataset.get_batch(8)
+        assert crossed is False
+        assert [sample.prompt for sample in first] == [data[idx]["text"] for idx in valid_indices[:8]]
+        assert dataset.index_manager.position == order.index(valid_indices[7]) + 1
+
+        second, crossed = dataset.get_batch(len(valid_indices) - 8)
+        assert crossed is False
+        assert [sample.prompt for sample in first + second] == [data[idx]["text"] for idx in valid_indices]
+        # The final row is valid, so every row in this epoch has now been examined.
+        assert dataset.index_manager.position == len(data)
+        assert dataset._filter_count == len(filtered)
+        assert dataset._total_processed == len(data)
+
     def test_shuffle_epoch(self, jsonl_file, mock_tokenizer):
         """Test that shuffle produces different order."""
         from relax.utils.data.streaming_dataset import StreamingDataset
@@ -843,6 +897,9 @@ class TestStreamingDataset:
         # Advance state
         _ = dataset.get_batch(7)
         state = dataset.get_state()
+        assert state["position"] == 7
+        assert state["epoch_id"] == 0
+        expected = [data[idx]["text"] for idx in dataset.index_manager.indices[7:15]]
 
         # Create new dataset and restore
         dataset2 = StreamingDataset(
@@ -857,6 +914,10 @@ class TestStreamingDataset:
 
         assert dataset2.index_manager.position == dataset.index_manager.position
         assert dataset2.index_manager.current_epoch == dataset.index_manager.current_epoch
+        for current in (dataset, dataset2):
+            samples, crossed = current.get_batch(8)
+            assert [sample.prompt for sample in samples] == expected
+            assert crossed is False
 
     def test_samples_proxy(self, jsonl_file, mock_tokenizer):
         """Test samples proxy for compatibility."""
@@ -933,21 +994,19 @@ class TestStreamingDataset:
                 prompt_key="text",
             )
 
+            dataset.shuffle(0)
+            first_epoch_order = list(dataset.index_manager.indices)
             samples1, crossed1 = dataset.get_batch(3)
             samples2, crossed2 = dataset.get_batch(3)
 
             prompts1 = [sample.prompt for sample in samples1]
-            assert len(prompts1) == 3
-            assert len(set(prompts1)) == 3
-            assert set(prompts1).issubset({"A1", "A2", "B0", "B1"})
+            assert crossed1 is False
+            assert prompts1 == [dataset.reader[idx]["text"] for idx in first_epoch_order[:3]]
             prompts2 = [sample.prompt for sample in samples2]
-            # The public contract is that batching stays within the sliced
-            # multi-file domain and wraps across epochs when needed. The
-            # exact second-batch ordering depends on internal over-fetch/cursor
-            # strategy and should not be treated as externally stable.
-            assert len(prompts2) == 3
-            assert set(prompts2).issubset({"A1", "A2", "B0", "B1"})
             assert crossed2 is True
+            expected_indices = first_epoch_order[3:] + dataset.index_manager.indices[:2]
+            assert prompts2 == [dataset.reader[idx]["text"] for idx in expected_indices]
+            assert dataset.index_manager.position == 2
         finally:
             for path in files:
                 if os.path.exists(path):

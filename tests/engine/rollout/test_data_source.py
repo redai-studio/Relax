@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+from argparse import Namespace
 from types import ModuleType
 from unittest.mock import MagicMock
 
@@ -188,6 +189,82 @@ class TestDataSourceIntegration:
             for path in files:
                 if os.path.exists(path):
                     os.unlink(path)
+
+    @pytest.mark.parametrize("samples_per_prompt", [1, 3])
+    @pytest.mark.parametrize("max_length", [None, 5])
+    def test_streaming_buffer_resume_preserves_groups_and_prompt_order(
+        self,
+        jsonl_file: tuple[str, list[dict[str, str]]],
+        data_source_module,
+        monkeypatch: pytest.MonkeyPatch,
+        samples_per_prompt: int,
+        max_length: int | None,
+    ) -> None:
+        from relax.utils.data.streaming_dataset import StreamingDataset
+        from relax.utils.types import Sample
+
+        data_source = data_source_module
+        filepath, rows = jsonl_file
+        tokenizer = MagicMock()
+        dataset = StreamingDataset(filepath, tokenizer, processor=None, max_length=max_length)
+        dataset.shuffle(0)
+        order = list(dataset.index_manager.indices)
+        filtered = {order[2], order[5]} if max_length is not None else set()
+        filtered_prompts = {rows[idx]["text"] for idx in filtered}
+        tokenizer.side_effect = lambda text, **kwargs: {"input_ids": [1] * (6 if text in filtered_prompts else 5)}
+        valid_indices = [idx for idx in order if idx not in filtered]
+        # Exercise the real buffer/data-source path with a local dataset and no model loading.
+        monkeypatch.setattr(data_source, "_create_dataset", lambda *args: dataset)
+        args = Namespace(
+            use_streaming_dataset=True,
+            rollout_global_dataset=True,
+            hf_checkpoint=None,
+            dump_details=None,
+            rollout_shuffle=True,
+            n_samples_per_prompt=samples_per_prompt,
+            buffer_filter_path=None,
+        )
+        source = data_source.RolloutDataSourceWithBuffer(args)
+        initial = source.get_samples(4)
+        partial = initial[0]
+        partial[0].status = Sample.Status.ABORTED
+        partial[0].tokens = [10, 11]
+        partial[0].response = "unfinished"
+        partial[0].response_length = 1
+        partial[0].abort_count = 1
+        partial[0].metadata["start_rollout_id"] = 0
+        source.add_samples([partial, initial[1]])
+
+        mixed = source.get_samples(len(valid_indices) - len(initial) + 2)
+        assert mixed[0] is partial
+        assert mixed[1] is initial[1]
+        assert partial[0].status == Sample.Status.ABORTED
+        assert partial[0].tokens == [10, 11]
+        assert partial[0].response == "unfinished"
+        assert partial[0].response_length == 1
+        assert partial[0].abort_count == 1
+        assert partial[0].metadata["start_rollout_id"] == 0
+
+        fresh_groups = initial + mixed[2:]
+        assert [group[0].prompt for group in fresh_groups] == [rows[idx]["text"] for idx in valid_indices]
+        assert all(len(group) == samples_per_prompt for group in fresh_groups)
+        assert [group[0].group_index for group in fresh_groups] == list(range(len(valid_indices)))
+        assert [sample.index for group in fresh_groups for sample in group] == list(
+            range(len(valid_indices) * samples_per_prompt)
+        )
+        assert dataset.index_manager.position == len(rows)
+        assert dataset.index_manager.current_epoch == source.epoch_id == 0
+        assert dataset._filter_count == len(filtered)
+        assert source.get_buffer_length() == 0
+
+        # A request entirely satisfied by resumed groups must not read new prompts.
+        source.add_samples(mixed[:2])
+        state = dataset.get_state()
+        group_index, sample_index = source.sample_group_index, source.sample_index
+        resumed = source.get_samples(2)
+        assert all(actual is expected for actual, expected in zip(resumed, mixed[:2], strict=True))
+        assert dataset.get_state() == state
+        assert (source.sample_group_index, source.sample_index) == (group_index, sample_index)
 
 
 if __name__ == "__main__":
