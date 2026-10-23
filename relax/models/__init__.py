@@ -61,6 +61,15 @@ except Exception as _e:
     get_logger(__name__).warning("Failed to import relax.models.kimi_k3: %s", _e)
 
 
+# Register V4.1's configuration and text-weight conversion before AutoBridge dispatch.
+try:
+    from relax.models.deepseekv41 import DeepSeekV41Bridge  # noqa: F401
+except Exception as _e:
+    from relax.utils.logging_utils import get_logger
+
+    get_logger(__name__).warning("Failed to import relax.models.deepseekv41: %s", _e)
+
+
 # Only advertise what actually got bound: exporting an unbound name here makes
 # `from relax.models import *` die with an unrelated AttributeError.
 __all__ = [_name for _name in _OMNI_NAMES if _name in globals()]

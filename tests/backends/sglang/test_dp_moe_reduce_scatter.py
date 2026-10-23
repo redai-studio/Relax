@@ -11,23 +11,28 @@ from typing import Optional
 
 import pytest
 
-from tests.backends.sglang.source_utils import sglang_source_path
+from tests.tools.sglang_patch_source import patched_source
 
 
 torch = pytest.importorskip("torch")
 
 
 def _load_reduce_scatterv() -> Callable[..., object]:
-    path = sglang_source_path("srt/distributed/parallel_state.py")
+    path = "python/sglang/srt/distributed/parallel_state.py"
     group = next(
         node
-        for node in ast.parse(path.read_text()).body
+        for node in ast.parse(patched_source(path)).body
         if isinstance(node, ast.ClassDef) and node.name == "GroupCoordinator"
     )
     function = next(
         node for node in group.body if isinstance(node, ast.FunctionDef) and node.name == "reduce_scatterv"
     )
-    namespace = {"torch": torch, "Optional": Optional, "List": list}
+    namespace = {
+        "torch": torch,
+        "Optional": Optional,
+        "List": list,
+        "envs": SimpleNamespace(SGLANG_ENABLE_DETERMINISTIC_INFERENCE=SimpleNamespace(get=lambda: False)),
+    }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["reduce_scatterv"]
 
@@ -93,18 +98,16 @@ def _combine(rank: int, dp_size: int, dtype, *, variable: bool = False):
         "_note_dp_gather_in_prefill_graph": lambda: None,
         "is_dp_gatherv_active": lambda: variable,
         "get_dp_global_num_tokens": lambda: sizes,
-        "get_tensor_model_parallel_world_size": lambda: tp_size,
-        "get_tensor_model_parallel_rank": lambda: rank,
-        "get_attention_dp_size": lambda: dp_size,
-        "get_tp_group": lambda: tp,
-        "get_attn_tp_group": lambda: attn,
+        "get_parallel": lambda: SimpleNamespace(
+            tp_size=tp_size, tp_rank=rank, attn_dp_size=dp_size, tp_group=tp, attn_tp_group=attn
+        ),
         "use_symmetric_memory": symmetric_memory,
         "is_dp_max_padding": lambda: True,
     }
-    path = sglang_source_path("srt/layers/dp_attention.py")
+    path = "python/sglang/srt/layers/dp_attention.py"
     function = next(
         node
-        for node in ast.parse(path.read_text()).body
+        for node in ast.parse(patched_source(path)).body
         if isinstance(node, ast.FunctionDef) and node.name == "dp_reduce_scatter_tensor"
     )
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)

@@ -71,6 +71,9 @@ def _fused_pair_key(name: str) -> str | None:
     `layers.N.attn.compressor.wkv.weight` both yield `layers.N.attn<S>weight`,
     which would let a q_a half pair with a compressor half.
     """
+    # Engram's standalone WKV projection has no WQ_A partner in SGLang.
+    if ".engram." in name:
+        return None
     best = None  # (fragment, pair_index)
     for index, pair in enumerate(_FUSED_PAIR_FRAGMENTS):
         for fragment in pair:

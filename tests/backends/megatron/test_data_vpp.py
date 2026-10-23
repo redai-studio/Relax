@@ -196,13 +196,48 @@ def test_rollout_minibatch_plan_prefers_explicit_steps(monkeypatch):
     assert plan.mini_local_sample_request == 16
 
 
-def test_rollout_minibatch_plan_rejects_non_divisible_prompt_groups(monkeypatch):
+@pytest.mark.parametrize(
+    "prompts,samples,minis,dp_size,local_samples",
+    [(9, 8, 3, 2, 12), (16, 8, 1, 32, 4)],
+)
+def test_rollout_minibatch_plan_allows_response_groups_across_dp(
+    monkeypatch, prompts, samples, minis, dp_size, local_samples
+):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        rollout_batch_size=prompts,
+        n_samples_per_prompt=samples,
+        global_batch_size=prompts * samples // minis,
+        num_steps_per_rollout=minis,
+    )
+
+    plan = data_module.build_rollout_minibatch_plan(args, dp_size=dp_size)
+
+    assert plan.mini_local_sample_request == local_samples
+    assert plan.mini_global_samples == local_samples * dp_size
+
+
+def test_rollout_minibatch_plan_rejects_non_divisible_sample_count(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        rollout_batch_size=9,
+        n_samples_per_prompt=3,
+        global_batch_size=None,
+        num_steps_per_rollout=3,
+    )
+
+    with pytest.raises(ValueError, match="mini_global_samples=9, dp_size=2"):
+        data_module.build_rollout_minibatch_plan(args, dp_size=2)
+
+
+def test_rollout_minibatch_plan_debug_requires_complete_prompt_groups(monkeypatch):
     data_module = _load_data_module(monkeypatch)
     args = Namespace(
         rollout_batch_size=9,
         n_samples_per_prompt=8,
         global_batch_size=None,
         num_steps_per_rollout=3,
+        debug_train_only=True,
     )
 
     with pytest.raises(ValueError, match="mini_rollout_batch_size must be divisible"):

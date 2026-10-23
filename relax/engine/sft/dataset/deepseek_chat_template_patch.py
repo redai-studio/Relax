@@ -34,6 +34,7 @@ from relax.engine.sft.dataset.sample import CanonicalSample
 # DeepSeek template so this patcher never collides with the Qwen one.
 _DS_USER = "<｜User｜>"
 _DS_ASSISTANT = "<｜Assistant｜>"
+_DS_V41_NATIVE_REASONING = "{%- set effective_drop = drop_thinking and not state.has_tools -%}"
 
 # The assistant-turn think scaffold emitted after ``<｜Assistant｜>`` on a
 # user/developer/tool predecessor (``chat_template.jinja`` lines 186-194, the
@@ -235,6 +236,22 @@ def try_patch_deepseek_chat_template(
         suppress_indices = tuple(index for index, message in enumerate(sample.messages) if message.role == "assistant")
     else:
         suppress_indices = _assistant_indices_with_think(sample)
+
+    if _DS_V41_NATIVE_REASONING in template:
+        # V4.1 natively renders reasoning_content; only normalize embedded
+        # <think> blocks, without applying V4's scaffold string replacements.
+        if suppress_indices:
+            thinking_mode = resolved_kwargs.get("thinking_mode")
+            if thinking_mode == "chat" or (thinking_mode is None and resolved_kwargs.get("enable_thinking") is False):
+                raise ValueError("DeepSeek V4.1 SFT reasoning requires thinking_mode='thinking'.")
+            resolved_kwargs[_EMBEDDED_THINK_INDICES_KEY] = suppress_indices
+        if resolved_kwargs.get("preserve_thinking") is not None:
+            resolved_kwargs.setdefault("drop_thinking", not resolved_kwargs["preserve_thinking"])
+        return TemplatePatchResult(
+            template=template,
+            kwargs=resolved_kwargs,
+            patch_name="deepseek_v41_reasoning",
+        )
 
     if not suppress_indices:
         # The scaffold may be unchanged while the history gate was patched.

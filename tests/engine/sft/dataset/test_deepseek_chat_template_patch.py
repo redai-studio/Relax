@@ -8,6 +8,7 @@ from relax.engine.sft.dataset.chat_template_patch import apply_chat_template_pat
 from relax.engine.sft.dataset.deepseek_chat_template_patch import (
     _DS_ASSISTANT_NON_TRANSITION_SCAFFOLD,
     _DS_ASSISTANT_SCAFFOLD,
+    _DS_V41_NATIVE_REASONING,
     _EMBEDDED_THINK_INDICES_KEY,
     _PER_MESSAGE_GUARD,
     _patch_deepseek_scaffold,
@@ -115,3 +116,21 @@ def test_embedded_think_indices_preserve_plain_historical_assistant():
     result = try_patch_deepseek_chat_template(sample, _DS_TEMPLATE, {})
     assert result.kwargs[_EMBEDDED_THINK_INDICES_KEY] == (3,)
     assert sample.messages[3].content == "<think>r</think>answer"
+
+
+@pytest.mark.parametrize("preserve", [None, True, False])
+def test_v41_normalizes_reasoning_without_rewriting_native_template(preserve):
+    template = "<｜User｜><｜Assistant｜>" + _DS_V41_NATIVE_REASONING
+    kwargs = {} if preserve is None else {"preserve_thinking": preserve}
+    result = try_patch_deepseek_chat_template(_sample("<think>r</think>answer"), template, kwargs)
+    assert result.template == template and not result.changed
+    assert result.patch_name == "deepseek_v41_reasoning"
+    assert result.kwargs[_EMBEDDED_THINK_INDICES_KEY] == (1,)
+    assert result.kwargs.get("drop_thinking") == (None if preserve is None else not preserve)
+
+
+@pytest.mark.parametrize("kwargs", [{"thinking_mode": "chat"}, {"enable_thinking": False}])
+def test_v41_rejects_dropping_supervised_reasoning_in_chat_mode(kwargs):
+    template = "<｜User｜><｜Assistant｜>" + _DS_V41_NATIVE_REASONING
+    with pytest.raises(ValueError, match="reasoning requires"):
+        try_patch_deepseek_chat_template(_sample("<think>r</think>answer"), template, kwargs)

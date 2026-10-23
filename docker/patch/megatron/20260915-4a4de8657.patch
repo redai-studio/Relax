@@ -670,6 +670,26 @@ index e0f7c9f..1d3c4e4 100644
  )
  from megatron.core.transformer.spec_utils import ModuleSpec
  from megatron.core.transformer.transformer_block import TransformerBlock
+@@ -229,7 +229,7 @@
+         self.rotary_pos_emb_cache = {}
+ 
+         # Transformer.
+-        self.decoder = TransformerBlock(
++        self.decoder = self._get_transformer_block_class()(
+             config=self.config,
+             spec=transformer_layer_spec,
+             pre_process=self.pre_process,
+@@ -301,6 +301,10 @@
+             if hasattr(module, 'finish_init'):
+                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
+                 module.finish_init(quant_config)
++
++    def _get_transformer_block_class(self) -> type[TransformerBlock]:
++        """Allow model-specific decoder blocks without replacing global core classes."""
++        return TransformerBlock
+ 
+     def set_input_tensor(self, input_tensor: Tensor) -> None:
+         """Sets input tensor to the model.
 @@ -557,6 +558,7 @@ class GPTModel(LanguageModule):
          padding_mask: Optional[Tensor] = None,
          output_processor: Optional[Callable[..., Tensor]] = None,
@@ -1904,3 +1924,108 @@ diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_para
          tp_group = expert_tp_group
      # Prefer provided tp_group when available (new explicit path).
      if tp_group is not None:
+diff --git a/megatron/core/tensor_parallel/mappings.py b/megatron/core/tensor_parallel/mappings.py
+--- a/megatron/core/tensor_parallel/mappings.py
++++ b/megatron/core/tensor_parallel/mappings.py
+@@ -19,7 +19,7 @@
+     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+ 
+ 
+-def _reduce(input_, group):
++def _reduce(input_, group, fp32=False):
+     """All-reduce the input tensor across model parallel group."""
+     assert group is not None, "group should not be None"
+ 
+@@ -28,6 +28,11 @@
+         return input_
+ 
+     # All-reduce.
++    if fp32:
++        input_fp32 = input_.float().contiguous()
++        torch.distributed.all_reduce(input_fp32, group=group)
++        return input_fp32.to(input_.dtype)
++
+     # Note: If input_ is contiguous, it is mutated in-place.
+     # If not, a new contiguous tensor is created and returned;
+     # callers must use the returned value to ensure the reduced result is captured.
+@@ -202,20 +207,21 @@
+     """Pass the input to the model parallel region."""
+ 
+     @staticmethod
+-    def symbolic(graph, input_, group):
++    def symbolic(graph, input_, group, all_reduce_grad_fp32=False):
+         """Symbolic function for tracing."""
+         return input_
+ 
+     @staticmethod
+-    def forward(ctx, input_, group):
+-        """Forward function."""
+-        ctx.group = group
++    def forward(ctx, input_, group, all_reduce_grad_fp32=False):
++        """Forward function."""
++        ctx.group = group
++        ctx.all_reduce_grad_fp32 = all_reduce_grad_fp32
+         return input_
+ 
+     @staticmethod
+     def backward(ctx, grad_output):
+         """Backward function."""
+-        return _reduce(grad_output, ctx.group), None
++        return _reduce(grad_output, ctx.group, fp32=ctx.all_reduce_grad_fp32), None, None
+ 
+ 
+ class _ReduceFromModelParallelRegion(torch.autograd.Function):
+@@ -534,10 +540,10 @@
+ # -----------------
+ 
+ 
+-def copy_to_tensor_model_parallel_region(input_, group=None):
+-    """Wrapper for autograd function: forward: copy, backward allreduce"""
+-    group = get_tensor_model_parallel_group_if_none(group)
+-    return _CopyToModelParallelRegion.apply(input_, group)
++def copy_to_tensor_model_parallel_region(input_, group=None, all_reduce_grad_fp32=False):
++    """Forward: copy; backward: allreduce, optionally accumulating gradients in FP32."""
++    group = get_tensor_model_parallel_group_if_none(group)
++    return _CopyToModelParallelRegion.apply(input_, group, all_reduce_grad_fp32)
+ 
+ 
+ def reduce_from_tensor_model_parallel_region(input_, group=None):
+diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/transformer/transformer_block.py
+--- a/megatron/core/transformer/transformer_block.py
++++ b/megatron/core/transformer/transformer_block.py
+@@ -398,21 +398,25 @@
+                 eps=self.config.layernorm_epsilon,
+             )
+             if self.config.enable_hyper_connections:
+-                hc_mult = self.config.num_residual_streams
+-                hc_dim = self.config.hidden_size * hc_mult
+-                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+-                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+-                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+-                nn.init.xavier_uniform_(self.hc_head_fn)
+-                if self.config.sequence_parallel:
+-                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+-                    setattr(self.hc_head_base, 'sequence_parallel', True)
+-                    setattr(self.hc_head_scale, 'sequence_parallel', True)
++                self._build_hyper_connection_output_head()
+         else:
+             self.final_layernorm = None  # Either this or nn.Identity
+ 
+         if self.config.inference_fuse_tp_communication:
+             self._setup_fused_tp_communication()
++
++    def _build_hyper_connection_output_head(self) -> None:
++        """Build the default learned contraction head; model-specific blocks may override."""
++        hc_mult = self.config.num_residual_streams
++        hc_dim = self.config.hidden_size * hc_mult
++        self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
++        self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
++        self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
++        nn.init.xavier_uniform_(self.hc_head_fn)
++        if self.config.sequence_parallel:
++            setattr(self.hc_head_fn, 'sequence_parallel', True)
++            setattr(self.hc_head_base, 'sequence_parallel', True)
++            setattr(self.hc_head_scale, 'sequence_parallel', True)
+ 
+     def has_final_layernorm_in_this_stage(self):
+         """

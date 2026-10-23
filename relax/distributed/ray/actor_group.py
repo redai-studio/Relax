@@ -9,7 +9,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
-from relax.utils.env import Envs
+from relax.utils.env import Envs, is_env_set
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 
@@ -70,11 +70,19 @@ class RayTrainGroup:
         assert pg is not None
         pg, reordered_bundle_indices, _reordered_gpu_ids = pg
 
+        # Megatron selects an unset FP8 scale policy on the assigned GPU before
+        # importing TE. Keep explicit settings and other backends' defaults.
+        fp8_scale_env = {}
+        if getattr(self.args, "train_backend", "megatron") != "megatron" or is_env_set(
+            "NVTE_FP8_BLOCK_SCALING_FP32_SCALES"
+        ):
+            fp8_scale_env["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] = Envs.NVTE_FP8_BLOCK_SCALING_FP32_SCALES
+
         env_vars = {
             # because sglang will always set NCCL_CUMEM_ENABLE to 0
             # we need also set it to 0 to prevent nccl error.
             "NCCL_CUMEM_ENABLE": Envs.NCCL_CUMEM_ENABLE,
-            "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": Envs.NVTE_FP8_BLOCK_SCALING_FP32_SCALES,
+            **fp8_scale_env,
             **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
             **self.runtime_env.get("env_vars", {}),
             **self.args.train_env_vars,

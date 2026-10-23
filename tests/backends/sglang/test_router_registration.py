@@ -26,11 +26,14 @@ def sglang_engine_module(monkeypatch):
     sglang_srt = ModuleType("sglang.srt")
     server_args = ModuleType("sglang.srt.server_args")
     server_args.ServerArgs = object
+    arg_utils = ModuleType("sglang.srt.arg_groups.arg_utils")
+    arg_utils.record_fields = lambda _cls: ()
     sglang_utils = ModuleType("sglang.srt.utils")
     sglang_utils.kill_process_tree = lambda _pid: None
     monkeypatch.setitem(sys.modules, "sglang", sglang)
     monkeypatch.setitem(sys.modules, "sglang.srt", sglang_srt)
     monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args)
+    monkeypatch.setitem(sys.modules, "sglang.srt.arg_groups.arg_utils", arg_utils)
     monkeypatch.setitem(sys.modules, "sglang.srt.utils", sglang_utils)
 
     checkpoint_client = ModuleType("relax.distributed.checkpoint_service.client.engine")

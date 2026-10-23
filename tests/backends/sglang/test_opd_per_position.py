@@ -1,10 +1,34 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from __future__ import annotations
+
+import ast
+from enum import Enum, auto
+from types import ModuleType
+
 import pytest
+
+from tests.tools.sglang_patch_source import extract_functions, patched_source
 
 
 torch = pytest.importorskip("torch")
-logprob = pytest.importorskip("sglang.srt.layers.logprob_processor")
+target = "python/sglang/srt/layers/logprob_processor.py"
+source = patched_source(target, include_per_position=True)
+functions = extract_functions(
+    source,
+    target,
+    {"get_token_ids_logprobs_raw", "get_token_ids_logprobs_chunk", "get_token_ids_logprobs_batch_optimized"},
+)
+stage = next(node for node in ast.parse(source).body if isinstance(node, ast.ClassDef) and node.name == "LogprobStage")
+logprob = ModuleType("patched_logprob_processor")
+logprob.__dict__.update(
+    torch=torch,
+    Enum=Enum,
+    auto=auto,
+    is_pin_memory_available=lambda device: False,
+    async_d2h=lambda value: value.cpu(),
+)
+exec(compile(ast.Module(body=[stage, *functions], type_ignores=[]), target, "exec"), logprob.__dict__)
 
 
 @pytest.mark.parametrize("top_k", [1, 3])
@@ -58,3 +82,46 @@ def test_per_position_zero_row_request_does_not_consume_scores():
     assert split == 0
     assert values == [[], [[0.0], [11.0]]]
     assert ids == [[], [[0], [1]]]
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("copy_to_pinned_cpu", [False, True])
+def test_per_position_chunks_preserve_normalization_and_async_copy(monkeypatch, normalize, copy_to_pinned_cpu):
+    scores = torch.arange(50, dtype=torch.float32).reshape(5, 10) / 10
+    queries = [[1, 8], [2, 6], [0, 9]]
+    row_max = scores.max(dim=1).values
+    normalizer = torch.logsumexp(scores - row_max[:, None], dim=1)
+    copies = []
+
+    def copy_to_cpu(values):
+        copies.append(values.clone())
+        return copies[-1]
+
+    monkeypatch.setattr(logprob, "async_d2h", copy_to_cpu)
+    values, ids = [], []
+    split = logprob.get_token_ids_logprobs_chunk(
+        scores[:2],
+        [queries],
+        [3],
+        values,
+        ids,
+        log_normalizer=(row_max[:2], normalizer[:2]) if normalize else None,
+        copy_to_pinned_cpu=copy_to_pinned_cpu,
+    )
+    assert split == 2
+    split = logprob.get_token_ids_logprobs_chunk(
+        scores[2:],
+        [queries, [2, 8]],
+        [3, 2],
+        values,
+        ids,
+        split,
+        log_normalizer=(row_max[2:], normalizer[2:]) if normalize else None,
+        copy_to_pinned_cpu=copy_to_pinned_cpu,
+    )
+    expected = scores.log_softmax(dim=1) if normalize else scores
+    actual = [torch.cat(rows) if copy_to_pinned_cpu else torch.tensor(rows) for rows in values]
+    assert split == 0 and ids == [queries, [[2, 8], [2, 8]]]
+    torch.testing.assert_close(actual[0], expected[:3].gather(1, torch.tensor(queries)))
+    torch.testing.assert_close(actual[1], expected[3:, [2, 8]])
+    assert len(copies) == (3 if copy_to_pinned_cpu else 0)

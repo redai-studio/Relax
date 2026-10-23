@@ -460,6 +460,26 @@ def all_gather_with_cp(
     return full_tensor
 
 
+def slice_bshd_contiguous_cp(
+    tensor: torch.Tensor,
+    pad_value: int | float,
+    max_seq_len: int,
+    *,
+    cp_size: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Pad one BSHD sample and select its contiguous CP slice without global
+    process-group state."""
+    if cp_size < 1 or not 0 <= cp_rank < cp_size:
+        raise ValueError(f"Invalid contiguous CP rank/size: {cp_rank}/{cp_size}.")
+    if max_seq_len < tensor.size(0) or max_seq_len % cp_size:
+        raise ValueError("BSHD contiguous CP requires a padded length covering the sample and divisible by CP size.")
+    padding = (0, 0) * (tensor.dim() - 1) + (0, max_seq_len - tensor.size(0))
+    padded = F.pad(tensor, padding, value=pad_value)
+    local_length = max_seq_len // cp_size
+    return padded.narrow(0, cp_rank * local_length, local_length)
+
+
 def slice_with_cp(
     tokens: torch.Tensor,
     pad_value: tuple[int, float, Callable],

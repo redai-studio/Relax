@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import random
 import socket
 
@@ -76,6 +78,20 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 def init(args):
     set_args(args)
+
+    if getattr(args, "fp8", None) and getattr(args.fp8_recipe, "value", args.fp8_recipe) == "blockwise":
+        from relax.utils import device as device_utils
+        from relax.utils.env import Envs
+
+        if (
+            device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
+            and torch.cuda.get_device_capability()[0] >= 10
+            and Envs.NVTE_FP8_BLOCK_SCALING_FP32_SCALES == "1"
+        ):
+            raise ValueError(
+                "Blackwell FP8 blockwise training requires NVTE_FP8_BLOCK_SCALING_FP32_SCALES=0; "
+                "unset the variable to select the GPU-specific default, or explicitly set it to 0 before launch."
+            )
 
     if getattr(args, "disable_jit_fuser", False):
         from megatron.core.jit import disable_jit_fuser

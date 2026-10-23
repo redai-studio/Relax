@@ -308,6 +308,11 @@ def get_model_provider_func(
         if is_kimi_k3:
             from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
 
+        is_deepseek_v41 = hasattr(provider, "v41_hf_config")
+        if is_deepseek_v41:
+            from relax.models.deepseekv41.configuration import ARCHITECTURE_KEYS as V41_ARCHITECTURE_KEYS
+            from relax.models.deepseekv41.configuration import configure_runtime as configure_v41_runtime
+
         # Override provider attributes with matching args values
         bridge_keys = [
             "attention_backend",
@@ -405,7 +410,7 @@ def get_model_provider_func(
         args_dict = vars(args)
         for attr in vars(provider):
             if attr in args_dict and attr in bridge_keys:
-                if is_kimi_k3 and attr in ARCHITECTURE_KEYS:
+                if (is_kimi_k3 and attr in ARCHITECTURE_KEYS) or (is_deepseek_v41 and attr in V41_ARCHITECTURE_KEYS):
                     continue
                 old_val = getattr(provider, attr)
                 new_val = args_dict[attr]
@@ -415,6 +420,9 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        if is_deepseek_v41:
+            configure_v41_runtime(provider, args)
 
         if is_kimi_k3:
             configure_runtime(provider, args)

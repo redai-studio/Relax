@@ -2,14 +2,13 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.17-cu129
+ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.21-cu130
 ARG TRAIN_IMAGE=train
 ARG HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
+# One amd64 image for Hopper and Blackwell; GPU kernels select their backend at runtime.
 FROM ${BASE_IMAGE} as base
 
-ENV NVIDIA_PYTORCH_VERSION=25.06 \
-    PYTORCH_BUILD_VERSION=2.9.0 \
-    TARGETARCH=amd64 \
+ENV TARGETARCH=amd64 \
     PYVER=3.12 \
     PYSFX=3 \
     L4T=0 \
@@ -35,40 +34,40 @@ FROM base as sglang
 
 WORKDIR /sgl-workspace/sglang
 
-RUN pip install nvidia-cudnn-cu12==9.16.0.29
-
 FROM base as train
 
-RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
-    pip install --no-cache-dir flash-linear-attention==0.4.2 && \
-    pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
+# FA2 uses generic SM100 cubins on both B200 (SM100) and B300 (SM103).
+# This version's build script accepts "100", not "103".
+RUN FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS="80;90;100" MAX_JOBS=64 \
+    pip -v install flash-attn==2.7.4.post1 --force-reinstall --no-deps --no-build-isolation --no-cache-dir && \
+    pip install --no-cache-dir flash-linear-attention==0.5.2
+
+# Keep TileLang 0.1.12 with the Blackwell FP16 vector-store fix.
+COPY docker/patch/tilelang/0.1.12-blackwell-fp16-store.patch /tmp/tilelang-blackwell-fp16-store.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("tilelang").origin).parent)')" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/tilelang-blackwell-fp16-store.patch
 
 # DeepSeek-V4 DSA deps, both listed under mcore's `no_pypi_wheels` so built from pinned source:
 #   - fast-hadamard-transform: required by the Lightning Indexer (dsa.rotate_activation asserts on it)
 #   - FlashMLA: fused DSA sparse attention; without it the CSA backward is quadratic in seq len
 #     (mcore only allows the fusion on SM90 when dsa_indexer_loss_coeff == 0)
 ARG FLASH_MLA_COMMIT=b7643bd54521f563b839b98289b5cd048c062ba2
-RUN MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps \
+RUN FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE MAX_JOBS=64 \
+    pip install --force-reinstall --no-cache-dir --no-build-isolation --no-deps \
         git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca && \
     git clone --recurse-submodules https://github.com/deepseek-ai/FlashMLA.git /opt/FlashMLA && \
     cd /opt/FlashMLA && git checkout ${FLASH_MLA_COMMIT} && \
     git submodule update --init --recursive && \
-    MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps . && \
+    CPLUS_INCLUDE_PATH="${CUDA_HOME:-/usr/local/cuda}/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}" \
+        MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps . && \
     cd / && python -c "import flash_mla; assert hasattr(flash_mla, 'flash_mla_sparse_fwd'), \
         'flash_mla built but flash_mla_sparse_fwd missing'" && \
     rm -rf /opt/FlashMLA
 
-# FA3 (Hopper flash-attention), built from source. This commit's _flash_attn_forward carries
-# window_size_left/right to match TE 2.14.1 (docs/draft/sglang-0.5.12-upgrade-plan.md §8.4).
-# The `cp` exposes flash_attn_3.flash_attn_interface, which is what TE imports. BUT this commit's
-# setup.py (py_modules=["flash_attn_interface"]) ALSO installs a *top-level* flash_attn_interface.py
-# (into the egg root). That top-level module and the copied flash_attn_3/flash_attn_interface.py
-# both register the torch custom op flash_attn_3::_flash_attn_forward; a second import in the same
-# process _destroy()s the Library TE bound to, so a later dispatch reads an empty schema
-# (use-after-free) and every actor forward crashes with `schema_.has_value() INTERNAL ASSERT
-# FAILED` (§8.5). Strip the stray top-level module (site-packages root + egg root). Keep
-# flash_attn_config.py: flash_attn_3/flash_attn_interface.py does `from flash_attn_config import
-# CONFIG` at forward time, so deleting it would break the forward with ModuleNotFoundError.
+# FA3 stays Hopper-only; Blackwell uses FA2/cuDNN with TE's FA4 disabled below.
+# TE 2.18 imports flash_attn_interface; existing callers use flash_attn_3.
+# Alias both names to one module so its Torch custom ops are registered once.
+# Keep flash_attn_config.py, which the interface imports during forward.
 RUN MAX_JOBS=64 \
     cd /opt && git clone https://github.com/Dao-AILab/flash-attention.git && \
     cd flash-attention/ && \
@@ -81,34 +80,45 @@ RUN MAX_JOBS=64 \
     cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py && \
     find $python_path -maxdepth 1 -name flash_attn_interface.py -delete && \
     find $python_path -maxdepth 2 -path '*.egg/flash_attn_interface.py' -delete && \
-    cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'stray top-level flash_attn_interface still importable'; import flash_attn_config" && \
+    printf '%s\n' 'import sys' 'from flash_attn_3 import flash_attn_interface' \
+        'sys.modules[__name__] = flash_attn_interface' > "$python_path/flash_attn_interface.py" && \
+    cd / && python -c "import flash_attn_interface as top; from flash_attn_3 import flash_attn_interface as fa3; assert top is fa3; import flash_attn_config" && \
     rm -rf /opt/flash-attention/
 
-RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
-    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
-    pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir && \
-    pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
-    NVCC_APPEND_FLAGS="--threads 32" \
-    pip -v install --disable-pip-version-check --no-cache-dir \
+# TE 2.18 defers optional cuBLAS symbol resolution for CUDA 13.0 compatibility.
+RUN NVTE_PYTORCH_FORCE_BUILD=TRUE MAX_JOBS=32 \
+    pip -v install --no-cache-dir --no-build-isolation "transformer_engine[core_cu13,pytorch]==2.18.0" && \
+    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall --no-deps && \
+    pip install "nvidia-modelopt==0.44.0" --no-build-isolation --no-cache-dir && \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0;10.3" NVCC_APPEND_FLAGS="--threads 32" \
+    pip -v install --force-reinstall --no-deps --disable-pip-version-check --no-cache-dir \
     --no-build-isolation \
     --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
     git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
+
+# TE 2.18 still omits B300 from the FA2 head_dim > 192 whitelist.
+COPY docker/patch/transformer_engine/2.18.0-fa2-sm103.patch /tmp/te-fa2-sm103.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/te-fa2-sm103.patch
+
+# FA4 b19 fails Qwen3.5 vision backward; b35 still fails TE's causal head256 backward.
+ENV NVTE_FLASH_ATTN_V4=0
 
 WORKDIR /root
 
 # Build the INT4 fake-quant CUDA extension required by INT4 QAT rollout weight sync.
 COPY relax/backends/megatron/kernels/int4_qat /tmp/int4_qat
 RUN cd /tmp/int4_qat && \
-    pip install . --no-build-isolation --no-cache-dir && \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0;10.3" pip install . --no-deps --no-build-isolation --no-cache-dir && \
     rm -rf /tmp/int4_qat
 
 ARG TRAIN_IMAGE=train
-# Build the CUDA 12 HybridEP wheel against the same Torch ABI as the final image.
+# Build HybridEP for Hopper and Blackwell against the final image's Torch/CUDA ABI.
 FROM ${TRAIN_IMAGE} as hybridep_builder
 COPY docker/patch/deepep/eb9cee7-hybridep-namespace.patch /tmp/hybridep-namespace.patch
 ARG HYBRID_EP_COMMIT
-ARG HYBRID_EP_CUDA_ARCH_LIST=9.0
-RUN pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
+ARG HYBRID_EP_CUDA_ARCH_LIST="9.0;10.0a;10.3a"
+RUN pip install --no-deps "nvidia-nvshmem-cu13==3.4.5" "pynvml==13.0.1" && \
     git clone --no-checkout https://github.com/deepseek-ai/DeepEP.git /tmp/HybridEP && \
     cd /tmp/HybridEP && git checkout --detach "$HYBRID_EP_COMMIT" && \
     test "$(git rev-parse HEAD)" = "$HYBRID_EP_COMMIT" && \
@@ -181,7 +191,7 @@ RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-trans
     pip install --no-cache-dir "ray[default,serve]==2.56.1" && \
     pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
-    pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
+    pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
     TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
@@ -189,12 +199,11 @@ RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-trans
 # MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
 # Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.
 # The final stage also covers externally supplied TRAIN_IMAGE builds.
-RUN pip install --no-cache-dir \
+RUN cupti_root="$(python -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')/nvidia/cu13" && \
+    ln -sf libcupti.so.13 "$cupti_root/lib/libcupti.so" && \
+    CUDA_PATH="$cupti_root" CPLUS_INCLUDE_PATH="${CUDA_HOME}/include:${CPLUS_INCLUDE_PATH}" \
+    pip install --no-cache-dir \
     "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
-
-# Pin both FLA distributions in the final stage, including external TRAIN_IMAGE builds.
-RUN pip install --no-cache-dir --force-reinstall --no-deps \
-    "fla-core==0.5.2" "flash-linear-attention==0.5.2"
 
 # Preserve small KDA gate gradients in FP32 dot products inside the backward kernel.
 COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-precision.patch
@@ -223,6 +232,7 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
 COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
+COPY docker/scripts/setup_memory_saver.py /tmp/setup_memory_saver.py
 COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
@@ -240,8 +250,8 @@ RUN cd Megatron-LM && \
     sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
     python -m compileall -q megatron && \
     rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch && \
-    apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
-    /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
+    apt update && apt install -y jq && \
+    python /tmp/setup_memory_saver.py
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
 COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
@@ -258,32 +268,41 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     rm sglang.patch sglang_per_pos_topk.patch; \
 fi
 
-# Shared MCore model sources are installed above, but this CUDA 12 image retains
-# its SGLang 0.5.17/TE 2.14 runtime. The optimized B300 TP4 recipe and Qwen3.8
-# SGLang 0.5.20 rollout require Dockerfile.cu13; Torch stays on CUDA 12.
+# Resolve training dependency constraints after all other package installs.
+# grpcio-tools must stay on protobuf 6 alongside CUTLASS and gRPC health/reflection.
+# NIXL 1.5.0 requires both CUDA backend wheels.
+RUN pip install --no-cache-dir packaging==25.0 protobuf==6.33.6 grpcio-tools==1.81.1 \
+        hydra-core==1.3.2 typeguard==4.6.0 pillow==11.3.0 imageio==2.38.1 nixl-cu12==1.5.0
 
-# Shared experiment fixes belong in the default CUDA 12 build as well. Keep its
-# NumPy<2, TE 2.14 and CUDA 12 libraries; do not install the B300 cu13/v2 stack.
+# Keep one OpenCV provider after resolving the base image metadata.
+RUN pip uninstall -y opencv-python-headless && \
+    pip install --no-cache-dir opencv-python==4.10.0.84
+
+# Restore the official DeepEP runtime after Torch's NCCL dependency resolution.
+RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7
+
+# Keep Torch's pip cuDNN; mixing it with the base image's apt cuDNN breaks TE imports.
+RUN apt-get remove -y --purge --allow-change-held-packages \
+        libcudnn9-cuda-13 libcudnn9-dev-cuda-13 libcudnn9-headers-cuda-13 && \
+    rm -rf /var/lib/apt/lists/*
+
+# TE can load NCCL before Torch; prefer the restored wheel over the system library.
+ENV LD_LIBRARY_PATH=/opt/sglang/lib/python${PYVER}/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH}
+
+# Keep legacy FLA isolated for recipes that explicitly select it.
 COPY docker/scripts/install_legacy_fla.py \
     docker/scripts/validate_hybridep_install.py \
     docker/scripts/record_qwen35_runtime.py \
     docker/scripts/validate_final_runtime.py \
-    docker/scripts/check_gpu_imports.py \
-    docker/scripts/repair_te_wheel_metadata.py /opt/relax/
+    docker/scripts/check_gpu_imports.py /opt/relax/
 COPY docker/patch/fla/0.4.2-legacy-runtime.patch /tmp/fla042.patch
 RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2 \
         --patch /tmp/fla042.patch --manifest /etc/relax-fla042-runtime.json && \
     rm /tmp/fla042.patch
+
 COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
-COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
-COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
-# Resolve late so existing compiled layers remain cached. NIXL packages both
-# backends, but dispatches to cu12 based on Torch; this does not change CUDA.
-RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt && \
-    pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt -r /opt/relax/cu12-runtime-requirements.txt && \
-    python /opt/relax/repair_te_wheel_metadata.py /opt/relax/te-wheel-tag.patch && \
-    pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
+RUN pip install --no-deps "nvidia-nvshmem-cu13==3.4.5" "pynvml==13.0.1" && \
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
     python /opt/relax/validate_hybridep_install.py && \
-    python /opt/relax/validate_final_runtime.py --profile cu12
+    python /opt/relax/validate_final_runtime.py --profile unified

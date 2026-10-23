@@ -3,7 +3,11 @@
 import importlib
 import logging
 
-from relax.utils.env import Envs
+from relax.utils.env import Envs, configure_fp8_block_scaling
+
+
+# TE reads FP8 recipe defaults during import, including through model registration.
+configure_fp8_block_scaling()
 
 
 try:

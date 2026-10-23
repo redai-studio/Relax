@@ -72,7 +72,8 @@ def align_score_centering_candidate_ids(
         start = max(response_start, chunk_start)
         end = min(seq_start + total_length - 1, chunk_end)
         aligned_ids.append(full_ids[start - response_start : end - response_start] if end > start else full_ids[:0])
-        seq_start += total_length
+        if args.qkv_format == "thd":
+            seq_start += total_length
     return aligned_ids
 
 

@@ -4401,15 +4401,23 @@ def slime_validate_args(args):
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
         # Offline training does not compute advantages.
         args.compute_advantages_and_returns = False
-        # Offline samples have highly variable length; only the dynamic-batch-size
-        # path knows how to (a) cap per-GPU tokens (CP-aware) and (b) build
-        # balanced micro-batches. Static --micro-batch-size cannot do either,
-        # so we require --use-dynamic-batch-size.
-        if not args.use_dynamic_batch_size:
+        # BSHD forbids dynamic batching. A single-sample micro-batch is bounded
+        # by the SFT dataset's explicit token cap and oversize=skip policy.
+        # Keep all other offline layouts on the existing dynamic-batch path.
+        static_bshd_sft = (
+            is_sft_mode(args)
+            and args.train_backend == "megatron"
+            and args.qkv_format == "bshd"
+            and args.micro_batch_size == 1
+            and args.max_tokens_per_gpu is not None
+            and args.max_tokens_per_gpu > 0
+            and args.sft_oversize_strategy == "skip"
+        )
+        if not args.use_dynamic_batch_size and not static_bshd_sft:
             raise ValueError(
                 f"--loss-type {args.loss_type} requires --use-dynamic-batch-size (with --max-tokens-per-gpu). "
-                "Offline training relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "
-                "samples that cannot fit on a single GPU."
+                "Static BSHD SFT instead requires --micro-batch-size 1, a positive --max-tokens-per-gpu "
+                "and --sft-oversize-strategy skip."
             )
         # The controller installs SeqlenBalancedSampler for offline training, so keep the
         # Megatron data path in DP-balanced mode as well.

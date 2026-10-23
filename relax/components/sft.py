@@ -34,7 +34,7 @@ from typing import Any
 import ray
 import torch.nn.functional as F
 from ray import serve
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig
 
 from relax.components.base import Base
 from relax.engine.sft.dataset.preference import (
@@ -52,6 +52,7 @@ from relax.engine.sft.runtime import (
     sft_tq_num_shards,
     should_run_sft_eval,
 )
+from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -373,7 +374,7 @@ class _SFTBatchProducerActor:
             if self._prefetch_num_workers is not None
             else _sft_prefetch_workers_per_shard(self.config, self._num_shards)
         )
-        self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
+        self._tokenizer = load_tokenizer(self.config.hf_checkpoint, trust_remote_code=True)
         try:
             self._processor_pool = ProcessorPool(
                 self.config.hf_checkpoint,
@@ -639,7 +640,7 @@ class SFT(Base):
             return
 
         prepare_model_maybe_update_args(self.config, completeness="metadata")
-        self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
+        self._tokenizer = load_tokenizer(self.config.hf_checkpoint, trust_remote_code=True)
         try:
             self._processor_pool = ProcessorPool(
                 self.config.hf_checkpoint, pool_size=_PRODUCER_POOL_SIZE, trust_remote_code=True
@@ -739,7 +740,7 @@ class SFT(Base):
             self._init_remote_eval_pipeline()
             return
         prepare_model_maybe_update_args(self.config, completeness="metadata")
-        self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
+        self._tokenizer = load_tokenizer(self.config.hf_checkpoint, trust_remote_code=True)
         if not is_preference_mode(self.config):
             try:
                 self._processor_pool = ProcessorPool(

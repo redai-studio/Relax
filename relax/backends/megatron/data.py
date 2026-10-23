@@ -36,6 +36,7 @@ from .cp_utils import (
     dynamic_cp_split_data,
     get_sum_of_sample_mean,
     maybe_padded_total_lengths,
+    slice_bshd_contiguous_cp,
     slice_log_prob_with_cp,
     slice_with_cp,
 )
@@ -106,13 +107,15 @@ def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBa
     mini_rollout_batch_size = rollout_batch_size // num_rollout_minis
     if mini_rollout_batch_size <= 0:
         raise ValueError(f"mini_rollout_batch_size must be positive, got {mini_rollout_batch_size}")
-    if mini_rollout_batch_size % dp_size != 0:
+    if getattr(args, "debug_train_only", False) and mini_rollout_batch_size % dp_size != 0:
         raise ValueError(
-            "mini_rollout_batch_size must be divisible by data parallel size when using current "
-            "sample-count TransferQueue API, "
+            "mini_rollout_batch_size must be divisible by data parallel size in debug_train_only "
+            "because debug reward groups are normalized after DP slicing, "
             f"got mini_rollout_batch_size={mini_rollout_batch_size}, dp_size={dp_size}"
         )
 
+    # Normal rollout rewards are group-normalized before entering TQ, whose
+    # identities count individual responses, not prompt groups.
     mini_global_samples = mini_rollout_batch_size * n_samples_per_prompt
     if mini_global_samples % dp_size != 0:
         raise ValueError(
@@ -503,6 +506,15 @@ def get_batch(
         max_seqlen = batch["max_seq_lens"][0]
         assert max([t.size(0) for t in tokens]) <= max_seqlen
 
+        if allgather_cp:
+            # Response fields were already CP-sliced against this length at ingestion.
+            alignment = 2 * cp_size * pad_size
+            if max_seqlen % alignment:
+                raise ValueError(
+                    "BSHD allgather CP length must be aligned in post_process_rollout_data "
+                    "before response fields are sliced; get_batch cannot change it."
+                )
+
         # For VL models with CP > 1, Bridge expects UNSPLIT tokens (it handles CP
         # splitting internally after vision embedding).  Save padded-but-unsplit
         # tokens so model.py can pass them to Bridge instead of the CP-split ones.
@@ -512,7 +524,12 @@ def get_batch(
             unsplit = [F.pad(t, (0, padded_len - t.size(0)), value=pad_token_id) for t in tokens]
             batch["unsplit_tokens"] = torch.stack(unsplit)
 
-        tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
+        if allgather_cp:
+            tokens = [
+                slice_bshd_contiguous_cp(t, pad_token_id, max_seqlen, cp_size=cp_size, cp_rank=cp_rank) for t in tokens
+            ]
+        else:
+            tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
         packed_seq_params = None
 
@@ -678,7 +695,9 @@ def get_batch(
         # Pre-CP, per-sample full-length mask used for the bridge-aligned MTP
         # labels/mask below (built after this loop closes).
         full_per_sample_loss_masks.append(loss_mask)
-        if not allgather_cp:
+        if qkv_format == "bshd" and allgather_cp:
+            loss_mask = slice_bshd_contiguous_cp(loss_mask, 0, max_seqlen, cp_size=cp_size, cp_rank=cp_rank)
+        elif not allgather_cp:
             loss_mask = slice_with_cp(
                 loss_mask, 0, qkv_format, max_seqlen, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank
             )

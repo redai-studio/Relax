@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import os
 
 import torch
@@ -8,22 +10,20 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 # Get CUDA arch list
 # NOTE: This setup script is CUDA-only as it compiles .cu kernel files via CUDAExtension.
 # Non-CUDA backends (NPU, XPU, PPU) should provide their own kernel implementations.
+env_arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
 arch_list = []
-if torch.cuda.is_available():
+if env_arch:
+    # Explicit cross-compilation targets take priority over the build host's GPU.
+    arch_list = [a.strip().replace("+PTX", "") for a in env_arch.replace(";", " ").split() if a.strip()]
+elif torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):
         major, minor = torch.cuda.get_device_capability(i)
         arch_list.append(f"{major}.{minor}")
     arch_list = sorted(set(arch_list))
 
-# Fallback to TORCH_CUDA_ARCH_LIST env var or default architectures when GPU is not available
+# Fallback when neither explicit targets nor a build-host GPU are available.
 if not arch_list:
-    env_arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
-    if env_arch:
-        # Parse TORCH_CUDA_ARCH_LIST format: "7.0 7.5 8.0 8.6 9.0+PTX"
-        arch_list = [a.strip().replace("+PTX", "") for a in env_arch.replace(";", " ").split() if a.strip()]
-    else:
-        # Default to common architectures (Volta, Turing, Ampere, Ada, Hopper)
-        arch_list = ["8.0", "8.6", "8.9", "9.0"]
+    arch_list = ["8.0", "8.6", "8.9", "9.0"]
 
 setup(
     name="fake_int4_quant_cuda",

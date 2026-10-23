@@ -120,6 +120,16 @@ DEFAULT_PATCH_SIZE = 14
 
 
 def load_tokenizer(name_or_path: str, **kwargs):
+    config_path = os.path.join(name_or_path, "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path) as config_file:
+            model_type = json.load(config_file).get("model_type")
+        if model_type in ("deepseek_v41", "deepseek_v41_text"):
+            # Data-source workers do not import the Megatron backend that
+            # normally registers this configuration-only HF compatibility shim.
+            from relax.models.deepseekv41.configuration import register_hf_config
+
+            register_hf_config()
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
     # Multimodal models like Qwen3-Omni ship the chat template in a standalone
     # chat_template.json (loaded by AutoProcessor) rather than tokenizer_config.json,

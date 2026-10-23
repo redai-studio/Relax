@@ -83,7 +83,7 @@ def _patch_pipeline_dependencies(monkeypatch, n_samples: int = 8):
     fake_tok.chat_template = "{% generation %}assistant{% endgeneration %}"
 
     monkeypatch.setattr("relax.components.sft.SFTStreamingDataset", lambda **kw: fake_ds)
-    monkeypatch.setattr("relax.components.sft.AutoTokenizer.from_pretrained", lambda *a, **kw: fake_tok)
+    monkeypatch.setattr("relax.components.sft.load_tokenizer", lambda *a, **kw: fake_tok)
     monkeypatch.setattr("relax.components.sft.ProcessorPool", MagicMock())
     monkeypatch.setattr("relax.components.sft._resolve_pad_token_ids_from_config", lambda *a, **kw: frozenset())
     monkeypatch.setattr("relax.components.sft.print_first_sample", lambda **kw: None)
@@ -337,7 +337,7 @@ def test_sft_remote_batch_producer_resolves_model_on_its_node(monkeypatch):
 
     monkeypatch.setattr(sft_module, "attach_tq_client", MagicMock(return_value=fake_client))
     monkeypatch.setattr(sft_module, "prepare_model_maybe_update_args", _prepare_model)
-    monkeypatch.setattr(sft_module.AutoTokenizer, "from_pretrained", _load_tokenizer)
+    monkeypatch.setattr(sft_module, "load_tokenizer", _load_tokenizer)
     monkeypatch.setattr(sft_module, "ProcessorPool", MagicMock())
     monkeypatch.setattr(sft_module, "_resolve_pad_token_ids_from_config", MagicMock(return_value=frozenset()))
     create_dataset = MagicMock(return_value=fake_dataset)
@@ -378,7 +378,7 @@ def test_sft_remote_batch_producer_restricts_train_pool_for_eval_size(monkeypatc
 
     monkeypatch.setattr(sft_module, "attach_tq_client", MagicMock())
     monkeypatch.setattr(sft_module, "prepare_model_maybe_update_args", MagicMock())
-    monkeypatch.setattr(sft_module.AutoTokenizer, "from_pretrained", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(sft_module, "load_tokenizer", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(sft_module, "ProcessorPool", MagicMock())
     monkeypatch.setattr(sft_module, "_resolve_pad_token_ids_from_config", MagicMock(return_value=frozenset()))
     monkeypatch.setattr(sft_module, "_create_sft_train_dataset", MagicMock(return_value=fake_dataset))

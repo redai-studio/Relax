@@ -1208,6 +1208,9 @@ def post_process_rollout_data(args, rollout_data):
 
         # pad to reduce memory fragmentation and maybe make the computation faster
         pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+        if getattr(args, "allgather_cp", False):
+            # Finalize BSHD physical length before response fields are CP-sliced.
+            pad_size *= 2 * mpu.get_context_parallel_world_size()
         max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
 
         rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])

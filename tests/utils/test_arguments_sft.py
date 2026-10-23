@@ -151,6 +151,42 @@ def test_dpo_initial_reference_and_resume_keep_separate_checkpoint_roles(
     assert args.ckpt_step == (7 if source == "megatron" and load_mode == "new" else 100)
 
 
+@pytest.mark.parametrize(
+    "overrides,accepted",
+    [
+        ({}, True),
+        ({"qkv_format": "thd"}, False),
+        ({"micro_batch_size": 2}, False),
+        ({"max_tokens_per_gpu": None}, False),
+        ({"sft_oversize_strategy": "keep"}, False),
+        ({"loss_type": "dpo"}, False),
+    ],
+)
+def test_static_bshd_sft_requires_single_sample_and_bounded_skip(arguments_module, overrides, accepted):
+    args = _opd_args()
+    vars(args).update(
+        loss_type="sft",
+        prompt_data=["/train.parquet"],
+        use_dynamic_batch_size=False,
+        qkv_format="bshd",
+        micro_batch_size=1,
+        max_tokens_per_gpu=4096,
+        sft_oversize_strategy="skip",
+        sft_oversize_custom_function_path=None,
+        n_samples_per_prompt=1,
+    )
+    vars(args).update(overrides)
+    if not accepted:
+        with pytest.raises(ValueError, match="requires --use-dynamic-batch-size"):
+            arguments_module.slime_validate_args(args)
+        return
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.qkv_format == "bshd" and not args.use_dynamic_batch_size
+    assert args.balance_data and not args.compute_advantages_and_returns
+
+
 @pytest.mark.parametrize("cli,expected", [([], "balanced"), (["--sft-packing-strategy", "binpack"], "binpack")])
 def test_sft_packing_preserves_default_and_archived_recipe(arguments_module, cli, expected):
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)

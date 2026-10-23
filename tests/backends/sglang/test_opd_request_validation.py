@@ -2,14 +2,18 @@
 
 """CPU checks against the SGLang patch installed in the training image."""
 
+from __future__ import annotations
+
+import ast
 from array import array
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
 from relax.utils.opd.opd_main_worker import LogprobResponse
+from tests.tools.sglang_patch_source import extract_functions, patched_source
 
 
 torch = pytest.importorskip("torch")
@@ -17,8 +21,38 @@ tokenizer_manager = pytest.importorskip("sglang.srt.managers.tokenizer_manager")
 schedule_batch = pytest.importorskip("sglang.srt.managers.schedule_batch")
 
 
+@pytest.fixture(autouse=True)
+def patched_opd_methods(monkeypatch):
+    # Exercise exactly the shipped 0.5.21 methods while using installed request
+    # data types. No installed package files are changed.
+    for module, cls, target, names in (
+        (
+            tokenizer_manager,
+            tokenizer_manager.TokenizerManager,
+            "managers/tokenizer_manager.py",
+            {"_create_tokenized_object", "_add_relax_logprob_base64"},
+        ),
+        (schedule_batch, schedule_batch.ScheduleBatch, "managers/schedule_batch.py", {"prepare_for_extend"}),
+    ):
+        target = f"python/sglang/srt/{target}"
+        nodes = extract_functions(patched_source(target, include_per_position=True), target, names)
+        for node in nodes:
+            node.decorator_list = []
+        namespace = dict(vars(module))
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), target, "exec"), namespace)
+        for name in names:
+            loaded = namespace[name]
+            function = FunctionType(loaded.__code__, vars(module), name, loaded.__defaults__)
+            if name == "_add_relax_logprob_base64":
+                function = staticmethod(function)
+            monkeypatch.setattr(cls, name, function, raising=False)
+
+
 @pytest.fixture
-def tokenized_request():
+def tokenized_request(monkeypatch):
+    monkeypatch.setattr(
+        tokenizer_manager, "get_disagg", lambda: SimpleNamespace(disaggregation_transfer_backend="none")
+    )
     request = tokenizer_manager.GenerateReqInput(
         rid="opd-test",
         input_ids=[1, 99, 2, 10, 11],
@@ -103,7 +137,12 @@ def test_regular_query_does_not_require_per_position_shape(tokenized_request):
 @pytest.mark.parametrize("top_k", [1, 3])
 def test_opd_scheduler_slices_queries_across_prefill_chunks(monkeypatch, top_k):
     monkeypatch.setattr(
-        schedule_batch, "get_server_args", lambda: SimpleNamespace(enable_mamba_extra_buffer=lambda: False)
+        schedule_batch,
+        "get_exec",
+        lambda: SimpleNamespace(
+            features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
+            mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
+        ),
     )
     monkeypatch.setattr(
         schedule_batch,

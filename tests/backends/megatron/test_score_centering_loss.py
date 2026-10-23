@@ -324,3 +324,96 @@ def test_scoring_distributed_selected_probabilities_and_gradients(tmp_path, kind
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("CPU distributed Gloo is unavailable")
     mp.spawn(_distributed_scoring_worker, args=(str(tmp_path / "rendezvous"), kind), nprocs=2, join=True)
+
+
+def _distributed_bshd_scoring_worker(rank, init_file, recompute):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2, timeout=timedelta(seconds=45)
+    )
+    try:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            loss, cp = _backend(monkeypatch, rank=rank, cp_size=2)
+            args = _args(qkv_format="bshd", allgather_cp=True, entropy_coef=0.0 if recompute else 0.1)
+            max_seq_len = 16 if recompute else 8
+            cp_kwargs = {}
+            if recompute:
+                cp_kwargs = {"dynamic_cp_size": 2, "dynamic_cp_rank": rank}
+                # Effective CP must override static state, including the CP1 fast path.
+                monkeypatch.setattr(loss.mpu, "get_context_parallel_world_size", lambda: 1)
+                monkeypatch.setattr(loss.mpu, "get_context_parallel_rank", lambda: 1 - rank)
+            torch.manual_seed(17)
+            base = torch.randn(2, max_seq_len, 8)
+            base[..., 5:] = 30
+            tokens = [torch.tensor([1, 2, 0, 4, 1, 3]), torch.tensor([1, 2, 0, 4, 1, 3, 2, 0])]
+            total_lengths = [6, 8]
+            response_lengths = [4, 5]
+            ids = [torch.arange(length * 2).reshape(length, 2) % 5 for length in response_lengths]
+            local_ids = [
+                cp.slice_log_prob_with_cp(row, total, response, "bshd", max_seq_len, **cp_kwargs)
+                for row, total, response in zip(ids, total_lengths, response_lengths, strict=True)
+            ]
+            oracle_logits = base.clone().requires_grad_()
+            expected = {key: [] for key in ("log_probs", "topk_log_probs", "entropy", "topk_token_ids")}
+            for index, (sample_tokens, total, response, candidates) in enumerate(
+                zip(tokens, total_lengths, response_lengths, ids, strict=True)
+            ):
+                logits = oracle_logits[index, total - response - 1 : total - 1, :5]
+                logp = (logits / args.rollout_temperature).log_softmax(-1)
+                expected["log_probs"].append(logp.gather(-1, sample_tokens[-response:, None]).squeeze(-1))
+                expected["topk_log_probs"].append(logp.gather(-1, candidates))
+                expected["entropy"].append(-(logp.exp() * logp).sum(-1))
+                expected["topk_token_ids"].append(logp.topk(2, dim=-1).indices)
+            start, end = rank * (max_seq_len // 2), (rank + 1) * (max_seq_len // 2)
+            local = base[:, start:end].clone().requires_grad_()
+            grad_modes = []
+
+            def compute_loss(model_logits):
+                grad_modes.append(torch.is_grad_enabled())
+                _, result = loss.get_log_probs_and_entropy(
+                    model_logits,
+                    args=args,
+                    unconcat_tokens=tokens,
+                    total_lengths=total_lengths,
+                    response_lengths=response_lengths,
+                    max_seq_lens=[max_seq_len, max_seq_len],
+                    gather_topk_token_ids=local_ids,
+                    with_entropy=True,
+                    with_topk=True,
+                    topk_k=2,
+                    **cp_kwargs,
+                )
+                for key, references in expected.items():
+                    for actual, reference, total, response in zip(
+                        result[key], references, total_lengths, response_lengths, strict=True
+                    ):
+                        sliced = cp.slice_log_prob_with_cp(
+                            reference, total, response, "bshd", max_seq_len, **cp_kwargs
+                        )
+                        torch.testing.assert_close(actual, sliced)
+                        if key == "topk_token_ids":
+                            assert actual.dtype == torch.long and not actual.requires_grad
+                        elif key == "entropy":
+                            assert actual.requires_grad == (torch.is_grad_enabled() and args.entropy_coef != 0)
+                keys = ("log_probs", "topk_log_probs") + (("entropy",) if args.entropy_coef != 0 else ())
+                return sum(value.sum() for key in keys for value in result[key])
+
+            if recompute:
+                from torch.utils.checkpoint import checkpoint
+
+                output = checkpoint(compute_loss, local, use_reentrant=True)
+            else:
+                output = compute_loss(local)
+            output.backward()
+            keys = ("log_probs", "topk_log_probs") + (("entropy",) if args.entropy_coef != 0 else ())
+            sum(value.sum() for key in keys for value in expected[key]).backward()
+            torch.testing.assert_close(local.grad, oracle_logits.grad[:, start:end], atol=1e-6, rtol=1e-5)
+            assert grad_modes == ([False, True] if recompute else [True])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_bshd_scoring_cp_multi_sample_candidates_and_empty_rank_gradients(tmp_path, recompute):
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("CPU distributed Gloo is unavailable")
+    mp.spawn(_distributed_bshd_scoring_worker, args=(str(tmp_path / "rendezvous"), recompute), nprocs=2, join=True)

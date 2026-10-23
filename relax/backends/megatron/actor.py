@@ -6,6 +6,7 @@ import random
 import socket
 import time
 from argparse import Namespace
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from typing import Any, List
@@ -109,6 +110,7 @@ from .collective_utils import _agree_drained
 from .cp_utils import (
     all_gather_with_cp,
     maybe_padded_total_lengths,
+    slice_bshd_contiguous_cp,
     slice_with_cp,
     warmup_pipeline_process_group,
     warmup_static_cp_forward_neighbor_p2p,
@@ -153,6 +155,46 @@ logger = logging.getLogger(__name__)
 
 
 ROLLOUT_MINI_BATCH_METAS_KEY = "rollout_mini_batch_metas"
+
+
+def _pack_bshd_routing_replay(
+    routed_experts: list[torch.Tensor],
+    max_seq_lens: list[int],
+    *,
+    allgather_cp: bool,
+    cp_size: int,
+    cp_rank: int,
+    pad_func: Callable[[torch.Tensor, int], torch.Tensor],
+) -> torch.Tensor:
+    """Match BSHD forward's per-sample CP slices and sequence-major MoE
+    flattening."""
+    if not routed_experts or len(routed_experts) != len(max_seq_lens):
+        raise ValueError("BSHD routing replay requires max_seq_lens for every sample.")
+    max_seq_len = max_seq_lens[0]
+    if max_seq_len <= 0 or any(length != max_seq_len for length in max_seq_lens):
+        raise ValueError("BSHD routing replay requires a common padded length within each microbatch.")
+
+    local_routes = []
+    for experts in routed_experts:
+        # SGLang records T-1 rows; the last token and all physical padding must
+        # receive valid filler routes, using the same padded length as get_batch.
+        if experts.size(0) >= max_seq_len:
+            raise ValueError("BSHD routing replay must leave room for the final unrecorded token.")
+        experts = pad_func(experts, max_seq_len - experts.size(0))
+        if allgather_cp:
+            experts = slice_bshd_contiguous_cp(experts, 0, max_seq_len, cp_size=cp_size, cp_rank=cp_rank)
+        else:
+            experts = slice_with_cp(
+                experts,
+                pad_func,
+                "bshd",
+                max_seq_len,
+                dynamic_cp_size=cp_size,
+                dynamic_cp_rank=cp_rank,
+            )
+        local_routes.append(experts)
+    # Hidden states reach MoE as [S_local, B, H], not a concatenation of samples.
+    return torch.stack(local_routes, dim=1).flatten(0, 1)
 
 
 def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
@@ -441,6 +483,12 @@ class MegatronTrainRayActor(TrainRayActor):
         for i in range(args.num_gpus_per_node):
             if i == dist.get_rank() % args.num_gpus_per_node:
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+                if self.hf_config.model_type in ("deepseek_v41", "deepseek_v41_text"):
+                    # SGLang flattens V4.1 configs and changes their architecture to V4.
+                    from relax.models.deepseekv41.configuration import register_hf_config
+
+                    register_hf_config(for_training=True)
+                    self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
 
@@ -942,7 +990,10 @@ class MegatronTrainRayActor(TrainRayActor):
             return torch.cat([experts, pad], dim=0)
 
         for _ in range(sum(num_microbatches)):
-            batch = data_iterator[0].get_next(["rollout_routed_experts", "tokens"])
+            fields = ["rollout_routed_experts", "tokens"]
+            if self.args.qkv_format == "bshd":
+                fields.append("max_seq_lens")
+            batch = data_iterator[0].get_next(fields)
             rollout_routed_experts = batch["rollout_routed_experts"]
             tokens = batch["tokens"]
             # Reshape from flattened 2D (seq_i, num_layers*topk) back to 3D (seq_i, num_layers, topk)
@@ -969,14 +1020,23 @@ class MegatronTrainRayActor(TrainRayActor):
             # matches the bridge; the per-CP-rank stream is then tp-divisible, so no global pad (the
             # bridge adds none either).
             #
-            # For non-VL allgather CP, get_batch concatenates the global stream first, pads it to
+            # For non-VL THD allgather CP, get_batch concatenates the global stream first, pads it to
             # cp*tp*data_pad_size_multiplier, then takes one contiguous chunk per CP rank.  Otherwise
             # the forward uses get_batch's per-sample slice_with_cp (2*cp align) + global
             # tp*data_pad_size_multiplier pad, so mirror the corresponding layout here.
             padded_total_lengths = maybe_padded_total_lengths(
                 [t.shape[0] for t in tokens], self.args.qkv_format, getattr(self.args, "is_vl_model", False)
             )
-            if padded_total_lengths is not None:
+            if self.args.qkv_format == "bshd":
+                rollout_routed_experts = _pack_bshd_routing_replay(
+                    rollout_routed_experts,
+                    batch["max_seq_lens"],
+                    allgather_cp=self.args.allgather_cp,
+                    cp_size=mpu.get_context_parallel_world_size(),
+                    cp_rank=mpu.get_context_parallel_rank(),
+                    pad_func=pad_func,
+                )
+            elif padded_total_lengths is not None:
                 rollout_routed_experts = [
                     pad_func(r, padded_total_lengths[i] - r.shape[0]) for i, r in enumerate(rollout_routed_experts)
                 ]
@@ -2929,7 +2989,11 @@ class MegatronTrainRayActor(TrainRayActor):
         with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
-            print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
+            # The TMS train pool is still paused; empty_cache would free its unmapped blocks.
+            print_memory(
+                "after update_weights",
+                clear_before_print=not device_utils.is_npu_available and not self._train_state_offloader.uses_tms,
+            )
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)

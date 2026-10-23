@@ -1,19 +1,20 @@
 diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/layers/logprob_processor.py
+index 9d5690a7cac17357bb41d28e5dd00e614562384f..9cab97ca2c5e5c6c72ad6665c5ae67a94641ccca 100644
 --- a/python/sglang/srt/layers/logprob_processor.py
 +++ b/python/sglang/srt/layers/logprob_processor.py
-@@ -123,6 +123,8 @@
-                 vals.append([])
-                 idxs.append([])
+@@ -160,6 +160,8 @@
+                 row = logprobs.new_empty((0,))
+                 token_ids = []
              else:
 +                if token_ids and isinstance(token_ids[0], list):
 +                    token_ids = token_ids[-1]
-                 token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
-                     logprobs.device, non_blocking=True
-                 )
-@@ -147,9 +149,15 @@
-             token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
-                 logprobs.device, non_blocking=True
-             )
+                 token_ids_tensor = torch.tensor(
+                     token_ids, dtype=torch.long, pin_memory=pin_memory
+                 ).to(logprobs.device, non_blocking=True)
+@@ -184,9 +186,15 @@
+             token_ids_tensor = torch.tensor(
+                 token_ids, dtype=torch.long, pin_memory=pin_memory
+             ).to(logprobs.device, non_blocking=True)
 -            pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
 +            if token_ids_tensor.ndim == 2:
 +                assert token_ids_tensor.shape[0] == pruned_len
@@ -28,53 +29,45 @@ diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/l
              pt += pruned_len
      return vals, idxs
  
-@@ -279,14 +287,24 @@
-         # Get the token ids logprobs
+@@ -359,7 +367,14 @@
          val = []
          idx = []
--        for j in range(pruned_len):
--            # Handle remaining tokens in next chunk if any
--            if pt + j >= logprobs.shape[0]:
--                next_split_pruned_len = split_pruned_len + j
--                break
--            if token_ids is not None:
--                val.append(logprobs[pt + j, token_ids].tolist())
--                idx.append(token_ids)
-+        if token_ids and isinstance(token_ids[0], list):
-+            assert len(token_ids) == pruned_len + split_pruned_len
-+            take = min(pruned_len, max(logprobs.shape[0] - pt, 0))
-+            idx = token_ids[split_pruned_len : split_pruned_len + take]
-+            if take:
-+                query = torch.tensor(idx, dtype=torch.long, device=logprobs.device)
-+                val = torch.gather(logprobs[pt : pt + take], 1, query).tolist()
-+            if take < pruned_len:
-+                next_split_pruned_len = split_pruned_len + take
-+        else:
-+            for j in range(pruned_len):
-+                # Handle remaining tokens in next chunk if any
-+                if pt + j >= logprobs.shape[0]:
-+                    next_split_pruned_len = split_pruned_len + j
-+                    break
-+                if token_ids is not None:
-+                    val.append(logprobs[pt + j, token_ids].tolist())
-+                    idx.append(token_ids)
+         if token_ids is not None and available_len > 0:
+-            rows = logprobs[pt : pt + available_len, token_ids]
++            if token_ids and isinstance(token_ids[0], list):
++                assert len(token_ids) == pruned_len + split_pruned_len
++                row_ids = token_ids[split_pruned_len : split_pruned_len + available_len]
++                query = torch.tensor(row_ids, dtype=torch.long, device=logprobs.device)
++                rows = torch.gather(logprobs[pt : pt + available_len], 1, query)
++            else:
++                rows = logprobs[pt : pt + available_len, token_ids]
++                row_ids = [token_ids] * available_len
+             if log_normalizer is not None:
+                 rows = (
+                     rows.float() - row_max[pt : pt + available_len, None]
+@@ -368,7 +383,7 @@
+                 val.append(async_d2h(rows))
+             else:
+                 val.extend(rows.tolist())
+-            idx.extend([token_ids] * available_len)
++            idx.extend(row_ids)
  
          # Split-sequence continuations extend; everyone else owns a fresh
          # (possibly empty) entry.
-@@ -597,6 +615,9 @@
+@@ -845,6 +860,8 @@
          # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
          # indices = [[1, 3], [2], [0, 2, 4]]
      """
-+    # Prefill-only requests still score a final sampling position. Nested
-+    # queries describe the prefill rows; only the final dummy row belongs here.
++    # Prefill-only queries describe input rows; sampling uses the final dummy row.
 +    token_ids_logprobs = [ids[-1] if ids and isinstance(ids[0], list) else ids for ids in token_ids_logprobs]
      batch_size = len(token_ids_logprobs)
      device = logprobs.device
  
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 44be0402d980e4684bee365ce4a375832bf7c5b5..c9df885a77212f402de2f3d97f194348c0043ae3 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -2517,7 +2517,24 @@
+@@ -2975,7 +2975,24 @@
  
          if self.return_logprob:
              self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
@@ -101,9 +94,10 @@ diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/ma
          self.extend_logprob_start_lens = extend_logprob_start_lens
          self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 3880f762ddbcb7737e90e1a0018b590136c3d7a8..b5504b0af4b023a4f070b0c34e0f5b6f2f1a17bc 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1340,6 +1340,35 @@
+@@ -1484,6 +1484,35 @@
          sampling_params.normalize(self.tokenizer)
          sampling_params.verify(self.model_config.vocab_size)
  
@@ -139,7 +133,7 @@ diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt
          # Build return object
          if isinstance(obj, GenerateReqInput):
              session_params = (
-@@ -2486,6 +2515,9 @@
+@@ -2696,6 +2725,9 @@
          token_ids_logprob: List[int],
          return_text_in_logprobs: bool,
      ):
@@ -149,7 +143,7 @@ diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt
          # 1. Handle regular logprobs
          if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
              state.input_token_logprobs.extend(
-@@ -2619,6 +2651,38 @@
+@@ -2828,6 +2860,38 @@
              meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
              meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
  

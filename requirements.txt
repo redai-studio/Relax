@@ -3,7 +3,7 @@ fastapi==0.139.1
 uvicorn
 apprise
 clearml==2.1.3
-numpy<2
+numpy
 pytest
 pytest-asyncio
 requests
@@ -24,7 +24,7 @@ tensorboard
 wandb
 debugpy==1.8.0
 math_verify==0.8.0
-librosa
+librosa==0.11.0
 diffusers>=0.37.0
 imageio[ffmpeg]
 # Upper-bounded on purpose: relax/backends/fsdp/lora.py imports
@@ -33,9 +33,9 @@ peft>=0.20.0,<0.21.0
 soundfile
 colorlog
 loguru
-av==17.0.0
+av==16.1.0
 transformers
-huggingface_hub==1.7.2
+huggingface_hub>=1.10.0
 blessed==1.38.0
 gpustat
 dool
@@ -43,5 +43,5 @@ pystack
 py-spy
 ipdb
 mathruler==0.1.0
-pyarrow==14.0.2
+pyarrow>=16.0.0
 boto3  # s3:// -> /dev/shm model downloader (relax/utils/s3_model_loader.py)

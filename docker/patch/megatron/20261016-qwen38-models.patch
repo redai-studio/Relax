@@ -5288,9 +5288,9 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
              )
 -            if self.config.enable_hyper_connections:
 +            if self.config.enable_hyper_connections and not getattr(self.final_layernorm, "contracts_mhc_streams", False):
-                 hc_mult = self.config.num_residual_streams
-                 hc_dim = self.config.hidden_size * hc_mult
-                 self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                 self._build_hyper_connection_output_head()
+         else:
+             self.final_layernorm = None  # Either this or nn.Identity
 @@ -522,14 +522,15 @@
                  mhc_multistream = hidden_states
              # DSv4 introduced the new output contraction for mHC.

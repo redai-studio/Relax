@@ -2,6 +2,7 @@
 """Exercise image repairs without modifying the installed runtime."""
 
 import importlib.util
+import json
 import os
 import shlex
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -205,6 +207,54 @@ def test_final_check_rejects_platform_ray_override(monkeypatch):
         validator.main()
 
 
+@pytest.mark.parametrize(
+    "profile,gpu_arch,numpy_version,cuda_version,legacy",
+    [
+        ("unified", None, "1.26.4", "13.0", True),
+        ("unified", None, "2.2.6", "13.0", True),
+        ("cu12", None, "1.26.4", "12.9", True),
+        ("cu13", "b300", "2.2.6", "13.0", True),
+        ("cu13", "h800", "2.2.6", "13.0", False),
+    ],
+)
+def test_final_runtime_profiles(tmp_path, monkeypatch, profile, gpu_arch, numpy_version, cuda_version, legacy):
+    monkeypatch.syspath_prepend(str(ROOT / "docker/scripts"))
+    validator = load_script("validate_final_runtime")
+    monkeypatch.setattr(sys, "argv", ["validate_final_runtime.py", "--profile", profile])
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(version=SimpleNamespace(cuda=cuda_version)))
+    monkeypatch.setenv("RELAX_HYBRID_EP_COMMIT", "eb9cee7de5a24193bf09500668d3a619d3d3f3fb")
+    if gpu_arch:
+        monkeypatch.setenv("RELAX_GPU_ARCH", gpu_arch)
+    else:
+        monkeypatch.delenv("RELAX_GPU_ARCH", raising=False)
+    versions = {
+        "ray": "2.56.1",
+        "numpy": numpy_version,
+        "nvidia-nccl-cu13": "2.30.7",
+        "fla-core": "0.5.2",
+        "torch": "2.13.0",
+        "transformer-engine": "2.18.0",
+        "relax-hybrid-ep": "1.2.1+eb9cee7",
+    }
+    monkeypatch.setattr(validator.md, "version", versions.__getitem__)
+    monkeypatch.setattr(
+        validator.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", "")
+    )
+    monkeypatch.setattr(validator, "Path", lambda path: tmp_path / path.lstrip("/"))
+    checked = []
+    monkeypatch.setattr(validator, "source_hash", lambda path: checked.append(path) or validator.SOURCE_SHA256)
+    (tmp_path / "etc").mkdir()
+    if legacy:
+        (tmp_path / "etc/relax-fla042-runtime.json").write_text(
+            json.dumps({"root": "/legacy", "source_sha256": validator.SOURCE_SHA256})
+        )
+    validator.main()
+    report = json.loads((tmp_path / "etc/relax-final-runtime.json").read_text())
+    assert report["profile"] == profile and report["gpu_arch"] == gpu_arch
+    assert report["packages"]["numpy"] == numpy_version
+    assert checked == ([tmp_path / "legacy/fla"] if legacy else [])
+
+
 def test_published_constraints_allow_vendor_ray_without_relaxing_other_pins(tmp_path):
     source = (ROOT / "docker/Dockerfile.cu13").read_text()
     export = next(line.strip() for line in source.splitlines() if "sed 's/^ray==" in line)
@@ -252,13 +302,13 @@ def test_published_constraints_allow_vendor_ray_without_relaxing_other_pins(tmp_
         assert (result.returncode == 0) == expected_success, result.stdout + result.stderr
 
 
-def test_default_dockerfile_installs_shared_repairs_without_cu13_libraries():
+def test_default_dockerfile_installs_shared_repairs_for_unified_runtime():
     source = (ROOT / "docker/Dockerfile").read_text()
     assert "install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2" in source
     assert "--from=hybridep_builder /opt/ep-wheels" in source
     assert "python /opt/relax/validate_hybridep_install.py" in source
-    assert "validate_final_runtime.py --profile cu12" in source
-    assert "nvidia-nvshmem-cu12==3.4.5" in source
-    assert "nvidia-nvshmem-cu13" not in source
-    assert "nvidia-nccl-cu13" not in source
-    assert "v0.5.17-cu129" in source
+    assert "validate_final_runtime.py --profile unified" in source
+    assert "nvidia-nvshmem-cu13==3.4.5" in source
+    assert "nvidia-nvshmem-cu12" not in source
+    assert "nvidia-nccl-cu13==2.30.7" in source
+    assert "v0.5.21-cu130" in source

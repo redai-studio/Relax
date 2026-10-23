@@ -1,0 +1,11 @@
+--- a/transformer_engine/pytorch/attention/dot_product_attention/utils.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/utils.py
+@@ -851,7 +851,7 @@
+             or fa2_padded_head_dim % 8 != 0
+             or (
+                 fa2_padded_head_dim > 192
+-                and device_compute_capability not in ((8, 0), (9, 0), (10, 0), (12, 0))
++                and device_compute_capability not in ((8, 0), (9, 0), (10, 0), (10, 3), (12, 0))
+             )
+         )
+     ):

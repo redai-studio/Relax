@@ -371,6 +371,7 @@ class MegatronTrainStateOffloader:
     def __init__(self, model: Optional[List], optimizer, args) -> None:
         self.enabled: bool = bool(getattr(args, "offload_train", False))
         self.uses_tms: bool = False
+        self._model = model
 
         # Default is torch_memory_saver; --selective-offload forces the selective path.
         force_selective = bool(getattr(args, "selective_offload", False))
@@ -415,6 +416,15 @@ class MegatronTrainStateOffloader:
         No-op when disabled.
         """
         if self.enabled:
+            # The sleep boundary is after forward/backward. Optional model hooks
+            # release recomputable cross-layer tensors, including state rebuilt
+            # during full-recompute backward, before either offload strategy runs.
+            if self._model is not None:
+                for chunk in self._model:
+                    for module in chunk.modules():
+                        release = getattr(module, "_release_transient_state", None)
+                        if callable(release):
+                            release()
             self._strategy.offload()
 
     def reload(self) -> None:
