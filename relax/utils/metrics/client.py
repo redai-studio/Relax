@@ -6,6 +6,12 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Union
 
 import requests
+from requests.adapters import HTTPAdapter
+
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def _sanitize_for_json(value: Any) -> Any:
@@ -47,17 +53,35 @@ class MetricsClient:
     Provides a convenient interface for logging metrics and reporting them at
     the end of steps. Supports both synchronous and asynchronous operation
     modes.
+
+    All requests go through one long-lived :class:`requests.Session` so that the
+    TCP connection is reused. That matters because this client is driven from
+    the training thread: one call per metric batch and one per report step, per
+    rollout and per optimizer step, on one rank. Opening a fresh connection for
+    each of those puts a handshake on the training critical path and makes that
+    rank arrive late at the next collective.
     """
 
-    def __init__(self, service_url: str = "http://localhost:8000/metrics"):
+    def __init__(self, service_url: str = "http://localhost:8000/metrics", pool_maxsize: int = 32):
         """Initialize the metrics client.
 
         Args:
             service_url: URL of the metrics service
+            pool_maxsize: Connections kept per host. The training rank issues
+                its requests one at a time, so this only needs headroom for
+                concurrent callers of the same client instance.
         """
         self.service_url = service_url.rstrip("/")
         self._buffer = defaultdict(list)
         self._lock = threading.Lock()
+
+        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=pool_maxsize, max_retries=0)
+        self._session = requests.Session()
+        # The metrics service is a cluster-local endpoint. Do not let
+        # HTTP_PROXY / HTTPS_PROXY from the environment redirect it.
+        self._session.trust_env = False
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
 
     def log_metric(
         self,
@@ -197,7 +221,7 @@ class MetricsClient:
             True if successful, False otherwise
         """
         try:
-            response = requests.post(
+            response = self._session.post(
                 f"{self.service_url}/log_metric",
                 json={
                     "step": step,
@@ -208,15 +232,15 @@ class MetricsClient:
                 timeout=5,
             )
             if response.status_code != 200:
-                print(f"[MetricsClient] log_metric failed: HTTP {response.status_code}, response: {response.text}")
+                logger.warning(f"log_metric failed: HTTP {response.status_code}, response: {response.text}")
                 return False
             result = response.json()
             if result.get("status") != "success":
-                print(f"[MetricsClient] log_metric failed: {result}")
+                logger.warning(f"log_metric failed: {result}")
                 return False
             return True
         except Exception as e:
-            print(f"[MetricsClient] log_metric exception: {e}")
+            logger.warning(f"log_metric exception: {e}")
             return False
 
     def _send_metrics_batch(
@@ -236,23 +260,21 @@ class MetricsClient:
             True if successful, False otherwise
         """
         try:
-            response = requests.post(
+            response = self._session.post(
                 f"{self.service_url}/log_metrics_batch",
                 json={"step": step, "metrics": _sanitize_for_json(metrics), "tags": tags},
                 timeout=5,
             )
             if response.status_code != 200:
-                print(
-                    f"[MetricsClient] log_metrics_batch failed: HTTP {response.status_code}, response: {response.text}"
-                )
+                logger.warning(f"log_metrics_batch failed: HTTP {response.status_code}, response: {response.text}")
                 return False
             result = response.json()
             if result.get("status") != "success":
-                print(f"[MetricsClient] log_metrics_batch failed: {result}")
+                logger.warning(f"log_metrics_batch failed: {result}")
                 return False
             return True
         except Exception as e:
-            print(f"[MetricsClient] log_metrics_batch exception: {e}")
+            logger.warning(f"log_metrics_batch exception: {e}")
             return False
 
     def _send_report_step(self, step: int) -> Dict[str, Any]:
@@ -267,17 +289,17 @@ class MetricsClient:
         """
         try:
             # Then, trigger reporting
-            response = requests.post(f"{self.service_url}/report_step", json={"step": step}, timeout=10)
+            response = self._session.post(f"{self.service_url}/report_step", json={"step": step}, timeout=10)
 
             if response.status_code != 200:
-                print(f"[MetricsClient] report_step failed: HTTP {response.status_code}, response: {response.text}")
+                logger.warning(f"report_step failed: HTTP {response.status_code}, response: {response.text}")
                 return {"status": "error", "message": f"HTTP {response.status_code}: {response.text}"}
             result = response.json()
             if result.get("status") != "success":
-                print(f"[MetricsClient] report_step failed: {result}")
+                logger.warning(f"report_step failed: {result}")
             return result
         except Exception as e:
-            print(f"[MetricsClient] report_step exception: {e}")
+            logger.warning(f"report_step exception: {e}")
             return {"status": "error", "message": str(e)}
 
     def health_check(self) -> Dict[str, Any]:
@@ -287,13 +309,13 @@ class MetricsClient:
             Dict with health status information
         """
         try:
-            response = requests.get(f"{self.service_url}/health", timeout=5)
+            response = self._session.get(f"{self.service_url}/health", timeout=5)
             if response.status_code != 200:
-                print(f"[MetricsClient] health_check failed: HTTP {response.status_code}, response: {response.text}")
+                logger.warning(f"health_check failed: HTTP {response.status_code}, response: {response.text}")
                 return {"status": "error", "message": f"HTTP {response.status_code}: {response.text}"}
             return response.json()
         except Exception as e:
-            print(f"[MetricsClient] health_check exception: {e}")
+            logger.warning(f"health_check exception: {e}")
             return {"status": "error", "message": str(e)}
 
 
