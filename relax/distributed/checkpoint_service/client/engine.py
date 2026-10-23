@@ -116,6 +116,21 @@ class CheckpointEngineClient:
         # Metrics
         self._metrics = MetricsCollector() if self.config.enable_metrics else None
 
+    async def reset_inference_transport(self, role: str) -> None:
+        """Reset one sender transport while all inference I/O is idle.
+
+        The caller owns the recovery reservation and waits for this operation
+        on every Actor rank before admitting a new receiver or sender.
+        """
+        if role not in {"rollout", "actor_fwd"}:
+            raise ValueError(f"Unsupported inference transport: {role}")
+        if self.role != "actor" or self._backend is None:
+            raise RuntimeError("Inference transport reset requires an initialized Actor sender")
+        if role == "actor_fwd" and self.rank == 0:
+            response = await self._http_client.get(f"{self.coordinator_url}/clear_weight_meta")
+            response.raise_for_status()
+        self._backend.reset_inference_transport(role)
+
     @property
     def role(self) -> str:
         """Get the role name of current node."""

@@ -283,6 +283,39 @@ class DeviceDirectBackend(CommBackend):
                 continue
             yield name, tensor
 
+    def reset_inference_transport(self, role: str) -> None:
+        """Discard one idle Actor-to-inference transport before replacement.
+
+        The caller must hold the recovery reservation and have observed every
+        old sender/receiver RPC finish. This does not abort collectives. Any
+        failure propagates to global restart; training process groups and model
+        state are never reset here.
+        """
+        if role not in {"rollout", "actor_fwd"}:
+            raise ValueError(f"Unsupported inference transport: {role}")
+        if self.role_info is None or self.role_info.role_name != "actor":
+            raise RuntimeError("Only the Actor sender can reset an inference transport")
+
+        if role == "actor_fwd":
+            group = self._model_update_groups_for_actor_fwd_ref
+            if group is not None:
+                dist.destroy_process_group(group)
+                self._model_update_groups_for_actor_fwd_ref = None
+            return
+
+        if self._lora_adapter_mode:
+            raise NotImplementedError("Rollout transport recovery does not support LoRA adapter mode")
+        if self._model_update_groups is not None:
+            dist.destroy_process_group(self._model_update_groups)
+            self._model_update_groups = None
+        # These are HTTP proxy actors, not the inference engines themselves.
+        # Do not use _cleanup_rollout_engines: it suppresses cleanup failures.
+        for rank, engine in list(self.rollout_engines.items()):
+            ray.kill(engine, no_restart=True)
+            del self.rollout_engines[rank]
+        self.rollout_topology = {}
+        self._rollout_topology_signature = None
+
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
         """Build a stable signature of the rollout topology.

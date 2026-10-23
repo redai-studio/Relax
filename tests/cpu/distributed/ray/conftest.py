@@ -2,6 +2,7 @@
 
 """Shared fixtures and helpers for autoscale tests."""
 
+import asyncio
 import os
 import sys
 import threading
@@ -141,10 +142,10 @@ def make_mock_args(**overrides):
         num_gpus_per_node=8,
         scale_out_timeout=1800.0,
         scale_out_partial_success_policy="rollback_all",
+        use_fault_tolerance=False,
         scale_in_drain_timeout=30.0,
         scale_in_shutdown_timeout=30.0,
         fully_async=True,
-        use_fault_tolerance=False,
         debug_train_only=False,
         offload_rollout=False,
         sglang_pp_size=1,
@@ -225,6 +226,9 @@ def create_test_manager(args=None, servers=None):
         args = make_mock_args()
 
     manager = object.__new__(_OriginalRM)
+    manager._weight_sync_port_cursor = None
+    manager._weight_sync_port_allocation_lock = asyncio.Lock()
+    manager._scale_weight_sync_precheck_port_allocation_lock = asyncio.Lock()
     manager.args = args
     manager._engine_actor_states = _get_engine_actor_states()
     manager.servers = servers if servers is not None else {}
