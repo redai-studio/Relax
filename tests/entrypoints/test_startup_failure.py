@@ -51,6 +51,7 @@ def _train_namespace():
         "maybe_pin_baseline_to_stable": Mock(),
         "_ctrl": None,
         "_shutdown_done": False,
+        "_training_completed": False,
         "_kernel_cache_heartbeat": None,
         "_SHUTDOWN_TIMEOUT_SEC": 60,
         "_NORMAL_SHUTDOWN_TIMEOUT_SEC": 1800,
@@ -89,6 +90,7 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
         ns["main"](SimpleNamespace())
     expected = 1 if fail_at else 0
     assert exc.value.code == expected
+    assert ns["_training_completed"] is (fail_at is None)
     assert events == ["serve", "ray", ("exit", expected)]
     controller.shutdown.assert_called_once()
 
@@ -159,6 +161,7 @@ def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, rem
         "ServiceStartupPhase": _FakePhase,
         "remove_placement_group": remove_pg or (lambda pg: None),
         "Any": object,
+        "os": os,
         "Optional": Optional,
         "Service": object,
     }
@@ -292,6 +295,7 @@ def test_controller_allocate_phase_abort_survives_pg_cleanup_failure():
 def test_service_constructor_failure_is_bounded_and_propagated(has_data_source):
     ns = {
         "Any": object,
+        "os": os,
         "Optional": Optional,
         "Namespace": SimpleNamespace,
         "logger": Mock(),
@@ -320,6 +324,7 @@ def test_service_deploy_failure_releases_owned_pg():
     remove_pg = Mock()
     ns = {
         "Any": object,
+        "os": os,
         "Optional": Optional,
         "Namespace": SimpleNamespace,
         "logger": Mock(),
@@ -407,3 +412,21 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
     ns["shutdown"](partial_controller)
     stop_teacher.assert_called_once_with(teacher)
     stop_routers.assert_called_once()
+
+
+@pytest.mark.parametrize("health", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "failure", "signal", "atexit"])
+def test_tracking_finishes_only_after_confirmed_training_completion(health, outcome):
+    ns = _train_namespace()
+    events = []
+    ns["_ctrl"] = SimpleNamespace(shutdown=Mock(), _metrics_service_enabled=True, _health_check_enabled=health)
+    ns["_training_completed"] = outcome in {"success", "signal"}
+    ns["_hard_exit"] = Mock()
+    finish = ns["serve"].get_app_handle.return_value.finish_tracking.remote
+    finish.side_effect = lambda: events.append("finish") or Mock(result=Mock(return_value={"status": "success"}))
+    ns["serve"].shutdown.side_effect = lambda: events.append("shutdown")
+    ns["_graceful_shutdown"](
+        sig=signal.SIGTERM if outcome == "signal" else None,
+        exit_code={"success": 0, "failure": 1, "signal": 0, "atexit": None}[outcome],
+    )
+    assert events == (["finish", "shutdown"] if outcome == "success" else ["shutdown"])

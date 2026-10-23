@@ -410,6 +410,204 @@ class TestPrefetchBuffer:
         finally:
             buffer.stop()
 
+    def test_completed_samples_publish_and_refill_before_slow_sample(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        release = threading.Event()
+        refill_started = threading.Event()
+        calls = []
+
+        def process(idx):
+            calls.append(idx)
+            if idx == 0:
+                assert release.wait(3)
+            if idx == 2:
+                refill_started.set()
+            return None if idx == 1 else idx
+
+        buffer = PrefetchBuffer(process, chunk_size=2, max_cached=4, num_workers=2)
+        buffer.set_index_order(list(range(6)))
+        try:
+            assert buffer.wait_for(1, timeout=2)
+            assert refill_started.wait(2), "idle worker must refill before sample 0 completes"
+            with buffer._lock:
+                assert 0 not in buffer._cache
+                assert buffer._cache[1] is None
+            release.set()
+            result = []
+            for idx in range(6):
+                assert buffer.wait_for(idx, timeout=2)
+                found, sample = buffer.get_cached(idx)
+                assert found
+                result.append(sample)
+            assert result == [0, None, 2, 3, 4, 5]
+            assert sorted(calls) == list(range(6))
+        finally:
+            release.set()
+            buffer.stop()
+
+    def test_cache_and_outstanding_work_share_capacity(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        release = threading.Event()
+        fourth_started = threading.Event()
+        calls = []
+
+        def process(idx):
+            calls.append(idx)
+            if idx == 0:
+                assert release.wait(3)
+            if idx == 3:
+                fourth_started.set()
+            return idx
+
+        buffer = PrefetchBuffer(process, chunk_size=3, max_cached=3, num_workers=3)
+        buffer.set_index_order(list(range(8)))
+        try:
+            assert buffer.wait_for(1, timeout=2)
+            assert buffer.wait_for(2, timeout=2)
+            assert not fourth_started.wait(0.15)
+            assert sorted(calls) == [0, 1, 2]
+            assert buffer.get_cached(1) == (True, 1)
+            assert fourth_started.wait(2)
+            assert buffer.wait_for(3, timeout=2)
+            with buffer._lock:
+                assert set(buffer._cache) == {2, 3}
+        finally:
+            release.set()
+            buffer.stop()
+
+    def test_timed_out_running_task_keeps_slot_and_discards_late_result(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        release = threading.Event()
+        next_started = threading.Event()
+
+        def process(idx):
+            if idx == 0:
+                assert release.wait(3)
+            else:
+                next_started.set()
+            return idx
+
+        buffer = PrefetchBuffer(process, chunk_size=1, max_cached=1, num_workers=1)
+        buffer._PROCESS_TIMEOUT_SECONDS = 0.05
+        buffer.set_index_order([0, 1])
+        try:
+            assert buffer.wait_for(0, timeout=2)
+            assert buffer.get_cached(0) == (True, None)
+            assert not next_started.wait(0.15)
+            release.set()
+            assert buffer.wait_for(1, timeout=2)
+            assert buffer.get_cached(1) == (True, 1)
+            assert buffer.get_cached(0) == (False, None)
+        finally:
+            release.set()
+            buffer.stop()
+
+    def test_epoch_reset_cancels_queued_work_and_ignores_old_result(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        old_started = threading.Event()
+        old_release = threading.Event()
+        old_done = threading.Event()
+        new_started = threading.Event()
+        new_release = threading.Event()
+
+        def process(idx):
+            if idx == 0:
+                old_started.set()
+                assert old_release.wait(3)
+                old_done.set()
+            if idx == 2:
+                new_started.set()
+                assert new_release.wait(3)
+            return idx
+
+        buffer = PrefetchBuffer(process, chunk_size=2, max_cached=2, num_workers=1)
+        buffer.set_index_order([0, 1])
+        try:
+            assert old_started.wait(2)
+            buffer.set_index_order([2])
+            assert new_started.wait(2)
+            old_release.set()
+            assert old_done.wait(2)
+            assert not buffer._finished
+            new_release.set()
+            assert buffer.wait_for(2, timeout=2)
+            assert buffer.get_cached(2) == (True, 2)
+            with buffer._lock:
+                assert not buffer._cache
+        finally:
+            old_release.set()
+            new_release.set()
+            buffer.stop()
+
+    def test_executor_initialization_failure_finishes_generation(self, monkeypatch):
+        from relax.utils.data import streaming_dataset
+
+        def fail_executor(**kwargs):
+            raise RuntimeError("executor unavailable")
+
+        buffer = streaming_dataset.PrefetchBuffer(lambda idx: idx)
+        buffer._finished = False
+        monkeypatch.setattr(streaming_dataset, "ThreadPoolExecutor", fail_executor)
+        with pytest.raises(RuntimeError, match="executor unavailable"):
+            buffer._run(buffer._stop)
+        assert buffer._finished
+        assert buffer.wait_for(0) is False
+
+    def test_waiter_wakes_when_stream_finishes_without_requested_index(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        release = threading.Event()
+        buffer = PrefetchBuffer(lambda idx: release.wait(2) and idx, max_cached=2, num_workers=1)
+        buffer.set_index_order([0])
+        result = []
+        waiter = threading.Thread(target=lambda: result.append(buffer.wait_for(99)), daemon=True)
+        waiter.start()
+        try:
+            release.set()
+            waiter.join(2)
+            assert not waiter.is_alive()
+            assert result == [False]
+        finally:
+            release.set()
+            buffer.stop()
+
+    def test_submission_retry_does_not_duplicate_already_submitted_samples(self, monkeypatch):
+        import relax.utils.data.streaming_dataset as module
+
+        original = module.ThreadPoolExecutor
+        calls = []
+
+        class FlakyExecutor(original):
+            attempts = 0
+
+            def submit(self, fn, *args, **kwargs):
+                self.attempts += 1
+                if self.attempts == 2:
+                    raise RuntimeError("temporary submit failure")
+                return super().submit(fn, *args, **kwargs)
+
+        monkeypatch.setattr(module, "ThreadPoolExecutor", FlakyExecutor)
+
+        def process(idx):
+            calls.append(idx)
+            if idx == 1:
+                raise ValueError("bad sample")
+            return idx
+
+        buffer = module.PrefetchBuffer(process, chunk_size=3, max_cached=3, num_workers=2)
+        buffer.set_index_order([0, 1, 2])
+        try:
+            for idx, expected in [(0, 0), (1, None), (2, 2)]:
+                assert buffer.wait_for(idx, timeout=2)
+                assert buffer.get_cached(idx) == (True, expected)
+            assert sorted(calls) == [0, 1, 2]
+        finally:
+            buffer.stop()
+
 
 class TestIndexManager:
     """Tests for IndexManager class."""

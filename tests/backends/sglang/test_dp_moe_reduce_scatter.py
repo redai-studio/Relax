@@ -90,6 +90,7 @@ def _combine(rank: int, dp_size: int, dtype, *, variable: bool = False):
 
     namespace = {
         "torch": torch,
+        "_note_dp_gather_in_prefill_graph": lambda: None,
         "is_dp_gatherv_active": lambda: variable,
         "get_dp_global_num_tokens": lambda: sizes,
         "get_tensor_model_parallel_world_size": lambda: tp_size,

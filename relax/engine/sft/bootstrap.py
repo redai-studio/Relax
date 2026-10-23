@@ -35,7 +35,7 @@ def resolve_sft_algo_key(config: Namespace) -> str:
     return config.advantage_estimator
 
 
-def resolve_sft_num_rollout(config: Namespace) -> None:
+def resolve_sft_num_rollout(config: Namespace) -> dict | None:
     """Fill in ``config.num_rollout`` (and ``num_rollout_per_epoch``) from
     offline data.
 
@@ -55,6 +55,7 @@ def resolve_sft_num_rollout(config: Namespace) -> None:
         assert config.num_rollout > 0
         return
 
+    line_offsets_cache = {}
     # Lazy import: pulling streaming dataset at module load would drag heavy
     # multimodal deps into every controller import.
     if is_preference_mode(config):
@@ -65,9 +66,9 @@ def resolve_sft_num_rollout(config: Namespace) -> None:
             prefetch_max_cached=0,
         )
     else:
-        from relax.engine.sft.dataset.streaming import SFTStreamingDataset
+        from relax.engine.sft.dataset.streaming import _build_reader
 
-        sizing_dataset = SFTStreamingDataset(path=config.prompt_data, prefetch_max_cached=0)
+        sizing_dataset = _build_reader(config.prompt_data, pre_make_index=True, line_offsets_cache=line_offsets_cache)
 
     # Sized-only construction: no tokenizer/processor needed because we never
     # call get_batch — we just need len() to derive num_rollout.
@@ -107,6 +108,8 @@ def resolve_sft_num_rollout(config: Namespace) -> None:
         f"(num_rollout_per_epoch={config.num_rollout_per_epoch}, train_size={dataset_size}, "
         f"eval_size={eval_size}, total_size={total_size})"
     )
+
+    return line_offsets_cache or None
 
 
 def validate_sft_resource(config: Namespace) -> None:

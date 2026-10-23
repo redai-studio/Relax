@@ -4,7 +4,9 @@ import logging
 import pickle
 import time
 from argparse import Namespace
+from concurrent.futures import CancelledError
 from functools import partial
+from threading import Event
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -704,6 +706,53 @@ def fetch_data_from_transfer_queue(
     return [tq_client.get_data(batch_meta), batch_meta], time.perf_counter() - start
 
 
+def _prefetch_data_from_transfer_queue(
+    tq_client,
+    data_fields: list[str],
+    batch_size: int,
+    partition_id: str,
+    task_name: str,
+    sampling_config: dict,
+    batch_index: int,
+    *,
+    cancel_event: Event,
+    poll_interval: float = 0.05,
+    timeout: float = 300.0,
+    fetch_data: Callable | None = None,
+) -> tuple[list, float]:
+    """Wait for one raw CPU batch without abandoning an empty partition.
+
+    Only empty metadata is retried, using the same sampler replay key. Once
+    metadata is nonempty, the payload is fetched exactly once, even if a stop
+    arrives during the RPC. The local deadline bounds empty polling; in-flight
+    RPCs retain the TransferQueue client's own timeout. Report only RPC time,
+    excluding polling sleeps, for the existing data-fetch metric.
+    """
+    deadline = time.monotonic() + timeout
+    fetch_seconds = 0.0
+    while True:
+        if cancel_event.is_set():
+            raise CancelledError("SFT train-data prefetch stopped")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"SFT train-data prefetch timed out waiting for partition {partition_id}")
+        fetch = fetch_data if fetch_data is not None else fetch_data_from_transfer_queue
+        client_kwargs = {} if fetch_data is not None else {"tq_client": tq_client}
+        payload, elapsed = fetch(
+            **client_kwargs,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=batch_index,
+        )
+        fetch_seconds += elapsed
+        if payload[1].size > 0:
+            return payload, fetch_seconds
+        # An interruptible wait lets shutdown stop polling without a new RPC.
+        cancel_event.wait(min(max(poll_interval, 0.001), max(0.0, deadline - time.monotonic())))
+
+
 def get_data_from_transfer_queue(
     args,
     tq_client,
@@ -1121,11 +1170,22 @@ def post_process_rollout_data(args, rollout_data):
 
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
+    if Envs.RELAX_SFT_SELECTIVE_LOGITS and getattr(args, "loss_type", None) == "sft":
+        masks = rollout_data["loss_masks"]
+        # Per-rank fetch supplies CPU masks. Never copy CUDA masks back in the
+        # training path; unsupported producers simply retain the original head.
+        if all(not isinstance(mask, torch.Tensor) or mask.device.type == "cpu" for mask in masks):
+            rollout_data["selective_loss_masks_cpu"] = [torch.as_tensor(mask, dtype=torch.int) for mask in masks]
+
     cuda_dev = device_utils.make_current_torch_device()
     rollout_data["tokens"] = [torch.as_tensor(t, dtype=torch.long, device=cuda_dev) for t in rollout_data["tokens"]]
     rollout_data["loss_masks"] = [
         torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
+    if "pre_shifted_labels" in rollout_data:
+        rollout_data["pre_shifted_labels"] = [
+            torch.as_tensor(label, dtype=torch.long, device=cuda_dev) for label in rollout_data["pre_shifted_labels"]
+        ]
     if "classification_labels" in rollout_data:
         label_dtype = (
             torch.long

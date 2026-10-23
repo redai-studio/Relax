@@ -10,61 +10,41 @@ multi-rank scenarios.
 
 from __future__ import annotations
 
-import sys
-from types import ModuleType, SimpleNamespace
+import ast
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 
 from relax.utils.types import ParamInfo
 
 
-# ---------------------------------------------------------------------------
-# Module-level mocking: stub out megatron.core so we can import without GPU.
-# ---------------------------------------------------------------------------
-
-_MEGATRON_MODULES = [
-    "megatron",
-    "megatron.core",
-    "megatron.core.mpu",
-    "megatron.core.transformer",
-    "megatron.core.transformer.transformer_layer",
-    "megatron.core.tensor_parallel",
-    "megatron.bridge",
-    "megatron.bridge.models",
-    "megatron.bridge.peft",
-    "megatron.bridge.peft.lora",
-    "megatron.bridge.peft.lora_merge",
+# Load the actual collective functions without importing the training backend.
+# Global Megatron stubs trigger model/MTP registration in spawned workers and
+# make this CPU/Gloo regression depend on the installed GPU image.
+_SOURCE = Path(__file__).resolve().parents[4] / "relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py"
+_FUNCTIONS = {
+    "_broadcast_converted_bucket",
+    "_broadcast_converted_phase",
+    "_compute_slot_size",
+    "_decode_metadata",
+    "_encode_metadata",
+}
+_CONSTANTS = {"_DTYPE_TO_CODE", "_CODE_TO_DTYPE"}
+_nodes = [
+    node
+    for node in ast.parse(_SOURCE.read_text()).body
+    if (isinstance(node, ast.FunctionDef) and node.name in _FUNCTIONS)
+    or (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in _CONSTANTS for t in node.targets))
 ]
-
-_MISSING = object()
-_saved = {}
-for _mod in _MEGATRON_MODULES:
-    _saved[_mod] = sys.modules.get(_mod, _MISSING)
-    sys.modules[_mod] = ModuleType(_mod)
-    if _mod in {"megatron", "megatron.core", "megatron.core.transformer", "megatron.bridge", "megatron.bridge.peft"}:
-        sys.modules[_mod].__path__ = []
-sys.modules["megatron.core"].mpu = sys.modules["megatron.core.mpu"]
-sys.modules["megatron.core.transformer.transformer_layer"].get_transformer_layer_offset = MagicMock(return_value=0)
-sys.modules["megatron.bridge.peft.lora"].LoRAMerge = MagicMock
-
-try:
-    pytest.importorskip("triton")
-
-    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (  # noqa: E402
-        _broadcast_converted_bucket,
-        _broadcast_converted_phase,
-        _compute_slot_size,
-        _decode_metadata,
-        _encode_metadata,
-    )
-finally:
-    for _mod, _orig in _saved.items():
-        if _orig is _MISSING:
-            sys.modules.pop(_mod, None)
-        else:
-            sys.modules[_mod] = _orig
+_scope = {"torch": torch, "dist": torch.distributed, "mpu": SimpleNamespace()}
+exec(compile(ast.Module(body=_nodes, type_ignores=[]), str(_SOURCE), "exec"), _scope)
+_broadcast_converted_bucket = _scope["_broadcast_converted_bucket"]
+_broadcast_converted_phase = _scope["_broadcast_converted_phase"]
+_compute_slot_size = _scope["_compute_slot_size"]
+_decode_metadata = _scope["_decode_metadata"]
+_encode_metadata = _scope["_encode_metadata"]
 
 
 # ---------------------------------------------------------------------------
@@ -326,10 +306,8 @@ class TestBroadcastQuantizedBucket:
 
     @staticmethod
     def _run_bucket(bucket_infos, all_converted, pp_size, ep_size):
-        with (
-            patch("relax.backends.megatron.weight_update.hf_weight_iterator_bridge.dist") as mock_dist,
-            patch("relax.backends.megatron.weight_update.hf_weight_iterator_bridge.mpu") as mock_mpu,
-        ):
+        mock_dist, mock_mpu = MagicMock(), MagicMock()
+        with patch.dict(_broadcast_converted_bucket.__globals__, dist=mock_dist, mpu=mock_mpu):
             mock_dist.get_rank.return_value = 0
             mock_mpu.get_pipeline_model_parallel_world_size.return_value = pp_size
             mock_mpu.get_expert_model_parallel_world_size.return_value = ep_size

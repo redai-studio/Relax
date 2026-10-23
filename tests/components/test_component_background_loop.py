@@ -12,7 +12,8 @@ from relax.components.background_loop import BackgroundLoopRunner
 
 
 @pytest.fixture(params=[("actor", "Actor"), ("actor_fwd", "ActorFwd"), ("critic", "Critic")])
-def component(request):
+def component(request, monkeypatch):
+    monkeypatch.setattr("relax.utils.tq.lifecycle.detach_tq_client", Mock())
     module_name, class_name = request.param
     module = importlib.import_module(f"relax.components.{module_name}")
     deployment_cls = getattr(module, class_name).func_or_class
@@ -33,8 +34,14 @@ def component(request):
 
 @pytest.mark.parametrize("health_check", [False, True])
 @pytest.mark.parametrize("report_fails", [False, True])
-async def test_component_concurrent_failure_preserves_health_policy(component, health_check, report_fails):
+async def test_component_concurrent_failure_preserves_health_policy(
+    component, health_check, report_fails, monkeypatch
+):
     component.config.use_health_check = health_check
+    report_ack = threading.Event()
+    if component.role == "actor":
+        namespace = type(component)._background_run.__globals__
+        monkeypatch.setitem(namespace, "ray", Mock(get=lambda ref, timeout: report_ack.set()))
     release = threading.Event()
     error = ValueError("compute failed")
     report_error = RuntimeError("health report failed")
@@ -53,9 +60,15 @@ async def test_component_concurrent_failure_preserves_health_policy(component, h
         await asyncio.sleep(0)
     finally:
         release.set()
+    if component.role == "actor" and health_check and not report_fails:
+        assert await asyncio.to_thread(report_ack.wait, 5)
+        assert all(not task.done() for task in tasks)
+        component._stop_event.set()
     results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 5)
     expected = None if health_check else error
-    if report_fails and component.role != "critic":
+    if component.role == "actor":
+        expected = error
+    elif report_fails and component.role != "critic":
         expected = report_error
     assert all(result is expected for result in results)
     worker.assert_called_once()
@@ -138,9 +151,10 @@ async def test_component_constructor_initializes_shared_runner(component, monkey
     # Serve ingress serializes the class; its functions can own copied globals.
     # Patch the bindings the deployed constructor actually resolves.
     namespace = type(component).__init__.__globals__
-    monkeypatch.setitem(namespace, "allocate_train_group", Mock(return_value=Mock()))
-    monkeypatch.setitem(namespace, "tq", Mock())
-    monkeypatch.setitem(namespace, "ray", Mock(get=Mock(return_value=[0])))
+    train_group = Mock()
+    train_group.init_and_wait.return_value = [0]
+    monkeypatch.setitem(namespace, "allocate_train_group", Mock(return_value=train_group))
+    monkeypatch.setitem(namespace, "attach_tq_client", Mock(return_value=Mock()))
     config = Namespace(
         tq_config={},
         kl_coef=0,

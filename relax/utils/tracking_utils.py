@@ -48,16 +48,16 @@ def log(args, metrics, step_key: str):
     return True
 
 
-def flush_metrics(args, step: int):
+def flush_metrics(args, step: int, *, wait: bool = True):
     """Flush any buffered metrics in the metrics service adapter.
 
-    This should be called at the end of each step to ensure all metrics are
-    reported to the metrics service.
+    Wait for delivery by default. Intermediate training steps may pass
+    wait=False to overlap reporting; the final step must wait before shutdown.
     """
     if getattr(args, "use_metrics_service", False):
         adapter = get_metrics_service_adapter()
         if adapter:
-            return adapter.flush(step)
+            return adapter.flush(step, wait=wait)
     return True
 
 

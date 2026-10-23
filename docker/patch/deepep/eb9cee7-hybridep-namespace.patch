@@ -1,0 +1,146 @@
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -150,7 +150,7 @@
+     print()
+
+     extension_hybrid_ep_cpp = CUDAExtension(
+-        "hybrid_ep_cpp",
++        "_relax_hybrid_ep.hybrid_ep_cpp",
+         sources=sources,
+         include_dirs=include_dirs,
+         library_dirs=library_dirs,
+@@ -252,7 +252,9 @@
+     print()
+
+     extension_deep_ep_cpp = CUDAExtension(
+-        name='deep_ep_cpp',
++        name='_relax_hybrid_ep.deep_ep_cpp',
++        # Isolate all legacy C++ types from any public DeepEP already in the image.
++        define_macros=[('deep_ep', 'relax_hybrid_deep_ep')],
+         include_dirs=include_dirs,
+         library_dirs=library_dirs,
+         sources=sources,
+@@ -271,11 +273,10 @@
+         revision = ''
+
+     setuptools.setup(
+-        name='deep_ep',
++        name='relax_hybrid_ep',
+         version='1.2.1' + revision,
+-        packages=setuptools.find_packages(
+-            include=['deep_ep']
+-        ),
++        packages=['_relax_hybrid_ep'],
++        package_dir={'_relax_hybrid_ep': 'deep_ep'},
+         install_requires=[
+             'pynvml',
+         ],
+@@ -287,7 +288,7 @@
+             'build_ext': BuildExtension
+         },
+         package_data={
+-            'deep_ep': collect_package_files('deep_ep', 'backend'),
++            '_relax_hybrid_ep': collect_package_files('deep_ep', 'backend'),
+         },
+         include_package_data=True
+     )
+diff --git a/deep_ep/__init__.py b/deep_ep/__init__.py
+--- a/deep_ep/__init__.py
++++ b/deep_ep/__init__.py
+@@ -6,5 +6,5 @@
+ from .hybrid_ep_buffer import HybridEPBuffer
+
+ # noinspection PyUnresolvedReferences
+-from deep_ep_cpp import Config
+-from hybrid_ep_cpp import HybridEpConfigInstance
++from .deep_ep_cpp import Config
++from .hybrid_ep_cpp import HybridEpConfigInstance
+diff --git a/deep_ep/utils.py b/deep_ep/utils.py
+--- a/deep_ep/utils.py
++++ b/deep_ep/utils.py
+@@ -6,7 +6,7 @@
+ from typing import Any, Optional, Tuple
+
+ # noinspection PyUnresolvedReferences
+-from deep_ep_cpp import Config, EventHandle
++from .deep_ep_cpp import Config, EventHandle
+
+
+ class EventOverlap:
+diff --git a/deep_ep/buffer.py b/deep_ep/buffer.py
+--- a/deep_ep/buffer.py
++++ b/deep_ep/buffer.py
+@@ -5,9 +5,9 @@
+ from typing import Callable, List, Tuple, Optional, Union
+
+ # noinspection PyUnresolvedReferences
+-import deep_ep_cpp
++from . import deep_ep_cpp
+ # noinspection PyUnresolvedReferences
+-from deep_ep_cpp import Config, EventHandle
++from .deep_ep_cpp import Config, EventHandle
+ from .utils import EventOverlap, check_nvlink_connections
+
+
+diff --git a/deep_ep/hybrid_ep_buffer.py b/deep_ep/hybrid_ep_buffer.py
+--- a/deep_ep/hybrid_ep_buffer.py
++++ b/deep_ep/hybrid_ep_buffer.py
+@@ -3,7 +3,7 @@
+ import torch
+ import os
+ import shutil
+-import hybrid_ep_cpp
++from . import hybrid_ep_cpp
+ import warnings
+
+ def indices_to_map(
+diff --git a/csrc/event.hpp b/csrc/event.hpp
+--- a/csrc/event.hpp
++++ b/csrc/event.hpp
+@@ -5,25 +5,27 @@
+
+ namespace deep_ep {
+
+-struct EventHandle {
++struct RelaxHybridEventHandle {
+     std::shared_ptr<torch::Event> event;
+
+-    EventHandle() {
++    RelaxHybridEventHandle() {
+         event = std::make_shared<torch::Event>(torch::kCUDA);
+         event->record(at::cuda::getCurrentCUDAStream());
+     }
+
+-    explicit EventHandle(const at::cuda::CUDAStream& stream) {
++    explicit RelaxHybridEventHandle(const at::cuda::CUDAStream& stream) {
+         event = std::make_shared<torch::Event>(torch::kCUDA);
+         event->record(stream);
+     }
+
+-    EventHandle(const EventHandle& other) = default;
++    RelaxHybridEventHandle(const RelaxHybridEventHandle& other) = default;
+
+     void current_stream_wait() const {
+         at::cuda::getCurrentCUDAStream().unwrap().wait(*event);
+     }
+ };
++
++using EventHandle = RelaxHybridEventHandle;
+
+ torch::Event create_event(const at::cuda::CUDAStream &s) {
+     auto event = torch::Event(torch::kCUDA);
+diff --git a/csrc/deep_ep.cpp b/csrc/deep_ep.cpp
+--- a/csrc/deep_ep.cpp
++++ b/csrc/deep_ep.cpp
+@@ -1906,9 +1906,9 @@
+         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint)
+         .def("get_pcie_buffer_size_hint", &deep_ep::Config::get_pcie_buffer_size_hint);
+     m.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
+
+-    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
++    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle", pybind11::module_local())
+         .def(pybind11::init<>())
+         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
+
+     pybind11::class_<deep_ep::Buffer>(m, "Buffer")

@@ -1,0 +1,939 @@
+diff --git a/flash_attn/cute/flash_bwd_mla_dq_dqv_sm100_h64.py b/flash_attn/cute/flash_bwd_mla_dq_dqv_sm100_h64.py
+--- a/flash_attn/cute/flash_bwd_mla_dq_dqv_sm100_h64.py
++++ b/flash_attn/cute/flash_bwd_mla_dq_dqv_sm100_h64.py
+@@ -46,9 +46,9 @@
+ from cutlass.cute.nvgpu import cpasync, tcgen05
+ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+ 
+-from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
+-from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManagerH64
+-from flash_attn.cute.utils import get_batch_from_cu_tensor
++from _relax_fa4_pr2968.cute.pack_gqa import sparse_mla_qhead_tile
++from _relax_fa4_pr2968.cute.topk_gather_kv import CpasyncGatherKVManagerH64
++from _relax_fa4_pr2968.cute.utils import get_batch_from_cu_tensor
+ 
+ 
+ class dQdQvGemmKernelH64:
+diff --git a/flash_attn/cute/paged_kv.py b/flash_attn/cute/paged_kv.py
+--- a/flash_attn/cute/paged_kv.py
++++ b/flash_attn/cute/paged_kv.py
+@@ -6,7 +6,7 @@
+ from cutlass.cute.nvgpu import cpasync
+ from cutlass import Int32, const_expr
+ 
+-from flash_attn.cute import utils
++from _relax_fa4_pr2968.cute import utils
+ from quack.cute_dsl_utils import ParamsBase
+ from cutlass.cute import FastDivmodDivisorV2
+ 
+diff --git a/flash_attn/cute/mask.py b/flash_attn/cute/mask.py
+--- a/flash_attn/cute/mask.py
++++ b/flash_attn/cute/mask.py
+@@ -10,10 +10,10 @@
+ from cutlass.cutlass_dsl import min as dsl_min
+ 
+ from quack import layout_utils
+-import flash_attn.cute.utils as utils
+-from flash_attn.cute.block_info import BlockInfo
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.utils import AuxData
++import _relax_fa4_pr2968.cute.utils as utils
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.utils import AuxData
+ 
+ MaskGenFn: TypeAlias = Callable[[int], Uint32]
+ MASK_R2P_CHUNK_SIZE: int = 32
+diff --git a/flash_attn/cute/flash_fwd_sm100.py b/flash_attn/cute/flash_fwd_sm100.py
+--- a/flash_attn/cute/flash_fwd_sm100.py
++++ b/flash_attn/cute/flash_fwd_sm100.py
+@@ -33,34 +33,34 @@
+ 
+ from quack import copy_utils, layout_utils
+ 
+-from flash_attn.cute.paged_kv import PagedKVManager
+-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+-from flash_attn.cute import utils
+-import flash_attn.cute.pipeline as pipeline_custom
++from _relax_fa4_pr2968.cute.paged_kv import PagedKVManager
++from _relax_fa4_pr2968.cute.cute_dsl_utils import assume_tensor_aligned
++from _relax_fa4_pr2968.cute import utils
++import _relax_fa4_pr2968.cute.pipeline as pipeline_custom
+ import cutlass.pipeline as cutlass_pipeline
+-from flash_attn.cute.mask import AttentionMask
+-from flash_attn.cute.softmax import (
++from _relax_fa4_pr2968.cute.mask import AttentionMask
++from _relax_fa4_pr2968.cute.softmax import (
+     SoftmaxSm100,
+     apply_score_mod_inner,
+     apply_learnable_sink,
+     load_learnable_sink,
+ )
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
+-from flash_attn.cute.block_sparsity import BlockSparseTensors
+-from flash_attn.cute.block_sparse_utils import (
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute.block_sparsity import BlockSparseTensors
++from _relax_fa4_pr2968.cute.block_sparse_utils import (
+     get_total_block_count,
+     produce_block_sparse_loads_sm100,
+     softmax_block_sparse_sm100,
+     handle_block_sparse_empty_tile_correction_sm100,
+ )
+-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+-from flash_attn.cute import mma_sm100_desc as sm100_desc
+-from flash_attn.cute import blackwell_helpers as sm100_utils
+-from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
++from _relax_fa4_pr2968.cute.pack_gqa import PackGQA, pack_gqa_layout
++from _relax_fa4_pr2968.cute import mma_sm100_desc as sm100_desc
++from _relax_fa4_pr2968.cute import blackwell_helpers as sm100_utils
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierFwdSm100
+ from cutlass.cute import FastDivmodDivisorV2
+ from quack.cute_dsl_utils import ParamsBase
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     SchedulerState,
+     SchedulingMode,
+     TileSchedulerArguments,
+@@ -71,9 +71,9 @@
+     SingleTileVarlenScheduler,
+     DynamicPersistentVarlenScheduler,
+ )
+-from flash_attn.cute.fa_logging import fa_log, fa_printf
+-from flash_attn.cute.utils import smid
+-from flash_attn.cute.utils import AuxData
++from _relax_fa4_pr2968.cute.fa_logging import fa_log, fa_printf
++from _relax_fa4_pr2968.cute.utils import smid
++from _relax_fa4_pr2968.cute.utils import AuxData
+ 
+ # === TUNING KNOBS (agent-editable) ===
+ # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
+diff --git a/flash_attn/cute/block_info.py b/flash_attn/cute/block_info.py
+--- a/flash_attn/cute/block_info.py
++++ b/flash_attn/cute/block_info.py
+@@ -6,7 +6,7 @@
+ import cutlass.cute as cute
+ from cutlass import Int32, const_expr
+ 
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK, SeqlenInfoQKNewK
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK, SeqlenInfoQKNewK
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/flash_attn/cute/block_sparsity.py b/flash_attn/cute/block_sparsity.py
+--- a/flash_attn/cute/block_sparsity.py
++++ b/flash_attn/cute/block_sparsity.py
+@@ -7,7 +7,7 @@
+ import cutlass.cute as cute
+ import torch
+ 
+-from flash_attn.cute.cute_dsl_utils import get_broadcast_dims, to_cute_tensor
++from _relax_fa4_pr2968.cute.cute_dsl_utils import get_broadcast_dims, to_cute_tensor
+ 
+ 
+ def ceildiv(a: int, b: int) -> int:
+diff --git a/flash_attn/cute/cu_blocks_kernel.py b/flash_attn/cute/cu_blocks_kernel.py
+--- a/flash_attn/cute/cu_blocks_kernel.py
++++ b/flash_attn/cute/cu_blocks_kernel.py
+@@ -6,7 +6,7 @@
+ import cutlass.cute as cute
+ from cutlass import Int32, const_expr
+ 
+-from flash_attn.cute.utils import get_batch_from_cu_tensor
++from _relax_fa4_pr2968.cute.utils import get_batch_from_cu_tensor
+ 
+ 
+ class CuSeqlensToBlocksKernel:
+diff --git a/flash_attn/cute/flash_bwd_preprocess.py b/flash_attn/cute/flash_bwd_preprocess.py
+--- a/flash_attn/cute/flash_bwd_preprocess.py
++++ b/flash_attn/cute/flash_bwd_preprocess.py
+@@ -24,15 +24,15 @@
+ 
+ from quack import copy_utils, layout_utils
+ 
+-from flash_attn.cute import utils
+-from flash_attn.cute.seqlen_info import SeqlenInfo
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfo
+ from quack.cute_dsl_utils import ParamsBase
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     SingleTileScheduler,
+     SingleTileVarlenScheduler,
+     TileSchedulerArguments,
+ )
+-from flash_attn.cute.pack_gqa import pack_gqa_layout
++from _relax_fa4_pr2968.cute.pack_gqa import pack_gqa_layout
+ 
+ 
+ class FlashAttentionBackwardPreprocess:
+diff --git a/flash_attn/cute/cache_utils.py b/flash_attn/cute/cache_utils.py
+--- a/flash_attn/cute/cache_utils.py
++++ b/flash_attn/cute/cache_utils.py
+@@ -17,7 +17,7 @@
+ import cutlass.cute as cute
+ import tvm_ffi
+ from cutlass.cutlass_dsl import JitCompiledFunction
+-from flash_attn.cute.fa_logging import fa_log
++from _relax_fa4_pr2968.cute.fa_logging import fa_log
+ 
+ # Pre-load cute DSL runtime libraries with RTLD_GLOBAL so that their symbols
+ # (e.g. _cudaLibraryLoadData) are visible to .so modules loaded later via dlopen.
+diff --git a/flash_attn/cute/softmax.py b/flash_attn/cute/softmax.py
+--- a/flash_attn/cute/softmax.py
++++ b/flash_attn/cute/softmax.py
+@@ -10,10 +10,10 @@
+ from cutlass import Float32, Boolean
+ 
+ from quack import layout_utils
+-import flash_attn.cute.utils as utils
++import _relax_fa4_pr2968.cute.utils as utils
+ from quack.cute_dsl_utils import ParamsBase
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.utils import AuxData
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.utils import AuxData
+ 
+ 
+ @cute.jit
+diff --git a/flash_attn/cute/tile_scheduler.py b/flash_attn/cute/tile_scheduler.py
+--- a/flash_attn/cute/tile_scheduler.py
++++ b/flash_attn/cute/tile_scheduler.py
+@@ -26,8 +26,8 @@
+ 
+ from quack.cute_dsl_utils import ParamsBase
+ 
+-import flash_attn.cute.utils as utils
+-from flash_attn.cute.fast_math import clz
++import _relax_fa4_pr2968.cute.utils as utils
++from _relax_fa4_pr2968.cute.fast_math import clz
+ 
+ 
+ class SchedulingMode(IntEnum):
+diff --git a/flash_attn/cute/flash_fwd.py b/flash_attn/cute/flash_fwd.py
+--- a/flash_attn/cute/flash_fwd.py
++++ b/flash_attn/cute/flash_fwd.py
+@@ -23,18 +23,18 @@
+ from quack import copy_utils
+ from quack import layout_utils
+ 
+-from flash_attn.cute import ampere_helpers as sm80_utils
+-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+-from flash_attn.cute import utils
+-from flash_attn.cute.mask import AttentionMask
+-from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
+-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+-from flash_attn.cute.named_barrier import NamedBarrierFwd
+-from flash_attn.cute.block_sparsity import BlockSparseTensors
+-from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+-from flash_attn.cute.utils import AuxData
++from _relax_fa4_pr2968.cute import ampere_helpers as sm80_utils
++from _relax_fa4_pr2968.cute.cute_dsl_utils import assume_tensor_aligned
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute.mask import AttentionMask
++from _relax_fa4_pr2968.cute.softmax import Softmax, apply_score_mod_inner
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute.pack_gqa import PackGQA, pack_gqa_layout
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierFwd
++from _relax_fa4_pr2968.cute.block_sparsity import BlockSparseTensors
++from _relax_fa4_pr2968.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
++from _relax_fa4_pr2968.cute.utils import AuxData
+ 
+ 
+ class FlashAttentionForwardBase:
+@@ -1244,6 +1244,6 @@
+ # SM90 forward pass moved to flash_fwd_sm90.py; re-export for backward compatibility
+ def __getattr__(name):
+     if name == "FlashAttentionForwardSm90":
+-        from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
++        from _relax_fa4_pr2968.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+         return FlashAttentionForwardSm90
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -17,20 +17,20 @@
+ import cutlass.cute as cute
+ from cutlass import Int32, Float32
+ from quack.compile_utils import make_fake_tensor as fake_tensor
+-from flash_attn.cute.cache_utils import get_jit_cache
+-from flash_attn.cute.testing import is_fake_mode
++from _relax_fa4_pr2968.cute.cache_utils import get_jit_cache
++from _relax_fa4_pr2968.cute.testing import is_fake_mode
+ 
+ 
+ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
+-    from flash_attn.cute import cute_dsl_ptxas  # noqa: F401
++    from _relax_fa4_pr2968.cute import cute_dsl_ptxas  # noqa: F401
+ 
+     # Patch to dump ptx and then use system ptxas to compile to cubin
+     cute_dsl_ptxas.patch()
+ 
+ 
+-from flash_attn.cute import utils
+-from flash_attn.cute import fa_logging
+-from flash_attn.cute.cute_dsl_utils import (
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute import fa_logging
++from _relax_fa4_pr2968.cute.cute_dsl_utils import (
+     get_aux_tensor_metadata,
+     get_broadcast_dims,
+     get_num_sms_for_selection,
+@@ -39,36 +39,36 @@
+     to_cute_tensor,
+     validate_output_layout,
+ )
+-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
+-from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+-from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+-from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+-from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
+-from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+-from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+-from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
+-from flash_attn.cute.flash_bwd_postprocess import (
++from _relax_fa4_pr2968.cute.flash_fwd import FlashAttentionForwardSm80
++from _relax_fa4_pr2968.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
++from _relax_fa4_pr2968.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
++from _relax_fa4_pr2968.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
++from _relax_fa4_pr2968.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
++from _relax_fa4_pr2968.cute.flash_bwd import FlashAttentionBackwardSm80
++from _relax_fa4_pr2968.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
++from _relax_fa4_pr2968.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
++from _relax_fa4_pr2968.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
++from _relax_fa4_pr2968.cute.flash_bwd_postprocess import (
+     FlashAttentionBackwardPostprocess,
+     LearnableSinkBwdTensors,
+     DSinkReduceKernel,
+ )
+-from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+-from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
+-from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
+-from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
+-from flash_attn.cute.flash_fwd_mla_1cta_sm100 import FlashAttentionMLAForward1CtaSm100
+-from flash_attn.cute.flash_fwd_mla_1cta_kb64_sm100 import FlashAttentionMLAForward1CtaKb64Sm100
+-from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
+-from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
+-from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
+-from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100_h64 import dQdQvGemmKernelH64
+-from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
++from _relax_fa4_pr2968.cute.flash_fwd_combine import FlashAttentionForwardCombine
++from _relax_fa4_pr2968.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
++from _relax_fa4_pr2968.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
++from _relax_fa4_pr2968.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
++from _relax_fa4_pr2968.cute.flash_fwd_mla_1cta_sm100 import FlashAttentionMLAForward1CtaSm100
++from _relax_fa4_pr2968.cute.flash_fwd_mla_1cta_kb64_sm100 import FlashAttentionMLAForward1CtaKb64Sm100
++from _relax_fa4_pr2968.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
++from _relax_fa4_pr2968.cute.pack_gqa import sparse_mla_qhead_tile
++from _relax_fa4_pr2968.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
++from _relax_fa4_pr2968.cute.flash_bwd_mla_dq_dqv_sm100_h64 import dQdQvGemmKernelH64
++from _relax_fa4_pr2968.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
+ 
+ # SM100 head_dim=256 2CTA backward kernel
+ 
+-from flash_attn.cute.utils import AuxData
+-from flash_attn.cute.block_sparsity import (
++from _relax_fa4_pr2968.cute.utils import AuxData
++from _relax_fa4_pr2968.cute.block_sparsity import (
+     BlockSparseTensorsTorch,
+     block_sparse_bwd_supports_2cta,
+     get_kv_subtile_factor,
+diff --git a/flash_attn/cute/flash_fwd_mla_1cta_sm100.py b/flash_attn/cute/flash_fwd_mla_1cta_sm100.py
+--- a/flash_attn/cute/flash_fwd_mla_1cta_sm100.py
++++ b/flash_attn/cute/flash_fwd_mla_1cta_sm100.py
+@@ -54,23 +54,23 @@
+ 
+ from quack import copy_utils
+ 
+-from flash_attn.cute import utils as fa_utils
+-from flash_attn.cute.utils import get_batch_from_cu_tensor
+-from flash_attn.cute.pack_gqa import (
++from _relax_fa4_pr2968.cute import utils as fa_utils
++from _relax_fa4_pr2968.cute.utils import get_batch_from_cu_tensor
++from _relax_fa4_pr2968.cute.pack_gqa import (
+     PackGQA,
+     pack_gqa_layout,
+     qheads_first_tma_view,
+     regroup_padded_qheads,
+     sparse_mla_qhead_tile,
+ )
+-from flash_attn.cute.paged_kv import PagedKVManager
+-from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
+-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+-import flash_attn.cute.blackwell_helpers as fa_sm100_utils
+-from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.paged_kv import PagedKVManager
++from _relax_fa4_pr2968.cute.topk_gather_kv import CpasyncGatherKVManager
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute.flash_fwd_sm100 import DescaleTensors
++import _relax_fa4_pr2968.cute.blackwell_helpers as fa_sm100_utils
++from _relax_fa4_pr2968.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     SchedulerState,
+     SchedulingMode,
+     TileSchedulerArguments,
+@@ -80,7 +80,7 @@
+     SingleTileVarlenScheduler,
+     ParamsBase,
+ )
+-from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
+ 
+ 
+ class FlashAttentionMLAForward1CtaSm100:
+diff --git a/flash_attn/cute/flash_bwd_sm100.py b/flash_attn/cute/flash_bwd_sm100.py
+--- a/flash_attn/cute/flash_bwd_sm100.py
++++ b/flash_attn/cute/flash_bwd_sm100.py
+@@ -16,29 +16,29 @@
+ from cutlass.pipeline import PipelineAsync
+ 
+ from quack import layout_utils
+-from flash_attn.cute import utils
+-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+-from flash_attn.cute import copy_utils
+-from flash_attn.cute import pipeline
+-from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
+-from flash_attn.cute.mask import AttentionMask
+-from flash_attn.cute.pack_gqa import pack_gqa_layout
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute.cute_dsl_utils import assume_tensor_aligned
++from _relax_fa4_pr2968.cute import copy_utils
++from _relax_fa4_pr2968.cute import pipeline
++from _relax_fa4_pr2968.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
++from _relax_fa4_pr2968.cute.mask import AttentionMask
++from _relax_fa4_pr2968.cute.pack_gqa import pack_gqa_layout
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
+ from quack.cute_dsl_utils import ParamsBase
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     TileSchedulerArguments,
+     SingleTileScheduler,
+     SingleTileLPTBwdScheduler,  # noqa
+     SingleTileVarlenScheduler,
+ )
+ 
+-from flash_attn.cute import barrier
+-from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
+-from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
+-from flash_attn.cute.block_sparsity import BlockSparseTensors
+-from flash_attn.cute.utils import AuxData
+-from flash_attn.cute.block_sparse_utils import (
++from _relax_fa4_pr2968.cute import barrier
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierBwdSm100
++from _relax_fa4_pr2968.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
++from _relax_fa4_pr2968.cute.block_sparsity import BlockSparseTensors
++from _relax_fa4_pr2968.cute.utils import AuxData
++from _relax_fa4_pr2968.cute.block_sparse_utils import (
+     get_total_q_block_count_bwd,
+     get_block_sparse_iteration_info_bwd,
+     get_m_block_from_iter_bwd,
+diff --git a/flash_attn/cute/flash_fwd_mla_1cta_kb64_sm100.py b/flash_attn/cute/flash_fwd_mla_1cta_kb64_sm100.py
+--- a/flash_attn/cute/flash_fwd_mla_1cta_kb64_sm100.py
++++ b/flash_attn/cute/flash_fwd_mla_1cta_kb64_sm100.py
+@@ -55,18 +55,18 @@
+ from cutlass.utils import ClcDynamicPersistentTileScheduler
+ from cutlass._mlir.dialects import llvm
+ 
+-from flash_attn.cute.pack_gqa import (
++from _relax_fa4_pr2968.cute.pack_gqa import (
+     pack_gqa_layout,
+     qheads_first_tma_view,
+     regroup_padded_qheads,
+ )
+-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
+-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+-import flash_attn.cute.blackwell_helpers as fa_sm100_utils
+-from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.cute_dsl_utils import assume_tensor_aligned
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute.flash_fwd_sm100 import DescaleTensors
++import _relax_fa4_pr2968.cute.blackwell_helpers as fa_sm100_utils
++from _relax_fa4_pr2968.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     SchedulerState,
+     SingleTileLPTScheduler,
+     SingleTileScheduler,
+@@ -74,9 +74,9 @@
+     TileSchedulerProtocol,
+     ParamsBase,
+ )
+-from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManagerH64
+-from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
+-from flash_attn.cute.flash_fwd_mla_1cta_sm100 import FlashAttentionMLAForward1CtaSm100
++from _relax_fa4_pr2968.cute.topk_gather_kv import CpasyncGatherKVManagerH64
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
++from _relax_fa4_pr2968.cute.flash_fwd_mla_1cta_sm100 import FlashAttentionMLAForward1CtaSm100
+ 
+ 
+ @cute.jit
+diff --git a/flash_attn/cute/compute_block_sparsity.py b/flash_attn/cute/compute_block_sparsity.py
+--- a/flash_attn/cute/compute_block_sparsity.py
++++ b/flash_attn/cute/compute_block_sparsity.py
+@@ -6,27 +6,27 @@
+ import torch
+ from cutlass import Boolean, Int8, Int32, const_expr
+ 
+-from flash_attn.cute.block_sparsity import (
++from _relax_fa4_pr2968.cute.block_sparsity import (
+     BlockSparseTensors,
+     BlockSparseTensorsTorch,
+     to_cute_block_sparse_tensors,
+ )
+-from flash_attn.cute.block_sparse_utils import get_curr_blocksparse_tensors
+-from flash_attn.cute.testing import is_fake_mode
+-from flash_attn.cute.cute_dsl_utils import (
++from _relax_fa4_pr2968.cute.block_sparse_utils import get_curr_blocksparse_tensors
++from _relax_fa4_pr2968.cute.testing import is_fake_mode
++from _relax_fa4_pr2968.cute.cute_dsl_utils import (
+     get_aux_tensor_metadata,
+     to_cute_aux_tensor,
+     to_cute_tensor,
+ )
+-from flash_attn.cute.utils import (
++from _relax_fa4_pr2968.cute.utils import (
+     get_batch_from_cu_tensor,
+     hash_callable,
+     scalar_to_ssa,
+     ssa_to_scalar,
+ )
+-from flash_attn.cute.mask import call_mask_mod
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.utils import AuxData
++from _relax_fa4_pr2968.cute.mask import call_mask_mod
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.utils import AuxData
+ 
+ 
+ class BlockSparsityKernel:
+diff --git a/flash_attn/cute/block_sparse_utils.py b/flash_attn/cute/block_sparse_utils.py
+--- a/flash_attn/cute/block_sparse_utils.py
++++ b/flash_attn/cute/block_sparse_utils.py
+@@ -14,11 +14,11 @@
+ from quack import copy_utils
+ 
+ # Import data structures from block_sparsity
+-from flash_attn.cute.block_sparsity import BlockSparseTensors
+-from flash_attn.cute.named_barrier import NamedBarrierBwd
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.softmax import apply_learnable_sink, load_learnable_sink
+-from flash_attn.cute.utils import AuxData
++from _relax_fa4_pr2968.cute.block_sparsity import BlockSparseTensors
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierBwd
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.softmax import apply_learnable_sink, load_learnable_sink
++from _relax_fa4_pr2968.cute.utils import AuxData
+ 
+ 
+ @cute.jit
+diff --git a/flash_attn/cute/flash_fwd_combine.py b/flash_attn/cute/flash_fwd_combine.py
+--- a/flash_attn/cute/flash_fwd_combine.py
++++ b/flash_attn/cute/flash_fwd_combine.py
+@@ -14,10 +14,10 @@
+ 
+ from quack.cute_dsl_utils import ParamsBase
+ 
+-from flash_attn.cute import utils
+-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+-from flash_attn.cute.seqlen_info import SeqlenInfo
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute.cute_dsl_utils import assume_tensor_aligned
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfo
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     SingleTileScheduler,
+     SingleTileVarlenScheduler,
+     TileSchedulerArguments,
+diff --git a/flash_attn/cute/flash_bwd_postprocess.py b/flash_attn/cute/flash_bwd_postprocess.py
+--- a/flash_attn/cute/flash_bwd_postprocess.py
++++ b/flash_attn/cute/flash_bwd_postprocess.py
+@@ -19,13 +19,13 @@
+ from quack import layout_utils
+ from quack import sm90_utils
+ 
+-from flash_attn.cute import utils
+-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+-from flash_attn.cute import ampere_helpers as sm80_utils
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute.cute_dsl_utils import assume_tensor_aligned
++from _relax_fa4_pr2968.cute import ampere_helpers as sm80_utils
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
+ import cutlass.cute.nvgpu.tcgen05 as tcgen05
+ from quack.cute_dsl_utils import ParamsBase
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     SingleTileScheduler,
+     SingleTileVarlenScheduler,
+     TileSchedulerArguments,
+diff --git a/flash_attn/cute/flash_bwd_sm90.py b/flash_attn/cute/flash_bwd_sm90.py
+--- a/flash_attn/cute/flash_bwd_sm90.py
++++ b/flash_attn/cute/flash_bwd_sm90.py
+@@ -17,25 +17,25 @@
+ from quack import sm90_utils
+ from quack.sm90_utils import gemm_zero_init, gemm_w_idx
+ 
+-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+-from flash_attn.cute import utils
+-from flash_attn.cute.mask import AttentionMask
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
+-from flash_attn.cute import pipeline
++from _relax_fa4_pr2968.cute.cute_dsl_utils import assume_tensor_aligned
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute.mask import AttentionMask
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute import pipeline
+ from quack.cute_dsl_utils import ParamsBase
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     TileSchedulerArguments,
+     SingleTileScheduler,
+     SingleTileLPTBwdScheduler,
+     SingleTileVarlenScheduler,
+ )
+-from flash_attn.cute import barrier
+-from flash_attn.cute.named_barrier import NamedBarrierBwd
+-from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
+-from flash_attn.cute.block_sparsity import BlockSparseTensors
+-from flash_attn.cute.utils import AuxData
+-from flash_attn.cute.block_sparse_utils import (
++from _relax_fa4_pr2968.cute import barrier
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierBwd
++from _relax_fa4_pr2968.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
++from _relax_fa4_pr2968.cute.block_sparsity import BlockSparseTensors
++from _relax_fa4_pr2968.cute.utils import AuxData
++from _relax_fa4_pr2968.cute.block_sparse_utils import (
+     get_total_q_block_count_bwd,
+     produce_block_sparse_q_loads_bwd_sm90,
+     consume_block_sparse_mma_bwd_sm90,
+diff --git a/flash_attn/cute/pack_gqa.py b/flash_attn/cute/pack_gqa.py
+--- a/flash_attn/cute/pack_gqa.py
++++ b/flash_attn/cute/pack_gqa.py
+@@ -9,7 +9,7 @@
+ 
+ 
+ from quack import layout_utils
+-import flash_attn.cute.utils as utils
++import _relax_fa4_pr2968.cute.utils as utils
+ 
+ 
+ def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
+diff --git a/flash_attn/cute/flash_bwd.py b/flash_attn/cute/flash_bwd.py
+--- a/flash_attn/cute/flash_bwd.py
++++ b/flash_attn/cute/flash_bwd.py
+@@ -15,17 +15,17 @@
+ import cutlass.utils as utils_basic
+ 
+ from quack import layout_utils
+-from flash_attn.cute import ampere_helpers as sm80_utils
+-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+-from flash_attn.cute import utils
+-from flash_attn.cute.mask import AttentionMask
+-from flash_attn.cute.softmax import call_score_mod, call_score_mod_bwd
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute import ampere_helpers as sm80_utils
++from _relax_fa4_pr2968.cute.cute_dsl_utils import assume_tensor_aligned
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute.mask import AttentionMask
++from _relax_fa4_pr2968.cute.softmax import call_score_mod, call_score_mod_bwd
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
+ from quack.cute_dsl_utils import ParamsBase
+-from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+-from flash_attn.cute.block_sparsity import BlockSparseTensors
+-from flash_attn.cute.utils import AuxData
++from _relax_fa4_pr2968.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
++from _relax_fa4_pr2968.cute.block_sparsity import BlockSparseTensors
++from _relax_fa4_pr2968.cute.utils import AuxData
+ 
+ 
+ class FlashAttentionBackwardSm80:
+diff --git a/flash_attn/cute/flash_bwd_mla_dk_sm100.py b/flash_attn/cute/flash_bwd_mla_dk_sm100.py
+--- a/flash_attn/cute/flash_bwd_mla_dk_sm100.py
++++ b/flash_attn/cute/flash_bwd_mla_dk_sm100.py
+@@ -45,7 +45,7 @@
+ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+ from cutlass.cute.nvgpu import cpasync, tcgen05
+ 
+-from flash_attn.cute.utils import get_batch_from_cu_tensor
++from _relax_fa4_pr2968.cute.utils import get_batch_from_cu_tensor
+ 
+ 
+ @dsl_user_op
+diff --git a/flash_attn/cute/prepare_scheduler.py b/flash_attn/cute/prepare_scheduler.py
+--- a/flash_attn/cute/prepare_scheduler.py
++++ b/flash_attn/cute/prepare_scheduler.py
+@@ -9,7 +9,7 @@
+ import cutlass.cute as cute
+ from cutlass import Int32, const_expr, Float32
+ from cutlass.cute import FastDivmodDivisorV2
+-import flash_attn.cute.utils as utils
++import _relax_fa4_pr2968.cute.utils as utils
+ 
+ 
+ class SchedulerMetadataTensorsTorch(NamedTuple):
+diff --git a/flash_attn/cute/benchmark_flash_attention_fp8.py b/flash_attn/cute/benchmark_flash_attention_fp8.py
+--- a/flash_attn/cute/benchmark_flash_attention_fp8.py
++++ b/flash_attn/cute/benchmark_flash_attention_fp8.py
+@@ -1,7 +1,7 @@
+ # Benchmark FP8 attention for FA4 (CuTe-DSL) on SM100.
+ #
+ # Run (recommended):
+-#   python -m flash_attn.cute.benchmark_flash_attention_fp8
++#   python -m _relax_fa4_pr2968.cute.benchmark_flash_attention_fp8
+ #
+ # Notes:
+ # - This is intended to be used while bringing up FP8 support for SM100.
+@@ -21,8 +21,8 @@
+ import torch
+ from einops import rearrange
+ 
+-from flash_attn.cute.benchmark import benchmark_forward
+-from flash_attn.cute.interface import _flash_attn_fwd as flash_attn_cute_fwd
++from _relax_fa4_pr2968.cute.benchmark import benchmark_forward
++from _relax_fa4_pr2968.cute.interface import _flash_attn_fwd as flash_attn_cute_fwd
+ 
+ try:
+     import cudnn
+diff --git a/flash_attn/cute/blackwell_helpers.py b/flash_attn/cute/blackwell_helpers.py
+--- a/flash_attn/cute/blackwell_helpers.py
++++ b/flash_attn/cute/blackwell_helpers.py
+@@ -8,7 +8,7 @@
+ from cutlass.cute.nvgpu import tcgen05
+ from cutlass._mlir.dialects import llvm
+ 
+-import flash_attn.cute.mma_sm100_desc as sm100_desc
++import _relax_fa4_pr2968.cute.mma_sm100_desc as sm100_desc
+ 
+ 
+ def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
+diff --git a/flash_attn/cute/flash_fwd_sm90.py b/flash_attn/cute/flash_fwd_sm90.py
+--- a/flash_attn/cute/flash_fwd_sm90.py
++++ b/flash_attn/cute/flash_fwd_sm90.py
+@@ -21,23 +21,23 @@
+ from quack import layout_utils
+ from quack import sm90_utils
+ 
+-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+-from flash_attn.cute import utils
+-from flash_attn.cute.mask import AttentionMask
+-from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
+-from flash_attn.cute.block_sparsity import BlockSparseTensors
+-from flash_attn.cute.block_sparse_utils import (
++from _relax_fa4_pr2968.cute.cute_dsl_utils import assume_tensor_aligned
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute.mask import AttentionMask
++from _relax_fa4_pr2968.cute.softmax import Softmax, apply_score_mod_inner
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute.block_sparsity import BlockSparseTensors
++from _relax_fa4_pr2968.cute.block_sparse_utils import (
+     produce_block_sparse_loads,
+     consume_block_sparse_loads,
+ )
+-from flash_attn.cute import pipeline as pipeline_custom
+-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
+-from flash_attn.cute.paged_kv import PagedKVManager
+-from flash_attn.cute.named_barrier import NamedBarrierFwd
++from _relax_fa4_pr2968.cute import pipeline as pipeline_custom
++from _relax_fa4_pr2968.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
++from _relax_fa4_pr2968.cute.paged_kv import PagedKVManager
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierFwd
+ from quack.cute_dsl_utils import ParamsBase
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     TileSchedulerArguments,
+     SingleTileScheduler,
+     SingleTileLPTScheduler,
+@@ -45,8 +45,8 @@
+ )
+ from cutlass.cute import FastDivmodDivisorV2
+ 
+-from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
+-from flash_attn.cute.utils import AuxData
++from _relax_fa4_pr2968.cute.flash_fwd import FlashAttentionForwardBase
++from _relax_fa4_pr2968.cute.utils import AuxData
+ 
+ 
+ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
+diff --git a/flash_attn/cute/topk_gather_kv.py b/flash_attn/cute/topk_gather_kv.py
+--- a/flash_attn/cute/topk_gather_kv.py
++++ b/flash_attn/cute/topk_gather_kv.py
+@@ -9,8 +9,8 @@
+ from cutlass import Int32, Uint32, const_expr, Boolean
+ from cutlass.cute import FastDivmodDivisorV2
+ 
+-from flash_attn.cute import utils
+-from flash_attn.cute.utils import warp_reduce
++from _relax_fa4_pr2968.cute import utils
++from _relax_fa4_pr2968.cute.utils import warp_reduce
+ from quack.cute_dsl_utils import ParamsBase
+ 
+ import math
+diff --git a/flash_attn/cute/flash_fwd_sm120.py b/flash_attn/cute/flash_fwd_sm120.py
+--- a/flash_attn/cute/flash_fwd_sm120.py
++++ b/flash_attn/cute/flash_fwd_sm120.py
+@@ -9,7 +9,7 @@
+ import cutlass.utils as utils_basic
+ from cutlass.base_dsl.arch import Arch
+ 
+-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
++from _relax_fa4_pr2968.cute.flash_fwd import FlashAttentionForwardSm80
+ 
+ 
+ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
+diff --git a/flash_attn/cute/flash_bwd_sm120.py b/flash_attn/cute/flash_bwd_sm120.py
+--- a/flash_attn/cute/flash_bwd_sm120.py
++++ b/flash_attn/cute/flash_bwd_sm120.py
+@@ -8,7 +8,7 @@
+ import cutlass
+ import cutlass.utils as utils_basic
+ 
+-from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
++from _relax_fa4_pr2968.cute.flash_bwd import FlashAttentionBackwardSm80
+ 
+ 
+ class FlashAttentionBackwardSm120(FlashAttentionBackwardSm80):
+diff --git a/flash_attn/cute/flash_fwd_mla_sm100.py b/flash_attn/cute/flash_fwd_mla_sm100.py
+--- a/flash_attn/cute/flash_fwd_mla_sm100.py
++++ b/flash_attn/cute/flash_fwd_mla_sm100.py
+@@ -18,22 +18,22 @@
+ 
+ from quack import copy_utils
+ 
+-from flash_attn.cute.pack_gqa import (
++from _relax_fa4_pr2968.cute.pack_gqa import (
+     pack_gqa_layout,
+     make_packgqa_tiled_tma_atom,
+     qheads_first_tma_view,
+     regroup_padded_qheads,
+     sparse_mla_qhead_tile,
+ )
+-from flash_attn.cute.paged_kv import PagedKVManager
+-from flash_attn.cute import utils as fa_utils
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
+-from flash_attn.cute.mask import AttentionMask
+-import flash_attn.cute.blackwell_helpers as fa_sm100_utils
+-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+-from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.paged_kv import PagedKVManager
++from _relax_fa4_pr2968.cute import utils as fa_utils
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
++from _relax_fa4_pr2968.cute.mask import AttentionMask
++import _relax_fa4_pr2968.cute.blackwell_helpers as fa_sm100_utils
++from _relax_fa4_pr2968.cute.flash_fwd_sm100 import DescaleTensors
++from _relax_fa4_pr2968.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     SchedulerState,
+     SchedulingMode,
+     TileSchedulerArguments,
+@@ -43,13 +43,13 @@
+     SingleTileVarlenScheduler,
+     ParamsBase,
+ )
+-from flash_attn.cute.fa_logging import fa_log, fa_printf
+-from flash_attn.cute.utils import smid, get_batch_from_cu_tensor
+-
+-from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
+-
+-
+-from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
++from _relax_fa4_pr2968.cute.fa_logging import fa_log, fa_printf
++from _relax_fa4_pr2968.cute.utils import smid, get_batch_from_cu_tensor
++
++from _relax_fa4_pr2968.cute.topk_gather_kv import CpasyncGatherKVManager
++
++
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
+ 
+ 
+ class FlashAttentionMLAForwardSm100:
+diff --git a/flash_attn/cute/flash_bwd_mla_dq_dqv_sm100.py b/flash_attn/cute/flash_bwd_mla_dq_dqv_sm100.py
+--- a/flash_attn/cute/flash_bwd_mla_dq_dqv_sm100.py
++++ b/flash_attn/cute/flash_bwd_mla_dq_dqv_sm100.py
+@@ -44,9 +44,9 @@
+ from cutlass.cute.nvgpu import cpasync, tcgen05
+ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+ 
+-from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
+-from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
+-from flash_attn.cute.utils import get_batch_from_cu_tensor
++from _relax_fa4_pr2968.cute.pack_gqa import sparse_mla_qhead_tile
++from _relax_fa4_pr2968.cute.topk_gather_kv import CpasyncGatherKVManager
++from _relax_fa4_pr2968.cute.utils import get_batch_from_cu_tensor
+ 
+ 
+ class dQdQvGemmKernel:
+diff --git a/flash_attn/cute/flash_bwd_mla_sm100.py b/flash_attn/cute/flash_bwd_mla_sm100.py
+--- a/flash_attn/cute/flash_bwd_mla_sm100.py
++++ b/flash_attn/cute/flash_bwd_mla_sm100.py
+@@ -16,17 +16,17 @@
+ 
+ from quack import copy_utils, layout_utils
+ 
+-from flash_attn.cute.pack_gqa import (
++from _relax_fa4_pr2968.cute.pack_gqa import (
+     pack_gqa_layout,
+     qheads_first_tma_view,
+     regroup_padded_qheads,
+     select_modes,
+     sparse_mla_qhead_tile,
+ )
+-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+-from flash_attn.cute.block_info import BlockInfo
+-import flash_attn.cute.blackwell_helpers as fa_sm100_utils
+-from flash_attn.cute.tile_scheduler import (
++from _relax_fa4_pr2968.cute.seqlen_info import SeqlenInfoQK
++from _relax_fa4_pr2968.cute.block_info import BlockInfo
++import _relax_fa4_pr2968.cute.blackwell_helpers as fa_sm100_utils
++from _relax_fa4_pr2968.cute.tile_scheduler import (
+     SchedulerState,
+     SchedulingMode,
+     TileSchedulerArguments,
+@@ -36,14 +36,14 @@
+     SingleTileVarlenScheduler,
+     ParamsBase,
+ )
+-from flash_attn.cute.fa_logging import fa_log, fa_printf
+-from flash_attn.cute.utils import smid, elem_pointer, get_batch_from_cu_tensor
+-from flash_attn.cute.copy_utils import tiled_copy_2d, atomic_add_fp32x4
+-
+-from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
+-
+-
+-from flash_attn.cute.named_barrier import NamedBarrierBwdSm100_MLA2CTA
++from _relax_fa4_pr2968.cute.fa_logging import fa_log, fa_printf
++from _relax_fa4_pr2968.cute.utils import smid, elem_pointer, get_batch_from_cu_tensor
++from _relax_fa4_pr2968.cute.copy_utils import tiled_copy_2d, atomic_add_fp32x4
++
++from _relax_fa4_pr2968.cute.topk_gather_kv import CpasyncGatherKVManager
++
++
++from _relax_fa4_pr2968.cute.named_barrier import NamedBarrierBwdSm100_MLA2CTA
+ 
+ 
+ class FlashAttentionSparseMLABackwardSm100:

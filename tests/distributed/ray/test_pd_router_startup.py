@@ -350,17 +350,30 @@ def test_router_cleanup_retains_failed_process_for_retry(rollout_module):
     assert rollout_module._LAUNCHED_ROUTER_PROCESSES == []
 
 
-def test_rollout_owner_stops_router_even_when_engine_disposal_fails(monkeypatch, rollout_module):
+@pytest.mark.parametrize("failure", [None, "engine", "detach"])
+def test_rollout_owner_releases_tq_and_router_on_disposal(monkeypatch, rollout_module, failure):
     cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
     manager = object.__new__(cls)
     manager._stop_eviction_monitor = Mock()
     manager._health_monitors = [Mock()]
-    manager._shutdown_all_engines = Mock(side_effect=RuntimeError("engine shutdown failed"))
-    stop = Mock()
-    monkeypatch.setattr(rollout_module, "stop_launched_routers", stop)
-    with pytest.raises(RuntimeError, match="engine shutdown failed"):
+    manager.data_system_client = Mock()
+    events = []
+
+    def cleanup(stage):
+        events.append(stage)
+        if stage == failure:
+            raise RuntimeError(f"{stage} shutdown failed")
+
+    manager._shutdown_all_engines = lambda: cleanup("engine")
+    monkeypatch.setattr(rollout_module, "detach_tq_client", lambda: cleanup("detach"))
+    monkeypatch.setattr(rollout_module, "stop_launched_routers", lambda: cleanup("router"))
+    if failure is None:
         manager.dispose()
-    stop.assert_called_once()
+    else:
+        with pytest.raises(RuntimeError, match=f"{failure} shutdown failed"):
+            manager.dispose()
+    assert events == ["engine", "detach", "router"]
+    assert manager.data_system_client is None
 
 
 def test_engine_shutdown_uses_one_deadline_for_all_pd_workers(monkeypatch, rollout_module):

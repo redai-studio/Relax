@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import os
 import time
 from contextlib import contextmanager
@@ -31,9 +33,14 @@ def monkey_patch_torch_dist(args=None):
     old_new_group = dist.new_group
     old_new_group_dict[pid] = old_new_group
     dist.old_new_group = old_new_group
+    use_reloadable_groups = getattr(args, "offload_train", True)
 
     def new_group(*args, **kwargs):
         group = old_new_group(*args, **kwargs)
+        # Resident training never destroys/reloads groups. Keep the registered
+        # native ProcessGroup metadata required by torch.compile collectives.
+        if not use_reloadable_groups:
+            return group
         # skip none nccl group.
         if len(args) >= 3 and args[2] == "gloo" or "backend" in kwargs and kwargs["backend"] == "gloo":
             return group
@@ -294,6 +301,26 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
 
     def alltoall(self, *a, **kw):
         return self._fwd("alltoall", *a, **kw)
+
+    # torch>=2.13 renamed the single-tensor collectives on ProcessGroup and
+    # ``distributed_c10d`` now calls the new names (``group.reduce_scatter_single(...)``
+    # instead of ``group._reduce_scatter_base(...)`` etc.). Without these overrides
+    # the call falls through to the C++ trampoline default, which returns a
+    # ``PyWorkHolder`` whose ``wait()`` segfaults. Harmless on older torch (never called).
+    def reduce_scatter_single(self, *a, **kw):
+        return self._fwd("reduce_scatter_single", *a, **kw)
+
+    def reduce_scatter_single_coalesced(self, *a, **kw):
+        return self._fwd("reduce_scatter_single_coalesced", *a, **kw)
+
+    def all_gather_single(self, *a, **kw):
+        return self._fwd("all_gather_single", *a, **kw)
+
+    def all_gather_single_coalesced(self, *a, **kw):
+        return self._fwd("all_gather_single_coalesced", *a, **kw)
+
+    def all_to_all_single(self, *a, **kw):
+        return self._fwd("all_to_all_single", *a, **kw)
 
     def send(self, *a, **kw):
         return self._fwd("send", *a, **kw)

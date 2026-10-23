@@ -1,0 +1,20 @@
+--- a/fla/modules/conv/triton/ops.py
++++ b/fla/modules/conv/triton/ops.py
+@@ -59,7 +59,7 @@
+     if cu_seqlens is not None and chunk_indices is None:
+         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+-    NB = triton.cdiv(B*T, 1024)
++    NB = triton.next_power_of_2(triton.cdiv(B*T, 1024))
+
+     y = torch.empty_like(x, memory_format=torch.contiguous_format)
+
+@@ -170,7 +170,7 @@
+     if cu_seqlens is not None and chunk_indices is None:
+         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+-    NB = triton.cdiv(B*T, 1024)
++    NB = triton.next_power_of_2(triton.cdiv(B*T, 1024))
+
+     y = None
+     if activation is not None:

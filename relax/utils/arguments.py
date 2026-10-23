@@ -42,7 +42,7 @@ logger = get_logger(__name__)
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps'
+    'TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps'
 )
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
@@ -80,6 +80,14 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _nonnegative_finite_float(value: str) -> float:
+    """argparse type for bounded auxiliary-loss coefficients."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a finite non-negative float, got {value!r}")
     return parsed
 
 
@@ -244,6 +252,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=1,
                 help="Fully async pipeline num of iters every global batch.",
             )
+            # ── RDMA transport (MooncakeStore backend) ──────────────────────────
+            # The default selects the existing SimpleStorage data path. These
+            # expose *intent* only; Mooncake internals (endpoint,
+            # buffer, segment, timeout, master strategy) are handled via internal
+            # defaults / deployment environment, not CLI flags.
+            parser.add_argument(
+                "--tq-rdma-mode",
+                choices=["off", "auto", "required"],
+                default="off",
+                help=(
+                    "TransferQueue data-plane transport. 'off' (default) uses "
+                    "SimpleStorage/ZMQ with bounded worker attach and cleanup. "
+                    "'auto' attempts MooncakeStore over host RDMA and falls back "
+                    "to SimpleStorage when it is unavailable (with a WARNING). "
+                    "'required' fails fast instead of falling back."
+                ),
+            )
+            parser.add_argument(
+                "--tq-rdma-device",
+                type=str,
+                default="",
+                help=(
+                    "RDMA device name for MooncakeStore (e.g. mlx5_bond_0). Empty "
+                    "(default) lets Mooncake auto-select. On multi-NIC hosts the "
+                    "auto-selected device may fail cross-node; specify explicitly if "
+                    "needed."
+                ),
+            )
             return parser
 
         def add_cluster_arguments(parser):
@@ -331,6 +367,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="thd",
                 help="The qkv layout for Megatron backend.",
             )
+            qsa_coeff_option = "--qsa-indexer-loss-coeff"
+            if qsa_coeff_option in parser._option_string_actions:
+                # Megatron registers TransformerConfig fields on newer revisions.
+                qsa_coeff_action = parser._option_string_actions[qsa_coeff_option]
+                qsa_coeff_action.type = _nonnegative_finite_float
+                qsa_coeff_action.default = 0.0
+            else:
+                parser.add_argument(
+                    qsa_coeff_option,
+                    type=_nonnegative_finite_float,
+                    default=0.0,
+                    help="QSA Stage-2 indexer KL coefficient; positive values require the opt-in selected-ID sparse backend.",
+                )
             parser.add_argument(
                 "--true-on-policy-mode",
                 action="store_true",
@@ -640,6 +689,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-wholepack",
+                action="store_true",
+                help="Enable the reviewed 64-GPU Qwen3.5 wholepack scheduling policy explicitly.",
+            )
+            parser.add_argument(
+                "--sft-packing-strategy",
+                choices=["balanced", "binpack"],
+                default="balanced",
+                help="Dynamic SFT microbatch packing algorithm; binpack preserves the archived SFT recipe.",
+            )
+            parser.add_argument(
                 "--sft-max-in-flight-steps",
                 type=int,
                 default=None,
@@ -689,19 +749,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=["sft", "cpt"],
                 default="sft",
                 help=(
-                    "Use cpt for text-only continued pretraining: raw text plus tokenizer EOS, "
+                    "Use cpt for continued pretraining: raw text plus tokenizer EOS, "
                     "no chat template, and a CPT loss mask (see --sft-cpt-template). Requires --loss-type sft. "
                     "Read text from --input-key (or text/messages when the default input key is absent)."
                 ),
             )
             parser.add_argument(
                 "--sft-cpt-template",
-                choices=["raw", "qwen3_5"],
+                choices=["raw", "qwen3_5", "multimodal"],
                 default="raw",
                 help=(
                     "CPT text preprocessing. raw preserves text and supervises all tokens; "
                     "qwen3_5 matches ms-swift Qwen3.5 generation preprocessing and "
-                    "all+ignore_empty_think masks. Requires --sft-training-mode cpt."
+                    "all+ignore_empty_think masks; multimodal preserves the chat/processor layout and supervises text tokens. Requires --sft-training-mode cpt."
                 ),
             )
             parser.add_argument(
@@ -2415,6 +2475,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "For example, --memory-snapshot-num-steps 3 dumps after step 2 (0-indexed).",
             )
             parser.add_argument(
+                "--profile-output-dir",
+                type=str,
+                default="traces",
+                help="Root directory for profiler outputs. Experiment name and trace type are appended.",
+            )
+            parser.add_argument(
                 "--profile-target",
                 type=str,
                 choices=["train_overall", "train_actor", "train_log_probs"],
@@ -3267,9 +3333,12 @@ def _validate_cpt_args(args) -> None:
         "--custom-dataset-class": getattr(args, "custom_dataset_class_path", None),
         "--sft-oversize-strategy custom": getattr(args, "sft_oversize_strategy", None) == "custom",
     }
+    if getattr(args, "sft_cpt_template", "raw") == "multimodal":
+        for name in ("--multimodal-keys", "--conversation-key-map", "--apply-chat-template-kwargs"):
+            incompatible.pop(name)
     enabled = [name for name, value in incompatible.items() if value]
     if enabled:
-        raise ValueError(f"Text-only CPT does not support: {', '.join(enabled)}.")
+        raise ValueError(f"Selected CPT template does not support: {', '.join(enabled)}.")
 
 
 def _normalize_sft_max_in_flight_steps(args, is_offline: bool) -> None:

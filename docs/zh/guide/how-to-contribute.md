@@ -264,7 +264,7 @@ make docs-preview
 
 ## CI
 
-PR 会运行 CPU 检查、GPU 单元测试和 GPU/NPU 集成测试。操作 CI 时，在新 PR 评论的首行写一条指令。PR 作者及拥有仓库写权限的贡献者可以重跑、取消 CI。
+PR 会运行 pre-commit 检查、GPU 单元测试和 GPU/NPU 集成测试。操作 CI 时，在新 PR 评论的首行写一条指令。PR 作者及拥有仓库写权限的贡献者可以重跑、取消 CI。
 
 | 指令 | 用途 |
 | --- | --- |
@@ -274,13 +274,12 @@ PR 会运行 CPU 检查、GPU 单元测试和 GPU/NPU 集成测试。操作 CI �
 | `/help` | 查看指令和 target |
 | `/review` | 请求代码 review |
 
-Target 使用 `workflow` 或 `workflow/job` 命名。例如，`/rerun ci` 重跑整个 pre-commit/CPU workflow，`/rerun ci/pre-commit` 选择其中的 pre-commit 检查；`all` 表示所有已配置的 workflow。
+Target 使用 `workflow` 或 `workflow/job` 命名。例如，`/rerun ci` 重跑整个 pre-commit workflow，`/rerun ci/pre-commit` 选择其中的 pre-commit 检查；`all` 表示所有已配置的 workflow。
 
 | Target | Workflow / 检查 |
 | --- | --- |
-| `ci` | 全部 pre-commit 与 CPU 检查 |
+| `ci` | 全部 pre-commit 检查 |
 | `ci/pre-commit` | Pre-commit 检查 |
-| `ci/cpu-310`、`ci/cpu-311`、`ci/cpu-312` | Python 3.10 / 3.11 / 3.12 CPU 测试 |
 | `gpu-unit` | GPU 单元测试 |
 | `integration` | 全部 GPU/NPU 集成测试 |
 | `integration/gpu-async` | Qwen3-4B GPU 异步训练 |

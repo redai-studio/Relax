@@ -274,3 +274,42 @@ def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:
 def evaluation_step_for_rollout(args: Namespace, rollout_id: int) -> int:
     """Map a zero-based training rollout to the evaluation step namespace."""
     return rollout_id + 1 if is_offline_mode(args) else rollout_id
+
+
+def resident_sft_param_overlap_enabled(args: Namespace) -> bool:
+    """Validate the opt-in resident SFT experiment before retaining gathers.
+
+    This first implementation excludes periodic weight readers. Actor-side
+    validation additionally checks there is no rollout manager/model swapping.
+    Explicit save/sleep boundaries still synchronize any pending parameters.
+    """
+    if not Envs.RELAX_SFT_RESIDENT_PARAM_OVERLAP:
+        return False
+    required = ("use_distributed_optimizer", "overlap_grad_reduce", "overlap_param_gather")
+    incompatible = (
+        "fully_async",
+        "hybrid",
+        "use_critic",
+        "keep_old_actor",
+        "enable_mtp_training",
+        "mtp_only_training",
+        "eval_prompt_data",
+        "eval_size",
+        "sft_predict_interval",
+        "save",
+        "save_hf",
+        "rotate_ckpt",
+        "debug_train_only",
+        "debug_rollout_only",
+        "custom_megatron_before_train_step_hook_path",
+    )
+    if not is_sft_mode(args) or any(not getattr(args, name, False) for name in required):
+        raise ValueError("Resident parameter overlap requires SFT and distributed optimizer with both overlap flags")
+    conflicts = [name for name in incompatible if getattr(args, name, None)]
+    if conflicts:
+        raise ValueError(f"Resident SFT parameter overlap does not support: {', '.join(conflicts)}")
+    if getattr(args, "moe_shared_expert_overlap", False) and not getattr(
+        args, "_relax_shared_expert_gate_ready_verified", False
+    ):
+        raise ValueError("Shared resident overlap requires verified gate parameter readiness")
+    return True

@@ -459,6 +459,9 @@ def post_process_env(args, env):
     if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
         env["env_vars"]["RELAX_SFT_TQ_SHARDS"] = str(Envs.RELAX_SFT_TQ_SHARDS)
 
+    # Use the same file-scanning concurrency in the driver and SFT replicas.
+    env["env_vars"].setdefault("RELAX_JSONL_INDEX_WORKERS", str(Envs.RELAX_JSONL_INDEX_WORKERS))
+
     # ray-job.sh prepares the node-local cache before launching the inner Ray
     # job. Carry its resolved session into the runtime env that Controller
     # explicitly forwards through detached Serve deployments to TrainGroup.

@@ -149,3 +149,11 @@ def test_dpo_initial_reference_and_resume_keep_separate_checkpoint_roles(
     assert args.no_load_rng is (load_mode != "resume")
     assert args.dpo_reference_free is False
     assert args.ckpt_step == (7 if source == "megatron" and load_mode == "new" else 100)
+
+
+@pytest.mark.parametrize("cli,expected", [([], "balanced"), (["--sft-packing-strategy", "binpack"], "binpack")])
+def test_sft_packing_preserves_default_and_archived_recipe(arguments_module, cli, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    assert parser.parse_args(cli).sft_packing_strategy == expected

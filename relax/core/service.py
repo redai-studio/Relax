@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 import threading
 import time
 from argparse import Namespace
@@ -10,7 +11,7 @@ import requests
 from ray import serve
 from ray.util.placement_group import remove_placement_group
 
-from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.core.node_group_affinity import require_control_plane_resource_on_node, with_control_plane_affinity
 from relax.distributed.ray.placement_group import (
     _require_node_group_markers,
     create_placement_group,
@@ -123,6 +124,20 @@ class Service:
             self.config,
             {"runtime_env": self.runtime_env},
         )
+        data_node_ip = os.environ.get("RELAX_SFT_DATA_NODE_IP", "").strip()
+        if self.role == "sft" and data_node_ip:
+            resource = f"node:{data_node_ip}"
+            node = next(
+                (node for node in ray.nodes() if node.get("Alive") and node.get("NodeManagerAddress") == data_node_ip),
+                None,
+            )
+            if node is None or node.get("Resources", {}).get(resource, 0) < 0.001:
+                raise ValueError(f"SFT data node is not available: {data_node_ip}")
+            require_control_plane_resource_on_node(self.config, node["NodeID"])
+            ray_actor_options["resources"] = {
+                **ray_actor_options.get("resources", {}),
+                resource: 0.001,
+            }
         if self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env

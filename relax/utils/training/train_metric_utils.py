@@ -63,6 +63,9 @@ def log_perf_data_raw(
             freeze_params_name_list=getattr(args, "freeze_params_name_list", None),
             only_train_params_name_list=getattr(args, "only_train_params_name_list", None),
         )
+        for name in ("enable_mtp_training", "mtp_num_layers", "mtp_detach_paths", "mtp_only_training"):
+            if hasattr(args, name):
+                estimate_kwargs[name] = getattr(args, name)
         estimated_tflops, peak_tflops = flops_counter.estimate(**estimate_kwargs)
         # estimated_tflops is total fwd+bwd TFLOPS at delta_time=1 => raw TFLOPS count
         # Normalize to per-GPU
@@ -103,6 +106,10 @@ def log_perf_data_raw(
             response_lens = getattr(timer_instance, "response_lens", None)
             if response_lens:
                 log_dict["perf/step_resp_token_per_s"] = sum(response_lens) / total_time
+
+    for name in ("actor_train_tok_per_s", "step_token_per_s", "step_resp_token_per_s"):
+        if f"perf/{name}" in log_dict:
+            log_dict[f"perf/{name}_per_card"] = log_dict[f"perf/{name}"] / world_size
 
     logger.info(f"perf {rollout_id}: {log_dict}")
 

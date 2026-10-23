@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 import ray
 import sglang_router
-import transfer_queue as tq
 import yaml
 from packaging.version import parse
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -61,6 +60,7 @@ from relax.utils.s3_model_loader import (
     prepare_model_maybe_update_args,
 )
 from relax.utils.scale_utils import PrecheckProbeCategory, ScaleOutFailure, ScaleOutFailureCategory
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -916,8 +916,10 @@ class RolloutManager(ReloadableMixin):
 
         self.data_source = data_source
 
-        tq.init(self.args.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.args.tq_config,
+            role="rollout_worker",
+        )
 
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
@@ -1052,9 +1054,15 @@ class RolloutManager(ReloadableMixin):
                 monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
             self._shutdown_all_engines()
         finally:
-            # Routers are child processes of this Ray actor, so its process
-            # owns the registry; the Controller driver's registry is separate.
-            stop_launched_routers()
+            try:
+                # Deregister the worker's Mooncake segment before a fast restart.
+                if getattr(self, "data_system_client", None) is not None:
+                    detach_tq_client()
+            finally:
+                self.data_system_client = None
+                # Routers are child processes of this Ray actor, so its process
+                # owns the registry; the Controller driver's registry is separate.
+                stop_launched_routers()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.

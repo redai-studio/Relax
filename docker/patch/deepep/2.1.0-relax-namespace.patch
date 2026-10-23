@@ -1,0 +1,171 @@
+diff --git a/deep_ep/__init__.py b/deep_ep/__init__.py
+--- a/deep_ep/__init__.py
++++ b/deep_ep/__init__.py
+@@ -73,7 +73,7 @@
+     Initialize the JIT compilation runtime. Sets up CUDA and NCCL root paths for the JIT compiler.
+     """
+     # noinspection PyUnresolvedReferences
+-    import deep_ep._C as _C
++    import _relax_deep_ep_v2._C as _C
+     library_root_path = os.path.dirname(os.path.abspath(__file__))
+     _C.init_jit(library_root_path,  # Library root directory path
+                 find_cuda_home(),   # CUDA home
+@@ -92,6 +92,6 @@
+ from .utils.envs import get_physical_domain_size, get_logical_domain_size
+ 
+ # noinspection PyUnresolvedReferences
+-from deep_ep._C import Config, topk_idx_t
++from _relax_deep_ep_v2._C import Config, topk_idx_t
+ 
+ __version__ = '2.1.0'
+diff --git a/deep_ep/buffers/legacy.py b/deep_ep/buffers/legacy.py
+--- a/deep_ep/buffers/legacy.py
++++ b/deep_ep/buffers/legacy.py
+@@ -4,9 +4,9 @@
+ from typing import Callable, List, Tuple, Optional, Union
+ 
+ # noinspection PyUnresolvedReferences
+-import deep_ep._C as _C
++import _relax_deep_ep_v2._C as _C
+ # noinspection PyUnresolvedReferences
+-from deep_ep._C import Config, EventHandle
++from _relax_deep_ep_v2._C import Config, EventHandle
+ from ..utils.event import EventOverlap
+ from ..utils.envs import check_nvlink_connections, check_torch_deterministic
+ 
+diff --git a/deep_ep/buffers/elastic.py b/deep_ep/buffers/elastic.py
+--- a/deep_ep/buffers/elastic.py
++++ b/deep_ep/buffers/elastic.py
+@@ -7,9 +7,9 @@
+ from contextlib import contextmanager
+ 
+ # noinspection PyUnresolvedReferences
+-import deep_ep._C as _C
++import _relax_deep_ep_v2._C as _C
+ # noinspection PyUnresolvedReferences
+-from deep_ep._C import EventHandle
++from _relax_deep_ep_v2._C import EventHandle
+ 
+ from ..utils.event import EventOverlap
+ from ..utils.math import align
+diff --git a/deep_ep/utils/event.py b/deep_ep/utils/event.py
+--- a/deep_ep/utils/event.py
++++ b/deep_ep/utils/event.py
+@@ -2,7 +2,7 @@
+ from typing import Any, Optional, Tuple, Callable
+ 
+ # noinspection PyUnresolvedReferences
+-from deep_ep._C import EventHandle
++from _relax_deep_ep_v2._C import EventHandle
+ 
+ 
+ class EventOverlap:
+diff --git a/deep_ep/utils/envs.py b/deep_ep/utils/envs.py
+--- a/deep_ep/utils/envs.py
++++ b/deep_ep/utils/envs.py
+@@ -9,7 +9,7 @@
+ from typing import Tuple
+ 
+ # noinspection PyUnresolvedReferences
+-import deep_ep._C as _C
++import _relax_deep_ep_v2._C as _C
+ 
+ from .comm import get_nccl_comm_handle
+ 
+diff --git a/deep_ep/utils/comm.py b/deep_ep/utils/comm.py
+--- a/deep_ep/utils/comm.py
++++ b/deep_ep/utils/comm.py
+@@ -5,7 +5,7 @@
+ import torch.distributed as dist
+ 
+ # noinspection PyUnresolvedReferences
+-import deep_ep._C as _C
++import _relax_deep_ep_v2._C as _C
+ 
+ 
+ class NCCLCommHandle:
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -13,7 +13,7 @@
+ persistent_env_names = ('EP_JIT_CACHE_DIR', 'EP_JIT_PRINT_COMPILER_COMMAND', 'EP_NUM_TOPK_IDX_BITS', 'EP_NCCL_ROOT_DIR')
+ 
+ # Load discover module without triggering `deep_ep.__init__`
+-find_pkgs_spec = importlib.util.spec_from_file_location('find_pkgs', os.path.join(current_dir, 'deep_ep', 'utils', 'find_pkgs.py'))
++find_pkgs_spec = importlib.util.spec_from_file_location('find_pkgs', os.path.join(current_dir, '_relax_deep_ep_v2', 'utils', 'find_pkgs.py'))
+ find_pkgs = importlib.util.module_from_spec(find_pkgs_spec)
+ find_pkgs_spec.loader.exec_module(find_pkgs)
+ 
+@@ -48,7 +48,7 @@
+ 
+ 
+ def get_package_version():
+-    with open(Path(current_dir) / 'deep_ep' / '__init__.py', 'r') as f:
++    with open(Path(current_dir) / '_relax_deep_ep_v2' / '__init__.py', 'r') as f:
+         version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
+     public_version = ast.literal_eval(version_match.group(1))
+ 
+@@ -83,9 +83,9 @@
+             code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
+ 
+         # Create temporary build directory
+-        build_include_dir = os.path.join(self.build_lib, 'deep_ep')
++        build_include_dir = os.path.join(self.build_lib, '_relax_deep_ep_v2')
+         os.makedirs(build_include_dir, exist_ok=True)
+-        with open(os.path.join(self.build_lib, 'deep_ep', 'envs.py'), 'w') as f:
++        with open(os.path.join(self.build_lib, '_relax_deep_ep_v2', 'envs.py'), 'w') as f:
+             f.write(code)
+ 
+ 
+@@ -98,7 +98,7 @@
+     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
+     nvcc_flags = ['-O3', '-Xcompiler', '-O3', '--extended-lambda', '--diag-suppress=128,2417']
+     sources = ['csrc/python_api.cpp', 'csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu']
+-    include_dirs = [f'{current_dir}/deep_ep/include',
++    include_dirs = [f'{current_dir}/_relax_deep_ep_v2/include',
+                     f'{current_dir}/third-party/fmt/include',
+                     '/usr/local/cuda/include/cccl']
+     library_dirs = []
+@@ -195,16 +195,16 @@
+     print()
+ 
+     setuptools.setup(
+-        name='deep_ep',
++        name='relax-deep-ep-v2',
+         version=get_package_version(),
+-        packages=setuptools.find_packages(include=['deep_ep', 'deep_ep.*']),
++        packages=setuptools.find_packages(include=['_relax_deep_ep_v2', '_relax_deep_ep_v2.*']),
+         package_data={
+-            'deep_ep': [
++            '_relax_deep_ep_v2': [
+                 'include/deep_ep/**/*',
+             ]
+         },
+         ext_modules=[
+-            CUDAExtension(name='deep_ep._C',
++            CUDAExtension(name='_relax_deep_ep_v2._C',
+                           include_dirs=include_dirs,
+                           library_dirs=library_dirs,
+                           sources=sources,
+--- a/csrc/utils/event.hpp
++++ b/csrc/utils/event.hpp
+@@ -10 +10 @@
+-struct EventHandle {
++struct RelaxV2EventHandle {
+@@ -14 +14 @@
+-    EventHandle() {
++    RelaxV2EventHandle() {
+@@ -19 +19 @@
+-    explicit EventHandle(const at::cuda::CUDAStream& stream) {
++    explicit RelaxV2EventHandle(const at::cuda::CUDAStream& stream) {
+@@ -24 +24 @@
+-    EventHandle(const EventHandle& other) = default;
++    RelaxV2EventHandle(const RelaxV2EventHandle& other) = default;
+@@ -27,0 +28,2 @@
++
++using EventHandle = RelaxV2EventHandle;
+--- a/csrc/legacy/buffer.hpp
++++ b/csrc/legacy/buffer.hpp
+@@ -1763 +1763 @@
+-    pybind11::class_<EventHandle>(m, "EventHandle")
++    pybind11::class_<EventHandle>(m, "EventHandle", pybind11::module_local())

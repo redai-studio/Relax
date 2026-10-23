@@ -4,8 +4,10 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=lmsysorg/sglang:v0.5.17-cu130@sha256:16aba8925507e631e1dc1e23d95d026533602591775f6a8db68b74ee99746155
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.20-cu130@sha256:b27fce60bc5494c118c4910702812bcfa8cee67abcdd1ff8b0902f21647552f4
 ARG TRAIN_IMAGE=train
+ARG HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
+ARG DEEP_EP_V2_COMMIT=099d5f2bad488b9c534ea785062b12f2e91d1d41
 # GPU_ARCH: hopper (H20/H800, SM90) or b300 (Blackwell Ultra, SM103, AWS EFA).
 ARG GPU_ARCH=b300
 FROM ${BASE_IMAGE} as base
@@ -13,12 +15,12 @@ FROM ${BASE_IMAGE} as base
 ARG GPU_ARCH=b300
 # Share CUDA build targets across stages; Hopper also retains INT4 QAT support for SM80-SM89.
 RUN case "$GPU_ARCH" in \
-        b300)   ARCHES="10.0a 10.3a"; EXPECT_SM="103" ;; \
-        hopper) ARCHES="8.0 8.6 8.9 9.0"; EXPECT_SM="90" ;; \
+        b300)   ARCHES="10.0a 10.3a"; EXPECT_SM="103"; FA_ARCHES="100" ;; \
+        hopper) ARCHES="8.0 8.6 8.9 9.0"; EXPECT_SM="90"; FA_ARCHES="80;90" ;; \
         *) echo "Unsupported GPU_ARCH='$GPU_ARCH' (expected: hopper | b300)" >&2; exit 1 ;; \
     esac && \
-    printf 'export TORCH_CUDA_ARCH_LIST="%s"\nexport FLASHINFER_CUDA_ARCH_LIST="%s"\nexport RELAX_EXPECT_SM="%s"\n' \
-        "$ARCHES" "$ARCHES" "$EXPECT_SM" > /etc/relax_build.env && \
+    printf 'export TORCH_CUDA_ARCH_LIST="%s"\nexport FLASHINFER_CUDA_ARCH_LIST="%s"\nexport RELAX_EXPECT_SM="%s"\nexport FLASH_ATTN_CUDA_ARCHS="%s"\n' \
+        "$ARCHES" "$ARCHES" "$EXPECT_SM" "$FA_ARCHES" > /etc/relax_build.env && \
     cat /etc/relax_build.env
 
 ENV TARGETARCH=amd64 \
@@ -33,13 +35,14 @@ ENV TARGETARCH=amd64 \
     DEBIAN_FRONTEND=noninteractive
 
 ARG TE_VERSION=2.18.0
-ARG TILELANG_VERSION=0.1.11
+ARG TILELANG_VERSION=0.1.12
 ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:${PATH} \
     PIP_CONSTRAINT=/etc/relax-cu130-constraints.txt
 
 COPY docker/scripts/blackwell_constraints.py /tmp/blackwell_constraints.py
-RUN python /tmp/blackwell_constraints.py
+RUN python /tmp/blackwell_constraints.py && \
+    pip install --no-cache-dir "ray[default,serve]==2.56.1"
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
     build-essential patchelf tmux net-tools htop nano iputils-ping \
@@ -77,7 +80,7 @@ RUN python -c "import torch; assert torch.backends.cudnn.version() is not None"
 
 # FA2 is retained as a comparison backend. Build against this image's Torch/CUDA ABI.
 # Hopper-only FA3 is intentionally omitted from this B300-focused CUDA 13 image.
-RUN FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=32 \
+RUN . /etc/relax_build.env && FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=32 \
     pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
     pip install --no-cache-dir flash-linear-attention==0.4.1
 
@@ -117,10 +120,53 @@ RUN . /etc/relax_build.env && \
     rm -rf /tmp/int4_qat
 
 ARG TRAIN_IMAGE=train
+# Compile communication extensions independently of application dependencies and
+# patches. Keep the same Python/library paths as the final TRAIN_IMAGE: DeepEP
+# records NCCL/NVSHMEM paths in its wheel and extension rpath.
+FROM ${TRAIN_IMAGE} as ep_builder_base
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps "nvidia-nvshmem-cu13==3.4.5" "pynvml==13.0.1" \
+        "nvidia-nccl-cu13==2.30.7"
+
+FROM ep_builder_base as hybridep_builder
+COPY docker/patch/deepep/eb9cee7-hybridep-namespace.patch /tmp/hybridep-namespace.patch
+ARG HYBRID_EP_COMMIT
+RUN . /etc/relax_build.env && \
+    if [ "$RELAX_EXPECT_SM" = "90" ]; then export TORCH_CUDA_ARCH_LIST="9.0"; fi && \
+    git clone --no-checkout https://github.com/deepseek-ai/DeepEP.git /tmp/HybridEP && \
+    cd /tmp/HybridEP && git checkout --detach "$HYBRID_EP_COMMIT" && \
+    test "$(git rev-parse HEAD)" = "$HYBRID_EP_COMMIT" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/hybridep-namespace.patch && \
+    CUDA_VISIBLE_DEVICES="" HYBRID_EP_MULTINODE=0 \
+        CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}" \
+        LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+        MAX_JOBS=16 pip wheel --no-build-isolation --no-deps --wheel-dir /opt/ep-wheels . && \
+    cd / && rm -rf /tmp/HybridEP
+
+FROM ep_builder_base as deepep_v2_builder
+ARG DEEP_EP_V2_COMMIT
+COPY docker/patch/deepep/2.1.0-relax-namespace.patch /tmp/deepep-v2.patch
+RUN . /etc/relax_build.env && \
+    git clone https://github.com/deepseek-ai/DeepEP.git /tmp/DeepEP-v2 && \
+    cd /tmp/DeepEP-v2 && git checkout --detach "$DEEP_EP_V2_COMMIT" && \
+    test "$(git rev-parse HEAD)" = "$DEEP_EP_V2_COMMIT" && \
+    git submodule update --init --recursive && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/deepep-v2.patch && \
+    mv deep_ep _relax_deep_ep_v2 && \
+    NCCL_ROOT="$(python -c 'import importlib.metadata as m; print(m.distribution("nvidia-nccl-cu13").locate_file("nvidia/nccl"))')" && \
+    CUDA_VISIBLE_DEVICES="" MAX_JOBS=16 EP_NCCL_ROOT_DIR="$NCCL_ROOT" \
+        LIBRARY_PATH="$NCCL_ROOT/lib:/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+        pip wheel --no-build-isolation --no-deps --wheel-dir /opt/ep-wheels . && \
+    cd / && rm -rf /tmp/DeepEP-v2
+
 # Build the patched router against the same Python/libc as the final image.
 FROM ${TRAIN_IMAGE} as router_builder
 
 ARG ROUTER_RUST_VERSION=1.97.1
+# Override these build args when CI requires an approved Rust mirror.
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+ARG ROUTER_RUSTUP_INIT_URL=https://sh.rustup.rs
 ARG ROUTER_BUILD_JOBS=16
 ENV PATH=/root/.cargo/bin:${PATH} \
     CARGO_BUILD_JOBS=${ROUTER_BUILD_JOBS} \
@@ -129,8 +175,15 @@ ENV PATH=/root/.cargo/bin:${PATH} \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl git libssl-dev pkg-config protobuf-compiler && \
     rm -rf /var/lib/apt/lists/* && \
-    curl --proto '=https' --tlsv1.2 --fail --location https://sh.rustup.rs -o /tmp/rustup-init.sh && \
-    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${ROUTER_RUST_VERSION}" && \
+    curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --retry-all-errors \
+        --connect-timeout 30 --max-time 300 "$ROUTER_RUSTUP_INIT_URL" -o /tmp/rustup-init.sh && \
+    (for attempt in 1 2 3; do \
+        if sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${ROUTER_RUST_VERSION}"; then \
+            exit 0; \
+        fi; \
+        if [ "$attempt" -eq 3 ]; then exit 1; fi; \
+        sleep 5; \
+    done) && \
     python -m pip install --no-cache-dir "maturin==1.9.6"
 COPY docker/patch/sglang-router /tmp/router-patch
 COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
@@ -142,11 +195,16 @@ WORKDIR /root
 
 ARG GPU_ARCH=b300
 ARG PATCH_VERSION=latest
-ARG ENABLE_SGLANG_PATCH=1
 
 ENV RELAX_GPU_ARCH=${GPU_ARCH}
 
-# CUTLASS DSL and gRPC require protobuf 6, including when reusing an older TRAIN_IMAGE.
+# Reused TRAIN_IMAGE must come from this runtime generation; old CUDA binaries
+# cannot be upgraded safely by changing Python constraints in the final stage.
+RUN python -c "import importlib.metadata as m; \
+assert m.version('sglang') == '0.5.20' and m.version('tilelang') == '0.1.12', \
+'Build the train target from this Dockerfile before reusing TRAIN_IMAGE'"
+
+# CUTLASS DSL and gRPC require protobuf 6, including when reusing a compatible TRAIN_IMAGE.
 RUN sed -i '/^protobuf[<=>!~]/d' "$PIP_CONSTRAINT" && \
     printf '%s\n' 'protobuf>=6.33.5,<7' >> "$PIP_CONSTRAINT" && \
     pip install --no-cache-dir 'protobuf>=6.33.5,<7'
@@ -189,10 +247,18 @@ RUN sed -i '/^flash-linear-attention==/d; /^fla-core==/d' "$PIP_CONSTRAINT" && \
         "fla-core==0.5.2" "flash-linear-attention==0.5.2" && \
     pip install --no-cache-dir megatron-energon
 
-# Preserve small KDA gate gradients in FP32 dot products inside the backward kernel.
-COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-precision.patch
+# Keep related build inputs in one layer: the inherited CUDA image is already deep.
+# Preserve KDA precision, then install all process-selected convolution entries.
+ENV RELAX_FLA_CONV_NB_MODE=auto
+COPY docker/patch/fla/0.5.2-kda-backward-precision.patch \
+    docker/patch/fla/0.5.2-qwen38-output-config.patch \
+    docker/patch/fla/0.5.2-conv-static-entries.patch /tmp/fla-patches/
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
-    patch --batch --forward -p1 < /tmp/fla-kda-backward-precision.patch
+    patch --batch --forward -p1 < /tmp/fla-patches/0.5.2-kda-backward-precision.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-patches/0.5.2-qwen38-output-config.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-patches/0.5.2-conv-static-entries.patch && \
+    python -m compileall -q fla/modules/conv/triton && \
+    rm -r /tmp/fla-patches
 
 RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
     -o apptainer_1.4.1_amd64.deb https://github.com/apptainer/apptainer/releases/download/v1.4.1/apptainer_1.4.1_amd64.deb \
@@ -201,22 +267,36 @@ RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
     && rm apptainer_1.4.1_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
+# One patched inference runtime for existing models and Qwen3.8.
+COPY docker/patch/sglang/v0.5.20.patch /tmp/sglang.patch
+RUN cd /sgl-workspace/sglang && \
+    test "$(git rev-parse HEAD)" = "94602c9c2b7cbdb8efd5c52802dac6a1c180089e" && \
+    git apply --check /tmp/sglang.patch && git apply /tmp/sglang.patch && \
+    sha256sum /tmp/sglang.patch > /etc/relax-sglang-patch.sha256 && \
+    pip install --no-cache-dir setuptools-scm==9.2.2 && \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.20 \
+        pip install --no-deps --no-build-isolation -e ./python && \
+    pip install --no-cache-dir transformers==5.16.0 tokenizers==0.23.2 && \
+    rm /tmp/sglang.patch
+
 COPY requirements.txt /tmp/requirements.txt
 
 # Align the older Relax pins with the CUDA 13 base: CuPy 14 needs NumPy 2,
 # which requires a compatible PyArrow; kernels also needs Hub >=1.10.
 # ClearML 2.1.4 accepts PyJWT >=2.11 alongside current MCP releases.
-RUN sed -i \
+RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq-assignment.patch \
+    sed -i \
     -e 's/^clearml==2\.1\.3$/clearml==2.1.4/' \
     -e 's/numpy<2/numpy==2.2.6/g' \
     -e 's/pyarrow==14\.0\.2/pyarrow==20.0.0/g' \
     -e 's/huggingface_hub==1\.7\.2/huggingface_hub==1.10.0/g' \
-    /tmp/requirements.txt
-
-RUN pip install --ignore-installed 'PyJWT>=2.10.1,<3' && \
+    /tmp/requirements.txt && \
+    pip install --ignore-installed 'PyJWT>=2.10.1,<3' && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
+    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
+    TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
 
 # Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
@@ -228,18 +308,27 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
     rm -rf /tmp/router-wheels
 
 
-COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
-COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
+COPY docker/patch/${PATCH_VERSION}/megatron.patch \
+    docker/patch/megatron/sync-save-bounded-staging.patch \
+    docker/patch/megatron/20261016-qwen38-models.patch \
+    docker/patch/megatron/20261020-qwen35-optimized.patch \
+    docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
-    patch --batch --forward -p1 < /root/Megatron-LM/megatron.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /root/Megatron-LM/megatron.patch && \
     if grep -R -n '^<<<<<<< ' .; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
+    patch --batch --forward --fuzz=0 -p1 < sync-save-bounded-staging.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
+    sha256sum 20261016-qwen38-models.patch > /etc/relax-qwen38-model-patch.sha256 && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
+    sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
+    sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch && \
     apt-get update && apt-get install -y --no-install-recommends jq && \
     rm -rf /var/lib/apt/lists/*
 
@@ -252,41 +341,122 @@ RUN . /etc/relax_build.env && \
     CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:${PATH} GPU_ARCH="${GPU_ARCH}" \
     python /tmp/build_flashinfer_sampling.py
 
-COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
-COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
-RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
-    cd /sgl-workspace/sglang && git add . && \
-    sha256sum sglang.patch > /etc/relax-sglang-patch.sha256 && \
-    git update-index --refresh && \
-    git apply sglang.patch --3way && \
-    if grep -R -n '^<<<<<<< ' .; then \
-    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
-    exit 1; \
-    fi && \
-    git apply --check sglang_per_pos_topk.patch && \
-    git apply sglang_per_pos_topk.patch && \
-    rm sglang.patch sglang_per_pos_topk.patch; \
-fi
-
 # Complete --no-deps installs, match Energon's fsspec, and retain audioread for multimodal imports.
-# NIXL 1.3.2 requires both backend wheels and selects CUDA at runtime.
-RUN pip install --no-cache-dir "hydra-core==1.3.2" "nixl-cu12==1.3.2" \
+# NIXL 1.4.1 requires both backend wheels and selects CUDA at runtime.
+RUN pip install --no-cache-dir "hydra-core==1.3.2" "nixl-cu12==1.4.1" \
         "s3fs==2025.3.0" "fsspec==2025.3.0" "boto3==1.41.5" "botocore==1.41.5" \
-        "packaging==25.0" "pillow==11.3.0" "audioread==3.1.0"
+        "packaging==25.0" "pillow==11.3.0" "audioread==3.1.0" "cuda-pathfinder==1.5.4" \
+        "grpcio-tools==1.81.1" "grpcio-health-checking==1.81.1" "grpcio-reflection==1.81.1" \
+        "typeguard>=4.0.1" "imageio>=2.37.0" "quack-kernels==0.6.4"
+
+# Keep one OpenCV provider after resolving the base image metadata.
+RUN pip uninstall -y opencv-python-headless && \
+    pip install --no-cache-dir opencv-python==4.10.0.84
 
 # Check package versions and CPU-loadable components during docker build.
 # TE and SGLang require libcuda from the host; validate their imports at runtime.
-COPY docker/scripts/validate_blackwell.py /tmp/validate_blackwell.py
-COPY docker/scripts/check_gpu_imports.py /opt/relax/check_gpu_imports.py
-RUN python /tmp/validate_blackwell.py && \
+COPY docker/scripts/validate_final_runtime.py \
+    docker/scripts/record_qwen35_runtime.py \
+    docker/scripts/validate_hybridep_install.py \
+    docker/scripts/install_legacy_fla.py \
+    docker/scripts/validate_blackwell.py \
+    docker/scripts/validate_unified_runtime.py \
+    docker/scripts/check_gpu_imports.py /opt/relax/
+RUN python /opt/relax/validate_blackwell.py && \
+    python /opt/relax/validate_unified_runtime.py && \
+    python -m pip check
+
+# Qwen3.8's HybridEP dispatcher is needed on both Hopper and B300.
+FROM relax_build as relax_ep
+# Match the HybridEP revision used by the pinned MCore's CUDA 13 CI recipe.
+# Build both DeepEP and HybridEP against this image, not archived .so files.
+ARG HYBRID_EP_COMMIT
+ENV RELAX_HYBRID_EP_COMMIT=${HYBRID_EP_COMMIT}
+# DeepEP declares the pynvml distribution; nvidia-ml-py alone only supplies its import.
+# 13.0.1 permits nvidia-ml-py >=12 without the <13 cap of pynvml 12.0.0.
+RUN --mount=type=bind,from=hybridep_builder,source=/opt/ep-wheels,target=/tmp/ep-wheels \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps "nvidia-nvshmem-cu13==3.4.5" "pynvml==13.0.1" && \
+    pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
+    python /opt/relax/validate_hybridep_install.py && \
     python -m pip check
 
 # Enable the EFA NCCL plugin only for B300; Hopper clusters may not have EFA.
-FROM relax_build as relax_hopper
+FROM relax_ep as relax_hopper
+ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/sglang/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}
 
-FROM relax_build as relax_b300
+FROM relax_ep as relax_b300
+
+# The archived 35B recipe uses a private complete FLA source closure, not a global downgrade.
+COPY docker/patch/fla/0.4.2-legacy-runtime.patch /tmp/fla042.patch
+RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2 \
+        --patch /tmp/fla042.patch --manifest /etc/relax-fla042-runtime.json && \
+    rm /tmp/fla042.patch
+
+# Keep DeepEP 1.x/HybridEP for existing recipes; build v2 under its own namespace.
+# All native code uses the final image's Torch ABI. No offline runtime overlay.
+ARG DEEP_EP_V2_COMMIT
+ARG FA4_COMMIT=56e48e3cc3557cfb9f45ec4763c5f971e17cbcbc
+ARG FLASHQLA_COMMIT=5538c35f0df33ef804eacd90c77d9d9087c1d4e4
+COPY docker/patch/flash-attention/56e48e3-fa4-isolated.patch \
+    docker/patch/deepep/2.1.0-relax-namespace.patch \
+    docker/patch/flash-qla/0.1.3-kkt-no-tma.patch \
+    docker/scripts/record_qwen35_runtime.py \
+    docker/scripts/validate_b300_runtime.py \
+    docker/patch/flash-attention/fa4-source-pins.json \
+    docker/patch/cublas/13.3.0.5-library-pins.json /tmp/qwen35-build/
+RUN install -m 644 /tmp/qwen35-build/record_qwen35_runtime.py /tmp/qwen35-build/validate_b300_runtime.py /opt/relax/ && \
+    cp /tmp/qwen35-build/fa4-source-pins.json /tmp/fa4-source-pins.json && \
+    cp /tmp/qwen35-build/13.3.0.5-library-pins.json /tmp/cublas-library-pins.json && \
+    sed -i '/^nvidia-cutlass-dsl==/d' "$PIP_CONSTRAINT" && \
+    printf '%s\n' 'nvidia-cutlass-dsl==4.6.2' >> "$PIP_CONSTRAINT" && \
+    pip install --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.6.2' && \
+    pip install --no-cache-dir --no-deps --target /opt/relax/cublas13.3 'nvidia-cublas==13.3.0.5' && \
+    python -m pip check
+# Match the builder's NCCL before loading the independently compiled v2 wheel.
+RUN --mount=type=bind,from=deepep_v2_builder,source=/opt/ep-wheels,target=/tmp/ep-wheels \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7 && \
+    pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl
+# Fetch the pinned object explicitly: PR commits need not be reachable from cloned branches/tags.
+RUN git init /tmp/flash-attention && cd /tmp/flash-attention && \
+    git fetch --depth=1 https://github.com/Dao-AILab/flash-attention.git "$FA4_COMMIT" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "$FA4_COMMIT" && \
+    mkdir -p /opt/relax/qwen35/sources && \
+    cp -a flash_attn/cute /opt/relax/qwen35/sources/fa4-upstream && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/qwen35-build/56e48e3-fa4-isolated.patch && \
+    cp -a flash_attn/cute /opt/relax/qwen35/sources/fa4-isolated && \
+    FA4_SITE="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/_relax_fa4_pr2968" && \
+    mkdir -p "$FA4_SITE" && touch "$FA4_SITE/__init__.py" && \
+    cp -a flash_attn/cute "$FA4_SITE/cute" && cd / && rm -rf /tmp/flash-attention
+# Exact source revision verified against the delivery archive (before the KKT patch).
+RUN git init /tmp/FlashQLA && cd /tmp/FlashQLA && \
+    git fetch --depth=1 https://github.com/QwenLM/FlashQLA.git "$FLASHQLA_COMMIT" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "$FLASHQLA_COMMIT" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/qwen35-build/0.1.3-kkt-no-tma.patch && \
+    pip install --no-cache-dir --no-deps --no-build-isolation . && cd / && rm -rf /tmp/FlashQLA && \
+    python /opt/relax/record_qwen35_runtime.py
+
+# HybridEP is built for a single NVLink domain; NCCL/EFA still handles other collectives.
+# Validate source contracts at build time; CUDA imports/numerics require a GPU run.
+RUN python /opt/relax/validate_b300_runtime.py && rm -r /tmp/qwen35-build
 ENV FI_PROVIDER=efa \
     NCCL_NET_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so \
     TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 FROM relax_${GPU_ARCH} as relax
+
+# Restore the official 0.5.20 image runtime after all dependency resolution.
+# Its DeepEP binaries require NCCL 2.30.7; Torch metadata still pins 2.29.7.
+# pip check above validates every other dependency before this explicit override.
+RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7 && \
+    python -c "import importlib.metadata as m; assert m.version('nvidia-nccl-cu13') == '2.30.7'" && \
+    python /opt/relax/validate_hybridep_install.py && \
+    python /opt/relax/validate_final_runtime.py && \
+    sed 's/^ray==2\.56\.1$/ray==2.56.1.*/' "$PIP_CONSTRAINT" > /etc/relax-cu130-runtime-constraints.txt
+
+# Build and validation above require official Ray. Derived platform images may
+# install a 2.56.1 vendor revision; retain all NumPy/Torch/CUDA constraints.
+ENV PIP_CONSTRAINT=/etc/relax-cu130-runtime-constraints.txt

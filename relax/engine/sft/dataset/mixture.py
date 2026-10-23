@@ -37,11 +37,11 @@ def _resolve_source_path(value: Any, *, config_dir: Path) -> str | list[str]:
     raise ValueError("mixture dataset 'path' must be a string or a non-empty list of strings")
 
 
-def _build_source_reader(path: str | list[str]):
+def _build_source_reader(path: str | list[str], **reader_kwargs: Any):
     paths, row_slice = resolve_path_plan(path)
     if len(paths) == 1 and row_slice is None:
-        return StreamingReader(paths[0])
-    return CompositeStreamingReader(paths, row_slice)
+        return StreamingReader(paths[0], **reader_kwargs)
+    return CompositeStreamingReader(paths, row_slice, **reader_kwargs)
 
 
 def _allocate_quotas(weights: list[float], total: int) -> list[int]:
@@ -100,7 +100,7 @@ class WeightedMixtureStreamingReader:
         logger.info(f"Loaded prompt-data mixture {config_path}: epoch_size={self.epoch_size}, sources={sources}")
 
     @classmethod
-    def from_yaml(cls, config_path: str) -> "WeightedMixtureStreamingReader":
+    def from_yaml(cls, config_path: str, **reader_kwargs: Any) -> "WeightedMixtureStreamingReader":
         config_file = Path(config_path).expanduser().resolve()
         with config_file.open(encoding="utf-8") as stream:
             raw = yaml.safe_load(stream)
@@ -135,7 +135,7 @@ class WeightedMixtureStreamingReader:
                 if not math.isfinite(weight) or weight <= 0:
                     raise ValueError(f"Prompt-data mixture dataset {name!r} weight must be finite and > 0")
             names.append(name)
-            readers.append(_build_source_reader(path))
+            readers.append(_build_source_reader(path, **reader_kwargs))
             weights.append(weight)
 
         configured_weights = [weight for weight in weights if weight is not None]

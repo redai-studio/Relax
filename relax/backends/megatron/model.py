@@ -1253,7 +1253,11 @@ def train_one_step(
                 # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
                 # calls. This gate MUST match _chunked_mtp_enabled() in that patch.
                 mtp_enabled = getattr(args, "enable_mtp_training", False)
-                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False)
+                head_config = get_model_config(model)
+                fused_linear = (
+                    head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
+                )
+                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False) and not fused_linear
                 mtp_output_layer_calls = (
                     0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
