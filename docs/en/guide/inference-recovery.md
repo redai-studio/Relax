@@ -13,7 +13,7 @@ These settings are environment variables, not CLI arguments. Set them in the **t
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `RELAX_ENABLE_INFERENCE_RECOVERY` | Depends on the training mode | `true` or `1` enables recovery; `false` or `0` disables it. Controls local recovery of both Rollout and standalone ActorFwd. |
-| `RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS` | `3` | Non-negative integer. A cumulative attempt budget shared by Rollout and ActorFwd; `0` sends the first failure to global restart. A negative or non-integer value raises an error when recovery is enabled. |
+| `RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS` | `3` | Non-negative integer. A cumulative attempt budget shared by Rollout and ActorFwd; `0` sends the first failure to global restart. Negative values raise when recovery is enabled; non-integer values are rejected by environment validation at startup. |
 | `RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT` | `180` | Positive number of seconds to wait for old operations to exit, also used during handoff to global restart. This is not a total recovery timeout. |
 
 | Training mode | Behavior when the switch is unset | Locally recoverable roles |
@@ -23,6 +23,8 @@ These settings are environment variables, not CLI arguments. Set them in the **t
 | Colocate without hybrid | Disabled; explicitly set `true` or `1` to enable | Rollout |
 
 Values are case-insensitive and ignore surrounding whitespace, so `TRUE` is equivalent to `true`. With an explicit `true` or `1`, unsupported settings cause startup to raise `Unsupported inference recovery configuration` and list the conflicting fields. When the switch is unset, unsupported configurations keep the existing behavior. Setting `false` or `0` disables the feature and skips its configuration checks.
+
+These three variables follow the shared environment configuration rules: empty values use the default, as if unset. The switch also accepts `on`/`off`, `yes`/`no`, `t`/`f`, and `y`/`n`. Invalid booleans or values that cannot be converted to the declared numeric type are rejected at startup, even when local recovery is disabled.
 
 ### Enabling and disabling recovery
 

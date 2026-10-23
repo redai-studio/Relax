@@ -10,6 +10,7 @@ from typing import Any
 import ray
 
 from relax.utils.async_utils import run
+from relax.utils.env import Envs
 
 
 class UnsafeInferenceError(RuntimeError):
@@ -168,16 +169,12 @@ class RecoveryGate:
 def configure_recovery(config: Namespace) -> Any:
     """Enable supported full-async/hybrid recovery by default; colocate is opt-
     in."""
-    import os
-
     from relax.core.node_group_affinity import with_control_plane_affinity
 
     config.inference_recovery = False
     config.inference_recovery_state = None
-    choice = os.environ.get("RELAX_ENABLE_INFERENCE_RECOVERY")
-    if choice is not None:
-        choice = choice.strip().lower()
-    if choice not in (None, "1", "true"):
+    choice = Envs.RELAX_ENABLE_INFERENCE_RECOVERY
+    if choice is False:
         return None
     hybrid = bool(getattr(config, "hybrid", False))
     fully_async = bool(getattr(config, "fully_async", False))
@@ -233,13 +230,10 @@ def configure_recovery(config: Namespace) -> Any:
             if not getattr(config, name, False)
         )
     if conflicts:
-        if choice in ("1", "true"):
+        if choice is True:
             raise ValueError("Unsupported inference recovery configuration: " + "; ".join(conflicts))
         return None
-    try:
-        max_attempts = int(os.environ.get("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", "3"))
-    except ValueError as exc:
-        raise ValueError("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer") from exc
+    max_attempts = Envs.RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS
     if max_attempts < 0:
         raise ValueError("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer")
     config.inference_recovery_state = InferenceRecoveryState.options(**with_control_plane_affinity(config)).remote(

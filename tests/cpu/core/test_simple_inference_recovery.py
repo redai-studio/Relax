@@ -9,6 +9,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.utils.env import Envs
+
 
 def _source():
     path = Path(__file__).parents[3] / "relax/core/inference_recovery.py"
@@ -23,6 +25,7 @@ def _source():
         "time": SimpleNamespace(sleep=lambda _: None),
         "ray": SimpleNamespace(),
         "run": asyncio.run,
+        "Envs": Envs,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return namespace
@@ -191,7 +194,7 @@ def test_disabled_gate_has_no_state_or_tq_side_effects():
     gate.fail(ValueError("legacy behavior"))
 
 
-@pytest.mark.parametrize("flag", ["", "0", "false", "FALSE", " false "])
+@pytest.mark.parametrize("flag", ["0", "false", "FALSE", " false "])
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_explicit_disable_skips_eligibility_checks(monkeypatch, flag, hybrid):
     import sys
