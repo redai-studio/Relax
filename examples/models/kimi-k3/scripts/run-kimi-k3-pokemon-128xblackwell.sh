@@ -1,43 +1,41 @@
 #!/bin/bash
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# GPU profile: 280G Blackwell per GPU.
 #
-# Full Kimi K3 text-only full-parameter SFT on HellaSwag, with a held-out
-# validation set. 16 x 8 B300 GPUs, BF16 from the MXFP4 checkpoint.
-# TP4/PP4/CP8/EP32/ETP1: DP1, expert-DP1; ordinary 1F1B, no VPP or MTP.
+# Full Kimi K3 multimodal full-parameter SFT: 93 language layers, 896 experts,
+# full vision. 16 x 8 GPUs (280G Blackwell each), BF16 from the MXFP4 checkpoint.
+# TP4/PP4/CP4/EP32/ETP1: DP2, expert-DP1; ordinary 1F1B, no VPP or MTP.
 # PP layer counts: 23 + 24 + 24 + 22 = 93.
 #
-# Hyperparameters follow the official recipe k3_hellaswag.yaml (NVIDIA
-# nemo_automodel, 256 GPU FSDP2). Mapped 1:1 where the knob exists in Megatron:
-#   global_batch_size 256 | max_steps 100 | num_epochs 1 | val_every_steps 100
-#   seed 1234 | lr 1e-5 | weight_decay 0.0 | betas [0.9, 0.95] | clip_grad 1.0
-#   dataloader shuffle: true -> --rollout-shuffle
-#   adam eps 1e-8 is Megatron's default, so it is not passed explicitly.
-# With 25600 prepared train rows and GBS 256, the default 100 steps cover
-# one epoch. Supply train.jsonl and a held-out validation.jsonl.
+# Scaled from the validated 64-GPU LoRA run (TP4/PP4/CP4/EP16/DP1, 200/200 steps,
+# ~16 s/step, grad_norm flat): the extra 64 GPUs go into EP and DP, so
+# EP16 -> EP32 halves the per-rank expert weights to 896/32 = 28 experts/rank
+# (same per-rank expert count as the 192-GPU script) while CP4 and the 32768-token
+# packing budget stay exactly as validated.
 #
-# PP4 leaves 32 GPUs per pipeline stage; EP32 assigns 28 routed experts/rank.
-# This recipe defaults to CP8 and DP1. CP_SIZE can override context
-# parallelism; revalidate memory use and throughput after changing it.
-# MAX_TOKENS_PER_GPU defaults to 16384. Dynamic batching and padding determine
-# the actual microbatch count; inspect packing metrics when tuning PP utilization.
+# HOST RAM — this is the binding constraint for full-parameter SFT, not HBM.
+# Every parameter carries an FP32 master copy (4 B) + Adam m/v (8 B) + BF16 grad
+# (2 B) ~= 14 B, so 2.78T params ~= 39 TB of offloaded optimizer state, i.e.
+# ~2.4 TB on each of the 16 nodes. That fits under a ~4 TB/node budget but without
+# much headroom: if a node OOMs during load or step 0, lower
+# OPTIMIZER_OFFLOAD_FRACTION (0.5 keeps half the optimizer state/work on the GPUs)
+# or run on more nodes. LoRA instead keeps this cost negligible — see
+# examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-lora-64xblackwell.sh.
 #
-# HOST RAM is the binding constraint for full-parameter SFT: FP32 master (4 B) +
-# Adam m/v (8 B) + BF16 grad (2 B) ~= 14 B/param over 2.78T params ~= 39 TB,
-# i.e. ~2.4 TB on each of the 16 nodes. If a node OOMs at load or step 0, lower
-# OPTIMIZER_OFFLOAD_FRACTION (0.5 keeps half on the GPUs) or add nodes.
+# Dispatcher: defaults to the plain all-to-all dispatcher, NOT DeepEP. DeepEP's
+# NVSHMEM init segfaults on this cluster's AWS EFA fabric once GDRCopy is
+# unavailable. Set USE_DEEPEP=1 to opt back into deepep+flex where supported.
 #
-# Dispatcher defaults to plain all-to-all, NOT DeepEP: DeepEP's NVSHMEM init
-# segfaults on this cluster's AWS EFA fabric. USE_DEEPEP=1 opts back in.
-#
-# Model load takes ~7-15 min (2.78T params, MXFP4->BF16 dequant); a job sitting
-# in "loading" is not a hang. Step 0 is also slow (compile + NCCL init).
+# Model load takes ~7-15 min (2.78T params, MXFP4->BF16 dequant, CPU-offloaded);
+# a job sitting in "loading" is not a hang — the first `training step 0/200` log
+# line is the real start signal. Step 0 itself is also slow (compile + NCCL init).
 #
 # Submit on the head of an existing 128-GPU Ray cluster:
 #   bash scripts/entrypoint/ray-job.sh \
-#       examples/models/kimi-k3/scripts/run-kimi-k3-hellaswag-128xb300.sh
+#       examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-128xblackwell.sh
 # Inspect arguments without touching Ray:
-#   DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-hellaswag-128xb300.sh
+#   DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-128xblackwell.sh
 
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
@@ -49,17 +47,14 @@ source "${MODEL_CONFIG_DIR}/kimi-k3.sh"
 
 HF_CHECKPOINT="${HF_CHECKPOINT:-${MODEL_DIR:-}}"
 : "${HF_CHECKPOINT:?Set MODEL_DIR or HF_CHECKPOINT to the shared HF model directory}"
-HELLASWAG_DATA_DIR="${HELLASWAG_DATA_DIR:-${DATA_DIR:-}}"
-: "${HELLASWAG_DATA_DIR:?Set DATA_DIR or HELLASWAG_DATA_DIR to the shared dataset directory}"
-# Rows are {"messages": [{"role": ..., "content": ...}], "source_id": ...} --
-# already the OpenAI shape SFT expects, so no --conversation-key-map is needed.
-PROMPT_DATA="['${HELLASWAG_DATA_DIR}/train.jsonl']"
-EVAL_DATA="${HELLASWAG_DATA_DIR}/validation.jsonl"
-PROJECT_NAME="${PROJECT_NAME:-Relax/sft/kimi-k3-hellaswag}"
-EXP_NAME="${EXP_NAME:-kimi-k3-full-sft-hellaswag-b300-gpu128-bridge}"
-# 25600 train rows / GBS 256 = 100 steps = exactly one epoch.
-NUM_STEPS="${NUM_STEPS:-100}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
+POKEMON_DATA_DIR="${POKEMON_DATA_DIR:-${DATA_DIR:-}}"
+: "${POKEMON_DATA_DIR:?Set DATA_DIR or POKEMON_DATA_DIR to the shared dataset directory}"
+PROMPT_DATA="['${POKEMON_DATA_DIR}/pokemon_gpt4o_zh.parquet']"
+PROJECT_NAME="${PROJECT_NAME:-Relax/sft/kimi-k3-pokemon}"
+EXP_NAME="${EXP_NAME:-kimi-k3-full-sft-pokemon-zh-blackwell-280g-gpu128-bridge}"
+NUM_STEPS="${NUM_STEPS:-200}"
+# 8192 * CP4 = 32768-token packing budget, as validated on the 64-GPU run.
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
 now=$(date "+%Y-%m-%d-%H-%M-%S")
 
 # DeepEP segfaults on this cluster's EFA fabric; NVSHMEM's libfabric transport is
@@ -72,10 +67,8 @@ CKPT_ARGS=(
     --trust-remote-code
     --ref-load "${HF_CHECKPOINT}"
     --megatron-to-hf-mode bridge
+    # The 833-example dataset repeats; one epoch would end after only a few steps.
     --num-rollout "${NUM_STEPS}"
-    --save-interval "${SAVE_INTERVAL:-50}"
-    # num_epochs: 1 -- one pass over the 25600 rows, no repetition.
-    # --num-epoch "${NUM_EPOCH:-1}"
 )
 # Distributed checkpoints of the full model are very large; opt in with SAVE_DIR.
 if [ -n "${SAVE_DIR:-}" ]; then
@@ -86,12 +79,13 @@ fi
 SFT_ARGS=(
     --loss-type sft
     --prompt-data "${PROMPT_DATA}"
-    # Text-only: no --multimodal-keys, no --conversation-key-map.
-    --input-key messages
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
-    # dataloader.shuffle: true in the recipe.
-    --rollout-shuffle
+    --input-key conversations
+    --multimodal-keys '{"image":"images"}'
+    --conversation-key-map '{"from":"role","value":"content","human":"user","gpt":"assistant"}'
+    # DP2: half the global batch per replica.
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
     --use-dynamic-batch-size
+    # CP4 gives a MAX_TOKENS_PER_GPU*4 = 32768-token packing budget.
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
     --sft-oversize-strategy skip
     --balance-data
@@ -101,16 +95,9 @@ SFT_ARGS=(
     --sft-tq-timeout-minutes 60
 )
 
-# Held-out validation set (recipe: validation split, 256 rows, val_every_steps 100).
-# --eval-prompt-data takes "<name> <path>" and is mutually exclusive with
-# --eval-size; the eval dataset reuses --input-key and the train key handling.
-EVAL_ARGS=(
-    # --skip-eval-before-train
-    --eval-prompt-data hellaswag "${EVAL_DATA}"
-    --eval-interval "${EVAL_INTERVAL:-20}"
-)
-
 # MoE token dispatcher. Default = plain all-to-all (no NVSHMEM, EFA-safe).
+# USE_DEEPEP=1 restores the deepep+flex path (only safe on a fabric where
+# DeepEP's NVSHMEM init does not segfault).
 if [ "${USE_DEEPEP:-0}" = 1 ]; then
     DISPATCHER_ARGS=(
         --moe-flex-dispatcher-backend deepep
@@ -128,10 +115,9 @@ PERF_ARGS=(
     --pipeline-model-parallel-size 4
     --decoder-first-pipeline-num-layers 23
     --decoder-last-pipeline-num-layers 22
-    # Default CP8; override with CP_SIZE for the target context length.
-    --context-parallel-size "${CP_SIZE:-8}"
+    --context-parallel-size "${CP_SIZE:-4}"
     --calculate-per-token-loss
-    # 32 GPUs per PP stage (TP4*CP8*DP1) -> EP32, 896/32 = 28 experts/rank.
+    # 32 GPUs per PP stage (TP4*CP4*DP2) -> EP32, 896/32 = 28 experts/rank.
     --expert-model-parallel-size "${EP_SIZE:-32}"
     --expert-tensor-parallel-size 1
 
@@ -143,6 +129,9 @@ PERF_ARGS=(
     --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
     --main-grads-dtype bf16
+    # ~14 B/param of FP32 master + Adam m/v + BF16 grad over 2.78T params is
+    # ~39 TB, i.e. ~2.4 TB per node across 16 nodes. Drop to 0.5 to move half the
+    # optimizer state/work onto the GPUs if host RAM runs short.
     --optimizer-offload-fraction "${OPTIMIZER_OFFLOAD_FRACTION:-1.0}"
 
     --disable-weights-backuper
@@ -153,15 +142,14 @@ PERF_ARGS=(
     "${DISPATCHER_ARGS[@]}"
 )
 
-# Matches the recipe's AdamW block: lr 1e-5, weight_decay 0.0, betas [0.9, 0.95].
 OPTIMIZER_ARGS=(
     --optimizer adam
     --lr "${LR:-1e-5}"
     --lr-decay-style cosine
     --min-lr 1e-6
-    --weight-decay "${WEIGHT_DECAY:-0.0}"
+    --weight-decay 0.1
     --adam-beta1 0.9
-    --adam-beta2 0.95
+    --adam-beta2 0.98
     --clip-grad 1.0
 )
 
@@ -177,7 +165,7 @@ MISC_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --attention-backend flash
-    # rng.seed: 1234 in the recipe.
+    # Pin RNG for reproducibility / parity with the 64-GPU run.
     --seed "${SEED:-1234}"
 )
 
@@ -189,7 +177,6 @@ TRAIN_ARGS=(
     "${MODEL_ARGS[@]}"
     "${CKPT_ARGS[@]}"
     "${SFT_ARGS[@]}"
-    "${EVAL_ARGS[@]}"
     "${OPTIMIZER_ARGS[@]}"
     "${METRICS_ARGS[@]}"
     "${PERF_ARGS[@]}"

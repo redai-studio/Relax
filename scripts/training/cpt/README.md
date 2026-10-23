@@ -58,7 +58,7 @@ bash scripts/entrypoint/ray-job.sh \
 
 日志写入 `${OUTPUT_ROOT}/${RUN_NAME}/train.log`。可覆盖 `TRAIN_STEPS`、`PROMPT_DATA`、`HF_CHECKPOINT`、`RUN_NAME`、`OUTPUT_ROOT`、`SEQ_LENGTH`、`MAX_TOKENS_PER_GPU`、`LR_DECAY_STEPS` 和 `WARMUP_STEPS`。
 
-## 可扩展 H800 配置
+## 可扩展 80G Hopper 配置
 
 通用脚本默认每个节点使用 8 张 GPU，支持 1、2、4、8、16 个节点：
 

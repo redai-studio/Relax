@@ -1,5 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# GPU profile: 96G Hopper per GPU.
 #
 # ALFWorld agentic GRPO (no distillation), Qwen3.5-35B-A3B (MoE), 8xGPU colocate.
 # Rollout: 2P2D, TP2/EP1 per engine (4 P GPUs + 4 D GPUs); actor remains TP4/EP8.
@@ -33,7 +34,7 @@ ALFWORLD_DATA="${ALFWORLD_DATA:-/root/alfworld}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=20}"
 
 # Multi-turn budget, sized from measured 2-step runs on this corpus
-# (Qwen3.5-35B-A3B, 8xH20, 128 sessions/step):
+# (Qwen3.5-35B-A3B, 8x96G Hopper, 128 sessions/step):
 #   * each turn costs ~540 prompt tokens (the ~33-entry admissible-action list
 #     dominates, and it is re-sent every turn) + ~230 generated  => ~770/turn;
 #   * a full MAX_TURNS=40 episode therefore needs ~31K, and long <think> turns

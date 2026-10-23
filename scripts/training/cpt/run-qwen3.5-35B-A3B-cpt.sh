@@ -1,6 +1,7 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3.5-35B-A3B CPT scalable H800 baseline. Set NUM_NODES for 8 GPUs per
+# GPU profile: 80G Hopper per GPU.
+# Qwen3.5-35B-A3B CPT scalable 80G Hopper baseline. Set NUM_NODES for 8 GPUs per
 # node, or set NUM_GPUS directly. Supported world sizes: 8/16/32/64/128.
 set -euo pipefail
 

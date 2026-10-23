@@ -1,6 +1,7 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3.5-35B-A3B CPT 128K H800 DeepEP experiment: 16 nodes x 8 GPUs.
+# GPU profile: 80G Hopper per GPU.
+# Qwen3.5-35B-A3B CPT 128K 80G Hopper DeepEP experiment: 16 nodes x 8 GPUs.
 # Defaults: TP2/PP2(22/18)/CP2/EP8/DP16, GBS256, dynamic 64K-token
 # microbatches, full recompute, flex/DeepEP MoE dispatch, and MTP disabled.
 #

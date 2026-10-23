@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Opt-in numerical gates inside the built B300 image; no cluster
+"""Opt-in numerical gates inside the built 280G Blackwell image; no cluster
 submission."""
 
 import os
@@ -10,8 +10,8 @@ import torch.nn.functional as F
 
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("RELAX_RUN_B300_GPU_TESTS") != "1" or not torch.cuda.is_available(),
-    reason="Requires an explicitly selected B300 GPU image (RELAX_RUN_B300_GPU_TESTS=1)",
+    os.environ.get("RELAX_RUN_BLACKWELL_GPU_TESTS") != "1" or not torch.cuda.is_available(),
+    reason="Requires an explicitly selected 280G Blackwell GPU image (RELAX_RUN_BLACKWELL_GPU_TESTS=1)",
 )
 
 
@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 def test_fla_packed_convolution_forward_and_backward(lengths):
     from fla.modules.conv import causal_conv1d
 
-    assert torch.cuda.get_device_capability() == (10, 3), "Run this gate on B300"
+    assert torch.cuda.get_device_capability() == (10, 3), "Run this gate on 280G Blackwell"
     torch.manual_seed(42)
     inputs = [
         torch.randn(1, sum(lengths), 64, device="cuda"),
@@ -47,7 +47,7 @@ def test_fla_packed_convolution_forward_and_backward(lengths):
 def test_te_cross_entropy_forward_and_backward():
     from relax.utils.training.fused_ce import te_cross_entropy
 
-    assert torch.cuda.get_device_capability() == (10, 3), "Run this gate on B300"
+    assert torch.cuda.get_device_capability() == (10, 3), "Run this gate on 280G Blackwell"
     torch.manual_seed(42)
     logits = torch.randn(37, 1, 8192, device="cuda", requires_grad=True)
     reference = logits.detach().clone().requires_grad_()
@@ -69,7 +69,7 @@ def test_qwen38_native_router_checkpoint_matches_sorted_forward_and_gradients(mo
     native = inspect.unwrap(moe_utils.topk_routing_with_score_function)
     if "qb_histogram" not in inspect.signature(native).parameters:
         pytest.skip("Requires the unified MCore native replay routing API")
-    assert torch.cuda.get_device_capability() == (10, 3), "Run this gate on B300"
+    assert torch.cuda.get_device_capability() == (10, 3), "Run this gate on 280G Blackwell"
     assert "use_sorted_topk" in inspect.getsource(native), "Requires rebuilt static model operators"
     monkeypatch.setenv("RELAX_QWEN38_ROUTER_SORTED_REPLAY", "1")
     wrapped = native

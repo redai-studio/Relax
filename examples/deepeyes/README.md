@@ -44,9 +44,9 @@ bash benchmark.sh run_deepeyes
 bash examples/deepeyes/run_deepeyes.sh
 ```
 
-在单机 8×H800（80GB）上运行 `run_deepeyes.sh` 时的 GPU 使用率监控（平均约 66%）：
+在单机 8×80G Hopper GPU 上运行 `run_deepeyes.sh` 时的 GPU 使用率监控（平均约 66%）：
 
-![单机 8×H800（80GB）运行 run_deepeyes.sh 的 GPU 使用率](../../docs/public/deepeyes-h800.png)
+![单机 8×80G Hopper GPU 运行 run_deepeyes.sh 的 GPU 使用率](../../docs/public/deepeyes-hopper.png)
 
 ## 文件结构
 

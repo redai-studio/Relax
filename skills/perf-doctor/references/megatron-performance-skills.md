@@ -7,7 +7,7 @@
 ## 共同使用方式
 
 1. 根据症状选择下列小节；必要时读取该 skill 原文及验证卡。未安装也可通过链接读取，不自动安装依赖。
-2. 收集模型/任务、GPU 型号与拓扑、镜像和 MCore/TE/CUDA/NCCL 版本、序列长度、MBS/GBS、并行布局、精度、路由、recompute、dispatcher 和 graph scope。已有硬件证据优先于 `perf-doctor` 的默认 H20 假设。
+2. 收集模型/任务、GPU 型号与拓扑、镜像和 MCore/TE/CUDA/NCCL 版本、序列长度、MBS/GBS、并行布局、精度、路由、recompute、dispatcher 和 graph scope。已有硬件证据优先于 `perf-doctor` 的默认 96G Hopper 假设。
 3. 将上游建议映射到 Relax：读启动脚本及其 `source` 的模型配置，再追踪 `relax/utils/arguments.py`、`relax/backends/megatron/arguments.py`、`model_provider.py`、`model.py` 和训练镜像中的 MCore/TE 实现。核实参数是否存在、是否被覆盖、是否传入运行时；找不到对应能力就标注“未核实/未接入”。
 4. 输出候选、限制、Relax 代码依据和验证计划。区分“保持训练语义的候选”与“仅 benchmark 的设置”；强制均衡路由、mock data、关闭检查或跳过 optimizer/checkpoint 不能证明真实训练收益。
 

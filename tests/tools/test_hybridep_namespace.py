@@ -16,9 +16,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture
 def hybrid_source(tmp_path):
-    source = os.environ.get("B300_HYBRIDEP_SOURCE_DIR")
+    source = os.environ.get("BLACKWELL_HYBRIDEP_SOURCE_DIR")
     if not source:
-        pytest.skip("Set B300_HYBRIDEP_SOURCE_DIR to pinned unpatched HybridEP sources")
+        pytest.skip("Set BLACKWELL_HYBRIDEP_SOURCE_DIR to pinned unpatched HybridEP sources")
     target = tmp_path / "source"
     shutil.copytree(source, target)
     result = subprocess.run(

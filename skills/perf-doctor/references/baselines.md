@@ -9,11 +9,11 @@ baseline 不是硬规则，是 cross-reference；脚本注释明确说在做对�
 
 ---
 
-## Qwen3.5-35B-A3B · 64×H800 80GB · sync (colocate)
+## Qwen3.5-35B-A3B · 64×80G Hopper · sync (colocate)
 
 | 维度 | 值 |
 |---|---|
-| GPUs | 64（8 节点 × 8 卡 H800-80G）|
+| GPUs | 64（8 节点 × 8 卡 80G Hopper）|
 | Mode | `--colocate`（sync）|
 | Model | Qwen3.5-35B-A3B（MoE，总参 35B / 激活 ~3B / 128 experts）|
 | TP | 2 |
@@ -31,10 +31,10 @@ baseline 不是硬规则，是 cross-reference；脚本注释明确说在做对�
 
 - **TP=2**：MoE A3B 激活参数小，TP 大了 all-reduce 占比反而上升；2 够装单层
 - **PP=2**：35B 在 TP2·EP16 下单层可装，但 40K context 的 activation 需要纵向再切一刀
-- **CP=4**：40K context 必须切 sequence 维（CP=1 时 attention 显存 O(seq²) 爆），10K/CP rank 是 H800 的舒适区
+- **CP=4**：40K context 必须切 sequence 维（CP=1 时 attention 显存 O(seq²) 爆），10K/CP rank 是 80G Hopper 的舒适区
 - **EP=16**：128 experts / 16 = 每 EP rank 8 expert，配合 DeepEP dispatcher 通信成本最低
 - **DP=4 + balance-data**：变长 + 大 DP 必开 balance，否则 straggler 拖整批
-- **sync 模式**：colocate 复用 64 卡，避免 fully-async 在 H800 上 actor/rollout 拆分难匹配
+- **sync 模式**：colocate 复用 64 卡，避免 fully-async 在 80G Hopper 上 actor/rollout 拆分难匹配
 
 **Memory budget（粗算）：**
 
@@ -46,7 +46,7 @@ baseline 不是硬规则，是 cross-reference；脚本注释明确说在做对�
 
 **何时偏离这条 baseline 是合理的：**
 
-- 64×H20 96G（非 H800）→ 显存更宽，PP 可降到 1；通信带宽不同，CP 可能降到 2
+- 64×96G Hopper（显存容量高于上述配置）→ 显存更宽，PP 可降到 1；通信带宽不同，CP 可能降到 2
 - 改 fully-async → 需要拆 actor/rollout 资源池，参数会重新算
 - context 降到 8K 以下 → CP 可以从 4 降到 1
 

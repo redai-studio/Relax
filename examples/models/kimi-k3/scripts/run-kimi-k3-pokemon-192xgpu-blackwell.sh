@@ -1,18 +1,19 @@
 #!/bin/bash
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# GPU profile: 280G Blackwell per GPU.
 #
 # Full Kimi K3 multimodal SFT: 93 language layers, 896 experts, full vision.
-# 24 x 8 B300 GPUs (275040 MiB each), BF16 training from the MXFP4 checkpoint.
+# 24 x 8 GPUs (280G Blackwell each), BF16 training from the MXFP4 checkpoint.
 # TP4/PP6/CP2/EP32/ETP1: DP4, expert-DP1; ordinary 1F1B, no VPP or MTP.
 # PP layer counts: 15 + 16 + 16 + 16 + 16 + 14 = 93.
 # Requires the upgraded Blackwell image with the K3 CP/recompute patches.
 #
 # Submit on the head of an existing 192-GPU Ray cluster:
 #   bash scripts/entrypoint/ray-job.sh \
-#       examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-192xgpu-b300.sh
+#       examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-192xgpu-blackwell.sh
 # Inspect arguments without touching Ray:
-#   DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-192xgpu-b300.sh
+#   DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-192xgpu-blackwell.sh
 
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
@@ -28,7 +29,7 @@ POKEMON_DATA_DIR="${POKEMON_DATA_DIR:-${DATA_DIR:-}}"
 : "${POKEMON_DATA_DIR:?Set DATA_DIR or POKEMON_DATA_DIR to the shared dataset directory}"
 PROMPT_DATA="['${POKEMON_DATA_DIR}/pokemon_gpt4o_zh.parquet']"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/kimi-k3-pokemon}"
-EXP_NAME="${EXP_NAME:-kimi-k3-full-sft-pokemon-zh-b300-gpu192-bridge}"
+EXP_NAME="${EXP_NAME:-kimi-k3-full-sft-pokemon-zh-blackwell-280g-gpu192-bridge}"
 NUM_STEPS="${NUM_STEPS:-200}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-512}"
 now=$(date "+%Y-%m-%d-%H-%M-%S")

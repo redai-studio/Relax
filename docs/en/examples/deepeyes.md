@@ -73,9 +73,9 @@ cd /root/Relax
 bash examples/deepeyes/run_deepeyes.sh
 ```
 
-GPU utilization while running `run_deepeyes.sh` on a single node with 8×H800 (80GB) (~66% on average):
+GPU utilization while running `run_deepeyes.sh` on a single node with 8×80G Hopper GPUs (~66% on average):
 
-![GPU utilization running run_deepeyes.sh on a single node with 8×H800 (80GB)](/deepeyes-h800.png)
+![GPU utilization running run_deepeyes.sh on a single node with 8×80G Hopper GPUs](/deepeyes-hopper.png)
 
 ### Remote Cluster (via Ray Job)
 

@@ -27,7 +27,7 @@ def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage
         indexer = install_indexer_qat(model, bf16_scores=scores)
     get_logger(__name__).info(
         "[DSV4-MXFP4] mode=%s; native P2 FP8 projections=%d; indexer Q/K MXFP4 modules=%d; "
-        "BF16 final score simulation=%s. H800 indexer uses BF16 kernels. Uncovered FP8: %s",
+        "BF16 final score simulation=%s. 80G Hopper indexer uses BF16 kernels. Uncovered FP8: %s",
         mode,
         len(fp8),
         len(indexer),

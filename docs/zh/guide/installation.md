@@ -45,7 +45,7 @@ make docker-train
 make docker-dev
 
 # 仅在本地构建 Blackwell dev 镜像。
-DO_PUSH=0 make docker-dev-cu13-b300
+DO_PUSH=0 make docker-dev-cu13-blackwell
 ```
 
 `make train` 是 `make docker-train` 的别名。三个变体分别检查各自的镜像标签，cu12 已存在时仍会继续检查并构建缺少的 cu13 镜像。
@@ -55,10 +55,10 @@ DO_PUSH=0 make docker-dev-cu13-b300
 | 变体 | Dockerfile | Train 目标 | Dev 目标 |
 | --- | --- | --- | --- |
 | CUDA 12.9 | `docker/Dockerfile` | `docker-train-cu12` | `docker-dev-cu12` |
-| CUDA 13.0 Blackwell | `docker/Dockerfile.cu13` | `docker-train-cu13-b300` | `docker-dev-cu13-b300` |
+| CUDA 13.0 Blackwell | `docker/Dockerfile.cu13` | `docker-train-cu13-blackwell` | `docker-dev-cu13-blackwell` |
 | CUDA 13.0 Hopper | `docker/Dockerfile.cu13` | `docker-train-cu13-hopper` | `docker-dev-cu13-hopper` |
 
-Blackwell 使用 `GPU_ARCH=b300`，Hopper 使用 `GPU_ARCH=hopper`。镜像标签的后缀分别为 `cu12`、`cu13-blackwell` 和 `cu13-hopper`。默认镜像名为 `<REGISTRY>/<IMAGE_REPOSITORY>:train-YYYYMMDD-<hash8>-<suffix>` 和 `<REGISTRY>/<IMAGE_REPOSITORY>:dev-YYYYMMDD-<hash8>-<suffix>`，其中日期为构建日期，`hash8` 为当前 Git commit 的前八位。
+Blackwell 使用 `GPU_ARCH=blackwell`，Hopper 使用 `GPU_ARCH=hopper`。镜像标签的后缀分别为 `cu12`、`cu13-blackwell` 和 `cu13-hopper`。默认镜像名为 `<REGISTRY>/<IMAGE_REPOSITORY>:train-YYYYMMDD-<hash8>-<suffix>` 和 `<REGISTRY>/<IMAGE_REPOSITORY>:dev-YYYYMMDD-<hash8>-<suffix>`，其中日期为构建日期，`hash8` 为当前 Git commit 的前八位。
 
 默认 `DO_PUSH=1`：远端已存在的镜像会跳过，新构建的镜像会推送。设置 `DO_PUSH=0` 时检查并跳过本地已存在的镜像，不执行推送。两种模式均需设置 `REGISTRY`。
 
@@ -75,11 +75,11 @@ Makefile 从环境变量或 Make 命令行赋值中读取以下覆盖项：
 ```bash
 # 复用已有的 Blackwell train 镜像；请替换日期和哈希占位符。
 CU13_BLACKWELL_TRAIN_IMAGE="$REGISTRY/relax:train-YYYYMMDD-HASH8-cu13-blackwell" \
-  DO_PUSH=0 make docker-dev-cu13-b300
+  DO_PUSH=0 make docker-dev-cu13-blackwell
 ```
 
 ::: warning CUDA 13 验证状态
-`docker/Dockerfile.cu13` 是候选构建配置。正式发布前仍需完成完整镜像构建和 GPU 验证，包括 B300 前向与反向验证。提供这些构建目标不代表已发布的 `latest` 镜像已经支持 Blackwell。
+`docker/Dockerfile.cu13` 提供面向 Hopper 和 Blackwell 架构的候选编译配置。完整镜像构建结果需另行确认，实机验证（包括前向与反向计算）需另行进行。这些构建目标本身不代表已发布的 `latest` 镜像已经支持 Blackwell。
 :::
 
 #### 直接使用 Docker 构建

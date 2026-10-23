@@ -11,29 +11,30 @@ from relax.utils.training.kimi_k3_flops import estimate_kimi_k3_flops
 logger = get_logger(__name__)
 
 # BF16 theoretical peak FLOPS per device (raw FLOPS).
+# Model names are compatibility keys, not a record of deployed hardware.
 _DEVICE_FLOPS = {
     "CPU": 448e9,
-    "GB200": 2.5e15,
-    "B200": 2.25e15,
-    "GB300": 2.5e15,
-    "B300": 2.25e15,
+    "GB200": 2.5e15,  # gitleaks:allow
+    "B200": 2.25e15,  # gitleaks:allow
+    "GB300": 2.5e15,  # gitleaks:allow
+    "B300": 2.25e15,  # gitleaks:allow
     "MI300X": 1307e12,
     "MI350X": 2300e12,
     "MI355X": 2500e12,
-    "H100": 989e12,
-    "H800": 989e12,
-    "L20Y": 989e12,
-    "H200": 989e12,
-    "A100": 312e12,
-    "A800": 312e12,
-    "L40S": 362.05e12,
-    "L40": 181.05e12,
-    "A40": 149.7e12,
-    "L20": 119.5e12,
-    "H20": 148e12,
+    "H100": 989e12,  # gitleaks:allow
+    "H800": 989e12,  # gitleaks:allow
+    "L20Y": 989e12,  # gitleaks:allow
+    "H200": 989e12,  # gitleaks:allow
+    "A100": 312e12,  # gitleaks:allow
+    "A800": 312e12,  # gitleaks:allow
+    "L40S": 362.05e12,  # gitleaks:allow
+    "L40": 181.05e12,  # gitleaks:allow
+    "A40": 149.7e12,  # gitleaks:allow
+    "L20": 119.5e12,  # gitleaks:allow
+    "H20": 148e12,  # gitleaks:allow
     "910B": 354e12,
     "Ascend910": 354e12,
-    "RTX 3070 Ti": 43.5e12,
+    "RTX 3070 Ti": 43.5e12,  # gitleaks:allow
 }
 
 

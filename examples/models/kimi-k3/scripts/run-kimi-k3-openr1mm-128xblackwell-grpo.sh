@@ -1,7 +1,8 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# GPU profile: 280G Blackwell per GPU.
 #
-# Full-parameter Kimi K3 GRPO, 16 x 8 B300, actor/rollout colocated.
+# Full-parameter Kimi K3 GRPO, 16 x 8 GPUs (280G Blackwell each), actor/rollout colocated.
 # Training: TP4/PP4 (21+24+24+24)/CP2/EP32/ETP1, including vision.
 # Rollout: 8 engines with attention TP8/DP2 and MoE EP16, two nodes per engine.
 # Requires the current SGLang MXFP4 reload patch on EVERY node.
@@ -21,7 +22,7 @@ source "${MODEL_CONFIG_DIR}/kimi-k3.sh"
 HF_CHECKPOINT="${HF_CHECKPOINT:-${MODEL_DIR:?Set MODEL_DIR to the HF model directory}/Kimi-K3}"
 PROMPT_SET="${PROMPT_SET:-${DATA_DIR:?Set DATA_DIR to the prepared dataset directory}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet}"
 now=$(date '+%Y-%m-%d-%H-%M-%S')
-EXP_NAME="${EXP_NAME:-kimi-k3-openr1mm-grpo-128xb300}"
+EXP_NAME="${EXP_NAME:-kimi-k3-openr1mm-grpo-128xblackwell-280g}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/rl/kimi-k3-openr1mm}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}/${EXP_NAME}}"
 SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"

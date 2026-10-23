@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""H800 numerical simulation of indexer MXFP4 Q/K and BF16 final scores.
+"""80G Hopper numerical simulation of indexer MXFP4 Q/K and BF16 final scores.
 
 QDQ follows Hadamard and precedes CP gather, so top-k and auxiliary backward
 share the same activation values. The existing SM90 kernel still consumes BF16.

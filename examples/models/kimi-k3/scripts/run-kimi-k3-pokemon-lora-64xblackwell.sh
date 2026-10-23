@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# GPU profile: 280G Blackwell per GPU.
 #
-# Full Kimi K3 multimodal LoRA SFT on 8 x 8 B300: reuse the full-model 64-GPU
+# Full Kimi K3 multimodal LoRA SFT on 8 x 8 GPUs (280G Blackwell each): reuse the full-model 64-GPU
 # base driver (93 layers, 896 experts, TP4/PP4/CP4/EP16, all-to-all dispatcher,
 # CPU optimizer offload) and train adapters only. LoRA keeps optimizer state
 # negligible, so the full 2.78T model fits on 64 GPUs where full-parameter SFT
@@ -21,15 +22,15 @@
 #
 # Usage (submit through the existing cluster entrypoint):
 #   bash scripts/entrypoint/ray-job.sh \
-#       examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-lora-64xb300.sh
+#       examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-lora-64xblackwell.sh
 # Inspect resolved arguments without starting Ray or submitting:
-#   DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-lora-64xb300.sh
+#   DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-lora-64xblackwell.sh
 
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-export EXP_NAME="${EXP_NAME:-kimi-k3-full-lora-sft-pokemon-zh-b300-gpu64-bridge}"
+export EXP_NAME="${EXP_NAME:-kimi-k3-full-lora-sft-pokemon-zh-blackwell-280g-gpu64-bridge}"
 # Produce an early adapter checkpoint for conversion validation.
 export NUM_STEPS="${NUM_STEPS:-1}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
@@ -78,4 +79,4 @@ PY
     export RUNTIME_ENV_JSON
 fi
 
-exec bash "${SCRIPT_DIR}/run-kimi-k3-pokemon-64xb300.sh" "${LORA_ARGS[@]}" "$@"
+exec bash "${SCRIPT_DIR}/run-kimi-k3-pokemon-64xblackwell.sh" "${LORA_ARGS[@]}" "$@"

@@ -259,11 +259,11 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
 fi
 
 # Shared MCore model sources are installed above, but this CUDA 12 image retains
-# its SGLang 0.5.17/TE 2.14 runtime. The optimized B300 TP4 recipe and Qwen3.8
+# its SGLang 0.5.17/TE 2.14 runtime. The optimized 280G Blackwell TP4 recipe and Qwen3.8
 # SGLang 0.5.20 rollout require Dockerfile.cu13; Torch stays on CUDA 12.
 
 # Shared experiment fixes belong in the default CUDA 12 build as well. Keep its
-# NumPy<2, TE 2.14 and CUDA 12 libraries; do not install the B300 cu13/v2 stack.
+# NumPy<2, TE 2.14 and CUDA 12 libraries; do not install the 280G Blackwell cu13/v2 stack.
 COPY docker/scripts/install_legacy_fla.py \
     docker/scripts/validate_hybridep_install.py \
     docker/scripts/record_qwen35_runtime.py \

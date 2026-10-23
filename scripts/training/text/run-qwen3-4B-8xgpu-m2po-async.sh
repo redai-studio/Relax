@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# GPU profile: 96G Hopper per GPU.
 #
 # Qwen3-4B 8xGPU M2PO fully-async off-policy validation script.
 # Reference: https://arxiv.org/abs/2510.01161 (Second-Moment Trust Policy Optimization)
@@ -158,7 +159,7 @@ MISC_ARGS=(
 )
 
 mkdir -p log
-# Disable NVLS to avoid NVSwitch/FabricManager compatibility errors on H20
+# Disable NVLS to avoid NVSwitch/FabricManager compatibility errors on 96G Hopper
 export NCCL_NVLS_ENABLE=0
 
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \

@@ -23,7 +23,7 @@ min_coverage_scale_in: 1.0
 rollout_service_url: "http://localhost:8000/rollout"
 
 scale_out_policy:
-  # H20 validation load observes about 22% usage before scaling.
+  # 96G Hopper validation load observes about 22% usage before scaling.
   token_usage_threshold: 0.15
   queue_depth_per_engine: 1
   queue_time_p95_threshold: 1.0

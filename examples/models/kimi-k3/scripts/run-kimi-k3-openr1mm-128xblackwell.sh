@@ -1,26 +1,30 @@
 #!/bin/bash
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# GPU profile: 280G Blackwell per GPU.
 #
-# Full Kimi K3 text-only full-parameter SFT on HellaSwag, with a held-out
-# validation set. 16 x 8 B300 GPUs, BF16 from the MXFP4 checkpoint.
-# TP4/PP4/CP2/EP32/ETP1: DP4, expert-DP1; ordinary 1F1B, no VPP or MTP.
-# PP layer counts: 23 + 24 + 24 + 22 = 93.
+# Full Kimi K3 multimodal SFT on multimodal-open-r1-8k-verified.
+# 16 x 8 GPUs (280G Blackwell each), BF16 from the MXFP4 checkpoint. This uses the Kimi K3
+# chat rendering (K3 XTML encoder) and vision processor.
+# TP4/PP4/CP8/EP32/ETP1: DP1, expert-DP1; ordinary 1F1B, no VPP or MTP.
+# PP layer counts: 21 + 24 + 24 + 24 = 93; stage 0 also hosts the vision tower.
 #
 # Hyperparameters follow the official recipe k3_hellaswag.yaml (NVIDIA
 # nemo_automodel, 256 GPU FSDP2). Mapped 1:1 where the knob exists in Megatron:
-#   global_batch_size 256 | max_steps 100 | num_epochs 1 | val_every_steps 100
+#   global_batch_size 256 | seed 1234 | lr 1e-5 | weight_decay 0.0
 #   seed 1234 | lr 1e-5 | weight_decay 0.0 | betas [0.9, 0.95] | clip_grad 1.0
 #   dataloader shuffle: true -> --rollout-shuffle
 #   adam eps 1e-8 is Megatron's default, so it is not passed explicitly.
-# With 25600 prepared train rows and GBS 256, the default 100 steps cover
-# one epoch. Supply train.jsonl and a held-out validation.jsonl.
+# The converted dataset has 7424 train rows and 265 held-out test rows.
+# 7424 / GBS 256 = 29 steps = exactly one pass over training data.
 #
-# PP4 leaves 32 GPUs per pipeline stage; EP32 assigns 28 routed experts/rank.
-# This recipe defaults to CP2 and DP4. CP_SIZE can override context
-# parallelism; revalidate memory use and throughput after changing it.
-# MAX_TOKENS_PER_GPU defaults to 1024. Dynamic batching and padding determine
-# the actual microbatch count; inspect packing metrics when tuning PP utilization.
+# Parallelism is NOT copied from the recipe: that is a 256-GPU FSDP2 layout
+# (tp1/cp1/pp8/ep32/dp32). On 128 GPUs under Megatron, PP4 is what still yields
+# 32 GPUs per pipeline stage and therefore EP32 -> 896/32 = 28 experts/rank,
+# which is the lever that fits the 2.72T of routed experts. CP8 and a 16384
+# token/GPU budget accommodate visual tokens and long reasoning responses.
+#
+# Dynamic batching uses the token budget below for image and reasoning samples.
 #
 # HOST RAM is the binding constraint for full-parameter SFT: FP32 master (4 B) +
 # Adam m/v (8 B) + BF16 grad (2 B) ~= 14 B/param over 2.78T params ~= 39 TB,
@@ -35,9 +39,11 @@
 #
 # Submit on the head of an existing 128-GPU Ray cluster:
 #   bash scripts/entrypoint/ray-job.sh \
-#       examples/models/kimi-k3/scripts/run-kimi-k3-hellaswag-128xb300-rawtext.sh
+#       examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh
 # Inspect arguments without touching Ray:
-#   DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-hellaswag-128xb300-rawtext.sh
+#   DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh
+# Save validation: NUM_STEPS=2 SAVE_INTERVAL=2 stops after two training steps
+# and saves iteration 1 (training step indices are zero-based).
 
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
@@ -49,24 +55,19 @@ source "${MODEL_CONFIG_DIR}/kimi-k3.sh"
 
 HF_CHECKPOINT="${HF_CHECKPOINT:-${MODEL_DIR:-}}"
 : "${HF_CHECKPOINT:?Set MODEL_DIR or HF_CHECKPOINT to the shared HF model directory}"
-HELLASWAG_DATA_DIR="${HELLASWAG_DATA_DIR:-${DATA_DIR:-}}"
-: "${HELLASWAG_DATA_DIR:?Set DATA_DIR or HELLASWAG_DATA_DIR to the shared dataset directory}"
-# Rows are {"messages": [{"role": ..., "content": ...}], "source_id": ...} --
-# already the OpenAI shape SFT expects, so no --conversation-key-map is needed.
-PROMPT_DATA="['${HELLASWAG_DATA_DIR}/train.jsonl']"
-EVAL_DATA="${HELLASWAG_DATA_DIR}/validation.jsonl"
-PROJECT_NAME="${PROJECT_NAME:-Relax/sft/kimi-k3-hellaswag}"
-EXP_NAME="${EXP_NAME:-kimi-k3-full-sft-hellaswag-b300-gpu128-rawtext}"
-# 25600 train rows / GBS 256 = 100 steps = exactly one epoch.
-NUM_STEPS="${NUM_STEPS:-100}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-1024}"
+OPENR1MM_DATA_DIR="${OPENR1MM_DATA_DIR:-${DATA_DIR:-}}"
+: "${OPENR1MM_DATA_DIR:?Set DATA_DIR or OPENR1MM_DATA_DIR to the shared dataset directory}"
+PROMPT_DATA="['${OPENR1MM_DATA_DIR}/train.parquet']"
+PROJECT_NAME="${PROJECT_NAME:-Relax/sft/kimi-k3-openr1mm}"
+EXP_NAME="${EXP_NAME:-kimi-k3-full-sft-openr1mm-blackwell-280g-gpu128-chat}"
+NUM_STEPS="${NUM_STEPS:-}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
+FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-1}"
 now=$(date "+%Y-%m-%d-%H-%M-%S")
 
-# Render rows without the chat template (see the header). Read per-call in
-# relax/engine/sft/dataset/chat_template.py::render_with_loss_mask; an env var
-# rather than a CLI flag so it also reaches the eval dataset, which
-# relax/components/sft.py constructs directly without dataset kwargs.
-export RELAX_SFT_RAW_TEXT_CONCAT=1
+# The source HellaSwag script enabled text-only rendering. Clear any inherited
+# setting so SFT uses Kimi K3's multimodal chat renderer for training.
+unset RELAX_SFT_RAW_TEXT_CONCAT
 
 # DeepEP segfaults on this cluster's EFA fabric; NVSHMEM's libfabric transport is
 # the supported path when deepep is opted back in via USE_DEEPEP=1. Harmless with
@@ -78,42 +79,43 @@ CKPT_ARGS=(
     --trust-remote-code
     --ref-load "${HF_CHECKPOINT}"
     --megatron-to-hf-mode bridge
-    --num-rollout "${NUM_STEPS}"
-    --save-interval "${SAVE_INTERVAL:-50}"
-    # num_epochs: 1 -- one pass over the 25600 rows, no repetition.
-    # --num-epoch "${NUM_EPOCH:-1}"
+    --save-interval "${SAVE_INTERVAL:-100}"
+    # 29 steps at GBS 256 consume the complete training split once.
+    --num-epoch "${NUM_EPOCH:-3}"
 )
+# Leave epoch-based training unchanged unless an explicit step limit is set.
+if [ -n "${NUM_STEPS}" ]; then
+    CKPT_ARGS+=(--num-rollout "${NUM_STEPS}")
+fi
 # Distributed checkpoints of the full model are very large; opt in with SAVE_DIR.
 if [ -n "${SAVE_DIR:-}" ]; then
     CKPT_ARGS+=(--save "${SAVE_DIR}/${EXP_NAME}" --load "${SAVE_DIR}/${EXP_NAME}"
         --save-interval "${SAVE_INTERVAL:-100}" --max-actor-ckpt-to-keep 1)
 fi
 
+# Long-context full-model runs save weights only unless explicitly overridden.
+if [ "${SAVE_OPTIMIZER:-0}" != 1 ]; then
+    CKPT_ARGS+=(--no-save-optim)
+fi
+
 SFT_ARGS=(
     --loss-type sft
     --prompt-data "${PROMPT_DATA}"
-    # Text-only: no --multimodal-keys, no --conversation-key-map.
     --input-key messages
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
+    --multimodal-keys '{"image":"images"}'
+    --image-max-token-num 1024
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-512}"
     # dataloader.shuffle: true in the recipe.
     --rollout-shuffle
     --use-dynamic-batch-size
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
     --sft-oversize-strategy skip
+    --sft-invalid-multimodal-strategy skip
     --balance-data
     --per-rank-fetch
     --sft-prefetch-num-workers 16
     --sft-prefetch-buffer-size 256
     --sft-tq-timeout-minutes 60
-)
-
-# Held-out validation set (recipe: validation split, 256 rows, val_every_steps 100).
-# --eval-prompt-data takes "<name> <path>" and is mutually exclusive with
-# --eval-size; the eval dataset reuses --input-key and the train key handling.
-EVAL_ARGS=(
-    # --skip-eval-before-train
-    --eval-prompt-data hellaswag "${EVAL_DATA}"
-    --eval-interval "${EVAL_INTERVAL:-20}"
 )
 
 # MoE token dispatcher. Default = plain all-to-all (no NVSHMEM, EFA-safe).
@@ -128,16 +130,23 @@ else
     )
 fi
 
+# Trainable vision uses per-layer activation checkpointing; vision DP requires a frozen tower.
+VISION_ARGS=()
+if [ "${FREEZE_VISION_TOWER}" = 1 ]; then
+    VISION_ARGS=(--vision-dp-when-tp --freeze-vision-model)
+fi
+
 PERF_ARGS=(
     --tensor-model-parallel-size 4
     --sequence-parallel
+    "${VISION_ARGS[@]}"
     --pipeline-model-parallel-size 4
-    --decoder-first-pipeline-num-layers 23
-    --decoder-last-pipeline-num-layers 22
-    # Default CP2; override with CP_SIZE for the target context length.
-    --context-parallel-size "${CP_SIZE:-2}"
+    --decoder-first-pipeline-num-layers 21
+    --decoder-last-pipeline-num-layers 24
+    # Preserve the K3 128-GPU layout used by the source script.
+    --context-parallel-size "${CP_SIZE:-8}"
     --calculate-per-token-loss
-    # 32 GPUs per PP stage (TP4*CP2*DP4) -> EP32, 896/32 = 28 experts/rank.
+    # 32 GPUs per PP stage (TP4*CP8*DP1) -> EP32, 896/32 = 28 experts/rank.
     --expert-model-parallel-size "${EP_SIZE:-32}"
     --expert-tensor-parallel-size 1
 
@@ -188,14 +197,13 @@ MISC_ARGS=(
 )
 
 TRAIN_ARGS=(
-    --train-env-vars "{\"FLA_TILELANG\":\"${FLA_TILELANG:-0}\"}"
+    --train-env-vars "{\"FLA_TILELANG\":\"${FLA_TILELANG:-0}\",\"PYTORCH_CUDA_ALLOC_CONF\":\"expandable_segments:True\"}"
     --resource '{"sft": [1, 0], "actor": [1, 128]}'
     --sft-max-in-flight-steps 1
     --num-data-storage-units 16
     "${MODEL_ARGS[@]}"
     "${CKPT_ARGS[@]}"
     "${SFT_ARGS[@]}"
-    "${EVAL_ARGS[@]}"
     "${OPTIMIZER_ARGS[@]}"
     "${METRICS_ARGS[@]}"
     "${PERF_ARGS[@]}"
@@ -221,10 +229,10 @@ import os
 
 runtime = json.loads(os.environ["RUNTIME_ENV_JSON"])
 env = runtime.setdefault("env_vars", {})
-env["RELAX_SFT_RAW_TEXT_CONCAT"] = os.environ["RELAX_SFT_RAW_TEXT_CONCAT"]
+env.pop("RELAX_SFT_RAW_TEXT_CONCAT", None)
 propagate = env.get("RELAX_PROPAGATE_ENV_VARS", "").split(",")
 env["RELAX_PROPAGATE_ENV_VARS"] = ",".join(
-    dict.fromkeys(name for name in [*propagate, "RELAX_SFT_RAW_TEXT_CONCAT"] if name)
+    dict.fromkeys(name for name in propagate if name and name != "RELAX_SFT_RAW_TEXT_CONCAT")
 )
 print(json.dumps(runtime))
 PY

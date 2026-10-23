@@ -12,7 +12,7 @@ import pytest
 from tests.examples.test_kimi_k3_scripts import ROOT, _environment
 
 
-FULL = ROOT / "examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh"
+FULL = ROOT / "examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh"
 SMOKE = ROOT / "scripts/training/text/run-kimi-k3-5l-8xgpu-grpo.sh"
 
 

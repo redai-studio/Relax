@@ -1,6 +1,7 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3.5-35B-A3B CPT two-node H800 baseline: 2x8 GPUs, GBS2048, dynamic
+# GPU profile: 80G Hopper per GPU.
+# Qwen3.5-35B-A3B CPT two-node 80G Hopper baseline: 2x8 GPUs, GBS2048, dynamic
 # 32768-token microbatches, TP2/PP2(22/18)/EP4, DP communication overlap,
 # CUTLASS grouped GEMM, and shared-expert overlap.
 #

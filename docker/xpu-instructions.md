@@ -4,7 +4,7 @@
 
 本文档介绍在昆仑芯（KLX）算力节点上使用 Relax 框架业界主流开源大模型的完整流程。Relax 已在 KLX 上完成链路适配，覆盖纯文本 RL、多模态 RL 与 SFT；相同模型、数据集和超参下，KLX 的曲线与 GPU 基线保持一致。
 
-- 精度判据：RL 观察 `raw_reward`，SFT 观察 `loss`，与 H20 基线对齐
+- 精度判据：RL 观察 `raw_reward`，SFT 观察 `loss`，与 96G Hopper 基线对齐
 - 当前验证集中在 colocate（同步）模式，覆盖 8 卡单机至 16 卡两机
 - 后端接入：KLX 设备抽象、Ray 资源识别、BKCL 通信与训推权重同步均已合入主干，用户使用仓库现有脚本即可复现
 
@@ -96,7 +96,7 @@ bash scripts/training/sft/run-qwen3.5-9B-8xklx.sh
 
 ## 精度对齐
 
-以下曲线来自相同模型、数据集和超参下的 XPU 与 H20 对比。RL 以 `raw_reward` 为指标，SFT 以 `loss` 为指标。
+以下曲线来自相同模型、数据集和超参下的 XPU 与 96G Hopper 对比。RL 以 `raw_reward` 为指标，SFT 以 `loss` 为指标。
 
 Qwen3.5-9B · DAPO RL
 

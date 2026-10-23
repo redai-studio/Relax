@@ -35,12 +35,12 @@ def main() -> None:
     assert torch.cuda.is_available(), "GPU/driver unavailable"
     import_module("transformer_engine.pytorch")
     import_module("sgl_kernel")
-    if os.environ.get("RELAX_GPU_ARCH") in {"b300", "hopper"} or os.environ.get("RELAX_HYBRID_EP_COMMIT"):
+    if os.environ.get("RELAX_GPU_ARCH") in {"blackwell", "hopper"} or os.environ.get("RELAX_HYBRID_EP_COMMIT"):
         deep_ep = import_module("_relax_hybrid_ep")
         import_module("_relax_hybrid_ep.deep_ep_cpp")
         import_module("_relax_hybrid_ep.hybrid_ep_cpp")
         assert hasattr(deep_ep, "Buffer") and hasattr(deep_ep, "HybridEPBuffer")
-    if os.environ.get("RELAX_GPU_ARCH") == "b300":
+    if os.environ.get("RELAX_GPU_ARCH") == "blackwell":
         from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
 
         assert callable(parallel_cross_entropy)

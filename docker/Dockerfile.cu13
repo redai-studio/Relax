@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # CUDA 13 / TE 2.18 candidate. Build context: Relax repository root.
-# Full image build and B300 forward/backward validation are required before promotion.
+# Architecture-targeted compilation configuration; GPU runtime validation must be performed separately.
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
@@ -8,16 +8,16 @@ ARG BASE_IMAGE=lmsysorg/sglang:v0.5.20-cu130@sha256:b27fce60bc5494c118c491070281
 ARG TRAIN_IMAGE=train
 ARG HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
 ARG DEEP_EP_V2_COMMIT=099d5f2bad488b9c534ea785062b12f2e91d1d41
-# GPU_ARCH: hopper (H20/H800, SM90) or b300 (Blackwell Ultra, SM103, AWS EFA).
-ARG GPU_ARCH=b300
+# GPU_ARCH: hopper (SM90) or blackwell (SM100/SM103, AWS EFA).
+ARG GPU_ARCH=blackwell
 FROM ${BASE_IMAGE} as base
 
-ARG GPU_ARCH=b300
+ARG GPU_ARCH=blackwell
 # Share CUDA build targets across stages; Hopper also retains INT4 QAT support for SM80-SM89.
 RUN case "$GPU_ARCH" in \
-        b300)   ARCHES="10.0a 10.3a"; EXPECT_SM="103"; FA_ARCHES="100" ;; \
+        blackwell) ARCHES="10.0a 10.3a"; EXPECT_SM="103"; FA_ARCHES="100" ;; \
         hopper) ARCHES="8.0 8.6 8.9 9.0"; EXPECT_SM="90"; FA_ARCHES="80;90" ;; \
-        *) echo "Unsupported GPU_ARCH='$GPU_ARCH' (expected: hopper | b300)" >&2; exit 1 ;; \
+        *) echo "Unsupported GPU_ARCH='$GPU_ARCH' (expected: hopper | blackwell)" >&2; exit 1 ;; \
     esac && \
     printf 'export TORCH_CUDA_ARCH_LIST="%s"\nexport FLASHINFER_CUDA_ARCH_LIST="%s"\nexport RELAX_EXPECT_SM="%s"\nexport FLASH_ATTN_CUDA_ARCHS="%s"\n' \
         "$ARCHES" "$ARCHES" "$EXPECT_SM" "$FA_ARCHES" > /etc/relax_build.env && \
@@ -56,7 +56,7 @@ RUN apt-get update && apt-get install -y locales tzdata && \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 ARG EFA_INSTALLER_VERSION=latest
-RUN if [ "$GPU_ARCH" = "b300" ]; then \
+RUN if [ "$GPU_ARCH" = "blackwell" ]; then \
     cd /tmp && \
     curl -fsSL -O https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
     tar -xf aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
@@ -79,7 +79,7 @@ FROM base as train
 RUN python -c "import torch; assert torch.backends.cudnn.version() is not None"
 
 # FA2 is retained as a comparison backend. Build against this image's Torch/CUDA ABI.
-# Hopper-only FA3 is intentionally omitted from this B300-focused CUDA 13 image.
+# Hopper-only FA3 is intentionally omitted from this 280G Blackwell-focused CUDA 13 image.
 RUN . /etc/relax_build.env && FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=32 \
     pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
     pip install --no-cache-dir flash-linear-attention==0.4.1
@@ -193,7 +193,7 @@ FROM ${TRAIN_IMAGE} as relax_build
 
 WORKDIR /root
 
-ARG GPU_ARCH=b300
+ARG GPU_ARCH=blackwell
 ARG PATCH_VERSION=latest
 
 ENV RELAX_GPU_ARCH=${GPU_ARCH}
@@ -209,7 +209,7 @@ RUN sed -i '/^protobuf[<=>!~]/d' "$PIP_CONSTRAINT" && \
     printf '%s\n' 'protobuf>=6.33.5,<7' >> "$PIP_CONSTRAINT" && \
     pip install --no-cache-dir 'protobuf>=6.33.5,<7'
 
-# Rebuild the bundled SGLang kernel only when B300 needs missing SM103 support.
+# Rebuild the bundled SGLang kernel only when 280G Blackwell needs missing SM103 support.
 COPY docker/scripts/ensure_sgl_kernel_sm103.py /tmp/ensure_sgl_kernel_sm103.py
 RUN python /tmp/ensure_sgl_kernel_sm103.py
 
@@ -335,7 +335,7 @@ RUN cd Megatron-LM && \
 COPY docker/scripts/setup_memory_saver.py /tmp/setup_memory_saver.py
 RUN python /tmp/setup_memory_saver.py
 
-# Rebuild FlashInfer sampling for B300; Hopper keeps the prebuilt SM90 kernel.
+# Rebuild FlashInfer sampling for 280G Blackwell; Hopper keeps the prebuilt SM90 kernel.
 COPY docker/scripts/build_flashinfer_sampling.py /tmp/build_flashinfer_sampling.py
 RUN . /etc/relax_build.env && \
     CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:${PATH} GPU_ARCH="${GPU_ARCH}" \
@@ -366,7 +366,7 @@ RUN python /opt/relax/validate_blackwell.py && \
     python /opt/relax/validate_unified_runtime.py && \
     python -m pip check
 
-# Qwen3.8's HybridEP dispatcher is needed on both Hopper and B300.
+# Qwen3.8's HybridEP dispatcher is needed on both Hopper and 280G Blackwell.
 FROM relax_build as relax_ep
 # Match the HybridEP revision used by the pinned MCore's CUDA 13 CI recipe.
 # Build both DeepEP and HybridEP against this image, not archived .so files.
@@ -381,11 +381,11 @@ RUN --mount=type=bind,from=hybridep_builder,source=/opt/ep-wheels,target=/tmp/ep
     python /opt/relax/validate_hybridep_install.py && \
     python -m pip check
 
-# Enable the EFA NCCL plugin only for B300; Hopper clusters may not have EFA.
+# Enable the EFA NCCL plugin only for 280G Blackwell; Hopper clusters may not have EFA.
 FROM relax_ep as relax_hopper
 ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/sglang/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}
 
-FROM relax_ep as relax_b300
+FROM relax_ep as relax_blackwell
 
 # The archived 35B recipe uses a private complete FLA source closure, not a global downgrade.
 COPY docker/patch/fla/0.4.2-legacy-runtime.patch /tmp/fla042.patch
@@ -402,10 +402,10 @@ COPY docker/patch/flash-attention/56e48e3-fa4-isolated.patch \
     docker/patch/deepep/2.1.0-relax-namespace.patch \
     docker/patch/flash-qla/0.1.3-kkt-no-tma.patch \
     docker/scripts/record_qwen35_runtime.py \
-    docker/scripts/validate_b300_runtime.py \
+    docker/scripts/validate_blackwell_runtime.py \
     docker/patch/flash-attention/fa4-source-pins.json \
     docker/patch/cublas/13.3.0.5-library-pins.json /tmp/qwen35-build/
-RUN install -m 644 /tmp/qwen35-build/record_qwen35_runtime.py /tmp/qwen35-build/validate_b300_runtime.py /opt/relax/ && \
+RUN install -m 644 /tmp/qwen35-build/record_qwen35_runtime.py /tmp/qwen35-build/validate_blackwell_runtime.py /opt/relax/ && \
     cp /tmp/qwen35-build/fa4-source-pins.json /tmp/fa4-source-pins.json && \
     cp /tmp/qwen35-build/13.3.0.5-library-pins.json /tmp/cublas-library-pins.json && \
     sed -i '/^nvidia-cutlass-dsl==/d' "$PIP_CONSTRAINT" && \
@@ -441,7 +441,7 @@ RUN git init /tmp/FlashQLA && cd /tmp/FlashQLA && \
 
 # HybridEP is built for a single NVLink domain; NCCL/EFA still handles other collectives.
 # Validate source contracts at build time; CUDA imports/numerics require a GPU run.
-RUN python /opt/relax/validate_b300_runtime.py && rm -r /tmp/qwen35-build
+RUN python /opt/relax/validate_blackwell_runtime.py && rm -r /tmp/qwen35-build
 ENV FI_PROVIDER=efa \
     NCCL_NET_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so \
     TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas

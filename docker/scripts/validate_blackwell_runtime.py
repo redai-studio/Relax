@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Check the B300 image's source contracts without importing CUDA
+"""Check the 280G Blackwell image's source contracts without importing CUDA
 extensions."""
 
 import ast
@@ -74,7 +74,7 @@ def check_mcore(root: Path) -> None:
         "gdn_conv_pad_alignment",
     }
     if missing := required - fields:
-        raise ValueError(f"MCore is missing B300 configuration fields: {sorted(missing)}")
+        raise ValueError(f"MCore is missing 280G Blackwell configuration fields: {sorted(missing)}")
     gpt = (root / "core/models/gpt/gpt_model.py").read_text()
     if "labels_are_shifted" not in gpt:
         raise ValueError("MCore is missing Relax's shifted-label MTP patch")
@@ -124,7 +124,7 @@ def main() -> None:
         "packages": expected,
         "gpu_validated": False,
     }
-    Path("/etc/relax-b300-runtime.json").write_text(json.dumps(report, indent=2) + "\n")
+    Path("/etc/relax-blackwell-runtime.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":

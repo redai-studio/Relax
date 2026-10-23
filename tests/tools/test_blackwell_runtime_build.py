@@ -13,16 +13,18 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location("b300_validation", ROOT / "docker/scripts/validate_b300_runtime.py")
+SPEC = importlib.util.spec_from_file_location(
+    "blackwell_validation", ROOT / "docker/scripts/validate_blackwell_runtime.py"
+)
 validation = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(validation)
 
 
 @pytest.fixture
 def fla_tree(tmp_path):
-    source = os.environ.get("B300_FLA_SOURCE_DIR")
+    source = os.environ.get("BLACKWELL_FLA_SOURCE_DIR")
     if not source:
-        pytest.skip("Set B300_FLA_SOURCE_DIR to the unpacked fla-core/flash-linear-attention 0.5.2 wheel root")
+        pytest.skip("Set BLACKWELL_FLA_SOURCE_DIR to the unpacked fla-core/flash-linear-attention 0.5.2 wheel root")
     shutil.copytree(Path(source) / "fla", tmp_path / "fla")
     # Ensure the new convolution patches compose with main's existing KDA precision patch.
     subprocess.run(
@@ -81,7 +83,7 @@ def test_fla_validation_rejects_kernel_arithmetic_changes(fla_tree, filename):
 
 
 @pytest.mark.parametrize("mode", ["original", "pow2", "none", "auto"])
-@pytest.mark.parametrize("arch", ["b300", "hopper", ""])
+@pytest.mark.parametrize("arch", ["blackwell", "hopper", ""])
 def test_fla_policy_selects_entries_once_per_process(fla_tree, monkeypatch, mode, arch):
     install_conv_entries(fla_tree)
     monkeypatch.setenv("RELAX_FLA_CONV_NB_MODE", mode)
@@ -90,7 +92,7 @@ def test_fla_policy_selects_entries_once_per_process(fla_tree, monkeypatch, mode
     scope = {}
     source = fla_tree / "fla/modules/conv/triton/conv_policy.py"
     exec(compile(source.read_text(), str(source), "exec"), scope)
-    expected = ("none" if arch == "b300" else "original") if mode == "auto" else mode
+    expected = ("none" if arch == "blackwell" else "original") if mode == "auto" else mode
     assert scope["CONV_NB_MODE"] == expected
     for batch, length in [(1, 1), (2, 1025), (1, 4097), (2, 65537)]:
         nb = (batch * length + 1023) // 1024
@@ -143,16 +145,16 @@ def test_fla_validation_rejects_unknown_mode(tmp_path):
 
 
 def test_pinned_mcore_exposes_required_runtime_contracts():
-    source = os.environ.get("B300_MEGATRON_SOURCE_DIR")
+    source = os.environ.get("BLACKWELL_MEGATRON_SOURCE_DIR")
     if not source:
-        pytest.skip("Set B300_MEGATRON_SOURCE_DIR to the assembled and patched Megatron source root")
+        pytest.skip("Set BLACKWELL_MEGATRON_SOURCE_DIR to the assembled and patched Megatron source root")
     validation.check_mcore(Path(source) / "megatron")
 
 
 def test_pinned_hybridep_retains_both_dispatch_apis(tmp_path):
-    source = os.environ.get("B300_HYBRIDEP_SOURCE_DIR")
+    source = os.environ.get("BLACKWELL_HYBRIDEP_SOURCE_DIR")
     if not source:
-        pytest.skip("Set B300_HYBRIDEP_SOURCE_DIR to the pinned HybridEP source root")
+        pytest.skip("Set BLACKWELL_HYBRIDEP_SOURCE_DIR to the pinned HybridEP source root")
     package = Path(source) / "deep_ep"
     validation.check_hybridep(package)
     for name in ("__init__.py", "hybrid_ep_buffer.py"):
@@ -181,9 +183,9 @@ def test_main_hybridep_padding_growth_and_combine_gradients(monkeypatch, dense):
 
     import torch
 
-    source = os.environ.get("B300_MEGATRON_SOURCE_DIR")
+    source = os.environ.get("BLACKWELL_MEGATRON_SOURCE_DIR")
     if not source:
-        pytest.skip("Set B300_MEGATRON_SOURCE_DIR to the patched source root")
+        pytest.skip("Set BLACKWELL_MEGATRON_SOURCE_DIR to the patched source root")
     path = Path(source) / "megatron/core/transformer/moe/token_dispatcher.py"
     ns = load_methods(
         path,
@@ -245,9 +247,9 @@ def test_main_hybridep_padding_growth_and_combine_gradients(monkeypatch, dense):
 def test_pinned_hybridep_requests_buffer_growth():
     from types import SimpleNamespace
 
-    source = os.environ.get("B300_HYBRIDEP_SOURCE_DIR")
+    source = os.environ.get("BLACKWELL_HYBRIDEP_SOURCE_DIR")
     if not source:
-        pytest.skip("Set B300_HYBRIDEP_SOURCE_DIR to the pinned source root")
+        pytest.skip("Set BLACKWELL_HYBRIDEP_SOURCE_DIR to the pinned source root")
 
     class Config(SimpleNamespace):
         def is_valid(self):

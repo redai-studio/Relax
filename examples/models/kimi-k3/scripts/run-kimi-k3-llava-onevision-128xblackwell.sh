@@ -1,9 +1,10 @@
 #!/bin/bash
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# GPU profile: 280G Blackwell per GPU.
 #
 # Full Kimi K3 multimodal SFT on LLaVA-OneVision-1.5-Instruct-Data.
-# 16 x 8 B300 GPUs, BF16 from the MXFP4 checkpoint. This uses the Kimi K3
+# 16 x 8 GPUs (280G Blackwell each), BF16 from the MXFP4 checkpoint. This uses the Kimi K3
 # chat rendering (K3 XTML encoder) and vision processor.
 # TP4/PP4/CP8/EP32/ETP1: DP1, expert-DP1; ordinary 1F1B, no VPP or MTP.
 # PP layer counts: 21 + 24 + 24 + 24 = 93; stage 0 also hosts the vision tower.
@@ -32,7 +33,7 @@ LLAVA_DATA_DIR="${LLAVA_DATA_DIR:-${DATA_DIR:-}}"
 : "${LLAVA_DATA_DIR:?Set DATA_DIR or LLAVA_DATA_DIR to the prepared dataset directory}"
 PROMPT_DATA="${PROMPT_DATA:-${LLAVA_DATA_DIR}/train}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/kimi-k3-llava-onevision}"
-EXP_NAME="${EXP_NAME:-kimi-k3-full-sft-llava-onevision-1m-b300-gpu128-chat}"
+EXP_NAME="${EXP_NAME:-kimi-k3-full-sft-llava-onevision-1m-blackwell-280g-gpu128-chat}"
 if [ "${DRY_RUN:-0}" != 1 ] && [ ! -f "${LLAVA_DATA_DIR}/READY.json" ]; then
     echo "Data preparation is incomplete: ${LLAVA_DATA_DIR}/READY.json is missing." >&2
     exit 1

@@ -1,22 +1,22 @@
-# B300 runtime migration into the CUDA 13 image
+# 280G Blackwell runtime migration into the CUDA 13 image
 
-The B300 runtime is built by `docker/Dockerfile.cu13`, target `relax`, with
-`GPU_ARCH=b300`. Do not run the historical Ray-node installer or replace
+The 280G Blackwell runtime is built by `docker/Dockerfile.cu13`, target `relax`, with
+`GPU_ARCH=blackwell`. Do not run the historical Ray-node installer or replace
 `/root/Megatron-LM` with an archived directory after building the image.
 The `train` target alone does not include the final runtime integration.
 
 This is a source-validated candidate. The delivered archive has been inspected
 as described below; this does not establish equivalence of archived native
-binaries. A complete Docker build, B300 numerical gates, and multi-node
+binaries. A complete Docker build, 280G Blackwell numerical gates, and multi-node
 save/resume remain required. CPU tests and successful patch application are not
 GPU validation.
 
 The source alignment targets, fetched on 2026-10-20, are
-`feat/minhao/qwen35-b300-optimized-delivery@3fb0859060e51700cba8d30f8d00dac4b9989cbd`
+`feat/minhao/qwen35-b300-optimized-delivery@3fb0859060e51700cba8d30f8d00dac4b9989cbd` <!-- gitleaks:allow historical source identifier -->
 and `feat/qwen38-final@85f95e0d42d385f9ff1257907486e87d246c6f1f`.
 The installer is a reference delivery, not a build input: Docker builds fetch
 pinned upstream sources and apply the checked-in patches. No `install.sh`,
-`activate.sh`, archived site-packages or precompiled B300 wheel is required.
+`activate.sh`, archived site-packages or precompiled 280G Blackwell wheel is required.
 
 Both Dockerfiles apply `20261020-model-operators.patch` after the existing model
 patches. This replaces the former `megatron_patch` import-time installers with
@@ -28,11 +28,11 @@ with a rebuilt image: a checkout alone cannot install the new native entry
 points into an older image. Existing feature gates and native fallbacks remain;
 this does not establish binary or numerical compatibility across GPU families.
 
-| Image              | Shared Qwen model source patches | Optimized TP4 recipe                                | Qwen3.8 SGLang rollout                                                         |
-| ------------------ | -------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------ |
-| CUDA 13 / B300     | Included                         | Build configured; hardware acceptance pending       | Unified SGLang 0.5.20 source                                                   |
-| CUDA 13 / Hopper   | Included                         | HybridEP build added; TP4-only dependencies omitted | Unified source; Hopper acceptance pending                                      |
-| CUDA 12.9 / Hopper | Included                         | Not enabled; no CUDA 13 libraries installed         | Existing SGLang 0.5.17 retained; not equivalent to the Qwen3.8 CUDA 13 rollout |
+| Image                    | Shared Qwen model source patches | Optimized TP4 recipe                                | Qwen3.8 SGLang rollout                                                         |
+| ------------------------ | -------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------ |
+| CUDA 13 / 280G Blackwell | Included                         | Build configured; hardware acceptance pending       | Unified SGLang 0.5.20 source                                                   |
+| CUDA 13 / Hopper         | Included                         | HybridEP build added; TP4-only dependencies omitted | Unified source; Hopper acceptance pending                                      |
+| CUDA 12.9 / Hopper       | Included                         | Not enabled; no CUDA 13 libraries installed         | Existing SGLang 0.5.17 retained; not equivalent to the Qwen3.8 CUDA 13 rollout |
 
 FlashQLA and DeepEP upstream support Hopper, but the delivered Relax recipe
 checks CUDA 13 library paths, cuBLAS 13.3 and a specific TP4 topology. Installing
@@ -40,7 +40,7 @@ their CUDA 12 packages alone does not port that recipe. CUDA 12 / Blackwell is o
 Qwen3.5 architecture; the newer Flash-Next/QSA rollout path is the part requiring
 the unified SGLang stack. The CUDA 12 image keeps
 TE 2.14.1 and its existing attention backends; it does not claim complete
-functional or performance parity with either B300 delivery.
+functional or performance parity with either 280G Blackwell delivery.
 
 ## Dependency and patch mapping
 
@@ -54,7 +54,7 @@ functional or performance parity with either B300 delivery.
 | `audioread==3.1.0`, TE `2.18.0`                          | Already pinned in main's CUDA 13 Dockerfile. Validate required APIs; do not install runtime-local Python overlays.                                                                                                                                                                                                                        |
 | Torch `2.11.0+cu130`, Triton `3.6.0` assertions          | Main preserves the packages from its digest-pinned SGLang CUDA 13 base via build constraints. Record actual versions in `/etc/relax-cu130-build.json`; do not independently replace Torch with old archive requirements.                                                                                                                  |
 | Triton cache ZIPs tied to previous nodes                 | Do not ship historical machine caches. Keep the compiler available and allow the built runtime to create its own caches.                                                                                                                                                                                                                  |
-| Runtime cuDNN/path overrides                             | Use the CUDA 13 image's libraries and build-time CCCL include path. Do not inject the old `/opt/b300-peveak` or `/opt/relax/cudnn` paths.                                                                                                                                                                                                 |
+| Runtime cuDNN/path overrides                             | Use the CUDA 13 image's libraries and build-time CCCL include path. Do not inject archived runtime paths or `/opt/relax/cudnn` overrides.                                                                                                                                                                                                 |
 
 The HybridEP build uses `nvidia-nvshmem-cu13==3.4.5`, following the same pinned
 MCore CI recipe. HybridEP's multinode extension is disabled: each ETP×EP group
@@ -73,14 +73,14 @@ From the repository root, build locally without publishing:
 
 ```bash
 docker build -f docker/Dockerfile.cu13 --target relax \
-  --build-arg GPU_ARCH=b300 \
-  -t relax:b300-runtime-candidate .
+  --build-arg GPU_ARCH=blackwell \
+  -t relax:blackwell-runtime-candidate .
 ```
 
 Both Dockerfiles install all three convolution entries in one image. There is
 no `FLA_CONV_NB_MODE` build argument. Set `RELAX_FLA_CONV_NB_MODE` to `original`,
 `pow2`, or `none` before starting each training process. `auto` (the default)
-selects `none` when `RELAX_GPU_ARCH=b300`, otherwise `original`. Selection is
+selects `none` when `RELAX_GPU_ARCH=blackwell`, otherwise `original`. Selection is
 frozen on first FLA convolution import; restart workers to change it. Each entry owns its
 autotuner, and kernels are JIT compiled only when used. Kernel arithmetic is
 identical across entries. The optimized Qwen3.5 TP4 recipe requires `none`.
@@ -94,7 +94,7 @@ available for the `original` entry and is also frozen at first import.
 HybridEP and isolated DeepEP v2 are built in separate wheel stages based on the
 same `TRAIN_IMAGE`. Changing application patches does not invalidate these
 stages; changing the v2 namespace patch does not rebuild HybridEP. The shared CUDA 13 runtime stage mounts the HybridEP wheel, and the final
-B300 stage mounts the isolated v2 wheel during installation without adding a second copy
+280G Blackwell stage mounts the isolated v2 wheel during installation without adding a second copy
 to the image. Builder and runtime retain identical Torch/CUDA ABI and
 NCCL/NVSHMEM installation paths because the extensions record those paths.
 Do not reuse these wheels in the CUDA 12 image.
@@ -109,28 +109,28 @@ validation step, not a prerequisite for the image build.
 
 The final build checks versions, compiled-extension presence, both DeepEP APIs,
 MCore configuration fields, shifted-label MTP support and all three FLA entries.
-It writes `/etc/relax-b300-runtime.json`; that report explicitly records
+It writes `/etc/relax-blackwell-runtime.json`; that report explicitly records
 `gpu_validated: false`. `python /opt/relax/check_gpu_imports.py` then checks dynamic
 CUDA imports when running the image on a GPU host.
 
 ## Tests and acceptance
 
 CPU source tests take explicit source directories; none downloads dependencies or
-starts Ray jobs. `B300_FLA_SOURCE_DIR` is the extraction root containing `fla/` from
-both pinned 0.5.2 wheels. `B300_MEGATRON_SOURCE_DIR` is the assembled main source
-with both patches applied. `B300_HYBRIDEP_SOURCE_DIR` is the pinned DeepEP checkout.
+starts Ray jobs. `BLACKWELL_FLA_SOURCE_DIR` is the extraction root containing `fla/` from
+both pinned 0.5.2 wheels. `BLACKWELL_MEGATRON_SOURCE_DIR` is the assembled main source
+with both patches applied. `BLACKWELL_HYBRIDEP_SOURCE_DIR` is the pinned DeepEP checkout.
 
 ```bash
-PYTHONPATH=. pytest -q tests/tools/test_b300_runtime_build.py \
+PYTHONPATH=. pytest -q tests/tools/test_blackwell_runtime_build.py \
   tests/scripts/test_qwen_moe_runtime_preflight.py tests/scripts/test_qwen_moe_entries.py \
   tests/backends/megatron/test_model_provider_vpp.py
 ```
 
-Inside the image on explicitly allocated B300 hardware:
+Inside the image on explicitly allocated 280G Blackwell hardware:
 
 ```bash
-RELAX_RUN_B300_GPU_TESTS=1 PYTHONPATH=. pytest -q \
-  tests/integration/test_b300_runtime_numerics.py
+RELAX_RUN_BLACKWELL_GPU_TESTS=1 PYTHONPATH=. pytest -q \
+  tests/integration/test_blackwell_runtime_numerics.py
 ```
 
 Run those numerical gates separately for each FLA variant intended for deployment.
@@ -139,7 +139,7 @@ independent PyTorch convolution and TE CE with native PyTorch CE.
 
 Remaining distributed gates: ordinary DeepEP and HybridEP dispatch/combine and
 backward; unequal rank token counts; a small, larger, then smaller microbatch to
-exercise buffer growth; CP1/CP4 with MTP0/MTP1; then actual B300 training and
+exercise buffer growth; CP1/CP4 with MTP0/MTP1; then actual 280G Blackwell training and
 checkpoint save/resume. The CPU buffer test verifies requested capacity updates,
 not CUDA allocation or distributed synchronization correctness.
 
@@ -171,13 +171,13 @@ checks do not establish GPU numerical or performance equivalence.
 
 ## Optimized TP4 delivery (3fb0859060e5)
 
-The same final B300 image also builds these recipe dependencies:
+The same final 280G Blackwell image also builds these recipe dependencies:
 
 | Dependency   | Fixed source/version                               | Coexistence                                                                  |
 | ------------ | -------------------------------------------------- | ---------------------------------------------------------------------------- |
 | DeepEP 2.1.0 | `099d5f2bad488b9c534ea785062b12f2e91d1d41`         | `relax-deep-ep-v2` / `_relax_deep_ep_v2`; canonical DeepEP/HybridEP retained |
 | FA4          | `56e48e3cc3557cfb9f45ec4763c5f971e17cbcbc`         | `_relax_fa4_pr2968.cute`; FA2 retained                                       |
-| CUTLASS DSL  | `4.6.2`, CUDA 13 extra                             | B300 image dependency; no worker-side alias mutation                         |
+| CUTLASS DSL  | `4.6.2`, CUDA 13 extra                             | 280G Blackwell image dependency; no worker-side alias mutation               |
 | cuBLAS       | `nvidia-cublas==13.3.0.5`                          | Libraries in `/opt/relax/cublas13.3`; preloaded only by the optimized recipe |
 | FlashQLA     | v0.1.3, `5538c35f0df33ef804eacd90c77d9d9087c1d4e4` | KKT TMA lowering disabled by static patch for TileLang 0.1.12                |
 
@@ -211,7 +211,7 @@ Run the optimized recipe through the standalone shell entry:
 
 ```bash
 MODEL_DIR=/shared/model DATA_DIR=/shared/data.jsonl SAVE_DIR=/shared/checkpoints \
-  bash scripts/training/sft/run-qwen35-optimized-64xB300.sh
+  bash scripts/training/sft/run-qwen35-optimized-64xblackwell.sh
 ```
 
 The script sources the shared model definition from `scripts/models/` and keeps
@@ -230,7 +230,7 @@ selecting private binpacking and whole-pack exchange. Evaluation uses the
 existing sampler. Async CPU prepacking is rejected; raw data prefetch is
 supported. Other recipes retain their current packing behavior.
 
-The optimized kernels require B300 training validation: masked/empty MTP and main
+The optimized kernels require 280G Blackwell training validation: masked/empty MTP and main
 loss gradients, dispatch/combine backward, short/oversize packs, throughput and
 peak memory, and checkpoint replay. Repeat the existing Qwen3.8, 397B CPT and 35B
 multimodal SFT acceptance runs against this final image. Hopper keeps its existing
@@ -249,7 +249,7 @@ delivery was validated with 0.1.11, 0.6.3 and 0.4.2. Its historical numerical
 acceptance does not transfer to this image. The FlashQLA patch now also checks
 the actual compiled KKT source for unexpected TMA stores before launch, cached
 per kernel specialization. CUDA 13 Hopper includes HybridEP but still requires
-its own build and GPU acceptance; the B300 TP4 recipe is not enabled there.
+its own build and GPU acceptance; the 280G Blackwell TP4 recipe is not enabled there.
 
 This audit environment has no Docker/BuildKit executable. Patch replay and CPU
 checks cannot establish that all three image builds succeed. CUDA 12 Hopper

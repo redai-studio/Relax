@@ -58,7 +58,7 @@ python -m examples.algorithms.score-centering.recipe \
 
 | 项目       | 配置                                                                          |
 | ---------- | ----------------------------------------------------------------------------- |
-| 模型与硬件 | Qwen3-0.6B，单机 8×H20，colocate                                              |
+| 模型与硬件 | Qwen3-0.6B，单机 8×96G Hopper，colocate                                       |
 | 并行       | trainer TP/PP/CP=1、DP=8；8 个单卡 rollout engine                             |
 | 精度       | BF16 trainer；FP8 W/A sampler、FP8 E4M3 KV cache                              |
 | batch      | 64 prompts×8 responses，global batch=512，每批一次参数更新                    |
@@ -121,7 +121,7 @@ Ray 默认阻塞跟随日志，显式设置 `RAY_NO_WAIT=1` 才非阻塞。日�
 
 实验曲线见 [PR #440 中的实验报告](https://github.com/redai-studio/Relax/pull/440#issuecomment-6248536659)。
 
-Qwen3-0.6B，8×H20，BF16 trainer / FP8 sampler，seed=0。下表为在线 FP8 dev 准确率：64 道题各采样 8 次，共 512 个回答。
+Qwen3-0.6B，8×96G Hopper，BF16 trainer / FP8 sampler，seed=0。下表为在线 FP8 dev 准确率：64 道题各采样 8 次，共 512 个回答。
 
 | 方法     | 实际训练步数 | 第 25 步 | 第 50 步 | 最高准确率（步数） | 最后准确率（步数） | 训练表现                                                  |
 | -------- | -----------: | -------: | -------: | ------------------ | ------------------ | --------------------------------------------------------- |

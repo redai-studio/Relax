@@ -107,7 +107,7 @@ def test_docker_makefile_pairs_variants(docker_make: Callable[..., MakeResult], 
         assert ("BASE_IMAGE=cu12-base" if is_cu12 else "BASE_IMAGE=cu13-base") in build
         assert "PATCH_VERSION=latest" in build
         if not is_cu12:
-            assert ("GPU_ARCH=b300" if tag.endswith("-blackwell") else "GPU_ARCH=hopper") in build
+            assert ("GPU_ARCH=blackwell" if tag.endswith("-blackwell") else "GPU_ARCH=hopper") in build
         if ":dev-" in tag:
             assert build[build.index("--target") + 1] == "relax"
             assert f"TRAIN_IMAGE={tag.replace(':dev-', ':train-')}" in build
@@ -252,7 +252,7 @@ def test_docker_makefile_dev_command_line_overrides_environment(docker_make: Cal
         assert f"TRAIN_IMAGE={image_tag('train', variant)}" in build
 
 
-@pytest.mark.parametrize("variant,arch", [("cu13-blackwell", "b300"), ("cu13-hopper", "hopper")])
+@pytest.mark.parametrize("variant,arch", [("cu13-blackwell", "blackwell"), ("cu13-hopper", "hopper")])
 @pytest.mark.parametrize("source", ["environment", "command-line"])
 def test_docker_makefile_single_variant_dev_override(
     docker_make: Callable[..., MakeResult], variant: str, arch: str, source: str
@@ -320,7 +320,7 @@ def test_docker_makefile_stops_after_build_failure(docker_make: Callable[..., Ma
 
 
 @pytest.mark.parametrize("kind", ["train", "dev"])
-@pytest.mark.parametrize("variant,arch", [("cu12", None), ("cu13-blackwell", "b300"), ("cu13-hopper", "hopper")])
+@pytest.mark.parametrize("variant,arch", [("cu12", None), ("cu13-blackwell", "blackwell"), ("cu13-hopper", "hopper")])
 def test_docker_makefile_builds_one_variant(
     docker_make: Callable[..., MakeResult], variant: str, arch: str | None, kind: str
 ) -> None:

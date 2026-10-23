@@ -1,0 +1,10 @@
+# Existing CI labels and issue-template example; .github is excluded from this change.
+# Use inline gitleaks:allow comments when these files can be updated together.
+.github/ISSUE_TEMPLATE/bug_report.md:nvidia-gpu-model:19
+.github/workflows/integration-test.yml:nvidia-gpu-model:33
+.github/workflows/unittest.yml:nvidia-gpu-model:32
+.github/workflows/unittest.yml:nvidia-gpu-model:33
+
+# Preserve upstream hardware capability dispatch in dependency patch context.
+docker/patch/sglang/v0.5.20.patch:nvidia-gpu-model:1797
+docker/patch/sglang/v0.5.20.patch:nvidia-gpu-model:1804

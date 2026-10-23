@@ -111,7 +111,7 @@ def test_kimi_k3_recipe_dry_run_never_calls_ray(tmp_path, script):
 def test_kimi_k3_recipe_preserves_explicit_wait_and_optimizer_save(tmp_path, no_wait):
     env, capture = _environment(tmp_path)
     env.update(RAY_NO_WAIT=no_wait, SAVE_OPTIMIZER="1", SAVE_DIR=str(tmp_path / "save"), FLA_TILELANG="1")
-    script = ROOT / "examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300.sh"
+    script = ROOT / "examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh"
     subprocess.run(["bash", str(script)], cwd=ROOT, env=env, check=True, capture_output=True, timeout=30)
     argv = json.loads(capture.read_text())
     assert ("--no-wait" in argv) is bool(no_wait)

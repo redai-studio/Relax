@@ -10,7 +10,7 @@
 - **Category:** memory (省显存 / 严重伤性能)
 - **Severity:** warn
 - **Trigger:** 同时出现 `--optimizer-cpu-offload` + `--overlap-cpu-optimizer-d2h-h2d` + `--use-precision-aware-optimizer`
-- **Why:** 把 optimizer state offload 到 CPU，可让显存预算砍掉一半（如 35B-A3B 能 4×H20 96G 跑），但 step 时间通常 +30~60%、MFU 显著下降
+- **Why:** 把 optimizer state offload 到 CPU，可让显存预算砍掉一半（如 35B-A3B 能 4×96G Hopper 跑），但 step 时间通常 +30~60%、MFU 显著下降
 - **Fix:** 估算 `param_count × (fp32_master + adam_m + adam_v) ≈ param_count × 12 bytes`，再加 grad + activation。如果 `(总 GPU 显存 - 估算) > 30%` 余量，三件套全删；先去掉 `--use-precision-aware-optimizer`、再去 `--overlap-cpu-optimizer-d2h-h2d`、最后才考虑保留 `--optimizer-cpu-offload`
 - **Skip when:** GPU 数 × 单卡显存 < `param × 12B / EP / TP`（确实不开就 OOM）；或脚本注释明确说"边界 case 不开会 OOM"
 
@@ -27,7 +27,7 @@
 - **Severity:** warn
 - **Trigger:** `--use-dynamic-batch-size` 开启且 `--max-tokens-per-gpu` 偏离合理区间
 - **Why:** 设太低 → micro-batch 太小、kernel 利用率低；设太高 → OOM / 频繁 retry
-- **Fix:** 经验值 `max-tokens-per-gpu ≈ rollout-max-response-len × N`，其中 N 由 TP×CP 和可用显存定。H20 96G + TP2 + CP1 + 8K resp-len 常见值 = 20480；TP2 + CP2 = 10240。Cross-check 已工作过的同型脚本
+- **Fix:** 经验值 `max-tokens-per-gpu ≈ rollout-max-response-len × N`，其中 N 由 TP×CP 和可用显存定。96G Hopper + TP2 + CP1 + 8K resp-len 常见值 = 20480；TP2 + CP2 = 10240。Cross-check 已工作过的同型脚本
 - **Skip when:** 脚本是新模型 / 新场景且作者已手动调过
 
 ### R-M04 — `--sglang-mem-fraction-static`
@@ -90,7 +90,7 @@
 ### R-P06 — TP 跨节点
 - **Category:** performance (critical)
 - **Severity:** critical
-- **Trigger:** `--tensor-model-parallel-size > 8`（H20/H100 单节点 8 卡）或 TP × 节点内其他并行 > 单节点 GPU 数
+- **Trigger:** `--tensor-model-parallel-size > 8`（96G Hopper / 80G Hopper 单节点 8 卡）或 TP × 节点内其他并行 > 单节点 GPU 数
 - **Why:** TP 每层都 all-reduce，跨 NVLink boundary 后走 IB，带宽下降一个数量级；几乎一定显著掉 MFU
 - **Fix:** TP <= 8，多出来的并行放到 PP / EP / DP
 - **Skip when:** 几乎不存在合理 skip 场景；若用户明确说在做跨节点 TP 调研可降级 warn

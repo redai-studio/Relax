@@ -81,22 +81,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     with tempfile.TemporaryDirectory(prefix="gitleaks-tracked-") as tmpdir:
-        snapshot_root = Path(tmpdir)
+        snapshot_root = Path(tmpdir) / "contents"
+        snapshot_root.mkdir()
+        names_root = Path(tmpdir) / "filenames"
+        names_root.mkdir()
         _copy_tracked_files(repo_root, snapshot_root, tracked_files)
+        # Gitleaks can skip binary, empty and symlink files before path rules.
+        # Give each path a one-line text file so its fingerprint is stable even
+        # when other tracked files are added. Keep these separate from real files.
+        for path in tracked_files:
+            manifest = names_root / ".gitleaks-paths" / f"{path.as_posix()}.txt"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(f"{path.as_posix()}\n", encoding="utf-8")
 
-        result = subprocess.run(
-            ["gitleaks", "dir", "--redact", "--verbose", str(snapshot_root)],
-            cwd=repo_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        ignore_file = snapshot_root / ".gitleaksignore"
+        if ignore_file.is_file():
+            shutil.copy2(ignore_file, names_root / ".gitleaksignore")
 
-        _relay(result.stdout, sys.stdout, snapshot_root)
-        _relay(result.stderr, sys.stderr, snapshot_root)
-        return result.returncode
+        # Relative scan paths keep native .gitleaksignore fingerprints stable.
+        for scan_root in (snapshot_root, names_root):
+            result = subprocess.run(
+                ["gitleaks", "dir", "--config", str(repo_root / ".gitleaks.toml"), "--redact", "--verbose", "."],
+                cwd=scan_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            _relay(result.stdout, sys.stdout, scan_root)
+            _relay(result.stderr, sys.stderr, scan_root)
+            if result.returncode:
+                return result.returncode
+        return 0
 
 
 if __name__ == "__main__":

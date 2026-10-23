@@ -114,8 +114,9 @@ MODEL_ARGS=(
     # model_provider.py's bridge_keys loop assigns args values unconditionally,
     # so provider.dsa_indexer_loss_coeff ends up None regardless.
     #
-    # 0.0 is what every upstream H100 recipe uses (bridge/recipes/deepseek/h100/
-    # deepseek_v4.py:94,174,246,331,401); only the GB200/GB300 *pretrain* recipes
+    # Device names below identify upstream recipes, not runs of this project.
+    # 0.0 is what every upstream H100 recipe uses (bridge/recipes/deepseek/h100/  # gitleaks:allow
+    # deepseek_v4.py:94,174,246,331,401); only the GB200/GB300 *pretrain* recipes  # gitleaks:allow
     # use 0.01. The indexer KL loss is the sole gradient path into the Lightning
     # Indexer, so 0.0 freezes the indexer at its pretrained state -- which is what
     # we want for RL post-training.
@@ -139,8 +140,8 @@ MODEL_ARGS=(
     # -> "Tensor data pointer is not aligned to 16 bytes" on the first b % 4 != 0
     # that misses the JIT compile cache. The sparse branch never touches
     # q_causal_offsets, and its `if loss_coeff > 0` skips the backward kernel
-    # entirely at coeff 0. Every upstream recipe with fusion on (gb200/gb300 perf)
-    # sets this True; the h100 recipes leave it False only because they also force
+    # entirely at coeff 0. Every upstream recipe with fusion on (gb200/gb300 perf)  # gitleaks:allow
+    # sets this True; the h100 recipes leave it False only because they also force  # gitleaks:allow
     # fusion off.
     --dsa-indexer-use-sparse-loss
 
