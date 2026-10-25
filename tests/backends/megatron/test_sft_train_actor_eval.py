@@ -7,7 +7,30 @@ from argparse import Namespace
 
 import pytest
 
-from relax.engine.sft.runtime import evaluation_step_for_rollout, should_run_sft_eval, should_run_sft_predict
+from relax.engine.sft.runtime import (
+    evaluation_step_for_rollout,
+    should_refresh_actor_snapshot,
+    should_run_sft_eval,
+    should_run_sft_predict,
+)
+
+
+@pytest.mark.parametrize(
+    ("loss_type", "backup_tags", "predict_interval", "expected"),
+    [
+        pytest.param("sft", ["actor"], None, False, id="plain_sft"),
+        pytest.param("sft", ["actor"], 10, True, id="sft_prediction"),
+        pytest.param("sft", ["actor", "ref"], None, True, id="reference_switch"),
+        pytest.param("sft", ["actor", "teacher"], None, True, id="teacher_switch"),
+        pytest.param("sft", ["actor", "old_actor"], None, True, id="old_actor_switch"),
+        pytest.param("policy_loss", ["actor"], None, True, id="rl"),
+        pytest.param("dpo", ["actor"], None, True, id="dpo"),
+        pytest.param("rm", ["actor"], None, True, id="rm"),
+    ],
+)
+def test_should_refresh_actor_snapshot(loss_type, backup_tags, predict_interval, expected):
+    args = Namespace(loss_type=loss_type, sft_predict_interval=predict_interval)
+    assert should_refresh_actor_snapshot(args, backup_tags) is expected
 
 
 def _mk_actor_args():

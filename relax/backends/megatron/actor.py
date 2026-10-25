@@ -43,6 +43,7 @@ from relax.engine.sft.runtime import (
     sft_partition_ids,
     sft_task_name,
     sft_tq_num_shards,
+    should_refresh_actor_snapshot,
     should_run_sft_eval,
     should_run_sft_predict,
     should_skip_mtp_only_weight_management,
@@ -2095,10 +2096,8 @@ class MegatronTrainRayActor(TrainRayActor):
             IndexerReplay.finish_step(expect_backward=self.args.recompute_granularity == "full")
 
         # Refresh snapshots for rollout sync, model switching, or SFT prediction.
-        if hasattr(self, "weights_backuper") and (
-            not is_sft_mode(self.args)
-            or self.weights_backuper.backup_tags != ["actor"]
-            or self.args.sft_predict_interval is not None
+        if hasattr(self, "weights_backuper") and should_refresh_actor_snapshot(
+            self.args, self.weights_backuper.backup_tags
         ):
             self.weights_backuper.backup("actor")
 

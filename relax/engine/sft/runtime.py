@@ -162,6 +162,20 @@ def validate_preference_args(args: Namespace) -> None:
             raise ValueError("standard DPO requires --enable-weights-backuper for actor/ref snapshots")
 
 
+def should_refresh_actor_snapshot(args: Namespace, backup_tags: list[str]) -> bool:
+    """Return whether to refresh actor backup state after training.
+
+    Preserve refreshes outside SFT and when additional snapshots or SFT
+    prediction are configured. Skip actor-only SFT without prediction.
+    """
+    if not is_sft_mode(args):
+        return True
+    if backup_tags != ["actor"]:
+        return True
+    if getattr(args, "sft_predict_interval", None) is not None:
+        return True
+    return False
+
 def should_skip_mtp_only_weight_management(
     args: Namespace,
     *,
