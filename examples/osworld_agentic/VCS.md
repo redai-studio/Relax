@@ -19,6 +19,18 @@ vcs_prune_images: 2
 
 沿用现有脚本中的显式 export、自定义 advantage、dynamic batching 和 token 预算设置。多片段不能改用普通逐样本 reward 归一化。任务指令与工具定义较长时，保留文字仍可能触及上下文上限；VCS 只限制图片，不保证任意长轨迹都能装入上下文。
 
+也可通过训练脚本的 worker/agent 环境统一开启（显式环境变量优先于 YAML）：
+
+```bash
+export RELAX_VCS=1
+export RELAX_VCS_KEEP_IMAGES=2
+export RELAX_VCS_PRUNE_IMAGES=2
+```
+
+`RELAX_VCS=0` 强制关闭；未设置时保留原 YAML 行为。Ray 启动脚本须把这些变量放入 runtime env 并传给 agent 子进程，单独在提交端 export 不保证 worker 可见。
+
+公共实现位于 `relax.utils.visual_context.VisualContext`，OSWorld 的原导入路径保留为兼容适配器。其他 CUA agent 使用默认的 `full_history` 模式：每个顺序会话创建独立实例，在实际请求前调用 `prepare(payload)`，回复后用精确的请求与真实 assistant 消息组成 record 调用 `commit(record, usage)`，会话结束调用 `finish(reason)`，显式导出 `records` 而不是每次调用。每个环境轮开始调用 `begin_turn(turn)`；同轮解析重试不重置。全量历史可包含 user/tool 截图、工具调用、工具结果和初始任务文本。上游截图折叠须关闭，由 VCS 统一裁剪。`latest_observation` 模式只用于 OSWorld 当前重建 prompt 的约定。
+
 ## 精确规则与例子
 
 依据 [SCALECUA §3.4、Figure 4 / Algorithm 1 与附录 C.1 / Algorithm 2](https://arxiv.org/pdf/2607.11185)，采用算法中的严格条件 `下一次请求图片数 > K + Δ`。正文另有“达到阈值”的描述，本实现以伪代码为准。计数包含初始截图、当前截图；不是唯一图片数，相同截图再次观察也计一次。超过阈值后移除最旧的 Δ 张，并非立即降到 K 张。每次只加入一张新截图，因此阈值刚超过时裁剪后为 K+1 张。
@@ -52,7 +64,7 @@ vcs_prune_images: 2
 - 上游解析失败会用相同 prompt 重采样，最多五次。VCS 保持该策略：失败回复仍参与训练，但作为先前片段的末次回答；重试输入不加入该失败回复。每次已返回非空 content 的调用均保留，含 `finish_reason=length`；空回复与没有拿到结果的传输尝试不凭空生成训练目标。若外部版本开始改写解析重试的消息，则明确报错，不能静默丢弃纠错提示。
 - 任务完成、正常步数耗尽，以及驱动已处理的 `predict_error` / context length 提前结束都会保存最后非空片段。取消、丢弃和无法完成结果写出的异常仍遵循原有 Session 生命周期，不保证导出。HTTP 响应丢失后的重试仍继承原有服务语义，不提供新的 exactly-once 传输协议。
 - `metadata.vcs_segment` 包含分段原因、调用索引、环境轮号、解析尝试号、新回答数、图像数、裁剪数、触发时图像数、输入/回答 token 数。尾段原因采用任务终止原因。原有 `_session_metrics` 增加 `osworld/vcs_segments`、`osworld/vcs_pruned_images`、`osworld/input_tokens`、`osworld/answer_tokens`，经现有指标接口上报。调用数、解析重试数、环境步数仍走原指标。token 统计来自模型 API usage，精确训练 mask/token/probability 以 Forest 生成的 Sample/dump 为准。
-- 本实现只接入 OSWorld 适配层，不修改 Relax 核心，不增加依赖。归档仍记录每次实际模型请求，而不是用片段代替调用。外部 `HybridAgentLocal.trajectory` 的调试字段仍是其临时构造的 baseline prompt，实际 VCS 请求请查 Relax dump 或归档。
+- VCS 算法共用于 Relax 公共模块和 CUA 适配层，不增加依赖，也不改变 SessionForest 的 token 归属逻辑。归档仍记录每次实际模型请求，而不是用片段代替调用。外部 `HybridAgentLocal.trajectory` 的调试字段仍是其临时构造的 baseline prompt，实际 VCS 请求请查 Relax dump 或归档。
 
 CPU 回归命令（mock 模型和环境，无 Nex/GPU）：
 

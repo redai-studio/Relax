@@ -344,6 +344,9 @@ class Envs(metaclass=_EnvsMeta):
 
     # ------------- Agentic runner -------------
     RELAX = EnvProperty("RELAX", str, None)
+    RELAX_VCS = EnvProperty("RELAX_VCS", bool, False)
+    RELAX_VCS_KEEP_IMAGES = EnvProperty("RELAX_VCS_KEEP_IMAGES", int, 2)
+    RELAX_VCS_PRUNE_IMAGES = EnvProperty("RELAX_VCS_PRUNE_IMAGES", int, 2)
 
     # ------------- Entrypoint / launcher scripts -------------
     # Set by scripts/entrypoint/*.sh; read back by the training scripts to

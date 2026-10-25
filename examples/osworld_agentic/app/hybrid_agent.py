@@ -64,9 +64,13 @@ class RelaxHybridAgent(HybridAgentLocal):
     ) -> None:
         if context_mode not in ("baseline", "vcs"):
             raise ValueError(f"Unknown OSWorld context_mode: {context_mode}")
-        if context_mode == "vcs" and kwargs.get("context_policy", "baseline") != "baseline":
+        self.visual_context = VisualContext.from_env(
+            enabled=context_mode == "vcs",
+            keep_images=vcs_keep_images,
+            prune_images=vcs_prune_images,
+        )
+        if self.visual_context is not None and kwargs.get("context_policy", "baseline") != "baseline":
             raise ValueError("VCS requires context_policy=baseline (no screenshot skipping)")
-        self.visual_context = VisualContext(vcs_keep_images, vcs_prune_images) if context_mode == "vcs" else None
         super().__init__(**kwargs)
         self._llm_call_timeout_s = float(llm_call_timeout_s)
         self._max_llm_call_retries = int(max_llm_call_retries)

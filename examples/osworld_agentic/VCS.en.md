@@ -19,6 +19,18 @@ Set `context_mode: baseline` to restore the original path. Setting both image pa
 
 Keep the recipe's explicit exports, custom advantage callback, dynamic batching and token budgets. Do not switch multiple segments to ordinary per-row reward normalization. Preserved text and tool definitions can still exceed the model context limit: VCS bounds images, not arbitrary episode length.
 
+The worker/agent environment can also enable the shared switch (explicit environment values override YAML):
+
+```bash
+export RELAX_VCS=1
+export RELAX_VCS_KEEP_IMAGES=2
+export RELAX_VCS_PRUNE_IMAGES=2
+```
+
+`RELAX_VCS=0` forces VCS off; an unset switch preserves YAML behavior. Forward these variables through the Ray runtime environment and into agent subprocesses. Exporting them only on the submission host is insufficient.
+
+The shared implementation is `relax.utils.visual_context.VisualContext`; the OSWorld import remains a compatibility adapter. Other CUA adapters use the default `full_history` mode with one instance per sequential conversation: call `prepare(payload)` before the actual request, `commit(record, usage)` with the exact request and real assistant response, then `finish(reason)` and explicitly export `records`. Call `begin_turn(turn)` once per environment turn, retaining its state across parsing retries. Full history supports user/tool screenshots, tool calls/results and the initial task text. Disable upstream screenshot collapse so VCS owns pruning. The `latest_observation` mode retains OSWorld's rebuilt-prompt contract.
+
 ## Exact boundary and example
 
 Following [SCALECUA §3.4, Figure 4 / Algorithm 1 and Appendix C.1 / Algorithm 2](https://arxiv.org/pdf/2607.11185), pruning triggers when `images in the next request > K + Δ`. The prose also says “reaches”; this implementation follows the strict inequality in the pseudocode. Count both the initial and current screenshot, including repeated identical observations. Remove the oldest Δ images, rather than immediately reducing the count to K. With one new screenshot per observation, the first request after pruning has K+1 images.
@@ -52,7 +64,7 @@ All segments retain the same Session / `Sample.index` and trajectory advantage. 
 - Upstream parsing retries resample the same prompt up to five times. Failed answers remain training targets in the preceding segment; they are not inserted into retry input. Every returned nonempty content is retained, including length-truncated content. Empty responses or failed transport attempts do not create synthetic targets. If another upstream version rewrites retry messages, the adapter raises an explicit error instead of dropping correction text.
 - Completion, normal step exhaustion and handled `predict_error` / context-length termination save the last nonempty segment. Cancellation, discarded Sessions and errors that prevent output retain the existing lifecycle; export is not guaranteed. Lost HTTP responses still follow existing transport semantics; this feature adds no exactly-once transport protocol.
 - `metadata.vcs_segment` includes boundary reason, call indices, environment turns, parse attempts, new answer count, image/prune counts, triggering image count and input/answer token counts. The tail uses the task stop reason. Existing `_session_metrics` adds `osworld/vcs_segments`, `osworld/vcs_pruned_images`, `osworld/input_tokens` and `osworld/answer_tokens`. Existing model-call, retry and environment-step metrics retain their meaning. Token diagnostics use API usage; the Forest-generated Sample/dump is authoritative for exact masks, tokens and probabilities.
-- Changes stay in the OSWorld adapter, with no core changes or new dependencies. Archiving still captures actual calls, not segments as substitute calls. The external `HybridAgentLocal.trajectory` debug field still contains its temporary baseline prompt; use Relax dumps or the archive for actual VCS context.
+- The VCS algorithm is shared by a Relax utility module and CUA adapters, without new dependencies or changes to SessionForest token ownership. Archiving still captures actual calls, not segments as substitute calls. The external `HybridAgentLocal.trajectory` debug field still contains its temporary baseline prompt; use Relax dumps or the archive for actual VCS context.
 
 CPU regression command, with mock models and environments and no Nex/GPU:
 
