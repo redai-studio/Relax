@@ -176,6 +176,7 @@ def should_refresh_actor_snapshot(args: Namespace, backup_tags: list[str]) -> bo
         return True
     return False
 
+
 def should_skip_mtp_only_weight_management(
     args: Namespace,
     *,
