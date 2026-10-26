@@ -121,9 +121,9 @@ class PrepareDomain:
                     )
             sequence = self._next_group_sequence
             self._next_group_sequence += 1
-            self._pending_group_inputs.append(
-                GroupInput(group_id=f"{self.scope_id}:prepare_group_{sequence}", samples=sample_group)
-            )
+            group_input = GroupInput(group_id=f"{self.scope_id}:prepare_group_{sequence}", samples=sample_group)
+            self.runtime_domain.observe_group_input(group_input)
+            self._pending_group_inputs.append(group_input)
         if self._prelaunch_next_step:
             self.fill()
 

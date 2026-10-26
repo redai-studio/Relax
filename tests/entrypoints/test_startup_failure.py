@@ -5,6 +5,7 @@
 import ast
 import asyncio
 import concurrent.futures
+import json
 import os
 import signal
 import subprocess
@@ -18,6 +19,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import yaml
+
+from relax.utils.agentic_obs.run_hooks import RunRecorder
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +39,7 @@ def _load_definitions(path, names, namespace):
 
 def _train_namespace():
     namespace = {
+        "asyncio": asyncio,
         "os": os,
         "sys": sys,
         "signal": Mock(SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT, Signals=signal.Signals),
@@ -47,6 +51,7 @@ def _train_namespace():
         "ray": Mock(),
         "serve": Mock(),
         "Controller": Mock(),
+        "RunRecorder": RunRecorder,
         "post_process_env": lambda args, env: env,
         "init_tracking": Mock(),
         "maybe_pin_baseline_to_stable": Mock(),
@@ -54,6 +59,8 @@ def _train_namespace():
         "_shutdown_done": False,
         "_training_completed": False,
         "_kernel_cache_heartbeat": None,
+        "_run_recorder": None,
+        "_unhandled_exit_code": 0,
         "_SHUTDOWN_TIMEOUT_SEC": 60,
         "_NORMAL_SHUTDOWN_TIMEOUT_SEC": 1800,
     }
@@ -116,13 +123,168 @@ def test_train_cleans_up_if_tracking_fails_before_controller(monkeypatch):
     assert events == ["serve", "ray", ("exit", 1)]
 
 
+@pytest.mark.parametrize("failure_stage", [None, "startup", "training", "checkpoint"])
+def test_train_records_run_outcome_before_remote_cleanup(tmp_path, monkeypatch, failure_stage):
+    monkeypatch.delenv("RELAX_KERNEL_CACHE_DIR", raising=False)
+    ns = _train_namespace()
+    path = tmp_path / "run_test/stages/run.jsonl"
+    before_cleanup = []
+
+    class FakeController:
+        def __init__(self, *args):
+            if failure_stage == "startup":
+                raise RuntimeError("startup failed")
+
+        def training_loop(self):
+            if failure_stage in ("training", "checkpoint"):
+                error = OSError("Disk quota exceeded")
+                if failure_stage == "checkpoint":
+                    error._relax_run_failure_stage = "checkpoint"
+                raise error
+
+        def shutdown(self):
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            before_cleanup.extend(rows)
+
+    def hard_exit(code):
+        raise SystemExit(code)
+
+    ns["Controller"] = FakeController
+    ns["_hard_exit"] = hard_exit
+    args = SimpleNamespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test")
+    with pytest.raises(SystemExit) as caught:
+        ns["main"](args)
+    assert caught.value.code == (1 if failure_stage else 0)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(before_cleanup) == 2 and before_cleanup[1]["is_terminal"]
+    assert before_cleanup[1]["operation"] == (failure_stage or "training")
+    assert before_cleanup[1]["status"] == ("failed" if failure_stage else "completed")
+    assert rows[0]["stage_id"] == rows[1]["stage_id"]
+    assert rows[1]["occurred_at"] >= rows[0]["occurred_at"]
+    if failure_stage:
+        assert "failed" in rows[1]["reason"] or "Disk quota exceeded" in rows[1]["reason"]
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+@pytest.mark.parametrize("recorded", [None, "failed", "completed"])
+def test_train_signal_preserves_known_run_outcome(tmp_path, sig, recorded):
+    ns = _train_namespace()
+    recorder = RunRecorder(SimpleNamespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test"))
+    recorder.start()
+    recorder.set_phase("training")
+    if recorded is not None:
+        recorder.record_outcome(recorded)
+    ns["_run_recorder"] = recorder
+
+    def hard_exit(code):
+        raise SystemExit(code)
+
+    ns["_hard_exit"] = hard_exit
+    with pytest.raises(SystemExit) as caught:
+        ns["_graceful_shutdown"](sig)
+    assert caught.value.code == 128 + sig
+    path = tmp_path / "run_test/stages/run.jsonl"
+    start, end = [json.loads(line) for line in path.read_text().splitlines()]
+    assert end["status"] == (recorded or "cancelled")
+    assert end["is_terminal"] and start["stage_id"] == end["stage_id"]
+    if recorded is None:
+        assert signal.Signals(sig).name in end["reason"]
+
+
+def test_train_atexit_does_not_infer_success_from_process_exit(tmp_path):
+    ns = _train_namespace()
+    recorder = RunRecorder(SimpleNamespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test"))
+    recorder.start()
+    ns["_run_recorder"] = recorder
+    ns["_graceful_shutdown"]()
+    path = tmp_path / "run_test/stages/run.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["status"] == "start"
+
+
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (KeyboardInterrupt(), "cancelled"),
+        (asyncio.CancelledError(), "cancelled"),
+        (SystemExit(0), "cancelled"),
+        (SystemExit(2), "failed"),
+    ],
+)
+def test_train_base_exception_records_outcome_without_replacing_error(tmp_path, monkeypatch, error, status):
+    monkeypatch.delenv("RELAX_KERNEL_CACHE_DIR", raising=False)
+    ns = _train_namespace()
+
+    class FakeController:
+        def __init__(self, *args):
+            pass
+
+        def training_loop(self):
+            raise error
+
+    ns["Controller"] = FakeController
+    args = SimpleNamespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test")
+    with pytest.raises(type(error)) as caught:
+        ns["main"](args)
+    assert caught.value is error
+    path = tmp_path / "run_test/stages/run.jsonl"
+    assert len(path.read_text().splitlines()) == 1
+    timer = Mock()
+    ns["threading"] = SimpleNamespace(Timer=Mock(return_value=timer))
+    recorder = ns["_run_recorder"]
+    original_flush = recorder.flush
+
+    def guarded_flush():
+        timer.start.assert_called_once()
+        original_flush()
+
+    monkeypatch.setattr(recorder, "flush", guarded_flush)
+    # Simulate the registered atexit callback after the original exception.
+    ns["_graceful_shutdown"]()
+    expected_code = (
+        error.code if isinstance(error, SystemExit) else (130 if isinstance(error, KeyboardInterrupt) else 1)
+    )
+    assert ns["threading"].Timer.call_args.kwargs["args"] == (expected_code,)
+    end = json.loads(path.read_text().splitlines()[1])
+    assert end["status"] == status and end["operation"] == "training"
+
+
+def test_train_sigterm_flushes_run_outcome_before_hard_exit(tmp_path):
+    script = f"""
+import os
+import runpy
+import signal
+from types import SimpleNamespace
+from relax.utils.agentic_obs.run_hooks import RunRecorder
+ns = runpy.run_path({str(Path(__file__).resolve())!r})['_train_namespace']()
+recorder = RunRecorder(SimpleNamespace(dump_agentic_obs={str(tmp_path)!r}, agentic_obs_run_id='run_test'))
+recorder.start()
+recorder.set_phase('training')
+ns['_run_recorder'] = recorder
+signal.signal(signal.SIGTERM, ns['_graceful_shutdown'])
+os.kill(os.getpid(), signal.SIGTERM)
+"""
+    result = subprocess.run([sys.executable, "-c", script], timeout=10, capture_output=True, text=True)
+    assert result.returncode == 128 + signal.SIGTERM, result.stderr
+    path = tmp_path / "run_test/stages/run.jsonl"
+    start, end = [json.loads(line) for line in path.read_text().splitlines()]
+    assert end["status"] == "cancelled" and "SIGTERM" in end["reason"]
+    assert start["stage_id"] == end["stage_id"]
+
+
 @pytest.mark.parametrize("hang_at", ["serve", "controller"])
 @pytest.mark.parametrize("exit_code", [0, 1, 143])
-def test_train_shutdown_deadline_exits_blocked_process(hang_at, exit_code):
+def test_train_shutdown_deadline_exits_blocked_process(tmp_path, hang_at, exit_code):
     script = f"""
 import runpy
 import threading
+from types import SimpleNamespace
+from relax.utils.agentic_obs.run_hooks import RunRecorder
 ns = runpy.run_path({str(Path(__file__).resolve())!r})["_train_namespace"]()
+recorder = RunRecorder(SimpleNamespace(dump_agentic_obs={str(tmp_path)!r}, agentic_obs_run_id='run_test'))
+recorder.start()
+recorder.record_outcome('completed' if {exit_code} == 0 else 'failed')
+ns['_run_recorder'] = recorder
 ns["_SHUTDOWN_TIMEOUT_SEC"] = 0.05
 ns["_NORMAL_SHUTDOWN_TIMEOUT_SEC"] = 0.05
 if {hang_at!r} == "controller":
@@ -134,6 +296,9 @@ ns["_graceful_shutdown"](exit_code={exit_code})
 """
     result = subprocess.run([sys.executable, "-c", script], timeout=10, capture_output=True, text=True)
     assert result.returncode == exit_code, result.stderr
+    path = tmp_path / "run_test/stages/run.jsonl"
+    start, end = [json.loads(line) for line in path.read_text().splitlines()]
+    assert end["is_terminal"] and end["status"] == ("completed" if exit_code == 0 else "failed")
 
 
 class _FakePhase(str, Enum):

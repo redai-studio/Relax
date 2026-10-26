@@ -38,6 +38,8 @@ from megatron.training.training import get_model
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
 from relax.utils import tracking_utils
+from relax.utils.agentic_obs import agentic_obs_enabled
+from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.device import device_module
 from relax.utils.env import Envs
@@ -1320,6 +1322,7 @@ def train_one_step(
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
+                    *(OBSERVATION_DATA_FIELDS if agentic_obs_enabled(args) else ()),
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1540,6 +1543,8 @@ def train_one_step(
         memory_before = available_memory()
         device_module.empty_cache()
         logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
+    from relax.utils.agentic_obs.train_hooks import record_optimizer_result
+
     valid_step = True
     skipped_nonfinite_grad = False
     if _is_global_zero_token_step(losses_reduced):
@@ -1557,6 +1562,7 @@ def train_one_step(
         update_successful = False
         grad_norm = 0.0
         num_zeros_in_grad = None
+        record_optimizer_result(False)
     else:
         try:
             update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
@@ -1581,6 +1587,7 @@ def train_one_step(
                 exc,
                 exc_info=True,
             )
+        record_optimizer_result(bool(update_successful))
 
         if not getattr(args, "check_for_nan_in_loss_and_grad", True):
             # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
@@ -1834,9 +1841,14 @@ def train(
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
+        from relax.utils.agentic_obs.train_hooks import observe_train_step
+
         # Cover all micro-batches, the optimizer, and post-step parameter gather.
         with log_step_peak_memory(rollout_id, rollout_id * num_steps_per_rollout + step_id, memory_ranks, memory_role):
-            with timer(f"train_micro_batch_{step_id}", keep=False):
+            with (
+                timer(f"train_micro_batch_{step_id}", keep=False),
+                observe_train_step(args, rollout_id, step_id, role=getattr(model[0], "role", "actor")),
+            ):
                 loss_dict, grad_norm = train_one_step(
                     args,
                     rollout_id,
