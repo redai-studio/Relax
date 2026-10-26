@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import ctypes
 import gc
-import logging
-import os
 import time
 from argparse import Namespace
 from dataclasses import dataclass, field
@@ -21,6 +19,8 @@ import torch
 
 from relax.agentic.pipeline import GroupExport
 from relax.agentic.profile import mark_sample_agentic_event, mark_sample_agentic_event_once
+from relax.utils.env import Envs
+from relax.utils.logging_utils import get_logger
 from relax.utils.types import Sample
 
 
@@ -32,16 +32,16 @@ from relax.utils.types import Sample
 # After async_put() succeeded the trainer owns the only copy that matters; replace
 # pixel tensors with 0-row stand-ins that keep dtype and width. image_grid_thw is
 # tiny and stays (metrics derive per-image token counts from it).
-_MM_RELEASE_AFTER_TRANSFER = os.environ.get("RELAX_MM_RELEASE_AFTER_TRANSFER", "0") == "1"
+_MM_RELEASE_AFTER_TRANSFER = Envs.RELAX_MM_RELEASE_AFTER_TRANSFER
 # Replacing the tensor is not enough: glibc raises its dynamic mmap threshold after
 # the first large free, so later pixel blocks come from the arena and free() only
 # returns them to the process, never to the OS -- RSS climbed monotonically for the
 # whole 3h rollout even though every batch had been released. gc + malloc_trim(0)
 # hands the arena's free pages back. The log line tells us which of the two it was.
-_TRANSFER_BATCH_GROUPS = int(os.environ.get("RELAX_TRANSFER_BATCH_GROUPS", "0") or 0)
-_MM_RELEASE_TRIM = os.environ.get("RELAX_MM_RELEASE_TRIM", "1") == "1"
-_MM_RELEASE_LOG = os.environ.get("RELAX_MM_RELEASE_LOG", "1") == "1"
-_MM_LOG = logging.getLogger(__name__)
+_TRANSFER_BATCH_GROUPS = Envs.RELAX_TRANSFER_BATCH_GROUPS
+_MM_RELEASE_TRIM = Envs.RELAX_MM_RELEASE_TRIM
+_MM_RELEASE_LOG = Envs.RELAX_MM_RELEASE_LOG
+_MM_LOG = get_logger(__name__)
 try:
     _MM_LIBC = ctypes.CDLL("libc.so.6")
 except Exception:
@@ -69,6 +69,7 @@ def _release_transferred_pixels(samples: List[Sample]) -> int:
             if isinstance(v, torch.Tensor) and v.numel() > 0:
                 freed += v.numel() * v.element_size()
                 mm[key] = v.new_empty((0,) + tuple(v.shape[1:]))
+            del v  # Drop the final tensor reference before collecting/trimming.
     if freed > 0 and _MM_RELEASE_TRIM:
         _rss0 = _mm_rss_bytes()
         gc.collect()

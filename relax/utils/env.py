@@ -345,8 +345,15 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Agentic runner -------------
     RELAX = EnvProperty("RELAX", str, None)
     RELAX_VCS = EnvProperty("RELAX_VCS", bool, False)
+    RELAX_TRAIN_VISION_CACHE = EnvProperty("RELAX_TRAIN_VISION_CACHE", bool, False)
+    RELAX_TRAIN_VISION_CACHE_MAX_BYTES = EnvProperty("RELAX_TRAIN_VISION_CACHE_MAX_BYTES", int, 268435456)
     RELAX_VCS_KEEP_IMAGES = EnvProperty("RELAX_VCS_KEEP_IMAGES", int, 2)
     RELAX_VCS_PRUNE_IMAGES = EnvProperty("RELAX_VCS_PRUNE_IMAGES", int, 2)
+    RELAX_TRANSFER_BATCH_GROUPS = EnvProperty("RELAX_TRANSFER_BATCH_GROUPS", int, 0)
+    RELAX_MM_RELEASE_AFTER_TRANSFER = EnvProperty("RELAX_MM_RELEASE_AFTER_TRANSFER", bool, False)
+    RELAX_MM_RELEASE_TRIM = EnvProperty("RELAX_MM_RELEASE_TRIM", bool, True)
+    RELAX_MM_RELEASE_LOG = EnvProperty("RELAX_MM_RELEASE_LOG", bool, True)
+    RELAX_MM_PIXEL_DTYPE = EnvProperty("RELAX_MM_PIXEL_DTYPE", str, "fp32")
 
     # ------------- Entrypoint / launcher scripts -------------
     # Set by scripts/entrypoint/*.sh; read back by the training scripts to

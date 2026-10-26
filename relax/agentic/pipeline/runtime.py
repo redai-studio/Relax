@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
 import time
 import uuid
 import zlib
@@ -37,6 +36,7 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.utils.env import Envs
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
@@ -49,7 +49,7 @@ from relax.utils.types import Sample
 # information per channel) and the ViT computes in bf16, so float32 storage is
 # pure overhead: 2x RAM in the rollout buffers and 2x pickle on every transfer.
 # Mirrors the reference repo's cast_pixel_fp16 (train/osworld_vlm_preprocess_shards.py).
-_MM_PIXEL_DTYPE_NAME = os.environ.get("RELAX_MM_PIXEL_DTYPE", "fp32").strip().lower()
+_MM_PIXEL_DTYPE_NAME = Envs.RELAX_MM_PIXEL_DTYPE.strip().lower()
 _MM_PIXEL_DTYPES = {
     "fp32": None,
     "float32": None,

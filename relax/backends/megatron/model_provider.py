@@ -43,6 +43,7 @@ from relax.utils.megatron_peft_utils import (
     summarize_lora_modules,
 )
 from relax.utils.misc import load_function
+from relax.utils.multimodal.vision_feature_cache import install_train_vision_cache
 from relax.utils.training.ppo_utils import (
     ensure_sequence_classification_head_trainable,
     install_critic_value_head_in_provider,
@@ -292,6 +293,7 @@ def get_model_provider_func(
             install_sequence_classification_head_in_provider(model, args, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
+            install_train_vision_cache(model)
             _install_cp_probe(model)
             return model
 
@@ -551,6 +553,7 @@ def get_model_provider_func(
             )
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
+            install_train_vision_cache(model)
             _install_cp_probe(model)
             return model
 
@@ -679,6 +682,7 @@ def get_model_provider_func(
 
         _maybe_mark_unsplit_forward(args, model)
         install_conditional_branch_sync(args, model)
+        install_train_vision_cache(model)
         _install_cp_probe(model)
         return model
 

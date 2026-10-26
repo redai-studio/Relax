@@ -77,6 +77,7 @@ from relax.utils.megatron_peft_utils import (
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.model_source import is_model_source_alias
+from relax.utils.multimodal.vision_feature_cache import clear_train_vision_cache
 from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_offload_handle,
     append_managed_opd_teacher_onload_handle,
@@ -705,6 +706,7 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        clear_train_vision_cache(self.model, reason="offload")
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
@@ -772,6 +774,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # _rebuild_dpo_reference), so skipping avoids a redundant
             # full-weight CPU->GPU copy per step after the ref forward.
             return
+        clear_train_vision_cache(self.model, reason=f"weight_switch:{self._active_model_tag}->{target_tag}")
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
 

@@ -20,6 +20,7 @@ from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.multimodal.stats import count_images, get_multimodal_token_counts
@@ -734,12 +735,20 @@ def get_batch(
         multimodal_data = {}  # key -> concatenated tensor
         multimodal_num_items = {}  # key -> list of item counts per sequence
         tensor_dict_list = {}
+        cache_infos = []
+        cache_complete = True
         input_key_map = getattr(get_args(), "multimodal_input_key_map", {})
 
         for mm_input_dict in multimodal_train_inputs:
             if mm_input_dict is None:
                 continue
+            if Envs.RELAX_TRAIN_VISION_CACHE:
+                cache_infos.extend(mm_input_dict.get("_relax_vision_cache") or [])
+                if mm_input_dict.get("pixel_values") is not None and not mm_input_dict.get("_relax_vision_cache"):
+                    cache_complete = False
             for key, mm_tensor in mm_input_dict.items():
+                if key == "_relax_vision_cache":
+                    continue
                 mapped_key = input_key_map.get(key, key)
                 if mapped_key != key and mapped_key in mm_input_dict:
                     raise ValueError(f"Multimodal inputs contain both {key!r} and its mapped key {mapped_key!r}.")
@@ -760,6 +769,8 @@ def get_batch(
                     multimodal_data[key] = torch.cat(tensor_list, dim=0)
                 multimodal_num_items[key] = [t.size(0) for t in tensor_list]
 
+        if Envs.RELAX_TRAIN_VISION_CACHE and cache_complete and cache_infos:
+            multimodal_data["_relax_vision_cache"] = cache_infos
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
 

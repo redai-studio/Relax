@@ -184,6 +184,15 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         getattr(sample, "multimodal_train_inputs", None) is not None for sample in samples
     ):
         train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
+        if Envs.RELAX_TRAIN_VISION_CACHE:
+            from relax.utils.multimodal.vision_feature_cache import attach_vision_cache_info
+
+            train_data["multimodal_train_inputs"] = [
+                attach_vision_cache_info(
+                    sample.session_id or (sample.metadata or {}).get("session_id"), sample.multimodal_train_inputs
+                )
+                for sample in samples
+            ]
 
     if args.use_opd:
         from relax.engine.rollout.on_policy_distillation import produce_opd_transfer_data
