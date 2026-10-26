@@ -19,7 +19,7 @@ from relax.backends.megatron.model_provider import (
     freeze_model_params,
     validate_mtp_only_trainable_params,
 )
-from relax.engine.sft.runtime import should_bypass_main_output_layer, should_skip_mtp_only_weight_management
+from relax.engine.sft.runtime import should_bypass_main_output_layer, should_skip_sft_weight_management
 
 
 class _MtpOnlyModel(torch.nn.Module):
@@ -189,10 +189,6 @@ def _actor_args(**overrides) -> Namespace:
     return Namespace(**defaults)
 
 
-def test_pure_mtp_only_sft_skips_weight_management():
-    assert should_skip_mtp_only_weight_management(_actor_args()) is True
-
-
 @pytest.mark.parametrize("prepacked", [False, True])
 def test_mtp_only_sft_reaches_train_without_weight_backuper(monkeypatch, prepacked):
     actor_module = pytest.importorskip("relax.backends.megatron.actor", exc_type=ImportError)
@@ -211,7 +207,7 @@ def test_mtp_only_sft_reaches_train_without_weight_backuper(monkeypatch, prepack
     actor.optimizer = object()
     actor.opt_param_scheduler = object()
     actor.rollout_data_postprocess = None
-    assert should_skip_mtp_only_weight_management(actor.args)
+    assert should_skip_sft_weight_management(actor.args)
     assert not hasattr(actor, "weights_backuper")
 
     iterator = SimpleNamespace(close=Mock())
@@ -239,19 +235,3 @@ def test_mtp_only_sft_reaches_train_without_weight_backuper(monkeypatch, prepack
         make_iterator.assert_not_called()
     else:
         make_iterator.assert_called_once_with(actor.args, actor.model, rollout_data)
-
-
-@pytest.mark.parametrize(
-    ("overrides", "extra_kwargs"),
-    [
-        ({"mtp_only_training": False}, {}),
-        ({"loss_type": "policy_loss"}, {}),
-        ({"sft_predict_interval": 10}, {}),
-        ({"offload_train": True}, {}),
-        ({"keep_old_actor": True}, {}),
-        ({}, {"with_ref": True}),
-        ({}, {"with_opd_teacher": True}),
-    ],
-)
-def test_mtp_only_keeps_weight_management_when_another_consumer_needs_it(overrides, extra_kwargs):
-    assert should_skip_mtp_only_weight_management(_actor_args(**overrides), **extra_kwargs) is False

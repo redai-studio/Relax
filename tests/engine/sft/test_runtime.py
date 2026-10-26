@@ -34,11 +34,15 @@ def test_resolve_sft_split_indices_matches_ms_swift_rng_order():
     assert eval_indices[:8] == (91, 52, 40, 13, 32, 26, 65, 1)
 
 
-@pytest.mark.parametrize("task_type", ["causal_lm", "seq_cls", "seq_contrast"])
-def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type):
+@pytest.mark.parametrize(
+    ("task_type", "mtp_only_training"),
+    [("causal_lm", False), ("seq_cls", False), ("seq_contrast", False), ("causal_lm", True)],
+)
+def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mtp_only_training):
     args = Namespace(
         loss_type="sft",
         task_type=task_type,
+        mtp_only_training=mtp_only_training,
         save="checkpoints",
         save_interval=10,
         save_hf="export",
@@ -55,17 +59,15 @@ def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type):
         ({"loss_type": "policy_loss"}, {}),
         ({"loss_type": "dpo"}, {}),
         ({"loss_type": "rm"}, {}),
-        ({"fully_async": True}, {}),
-        ({"hybrid": True}, {}),
         ({"sft_predict_interval": 10}, {}),
         ({"offload_train": True}, {}),
-        ({"compute_advantages_and_returns": True}, {}),
         ({"keep_old_actor": True}, {}),
         ({}, {"with_ref": True}),
         ({}, {"with_opd_teacher": True}),
     ],
 )
-def test_sft_keeps_weight_management_for_consumers_and_other_execution_paths(overrides, consumers):
-    args = Namespace(**{"loss_type": "sft", **overrides})
+@pytest.mark.parametrize("mtp_only_training", [False, True])
+def test_sft_keeps_weight_management_for_consumers_and_other_losses(overrides, consumers, mtp_only_training):
+    args = Namespace(**{"loss_type": "sft", "mtp_only_training": mtp_only_training, **overrides})
 
     assert not should_skip_sft_weight_management(args, **consumers)
