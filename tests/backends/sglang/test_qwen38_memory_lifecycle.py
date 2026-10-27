@@ -31,7 +31,7 @@ def _load_method(path: Path, class_name: str, method_name: str, namespace: dict)
 def lifecycle():
     source = os.environ.get("SGLANG_SOURCE_DIR")
     if not source:
-        pytest.skip("Set SGLANG_SOURCE_DIR to the patched SGLang 0.5.20 checkout")
+        pytest.skip("Set SGLANG_SOURCE_DIR to the patched SGLang checkout")
     root = Path(source) / "python/sglang/srt/managers"
     events = []
     updater = SimpleNamespace(offload_tags=set(), scheduler=None, tp_cpu_group=object())
@@ -62,7 +62,8 @@ def lifecycle():
     }
     scheduler = SimpleNamespace(
         weight_updater=updater,
-        is_fully_idle=lambda: True,
+        is_fully_idle=lambda **_kwargs: True,
+        _engine_paused=False,
         tree_cache=SimpleNamespace(reset=clear_pool),
         req_to_token_pool=SimpleNamespace(clear=clear_pool, reset_aux_cache_allocator=clear_pool),
         token_to_kv_pool_allocator=SimpleNamespace(clear=clear_pool),
@@ -75,7 +76,7 @@ def lifecycle():
     flush = _load_method(root / "scheduler.py", "Scheduler", "flush_cache", namespace)
     scheduler.flush_cache = MethodType(flush, scheduler)
     updater.flush_cache = scheduler.flush_cache
-    updater.is_fully_idle = lambda: True
+    updater.is_fully_idle = lambda **_kwargs: True
     updater.memory_saver_adapter = SimpleNamespace(pause=pause)
     updater._assert_weight_cache_inactive = lambda _op: None
     updater.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(model=object()))
@@ -100,7 +101,7 @@ def test_qwen38_live_flush_clears_pools_and_busy_flush_preserves_them(lifecycle)
     assert lifecycle.scheduler.flush_cache(empty_cache=False)
     assert lifecycle.events == ["clear_pool"] * 6
     lifecycle.events.clear()
-    lifecycle.scheduler.is_fully_idle = lambda: False
+    lifecycle.scheduler.is_fully_idle = lambda **_kwargs: False
     assert not lifecycle.scheduler.flush_cache()
     assert lifecycle.events == []
 

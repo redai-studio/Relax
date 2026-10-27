@@ -68,6 +68,7 @@ def dummy_lifecycle():
         "torch": torch,
         "nn": torch.nn,
         "_is_cuda": True,
+        "_use_aiter": False,
         "UnquantizedLinearMethod": UnquantizedLinearMethod,
         "get_lora": lambda: SimpleNamespace(enable_lora=False, lora_paths=None),
         "get_model": lambda: config,
@@ -84,7 +85,14 @@ def dummy_lifecycle():
         )
         setattr(Model, method, implementation)
     initialize = _load_function(root / "model_loader/weight_utils.py", None, "initialize_dummy_weights", namespace)
-    post_load = _load_function(root / "model_loader/loader.py", None, "_post_load_weights", namespace)
+    post_load = _load_function(
+        root / "model_loader/loader.py",
+        None,
+        "post_load_weights"
+        if "def post_load_weights(" in (root / "model_loader/loader.py").read_text()
+        else "_post_load_weights",
+        namespace,
+    )
     return SimpleNamespace(Model=Model, config=config, initialize=initialize, post_load=post_load, root=root)
 
 
@@ -236,63 +244,59 @@ def test_qwen38_mtp_post_load_initializes_hc_and_reload_preserves_storage(dummy_
 
 
 @pytest.mark.parametrize("restore,process", [(True, False), (False, True), (True, True)])
-def test_eagle_v2_post_process_delegates_only_to_draft(dummy_lifecycle, restore, process):
+@pytest.mark.parametrize("has_draft,fail_draft", [(False, False), (True, False), (True, True)])
+def test_eagle_v2_post_process_uses_native_runner_selection(dummy_lifecycle, restore, process, has_draft, fail_draft):
     calls = []
     namespace = {
         "torch": SimpleNamespace(distributed=SimpleNamespace(barrier=lambda **kwargs: calls.append("barrier"))),
         "logger": SimpleNamespace(error=lambda message: calls.append(("error", message))),
         "PostProcessWeightsReqOutput": SimpleNamespace,
     }
-    delegate = _load_function(
-        dummy_lifecycle.root / "speculative/eagle_worker_v2.py", "EAGLEWorkerV2", "post_process_weights", namespace
-    )
-    scheduler = _load_function(
-        dummy_lifecycle.root / "managers/scheduler_components/weight_updater.py",
-        "SchedulerWeightUpdaterManager",
-        "post_process_weights",
-        namespace,
+    root = dummy_lifecycle.root
+    path = root / "managers/scheduler_components/weight_updater.py"
+    if "def _select_runners(" not in path.read_text():
+        pytest.skip("Requires SGLang's native runner-selection API")
+    _load_function(path, None, "_parse_runner_selector", namespace)
+    select = _load_function(path, "SchedulerWeightUpdaterManager", "_select_runners", namespace)
+    post_process = _load_function(path, "SchedulerWeightUpdaterManager", "post_process_weights", namespace)
+    base = root / "speculative/base_spec_worker.py"
+    spec_type = type(
+        "SpecWorker",
+        (),
+        {
+            "draft_worker": _load_function(base, "BaseSpecWorker", "draft_worker", namespace),
+            "weight_update_runners": _load_function(base, "BaseSpecWorker", "weight_update_runners", namespace),
+        },
     )
 
-    def draft_hook(**kwargs):
-        calls.append(("draft", kwargs))
-        return True, "draft processed"
+    def hook(role):
+        def process_weights(**kwargs):
+            calls.append((role, kwargs))
+            return (False, "repacking failed") if role == "draft" and fail_draft else (True, role + " processed")
 
-    def target_hook(request):
-        calls.append(("target", request))
-        return True, "target processed"
+        return SimpleNamespace(post_process_weights=process_weights)
 
-    worker = SimpleNamespace(
-        _draft_worker=SimpleNamespace(draft_runner=SimpleNamespace(post_process_weights=draft_hook))
-    )
-    worker.post_process_weights = lambda request: delegate(worker, request)
+    target, draft = hook("target"), hook("draft")
+    worker = spec_type()
+    worker._draft_worker = SimpleNamespace(draft_runners=[draft]) if has_draft else None
     manager = SimpleNamespace(
-        tp_worker=SimpleNamespace(post_process_weights=target_hook), draft_worker=worker, tp_cpu_group=object()
+        _session=None,
+        tp_worker=SimpleNamespace(weight_update_runners=lambda: [("target", target)]),
+        draft_worker=worker,
+        tp_cpu_group=object(),
     )
+    manager._select_runners = lambda: select(manager)
     request = SimpleNamespace(restore_weights_before_load=restore, post_process_quantization=process)
-    result = scheduler(manager, request)
-    assert result.success and result.message == "draft processed"
-    assert calls == [
-        ("target", request),
-        ("draft", {"restore_weights_before_load": restore, "post_process_quantization": process}),
-        "barrier",
-    ]
-
-
-def test_eagle_v2_post_process_non_draft_pp_rank_is_noop(dummy_lifecycle):
-    delegate = _load_function(
-        dummy_lifecycle.root / "speculative/eagle_worker_v2.py", "EAGLEWorkerV2", "post_process_weights", {}
+    result = post_process(manager, request)
+    options = {"restore_weights_before_load": restore, "post_process_quantization": process}
+    expected = [("target", options)]
+    if has_draft:
+        expected.append(("draft", options))
+    if fail_draft:
+        expected.append(("error", "repacking failed"))
+    expected.append("barrier")
+    assert calls == expected
+    assert result.success == (not fail_draft)
+    assert result.message == (
+        "repacking failed" if fail_draft else ("draft" if has_draft else "target") + " processed"
     )
-    assert delegate(SimpleNamespace(_draft_worker=None), None) == (True, "Success")
-
-
-def test_eagle_v2_post_process_preserves_draft_failure(dummy_lifecycle):
-    delegate = _load_function(
-        dummy_lifecycle.root / "speculative/eagle_worker_v2.py", "EAGLEWorkerV2", "post_process_weights", {}
-    )
-    worker = SimpleNamespace(
-        _draft_worker=SimpleNamespace(
-            draft_runner=SimpleNamespace(post_process_weights=lambda **kwargs: (False, "repacking failed"))
-        )
-    )
-    request = SimpleNamespace(restore_weights_before_load=False, post_process_quantization=True)
-    assert delegate(worker, request) == (False, "repacking failed")

@@ -65,6 +65,7 @@ from relax.agentic.session.state import (
     _messages_tools_template_state_hash,
     _multimodal_inputs_from_messages,
     check_messages,
+    merge_routed_experts,
     normalize_template_kwargs,
     normalize_tools,
 )
@@ -279,7 +280,7 @@ def _decode_routed_experts(
     token_count: int,
 ) -> Any:
     encoded = meta_info.get("routed_experts")
-    if not encoded or token_count <= 1:
+    if encoded is None:
         return None
     import numpy as np
     import pybase64
@@ -2583,10 +2584,17 @@ class AgenticSessionShard:
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
         self._accumulate_request_meta(ir, meta_info=result.meta_info)
-        ir.pending_routed_experts = _decode_routed_experts(
+        routed_experts = _decode_routed_experts(
             args=self.args,
             meta_info=result.meta_info,
             token_count=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
+        )
+        if getattr(self.args, "use_rollout_routing_replay", False) and result.new_tokens and routed_experts is None:
+            raise ValueError("Backend omitted routed experts for newly accepted tokens")
+        ir.pending_routed_experts = merge_routed_experts(
+            ir.pending_routed_experts,
+            routed_experts,
+            expected_rows=max(0, len(ir.history_train_token_prefix) + len(ir.pending_token_delta) - 1),
         )
 
     def _terminal_response_locked(

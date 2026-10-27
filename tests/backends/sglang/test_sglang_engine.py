@@ -325,3 +325,81 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
     expected = list(dict.fromkeys([*(existing or []), "relax.backends.sglang.weight_loader.load_expert_slices"]))
     assert result["custom_weight_loader"] == expected
     assert result["custom_weight_loader"] is not existing
+
+
+@pytest.mark.parametrize("routing_replay", [False, True])
+@pytest.mark.parametrize(
+    "worker_type,cli_mode,overrides,is_pd",
+    [
+        ("regular", None, None, False),
+        ("regular", "null", None, False),
+        ("prefill", None, None, True),
+        ("decode", None, None, True),
+        ("regular", "prefill", None, True),
+        ("regular", "decode", None, True),
+        ("regular", None, {"disaggregation_mode": "prefill"}, True),
+        ("regular", None, {"disaggregation_mode": "decode"}, True),
+        ("prefill", None, {"disaggregation_mode": "null"}, True),
+        ("decode", None, {"enable_return_routed_experts": False}, True),
+    ],
+)
+def test_policy_pd_routing_replay_accepts_configured_topology(
+    monkeypatch, sglang_engine_module, routing_replay, worker_type, cli_mode, overrides, is_pd
+):
+    module = sglang_engine_module
+    monkeypatch.setattr(
+        module,
+        "ServerArgs",
+        make_dataclass(
+            "ServerArgs", [("disaggregation_mode", str, "null"), ("enable_return_routed_experts", bool, False)]
+        ),
+    )
+    monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=2,
+        num_gpus_per_node=8,
+        hf_checkpoint="/test/model",
+        seed=42,
+        offload_rollout=True,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        sglang_ep_size=1,
+        use_rollout_routing_replay=routing_replay,
+        sglang_disaggregation_mode=cli_mode,
+        fp16=False,
+    )
+    module._compute_server_args(
+        args,
+        0,
+        "localhost:8000",
+        8001,
+        "localhost",
+        8002,
+        worker_type=worker_type,
+        disaggregation_bootstrap_port=8003,
+        base_gpu_id=0,
+        sglang_overrides=overrides,
+    )
+
+
+@pytest.mark.parametrize("engine_class", ["SGLangEngine", "GenRMEngine"])
+@pytest.mark.parametrize("routing_replay", [False, True])
+@pytest.mark.parametrize("actual_mode", ["null", "prefill", "decode"])
+def test_external_pd_routing_replay_registers_native_worker(
+    monkeypatch, sglang_engine_module, engine_class, routing_replay, actual_mode
+):
+    module = sglang_engine_module
+    engine = object.__new__(getattr(module, engine_class))
+    engine.args = SimpleNamespace(use_rollout_routing_replay=routing_replay)
+    engine.rank, engine.worker_type = 0, "regular"
+    engine.server_host, engine.server_port = "localhost", 8000
+    engine._skip_router_registration = False
+    engine.process = None
+    engine.register_to_router = Mock()
+    response = Mock()
+    response.json.return_value = {"disaggregation_mode": actual_mode}
+    monkeypatch.setattr(module.requests, "get", Mock(return_value=response))
+    monkeypatch.setattr(module, "_wait_server_healthy", Mock())
+    # Actual PD topology is accepted for both policy and independent GenRM engines.
+    engine._init_external({}, external_engine_need_check_fields=[])
+    engine.register_to_router.assert_called_once_with()

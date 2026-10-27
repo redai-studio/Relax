@@ -27,8 +27,17 @@ def _function(tree: ast.AST, name: str, namespace: dict):
 
 @pytest.fixture
 def hooks(kimi_source):
-    ns = {"torch": torch, "ReplicatedLinear": object, "RMSNorm": object}
+    ns = {
+        "torch": torch,
+        "nn": torch.nn,
+        "ReplicatedLinear": object,
+        "RMSNorm": object,
+        "_is_npu": False,
+        "_is_hip": False,
+    }
     _function(ast.parse(sglang_source_path("srt/layers/attn_residual.py").read_text()), "get_cw", ns)
+    if any(isinstance(node, ast.FunctionDef) and node.name == "_get_k3_dense_weight" for node in kimi_source.body):
+        _function(kimi_source, "_get_k3_dense_weight", ns)
     for name in ("PPMissingLayer", "KimiK3MoE", "KimiK3DeltaAttention"):
         ns[name] = type(name, (), {})
     return kimi_source, ns
@@ -113,6 +122,48 @@ def test_k3_fused_decode_reload_refreshes_captured_inputs(hooks):
         assert [tensor.data_ptr() for tensor in captured[:-1]] == pointers
         for tensor in captured[:-1]:
             torch.testing.assert_close(tensor, torch.full_like(tensor, value))
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("hip", [False, True])
+def test_k3_gate_weight_keeps_checkpoint_name_after_fusion(hooks, hip):
+    import re
+    from collections.abc import Iterable
+    from types import MethodType
+
+    tree, ns = hooks
+    ns.update(
+        _is_hip=hip,
+        Iterable=Iterable,
+        get_layer_id=lambda _: None,
+        _EXPERT_WEIGHT_NAME=re.compile(r"experts\.\d+\.\w+\."),
+        maybe_remap_kv_scale_name=lambda name, _: name,
+        _maybe_map_fp8_pb_scale_name=lambda name, _: name,
+        default_weight_loader=lambda param, value, **_: param.data.copy_(value),
+    )
+    _function(tree, "_merge_weights_as_views", ns)
+    attn = torch.nn.Module()
+    attn.f_a_proj = torch.nn.Linear(4, 3, bias=False)
+    attn.b_proj = torch.nn.Linear(4, 1, bias=False)
+    attn.f_b_proj = torch.nn.Linear(3, 4, bias=False)
+    attn.use_full_rank_gate, attn._bfa_uses_block_fp8 = True, False
+    attn._merge_kda_inproj_weights_hip = lambda: True
+    attn._merge_bfa_weights = MethodType(_function(tree, "_merge_bfa_weights", ns), attn)
+    model = torch.nn.Module()
+    model.self_attn = attn
+    model.config = SimpleNamespace(linear_attn_config={"use_full_rank_gate": True}, is_moe=False, num_hidden_layers=1)
+    model.post_load_weights = attn._merge_bfa_weights
+    model.load_weights = MethodType(_function(tree, "load_weights", ns), model)
+    attn._merge_bfa_weights()
+    captured = attn._bfa_f_b_w
+    pointer = captured.data_ptr()
+    for value in (2.0, 5.0):
+        loaded = model.load_weights([("self_attn.f_b_proj.weight", torch.full_like(attn.f_b_proj.weight, value))])
+        assert "self_attn.f_b_proj.weight" in loaded
+        assert captured.data_ptr() == pointer == attn._bfa_f_b_w.data_ptr()
+        torch.testing.assert_close(captured, torch.full_like(captured, value))
+    assert "self_attn.f_b_proj.weight" in dict(model.named_parameters())
+    assert "self_attn._bfa_f_b_w" not in dict(model.named_parameters())
 
 
 def test_k3_weight_update_defers_post_load_until_successful_end(hooks):

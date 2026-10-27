@@ -1,0 +1,41 @@
+--- a/transformer_engine/pytorch/attention/dot_product_attention/utils.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/utils.py
+@@ -841,6 +841,7 @@
+                 )
+             use_fused_attention = False
+ 
++    # FA2 kernels built for SM100 also support the SM10x family, including SM103.
+     fa2_padded_head_dim = max(head_dim_qk, head_dim_v)
+     if (  # pylint: disable=too-many-boolean-expressions
+         use_flash_attention_2
+@@ -851,6 +852,7 @@
+             or (
+                 fa2_padded_head_dim > 192
+                 and device_compute_capability not in ((8, 0), (9, 0), (10, 0), (12, 0))
++                and device_compute_capability[0] != 10
+             )
+         )
+     ):
+@@ -926,6 +928,22 @@
+                 head_dim_qk,
+                 head_dim_v,
+                 device_compute_capability[0] * 10 + device_compute_capability[1],
++            )
++            use_flash_attention_4 = False
++        # FA4's SM100 backward requires aligned head tiles; padded visual heads
++        # (e.g. Qwen3.5 head_dim=72) fail in preprocess or dQ reduction. Keep
++        # native FA2/fused filtering for these shapes and retain FA4 for hd256.
++        if (
++            use_flash_attention_4
++            and is_training
++            and (10, 0) <= device_compute_capability < (12, 0)
++            and (head_dim_qk % 32 != 0 or head_dim_v % 32 != 0)
++        ):
++            logger.debug(
++                "Disabling FlashAttention 4 for SM100 training with unaligned head dimensions. "
++                "Found: head_dim_qk = %s, head_dim_v = %s.",
++                head_dim_qk,
++                head_dim_v,
+             )
+             use_flash_attention_4 = False
+         # flash-attn-4 4.0.0b11 validates (256, 256) on SM100, but its dedicated

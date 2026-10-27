@@ -35,6 +35,11 @@ def main() -> None:
     assert torch.cuda.is_available(), "GPU/driver unavailable"
     import_module("transformer_engine.pytorch")
     import_module("sgl_kernel")
+    expected_sglang = os.environ.get("RELAX_SGLANG_VERSION")
+    if expected_sglang:
+        sglang = import_module("sglang")
+        assert md.version("sglang") == sglang.__version__ == expected_sglang
+        import_module("sglang.srt.server_args")
     if os.environ.get("RELAX_GPU_ARCH") in {"blackwell", "hopper"} or os.environ.get("RELAX_HYBRID_EP_COMMIT"):
         deep_ep = import_module("_relax_hybrid_ep")
         import_module("_relax_hybrid_ep.deep_ep_cpp")

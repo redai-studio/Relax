@@ -27,7 +27,12 @@ def _load_reduce_scatterv() -> Callable[..., object]:
     function = next(
         node for node in group.body if isinstance(node, ast.FunctionDef) and node.name == "reduce_scatterv"
     )
-    namespace = {"torch": torch, "Optional": Optional, "List": list}
+    namespace = {
+        "torch": torch,
+        "Optional": Optional,
+        "List": list,
+        "envs": SimpleNamespace(SGLANG_ENABLE_DETERMINISTIC_INFERENCE=SimpleNamespace(get=lambda: False)),
+    }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["reduce_scatterv"]
 
@@ -101,6 +106,10 @@ def _combine(rank: int, dp_size: int, dtype, *, variable: bool = False):
         "use_symmetric_memory": symmetric_memory,
         "is_dp_max_padding": lambda: True,
     }
+    namespace["_note_dp_gather_in_prefill_graph"] = lambda: None
+    namespace["get_parallel"] = lambda: SimpleNamespace(
+        tp_size=tp_size, tp_rank=rank, attn_dp_size=dp_size, tp_group=tp, attn_tp_group=attn
+    )
     path = sglang_source_path("srt/layers/dp_attention.py")
     function = next(
         node

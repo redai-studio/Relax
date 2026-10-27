@@ -6,10 +6,18 @@ sglang:
       - worker_type: prefill
         num_gpus: 4
         overrides:
+          # Qwen3.5 no_buffer forces page_size=1 on prefill.
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          page_size: 64
           enable_hierarchical_cache: false
           hicache_storage_backend: null
       - worker_type: decode
         num_gpus: 4
         overrides:
+          # Qwen3.5 no_buffer forces page_size=1 on prefill.
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          page_size: 64
           enable_hierarchical_cache: false
           hicache_storage_backend: null

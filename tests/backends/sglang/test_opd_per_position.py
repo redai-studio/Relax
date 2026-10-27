@@ -19,7 +19,7 @@ _names = {
     "get_token_ids_logprobs_batch_optimized",
 }
 _nodes = [node for node in ast.parse(_source.read_text()).body if getattr(node, "name", None) in _names]
-_namespace = {"torch": torch, "Enum": Enum, "auto": auto}
+_namespace = {"torch": torch, "Enum": Enum, "auto": auto, "is_pin_memory_available": lambda _device: False}
 _module = ast.Module(
     body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *_nodes],
     type_ignores=[],

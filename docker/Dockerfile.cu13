@@ -4,7 +4,7 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=lmsysorg/sglang:v0.5.20-cu130@sha256:b27fce60bc5494c118c4910702812bcfa8cee67abcdd1ff8b0902f21647552f4
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.21
 ARG TRAIN_IMAGE=train
 ARG HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
 ARG DEEP_EP_V2_COMMIT=099d5f2bad488b9c534ea785062b12f2e91d1d41
@@ -189,6 +189,15 @@ COPY docker/patch/sglang-router /tmp/router-patch
 COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
 RUN bash /tmp/build_sglang_router.sh /tmp/router-patch /opt/router-wheels
 
+# Build the deferred HiCache completion binding with the final runtime's Torch ABI.
+FROM router_builder as tree_core_builder
+COPY docker/patch/sglang/v0.5.21.patch /tmp/tree-core.patch
+COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
+RUN cd /sgl-workspace/sglang && \
+    test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
+    git apply --check /tmp/tree-core.patch && git apply /tmp/tree-core.patch && \
+    python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core
+
 FROM ${TRAIN_IMAGE} as relax_build
 
 WORKDIR /root
@@ -196,12 +205,14 @@ WORKDIR /root
 ARG GPU_ARCH=blackwell
 ARG PATCH_VERSION=latest
 
-ENV RELAX_GPU_ARCH=${GPU_ARCH}
+ENV RELAX_GPU_ARCH=${GPU_ARCH} \
+    RELAX_SGLANG_VERSION=0.5.21 \
+    SGLANG_RUST_BUILD_MODE=never
 
 # Reused TRAIN_IMAGE must come from this runtime generation; old CUDA binaries
 # cannot be upgraded safely by changing Python constraints in the final stage.
 RUN python -c "import importlib.metadata as m; \
-assert m.version('sglang') == '0.5.20' and m.version('tilelang') == '0.1.12', \
+assert m.version('sglang') == '0.5.21' and m.version('tilelang') == '0.1.12', \
 'Build the train target from this Dockerfile before reusing TRAIN_IMAGE'"
 
 # CUTLASS DSL and gRPC require protobuf 6, including when reusing a compatible TRAIN_IMAGE.
@@ -220,6 +231,11 @@ assert m.version('transformer-engine') == '2.18.0'"
 COPY docker/patch/transformer_engine/2.18.0-cp-padding-no-host-sync.patch /tmp/te-cp-padding-no-host-sync.patch
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/te-cp-padding-no-host-sync.patch
+
+# Keep FA4 for supported training heads and use the native fallback for head72.
+COPY docker/patch/transformer_engine/2.18.0-blackwell-fa4-head-dim.patch /tmp/te-blackwell-fa4-head-dim.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/te-blackwell-fa4-head-dim.patch
 
 ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
@@ -272,16 +288,20 @@ RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
     && rm -rf /var/lib/apt/lists/*
 
 # One patched inference runtime for existing models and Qwen3.8.
-COPY docker/patch/sglang/v0.5.20.patch /tmp/sglang.patch
+COPY docker/patch/sglang/v0.5.21.patch /tmp/sglang.patch
 RUN cd /sgl-workspace/sglang && \
-    test "$(git rev-parse HEAD)" = "94602c9c2b7cbdb8efd5c52802dac6a1c180089e" && \
+    test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
     git apply --check /tmp/sglang.patch && git apply /tmp/sglang.patch && \
     sha256sum /tmp/sglang.patch > /etc/relax-sglang-patch.sha256 && \
     pip install --no-cache-dir setuptools-scm==9.2.2 && \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.20 \
+    SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21 \
         pip install --no-deps --no-build-isolation -e ./python && \
     pip install --no-cache-dir transformers==5.16.0 tokenizers==0.23.2 && \
     rm /tmp/sglang.patch
+
+COPY --from=tree_core_builder /opt/relax-tree-core /opt/relax-tree-core
+COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
+RUN python /tmp/build_sglang_tree_core.py install /opt/relax-tree-core
 
 COPY requirements.txt /tmp/requirements.txt
 
@@ -314,6 +334,7 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch \
     docker/patch/megatron/sync-save-bounded-staging.patch \
+    docker/patch/megatron/kimi-packed-sequence-api.patch \
     docker/patch/megatron/20261016-qwen38-models.patch \
     docker/patch/megatron/20261020-qwen35-optimized.patch \
     docker/patch/megatron/20261020-model-operators.patch \
@@ -326,6 +347,7 @@ RUN cd Megatron-LM && \
     exit 1; \
     fi && \
     patch --batch --forward --fuzz=0 -p1 < sync-save-bounded-staging.patch && \
+    patch --batch --forward --fuzz=0 -p1 < kimi-packed-sequence-api.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
     sha256sum 20261016-qwen38-models.patch > /etc/relax-qwen38-model-patch.sha256 && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
@@ -336,7 +358,7 @@ RUN cd Megatron-LM && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch kimi-packed-sequence-api.patch 20261016-qwen38-models.patch && \
     apt-get update && apt-get install -y --no-install-recommends jq && \
     rm -rf /var/lib/apt/lists/*
 
@@ -456,7 +478,7 @@ ENV FI_PROVIDER=efa \
 
 FROM relax_${GPU_ARCH} as relax
 
-# Restore the official 0.5.20 image runtime after all dependency resolution.
+# Restore the unified image runtime after all dependency resolution.
 # Its DeepEP binaries require NCCL 2.30.7; Torch metadata still pins 2.29.7.
 # pip check above validates every other dependency before this explicit override.
 RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7 && \

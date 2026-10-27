@@ -1,0 +1,25 @@
+--- a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
++++ b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
+@@ -557,13 +557,15 @@
+                 and saved_attention_mask is not None
+                 and saved_attention_mask.dim() == 2
+             ):
+-                inputs_embeds = preprocess_packed_seqs(
+-                    inputs_embeds,
+-                    saved_attention_mask,
+-                    pre_process=True,
+-                    use_packed_sequence=True,
+-                    packed_seq_params=packed_seq_params,
+-                )[0]
++                inputs_embeds = (
++                    preprocess_packed_seqs(
++                        inputs_embeds,
++                        saved_attention_mask,
++                        pre_process=True,
++                    )[0]
++                    .transpose(0, 1)
++                    .contiguous()
++                )
+                 attention_mask = None
+             else:
+                 if cp_size > 1 and packed_seq_params is not None:

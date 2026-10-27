@@ -2,7 +2,9 @@
 
 """CPU checks against the SGLang patch installed in the training image."""
 
+import re
 from array import array
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -18,7 +20,7 @@ schedule_batch = pytest.importorskip("sglang.srt.managers.schedule_batch")
 
 
 @pytest.fixture
-def tokenized_request():
+def tokenized_request(monkeypatch):
     request = tokenizer_manager.GenerateReqInput(
         rid="opd-test",
         input_ids=[1, 99, 2, 10, 11],
@@ -35,6 +37,9 @@ def tokenized_request():
         server_args=SimpleNamespace(disaggregation_transfer_backend="none"),
         rid_to_state={request.rid: SimpleNamespace(time_stats=Mock())},
     )
+
+    if hasattr(tokenizer_manager, "get_disagg"):
+        monkeypatch.setattr(tokenizer_manager, "get_disagg", lambda: manager.server_args)
 
     def create(input_ids=None):
         return tokenizer_manager.TokenizerManager._create_tokenized_object(manager, request, None, input_ids)
@@ -102,9 +107,19 @@ def test_regular_query_does_not_require_per_position_shape(tokenized_request):
 
 @pytest.mark.parametrize("top_k", [1, 3])
 def test_opd_scheduler_slices_queries_across_prefill_chunks(monkeypatch, top_k):
-    monkeypatch.setattr(
-        schedule_batch, "get_server_args", lambda: SimpleNamespace(enable_mamba_extra_buffer=lambda: False)
-    )
+    if hasattr(schedule_batch, "get_exec"):
+        monkeypatch.setattr(
+            schedule_batch,
+            "get_exec",
+            lambda: SimpleNamespace(
+                features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
+                mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            schedule_batch, "get_server_args", lambda: SimpleNamespace(enable_mamba_extra_buffer=lambda: False)
+        )
     monkeypatch.setattr(
         schedule_batch,
         "alloc_for_extend",
@@ -163,3 +178,120 @@ def test_compact_logprobs_preserve_scheduler_flat_topk():
     ids, values = LogprobResponse({"meta_info": meta}).strict_topk("input_top_logprobs", 2, 2)
     np.testing.assert_array_equal(ids, expected_ids)
     np.testing.assert_array_equal(values, expected_values)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_count,repeats", [(1, 1), (2, 1), (1, 257), (2, 257)])
+@pytest.mark.parametrize("avoid_retokenize", [False, True])
+@pytest.mark.parametrize("use_legacy_fallback", [False, True])
+async def test_qwen_uncached_image_prefill_preserves_sampled_ids(
+    monkeypatch, image_count, repeats, avoid_retokenize, use_legacy_fallback
+):
+    from sglang.srt.multimodal.processors import base_processor, qwen_vl
+
+    class Tokenizer:
+        pieces = {8: "prefix ", 9: " suffix ", 10: "h", 11: "ello", 20: "hello", 99: "<image>"}
+
+        def decode(self, ids):
+            return "".join(self.pieces[token] for token in ids)
+
+        def encode(self, text):
+            ids = []
+            while text:
+                for token, piece in sorted(self.pieces.items(), key=lambda item: -len(item[1])):
+                    if text.startswith(piece):
+                        ids.append(token)
+                        text = text[len(piece) :]
+                        break
+                else:
+                    raise AssertionError(text)
+            return ids
+
+    tokenizer = Tokenizer()
+    response_ids = [10, 11] * repeats
+    assert tokenizer.encode(tokenizer.decode(response_ids)) != response_ids
+    prompt_ids = [8] + [token for _ in range(image_count) for token in (99, 9)]
+    original_ids = prompt_ids + response_ids
+    counts = [4, 6][:image_count]
+    images = [object() for _ in counts]
+    processor = qwen_vl.QwenVLImageProcessor.__new__(qwen_vl.QwenVLImageProcessor)
+    processor._tokenizer = tokenizer
+    processor.skip_tokenizer_init = False
+    processor.support_dynamic_frame_expansion = use_legacy_fallback
+    processor.hf_config = SimpleNamespace(model_type="qwen3_5")
+    processor.model_type = "qwen3_5"
+    processor.video_config = {}
+    processor.vision_start_token_id = 1
+    processor.vision_end_token_id = 2
+    processor.mm_tokens = SimpleNamespace(
+        image_token="<image>",
+        image_token_id=99,
+        image_token_regex=re.compile("<image>"),
+        video_token=None,
+        audio_token=None,
+        video_token_id=None,
+        audio_token_id=None,
+        get_combined_regex=lambda: re.compile(r"(<image>)"),
+        get_modality_of_token=lambda text: base_processor.Modality.IMAGE if text == "<image>" else None,
+    )
+
+    loaders_used = []
+
+    def load_images(**kwargs):
+        loaders_used.append("legacy")
+        futures = []
+        for image in images:
+            future = Future()
+            future.set_result(image)
+            futures.append(future)
+        return futures, [(base_processor.Modality.IMAGE, image, None) for image in images]
+
+    def load_images_simple(data_list, modality, *args):
+        if not data_list:
+            return []
+        loaders_used.append("fast")
+        tasks = []
+        for index, image in enumerate(data_list):
+            future = Future()
+            future.set_result(image)
+            tasks.append((modality, index, future))
+        return tasks
+
+    # Stub I/O and model features; execute the real load_mm_data dispatcher,
+    # both loaders and Qwen uncached path with noncanonical response IDs.
+    processor.submit_data_loading_tasks = load_images
+    processor._submit_mm_data_loading_tasks_simple = load_images_simple
+    processor._process_loaded_mm_data = lambda modality, raw, result: (False, [result], [], [])
+    processor._resolve_processor = lambda processor=None: (None, tokenizer)
+    processor.resolve_image_token_counts = lambda loaded: counts
+
+    def process_features(input_text, **kwargs):
+        retokenized = tokenizer.encode(input_text)
+        ids = processor._expand_input_ids(retokenized, counts, 99)
+        return [], torch.tensor(ids), {"image_grid_thw": torch.tensor([[1, 4, n] for n in counts])}
+
+    processor._process_and_collect_mm_items = process_features
+    processor._finalize_mm_items = lambda items, **kwargs: items
+
+    async def process_in_worker(base_output, tokens, **kwargs):
+        return processor.process_and_combine_mm_data(base_output, tokens, **kwargs)
+
+    processor.process_and_combine_mm_data_async = process_in_worker
+    processor._mark_cuda_ipc_features_for_deferred_reconstruction = lambda items: None
+    processor._get_grid_from_output_or_items = lambda output, items, field, *args: output.get(field)
+    processor._get_precomputed_mrope_from_output = lambda output: None
+    processor._compute_image_only_mrope_positions_from_offsets = lambda input_len, **kwargs: (
+        torch.zeros((3, input_len), dtype=torch.long),
+        torch.zeros(1, dtype=torch.long),
+    )
+    monkeypatch.setattr(base_processor.envs.SGLANG_MM_AVOID_RETOKENIZE, "get", lambda: avoid_retokenize)
+    result = await processor._process_mm_data_uncached(
+        images, original_ids, SimpleNamespace(video_data=None, audio_data=None, rid="sampled-ids")
+    )
+    expected_response = response_ids if avoid_retokenize else [20] * repeats
+    expected = [8] + [token for count in counts for token in [99] * count + [9]] + expected_response
+    assert result.input_ids == expected
+    assert result.input_ids[-len(expected_response) :] == expected_response
+    assert loaders_used == ["legacy" if use_legacy_fallback else "fast"]
+    assert result.mrope_positions.shape[-1] == len(expected)
+    assert original_ids == prompt_ids + response_ids

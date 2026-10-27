@@ -1432,3 +1432,97 @@ async def test_agentic_503_is_pre_dispatch_before_permit_cleanup_finishes():
     assert task.done() and list(session.queued_irs) == [ir]
     assert ir.backend_started is False
     abort_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_routing_replay_preserves_routes_across_partial_attempts():
+    import base64
+
+    shard, _group, _session, ir = _router_recovery_shard()
+    shard.args.use_rollout_routing_replay = True
+    shard.args.num_layers, shard.args.moe_router_topk = 2, 2
+    ir.history_train_token_prefix = [1, 2, 3]
+    ir.pending_token_delta = []
+    first = np.full((4, 2, 2), 10, dtype=np.int32)
+    second = np.full((6, 2, 2), 99, dtype=np.int32)
+    second[4:] = 20
+    for routes in (first, second):
+        shard._apply_generate_result(
+            ir,
+            BackendGenerateResult(
+                new_tokens=[4, 5],
+                new_log_probs=[-0.1, -0.2],
+                finish_type="abort",
+                meta_info={"routed_experts": base64.b64encode(routes.tobytes()).decode()},
+                elapsed=0.1,
+            ),
+        )
+    np.testing.assert_array_equal(ir.pending_routed_experts[:4], first)
+    np.testing.assert_array_equal(ir.pending_routed_experts[4:], second[4:])
+    shard._apply_generate_result(
+        ir, BackendGenerateResult(new_tokens=[], new_log_probs=[], finish_type="abort", meta_info={}, elapsed=0.1)
+    )
+    assert len(ir.pending_routed_experts) == 6
+    with pytest.raises(ValueError, match="omitted routed experts"):
+        shard._apply_generate_result(
+            ir,
+            BackendGenerateResult(new_tokens=[6], new_log_probs=[-0.1], finish_type="stop", meta_info={}, elapsed=0.1),
+        )
+
+
+def test_routing_replay_preserves_selected_session_branch():
+    forest, root = _forest_with_initial_obs(
+        session_id="routes",
+        messages=[{"role": "user", "content": "prompt"}],
+        train_token_delta=[1, 2, 3],
+        rollout_token_delta=[1, 2, 3],
+    )
+    first_routes = np.full((4, 2, 2), 10, dtype=np.int32)
+    first = forest.append_resp(
+        parent_state_hash=root.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": "first"}],
+        token_delta=[4, 5],
+        logprob_delta=[-0.1, -0.2],
+        rollout_routed_experts=first_routes,
+    )
+    observation = forest.append_obs(
+        parent_state_hash=first.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "user", "content": "next"}],
+        train_token_delta=[6, 7],
+        rollout_token_delta=[6, 7],
+        multimodal_train_inputs_delta=None,
+        backend_image_data_delta=[],
+        backend_audio_data_delta=[],
+        backend_video_data_delta=[],
+        tools=None,
+        chat_template_kwargs=None,
+    )
+    next_routes = np.full((7, 2, 2), 20, dtype=np.int32)
+    next_resp = forest.append_resp(
+        parent_state_hash=observation.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": "second"}],
+        token_delta=[8],
+        logprob_delta=[-0.3],
+        rollout_routed_experts=next_routes,
+    )
+    np.testing.assert_array_equal(next_resp.rollout_routed_experts[:4], first_routes)
+    np.testing.assert_array_equal(next_resp.rollout_routed_experts[4:], next_routes[4:])
+    sibling_routes = np.full((3, 2, 2), 30, dtype=np.int32)
+    sibling = forest.append_resp(
+        parent_state_hash=root.state_hash,
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": "fork"}],
+        token_delta=[9],
+        logprob_delta=[-0.4],
+        rollout_routed_experts=sibling_routes,
+    )
+    np.testing.assert_array_equal(sibling.rollout_routed_experts, sibling_routes)
+    np.testing.assert_array_equal(first.rollout_routed_experts, first_routes)
+    np.testing.assert_array_equal(next_routes, np.full((7, 2, 2), 20, dtype=np.int32))

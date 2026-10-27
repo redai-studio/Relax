@@ -37,7 +37,7 @@ def require_mtp_stream_norm(path: Path) -> None:
 
 def main() -> None:
     for name, version in {
-        "sglang": "0.5.20",
+        "sglang": "0.5.21",
         "transformers": "5.16.0",
         "tokenizers": "0.23.2",
         "tilelang": "0.1.12",
