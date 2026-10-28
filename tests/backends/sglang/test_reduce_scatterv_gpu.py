@@ -114,6 +114,9 @@ def _check_reduce_scatterv(rank: int, init_method: str) -> None:
                         check(result, phase)
                     del graph, result
 
+        if not hasattr(group, "_deterministic_reduce_scatterv"):
+            return  # 0.5.17 is covered by the regular NCCL and graph matrix above.
+
         # The deterministic dispatch must use the same FP32 accumulation as the
         # regular PyNCCL path, including when replayed from a CUDA graph.
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)

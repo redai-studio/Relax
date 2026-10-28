@@ -417,8 +417,6 @@ def test_external_pd_routing_replay_registers_native_worker(
 def test_transport_respects_engine_topology_and_native_validation(
     request, monkeypatch, engine, worker, gpus, engine_gpus, cli, overrides, expected
 ):
-    from sglang.srt.arg_groups import serving_hook
-
     from relax.backends.sglang.arguments import ServerArgs, add_sglang_arguments
 
     # Keep the real CLI and SGLang validation; isolate only hardware/model discovery.
@@ -463,15 +461,26 @@ def test_transport_respects_engine_topology_and_native_validation(
         **{"encoder_only": False, "tokenizer_worker_num": 1, "disaggregation_mode": "null", **actual}
     )
     monkeypatch.delenv("SGLANG_USE_CUDA_IPC_TRANSPORT", raising=False)
-    monkeypatch.setattr(serving_hook, "resolving_view", lambda _: cfg)
-    monkeypatch.setattr(serving_hook, "model_config_of", lambda _: SimpleNamespace(is_multimodal=True))
-    monkeypatch.setattr(serving_hook, "get_platform", lambda: SimpleNamespace(is_cuda=True))
-    monkeypatch.setattr(serving_hook, "is_mnnvl_fabric_device", lambda: False)
-    monkeypatch.setattr(serving_hook, "declare_resolution", lambda _, __, **values: vars(cfg).update(values))
+    if hasattr(ServerArgs, "_handle_multimodal_feature_transport"):
+        cfg.keep_mm_feature_on_device = False
+        validate_transport = ServerArgs._handle_multimodal_feature_transport
+        monkeypatch.setitem(validate_transport.__globals__, "is_cuda", lambda: True)
+        # 0.5.17's native auto policy chooses IPC for a regular single-node engine.
+        native_default = "cuda_ipc" if cfg.nnodes == 1 and cfg.disaggregation_mode == "null" else "cpu"
+    else:
+        from sglang.srt.arg_groups import serving_hook
+
+        monkeypatch.setattr(serving_hook, "resolving_view", lambda _: cfg)
+        monkeypatch.setattr(serving_hook, "model_config_of", lambda _: SimpleNamespace(is_multimodal=True))
+        monkeypatch.setattr(serving_hook, "get_platform", lambda: SimpleNamespace(is_cuda=True))
+        monkeypatch.setattr(serving_hook, "is_mnnvl_fabric_device", lambda: False)
+        monkeypatch.setattr(serving_hook, "declare_resolution", lambda _, __, **values: vars(cfg).update(values))
+        validate_transport = serving_hook.handle_multimodal_feature_transport
+        native_default = "cpu"
     if expected == "cuda_ipc" and actual["nnodes"] > 1:
         # Explicit incompatible user choices must still receive SGLang's error.
         with pytest.raises(ValueError, match="only supports a single node"):
-            serving_hook.handle_multimodal_feature_transport(cfg)
+            validate_transport(cfg)
     else:
-        serving_hook.handle_multimodal_feature_transport(cfg)
-        assert cfg.mm_feature_transport == (expected or "cpu")
+        validate_transport(cfg)
+        assert cfg.mm_feature_transport == (expected or native_default)

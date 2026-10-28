@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Keep Relax decode deadlines inside SGLang's native failure consensus."""
+"""PD completion and rank-consistent transfer deadlines across SGLang
+releases."""
 
 import ast
 import os
@@ -17,7 +18,9 @@ try:
     _sglang_version = metadata.version("sglang")
 except metadata.PackageNotFoundError:
     pytest.skip("SGLang is not installed", allow_module_level=True)
-pytestmark = pytest.mark.skipif(Version(_sglang_version) < Version("0.5.21"), reason="SGLang 0.5.21 PD queues")
+requires_sglang_0521 = pytest.mark.skipif(
+    Version(_sglang_version) < Version("0.5.21"), reason="SGLang 0.5.21 PD queues"
+)
 
 
 def _load(relative_path: str, class_name: str, member_name: str | None = None, **namespace):
@@ -48,6 +51,7 @@ def _transport(status, states):
     return transport
 
 
+@requires_sglang_0521
 def test_prefill_one_rank_deadline_retires_request_on_all_ranks(monkeypatch):
     states = _load("srt/disaggregation/base/conn.py", "KVPoll")
     monkeypatch.setenv("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "100")
@@ -111,6 +115,7 @@ def test_prefill_one_rank_deadline_retires_request_on_all_ranks(monkeypatch):
     assert failed == released == streamed == requests
 
 
+@requires_sglang_0521
 def test_pp_transfer_deadlines_enter_terminal_intersection_before_release(monkeypatch):
     states = _load("srt/disaggregation/base/conn.py", "KVPoll")
     monkeypatch.setenv("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "100")
@@ -206,3 +211,120 @@ def test_pp_transfer_deadlines_enter_terminal_intersection_before_release(monkey
         if not expected:
             assert failed == released == streamed == []
     assert failed == released == streamed == [req for stage in requests for req in stage]
+
+
+@pytest.mark.parametrize("return_routes", [True, False])
+def test_prefill_success_collects_routes_before_releasing_slots(return_routes):
+    torch = pytest.importorskip("torch")
+    states = _load("srt/disaggregation/base/conn.py", "KVPoll")
+    events, streamed = [], []
+    routes = torch.arange(6, dtype=torch.int32).reshape(3, 1, 2)
+    expected = routes.clone()
+    req = SimpleNamespace(
+        rid="pd-routes",
+        pending_bootstrap=False,
+        finished_reason=None,
+        return_logprob=False,
+        return_routed_experts=return_routes,
+        routed_experts=None,
+        routed_experts_start_len=0,
+        origin_input_ids=[1, 2, 3],
+        output_ids_through_stop=[4],
+        req_pool_idx=0,
+        kv=SimpleNamespace(req_pool_idx=0),
+        cache_request_handle=object(),
+        bootstrap_host="fake",
+        disagg_kv_sender=SimpleNamespace(clear=lambda: None),
+        time_stats=SimpleNamespace(
+            set_prefill_kv_transfer_finish_time=lambda: None,
+            set_completion_time=lambda: None,
+        ),
+    )
+
+    def get_topk(**kwargs):
+        assert req.finished_reason is None
+        assert kwargs["req_pool_idx"] == 0 and kwargs["seqlen"] == 4
+        events.append("collect")
+        return routes[kwargs["start_len"] : kwargs["seqlen"] - 1].clone()
+
+    collect = _load(
+        "srt/managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor",
+        "_maybe_collect_routed_experts",
+        get_global_experts_capturer=lambda: SimpleNamespace(get_topk=get_topk),
+    )
+
+    def release(*_):
+        events.append("release")
+        routes.fill_(-1)
+        req.req_pool_idx = req.kv.req_pool_idx = None
+
+    def stream(reqs, *_):
+        events.append("output")
+        streamed.extend(reqs)
+
+    process = _load(
+        "srt/disaggregation/prefill.py",
+        "SchedulerDisaggregationPrefillMixin",
+        "process_disagg_prefill_inflight_queue",
+        os=os,
+        time=SimpleNamespace(perf_counter=lambda: 0),
+        KVPoll=states,
+        FINISH_ABORT=type("Abort", (), {}),
+        FINISH_LENGTH=lambda length: SimpleNamespace(length=length),
+        FAKE_BOOTSTRAP_HOST="fake",
+        CacheRequestOutcome=SimpleNamespace(SUCCESS="success"),
+        poll_and_all_reduce_attn_cp_tp_group=lambda *_: [states.Success],
+        release_kv_cache=release,
+        maybe_release_metadata_buffer=lambda *_: None,
+    )
+    processor = SimpleNamespace(req_to_token_pool=object())
+    processor._maybe_collect_routed_experts = MethodType(collect, processor)
+    scheduler = SimpleNamespace(
+        disagg_prefill_inflight_queue=[req],
+        poll_prefill_transfer_statuses=lambda: [states.Success],
+        attn_cp_cpu_group=None,
+        attn_tp_cpu_group=None,
+        batch_result_processor=processor,
+        tree_cache=SimpleNamespace(finish=lambda *_: None),
+        req_to_metadata_buffer_idx_allocator=None,
+        output_streamer=SimpleNamespace(stream_output=stream),
+    )
+    assert process(scheduler, rids_to_check=[req.rid]) == streamed == [req]
+    assert scheduler.disagg_prefill_inflight_queue == []
+    assert events == (["collect"] if return_routes else []) + ["release", "output"]
+    if return_routes:
+        torch.testing.assert_close(req.routed_experts, expected)
+    else:
+        assert req.routed_experts is None
+
+
+def test_first_token_stop_collects_before_decode_releases_slots():
+    events = []
+    req = SimpleNamespace(
+        time_stats=SimpleNamespace(set_decode_prebuilt_finish_time=lambda: None, set_quick_finish_time=lambda: None),
+        update_finish_state=lambda: None,
+        finished=lambda: True,
+    )
+    namespace = {
+        "DisaggregationMode": SimpleNamespace(DECODE="decode"),
+        "get_disagg": lambda: SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
+        "get_memory": lambda: SimpleNamespace(enable_hisparse=False),
+        "release_kv_cache": lambda *_: events.append("release"),
+    }
+    process = _load(
+        "srt/managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor",
+        "process_batch_result_prebuilt",
+        **namespace,
+    )
+    process(
+        SimpleNamespace(
+            disaggregation_mode="decode",
+            _maybe_collect_routed_experts=lambda _: events.append("collect"),
+            tree_cache=None,
+            output_streamer=SimpleNamespace(stream_output=lambda *_: events.append("output")),
+        ),
+        SimpleNamespace(reqs=[req], return_logprob=False),
+    )
+    assert events == ["collect", "release", "output"]

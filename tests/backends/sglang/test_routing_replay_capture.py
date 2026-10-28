@@ -425,31 +425,3 @@ def test_storage_only_prefixes_recompute_when_routes_are_required(mode, expected
         },
     )
     assert check() is expected
-
-
-def test_first_token_stop_collects_before_decode_releases_slots():
-    events = []
-    req = SimpleNamespace(
-        time_stats=SimpleNamespace(set_decode_prebuilt_finish_time=lambda: None, set_quick_finish_time=lambda: None),
-        update_finish_state=lambda: None,
-        finished=lambda: True,
-    )
-    namespace = {
-        "DisaggregationMode": SimpleNamespace(DECODE="decode"),
-        "get_disagg": lambda: SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
-        "get_memory": lambda: SimpleNamespace(enable_hisparse=False),
-        "release_kv_cache": lambda *_: events.append("release"),
-    }
-    process = load(
-        "process_batch_result_prebuilt", "srt/managers/scheduler_components/batch_result_processor.py", namespace
-    )
-    process(
-        SimpleNamespace(
-            disaggregation_mode="decode",
-            _maybe_collect_routed_experts=lambda _: events.append("collect"),
-            tree_cache=None,
-            output_streamer=SimpleNamespace(stream_output=lambda *_: events.append("output")),
-        ),
-        SimpleNamespace(reqs=[req], return_logprob=False),
-    )
-    assert events == ["collect", "release", "output"]

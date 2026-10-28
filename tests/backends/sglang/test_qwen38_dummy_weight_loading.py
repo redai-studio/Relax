@@ -32,6 +32,8 @@ def dummy_lifecycle():
     if not source:
         pytest.skip("Set SGLANG_SOURCE_DIR to the patched SGLang checkout")
     root = Path(source) / "python/sglang/srt"
+    if not (root / "models/qwen4_exp.py").is_file():
+        pytest.skip("Qwen3.8 requires the CUDA 13 SGLang image")
 
     class UnquantizedLinearMethod:
         pass

@@ -76,6 +76,12 @@ def _check_deterministic_reduce_scatterv(rank: int, init_method: str) -> None:
 
 
 def test_deterministic_bf16_reduce_scatterv_uses_fp32_accumulation(tmp_path) -> None:
+    source = ast.parse(sglang_source_path("srt/distributed/parallel_state.py").read_text())
+    if not any(
+        isinstance(node, ast.FunctionDef) and node.name == "_deterministic_reduce_scatterv"
+        for node in ast.walk(source)
+    ):
+        pytest.skip("This SGLang version has no deterministic reduce_scatterv path")
     torch.multiprocessing.spawn(
         _check_deterministic_reduce_scatterv, args=(f"file://{tmp_path / 'gloo-init'}",), nprocs=4, join=True
     )

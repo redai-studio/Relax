@@ -141,6 +141,11 @@ def test_k3_gate_weight_keeps_checkpoint_name_after_fusion(hooks, hip):
         _maybe_map_fp8_pb_scale_name=lambda name, _: name,
         default_weight_loader=lambda param, value, **_: param.data.copy_(value),
     )
+    merge = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_merge_bfa_weights"
+    )
+    if not hip and not any(isinstance(node, ast.Attribute) and node.attr == "_bfa_f_b_w" for node in ast.walk(merge)):
+        pytest.skip("This SGLang version does not fuse the CUDA K3 gate projection")
     _function(tree, "_merge_weights_as_views", ns)
     attn = torch.nn.Module()
     attn.f_a_proj = torch.nn.Linear(4, 3, bias=False)

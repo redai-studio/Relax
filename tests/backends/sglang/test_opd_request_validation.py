@@ -116,7 +116,7 @@ def test_opd_scheduler_slices_queries_across_prefill_chunks(monkeypatch, top_k):
                 mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
             ),
         )
-    else:
+    if hasattr(schedule_batch, "get_server_args"):
         monkeypatch.setattr(
             schedule_batch, "get_server_args", lambda: SimpleNamespace(enable_mamba_extra_buffer=lambda: False)
         )
@@ -217,6 +217,7 @@ async def test_qwen_uncached_image_prefill_preserves_sampled_ids(
     processor = qwen_vl.QwenVLImageProcessor.__new__(qwen_vl.QwenVLImageProcessor)
     processor._tokenizer = tokenizer
     processor.skip_tokenizer_init = False
+    processor.use_cuda_ipc = False
     processor.support_dynamic_frame_expansion = use_legacy_fallback
     processor.hf_config = SimpleNamespace(model_type="qwen3_5")
     processor.model_type = "qwen3_5"
@@ -285,7 +286,8 @@ async def test_qwen_uncached_image_prefill_preserves_sampled_ids(
         torch.zeros(1, dtype=torch.long),
     )
     monkeypatch.setattr(base_processor.envs.SGLANG_MM_AVOID_RETOKENIZE, "get", lambda: avoid_retokenize)
-    result = await processor._process_mm_data_uncached(
+    process_mm_data = getattr(processor, "_process_mm_data_uncached", processor.process_mm_data_async)
+    result = await process_mm_data(
         images, original_ids, SimpleNamespace(video_data=None, audio_data=None, rid="sampled-ids")
     )
     expected_response = response_ids if avoid_retokenize else [20] * repeats
