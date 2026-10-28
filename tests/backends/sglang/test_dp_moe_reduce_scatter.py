@@ -6,6 +6,7 @@ patch."""
 import ast
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from types import MethodType, SimpleNamespace
 from typing import Optional
 
@@ -17,24 +18,67 @@ from tests.backends.sglang.source_utils import sglang_source_path
 torch = pytest.importorskip("torch")
 
 
-def _load_reduce_scatterv() -> Callable[..., object]:
+def _load_reduce_scatterv(name: str = "reduce_scatterv", *, deterministic: bool = False) -> Callable[..., object]:
     path = sglang_source_path("srt/distributed/parallel_state.py")
     group = next(
         node
         for node in ast.parse(path.read_text()).body
         if isinstance(node, ast.ClassDef) and node.name == "GroupCoordinator"
     )
-    function = next(
-        node for node in group.body if isinstance(node, ast.FunctionDef) and node.name == "reduce_scatterv"
-    )
+    function = next(node for node in group.body if isinstance(node, ast.FunctionDef) and node.name == name)
     namespace = {
         "torch": torch,
         "Optional": Optional,
         "List": list,
-        "envs": SimpleNamespace(SGLANG_ENABLE_DETERMINISTIC_INFERENCE=SimpleNamespace(get=lambda: False)),
+        "envs": SimpleNamespace(SGLANG_ENABLE_DETERMINISTIC_INFERENCE=SimpleNamespace(get=lambda: deterministic)),
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
-    return namespace["reduce_scatterv"]
+    return namespace[name]
+
+
+def _check_deterministic_reduce_scatterv(rank: int, init_method: str) -> None:
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=4, init_method=init_method, timeout=timedelta(seconds=60)
+    )
+    try:
+
+        def all_reduce(value):
+            torch.distributed.all_reduce(value, group=torch.distributed.group.WORLD)
+            return value
+
+        group = SimpleNamespace(world_size=4, rank_in_group=rank, pynccl_comm=None, all_reduce=all_reduce)
+        group._deterministic_reduce_scatterv = MethodType(
+            _load_reduce_scatterv("_deterministic_reduce_scatterv"), group
+        )
+        reduce_scatter = MethodType(_load_reduce_scatterv(deterministic=True), group)
+        # Check real cancellation, an empty owner, caller-owned storage and aliasing.
+        for sizes, output_mode in [([0, 1, 3, 4], "provided"), (None, "alias"), (None, "allocated")]:
+            counts = sizes if sizes is not None else [2] * 4
+            count, offset = counts[rank], sum(counts[:rank])
+            source = torch.full((sum(counts), 4), (256, 1, -256, 0.5)[rank], dtype=torch.bfloat16)
+            original = source.clone()
+            output = None
+            if output_mode == "provided":
+                output = torch.empty((count, 4), dtype=source.dtype)
+            elif output_mode == "alias":
+                output = source.narrow(0, offset, count)
+            result = reduce_scatter(source, output=output, sizes=sizes)
+            assert result.dtype == source.dtype
+            if output is not None:
+                assert result is output
+            torch.testing.assert_close(result, torch.full((count, 4), 1.5, dtype=source.dtype), rtol=0, atol=0)
+            if output_mode == "alias":
+                original.narrow(0, offset, count).fill_(1.5)
+            torch.testing.assert_close(source, original, rtol=0, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_deterministic_bf16_reduce_scatterv_uses_fp32_accumulation(tmp_path) -> None:
+    torch.multiprocessing.spawn(
+        _check_deterministic_reduce_scatterv, args=(f"file://{tmp_path / 'gloo-init'}",), nprocs=4, join=True
+    )
 
 
 def _combine(rank: int, dp_size: int, dtype, *, variable: bool = False):

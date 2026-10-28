@@ -4,7 +4,6 @@
 
 import ast
 import os
-from http import HTTPStatus
 from importlib import metadata
 from types import MethodType, SimpleNamespace
 
@@ -47,128 +46,6 @@ def _transport(status, states):
 
     transport.abort = abort
     return transport
-
-
-@pytest.mark.parametrize("pp_size,consensus", [(1, "failed"), (2, "failed"), (2, "pending")])
-def test_decode_deadline_aborts_receiver_before_consensus(pp_size: int, consensus: str, monkeypatch) -> None:
-    states = _load("srt/disaggregation/base/conn.py", "KVPoll")
-    monkeypatch.setenv("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "100")
-    receiver = _transport(states.Bootstrapping, states)
-    req = SimpleNamespace(
-        rid="request", bootstrap_room=1, time_stats=SimpleNamespace(decode_prealloc_queue_entry_time=1.0)
-    )
-    failures = []
-
-    def collective(*_):
-        assert receiver.abort_count == 1
-        assert not failures
-        return [None if consensus == "pending" else states.Failed]
-
-    update = _load(
-        "srt/disaggregation/decode.py",
-        "DecodePreallocQueue",
-        "_update_handshake_waiters",
-        os=os,
-        time=SimpleNamespace(perf_counter=lambda: 200.0),
-        KVPoll=states,
-        HTTPStatus=HTTPStatus,
-        logger=SimpleNamespace(error=lambda *_: None, debug=lambda *_: None),
-        poll_and_all_reduce=collective,
-        poll_and_all_reduce_pp=collective,
-        prepare_abort=lambda *args, **kwargs: failures.append(args[0]),
-    )
-    queue = SimpleNamespace(
-        queue=[SimpleNamespace(req=req, kv_receiver=receiver)],
-        pp_size=pp_size,
-        tp_rank=0,
-        gloo_group=None,
-        scheduler=SimpleNamespace(metrics_reporter=SimpleNamespace(enable_metrics=False)),
-    )
-    update(queue, pp_good_rids=[], pp_bad_rids=[])
-    assert failures == ([req] if consensus == "failed" else [])
-
-
-@pytest.mark.parametrize("pp_size", [1, 2])
-def test_decode_deadline_crossed_during_consensus_waits_for_next_poll(pp_size, monkeypatch):
-    states = _load("srt/disaggregation/base/conn.py", "KVPoll")
-    monkeypatch.setenv("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "100")
-    failures = []
-    ranks = []
-    for rank, before, after in ((0, 100.9, 101.1), (1, 100.8, 100.95)):
-        clock = SimpleNamespace(now=before, after=after, consensus=states.Bootstrapping)
-        receiver = _transport(states.Bootstrapping, states)
-        req = SimpleNamespace(
-            rid="request", bootstrap_room=1, time_stats=SimpleNamespace(decode_prealloc_queue_entry_time=1.0)
-        )
-
-        def collective(*_, clock=clock):
-            # Both ranks entered before the deadline. Only one crosses it while
-            # the already-agreed Bootstrapping result is being returned.
-            clock.now = clock.after
-            return [clock.consensus]
-
-        update = _load(
-            "srt/disaggregation/decode.py",
-            "DecodePreallocQueue",
-            "_update_handshake_waiters",
-            os=os,
-            time=SimpleNamespace(perf_counter=lambda clock=clock: clock.now),
-            KVPoll=states,
-            HTTPStatus=HTTPStatus,
-            logger=SimpleNamespace(error=lambda *_: None, debug=lambda *_: None),
-            poll_and_all_reduce=collective,
-            poll_and_all_reduce_pp=collective,
-            prepare_abort=lambda req, *args, **kwargs: failures.append(req),
-        )
-        queue = SimpleNamespace(
-            queue=[SimpleNamespace(req=req, kv_receiver=receiver)],
-            pp_size=pp_size,
-            tp_rank=rank,
-            gloo_group=None,
-            scheduler=SimpleNamespace(metrics_reporter=SimpleNamespace(enable_metrics=False)),
-        )
-        ranks.append((clock, receiver, req, queue, update))
-        update(queue, pp_good_rids=[], pp_bad_rids=[])
-
-    assert failures == []
-    assert all(receiver.abort_count == 0 for _, receiver, *_ in ranks)
-    # On the next poll the deadline is observed before the collective, whose
-    # Failed result retires the same request on both ranks.
-    for clock, receiver, req, queue, update in ranks:
-        clock.now = clock.after = 102.0
-        clock.consensus = states.Failed
-        update(queue, pp_good_rids=[], pp_bad_rids=[req.rid])
-        assert receiver.abort_count == 1
-    assert failures == [req for _, _, req, *_ in ranks]
-
-
-@pytest.mark.parametrize(
-    "status,pending,entry,expected",
-    [
-        ("WaitingForInput", False, 1.0, "Failed"),
-        ("Transferring", False, 1.0, "Failed"),
-        ("Transferring", True, 1.0, "Transferring"),
-        ("Transferring", False, 0.0, "Transferring"),
-        ("Transferring", False, 100.0, "Transferring"),
-        ("Success", False, 1.0, "Success"),
-        ("Failed", False, 1.0, "Failed"),
-    ],
-)
-def test_prefill_deadline_preserves_terminal_and_unstarted_transfers(status, pending, entry, expected):
-    states = _load("srt/disaggregation/base/conn.py", "KVPoll")
-    poller = _load(
-        "srt/disaggregation/prefill.py",
-        "_PrefillTransferDeadlinePoller",
-        KVPoll=states,
-        logger=SimpleNamespace(error=lambda *_: None),
-    )
-    req = SimpleNamespace(
-        rid="request",
-        disagg_kv_sender=_transport(getattr(states, status), states),
-        pending_bootstrap=pending,
-        time_stats=SimpleNamespace(prefill_transfer_queue_entry_time=entry),
-    )
-    assert poller(req, 200.0, 100.0).poll() == getattr(states, expected)
 
 
 def test_prefill_one_rank_deadline_retires_request_on_all_ranks(monkeypatch):

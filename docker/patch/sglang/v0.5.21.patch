@@ -1590,10 +1590,21 @@ index b72dc2a2..9e725912 100644
      def process_prefill_chunk(
          self: Scheduler,
 diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
-index 37c67327..805e36e9 100644
+index 37c67327..f1210050 100644
 --- a/python/sglang/srt/distributed/parallel_state.py
 +++ b/python/sglang/srt/distributed/parallel_state.py
-@@ -1286,7 +1286,16 @@ class GroupCoordinator:
+@@ -1249,6 +1249,8 @@ class GroupCoordinator:
+         else:
+             assert output.shape == output_shape
+-        # Preserve input even when all_reduce mutates its argument.
+-        reduced = self.all_reduce(input_.clone())
++        # Match reduce_scatterv's BF16 accumulation precision and preserve input
++        # even when all_reduce mutates its argument.
++        reduce_input = input_.float() if input_.dtype == torch.bfloat16 else input_.clone()
++        reduced = self.all_reduce(reduce_input)
+         output.copy_(reduced.narrow(0, offset, chunk_size))
+         return output
+@@ -1286,7 +1288,16 @@ class GroupCoordinator:
              else:
                  assert output.shape == output_shape
  

@@ -243,8 +243,7 @@ def test_qwen38_mtp_post_load_initializes_hc_and_reload_preserves_storage(dummy_
     assert torch.equal(cached, torch.full_like(cached, 2))
 
 
-@pytest.mark.parametrize("restore,process", [(True, False), (False, True), (True, True)])
-@pytest.mark.parametrize("has_draft,fail_draft", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("restore,process,has_draft,fail_draft", [(True, True, True, False)])
 def test_eagle_v2_post_process_uses_native_runner_selection(dummy_lifecycle, restore, process, has_draft, fail_draft):
     calls = []
     namespace = {

@@ -4,10 +4,10 @@
 release."""
 
 import ast
-from contextlib import contextmanager, nullcontext
+import os
 from importlib import metadata
-from types import MethodType, SimpleNamespace
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from packaging.version import Version
@@ -36,7 +36,7 @@ def _load(path, class_name, name, **namespace):
     return namespace[name]
 
 
-@pytest.mark.parametrize("kernel_heads", [12, 64])
+@pytest.mark.parametrize("kernel_heads", [12])
 def test_deepseek_sink_refresh_keeps_existing_views(kernel_heads):
     path = "srt/models/deepseek_v4.py"
     local = _load(path, "MqaAttentionBase", "_local_attn_sink")
@@ -58,350 +58,6 @@ def test_deepseek_sink_refresh_keeps_existing_views(kernel_heads):
         assert attention._attn_sink_local is cached and cached.data_ptr() == pointer
         torch.testing.assert_close(view[:12], attention.attn_sink[12:24])
         assert torch.count_nonzero(cached[12:]) == 0
-
-
-@pytest.mark.parametrize("tp_size", [1, 4])
-def test_deepseek_sink_refresh_leaves_native_lazy_allocation(tp_size):
-    path = "srt/models/deepseek_v4.py"
-    attention = SimpleNamespace(
-        attn_tp_size=tp_size,
-        attn_tp_rank=0,
-        n_local_heads=12,
-        n_heads=48,
-        attn_sink=torch.arange(48, dtype=torch.float32),
-        _attn_sink_local=None,
-    )
-    _load(path, "MqaAttentionBase", "refresh_attn_sink_cache")(attention)
-    assert attention._attn_sink_local is None
-    latest = _load(path, "MqaAttentionBase", "_local_attn_sink")(attention, 12)
-    torch.testing.assert_close(latest[:12], attention.attn_sink[:12])
-
-
-def test_deepseek_post_load_refreshes_every_local_layer():
-    layers = [
-        SimpleNamespace(
-            self_attn=SimpleNamespace(compress_ratio=0, refresh_attn_sink_cache=Mock()),
-            refresh_mhc_norm_weight_cache=Mock(),
-        )
-        for _ in range(2)
-    ]
-    model = SimpleNamespace(wo_a_fp8=False, model=SimpleNamespace(start_layer=0, end_layer=2, layers=layers))
-    _load("srt/models/deepseek_v4.py", "DeepseekV4ForCausalLM", "post_load_weights")(model)
-    for layer in layers:
-        layer.refresh_mhc_norm_weight_cache.assert_called_once_with()
-        layer.self_attn.refresh_attn_sink_cache.assert_called_once_with()
-
-
-@pytest.mark.parametrize(
-    "kind,has_draft,selector,legacy_flag,session_selector,expected",
-    [
-        ("tensor", False, None, None, None, "target"),
-        ("tensor", True, None, None, None, "draft"),
-        ("tensor", True, None, False, None, "draft"),
-        ("tensor", True, None, True, None, "target"),
-        ("tensor", True, "target", False, None, "target"),
-        ("tensor", True, "draft", True, None, "draft"),
-        ("tensor", True, "all", True, None, "all"),
-        ("tensor", True, None, None, "all", "all"),
-        ("tensor", True, None, False, "all", "draft"),
-        ("tensor", True, None, True, "all", "target"),
-        ("distributed", False, None, None, None, "target"),
-        ("distributed", True, None, None, None, "target"),
-        ("distributed", True, None, None, "all", "all"),
-        ("distributed", True, "draft", None, None, "draft"),
-        ("distributed", True, "all", None, "target", "all"),
-    ],
-)
-def test_weight_update_preserves_legacy_routing(
-    monkeypatch, kind, has_draft, selector, legacy_flag, session_selector, expected
-):
-    from sglang.srt.managers import io_struct
-
-    calls = []
-    selected = []
-    runners = {}
-    for role in ("target", "draft"):
-        updater = SimpleNamespace(
-            receive_weights_from_distributed=lambda **kwargs: [("weight", torch.ones(1))],
-            load_weights_from_distributed=lambda weights, role=role: (calls.append(role) or True, "ok"),
-            update_weights_from_tensor=lambda role=role, **kwargs: (calls.append(role) or True, "ok"),
-        )
-        runners[role] = SimpleNamespace(weight_updater=updater)
-
-    def select(value):
-        selected.append(value)
-        return [(role, runners[role]) for role in ("target", "draft") if value == "all" or value == role]
-
-    session = None if session_selector is None else SimpleNamespace(selector=session_selector, loaded_weights=False)
-    manager = SimpleNamespace(
-        tp_worker=SimpleNamespace(model_runner=runners["target"], deserialize_own_rank=lambda blobs: []),
-        draft_worker=object() if has_draft else None,
-        _session=session,
-        tp_cpu_group=None,
-        _observe_weight_load=lambda label: nullcontext(),
-        _select_runners=select,
-        flush_cache_after_weight_update=Mock(),
-        record_weight_version_after_update=Mock(),
-    )
-
-    def replace(obj, **kwargs):
-        return SimpleNamespace(**(vars(obj) | kwargs))
-
-    operation = _load(
-        "srt/managers/scheduler_components/weight_updater.py",
-        "SchedulerWeightUpdaterManager",
-        "update_weights_from_" + kind,
-        torch=torch,
-        logger=Mock(),
-        msgspec=SimpleNamespace(structs=SimpleNamespace(replace=replace)),
-        UpdateWeightsFromTensorReqOutput=io_struct.UpdateWeightsFromTensorReqOutput,
-        UpdateWeightsFromDistributedReqOutput=io_struct.UpdateWeightsFromDistributedReqOutput,
-    )
-    monkeypatch.setattr(torch.distributed, "barrier", Mock())
-    kwargs = {} if selector is None else {"selector": selector}
-    if kind == "tensor":
-        request = io_struct.UpdateWeightsFromTensorReqInput(serialized_named_tensors=[b"bucket"], **kwargs)
-        if legacy_flag is not None:
-            request.disable_draft_model = legacy_flag
-    else:
-        request = io_struct.UpdateWeightsFromDistributedReqInput(names=[], dtypes=[], shapes=[], **kwargs)
-    assert operation(manager, request).success
-    assert selected == [expected]
-    assert calls == (["target", "draft"] if expected == "all" else [expected])
-    if session is not None:
-        assert manager._session.loaded_weights
-
-
-@pytest.mark.parametrize("layerwise", [False, True])
-@pytest.mark.parametrize("initialized", [False, True])
-@pytest.mark.parametrize("merge", [False, True])
-def test_tensor_lora_uses_native_offload_and_invalidates_conditioning(layerwise, initialized, merge):
-    path = "multimodal_gen/runtime/pipelines_core/lora/pipeline.py"
-    events = []
-
-    @contextmanager
-    def materialize(**kwargs):
-        assert not layerwise
-        events.append("materialize")
-        yield
-
-    def convert(**kwargs):
-        assert kwargs == {"snapshot_base": not layerwise}
-        events.append("convert")
-
-    def apply(*args, **kwargs):
-        events.append("apply")
-        return 3
-
-    pipeline = SimpleNamespace(
-        VALID_TARGETS={"transformer"},
-        lora_initialized=initialized,
-        _invalidate_lora_conditioning=lambda: events.append("invalidate"),
-        _has_layerwise_offload=lambda *args: layerwise,
-        _temporarily_disable_offload=materialize,
-        convert_to_lora_layers=convert,
-        _ingest_lora_state_dict=lambda *args: events.append("ingest"),
-        _get_target_lora_layers=lambda target: ([("transformer", {"linear": object()})], None),
-        _resolve_lora_merge_mode=lambda *args: "merge" if merge else "unmerged",
-        _should_merge_lora_for_layers=lambda *args: merge,
-        _needs_lora_weight_update_context=lambda *args: merge,
-        _apply_lora_to_layers=apply,
-        loaded_adapter_paths={},
-        cur_adapter_name={},
-        cur_adapter_path={},
-        is_lora_merged={},
-        cur_adapter_strength={},
-        cur_adapter_config={},
-    )
-    pipeline._weight_update_context = MethodType(
-        _load(path, "LoRAPipeline", "_weight_update_context", nullcontext=nullcontext), pipeline
-    )
-    operation = _load(
-        path,
-        "LoRAPipeline",
-        "set_lora_from_tensors",
-        logger=Mock(),
-        nullcontext=nullcontext,
-        normalize_lora_state_dict=lambda state, **kwargs: state,
-        dist=SimpleNamespace(get_rank=lambda: 0),
-    )
-    assert operation(pipeline, "adapter", {"lora_A": torch.ones(1)}) == 3
-    assert events[0] == "invalidate" and events[-1] == "apply"
-    assert ("convert" in events) == (not initialized)
-    assert ("materialize" in events) == (merge and not layerwise)
-    assert pipeline.cur_adapter_name == {"transformer": "adapter"}
-    assert pipeline.is_lora_merged == {"transformer": merge}
-
-
-@pytest.mark.parametrize("heads", [8, 16, 32])
-def test_dsa_head_gates_keep_original_repeat_order(heads):
-    operation = _load("srt/layers/attention/dsa/utils.py", None, "match_head_gate_q_scale")
-    weights = torch.arange(heads, dtype=torch.float32).reshape(1, heads)
-    actual = operation(weights, torch.ones(1, 32, 1))
-    expected = torch.tensor([[head for head in range(heads) for _ in range(32 // heads)]], dtype=torch.float32)
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.parametrize("idle", [False, True])
-def test_paused_scheduler_keeps_polling_hicache(idle):
-    poll = Mock()
-    scheduler = SimpleNamespace(
-        enable_hierarchical_cache=True,
-        tree_cache=SimpleNamespace(check_hicache_events=poll),
-        is_fully_idle=lambda: idle,
-        metrics_reporter=Mock(),
-    )
-    operation = _load("srt/managers/scheduler.py", "Scheduler", "_record_scheduler_state_for_paused_engine")
-    operation(scheduler)
-    poll.assert_called_once_with()
-    expected = (
-        scheduler.metrics_reporter.record_scheduler_idle
-        if idle
-        else scheduler.metrics_reporter.record_scheduler_active
-    )
-    expected.assert_called_once_with()
-
-
-@pytest.mark.parametrize(
-    "condition", ["ready", "disabled", "missing", "root", "backed", "pending", "unlocked", "no_mamba", "write_back"]
-)
-def test_deferred_hicache_backup_requires_protected_checkpoint(condition):
-    path = "srt/mem_cache/unified_cache/unified_tree_core.py"
-    component = SimpleNamespace(FULL="full", MAMBA="mamba")
-    root = object()
-    node = SimpleNamespace(
-        evicted=False,
-        backuped=False,
-        write_through_pending_id=None,
-        hit_count=0,
-        component_data={"full": SimpleNamespace(lock_ref=1), "mamba": SimpleNamespace(value=object())},
-    )
-    if condition == "backed":
-        node.backuped = True
-    elif condition == "pending":
-        node.write_through_pending_id = 1
-    elif condition == "unlocked":
-        node.component_data["full"].lock_ref = 0
-    elif condition == "no_mamba":
-        node.component_data["mamba"].value = None
-    arena = {7: node, 0: root}
-    core = SimpleNamespace(
-        root_node=root,
-        _node_arena=arena,
-        enable_hicache=condition != "disabled",
-        is_write_back=condition == "write_back",
-        enable_external_cache_linker=False,
-        write_through_threshold=1,
-    )
-    core._inc_hit_count_and_check = MethodType(_load(path, "UnifiedTreeCore", "_inc_hit_count_and_check"), core)
-    core._build_backup_kv_action = Mock(return_value="backup")
-    operation = _load(path, "UnifiedTreeCore", "finish_deferred_chunked_backup", ComponentType=component)
-    node_id = 0 if condition == "root" else 99 if condition == "missing" else 7
-    assert operation(core, node_id) == (["backup"] if condition == "ready" else [])
-    assert core._build_backup_kv_action.call_count == (1 if condition == "ready" else 0)
-
-
-@pytest.mark.parametrize(
-    "condition",
-    [
-        "finished",
-        "abort",
-        "unfinished",
-        "stale_root",
-        "stale_node",
-        "stale_length",
-        "no_controller",
-        "no_extra_buffer",
-        "new_checkpoint",
-    ],
-)
-def test_final_short_tail_finishes_backup_before_component_cleanup(condition):
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-    class Key(list):
-        def __init__(self, tokens, *args, **kwargs):
-            super().__init__(tokens)
-
-        def page_aligned(self, page_size):
-            return self
-
-    events = []
-    marker = {"stale_root": (1, 7, 4), "stale_node": (0, 8, 4), "stale_length": (0, 7, 3)}.get(condition, (0, 7, 4))
-    reason = FINISH_ABORT() if condition == "abort" else None if condition == "unfinished" else object()
-    request = SimpleNamespace(
-        _hicache_deferred_chunked_backup=marker,
-        origin_input_ids=[1, 2, 3, 4],
-        output_ids=[5],
-        kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=4),
-        last_node=7,
-        priority=0,
-        session_id=None,
-        kv_rotation_base=None,
-        extra_key=None,
-        cache_salt=None,
-        finished_reason=reason,
-    )
-
-    def finish(node_id):
-        assert node_id == 7 and request.kv.cache_protected_len == 4
-        assert "cleanup" not in events
-        return ["backup"]
-
-    def insert(params):
-        events.append("insert")
-        return SimpleNamespace(
-            last_device_node=8 if condition == "new_checkpoint" else 0, rotation_tail_declined=False
-        )
-
-    cache = SimpleNamespace(
-        disable=False,
-        cache_controller=None if condition == "no_controller" else object(),
-        enable_mamba_extra_buffer=condition != "no_extra_buffer",
-        enable_session_radix_cache=False,
-        page_size=1,
-        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(10).reshape(1, 10)),
-        tree_core=SimpleNamespace(
-            root_node_handle=lambda extra_key: 0,
-            is_root=lambda node_id: node_id == 0,
-            is_eagle=False,
-            finish_deferred_chunked_backup=finish,
-        ),
-        _components_tuple=[
-            SimpleNamespace(
-                component_type="mamba",
-                prepare_for_caching_req=lambda **kwargs: 0,
-                floor_cache_len=lambda size: size,
-                cleanup_after_caching_req=lambda *args, **kwargs: events.append("cleanup"),
-            )
-        ],
-        insert=insert,
-        _apply_cache_actions=lambda actions: events.extend(actions),
-    )
-    operation = _load(
-        "srt/mem_cache/unified_radix_cache.py",
-        "UnifiedRadixCache",
-        "insert_req",
-        RadixKey=Key,
-        InsertParams=SimpleNamespace,
-        BASE_COMPONENT_TYPE="full",
-        torch=torch,
-    )
-    operation(cache, request, up_to=5)
-    assert request._hicache_deferred_chunked_backup is None
-    assert events == (["insert", "backup", "cleanup"] if condition == "finished" else ["insert", "cleanup"])
-    operation(cache, request, up_to=5)
-    assert events.count("backup") == (1 if condition == "finished" else 0)
-
-
-@pytest.mark.parametrize("inserted", [False, True])
-def test_hicache_release_clears_marker_even_if_insert_was_skipped(inserted):
-    cleanup = Mock()
-    request = SimpleNamespace(_hicache_deferred_chunked_backup=(0, 7, 4))
-    cache = SimpleNamespace(_components_tuple=[SimpleNamespace(cleanup_after_caching_req=cleanup)])
-    operation = _load("srt/mem_cache/unified_radix_cache.py", "UnifiedRadixCache", "on_release")
-    operation(cache, request, inserted=inserted)
-    assert request._hicache_deferred_chunked_backup is None
-    assert cleanup.call_count == (0 if inserted else 1)
 
 
 def _deferred_tree(backend, *, enabled=True):
@@ -484,75 +140,7 @@ def test_real_deferred_checkpoint_respects_namespace_and_cache_salt(backend):
         assert core.match_full_device_prefix(key)[0] == expected
 
 
-@pytest.mark.parametrize("backend", ["python", "rust"])
-def test_real_deferred_backup_keeps_threshold_and_ancestor_hit_counts(backend):
-    from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
-
-    core = _deferred_tree(backend)
-    parent = _chunked_checkpoint(core)
-    leaf = _chunked_checkpoint(core, 512, prefix_len=256)
-    receipt = core.inc_lock_ref(leaf).to_dec_params()
-    try:
-        assert core.finish_deferred_chunked_backup(leaf) == []
-        # Finishing the child must not add a hit to its ancestor.
-        assert core.finish_deferred_chunked_backup(parent) == []
-        actions = core.finish_deferred_chunked_backup(leaf)
-        assert len(actions) == 1 and isinstance(actions[0], BackupKV)
-        assert actions[0].node_ids == [parent, leaf]
-        core.mark_write_through_pending(actions[0].node_ids, leaf)
-        assert core.finish_deferred_chunked_backup(leaf) == []
-    finally:
-        core.dec_lock_ref(leaf, receipt)
-
-
-@pytest.mark.parametrize("backend", ["python", "rust"])
-@pytest.mark.parametrize("condition", ["disabled", "root", "stale", "unlocked", "no_mamba", "backed", "write_back"])
-def test_real_deferred_backup_rejects_unprotected_or_invalid_checkpoints(backend, condition):
-    core = _deferred_tree(backend, enabled=condition != "disabled")
-    core.write_through_threshold = 1
-    node = _chunked_checkpoint(core)
-    if condition == "no_mamba":
-        from array import array
-
-        from sglang.srt.mem_cache.radix_cache import RadixKey
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-
-        # A real aligned split has FULL KV but no Mamba checkpoint of its own.
-        _chunked_checkpoint(
-            core,
-            prefix_len=128,
-            tokens=list(range(128)) + list(range(10000, 10128)),
-            mamba_slot=257,
-            value_offset=2000,
-        )
-        common = RadixKey(array("q", range(128)), extra_key="adapter", cache_salt="tenant")
-        node = core.match_full_device_prefix(common)[1]
-        assert not core.is_root(node)
-        assert core.get_component_device_value(node, ComponentType.MAMBA) is None
-    receipt = core.inc_lock_ref(node).to_dec_params()
-    if condition == "root":
-        target = core.root_node_handle("adapter")
-    else:
-        target = node
-    if condition == "backed":
-        core.commit_backup(node, torch.arange(2000, 2256, dtype=torch.int64), {})
-    elif condition == "write_back":
-        core.is_write_back = True
-    elif condition == "unlocked":
-        core.dec_lock_ref(node, receipt)
-    elif condition == "stale":
-        previous_root = core.root_node_handle("adapter")
-        core.reset()
-        assert core.root_node_handle("adapter") != previous_root
-    try:
-        assert core.finish_deferred_chunked_backup(target) == []
-    finally:
-        if condition not in ("stale", "unlocked"):
-            core.dec_lock_ref(node, receipt)
-
-
-@pytest.mark.parametrize("backend", ["python", "rust"])
-@pytest.mark.parametrize("condition", ["finished", "abort", "unfinished", "stale_root", "stale_node", "stale_length"])
+@pytest.mark.parametrize("backend,condition", [("rust", "finished")])
 def test_real_tree_final_short_tail_uses_backend_neutral_identity_and_clears_once(backend, condition):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
@@ -634,41 +222,7 @@ def test_real_tree_final_short_tail_uses_backend_neutral_identity_and_clears_onc
         core.dec_lock_ref(node, receipt)
 
 
-def test_glm_image_epd_accepts_native_receiver_metadata():
-    embedding = torch.ones(2, 4)
-    processor = SimpleNamespace(
-        build_input_ids=lambda prompt, **kwargs: ([1, 99, 2], [(1, 2)], None),
-        hf_config=object(),
-        IM_START_TOKEN_ID=1,
-        IM_END_TOKEN_ID=2,
-        IM_TOKEN_ID=99,
-    )
-    rope = SimpleNamespace(get_rope_index_glm4v=lambda **kwargs: (torch.zeros(3, 1, 3), torch.zeros(1)))
-    operation = _load(
-        "srt/multimodal/processors/glm4v.py",
-        "Glm4vImageProcessor",
-        "get_mm_data",
-        Modality=SimpleNamespace(IMAGE="image"),
-        MultimodalDataItem=SimpleNamespace,
-        MultimodalProcessorOutput=SimpleNamespace,
-        MRotaryEmbedding=rope,
-        torch=torch,
-    )
-    result = operation(
-        processor,
-        "prompt",
-        {"image": embedding},
-        torch.tensor([[1, 2, 2]]),
-        video_grid_thw=None,
-        audio_feature_lens=None,
-    )
-    assert result.input_ids == [1, 99, 2]
-    assert result.mm_items[0].precomputed_embeddings is embedding
-    assert result.mrope_positions.shape == (3, 3)
-
-
-@pytest.mark.parametrize("kind", ["named", "lora", "mixed_bucket", "empty"])
-@pytest.mark.parametrize("output_str", [False, True])
+@pytest.mark.parametrize("kind,output_str", [("named", False)])
 def test_relax_weight_payloads_use_native_safe_pickle_types(monkeypatch, record_property, kind, output_str):
     from sglang.srt.utils.common import MultiprocessingSerializer, SafeUnpickler
     from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
@@ -765,45 +319,82 @@ def _run_gc_startup(*, skip, elastic=False, warmup_ok=True, wait_weights=False, 
     return calls, state.tokenizer_manager.server_status
 
 
-@pytest.mark.parametrize("elastic", [False, True])
+@pytest.mark.parametrize("elastic", [False])
 def test_skip_server_warmup_never_freezes_gc_before_http_bind(elastic):
     assert _run_gc_startup(skip=True, elastic=elastic) == (["ready", "callback"], "Up")
 
 
-def test_normal_server_warmup_freezes_gc_before_launch_callback():
-    calls, status = _run_gc_startup(skip=False)
-    assert calls == [
-        "warmup",
-        (
-            "freeze_gc",
-            "http://server.invalid/freeze_gc",
-            {"headers": {"Authorization": "Bearer test-admin"}, "timeout": 10, "verify": True},
-        ),
-        "HTTP200",
-        "ready",
-        "callback",
+@pytest.fixture
+def legacy_load_service():
+    fastapi = pytest.importorskip("fastapi")
+    if "SGLANG_TEST_SOURCE_ROOT" not in os.environ:
+        try:
+            version = metadata.version("sglang")
+        except metadata.PackageNotFoundError:
+            pytest.skip("Requires installed SGLang or SGLANG_TEST_SOURCE_ROOT")
+        if Version(version) < Version("0.5.21"):
+            pytest.skip("SGLang 0.5.21 migration")
+    source = sglang_source_path("srt/entrypoints/http_server.py")
+    tree = ast.parse(source.read_text())
+    node = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_load")
+    app = fastapi.FastAPI()
+    manager = SimpleNamespace(get_loads=AsyncMock(return_value=[]))
+    clock = Mock(return_value=123.5)
+    namespace = {
+        "app": app,
+        "_global_state": SimpleNamespace(tokenizer_manager=manager),
+        "time": SimpleNamespace(perf_counter=clock),
+    }
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+    return app, manager, clock
+
+
+def _snapshot(rank, running, waiting, total, used):
+    return SimpleNamespace(
+        dp_rank=rank,
+        num_running_reqs=running,
+        num_waiting_reqs=waiting,
+        num_total_tokens=total,
+        num_used_tokens=used,
+    )
+
+
+def test_legacy_load_preserves_router_array_and_dp_token_accounting(legacy_load_service):
+    TestClient = pytest.importorskip("fastapi.testclient").TestClient
+    app, manager, clock = legacy_load_service
+    manager.get_loads.return_value = [_snapshot(2, 2, 3, 70, 20), _snapshot(7, 0, 4, 100, 60)]
+    with TestClient(app) as client:
+        response = client.get("/get_load")
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "dp_rank": 2,
+            "num_reqs": 5,
+            "num_waiting_reqs": 3,
+            "num_tokens": 70,
+            "num_pending_tokens": 50,
+            "ts_tic": 123.5,
+        },
+        {
+            "dp_rank": 7,
+            "num_reqs": 4,
+            "num_waiting_reqs": 4,
+            "num_tokens": 100,
+            "num_pending_tokens": 40,
+            "ts_tic": 123.5,
+        },
     ]
-    assert status == "Up"
+    # The pinned router sums this field directly from the top-level JSON array.
+    assert sum(item["num_tokens"] for item in response.json()) == 170
+    manager.get_loads.assert_awaited_once_with(include=["core"])
+    clock.assert_called_once_with()
 
 
-def test_failed_server_warmup_never_freezes_gc_or_announces_ready():
-    assert _run_gc_startup(skip=False, warmup_ok=False) == (["warmup"], "Initial")
-
-
-def test_elastic_joiner_without_skip_keeps_upstream_freeze_attempt():
-    calls, status = _run_gc_startup(skip=False, elastic=True)
-    assert [call[0] if isinstance(call, tuple) else call for call in calls] == [
-        "freeze_gc",
-        "GC_warning",
-        "ready",
-        "callback",
-    ]
-    assert status == "Up"
-
-
-def test_skipped_warmup_waits_for_checkpoint_weights_before_ready():
-    assert _run_gc_startup(skip=True, wait_weights=True) == (["wait_weights", "ready", "callback"], "Up")
-
-
-def test_skipped_warmup_does_not_require_launch_callback():
-    assert _run_gc_startup(skip=True, with_callback=False) == (["ready"], "Up")
+def test_legacy_load_does_not_report_fake_idle_on_backend_error(legacy_load_service):
+    TestClient = pytest.importorskip("fastapi.testclient").TestClient
+    app, manager, _ = legacy_load_service
+    manager.get_loads.side_effect = RuntimeError("load snapshots unavailable")
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/get_load")
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"

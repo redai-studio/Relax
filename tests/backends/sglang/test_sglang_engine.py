@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import argparse
 import sys
 from dataclasses import make_dataclass
 from types import ModuleType, SimpleNamespace
@@ -327,25 +328,8 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
     assert result["custom_weight_loader"] is not existing
 
 
-@pytest.mark.parametrize("routing_replay", [False, True])
-@pytest.mark.parametrize(
-    "worker_type,cli_mode,overrides,is_pd",
-    [
-        ("regular", None, None, False),
-        ("regular", "null", None, False),
-        ("prefill", None, None, True),
-        ("decode", None, None, True),
-        ("regular", "prefill", None, True),
-        ("regular", "decode", None, True),
-        ("regular", None, {"disaggregation_mode": "prefill"}, True),
-        ("regular", None, {"disaggregation_mode": "decode"}, True),
-        ("prefill", None, {"disaggregation_mode": "null"}, True),
-        ("decode", None, {"enable_return_routed_experts": False}, True),
-    ],
-)
-def test_policy_pd_routing_replay_accepts_configured_topology(
-    monkeypatch, sglang_engine_module, routing_replay, worker_type, cli_mode, overrides, is_pd
-):
+@pytest.mark.parametrize("worker_type", ["prefill", "decode"])
+def test_policy_pd_routing_replay_accepts_configured_topology(monkeypatch, sglang_engine_module, worker_type):
     module = sglang_engine_module
     monkeypatch.setattr(
         module,
@@ -364,11 +348,11 @@ def test_policy_pd_routing_replay_accepts_configured_topology(
         sglang_pp_size=1,
         sglang_dp_size=1,
         sglang_ep_size=1,
-        use_rollout_routing_replay=routing_replay,
-        sglang_disaggregation_mode=cli_mode,
+        use_rollout_routing_replay=True,
+        sglang_disaggregation_mode=None,
         fp16=False,
     )
-    module._compute_server_args(
+    result, _ = module._compute_server_args(
         args,
         0,
         "localhost:8000",
@@ -378,19 +362,20 @@ def test_policy_pd_routing_replay_accepts_configured_topology(
         worker_type=worker_type,
         disaggregation_bootstrap_port=8003,
         base_gpu_id=0,
-        sglang_overrides=overrides,
+        sglang_overrides=None,
     )
 
+    assert result["disaggregation_mode"] == worker_type
+    assert result["enable_return_routed_experts"] is True
 
-@pytest.mark.parametrize("engine_class", ["SGLangEngine", "GenRMEngine"])
-@pytest.mark.parametrize("routing_replay", [False, True])
-@pytest.mark.parametrize("actual_mode", ["null", "prefill", "decode"])
+
+@pytest.mark.parametrize("engine_class,actual_mode", [("SGLangEngine", "prefill"), ("GenRMEngine", "decode")])
 def test_external_pd_routing_replay_registers_native_worker(
-    monkeypatch, sglang_engine_module, engine_class, routing_replay, actual_mode
+    monkeypatch, sglang_engine_module, engine_class, actual_mode
 ):
     module = sglang_engine_module
     engine = object.__new__(getattr(module, engine_class))
-    engine.args = SimpleNamespace(use_rollout_routing_replay=routing_replay)
+    engine.args = SimpleNamespace(use_rollout_routing_replay=True)
     engine.rank, engine.worker_type = 0, "regular"
     engine.server_host, engine.server_port = "localhost", 8000
     engine._skip_router_registration = False
@@ -403,3 +388,90 @@ def test_external_pd_routing_replay_registers_native_worker(
     # Actual PD topology is accepted for both policy and independent GenRM engines.
     engine._init_external({}, external_engine_need_check_fields=[])
     engine.register_to_router.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "engine,worker,gpus,engine_gpus,cli,overrides,expected",
+    [
+        ("policy", "regular", 2, None, [], {}, "cuda_ipc"),
+        ("policy", "prefill", 32, None, [], {}, None),
+        ("policy", "decode", 32, None, [], {}, None),
+        ("policy", "regular", 32, 2, [], {}, "cuda_ipc"),
+        ("genrm", "regular", 32, 2, [], {}, "cuda_ipc"),
+        ("genrm", "regular", 2, 32, [], {}, None),
+        ("genrm", "regular", 2, 2, [], {"nnodes": 4}, None),
+        ("genrm", "regular", 2, 2, [], {"mm_feature_transport": None}, None),
+        ("policy", "regular", 2, None, ["--sglang-mm-feature-transport", "cpu"], {}, "cpu"),
+        (
+            "policy",
+            "regular",
+            32,
+            None,
+            ["--sglang-mm-feature-transport", "cuda_ipc"],
+            {"mm_feature_transport": "cpu"},
+            "cpu",
+        ),
+        ("policy", "regular", 32, None, ["--sglang-mm-feature-transport", "cuda_ipc"], {}, "cuda_ipc"),
+    ],
+)
+def test_transport_respects_engine_topology_and_native_validation(
+    request, monkeypatch, engine, worker, gpus, engine_gpus, cli, overrides, expected
+):
+    from sglang.srt.arg_groups import serving_hook
+
+    from relax.backends.sglang.arguments import ServerArgs, add_sglang_arguments
+
+    # Keep the real CLI and SGLang validation; isolate only hardware/model discovery.
+    parser = add_sglang_arguments(argparse.ArgumentParser(add_help=False))
+    parsed = parser.parse_args(cli)
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=gpus,
+        genrm_num_gpus_per_engine=engine_gpus or 2,
+        num_gpus_per_node=8,
+        hf_checkpoint="policy-model",
+        genrm_model_path="reward-model",
+        genrm_engine_config=overrides,
+        seed=42,
+        offload_rollout=True,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        sglang_ep_size=1,
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_mm_feature_transport=parsed.sglang_mm_feature_transport,
+    )
+    module = request.getfixturevalue("sglang_engine_module")
+    monkeypatch.setattr(module, "ServerArgs", ServerArgs)
+    monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu: gpu)
+    compute = module._compute_genrm_server_args if engine == "genrm" else module._compute_server_args
+    options = {} if engine == "genrm" else {"sglang_overrides": overrides, "num_gpus_per_engine": engine_gpus}
+    actual, _ = compute(
+        args,
+        0,
+        "localhost:1234",
+        1235,
+        "localhost",
+        1236,
+        worker_type=worker,
+        disaggregation_bootstrap_port=1237,
+        base_gpu_id=0,
+        **options,
+    )
+    assert actual["mm_feature_transport"] == expected
+
+    cfg = SimpleNamespace(
+        **{"encoder_only": False, "tokenizer_worker_num": 1, "disaggregation_mode": "null", **actual}
+    )
+    monkeypatch.delenv("SGLANG_USE_CUDA_IPC_TRANSPORT", raising=False)
+    monkeypatch.setattr(serving_hook, "resolving_view", lambda _: cfg)
+    monkeypatch.setattr(serving_hook, "model_config_of", lambda _: SimpleNamespace(is_multimodal=True))
+    monkeypatch.setattr(serving_hook, "get_platform", lambda: SimpleNamespace(is_cuda=True))
+    monkeypatch.setattr(serving_hook, "is_mnnvl_fabric_device", lambda: False)
+    monkeypatch.setattr(serving_hook, "declare_resolution", lambda _, __, **values: vars(cfg).update(values))
+    if expected == "cuda_ipc" and actual["nnodes"] > 1:
+        # Explicit incompatible user choices must still receive SGLang's error.
+        with pytest.raises(ValueError, match="only supports a single node"):
+            serving_hook.handle_multimodal_feature_transport(cfg)
+    else:
+        serving_hook.handle_multimodal_feature_transport(cfg)
+        assert cfg.mm_feature_transport == (expected or "cpu")

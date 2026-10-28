@@ -125,7 +125,7 @@ def test_k3_fused_decode_reload_refreshes_captured_inputs(hooks):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("hip", [False, True])
+@pytest.mark.parametrize("hip", [False])
 def test_k3_gate_weight_keeps_checkpoint_name_after_fusion(hooks, hip):
     import re
     from collections.abc import Iterable

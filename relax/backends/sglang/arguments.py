@@ -262,10 +262,6 @@ def add_sglang_arguments(parser):
     ServerArgs.add_cli_args(parser)
     parser.add_argument = old_add_argument
 
-    # Keep multi-process multimodal features on CUDA across SGLang versions.
-    # Explicit CLI values and per-engine config overrides retain priority.
-    parser.set_defaults(sglang_mm_feature_transport="cuda_ipc")
-
     # PD disaggregation / multi-group config
     parser.add_argument(
         "--prefill-num-servers",

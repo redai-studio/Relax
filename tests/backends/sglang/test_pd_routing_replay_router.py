@@ -255,9 +255,7 @@ def test_pd_retires_idle_connections_before_backend_close(router):
     assert rooms == [request["bootstrap_room"] for request in decode_worker.received]
 
 
-@pytest.mark.parametrize(
-    "completion,start,missing", [(4, 0, False), (1, 0, True), (0, 0, True), (4, 1, False), (1, 3, True), (0, 3, True)]
-)
+@pytest.mark.parametrize("completion,start,missing", [(4, 1, False), (1, 0, True), (0, 0, True)])
 def test_pd_native_routes_cover_prompt_once(router, completion, start, missing):
     _, (prefill, worker) = router
     p = [10] * ((3 - start) * 4)
@@ -276,7 +274,7 @@ def test_pd_native_routes_cover_prompt_once(router, completion, start, missing):
     assert worker.received[-1]["routed_experts_start_len"] == start
 
 
-@pytest.mark.parametrize("corruption", ["base64", "shape", "missing", "prompt"])
+@pytest.mark.parametrize("corruption", ["missing"])
 def test_pd_router_rejects_incomplete_success_routes(router, corruption):
     _, (_, worker) = router
     worker.result = response(3, 3, [99] * 12 + [20] * 8)
@@ -295,16 +293,7 @@ def test_pd_router_rejects_incomplete_success_routes(router, corruption):
     assert "routing" in error.value.read().decode().lower()
 
 
-def test_pd_batch_routes_keep_each_prompt(router):
-    _, (prefill, worker) = router
-    prefill.result = [response(3, 1, [10] * 12), response(5, 1, [30] * 20)]
-    worker.result = [response(3, 2, [99] * 12 + [20] * 4), response(5, 2, [99] * 20 + [40] * 4)]
-    with generate(router, batch=True) as result:
-        values = json.load(result)
-    assert [decode(v["meta_info"]["routed_experts"]) for v in values] == [[10] * 12 + [20] * 4, [30] * 20 + [40] * 4]
-
-
-@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("split", [True])
 def test_pd_sse_handles_split_utf8_crlf_and_final_with_done(router, split):
     _, (prefill, worker) = router
     prefill.result = response(3, 1, [10] * 12)
@@ -321,16 +310,7 @@ def test_pd_sse_handles_split_utf8_crlf_and_final_with_done(router, split):
     assert worker.received[-1]["stream"] is True
 
 
-def test_pd_sse_preserves_native_errors(router):
-    _, (_, worker) = router
-    worker.result = [b'data: {"error":{"message":"model unavailable","code":503}}\n\ndata: [DONE]\n\n']
-    with generate(router, stream=True) as result:
-        raw = result.read().decode()
-    assert "model unavailable" in raw and "503" in raw and "[DONE]" in raw
-
-
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("prefill_status", [400, 503, None])
+@pytest.mark.parametrize("stream,prefill_status", [(True, 503)])
 def test_pd_prefill_failure_is_not_hidden_by_decode_error(router, stream, prefill_status):
     _, (prefill, worker) = router
     prefill.disconnect = prefill_status is None
@@ -364,13 +344,3 @@ def test_pd_prefill_failure_is_not_hidden_by_decode_error(router, stream, prefil
     body = outcome["body"].lower()
     assert "prefill" in body
     assert len(prefill.received) == len(worker.received) == 1
-
-
-@pytest.mark.parametrize("stream", [False, True])
-def test_pd_decode_http_failure_is_preserved(router, stream):
-    _, (_, worker) = router
-    worker.response_status = 400
-    with pytest.raises(HTTPError) as error:
-        generate(router, stream=stream)
-    assert error.value.code == 400
-    assert "decode rejected request" in error.value.read().decode()

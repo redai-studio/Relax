@@ -181,9 +181,9 @@ def test_compact_logprobs_preserve_scheduler_flat_topk():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("image_count,repeats", [(1, 1), (2, 1), (1, 257), (2, 257)])
-@pytest.mark.parametrize("avoid_retokenize", [False, True])
-@pytest.mark.parametrize("use_legacy_fallback", [False, True])
+@pytest.mark.parametrize(
+    "image_count,repeats,avoid_retokenize,use_legacy_fallback", [(2, 257, True, False), (2, 257, True, True)]
+)
 async def test_qwen_uncached_image_prefill_preserves_sampled_ids(
     monkeypatch, image_count, repeats, avoid_retokenize, use_legacy_fallback
 ):

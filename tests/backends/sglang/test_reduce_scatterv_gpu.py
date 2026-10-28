@@ -21,6 +21,7 @@ def _check_reduce_scatterv(rank: int, init_method: str) -> None:
         initialize_model_parallel,
         set_custom_all_reduce,
     )
+    from sglang.srt.environ import envs
     from sglang.srt.layers import dp_attention
     from sglang.srt.layers.moe.utils import should_use_dp_reduce_scatterv
     from sglang.srt.runtime_context import publish
@@ -112,6 +113,25 @@ def _check_reduce_scatterv(rank: int, init_method: str) -> None:
                         torch.cuda.synchronize()
                         check(result, phase)
                     del graph, result
+
+        # The deterministic dispatch must use the same FP32 accumulation as the
+        # regular PyNCCL path, including when replayed from a CUDA graph.
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
+        sizes = [0, 1, 3, 4]
+        value = torch.full((8, 4), (256, 1, -256, 0.5)[rank], device=device, dtype=torch.bfloat16)
+        original = value.clone()
+        output = torch.empty((sizes[rank], 4), device=device, dtype=torch.bfloat16)
+        with graph_capture() as capture:
+            group.reduce_scatterv(value, output=output, sizes=sizes)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture.stream):
+                result = group.reduce_scatterv(value, output=output, sizes=sizes)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert result is output
+        torch.testing.assert_close(result, torch.full_like(output, 1.5), rtol=0, atol=0)
+        torch.testing.assert_close(value, original, rtol=0, atol=0)
     finally:
         cleanup_dist_env_and_memory()
 

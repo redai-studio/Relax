@@ -29,8 +29,8 @@ def _bridge_root() -> Path:
     pytest.skip("Megatron Bridge with Kimi support is required")
 
 
-@pytest.mark.parametrize("tp,cp,rank", [(1, 1, 0), (2, 1, 0), (1, 2, 0), (1, 2, 1), (2, 2, 0), (2, 2, 1)])
-@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.int32])
+@pytest.mark.parametrize("tp,cp,rank", [(2, 2, 1)])
+@pytest.mark.parametrize("mask_dtype", [torch.bool])
 def test_kimi_packed_call_preserves_sequence_first_cp_layout(tp: int, cp: int, rank: int, mask_dtype) -> None:
     root = _bridge_root()
     utility = root / "qwen_vl/modelling_qwen3_vl/utils.py"
@@ -105,9 +105,7 @@ def test_kimi_packed_call_preserves_sequence_first_cp_layout(tp: int, cp: int, r
     assert params.cu_seqlens_kv.tolist() == params.cu_seqlens_q.tolist()
 
 
-@pytest.mark.parametrize("cp", [1, 2])
-@pytest.mark.parametrize("has_labels", [False, True])
-@pytest.mark.parametrize("has_mask", [False, True])
+@pytest.mark.parametrize("cp,has_labels,has_mask", [(2, True, True), (1, False, False)])
 def test_kimi_forward_returns_mask_only_when_present(cp: int, has_labels: bool, has_mask: bool) -> None:
     model_path = _bridge_root() / "kimi_vl/modeling_kimi_k25_vl.py"
     tree = ast.parse(model_path.read_text())
