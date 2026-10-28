@@ -359,6 +359,21 @@ class _SFTPrepackedDeviceIterator:
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    def set_rollout_manager(self, rollout_manager: Any) -> None:
+        super().set_rollout_manager(rollout_manager)
+        config = ray.get(rollout_manager.get_lora_training_config.remote())
+        self._managed_lora_publication = config is not None
+        if config is not None:
+            if (
+                not self.args.fully_async
+                or self.args.hybrid
+                or self.args.colocate
+                or self.args.offload_rollout
+                or not is_lora_adapter_mode(self.args)
+            ):
+                raise ValueError("managed training publication requires fully-async adapter mode")
+            self.checkpoint_engine_client.backend.configure_lora_publication(config, rollout_manager)
+
     @property
     def _per_step_rollout(self) -> bool:
         """RL consumes weights every train step.
@@ -1384,7 +1399,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Cleanup MUST run even if /evaluate failed, otherwise rollout + health
             # monitoring stay paused forever. Short call -> keep the timeout;
             # swallow its own errors independently.
-            if end_update_weight:
+            if end_update_weight and not getattr(self, "_managed_lora_publication", False):
                 try:
                     response = requests.get(
                         f"{rollout_serve_url}/end_update_weight", timeout=self.args.rollout_http_timeout
@@ -3124,9 +3139,14 @@ class MegatronTrainRayActor(TrainRayActor):
         if dist.get_rank(process_group) == 0:
             # Check rollout service
             try:
-                rollout_serve_url = get_serve_url("rollout")
+                if getattr(self, "_managed_lora_publication", False):
+                    # Version publication owns rollout readiness. Do not enter
+                    # the legacy pause/recovery handshake.
+                    rollout_serve_url = None
+                else:
+                    rollout_serve_url = get_serve_url("rollout")
                 retry_deadline = None
-                while True:
+                while rollout_serve_url is not None:
                     request_timeout = self.args.rollout_http_timeout
                     if retry_deadline is not None:
                         request_timeout = retry_deadline - time.monotonic()
@@ -3238,15 +3258,30 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
         print_memory("before update_weights")
 
+        managed = getattr(self, "_managed_lora_publication", False)
+        if managed:
+            from relax.engine.lora_versions.training import run_on_training_rank_zero
+
+            def acquire_topology_lease() -> None:
+                if not ray.get(self.rollout_manager.set_weight_updating.remote(True)):
+                    raise RuntimeError("the managed engine pool is being changed")
+
+            run_on_training_rank_zero(acquire_topology_lease, phase="LoRA topology lease")
+
         weight_sync_lock = getattr(self, "_weight_sync_lock", None)
-        if weight_sync_lock is not None and dist.get_rank() == 0:
-            acquired = False
-            while not acquired:
-                acquired = ray.get(weight_sync_lock.acquire.remote())
-                if not acquired:
+
+        def acquire_sync_lock() -> None:
+            if weight_sync_lock is not None:
+                while not ray.get(weight_sync_lock.acquire.remote()):
                     time.sleep(1)
 
+        lock_acquired = False
         try:
+            if managed:
+                run_on_training_rank_zero(acquire_sync_lock, phase="LoRA weight-sync lock")
+            elif dist.get_rank() == 0:
+                acquire_sync_lock()
+            lock_acquired = True
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
             synced_actor_ids = run(
@@ -3263,7 +3298,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     # sync without stranding other ranks at their barrier.
                     logger.exception("Recovered engine Router publication failed; will retry after weight sync")
         finally:
-            if weight_sync_lock is not None and dist.get_rank() == 0:
+            if managed:
+
+                def release_managed_locks() -> None:
+                    try:
+                        if lock_acquired and weight_sync_lock is not None:
+                            ray.get(weight_sync_lock.release.remote())
+                    finally:
+                        ray.get(self.rollout_manager.set_weight_updating.remote(False))
+
+                run_on_training_rank_zero(release_managed_locks, phase="LoRA weight-sync cleanup")
+            elif lock_acquired and weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())
 
     @timer

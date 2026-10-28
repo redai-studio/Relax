@@ -53,7 +53,10 @@ from relax.agentic.session.service import (
     _SessionResultCell,
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
+from relax.engine.lora_versions.manager import SessionKey
 from relax.utils.types import Sample
+from tests.engine.lora_versions.test_manager import publish
+from tests.engine.lora_versions.test_runtime import host_with_version, remote
 
 
 # ``relax.agentic.rollout`` only needs this logging helper at import time. Keep
@@ -505,7 +508,7 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     expected: bool,
 ) -> None:
     pipeline = object.__new__(AgenticResidentPipeline)
-    pipeline.args = SimpleNamespace(fully_async=fully_async)
+    pipeline.args = SimpleNamespace(fully_async=fully_async, max_staleness=1)
     pipeline.transfer_domain = SimpleNamespace(total_debt=debt, previous_debt=previous_debt)
     pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=tuple(range(interrupted_count)))
 
@@ -694,6 +697,9 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         slime_router_sticky=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
+    adapter._request_endpoints = {}
+    adapter._session_endpoints = {}
+    adapter._session_requests = {}
     adapter.tokenizer = _FakeTokenizer()
     adapter.compiler = SimpleNamespace(processor=None)
     return adapter
@@ -1432,3 +1438,238 @@ async def test_agentic_503_is_pre_dispatch_before_permit_cleanup_finishes():
     assert task.done() and list(session.queued_irs) == [ir]
     assert ir.backend_started is False
     abort_request.assert_not_awaited()
+
+
+def _managed_shard_session():
+    shard, group, session, ir = _router_recovery_shard()
+    host, manager = host_with_version()
+    manager.register_shard("s", "boot")
+    shard._lora_runtime = SimpleNamespace(
+        bind=remote(host.bind),
+        route=remote(host.route),
+        release=remote(host.release),
+        advance_watermark=remote(host.advance_watermark),
+        close_shard=remote(host.close_shard),
+    )
+    shard._lora_release_lock = asyncio.Lock()
+    shard._lora_shard_id = "s"
+    shard._lora_instance_id = "boot"
+    shard._lora_sequence = 1
+    shard._lora_live_sequences = {0}
+    shard._lora_pending_releases = set()
+    shard._session_records = {session.session_id: session}
+    shard.args.agentic_session_lifecycle = False
+    session.lora_key = SessionKey("s", "boot", 0)
+    return shard, group, session, ir, host, manager
+
+
+async def test_managed_session_bind_lost_reply_retries_original_key():
+    shard, _group, session, _ir, host, manager = _managed_shard_session()
+
+    async def lost_reply(key):
+        await host.bind(key)
+        raise TimeoutError("lost bind reply")
+
+    shard._lora_runtime.bind = remote(lost_reply)
+    with pytest.raises(TimeoutError):
+        await shard._bind_lora_session(session)
+    publish(manager, 1)
+    shard._lora_runtime.bind = remote(host.bind)
+    bound = await shard._bind_lora_session(session)
+    assert bound.version_id == 0
+    assert manager.publication(0).session_count == 1
+    assert manager.publication(1).session_count == 0
+
+
+async def test_managed_session_finish_joins_pending_bind_before_release():
+    shard, group, session, ir, host, manager = _managed_shard_session()
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def delayed_bind(key):
+        binding = await host.bind(key)
+        entered.set()
+        await resume.wait()
+        return binding
+
+    shard._lora_runtime.bind = remote(delayed_bind)
+    backend = SimpleNamespace(generate=AsyncMock(), abort_request=AsyncMock(), close_session=AsyncMock())
+    shard._generation_backend = backend
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await entered.wait()
+    closing = asyncio.create_task(shard._finish_session(session, None))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not closing.done()
+    assert manager.publication(0).session_count == 1
+    resume.set()
+    assert await asyncio.wait_for(closing, 2) is None
+    backend.generate.assert_not_awaited()
+    assert manager.publication(0).session_count == 0
+    assert session not in group.sessions
+    assert not shard._lora_live_sequences
+
+
+async def test_managed_release_retry_watermark_preserves_unbound_prelaunch_session():
+    shard, _group, session, _ir, host, manager = _managed_shard_session()
+    # Sequence zero is an older prelaunch Session, not yet bound.
+    session.lora_key = SessionKey("s", "boot", 1)
+    shard._lora_live_sequences = {0, 1}
+    shard._lora_sequence = 2
+    await shard._bind_lora_session(session)
+
+    async def lost_release(key):
+        await host.release(key)
+        raise TimeoutError("lost release reply")
+
+    shard._lora_runtime.release = remote(lost_release)
+    assert isinstance(await shard._release_lora_session(session), TimeoutError)
+    assert shard._lora_pending_releases == {session.lora_key}
+    assert shard._lora_live_sequences == {0, 1}
+    shard._lora_runtime.release = remote(host.release)
+    await shard.lora_heartbeat()
+    assert shard._lora_live_sequences == {0}
+    assert await host.bind(SessionKey("s", "boot", 0)) == session.lora_binding
+    assert manager.publication(0).session_count == 1
+
+
+async def test_managed_session_keeps_version_across_abort_resume_and_tool_gap():
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    calls = []
+
+    async def generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            new_tokens=[], new_log_probs=[], finish_type="abort", meta_info={"weight_version": "mutable"}, elapsed=0.1
+        )
+
+    shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
+    for iteration in range(2):
+        if iteration:
+            publish(manager, 1)
+            session.queued_irs.clear()
+        task = asyncio.create_task(shard._run_ir(session, ir))
+        ir.runner_task = task
+        await task
+    assert len(calls) == 2
+    assert calls[0]["lora_path"] == calls[1]["lora_path"] == session.lora_binding.lora_name
+    assert calls[0]["engine_url"] == calls[1]["engine_url"]
+    assert ir.pending_weight_version_delta == ["0", "0"]
+    assert ir.latest_backend_meta["engine_weight_version"] == "mutable"
+    assert manager.publication(0).session_count == 1
+
+
+async def test_managed_generation_transport_error_aborts_and_ends_session():
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    backend = SimpleNamespace(
+        generate=AsyncMock(side_effect=httpx.ReadError("accepted then disconnected")),
+        abort_request=AsyncMock(),
+        close_session=AsyncMock(),
+        tokenizer=_FakeTokenizer(),
+    )
+    shard._generation_backend = backend
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await asyncio.wait_for(task, 2)
+    backend.generate.assert_awaited_once()
+    backend.abort_request.assert_awaited_once()
+    assert backend.abort_request.call_args.args[0] == backend.generate.call_args.kwargs["request_id"]
+    assert isinstance(session.result_cell.payload, RuntimeGroupError)
+    assert session.session_id not in shard._session_records
+    assert manager.publication(0).session_count == 0
+
+
+async def test_managed_backend_direct_transport_never_resends_and_cleans_endpoint_maps(monkeypatch):
+    adapter = _backend_adapter(lifecycle_enabled=True)
+    requests = []
+
+    async def transport(request):
+        requests.append(request)
+        raise httpx.ReadError("accepted then disconnected")
+
+    adapter._managed_http = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    monkeypatch.setattr(runtime_mod, "post", AsyncMock(side_effect=AssertionError("must not resend")))
+    try:
+        with pytest.raises(httpx.ReadError):
+            await adapter.generate(
+                input_ids=[1],
+                sampling_params={},
+                session_id="s",
+                request_id="r",
+                lora_path="version",
+                engine_url="http://managed",
+            )
+        assert len(requests) == 1
+        assert json.loads(requests[0].content)["lora_path"] == "version"
+        assert str(requests[0].url) == "http://managed/generate"
+        cleanup = AsyncMock(side_effect=TimeoutError("cleanup unavailable"))
+        monkeypatch.setattr(runtime_mod, "post", cleanup)
+        with pytest.raises(TimeoutError):
+            await adapter.abort_request("r")
+        assert cleanup.call_args.args[0] == "http://managed/abort_request"
+        assert not await adapter.close_session("s", timeout_s=1)
+        assert not adapter._request_endpoints
+        assert not adapter._session_endpoints
+        assert not adapter._session_requests
+    finally:
+        await adapter._managed_http.aclose()
+
+
+async def test_managed_transport_failure_and_concurrent_finish_do_not_wait_on_each_other():
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def abort(_request_id):
+        entered.set()
+        await resume.wait()
+
+    shard._generation_backend = SimpleNamespace(
+        generate=AsyncMock(side_effect=httpx.ReadError("accepted then disconnected")),
+        abort_request=abort,
+        close_session=AsyncMock(),
+        tokenizer=_FakeTokenizer(),
+    )
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await entered.wait()
+    finishing = asyncio.create_task(shard._finish_session(session, None))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    resume.set()
+    await asyncio.wait_for(asyncio.gather(runner, finishing), 2)
+    assert manager.publication(0).session_count == 0
+
+
+async def test_managed_shard_shutdown_is_idempotent_after_host_exits():
+    shard, _group, session, _ir, _host, manager = _managed_shard_session()
+    shard._permit_cleanup_tasks = set()
+    shard._generation_backend = SimpleNamespace(
+        abort_request=AsyncMock(),
+        close_session=AsyncMock(),
+        shutdown=AsyncMock(),
+    )
+    await shard._bind_lora_session(session)
+    await shard.shutdown()
+    assert manager.publication(0).session_count == 0
+    assert shard._lora_runtime is None
+    await shard.shutdown()
+    shard._generation_backend.shutdown.assert_awaited_once()
+
+
+async def test_managed_prepare_gate_does_not_bind_and_failed_fleet_injection_closes_all_shards():
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    shard._train_generation_open = False
+    shard._generation_backend = SimpleNamespace(generate=AsyncMock())
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await runner
+    assert session.lora_bind_task is None
+    assert manager.publication(0).session_count == 0
+    handles = [SimpleNamespace(set_lora_runtime=remote(AsyncMock()), shutdown=remote(AsyncMock())) for _ in range(2)]
+    handles[1].set_lora_runtime.remote.side_effect = RuntimeError("failed injection")
+    bindings = [SimpleNamespace(actor_name=f"shard-{i}", handle=handle) for i, handle in enumerate(handles)]
+    domain = RuntimeDomain(Namespace(), "train", bindings, concurrency=1)
+    with pytest.raises(RuntimeError, match="failed to configure"):
+        await domain.bind_lora_runtime(object())
+    for handle in handles:
+        handle.shutdown.remote.assert_awaited_once()

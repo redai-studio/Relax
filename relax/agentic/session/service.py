@@ -68,6 +68,8 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
+from relax.engine.lora_versions.identity import VersionIdentity
+from relax.engine.lora_versions.manager import SessionKey
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import get_spec_token_counts
@@ -1431,6 +1433,9 @@ class _SessionRecord:
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
+    lora_key: Optional[SessionKey] = None
+    lora_binding: Optional[VersionIdentity] = None
+    lora_bind_task: Optional[asyncio.Task] = None
 
     @property
     def interrupted(self) -> bool:
@@ -1464,6 +1469,15 @@ class AgenticSessionShard:
         # OpenAI ingress index. ResidentGroup.sessions owns each Session's
         # lifecycle; this table resolves a route token to that direct ref.
         self._session_records: Dict[str, _SessionRecord] = {}
+        self._closed = False
+        self._lora_runtime: Any = None
+        self._lora_configuring = False
+        self._lora_shard_id = ""
+        self._lora_instance_id = uuid4().hex
+        self._lora_sequence = 0
+        self._lora_live_sequences: set[int] = set()
+        self._lora_pending_releases: set[SessionKey] = set()
+        self._lora_release_lock = asyncio.Lock()
         self._train_generation_open = False
         self._state_revision = 0
         self._state_changed = asyncio.Event()
@@ -1484,6 +1498,73 @@ class AgenticSessionShard:
         if endpoint[0] is not None and endpoint != (router_ip, router_port):
             raise RuntimeError("Cannot replace a SessionShard router within its lifecycle")
         self.args.sglang_router_ip, self.args.sglang_router_port = router_ip, router_port
+
+    async def set_lora_runtime(self, runtime: Any, shard_id: str) -> None:
+        if self._closed or self._lora_configuring:
+            raise RuntimeError("SessionShard is closed or being configured")
+        if getattr(self, "_lora_runtime", None) is not None:
+            if self._lora_runtime == runtime and self._lora_shard_id == shard_id:
+                return
+            raise RuntimeError("Cannot replace a SessionShard LoRA runtime")
+        if self._groups:
+            raise RuntimeError("LoRA runtime must be configured before any Session starts")
+        self._lora_configuring = True
+        try:
+            await runtime.register_shard.remote(
+                shard_id, self._lora_instance_id, ray.get_runtime_context().current_actor
+            )
+            if self._closed:
+                await runtime.close_shard.remote(shard_id, self._lora_instance_id)
+                raise RuntimeError("SessionShard closed during LoRA configuration")
+            self._lora_shard_id = shard_id
+            self._lora_runtime = runtime
+        except BaseException:
+            self._closed = True
+            raise
+        finally:
+            self._lora_configuring = False
+
+    async def _bind_lora_session(self, session: _SessionRecord) -> VersionIdentity:
+        if session.lora_bind_task is not None and session.lora_bind_task.done():
+            if session.lora_bind_task.cancelled() or session.lora_bind_task.exception() is not None:
+                session.lora_bind_task = None
+        if session.lora_bind_task is None:
+
+            async def bind() -> VersionIdentity:
+                binding = await self._lora_runtime.bind.remote(session.lora_key)
+                session.lora_binding = binding
+                return binding
+
+            session.lora_bind_task = asyncio.create_task(bind())
+        return await asyncio.shield(session.lora_bind_task)
+
+    async def lora_heartbeat(self) -> None:
+        """Retry lost release ACKs without losing tombstone ownership."""
+        async with self._lora_release_lock:
+            if self._lora_runtime is None:
+                return
+            for key in tuple(self._lora_pending_releases):
+                await self._lora_runtime.release.remote(key)
+                self._lora_pending_releases.discard(key)
+                self._lora_live_sequences.discard(key.sequence)
+            # Include Sessions that have not reached their first request yet.
+            watermark = min(self._lora_live_sequences, default=self._lora_sequence) - 1
+            if watermark >= 0:
+                await self._lora_runtime.advance_watermark.remote(
+                    self._lora_shard_id, self._lora_instance_id, watermark
+                )
+
+    async def _release_lora_session(self, session: _SessionRecord) -> Optional[BaseException]:
+        if session.lora_key is None:
+            return None
+        if session.lora_bind_task is not None:
+            await asyncio.gather(session.lora_bind_task, return_exceptions=True)
+        self._lora_pending_releases.add(session.lora_key)
+        try:
+            await self.lora_heartbeat()
+        except Exception as error:
+            return error
+        return None
 
     def _notify_state_change(self, group: Optional[ResidentGroup] = None) -> None:
         """Advance the Shard event cursor after owned refs change."""
@@ -1542,6 +1623,8 @@ class AgenticSessionShard:
     ) -> None:
         """Register one group and start every Session agent."""
 
+        if getattr(self, "_closed", False) or getattr(self, "_lora_configuring", False):
+            raise RuntimeGroupError("SessionShard is not accepting new groups")
         if group_id in self._groups:
             raise RuntimeGroupError(f"group token is already resident: {group_id}")
 
@@ -1571,6 +1654,11 @@ class AgenticSessionShard:
                 )
             )
         self._groups[group_id] = group
+        if getattr(self, "_lora_runtime", None) is not None:
+            for session in group.sessions:
+                session.lora_key = SessionKey(self._lora_shard_id, self._lora_instance_id, self._lora_sequence)
+                self._lora_live_sequences.add(self._lora_sequence)
+                self._lora_sequence += 1
         self._session_records.update((session.session_id, session) for session in group.sessions)
 
         try:
@@ -1978,6 +2066,14 @@ class AgenticSessionShard:
     async def _shutdown(self) -> None:
         """Drop resident groups, then release the Shard-owned backend."""
 
+        task = getattr(self, "_shutdown_task", None)
+        if task is None or (task.done() and task.exception() is not None):
+            task = asyncio.create_task(self._shutdown_once())
+            self._shutdown_task = task
+        await asyncio.shield(task)
+
+    async def _shutdown_once(self) -> None:
+        self._closed = True
         self._train_generation_open = False
         first_error: Optional[BaseException] = None
         for group in tuple(self._groups.values()):
@@ -1995,12 +2091,19 @@ class AgenticSessionShard:
             if first_error is None and isinstance(outcome, BaseException):
                 first_error = outcome
         try:
-            await self._generation_backend.shutdown()
+            if not getattr(self, "_backend_shutdown_done", False):
+                await self._generation_backend.shutdown()
+                self._backend_shutdown_done = True
         except BaseException as error:
             if first_error is None:
                 first_error = error
         if first_error is not None:
             raise first_error
+        if getattr(self, "_lora_runtime", None) is not None:
+            await self._lora_runtime.close_shard.remote(self._lora_shard_id, self._lora_instance_id)
+            self._lora_pending_releases.clear()
+            self._lora_live_sequences.clear()
+            self._lora_runtime = None
 
     async def _chat(
         self,
@@ -2411,6 +2514,21 @@ class AgenticSessionShard:
                 router_unavailable = False
                 async with self._admission_lease(session, ir):
                     async with self._sglang_request_permit():
+                        managed_kwargs = {}
+                        if session.lora_key is not None:
+                            async with session.lock:
+                                if not is_current():
+                                    return
+                                if not self._group_generation_open(group) and not session.protected_until_finalize:
+                                    ir.runner_task = None
+                                    session.queued_irs.appendleft(ir)
+                                    self._notify_state_change(group)
+                                    return
+                            # A shared, shielded task survives pause/cancel and
+                            # is joined by finalization before releasing its key.
+                            binding = await self._bind_lora_session(session)
+                            endpoint = await self._lora_runtime.route.remote(session.lora_key, binding)
+                            managed_kwargs = {"lora_path": binding.lora_name, "engine_url": endpoint}
                         async with session.lock:
                             if not is_current():
                                 return
@@ -2439,15 +2557,42 @@ class AgenticSessionShard:
                                 return_logprob=group.rollout_mode == "train" or ir.logprobs,
                                 collect_score_centering=group.rollout_mode == "train",
                                 fail_fast_no_workers=router_recovery_enabled,
+                                **managed_kwargs,
                             )
+                            if session.lora_binding is not None:
+                                result.meta_info["engine_weight_version"] = result.meta_info.get("weight_version")
+                                result.meta_info["weight_version"] = str(session.lora_binding.version_id)
                         except httpx.HTTPStatusError as error:
-                            router_unavailable = router_recovery_enabled and is_router_no_available_workers(error)
+                            if managed_kwargs:
+                                raise RuntimeGroupError(f"managed generation rejected: {error}") from error
+                            router_unavailable = (
+                                not managed_kwargs
+                                and router_recovery_enabled
+                                and is_router_no_available_workers(error)
+                            )
                             if not router_unavailable:
                                 raise
                             # The router rejected this attempt before dispatch. Clear
                             # backend ownership before context cleanup can await, so a
                             # concurrent pause treats the runner as cancellable waiting.
                             ir.backend_started = False
+                        except BackendContextLengthExceededError:
+                            raise
+                        except Exception as error:
+                            if not managed_kwargs:
+                                raise
+                            # A transport failure may follow acceptance. End
+                            # this Session and target the original rid before
+                            # dropping its request ownership.
+                            async with session.lock:
+                                session.phase = SessionPhase.FINALIZING
+                            try:
+                                await self._generation_backend.abort_request(backend_request_id)
+                            except Exception as abort_error:
+                                raise RuntimeGroupError(
+                                    f"managed generation failed ({error}); abort failed ({abort_error})"
+                                ) from error
+                            raise RuntimeGroupError(f"managed generation failed: {error}") from error
                         finally:
                             mark_agentic_event(
                                 agentic_trace_events(ir.pending_export_metadata_patch),
@@ -2501,7 +2646,10 @@ class AgenticSessionShard:
                 if ir in session.live_irs and ir.runner_task is runner_task:
                     ir.runner_task = None
                     ir.backend_started = False
-            await self._handle_infra_failure(session, error)
+                finalizing = session.finish_task is not None
+            # An existing finalizer may already be joining this runner.
+            if not finalizing:
+                await self._handle_infra_failure(session, error)
             return
         except Exception as error:
             async with session.lock:
@@ -2950,6 +3098,9 @@ class AgenticSessionShard:
                 session.session_id,
                 timeout_s=_SESSION_CLOSE_TIMEOUT_S,
             )
+        elif session.lora_key is not None:
+            await self._generation_backend.close_session(session.session_id, timeout_s=_SESSION_CLOSE_TIMEOUT_S)
+        lora_release_error = await self._release_lora_session(session)
         async with session.lock:
             for ir in irs:
                 ir.runner_task = None
@@ -2972,6 +3123,8 @@ class AgenticSessionShard:
             (abort_outcome for abort_outcome in abort_outcomes if isinstance(abort_outcome, BaseException)),
             None,
         )
+        if cleanup_error is None:
+            cleanup_error = lora_release_error
         if self.args.agentic_session_lifecycle:
             self._lifecycle_close_count += 1
             self._lifecycle_close_failure_count += int(not lifecycle_closed)

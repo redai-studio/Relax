@@ -569,6 +569,11 @@ class SGLangBackendAdapter:
         if score_centering_enabled(args):
             resolve_score_centering_vocab_size(args)
         self._session_lifecycle = args.agentic_session_lifecycle
+        self._request_endpoints: dict[str, str] = {}
+        self._session_endpoints: dict[str, set[str]] = {}
+        self._session_requests: dict[str, set[str]] = {}
+        # The shared request permit already bounds concurrency.
+        self._managed_http = httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None))
         self.tokenizer = self._resources.tokenizer
         self.compiler = SGLangMessageCompiler(
             tokenizer=self._resources.tokenizer,
@@ -597,7 +602,11 @@ class SGLangBackendAdapter:
         return_logprob: bool = True,
         collect_score_centering: bool = True,
         fail_fast_no_workers: bool = False,
+        lora_path: str | None = None,
+        engine_url: str | None = None,
     ) -> BackendGenerateResult:
+        if (lora_path is None) != (engine_url is None):
+            raise ValueError("managed generation requires both a version and an engine endpoint")
         payload = {
             "input_ids": input_ids,
             "sampling_params": sampling_params,
@@ -621,13 +630,20 @@ class SGLangBackendAdapter:
             # The full input_ids remain authoritative; session_id only tags
             # the resulting radix leaves for terminal cleanup.
             payload["session_id"] = session_id
+        if lora_path is not None:
+            payload["lora_path"] = lora_path
+            self._request_endpoints[request_id] = engine_url
+            if session_id:
+                self._session_endpoints.setdefault(session_id, set()).add(engine_url)
+                self._session_requests.setdefault(session_id, set()).add(request_id)
         headers = None
         if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         try:
-            output = await post(
-                f"{self._router_url}/generate",
+            send = self._managed_post if engine_url else post
+            output = await send(
+                f"{engine_url or self._router_url}/generate",
                 payload,
                 headers=headers,
                 fail_fast_no_workers=fail_fast_no_workers,
@@ -673,18 +689,27 @@ class SGLangBackendAdapter:
             new_topk_log_probs=topk_log_probs,
         )
 
+    async def _managed_post(self, url: str, payload: dict, *, headers: dict | None, **_kwargs: Any) -> dict:
+        # The general post helper may resend through a local client after a
+        # distributed transport error. That is ambiguous for generation.
+        response = await self._managed_http.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
     async def abort_request(self, request_id: str) -> None:
-        urls = await self._worker_urls()
+        endpoint = self._request_endpoints.get(request_id)
+        urls = [endpoint] if endpoint else await self._worker_urls()
         await asyncio.gather(*(post(f"{url}/abort_request", {"rid": request_id}) for url in urls))
 
     async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
         """Release one terminal Session from every engine radix cache."""
 
         if not self._session_lifecycle:
+            self._forget_session_endpoints(session_id)
             return True
 
         async def close_all_workers() -> list[Any]:
-            urls = await self._worker_urls()
+            urls = self._session_endpoints.get(session_id) or await self._worker_urls()
             return await asyncio.gather(
                 *(post(f"{url}/close_session", {"session_id": session_id}) for url in urls),
                 return_exceptions=True,
@@ -694,7 +719,16 @@ class SGLangBackendAdapter:
             outcomes = await asyncio.wait_for(close_all_workers(), timeout=timeout_s)
         except Exception:
             return False
+        finally:
+            # Cache cleanup is best effort at Session termination. There is no
+            # later cache-close owner; do not retain per-request routing tables.
+            self._forget_session_endpoints(session_id)
         return all(not isinstance(outcome, BaseException) for outcome in outcomes)
+
+    def _forget_session_endpoints(self, session_id: str) -> None:
+        self._session_endpoints.pop(session_id, None)
+        for request_id in self._session_requests.pop(session_id, ()):
+            self._request_endpoints.pop(request_id, None)
 
     async def _worker_urls(self) -> list[str]:
         try:
@@ -715,6 +749,7 @@ class SGLangBackendAdapter:
         return router_worker_base_urls(response["urls"])
 
     async def shutdown(self) -> None:
+        await self._managed_http.aclose()
         self._resources.shutdown()
 
 
@@ -932,6 +967,19 @@ class RuntimeDomain:
             asyncio.gather(*(handle.set_router_address.remote(router_ip, router_port) for handle in handles)),
             timeout=getattr(self.args, "rollout_engine_init_timeout", 3600.0),
         )
+
+    async def bind_lora_runtime(self, handle: Any) -> None:
+        """Configure the shared train/Eval Session owners before launch."""
+        outcomes = await asyncio.gather(
+            *(shard.handle.set_lora_runtime.remote(handle, shard.actor_name) for shard in self._shards),
+            return_exceptions=True,
+        )
+        if any(isinstance(outcome, BaseException) for outcome in outcomes):
+            # A mixed fleet must never accept a group on the unmanaged path.
+            await asyncio.gather(*(shard.handle.shutdown.remote() for shard in self._shards), return_exceptions=True)
+            raise RuntimeError("failed to configure the managed LoRA Session fleet") from next(
+                outcome for outcome in outcomes if isinstance(outcome, BaseException)
+            )
 
     @property
     def interrupted_group_ids(self) -> Tuple[str, ...]:
