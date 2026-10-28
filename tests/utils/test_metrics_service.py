@@ -2,7 +2,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Basic tests for the Metrics Service components."""
 
+import os
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
 
 # MetricsBuffer is defined inside metrics.py, we need to import it correctly
@@ -69,13 +72,30 @@ class TestMetricsBuffer(unittest.TestCase):
         self.assertFalse(self.buffer.has_metrics_for_step(2))
 
 
+class _SuccessHandler(BaseHTTPRequestHandler):
+    """Answers every metrics endpoint with success."""
+
+    def _reply(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = b'{"status": "success"}'
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = _reply
+
+    def log_message(self, *args):
+        pass
+
+
 class TestMetricsClient(unittest.TestCase):
     """Test MetricsClient class."""
 
     def setUp(self):
         self.client = MetricsClient("http://test-server:8000/metrics")
 
-    @patch("requests.post")
+    @patch("relax.utils.metrics.client._request")
     def test_log_metric_buffered(self, mock_post):
         """Test logging metrics with buffering."""
         # Log metrics with buffering (immediate=False)
@@ -91,7 +111,7 @@ class TestMetricsClient(unittest.TestCase):
         self.assertEqual(self.client.get_buffered_metrics_count(step=1), 1)
         self.assertEqual(self.client.get_buffered_metrics_count(), 1)
 
-    @patch("requests.post")
+    @patch("relax.utils.metrics.client._request")
     def test_log_metrics_batch_buffered(self, mock_post):
         """Test logging batch metrics with buffering."""
         metrics = {
@@ -105,6 +125,23 @@ class TestMetricsClient(unittest.TestCase):
         self.assertTrue(result)
         mock_post.assert_not_called()
         self.assertEqual(self.client.get_buffered_metrics_count(step=2), 3)
+
+    def test_requests_ignore_proxy_environment(self):
+        """Requests reach the cluster-local service directly even when the
+        environment names a proxy (nothing listens at this one)."""
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _SuccessHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+        with patch.dict(os.environ, dict.fromkeys(names, "http://proxy.invalid:3128")):
+            # A NO_PROXY that covers 127.0.0.1 would bypass the proxy anyway.
+            os.environ.pop("NO_PROXY", None)
+            os.environ.pop("no_proxy", None)
+            client = MetricsClient(f"http://127.0.0.1:{server.server_address[1]}/metrics")
+            self.assertTrue(client.log_metrics_batch(step=1, metrics={"loss": 1.0}, immediate=True))
+            self.assertEqual(client.report_step(1)["status"], "success")
+            self.assertEqual(client.health_check()["status"], "success")
 
     def test_clear_buffer(self):
         """Test clearing the buffer."""
