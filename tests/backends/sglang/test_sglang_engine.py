@@ -11,15 +11,42 @@ import pytest
 pytest_plugins = ["tests.backends.sglang.test_router_registration"]
 
 
+@pytest.mark.parametrize("role", ["teacher", "genrm"])
+@pytest.mark.parametrize("operation", ["begin_weight_update", "end_weight_update"])
+def test_static_engine_rejects_weight_update_sessions(monkeypatch, sglang_engine_module, role, operation):
+    from relax.inference.engine_spec import InferenceEngineSpec
+
+    module = sglang_engine_module
+    engine = object.__new__(module.SGLangEngine)
+    engine.engine_spec = InferenceEngineSpec(role)
+    monkeypatch.setattr(module, "_sglang_has_weight_update_session", lambda: True)
+    post = Mock()
+    monkeypatch.setattr(module.requests, "post", post)
+
+    with pytest.raises(RuntimeError, match="STATIC"):
+        getattr(engine, operation)()
+
+    post.assert_not_called()
+
+
 @pytest.mark.parametrize("node_rank", [0, 1])
 def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeypatch, sglang_engine_module, node_rank):
+    from relax.backends.sglang.process_lifecycle import run_in_backend_session
+
     module = sglang_engine_module
     events = []
 
     process = Mock()
     process.start.side_effect = lambda: events.append("start")
     process.is_alive.return_value = True
-    multiprocessing = SimpleNamespace(set_start_method=Mock(), Process=Mock(return_value=process))
+    receive_ready, send_ready = Mock(), Mock()
+    receive_ready.poll.return_value = True
+    receive_ready.recv.return_value = {"pid": 456, "session_id": 456}
+    multiprocessing = SimpleNamespace(
+        set_start_method=Mock(),
+        Process=Mock(return_value=process),
+        Pipe=Mock(return_value=(receive_ready, send_ready)),
+    )
 
     wait = Mock(side_effect=lambda **_kwargs: events.append("wait"))
     monkeypatch.setattr(module, "multiprocessing", multiprocessing)
@@ -32,7 +59,13 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     assert module.launch_server_process(server_args) is process
 
     multiprocessing.set_start_method.assert_called_once_with("spawn", force=True)
-    multiprocessing.Process.assert_called_once_with(target=module._launch_server_with_patches, args=(server_args, 123))
+    multiprocessing.Process.assert_called_once_with(
+        target=run_in_backend_session, args=(module._launch_server_with_patches, (server_args, 123), send_ready)
+    )
+    multiprocessing.Pipe.assert_called_once_with(duplex=False)
+    assert process.backend_session == receive_ready.recv.return_value
+    receive_ready.close.assert_called_once_with()
+    send_ready.close.assert_called_once_with()
     process.start.assert_called_once_with()
     if node_rank == 0:
         assert events == ["start", "wait"]

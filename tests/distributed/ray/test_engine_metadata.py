@@ -84,7 +84,7 @@ def make_manager(engines, refs):
         num_gpus_per_engine=1,
         num_new_engines=0,
     )
-    group.engine_init_records = {slot: SimpleNamespace(value=ref) for slot, ref in enumerate(refs)}
+    group.engine_init_records = {slot: rollout._EngineInitRecord(value=ref) for slot, ref in enumerate(refs)}
     server = rollout.RolloutServer(engine_groups=[group], router_ip="127.0.0.1", router_port=3000, model_name="actor")
     manager = object.__new__(rollout.RolloutManager.__ray_metadata__.modified_class)
     manager._engine_actor_states = ActorState
@@ -266,6 +266,7 @@ def test_get_engines_info_init_read_failure_is_retryable_and_preserves_peer(zero
 def test_get_engines_info_caches_copies_and_drops_extra_fields(zero_wait_get):
     original = engine_metadata()
     original["extra"] = ["mutable"]
+    original["backend_session"] = {"session_id": 5678, "pid": 5678, "start_time": 9012}
     ref = InitResult(original)
     engine = make_engine()
     manager, group = make_manager([engine], [ref])
@@ -274,12 +275,15 @@ def test_get_engines_info_caches_copies_and_drops_extra_fields(zero_wait_get):
 
     assert group.engine_init_records[0].value == engine_metadata()
     assert group.engine_init_records[0].value is not original
+    assert group.engine_init_records[0].backend_session == original["backend_session"]
+    assert "backend_session" not in engine_rows(first)[0]
     engine_rows(first)[0]["url"] = "http://response-was-mutated"
     original["url"] = "http://init-result-was-mutated"
     ref.error = RuntimeError("ref became unreadable after cache")
     second = manager.get_engines_info()
     assert engine_rows(second)[0]["url"] == engine_metadata()["url"]
     assert second["observation"]["complete"] is True
+    assert "backend_session" not in engine_rows(second)[0]
     assert ref.reads == 1
     assert engine._get_local_state.call_count == 4
     json.dumps(second)
@@ -341,7 +345,7 @@ def test_get_engines_info_generation_change_wins_over_every_ref_outcome(zero_wai
         ref.error = RuntimeError("init result unavailable")
     manager, group = make_manager([old_engine], [ref])
     old_record = group.engine_init_records[0]
-    new_record = SimpleNamespace(value=InitResult(engine_metadata(pid=2)))
+    new_record = rollout._EngineInitRecord(value=InitResult(engine_metadata(pid=2)))
 
     def replace():
         if replacement in {"engine", "replace_both"}:
@@ -394,7 +398,7 @@ def test_get_engines_info_a_to_none_to_b_never_reuses_a_metadata(zero_wait_get):
     group.all_engines[0] = make_engine()
     assert_issue(manager.get_engines_info(), "missing_record")
     new_ref = InitResult(engine_metadata(pid=2), pending=True)
-    group.engine_init_records[0] = SimpleNamespace(value=new_ref)
+    group.engine_init_records[0] = rollout._EngineInitRecord(value=new_ref)
     assert_issue(manager.get_engines_info(), "init_pending")
     new_ref.pending = False
     recovered = manager.get_engines_info()
@@ -406,7 +410,7 @@ def test_get_engines_info_late_cache_write_only_mutates_captured_record(zero_wai
     old_engine, new_engine = make_engine(), make_engine()
     old_ref, new_ref = InitResult(engine_metadata(pid=1)), InitResult(engine_metadata(pid=2))
     manager, group = make_manager([old_engine], [old_ref])
-    new_record = SimpleNamespace(value=new_ref)
+    new_record = rollout._EngineInitRecord(value=new_ref)
 
     class ReplaceDuringCacheWrite:
         value = property(lambda self: self.cached_value)
@@ -439,7 +443,7 @@ def test_get_engines_info_does_not_mix_status_if_slot_changes_after_helper(
     def read_then_replace(*args, **kwargs):
         row_data = real_helper(*args, **kwargs)
         group.all_engines[0] = make_engine() if initially_absent else None
-        group.engine_init_records[0] = SimpleNamespace(value=InitResult(engine_metadata(pid=2)))
+        group.engine_init_records[0] = rollout._EngineInitRecord(value=InitResult(engine_metadata(pid=2)))
         return row_data
 
     monkeypatch.setattr(rollout, "_read_engine_metadata", read_then_replace)
@@ -526,8 +530,8 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
     live, first, second = make_engine(), make_engine(), make_engine()
     manager, group = make_manager([live, None, None], [engine_metadata(pid=1)])
     live_record = group.engine_init_records[0]
-    group.engine_init_records[1] = SimpleNamespace(value=engine_metadata(pid=99))
-    group.engine_init_records[2] = SimpleNamespace(value=engine_metadata(pid=98))
+    group.engine_init_records[1] = rollout._EngineInitRecord(value=engine_metadata(pid=99))
+    group.engine_init_records[2] = rollout._EngineInitRecord(value=engine_metadata(pid=98))
     group.rank_offset = 5
     group.is_scaled_out = mode in ("native_scale_out", "native_recover")
     group.skip_dcs_registration = mode == "native_scale_out"
@@ -660,6 +664,8 @@ def prepare_external_manager(monkeypatch, *, policy="keep_partial", finalize_suc
 
 def test_external_partial_success_publishes_matching_compressed_refs(monkeypatch, zero_wait_get):
     manager, request, initial_group, engines, refs = prepare_external_manager(monkeypatch)
+    for engine, ref in zip(engines, refs):
+        engine.get_url.remote.side_effect = lambda ref=ref: InitResult(ref.value["url"])
     real_finalize = manager._finalize_engine_group_registration
     manager._finalize_engine_group_registration = AsyncMock(wraps=real_finalize)
 
@@ -676,6 +682,11 @@ def test_external_partial_success_publishes_matching_compressed_refs(monkeypatch
     assert new_group.engine_init_records[0].value is refs[0]
     assert new_group.engine_init_records[1].value is refs[2]
     manager._rollback_engines.assert_awaited_once_with([engines[1]])
+    for engine in (engines[0], engines[2]):
+        engine.get_url.remote.assert_called_once_with()
+        engine.get_url.remote.reset_mock()
+        engine.get_url.remote.side_effect = lambda: pytest.fail("discovery submitted get_url RPC")
+    engines[1].get_url.remote.assert_not_called()
     observed = manager.get_engines_info()
     assert observed["observation"]["complete"] is True
     assert [row["rank"] for row in engine_rows(observed, group_index=1)] == [1, 2]
@@ -706,7 +717,7 @@ def test_external_failure_cleans_only_owned_success_and_failure_actors(monkeypat
         engine.register_to_router.remote.assert_not_called()
 
 
-def test_native_finalizer_keeps_existing_init_record_identity():
+def test_native_finalizer_keeps_existing_init_record_identity(zero_wait_get):
     engine = make_engine()
     ref = InitResult(engine_metadata())
     manager, group = make_manager([engine], [ref])
@@ -717,6 +728,7 @@ def test_native_finalizer_keeps_existing_init_record_identity():
     manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
     engine.register_dcs.remote.side_effect = lambda: InitResult(None)
     engine.register_to_router.remote.side_effect = lambda: InitResult(True)
+    engine.get_url.remote.side_effect = lambda: InitResult(ref.value["url"])
     request = rollout.ScaleOutRequest(
         request_id="native-metadata-test", status=rollout.ScaleOutStatus.CREATING, model_name="actor"
     )
@@ -730,9 +742,14 @@ def test_native_finalizer_keeps_existing_init_record_identity():
     assert server.engine_groups == [group]
     assert group.engine_init_records[0] is record
     assert record.value is ref
+    engine.get_url.remote.assert_called_once_with()
+    engine.get_url.remote.reset_mock()
+    engine.get_url.remote.side_effect = lambda: pytest.fail("discovery submitted get_url RPC")
+    assert manager.get_engines_info()["observation"]["complete"] is True
+    assert group.engine_init_records[0] is record
 
 
-def prepare_sglang_init(monkeypatch, *, external=False, node_rank=0):
+def prepare_sglang_init(monkeypatch, *, external=False, node_rank=0, backend_session=None):
     from relax.backends.sglang import sglang_engine
 
     args = SimpleNamespace(sglang_router_ip="127.0.0.1", sglang_router_port=3000, rollout_external=external)
@@ -748,7 +765,12 @@ def prepare_sglang_init(monkeypatch, *, external=False, node_rank=0):
     monkeypatch.setattr(
         sglang_engine.ray, "get_runtime_context", lambda: SimpleNamespace(get_node_id=lambda: "ray-node")
     )
-    engine._init_normal = MagicMock(side_effect=lambda *args, **kwargs: events.append("normal_started"))
+
+    def start_normal(*args, **kwargs):
+        events.append("normal_started")
+        engine.process = SimpleNamespace(backend_session=backend_session, is_alive=lambda: False)
+
+    engine._init_normal = MagicMock(side_effect=start_normal)
     engine._init_external = MagicMock(side_effect=lambda *args, **kwargs: events.append("external_started"))
     engine.register_dcs = MagicMock(side_effect=lambda: events.append("dcs_registered"))
     return engine, events
@@ -758,7 +780,16 @@ def prepare_sglang_init(monkeypatch, *, external=False, node_rank=0):
 @pytest.mark.parametrize("external", [False, True])
 @pytest.mark.parametrize("node_rank", [0, 1])
 def test_sglang_init_returns_metadata_after_success_for_both_dcs_paths(monkeypatch, skip_dcs, external, node_rank):
-    engine, events = prepare_sglang_init(monkeypatch, external=external, node_rank=node_rank)
+    backend_session = {
+        "boot_id": "test-boot",
+        "pid_namespace": 1234,
+        "pid": 5678,
+        "session_id": 5678,
+        "start_time": 9012,
+    }
+    engine, events = prepare_sglang_init(
+        monkeypatch, external=external, node_rank=node_rank, backend_session=backend_session
+    )
 
     result = engine.init("2001:db8::1:30001", 30000, None, host="2001:db8::1", skip_dcs_registration=skip_dcs)
 
@@ -766,6 +797,7 @@ def test_sglang_init_returns_metadata_after_success_for_both_dcs_paths(monkeypat
         "url": "http://[2001:db8::1]:30000" if node_rank == 0 else None,
         "pid": os.getpid(),
         "node_id": "ray-node",
+        "backend_session": None if external else backend_session,
     }
     assert events == ["external_started" if external else "normal_started"] + ([] if skip_dcs else ["dcs_registered"])
     assert engine.register_dcs.call_count == int(not skip_dcs)

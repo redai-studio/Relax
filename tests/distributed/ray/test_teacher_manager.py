@@ -1,57 +1,36 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import importlib
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _cleanup_teacher_manager_module():
-    yield
-    sys.modules.pop("relax.distributed.ray.teacher_manager", None)
+pytest.importorskip("sglang")
 
-
-def _install_teacher_manager_stubs(monkeypatch):
-    sglang_engine = ModuleType("relax.backends.sglang.sglang_engine")
-    sglang_engine.SGLangEngine = object
-
-    # Import the real factory before installing the optional engine stubs.
-    placement = importlib.import_module("relax.distributed.ray.placement_group")
-    monkeypatch.setattr(placement, "create_placement_group", MagicMock())
-
-    rollout = ModuleType("relax.distributed.ray.rollout")
-    rollout._allocate_rollout_engine_addr_and_ports_normal = MagicMock()
-
-    ray_utils = ModuleType("relax.distributed.ray.utils")
-    ray_utils.NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = []
-
-    http_utils = ModuleType("relax.utils.http_utils")
-    http_utils.find_available_port = MagicMock(return_value=15000)
-
-    monkeypatch.setitem(sys.modules, "relax.backends.sglang.sglang_engine", sglang_engine)
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout)
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.utils", ray_utils)
-    monkeypatch.setitem(sys.modules, "relax.utils.http_utils", http_utils)
+from relax.distributed.ray import teacher_manager as teacher_manager_module
 
 
 def _import_teacher_manager(monkeypatch):
-    _install_teacher_manager_stubs(monkeypatch)
-    sys.modules.pop("relax.distributed.ray.teacher_manager", None)
-    return importlib.import_module("relax.distributed.ray.teacher_manager")
+    placement = importlib.import_module("relax.distributed.ray.placement_group")
+    factory = MagicMock()
+    monkeypatch.setattr(placement, "create_placement_group", factory)
+    monkeypatch.setattr(teacher_manager_module, "create_placement_group", factory)
+    monkeypatch.setattr(teacher_manager_module, "_allocate_rollout_engine_addr_and_ports_normal", MagicMock())
+    monkeypatch.setattr(teacher_manager_module, "find_available_port", MagicMock(return_value=15000))
+    return teacher_manager_module
 
 
 def _make_teacher_manager(monkeypatch, *, num_replicas=1, gpus_per_replica=16, shared_pg=True, bundle_offset=0):
     teacher_manager_module = _import_teacher_manager(monkeypatch)
-    original_init = teacher_manager_module.MultiEngineManager.__init__
+    original_init = teacher_manager_module.InferenceManager.__init__
 
     def skip_engine_init(self, *args, **kwargs):
         kwargs["skip_init"] = True
         original_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(teacher_manager_module.MultiEngineManager, "__init__", skip_engine_init)
+    monkeypatch.setattr(teacher_manager_module.InferenceManager, "__init__", skip_engine_init)
     args = SimpleNamespace(
         num_gpus_per_node=8,
         rollout_num_gpus=80,
@@ -137,9 +116,11 @@ def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
 
 def test_teacher_manager_exposes_ray_actor_api(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
+    from relax.distributed.ray.inference_manager import InferenceManager
 
     assert hasattr(teacher_manager.TeacherManager, "remote")
     assert hasattr(teacher_manager.TeacherManager, "options")
+    assert issubclass(teacher_manager.TeacherManager.__ray_metadata__.modified_class, InferenceManager)
 
 
 @pytest.mark.parametrize(("gpus_per_replica", "num_nodes"), [(2, 1), (16, 2)])
@@ -189,6 +170,9 @@ def test_teacher_placement_uses_distributed_factory_and_preserves_ownership(monk
     manager._shared_pg = shared
     manager._bundle_offset = 2
     manager._shared_pg_tuple = ("shared", [0, 1], [0, 1])
+    manager._local_gpus_per_worker = 2
+    manager._dedicated_replica_pgs = {}
+    manager._planned_placement = None
     placement.create_placement_group.return_value = ("dedicated", [0, 1], [0, 1])
 
     pg, owned, gpu_index = manager._resolve_placement(1)
@@ -230,7 +214,7 @@ def test_dedicated_multinode_replica_creates_one_pg_for_both_slots(monkeypatch):
         placements.append(placement)
         manager._engine_placements[rank] = placement[:2]
 
-    assert placements == [(pg0, True, 0), (pg0, False, 8), (pg1, True, 0), (pg1, False, 8)]
+    assert placements == [(pg0, True, 0), (pg0, True, 8), (pg1, True, 0), (pg1, True, 8)]
     assert teacher_manager_module.create_placement_group.call_count == 2
     for call in teacher_manager_module.create_placement_group.call_args_list:
         assert call.kwargs["num_gpus"] == 16
@@ -321,7 +305,10 @@ def test_multinode_teacher_routes_and_memory_operations_use_only_heads(monkeypat
     for rank, engine in enumerate(engines):
         engine.get_url.remote.return_value = f"http://192.0.2.{rank + 1}:15000"
         engine.health_generate.remote.return_value = True
+        engine.health_process.remote.return_value = True
     manager.all_engines = engines
+    for key, workers in manager._inference_replicas().items():
+        manager._inference_observation.initialized(key, workers, weights_ready=True)
     monkeypatch.setattr(teacher_manager_module.ray, "get", lambda ref, timeout=None: ref)
 
     assert manager.get_urls() == ["http://192.0.2.1:15000/generate", "http://192.0.2.3:15000/generate"]

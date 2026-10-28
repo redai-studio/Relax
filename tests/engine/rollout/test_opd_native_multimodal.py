@@ -11,6 +11,7 @@ import pybase64
 import pytest
 
 from relax.engine.rollout.on_policy_distillation import OpdManager
+from relax.inference.routing import InferenceRoutingError
 from relax.utils.opd.opd_main_worker import LogprobResponse
 from relax.utils.opd.opd_multimodal import (
     encode_image_inputs,
@@ -107,11 +108,31 @@ class _Session:
         raise RuntimeError("HTTP failure")
 
 
+@pytest.fixture(params=["external", "managed"])
+def teacher_manager(request, monkeypatch):
+    def create(session, **overrides):
+        if request.param == "managed":
+
+            async def generate(url, payload, **kwargs):
+                session.requests.append((url, payload))
+                if session.status >= 400:
+                    if session.status == 503:
+                        raise InferenceRoutingError(session.status, "Teacher unavailable")
+                    session.raise_for_status()
+                return session.response
+
+            monkeypatch.setattr("relax.engine.rollout.on_policy_distillation.generate_with_discovery", generate)
+            overrides.update(_inference_teacher_discovery_url="http://teacher", opd_teacher_timeout_s=1.0)
+        return _manager(**overrides)
+
+    return create
+
+
 @pytest.mark.asyncio
-async def test_plain_image_opd_uses_collapsed_ids_raw_images_and_expanded_offset(processor_state):
+async def test_plain_image_opd_uses_collapsed_ids_raw_images_and_expanded_offset(processor_state, teacher_manager):
     sample = _sample()
     session = _Session(_response(sample.tokens))
-    assert await _manager()._teacher_prefill(sample, session)
+    assert await teacher_manager(session)._teacher_prefill(sample, session)
     payload = session.requests[0][1]
     assert payload["input_ids"] == sample.rollout_tokens
     assert payload["image_data"] == ["student-image"]
@@ -121,29 +142,35 @@ async def test_plain_image_opd_uses_collapsed_ids_raw_images_and_expanded_offset
 
 
 @pytest.mark.asyncio
-async def test_image_teacher_prefix_uses_collapsed_prompt_boundary(processor_state):
+async def test_image_teacher_prefix_uses_collapsed_prompt_boundary(processor_state, teacher_manager):
     sample = _sample()
     session = _Session(_response(sample.tokens[:-2] + [20, 21] + sample.tokens[-2:]))
-    await _manager(opd_teacher_response_prefix_token_ids=[20, 21])._teacher_prefill(sample, session)
+    await teacher_manager(session, opd_teacher_response_prefix_token_ids=[20, 21])._teacher_prefill(sample, session)
     payload = session.requests[0][1]
     assert payload["input_ids"] == [1, 99, 2, 20, 21, 10, 11]
     assert payload["logprob_start_len"] == 6
 
 
 @pytest.mark.asyncio
-async def test_image_teacher_rejects_same_length_retokenization_before_assigning_logprobs(processor_state):
+async def test_image_teacher_rejects_same_length_retokenization_before_assigning_logprobs(
+    processor_state, teacher_manager
+):
     sample = _sample()
     session = _Session(_response(sample.tokens[:-2] + [12, 13]))
     with pytest.raises(ValueError, match="expanded input IDs differ"):
-        await _manager()._teacher_prefill(sample, session)
+        await teacher_manager(session)._teacher_prefill(sample, session)
     assert sample.teacher_log_probs is None
 
 
 @pytest.mark.asyncio
-async def test_image_teacher_http_failure_cannot_be_masked_by_partial_batch_success(processor_state):
+@pytest.mark.parametrize("status", [500, 503])
+async def test_image_teacher_http_failure_cannot_be_masked_by_partial_batch_success(
+    processor_state, teacher_manager, status
+):
     sample = _sample()
+    session = _Session({}, status=status)
     with pytest.raises(RuntimeError, match="Native image OPD teacher prefill failed"):
-        await _manager()._teacher_prefill(sample, _Session({}, status=500))
+        await teacher_manager(session)._teacher_prefill(sample, session)
     assert sample.teacher_log_probs is None
 
 

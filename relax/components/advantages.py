@@ -11,6 +11,7 @@ from tensordict import TensorDict
 
 from relax.algorithms.advantages import compute_advantages_and_returns
 from relax.components.base import Base
+from relax.inference.defer import wait_inference_commit
 from relax.utils.async_utils import run as run_
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
@@ -56,6 +57,7 @@ class Advantages(Base):
         )
         try:
             while step < self.config.num_rollout:
+                run_(wait_inference_commit(self.config, step))
                 self._logger.info(
                     f"Start to got rollout_id: {step} data from transfer queue for compute advantages and returns."
                 )

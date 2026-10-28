@@ -48,6 +48,8 @@ def test_controller_shutdown_disposes_rollout_owner(monkeypatch, controller_modu
     service = SimpleNamespace(get_rollout_manager=AsyncMock(return_value=manager))
     controller.serve_dict = {controller_module.ROLES.rollout: service}
     controller._teacher_manager = None
+    controller._teacher_gateway = None
+    controller.config = SimpleNamespace()
     controller._shutdown_agentic_rollout_services = lambda: events.append("agentic")
     controller._cleanup_s3_model_weights_after_init = Mock()
     monkeypatch.setattr(controller_module, "run", asyncio.run)
@@ -77,7 +79,8 @@ def test_global_restart_disposes_owner_before_deleting_deployments(monkeypatch, 
     controller.serve_dict = {controller_module.ROLES.rollout: SimpleNamespace(_stop_heartbeat_thread=Mock())}
     events = []
     controller._cancel_pending_tasks = lambda: events.append("cancel")
-    controller._dispose_rollout_manager = lambda: events.append("dispose")
+    controller._confirm_inference_cleanup_for_restart = lambda: events.append("dispose")
+    controller._teacher_gateway = None
     monkeypatch.setattr(controller_module, "recovery_load_path", lambda config: None)
 
     class ReachedDeletion(BaseException):

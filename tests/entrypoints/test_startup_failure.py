@@ -413,6 +413,9 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
     partial_controller = SimpleNamespace(
         serve_dict={},
         _teacher_manager=teacher,
+        _shutdown_teacher_gateway=Mock(),
+        _shutdown_genrm_managers=Mock(),
+        _shutdown_inference_coordinator=Mock(),
         _shutdown_agentic_rollout_services=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )

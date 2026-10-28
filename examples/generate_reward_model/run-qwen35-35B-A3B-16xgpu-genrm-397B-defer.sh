@@ -6,11 +6,10 @@
 # dataset, using Qwen3.5-397B-A17B as the Generative Reward Model (GenRM).
 #
 # Mode: DEFER / SWAP — rollout and GenRM share ALL 16 GPUs (shared-bundles).
-# Inline reward is a no-op (--rm-type dummy); after all rollout finishes,
-# custom_reward_post_process (post_process_genrm_swap.py) offloads rollout,
-# onloads GenRM on the same 16 GPUs, batch-scores every sample, then offloads
-# GenRM before training starts. Rollout runs at full 16-GPU width; GenRM also
-# runs at full 16-GPU width. Serialized instead of overlapped.
+# Framework-managed deferred scoring offloads rollout after each closed batch,
+# activates GenRM on the same 16 GPUs, scores every sample with the registered
+# dapo-genrm adapter, and commits the batch before training starts. Rollout and
+# GenRM both run at full 16-GPU width, serialized instead of overlapped.
 #
 # Suitable for RLVR / heavy-rollout workloads where the rollout kernel
 # dominates and long-tail is minimal — the extra 8 GPUs during rollout more
@@ -57,9 +56,8 @@ ROLLOUT_ARGS=(
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rm-type dummy
-   --defer-reward-to-post-process
-   --custom-reward-post-process-path examples.generate_reward_model.post_process_genrm_swap.custom_reward_post_process
+   --rm-type dapo-genrm
+   --inference-defer-roles genrm
    --reward-key score
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size 16
@@ -69,32 +67,6 @@ ROLLOUT_ARGS=(
    --global-batch-size 128
    --use-fault-tolerance
    --balance-data
-)
-
-# Training reward is --rm-type dummy (real reward is deferred to the GenRM
-# post-process pass). Eval runs inline, so without an explicit scorer it would
-# inherit the global dummy rm_type and report a constant 0.0 (pass@k all zero).
-# resolve_rm_type prefers the per-sample metadata rm_type over args.rm_type, and
-# inject_metadata sources it from the eval dataset config's rm_type. --eval-config
-# is the only path that can set a per-dataset rm_type (--eval-prompt-data only
-# carries name/path), so pin the AIME eval to the real DAPO math verifier here.
-EVAL_CONFIG=${EXP_DIR}/eval-aime-dapo-${now}.yaml
-cat >"${EVAL_CONFIG}" <<EOF
-eval:
-  datasets:
-    - name: aime
-      path: ${DATA_DIR}/aime-2024/aime-2024.jsonl
-      rm_type: dapo
-EOF
-
-EVAL_ARGS=(
-   --log-passrate
-   --skip-eval-before-train
-   --eval-interval 20
-   --eval-config ${EVAL_CONFIG}
-   --n-samples-per-eval-prompt 8
-   --eval-max-response-len 8192
-   --eval-top-p 0.7
 )
 
 PERF_ARGS=(
@@ -109,7 +81,6 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --use-dynamic-batch-size
    --max-tokens-per-gpu 20480
    # --log-probs-max-tokens-per-gpu 40960
 
@@ -148,12 +119,12 @@ OPTIMIZER_ARGS=(
 
 # Rollout engine for the 35B-A3B actor. Shared-bundles colocate with GenRM:
 # rollout owns all 16 GPUs during generate; GenRM is asleep. Between rollout
-# and train, custom_reward_post_process (post_process_genrm_swap.py) offloads
-# rollout, onloads GenRM on the same 16 GPUs, batch-scores, then offloads
-# GenRM. mem_fraction can be generous because rollout and GenRM never hold
-# GPU memory at the same time.
-# rollout-num-gpus-per-engine 8 → 2 engines (TP=8 each) across 16 GPUs.
-# sglang-server-concurrency 32 → 32 in-flight per engine × 2 engines = 64 global.
+# and train, the framework deferred scoring stage offloads rollout, onloads
+# GenRM on the same 16 GPUs, scores the closed batch, then offloads GenRM.
+# mem_fraction can be generous because rollout and GenRM never hold GPU memory
+# at the same time.
+# rollout-num-gpus-per-engine 2 → 8 engines (TP=2 each) across 16 GPUs.
+# sglang-server-concurrency 32 → 32 in-flight per engine × 8 engines = 256 global.
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
@@ -164,8 +135,8 @@ SGLANG_ARGS=(
 # TP=8 is hard-capped by FP8 quantization: shared_expert per-partition must
 # divide block_n=128, i.e. 1024/TP % 128 == 0 → TP must divide 8. So we run
 # 2 engines of TP=DP=EP=8 across the 16 GPUs; router load-balances the batch.
-# Onloaded only during the post-process batch pass; asleep during rollout
-# and train.
+# Onloaded only during the framework scoring phase; asleep during rollout and
+# train.
 GENRM_ARGS=(
    --genrm-model-path ${MODEL_DIR}/Qwen3.5-397B-A17B-FP8/
    --genrm-num-gpus 16
@@ -214,14 +185,12 @@ export RUNTIME_ENV_JSON
 # actor_total triggers _genrm_colocate_with_rollout in
 # relax/utils/arguments.py:2887).
 # Two-phase execution (verl-style "reward loop colocate mode"):
-#   Phase A: rollout awake (16 GPU, 2× TP=8 engines), GenRM asleep.
-#            --rm-type dummy → inline reward is a no-op.
-#   Phase B: after all rollout done, post_process_genrm_swap.py offloads
-#            rollout, onloads GenRM on the same 16 GPUs (2× TP=8 engines),
-#            batch-scores every sample, then offloads GenRM.
-#   Phase C: actor wakes for train + weight update; GenRM stays offloaded
-#            (--defer-reward-to-post-process makes actor.update_weights skip
-#            its usual GenRM onload).
+#   Phase A: rollout awake (16 GPU, 8× TP=2 engines), GenRM asleep.
+#   Phase B: framework scoring offloads rollout, onloads GenRM on the same
+#            16 GPUs (2× TP=8 engines), scores every sample with dapo-genrm,
+#            validates the closed batch, then offloads GenRM.
+#   Phase C: actor waits for the committed batch, then wakes for train and
+#            weight update while GenRM stays offloaded.
 # ============================================
 
 mkdir -p log
@@ -240,7 +209,6 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    "${GRPO_ARGS[@]}" \
    "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
-   "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
    "${GENRM_ARGS[@]}" \
    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-35B-A3B-GRPO-GenRM397B-defer-gpu16-${now}.log

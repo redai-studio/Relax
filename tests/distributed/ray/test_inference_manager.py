@@ -1,40 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Core lifecycle behavior of ``MultiEngineManager``, exercised without a Ray
-cluster: fake engine handles stand in for Ray ObjectRefs, and ``ray.get``/
-``ray.kill`` are patched onto the module directly.
-
-This is the shared skeleton behind both ``GenRMManager`` and
-``TeacherManager``, so a regression here silently breaks both judge serving
-and OPD teacher recovery/offload-onload.
-"""
 
 from __future__ import annotations
 
-import sys
 from types import SimpleNamespace
 
 import pytest
 
-
-try:
-    import ray  # noqa: F401
-
-    from relax.distributed.ray.multi_engine_manager import MultiEngineManager
-
-    HAS_DEPS = True
-except ImportError:
-    HAS_DEPS = False
-
-
-pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="requires ray")
+from relax.distributed.ray import inference_manager
+from relax.distributed.ray.inference_manager import InferenceManager
 
 
 class _RemoteCall:
-    """Fakes ``engine.method.remote()``: returns a token that the patched
-    ``ray.get`` resolves to whatever the engine was configured to return (or
-    raises, for a dead engine)."""
-
     def __init__(self, engine: "_FakeEngine", method: str):
         self._engine = engine
         self._method = method
@@ -53,17 +30,15 @@ class _FakeEngine:
         return _RemoteCall(self, method)
 
 
-class _FakeManager(MultiEngineManager):
-    """A minimal concrete manager: one engine per rank, no placement group
-    (hooks return sentinel values that the test never inspects)."""
-
+class _FakeManager(InferenceManager):
     def __init__(
-        self, num_slots: int, *, nodes_per_engine: int = 1, owns_pg: bool = False, log_prefix: str = "[fake]"
+        self, num_slots: int, *, owns_pg: bool = False, nodes_per_engine: int = 1, log_prefix: str = "[fake]"
     ):
         self._made: list[_FakeEngine] = []
         self._dead_at_init: set[int] = set()
         self._removed_pg = False
         self._instance_owns_pg = owns_pg
+        self._inference_preserves_weights = True
         super().__init__(
             SimpleNamespace(),
             num_slots=num_slots,
@@ -86,17 +61,12 @@ class _FakeManager(MultiEngineManager):
 
 
 class _FakeEngineActorCls:
-    """Stand-in engine "actor class"; ``ray.remote(cls)`` in the base class
-    just needs something ``.options(...).remote(...)`` works on."""
+    pass
 
 
 @pytest.fixture(autouse=True)
 def _patch_ray(monkeypatch):
-    """Patch the ray module used by multi_engine_manager: ``ray.remote`` wraps
-    our fake class into something whose ``.options().remote()`` returns a
-    _FakeEngine; ``ray.get`` resolves _RemoteCall tokens; ``ray.kill`` is a no-
-    op recorder."""
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.inference_manager as inference_manager
 
     created: list[_FakeEngine] = []
     killed: list[_FakeEngine] = []
@@ -104,7 +74,7 @@ def _patch_ray(monkeypatch):
 
     def fake_remote(cls):
         if cls is not _FakeEngineActorCls:
-            return cls  # pass through decorators applied to real classes elsewhere
+            return cls
 
         class _Options:
             @staticmethod
@@ -134,10 +104,10 @@ def _patch_ray(monkeypatch):
     def fake_kill(engine):
         killed.append(engine)
 
-    monkeypatch.setattr(mem.ray, "remote", fake_remote)
-    monkeypatch.setattr(mem.ray, "get", fake_get)
-    monkeypatch.setattr(mem.ray, "kill", fake_kill)
-    monkeypatch.setattr(mem.ray.exceptions, "RayActorError", RuntimeError, raising=False)
+    monkeypatch.setattr(inference_manager.ray, "remote", fake_remote)
+    monkeypatch.setattr(inference_manager.ray, "get", fake_get)
+    monkeypatch.setattr(inference_manager.ray, "kill", fake_kill)
+    monkeypatch.setattr(inference_manager.ray.exceptions, "RayActorError", RuntimeError, raising=False)
 
     yield state
 
@@ -145,27 +115,26 @@ def _patch_ray(monkeypatch):
 def test_fanout_isolates_one_dead_engine_from_the_rest(_patch_ray):
     manager = _FakeManager(num_slots=3)
     for engine in manager.all_engines:
-        engine.calls.clear()  # drop the init() calls made during construction
+        engine.calls.clear()
     dead_engine = manager.all_engines[1]
     dead_engine.dead_methods = frozenset({"release_memory_occupation"})
 
     dead_ranks = manager._fanout("release_memory_occupation")
 
     assert dead_ranks == [1]
-    # The other two engines still got the call.
     assert manager.all_engines[0].calls == ["release_memory_occupation"]
     assert manager.all_engines[2].calls == ["release_memory_occupation"]
 
 
 def test_fanout_reraises_non_dead_exceptions(_patch_ray, monkeypatch):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.inference_manager as inference_manager
 
     manager = _FakeManager(num_slots=1)
 
     def raise_value_error(handle_or_list, timeout=None):
         raise ValueError("a real bug, not a dead engine")
 
-    monkeypatch.setattr(mem.ray, "get", raise_value_error)
+    monkeypatch.setattr(inference_manager.ray, "get", raise_value_error)
 
     with pytest.raises(ValueError, match="a real bug"):
         manager._fanout("release_memory_occupation")
@@ -174,7 +143,7 @@ def test_fanout_reraises_non_dead_exceptions(_patch_ray, monkeypatch):
 def test_offload_onload_are_idempotent_when_state_unchanged(_patch_ray):
     manager = _FakeManager(num_slots=2)
     for engine in manager.all_engines:
-        engine.calls.clear()  # drop the init() calls made during construction
+        engine.calls.clear()
     assert manager.is_onloaded()
 
     manager.offload()
@@ -182,7 +151,6 @@ def test_offload_onload_are_idempotent_when_state_unchanged(_patch_ray):
     for engine in manager.all_engines:
         assert engine.calls == ["release_memory_occupation"]
 
-    # A second offload while already offloaded must not re-fire the RPC.
     manager.offload()
     for engine in manager.all_engines:
         assert engine.calls == ["release_memory_occupation"]
@@ -192,7 +160,6 @@ def test_offload_onload_are_idempotent_when_state_unchanged(_patch_ray):
     for engine in manager.all_engines:
         assert engine.calls == ["release_memory_occupation", "resume_memory_occupation"]
 
-    # A second onload (no tags) while already onloaded must not re-fire the RPC.
     manager.onload()
     for engine in manager.all_engines:
         assert engine.calls == ["release_memory_occupation", "resume_memory_occupation"]
@@ -205,7 +172,7 @@ def test_retire_engines_kills_and_nulls_the_slot(_patch_ray):
     manager._retire_engines([0])
 
     assert manager.all_engines[0] is None
-    assert manager.all_engines[1] is not None  # untouched
+    assert manager.all_engines[1] is not None
     assert dead_engine in _patch_ray.killed
 
 
@@ -219,11 +186,11 @@ def test_recover_rebuilds_only_the_dead_slot(_patch_ray):
     assert rebuilt == {0}
     assert manager.all_engines[0] is not None
     assert manager.all_engines[0] is not original_engine_1
-    assert manager.all_engines[1] is original_engine_1  # untouched
+    assert manager.all_engines[1] is original_engine_1
 
 
 def test_recover_raises_on_total_wipeout(_patch_ray, monkeypatch):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.inference_manager as inference_manager
 
     manager = _FakeManager(num_slots=1)
     manager._retire_engines([0])
@@ -239,19 +206,15 @@ def test_recover_raises_on_total_wipeout(_patch_ray, monkeypatch):
     class _FailingActor:
         options = staticmethod(failing_options)
 
-    monkeypatch.setattr(mem.ray, "remote", lambda cls: _FailingActor)
+    monkeypatch.setattr(inference_manager.ray, "remote", lambda cls: _FailingActor)
 
     with pytest.raises(RuntimeError, match="could not be rebuilt"):
         manager.recover()
 
 
 def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray, monkeypatch):
-    # ray.util.placement_group is shadowed as an attribute by a same-named
-    # function on the ray.util package, so it must be patched via sys.modules
-    # (where the actual submodule lives) rather than a dotted monkeypatch path.
-    placement_group_submodule = sys.modules["ray.util.placement_group"]
     removed_pgs = []
-    monkeypatch.setattr(placement_group_submodule, "remove_placement_group", lambda pg: removed_pgs.append(pg))
+    monkeypatch.setattr(inference_manager, "remove_placement_group", lambda pg: removed_pgs.append(pg))
 
     owning_manager = _FakeManager(num_slots=1, owns_pg=True)
     owning_manager.shutdown()
@@ -263,9 +226,36 @@ def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray,
     assert removed_pgs == []
 
 
+def test_inference_manager_partial_resume_does_not_skip_full_resume(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+    engine.calls.clear()
+
+    manager.offload()
+    manager.onload(tags=["weights"])
+    manager.onload()
+
+    assert engine.calls == [
+        "release_memory_occupation",
+        "resume_memory_occupation",
+        "resume_memory_occupation",
+        "continue_generation",
+    ]
+
+
+def test_inference_manager_shutdown_retires_all_multinode_worker_slots(_patch_ray):
+    manager = _FakeManager(num_slots=4, nodes_per_engine=2)
+    original_engines = list(manager.all_engines)
+
+    manager.shutdown()
+
+    assert set(_patch_ray.killed) == set(original_engines)
+    assert manager.all_engines == [None, None, None, None]
+
+
 def test_shutdown_cleans_follower_slots_and_preserves_borrowed_placement_group(_patch_ray, monkeypatch):
     removed_pgs = []
-    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", removed_pgs.append)
+    monkeypatch.setattr(inference_manager, "remove_placement_group", removed_pgs.append)
     manager = _FakeManager(num_slots=4, nodes_per_engine=2)
     engines = list(manager.all_engines)
     for engine in engines:
@@ -307,7 +297,7 @@ def test_multinode_shutdown_stops_followers_before_removing_owned_group(_patch_r
     manager = _FakeManager(num_slots=2, nodes_per_engine=2)
     engines = list(manager.all_engines)
     shared_pg = ("shared-pg", [0, 1], [0, 0])
-    manager._engine_placements = {0: (shared_pg, True), 1: (shared_pg, False)}
+    manager._engine_placements = {0: (shared_pg, True), 1: (shared_pg, True)}
     removed_pgs = []
 
     def remove_pg(pg):
@@ -315,7 +305,7 @@ def test_multinode_shutdown_stops_followers_before_removing_owned_group(_patch_r
         assert all("shutdown" in engine.calls for engine in engines)
         removed_pgs.append(pg)
 
-    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", remove_pg)
+    monkeypatch.setattr(inference_manager, "remove_placement_group", remove_pg)
     manager.shutdown()
 
     assert removed_pgs == ["shared-pg"]
@@ -325,7 +315,7 @@ def test_multinode_shutdown_stops_followers_before_removing_owned_group(_patch_r
 
 @pytest.mark.parametrize("failure", ["actor_creation", "address", "init"])
 def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_patch_ray, monkeypatch, failure):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.inference_manager as mem
 
     manager = _FakeManager(num_slots=4, nodes_per_engine=2)
     healthy_engines = manager.all_engines[2:]
@@ -337,7 +327,7 @@ def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_p
     removed_pgs = []
 
     def resolve_placement(rank):
-        return shared_pg, rank == 0, rank
+        return shared_pg, True, rank
 
     def remove_pg(pg):
         assert all(engine in _patch_ray.killed for engine in _patch_ray.created)
@@ -345,7 +335,7 @@ def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_p
         removed_pgs.append(pg)
 
     monkeypatch.setattr(manager, "_resolve_placement", resolve_placement)
-    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", remove_pg)
+    monkeypatch.setattr(inference_manager, "remove_placement_group", remove_pg)
     if failure == "actor_creation":
         _patch_ray.fail_create_rank = 0
     elif failure == "address":
