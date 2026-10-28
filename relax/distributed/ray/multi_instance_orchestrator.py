@@ -68,16 +68,29 @@ def start_multi_instance_managers(
     """
     managers: dict[str, Any] = {}
     bundle_offset = region_offset
-    for key, spec in instance_specs.items():
-        per_instance_args = build_manager_args(args, key, spec)
-        manager = spawn_manager(key, per_instance_args, bundle_offset, spec)
-        managers[key] = manager
-        logger.info(f"Launched instance '{key}': bundle_offset={bundle_offset}, num_gpus={spec['num_gpus']}")
-        # Prefix sum, not idx * num_gpus: instances may have unequal GPU
-        # budgets, so each region must start where the previous one ended.
-        bundle_offset += spec["num_gpus"]
+    try:
+        for key, spec in instance_specs.items():
+            per_instance_args = build_manager_args(args, key, spec)
+            manager = spawn_manager(key, per_instance_args, bundle_offset, spec)
+            managers[key] = manager
+            logger.info(f"Launched instance '{key}': bundle_offset={bundle_offset}, num_gpus={spec['num_gpus']}")
+            # Prefix sum, not idx * num_gpus: instances may have unequal GPU
+            # budgets, so each region must start where the previous one ended.
+            bundle_offset += spec["num_gpus"]
 
-    if getattr(args, "offload_rollout", False):
-        ray.get([m.offload.remote() for m in managers.values()])
+        if getattr(args, "offload_rollout", False):
+            ray.get([m.offload.remote() for m in managers.values()])
+
+    except BaseException:
+        for manager in managers.values():
+            try:
+                ray.get(manager.shutdown.remote(), timeout=60)
+            except Exception:
+                logger.exception("Failed to shut down candidate inference manager")
+            try:
+                ray.kill(manager)
+            except Exception:
+                logger.exception("Failed to kill candidate inference manager")
+        raise
 
     return managers

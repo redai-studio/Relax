@@ -734,30 +734,66 @@ async def generate_and_rm(
     if args.group_rm:
         return sample
 
+    # Decoupled Teacher engines have their own resource pool, so they can score
+    # the generated response before a custom reward runs.  The colocated path
+    # keeps the existing post-reward prefill ordering because its Teacher shares
+    # the Actor placement group and is coordinated by the deferred lifecycle.
+    decoupled_opd = (
+        state.opd_manager is not None
+        and not evaluation
+        and not getattr(args, "opd_teacher_defer", False)
+        and not getattr(args, "colocate", False)
+    )
+
     # multi samples
     if isinstance(sample, list):
         samples = sample
         if any(sample.status == Sample.Status.ABORTED for sample in samples):
             return samples
 
+        if decoupled_opd:
+            await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
+
         # for multi agent system, the reward of some sample is calculated during generation.
         samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
+        rewards = (
+            [{args.reward_key: 0.0} if args.reward_key else 0.0 for _ in samples_need_reward]
+            if getattr(args, "defer_reward_to_post_process", False)
+            else await batched_async_rm(args, samples_need_reward)
+        )
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        if (
+            state.opd_manager
+            and not evaluation
+            and not getattr(args, "opd_teacher_defer", False)
+            and not decoupled_opd
+        ):
             await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
 
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
             return sample
+
+        if decoupled_opd:
+            await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
+
         # for multi-turn environment, a reward could be assigned to the agent.
         if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
+            sample.reward = (
+                ({args.reward_key: 0.0} if args.reward_key else 0.0)
+                if getattr(args, "defer_reward_to_post_process", False)
+                else await async_rm(args, sample)
+            )
 
-        if state.opd_manager and not evaluation:
+        if (
+            state.opd_manager
+            and not evaluation
+            and not getattr(args, "opd_teacher_defer", False)
+            and not decoupled_opd
+        ):
             await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
 
     return sample
@@ -838,11 +874,29 @@ async def generate_and_rm_group(
     group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
     if (not state.aborted or evaluation) and args.group_rm and not group_has_training_abort:
-        rewards = await batched_async_rm(args, group)
+        decoupled_opd = (
+            state.opd_manager is not None
+            and not evaluation
+            and not getattr(args, "opd_teacher_defer", False)
+            and not getattr(args, "colocate", False)
+        )
+        if decoupled_opd:
+            await state.opd_manager.prefill(group, _encode_multimodal_inputs)
+
+        rewards = (
+            [{args.reward_key: 0.0} if args.reward_key else 0.0 for _ in group]
+            if getattr(args, "defer_reward_to_post_process", False)
+            else await batched_async_rm(args, group)
+        )
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        if (
+            state.opd_manager
+            and not evaluation
+            and not getattr(args, "opd_teacher_defer", False)
+            and not decoupled_opd
+        ):
             await state.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     return group
@@ -948,6 +1002,15 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    deferred = bool(getattr(args, "opd_teacher_defer", False) or getattr(args, "defer_reward_to_post_process", False))
+    deferred_batches = []
+    drained_samples = None
+
+    async def _transfer(*transfer_args, **transfer_kwargs):
+        if deferred:
+            deferred_batches.append((transfer_args, transfer_kwargs))
+        else:
+            await transfer_batch_to_data_system(*transfer_args, **transfer_kwargs)
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1119,7 +1182,7 @@ async def generate_rollout_async(
                 # is_last: this backfill closes the previous partition's debt.
                 prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
                 transfer_task = asyncio.create_task(
-                    transfer_batch_to_data_system(
+                    _transfer(
                         args,
                         batch_to_transfer,
                         n,
@@ -1140,7 +1203,7 @@ async def generate_rollout_async(
                     # it always closes the debt, so it is the previous partition's last.
                     prev_is_last = args.fully_async and (committed_prev + n_prev >= prev_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        _transfer(
                             args,
                             batch_to_transfer[:cutoff_batch],
                             n_prev,
@@ -1161,7 +1224,7 @@ async def generate_rollout_async(
                     # target (no deficit carried) — otherwise the tail is backfilled next step.
                     curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        _transfer(
                             args,
                             batch_to_transfer,
                             n,
@@ -1182,7 +1245,7 @@ async def generate_rollout_async(
         if is_final_backfill:
             prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
             transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
+                _transfer(
                     args,
                     batch_to_transfer,
                     n,
@@ -1200,7 +1263,7 @@ async def generate_rollout_async(
             if n_prev:
                 transfer_tasks.append(
                     asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        _transfer(
                             args,
                             batch_to_transfer[:n_prev],
                             n_prev,
@@ -1216,7 +1279,7 @@ async def generate_rollout_async(
             if n:
                 transfer_tasks.append(
                     asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        _transfer(
                             args,
                             batch_to_transfer,
                             n,
@@ -1233,6 +1296,31 @@ async def generate_rollout_async(
     # Wait for all transfer tasks to complete
     if transfer_tasks:
         await asyncio.gather(*transfer_tasks)
+    if deferred:
+        # Oversampling work must finish/abort before any GPU lease changes.
+        drained_samples = await abort(args, rollout_id)
+        from relax.inference.lifecycle import run_deferred_batch
+
+        def flatten(rows):
+            for row in rows:
+                if isinstance(row, list):
+                    yield from flatten(row)
+                else:
+                    yield row
+
+        retained = sorted(
+            [sample for transfer_args, _ in deferred_batches for sample in flatten(transfer_args[1])],
+            key=lambda sample: sample.index,
+        )
+
+        async def publish():
+            for transfer_args, transfer_kwargs in deferred_batches:
+                await transfer_batch_to_data_system(*transfer_args, **transfer_kwargs)
+
+        reward_groups = [flatten(group) for transfer_args, _ in deferred_batches for group in transfer_args[1]]
+        await run_deferred_batch(
+            args, retained, state.opd_manager, _encode_multimodal_inputs, publish, reward_groups=reward_groups
+        )
     pbar.close()
 
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
@@ -1250,7 +1338,9 @@ async def generate_rollout_async(
 
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
-    new_aborted, completed_protected = await abort(args, rollout_id)
+    new_aborted, completed_protected = (
+        drained_samples if drained_samples is not None else await abort(args, rollout_id)
+    )
     for group in new_aborted + completed_protected:
         # Groups completed during abort have not passed the main-loop filter.
         if (
@@ -1315,7 +1405,7 @@ async def generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                await _transfer(args, accepted, len(accepted), rollout_id, data_system_client)
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
     global CURRENT_ROLLOUT_BATCH
@@ -1358,6 +1448,38 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
         results = {}
         for r in results_list:
             results.update(r)
+        if getattr(args, "defer_reward_to_post_process", False) and results:
+            from relax.distributed.ray.rollout import get_local_rollout_manager
+            from relax.inference.lifecycle import run_deferred_batch
+
+            eval_args = copy.copy(args)
+            eval_args.opd_teacher_defer = False
+            samples = [sample for result in results.values() for sample in result["samples"]]
+
+            async def finish_rewards():
+                return None
+
+            reward_groups = {}
+            for sample in samples:
+                reward_groups.setdefault(getattr(sample, "_inference_reward_group", None), []).append(sample)
+            await run_deferred_batch(
+                eval_args,
+                samples,
+                None,
+                _encode_multimodal_inputs,
+                finish_rewards,
+                evaluation=True,
+                reward_groups=list(reward_groups.values()),
+            )
+            await get_local_rollout_manager().onload()
+            if not getattr(args, "opd_teacher_defer", False):
+                for teacher in getattr(args, "_inference_teacher_managers", {}).values():
+                    await teacher.onload.remote()
+            reward_key = args.eval_reward_key or args.reward_key
+            for result in results.values():
+                result["rewards"] = [
+                    sample.reward if not reward_key else sample.reward[reward_key] for sample in result["samples"]
+                ]
         return RolloutFnEvalOutput(data=results), []
     finally:
         state.evaluating -= 1
@@ -1420,6 +1542,7 @@ async def eval_rollout_single_dataset(
             group = []
             for j in range(dataset_cfg.n_samples_per_eval_prompt):
                 sample = copy.deepcopy(prompt_sample)
+                sample._inference_reward_group = (dataset_cfg.name, _i)
                 sample.index = sample_index
                 sample_index += 1
                 sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
@@ -1494,7 +1617,11 @@ async def eval_rollout_single_dataset(
     reward_key = args.eval_reward_key or args.reward_key
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "rewards": (
+                []
+                if getattr(args, "defer_reward_to_post_process", False)
+                else [sample.reward if not reward_key else sample.reward[reward_key] for sample in data]
+            ),
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
         }

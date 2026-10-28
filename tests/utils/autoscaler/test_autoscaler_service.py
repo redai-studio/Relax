@@ -76,7 +76,9 @@ def test_evaluate_incomplete_discovery_pauses_new_scaling(action):
         "issues": [{"scope": "default/0/6", "reason": "init_pending"}],
     }
     svc = _service(_FakeSession(get_payload=payload))
-    svc._state.pending_requests = [{"request_id": "old", "action": "scale_out", "status": "ACTIVE"}]
+    svc._state.pending_requests = [
+        {"request_id": "old", "action": "scale_out", "status": "ACTIVE", "cleanup_required": False}
+    ]
     svc.metrics_collector = Mock()
     svc.metrics_collector.collect_all = AsyncMock(return_value={})
     svc.metrics_collector.get_aggregated_metrics.return_value = AggregatedMetrics(
@@ -424,8 +426,12 @@ def test_evaluate_resets_debounce_when_no_engines():
 
 
 def test_update_pending_requests_treats_partial_as_terminal():
-    svc = _service(session=_FakeSession())  # terminal-at-entry: GET is never issued
-    svc._state.pending_requests = [{"request_id": "r1", "action": "scale_out", "status": "PARTIAL", "delta": 2}]
+    # Terminal-at-entry with cleanup PROVEN clean (authoritative False): the
+    # GET is never issued and the request finalizes immediately.
+    svc = _service(session=_FakeSession())
+    svc._state.pending_requests = [
+        {"request_id": "r1", "action": "scale_out", "status": "PARTIAL", "delta": 2, "cleanup_required": False}
+    ]
     asyncio.run(svc._update_pending_requests())
     assert svc._state.pending_requests == []
     assert len(svc._state.scale_history) == 1
@@ -446,10 +452,12 @@ def test_update_pending_requests_keeps_non_terminal():
 
 
 def test_update_pending_requests_scale_in_completed_terminal():
-    """scale_in terminal state is COMPLETED (not ACTIVE) -> moved to
-    history."""
+    """scale_in terminal state is COMPLETED (not ACTIVE) -> moved to history
+    when cleanup is proven clean."""
     svc = _service(session=_FakeSession())  # terminal-at-entry: GET is never issued
-    svc._state.pending_requests = [{"request_id": "s1", "action": "scale_in", "status": "COMPLETED", "delta": 1}]
+    svc._state.pending_requests = [
+        {"request_id": "s1", "action": "scale_in", "status": "COMPLETED", "delta": 1, "cleanup_required": False}
+    ]
     asyncio.run(svc._update_pending_requests())
     assert svc._state.pending_requests == []
     assert len(svc._state.scale_history) == 1
@@ -467,6 +475,7 @@ def test_update_pending_requests_propagates_failure_categories():
             "status": "FAILED",
             "error_message": "scale-out failed: NCCL transport mismatch: wrong_type",
             "failure_categories": ["NCCL_PRECHECK_TRANSPORT_MISMATCH"],
+            "cleanup_required": False,
         },
         get_status=200,
     )
@@ -825,3 +834,71 @@ def test_update_config_validate_backstop_rejects_invariant_violation():
     req = ConfigUpdateRequest(metrics_interval_secs=100.0)  # > evaluation_interval_secs
     with pytest.raises(ValueError):
         asyncio.run(svc.update_config(req))
+
+
+@pytest.mark.parametrize("incomplete_service", ["rollout", "genrm"])
+def test_incomplete_observation_only_pauses_affected_service(incomplete_service):
+    svc = _service()
+    svc.config.service_targets = {"genrm": "http://genrm"}
+    svc._rebuild_service_runtimes()
+    svc._update_pending_requests = AsyncMock()
+
+    async def fetch(service="rollout"):
+        complete = service != incomplete_service
+        issues = [] if complete else [{"scope": service, "reason": "capacity_unavailable"}]
+        return [{"id": service, "url": f"http://{service}", "model_name": "default"}], {
+            "complete": complete,
+            "issues": issues,
+        }
+
+    svc._fetch_engines = fetch
+    for runtime in svc._services.values():
+        runtime.metrics_collector = Mock()
+        runtime.metrics_collector.collect_all = AsyncMock(return_value={})
+        runtime.decision_engine = Mock()
+        runtime.decision_engine.evaluate.return_value = ScalingDecision(action=ScalingAction.NONE)
+    asyncio.run(svc._evaluate_and_scale())
+    for name, runtime in svc._services.items():
+        if name == incomplete_service:
+            runtime.decision_engine.reset_condition_trackers.assert_called_once()
+            runtime.decision_engine.evaluate.assert_not_called()
+            runtime.metrics_collector.collect_all.assert_not_awaited()
+        else:
+            runtime.decision_engine.evaluate.assert_called_once()
+            runtime.metrics_collector.collect_all.assert_awaited_once()
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_genrm_discovery_preserves_observation_protocol(complete):
+    observation = {
+        "complete": complete,
+        "issues": [] if complete else [{"scope": "judge", "reason": "cleanup_pending"}],
+    }
+    svc = _service(
+        _FakeSession(
+            get_payload={
+                "instances": {"judge": {"engines": [{"host": "192.0.2.1", "port": 8000}]}},
+                "observation": observation,
+            }
+        )
+    )
+    svc.config.service_targets = {"genrm": "http://genrm"}
+    engines, observed = asyncio.run(svc._fetch_engines("genrm"))
+    assert engines[0]["url"] == "http://192.0.2.1:8000"
+    assert engines[0]["model_name"] == "judge"
+    assert observed == observation
+
+
+@pytest.mark.parametrize(
+    "host,port", [([], 8000), ({"bad": 1}, 8000), ("host", "bad"), ("host", True), ("host", 65536)]
+)
+def test_genrm_discovery_rejects_invalid_address(host, port):
+    svc = _service(
+        _FakeSession(
+            get_payload={"engines": [{"host": host, "port": port}], "observation": {"complete": True, "issues": []}}
+        )
+    )
+    svc.config.service_targets = {"genrm": "http://genrm"}
+    engines, observation = asyncio.run(svc._fetch_engines("genrm"))
+    assert engines == []
+    assert not observation["complete"]

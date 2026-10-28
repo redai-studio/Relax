@@ -3,6 +3,7 @@
 import threading
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import transfer_queue
@@ -18,6 +19,29 @@ if not hasattr(transfer_queue, "StreamingTokenBudgetSampler"):
 
 controller = load_controller_with_stubbed_dependencies("_test_controller_s3_model_cleanup_controller")
 ROLES = controller.ROLES
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_invalid_rollout_budget_fails_before_teacher_or_pg_creation(monkeypatch, hybrid):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(
+        advantage_estimator="grpo",
+        resource={"actor": [1, 4], "rollout": [1, 4]},
+        colocate=hybrid,
+        hybrid=hybrid,
+        rollout_num_gpus=8,
+        rollout_num_gpus_per_engine=2,
+        num_gpus_per_node=4,
+    )
+    boundaries = []
+    for name in ("maybe_start_managed_opd_teacher", "create_placement_group", "create_data_source_actor"):
+        spy = Mock(side_effect=AssertionError(f"Invalid layout reached {name}"))
+        monkeypatch.setattr(controller, name, spy)
+        boundaries.append(spy)
+    with pytest.raises(ValueError, match="independent resource budget"):
+        instance.register_all_serve()
+    for spy in boundaries:
+        spy.assert_not_called()
 
 
 def test_train_start_config_attaches_remote_model_config_without_mutating_args(monkeypatch):
@@ -329,6 +353,7 @@ def test_controller_prepares_then_deploys_service(monkeypatch):
 def test_controller_service_phase_preserves_fully_async_concurrency():
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = SimpleNamespace(fully_async=True)
+    instance.serve_dict = {}
     barrier = threading.Barrier(2)
 
     def task(role):
@@ -343,6 +368,22 @@ def test_controller_service_phase_preserves_fully_async_concurrency():
         "actor": "service-actor",
         "rollout": "service-rollout",
     }
+
+
+def test_failed_service_phase_retains_successes_and_cleans_failed_service():
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(fully_async=False)
+    instance.serve_dict = {}
+    success, failed = object(), object()
+    instance._cleanup_aborted_service = Mock()
+
+    def task(role):
+        return (role, success, None) if role == "rollout" else (role, failed, "engine init failed")
+
+    with pytest.raises(RuntimeError, match="engine init failed"):
+        instance._run_service_phase(controller.ServiceStartupPhase.DEPLOY, task, [("rollout",), ("genrm",)])
+    assert instance.serve_dict == {"rollout": success}
+    instance._cleanup_aborted_service.assert_called_once_with("genrm", failed, deploy=True)
 
 
 @pytest.mark.parametrize(
@@ -430,7 +471,7 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         async def set_rollout_manager(self, _manager):
             events.append("set_rollout_manager")
 
-        def update_weights_fully_async(self):
+        def update_weights_fully_async(self, rollout_only=False, actor_fwd_only=False):
             async def update():
                 events.append("update_weights")
 
@@ -469,6 +510,7 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
     instance._pending_task_refs = []
     instance._pending_task_refs_lock = threading.Lock()
     instance._restarting = False
+    instance._metrics_service_enabled = False
     monkeypatch.setattr(controller, "set_managed_opd_teacher_on_actor_service", lambda *_args: _async_noop())
     monkeypatch.setattr(instance, "_cleanup_s3_model_weights_after_init", lambda: events.append("cleanup"))
 
@@ -482,3 +524,60 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
 
 async def _async_noop():
     return None
+
+
+def test_prefetch_start_failure_releases_only_exclusive_placement(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model"))
+    instance.serve_dict = {}
+    owned = SimpleNamespace(pgs=("owned-pg", [], []), _is_shared_pgs=False)
+    shared = SimpleNamespace(pgs=("shared-pg", [], []), _is_shared_pgs=True)
+    instance._run_service_phase = Mock(return_value={"actor": owned, "rollout": shared})
+    instance._start_model_prefetch = Mock(side_effect=RuntimeError("prefetch failed"))
+    remove = Mock()
+    monkeypatch.setattr(controller, "remove_placement_group", remove)
+    with pytest.raises(RuntimeError, match="prefetch failed"):
+        instance._start_services([])
+    remove.assert_called_once_with("owned-pg")
+    assert instance.serve_dict == {}
+
+
+def test_late_genrm_deployment_cleans_managers_before_deleting_service(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(_genrm_instances_resolved={"judge": {}})
+    events = []
+    manager = SimpleNamespace(shutdown=SimpleNamespace(remote=lambda: events.append("shutdown")))
+
+    async def get_manager(key):
+        assert key == "judge"
+        return manager
+
+    service = SimpleNamespace(
+        _deployed=True, _is_shared_pgs=True, _stop_heartbeat_thread=lambda: None, get_genrm_manager=get_manager
+    )
+    monkeypatch.setattr(controller.ray, "get", lambda ref, timeout=None: ref)
+    monkeypatch.setattr(controller.ray, "kill", lambda actor: events.append("kill"))
+    monkeypatch.setattr(controller.serve, "delete", lambda role: events.append("delete"))
+    instance._cleanup_aborted_service(controller.GENRM_ROLE, service, deploy=True)
+    assert events == ["shutdown", "kill", "delete"]
+
+
+def test_staged_deploy_failure_releases_unstarted_services(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model"), fully_async=False)
+    instance.serve_dict = {}
+
+    def fail_deploy():
+        raise RuntimeError("first deploy failed")
+
+    first = SimpleNamespace(pgs=("first", [], []), _is_shared_pgs=False, _deployed=False, deploy=fail_deploy)
+    later = SimpleNamespace(pgs=("later", [], []), _is_shared_pgs=False, _deployed=False, deploy=Mock())
+    instance._create_service_task = lambda *args, **kwargs: (args[0], first if args[0] == "actor" else later, None)
+    instance._start_model_prefetch = Mock(return_value=[])
+    remove = Mock()
+    monkeypatch.setattr(controller, "remove_placement_group", remove)
+    monkeypatch.setattr(controller.serve, "delete", Mock())
+    with pytest.raises(RuntimeError, match="first deploy failed"):
+        instance._start_services([("actor",), ("rollout",)])
+    assert {call.args[0] for call in remove.call_args_list} == {"first", "later"}
+    later.deploy.assert_not_called()

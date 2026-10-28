@@ -298,7 +298,7 @@ def test_get_engines_info_rechecks_alive_after_metadata_read(zero_wait_get, cach
     assert engine_rows(result) == [{"rank": 0, "status": "active", "actor_state": "DEAD"}]
 
 
-def test_get_engines_info_filters_models_and_counts_multinode_rows(zero_wait_get):
+def test_get_engines_info_filters_models_and_counts_multinode_heads(zero_wait_get):
     manager, group = make_manager(
         [make_engine(), make_engine(), make_engine(), make_engine()],
         [
@@ -318,10 +318,12 @@ def test_get_engines_info_filters_models_and_counts_multinode_rows(zero_wait_get
 
     assert list(result["models"]) == ["actor"]
     assert result["observation"] == {"complete": True, "issues": []}
-    assert result["total_engines"] == result["models"]["actor"]["total_engines"] == 4
-    assert [row["rank"] for row in engine_rows(result)] == [7, 8, 9, 10]
+    assert result["total_engines"] == result["models"]["actor"]["total_engines"] == 2
+    assert [row["rank"] for row in engine_rows(result)] == [7, 9]
+    assert [row["pid"] for row in engine_rows(result)] == [1, 3]
     assert len([row for row in engine_rows(result) if "url" in row]) == 2
-    assert engine_rows(result)[3]["node_id"] == ""
+    # Hidden followers are still observed and cached for health checks.
+    assert group.engine_init_records[3].value["node_id"] == ""
     assert len(zero_wait_get) == 4
     assert manager.get_engines_info(model_name="missing") == {
         "models": {},

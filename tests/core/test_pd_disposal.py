@@ -53,7 +53,7 @@ def test_controller_shutdown_disposes_rollout_owner(monkeypatch, controller_modu
     monkeypatch.setattr(controller_module, "run", asyncio.run)
     get = Mock(side_effect=lambda *args, **kwargs: events.append("dispose"))
     monkeypatch.setattr(controller_module.ray, "get", get)
-    monkeypatch.setattr(controller_module, "shutdown_managed_opd_teacher", lambda _: events.append("teacher"))
+    monkeypatch.setattr(controller, "_shutdown_static_inference", lambda: events.append("teacher"))
     monkeypatch.setitem(
         sys.modules,
         "relax.distributed.ray.rollout",

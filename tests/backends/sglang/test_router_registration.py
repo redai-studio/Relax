@@ -626,7 +626,8 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
 
     engine = _pd_engine(sglang_engine_module)
     engine.args.rollout_external = False
-    engine.process = SimpleNamespace(pid=123)
+    engine.process = Mock(pid=123)
+    engine.process.is_alive.return_value = False
     unregister = Mock(side_effect=RuntimeError("router is unavailable"))
     killed = Mock()
     monkeypatch.setattr(engine, "unregister_from_router", unregister)

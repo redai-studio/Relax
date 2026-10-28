@@ -19,8 +19,9 @@ def test_update_weights_shares_rollout_recovery_result_before_weight_sync(monkey
     current_rank = 0
     shared_status = []
     reached_weight_sync = []
-    recovery_ref, engines_ref = object(), object()
+    recovery_ref, engines_ref, readiness_ref = object(), object(), object()
     manager = SimpleNamespace(
+        set_policy_weights_ready=SimpleNamespace(remote=Mock(return_value=readiness_ref)),
         recover_rollout_engines=SimpleNamespace(remote=Mock(return_value=recovery_ref)),
         get_rollout_engines_and_lock=SimpleNamespace(remote=Mock(return_value=engines_ref)),
     )
@@ -38,7 +39,11 @@ def test_update_weights_shares_rollout_recovery_result_before_weight_sync(monkey
         pass
 
     def get(ref):
+        if ref is readiness_ref:
+            assert current_rank == 0
+            return None
         if ref is recovery_ref:
+            manager.set_policy_weights_ready.remote.assert_called_once_with(False)
             if fails:
                 raise RuntimeError("Required PD router registration failed")
             return None
@@ -69,6 +74,7 @@ def test_update_weights_shares_rollout_recovery_result_before_weight_sync(monkey
                 actor_module.MegatronTrainRayActor.update_weights.__wrapped__(actor)
 
     manager.recover_rollout_engines.remote.assert_called_once()
+    manager.set_policy_weights_ready.remote.assert_called_once_with(False)
     assert all(call.args == (process_group,) for call in get_rank.call_args_list)
     assert reached_weight_sync == ([] if fails else [0, 1])
     assert manager.get_rollout_engines_and_lock.remote.call_count == (0 if fails else 2)

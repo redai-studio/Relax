@@ -57,6 +57,7 @@ class _ManagerStub:
     def __init__(self, set_weight_updating_fn=None, health_monitoring_pause_fn=None):
         self.health_monitoring_pause = _RemoteStub(health_monitoring_pause_fn or (lambda *a, **k: _ok()))
         self.set_weight_updating = _RemoteStub(set_weight_updating_fn or (lambda *a, **k: _prepared()))
+        self.set_policy_weights_ready = _RemoteStub(lambda *a, **k: _ok())
 
 
 def _make_rollout(*, can_update: bool, manager: _ManagerStub) -> "Rollout":

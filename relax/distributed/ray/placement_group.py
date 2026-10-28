@@ -122,23 +122,31 @@ def create_placement_group(
     bundles = [dict(base_bundle) for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
-    ray.get(pg.ready())
     # use info actor to get the GPU id
     info_actors = []
     accelerator_kwargs = get_ray_accelerator_kwargs(1)
-    for i in range(num_bundles):
-        info_actors.append(
-            InfoActor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=i,
-                ),
-                **accelerator_kwargs,
-            ).remote()
-        )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
+    try:
+        ray.get(pg.ready(), timeout=900)
+        for i in range(num_bundles):
+            info_actors.append(
+                InfoActor.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        placement_group_bundle_index=i,
+                    ),
+                    **accelerator_kwargs,
+                ).remote()
+            )
+        gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors], timeout=60)
+    except BaseException:
+        ray.util.remove_placement_group(pg)
+        raise
+    finally:
+        for actor in info_actors:
+            try:
+                ray.kill(actor)
+            except Exception:
+                logger.exception("Failed to clean up placement probe actor")
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
     sorted_bundle_infos = sorted(bundle_infos, key=sort_key)

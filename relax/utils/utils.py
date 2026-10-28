@@ -233,6 +233,10 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     Returns:
         List[float | List[float]]
     """
+    if samples and all(hasattr(sample, "_inference_reward_result") for sample in samples):
+        cached = [sample._inference_reward_result for sample in samples]
+        return cached
+
     # NOTE(wulumeng): Keep this single-return contract. This function previously returned
     # (raw_rewards, post_processed_rewards); it now intentionally returns only
     # post_processed_rewards.

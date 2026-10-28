@@ -197,8 +197,8 @@ SERVICES: list[tuple[str, str, str, str]] = [
             "Uses SGLang engines to perform preference evaluation by comparing model "
             "responses against ground truth or quality standards.  The service accepts "
             "OpenAI-style chat messages and returns raw model judgements.\n\n"
-            "GenRM is a passive HTTP service — unlike Actor or Rollout it does not run "
-            "a background loop.  It only responds to incoming ``/generate`` requests."
+            "GenRM has no autonomous training loop. It serves generation and lifecycle "
+            "requests over HTTP and monitors accepted scaling operations asynchronously."
         ),
     ),
     (
@@ -237,6 +237,7 @@ def main() -> None:
         out = DOCS_PUBLIC / f"{name}.json"
         with open(out, "w", encoding="utf-8") as f:
             json.dump(spec, f, indent=2, ensure_ascii=False)
+            f.write("\n")
         print(f"  ✓ {out.relative_to(ROOT)}")
 
     print(f"\nGenerated {len(SERVICES)} OpenAPI specs in {DOCS_PUBLIC.relative_to(ROOT)}/")

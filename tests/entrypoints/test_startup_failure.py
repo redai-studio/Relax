@@ -394,29 +394,35 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
     methods = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {"shutdown", "_dispose_rollout_manager", "_shutdown_static_inference", "_get_genrm_managers_for_cleanup"}
     ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
         sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
     )
-    stop_teacher = Mock()
+    ray = Mock()
     ns = {
+        "Any": object,
         "logger": Mock(),
         "ROLES": SimpleNamespace(rollout="rollout", sft="sft"),
-        "shutdown_managed_opd_teacher": stop_teacher,
+        "GENRM_ROLE": "genrm",
+        "ray": ray,
         "asyncio": asyncio,
         "run": asyncio.run,
     }
     exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
-    teacher = object()
+    teacher = SimpleNamespace(shutdown=SimpleNamespace(remote=Mock(return_value="teacher-shutdown-ref")))
     partial_controller = SimpleNamespace(
         serve_dict={},
         _teacher_manager=teacher,
         _shutdown_agentic_rollout_services=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
+        _close_data_system=Mock(),
     )
-    partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
+    for name in ("_dispose_rollout_manager", "_shutdown_static_inference", "_get_genrm_managers_for_cleanup"):
+        setattr(partial_controller, name, ns[name].__get__(partial_controller))
     stop_image = AsyncMock(side_effect=RuntimeError("producer unavailable") if mode == "i2i_stop_failure" else None)
     if mode != "missing_config":
         partial_controller.config = SimpleNamespace(
@@ -430,7 +436,9 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
         stop_image.assert_awaited_once()
     else:
         stop_image.assert_not_called()
-    stop_teacher.assert_called_once_with(teacher)
+    teacher.shutdown.remote.assert_called_once_with()
+    ray.get.assert_called_once_with("teacher-shutdown-ref", timeout=60)
+    ray.kill.assert_called_once_with(teacher)
     stop_routers.assert_called_once()
     partial_controller._shutdown_agentic_rollout_services.assert_called_once()
     partial_controller._cleanup_s3_model_weights_after_init.assert_called_once_with(force=True)

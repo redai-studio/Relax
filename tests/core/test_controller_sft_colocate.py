@@ -77,7 +77,9 @@ def test_register_all_serve_sft_colocate_uses_optional_roles(
     controller = Namespace(
         config=Namespace(
             colocate=True,
-            resource={role: (1, 1) for role in algo},
+            offload_train=with_rollout,
+            offload_rollout=with_rollout,
+            resource={role: (1, 1) for role in algo if with_rollout or role != ROLES.rollout},
             data_source_path="test.data_source",
         ),
         runtime_env=None,
