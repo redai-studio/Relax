@@ -95,7 +95,8 @@ class _FakeClock:
 
 
 def _make_engine():
-    engine = m.GenRMEngine.__new__(m.GenRMEngine)
+    engine = m.SGLangEngine.__new__(m.SGLangEngine)
+    engine.profile = m.GENRM_PROFILE
     engine.node_rank = 0
     engine.server_host = "127.0.0.1"
     engine.server_port = 30000

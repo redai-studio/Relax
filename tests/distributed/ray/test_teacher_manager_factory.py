@@ -62,6 +62,7 @@ def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypat
         gpus_per_replica=4,
         pg=("pg", list(range(8)), list(range(8))),
         shared_pg=True,
+        bundle_offset=4,
         runtime_env={"env_vars": {"A": "B"}},
     )
 
@@ -69,6 +70,7 @@ def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypat
     assert urls == ["http://teacher/generate"]
     assert captured["calls"] == ["get_urls", "offload"]
     assert captured["options"] == {
+        "name": "relax_teacher_manager",
         "num_cpus": 1,
         "num_gpus": 0,
         "runtime_env": {"env_vars": {"A": "B"}},
@@ -78,4 +80,5 @@ def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypat
     assert captured["remote_kwargs"] == {
         "pg": ("pg", list(range(8)), list(range(8))),
         "shared_pg": True,
+        "bundle_offset": 4,
     }

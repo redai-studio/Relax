@@ -71,16 +71,16 @@ def _make_teacher_manager(monkeypatch, *, num_replicas=1, gpus_per_replica=16, s
     return teacher_manager_module, manager
 
 
-def test_teacher_gpu_index_uses_rollout_offset_for_shared_pg(monkeypatch):
+def test_teacher_gpu_index_starts_at_planned_bundle_offset_for_shared_pg(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    args = SimpleNamespace(rollout_num_gpus=4)
 
+    # The placement plan already accounts for the rollout region in front.
     assert (
         teacher_manager._resolve_teacher_gpu_index(
-            args=args,
             replica=0,
             gpus_per_replica=4,
             shared_pg=True,
+            bundle_offset=4,
         )
         == 4
     )
@@ -88,11 +88,9 @@ def test_teacher_gpu_index_uses_rollout_offset_for_shared_pg(monkeypatch):
 
 def test_teacher_gpu_index_starts_at_zero_for_dedicated_pg(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    args = SimpleNamespace(rollout_num_gpus=4)
 
     assert (
         teacher_manager._resolve_teacher_gpu_index(
-            args=args,
             replica=0,
             gpus_per_replica=4,
             shared_pg=False,
@@ -101,17 +99,15 @@ def test_teacher_gpu_index_starts_at_zero_for_dedicated_pg(monkeypatch):
     )
 
 
-def test_teacher_gpu_index_uses_teacher_relative_bundle_offset(monkeypatch):
+def test_teacher_gpu_index_adds_replica_stride_to_absolute_bundle_offset(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    args = SimpleNamespace(rollout_num_gpus=8)
 
     assert (
         teacher_manager._resolve_teacher_gpu_index(
-            args=args,
             replica=1,
             gpus_per_replica=2,
             shared_pg=True,
-            bundle_offset=4,
+            bundle_offset=12,
         )
         == 14
     )
@@ -142,6 +138,85 @@ def test_teacher_manager_exposes_ray_actor_api(monkeypatch):
     assert hasattr(teacher_manager.TeacherManager, "options")
 
 
+def test_teacher_manager_answers_snapshots_outside_its_default_concurrency_group(monkeypatch):
+    """Discovery must not queue behind an offload or an engine rebuild."""
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    metadata = teacher_manager.TeacherManager.__ray_metadata__
+
+    group = metadata.modified_class.get_inference_snapshot.__ray_concurrency_group__
+    assert metadata.concurrency_groups == {group: 1}
+    # Everything that changes engine state stays serialized in the default group.
+    for method in ("onload", "offload", "recover", "shutdown"):
+        assert not hasattr(getattr(metadata.modified_class, method), "__ray_concurrency_group__")
+
+
+def test_teacher_manager_starts_engines_with_teacher_profile(monkeypatch):
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager._overrides = {"model_path": "/teacher"}
+    manager.gpus_per_replica = 2
+
+    assert manager._build_engine_ctor_kwargs(0) == {
+        "sglang_overrides": {"model_path": "/teacher"},
+        "num_gpus_per_engine": 2,
+        "register_sigterm_handler": False,
+        "profile": "teacher",
+    }
+
+
+def test_teacher_engine_asks_for_a_smaller_slice_on_rollout_bundles(monkeypatch):
+    """A deferred teacher on rollout's own bundles shares each of them with the
+    training actor and a rollout engine, like a GenRM that shares them."""
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+
+    def resources(*, shared_pg, bundle_offset):
+        manager = object.__new__(manager_cls)
+        manager.args = SimpleNamespace(rollout_num_gpus=8)
+        manager._shared_pg = shared_pg
+        manager._bundle_offset = bundle_offset
+        return manager._ray_resource_kwargs(0)
+
+    assert resources(shared_pg=True, bundle_offset=0) == {"num_cpus": 0.1, "num_gpus": 0.1}
+    assert resources(shared_pg=True, bundle_offset=4) == {"num_cpus": 0.1, "num_gpus": 0.1}
+    # After rollout's region, or on a placement group of its own: unchanged.
+    assert resources(shared_pg=True, bundle_offset=8) == {"num_cpus": 0.2, "num_gpus": 0.2}
+    assert resources(shared_pg=False, bundle_offset=0) == {"num_cpus": 0.2, "num_gpus": 0.2}
+
+
+def test_teacher_manager_checks_a_shared_placement_group_before_start(monkeypatch):
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager._shared_pg_tuple = ("pg", list(range(8)), list(range(8)))
+
+    manager._shared_pg = True
+    assert manager._physical_placement() == ("actor", manager._shared_pg_tuple)
+    # A dedicated replica's placement group does not exist yet; it is checked when it is created.
+    manager._shared_pg = False
+    assert manager._physical_placement() is None
+
+
+def test_dedicated_teacher_placement_group_is_checked_and_returned_when_unusable(monkeypatch):
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager.args = SimpleNamespace(num_gpus_per_node=8)
+    manager.nodes_per_engine = 1
+    manager._shared_pg = False
+    manager.gpus_per_replica = 2
+    removed = []
+    # A 2-GPU group that Ray packed onto GPU 3 and GPU 5.
+    monkeypatch.setattr(teacher_manager, "create_placement_group", lambda **kwargs: ("pg", [0, 1], [3, 5]))
+    monkeypatch.setattr(teacher_manager, "remove_placement_group", removed.append)
+
+    with pytest.raises(ValueError, match="teacher replica 0.*not contiguous"):
+        manager._resolve_placement(0)
+
+    assert removed == ["pg"]
+
+
 @pytest.mark.parametrize(("gpus_per_replica", "num_nodes"), [(2, 1), (16, 2)])
 def test_teacher_recovery_reuses_original_endpoints(monkeypatch, gpus_per_replica, num_nodes):
     teacher_manager_module, manager = _make_teacher_manager(monkeypatch, gpus_per_replica=gpus_per_replica)
@@ -164,15 +239,58 @@ def test_teacher_recovery_reuses_original_endpoints(monkeypatch, gpus_per_replic
     teacher_manager_module._allocate_rollout_engine_addr_and_ports_normal.assert_not_called()
 
 
-def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
+def _patch_engine_actors(monkeypatch):
+    """Let the manager "create" engines without a cluster: every engine actor
+    is a recording stand-in and ``ray.get`` resolves its calls immediately."""
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    class _Engine:
+        def __getattr__(self, method):
+            return SimpleNamespace(remote=lambda **kwargs: None)
+
+    class _EngineActor:
+        @staticmethod
+        def options(**options):
+            return SimpleNamespace(remote=lambda *args, **kwargs: _Engine())
+
+    monkeypatch.setattr(mem.ray, "remote", lambda cls: _EngineActor)
+    monkeypatch.setattr(mem.ray, "get", lambda refs, timeout=None: refs)
+    monkeypatch.setattr(mem.ray, "kill", lambda engine: None)
+
+
+def test_dedicated_teacher_recovery_rebuilds_and_bumps_revision(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
+    _patch_engine_actors(monkeypatch)
+    # Every dedicated replica gets its own placement group, and the rebuilt one
+    # lands on another host.
+    placement_groups = iter([("pg-first", [0, 1], [0, 1]), ("pg-rebuilt", [0, 1], [0, 1])])
+    hosts = iter(["192.0.2.1", "192.0.2.2"])
+    monkeypatch.setattr(teacher_manager, "create_placement_group", lambda **kwargs: next(placement_groups))
+    monkeypatch.setattr(
+        teacher_manager,
+        "_allocate_rollout_engine_addr_and_ports_normal",
+        lambda **kwargs: ({0: {"host": next(hosts), "port": kwargs["base_port"]}}, None),
+    )
+    removed = []
+    # ``ray.util.placement_group`` as an attribute is the function of that name; go by module.
+    monkeypatch.setattr(importlib.import_module("ray.util.placement_group"), "remove_placement_group", removed.append)
+
     manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
     manager = object.__new__(manager_cls)
-    manager._shared_pg = False
-    manager.all_engines = [None]
+    manager_cls.__init__(manager, SimpleNamespace(teacher_hf_checkpoint="/teacher", num_gpus_per_node=8), 1, 2)
+    before = manager.get_inference_snapshot()
 
-    with pytest.raises(RuntimeError, match="global restart"):
-        manager.recover()
+    manager._retire_engines([0])  # the engine died
+    rebuilt = manager.recover()
+    after = manager.get_inference_snapshot()
+
+    # Rebuilt in place of a global restart, and the move is visible to discovery.
+    assert rebuilt == {0}
+    assert before["engines"] == [{"index": 0, "base_url": "http://192.0.2.1:15000", "state": "ready"}]
+    assert after["engines"] == [{"index": 0, "base_url": "http://192.0.2.2:15000", "state": "ready"}]
+    assert after["topology_revision"] > before["topology_revision"]
+    # The dead engine's placement group went back to the cluster.
+    assert removed == ["pg-first"]
 
 
 @pytest.mark.parametrize("shared", [False, True])
@@ -196,7 +314,7 @@ def test_teacher_placement_uses_distributed_factory_and_preserves_ownership(monk
     assert owned is (not shared)
     if shared:
         assert pg is manager._shared_pg_tuple
-        assert gpu_index == 8
+        assert gpu_index == 4
         placement.create_placement_group.assert_not_called()
     else:
         assert pg is placement.create_placement_group.return_value
@@ -214,7 +332,7 @@ def test_tp16_teachers_use_two_distinct_node_slots_in_their_own_slice(monkeypatc
     second_pg, second_owns_pg, second_index = manager._resolve_placement(1)
     assert first_pg is second_pg
     assert not first_owns_pg and not second_owns_pg
-    assert (first_index, second_index) == (80 + bundle_offset, 88 + bundle_offset)
+    assert (first_index, second_index) == (bundle_offset, 8 + bundle_offset)
     assert first_pg[2][first_index] == second_pg[2][second_index] == 0
 
 
@@ -228,7 +346,7 @@ def test_dedicated_multinode_replica_creates_one_pg_for_both_slots(monkeypatch):
     for rank in range(4):
         placement = manager._resolve_placement(rank)
         placements.append(placement)
-        manager._engine_placements[rank] = placement[:2]
+        manager._pool.placements[rank] = placement[:2]
 
     assert placements == [(pg0, True, 0), (pg0, False, 8), (pg1, True, 0), (pg1, False, 8)]
     assert teacher_manager_module.create_placement_group.call_count == 2
@@ -321,7 +439,7 @@ def test_multinode_teacher_routes_and_memory_operations_use_only_heads(monkeypat
     for rank, engine in enumerate(engines):
         engine.get_url.remote.return_value = f"http://192.0.2.{rank + 1}:15000"
         engine.health_generate.remote.return_value = True
-    manager.all_engines = engines
+    manager.all_engines[:] = engines
     monkeypatch.setattr(teacher_manager_module.ray, "get", lambda ref, timeout=None: ref)
 
     assert manager.get_urls() == ["http://192.0.2.1:15000/generate", "http://192.0.2.3:15000/generate"]
