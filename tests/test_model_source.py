@@ -26,6 +26,8 @@ def arguments_module(monkeypatch):
     sglang_arguments = ModuleType("relax.backends.sglang.arguments")
     sglang_arguments.sglang_parse_args = lambda: None
     sglang_arguments.validate_args = lambda args: args
+    # 参数收尾阶段会读子解析器的声明来补字段（finalize_args），替身也要提供该入口。
+    sglang_arguments.add_sglang_arguments = lambda parser: parser
     monkeypatch.setitem(sys.modules, "relax.backends.sglang.arguments", sglang_arguments)
 
     module_name = "relax.utils.arguments"
