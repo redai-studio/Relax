@@ -4,17 +4,39 @@ stacks.
 
 Usage: python3 scripts/profile/fix_trace_stacks.py tmp/traces/*.trace.json.gz
 Writes fixed/<name>.fixed-stacks.trace.json.gz beside each input.
-Always writes fixed/merged.trace.json.gz beside the first input, grouped by CPU/GPU stream, then rank.
+By default writes fixed/merged.trace.json.gz beside the first input, grouped by CPU/GPU stream, then rank.
 Use --merge PATH only to override the merged output path.
 Uses only the Python standard library and streams large traces.
+
+Fix and trim each rank independently, without merging (default: middle 4 forward calls):
+  python3 scripts/profile/fix_trace_stacks.py tmp/traces/*.trace.json.gz --per-rank
+Writes fixed/<name>.fixed-stacks.trimmed.trace.json.gz beside each input.
+--output-dir overrides the destination; --overview retains the full-step overview instead.
+Time/microbatch windows are selected independently for each rank.
+
+Independently trim an existing merged trace (does not repair or merge again):
+  python3 scripts/profile/fix_trace_stacks.py merged.trace.json.gz --trim-merged --microbatch-count 4
+Or select a shared time window relative to the first timestamp, in milliseconds:
+  python3 scripts/profile/fix_trace_stacks.py merged.trace.json.gz --trim-merged \
+      --window-start-ms 1000 --window-duration-ms 2000
+Writes merged.trimmed.trace.json.gz by default; --output overrides this path.
+To trim and merge existing per-rank fixed files into a new file:
+  python3 scripts/profile/fix_trace_stacks.py fixed/*.fixed-stacks.trace.json.gz \
+      --trim-fixed --microbatch-count 4 --output fixed/merged.trimmed.trace.json.gz
+Use --trim-fixed --overview instead for a full-step overview of all PP stages,
+written to merged.overview.trace.json.gz by default.
+From raw dumps, --export-views --output-dir PATH produces both final views.
+--reuse-fixed optionally reuses newer fixed copies with identical headers.
 """
 
 import argparse
 import gzip
 import json
+import math
 import os
 import re
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
@@ -143,13 +165,13 @@ def write_gzip(output: Path, chunks: Iterator[str]) -> None:
             os.unlink(temporary)
 
 
-def fix(source: Path) -> Path:
+def fix(source: Path, output: Path = None) -> Path:
     suffix = ".trace.json.gz"
     if not source.name.endswith(suffix):
         raise ValueError(f"Expected a {suffix} file: {source}")
     if source.name.endswith(".fixed-stacks" + suffix):
         raise ValueError(f"Already a repaired trace: {source}")
-    output = source.parent / "fixed" / (source.name[: -len(suffix)] + ".fixed-stacks" + suffix)
+    output = output or source.parent / "fixed" / (source.name[: -len(suffix)] + ".fixed-stacks" + suffix)
     counts = {"events": 0, "corrected": 0}
     write_gzip(output, fixed_chunks(source, counts))
     print(f"{source}: {counts['events']:,} events, {counts['corrected']:,} durations fixed -> {output}")
@@ -269,13 +291,375 @@ def merged_chunks(sources: list) -> Iterator[str]:
     yield '],"stackFrames":' + json.dumps(frames) + ',"mergedSources":' + json.dumps(source_metadata) + "}"
 
 
+def trim_window(source: Path, options: argparse.Namespace) -> tuple:
+    """Select one common timestamp window; forward calls anchor microbatch
+    selection."""
+    first_ts = None
+    markers, ranks = {}, {}
+    source_rank = read_header(source).get("distributedInfo", {}).get("rank")
+    for part in trace_parts(source):
+        if isinstance(part, str):
+            continue
+        event, _ = part
+        if "ts" in event:
+            first_ts = min(first_ts, event["ts"]) if first_ts is not None else event["ts"]
+        if event.get("ph") == "M" and event.get("name") == "thread_name":
+            match = re.search(r"Rank (\d+) /", event.get("args", {}).get("name", ""))
+            if match:
+                ranks[event.get("tid")] = int(match[1])
+        name = event.get("name", "")
+        if event.get("ph") == "X" and (
+            name == "forward_step" or ("schedules.py" in name and name.endswith(": forward_step"))
+        ):
+            markers.setdefault(event.get("tid"), []).append((event["ts"], event["ts"] + event["dur"]))
+    if first_ts is None:
+        raise ValueError("Trace has no timestamped events")
+    if options.microbatch_count is not None:
+        if source_rank is not None:
+            for tid in markers:
+                ranks.setdefault(tid, int(source_rank))
+        candidates = [tid for tid in markers if tid in ranks]
+        if not candidates:
+            raise ValueError("No forward_step markers on merged CPU rank tracks; use an explicit time window")
+        tid = min(candidates, key=lambda tid: (ranks[tid], -len(markers[tid])))
+        calls = sorted(set(markers[tid]))
+        # Ignore nested duplicate annotations of the same forward call.
+        calls = [call for i, call in enumerate(calls) if i == 0 or call[0] >= calls[i - 1][1]]
+        count = options.microbatch_count
+        start = options.microbatch_start
+        if start is None:
+            start = max((len(calls) - count) // 2, 0)
+        if start + count > len(calls):
+            raise ValueError(f"Requested forward calls [{start}, {start + count}), only {len(calls)} found")
+        lo = calls[start][0]
+        hi = calls[start + count][0] if start + count < len(calls) else calls[-1][1]
+        print(f"Window anchored to rank {ranks[tid]} forward calls [{start}, {start + count})", flush=True)
+    else:
+        lo = first_ts + options.window_start_ms * 1000
+        hi = lo + options.window_duration_ms * 1000
+    return lo, hi, ranks
+
+
+def overlaps(event: dict, lo: float, hi: float) -> bool:
+    if "ts" not in event:
+        return False
+    ts = event["ts"]
+    duration = event.get("dur", 0)
+    return ts < hi and (ts + duration > lo if duration > 0 else ts >= lo)
+
+
+def flow_key(event: dict) -> tuple:
+    return event.get("scope"), event.get("id"), json.dumps(event.get("id2"), sort_keys=True)
+
+
+def trim_merged(
+    source: Path, output: Path, options: argparse.Namespace, window: tuple = None, origin: Path = None
+) -> None:
+    """Stream a cropped copy, preserving linked launches, flows and referenced
+    stack frames."""
+    overview = getattr(options, "overview", False)
+    lo, hi, ranks = (
+        (-math.inf, math.inf, {}) if overview else (window if window is not None else trim_window(source, options))
+    )
+    correlations, flows = set(), set()
+    for part in () if overview else trace_parts(source):
+        if isinstance(part, str):
+            continue
+        event, _ = part
+        if not overlaps(event, lo, hi):
+            continue
+        correlation = event.get("args", {}).get("correlation")
+        if isinstance(correlation, int) and correlation >= 0:
+            correlations.add((ranks.get(event.get("tid")), correlation))
+        if event.get("ph") in ("s", "t", "f"):
+            flows.add(flow_key(event))
+
+    def chunks() -> Iterator[str]:
+        first = True
+        kept, total = 0, 0
+        referenced = set()
+        for part in trace_parts(source):
+            if isinstance(part, str):
+                if not part.startswith("]"):
+                    yield part
+                    continue
+                tail = json.loads('{"traceEvents":[]' + part[1:])
+                del tail["traceEvents"]
+                frames = tail.get("stackFrames", {})
+                pending = list(referenced)
+                while pending:
+                    frame = frames.get(pending.pop(), {})
+                    parent = frame.get("parent")
+                    if parent is not None and str(parent) not in referenced:
+                        referenced.add(str(parent))
+                        pending.append(str(parent))
+                tail["stackFrames"] = {key: value for key, value in frames.items() if key in referenced}
+                tail["trimInfo"] = {
+                    "source": str(origin or source),
+                    "start_us": None if overview else lo,
+                    "end_us": None if overview else hi,
+                    "input_events": total,
+                    "output_events": kept,
+                    "note": "Full-step overview; Python, CPU operator and fwdbwd events and Call stack text removed."
+                    if overview
+                    else "Intersecting events retain full durations; linked launches/flows may be outside "
+                    "window. Memory events cover this window only, not a full-step memory history.",
+                }
+                yield "]," + json.dumps(tail, ensure_ascii=False, separators=(",", ":"))[1:]
+                print(f"Retained {kept:,}/{total:,} events -> {output}", flush=True)
+                continue
+            event, raw = part
+            total += 1
+            correlation = event.get("args", {}).get("correlation")
+            linked = correlation is not None and (ranks.get(event.get("tid")), correlation) in correlations
+            flow = event.get("ph") in ("s", "t", "f") and flow_key(event) in flows
+            if not (event.get("ph") == "M" or overlaps(event, lo, hi) or linked or flow):
+                continue
+            if overview and event.get("cat") in ("python_function", "cpu_op", "fwdbwd"):
+                continue
+            if options.drop_python and event.get("cat") == "python_function":
+                continue
+            if (overview or options.drop_call_stacks) and "Call stack" in event.get("args", {}):
+                del event["args"]["Call stack"]
+                raw = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            referenced.update(str(event[key]) for key in ("sf", "esf") if key in event)
+            yield ("" if first else ",\n") + raw
+            first = False
+            kept += 1
+
+    if overview:
+        print(f"Full-step overview: {source}", flush=True)
+    else:
+        print(f"Shared window: {lo / 1000:.3f}–{hi / 1000:.3f} ms (trace timestamps)", flush=True)
+    write_gzip(output, chunks())
+
+
+def trim_fixed(sources: list, output: Path, options: argparse.Namespace) -> None:
+    """Crop per-rank traces on the same absolute clock, then merge cropped
+    copies."""
+    headers = [read_header(source) for source in sources]
+    if any(not isinstance(header.get("baseTimeNanoseconds"), int) for header in headers):
+        raise ValueError("Trimming fixed traces requires baseTimeNanoseconds for every input")
+    reference = min(range(len(sources)), key=lambda i: int(headers[i].get("distributedInfo", {}).get("rank", i)))
+    if options.overview:
+        lo, hi = -math.inf, math.inf
+    else:
+        lo, hi, _ = trim_window(sources[reference], options)
+    base = headers[reference]["baseTimeNanoseconds"]
+    # Scratch files live beside the output, on the same shared filesystem.
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="trim-fixed-", dir=output.parent) as temporary:
+        cropped = []
+        for index, (source, header) in enumerate(zip(sources, headers)):
+            offset = (header["baseTimeNanoseconds"] - base) / 1000
+            target = Path(temporary) / f"rank-{index}.trace.json.gz"
+            # Each input contains one rank, so correlation IDs are local here.
+            trim_merged(source, target, options, window=(lo - offset, hi - offset, {}))
+            cropped.append(target)
+        write_gzip(output, merged_chunks(cropped))
+    print(f"Trimmed and merged trace -> {output}", flush=True)
+
+
+def fix_trim_per_rank(sources: list[Path], options: argparse.Namespace) -> None:
+    """Repair and crop each raw trace, publishing separate files without a
+    merge."""
+    suffix = ".overview.trace.json.gz" if options.overview else ".trimmed.trace.json.gz"
+    outputs = [
+        (options.output_dir or source.parent / "fixed")
+        / (source.name.removesuffix(".trace.json.gz") + ".fixed-stacks" + suffix)
+        for source in sources
+    ]
+    protected = {source.resolve() for source in sources}
+    if len({output.resolve() for output in outputs}) != len(outputs):
+        raise ValueError("Per-rank output names collide; use distinct input filenames")
+    if any(output.exists() or output.resolve() in protected for output in outputs):
+        raise ValueError("Per-rank outputs must be new files; choose a new --output-dir")
+    for source, output in zip(sources, outputs):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="per-rank-", dir=output.parent) as temporary:
+            repaired = fix(source, Path(temporary) / "repaired.trace.json.gz")
+            window = None
+            if not options.overview:
+                lo, hi, _ = trim_window(repaired, options)
+                # One rank per input: CPU and GPU correlations share a local key.
+                window = (lo, hi, {})
+            trim_merged(repaired, output, options, window=window, origin=source)
+
+
+def export_views(sources: list, directory: Path, options: argparse.Namespace) -> None:
+    """Build both final merged views from raw dumps, keeping intermediates
+    temporary."""
+    overview = directory / "merged.overview.trace.json.gz"
+    detail = directory / f"merged.microbatch{options.microbatch_count}.trace.json.gz"
+    if overview.exists() or detail.exists():
+        raise ValueError("Output views already exist; choose a new --output-dir")
+    headers = [read_header(source) for source in sources]
+    if any("rank" not in header.get("distributedInfo", {}) for header in headers):
+        raise ValueError("--export-views requires per-rank raw dumps with distributedInfo.rank")
+    if len({header["distributedInfo"]["rank"] for header in headers}) != len(headers):
+        raise ValueError("Expected one input dump per rank")
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="export-views-", dir=directory) as temporary:
+        repaired = []
+        for index, (source, header) in enumerate(zip(sources, headers)):
+            cached = source.parent / "fixed" / source.name.replace(".trace.json.gz", ".fixed-stacks.trace.json.gz")
+            if (
+                options.reuse_fixed
+                and cached.is_file()
+                and cached.stat().st_mtime_ns >= source.stat().st_mtime_ns
+                and read_header(cached) == header
+            ):
+                print(f"Reusing repaired trace: {cached}", flush=True)
+                repaired.append(cached)
+            else:
+                repaired.append(fix(source, Path(temporary) / f"rank-{index}.fixed-stacks.trace.json.gz"))
+        detail_options = argparse.Namespace(**vars(options))
+        detail_options.overview = False
+        overview_options = argparse.Namespace(**vars(options))
+        overview_options.overview = True
+        # The two outputs are independent; separate processes also isolate their
+        # streaming state and let the small overview finish before the detail.
+        with ProcessPoolExecutor(max_workers=2) as pool:
+            tasks = [
+                pool.submit(trim_fixed, repaired, overview, overview_options),
+                pool.submit(trim_fixed, repaired, detail, detail_options),
+            ]
+            for task in tasks:
+                task.result()
+    print(f"Both views complete:\n{overview}\n{detail}", flush=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("traces", type=Path, nargs="+", help="PyTorch .trace.json.gz files")
     parser.add_argument(
         "--merge", type=Path, help="Merged output path (default: first input directory/fixed/merged.trace.json.gz)"
     )
+    parser.add_argument("--trim-merged", action="store_true", help="Only trim one existing merged trace")
+    parser.add_argument("--trim-fixed", action="store_true", help="Trim existing per-rank fixed traces and merge them")
+    parser.add_argument(
+        "--per-rank", action="store_true", help="Fix and trim each raw rank independently; never merge"
+    )
+    parser.add_argument(
+        "--overview", action="store_true", help="Full-step overview: omit Python/CPU ops and stack text"
+    )
+    parser.add_argument("--export-views", action="store_true", help="From raw dumps, export overview and local detail")
+    parser.add_argument("--output-dir", type=Path, help="Output directory for --export-views or --per-rank")
+    parser.add_argument("--reuse-fixed", action="store_true", help="Reuse newer fixed copies with matching headers")
+    parser.add_argument("--output", type=Path, help="New trimmed output path; input is never overwritten")
+    parser.add_argument("--window-start-ms", type=float, default=0, help="Window offset from first timestamp")
+    parser.add_argument("--window-duration-ms", type=float, help="Shared window duration")
+    parser.add_argument(
+        "--microbatch-count", type=int, help="Anchor window to N consecutive forward calls on first rank"
+    )
+    parser.add_argument("--microbatch-start", type=int, help="Zero-based forward call index (default: middle calls)")
+    parser.add_argument("--drop-python", action="store_true", help="Remove Python timeline events in trimmed output")
+    parser.add_argument("--drop-call-stacks", action="store_true", help="Remove repeated operator Call stack text")
     options = parser.parse_args()
+    if options.export_views:
+        if (
+            options.trim_fixed
+            or options.trim_merged
+            or options.per_rank
+            or options.overview
+            or options.merge
+            or options.output
+            or options.window_duration_ms is not None
+            or options.window_start_ms != 0
+            or options.drop_python
+            or options.drop_call_stacks
+        ):
+            parser.error("--export-views accepts raw inputs, --output-dir and microbatch options only")
+        if not options.output_dir:
+            parser.error("--export-views requires --output-dir")
+        if len({p.resolve() for p in options.traces}) != len(options.traces):
+            parser.error("Duplicate input files")
+        if any(not p.name.endswith(".trace.json.gz") or ".fixed-stacks." in p.name for p in options.traces):
+            parser.error("--export-views requires raw .trace.json.gz inputs")
+        options.microbatch_count = options.microbatch_count if options.microbatch_count is not None else 4
+        if options.microbatch_count <= 0 or (options.microbatch_start is not None and options.microbatch_start < 0):
+            parser.error("Microbatch count must be positive and start must be non-negative")
+        export_views(options.traces, options.output_dir, options)
+        raise SystemExit(0)
+    if options.reuse_fixed or (options.output_dir and not options.per_rank):
+        parser.error("--reuse-fixed requires --export-views; --output-dir requires --export-views or --per-rank")
+    if options.per_rank:
+        if options.trim_fixed or options.trim_merged or options.merge or options.output:
+            parser.error("--per-rank cannot use --trim-fixed, --trim-merged, --merge or --output")
+        if any(not p.name.endswith(".trace.json.gz") or ".fixed-stacks." in p.name for p in options.traces):
+            parser.error("--per-rank requires raw .trace.json.gz inputs")
+        if not options.overview and options.microbatch_count is None and options.window_duration_ms is None:
+            options.microbatch_count = 4
+    trim_options = (
+        options.output is not None
+        or options.window_start_ms != 0
+        or options.window_duration_ms is not None
+        or options.microbatch_count is not None
+        or options.microbatch_start is not None
+        or options.drop_python
+        or options.drop_call_stacks
+        or options.overview
+    )
+    if options.trim_merged or options.trim_fixed or options.per_rank:
+        if options.trim_merged and options.trim_fixed:
+            parser.error("Choose either --trim-merged or --trim-fixed")
+        if options.merge or (options.trim_merged and len(options.traces) != 1):
+            parser.error("Trimming cannot use --merge; --trim-merged requires exactly one input")
+        if len({p.resolve() for p in options.traces}) != len(options.traces):
+            parser.error("Duplicate input files")
+        if options.trim_fixed and any(not p.name.endswith(".fixed-stacks.trace.json.gz") for p in options.traces):
+            parser.error("--trim-fixed requires per-rank .fixed-stacks.trace.json.gz inputs")
+        if options.overview and (
+            options.microbatch_count is not None
+            or options.microbatch_start is not None
+            or options.window_duration_ms is not None
+            or options.window_start_ms != 0
+        ):
+            parser.error("--overview covers the full step and cannot use window/microbatch options")
+        if not options.overview and (options.microbatch_count is None) == (options.window_duration_ms is None):
+            parser.error("Choose exactly one of --microbatch-count and --window-duration-ms")
+        if options.microbatch_count is not None and options.microbatch_count <= 0:
+            parser.error("--microbatch-count must be positive")
+        if options.microbatch_start is not None and (options.microbatch_count is None or options.microbatch_start < 0):
+            parser.error("--microbatch-start requires --microbatch-count and must be non-negative")
+        if options.microbatch_count is not None and options.window_start_ms != 0:
+            parser.error("--window-start-ms cannot be combined with --microbatch-count")
+        if (
+            not math.isfinite(options.window_start_ms)
+            or options.window_start_ms < 0
+            or (
+                options.window_duration_ms is not None
+                and (not math.isfinite(options.window_duration_ms) or options.window_duration_ms <= 0)
+            )
+        ):
+            parser.error("Window start must be non-negative and duration must be positive")
+        if options.per_rank:
+            fix_trim_per_rank(options.traces, options)
+            raise SystemExit(0)
+        source = options.traces[0]
+        default_name = (
+            "merged.trimmed.trace.json.gz"
+            if options.trim_fixed
+            else (source.name.removesuffix(".trace.json.gz") + ".trimmed.trace.json.gz")
+        )
+        if options.overview:
+            default_name = (
+                "merged.overview.trace.json.gz"
+                if options.trim_fixed
+                else (source.name.removesuffix(".trace.json.gz") + ".overview.trace.json.gz")
+            )
+        output = options.output or source.with_name(default_name)
+        if output.resolve() in {p.resolve() for p in options.traces} or output.exists():
+            parser.error("Trimmed output must be a new file and must not overwrite the input")
+        if not output.name.endswith(".json.gz"):
+            parser.error("Trimmed output must end in .json.gz")
+        if options.trim_fixed:
+            trim_fixed(options.traces, output, options)
+        else:
+            trim_merged(source, output, options)
+        raise SystemExit(0)
+    if trim_options:
+        parser.error("Trimming options require --trim-merged, --trim-fixed or --per-rank")
     if len({p.resolve() for p in options.traces}) != len(options.traces):
         parser.error("Duplicate input files")
     output = options.merge or options.traces[0].parent / "fixed" / "merged.trace.json.gz"
