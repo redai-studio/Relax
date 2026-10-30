@@ -56,6 +56,7 @@ from relax.agentic.runner import (
 )
 from relax.agentic.session.admission import compute_reservation_tokens
 from relax.agentic.session.admission_coordinator import AdmissionCoordinator, RayAdmissionClient
+from relax.agentic.session.export_executor import SessionExportExecutor
 from relax.agentic.session.state import (
     InflightRequest,
     MsgNode,
@@ -1474,6 +1475,7 @@ class AgenticSessionShard:
         self._lifecycle_close_count = 0
         self._lifecycle_close_failure_count = 0
         self._generation_backend = SGLangBackendAdapter(args)
+        self._export_executor = SessionExportExecutor()
         self._agent_launcher = ManagedAgentLauncher(
             load_agent_app_spec_from_args(args),
             resolve_chat_api_base_url(),
@@ -1980,6 +1982,9 @@ class AgenticSessionShard:
         """Drop resident groups, then release the Shard-owned backend."""
 
         self._train_generation_open = False
+        export_executor = getattr(self, "_export_executor", None)
+        if export_executor is not None:
+            export_executor.stop_accepting()
         first_error: Optional[BaseException] = None
         for group in tuple(self._groups.values()):
             try:
@@ -1995,6 +2000,12 @@ class AgenticSessionShard:
         for outcome in permit_cleanup_outcomes:
             if first_error is None and isinstance(outcome, BaseException):
                 first_error = outcome
+        if export_executor is not None:
+            try:
+                await export_executor.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         try:
             await self._generation_backend.shutdown()
         except BaseException as error:
@@ -2784,6 +2795,7 @@ class AgenticSessionShard:
 
         finalize_arrive_at = time.time()
         outcome: _SessionResultPayload
+        cancelled = False
         async with session.lock:
             finalize_lock_acquired_at = time.time()
             if session.phase is not SessionPhase.ACTIVE:
@@ -2796,13 +2808,21 @@ class AgenticSessionShard:
                     "finalize_lock_acquired_at": finalize_lock_acquired_at,
                     "finalize_start_at": time.time(),
                 }
-                outcome = self._build_session_export_transport(
+                # All Forest writes and cleanup use this Session lock. Keep
+                # it until the worker really finishes, including cancellation,
+                # so no large trajectory snapshot is needed. Other Sessions
+                # and the Shard control plane remain free to make progress.
+                outcome = await self._export_executor.run(
+                    self._build_session_export_transport,
                     session=session,
                     reward=output.reward,
                     metadata=output.metadata,
                     output_records=output.records,
                     finalize_events=finalize_events,
                 )
+            except asyncio.CancelledError:
+                cancelled = True
+                outcome = None
             except AgentExecutionError as error:
                 logger.error(
                     "Dropping non-finalizable agentic session session_id=%s group_id=%s error_type=%s\n%s",
@@ -2816,6 +2836,12 @@ class AgenticSessionShard:
                 outcome = RuntimeGroupError(
                     f"agent export failed for {session.session_id}: {type(error).__name__}: {error}"
                 )
+        if cancelled:
+            await finish_before_cancellation(
+                self._finish_session(session, None),
+                f"cancelled-session-export:{session.session_id}",
+            )
+            raise asyncio.CancelledError
         await self._finish_session(session, outcome)
 
     def _build_session_export_transport(
