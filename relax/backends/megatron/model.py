@@ -1257,6 +1257,18 @@ def train_one_step(
     # capture is enabled and this step is selected).
     capture_hooks.begin_step_for(args, rollout_id, step_id)
 
+    optimizer_config = getattr(optimizer, "config", None)
+    if getattr(optimizer_config, "chunked_optimizer_state_offload", False) and (
+        getattr(optimizer_config, "optimizer_state_offload_fraction", 1.0) > 0.0
+    ):
+        # Adam creates master weights on the first update. Release them at every
+        # optimizer-to-forward boundary; prepare_grads restores them for the update.
+        # Keep masters resident when FP8 parameter staging still consumes them.
+        needs_master_for_param_sync = optimizer.optimizer_state_offload_requires_pre_forward_param_sync() or (
+            getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False) and getattr(args, "overlap_param_gather", False)
+        )
+        optimizer.offload_optimizer_state_for_forward(offload_master=not needs_master_for_param_sync)
+
     # Set grad to zero.
     for model_chunk in model:
         model_chunk.zero_grad_buffer()

@@ -24,8 +24,11 @@ logger = get_logger(__name__)
 
 
 class ImageReferenceTransport:
+    _FALLBACK_LOG_INTERVAL = 10_000
+
     def __init__(self, image_preprocess_on_rank: bool) -> None:
         self.enabled = image_preprocess_on_rank
+        self._fallback_count = 0
 
     def capture(self, images: list[Any] | None, idx: int, source_name: str) -> tuple[list[str] | None, bool]:
         image_refs = None
@@ -39,11 +42,13 @@ class ImageReferenceTransport:
                 # Per-sample fallback to the old pixel path; the rest of the
                 # dataset keeps the reference mode (mixed batches are fine:
                 # rows without a descriptor simply ship their pixels).
-                logger.warning(
-                    f"SFTStreamingDataset[image-preprocess-on-rank fallback]: sample idx={idx} in "
-                    f"{source_name!r} has no usable file references; shipping its pixel payload. "
-                    f"{exc}"
-                )
+                self._fallback_count += 1
+                if self._fallback_count == 1 or self._fallback_count % self._FALLBACK_LOG_INTERVAL == 0:
+                    logger.info(
+                        "SFTStreamingDataset[image-preprocess-on-rank fallback]: "
+                        f"{self._fallback_count} samples have used pixel payloads instead of file references. "
+                        f"Latest sample idx={idx} in {source_name!r}: {exc}"
+                    )
                 image_fallback = True
         return image_refs, image_fallback
 

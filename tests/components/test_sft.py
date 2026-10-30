@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import torch
 
-from relax.engine.sft.dataset.streaming import ProcessedSample
+from relax.engine.sft.dataset.streaming import ProcessedSample, apply_oversize_strategy
 from relax.engine.sft.runtime import resolve_sft_split_indices
 from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
 
@@ -164,6 +164,70 @@ def test_preference_datasets_receive_oversize_policy(monkeypatch, loss_type, ove
         load_custom_fn.assert_called_once_with("test.custom")
     else:
         load_custom_fn.assert_not_called()
+
+
+def test_sft_sequence_limit_is_bound_for_train_and_eval(monkeypatch):
+    from relax.components import sft as sft_module
+
+    fake_ds, _ = _patch_pipeline_dependencies(monkeypatch)
+    dataset_factory = MagicMock(return_value=fake_ds)
+    monkeypatch.setattr(sft_module, "SFTStreamingDataset", dataset_factory)
+    hooks = {}
+    for limit in (16, 24):
+        args = _make_args(max_tokens_per_gpu=8)
+        args.seq_length = limit
+        args.sft_oversize_strategy = "custom"
+        args.sft_oversize_custom_function_path = "relax.engine.sft.dataset.oversize.keep_within_sequence_limit"
+        args.eval_prompt_data = ["heldout", "/fake/eval.jsonl"]
+        sft = sft_module.SFT.func_or_class.__new__(sft_module.SFT.func_or_class)
+        sft.config = args
+        sft.step = 0
+        sft._dataset = None
+        sft._processor_pool = None
+        sft._logger_instance = MagicMock()
+        sft._init_data_pipeline()
+        train_call, eval_call = dataset_factory.call_args_list[-2:]
+        assert [call.kwargs["path"] for call in (train_call, eval_call)] == [args.prompt_data, ["/fake/eval.jsonl"]]
+        hooks[limit] = train_call.kwargs["oversize_custom_fn"]
+        assert eval_call.kwargs["oversize_custom_fn"] is hooks[limit]
+
+    for limit, hook in hooks.items():
+        for length in (16, 17, 24, 25):
+            tokens = torch.arange(length)
+            loss_mask = (tokens % 3 == 0).long()
+            result = apply_oversize_strategy(
+                tokens=tokens, loss_mask=loss_mask, capacity=8, strategy="custom", custom_fn=hook, idx=0
+            )
+            if length > limit:
+                assert result is None
+            else:
+                assert result[0] is tokens
+                assert result[1] is loss_mask
+
+
+@pytest.mark.parametrize("accepts_kwargs", [False, True])
+def test_sft_custom_hook_keeps_existing_arguments(monkeypatch, accepts_kwargs):
+    from relax.components import sft as sft_module
+
+    def legacy_hook(*, tokens, loss_mask, capacity, idx):
+        assert capacity == 8 and idx == 7
+        return tokens, loss_mask
+
+    def kwargs_hook(**kwargs):
+        return legacy_hook(**kwargs)
+
+    hook = kwargs_hook if accepts_kwargs else legacy_hook
+    monkeypatch.setattr(sft_module, "load_function", lambda _: hook)
+    args = _make_args()
+    args.sft_oversize_strategy = "custom"
+    args.sft_oversize_custom_function_path = "test.custom"
+    configured = sft_module._resolve_sft_dataset_options(args)["oversize_custom_fn"]
+    tokens = torch.arange(9)
+    result = apply_oversize_strategy(
+        tokens=tokens, loss_mask=tokens, capacity=8, strategy="custom", custom_fn=configured, idx=7
+    )
+    assert configured is hook
+    assert result[0] is tokens and result[1] is tokens
 
 
 @pytest.mark.asyncio

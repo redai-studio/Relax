@@ -2,11 +2,12 @@
 """Default-on compilation of Qwen3.8 gated-residual HC reads and write gates.
 
 Only the tensor math is compiled. Parameter publication stays outside the
-graph; parameter objects, residual writes and checkpoint policy stay native.
+graph; optional inner recomputation bounds the saved HC activations.
 """
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -121,6 +122,24 @@ def fused_mix(self: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor, tor
         and (inject is None or inject.shape == (4, 10240))
     )
     fn = compiled_mix(fixed_width)
+    if os.environ.get("RELAX_QWEN38_HC_RECOMPUTE", "0") == "1" and torch.is_grad_enabled():
+        from megatron.core.tensor_parallel.random import is_checkpointing
+        from torch.utils.checkpoint import checkpoint
+
+        max_local_rows = int(os.environ.get("RELAX_QWEN38_HC_OUTER_BYPASS_MAX_LOCAL_ROWS", "0"))
+        # Small decoder/MTP inputs covered by the outer uniform checkpoint
+        # can retain intermediates during replay to avoid another recomputation.
+        # Heads and longer inputs keep the inner non-reentrant checkpoint.
+        outer_covers_mix = (
+            fixed_width
+            and inject is not None
+            and self.config.recompute_granularity == "full"
+            and self.config.recompute_method == "uniform"
+            and is_checkpointing()
+            and hidden_states.shape[0] <= max_local_rows
+        )
+        if not outer_covers_mix:
+            return checkpoint(fn, hidden_states, *weights[:3], inject, self.n, self.norm_eps, use_reentrant=False)
     return fn(hidden_states, *weights[:3], inject, self.n, self.norm_eps)
 
 
