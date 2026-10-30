@@ -417,6 +417,21 @@ def test_external_pd_routing_replay_registers_native_worker(
 def test_transport_respects_engine_topology_and_native_validation(
     request, monkeypatch, engine, worker, gpus, engine_gpus, cli, overrides, expected
 ):
+    actual = _compute_engine_server_args(request, monkeypatch, engine, worker, gpus, engine_gpus, cli, overrides)
+    assert actual["mm_feature_transport"] == expected
+    _check_native_transport_validation(monkeypatch, actual, expected)
+
+
+@pytest.mark.parametrize("engine", ["policy", "genrm"])
+def test_transport_keeps_sglang_auto_policy_on_rocm(request, monkeypatch, engine):
+    # SGLang rejects CUDA IPC on ROCm, so a single-node ROCm engine keeps the auto policy.
+    actual = _compute_engine_server_args(request, monkeypatch, engine, "regular", 2, 2, [], {}, is_rocm=True)
+    assert actual["mm_feature_transport"] is None
+
+
+def _compute_engine_server_args(
+    request, monkeypatch, engine, worker, gpus, engine_gpus, cli, overrides, is_rocm=False
+):
     from relax.backends.sglang.arguments import ServerArgs, add_sglang_arguments
 
     # Keep the real CLI and SGLang validation; isolate only hardware/model discovery.
@@ -441,6 +456,8 @@ def test_transport_respects_engine_topology_and_native_validation(
     module = request.getfixturevalue("sglang_engine_module")
     monkeypatch.setattr(module, "ServerArgs", ServerArgs)
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu: gpu)
+    # The fixture stubs relax.utils.device, so the flag may not exist yet.
+    monkeypatch.setattr(module.device_utils, "is_rocm", is_rocm, raising=False)
     compute = module._compute_genrm_server_args if engine == "genrm" else module._compute_server_args
     options = {} if engine == "genrm" else {"sglang_overrides": overrides, "num_gpus_per_engine": engine_gpus}
     actual, _ = compute(
@@ -455,7 +472,11 @@ def test_transport_respects_engine_topology_and_native_validation(
         base_gpu_id=0,
         **options,
     )
-    assert actual["mm_feature_transport"] == expected
+    return actual
+
+
+def _check_native_transport_validation(monkeypatch, actual, expected):
+    from relax.backends.sglang.arguments import ServerArgs
 
     cfg = SimpleNamespace(
         **{"encoder_only": False, "tokenizer_worker_num": 1, "disaggregation_mode": "null", **actual}

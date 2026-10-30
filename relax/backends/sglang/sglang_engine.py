@@ -2056,13 +2056,15 @@ def _compute_genrm_server_args(
         kwargs[key] = value
         unused_keys.discard(key)
 
-    # CUDA IPC cannot cross nodes. Resolve the default after GenRM's own topology
-    # and overrides; an explicit None retains SGLang's automatic selection.
+    # CUDA IPC cannot cross nodes, and SGLang rejects it on ROCm. Resolve the default
+    # after GenRM's own topology and overrides; an explicit None retains SGLang's
+    # automatic selection.
     if (
         "mm_feature_transport" in server_arg_fields
         and "mm_feature_transport" not in (args.genrm_engine_config or {})
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
+        and not device_utils.is_rocm
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
@@ -2180,12 +2182,14 @@ def _compute_server_args(
             unused_keys.discard(key)
 
     # Use CUDA IPC only for engines confined to one node; multi-node engines
-    # retain SGLang's auto policy, including CUDA VMM where supported.
+    # retain SGLang's auto policy, including CUDA VMM where supported. SGLang
+    # rejects CUDA IPC on ROCm, so ROCm engines always keep the auto policy.
     if (
         "mm_feature_transport" in server_arg_field_names
         and "mm_feature_transport" not in (sglang_overrides or {})
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
+        and not device_utils.is_rocm
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
