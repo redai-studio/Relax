@@ -455,10 +455,16 @@ class MegatronTrainRayActor(TrainRayActor):
         # config in the HF checkpoint dir — only multimodal models ship one.
         # This way VL models with text-only batches (no --multimodal-keys) still
         # take the bridge VL+CP+thd path.
-        args.is_vl_model = any(
+        has_processor_config = any(
             os.path.exists(os.path.join(args.hf_checkpoint, name))
             for name in ("processor_config.json", "preprocessor_config.json")
         )
+
+        gemma4_text_conversion = (
+            getattr(self.hf_config, "model_type", None) == "gemma4"
+            and os.environ.get("GEMMA4_CONVERSION_MODE") == "text"
+        )
+        args.is_vl_model = has_processor_config and not gemma4_text_conversion
 
         from relax.utils.training.flops_counter import FlopsCounter
 

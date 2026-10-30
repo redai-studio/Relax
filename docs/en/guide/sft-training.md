@@ -679,3 +679,20 @@ Gemma4 template patches are opt-in environment variables and must be propagated 
 - `GEMMA4_SFT_MS_SWIFT_COMPAT=1` omits tool correlation fields from template inputs for explicit ms-swift compatibility.
 
 When using these template patches with HF export, pass `--save-hf-post-hook-path scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template`. Keep the same environment flags enabled during export so `chat_template.jinja` preserves the training-time boundaries for serving. The exported template also retains the ms-swift correlation-field filter, so a reloaded tokenizer applies it without Relax preprocessing or environment variables. This hook only patches the template; the existing exporter handles vision weights.
+
+
+### Gemma4 31B text SFT at 64K
+
+The opt-in `RELAX_GEMMA4_FORCE_FLEX_GLOBAL=1` worker environment variable selects chunked FlexAttention for Gemma4 global layers. Sliding-window layers continue to use FlashAttention; leaving the flag unset keeps the existing SDPA global path. Packed samples are handled independently. FlexAttention training requires zero attention dropout and currently supports CP1 only.
+
+The text launcher defaults to TP8/PP1/CP1, 65,536 tokens, chunked logits with per-chunk loss recomputation, full activation recomputation, and optimizer CPU offload. Two equal 8-GPU nodes can use TP8/DP2 by setting `NUM_NODES=2 GPUS_PER_NODE=8`. Tied embeddings require gradient overlap to remain disabled. The launcher always selects text conversion; image inputs are not part of this profile.
+
+```bash
+RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/messages.jsonl \
+  bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-gemma4-31B-sft-64k-8xgpu.sh
+```
+
+`run-gemma4-31B-multiturn-flex64k.sh` reuses that launcher with messages input and nonblocking submission. Both profiles default to `GEMMA4_SFT_THINKING=0`, enable tool-turn boundaries, and export the matching template using the Gemma4 post-hook. `DISABLE_CHECKPOINT_SAVE=1` disables model saves; `OPTIMIZER_CPU_OFFLOAD=0` disables CPU offload. Oversized samples are skipped by default (`SFT_OVERSIZE_STRATEGY=skip`).
+
+The Flex path needs a PyTorch runtime with FlexAttention and BlockMask support. Validate CUDA forward/backward agreement, actual 64K peak memory, and training stability on the target runtime before production use; CPU reference checks do not establish full-model GPU numerical equivalence.

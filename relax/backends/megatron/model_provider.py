@@ -361,6 +361,8 @@ def get_model_provider_func(
             "cp_comm_type",
             "cp_partition_mode",
             "sequence_packing_scheduler",
+            "max_seqlen_per_dp_cp_rank",
+            "pad_packed_seq_alignment",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "variable_seq_lengths",

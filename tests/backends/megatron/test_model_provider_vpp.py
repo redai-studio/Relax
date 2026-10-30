@@ -56,6 +56,8 @@ def _install_fake_megatron(monkeypatch, provider=None):
     gpt = types.ModuleType("megatron.core.models.gpt")
     gpt_layer_specs = types.ModuleType("megatron.core.models.gpt.gpt_layer_specs")
     transformer = types.ModuleType("megatron.core.transformer")
+    multi_token_prediction = types.ModuleType("megatron.core.transformer.multi_token_prediction")
+    multi_token_prediction.MultiTokenPredictionBlock = type("MultiTokenPredictionBlock", (torch.nn.Module,), {})
     spec_utils = types.ModuleType("megatron.core.transformer.spec_utils")
     transformer_config = types.ModuleType("megatron.core.transformer.transformer_config")
     training = types.ModuleType("megatron.training")
@@ -110,6 +112,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
         "megatron.core.models.gpt": gpt,
         "megatron.core.models.gpt.gpt_layer_specs": gpt_layer_specs,
         "megatron.core.transformer": transformer,
+        "megatron.core.transformer.multi_token_prediction": multi_token_prediction,
         "megatron.core.transformer.spec_utils": spec_utils,
         "megatron.core.transformer.transformer_config": transformer_config,
         "megatron.training": training,
@@ -703,3 +706,16 @@ def test_bridge_forwards_blackwell_runtime_configuration(monkeypatch, name, valu
     module, provider = _load_model_provider(monkeypatch, provider)
     module.get_model_provider_func(_bridge_args(**{name: value}))(pre_process=True, post_process=True)
     assert getattr(provider, name) == value
+
+
+@pytest.mark.parametrize("max_tokens,alignment", [(65536, 8), (4096, 16)])
+def test_bridge_provider_receives_packed_sequence_limits(monkeypatch, max_tokens, alignment):
+    provider = _FakeProvider()
+    provider.max_seqlen_per_dp_cp_rank = 2048
+    provider.pad_packed_seq_alignment = 1
+    module, provider = _load_model_provider(monkeypatch, provider=provider)
+    module.get_model_provider_func(
+        _bridge_args(max_seqlen_per_dp_cp_rank=max_tokens, pad_packed_seq_alignment=alignment)
+    )
+    assert provider.max_seqlen_per_dp_cp_rank == max_tokens
+    assert provider.pad_packed_seq_alignment == alignment

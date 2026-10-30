@@ -13,21 +13,99 @@ Ported from THUDM/slime ``slime_plugins/models/gemma4.py::SDPACoreAttention``.
 Dispatch, CP == 1 only:
 
     thd + cu_seqlens + head_dim <= 256  -> flash_attn_varlen_func, window (sw-1, 0)
-    thd + cu_seqlens + head_dim  > 256  -> per-sub-sequence causal SDPA
+    thd + cu_seqlens + head_dim  > 256  -> per-sub-sequence causal SDPA by default
+    thd + cu_seqlens + head_dim  > 256  -> chunked FlexAttention when explicitly enabled
     thd without cu_seqlens              -> raises
     sbhd                                -> raises
 """
 
-from typing import Optional
+from functools import lru_cache
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
+
+
 logger = get_logger(__name__)
+
+
+_FLEX_BLOCK_SIZE = 128
+_FLEX_QUERY_CHUNK_SIZE = 32768
+_FLEX_KERNEL_OPTIONS = {
+    "BACKEND": "TRITON",
+    "ROWS_GUARANTEED_SAFE": True,
+    "BLOCKS_ARE_CONTIGUOUS": True,
+    "fwd_BLOCK_M": 32,
+    "fwd_BLOCK_N": 16,
+    "fwd_num_stages": 2,
+    "fwd_num_warps": 4,
+}
+
+
+@lru_cache(maxsize=1)
+def _get_compiled_flex_attention() -> Callable[..., torch.Tensor]:
+    from torch.nn.attention.flex_attention import flex_attention
+
+    compiled = torch.compile(flex_attention, fullgraph=True, dynamic=True)
+
+    def run(*args, **kwargs) -> torch.Tensor:
+        # Packed block counts specialize size-0/1 dimensions. Scope the larger
+        # variant budget to this opt-in call; importing the model changes no
+        # process-wide Dynamo defaults. Compilation happens on invocation.
+        with torch._dynamo.config.patch(recompile_limit=max(torch._dynamo.config.recompile_limit, 64)):
+            return compiled(*args, **kwargs)
+
+    return run
+
+
+def _ordered_block_indices(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    num_blocks = mask.sum(dim=-1, dtype=torch.int32)[None, None].contiguous()
+    indices = torch.argsort(mask.to(torch.int32), dim=-1, descending=True, stable=True)
+    return num_blocks, indices.to(torch.int32)[None, None].contiguous()
+
+
+@lru_cache(maxsize=16)
+def _causal_block_mask(
+    device: torch.device,
+    query_length: int,
+    key_length: int,
+    query_offset: int,
+) -> "BlockMask":
+    """Build a causal block mask without scanning every token pair."""
+    from torch.nn.attention.flex_attention import BlockMask
+
+    num_query_blocks = (query_length + _FLEX_BLOCK_SIZE - 1) // _FLEX_BLOCK_SIZE
+    num_key_blocks = (key_length + _FLEX_BLOCK_SIZE - 1) // _FLEX_BLOCK_SIZE
+    query_starts = torch.arange(num_query_blocks, device=device) * _FLEX_BLOCK_SIZE
+    query_ends = torch.clamp(query_starts + _FLEX_BLOCK_SIZE, max=query_length) - 1
+    key_starts = torch.arange(num_key_blocks, device=device) * _FLEX_BLOCK_SIZE
+    key_ends = torch.clamp(key_starts + _FLEX_BLOCK_SIZE, max=key_length) - 1
+
+    full = key_ends[None, :] <= query_offset + query_starts[:, None]
+    possible = key_starts[None, :] <= query_offset + query_ends[:, None]
+    partial_num, partial_indices = _ordered_block_indices(possible & ~full)
+    full_num, full_indices = _ordered_block_indices(full)
+
+    def causal_mask(_batch, _head, query_index, key_index):
+        return key_index <= query_index + query_offset
+
+    return BlockMask.from_kv_blocks(
+        partial_num,
+        partial_indices,
+        full_num,
+        full_indices,
+        BLOCK_SIZE=_FLEX_BLOCK_SIZE,
+        mask_mod=causal_mask,
+        seq_lengths=(query_length, key_length),
+    )
 
 
 def _is_sliding_layer(config, layer_number: int) -> bool:
@@ -99,6 +177,7 @@ class Gemma4CoreAttention(nn.Module):
         self.dropout_p = config.attention_dropout if attention_dropout is None else attention_dropout
         self.is_sliding = _is_sliding_layer(config, layer_number)
         self.window_size = _window_pair(getattr(config, "window_size", None)) if self.is_sliding else (-1, -1)
+        self.force_flex_global = not self.is_sliding and Envs.RELAX_GEMMA4_FORCE_FLEX_GLOBAL
 
     def _scale(self, head_dim: int) -> float:
         return self.softmax_scale if self.softmax_scale is not None else head_dim**-0.5
@@ -150,6 +229,41 @@ class Gemma4CoreAttention(nn.Module):
             out[s:e] = o.transpose(1, 2).reshape(e - s, -1)
         return out
 
+    def _thd_flex_per_subseq(self, query, key, value, boundaries):
+        """Memory-efficient global attention for packed long sequences."""
+        if self.training and self.dropout_p:
+            raise NotImplementedError("Gemma4 global FlexAttention requires attention dropout to be zero")
+
+        from torch.nn.attention.flex_attention import flex_attention
+
+        outputs = []
+        scale = self._scale(query.shape[2])
+        enable_gqa = query.shape[1] != key.shape[1]
+        attention_fn = _get_compiled_flex_attention() if query.is_cuda else flex_attention
+        for start, end in zip(boundaries, boundaries[1:]):
+            sample_key = key[start:end]
+            sample_value = value[start:end]
+            for query_start in range(0, end - start, _FLEX_QUERY_CHUNK_SIZE):
+                query_end = min(query_start + _FLEX_QUERY_CHUNK_SIZE, end - start)
+                query_chunk = query[start + query_start : start + query_end]
+                block_mask = _causal_block_mask(
+                    query.device,
+                    query_end - query_start,
+                    query_end,
+                    query_start,
+                )
+                output = attention_fn(
+                    query_chunk.unsqueeze(0).transpose(1, 2),
+                    sample_key[:query_end].unsqueeze(0).transpose(1, 2),
+                    sample_value[:query_end].unsqueeze(0).transpose(1, 2),
+                    block_mask=block_mask,
+                    scale=scale,
+                    enable_gqa=enable_gqa,
+                    kernel_options=_FLEX_KERNEL_OPTIONS,
+                )
+                outputs.append(output.transpose(1, 2).reshape(query_end - query_start, -1))
+        return torch.cat(outputs, dim=0)
+
     # ---------------- entry ----------------
 
     def forward(
@@ -183,6 +297,8 @@ class Gemma4CoreAttention(nn.Module):
                 if boundaries is None:
                     # PackedSeqParams built outside Relax's data path. Copy once.
                     boundaries = cu_seqlens.detach().cpu().tolist()
+                if self.force_flex_global:
+                    return self._thd_flex_per_subseq(query, key, value, boundaries)
                 return self._thd_sdpa_per_subseq(query, key, value, boundaries)
             raise NotImplementedError(
                 "Gemma4CoreAttention requires packed THD inputs with cu_seqlens. "
