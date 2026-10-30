@@ -267,6 +267,23 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_LORA_EXCLUDE_FROZEN_MODULES = EnvProperty("RELAX_LORA_EXCLUDE_FROZEN_MODULES", bool, False)
     RELAX_LORA_SHARE_EXPERT_ADAPTERS = EnvProperty("RELAX_LORA_SHARE_EXPERT_ADAPTERS", bool, None)
 
+    # ------------- Straggler profiler (relax/utils/straggler) -------------
+    RELAX_STRAGGLER_PROFILER = EnvProperty("RELAX_STRAGGLER_PROFILER", bool, False)
+    RELAX_STRAGGLER_REPORT_INTERVAL = EnvProperty("RELAX_STRAGGLER_REPORT_INTERVAL", int, 10)
+    RELAX_STRAGGLER_Z_THRESHOLD = EnvProperty("RELAX_STRAGGLER_Z_THRESHOLD", float, 3.0)
+    RELAX_STRAGGLER_REL_THRESHOLD = EnvProperty("RELAX_STRAGGLER_REL_THRESHOLD", float, 0.10)
+    RELAX_STRAGGLER_PERSIST_WINDOWS = EnvProperty("RELAX_STRAGGLER_PERSIST_WINDOWS", int, 3)
+    RELAX_STRAGGLER_RECOVER_WINDOWS = EnvProperty("RELAX_STRAGGLER_RECOVER_WINDOWS", int, 2)
+    RELAX_STRAGGLER_GATHER_TIMEOUT_S = EnvProperty("RELAX_STRAGGLER_GATHER_TIMEOUT_S", float, 60.0)
+    # Sampled-step traces: written by the primary rank (default: straggler/ under --timeline-dump-dir,
+    # off without either), newest TRACE_KEEP files kept.
+    RELAX_STRAGGLER_TRACE_DIR = EnvProperty("RELAX_STRAGGLER_TRACE_DIR", str, "")
+    RELAX_STRAGGLER_TRACE_KEEP = EnvProperty("RELAX_STRAGGLER_TRACE_KEEP", int, 50)
+    # Level at start (0 paused, 1 coarse, 2 detail, 3 modules; -1: detail with a trace directory, else
+    # coarse), and how often the primary rank polls the metrics service for a level change.
+    RELAX_STRAGGLER_LEVEL = EnvProperty("RELAX_STRAGGLER_LEVEL", int, -1)
+    RELAX_STRAGGLER_CONTROL_POLL_S = EnvProperty("RELAX_STRAGGLER_CONTROL_POLL_S", float, 5.0)
+
     # ------------- DeepSeek-V4 MXFP4 QAT -------------
     # Used only by relax.models.deepseek_v4.provider.model_provider;
     # these settings do not enable QAT without selecting that custom model provider.
