@@ -226,6 +226,9 @@ def create_test_manager(args=None, servers=None):
 
     manager = object.__new__(_OriginalRM)
     manager.args = args
+    from relax.engine.inference.admission import AdmissionGate
+
+    manager._admission = AdmissionGate()
     manager._engine_actor_states = _get_engine_actor_states()
     manager.servers = servers if servers is not None else {}
     manager._scale_out_requests = {}

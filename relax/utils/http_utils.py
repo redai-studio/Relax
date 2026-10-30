@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from relax.engine.inference.client import InferenceRequest, _settle, get_request_client
+from relax.engine.inference.routing import RoutingError
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
@@ -243,18 +245,58 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):
+async def _close_post_attempt(response: httpx.Response | None, permit: InferenceRequest | None) -> None:
+    async def close() -> None:
+        try:
+            if response is not None:
+                await response.aclose()
+        finally:
+            if permit is not None:
+                await permit.aclose()
+
+    pending = asyncio.create_task(close())
+    try:
+        await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        await _settle(pending)
+        raise
+
+
+async def _post(
+    client, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False, inference=None
+):
     retry_count = 0
     while retry_count < max_retries:
         response = None
+        permit = None
         try:
-            response = await client.post(url, json=payload or {}, headers=headers)
+            target_url = url
+            forwarded = payload or {}
+            if inference is not None:
+                forwarded = dict(forwarded)
+                selection = dict(inference)
+                selection.setdefault("model", forwarded.pop("model", None))
+                selection.setdefault("route_key", forwarded.pop("route_key", None))
+                permit = get_request_client(selection.pop("role")).request(**selection)
+                try:
+                    await permit.__aenter__()
+                except RoutingError as error:
+                    # Preserve the ordinary HTTP retry/error contract for callers.
+                    httpx.Response(
+                        error.status_code,
+                        request=httpx.Request("POST", url),
+                        json={"error": {"message": str(error)}},
+                        headers={"Retry-After": "5"} if error.status_code == 503 else {},
+                    ).raise_for_status()
+                target_url = f"{permit.target.base_url}{urlsplit(url).path}"
+            response = await client.post(target_url, json=forwarded, headers=headers)
             response.raise_for_status()
             content = await response.aread()
             try:
                 output = json.loads(content)
             except json.JSONDecodeError:
                 output = content.decode() if isinstance(content, bytes) else content
+            return output
         except Exception as e:
             retry_count += 1
 
@@ -279,22 +321,17 @@ async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None, fai
             if retry_count >= max_retries:
                 logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
                 raise e
-            await asyncio.sleep(1)
-            continue
         finally:
-            if response is not None:
-                await response.aclose()
-        break
-
-    return output
+            await _close_post_attempt(response, permit)
+        await asyncio.sleep(1)
 
 
 async def _post_with_error_envelope(
-    client, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False
+    client, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False, inference=None
 ):
     """Carry HTTP errors across Ray without pickling httpx.HTTPStatusError."""
     try:
-        return 0, await _post(client, url, payload, max_retries, headers, fail_fast_no_workers)
+        return 0, await _post(client, url, payload, max_retries, headers, fail_fast_no_workers, inference)
     except httpx.HTTPStatusError as error:
         return error.response.status_code, error.response.text
 
@@ -347,9 +384,11 @@ def _init_ray_distributed_post(args):
                 timeout=httpx.Timeout(None),
             )
 
-        async def do_post(self, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):
+        async def do_post(
+            self, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False, inference=None
+        ):
             return await _post_with_error_envelope(
-                self._client, url, payload, max_retries, headers, fail_fast_no_workers
+                self._client, url, payload, max_retries, headers, fail_fast_no_workers, inference
             )
 
     # Create actors per node
@@ -374,7 +413,7 @@ def _init_ray_distributed_post(args):
     _post_actors = created
 
 
-async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):
+async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False, *, inference=None):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         try:
@@ -386,8 +425,15 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no
                 # `min(32, cpu+4)`), which becomes a hard upper bound on the
                 # number of in-flight POSTs that can be waited on in parallel
                 # and produces large tail latencies under high concurrency.
-                obj_ref = actor.do_post.remote(url, payload, max_retries, headers, fail_fast_no_workers)
-                status_code, result = await obj_ref
+                kwargs = {"inference": inference} if inference is not None else {}
+                obj_ref = actor.do_post.remote(url, payload, max_retries, headers, fail_fast_no_workers, **kwargs)
+                try:
+                    status_code, result = await obj_ref
+                except asyncio.CancelledError:
+                    import ray
+
+                    ray.cancel(obj_ref)
+                    raise
                 if status_code:
                     request = httpx.Request("POST", url)
                     response = httpx.Response(status_code, request=request, text=result)
@@ -400,12 +446,12 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no
             # that would double the logical attempt and, for an SGLang
             # pre-dispatch 499, hide the real error the 499 mapping needs to
             # see. Only transport/actor failures fall back to the local client.
-            if isinstance(e, httpx.HTTPStatusError):
+            if inference is not None or isinstance(e, httpx.HTTPStatusError):
                 raise
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
-    return await _post(_http_client, url, payload, max_retries, headers, fail_fast_no_workers)
+    return await _post(_http_client, url, payload, max_retries, headers, fail_fast_no_workers, inference)
 
 
 async def get(url, max_retries=MAX_RETRIES):

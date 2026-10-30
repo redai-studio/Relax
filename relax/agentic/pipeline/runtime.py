@@ -631,6 +631,7 @@ class SGLangBackendAdapter:
                 payload,
                 headers=headers,
                 fail_fast_no_workers=fail_fast_no_workers,
+                inference={"role": "rollout"},
             )
         except httpx.HTTPStatusError as error:
             if _is_context_length_error(error):

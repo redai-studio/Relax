@@ -3,12 +3,13 @@
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AsyncExitStack
 
 import aiohttp
 import numpy as np
 
-from relax.engine.inference.client import InferenceClient
-from relax.engine.inference.routing import candidate_replicas, select_replica
+from relax.engine.inference.client import get_request_client
+from relax.engine.inference.routing import ModelUnavailableError, RoutingError, select_replica
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_main_worker, opd_opsd_worker
 from relax.utils.opd.opd_multimodal import (
@@ -17,6 +18,7 @@ from relax.utils.opd.opd_multimodal import (
     image_inputs,
     validate_image_input_ids,
 )
+from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
 from relax.utils.types import Sample
 
 
@@ -110,11 +112,8 @@ def _create_teacher_client_session(args) -> aiohttp.ClientSession:
 #      ``_pick_replica``.
 # Single-teacher path falls back to ``args.opd_teacher_urls`` / ``opd_teacher_url``.
 #
-# Which replicas a managed teacher has is read from its gateway's discovery
-# endpoint when ``args.opd_teacher_discovery_url`` is set, so a replica rebuilt
-# at another address is picked up without a restart. The URLs captured in
-# ``args`` at startup remain the fallback, and the only source for an external
-# teacher (``--opd-teacher-url``).
+# Managed teachers acquire an authoritative permit before every HTTP attempt.
+# Static URLs are used only for explicitly external teacher services.
 _TEACHER_URL_RR: dict[str, int] = {}
 # (teacher key, group_index) -> replica ordinal. Bounded by clearing wholesale:
 # this is a pure cache-locality heuristic, so a dropped entry only costs prefix
@@ -125,91 +124,23 @@ _MAX_TEACHER_GROUP_REPLICA = 1 << 16
 
 # Model name the single managed teacher is published under by its gateway.
 _SINGLE_TEACHER_MODEL = "__default__"
-# How long a discovered topology is used before it is fetched again, and the
-# minimum spacing of fetches triggered by failing teacher requests.
-_TEACHER_DISCOVERY_MAX_AGE_S = 5.0
-_TEACHER_DISCOVERY_COOLDOWN_S = 1.0
-_TEACHER_DISCOVERY_TIMEOUT_S = 2.0
-# discovery URL -> client caching that teacher role's topology.
-_TEACHER_TOPOLOGY: dict[str, InferenceClient] = {}
-_TEACHER_TOPOLOGY_REFRESHING: set[str] = set()
-# Discovery URLs already reported unreachable, so the warning is not repeated per batch.
-_TEACHER_DISCOVERY_WARNED: set[str] = set()
 
 
-def _fetch_teacher_topology(discovery_url: str) -> dict:
-    import requests
-
-    response = requests.get(discovery_url, timeout=_TEACHER_DISCOVERY_TIMEOUT_S)
-    response.raise_for_status()
-    return response.json()
+def _managed_teacher(args) -> bool:
+    return bool(getattr(args, "opd_teacher_discovery_url", None)) or is_managed_opd_teacher_enabled(args)
 
 
-def _teacher_topology(args) -> InferenceClient | None:
-    discovery_url = getattr(args, "opd_teacher_discovery_url", None)
-    if not discovery_url:
+def _teacher_route_key(args, sample: Sample | None) -> str | None:
+    routes = getattr(args, "opd_teacher_routes_map", None)
+    if not routes:
         return None
-    client = _TEACHER_TOPOLOGY.get(discovery_url)
-    if client is None:
-        client = InferenceClient(
-            lambda: _fetch_teacher_topology(discovery_url),
-            max_age_s=_TEACHER_DISCOVERY_MAX_AGE_S,
-            refresh_cooldown_s=_TEACHER_DISCOVERY_COOLDOWN_S,
-        )
-        _TEACHER_TOPOLOGY[discovery_url] = client
-    return client
-
-
-async def _refresh_teacher_topology(args) -> None:
-    """Bring the managed teacher's topology up to date, off the event loop.
-
-    Teacher URLs are picked synchronously per sample, so the picking itself
-    only reads the cached topology; this is where it is fetched. Concurrent
-    callers share one fetch and never wait for it.
-    """
-    client = _teacher_topology(args)
-    if client is None:
-        return
-    discovery_url: str = args.opd_teacher_discovery_url
-    if discovery_url in _TEACHER_TOPOLOGY_REFRESHING or not client.needs_refresh():
-        return
-    _TEACHER_TOPOLOGY_REFRESHING.add(discovery_url)
-    try:
-        await asyncio.to_thread(client.snapshot)
-        _TEACHER_DISCOVERY_WARNED.discard(discovery_url)
-    except Exception as exc:
-        if discovery_url not in _TEACHER_DISCOVERY_WARNED:
-            _TEACHER_DISCOVERY_WARNED.add(discovery_url)
-            logger.warning(
-                "OPD teacher discovery at %s is unreachable; using the teacher URLs captured at startup: %s",
-                discovery_url,
-                f"{type(exc).__name__}: {str(exc)[:256]}",
-            )
-    finally:
-        _TEACHER_TOPOLOGY_REFRESHING.discard(discovery_url)
-
-
-def _discovered_replicas(args, model: str) -> list[str] | None:
-    """Replica URLs of one managed teacher as last discovered.
-
-    ``None`` when there is nothing to go on -- no discovery configured, no
-    topology fetched yet, or no replica reported ready -- in which case the
-    caller keeps the URLs from ``args``.
-    """
-    client = _teacher_topology(args)
-    snapshot = client.last_snapshot if client is not None else None
-    model_snapshot = snapshot.model(model) if snapshot is not None else None
-    if model_snapshot is None:
-        return None
-    return [f"{replica.base_url}/generate" for replica in candidate_replicas(model_snapshot)] or None
-
-
-def _report_teacher_failure(args) -> None:
-    """A teacher request failed: look at the topology again before the next
-    batch, in case the replica was rebuilt elsewhere."""
-    client = _teacher_topology(args)
-    if client is not None:
-        client.report_failure()
+    key = getattr(args, "opd_teacher_key", None) or "data_source"
+    value = (getattr(sample, "metadata", None) or {}).get(key)
+    if value is None:
+        raise ValueError(f"MOPD routing: sample missing key '{key}' in metadata.")
+    if value not in routes:
+        raise KeyError(f"MOPD routing: no teacher route for '{key}={value}'. Available routes: {list(routes)}.")
+    return value
 
 
 def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
@@ -246,32 +177,17 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
 
 
 def _pick_teacher_url(args, sample=None) -> str:
-    routes_map = getattr(args, "opd_teacher_routes_map", None)
-    if routes_map and sample is not None:
-        key_field = getattr(args, "opd_teacher_key", None) or "data_source"
-        metadata = getattr(sample, "metadata", None) or {}
-        routing_value = metadata.get(key_field)
-        if routing_value is None:
-            raise ValueError(
-                f"MOPD routing: sample missing key '{key_field}' in metadata. "
-                f"Available metadata keys: {list(metadata.keys())}. "
-                f"Ensure the dataset has a '{key_field}' column and it is surfaced "
-                "via --metadata-key or the data pipeline."
-            )
-        replicas = routes_map.get(routing_value)
-        if not replicas:
-            raise KeyError(
-                f"MOPD routing: no teacher route for '{key_field}={routing_value}'. "
-                f"Available routes: {list(routes_map.keys())}."
-            )
-        replicas = _discovered_replicas(args, routing_value) or replicas
-        return _pick_replica(replicas, sample, routing_value)
-    # Single-teacher path: round-robin over replicas if configured.
-    discovered = _discovered_replicas(args, _SINGLE_TEACHER_MODEL)
-    urls = discovered or getattr(args, "opd_teacher_urls", None)
-    if urls and len(urls) > 1:
+    """Resolve an explicitly external teacher; managed callers need a
+    permit."""
+    if _managed_teacher(args):
+        raise ModelUnavailableError("Managed teacher requests require lookaside admission.")
+    route_key = _teacher_route_key(args, sample)
+    if route_key is not None:
+        return _pick_replica(args.opd_teacher_routes_map[route_key], sample, route_key)
+    urls = getattr(args, "opd_teacher_urls", None)
+    if urls:
         return _pick_replica(urls, sample, "__single__")
-    return discovered[0] if discovered else args.opd_teacher_url
+    return args.opd_teacher_url
 
 
 class OpdManager:
@@ -438,10 +354,7 @@ class OpdManager:
         if self.opsd_worker is not None:
             await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in samples])
 
-        await _refresh_teacher_topology(self.args)
         fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in samples])
-        if not all(fetch_results):
-            _report_teacher_failure(self.args)
         self._raise_if_all_failed(samples, fetch_results)
 
     async def student_stage(
@@ -481,14 +394,29 @@ class OpdManager:
         sample: Sample,
         err_tag: str,
         expected_input_ids: list[int] | None = None,
+        *,
+        inference: dict | None = None,
     ) -> opd_main_worker.LogprobResponse | None:
         try:
-            async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.error("OPD %s failed: status=%s, url=%s, body=%s", err_tag, resp.status, url, body[:2048])
-                    resp.raise_for_status()
-                data = await resp.json()
+            async with AsyncExitStack() as stack:
+                if inference is not None:
+                    selection = dict(inference)
+                    permit = await stack.enter_async_context(
+                        get_request_client(selection.pop("role")).request(**selection)
+                    )
+                    url = f"{permit.target.base_url}/generate"
+                async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error(
+                            "OPD %s failed: status=%s, url=%s, body=%s", err_tag, resp.status, url, body[:2048]
+                        )
+                        resp.raise_for_status()
+                    data = await resp.json()
+        except RoutingError:
+            # A sleeping managed model must never fall back to its startup URL
+            # or silently turn into missing teacher scores.
+            raise
         except Exception as exc:
             logger.error(
                 "OPD %s fetch failed for sample_index=%s, error=%s",
@@ -586,9 +514,24 @@ class OpdManager:
         if native:
             payload["return_prompt_token_ids"] = True
 
-        teacher_url = _pick_teacher_url(self.args, sample)
+        inference = None
+        if _managed_teacher(self.args):
+            inference = {
+                "role": "teacher",
+                "route_key": _teacher_route_key(self.args, sample),
+                "affinity_key": getattr(sample, "group_index", None),
+            }
+            teacher_url = ""  # Resolved only after acquiring the manager's permit.
+        else:
+            teacher_url = _pick_teacher_url(self.args, sample)
         resp_obj = await self._post_logprob(
-            session, teacher_url, payload, sample, "teacher prefill", expanded_ids if native else None
+            session,
+            teacher_url,
+            payload,
+            sample,
+            "teacher prefill",
+            expanded_ids if native else None,
+            inference=inference,
         )
         if resp_obj is None:
             return False
@@ -670,7 +613,13 @@ class OpdManager:
 
         student_url = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/generate"
         resp_obj = await self._post_logprob(
-            session, student_url, payload, sample, "student-at-teacher-topk", sample.tokens if native else None
+            session,
+            student_url,
+            payload,
+            sample,
+            "student-at-teacher-topk",
+            sample.tokens if native else None,
+            inference={"role": "rollout"},
         )
         if resp_obj is None:
             return

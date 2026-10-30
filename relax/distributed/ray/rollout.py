@@ -23,6 +23,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 
 from relax.backends.sglang.sglang_engine import RouterWorkerCleanup, SGLangEngine, remove_dead_router_worker
 from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.distributed.ray.engine_pool import EnginePool, EnginePoolSpec
 from relax.distributed.ray.rollout_scale_types import (
     ScaleInRequest,
     ScaleInStatus,
@@ -30,8 +31,8 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutRequest,
     ScaleOutStatus,
 )
-from relax.distributed.ray.engine_pool import EnginePool, EnginePoolSpec
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
+from relax.engine.inference.admission import ADMISSION_CONCURRENCY_GROUP, AdmissionGate, RequestPermit
 from relax.engine.inference.discovery import (
     EngineState,
     RoleSnapshot,
@@ -47,11 +48,9 @@ from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.http_utils import (
     _wrap_ipv6,
     find_available_port,
-    get,
     get_host_info,
     init_http_client,
     post,
-    router_worker_base_urls,
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
@@ -335,6 +334,8 @@ def _read_engine_metadata(
                             and isinstance(value["node_id"], str)
                         ):
                             metadata = {key: value[key] for key in ("url", "pid", "node_id")}
+                            if value.get("served_model_name"):
+                                metadata["served_model_name"] = value["served_model_name"]
                             record.value = metadata
                         else:
                             issue = "metadata_invalid"
@@ -379,6 +380,7 @@ class EngineGroup:
     require_router_registration: bool = False  # Verify managed PD registration before publication
     engine_init_records: dict[int, _EngineInitRecord] = dataclasses.field(default_factory=dict)
     _engine_urls: dict[int, str | None] = dataclasses.field(default_factory=dict, init=False, repr=False)
+    _served_model_names: dict[int, str] = dataclasses.field(default_factory=dict, init=False, repr=False)
 
     @property
     def nodes_per_engine(self):
@@ -528,6 +530,12 @@ class EngineGroup:
         if heads:
             urls = ray.get([self.all_engines[slot].get_url.remote() for slot in heads], timeout=10)
             self._engine_urls.update(zip(heads, urls, strict=True))
+            for slot in heads:
+                record = self.engine_init_records.get(slot)
+                if record is not None:
+                    metadata = record.value if isinstance(record.value, dict) else ray.get(record.value, timeout=10)
+                    if isinstance(metadata, dict) and metadata.get("served_model_name"):
+                        self._served_model_names[slot] = metadata["served_model_name"]
             pool.mark_initialized(heads)
 
     def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
@@ -570,6 +578,7 @@ class EngineGroup:
         new_engines = pool.create()
         for slot, _ in new_engines:
             self._engine_urls.pop(slot, None)
+            self._served_model_names.pop(slot, None)
         # Outside the group an engine is known by its global rank.
         rollout_engines = [(self.rank_offset + slot, engine) for slot, engine in new_engines]
 
@@ -932,6 +941,7 @@ def get_local_rollout_manager() -> "RolloutManager":
 
 @ray.remote(
     concurrency_groups={
+        ADMISSION_CONCURRENCY_GROUP: 1,
         "health_monitoring": 1,
         "scale_out": 8,
         "scale_in": 8,
@@ -958,6 +968,7 @@ class RolloutManager(ReloadableMixin):
     def __init__(self, args, pg, data_source=None):
         self.pg = pg
         self.args = args
+        self._admission = AdmissionGate()
         self._engine_actor_states = _get_engine_actor_states()
         self._dynamic_global_batch_size = None
 
@@ -1284,24 +1295,11 @@ class RolloutManager(ReloadableMixin):
         carrying images/videos/audio for each prompt; encoded inline and
         merged into the payload, mirroring the RL ``generate()`` path.
         """
-        import sglang_router
-        from packaging.version import parse
-
         from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
         self.health_monitoring_resume()
 
         router_base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
-        if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(self.args, "use_slime_router", False):
-            response = await get(f"{router_base}/list_workers")
-            worker_urls = response["urls"]
-        else:
-            response = await get(f"{router_base}/workers")
-            worker_urls = [w["url"] for w in response["workers"]]
-        worker_urls = router_worker_base_urls(worker_urls)
-        if not worker_urls:
-            worker_urls = [router_base]
-
         # Reuse the shared --eval-* sampling args (no SFT-predict-specific
         # flags). Defaults preserve the original SFT predict behaviour
         # (greedy, max_new_tokens=512) when --eval-* is not provided.
@@ -1317,12 +1315,12 @@ class RolloutManager(ReloadableMixin):
             multimodal_inputs_list = [None] * len(prompts)
 
         async def _one(idx: int, prompt: str, mm: dict | None) -> str:
-            url = f"{worker_urls[idx % len(worker_urls)]}/generate"
+            url = f"{router_base}/generate"
             payload: dict[str, Any] = {"text": prompt, "sampling_params": sampling_params}
             if mm:
                 encoded_mm, _ = await _encode_multimodal_inputs(mm)
                 payload.update(encoded_mm)
-            output = await post(url, payload)
+            output = await post(url, payload, inference={"role": "rollout", "direct": True})
             if isinstance(output, dict) and "text" in output:
                 return output["text"]
             if isinstance(output, str):
@@ -1343,7 +1341,9 @@ class RolloutManager(ReloadableMixin):
             logger.warning(f"Failed to load data source: {e}")
 
     async def offload(self):
-        self._offload_local()
+        # HTTP owners on this actor's default loop must finish and return their
+        # permits while the lifecycle thread waits for the drain.
+        await asyncio.to_thread(self._offload_local)
 
     def _offload_local(self):
         """Sync body of offload(); safe to call directly from code running
@@ -1352,6 +1352,18 @@ class RolloutManager(ReloadableMixin):
             logger.info("Rollout already offloaded; skipping")
             return
         self.health_monitoring_pause()
+        self._admission.drain(
+            lambda: ray.get(
+                [
+                    e.abort_requests.remote(timeout=30)
+                    for srv in self.servers.values()
+                    for e in srv.engines
+                    if e is not None
+                ],
+                timeout=35,
+            )
+        )
+        self._missing_memory = {GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH}
         for srv in self.servers.values():
             srv.offload()
         self.status = "offload"
@@ -1364,17 +1376,19 @@ class RolloutManager(ReloadableMixin):
         inside this actor's process (e.g. custom_reward_post_process)."""
         for srv in self.servers.values():
             srv.onload(tags)
-        # Full onload transitions status; per-tag calls leave status for the
-        # dedicated wrappers below (onload_weights / onload_kv).
-        if tags is None:
+        # Reopen only once every offloaded memory category has been restored.
+        missing = getattr(self, "_missing_memory", set())
+        missing.difference_update(tags if tags is not None else tuple(missing))
+        self._missing_memory = missing
+        if not missing:
             self.status = "onload"
+            self._admission.open()
 
     async def onload_weights(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     async def onload_kv(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
-        self.status = "onload"
 
     def get_status(self):
         return self.status
@@ -3490,6 +3504,16 @@ class RolloutManager(ReloadableMixin):
         result["observation"]["complete"] = not issues
         return result
 
+    @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
+    def acquire_inference(self, request_id: str, **selection: Any) -> RequestPermit:
+        return self._admission.acquire(
+            lambda: RoleSnapshot.from_dict(self.get_inference_snapshot()), request_id, **selection
+        )
+
+    @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
+    def release_inference(self, permit: RequestPermit) -> None:
+        self._admission.release(permit)
+
     @ray.method(concurrency_group="scale_out")
     def get_inference_snapshot(self) -> dict:
         """Topology of every rollout model in the unified discovery schema.
@@ -3521,16 +3545,39 @@ class RolloutManager(ReloadableMixin):
                         workers.append((f"{group.worker_type}-{rank}", url, state))
                     else:
                         replicas.append((rank, url, state))
-            models.append(build_model_snapshot(name, replicas, router_url=router_url, diagnostic_workers=workers))
+            group = srv.engine_groups[0] if srv.engine_groups else None
+            overrides = group.sglang_overrides if group else {}
+            served_name = (
+                next(
+                    (
+                        alias
+                        for g in srv.engine_groups
+                        for slot, alias in g._served_model_names.items()
+                        if slot < len(g.all_engines) and g.all_engines[slot] is not None
+                    ),
+                    None,
+                )
+                or overrides.get("served_model_name")
+                or getattr(self.args, "sglang_served_model_name", None)
+                or overrides.get("model_path")
+                or getattr(self.args, "hf_checkpoint", None)
+            )
+            models.append(
+                build_model_snapshot(
+                    name, replicas, router_url=router_url, diagnostic_workers=workers, served_model_name=served_name
+                )
+            )
 
         revision = getattr(self, "_topology_revision", None)
         if revision is None:
             revision = self._topology_revision = TopologyRevision()
-        return RoleSnapshot(
-            role="rollout",
-            topology_revision=revision.observe(models),
-            models=tuple(models),
-            default_model="default" if "default" in self.servers else None,
+        return self._admission.view(
+            RoleSnapshot(
+                role="rollout",
+                topology_revision=revision.observe(models),
+                models=tuple(models),
+                default_model="default" if "default" in self.servers else None,
+            )
         ).to_dict()
 
     @ray.method(concurrency_group="scale_out")

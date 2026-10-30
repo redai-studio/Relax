@@ -15,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 
 from relax.components import genrm as genrm_module
 from relax.engine.inference.gateway import InferenceGateway
+from tests.engine.inference.helpers import AdmissionManager
 
 
 GenRM = genrm_module.GenRM.func_or_class
@@ -100,12 +101,14 @@ def _make_genrm(monkeypatch, *instances: str, state: str = "ready"):
         }
         for name in instances
     }
-    genrm._engine_caches = {name: genrm_module._EngineCacheState() for name in instances}
-    for cache in genrm._engine_caches.values():
-        cache.refresh([ENGINE])
     genrm.tokenizers = {name: _Tokenizer() for name in instances}
     genrm._http_client = _EngineClient(" A is better \n")
-    genrm._gateway = InferenceGateway("genrm", genrm._fetch_inference_snapshot, upstream_name="GenRM engine")
+    genrm._gateway = InferenceGateway(
+        "genrm",
+        genrm._fetch_inference_snapshot,
+        upstream_name="GenRM engine",
+        request_client=AdmissionManager(genrm._fetch_inference_snapshot).client("genrm", specs=genrm.instance_specs),
+    )
     return genrm
 
 
@@ -138,25 +141,22 @@ async def test_genrm_generate_with_messages_keeps_legacy_response(monkeypatch, u
         _Request({"messages": messages, "route_key": "safety", "sampling_params": {"temperature": 0.7}})
     )
 
-    assert response == genrm_module.GenerateResponse(response="A is better")
+    assert response == genrm_module.GenerateResponse(response="raw")
     # Rendered with the selected instance's chat template...
     rendered, template_kwargs = genrm.tokenizers["safety"].calls[0]
-    assert [message.model_dump() for message in rendered] == messages
+    assert rendered == messages
     assert template_kwargs == {"tokenize": True, "add_generation_prompt": True}
     assert genrm.tokenizers["quality"].calls == []
     # ...and sent with request-level sampling params merged over the instance defaults.
-    assert genrm._http_client.posts == [
+    assert [(str(request.url), json.loads(request.content)) for request in upstream] == [
         (
-            f"http://{ENGINE[0]}:{ENGINE[1]}/generate",
+            "http://safety:1/generate",
             {
                 "input_ids": [11, 12, 13],
                 "sampling_params": {"temperature": 0.7, "top_p": 1.0, "top_k": -1, "max_new_tokens": 64},
             },
         )
     ]
-    # The legacy path picks its own engine: the gateway is not involved.
-    assert upstream == []
-    assert all(manager.calls == [] for manager in genrm.genrm_managers.values())
 
 
 async def test_genrm_generate_with_invalid_messages_is_a_validation_error(monkeypatch):
@@ -227,7 +227,8 @@ async def test_genrm_request_while_sleeping_returns_503(monkeypatch, upstream):
     assert "Retry-After" in excinfo.value.headers
     # Nothing was forwarded, and the request did not wake the model up.
     assert upstream == []
-    assert genrm.genrm_managers["__default__"].calls == ["get_inference_snapshot"]
+    # Bootstrap identifies the manager; admission then reads its live state.
+    assert genrm.genrm_managers["__default__"].calls == ["get_inference_snapshot"] * 2
 
 
 @pytest.mark.parametrize(

@@ -12,9 +12,7 @@ fall back to the sole "__default__" instance (the legacy single-model config).
 """
 
 import asyncio
-import time
 from argparse import Namespace
-from itertools import cycle
 from typing import Any, List, Optional, Union
 
 import httpx
@@ -27,8 +25,11 @@ from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
+from relax.engine.inference.client import InferenceRequestClient
 from relax.engine.inference.discovery import RoleSnapshot, role_snapshot_from_payloads
 from relax.engine.inference.gateway import SNAPSHOT_FETCH_TIMEOUT_S, InferenceGateway
+from relax.engine.inference.messages import genrm_payload
+from relax.engine.inference.routing import RoutingError, select_model
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -89,6 +90,7 @@ class GenerateRequest(BaseModel):
     messages: Union[List[Message], List[dict]]
     sampling_params: Optional[dict] = None
     route_key: Optional[str] = None
+    model: Optional[str] = None
 
 
 class GenerateResponse(BaseModel):
@@ -98,40 +100,6 @@ class GenerateResponse(BaseModel):
     """
 
     response: str
-
-
-class _EngineCacheState:
-    """Per-instance round-robin cache over a GenRMManager's live engine list.
-
-    Isolated per route_key so a dead/rebuilt engine on one instance never
-    perturbs another instance's cycle.
-    """
-
-    def __init__(self) -> None:
-        self.hosts_ports: Optional[list] = None
-        self.cycle: Optional[Any] = None
-        self.refreshed_at: float = 0.0
-
-    def invalidate(self) -> None:
-        now = time.monotonic()
-        if now - self.refreshed_at < Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S:
-            return
-        self.hosts_ports = None
-
-    def needs_refresh(self) -> bool:
-        if self.hosts_ports is None:
-            return True
-        if self.hosts_ports:
-            return False
-        return time.monotonic() - self.refreshed_at >= Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S
-
-    def refresh(self, hosts_ports: list) -> None:
-        self.refreshed_at = time.monotonic()
-        # Swap the list and its cycle together: the manager compacts the list
-        # over dead engines, so a cycle built for the old length would hand
-        # back an out-of-range index.
-        self.cycle = cycle(range(len(hosts_ports)))
-        self.hosts_ports = hosts_ports
 
 
 @serve.deployment(
@@ -185,24 +153,21 @@ class GenRM(Base):
         self.genrm_managers = create_genrm_managers(config, pg, runtime_env=runtime_env)
         self.instance_specs = config._genrm_instances_resolved
 
-        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
-        # Serves discovery and the unified endpoints. The messages-based
-        # /generate path below keeps its own engine picking.
-        self._gateway = InferenceGateway(role, self._fetch_inference_snapshot, upstream_name="GenRM engine")
-        self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
-        # Shared HTTP client for engine calls (avoids per-request connection overhead).
-        # Raise pool limits well above httpx's default 100 so one replica can fan out
-        # many concurrent engine requests; keepalive_expiry >> the default 5s so
-        # idle-then-reused connections aren't reaped mid-burst (avoids ReadError/500).
-        self._http_client = httpx.AsyncClient(
-            timeout=1800,
-            limits=httpx.Limits(
-                max_connections=_GENRM_HTTP_MAX_CONNECTIONS,
-                max_keepalive_connections=_GENRM_HTTP_MAX_CONNECTIONS,
-                keepalive_expiry=600,
+        self._gateway = InferenceGateway(
+            role,
+            self._fetch_inference_snapshot,
+            upstream_name="GenRM engine",
+            request_client=InferenceRequestClient(role, self.get_inference_resources),
+            proxy_client=httpx.AsyncClient(
+                timeout=1800,
+                limits=httpx.Limits(
+                    max_connections=_GENRM_HTTP_MAX_CONNECTIONS,
+                    max_keepalive_connections=_GENRM_HTTP_MAX_CONNECTIONS,
+                    keepalive_expiry=600,
+                ),
             ),
         )
-
+        self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
         # Load one tokenizer per instance -- distinct instances may be distinct
         # models with distinct tokenizers/chat templates.
         self.tokenizers = {
@@ -218,6 +183,10 @@ class GenRM(Base):
         loop does not block on it.
         """
         return None
+
+    async def get_inference_resources(self) -> dict:
+        snapshot = await asyncio.to_thread(self._fetch_inference_snapshot)
+        return {"snapshot": snapshot.to_dict(), "managers": self.genrm_managers, "specs": self.instance_specs}
 
     def _fetch_inference_snapshot(self) -> RoleSnapshot:
         payloads = ray.get(
@@ -268,7 +237,9 @@ class GenRM(Base):
             GenerateResponse containing raw model response text
         """
         try:
-            output = await self._call_engine(request.route_key, request.messages, request.sampling_params)
+            output = await self._call_engine(
+                request.route_key, request.messages, request.sampling_params, model=request.model
+            )
             response = output.get("text", "").strip()
             return GenerateResponse(response=response)
 
@@ -286,113 +257,34 @@ class GenRM(Base):
             )
         return key
 
-    def _pick_engine(self, route_key: Optional[str]) -> tuple[str, int, str, int]:
-        """Round-robin one live engine of the instance selected by
-        ``route_key``, refreshing that instance's cache if it was dropped."""
-        key = self._resolve_instance_key(route_key)
-        cache = self._engine_caches[key]
-        if cache.needs_refresh():
-            hosts_ports = ray.get(self.genrm_managers[key].get_engine_hosts_ports.remote())
-            cache.refresh(hosts_ports)
-
-        hosts_ports = cache.hosts_ports
-        if not hosts_ports:
-            raise RuntimeError(f"No genRM engines available for instance '{key}'")
-
-        # Thread-safe round-robin via itertools.cycle (next() is atomic in CPython).
-        # Re-read the local alias, not cache.*, so a concurrent invalidation
-        # can't make the index and the list disagree.
-        idx = next(cache.cycle) % len(hosts_ports)
-        host, port = hosts_ports[idx]
-        return key, idx, host, port
-
     async def _call_engine(
-        self, route_key: Optional[str], messages: list, sampling_params: Optional[dict] = None
+        self,
+        route_key: Optional[str],
+        messages: list,
+        sampling_params: Optional[dict] = None,
+        *,
+        model: Optional[str] = None,
     ) -> dict:
-        """Call an SGLang engine for text generation.
-
-        Uses the engine addresses obtained from the selected instance's
-        GenRMManager to send HTTP requests to the underlying SGLang server.
-
-        Args:
-            route_key: Selects which genRM instance to use.
-            messages: List of chat messages in OpenAI format.
-            sampling_params: Optional per-request sampling params that override defaults.
-
-        Returns:
-            Dict containing at least {"text": str} from the SGLang server.
-        """
-        key, idx, host, port = self._pick_engine(route_key)
-        spec = self.instance_specs[key]
-        # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
-        # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
-        # worker thread so it does not block this replica's event loop. Fast (Rust) tokenizers
-        # release the GIL during encode, so concurrent requests tokenize in parallel instead of
-        # serializing — without this a single replica throttles dispatch and starves the engines.
-        # Forward chat_template_kwargs from the instance's sampling_config through to
-        # the jinja template — e.g. `{"enable_thinking": false}` for Qwen3+ to
-        # suppress the default <think> block. Keys unused by the template are
-        # silently dropped by transformers, so this is safe across model families.
-        sampling_config = spec["sampling_config"]
-        chat_template_kwargs = sampling_config.get("chat_template_kwargs", {}) or {}
-        input_ids = await asyncio.to_thread(
-            self.tokenizers[key].apply_chat_template,
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            **chat_template_kwargs,
+        try:
+            resources = await self._gateway._requests.resources()
+            selected = select_model(RoleSnapshot.from_dict(resources["snapshot"]), model, route_key)
+        except RoutingError as exc:
+            raise HTTPException(
+                exc.status_code, str(exc), headers={"Retry-After": "5"} if exc.status_code == 503 else None
+            ) from exc
+        payload = await genrm_payload(
+            self.tokenizers[selected.name],
+            self.instance_specs[selected.name]["sampling_config"],
+            [message.model_dump() if isinstance(message, BaseModel) else message for message in messages],
+            sampling_params,
         )
-
-        if not isinstance(input_ids, list):
-            input_ids = (
-                input_ids["input_ids"]
-                if hasattr(input_ids, "__getitem__") and "input_ids" in input_ids
-                else list(input_ids)
-            )
-
-        # Merge per-request sampling params with default config
-        default_sampling = {
-            "temperature": sampling_config.get("temperature", 0.2),
-            "top_p": sampling_config.get("top_p", 1.0),
-            "top_k": sampling_config.get("top_k", -1),
-            "max_new_tokens": sampling_config.get("max_response_len", 1024),
-        }
-        # Override defaults with per-request params
-        if sampling_params:
-            default_sampling.update(sampling_params)
-
-        payload = {
-            "input_ids": input_ids,
-            "sampling_params": default_sampling,
-        }
-
-        # Retry transient resets (transport-level or 5xx) with short backoff so
-        # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
-        # (terminal) and a cancellation (caller timeout) is never retried.
-        # Serve→engine retry attempts for transient resets (ReadError / 5xx under
-        # bursty colocate contention), absorbing them before they surface as a 500
-        # to the client. Set 1 to disable.
-        retry_attempts = Envs.GENRM_ENGINE_RETRY_ATTEMPTS
-        for _attempt in range(1, retry_attempts + 1):
+        for attempt in range(1, Envs.GENRM_ENGINE_RETRY_ATTEMPTS + 1):
             try:
-                resp = await self._http_client.post(f"http://{host}:{port}/generate", json=payload)
-                resp.raise_for_status()
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
-                if (status == 0 or status >= 500) and _attempt < retry_attempts:
-                    # A transport error means this engine may be gone and its
-                    # replacement will come back on a different port, so drop the
-                    # cache and re-pick — retrying the same dead host is useless.
-                    if status == 0:
-                        self._engine_caches[key].invalidate()
-                    key, idx, host, port = self._pick_engine(route_key)
-                    await asyncio.sleep(0.3 * _attempt)
-                    continue
-                raise
-        return resp.json()
+                return await self._gateway.generate({"model": selected.name, **payload})
+            except HTTPException as exc:
+                if exc.status_code < 500 or attempt >= Envs.GENRM_ENGINE_RETRY_ATTEMPTS:
+                    raise
+                await asyncio.sleep(0.3 * attempt)
 
     @app.get("/engines")
     async def get_engines(self) -> dict:

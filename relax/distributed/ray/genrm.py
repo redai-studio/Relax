@@ -21,6 +21,7 @@ from relax.distributed.ray.multi_engine_manager import (  # noqa: F401
 )
 from relax.distributed.ray.placement_planner import GENRM_ROLE, plan_placement
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.engine.inference.admission import ADMISSION_CONCURRENCY_GROUP, RequestPermit
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
 
@@ -72,9 +73,26 @@ class GenRMManager(MultiEngineManager):
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
 
+    @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
+    def acquire_inference(self, request_id: str, **selection) -> RequestPermit:
+        return super().acquire_inference(request_id, **selection)
+
+    @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
+    def release_inference(self, permit: RequestPermit) -> None:
+        super().release_inference(permit)
+
     @ray.method(concurrency_group=SNAPSHOT_CONCURRENCY_GROUP)
     def get_inference_snapshot(self) -> dict:
         return super().get_inference_snapshot()
+
+    def served_model_name(self) -> str:
+        config = self.args.genrm_engine_config or {}
+        return (
+            config.get("served_model_name")
+            or getattr(self.args, "sglang_served_model_name", None)
+            or config.get("model_path")
+            or self.args.genrm_model_path
+        )
 
     def get_genrm_engines_and_lock(self):
         return self.engines, self.genrm_engine_lock, self.num_new_engines

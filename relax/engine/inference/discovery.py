@@ -81,10 +81,12 @@ class ModelSnapshot:
     engines: tuple[EngineSnapshot, ...] = ()
     # PD prefill/decode workers: reachable only through the router.
     diagnostic_workers: tuple[EngineSnapshot, ...] = ()
+    served_model_name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "state": self.state.value,
+            "served_model_name": self.served_model_name,
             "router_url": self.router_url,
             "engines": [engine.to_dict() for engine in self.engines],
             "diagnostic_workers": [worker.to_dict() for worker in self.diagnostic_workers],
@@ -98,6 +100,7 @@ class ModelSnapshot:
             router_url=data.get("router_url"),
             engines=tuple(EngineSnapshot.from_dict(item) for item in data.get("engines", ())),
             diagnostic_workers=tuple(EngineSnapshot.from_dict(item) for item in data.get("diagnostic_workers", ())),
+            served_model_name=data.get("served_model_name"),
         )
 
 
@@ -154,6 +157,7 @@ def build_model_snapshot(
     *,
     router_url: str | None = None,
     diagnostic_workers: Iterable[tuple[str, str | None, EngineState]] = (),
+    served_model_name: str | None = None,
 ) -> ModelSnapshot:
     """Build a model snapshot from ``(replica index, base_url, state)`` rows.
 
@@ -193,6 +197,7 @@ def build_model_snapshot(
         router_url=router_url,
         engines=replicas,
         diagnostic_workers=workers,
+        served_model_name=served_model_name,
     )
 
 
@@ -206,6 +211,7 @@ def model_snapshot_from_payload(name: str, payload: Mapping[str, Any]) -> ModelS
         name,
         [(row["index"], row.get("base_url"), EngineState(row["state"])) for row in payload.get("engines", ())],
         router_url=payload.get("router_url"),
+        served_model_name=payload.get("served_model_name"),
         diagnostic_workers=[
             (row["label"], row.get("base_url"), EngineState(row["state"]))
             for row in payload.get("diagnostic_workers", ())

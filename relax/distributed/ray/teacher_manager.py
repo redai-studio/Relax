@@ -5,16 +5,17 @@ import ray
 from ray.util.placement_group import remove_placement_group
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
-from relax.distributed.ray.placement_group import create_placement_group
 from relax.distributed.ray.multi_engine_manager import (
     SNAPSHOT_CONCURRENCY_GROUP,
     SNAPSHOT_CONCURRENCY_GROUPS,
     MultiEngineManager,
 )
+from relax.distributed.ray.placement_group import create_placement_group
 from relax.distributed.ray.placement_physical import validate_engine_bundles
 from relax.distributed.ray.placement_planner import ACTOR_POOL
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from relax.engine.inference.admission import ADMISSION_CONCURRENCY_GROUP, RequestPermit
 from relax.utils.env import Envs
 from relax.utils.http_utils import find_available_port
 from relax.utils.logging_utils import get_logger
@@ -110,9 +111,24 @@ class TeacherManager(MultiEngineManager):
             log_prefix="[OPD teacher]",
         )
 
+    @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
+    def acquire_inference(self, request_id: str, **selection) -> RequestPermit:
+        return super().acquire_inference(request_id, **selection)
+
+    @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
+    def release_inference(self, permit: RequestPermit) -> None:
+        super().release_inference(permit)
+
     @ray.method(concurrency_group=SNAPSHOT_CONCURRENCY_GROUP)
     def get_inference_snapshot(self) -> dict:
         return super().get_inference_snapshot()
+
+    def served_model_name(self) -> str:
+        return (
+            self._overrides.get("served_model_name")
+            or getattr(self._teacher_args, "sglang_served_model_name", None)
+            or self._overrides["model_path"]
+        )
 
     def get_urls(self) -> list[str]:
         urls = []

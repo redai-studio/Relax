@@ -510,6 +510,13 @@ def test_multi_engine_manager_snapshot_lists_only_head_engines(_patch_ray):
     assert model.state.value == "ready" and model.router_url is None
 
 
+def test_multi_engine_manager_snapshot_keeps_actual_served_model_alias(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    # Engine initialization may materialize a checkpoint at a different path.
+    manager._pool.init_metadata[0] = {"served_model_name": "/materialized/model"}
+    assert _named(manager).served_model_name == "/materialized/model"
+
+
 def test_multi_engine_manager_snapshot_revision_bumps_after_rebuild(_patch_ray):
     manager = _FakeManager(num_slots=2)
     initial = manager.get_inference_snapshot()["topology_revision"]

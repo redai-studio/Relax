@@ -221,6 +221,12 @@ generate.manages_inference_permit = True
 
 **注意**：解除会话级锁后，同时“活跃”的会话数不再受该信号量限制（仅在飞请求受限）；如需限制并发环境/工具的资源占用，请在自定义函数内自行控制。
 
+`post_generate` 还会在每次 HTTP 发送前（包括重试）向 RolloutManager 获取生命周期准入许可。内部使用 lookaside 模式：Manager 选择当前可用的 Router 或 Engine，调用方直接发送请求体。`url` 参数提供接口路径，目标主机由 Manager 决定；可在 payload 中用 `model` 或 `route_key` 选择受管模型。单独使用 `state.inference_permit()` 只限制并发，不能作为直连引擎的准入许可。
+
+外部调用方使用对应角色的 Gateway 接口。模型选择优先级依次为 `model`、`route_key`、配置的默认模型；`/v1/models` 列出可接受的模型名称和无歧义的 served-model 别名。未知模型返回 HTTP 400，正在排空或休眠的模型返回带 `Retry-After` 的 HTTP 503；请求不会自动唤醒模型。
+
+两条路径都持有准入许可直到 HTTP 响应关闭，流式响应也一样。Offload 会先关闭准入，等待已有请求结束后再释放显存；如果无法确认排空，则切换失败并保持准入关闭。自定义 HTTP transport 应使用 `InferenceRequestClient.request()` 的异步上下文覆盖发送与完整响应消费，不能仅凭缓存的 `/engines` 地址发送请求。显式配置的外部 OPD teacher URL 和 `GenRMClient(service_url=...)` 仍按外部 HTTP 服务调用。
+
 ## 训练脚本与关键参数概览
 
 完整的参数可参照 [配置说明](./configuration.md)。

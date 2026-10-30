@@ -12,6 +12,7 @@ import pytest
 from fastapi import HTTPException
 
 from relax.components import inference_gateway as gateway_module
+from tests.engine.inference.helpers import AdmissionManager
 
 
 Service = gateway_module.InferenceGatewayService.func_or_class
@@ -55,6 +56,7 @@ def _make_service(monkeypatch, managers, default_model=None):
     # ``@serve.ingress`` wraps the class in one whose ``__init__`` is async and
     # also boots the ASGI app; the first base is the class as written.
     Service.__bases__[0].__init__(service, "teacher", managers, default_model)
+    service._gateway._requests = AdmissionManager(service._fetch_inference_snapshot).client("teacher")
     return service
 
 

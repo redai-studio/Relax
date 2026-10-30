@@ -703,7 +703,8 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
 async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypatch, lifecycle_enabled) -> None:
     calls = []
 
-    async def fake_post(url, payload, headers=None, fail_fast_no_workers=False):
+    async def fake_post(url, payload, headers=None, fail_fast_no_workers=False, *, inference=None):
+        assert inference == {"role": "rollout"}
         calls.append((url, payload, headers, fail_fast_no_workers))
         return {
             "output_ids": [4],

@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from relax.components import rollout as rollout_module
 from relax.engine.inference.discovery import EngineState, RoleSnapshot, build_model_snapshot
 from relax.engine.inference.gateway import InferenceGateway
+from tests.engine.inference.helpers import AdmissionManager
 
 
 Rollout = rollout_module.Rollout.func_or_class
@@ -57,7 +58,9 @@ def _make_rollout(snapshot=SNAPSHOT):
     rollout = object.__new__(Rollout)
     rollout._logger_instance = None
     rollout._sglang_base_url = None
-    rollout._gateway = InferenceGateway("rollout", snapshot.to_dict, upstream_name="SGLang router")
+    rollout._gateway = InferenceGateway(
+        "rollout", snapshot.to_dict, upstream_name="SGLang router", request_client=AdmissionManager(snapshot).client()
+    )
     rollout.rollout_manager = type("_Manager", (), {})()
     rollout.rollout_manager.get_engines_info = _RemoteMethod(LEGACY_ENGINES)
     rollout.rollout_manager.get_router_address = _RemoteMethod({"router_ip": "192.0.2.1", "router_port": 3000})

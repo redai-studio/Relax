@@ -396,7 +396,8 @@ class _FakeEnv:
 
 
 def _patch_deepeyes(monkeypatch, de, state, env) -> None:
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, headers=None, *, inference=None):
+        assert inference["role"] == "rollout"
         state.records["locked_during_post"].append(state.semaphore.locked())
         state.records["posts"] += 1
         await asyncio.sleep(0)

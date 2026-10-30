@@ -144,7 +144,9 @@ def test_teacher_manager_answers_snapshots_outside_its_default_concurrency_group
     metadata = teacher_manager.TeacherManager.__ray_metadata__
 
     group = metadata.modified_class.get_inference_snapshot.__ray_concurrency_group__
-    assert metadata.concurrency_groups == {group: 1}
+    assert metadata.concurrency_groups == {group: 1, "inference_admission": 1}
+    for method in ("acquire_inference", "release_inference"):
+        assert getattr(metadata.modified_class, method).__ray_concurrency_group__ == "inference_admission"
     # Everything that changes engine state stays serialized in the default group.
     for method in ("onload", "offload", "recover", "shutdown"):
         assert not hasattr(getattr(metadata.modified_class, method), "__ray_concurrency_group__")

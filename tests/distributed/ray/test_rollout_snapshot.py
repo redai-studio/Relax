@@ -78,6 +78,27 @@ def test_rollout_snapshot_reports_router_and_logical_replicas(monkeypatch):
     assert not any(engine.direct_eligible for engine in model.engines)
 
 
+def test_rollout_snapshot_reports_actual_served_name_from_engine_init(monkeypatch):
+    group = make_engine_group(engines=_engines("http://engine:1"))
+    group._served_model_names[0] = "/materialized/model"
+    assert _snapshot(_manager(monkeypatch, [group])).models[0].served_model_name == "/materialized/model"
+
+
+async def test_rollout_split_resume_keeps_admission_closed_until_all_tags_return(monkeypatch):
+    from relax.engine.inference.routing import ModelUnavailableError
+
+    group = make_engine_group(engines=_engines("http://engine:1"))
+    manager = _manager(monkeypatch, [group], status="onload")
+    await manager.offload()
+    await manager.onload_kv()
+    with pytest.raises(ModelUnavailableError):
+        manager.acquire_inference("too-early")
+    await manager.onload_weights()
+    permit = manager.acquire_inference("ready")
+    manager.release_inference(permit)
+    assert manager.status == "onload"
+
+
 def test_rollout_snapshot_excludes_pd_workers_from_replicas(monkeypatch):
     prefill = make_engine_group(engines=_engines("http://p0:15000"), worker_type="prefill")
     decode = make_engine_group(engines=_engines("http://d0:15000"), worker_type="decode", rank_offset=1)

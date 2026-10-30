@@ -11,6 +11,11 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from relax.engine.inference.client import get_request_client
+from relax.engine.inference.discovery import RoleSnapshot
+from relax.engine.inference.messages import genrm_payload
+from relax.engine.inference.routing import select_model
+from relax.utils.http_utils import _post
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url
 
@@ -27,6 +32,7 @@ logger = get_logger(__name__)
 
 # Module-level singleton to avoid creating a new client per request
 _genrm_client: Optional["GenRMClient"] = None
+_external_clients: dict[tuple[str, float], "GenRMClient"] = {}
 
 
 class GenRMClient:
@@ -41,9 +47,13 @@ class GenRMClient:
         """Initialize GenRM client.
 
         Args:
-            service_url: URL of the GenRM service. If None, will use get_serve_url("genrm")
+            service_url: Explicit external GenRM HTTP service. If omitted,
+                use lookaside admission for Relax's managed GenRM engines.
             timeout: Request timeout in seconds
         """
+        self._managed = service_url is None
+        self._tokenizers: dict = {}
+        self._tokenizer_tasks: dict = {}
         if service_url is None:
             service_url = get_serve_url("genrm")
 
@@ -88,6 +98,8 @@ class GenRMClient:
         Returns:
             Raw response string from the GenRM model
         """
+        if self._managed:
+            return await self._generate_managed(messages, sampling_params, route_key)
         url = f"{self.service_url}/generate"
         payload: Dict = {
             "messages": messages,
@@ -130,6 +142,28 @@ class GenRMClient:
 
             await asyncio.sleep(backoff)
             backoff *= 2
+
+    async def _generate_managed(self, messages: list, sampling_params: dict | None, route_key: str | None) -> str:
+        resources = await get_request_client("genrm").resources()
+        model = select_model(RoleSnapshot.from_dict(resources["snapshot"]), route_key=route_key)
+        spec = resources["specs"][model.name]
+        if model.name not in self._tokenizers:
+            from relax.utils.data.processing_utils import load_tokenizer
+
+            if model.name not in self._tokenizer_tasks:
+                self._tokenizer_tasks[model.name] = asyncio.create_task(
+                    asyncio.to_thread(load_tokenizer, spec["model_path"], trust_remote_code=True)
+                )
+            self._tokenizers[model.name] = await asyncio.shield(self._tokenizer_tasks[model.name])
+        payload = await genrm_payload(self._tokenizers[model.name], spec["sampling_config"], messages, sampling_params)
+        output = await _post(
+            self._async_client,
+            str(httpx.URL(self.service_url).copy_with(path="/generate")),
+            payload,
+            max_retries=_GENRM_MAX_ATTEMPTS,
+            inference={"role": "genrm", "model": model.name},
+        )
+        return output.get("text", "").strip()
 
     def health_check(self) -> Dict:
         """Check health status of GenRM service (sync, safe to call at init).
@@ -193,6 +227,11 @@ def get_genrm_client(service_url: Optional[str] = None, timeout: float = 1800.0)
         GenRMClient instance (cached singleton)
     """
     global _genrm_client
+    if service_url is not None:
+        key = (service_url.rstrip("/"), timeout)
+        if key not in _external_clients:
+            _external_clients[key] = GenRMClient(service_url=service_url, timeout=timeout)
+        return _external_clients[key]
     if _genrm_client is None:
         _genrm_client = GenRMClient(service_url=service_url, timeout=timeout)
     return _genrm_client

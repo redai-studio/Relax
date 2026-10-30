@@ -28,7 +28,14 @@ from relax.distributed.ray.engine_pool import EnginePool, EnginePoolSpec
 from relax.distributed.ray.engine_pool import is_engine_dead as _is_engine_dead  # noqa: F401
 from relax.distributed.ray.placement_physical import validate_physical_placement
 from relax.distributed.ray.placement_planner import plan_placement
-from relax.engine.inference.discovery import TopologyRevision, build_model_snapshot, format_base_url
+from relax.engine.inference.admission import ADMISSION_CONCURRENCY_GROUP, AdmissionGate, RequestPermit
+from relax.engine.inference.discovery import (
+    RoleSnapshot,
+    TopologyRevision,
+    build_model_snapshot,
+    format_base_url,
+    role_snapshot_from_payloads,
+)
 from relax.utils.logging_utils import get_logger
 
 
@@ -54,7 +61,7 @@ _ENGINE_SHUTDOWN_TIMEOUT_S = 60.0
 # The base method stays untagged: Ray rejects a tagged method on an actor that
 # does not declare the group.
 SNAPSHOT_CONCURRENCY_GROUP = "inference_snapshot"
-SNAPSHOT_CONCURRENCY_GROUPS = {SNAPSHOT_CONCURRENCY_GROUP: 1}
+SNAPSHOT_CONCURRENCY_GROUPS = {SNAPSHOT_CONCURRENCY_GROUP: 1, ADMISSION_CONCURRENCY_GROUP: 1}
 
 
 class MultiEngineManager:
@@ -87,6 +94,7 @@ class MultiEngineManager:
         self.engine_actor_cls = engine_actor_cls
         self.nodes_per_engine = max(1, nodes_per_engine)
         self._log_prefix = log_prefix
+        self._admission = AdmissionGate()
 
         self.all_engines: list[Any] = [None] * num_slots
         # The hooks are looked up at call time, so subclasses only override them.
@@ -246,6 +254,8 @@ class MultiEngineManager:
         phase wants.
         """
         self._pool.activate(tags)
+        if tags is None:
+            self._admission.open()
 
     def offload(self) -> None:
         """Offload engine weights from GPU to free memory.
@@ -254,7 +264,24 @@ class MultiEngineManager:
         while other ranks wait on a barrier, so keep it short and leave the
         rebuild to the next onload().
         """
+        self._admission.drain(
+            lambda: ray.get([e.abort_requests.remote(timeout=30) for e in self.engines if e is not None], timeout=35)
+        )
         self._pool.deactivate()
+
+    def acquire_inference(self, request_id: str, **selection: Any) -> RequestPermit:
+        # Each static-model manager owns one model. Its facade supplies the
+        # public name; the manager's local name is deliberately private.
+        selection.pop("model", None)
+        selection.pop("route_key", None)
+        return self._admission.acquire(
+            lambda: role_snapshot_from_payloads("inference", {"_": self.get_inference_snapshot()}),
+            request_id,
+            **selection,
+        )
+
+    def release_inference(self, permit: RequestPermit) -> None:
+        self._admission.release(permit)
 
     def _fanout(self, method: str, *, skip_ranks: Optional[set] = None, **kwargs) -> list[int]:
         """Call ``method`` on every live engine; return the ranks that are
@@ -301,16 +328,31 @@ class MultiEngineManager:
 
         model = build_model_snapshot("_", rows)
         revision = self._topology_revision.observe([model], incarnations)
+        model = self._admission.view(RoleSnapshot("inference", revision, models=(model,))).models[0]
         return {
             "topology_revision": revision,
             "state": model.state.value,
             "router_url": None,
+            "served_model_name": next(
+                (
+                    self._pool.init_metadata[rank]["served_model_name"]
+                    for rank in self._pool.head_slots()
+                    if self.all_engines[rank] is not None
+                    and self._pool.init_metadata.get(rank, {}).get("served_model_name")
+                ),
+                self.served_model_name(),
+            ),
             "engines": [
-                {"index": index, "base_url": base_url, "state": state.value} for index, base_url, state in rows
+                {"index": index, "base_url": engine.base_url, "state": engine.state.value}
+                for index, engine in enumerate(model.engines)
             ],
         }
+
+    def served_model_name(self) -> str | None:
+        return None
 
     def shutdown(self) -> None:
         """Tear down every engine and remove any placement group this manager
         created for it."""
+        self._admission.close()
         self._pool.shutdown()

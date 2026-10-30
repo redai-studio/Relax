@@ -14,6 +14,7 @@ from starlette.requests import ClientDisconnect
 
 from relax.engine.inference.discovery import EngineState, RoleSnapshot, build_model_snapshot
 from relax.engine.inference.gateway import InferenceGateway, build_forward_headers
+from tests.engine.inference.helpers import AdmissionManager
 
 
 READY, SLEEPING = EngineState.READY, EngineState.SLEEPING
@@ -68,7 +69,8 @@ def upstream(monkeypatch):
 
 
 def _gateway(manager, **kwargs):
-    return InferenceGateway("teacher", manager.fetch, **kwargs)
+    admission = AdmissionManager(lambda: manager.snapshots[-1])
+    return InferenceGateway("teacher", manager.fetch, request_client=admission.client("teacher"), **kwargs)
 
 
 # ----------------------------------------------------------------------
@@ -139,7 +141,8 @@ class _NativeStream(httpx.AsyncByteStream):
 async def test_gateway_native_stream_preserves_sse_and_closes_upstream(upstream, role):
     stream = _NativeStream()
     upstream.use(lambda request: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream))
-    gateway = InferenceGateway(role, _Manager(_role(_model("math"), role=role)).fetch)
+    snapshot = _role(_model("math"), role=role)
+    gateway = InferenceGateway(role, _Manager(snapshot).fetch, request_client=AdmissionManager(snapshot).client(role))
 
     response = await gateway.generate({"model": "math", "input_ids": [1], "stream": True})
 
@@ -254,15 +257,13 @@ async def test_gateway_refreshes_topology_after_an_unreachable_replica(upstream)
         return httpx.Response(200, json={"text": "ok"})
 
     upstream.use(handler)
-    manager = _Manager(
-        _role(_model("math", states=(READY,), host="old"), revision=1),
-        _role(_model("math", states=(READY,), host="new"), revision=2),
-    )
+    manager = _Manager(_role(_model("math", states=(READY,), host="old"), revision=1))
     gateway = _gateway(manager, snapshot_max_age_s=3600)
 
     with pytest.raises(HTTPException) as excinfo:
         await gateway.generate({"input_ids": [1]})
     assert excinfo.value.status_code == 502
+    manager.snapshots.append(_role(_model("math", states=(READY,), host="new"), revision=2))
 
     assert await gateway.generate({"input_ids": [1]}) == {"text": "ok"}
     assert [request.url.host for request in upstream.seen] == ["old-0", "new-0"]

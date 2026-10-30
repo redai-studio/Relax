@@ -161,7 +161,9 @@ def test_genrm_engine_release_fails_fast_when_engine_is_unreachable(monkeypatch)
 
     engine, fake_requests = _running_engine(monkeypatch, refuse)
 
-    with pytest.raises(ConnectionError, match="unreachable while draining"):
+    from relax.engine.inference.admission import AdmissionDrainError
+
+    with pytest.raises(AdmissionDrainError, match="not confirmed"):
         engine.release_memory_occupation()
 
     assert len(fake_requests.gets) == m._MAX_CONSECUTIVE_CONNECT_ERRORS

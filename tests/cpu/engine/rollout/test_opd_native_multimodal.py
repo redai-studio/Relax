@@ -10,6 +10,7 @@ import numpy as np
 import pybase64
 import pytest
 
+from relax.engine.inference.discovery import EngineState, RoleSnapshot, build_model_snapshot
 from relax.engine.rollout.on_policy_distillation import OpdManager
 from relax.utils.opd.opd_main_worker import LogprobResponse
 from relax.utils.opd.opd_multimodal import (
@@ -20,6 +21,7 @@ from relax.utils.opd.opd_multimodal import (
 )
 from relax.utils.opd.opd_opsd_worker import OpsdWorker
 from relax.utils.types import Sample
+from tests.engine.inference.helpers import AdmissionManager
 
 
 @pytest.fixture
@@ -42,6 +44,12 @@ def processor_state(monkeypatch):
 
     module._run_image_processor = process
     monkeypatch.setitem(sys.modules, module.__name__, module)
+    owner = AdmissionManager(
+        RoleSnapshot(
+            "rollout", 1, models=(build_model_snapshot("default", [(0, "http://student:1", EngineState.READY)]),)
+        )
+    )
+    monkeypatch.setattr("relax.engine.rollout.on_policy_distillation.get_request_client", lambda role: owner.client())
     return state
 
 

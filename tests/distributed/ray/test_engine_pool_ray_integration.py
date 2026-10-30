@@ -21,6 +21,8 @@ from relax.distributed.ray.multi_engine_manager import (
     SNAPSHOT_CONCURRENCY_GROUPS,
     MultiEngineManager,
 )
+from relax.engine.inference.admission import ADMISSION_CONCURRENCY_GROUP
+from relax.engine.inference.routing import ModelUnavailableError
 
 
 RELEASE_SECONDS = 3.0
@@ -70,6 +72,14 @@ def _manager_class():
         @ray.method(concurrency_group=SNAPSHOT_CONCURRENCY_GROUP)
         def get_inference_snapshot(self) -> dict:
             return super().get_inference_snapshot()
+
+        @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
+        def acquire_inference(self, request_id, **selection):
+            return super().acquire_inference(request_id, **selection)
+
+        @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
+        def release_inference(self, permit):
+            super().release_inference(permit)
 
         def kill_engine(self, rank):
             ray.kill(self.all_engines[rank])
@@ -146,6 +156,23 @@ def test_engine_pool_runs_a_full_lifecycle_on_real_ray(manager):
     assert _states(manager) == ["ready", "ready"]
     # Sleeping and waking never moved an engine, so the topology is the one it started with.
     assert _snapshot(manager)["topology_revision"] == started["topology_revision"]
+
+
+def test_manager_returns_permits_while_default_group_waits_for_drain(manager):
+    permit = ray.get(manager.acquire_inference.remote("held"), timeout=10)
+    offload = manager.offload.remote()
+    assert _states_once_changed(manager, ["ready", "ready"]) == ["draining", "draining"]
+    with pytest.raises(ModelUnavailableError):
+        ray.get(manager.acquire_inference.remote("late"), timeout=10)
+    assert ray.wait([offload], timeout=0)[0] == []
+    # A default-group release would queue behind offload and deadlock here.
+    ray.get(manager.release_inference.remote(permit), timeout=10)
+    ray.get(offload, timeout=15)
+    assert _states(manager) == ["sleeping", "sleeping"]
+    ray.get(manager.onload.remote(), timeout=15)
+    current = ray.get(manager.acquire_inference.remote("new"), timeout=10)
+    assert current.generation != permit.generation
+    ray.get(manager.release_inference.remote(current), timeout=10)
 
 
 def test_engine_pool_retires_and_rebuilds_a_killed_engine_on_real_ray(manager):

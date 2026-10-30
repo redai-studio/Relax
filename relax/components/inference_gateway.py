@@ -11,6 +11,7 @@ The replica requests no GPU. It keeps answering discovery and health while the
 role's engines are asleep, draining or being rebuilt.
 """
 
+import asyncio
 from typing import Any, Optional
 
 import ray
@@ -18,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
+from relax.engine.inference.client import InferenceRequestClient
 from relax.engine.inference.discovery import RoleSnapshot, role_snapshot_from_payloads
 from relax.engine.inference.gateway import SNAPSHOT_FETCH_TIMEOUT_S, InferenceGateway
 from relax.utils.env import Envs
@@ -49,7 +51,16 @@ class InferenceGatewayService:
         self.role = role
         self._managers = dict(managers)
         self._default_model = default_model
-        self._gateway = InferenceGateway(role, self._fetch_inference_snapshot, upstream_name=f"{role} engine")
+        self._gateway = InferenceGateway(
+            role,
+            self._fetch_inference_snapshot,
+            upstream_name=f"{role} engine",
+            request_client=InferenceRequestClient(role, self.get_inference_resources),
+        )
+
+    async def get_inference_resources(self) -> dict:
+        snapshot = await asyncio.to_thread(self._fetch_inference_snapshot)
+        return {"snapshot": snapshot.to_dict(), "managers": self._managers}
 
     def _fetch_inference_snapshot(self) -> RoleSnapshot:
         payloads = ray.get(

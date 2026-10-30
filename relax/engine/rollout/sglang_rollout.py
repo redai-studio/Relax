@@ -187,7 +187,12 @@ class GenerateState(metaclass=SingletonMeta):
         if rollout abort has been signalled by the time the permit is acquired.
         """
         async with self.inference_permit():
-            return await post(url, payload, headers=headers)
+            return await post(
+                url,
+                payload,
+                headers=headers,
+                inference={"role": "rollout", "model": payload.get("model"), "route_key": payload.get("route_key")},
+            )
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
@@ -356,7 +361,13 @@ async def _post_generation(
         if attempt and state.abort_event.is_set():
             raise GenerationAborted
         try:
-            return await post(url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled)
+            return await post(
+                url,
+                payload,
+                headers=headers,
+                fail_fast_no_workers=router_recovery_enabled,
+                inference={"role": "rollout"},
+            )
         except httpx.HTTPStatusError as error:
             if not evaluation and is_expected_sglang_499(error):
                 raise GenerationAborted from error

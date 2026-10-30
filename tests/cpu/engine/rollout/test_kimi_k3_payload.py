@@ -66,7 +66,8 @@ def test_generate_keeps_training_ids_separate_and_resumes_rollout_ids(monkeypatc
     async def encode(images):
         return {"image_data": ["encoded"]}, 0.0
 
-    async def post(url, payload, headers=None, *, fail_fast_no_workers=False):
+    async def post(url, payload, headers=None, *, fail_fast_no_workers=False, inference=None):
+        assert inference == {"role": "rollout"}
         payloads.append({**payload, "input_ids": payload["input_ids"].copy()})
         return {"text": "a", "meta_info": {"output_token_logprobs": [(-0.1, 97)], "finish_reason": {"type": "abort"}}}
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import pytest
 
+from relax.engine.inference.admission import AdmissionDrainError
+
 
 pytest.importorskip("sglang.srt.server_args")
 
@@ -142,7 +144,7 @@ def test_release_raises_timeout_and_skips_release_when_never_idle(patched):
     # flush never returns 200 -> bounded deadline surfaces as TimeoutError and
     # release is NOT attempted (would crash the scheduler assert).
     fake_requests, _ = patched(flush_statuses=[400], drain_timeout=5.0)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(AdmissionDrainError):
         _make_engine().release_memory_occupation()
 
     assert "release_memory_occupation" not in fake_requests.calls
@@ -161,23 +163,23 @@ def test_release_tolerates_abort_failure(patched):
     assert fake_requests.calls.count("release_memory_occupation") == 1
 
 
-def test_release_tolerates_pause_failure_and_still_drains(patched):
-    # If pause does not take, per-retry abort still drains and release proceeds.
+def test_release_fails_closed_if_pause_is_not_confirmed(patched):
     import requests as _real_requests
 
     fake_requests, _ = patched(
         flush_statuses=[200],
         post_raises={"pause_generation": _real_requests.exceptions.ConnectionError("boom")},
     )
-    _make_engine().release_memory_occupation()
-
-    assert "abort_request" in fake_requests.calls
-    assert fake_requests.calls.count("release_memory_occupation") == 1
+    with pytest.raises(AdmissionDrainError):
+        _make_engine().release_memory_occupation()
+    assert "release_memory_occupation" not in fake_requests.calls
 
 
 def test_full_resume_reopens_admission(patched):
     fake_requests, _ = patched()
-    _make_engine().resume_memory_occupation(tags=None)
+    engine = _make_engine()
+    engine.release_memory_occupation()
+    engine.resume_memory_occupation(tags=None)
 
     assert "continue_generation" in fake_requests.calls
     assert fake_requests.calls.index("resume_memory_occupation") < fake_requests.calls.index("continue_generation")
@@ -186,6 +188,35 @@ def test_full_resume_reopens_admission(patched):
 def test_partial_resume_does_not_reopen_admission(patched):
     # A weights-only resume must not re-enable generation before KV cache is back.
     fake_requests, _ = patched()
-    _make_engine().resume_memory_occupation(tags=["weights"])
+    engine = _make_engine()
+    engine.release_memory_occupation()
+    engine.resume_memory_occupation(tags=["weights"])
 
     assert "continue_generation" not in fake_requests.calls
+
+
+@pytest.mark.parametrize("profile", ["POLICY_PROFILE", "GENRM_PROFILE", "TEACHER_PROFILE"])
+def test_split_resume_waits_for_all_memory_and_preserves_weight_update_pause(patched, profile):
+    fake_requests, _ = patched()
+    engine = _make_engine()
+    engine.profile = getattr(m, profile)
+    engine.release_memory_occupation()
+    engine.resume_memory_occupation(tags=["weights"])
+    engine.pause_generation()
+    engine.continue_generation()  # Weight sync must not resume missing KV.
+    assert "continue_generation" not in fake_requests.calls
+    engine.resume_memory_occupation(tags=["kv_cache"])
+    assert "continue_generation" not in fake_requests.calls
+    engine.resume_memory_occupation(tags=["cuda_graph"])
+    assert fake_requests.calls.count("continue_generation") == 1
+
+
+def test_full_resume_keeps_explicit_generation_pause(patched):
+    fake_requests, _ = patched()
+    engine = _make_engine()
+    engine.pause_generation()
+    engine.release_memory_occupation()
+    engine.resume_memory_occupation()
+    assert "continue_generation" not in fake_requests.calls
+    engine.continue_generation()
+    assert fake_requests.calls.count("continue_generation") == 1

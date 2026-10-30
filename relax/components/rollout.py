@@ -12,6 +12,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.engine.inference.client import InferenceRequestClient
 from relax.engine.inference.gateway import SNAPSHOT_FETCH_TIMEOUT_S, InferenceGateway
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
@@ -351,9 +352,13 @@ class Rollout(Base):
         self.status = "running"
 
         self._sglang_base_url: Optional[str] = None
-        # The chat proxy forwards to the SGLang router with the body untouched;
-        # the gateway adds discovery and the unified endpoints on top.
-        self._gateway = InferenceGateway("rollout", self._fetch_inference_snapshot, upstream_name="SGLang router")
+        # External inference uses the same manager admission as internal lookaside calls.
+        self._gateway = InferenceGateway(
+            "rollout",
+            self._fetch_inference_snapshot,
+            upstream_name="SGLang router",
+            request_client=InferenceRequestClient("rollout", self.get_inference_resources),
+        )
 
         # Wired by controller in colocate: rollout must wait for all sharing
         # peers (actor, critic, ...) to finish round N (sleep GPU) before
@@ -898,6 +903,10 @@ class Rollout(Base):
 
     # --- OpenAI-compatible Chat Completion API (proxied to SGLang router) ---
 
+    async def get_inference_resources(self) -> dict:
+        snapshot = await self.rollout_manager.get_inference_snapshot.remote()
+        return {"snapshot": snapshot, "managers": {name: self.rollout_manager for name in snapshot["models"]}}
+
     def _fetch_inference_snapshot(self) -> dict:
         return ray.get(self.rollout_manager.get_inference_snapshot.remote(), timeout=SNAPSHOT_FETCH_TIMEOUT_S)
 
@@ -928,10 +937,7 @@ class Rollout(Base):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
 
-        sglang_url = await self._ensure_sglang_base_url()
-        result = await self._gateway.proxy_chat_completions(
-            sglang_url, body, dict(request.headers), stream=bool(payload.stream)
-        )
+        result = await self._gateway.chat_completions(body, dict(request.headers))
         return result if payload.stream else ChatCompletionResponse(**result)
 
     @app.post("/generate")
@@ -949,5 +955,4 @@ class Rollout(Base):
 
     @app.get("/v1/models", response_model=ModelListResponse)
     async def list_models(self):
-        sglang_url = await self._get_sglang_url("/v1/models")
-        return ModelListResponse(**await self._gateway.proxy_get_json(sglang_url))
+        return ModelListResponse(**await self._gateway.models())

@@ -67,12 +67,20 @@ class RouteTarget:
 def select_model(snapshot: RoleSnapshot, model: str | None = None, route_key: str | None = None) -> ModelSnapshot:
     available = [item.name for item in snapshot.models]
     if model is not None:
+        if not isinstance(model, str):
+            raise UnknownModelError("model must be a string.")
         selected = snapshot.model(model)
+        if selected is None:
+            matches = [item for item in snapshot.models if item.served_model_name == model]
+            if len(matches) == 1:
+                selected = matches[0]
         if selected is None:
             raise UnknownModelError(f"Unknown model {model!r} for role {snapshot.role!r}; available: {available}.")
         return selected
 
     if route_key is not None:
+        if not isinstance(route_key, str):
+            raise UnknownModelError("route_key must be a string.")
         selected = snapshot.model(snapshot.route_keys.get(route_key, route_key))
         if selected is None:
             raise UnknownModelError(

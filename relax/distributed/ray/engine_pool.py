@@ -110,6 +110,7 @@ class EnginePool:
         # this pool are ever removed by it.
         self.placements: dict[int, tuple] = {}
         self.addresses: dict[int, dict] = {}
+        self.init_metadata: dict[int, dict] = {}
         # How many times each slot has been built.
         self.incarnations: dict[int, int] = {}
         self._states: dict[int, EngineState] = {}
@@ -205,6 +206,7 @@ class EnginePool:
 
             created.append((slot, engine))
             self.slots[slot] = engine
+            self.init_metadata.pop(slot, None)
             self.incarnations[slot] = self.incarnations.get(slot, 0) + 1
             if slot % self.nodes_per_engine == 0:
                 self._states[slot] = EngineState.STARTING
@@ -239,7 +241,10 @@ class EnginePool:
             init_handles = self.fire_init(created, addresses)
             # Bounded: a bundle on a dead node never schedules, and an unbounded
             # ray.get would block the caller forever.
-            ray.get(init_handles, timeout=self.spec.start_timeout_s)
+            results = ray.get(init_handles, timeout=self.spec.start_timeout_s)
+            for (slot, _), result in zip(created, results, strict=True):
+                if isinstance(result, dict):
+                    self.init_metadata[slot] = result
         except Exception:
             # Include placements whose actor creation failed, and stop all
             # processes before releasing any shared placement group.

@@ -8,13 +8,9 @@ It never touches a GPU and never changes an engine's state. In particular a
 request for a model that is not ready is answered with 503, not by waking the
 model up -- who holds GPU memory when is the lifecycle's decision.
 
-Two entry styles:
-
-- ``proxy_*`` forward to an upstream the caller already resolved. Rollout uses
-  these with its SGLang router, body untouched, so its long-standing
-  ``/v1/chat/completions`` contract is preserved byte for byte.
-- ``generate`` / ``chat_completions`` resolve the upstream from the role's
-  topology snapshot with the shared routing rules.
+Every inference entry acquires a manager-owned permit before proxying. Internal
+lookaside clients use the same admission gate and send their payload directly.
+Cached topology is used for discovery, never as proof of admission.
 """
 
 from __future__ import annotations
@@ -31,7 +27,13 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from relax.engine.inference.client import InferenceClient, SnapshotSource
+from relax.engine.inference.client import (
+    InferenceClient,
+    InferenceRequest,
+    InferenceRequestClient,
+    SnapshotSource,
+    _settle,
+)
 from relax.engine.inference.discovery import RoleSnapshot
 from relax.engine.inference.routing import (
     ModelUnavailableError,
@@ -45,12 +47,12 @@ from relax.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-_HOP_BY_HOP_HEADERS = frozenset({"host", "transfer-encoding", "connection", "keep-alive", "upgrade"})
+_HOP_BY_HOP_HEADERS = frozenset({"host", "transfer-encoding", "connection", "keep-alive", "upgrade", "content-length"})
 
 # Seconds a client should wait before retrying a model that is not ready.
 DEFAULT_RETRY_AFTER_S = 5
-# Upper bound on asking a manager for its snapshot. Past it the gateway keeps
-# answering from the snapshot it has rather than hanging with the manager.
+# Upper bound for diagnostic snapshot fetches. Cached discovery is never
+# sufficient to admit an inference request.
 SNAPSHOT_FETCH_TIMEOUT_S = 5.0
 
 
@@ -105,6 +107,51 @@ class _NativeStreamingResponse(StreamingResponse):
             await self.aclose()
 
 
+class _PermitStreamingResponse(StreamingResponse):
+    """Keep the permit until the upstream is closed, even before iteration."""
+
+    def __init__(self, response: StreamingResponse, permit: InferenceRequest) -> None:
+        self._response = response
+        self._permit = permit
+        self._close_task: asyncio.Task[None] | None = None
+
+        async def chunks() -> AsyncIterator[str | bytes]:
+            try:
+                async for chunk in response.body_iterator:
+                    yield chunk
+            finally:
+                await self.aclose()
+
+        super().__init__(
+            chunks(), status_code=response.status_code, headers=dict(response.headers), media_type=response.media_type
+        )
+
+    async def _close(self) -> None:
+        try:
+            close = getattr(self._response.body_iterator, "aclose", None)
+            if close is not None:
+                await close()
+            if isinstance(self._response, _NativeStreamingResponse):
+                await self._response.aclose()
+        finally:
+            await self._permit.aclose()
+
+    async def aclose(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            await _settle(self._close_task)
+            raise
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.aclose()
+
+
 class InferenceGateway:
     def __init__(
         self,
@@ -112,6 +159,8 @@ class InferenceGateway:
         fetch_snapshot: SnapshotSource,
         *,
         upstream_name: str = "inference engine",
+        request_client: InferenceRequestClient | None = None,
+        proxy_client: httpx.AsyncClient | None = None,
         snapshot_max_age_s: float = 1.0,
         retry_after_s: int = DEFAULT_RETRY_AFTER_S,
         clock: Callable[[], float] = time.monotonic,
@@ -122,16 +171,16 @@ class InferenceGateway:
             fetch_snapshot: Synchronous source of the role's topology snapshot,
                 typically a Ray call into the role's manager(s).
             upstream_name: What to call the upstream in error messages.
-            snapshot_max_age_s: How long a fetched snapshot is routed on before
-                it is fetched again; bounds how stale an availability answer
-                can be without paying a manager call per request.
+            snapshot_max_age_s: Cache age for diagnostic discovery responses.
+                Inference always acquires a permit from the live manager.
         """
         self.role = role
+        self._requests = request_client or InferenceRequestClient(role)
         self._upstream_name = upstream_name
         self._retry_after_s = retry_after_s
         self._topology = InferenceClient(fetch_snapshot, max_age_s=snapshot_max_age_s, clock=clock)
         self._routing_state = RoutingState()
-        self._proxy_client: httpx.AsyncClient | None = None
+        self._proxy_client = proxy_client
 
     # ------------------------------------------------------------------
     # Discovery.
@@ -164,9 +213,12 @@ class InferenceGateway:
 
     async def models(self) -> dict[str, Any]:
         snapshot = await self.snapshot()
+        names = [model.name for model in snapshot.models]
+        aliases = [model.served_model_name for model in snapshot.models if model.served_model_name]
+        names.extend(alias for alias in dict.fromkeys(aliases) if alias not in names and aliases.count(alias) == 1)
         return {
             "object": "list",
-            "data": [{"id": model.name, "object": "model", "owned_by": "relax"} for model in snapshot.models],
+            "data": [{"id": name, "object": "model", "owned_by": "relax"} for name in names],
         }
 
     async def resolve(
@@ -202,10 +254,27 @@ class InferenceGateway:
         if not isinstance(payload, Mapping):
             raise HTTPException(status_code=400, detail="Invalid request body: expected a JSON object")
         forwarded = dict(payload)
-        target = await self.resolve(model=forwarded.pop("model", None), route_key=forwarded.pop("route_key", None))
-        if forwarded.get("stream"):
-            return await self._stream_generate(f"{target.base_url}/generate", forwarded)
-        return await self.proxy_json(f"{target.base_url}/generate", forwarded)
+        permit = await self._admit(model=forwarded.pop("model", None), route_key=forwarded.pop("route_key", None))
+        transferred = False
+        try:
+            url = f"{permit.target.base_url}/generate"
+            if forwarded.get("stream"):
+                response = _PermitStreamingResponse(await self._stream_generate(url, forwarded), permit)
+                transferred = True
+                return response
+            return await self.proxy_json(url, forwarded)
+        finally:
+            if not transferred:
+                await permit.aclose()
+
+    async def _admit(self, **selection: Any) -> InferenceRequest:
+        permit = self._requests.request(**selection)
+        try:
+            return await permit.__aenter__()
+        except ModelUnavailableError as exc:
+            raise HTTPException(503, str(exc), headers={"Retry-After": str(self._retry_after_s)}) from exc
+        except RoutingError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
 
     async def _stream_generate(self, url: str, payload: Mapping[str, Any]) -> StreamingResponse:
         client = self._get_proxy_client()
@@ -216,7 +285,13 @@ class InferenceGateway:
         except httpx.HTTPStatusError as exc:
             try:
                 detail = (await exc.response.aread()).decode(errors="replace")
-                raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+                raise HTTPException(
+                    status_code=exc.response.status_code,
+                    detail=detail,
+                    headers={"Retry-After": exc.response.headers["Retry-After"]}
+                    if "Retry-After" in exc.response.headers
+                    else None,
+                ) from exc
             finally:
                 await exc.response.aclose()
         except httpx.RequestError as exc:
@@ -233,8 +308,25 @@ class InferenceGateway:
                 raise ValueError("request body must be a JSON object")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}") from exc
-        target = await self.resolve(model=request.get("model"), route_key=request.get("route_key"))
-        return await self.proxy_chat_completions(target.base_url, body, headers, stream=bool(request.get("stream")))
+        permit = await self._admit(model=request.get("model"), route_key=request.get("route_key"))
+        transferred = False
+        try:
+            original = dict(request)
+            request.pop("route_key", None)
+            request["model"] = permit.served_model_name or permit.target.model
+            result = await self.proxy_chat_completions(
+                permit.target.base_url,
+                body if request == original else json.dumps(request).encode(),
+                headers,
+                stream=bool(request.get("stream")),
+            )
+            if isinstance(result, StreamingResponse):
+                result = _PermitStreamingResponse(result, permit)
+                transferred = True
+            return result
+        finally:
+            if not transferred:
+                await permit.aclose()
 
     # ------------------------------------------------------------------
     # Proxying to an already resolved upstream.
@@ -256,7 +348,13 @@ class InferenceGateway:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=e.response.text,
+                headers={"Retry-After": e.response.headers["Retry-After"]}
+                if "Retry-After" in e.response.headers
+                else None,
+            )
         except httpx.RequestError as e:
             self._on_upstream_unreachable(url, e)
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {e}")
@@ -267,7 +365,13 @@ class InferenceGateway:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=e.response.text,
+                headers={"Retry-After": e.response.headers["Retry-After"]}
+                if "Retry-After" in e.response.headers
+                else None,
+            )
         except httpx.RequestError as e:
             self._on_upstream_unreachable(url, e)
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {e}")
@@ -289,7 +393,13 @@ class InferenceGateway:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=e.response.text,
+                headers={"Retry-After": e.response.headers["Retry-After"]}
+                if "Retry-After" in e.response.headers
+                else None,
+            )
         except httpx.RequestError as e:
             self._on_upstream_unreachable(url, e)
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {e}")

@@ -5,7 +5,8 @@
 Pins what the endpoint forwards to the SGLang router and how it maps upstream
 failures, so moving the proxy behind the shared gateway can be shown not to
 change it. ``_make_rollout`` is the only place that knows how the deployment is
-wired; the tests themselves must keep passing unmodified.
+wired. Registered-model payloads keep their transport contract; unknown models
+are rejected before proxying.
 """
 
 from __future__ import annotations
@@ -17,13 +18,15 @@ import pytest
 from fastapi import HTTPException
 
 from relax.components.rollout import Rollout as RolloutDeployment
+from relax.engine.inference.discovery import EngineState, RoleSnapshot, build_model_snapshot, format_base_url
 from relax.engine.inference.gateway import InferenceGateway
+from tests.engine.inference.helpers import AdmissionManager
 
 
 Rollout = RolloutDeployment.func_or_class
 
 ROUTER_URL = "http://10.0.0.1:3000"
-CHAT_BODY = json.dumps({"model": "not-a-registered-model", "messages": [{"role": "user", "content": "hi"}]}).encode()
+CHAT_BODY = json.dumps({"model": "served", "messages": [{"role": "user", "content": "hi"}]}).encode()
 COMPLETION = {
     "id": "chatcmpl-1",
     "object": "chat.completion",
@@ -69,7 +72,16 @@ def _make_rollout(monkeypatch, handler, *, router=("10.0.0.1", 3000)):
 
     rollout = object.__new__(Rollout)
     rollout._logger_instance = None
-    rollout._gateway = InferenceGateway("rollout", lambda: None, upstream_name="SGLang router")
+    model = build_model_snapshot(
+        "default",
+        [(0, "http://engine:1", EngineState.READY if router[0] else EngineState.SLEEPING)],
+        router_url=format_base_url(*router) if router[0] else None,
+        served_model_name="served",
+    )
+    snapshot = RoleSnapshot("rollout", 1, models=(model,))
+    rollout._gateway = InferenceGateway(
+        "rollout", snapshot.to_dict, upstream_name="SGLang router", request_client=AdmissionManager(snapshot).client()
+    )
     rollout._sglang_base_url = None
     address = {"router_ip": router[0], "router_port": router[1]}
     rollout.rollout_manager = type("_Manager", (), {})()
@@ -104,7 +116,7 @@ async def test_rollout_chat_proxy_forwards_body_and_filters_hop_by_hop_headers(m
     response = await _chat(rollout, headers=headers)
 
     assert seen["url"] == f"{ROUTER_URL}/v1/chat/completions"
-    # The body goes through untouched: the model name is not validated or rewritten.
+    # A registered served-model alias keeps the original body.
     assert seen["body"] == CHAT_BODY
     assert seen["headers"]["authorization"] == "Bearer token"
     assert seen["headers"]["x-trace-id"] == "abc"
@@ -158,7 +170,7 @@ async def test_rollout_chat_proxy_reports_503_without_router(monkeypatch):
 
 
 def _stream_body() -> bytes:
-    return json.dumps({"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode()
+    return json.dumps({"model": "served", "stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode()
 
 
 async def _collect(response) -> list[str]:
@@ -209,3 +221,12 @@ async def test_rollout_chat_proxy_client_has_no_timeout_and_wide_pool(monkeypatc
     assert (limits.max_connections, limits.max_keepalive_connections, limits.keepalive_expiry) == (4096, 4096, 600)
     timeout = client_kwargs[0]["timeout"]
     assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (None, None, None, None)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_rollout_chat_unknown_model_fails_before_upstream(monkeypatch, stream):
+    rollout, _ = _make_rollout(monkeypatch, lambda request: pytest.fail("unknown model forwarded"))
+    body = json.dumps({"model": "not-registered", "messages": [], "stream": stream}).encode()
+    with pytest.raises(HTTPException) as error:
+        await _chat(rollout, body)
+    assert error.value.status_code == 400

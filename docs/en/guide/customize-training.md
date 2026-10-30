@@ -225,6 +225,12 @@ To scope concurrency down to a single model request, declare the opt-in flag on 
 
 **Note**: once the session-level lock is lifted, the number of concurrently *active* sessions is no longer bounded by this semaphore (only in-flight requests are); throttle concurrent env/tool resource usage inside your function if needed.
 
+`post_generate` also obtains a lifecycle admission permit from the rollout manager before each HTTP attempt, including retries. It uses lookaside routing: the manager selects a current router or engine, and the caller sends the payload directly. The `url` argument supplies the endpoint path; the manager selects its host. Use `model` or `route_key` in the payload to select a managed model. `state.inference_permit()` alone controls concurrency; it does not authorize a direct engine request.
+
+External callers use the role's Gateway endpoints. Model selection follows `model`, then `route_key`, then the configured default. `/v1/models` lists the accepted model names and unambiguous served-model aliases. Unknown models return HTTP 400. A draining or sleeping model returns HTTP 503 with `Retry-After`; sending a request does not wake the model.
+
+Both paths hold admission until the HTTP response closes, including streaming responses. Offload closes admission and waits for existing requests before releasing GPU memory. If draining cannot be confirmed, the transition fails with admission closed. Custom HTTP transports must use `InferenceRequestClient.request()` as an async context around the entire send and response consumption; a cached `/engines` address is not an admission permit. Explicit external OPD teacher URLs and `GenRMClient(service_url=...)` remain external HTTP services.
+
 ## Training Script and Key Parameters
 
 For complete parameter reference, see [Configuration](./configuration.md).
