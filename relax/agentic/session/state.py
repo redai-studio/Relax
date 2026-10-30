@@ -16,6 +16,7 @@ import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
 from relax.utils.types import Sample
+from relax.utils.weight_version import WeightVersionSpan, WeightVersionsPerCall, coalesce_spans
 
 
 MsgKind = Literal["obs", "resp"]
@@ -423,7 +424,8 @@ class MsgNode:
     backend_image_data_delta: list[str] = field(default_factory=list)
     backend_audio_data_delta: list[str] = field(default_factory=list)
     backend_video_data_delta: list[str] = field(default_factory=list)
-    weight_version_delta: list[str] = field(default_factory=list)
+    # Spans are relative to this node's train_token_delta (0-based).
+    weight_version_delta: list[WeightVersionSpan] = field(default_factory=list)
     spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     tools: list[dict[str, Any]] | None = None
@@ -457,7 +459,8 @@ class InflightRequest:
     pending_logprob_delta: list[float] = field(default_factory=list)
     pending_topk_token_ids_delta: list[np.ndarray] = field(default_factory=list)
     pending_topk_logprob_delta: list[np.ndarray] = field(default_factory=list)
-    pending_weight_version_delta: list[str] = field(default_factory=list)
+    # Spans relative to pending_token_delta; only committed on successful append_resp.
+    pending_weight_version_delta: list[WeightVersionSpan] = field(default_factory=list)
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
@@ -699,7 +702,7 @@ class SessionForest:
         logprob_delta: list[float],
         topk_token_ids_delta: np.ndarray | None = None,
         topk_logprob_delta: np.ndarray | None = None,
-        weight_version_delta: list[str] | None = None,
+        weight_version_delta: list[WeightVersionSpan] | None = None,
         spec_delta: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
@@ -769,6 +772,10 @@ class SessionForest:
             "response_length": len(node.train_token_delta),
             "wall_elapsed_s": float(node.wall_elapsed_s),
             "generation_elapsed_s": float(node.generation_elapsed_s),
+            "weight_version_spans": [
+                {"version": span.version, "start": span.abs_start, "end": span.abs_end}
+                for span in coalesce_spans(node.weight_version_delta)
+            ],
             "events": copy.deepcopy(events) if isinstance(events, dict) else {},
         }
 
@@ -795,14 +802,16 @@ class SessionForest:
         turns: list[dict[str, Any]] = []
         response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
-        weight_versions: list[str] = []
+        weight_versions: list[WeightVersionsPerCall] = []
         spec_info = dict(_EMPTY_SPEC_DELTA)
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
         first_response_node: MsgNode | None = None
+        absolute_token_cursor = 0
 
         for idx, node in enumerate(lineage):
+            node_abs_start = absolute_token_cursor
             tokens.extend(node.train_token_delta)
             rollout_tokens.extend(node.rollout_token_delta)
             messages.extend(node.messages_delta)
@@ -813,7 +822,19 @@ class SessionForest:
             if node.kind == "resp":
                 if first_response_node is None:
                     first_response_node = node
-                turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
+                turn = self._agentic_trace_turn_from_node(node, len(turns))
+                absolute_spans = coalesce_spans(
+                    span.shifted(node_abs_start) for span in node.weight_version_delta
+                )
+                turn["weight_version_spans"] = [
+                    {
+                        "version": span.version,
+                        "abs_start": span.abs_start,
+                        "abs_end": span.abs_end,
+                    }
+                    for span in absolute_spans
+                ]
+                turns.append(turn)
                 response_start = len(continuation_train_tokens)
                 continuation_train_tokens.extend(node.train_token_delta)
                 response_node_spans.append([response_start, len(continuation_train_tokens)])
@@ -824,10 +845,14 @@ class SessionForest:
                         raise ValueError(f"Score Centering candidates missing from response node {node.state_hash}")
                     topk_token_ids.append(node.topk_token_ids_delta)
                     topk_log_probs.append(node.topk_logprob_delta)
-                weight_versions.extend(node.weight_version_delta)
+                # One WeightVersionsPerCall per committed response node / turn.
+                # Cancelled IR prefixes that never reached append_resp are absent.
+                weight_versions.append(WeightVersionsPerCall(spans=absolute_spans))
                 spec_info = _sum_counter_dict(spec_info, node.spec_delta)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
+                absolute_token_cursor += len(node.train_token_delta)
                 continue
+            absolute_token_cursor += len(node.train_token_delta)
             if idx == 0 or first_response_node is None:
                 continue
             continuation_train_tokens.extend(node.train_token_delta)

@@ -13,6 +13,7 @@ from relax.utils.misc import load_function
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.types import Sample
+from relax.utils.weight_version import WeightVersionsPerCall
 
 
 logger = get_logger(__name__)
@@ -26,7 +27,7 @@ def _shallow_copy_sample(src: Sample) -> Sample:
     # Shallow-copy mutable containers that downstream code mutates in-place.
     new.tokens = list(src.tokens)
     new.rollout_tokens = list(src.rollout_tokens)
-    new.weight_versions = list(src.weight_versions)
+    new.weight_versions = [WeightVersionsPerCall(spans=list(call.spans)) for call in src.weight_versions]
     new.metadata = dict(src.metadata)
     # Per-sample accumulators — create fresh instances.
     new.spec_info = Sample.SpecInfo()

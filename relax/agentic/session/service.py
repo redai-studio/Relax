@@ -72,6 +72,7 @@ from relax.agentic.session.state import (
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import get_spec_token_counts
+from relax.utils.weight_version import append_spans_from_meta_info, coalesce_spans
 
 
 # Stable actor-name prefix embedded in opaque Session route tokens. Renaming it
@@ -1614,10 +1615,20 @@ class AgenticSessionShard:
         return {key: value for key, value in sampling_params.items() if value is not None}
 
     @staticmethod
-    def _accumulate_request_meta(request, *, meta_info: dict[str, Any]) -> None:
-        weight_version = meta_info.get("weight_version")
-        if weight_version is not None:
-            request.pending_weight_version_delta.append(str(weight_version))
+    def _accumulate_request_meta(
+        request,
+        *,
+        meta_info: dict[str, Any],
+        pending_len_before: int = 0,
+        num_new_tokens: int = 0,
+    ) -> None:
+        append_spans_from_meta_info(
+            request.pending_weight_version_delta,
+            meta_info=meta_info,
+            pending_len_before=pending_len_before,
+            num_new_tokens=num_new_tokens,
+        )
+        request.pending_weight_version_delta[:] = coalesce_spans(request.pending_weight_version_delta)
         spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
         request.pending_spec_delta["spec_accept_token_num"] += spec_accept_token_num
         request.pending_spec_delta["spec_draft_token_num"] += spec_draft_token_num
@@ -2576,14 +2587,21 @@ class AgenticSessionShard:
     ) -> None:
         """Accumulate one backend attempt on the stable IR ref."""
 
-        ir.pending_token_delta.extend(result.new_tokens)
+        pending_len_before = len(ir.pending_token_delta)
+        new_tokens = list(result.new_tokens)
+        ir.pending_token_delta.extend(new_tokens)
         ir.pending_logprob_delta.extend(result.new_log_probs)
         if getattr(result, "new_topk_token_ids", None) is not None:
             ir.pending_topk_token_ids_delta.append(result.new_topk_token_ids)
             ir.pending_topk_logprob_delta.append(result.new_topk_log_probs)
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
-        self._accumulate_request_meta(ir, meta_info=result.meta_info)
+        self._accumulate_request_meta(
+            ir,
+            meta_info=result.meta_info,
+            pending_len_before=pending_len_before,
+            num_new_tokens=len(new_tokens),
+        )
         routed_experts = _decode_routed_experts(
             args=self.args,
             meta_info=result.meta_info,
