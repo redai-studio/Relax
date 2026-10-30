@@ -30,7 +30,7 @@ jobs:
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Unit Tests (H20, 4 GPUs)
-    runs-on: [self-hosted, linux, x64, h20, gpu]
+    runs-on: [self-hosted, linux, x64, 910c, gpu]
     # Allow time for image preparation, device acquisition, and the 30-minute test budget.
     timeout-minutes: 190
     env:
@@ -46,8 +46,10 @@ jobs:
         uses: ./.github/actions/prepare-image
         timeout-minutes: 120
         with:
+          dockerfile: docker/Dockerfile.cu13
+          build-args: GPU_ARCH=hopper
           # Include patch targets as well as the symlinks under patch/latest.
-          hash-key: ${{ hashFiles('docker/Dockerfile', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
+          hash-key: ${{ hashFiles('docker/Dockerfile.cu13', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'docker/scripts/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
 
       - name: Acquire test devices
         id: devices
