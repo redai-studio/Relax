@@ -206,6 +206,7 @@ For more parameters, refer to SGLang official documentation.
 | `--micro-batch-size` | int | 1 | Micro batch size. Ignored when `--use-dynamic-batch-size` is enabled |
 | `--num-steps-per-rollout` | int | None | Training steps per Rollout. Equivalent to setting GBS = `rollout_batch_size * n_samples_per_prompt / num_steps_per_rollout` |
 | `--use-dynamic-batch-size` | flag | False | Enable dynamic batching. Dynamically packs samples by length so each micro-batch's total tokens approach `--max-tokens-per-gpu` limit |
+| `--microbatch-balance` | str | tokens | Dynamic microbatch balancing objective: `tokens` or `flops`. FLOPs requires Megatron, dynamic batching, balanced packing and a model cost estimator; hard token capacity is unchanged. See [Performance Tuning](./performance-tuning.md#flops-balanced-dynamic-microbatches). |
 | `--max-tokens-per-gpu` | int | None | Maximum tokens per GPU. Must be set when dynamic batching is enabled. Should be set to approximately `max_response_len / cp_size` when using CP |
 | `--log-probs-max-tokens-per-gpu` | int | None | Maximum tokens per GPU when computing log probs. When None, equals `max-tokens-per-gpu` |
 | `--balance-data` | flag | False | Use `karmarkar_karp` to balance token count across data parallel ranks on the static/seqlen-balanced path. In fully async with `--use-dynamic-batch-size`, DP token balancing is automatic through `StreamingTokenBudgetSampler`; the flag is accepted but has no additional effect. Note: different responses for the same prompt may be assigned to different training steps |

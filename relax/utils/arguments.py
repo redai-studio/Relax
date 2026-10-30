@@ -1597,6 +1597,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--microbatch-balance",
+                choices=["tokens", "flops"],
+                default="tokens",
+                help=(
+                    "Balance dynamic microbatches within each DP rank by token count or estimated model FLOPs. "
+                    "FLOPs mode requires Megatron, dynamic batching, balanced packing and a registered model "
+                    "cost estimator. Token capacity and DP/VPP microbatch-count alignment remain unchanged."
+                ),
+            )
+            parser.add_argument(
                 "--max-tokens-per-gpu",
                 type=int,
                 default=None,
@@ -4034,6 +4044,9 @@ def slime_validate_args(args):
         )
         args.loss_type = "sft"
 
+    from relax.utils.training.microbatch_cost import validate_microbatch_balance
+
+    validate_microbatch_balance(args)
     is_offline = is_offline_mode(args)
     if is_offline:
         # Disable RL-only state for offline training so users do not have to pass

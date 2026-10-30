@@ -4,6 +4,42 @@ A practical guide to maximizing training throughput in Relax. All parameters men
 
 ---
 
+## FLOPs-balanced dynamic microbatches
+
+The Megatron backend can balance dynamic microbatches by estimated per-sample FLOPs. Text, images and videos with similar token counts can require different amounts of computation. This mode repartitions samples already assigned to each DP rank; it does not redistribute samples between DP ranks.
+
+The default, `--microbatch-balance tokens`, preserves existing behavior. To enable FLOPs balancing, add these options to the argument array in your training script:
+
+```bash
+--use-dynamic-batch-size \
+--microbatch-balance flops
+```
+
+Use the default `balanced` packing strategy. The option travels to workers in the training `args`; no environment variable is needed. Switch back to `--microbatch-balance tokens` for token balancing. Use separate save directories for A/B comparisons, keeping the model, data, seed, token budget and other settings identical.
+
+Token capacity still determines the microbatch count, followed by the existing DP/VPP alignment. FLOPs changes only the objective within that count. Capacity checks retain physical training lengths, including TP/CP document padding for unsplit THD inputs. Candidates that exceed capacity fall back to the existing token balancing and first-fit protection. An indivisible oversized sample remains isolated; enabling this mode does not make that sample fit in memory. Sample identity, optimizer-step boundaries and existing loss normalization are preserved.
+
+Built-in estimators support `qwen3_5`, `qwen3_5_moe`, `qwen3_5_text` and `qwen3_5_moe_text`, covering dense/MoE, full attention/GatedDeltaNet, images and videos. Multimodal samples require processor-produced CPU `image_grid_thw` / `video_grid_thw` metadata. Incomplete metadata raises an error instead of substituting token length for visual cost. Regular dynamic microbatching, synchronous SFT CPU async-prepack and repacking after DP count alignment share the same cost interface.
+
+The Qwen3.5 estimator includes Q/gate projections, active top-k and shared experts, the LM head, frame-local vision attention and the merged-token projector. It does not count embedding lookups as vocabulary GEMMs. Vision, projector and language freeze flags independently affect backward costs; input gradients remain counted when frozen weights must propagate gradients upstream. Enabled MTP is counted by execution depth, including repeated shared layers. MTP currently requires trainable language parameters, a full-attention final layer and no custom PP layout. Detached MTP heads still contribute input-gradient work.
+
+These are scheduling estimates, not executed CUDA instruction counts, and existing MFU reporting is unchanged. GDN uses three state contractions per token; heads use an all-token estimate. Chunk/WY overhead, padding, recomputation, communication, normalization and elementwise work are excluded. The initial implementation rejects LoRA, custom parameter-freeze lists, preference pairs, binpack, wholepack and fully-async streaming/drain. Similar-length text samples may receive the same partition as token balancing; measure any timing benefit with a fixed-workload A/B comparison.
+
+### Supporting another model
+
+The partitioner is model-independent. An extension implements `estimator(config, rollout_data, args) -> Sequence[float]`, returning one positive finite CPU cost for each entry in `rollout_data["total_lengths"]`, in the original order. The estimator validates its model structure, media and training configuration. It must not mutate inputs, access CUDA tensors or run collectives.
+
+Register it in an extension module. For example, if `my_package.costs` implements `estimate_sample_costs`:
+
+```python
+from relax.utils.training.microbatch_cost import register_sample_cost_estimator
+from my_package.costs import estimate_sample_costs
+
+register_sample_cost_estimator("your_hf_model_type", estimate_sample_costs)
+```
+
+Load that registration in every Megatron worker with the existing `RELAX_EXTRA_MODULES=my_package.registration` hook. A mismatched count, NaN/Inf, nonpositive cost or unknown model type raises an error. Before normal training enters its schedule, estimator failures propagate through model-parallel and DP-with-CP groups so peers exit together instead of entering training collectives. Unknown models must register an estimator or explicitly select `tokens`.
+
 ## Kimi K3 TFLOPS and MFU
 
 `perf/actor_train_tflops` estimates useful model FLOPs per GPU per second. `perf/mfu/actor_train` divides this rate by the device's BF16 dense peak (2250 TFLOPS for the 280G Blackwell configuration) and reports a fraction, so 0.4 means 40%. It uses the actor training time, not the total rollout/save wall time. Optimizer and offload time inside training reduce the rate.

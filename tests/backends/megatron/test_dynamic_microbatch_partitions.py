@@ -11,7 +11,13 @@ import pytest
 @pytest.fixture
 def partitioner():
     root = Path(__file__).resolve().parents[3]
-    namespace = {"logger": Mock()}
+    from relax.utils.training.microbatch_cost import sample_costs, validate_microbatch_balance
+
+    namespace = {
+        "logger": Mock(),
+        "sample_costs": sample_costs,
+        "validate_microbatch_balance": validate_microbatch_balance,
+    }
     names = {
         "get_first_fit_partitions",
         "get_binpack_partitions",
@@ -20,6 +26,7 @@ def partitioner():
         "_partitions_fit_capacity_or_singleton_oversize",
         "_get_capacity_safe_balanced_partitions",
         "_get_seqlen_partitions_with_dummy_padding",
+        "_get_synchronised_sample_costs",
     }
     for path in (
         "relax/utils/data/seqlen_balancing.py",
@@ -195,3 +202,155 @@ def test_iterator_uses_selected_packing_and_dp_aligned_count(partitioner, strate
     if strategy == "binpack":
         assert expected[:6] == [[9, 11], [3, 5], [0, 7], [1, 8], [2, 6], [4, 10]]
         assert dummy == {6, 7}
+
+
+def test_flops_objective_improves_equal_token_work_and_keeps_capacity(partitioner):
+    lengths = [8] * 6
+    costs = [100, 74, 99, 75, 80, 79]
+    reference, _ = partitioner(lengths, 3, 16)
+    actual, dummy = partitioner(lengths, 3, 16, costs=costs)
+    worst = lambda groups: max(sum(costs[i] for i in group) for group in groups)
+    assert worst(actual) < worst(reference)
+    assert dummy == set()
+    assert all(sum(lengths[i] for i in group) <= 16 for group in actual)
+    assert sorted(i for group in actual for i in group) == list(range(6))
+
+
+def test_flops_capacity_fallback_and_cheapest_dummy(partitioner):
+    lengths = [3, 9, 7, 6, 2, 5, 2, 5, 9]
+    actual, _ = partitioner(lengths, 5, 10, costs=[x * x for x in lengths])
+    assert all(sum(lengths[i] for i in group) <= 10 for group in actual)
+    groups, dummy = partitioner([4, 2], 3, 8, costs=[1, 100])
+    assert dummy == {2}
+    assert groups[2] == [0]  # Less compute even though this sample has more tokens.
+
+
+def test_iterator_slices_costs_at_each_optimizer_step(partitioner):
+    from types import SimpleNamespace
+
+    import numpy as np
+    import torch
+
+    root = Path(__file__).resolve().parents[3]
+    namespace = partitioner.__globals__
+    nodes = [
+        n
+        for n in ast.parse((root / "relax/backends/megatron/data.py").read_text()).body
+        if getattr(n, "name", None) in ("get_data_iterator", "_get_micro_batch_token_capacity")
+    ]
+    costs = [100, 74, 99, 75, 80, 79, 1, 90, 2, 91, 3, 92]
+    namespace.update(
+        torch=torch,
+        np=np,
+        mpu=SimpleNamespace(
+            get_data_parallel_world_size=lambda **kw: 1,
+            get_data_parallel_group=lambda **kw: "dp",
+            get_model_parallel_group=lambda: "model",
+            get_virtual_pipeline_model_parallel_world_size=lambda: None,
+            get_context_parallel_world_size=lambda: 1,
+            get_tensor_model_parallel_world_size=lambda: 1,
+        ),
+        dist=SimpleNamespace(all_reduce=lambda *a, **kw: None, ReduceOp=torch.distributed.ReduceOp),
+        device_utils=SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
+        is_preference_mode=lambda args: False,
+        ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY="global_counts",
+        ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY="local_counts",
+        DataIterator=lambda data, micro_batch_size, indices, **kw: SimpleNamespace(indices=indices, **kw),
+        sample_costs=lambda args, data: costs,
+    )
+    exec(
+        compile(
+            ast.Module(body=[ast.parse("from __future__ import annotations").body[0], *nodes], type_ignores=[]),
+            "data.py",
+            "exec",
+        ),
+        namespace,
+    )
+    args = SimpleNamespace(
+        microbatch_balance="flops", global_batch_size=6, use_dynamic_batch_size=True, max_tokens_per_gpu=16
+    )
+    rollout = {"total_lengths": [8] * 12}
+    iterators, counts = namespace["get_data_iterator"](args, [], rollout)
+    first, _ = partitioner([8] * 6, 3, 16, costs=costs[:6])
+    second, _ = partitioner([8] * 6, 3, 16, costs=costs[6:])
+    assert counts == [3, 3]
+    assert iterators[0].indices == [*first, *[[i + 6 for i in group] for group in second]]
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_real_qwen35_repartition_preserves_loss_gradient_and_update(partitioner, moe, monkeypatch):
+    import copy
+    import importlib
+    import inspect
+    from argparse import Namespace
+
+    import torch
+    import transformers
+
+    from relax.utils.training.qwen35_cost import estimate_sample_costs
+
+    config_class = transformers.Qwen3_5MoeTextConfig if moe else transformers.Qwen3_5TextConfig
+    model_class = transformers.Qwen3_5MoeForCausalLM if moe else transformers.Qwen3_5ForCausalLM
+    # Keep this CPU test on the upstream PyTorch reference when optional
+    # kernel dispatchers are installed in the training image.
+    modeling = importlib.import_module(model_class.__module__)
+    monkeypatch.setattr(
+        modeling, "torch_chunk_gated_delta_rule", inspect.unwrap(modeling.torch_chunk_gated_delta_rule)
+    )
+    config = config_class(
+        hidden_size=16,
+        vocab_size=32,
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        linear_num_key_heads=1,
+        linear_key_head_dim=4,
+        linear_num_value_heads=2,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        **(
+            {
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 8,
+                "shared_expert_intermediate_size": 8,
+            }
+            if moe
+            else {"intermediate_size": 32}
+        ),
+    )
+    config._attn_implementation = "eager"
+    lengths = [33, 43, 27, 21, 12, 15, 59, 47]
+    costs = estimate_sample_costs(config, {"total_lengths": lengths}, Namespace())
+    by_tokens, _ = partitioner(lengths, 4, 80)
+    by_flops, _ = partitioner(lengths, 4, 80, costs=costs)
+    assert sorted(by_tokens) != sorted(by_flops)
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        torch.manual_seed(47)
+        reference = model_class(config).train()
+        actual = copy.deepcopy(reference)
+        samples = [torch.randint(0, 32, (1, length)) for length in lengths]
+        losses = []
+        for model, groups in ((reference, by_tokens), (actual, by_flops)):
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+            total = 0.0
+            for group in groups:
+                for index in group:
+                    loss = model(input_ids=samples[index], labels=samples[index], use_cache=False).loss
+                    weighted = loss * (lengths[index] - 1) / sum(n - 1 for n in lengths)
+                    weighted.backward()
+                    total += float(weighted.detach())
+            losses.append(total)
+            optimizer.step()
+        assert losses[0] == pytest.approx(losses[1], abs=1e-6)
+        for left, right in zip(reference.parameters(), actual.parameters(), strict=True):
+            assert (left.grad is None) == (right.grad is None)
+            if left.grad is not None:
+                torch.testing.assert_close(left.grad, right.grad, atol=2e-6, rtol=2e-5)
+            torch.testing.assert_close(left, right, atol=2e-6, rtol=2e-5)
+    finally:
+        torch.set_num_threads(threads)
