@@ -105,9 +105,30 @@ def test_qdq_matches_native_bridge_and_preserves_master(device: str) -> None:
 
         invalid = original.clone()
         invalid[:3, 0] = torch.tensor([float("nan"), float("inf"), -float("inf")], dtype=dtype)
-        result = mxfp4_qdq(invalid.to(device)).cpu()
+        invalid_master = invalid.to(device)
+        invalid_effective = mxfp4_qdq(invalid_master)
+        result = invalid_effective.cpu()
         assert torch.equal(result[:3].view(torch.uint8), invalid[:3].view(torch.uint8))
         assert torch.equal(result[3:].view(torch.uint8), expected[3:].view(torch.uint8))
+
+        if device == "cuda" and dtype == torch.float32:
+            from relax.models.deepseek_v4.quantization import mxfp4_qdq_into
+
+            # Finite QDQ already matches Bridge above; keep the old CUDA cast
+            # as the direct-output reference, including NaN/Inf passthrough.
+            for cpu_master, gpu_master, old_qdq in (
+                (original, master, effective),
+                (invalid, invalid_master, invalid_effective),
+            ):
+                before_bytes = cpu_master.view(torch.uint8).clone()
+                output = torch.nn.Parameter(torch.empty_like(gpu_master, dtype=torch.bfloat16))
+                version = output._version
+                with torch.no_grad():
+                    mxfp4_qdq_into(gpu_master, output)
+                assert output._version == version + 1
+                assert torch.equal(output.detach().cpu().view(torch.uint8), old_qdq.bfloat16().cpu().view(torch.uint8))
+                assert torch.equal(cpu_master.view(torch.uint8), before_bytes)
+                assert torch.equal(gpu_master.detach().cpu().view(torch.uint8), before_bytes)
 
 
 @_GPU

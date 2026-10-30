@@ -781,7 +781,43 @@ index e0f7c9f..1d3c4e4 100644
 diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 --- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 +++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-@@ -249,6 +249,11 @@
+@@ -1,6 +1,6 @@
+ # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
+ from collections import defaultdict
+-from typing import Dict
++from typing import Callable, Dict
+
+ import torch
+
+@@ -76,6 +76,14 @@
+         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
+         self.param_update_in_fp32 = param_update_in_fp32
+         self.sub_optimizer_kwargs = kwargs
++        # Optional parameter-local replacement for CPU master -> GPU copy-back.
++        # Callbacks enqueue work on the current _h2d_stream; the existing event
++        # below fences their work before the training stream consumes weights.
++        # Keep this instance mapping outside _init_sub_optimizers: state loading
++        # rebuilds sub-optimizers, but does not replace the callback contract.
++        self._param_copy_back_gpu_callbacks: Dict[
++            torch.Tensor, Callable[[torch.Tensor, torch.Tensor], None]
++        ] = {}
+
+         self._init_sub_optimizers()
+         self._register_load_state_dict_hooks()
+@@ -121,7 +129,11 @@
+                 with torch.cuda.stream(self._h2d_stream):
+                     for param in _param_generator(optimizer):
+                         gpu_param = self.cpu_copys_map_gpu_param[param]
+-                        gpu_param.data.copy_(param.data, non_blocking=True)
++                        callback = self._param_copy_back_gpu_callbacks.get(gpu_param)
++                        if callback is None:
++                            gpu_param.data.copy_(param.data, non_blocking=True)
++                        else:
++                            callback(gpu_param, param)
+                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
+
+             return param_copy_back_gpu_hook
+@@ -249,6 +261,11 @@
          return cpu_optimizers
  
      def _get_sub_optimizer_param_groups(self, offload_fraction: float):
@@ -793,7 +829,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
          params = []
          for group in self.param_groups:
              params.extend(group["params"])
-@@ -276,6 +281,8 @@
+@@ -276,6 +293,8 @@
                      cpu_copy = True
                  if self.param_update_in_fp32 and param.dtype != torch.float32:
                      param = param.detach().clone().float()
@@ -802,7 +838,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
                      param_to_fp32_param[orig_param] = param
 
                  if cpu_copy:
-@@ -370,11 +377,11 @@
+@@ -370,11 +389,11 @@
          if not self.param_update_in_fp32:
              return
          for param, v in self.state.items():
@@ -819,7 +855,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
  
      def update_fp32_param_by_new_param(self):
          """
-@@ -382,6 +389,16 @@
+@@ -382,6 +401,16 @@
          """
          for param, fp32_param in self.param_to_fp32_param.items():
              fp32_param.data.copy_(param)

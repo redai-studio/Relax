@@ -1,0 +1,124 @@
+# Target: nvidia-cudnn-frontend==1.27.0, nvidia-cutlass-dsl==4.6.0 (CUDA 12).
+# Source: https://pypi.org/project/nvidia-cudnn-frontend/1.27.0/
+# Reuse native CuTe compile signatures for SM90 DSA backward with topk_length.
+# In this version max_topk is inactive in that kernel branch. Newer Frontend
+# kernels (including 1.31.0) use it there, so this patch MUST NOT be reused
+# without revalidating the kernel and cache key. Dockerfile checks package
+# versions and the wrapper/kernel/conversion/compiler sources before applying.
+# No-length specialization, kernel math, inputs and launch order are unchanged.
+
+--- a/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py
++++ b/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py
+@@ -253,6 +253,17 @@
+         have_topk_length,
+         max_topk,
+     )
++    if have_topk_length:
++        # max_topk is only read in the constexpr no-length kernel branch.
++        signature_config = compile_key[:-1]
++        # Keep a cheap exact-layout lookup before converting the CuTe arguments.
++        compile_key += (
++            device,
++            tuple(
++                (t.dtype, tuple(t.shape), tuple(t.stride()))
++                for t in (q4, kv4, dout4, lse_log2, dpsum, dq4, dkv_accum, topk4, tlen4)
++            ),
++        )
+     if compile_key not in flash_attn_bwd_sm90.compile_cache:
+         q_tensor = to_cute_tensor(q4)
+         kv_tensor = to_cute_tensor(kv4)
+@@ -263,37 +274,57 @@
+         topk_idxs_tensor = to_cute_tensor(topk4)
+         topk_length_tensor = to_cute_tensor(tlen4)
+
+-        fa_bwd_obj = FlashAttentionDSABackwardSm90(
+-            dtype,
+-            head_dim,
+-            head_dim_v,
+-            qhead_per_kvhead,
+-            tile_m=m_block_size,
+-            tile_n=n_block_size,
+-            KV_stage=KV_stage,
+-            PdS_stage=PdS_stage,
+-            SdP_swapAB=SdP_swapAB,
+-            dKV_swapAB=dKV_swapAB,
+-            dQ_swapAB=dQ_swapAB,
+-            num_threads=num_threads,
+-            have_topk_length=have_topk_length,
+-            max_topk=max_topk,
+-        )
+-        flash_attn_bwd_sm90.compile_cache[compile_key] = cute.compile(
+-            fa_bwd_obj,
+-            q_tensor,
+-            kv_tensor,
+-            do_tensor,
+-            lse_log2_tensor,
+-            dpsum_tensor,
+-            dq_tensor,
+-            dkv_accum_tensor,
+-            topk_idxs_tensor,
+-            topk_length_tensor,
+-            softmax_scale,
+-            current_stream,
+-            options="--enable-tvm-ffi",
+-        )
++        compiled = None
++        if have_topk_length:
++            # CuTe retains all static layout/alignment distinctions in its key.
++            signature_key = (
++                signature_config,
++                device,
++                arch,
++                tuple(
++                    t.__cache_key__
++                    for t in (
++                        q_tensor, kv_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
++                        dq_tensor, dkv_accum_tensor, topk_idxs_tensor, topk_length_tensor,
++                    )
++                ),
++            )
++            compiled = flash_attn_bwd_sm90.compile_cache_signature.get(signature_key)
++        if compiled is None:
++            fa_bwd_obj = FlashAttentionDSABackwardSm90(
++                dtype,
++                head_dim,
++                head_dim_v,
++                qhead_per_kvhead,
++                tile_m=m_block_size,
++                tile_n=n_block_size,
++                KV_stage=KV_stage,
++                PdS_stage=PdS_stage,
++                SdP_swapAB=SdP_swapAB,
++                dKV_swapAB=dKV_swapAB,
++                dQ_swapAB=dQ_swapAB,
++                num_threads=num_threads,
++                have_topk_length=have_topk_length,
++                max_topk=max_topk,
++            )
++            compiled = cute.compile(
++                fa_bwd_obj,
++                q_tensor,
++                kv_tensor,
++                do_tensor,
++                lse_log2_tensor,
++                dpsum_tensor,
++                dq_tensor,
++                dkv_accum_tensor,
++                topk_idxs_tensor,
++                topk_length_tensor,
++                softmax_scale,
++                current_stream,
++                options="--enable-tvm-ffi",
++            )
++            if have_topk_length:
++                flash_attn_bwd_sm90.compile_cache_signature[signature_key] = compiled
++        flash_attn_bwd_sm90.compile_cache[compile_key] = compiled
+     with torch.cuda.nvtx.range("flash_attn_bwd_sm90_kernel"):
+         flash_attn_bwd_sm90.compile_cache[compile_key](
+             q4,
+@@ -357,4 +388,5 @@
+
+ flash_attn_bwd_sm90.compile_cache_pre = {}
+ flash_attn_bwd_sm90.compile_cache = {}
++flash_attn_bwd_sm90.compile_cache_signature = {}
+ flash_attn_bwd_sm90.compile_cache_post = {}

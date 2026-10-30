@@ -289,5 +289,58 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
     pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
-    python /opt/relax/validate_hybridep_install.py && \
-    python /opt/relax/validate_final_runtime.py --profile cu12
+    python /opt/relax/validate_hybridep_install.py
+
+# Apply only after all pip installs. This cache specialization is valid for
+# Frontend 1.27.0 / CuTe DSL 4.6.0; newer kernels may use max_topk with lengths.
+# Reject incompatible images instead of silently skipping or downgrading packages.
+COPY docker/patch/cudnn/1.27.0-dsa-sm90-signature-cache.patch /tmp/cudnn-dsa-sm90-signature-cache.patch
+RUN python - <<'PY'
+import hashlib
+import importlib.metadata as md
+from pathlib import Path
+import subprocess
+
+expected_versions = {
+    "nvidia-cudnn-frontend": "1.27.0",
+    "nvidia-cutlass-dsl": "4.6.0",
+    "nvidia-cutlass-dsl-libs-core": "4.6.0",
+    "nvidia-cutlass-dsl-libs-base": "4.6.0",
+    "nvidia-cutlass-dsl-libs-cu12": "4.6.0",
+}
+for name, expected in expected_versions.items():
+    actual = md.version(name)
+    if actual != expected:
+        raise RuntimeError(f"DSA SM90 patch requires {name}=={expected}, got {actual}; rebase and validate the patch")
+
+frontend_root = Path(md.distribution("nvidia-cudnn-frontend").locate_file(""))
+cutlass_root = Path(md.distribution("nvidia-cutlass-dsl-libs-core").locate_file(""))
+dsa = frontend_root / "cudnn/deepseek_sparse_attention"
+cutlass = cutlass_root / "nvidia_cutlass_dsl/dsl_packages/cutlass"
+wrapper = dsa / "sparse_attention_backward/_interface_sm90.py"
+expected_sources = {
+    wrapper: "ddb32b504ac8ca85685edc048b60627b6b3d0904e35535ba9d0b1da960befed0",
+    dsa / "sparse_attention_backward/dsa_bwd_sm90.py": "33ff8c7ced119782177421775fe41130d9310745628a0cc928d7b2273b63b00c",
+    dsa / "utils/tensor_conversion.py": "387a96bd9973bdc362ca17a552963620612297942f1289ce1b6561953ea24151",
+    cutlass / "cute/runtime.py": "76feb3d7d180c5989a399e415a1fb328aabddc6dc92caef40a210f7d6f90458c",
+    cutlass / "base_dsl/compiler.py": "e7cdcea2051eb57be5e0178ad74fdc09cbfa814351fb20e448d01e6d0fce8379",
+    cutlass / "base_dsl/dsl.py": "cb285ab077b12653581dc030fcde0fe29be9f6ddff2677cb77fd593c4129ff8c",
+}
+
+def check_sources():
+    for path, expected in expected_sources.items():
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            raise RuntimeError(f"DSA SM90 patch source mismatch: {path}: expected {expected}, got {actual}")
+
+check_sources()
+patch = Path("/tmp/cudnn-dsa-sm90-signature-cache.patch")
+command = ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(patch)]
+subprocess.run([*command, "--dry-run"], cwd=frontend_root, check=True)
+subprocess.run(command, cwd=frontend_root, check=True)
+expected_sources[wrapper] = "21ee56f112434fd6de0f8828880b7bc28f3204f4191c97438fb19cd16e12095c"
+check_sources()
+compile(wrapper.read_bytes(), str(wrapper), "exec")
+patch.unlink()
+PY
+RUN python /opt/relax/validate_final_runtime.py --profile cu12
