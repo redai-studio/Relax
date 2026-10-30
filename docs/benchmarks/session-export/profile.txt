@@ -1,0 +1,24 @@
+         3279895 function calls (2755135 primitive calls) in 1.015 seconds
+
+   Ordered by: cumulative time
+   List reduced from 61 to 18 due to restriction <18>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      2/1    0.002    0.001    1.015    1.015 tracing_helper.py:475(_resume_span)
+        1    0.000    0.000    1.013    1.013 service.py:2809(_build_session_export_transport)
+        1    0.000    0.000    0.980    0.980 service.py:2911(_export_payload)
+        1    0.001    0.001    0.980    0.980 __init__.py:105(from_sample)
+        1    0.001    0.001    0.979    0.979 __init__.py:113(_compact_sample_payload)
+524733/23    0.399    0.000    0.966    0.042 copy.py:118(deepcopy)
+    63/22    0.000    0.000    0.965    0.044 copy.py:217(_deepcopy_dict)
+     16/8    0.166    0.010    0.965    0.121 copy.py:191(_deepcopy_list)
+   524913    0.172    0.000    0.172    0.000 {built-in method builtins.id}
+  1049579    0.137    0.000    0.137    0.000 {method 'get' of 'dict' objects}
+   524389    0.055    0.000    0.055    0.000 {method 'append' of 'list' objects}
+   524654    0.037    0.000    0.037    0.000 copy.py:172(_deepcopy_atomic)
+        1    0.000    0.000    0.033    0.033 service.py:2874(_build_sample)
+        1    0.000    0.000    0.033    0.033 state.py:775(build_sample)
+        2    0.000    0.000    0.022    0.011 state.py:377(_decode_tokens)
+        2    0.011    0.006    0.022    0.011 benchmark_session_export.py:49(decode)
+        3    0.012    0.004    0.012    0.004 {built-in method numpy.asarray}
+   131074    0.011    0.000    0.011    0.000 benchmark_session_export.py:50(<genexpr>)

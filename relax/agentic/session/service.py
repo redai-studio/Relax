@@ -15,6 +15,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import partial
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple, cast
 from uuid import uuid4
@@ -56,6 +57,7 @@ from relax.agentic.runner import (
 )
 from relax.agentic.session.admission import compute_reservation_tokens
 from relax.agentic.session.admission_coordinator import AdmissionCoordinator, RayAdmissionClient
+from relax.agentic.session.export import SessionExportWorker
 from relax.agentic.session.state import (
     InflightRequest,
     MsgNode,
@@ -1471,6 +1473,7 @@ class AgenticSessionShard:
         self._sglang_request_limiter = admission_coordinator
         self._admission_client = RayAdmissionClient(admission_coordinator) if args.agentic_program_admission else None
         self._permit_cleanup_tasks: set["asyncio.Task[None]"] = set()
+        self._export_worker = SessionExportWorker()
         self._lifecycle_close_count = 0
         self._lifecycle_close_failure_count = 0
         self._generation_backend = SGLangBackendAdapter(args)
@@ -1995,6 +1998,11 @@ class AgenticSessionShard:
         for outcome in permit_cleanup_outcomes:
             if first_error is None and isinstance(outcome, BaseException):
                 first_error = outcome
+        try:
+            await self._export_worker.shutdown()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         try:
             await self._generation_backend.shutdown()
         except BaseException as error:
@@ -2741,10 +2749,7 @@ class AgenticSessionShard:
             return
 
         if process_error is None:
-            await finish_before_cancellation(
-                self._finalize_terminal_session(session),
-                f"session-finalize:{session.session_id}",
-            )
+            await self._finalize_terminal_session(session)
             return
         if not isinstance(process_error, Exception):
             process_error = RuntimeGroupError(f"agent session task cancelled unexpectedly for {session.session_id}")
@@ -2779,6 +2784,12 @@ class AgenticSessionShard:
         )
 
     async def _finalize_terminal_session(self, session: _SessionRecord) -> None:
+        await finish_before_cancellation(
+            self._finalize_terminal_session_once(session),
+            f"session-finalize:{session.session_id}",
+        )
+
+    async def _finalize_terminal_session_once(self, session: _SessionRecord) -> None:
         """Build the compact export, release Session resources, then
         publish."""
 
@@ -2796,12 +2807,18 @@ class AgenticSessionShard:
                     "finalize_lock_acquired_at": finalize_lock_acquired_at,
                     "finalize_start_at": time.time(),
                 }
-                outcome = self._build_session_export_transport(
-                    session=session,
-                    reward=output.reward,
-                    metadata=output.metadata,
-                    output_records=output.records,
-                    finalize_events=finalize_events,
+                # Keep this terminal Forest exclusively owned until the worker
+                # finishes. Late chat commits/trace marks and drop cleanup all
+                # acquire this lock; unrelated Sessions remain responsive.
+                outcome = await self._export_worker.run(
+                    partial(
+                        self._build_session_export_transport,
+                        session=session,
+                        reward=output.reward,
+                        metadata=output.metadata,
+                        output_records=output.records,
+                        finalize_events=finalize_events,
+                    )
                 )
             except AgentExecutionError as error:
                 logger.error(
