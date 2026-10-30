@@ -25,6 +25,15 @@ _MTP_TRACKER_PARAMETERS = set(inspect.signature(MTPLossLoggingHelper.save_loss_t
 _COMPUTE_MTP_ACCEPTANCE_COUNTS = getattr(_mtp_mod, "_compute_mtp_acceptance_counts", None)
 
 
+def _normalization_counts(num_tokens, original_num_tokens, cp_group):
+    helper = getattr(_mtp_mod, "get_mtp_normalization_counts", None)
+    if helper is not None:
+        return helper(num_tokens, original_num_tokens, cp_group)
+    if cp_group is not None and cp_group.size() > 1:
+        raise RuntimeError("MTP with CP requires docker/patch/megatron/mtp-cp-normalization.patch")
+    return num_tokens, original_num_tokens, 1
+
+
 def _roll_mtp_labels_and_mask(
     labels: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -193,9 +202,12 @@ def _chunked_head_ce(
     return losses, correct, total
 
 
-def _save_mtp_loss_to_tracker(mtp_loss, num_tokens, layer_number, config, correct=None, total=None):
+def _save_mtp_loss_to_tracker(
+    mtp_loss, num_tokens, layer_number, config, correct=None, total=None, *, global_num_tokens=None, cp_size=1
+):
     """Log MTP loss across the legacy and token-aware tracker APIs."""
     avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    denominator = num_tokens if global_num_tokens is None else global_num_tokens
     # Preserve the Qwen3.8 baseline's mean of per-microbatch raw CEs,
     # independently of the new runtime's token-weighted objective tracker.
     if (
@@ -217,15 +229,17 @@ def _save_mtp_loss_to_tracker(mtp_loss, num_tokens, layer_number, config, correc
         if "correct" in _MTP_TRACKER_PARAMETERS:
             kwargs.update(correct=correct, total=total)
         MTPLossLoggingHelper.save_loss_to_tracker(
-            mtp_loss_scale * torch.sum(mtp_loss),
-            num_tokens,
+            mtp_loss_scale * torch.sum(mtp_loss) * (1 if config.calculate_per_token_loss else cp_size),
+            num_tokens if config.calculate_per_token_loss else denominator,
             layer_number,
             config.mtp_num_layers,
             **kwargs,
         )
         return
 
-    mtp_loss_for_log = (torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)) / num_tokens.clamp(min=1)
+    mtp_loss_for_log = (torch.sum(mtp_loss) * cp_size * (denominator > 0).to(mtp_loss.dtype)) / denominator.clamp(
+        min=1
+    )
     MTPLossLoggingHelper.save_loss_to_tracker(
         mtp_loss_for_log,
         layer_number,
@@ -448,18 +462,32 @@ def process_mtp_loss(
 
         # ---- identical to upstream from here (operates on [b, s], no vocab dim) ----
         mtp_loss = layer_loss_mask * mtp_loss
+        global_num_tokens, global_original_num_tokens, cp_size = _normalization_counts(
+            num_tokens, original_num_tokens, cp_group
+        )
         # Preserve the scaled logging contract of Relax's Docker Megatron patch.
         if is_training:
-            _save_mtp_loss_to_tracker(mtp_loss, num_tokens, mtp_layer_number, config, correct, total)
+            _save_mtp_loss_to_tracker(
+                mtp_loss,
+                num_tokens,
+                mtp_layer_number,
+                config,
+                correct,
+                total,
+                global_num_tokens=global_num_tokens,
+                cp_size=cp_size,
+            )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
+            num_tokens_safe = torch.clamp(global_num_tokens, min=1)
             mtp_loss_normalized = mtp_loss_scale * mtp_loss
             if not main_update_tokens:
-                mtp_loss_normalized = mtp_loss_normalized * (original_num_tokens / num_tokens_safe)
+                mtp_loss_normalized = mtp_loss_normalized * (global_original_num_tokens / num_tokens_safe)
             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
-            safe_num_tokens = num_tokens.clamp(min=1)
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens)
+            safe_num_tokens = global_num_tokens.clamp(min=1)
+            hidden_states = MTPLossAutoScaler.apply(
+                hidden_states, mtp_loss_scale * mtp_loss * cp_size / safe_num_tokens
+            )
 
     return hidden_states

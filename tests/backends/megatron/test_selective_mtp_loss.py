@@ -174,6 +174,19 @@ def test_selective_mtp_gathers_sp_before_selection(monkeypatch):
     "fallback", [None, "disabled", "eval", "teacher", "derived", "cp2", "bad_length", "bad_depth"]
 )
 def test_selective_mtp_process_gates_and_rolled_mask(monkeypatch, fallback):
+    if fallback == "cp2" and not hasattr(patch._mtp_mod, "get_mtp_normalization_counts"):
+        pytest.skip("CP requires the MCore MTP normalization patch")
+    cp_group = SimpleNamespace(size=lambda: 2 if fallback == "cp2" else 1)
+    reductions = []
+
+    def all_reduce(counts, *, group):
+        assert group is cp_group
+        assert counts.shape == (2,)
+        reductions.append(counts.clone())
+        # Model identical peer counts without a distributed process group.
+        counts.mul_(cp_group.size())
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     # Model the pinned image's acceptance API even when running on older MCore.
     monkeypatch.setattr(patch, "_COMPUTE_MTP_ACCEPTANCE_COUNTS", lambda *_args: None)
     monkeypatch.setenv("RELAX_SFT_SELECTIVE_LOGITS", "0" if fallback == "disabled" else "1")
@@ -226,11 +239,12 @@ def test_selective_mtp_process_gates_and_rolled_mask(monkeypatch, fallback):
         fallback != "eval",
         ce,
         config,
-        cp_group=SimpleNamespace(size=lambda: 2 if fallback == "cp2" else 1),
+        cp_group=cp_group,
         packed_seq_params=params,
         input_ids=labels,
         mtp_input_mask=torch.tensor([[1, 1, 0, 1, 1, 0, 1, 1]]) if fallback == "teacher" else None,
     )
+    assert len(reductions) == (2 if fallback == "cp2" else 0)
     assert len(seen) == 2
     for depth, (selected, rolled_mask) in enumerate(seen):
         if fallback in (None, "teacher"):
