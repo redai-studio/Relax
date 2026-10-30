@@ -2,6 +2,12 @@
 
 ## Overview
 
+Public image: **`ghcr.io/redai-studio/relaxrl:latest`**.
+
+```bash
+docker pull ghcr.io/redai-studio/relaxrl:latest
+```
+
 We publish two types of Docker images for Relax:
 
 ### 1. Stable Version
@@ -20,8 +26,13 @@ We publish two types of Docker images for Relax:
 
 Run these commands from the repository root. Set `REGISTRY` to your registry and optional namespace; `IMAGE_REPOSITORY` defaults to `relax`.
 
+For CUDA 12, the default base is `ghcr.io/redai-studio/relaxrl:sglang-v0.5.21-cu129`.
+See [CUDA-129.md](../CUDA-129.md) to build your own base, or set `BASE_IMAGE`
+to another compatible SGLang 0.5.21 image.
+
 ```bash
-export REGISTRY=registry.example.com/team
+export REGISTRY=ghcr.io/redai-studio
+export IMAGE_REPOSITORY=relaxrl
 
 # Build and push all three train images.
 make docker-train
@@ -77,11 +88,13 @@ For dev builds, a nonempty train override is used directly without building the 
 
 ```bash
 # Reuse an existing Blackwell train image; replace the date/hash placeholders.
-CU13_BLACKWELL_TRAIN_IMAGE="$REGISTRY/relax:train-YYYYMMDD-HASH8-cu13-blackwell" \
+CU13_BLACKWELL_TRAIN_IMAGE="$REGISTRY/$IMAGE_REPOSITORY:train-YYYYMMDD-HASH8-cu13-blackwell" \
   DO_PUSH=0 make docker-dev-cu13-blackwell
 ```
 
 See the [English installation guide](../docs/en/guide/installation.md) or [中文安装指南](../docs/zh/guide/installation.md) for container setup and direct Docker build examples.
+
+CUDA 12.9 / Hopper 的 SGLang 构建、训练 wheel 缓存导出与复用，见 [CUDA-129.md](../CUDA-129.md)。
 
 ## Pre-Release Testing
 
