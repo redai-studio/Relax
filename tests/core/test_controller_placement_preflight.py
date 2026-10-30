@@ -30,6 +30,44 @@ class _TeacherStartReached(Exception):
     pass
 
 
+@pytest.mark.parametrize("unconfirmed", [None, "owner", "training"])
+def test_controller_releases_shared_placement_only_after_every_owner_confirms(monkeypatch, unconfirmed):
+    from unittest.mock import Mock
+
+    instance = controller.Controller.__new__(controller.Controller)
+    owners = [Mock(), Mock()]
+    for owner in owners:
+        owner.shutdown.remote.return_value = None
+    if unconfirmed == "owner":
+        owners[0].shutdown.remote.return_value = RuntimeError("worker exit unconfirmed")
+    authority = Mock()
+    authority.managers.remote.return_value = owners
+    authority.resources_for.remote.return_value = {"shared": "pg"}
+    authority.snapshot.remote.return_value = {
+        "owners": {"training": "resident"} if unconfirmed == "training" else {},
+        "blocked": {},
+    }
+    instance._inference_authority = authority
+
+    def get(value, **kwargs):
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    remove = Mock()
+    monkeypatch.setattr(controller.ray, "get", get)
+    monkeypatch.setattr(controller, "remove_placement_group", remove)
+    assert instance._shutdown_inference_owners() is (unconfirmed is None)
+    for owner in owners:
+        owner.shutdown.remote.assert_called_once()
+    if unconfirmed is None:
+        remove.assert_called_once_with("pg")
+        authority.confirm_resource_release.remote.assert_called_once_with("shared", "controller")
+    else:
+        remove.assert_not_called()
+        authority.confirm_resource_release.remote.assert_not_called()
+
+
 def _genrm_spec(num_gpus):
     return {
         "model_path": "/judge",
@@ -57,6 +95,11 @@ def _colocate_teacher_config(**overrides):
 
 def _stub_startup(monkeypatch):
     teacher_starts = []
+    from unittest.mock import MagicMock
+
+    from relax.engine.inference import ownership
+
+    monkeypatch.setattr(ownership, "LifecycleAuthority", MagicMock())
 
     def fake_start_teacher(config, *, runtime_env=None):
         teacher_starts.append(config)

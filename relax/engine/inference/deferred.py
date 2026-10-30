@@ -22,11 +22,13 @@ import json
 import weakref
 from typing import Any, Iterable
 
+from relax.engine.inference.client import _settle
 from relax.engine.inference.lifecycle import (
     LifecycleCoordinator,
     local_rollout_participant,
     manager_participant,
 )
+from relax.engine.inference.phase_client import RemoteLifecycleCoordinator, control_call, gather_owned
 from relax.utils.logging_utils import get_logger
 
 
@@ -55,6 +57,25 @@ def is_deferred_teacher(args: Any) -> bool:
     )
 
 
+def needs_rollout_cpu_backup(args: Any) -> bool:
+    """A same-round return from shared scoring must restore the synced
+    policy."""
+    if not getattr(args, "offload_rollout", False):
+        return False
+    from relax.distributed.ray.placement_planner import Phase, claims_overlap, plan_placement
+
+    plan = plan_placement(args, validate=False)
+    return any(
+        rollout.role == "rollout"
+        and scorer.role != "rollout"
+        and Phase.SCORE in scorer.phases
+        and Phase.GENERATE not in scorer.phases
+        and claims_overlap(rollout, scorer)
+        for rollout in plan.claims
+        for scorer in plan.claims
+    )
+
+
 def validate_deferred_scoring_args(args: Any) -> None:
     """Reject a run the framework cannot defer scoring for.
 
@@ -63,6 +84,19 @@ def validate_deferred_scoring_args(args: Any) -> None:
             reach.
     """
     deferred_reward = is_framework_deferred_reward(args)
+    if needs_rollout_cpu_backup(args) and getattr(args, "sglang_config", None):
+        import yaml
+
+        with open(args.sglang_config) as stream:
+            config = yaml.safe_load(stream)
+        if any(
+            group.get("overrides", {}).get("enable_weights_cpu_backup") is False
+            for model in config.get("sglang", [])
+            for group in model.get("engine_groups", [])
+        ):
+            raise ValueError(
+                "Deferred shared scoring requires enable_weights_cpu_backup for same-round policy restore"
+            )
     if deferred_reward and getattr(args, "dynamic_sampling_filter_path", None) is not None:
         raise ValueError(
             "--defer-reward-to-post-process without --custom-reward-post-process-path is not supported with "
@@ -144,7 +178,7 @@ async def _score_group(args: Any, group: list) -> None:
         elif item.reward is None:
             item.reward = await async_rm(args, item)
 
-    await asyncio.gather(*(score(item) for item in group))
+    await gather_owned(score(item) for item in group)
 
 
 def _teacher_manager_actor_names(args: Any) -> dict[str, str]:
@@ -169,6 +203,8 @@ def build_local_coordinator(args: Any) -> LifecycleCoordinator:
     Rollout is switched in-process; the judges and teachers through their
     managers, found by actor name.
     """
+    if getattr(args, "_inference_authority", None) is not None:
+        return RemoteLifecycleCoordinator()
     import ray
 
     from relax.distributed.ray.placement_group import genrm_manager_actor_name
@@ -249,19 +285,19 @@ async def run_deferred_scoring(
             f"({len(reward_groups)} group(s) to reward, {len(teacher_samples)} sample(s) for the teacher)"
         )
         # The switches block on engine calls; keep them off the event loop.
-        await asyncio.to_thread(coordinator.enter_score)
         scored = False
         try:
-            await asyncio.gather(*(_score_group(args, group) for group in reward_groups))
+            await control_call(asyncio.to_thread(coordinator.enter_score))
+            await gather_owned(_score_group(args, group) for group in reward_groups)
             if teacher_samples:
                 await opd_manager.teacher_stage(teacher_samples)
             scored = True
         finally:
             # Also on failure: a scorer left awake would sit in the GPU memory
             # the next phase needs.
-            await asyncio.to_thread(coordinator.leave_score)
+            await _settle(asyncio.create_task(asyncio.to_thread(coordinator.leave_score)))
             if evaluation or (scored and needs_student):
-                await asyncio.to_thread(coordinator.enter_generate)
+                await _settle(asyncio.create_task(asyncio.to_thread(coordinator.enter_generate)))
         logger.info("Deferred scoring: left the score phase")
 
         if teacher_samples:

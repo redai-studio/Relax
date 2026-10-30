@@ -10,13 +10,10 @@ non-overlapping bundle_offset, and a ``(pg, list[manager])`` return shape.
 """
 
 import json
-import sys
 from argparse import Namespace
-from types import ModuleType
 
 
 def _install_fake_teacher_manager(monkeypatch, captured):
-    teacher_manager_module = ModuleType("relax.distributed.ray.teacher_manager")
 
     class _RemoteMethod:
         def __init__(self, name, owner):
@@ -33,25 +30,15 @@ def _install_fake_teacher_manager(monkeypatch, captured):
             self.get_urls = _RemoteMethod("get_urls", key)
             self.offload = _RemoteMethod("offload", key)
 
-    class _TeacherManagerActor:
-        @classmethod
-        def options(cls, **options):
-            return cls
+    from relax.distributed.ray import inference_manager
 
-        @classmethod
-        def remote(cls, args, num_replicas, gpus_per_replica, *, pg, shared_pg, bundle_offset):
-            key = args.teacher_hf_checkpoint
-            captured["ctor_calls"][key] = {
-                "num_replicas": num_replicas,
-                "gpus_per_replica": gpus_per_replica,
-                "pg": pg,
-                "shared_pg": shared_pg,
-                "bundle_offset": bundle_offset,
-            }
-            return _TeacherManagerHandle(key)
+    def create(args, role, model, pg, **kwargs):
+        key = args.teacher_hf_checkpoint
+        captured["ctor_calls"][key] = {"pg": pg, **{k: v for k, v in kwargs.items() if k != "runtime_env"}}
+        return _TeacherManagerHandle(key)
 
-    teacher_manager_module.TeacherManager = _TeacherManagerActor
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.teacher_manager", teacher_manager_module)
+    monkeypatch.setattr(inference_manager, "create_model_manager", create)
+    monkeypatch.setattr(inference_manager, "register_legacy_name", lambda *args: None)
 
 
 def _base_args(**overrides):

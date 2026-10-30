@@ -23,6 +23,7 @@ from tqdm import tqdm
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.inference.deferred import is_deferred_teacher, is_framework_deferred_reward, run_deferred_scoring
+from relax.engine.inference.phase_client import gather_owned
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -1272,13 +1273,19 @@ async def generate_rollout_async(
             # Nothing may be published from a step whose generation could not be stopped.
             for transfer_task in transfer_tasks:
                 transfer_task.cancel()
+            from relax.engine.inference.client import _settle
+
+            async def finish_transfers():
+                await asyncio.gather(*transfer_tasks, return_exceptions=True)
+
+            await _settle(asyncio.create_task(finish_transfers()))
             raise
         generation_stopped.set()
 
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
     if transfer_tasks:
-        await asyncio.gather(*transfer_tasks)
+        await gather_owned(transfer_tasks)
     pbar.close()
 
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)

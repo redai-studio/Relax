@@ -3,11 +3,45 @@
 """Tests for placement-group node affinity."""
 
 from argparse import Namespace
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from relax.core.service import Service, _require_node_group_markers, create_placement_group
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_training_deployment_holds_ownership_during_initialization_and_restart(restart):
+    events = []
+    service = Service.__new__(Service)
+    service.role = "actor"
+    service.config = Namespace(_inference_authority=object())
+    service.pgs = object()
+    service._deployed = False
+    service._stop_heartbeat_thread = MagicMock()
+    service._ensure_placement_group = MagicMock(return_value=service.pgs)
+    service._http_call = MagicMock(return_value={"step": 0})
+    service.run = MagicMock()
+
+    @contextmanager
+    def phase(*args):
+        events.append("acquire")
+        yield Namespace(switch=lambda value: events.append(value))
+        events.append("release")
+
+    with (
+        patch("relax.engine.inference.phase_client.PhaseSession.from_args", side_effect=phase),
+        patch("relax.core.service.serve.delete"),
+        patch("relax.core.service.time.sleep"),
+        patch("relax.core.service.recovery_load_path"),
+        patch.object(service, "_deploy", side_effect=lambda pg: events.append("deploy")),
+    ):
+        if restart:
+            service.restart()
+        else:
+            service.deploy()
+    assert events == ["acquire", "train", "deploy", "release"]
 
 
 def test_missing_markers_raise_after_retries():

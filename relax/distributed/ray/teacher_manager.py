@@ -7,7 +7,6 @@ from ray.util.placement_group import remove_placement_group
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.distributed.ray.multi_engine_manager import (
     SNAPSHOT_CONCURRENCY_GROUP,
-    SNAPSHOT_CONCURRENCY_GROUPS,
     MultiEngineManager,
 )
 from relax.distributed.ray.placement_group import create_placement_group
@@ -58,8 +57,7 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
     return env_vars
 
 
-@ray.remote(concurrency_groups=SNAPSHOT_CONCURRENCY_GROUPS)
-class TeacherManager(MultiEngineManager):
+class TeacherEngineRuntime(MultiEngineManager):
     """Launch and own Relax-managed OPD teacher SGLang engine(s)."""
 
     def __init__(
@@ -247,3 +245,6 @@ class TeacherManager(MultiEngineManager):
             )
             addr_and_ports.update({rank: per_engine_addr_and_ports[rank] for rank, _ in engines})
         return addr_and_ports
+
+
+from relax.distributed.ray.inference_manager import LegacyInferenceManager as TeacherManager  # noqa: E402, F401

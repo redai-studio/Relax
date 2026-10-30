@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack
@@ -9,6 +8,7 @@ import aiohttp
 import numpy as np
 
 from relax.engine.inference.client import get_request_client
+from relax.engine.inference.phase_client import gather_owned
 from relax.engine.inference.routing import ModelUnavailableError, RoutingError, select_replica
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_main_worker, opd_opsd_worker
@@ -352,9 +352,9 @@ class OpdManager:
 
     async def _run_teacher_stage(self, samples: list[Sample], session: aiohttp.ClientSession) -> None:
         if self.opsd_worker is not None:
-            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in samples])
+            await gather_owned(self.opsd_worker.build_teacher_inputs(self.args, s) for s in samples)
 
-        fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in samples])
+        fetch_results = await gather_owned(self._teacher_prefill(s, session) for s in samples)
         self._raise_if_all_failed(samples, fetch_results)
 
     async def student_stage(
@@ -379,7 +379,7 @@ class OpdManager:
         session: aiohttp.ClientSession,
         encode_multimodal_inputs: EncodeMultimodalInputs | None,
     ) -> None:
-        await asyncio.gather(*[self._student_prefill(s, session, encode_multimodal_inputs) for s in samples])
+        await gather_owned(self._student_prefill(s, session, encode_multimodal_inputs) for s in samples)
 
     def assemble_stage(self, samples: list[Sample]) -> None:
         """Combine what the two models returned into the fields training

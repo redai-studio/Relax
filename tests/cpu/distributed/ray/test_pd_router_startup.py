@@ -212,7 +212,7 @@ def test_managed_pd_adopts_registry_before_publishing_groups(monkeypatch, rollou
     assert all(group.skip_router_registration for group in groups)
 
 
-@pytest.mark.parametrize("fail_at", ["engines", "publication", None])
+@pytest.mark.parametrize("fail_at", ["engines", None])
 def test_startup_publishes_ready_router_or_rolls_back_owned_resources(monkeypatch, rollout_module, fail_at):
     existing, created = Mock(), Mock()
     existing.is_alive.return_value = created.is_alive.return_value = True
@@ -249,7 +249,7 @@ def test_startup_publishes_ready_router_or_rolls_back_owned_resources(monkeypatc
     if fail_at == "engines":
         publish.assert_not_called()
     else:
-        publish.assert_called_once_with("ready-router", 3000)
+        publish.assert_not_called()
 
 
 @pytest.mark.parametrize("defer_router", [False, True])
@@ -320,7 +320,6 @@ def test_start_rollout_servers_initializes_models_before_publishing_router(monke
             "engines",
             "ready-other",
             "router-other",
-            "publish",
         ]
     else:
         managed.assert_not_called()
@@ -334,7 +333,6 @@ def test_start_rollout_servers_initializes_models_before_publishing_router(monke
             "engines",
             "engines",
             "ready-other",
-            "publish",
         ]
 
 
@@ -350,51 +348,34 @@ def test_router_cleanup_retains_failed_process_for_retry(rollout_module):
     assert rollout_module._LAUNCHED_ROUTER_PROCESSES == []
 
 
-@pytest.mark.parametrize("failure", [None, "engine", "detach"])
-def test_rollout_owner_releases_tq_and_router_on_disposal(monkeypatch, rollout_module, failure):
-    cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
-    manager = object.__new__(cls)
+@pytest.mark.parametrize("failure", [False, True])
+def test_rollout_resource_owner_retains_routers_on_unconfirmed_engine_cleanup(monkeypatch, rollout_module, failure):
+    from relax.engine.inference.admission import AdmissionGate
+
+    manager = object.__new__(rollout_module.RolloutEngineRuntime)
+    manager._admission = AdmissionGate()
     manager._stop_eviction_monitor = Mock()
     manager._health_monitors = [Mock()]
-    manager.data_system_client = Mock()
-    events = []
-
-    def cleanup(stage):
-        events.append(stage)
-        if stage == failure:
-            raise RuntimeError(f"{stage} shutdown failed")
-
-    manager._shutdown_all_engines = lambda: cleanup("engine")
-    monkeypatch.setattr(rollout_module, "detach_tq_client", lambda: cleanup("detach"))
-    monkeypatch.setattr(rollout_module, "stop_launched_routers", lambda: cleanup("router"))
-    if failure is None:
-        manager.dispose()
-    else:
-        with pytest.raises(RuntimeError, match=f"{failure} shutdown failed"):
+    manager._shutdown_all_engines = Mock(side_effect=RuntimeError("unconfirmed") if failure else None)
+    router_cleanup = Mock()
+    monkeypatch.setattr(rollout_module, "stop_launched_routers", router_cleanup)
+    if failure:
+        with pytest.raises(RuntimeError, match="unconfirmed"):
             manager.dispose()
-    assert events == ["engine", "detach", "router"]
-    assert manager.data_system_client is None
+        router_cleanup.assert_not_called()
+    else:
+        manager.dispose()
+        router_cleanup.assert_called_once()
 
 
-def test_engine_shutdown_uses_one_deadline_for_all_pd_workers(monkeypatch, rollout_module):
-    cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
-    manager = object.__new__(cls)
-    engines = [make_mock_engine() for _ in range(4)]
-    manager.servers = {"default": SimpleNamespace(engine_groups=[SimpleNamespace(all_engines=engines)])}
-    timeouts = []
-
-    def get(ref, timeout):
-        timeouts.append(timeout)
-        rollout_module.time.sleep(timeout)
-        raise TimeoutError("engine unavailable")
-
-    killed = Mock()
-    monkeypatch.setattr(rollout_module.ray, "get", get)
-    monkeypatch.setattr(rollout_module.ray, "kill", killed)
-    manager._shutdown_all_engines(timeout=15.0)
-    assert timeouts == [15.0, 0.0, 0.0, 0.0]
-    assert rollout_module.time.now == 15.0
-    assert killed.call_count == 4
+def test_rollout_shutdown_keeps_unconfirmed_engine_groups(rollout_module):
+    manager = object.__new__(rollout_module.RolloutEngineRuntime)
+    pool = SimpleNamespace(shutdown=Mock(side_effect=RuntimeError("pending child process")))
+    group = SimpleNamespace(_engine_pool=lambda: pool)
+    manager.servers = {"default": SimpleNamespace(engine_groups=[group])}
+    with pytest.raises(RuntimeError, match="pending child process"):
+        manager._shutdown_all_engines()
+    assert manager.servers["default"].engine_groups == [group]
 
 
 @pytest.mark.parametrize("removed", [False, True])
@@ -468,7 +449,7 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
     monkeypatch.setattr(rollout_module, "remove_dead_router_worker", cleanup)
     pending, failed = object(), object()
     replacements = [make_mock_engine() for _ in slots]
-    # A shutdown queued behind pending init can time out; every actor must still be killed.
+    # A shutdown queued behind pending init can time out; retain the whole allocation.
     shutdown_ref = object()
     replacements[0].shutdown.remote.return_value = shutdown_ref
     attempts = []
@@ -504,28 +485,23 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
     monkeypatch.setattr(rollout_module.ray, "kill", kill)
     server = make_rollout_server(engine_groups=[group])
 
-    with pytest.raises(RuntimeError, match="Required PD router registration failed") as caught:
-        server.recover()
+    from relax.engine.inference.ownership import ResourceBlockedError
 
-    assert caught.value is failure
-    assert group.all_engines == surviving + [None] * len(slots)
-    assert server.num_new_engines == 0
+    with pytest.raises(ResourceBlockedError, match="Cleanup unconfirmed"):
+        server.recover()
+    assert group.all_engines == surviving + replacements
     assert group.engine_init_records == records
-    assert [call.args[0] for call in kill.call_args_list] == replacements
+    kill.assert_not_called()
     for engine in surviving:
         engine.shutdown.remote.assert_not_called()
 
-    server.recover()
-    assert group.all_engines == surviving + replacements
-    assert server.num_new_engines == len(slots)
-    assert [call.args[2].actor_id for call in cleanup.call_args_list] == [
-        f"{generation}-{slot}" for generation in ("old", "new") for slot in slots[::nodes_per_engine]
-    ]
-
 
 def test_owner_signals_all_monitors_before_bounded_join(monkeypatch, rollout_module):
-    cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
+    cls = rollout_module.RolloutEngineRuntime
     manager = object.__new__(cls)
+    from relax.engine.inference.admission import AdmissionGate
+
+    manager._admission = AdmissionGate()
     events = []
 
     def stop(name, timeout):
@@ -540,5 +516,5 @@ def test_owner_signals_all_monitors_before_bounded_join(monkeypatch, rollout_mod
     monkeypatch.setattr(rollout_module, "stop_launched_routers", lambda: events.append(("routers", None)))
     manager.dispose()
     assert events[:5] == [("eviction", 0.0)] + [(f"health-{i}", 0.0) for i in range(4)]
-    assert rollout_module.time.now == 5.0
+    assert rollout_module.time.now == 0.0
     assert events[-2:] == [("engines", None), ("routers", None)]

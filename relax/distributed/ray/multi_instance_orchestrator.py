@@ -19,8 +19,6 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-import ray
-
 from relax.utils.logging_utils import get_logger
 
 
@@ -61,8 +59,5 @@ def start_multi_instance_managers(
         per_instance_args = build_manager_args(args, key, spec)
         managers[key] = spawn_manager(key, per_instance_args, spec)
         logger.info(f"Launched instance '{key}': num_gpus={spec['num_gpus']}")
-
-    if getattr(args, "offload_rollout", False):
-        ray.get([m.offload.remote() for m in managers.values()])
 
     return managers

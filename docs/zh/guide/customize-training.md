@@ -221,11 +221,28 @@ generate.manages_inference_permit = True
 
 **注意**：解除会话级锁后，同时“活跃”的会话数不再受该信号量限制（仅在飞请求受限）；如需限制并发环境/工具的资源占用，请在自定义函数内自行控制。
 
-`post_generate` 还会在每次 HTTP 发送前（包括重试）向 RolloutManager 获取生命周期准入许可。内部使用 lookaside 模式：Manager 选择当前可用的 Router 或 Engine，调用方直接发送请求体。`url` 参数提供接口路径，目标主机由 Manager 决定；可在 payload 中用 `model` 或 `route_key` 选择受管模型。单独使用 `state.inference_permit()` 只限制并发，不能作为直连引擎的准入许可。
+`post_generate` 还会在每次 HTTP 发送前（包括重试）向 rollout InferenceManager 获取生命周期准入许可。内部使用 lookaside 模式：Manager 选择当前可用的 Router 或 Engine，调用方直接发送请求体。`url` 参数提供接口路径，目标主机由 Manager 决定；可在 payload 中用 `model` 或 `route_key` 选择受管模型。单独使用 `state.inference_permit()` 只限制并发，不能作为直连引擎的准入许可。
 
 外部调用方使用对应角色的 Gateway 接口。模型选择优先级依次为 `model`、`route_key`、配置的默认模型；`/v1/models` 列出可接受的模型名称和无歧义的 served-model 别名。未知模型返回 HTTP 400，正在排空或休眠的模型返回带 `Retry-After` 的 HTTP 503；请求不会自动唤醒模型。
 
 两条路径都持有准入许可直到 HTTP 响应关闭，流式响应也一样。Offload 会先关闭准入，等待已有请求结束后再释放显存；如果无法确认排空，则切换失败并保持准入关闭。自定义 HTTP transport 应使用 `InferenceRequestClient.request()` 的异步上下文覆盖发送与完整响应消费，不能仅凭缓存的 `/engines` 地址发送请求。显式配置的外部 OPD teacher URL 和 `GenRMClient(service_url=...)` 仍按外部 HTTP 服务调用。
+
+### 迁移自定义显存切换
+
+自定义 rollout 和 post-process 回调在 `RolloutWorkload` 内运行，并持有阶段 lease。通过该 lease 请求 score 阶段，评分结束后始终退出该阶段。完整示例见 [`post_process_genrm_swap.py`](../../../examples/generate_reward_model/post_process_genrm_swap.py)：
+
+```python
+from relax.engine.inference.phase_client import current_phase
+
+phase = current_phase()
+try:
+    phase.switch("score")
+    # 在此发起评分，并等待所有请求完成。
+finally:
+    phase.switch("leave_score")
+```
+
+异步回调使用 `await phase.aswitch(...)`。通过旧名称获取的 manager 若直接调用 `manager.offload.remote()`，现在必须传入 `lease=phase.lease`，缺少 lease 会报错。优先使用阶段切换，让 authority 协调所有重叠模型。不要让后台 GPU 请求在回调结束后继续运行。共享资源的 deferred scoring 会启用 SGLang CPU 权重备份，确保同一轮恢复生成时使用已同步的策略权重；冲突的 `enable_weights_cpu_backup: false` 引擎覆盖配置会被拒绝。
 
 ## 训练脚本与关键参数概览
 

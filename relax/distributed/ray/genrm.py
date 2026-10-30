@@ -36,8 +36,7 @@ _GENRM_PORT_WINDOW_SIZE = 1000
 _MAX_PORT = 65535
 
 
-@ray.remote(concurrency_groups=SNAPSHOT_CONCURRENCY_GROUPS)
-class GenRMManager(MultiEngineManager):
+class GenRMEngineRuntime(MultiEngineManager):
     """Manager for GenRM engines.
 
     This is a simplified version of RolloutManager focused on:
@@ -258,3 +257,6 @@ def _allocate_genrm_engine_addr_and_ports(*, args, new_engines, port_window_inde
         logger.info(f"Ports for genRM engine rank={rank}: {addr_and_ports[rank]}")
 
     return addr_and_ports
+
+
+from relax.distributed.ray.inference_manager import LegacyInferenceManager as GenRMManager  # noqa: E402, F401

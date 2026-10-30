@@ -341,15 +341,15 @@ class GenRM(Base):
         """
         return self.genrm_managers[self._resolve_instance_key(route_key)]
 
-    def onload(self) -> None:
+    def onload(self, *, lease=None) -> None:
         """Load genRM model weights to GPU, for every instance."""
         self._logger.info("GenRM onload requested")
-        ray.get([m.onload.remote() for m in self.genrm_managers.values()])
+        ray.get([m.onload.remote(lease=lease) for m in self.genrm_managers.values()])
 
-    def offload(self) -> None:
+    def offload(self, *, lease=None) -> None:
         """Offload genRM model weights from GPU, for every instance."""
         self._logger.info("GenRM offload requested")
-        ray.get([m.offload.remote() for m in self.genrm_managers.values()])
+        ray.get([m.offload.remote(lease=lease) for m in self.genrm_managers.values()])
 
 
 # ── Compatibility wrapper for old imports ─────────────────────────────────

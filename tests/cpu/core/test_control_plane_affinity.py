@@ -141,6 +141,10 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
             captured["options"] = options
             return cls
 
+    from relax.distributed.ray import inference_manager
+
+    monkeypatch.setattr(inference_manager, "create_model_manager", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(placement_group_module.ray, "get", lambda ref: {})
     rollout_module.RolloutManager = FakeRolloutManager
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout_module)
     monkeypatch.setattr(placement_group_module, "_get_head_node_id", lambda: node_id)
@@ -167,22 +171,24 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
 
 def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
     captured = {}
-    genrm_module = ModuleType("relax.distributed.ray.genrm")
+    from relax.distributed.ray import inference_manager
 
-    class FakeGenRMManager(_FakeActorClass):
+    class FakeOwner(_FakeActorClass):
         @classmethod
         def options(cls, **options):
             captured["options"] = options
             return cls
 
-    genrm_module.GenRMManager = FakeGenRMManager
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.genrm", genrm_module)
+    monkeypatch.setattr(inference_manager, "InferenceManager", FakeOwner)
+    monkeypatch.setattr(inference_manager, "register_legacy_name", lambda *a: None)
+    monkeypatch.setattr(inference_manager.ray, "get", lambda ref: None)
     args = _elastic_args(tmp_path, offload_rollout=False)
 
     placement_group_module.create_genrm_manager(args, "pg", runtime_env={"env_vars": {"A": "B"}})
 
     assert captured["options"] == {
-        "name": "relax_genrm_manager",
+        "name": "relax_inference_genrm",
+        "get_if_exists": True,
         "num_cpus": 1,
         "num_gpus": 0,
         "runtime_env": {"env_vars": {"A": "B"}},
@@ -193,21 +199,17 @@ def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
 def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
     captured_options = []
     captured_ctor_kwargs = []
-    genrm_module = ModuleType("relax.distributed.ray.genrm")
+    from relax.distributed.ray import inference_manager
 
-    class FakeGenRMManager(_FakeActorClass):
-        @classmethod
-        def options(cls, **options):
-            captured_options.append(options)
-            return cls
+    def create(*args, **kwargs):
+        captured_ctor_kwargs.append(kwargs)
+        return MagicMock()
 
-        @classmethod
-        def remote(cls, *args, **kwargs):
-            captured_ctor_kwargs.append(kwargs)
-            return MagicMock()
-
-    genrm_module.GenRMManager = FakeGenRMManager
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.genrm", genrm_module)
+    monkeypatch.setattr(inference_manager, "create_model_manager", create)
+    monkeypatch.setattr(
+        inference_manager, "register_legacy_name", lambda name, manager: captured_options.append({"name": name})
+    )
+    monkeypatch.setattr(inference_manager.ray, "get", lambda ref: None)
     spec = {
         "model_path": "/model",
         "num_gpus": 1,

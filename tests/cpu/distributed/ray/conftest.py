@@ -29,7 +29,7 @@ try:
 
     # Extract the original Python class from the Ray actor wrapper so we can
     # create lightweight instances without calling the heavy __init__.
-    from relax.distributed.ray.rollout import RolloutManager as _RayRM
+    from relax.distributed.ray.rollout import RolloutEngineRuntime as _RayRM
 
     # Ray's ActorClass stores the original Python class at
     # __ray_metadata__.modified_class (Ray 2.x).
@@ -232,6 +232,8 @@ def create_test_manager(args=None, servers=None):
     manager._engine_actor_states = _get_engine_actor_states()
     manager.servers = servers if servers is not None else {}
     manager._scale_out_requests = {}
+    manager._pending_groups = []
+    manager._owned_elastic_pgs = {}
     manager._scale_in_requests = {}
     manager._engine_lifecycle_lock = threading.RLock()
     manager._training_weight_updating = False
@@ -279,7 +281,8 @@ def patch_ray_get():
     _original = ray.get
     ray.get = mock_ray_get
     try:
-        yield
+        with patch("ray.kill"):
+            yield
     finally:
         ray.get = _original
 

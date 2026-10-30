@@ -182,7 +182,7 @@ class RolloutHealthMonitor:
             # it and kill/rebuild immediately.
             logger.error(
                 f"Health check failed for rollout engine {rollout_engine_id} "
-                f"(actor is dead). Killing actor immediately. Exception: {e}"
+                f"(actor is dead). Reporting failed incarnation. Exception: {e}"
             )
             self._kill_engine(rollout_engine_id=rollout_engine_id)
         except Exception as e:
@@ -195,7 +195,7 @@ class RolloutHealthMonitor:
                 logger.error(
                     f"Health check failed for rollout engine {rollout_engine_id} "
                     f"({failure_count} consecutive failures, threshold={self._max_consecutive_failures}). "
-                    f"Killing actor. Exception: {e}"
+                    f"Reporting failed incarnation. Exception: {e}"
                 )
                 self._kill_engine(rollout_engine_id=rollout_engine_id)
             else:
@@ -220,24 +220,12 @@ class RolloutHealthMonitor:
         if rollout_engine_id in self._intentionally_removed:
             logger.debug(f"Skipping kill for engine {rollout_engine_id} (intentionally removed)")
             return
-        logger.info(f"Killing engine group {rollout_engine_id}...")
-        for i in range(
-            rollout_engine_id * self._engine_group.nodes_per_engine,
-            (rollout_engine_id + 1) * self._engine_group.nodes_per_engine,
-        ):
-            engine = self._engine_group.all_engines[i]
-            if engine:
-                logger.info(f"Shutting down and killing engine at index {i}")
-                try:
-                    ray.get(engine.shutdown.remote())
-                    ray.get(engine.unregister_dcs.remote())
-                    ray.kill(engine)
-                    logger.info(f"Successfully killed engine at index {i}")
-                except Exception as e:
-                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
-            else:
-                logger.info(f"Engine at index {i} is already None")
-            self._engine_group.all_engines[i] = None
-        # Drop any stale failure count so a rebuilt engine reusing this slot
-        # starts from a clean slate instead of inheriting a near-threshold count.
+        # Observation only. The resource owner retires the reported incarnation
+        # under a lease; this thread must never clear slots or release a PG.
+        head = rollout_engine_id * self._engine_group.nodes_per_engine
+        pool = self._engine_group._engine_pool()
+        reports = getattr(self._engine_group, "health_failures", None)
+        if reports is None:
+            reports = self._engine_group.health_failures = {}
+        reports[head] = pool.incarnations.get(head, 0)
         self._consecutive_failures.pop(rollout_engine_id, None)

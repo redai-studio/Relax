@@ -119,7 +119,8 @@ class TrainRayActor(RayActor):
         raise NotImplementedError
 
     def set_rollout_manager(self, rollout_manager):
-        self.rollout_manager = rollout_manager
+        self.rollout_workload = rollout_manager
+        self.rollout_manager = ray.get(rollout_manager.get_inference_manager.remote())
         if not self.args.debug_rollout_only and self.args.rank == 0:
             ray.get(self.rollout_manager.set_train_parallel_config.remote(self.train_parallel_config))
         # Retrieve the distributed lock that serialises DCS weight sync with

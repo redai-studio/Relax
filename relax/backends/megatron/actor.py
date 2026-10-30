@@ -30,6 +30,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.distributed.ray.training_phase import leased_training, release_training_phase
 from relax.engine.inference.lifecycle import GenerateStage
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
@@ -660,7 +661,11 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             # recover to actor in the end.
             self._switch_model("actor")
-            if self._per_step_rollout:
+            if self._per_step_rollout or (
+                getattr(self.args, "_inference_authority", None) is not None
+                and self.args.colocate
+                and self.args.offload_rollout
+            ):
                 self.sleep()
 
         self.rollout_engines = None
@@ -863,6 +868,7 @@ class MegatronTrainRayActor(TrainRayActor):
         destroy_process_groups()
 
         self._train_state_offloader.offload()
+        self._inference_train_resident = False
 
         print_memory("after offload model")
 
@@ -872,6 +878,7 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("before wake_up model")
 
         self._train_state_offloader.reload()
+        self._inference_train_resident = True
 
         clear_memory()
         reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
@@ -1396,6 +1403,7 @@ class MegatronTrainRayActor(TrainRayActor):
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    @leased_training
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             # GenRM (one or more instances) and the managed OPD teacher release
@@ -1446,7 +1454,7 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
                 if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
-                    dynamic_size = ray.get(self.rollout_manager.get_dynamic_global_batch_size.remote())
+                    dynamic_size = ray.get(self.rollout_workload.get_dynamic_global_batch_size.remote())
                     batch_size = dynamic_size // dp_size
                     num_rollout_minis = 1
                 else:
@@ -2305,6 +2313,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @leased_training
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
@@ -2347,6 +2356,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
+    @leased_training
     def compute_actor_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             if self.args.use_rollout_routing_replay:
@@ -2545,6 +2555,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if clear_routing_replay_forward:
                 RoutingReplay.clear_all_forward()
 
+    @leased_training
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -2784,6 +2795,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @leased_training
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -2984,6 +2996,7 @@ class MegatronTrainRayActor(TrainRayActor):
             destroy_process_groups()
 
     @timer
+    @leased_training
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
@@ -3086,6 +3099,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # shared-bundles mode.
         if self.args.offload_rollout and dist.get_rank() == 0:
             self.lifecycle_coordinator(warm_rollout_kv=self._per_step_rollout).enter_generate(GenerateStage.REST)
+        release_training_phase(self)
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:

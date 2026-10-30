@@ -24,6 +24,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import torch
 
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.distributed.ray.training_phase import leased_training, release_training_phase
+from relax.engine.inference.lifecycle import GenerateStage
 from relax.engine.sft.runtime import is_i2i_sft
 from relax.models import flow_grpo
 from relax.models.generative import GenerativeModelAdapter
@@ -798,6 +800,7 @@ class FSDPTrainRayActor(TrainRayActor):
             f"{' (skipped: degenerate)' if skipped else ''}"
         )
 
+    @leased_training
     def train(self, rollout_id: int, rollout_data_ref=None) -> None:
         """Consume this rollout's transitions and run FlowGRPO updates.
 
@@ -1354,6 +1357,7 @@ class FSDPTrainRayActor(TrainRayActor):
             except Exception as e:  # flushing must never break training either
                 logger.warning(f"[rollout {rollout_id}] metric flush skipped ({e}).")
 
+    @leased_training
     def update_weights(self, *, offload_after_sync: bool = True) -> bool:
         """Stream the full transformer to every rollout engine (design doc
         10.3)."""
@@ -1413,13 +1417,10 @@ class FSDPTrainRayActor(TrainRayActor):
             getattr(self.args, "offload_rollout", False) and getattr(self, "rollout_manager", None) is not None
         )
         if offload_engine:
-            import ray
-            from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
-
             onload_error = None
             try:
                 if self._rank == 0:
-                    ray.get(self.rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
+                    self.lifecycle_coordinator().enter_generate(GenerateStage.WEIGHTS)
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
@@ -1495,7 +1496,6 @@ class FSDPTrainRayActor(TrainRayActor):
         if phase_lap is not None:
             phase_lap("actor_offload")
         if offload_engine:
-            import ray
             import torch.distributed as dist
 
             from relax.utils.distributed_utils import get_gloo_group
@@ -1505,7 +1505,7 @@ class FSDPTrainRayActor(TrainRayActor):
             onload_error = None
             try:
                 if self._rank == 0:
-                    ray.get(self.rollout_manager.onload.remote())
+                    self.lifecycle_coordinator().enter_generate(GenerateStage.REST)
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
@@ -1515,6 +1515,7 @@ class FSDPTrainRayActor(TrainRayActor):
             )
         if phase_lap is not None:
             phase_lap("engine_full_onload")
+        release_training_phase(self)
 
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if is_i2i_sft(self.args):
@@ -1580,6 +1581,7 @@ class FSDPTrainRayActor(TrainRayActor):
         offload_module_to_cpu(self.model)
         self._move_optimizer_state(torch.device("cpu"))
         self.clear_memory()
+        self._inference_train_resident = False
 
     def wake_up(self, tags=None, include_optimizer: bool = True) -> None:
         """Onload the actor back to GPU for train / weight sync.
@@ -1595,6 +1597,7 @@ class FSDPTrainRayActor(TrainRayActor):
         from relax.backends.fsdp.runtime import onload_module_to_device
 
         onload_module_to_device(self.model, self.device)
+        self._inference_train_resident = True
         if include_optimizer:
             self._move_optimizer_state(self.device)
 

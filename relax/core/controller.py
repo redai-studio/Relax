@@ -919,6 +919,10 @@ class Controller:
             return
         seen_pgs = set()
         for role, service in {**services, **failed_services}.items():
+            if getattr(service, "_inference_owner", None) is not None:
+                # Ownership was transferred during allocation, before prefetch.
+                # The common owner's shutdown also handles never-started pools.
+                continue
             pgs = getattr(service, "pgs", None)
             if pgs is None or getattr(service, "_is_shared_pgs", False):
                 continue
@@ -949,6 +953,10 @@ class Controller:
                 serve.delete(role)
             except Exception as e:
                 logger.warning(f"[{role}] Failed to delete deployment during phase abort: {e}")
+        if getattr(service, "_inference_owner", None) is not None:
+            # The owner retains failed or pending initialization and its PG.
+            # Only its confirmed shutdown may release that allocation.
+            return
         if getattr(service, "_is_shared_pgs", False):
             return
         pgs = getattr(service, "pgs", None)
@@ -1163,6 +1171,12 @@ class Controller:
         # engine exists; the managed OPD teacher right below is the first to start.
         placement_plan = plan_placement(self.config)
         validate_deferred_scoring_args(self.config)
+        from relax.engine.inference.ownership import LifecycleAuthority
+
+        self._inference_authority = LifecycleAuthority.options(
+            name="relax_inference_lifecycle", max_restarts=0
+        ).remote(placement_plan)
+        self.config._inference_authority = self._inference_authority
         if placement_plan.claims:
             logger.info(f"Inference placement plan:\n{placement_plan.describe()}")
 
@@ -1233,6 +1247,14 @@ class Controller:
         else:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None
+
+        self._shared_inference_pg = actor_rollout_pgs
+        if actor_rollout_pgs is not None:
+            ray.get(
+                self._inference_authority.register_resource.remote(
+                    actor_rollout_pgs[0].id.hex(), "controller", actor_rollout_pgs[0]
+                )
+            )
 
         service_args = [
             (
@@ -1447,6 +1469,37 @@ class Controller:
             logger.warning(f"RolloutManager disposal did not complete; resource cleanup is unverified: {e}")
             return False
 
+    def _shutdown_inference_owners(self, timeout: float = 120.0) -> bool:
+        authority = getattr(self, "_inference_authority", None)
+        if authority is None:
+            return True
+        try:
+            owners = ray.get(authority.managers.remote(), timeout=5)
+            # Settle every owner. A failed owner retains its resources and its
+            # ledger; global restart must not replace that ledger with empty state.
+            refs = [owner.shutdown.remote() for owner in owners]
+            errors = []
+            for ref in refs:
+                try:
+                    ray.get(ref, timeout=timeout)
+                except Exception as error:
+                    errors.append(error)
+            if errors:
+                raise RuntimeError(f"Inference cleanup unconfirmed: {errors}")
+            shared = ray.get(authority.resources_for.remote("controller"), timeout=5)
+            if shared:
+                ledger = ray.get(authority.snapshot.remote(), timeout=5)
+                if ledger["owners"] or ledger["blocked"]:
+                    raise RuntimeError("Shared placement still has active or unconfirmed GPU owners")
+                for key, pg in shared.items():
+                    remove_placement_group(pg)
+                    ray.get(authority.confirm_resource_release.remote(key, "controller"), timeout=5)
+                self._shared_inference_pg = None
+            return True
+        except Exception as error:
+            logger.error(f"Inference resources remain owned: {error}")
+            return False
+
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
         processes.
@@ -1476,7 +1529,10 @@ class Controller:
         # The gateway only fronts the teacher's engines; take it down first so
         # it never routes to engines that are being shut down.
         shutdown_managed_opd_teacher_gateway(self._teacher_manager)
-        shutdown_managed_opd_teacher(self._teacher_manager)
+        if getattr(self, "_inference_authority", None) is not None:
+            self._shutdown_inference_owners()
+        else:
+            shutdown_managed_opd_teacher(self._teacher_manager)
 
         self._shutdown_agentic_rollout_services()
 
@@ -1702,6 +1758,9 @@ class Controller:
 
         # The rollout actor owns router subprocesses; dispose before deleting its handle.
         self._dispose_rollout_manager()
+
+        if not self._shutdown_inference_owners():
+            raise RuntimeError("Global restart refused: inference resource release is unconfirmed")
 
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():

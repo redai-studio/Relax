@@ -56,6 +56,16 @@ def _coordinator(args: Namespace, events: list[str]) -> LifecycleCoordinator:
     return LifecycleCoordinator(plan_placement(args), participants, wait=lambda refs: None)
 
 
+def test_shared_scoring_rejects_disabled_weight_backup_before_allocation(tmp_path):
+    config = tmp_path / "engines.yaml"
+    config.write_text("sglang:\n  - engine_groups:\n      - overrides:\n          enable_weights_cpu_backup: false\n")
+    args = _args(offload_rollout=True, sglang_config=str(config))
+    with pytest.raises(ValueError, match="same-round policy restore"):
+        deferred.validate_deferred_scoring_args(args)
+    args._genrm_colocate_with_rollout = False
+    deferred.validate_deferred_scoring_args(args)
+
+
 @pytest.fixture
 def judge(monkeypatch):
     """Stands in for the configured reward function; records what it scored."""
@@ -635,8 +645,8 @@ def test_legacy_defer_script_entry_points_exist():
     """
     root = Path(__file__).resolve().parents[3]
     script = (root / "examples/generate_reward_model/post_process_genrm_swap.py").read_text()
-    assert 'ray.get_actor("relax_genrm_manager")' in script
-    assert "get_local_rollout_manager()" in script and "._offload_local()" in script
+    assert "phase = current_phase()" in script
+    assert 'phase.switch("score")' in script and 'phase.switch("leave_score")' in script
 
     from relax.distributed.ray.placement_group import genrm_manager_actor_name
 
@@ -647,6 +657,8 @@ def test_legacy_defer_script_entry_points_exist():
     rollout = ast.parse((root / "relax/distributed/ray/rollout.py").read_text())
     functions = {node.name: node for node in rollout.body if isinstance(node, ast.FunctionDef)}
     assert functions["get_local_rollout_manager"].args.args == []
-    (manager,) = [node for node in rollout.body if isinstance(node, ast.ClassDef) and node.name == "RolloutManager"]
+    (manager,) = [
+        node for node in rollout.body if isinstance(node, ast.ClassDef) and node.name == "RolloutEngineRuntime"
+    ]
     methods = {node.name: node for node in manager.body if isinstance(node, ast.FunctionDef)}
     assert [arg.arg for arg in methods["_offload_local"].args.args] == ["self"]

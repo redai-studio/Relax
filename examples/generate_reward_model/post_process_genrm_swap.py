@@ -16,20 +16,17 @@ Assumptions:
 - Shared-bundles colocate: rollout_num_gpus == genrm_num_gpus == actor_total.
 - GenRMManager is created with name="relax_genrm_manager" (see
   relax/distributed/ray/placement_group.py::create_genrm_manager).
-- We run inside the RolloutManager Ray actor's process, so rollout offload
-  goes through the in-process singleton (get_local_rollout_manager) to avoid
-  a self-remote-call deadlock. GenRM offload/onload goes through the Ray
-  handle (cross-actor call).
+- RolloutWorkload supplies the active phase lease. The common inference
+  owners perform the memory switches; this callback owns only scoring work.
 """
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-import ray
 import torch
 
-from relax.distributed.ray.rollout import get_local_rollout_manager
+from relax.engine.inference.phase_client import current_phase, gather_owned
 from relax.engine.rewards.dapo_genrm import (
     MAX_ANSWER_LEN,
     _extract_answer,
@@ -96,7 +93,7 @@ async def _score_all(samples):
             question = metadata.get("question", getattr(s, "prompt", ""))
             ground_truth = metadata.get("label", getattr(s, "label", ""))
             tasks.append(_score_one(client, url, question, ground_truth, s.response))
-        return await asyncio.gather(*tasks)
+        return await gather_owned(tasks)
 
 
 def _grpo_normalize(args, raw_rewards):
@@ -138,8 +135,8 @@ def custom_reward_post_process(args, samples):
     """Sync entry called by relax.utils.utils.post_process_rewards.
 
     Flow (one call per rollout batch):
-      1. Offload rollout (in-process direct call — same actor).
-      2. Onload GenRM (Ray handle — different actor).
+      1. Request the score phase using the workload lease.
+      2. The authority offloads rollout, then activates GenRM.
       3. Batch-score every sample via GenRM HTTP.
       4. Offload GenRM.
       5. Return normalized rewards — leave rollout offloaded (update_weights
@@ -152,15 +149,12 @@ def custom_reward_post_process(args, samples):
     else:
         flat_samples = list(samples)
 
-    rollout = get_local_rollout_manager()
-    rollout._offload_local()
-
-    genrm = ray.get_actor("relax_genrm_manager")
-    ray.get(genrm.onload.remote())
+    phase = current_phase()
     try:
+        phase.switch("score")
         raw_rewards = _run_async(_score_all(flat_samples))
     finally:
-        ray.get(genrm.offload.remote())
+        phase.switch("leave_score")
 
     reward_key = getattr(args, "reward_key", None)
     for sample, score in zip(flat_samples, raw_rewards, strict=True):

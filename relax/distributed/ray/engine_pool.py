@@ -31,6 +31,7 @@ import ray
 import requests
 
 from relax.engine.inference.discovery import EngineState
+from relax.engine.inference.ownership import ResourceBlockedError
 from relax.utils.logging_utils import get_logger
 
 
@@ -136,6 +137,8 @@ class EnginePool:
     def _move(self, head_slot: int, target: EngineState) -> None:
         """Take a live engine's state to ``target`` along the allowed edges."""
         state = self.state(head_slot)
+        if state is EngineState.BLOCKED:
+            raise ResourceBlockedError(f"Engine slot {head_slot} has unconfirmed cleanup")
         if state is EngineState.DEAD:
             return
         for _ in range(len(_NEXT_STATE)):
@@ -161,7 +164,7 @@ class EnginePool:
         """
         in_flight = EngineState.DRAINING if resident is EngineState.READY else EngineState.ONLOADING
         for head in self.head_slots():
-            if self.state(head) not in (in_flight, EngineState.STARTING, EngineState.DEAD):
+            if self.state(head) not in (in_flight, EngineState.STARTING, EngineState.DEAD, EngineState.BLOCKED):
                 self._move(head, resident)
         self._active = resident is EngineState.READY
 
@@ -256,18 +259,20 @@ class EnginePool:
         return [slot for slot, _ in created]
 
     def _remove_owned_pg(self, slot: int) -> None:
-        placement = self.placements.pop(slot, None)
+        placement = self.placements.get(slot)
         if placement is None:
             return
         pg_tuple, owns_pg = placement
         if not owns_pg:
+            self.placements.pop(slot, None)
             return
         try:
             from ray.util.placement_group import remove_placement_group
 
             remove_placement_group(pg_tuple[0])
+            self.placements.pop(slot, None)
         except Exception as exc:
-            logger.warning(self._log(f"remove placement group for rank={slot} failed: {exc}"))
+            raise ResourceBlockedError(self._log(f"remove placement group for rank={slot} failed: {exc}")) from exc
 
     # ------------------------------------------------------------------
     # GPU memory switching.
@@ -310,7 +315,7 @@ class EnginePool:
         engine-side drain (stop admitting, abort what is in flight) is part of
         the engine's release call. Idempotent.
         """
-        self._move_live((EngineState.READY,), EngineState.DRAINING)
+        self._move_live((EngineState.READY, EngineState.ONLOADING), EngineState.DRAINING)
 
     def deactivate(self) -> list[int]:
         """Release GPU memory on every live engine and wait. Idempotent.
@@ -319,7 +324,9 @@ class EnginePool:
         while other ranks wait on a barrier, so the rebuild is left to the next
         ``activate``. Returns the head slots retired.
         """
-        if not self._active:
+        if not self._active and all(
+            self.state(head) in (EngineState.SLEEPING, EngineState.DEAD) for head in self.head_slots()
+        ):
             logger.info(self._log("engines already offloaded; skipping"))
             return []
         logger.info(self._log("engines offload started"))
@@ -386,15 +393,19 @@ class EnginePool:
             handles[head] = getattr(engine, method).remote(**kwargs)
 
         dead = []
+        errors = []
         for head, handle in handles.items():
             try:
                 ray.get(handle)
             except Exception as exc:
                 if not is_engine_dead(exc):
-                    raise
+                    errors.append(exc)
+                    continue
                 logger.warning(self._log(f"engine rank={head} died during {method}: {exc}"))
-                self._states[head] = EngineState.DEAD
+                self._states[head] = EngineState.BLOCKED
                 dead.append(head)
+        if errors:
+            raise errors[0]
         return dead
 
     def failed_health_checks(
@@ -424,9 +435,12 @@ class EnginePool:
         """Shut down and kill the engine in each slot, empty the slot and
         remove a placement group created for it."""
         slots = list(slots)
+        errors = []
+        confirmed = []
         for slot in slots:
             engine = self.slots[slot]
             if engine is not None:
+                failed = False
                 for method in self.spec.teardown_calls:
                     # The engine's own shutdown kills the SGLang process tree. It
                     # must run before ray.kill or the scheduler subprocesses are
@@ -434,15 +448,30 @@ class EnginePool:
                     try:
                         ray.get(getattr(engine, method).remote(), timeout=self.spec.teardown_timeout_s)
                     except Exception as exc:
-                        logger.warning(self._log(f"engine rank={slot} {method} failed (killing anyway): {exc}"))
+                        errors.append(f"slot={slot} {method}: {exc}")
+                        failed = True
+                if failed:
+                    self._states[slot // self.nodes_per_engine * self.nodes_per_engine] = EngineState.BLOCKED
+                    continue
+            confirmed.append(slot)
+        # A multi-slot replica keeps its complete allocation until every child
+        # has confirmed shutdown. No kill request is an exit acknowledgement.
+        if errors:
+            raise ResourceBlockedError(self._log("Cleanup unconfirmed: " + "; ".join(errors)))
+        for slot in confirmed:
+            if self.slots[slot] is not None:
                 try:
-                    ray.kill(engine)
+                    ray.kill(self.slots[slot])
                 except Exception as exc:
-                    logger.warning(self._log(f"engine rank={slot} ray.kill failed: {exc}"))
+                    self._states[slot // self.nodes_per_engine * self.nodes_per_engine] = EngineState.BLOCKED
+                    raise ResourceBlockedError(f"slot={slot} actor cleanup: {exc}") from exc
                 logger.info(self._log(f"engine rank={slot} retired"))
-            self.slots[slot] = None
-        for slot in slots:
+        for slot in confirmed:
             self._remove_owned_pg(slot)
+            self.slots[slot] = None
+        for head in self.head_slots():
+            if all(engine is None for engine in self.slots[head : head + self.nodes_per_engine]):
+                self._states[head] = EngineState.DEAD
 
     def retire(self, head_slots: Iterable[int]) -> None:
         """Tear down the given logical engines, all their slots, so ``recover``
@@ -457,6 +486,8 @@ class EnginePool:
         Degrades rather than escalates: running on fewer engines beats a global
         restart. Only a pool with no engine left raises.
         """
+        if EngineState.BLOCKED in self._states.values():
+            raise ResourceBlockedError("Cannot rebuild a pool with unconfirmed engine cleanup")
         dead = [slot for slot, engine in enumerate(self.slots) if engine is None]
         if not dead:
             return set()
@@ -464,6 +495,8 @@ class EnginePool:
         logger.info(self._log(f"recovering {len(dead)} engine(s): ranks={dead}"))
         try:
             self.start(dead)
+        except ResourceBlockedError:
+            raise
         except Exception as exc:
             logger.exception(self._log(f"engine rebuild failed for ranks={dead}: {exc}"))
 

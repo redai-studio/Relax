@@ -10,10 +10,9 @@ is deactivated and confirmed first, and only then are the phase's residents
 activated. Who resides in which phase, and who shares bundles with whom, comes
 from the placement plan.
 
-The coordinator is stateless sequential logic over idempotent operations. Each
-process that drives a switch -- rank 0 of the training actor, the rollout
-manager for deferred scoring -- builds its own from the same plan, and a switch
-that failed halfway can simply be issued again.
+Production clients use the job's LifecycleAuthority and the current operation
+lease. The pure coordinator below remains a transport-independent adapter for
+standalone integrations; it cannot authorize mutations on managed resources.
 """
 
 from __future__ import annotations
@@ -258,6 +257,10 @@ def build_train_coordinator(
         warm_rollout_kv: Whether rollout's KV cache is restored after weight
             sync, ready for a generation that follows right away.
     """
+    if getattr(args, "_inference_authority", None) is not None:
+        from relax.engine.inference.phase_client import RemoteLifecycleCoordinator
+
+        return RemoteLifecycleCoordinator(warm_rollout_kv=warm_rollout_kv)
     participants: list[LifecycleParticipant] = []
     if rollout_manager is not None:
         participants.append(rollout_participant(rollout_manager, warm_kv=warm_rollout_kv))

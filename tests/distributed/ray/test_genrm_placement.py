@@ -43,7 +43,7 @@ def _import_genrm(monkeypatch):
 
 
 def _bare_manager(genrm, *, bundle_offset, num_gpu_per_engine, args):
-    manager_cls = genrm.GenRMManager.__ray_metadata__.modified_class
+    manager_cls = genrm.GenRMEngineRuntime
     manager = object.__new__(manager_cls)
     manager.args = args
     manager.pg = "pg"
@@ -103,20 +103,14 @@ def test_genrm_manager_checks_its_engines_in_the_pool_they_are_planned_in(monkey
 
 def _install_fake_genrm_manager(monkeypatch):
     ctor_kwargs = []
-    genrm_module = ModuleType("relax.distributed.ray.genrm")
+    from relax.distributed.ray import inference_manager
 
-    class FakeGenRMManager:
-        @classmethod
-        def options(cls, **options):
-            return cls
+    def create(args, role, model, pg, **kwargs):
+        ctor_kwargs.append({key: value for key, value in kwargs.items() if key not in {"runtime_env", "owns_pg"}})
+        return MagicMock()
 
-        @classmethod
-        def remote(cls, *args, **kwargs):
-            ctor_kwargs.append(kwargs)
-            return MagicMock()
-
-    genrm_module.GenRMManager = FakeGenRMManager
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.genrm", genrm_module)
+    monkeypatch.setattr(inference_manager, "create_model_manager", create)
+    monkeypatch.setattr(inference_manager, "register_legacy_name", lambda *args: None)
     return ctor_kwargs
 
 

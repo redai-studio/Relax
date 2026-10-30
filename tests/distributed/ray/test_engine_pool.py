@@ -124,6 +124,19 @@ def _states(pool: EnginePool) -> list[EngineState]:
     return [pool.state(head) for head in pool.head_slots()]
 
 
+def test_failed_onload_still_releases_every_partially_resident_engine(cluster):
+    pool = _make_pool(cluster, 2)
+    pool.start()
+    pool.deactivate()
+    pool.slots[0].fail["resume_memory_occupation"] = RuntimeError("partial onload")
+    with pytest.raises(RuntimeError, match="partial onload"):
+        pool.activate()
+    assert all("resume_memory_occupation" in engine.called() for engine in pool.slots)
+    pool.deactivate()
+    assert all(engine.called().count("release_memory_occupation") == 2 for engine in pool.slots)
+    assert _states(pool) == [SLEEPING, SLEEPING]
+
+
 # ----------------------------------------------------------------------
 # Bring-up.
 # ----------------------------------------------------------------------
@@ -285,8 +298,8 @@ def test_engine_pool_engine_found_dead_becomes_dead_from_any_state(cluster, prep
 
     assert pool.call_all("health_generate") == [1]
 
-    assert pool.state(1) is DEAD
-    assert pool.state(0) is not DEAD
+    assert pool.state(1) is EngineState.BLOCKED
+    assert pool.state(0) is not EngineState.BLOCKED
 
 
 def test_engine_pool_drain_only_marks_ready_engines(cluster):
@@ -511,7 +524,6 @@ def test_engine_pool_teardown_runs_the_spec_calls_in_order_then_kills(cluster):
     )
     pool.start()
     doomed, kept = pool.slots
-    doomed.fail["unregister_dcs"] = RuntimeError("coordinator unreachable")
 
     pool.teardown({0})
 

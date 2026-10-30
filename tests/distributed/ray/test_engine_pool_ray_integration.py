@@ -22,6 +22,7 @@ from relax.distributed.ray.multi_engine_manager import (
     MultiEngineManager,
 )
 from relax.engine.inference.admission import ADMISSION_CONCURRENCY_GROUP
+from relax.engine.inference.ownership import ResourceBlockedError
 from relax.engine.inference.routing import ModelUnavailableError
 
 
@@ -110,7 +111,12 @@ def manager(ray_cluster):
     )
     yield handle
     try:
-        ray.get(handle.shutdown.remote(), timeout=60)
+        try:
+            ray.get(handle.shutdown.remote(), timeout=60)
+        except ResourceBlockedError:
+            # This fixture owns CPU-only stand-ins; the test deliberately kills
+            # one without the production backend's child-process receipt.
+            pass
     finally:
         ray.kill(handle)
         remove_placement_group(pg)
@@ -175,20 +181,15 @@ def test_manager_returns_permits_while_default_group_waits_for_drain(manager):
     ray.get(manager.release_inference.remote(current), timeout=10)
 
 
-def test_engine_pool_retires_and_rebuilds_a_killed_engine_on_real_ray(manager):
+def test_engine_pool_keeps_killed_actor_blocked_without_child_exit_receipt(manager):
     before = _snapshot(manager)
     ray.get(manager.kill_engine.remote(1), timeout=30)
-
-    # The dead actor is found at the next switch and retired; the other engine completes.
-    ray.get(manager.offload.remote(), timeout=60)
-    assert _states(manager) == ["sleeping", "dead"]
-
-    # The next activation rebuilds it on the bundle it had.
-    ray.get(manager.onload.remote(), timeout=120)
-    after = _snapshot(manager)
-    assert [engine["state"] for engine in after["engines"]] == ["ready", "ready"]
-    assert after["topology_revision"] > before["topology_revision"]
-    assert ray.get(manager.health_check.remote(), timeout=30) is True
+    with pytest.raises(ResourceBlockedError, match="Cleanup unconfirmed"):
+        ray.get(manager.offload.remote(), timeout=60)
+    assert "blocked" in _states(manager)
+    with pytest.raises(ResourceBlockedError):
+        ray.get(manager.onload.remote(), timeout=30)
+    assert _snapshot(manager)["topology_revision"] == before["topology_revision"]
 
 
 def test_placement_physical_reads_bundle_nodes_from_real_ray(ray_cluster):

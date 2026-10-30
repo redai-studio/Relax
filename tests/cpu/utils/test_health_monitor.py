@@ -54,6 +54,11 @@ class _Group:
         self.all_engines = list(engines)
         self.nodes_per_engine = 1
 
+    def _engine_pool(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(incarnations={0: 7})
+
 
 def _install_ray_get(monkeypatch, seq):
     """Patch ``health_monitor.ray.get`` to consume a scripted sequence.
@@ -178,7 +183,9 @@ def test_health_monitor_kill_engine_clears_counter(monkeypatch):
     m._kill_engine(rollout_engine_id=0)
 
     assert 0 not in m._consecutive_failures
-    assert m._engine_group.all_engines[0] is None
+    assert m._engine_group.all_engines[0] is engine
+    assert m._engine_group.health_failures == {0: 7}
+    engine.shutdown.remote.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

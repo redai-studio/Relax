@@ -23,7 +23,6 @@ from typing import Any
 import requests
 import torch.distributed as dist
 
-from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import tracking_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
@@ -80,6 +79,10 @@ def run_sft_predict(actor, rollout_id: int) -> None:
     dist.barrier(group=get_gloo_group())
     if args.offload_train:
         _t = time.monotonic()
+        from relax.distributed.ray.training_phase import resume_training_phase
+
+        # Predict returned a release receipt; reacquire before SFT resumes.
+        resume_training_phase(actor)
         actor.wake_up()
         _t_wake = time.monotonic() - _t
     if is_main_rank:
@@ -115,18 +118,3 @@ async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
         rollout._logger.exception(error_msg)
         rollout.healthy.report_error.remote("rollout", error_msg)
         return {"status": "error", "message": error_msg}
-    finally:
-        # Mirror RL's per-cycle reset: full no-tag offload after each
-        # predict puts all 3 tags back in `offload_tags`, so the next
-        # predict cycle's `update_weights → onload_weights` and
-        # `onload_kv` both resume cleanly. SFT's per-step `update_weights`
-        # is gated on `_should_run_sft_predict`, so this offload only
-        # ever fires on predict steps. Must run even on exception —
-        # leaking KV/weights would starve the next training step's GPU
-        # memory. RL: rollout manages its own offload in `_async_run`,
-        # skip here.
-        if is_sft_mode(rollout.config) and rollout.config.offload_rollout:
-            try:
-                await rollout.rollout_manager.offload.remote()
-            except Exception as exc:
-                rollout._logger.warning(f"Post-predict offload failed at step {train_step}: {exc}")

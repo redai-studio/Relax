@@ -175,28 +175,23 @@ def create_managed_opd_teacher_manager(
 ) -> tuple[Any, list[str]]:
     import ray
 
-    from relax.distributed.ray.teacher_manager import TeacherManager
+    from relax.distributed.ray.inference_manager import create_model_manager, register_legacy_name
 
-    teacher_manager = TeacherManager.options(
-        **with_control_plane_affinity(
-            args,
-            {"name": TEACHER_MANAGER_ACTOR_NAME, "num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env},
-        )
-    ).remote(
+    teacher_manager = create_model_manager(
         args,
-        num_replicas,
-        gpus_per_replica,
-        pg=pg,
+        "teacher",
+        "__default__",
+        pg,
+        runtime_env=runtime_env,
+        num_replicas=num_replicas,
+        gpus_per_replica=gpus_per_replica,
         shared_pg=shared_pg,
         bundle_offset=bundle_offset,
     )
+    register_legacy_name(TEACHER_MANAGER_ACTOR_NAME, teacher_manager)
 
     urls = ray.get(teacher_manager.get_urls.remote())
     logger.info(f"[OPD teacher] TeacherManager initialized successfully: urls={urls}")
-
-    if shared_pg and getattr(args, "offload_rollout", False):
-        logger.info("[OPD teacher] Offloading teacher engines before actor init")
-        ray.get(teacher_manager.offload.remote())
 
     return teacher_manager, urls
 
@@ -322,9 +317,9 @@ def _start_managed_multi_teacher(
     # transformers dependency chain, so they stay deferred until every ValueError
     # check above has had a chance to short-circuit first.
     from relax.core.service import create_placement_group
+    from relax.distributed.ray.inference_manager import create_model_manager, register_legacy_name
     from relax.distributed.ray.multi_instance_orchestrator import start_multi_instance_managers
     from relax.distributed.ray.placement_planner import TEACHER_ROLE, plan_placement
-    from relax.distributed.ray.teacher_manager import TeacherManager
 
     actor_gpus = args.resource["actor"][1]
     rollout_gpus = int(args.rollout_num_gpus)
@@ -365,24 +360,19 @@ def _start_managed_multi_teacher(
         return teacher_args
 
     def _spawn_teacher_manager(key: str, per_instance_args: Any, spec: dict) -> Any:
-        return TeacherManager.options(
-            **with_control_plane_affinity(
-                per_instance_args,
-                {
-                    "name": f"{TEACHER_MANAGER_ACTOR_NAME}_{key}",
-                    "num_cpus": 1,
-                    "num_gpus": 0,
-                    "runtime_env": runtime_env,
-                },
-            )
-        ).remote(
+        manager = create_model_manager(
             per_instance_args,
-            spec["num_gpus"] // gpus_per_replica,
-            gpus_per_replica,
-            pg=shared_pg,
+            "teacher",
+            key,
+            shared_pg,
+            runtime_env=runtime_env,
+            num_replicas=spec["num_gpus"] // gpus_per_replica,
+            gpus_per_replica=gpus_per_replica,
             shared_pg=True,
             bundle_offset=plan.claim(TEACHER_ROLE, key).start,
         )
+        register_legacy_name(f"{TEACHER_MANAGER_ACTOR_NAME}_{key}", manager)
+        return manager
 
     instance_specs = {
         data_source: {"num_gpus": gpus_per_teacher, "checkpoint_path": ckpt}
@@ -484,14 +474,13 @@ def shutdown_managed_opd_teacher(teacher_manager: Any) -> None:
 
     import ray
 
-    # Support both single manager and list of managers (MOPD multi-teacher).
+    from relax.distributed.ray.inference_manager import ModelManager
+
     managers = teacher_manager if isinstance(teacher_manager, list) else [teacher_manager]
-    for mgr in managers:
-        try:
-            ray.get(mgr.shutdown.remote(), timeout=30)
-            logger.info("OPD teacher shut down.")
-        except Exception as e:
-            logger.warning(f"Failed to shut down OPD teacher: {e}")
+    owners = {mgr.handle if isinstance(mgr, ModelManager) else mgr for mgr in managers}
+    for owner in owners:
+        ray.get(owner.shutdown.remote(), timeout=60)
+    logger.info("OPD teacher resources released.")
 
 
 def has_managed_opd_teacher_manager(owner: Any) -> bool:

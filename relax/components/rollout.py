@@ -449,8 +449,6 @@ class Rollout(Base):
                 self._logger.info(f"Start rollout {local_step}/{self.config.num_rollout}")
                 try:
                     await self.rollout_manager.generate.remote(rollout_id=local_step)
-                    if self.config.offload_rollout:
-                        await self.rollout_manager.offload.remote()
                 except Exception as e:
                     error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
                     self._logger.exception(error_msg)
@@ -547,6 +545,11 @@ class Rollout(Base):
                 await self._run_task
             except asyncio.CancelledError:
                 pass
+        # The workload settles callbacks and pending prediction before its
+        # facade is replaced. Engines remain with the common inference owner.
+        from relax.engine.inference.phase_client import control_call
+
+        await control_call(self.rollout_manager.dispose.remote())
 
     # --- HTTP endpoints for restart / recovery (bypass Ray Serve handle) ---
 
@@ -904,8 +907,9 @@ class Rollout(Base):
     # --- OpenAI-compatible Chat Completion API (proxied to SGLang router) ---
 
     async def get_inference_resources(self) -> dict:
-        snapshot = await self.rollout_manager.get_inference_snapshot.remote()
-        return {"snapshot": snapshot, "managers": {name: self.rollout_manager for name in snapshot["models"]}}
+        manager = await self.rollout_manager.get_inference_manager.remote()
+        snapshot = await manager.get_inference_snapshot.remote()
+        return {"snapshot": snapshot, "managers": {name: manager for name in snapshot["models"]}}
 
     def _fetch_inference_snapshot(self) -> dict:
         return ray.get(self.rollout_manager.get_inference_snapshot.remote(), timeout=SNAPSHOT_FETCH_TIMEOUT_S)

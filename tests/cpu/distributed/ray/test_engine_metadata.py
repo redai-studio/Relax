@@ -86,7 +86,7 @@ def make_manager(engines, refs):
     )
     group.engine_init_records = {slot: SimpleNamespace(value=ref) for slot, ref in enumerate(refs)}
     server = rollout.RolloutServer(engine_groups=[group], router_ip="127.0.0.1", router_port=3000, model_name="actor")
-    manager = object.__new__(rollout.RolloutManager.__ray_metadata__.modified_class)
+    manager = object.__new__(rollout.RolloutEngineRuntime)
     manager._engine_actor_states = ActorState
     manager.servers = {"actor": server}
     manager.args = SimpleNamespace(

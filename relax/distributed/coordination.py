@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""GPU ownership coordination utilities for colocated deployments.
+"""Data-ordering barriers for colocated deployments.
 
 In colocated deployments, multiple training and inference roles share the same
 GPUs. The SGLang ``torch_memory_saver`` static pool, Megatron weights, and
@@ -9,6 +9,9 @@ GPUs" signals into two barriers:
 
 - :class:`RolloutOffloadBarrier` — waits for rollout (SGLang) to finish offloading
 - :class:`PeerStepBarrier` — waits for a group of training peers to finish a target round
+
+GPU ownership is authorized separately by LifecycleAuthority leases and all-rank
+release receipts. A status or step number alone does not authorize GPU reuse.
 
 Both barriers are stateless, lightweight polling wrappers around existing
 service handles or the rollout manager. They add no overhead when unused in
@@ -53,7 +56,8 @@ class PeerStepBarrier:
     Each peer only needs to expose ``get_step()``, which is already provided by
     the component base class. A peer whose ``get_step()`` is strictly greater
     than ``round_id`` has completed all computation for that round, including
-    backward, the optimizer step, and sleep, and has released its GPUs.
+    backward, the optimizer step, and sleep. GPU reuse additionally requires a
+    lifecycle lease.
 
     Args:
         peers: Mapping from role names to Ray Serve deployment handles.

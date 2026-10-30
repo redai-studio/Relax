@@ -1,11 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Common lifecycle skeleton for managers that own a pool of SGLang engine
-replicas (GenRM judges, OPD teachers, ...).
+"""Common adapter for fixed pools of SGLang engine replicas.
 
-Concrete managers subclass ``MultiEngineManager`` (in addition to their own
-``@ray.remote`` decorator) and implement the hooks below to plug in their
-engine actor class, placement, GPU/port allocation, and env vars. The
+GenRM and teacher runtimes live inside the role's ``InferenceManager`` and
+implement the hooks below for engine actors, placement, GPU/port allocation
+and environment variables. The
 mechanics -- parallel engine bring-up, health checking, dead-engine
 detection/retirement, recovery, and onload/offload with idempotency tracking
 -- live in ``EnginePool``, shared with rollout; this class turns the hooks
@@ -65,10 +64,10 @@ SNAPSHOT_CONCURRENCY_GROUPS = {SNAPSHOT_CONCURRENCY_GROUP: 1, ADMISSION_CONCURRE
 
 
 class MultiEngineManager:
-    """Base class for managers of a fixed-size pool of engine replicas.
+    """In-process adapter for a fixed-size pool of engine replicas.
 
-    Not a Ray actor itself -- subclasses apply ``@ray.remote`` so this class
-    can be unit-tested without a Ray runtime. Engine *slots* are tracked as a
+    The common owner invokes its resource operations under a lease. Engine
+    *slots* are tracked as a
     flat list indexed by rank; a ``None`` slot means "dead, needs rebuild".
 
     A slot is the unit of scheduling (one Ray actor, one placement-group

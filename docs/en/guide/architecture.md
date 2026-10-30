@@ -74,7 +74,7 @@ The components layer contains all RL service components, each deployed as a `@se
 | Component | File | Responsibility |
 |-----------|------|----------------|
 | **Actor** | [`actor.py`](../../../relax/components/actor.py) | Policy training (Megatron backend) |
-| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout service orchestration, manages RolloutManager |
+| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout service orchestration, runs RolloutWorkload |
 | **Critic** | [`critic.py`](../../../relax/components/critic.py) | PPO value estimation and clipped value-loss training |
 | **ActorFwd** | [`actor_fwd.py`](../../../relax/components/actor_fwd.py) | Forward inference log-prob (fully-async mode) |
 | **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | Advantage computation (PPO/GRPO/GSPO/SAPO/CISPO etc.) |
@@ -100,8 +100,18 @@ The backends layer wraps underlying training and inference engines:
 
 ### 6. Distributed Layer
 
-- [**Ray Actor Groups**](../../../relax/distributed/ray/): Manages RolloutManager, GenRMManager, and other Ray Actor groups
+- [**Ray Actor Groups**](../../../relax/distributed/ray/): Hosts per-role InferenceManager actors and training actor groups
 - [**DCS Checkpoint Service**](../../../relax/distributed/checkpoint_service/): Distributed weight synchronization service supporting NCCL/GLOO/TCP communication backends
+
+### Inference resource ownership
+
+Each inference role (`rollout`, `genrm`, `teacher`) has one CPU `InferenceManager` actor. It owns that role's model runtimes, engine pools, routers, admission, recovery and elastic resources. `RolloutWorkload` runs generation, evaluation, SFT prediction, custom callbacks and TransferQueue publication. Restarting a Serve facade reconnects to the existing owner.
+
+The job's `LifecycleAuthority` serializes operations on overlapping placement claims. A phase lease includes the job epoch, operation ID and generation. Memory switches, recovery and scaling validate the lease; old generations cannot mutate current resources. Independent claims can proceed concurrently. Leases do not expire automatically because a timeout cannot prove that GPU work stopped.
+
+Training enters through an all-rank ownership handoff. Weight restoration, weight synchronization and KV/cache restoration keep their existing order. A workload holds its lease through deferred scoring and request cleanup. A failed or cancelled batch waits for sibling operations before handing resources back. When memory release or process exit cannot be confirmed, the owner retains the engines and placement and reports `blocked`; global restart refuses to replace unconfirmed owners.
+
+The Controller owns the shared actor/rollout placement group. Dedicated inference placement groups transfer to their inference owner before deployment; elastic and dedicated teacher allocations belong to that owner too. Explicit external engines remain borrowed. The old manager names remain compatibility facades, and their memory operations require an explicit lease.
 
 ## Directory Structure
 
@@ -156,7 +166,7 @@ relax/
 │                                                      │                │
 │                                                      ▼                │
 │  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │                  RolloutManager.generate()                       │ │
+│  │                  RolloutWorkload.generate()                      │ │
 │  │  SGLang engine inference → reward computation → assemble data    │ │
 │  └───────────────────────────┬──────────────────────────────────────┘ │
 │                              │                                        │

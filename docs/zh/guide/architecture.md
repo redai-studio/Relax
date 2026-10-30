@@ -74,7 +74,7 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 | 组件 | 文件 | 职责 |
 |------|------|------|
 | **Actor** | [`actor.py`](../../../relax/components/actor.py) | 策略训练（Megatron 后端） |
-| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout 服务编排，管理 RolloutManager |
+| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout 服务编排，运行 RolloutWorkload |
 | **Critic** | [`critic.py`](../../../relax/components/critic.py) | PPO value 估计与裁剪 value loss 训练 |
 | **ActorFwd** | [`actor_fwd.py`](../../../relax/components/actor_fwd.py) | 前向推理 log-prob（fully-async 模式） |
 | **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | 优势计算（PPO/GRPO/GSPO/SAPO/CISPO 等） |
@@ -100,8 +100,18 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 
 ### 6. 分布式层 (Distributed)
 
-- [**Ray Actor 组**](../../../relax/distributed/ray/)：管理 RolloutManager、GenRMManager 等 Ray Actor 组
+- [**Ray Actor 组**](../../../relax/distributed/ray/)：运行各推理角色的 InferenceManager 和训练 Actor 组
 - [**DCS Checkpoint Service**](../../../relax/distributed/checkpoint_service/)：分布式权重同步服务，支持 NCCL/GLOO/TCP 通信后端
+
+### 推理资源所有权
+
+每个推理角色（`rollout`、`genrm`、`teacher`）各有一个 CPU `InferenceManager` actor，持有该角色的模型运行时、引擎池、Router、请求准入、恢复和弹性资源。`RolloutWorkload` 负责生成、评估、SFT predict、自定义回调和 TransferQueue 发布。Serve 服务重启时重新连接已有资源管理器。
+
+作业级 `LifecycleAuthority` 根据 placement claim 串行协调重叠资源。阶段 lease 包含作业 epoch、operation ID 和 generation；显存切换、恢复和扩缩容都要校验 lease，旧代操作不能修改当前资源。独立 claim 可以并发执行。Lease 不会自动过期，因为超时不能证明 GPU 工作已停止。
+
+训练通过所有 rank 确认的资源交接进入执行阶段，保留恢复权重、同步权重、恢复 KV/cache 的原有顺序。Workload 在 deferred scoring 和请求收尾期间持续持有 lease。批次失败或取消时，先等待同批操作结束再交回资源。如果显存释放或进程退出无法确认，管理器保留引擎及 placement 并报告 `blocked`；全局重启也会拒绝替换尚未确认退出的管理器。
+
+Controller 持有 actor/rollout 共享 PG。独立推理 PG 在部署前交由对应推理管理器持有，弹性和独立 teacher 分配的 PG 也由该管理器负责。显式外部引擎仍属于借用资源。旧 manager 名称保留为兼容入口，但显存操作必须携带显式 lease。
 
 ## 目录结构
 
@@ -156,7 +166,7 @@ relax/
 │                                                      │                │
 │                                                      ▼                │
 │  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │                  RolloutManager.generate()                       │ │
+│  │                  RolloutWorkload.generate()                      │ │
 │  │  SGLang engine inference → reward computation → assemble data    │ │
 │  └───────────────────────────┬──────────────────────────────────────┘ │
 │                              │                                        │

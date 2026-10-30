@@ -170,7 +170,19 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
 
 
 def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
+    from .inference_manager import create_model_manager
     from .rollout import RolloutManager
+
+    inference = create_model_manager(
+        args,
+        "rollout",
+        "__default__",
+        pg,
+        runtime_env=runtime_env,
+        owns_pg=getattr(args, "_inference_pg_owned", False),
+    )
+    for key, value in ray.get(inference.handle.runtime_config.remote(inference.model)).items():
+        setattr(args, key, value)
 
     # Get the head node ID to ensure RolloutManager runs on the head node
     # This is critical because the Router binds to the SLIME_HOST_IP address,
@@ -192,7 +204,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
                 ),
             },
         )
-    ).remote(args, pg, data_source=data_source)
+    ).remote(args, inference, data_source=data_source)
 
     # Add timeout protection to prevent indefinite blocking during initialization
     # The timeout is set to 120 seconds to allow sufficient time for:
@@ -226,13 +238,6 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
             f"num_rollout_per_epoch={num_rollout_per_epoch}, num_epoch={args.num_epoch}"
         )
 
-    if args.check_weight_update_equal:
-        ray.get(rollout_manager.check_weights.remote(action="snapshot"))
-        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
-
-    if args.offload_rollout:
-        ray.get(rollout_manager.offload.remote())
-
     return rollout_manager, num_rollout_per_epoch
 
 
@@ -265,31 +270,18 @@ def create_genrm_manager(args, pg, runtime_env=None, bundle_offset=0):
     Returns:
         Initialized GenRM manager
     """
-    from .genrm import GenRMManager
+    from .inference_manager import create_model_manager, register_legacy_name
 
-    # `name` (with no explicit namespace) lets user code inside other actors of
-    # the same Ray job look this up via ray.get_actor("relax_genrm_manager").
-    # Used by custom_reward_post_process_path when GenRM lifecycle is managed
-    # from userland. Only safe as a fixed, well-known name because this path
-    # is exclusively for the single-instance case (see create_genrm_managers).
-    genrm_manager = GenRMManager.options(
-        **with_control_plane_affinity(
-            args,
-            {
-                "name": GENRM_MANAGER_ACTOR_NAME,
-                "num_cpus": 1,
-                "num_gpus": 0,
-                "runtime_env": runtime_env,
-            },
-        )
-    ).remote(args, pg, bundle_offset=bundle_offset)
-
-    logger.info("GenRMManager initialized successfully")
-
-    # Offload if requested (for colocated mode)
-    if args.offload_rollout:
-        logger.info("Offloading GenRM engines (colocated mode)")
-        ray.get(genrm_manager.offload.remote())
+    genrm_manager = create_model_manager(
+        args,
+        "genrm",
+        "__default__",
+        pg,
+        runtime_env=runtime_env,
+        owns_pg=getattr(args, "_inference_pg_owned", False),
+        bundle_offset=bundle_offset,
+    )
+    register_legacy_name(GENRM_MANAGER_ACTOR_NAME, genrm_manager)
 
     return genrm_manager
 
@@ -311,7 +303,7 @@ def create_genrm_managers(args, pg, runtime_env=None):
     """
     import copy
 
-    from .genrm import GenRMManager
+    from .inference_manager import create_model_manager, register_legacy_name
     from .multi_instance_orchestrator import start_multi_instance_managers
 
     instance_specs = args._genrm_instances_resolved
@@ -332,22 +324,18 @@ def create_genrm_managers(args, pg, runtime_env=None):
         return instance_args
 
     def _spawn_genrm_manager(key, instance_args, spec):
-        return GenRMManager.options(
-            **with_control_plane_affinity(
-                instance_args,
-                {
-                    "name": genrm_manager_actor_name(instance_specs, key),
-                    "num_cpus": 1,
-                    "num_gpus": 0,
-                    "runtime_env": runtime_env,
-                },
-            )
-        ).remote(
+        manager = create_model_manager(
             instance_args,
+            "genrm",
+            key,
             pg,
+            runtime_env=runtime_env,
+            owns_pg=getattr(args, "_inference_pg_owned", False),
             bundle_offset=plan.claim(GENRM_ROLE, key).start,
             port_window_index=port_window_indices[key],
         )
+        register_legacy_name(genrm_manager_actor_name(instance_specs, key), manager)
+        return manager
 
     managers = start_multi_instance_managers(
         args=args,

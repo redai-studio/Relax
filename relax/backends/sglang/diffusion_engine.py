@@ -850,38 +850,11 @@ class SGLangNativeGenerationEngine(RayActor):
         proc = getattr(self, "process", None)
         if proc is None:
             return
-        pid = getattr(proc, "pid", None)
-        if not proc.is_alive() or pid is None:
-            self.process = None
-            return
-        # Reap the WHOLE tree by pid RIGHT NOW, while the parent (the uvicorn
-        # mp.Process) is still alive and its ``sgl_diffusion::scheduler_*`` workers
-        # are still attached as its children. ``kill_process_tree`` collects the
-        # descendant pids first and then SIGKILLs each, so reparenting during the
-        # kill is harmless — the same helper the text SGLangEngine relies on.
-        #
-        # Do NOT SIGTERM-and-wait first: if the parent exits before we reap, the
-        # workers reparent to init (ppid=1) and, having renamed their proctitle to
-        # ``sgl_diffusion::``, evade both a follow-up ``is_alive()`` check and the
-        # launcher's ``pkill python``/``pkill sglang`` cleanup — orphaning a full
-        # ~44GB CUDA process per GPU (observed, and the cause of the node-wedge /
-        # reboot cycle). CUDA state is reclaimed cleanly by the OS on SIGKILL.
-        try:
-            from sglang.srt.utils import kill_process_tree
+        from sglang.srt.utils import kill_process_tree
 
-            kill_process_tree(pid)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        # Reap the mp.Process entry itself. Without the join it stays a zombie in
-        # the Ray actor's process table until the actor exits — mp only clears the
-        # child on join/exitcode.
-        try:
-            proc.join(timeout=10)
-        except Exception:
-            pass
+        from relax.backends.sglang.process_cleanup import terminate_server
+
+        terminate_server(proc, kill_process_tree)
         self.process = None
 
     # -- http -----------------------------------------------------------------

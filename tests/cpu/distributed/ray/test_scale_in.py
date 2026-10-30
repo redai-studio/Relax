@@ -714,7 +714,7 @@ class TestRemoveEngine:
         assert g.all_engines[0] is None
 
     @pytest.mark.asyncio
-    async def test_fallback_to_ray_kill_on_shutdown_failure(self):
+    async def test_shutdown_failure_retains_slots_and_rejects_reuse(self):
         e1 = make_mock_engine()
         e1.shutdown.remote.return_value = AwaitableValue(None)
         # Make shutdown raise a timeout
@@ -723,9 +723,12 @@ class TestRemoveEngine:
 
         with patch("ray.kill") as mock_kill, patch("ray.get", side_effect=mock_ray_get):
             manager = create_test_manager()
-            await manager._remove_engine(g, 0, shutdown_timeout=1)
-            mock_kill.assert_called_once_with(e1)
-        assert g.all_engines[0] is None
+            from relax.engine.inference.ownership import ResourceBlockedError
+
+            with pytest.raises(ResourceBlockedError, match="unconfirmed"):
+                await manager._remove_engine(g, 0, shutdown_timeout=1)
+            mock_kill.assert_not_called()
+        assert g.all_engines[0] is e1
 
     @pytest.mark.asyncio
     async def test_dcs_failure_still_shuts_down_engine(self):
@@ -739,7 +742,7 @@ class TestRemoveEngine:
 
         assert group.all_engines[0] is None
         engine.shutdown.remote.assert_called_once()
-        kill.assert_not_called()
+        kill.assert_called_once_with(engine, no_restart=True)
 
     @pytest.mark.asyncio
     async def test_multi_node_engine_removal(self, patch_ray_get):

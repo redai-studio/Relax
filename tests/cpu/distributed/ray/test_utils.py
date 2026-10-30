@@ -17,9 +17,11 @@ from relax.utils.model_source import ModelSource
 try:
     from relax.distributed.ray.rollout import (
         EngineGroupLifecycle,
-        RolloutManager,
         ScaleOutRequest,
         ScaleOutStatus,
+    )
+    from relax.distributed.ray.rollout import (
+        RolloutEngineRuntime as RolloutManager,
     )
 
     HAS_DEPS = True

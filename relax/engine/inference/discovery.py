@@ -14,7 +14,7 @@ through the router.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
@@ -29,11 +29,13 @@ class EngineState(str, Enum):
     SLEEPING = "sleeping"
     ONLOADING = "onloading"
     DEAD = "dead"
+    BLOCKED = "blocked"
 
 
 # A model with replicas in mixed states reports the first of these that any
 # replica is in: one ready replica is enough to serve.
 _MODEL_STATE_PRECEDENCE = (
+    EngineState.BLOCKED,
     EngineState.READY,
     EngineState.ONLOADING,
     EngineState.STARTING,
@@ -207,7 +209,7 @@ def model_snapshot_from_payload(name: str, payload: Mapping[str, Any]) -> ModelS
     A manager does not know which model name its owner serves it under, so it
     reports replicas by index and the owner supplies the name.
     """
-    return build_model_snapshot(
+    model = build_model_snapshot(
         name,
         [(row["index"], row.get("base_url"), EngineState(row["state"])) for row in payload.get("engines", ())],
         router_url=payload.get("router_url"),
@@ -217,6 +219,11 @@ def model_snapshot_from_payload(name: str, payload: Mapping[str, Any]) -> ModelS
             for row in payload.get("diagnostic_workers", ())
         ],
     )
+    # The owner may be starting or quarantined before any engine is publishable.
+    # Its explicit model state must survive aggregation of an empty replica list.
+    if "state" in payload:
+        model = replace(model, state=EngineState(payload["state"]))
+    return model
 
 
 def role_snapshot_from_payloads(

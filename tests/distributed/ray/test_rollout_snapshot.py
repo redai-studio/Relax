@@ -99,6 +99,31 @@ async def test_rollout_split_resume_keeps_admission_closed_until_all_tags_return
     assert manager.status == "onload"
 
 
+@pytest.mark.parametrize("fail", [False, True])
+async def test_rollout_partial_resume_is_released_before_next_owner(monkeypatch, fail):
+    group = make_engine_group(engines=_engines("http://engine:1", "http://engine:2"))
+    manager = _manager(monkeypatch, [group], status="onload")
+    await manager.offload()
+    if fail:
+        failed_ref = object()
+        group.all_engines[1].resume_memory_occupation.remote.return_value = failed_ref
+
+        def get(ref, timeout=None):
+            if ref is failed_ref:
+                raise RuntimeError("partial onload")
+            return mock_ray_get(ref, timeout)
+
+        monkeypatch.setattr(rollout.ray, "get", get)
+        with pytest.raises(RuntimeError, match="partial onload"):
+            await manager.onload_weights()
+    else:
+        await manager.onload_weights()
+    await manager.offload()
+    for engine in group.all_engines:
+        assert engine.release_memory_occupation.remote.call_count == 2
+    assert _snapshot(manager).models[0].state.value == "sleeping"
+
+
 def test_rollout_snapshot_excludes_pd_workers_from_replicas(monkeypatch):
     prefill = make_engine_group(engines=_engines("http://p0:15000"), worker_type="prefill")
     decode = make_engine_group(engines=_engines("http://d0:15000"), worker_type="decode", rank_offset=1)

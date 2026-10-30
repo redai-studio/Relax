@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import copy
 import os
 import threading
 import time
@@ -78,6 +79,21 @@ class Service:
                 node_group_affinity=self.config.enable_affinity,
             )
         self.pgs = pgs
+        if str(role) in {"rollout", "genrm"}:
+            # Allocation stays before model prefetch; engine ownership is
+            # transferred to the common manager before Serve is deployed.
+            self.config = copy.copy(config)
+            self.config._inference_pg_owned = not self._is_shared_pgs and pgs is not None
+            if getattr(config, "_inference_authority", None) is not None:
+                from relax.distributed.ray.inference_manager import ensure_inference_manager
+
+                self._inference_owner = ensure_inference_manager(
+                    self.config,
+                    str(role),
+                    pgs,
+                    runtime_env=runtime_env,
+                    owns_pg=self.config._inference_pg_owned,
+                )
         logger.info(f"[{role}] Placement group initialized: {pgs}")
 
         if not defer_deploy:
@@ -88,7 +104,7 @@ class Service:
         if self._deployed:
             raise RuntimeError(f"[{self.role}] Service has already been deployed")
         try:
-            self._deploy(self.pgs)
+            self._deploy_with_ownership(self.pgs)
         except Exception:
             # A failed Serve deployment can leave the PG allocated even though
             # this wrapper never becomes visible to the Controller.
@@ -101,8 +117,25 @@ class Service:
         self._deployed = True
         logger.info(f"[{self.role}] Service deployed successfully")
 
+    def _deploy_with_ownership(self, pgs: Optional[Any]) -> None:
+        if (
+            str(self.role) in {"actor", "critic", "reference", "actor_fwd"}
+            and getattr(self.config, "_inference_authority", None) is not None
+        ):
+            from relax.engine.inference.phase_client import PhaseSession
+
+            with PhaseSession.from_args(self.config, str(self.role), f"initialize:{self.role}") as phase:
+                phase.switch("train")
+                phase._safe_to_release = False
+                self._deploy(pgs)
+        else:
+            self._deploy(pgs)
+
     def _release_placement_group(self) -> None:
         """Release this service's owned placement group, if any."""
+        if getattr(self, "_inference_owner", None) is not None:
+            # The common manager outlives its HTTP facade.
+            return
         if self.pgs is None or self._is_shared_pgs:
             return
         pg = self.pgs[0] if isinstance(self.pgs, tuple) else self.pgs
@@ -298,7 +331,7 @@ class Service:
         pgs = self._ensure_placement_group()
 
         recovery_load_path(self.config)  # Ensure config has the correct checkpoint paths after restart
-        self._deploy(pgs)
+        self._deploy_with_ownership(pgs)
         logger.info(f"[{self.role}] Service redeployed successfully")
 
         current_step = 0
@@ -328,6 +361,10 @@ class Service:
         Returns:
             The validated (or newly created) placement group tuple, or None.
         """
+        if getattr(self, "_inference_owner", None) is not None:
+            # Restarting an HTTP facade never reallocates a manager's GPUs.
+            ray.get(self._inference_owner.claim_placement.remote())
+            return self.pgs
         if self.pgs is None:
             # No PG needed (e.g. num_gpus=0)
             return None

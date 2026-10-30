@@ -59,7 +59,7 @@ def _make_teacher_manager(monkeypatch, *, num_replicas=1, gpus_per_replica=16, s
         teacher_sglang_dp_size=8,
     )
     pg = ("shared-pg", list(range(160)), [i % 8 for i in range(160)]) if shared_pg else None
-    manager_cls = teacher_manager_module.TeacherManager.__ray_metadata__.modified_class
+    manager_cls = teacher_manager_module.TeacherEngineRuntime
     manager = manager_cls(
         args,
         num_replicas,
@@ -138,23 +138,21 @@ def test_teacher_manager_exposes_ray_actor_api(monkeypatch):
     assert hasattr(teacher_manager.TeacherManager, "options")
 
 
-def test_teacher_manager_answers_snapshots_outside_its_default_concurrency_group(monkeypatch):
-    """Discovery must not queue behind an offload or an engine rebuild."""
+def test_teacher_manager_facade_uses_the_common_async_owner(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    metadata = teacher_manager.TeacherManager.__ray_metadata__
+    from relax.distributed.ray.inference_manager import InferenceManager, LegacyInferenceManager
 
-    group = metadata.modified_class.get_inference_snapshot.__ray_concurrency_group__
-    assert metadata.concurrency_groups == {group: 1, "inference_admission": 1}
-    for method in ("acquire_inference", "release_inference"):
-        assert getattr(metadata.modified_class, method).__ray_concurrency_group__ == "inference_admission"
-    # Everything that changes engine state stays serialized in the default group.
-    for method in ("onload", "offload", "recover", "shutdown"):
-        assert not hasattr(getattr(metadata.modified_class, method), "__ray_concurrency_group__")
+    assert teacher_manager.TeacherManager is LegacyInferenceManager
+    import inspect
+
+    owner = InferenceManager.__ray_metadata__.modified_class
+    assert inspect.iscoroutinefunction(owner.apply)
+    assert inspect.iscoroutinefunction(owner.acquire_inference)
 
 
 def test_teacher_manager_starts_engines_with_teacher_profile(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager_cls = teacher_manager.TeacherEngineRuntime
     manager = object.__new__(manager_cls)
     manager._overrides = {"model_path": "/teacher"}
     manager.gpus_per_replica = 2
@@ -171,7 +169,7 @@ def test_teacher_engine_asks_for_a_smaller_slice_on_rollout_bundles(monkeypatch)
     """A deferred teacher on rollout's own bundles shares each of them with the
     training actor and a rollout engine, like a GenRM that shares them."""
     teacher_manager = _import_teacher_manager(monkeypatch)
-    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager_cls = teacher_manager.TeacherEngineRuntime
 
     def resources(*, shared_pg, bundle_offset):
         manager = object.__new__(manager_cls)
@@ -189,7 +187,7 @@ def test_teacher_engine_asks_for_a_smaller_slice_on_rollout_bundles(monkeypatch)
 
 def test_teacher_manager_checks_a_shared_placement_group_before_start(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager_cls = teacher_manager.TeacherEngineRuntime
     manager = object.__new__(manager_cls)
     manager._shared_pg_tuple = ("pg", list(range(8)), list(range(8)))
 
@@ -202,7 +200,7 @@ def test_teacher_manager_checks_a_shared_placement_group_before_start(monkeypatc
 
 def test_dedicated_teacher_placement_group_is_checked_and_returned_when_unusable(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager_cls = teacher_manager.TeacherEngineRuntime
     manager = object.__new__(manager_cls)
     manager.args = SimpleNamespace(num_gpus_per_node=8)
     manager.nodes_per_engine = 1
@@ -277,7 +275,7 @@ def test_dedicated_teacher_recovery_rebuilds_and_bumps_revision(monkeypatch):
     # ``ray.util.placement_group`` as an attribute is the function of that name; go by module.
     monkeypatch.setattr(importlib.import_module("ray.util.placement_group"), "remove_placement_group", removed.append)
 
-    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager_cls = teacher_manager.TeacherEngineRuntime
     manager = object.__new__(manager_cls)
     manager_cls.__init__(manager, SimpleNamespace(teacher_hf_checkpoint="/teacher", num_gpus_per_node=8), 1, 2)
     before = manager.get_inference_snapshot()
@@ -301,7 +299,7 @@ def test_teacher_placement_uses_distributed_factory_and_preserves_ownership(monk
     teacher_manager = _import_teacher_manager(monkeypatch)
     placement = importlib.import_module("relax.distributed.ray.placement_group")
     assert teacher_manager.create_placement_group is placement.create_placement_group
-    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager_cls = teacher_manager.TeacherEngineRuntime
     manager = object.__new__(manager_cls)
     manager.args = SimpleNamespace(enable_affinity=affinity, rollout_num_gpus=4, num_gpus_per_node=8)
     manager.nodes_per_engine = 1

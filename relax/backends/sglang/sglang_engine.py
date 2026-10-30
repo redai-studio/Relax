@@ -1122,7 +1122,10 @@ class SGLangEngine(RayActor):
         finally:
             process = getattr(self, "process", None)
             if process is not None:
-                kill_process_tree(process.pid)
+                from relax.backends.sglang.process_cleanup import terminate_server
+
+                terminate_server(process, kill_process_tree)
+                self.process = None
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
@@ -2209,6 +2212,13 @@ def _compute_server_args(
                 logger.info(f"sglang_overrides: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
             kwargs[key] = value
             unused_keys.discard(key)
+
+    from relax.engine.inference.deferred import needs_rollout_cpu_backup
+
+    if needs_rollout_cpu_backup(args):
+        if (sglang_overrides or {}).get("enable_weights_cpu_backup") is False:
+            raise ValueError("Shared deferred scoring cannot disable enable_weights_cpu_backup")
+        kwargs["enable_weights_cpu_backup"] = True
 
     # Use CUDA IPC only for engines confined to one node; multi-node engines
     # retain SGLang's auto policy, including CUDA VMM where supported.
