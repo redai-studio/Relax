@@ -578,3 +578,210 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
     torch.testing.assert_close(rollout_data["rollout_topk_token_ids"][0], token_ids[expected_rows])
     torch.testing.assert_close(rollout_data["rollout_topk_log_probs"][0], log_probs[expected_rows])
     assert rollout_data["rollout_log_probs"][0].tolist() == expected_rows
+
+
+@pytest.mark.parametrize(
+    ("model_type", "overrides", "broadcast_pp", "expected_pixels"),
+    [(model_type, {}, True, False) for model_type in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")]
+    + [
+        ("other_vl", {}, True, True),
+        (None, {}, True, True),
+        ("qwen3_5_moe", {"custom_model_provider_path": "custom.provider"}, True, True),
+        ("qwen3_5_moe", {"megatron_to_hf_mode": "raw"}, True, True),
+        ("qwen3_5_moe", {"colocate": False}, True, True),
+        ("qwen3_5_moe", {"fully_async": True}, True, True),
+        ("qwen3_5_moe", {"fully_async": True}, False, True),
+        ("qwen3_5_moe", {}, False, True),
+        ("qwen3_5_moe", {"per_rank_fetch": True}, True, True),
+    ],
+)
+def test_get_data_keeps_qwen_pixels_on_first_stage(monkeypatch, model_type, overrides, broadcast_pp, expected_pixels):
+    from relax.utils import misc
+
+    stream_module = _load_stream_module(monkeypatch)
+    args = Namespace(
+        colocate=True,
+        fully_async=False,
+        megatron_to_hf_mode="bridge",
+        custom_model_provider_path=None,
+        hf_checkpoint="unused-in-test",
+        per_rank_fetch=False,
+    )
+    vars(args).update(overrides)
+
+    pipeline_rank = 0
+    config_reads = []
+
+    def get_config(_checkpoint):
+        config_reads.append(pipeline_rank)
+        if pipeline_rank != 0:
+            raise OSError("Receiver cannot read the checkpoint config")
+        if model_type is None:
+            raise ValueError("Custom model config needs trust_remote_code")
+        return Namespace(model_type=model_type)
+
+    monkeypatch.setattr(misc, "get_hf_config", get_config)
+    for name, value in (
+        ("get_tensor_model_parallel_rank", 0),
+        ("get_context_parallel_rank", 0),
+        ("get_tensor_model_parallel_world_size", 1),
+        ("get_context_parallel_world_size", 1),
+        ("get_pipeline_model_parallel_world_size", 2),
+    ):
+        monkeypatch.setattr(stream_module.mpu, name, lambda value=value: value, raising=False)
+    monkeypatch.setattr(stream_module.mpu, "get_pipeline_model_parallel_rank", lambda: pipeline_rank, raising=False)
+    monkeypatch.setattr(stream_module.mpu, "get_pipeline_model_parallel_group", lambda: "pp", raising=False)
+    monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(stream_module, "_maybe_log_tgd_pickle_diag", lambda *_args: None)
+    monkeypatch.setattr(stream_module, "_maybe_log_per_rank_fetch_diag", lambda *_args: None)
+    tensorclass = types.ModuleType("tensordict.tensorclass")
+    tensorclass.NonTensorData = type("NonTensorData", (), {})
+    monkeypatch.setitem(sys.modules, "tensordict.tensorclass", tensorclass)
+    monkeypatch.setattr(stream_module, "TensorDict", dict)
+    pixels = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+    grid = torch.tensor([[1, 2, 4]])
+    mm_inputs = [{"pixel_values": pixels, "image_grid_thw": grid}, None]
+    metadata_wire, tensor_wire = [], []
+
+    def broadcast_metadata(payload, **_kwargs):
+        if pipeline_rank == 0:
+            metadata_wire[:] = payload
+        else:
+            payload[:] = metadata_wire
+
+    monkeypatch.setattr(stream_module.dist, "broadcast_object_list", broadcast_metadata)
+    monkeypatch.setattr(stream_module.dist, "get_global_rank", lambda _group, rank: rank)
+
+    def broadcast_tensor(tensor, **_kwargs):
+        if pipeline_rank == 0:
+            tensor_wire.append(tensor.clone())
+        else:
+            tensor.copy_(tensor_wire.pop(0))
+
+    monkeypatch.setattr(stream_module.dist, "broadcast", broadcast_tensor)
+    for pipeline_rank in (0, 1):
+        fetched = (
+            {"multimodal_train_inputs": mm_inputs}
+            if pipeline_rank == 0 or args.per_rank_fetch or not broadcast_pp
+            else None
+        )
+        result, meta = stream_module.get_data_from_transfer_queue(
+            args=args,
+            tq_client=None,
+            data_fields=["multimodal_train_inputs"],
+            batch_size=2,
+            partition_id="train_0",
+            task_name="actor",
+            sampling_config={},
+            batch_index=0,
+            broadcast_pp=broadcast_pp,
+            per_rank_fetch=args.per_rank_fetch,
+            synchronize_per_rank_fetch=not args.per_rank_fetch,
+            prefetched_rollout_data=[fetched, "batch-meta"],
+            post_process=False,
+        )
+        assert meta == "batch-meta"
+        assert result["multimodal_train_inputs"][1] is None
+        row = result["multimodal_train_inputs"][0]
+        should_have_pixels = pipeline_rank == 0 or expected_pixels
+        assert ("pixel_values" in row) is should_have_pixels
+        if should_have_pixels:
+            assert torch.equal(row["pixel_values"], pixels)
+        assert torch.equal(row["image_grid_thw"], grid)
+    assert not tensor_wire
+    # A source-side config failure is a uniform fallback; receivers never decide
+    # independently, even when their local config would be unreadable.
+    assert config_reads == ([0] if not overrides and broadcast_pp else [])
+
+
+@pytest.mark.parametrize(("pp_size", "only_pp0_consumes_pixels"), [(1, True), (5, True), (5, False)])
+def test_multimodal_broadcast_collective_members_and_metadata(monkeypatch, pp_size, only_pp0_consumes_pixels):
+    """Exercise production CP/TP/PP routing on CPU; the transport is
+    recorded."""
+    from collections import defaultdict
+
+    stream_module = _load_stream_module(monkeypatch)
+    coordinates = [0, 0, 0]  # PP, TP, CP
+    for index, axis in enumerate(("pipeline_model", "tensor_model", "context")):
+        monkeypatch.setattr(
+            stream_module.mpu, f"get_{axis}_parallel_rank", lambda index=index: coordinates[index], raising=False
+        )
+        monkeypatch.setattr(
+            stream_module.mpu,
+            f"get_{axis}_parallel_world_size",
+            lambda index=index: pp_size if index == 0 else 2,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            stream_module.mpu,
+            f"get_{axis}_parallel_group",
+            lambda index=index: (index, tuple(value for i, value in enumerate(coordinates) if i != index)),
+            raising=False,
+        )
+
+    def group_member(group, local_rank):
+        axis, others = group
+        member = list(others)
+        member.insert(axis, local_rank)
+        return member[0] * 4 + member[1] * 2 + member[2]
+
+    monkeypatch.setattr(stream_module.dist, "get_global_rank", group_member)
+    wire, traces = {}, defaultdict(list)
+
+    def broadcast(tensor, src, group):
+        rank = coordinates[0] * 4 + coordinates[1] * 2 + coordinates[2]
+        calls = traces[(group, rank)]
+        key = (group, len(calls))
+        calls.append((tuple(tensor.shape), tensor.dtype))
+        if rank == src:
+            wire[key] = tensor.clone()
+        else:
+            tensor.copy_(wire[key])
+
+    monkeypatch.setattr(stream_module.dist, "broadcast", broadcast)
+    sample = {
+        "pixel_values": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
+        "image_grid_thw": torch.tensor([[1, 2, 4]]),
+        "pixel_values_videos": [torch.ones(4, 5), torch.full((2, 5), 3.0)],
+        "video_grid_thw": torch.tensor([[1, 4, 5], [1, 2, 5]]),
+        "input_features": torch.full((3, 7), 2.0),
+        "video_second_per_grid": [0.12345, 1.23456],
+    }
+    spec, tensors = stream_module._encode_multimodal_inputs([sample, None])
+    for pp in range(pp_size):
+        for tp in range(2):
+            for cp in range(2):
+                coordinates[:] = [pp, tp, cp]
+                is_src = coordinates == [0, 0, 0]
+                result = stream_module._broadcast_multimodal_inputs(
+                    spec,
+                    tensors if is_src else [],
+                    is_src,
+                    torch.device("cpu"),
+                    True,
+                    only_pp0_consumes_pixels=only_pp0_consumes_pixels,
+                )
+                assert result[1] is None
+                assert torch.equal(result[0]["image_grid_thw"], sample["image_grid_thw"])
+                assert torch.equal(result[0]["video_grid_thw"], sample["video_grid_thw"])
+                assert torch.equal(result[0]["input_features"], sample["input_features"])
+                assert result[0]["video_second_per_grid"] == sample["video_second_per_grid"]
+                if pp == 0 or not only_pp0_consumes_pixels:
+                    assert torch.equal(result[0]["pixel_values"], sample["pixel_values"])
+                    for actual, expected in zip(result[0]["pixel_values_videos"], sample["pixel_values_videos"]):
+                        assert torch.equal(actual, expected)
+                else:
+                    assert set(result[0]) == {
+                        "image_grid_thw",
+                        "video_grid_thw",
+                        "input_features",
+                        "video_second_per_grid",
+                    }
+
+    for group, _rank in traces:
+        expected = traces[(group, group_member(group, 0))]
+        for local_rank in range(pp_size if group[0] == 0 else 2):
+            assert traces[(group, group_member(group, local_rank))] == expected
+        if only_pp0_consumes_pixels and (group[0] == 0 or group[1][0] != 0):
+            # Neither PP collectives nor CP/TP groups outside PP0 carry pixels.
+            assert expected == [((1, 3), torch.int64), ((2, 3), torch.int64), ((3, 7), torch.float32)]
