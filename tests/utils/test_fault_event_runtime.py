@@ -47,7 +47,7 @@ def test_runtime_nine_producers_preserve_complete_256_event_set(make_runtime, mo
     runtime = make_runtime()
     barrier = threading.Barrier(10)
     committed = threading.Event()
-    original_append = runtime.store.append
+    original_append = runtime.store._append_committed
     recorded_ids = set()
     results = [[] for _ in range(9)]
 
@@ -64,7 +64,7 @@ def test_runtime_nine_producers_preserve_complete_256_event_set(make_runtime, mo
         for index in range(worker, 256, 9):
             results[worker].append(runtime.record(_draft(runtime, index)))
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     threads = [threading.Thread(target=produce, args=(index,), daemon=True) for index in range(9)]
     for thread in threads:
         thread.start()
@@ -89,7 +89,7 @@ def test_runtime_nine_producers_preserve_complete_256_event_set(make_runtime, mo
 def test_runtime_fifo_full_and_only_one_inflight(make_runtime, monkeypatch, queue_capacity):
     runtime = make_runtime(queue_capacity=queue_capacity)
     entered, release, committed = threading.Event(), threading.Event(), threading.Event()
-    original_append = runtime.store.append
+    original_append = runtime.store._append_committed
     calls, active, maximum_active = [], 0, 0
 
     def append(draft):
@@ -108,7 +108,7 @@ def test_runtime_fifo_full_and_only_one_inflight(make_runtime, monkeypatch, queu
         finally:
             active -= 1
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     try:
         assert runtime.record(_draft(runtime, 0))
         assert entered.wait(3)
@@ -132,7 +132,7 @@ def test_runtime_fifo_full_and_only_one_inflight(make_runtime, monkeypatch, queu
 def test_runtime_pending_state_releases_ids_across_retention_evictions(make_runtime, monkeypatch):
     runtime = make_runtime(capacity=8)
     committed_batch = threading.Barrier(2)
-    original_append = runtime.store.append
+    original_append = runtime.store._append_committed
     count = 0
 
     def append(draft):
@@ -143,7 +143,7 @@ def test_runtime_pending_state_releases_ids_across_retention_evictions(make_runt
             committed_batch.wait(3)
         return result
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     for batch in range(16):
         for index in range(batch * 128, (batch + 1) * 128):
             assert runtime.record(_draft(runtime, index))
@@ -179,11 +179,11 @@ def test_runtime_pending_duplicates_merge_and_failure_settles_once(make_runtime,
         runtime._lock.release()
         return original_status(value)
 
-    def submit(value):
-        original_submit(value)
+    def submit(value, context):
+        original_submit(value, context)
         settled.set()
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     monkeypatch.setattr(runtime.store, "commit_status", commit_status)
     monkeypatch.setattr(runtime, "_submit", submit)
     try:
@@ -206,7 +206,7 @@ def test_runtime_pending_duplicates_merge_and_failure_settles_once(make_runtime,
 def test_runtime_pending_conflicting_content_is_rejected(make_runtime, monkeypatch):
     runtime = make_runtime()
     entered, release, committed = threading.Event(), threading.Event(), threading.Event()
-    original_append = runtime.store.append
+    original_append = runtime.store._append_committed
     draft = _draft(runtime)
 
     def append(value):
@@ -216,7 +216,7 @@ def test_runtime_pending_conflicting_content_is_rejected(make_runtime, monkeypat
         committed.set()
         return result
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     try:
         assert runtime.record(draft)
         assert entered.wait(3)
@@ -234,7 +234,7 @@ def test_runtime_pending_conflicting_content_is_rejected(make_runtime, monkeypat
 def test_runtime_close_does_not_count_retained_duplicate_as_lost(make_runtime, monkeypatch):
     runtime = make_runtime()
     committed, entered, release = threading.Event(), threading.Event(), threading.Event()
-    original_append, original_status = runtime.store.append, runtime.store.commit_status
+    original_append, original_status = runtime.store._append_committed, runtime.store.commit_status
     draft, next_draft = _draft(runtime), _draft(runtime, 1)
 
     def append(value):
@@ -251,7 +251,7 @@ def test_runtime_close_does_not_count_retained_duplicate_as_lost(make_runtime, m
         runtime._lock.release()
         return original_status(value)
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     monkeypatch.setattr(runtime.store, "commit_status", commit_status)
     try:
         assert runtime.record(draft)
@@ -278,8 +278,8 @@ def test_runtime_retained_conflict_preserves_original_without_guessing_loss(make
     settled = threading.Event()
     original_submit = runtime._submit
 
-    def submit(value):
-        original_submit(value)
+    def submit(value, context):
+        original_submit(value, context)
         settled.set()
 
     monkeypatch.setattr(runtime, "_submit", submit)
@@ -302,11 +302,11 @@ def test_runtime_retained_duplicate_with_busy_append_is_not_lost(make_runtime, m
         calls.append(value)
         raise TimeoutError("BUSY")
 
-    def submit(value):
-        original_submit(value)
+    def submit(value, context):
+        original_submit(value, context)
         settled.set()
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     monkeypatch.setattr(runtime, "_submit", submit)
     assert runtime.record(draft)
     assert settled.wait(3)
@@ -324,11 +324,11 @@ def test_runtime_unverifiable_abandonment_reports_unknown_instead_of_lost(make_r
     def busy(_draft):
         raise TimeoutError("BUSY")
 
-    def submit(value):
-        original_submit(value)
+    def submit(value, context):
+        original_submit(value, context)
         settled.set()
 
-    monkeypatch.setattr(runtime.store, "append", busy)
+    monkeypatch.setattr(runtime.store, "_append_committed", busy)
     monkeypatch.setattr(runtime.store, "commit_status", busy)
     monkeypatch.setattr(runtime, "_submit", submit)
     assert runtime.record(_draft(runtime))
@@ -342,7 +342,7 @@ def test_runtime_unverifiable_abandonment_reports_unknown_instead_of_lost(make_r
 def test_runtime_busy_retries_same_draft_once(make_runtime, monkeypatch, retry_succeeds):
     runtime = make_runtime()
     entered, release, settled = threading.Event(), threading.Event(), threading.Event()
-    original_append, original_submit = runtime.store.append, runtime._submit
+    original_append, original_submit = runtime.store._append_committed, runtime._submit
     calls = []
     draft = _draft(runtime)
 
@@ -356,11 +356,11 @@ def test_runtime_busy_retries_same_draft_once(make_runtime, monkeypatch, retry_s
             return original_append(value)
         raise TimeoutError("BUSY")
 
-    def submit(value):
-        original_submit(value)
+    def submit(value, context):
+        original_submit(value, context)
         settled.set()
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     monkeypatch.setattr(runtime, "_submit", submit)
     try:
         assert runtime.record(draft)
@@ -387,11 +387,11 @@ def test_runtime_permanent_store_rejection_is_known_lost(make_runtime, monkeypat
         calls.append(draft)
         raise ValueError(code)
 
-    def submit(draft):
-        original_submit(draft)
+    def submit(draft, context):
+        original_submit(draft, context)
         settled.set()
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     monkeypatch.setattr(runtime, "_submit", submit)
     assert runtime.record(_draft(runtime))
     assert settled.wait(3)
@@ -406,7 +406,7 @@ def test_runtime_uncertain_store_disables_original_history(make_runtime, monkeyp
     runtime = make_runtime(queue_capacity=2)
     entered, release = threading.Event(), threading.Event()
     store = runtime.store
-    original_append = store.append
+    original_append = store._append_committed
     calls = []
 
     def append(draft):
@@ -414,14 +414,14 @@ def test_runtime_uncertain_store_disables_original_history(make_runtime, monkeyp
         entered.set()
         assert release.wait(3)
         if commit_first:
-            assert original_append(draft) == "accepted"
+            assert original_append(draft)[0] == "accepted"
         if failure == "invalid_result":
             return None
         if failure == "unrecognized_value_error":
             raise ValueError("untrusted details")
         raise RuntimeError("untrusted details")
 
-    monkeypatch.setattr(store, "append", append)
+    monkeypatch.setattr(store, "_append_committed", append)
     try:
         assert runtime.record(_draft(runtime))
         assert entered.wait(3)
@@ -456,7 +456,7 @@ def test_runtime_sequence_limit_stops_admission_but_keeps_history_readable(make_
         assert release.wait(3)
         raise RuntimeError("SEQUENCE_LIMIT")
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     try:
         assert runtime.record(_draft(runtime))
         assert entered.wait(3)
@@ -555,7 +555,7 @@ def test_runtime_concurrent_lock_rejections_are_atomic_and_saturate(make_runtime
 def test_runtime_close_does_not_wait_or_double_settle_inflight(make_runtime, monkeypatch, failure, lost, unknown):
     runtime = make_runtime(queue_capacity=2)
     entered, release = threading.Event(), threading.Event()
-    original_append = runtime.store.append
+    original_append = runtime.store._append_committed
     calls, closes = [], []
     runtime.query_server = SimpleNamespace(available=True, close=lambda: closes.append("closed"))
 
@@ -569,7 +569,7 @@ def test_runtime_close_does_not_wait_or_double_settle_inflight(make_runtime, mon
             raise OSError("commit status unavailable")
         return original_append(draft)
 
-    monkeypatch.setattr(runtime.store, "append", append)
+    monkeypatch.setattr(runtime.store, "_append_committed", append)
     try:
         assert runtime.record(_draft(runtime))
         assert entered.wait(3)
@@ -615,7 +615,7 @@ def test_runtime_unexpected_consumer_failure_disables_store_and_settles_queue(ma
     runtime = make_runtime(queue_capacity=2)
     entered, release = threading.Event(), threading.Event()
 
-    def submit(_draft):
+    def submit(_draft, _context):
         entered.set()
         assert release.wait(3)
         raise OSError("consumer failure")

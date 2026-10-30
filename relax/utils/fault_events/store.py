@@ -80,6 +80,14 @@ class FaultEventStore:
 
     def append(self, draft: EventDraft) -> str:
         """Atomically append, or recognize a retained duplicate or conflict."""
+        return self._append_committed(draft)[0]
+
+    def _append_committed(self, draft: EventDraft) -> tuple[str, _Record]:
+        """Return the exact immutable commit, even if another writer evicts it.
+
+        Runtime uses this internal result for export after the transaction. The
+        public append result and the query schema stay unchanged.
+        """
         if type(draft) is not EventDraft:
             raise ValueError("INVALID_EVENT")
         draft.validate()
@@ -94,7 +102,7 @@ class FaultEventStore:
                     raise RuntimeError("UNAVAILABLE")
                 if old.draft != draft:
                     raise ValueError("CONFLICT")
-                return "duplicate"
+                return "duplicate", old
             if not valid_uint(timestamp):
                 raise ValueError("INVALID_TIME")
             if self._latest == MAX_UINT:
@@ -114,7 +122,7 @@ class FaultEventStore:
             except Exception:
                 self.invalidate()
                 raise RuntimeError("UNAVAILABLE") from None
-            return "accepted"
+            return "accepted", item
 
     def _decode_cursor(self, cursor: str, role: str | None, fault_id: str | None) -> tuple[int, int]:
         try:

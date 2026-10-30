@@ -44,9 +44,70 @@ class HealthStatus:
 
     HEARTBEAT_TIMEOUT = 120.0
 
-    def __init__(self) -> None:
+    def __init__(self, fault_generation: int | None = None) -> None:
         """Initialize with empty health state."""
         self.state: Dict[str, ServiceHealthState] = {}
+        self._fault_generation = None
+        self._fault_source = None
+        self._fault_observation_error = False
+        if fault_generation is not None:
+            try:
+                from relax.utils.fault_events.models import valid_uint
+                from relax.utils.fault_events.source import FaultSource
+
+                if not valid_uint(fault_generation):
+                    raise ValueError("INVALID_GENERATION: generation must be an unsigned 64-bit int")
+                self._fault_generation = fault_generation
+                self._fault_source = FaultSource(fault_generation)
+            except Exception:
+                self._fault_observation_error = True
+
+    def _observe(self, method: str, *args: Any) -> Any:
+        if self._fault_source is None:
+            return None
+        try:
+            return getattr(self._fault_source, method)(*args)
+        except Exception:
+            self._fault_observation_error = True
+            # This boundary retires the source after a failed clear/update so
+            # the next unhealthy period cannot reuse uncertain identity. The
+            # original health state survives; runtime forwarding has no such
+            # identity-retirement responsibility.
+            self._fault_source = None
+            return None
+
+    def _fault_details(self, role: str) -> dict:
+        fault = self._observe("get", role)
+        # A source replaced by None after a failed observation stays unavailable.
+        unavailable = (
+            self._fault_observation_error or self._fault_source is None or self._fault_source.observation_error
+        )
+        if fault is not None and type(fault) is not dict:
+            fault, unavailable = None, True
+        result = {
+            "fault": fault,
+            "observation_error": unavailable,
+        }
+        if fault is not None:
+            try:
+                contexts = self._validated_trace_contexts(self._fault_source.trace_contexts(role))
+                ids = (fault.get("event_id"), fault.get("fatal_event_id"))
+                contexts = {key: value for key, value in contexts.items() if key in ids}
+                if contexts:
+                    result["trace_contexts"] = contexts
+            except Exception:
+                pass
+        return result
+
+    @staticmethod
+    def _validated_trace_contexts(payload: object) -> dict:
+        """Discard invalid optional metadata without changing local health."""
+        try:
+            from relax.utils.fault_events.context import parse_trace_contexts
+
+            return {key: value.to_payload() for key, value in parse_trace_contexts(payload).items()}
+        except Exception:
+            return {}
 
     def mark_healthy(self, role: str) -> None:
         """Mark a service as healthy.
@@ -59,8 +120,16 @@ class HealthStatus:
         self.state[role].healthy = True
         self.state[role].error = None
         self.state[role].last_heartbeat = time.time()
+        self._observe("clear", role)
 
-    def mark_unhealthy(self, role: str, error: Optional[str] = None) -> None:
+    def mark_unhealthy(
+        self,
+        role: str,
+        error: Optional[str] = None,
+        return_fault: bool = False,
+        reason_code: str = "reported_error",
+        include_trace_context: bool = False,
+    ) -> dict | None:
         """Mark a service as unhealthy.
 
         Args:
@@ -72,6 +141,13 @@ class HealthStatus:
         self.state[role].healthy = False
         if error:
             self.state[role].error = error
+        self._observe("error", role, reason_code, self.state[role].fatal)
+        if not return_fault:
+            return None
+        if include_trace_context:
+            details = self._fault_details(role)
+            return {key: value for key, value in details.items() if key != "observation_error"}
+        return self._observe("get", role)
 
     def update_heartbeat(self, role: str, step: int = 0) -> None:
         """Update heartbeat for a service.
@@ -117,8 +193,9 @@ class HealthStatus:
         self.state[role].task_running = False
         if fatal:
             self.state[role].fatal = True
+        self._observe("error", role, "reported_error", self.state[role].fatal)
 
-    def get_service_health(self, role: str) -> Dict:
+    def get_service_health(self, role: str, include_fault: bool = False) -> Dict:
         """Get detailed health info for a service.
 
         Args:
@@ -135,6 +212,7 @@ class HealthStatus:
                 "current_step": 0,
                 "task_running": False,
                 "fatal": False,
+                **(self._fault_details(role) if include_fault else {}),
             }
         state = self.state[role]
         return {
@@ -144,6 +222,7 @@ class HealthStatus:
             "current_step": state.current_step,
             "task_running": state.task_running,
             "fatal": state.fatal,
+            **(self._fault_details(role) if include_fault else {}),
         }
 
     def get_all_health(self) -> Dict[str, Dict]:
@@ -157,13 +236,28 @@ class HealthStatus:
             result[role] = self.get_service_health(role)
         return result
 
-    def get_unhealthy_services(self) -> List[str]:
+    def get_unhealthy_services(self, include_faults: bool = False) -> List[str] | dict:
         """Get list of currently unhealthy services.
 
         Returns:
             List of service role names with unhealthy status (not True).
         """
-        return [role for role, state in self.state.items() if not state.healthy]
+        roles = [role for role, state in self.state.items() if not state.healthy]
+        if not include_faults:
+            return roles
+        observed = self._observe("snapshot", roles.copy())
+        if type(observed) is not dict or type(observed.get("faults")) is not list or len(observed["faults"]) > 9:
+            observed = {"faults": [], "observation_error": True}
+        result = {
+            "roles": roles,
+            "source_generation": self._fault_generation,
+            "faults": observed["faults"],
+            "observation_error": self._fault_observation_error or observed.get("observation_error") is not False,
+        }
+        contexts = self._validated_trace_contexts(observed.get("trace_contexts"))
+        if contexts:
+            result["trace_contexts"] = contexts
+        return result
 
     def get_stale_services(self) -> List[str]:
         """Get services that have stale heartbeat (timeout).
@@ -228,10 +322,12 @@ class HealthChecker:
         on_unhealthy: Callable[[str], None],
         check_interval: float = 1.0,
         on_fatal: Optional[Callable[[str, str], None]] = None,
+        fault_events: Any = None,
     ):
         self.health_status = health_status
         self.on_unhealthy = on_unhealthy
         self.on_fatal = on_fatal
+        self.fault_events = fault_events
         self.check_interval = check_interval
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -286,11 +382,26 @@ class HealthChecker:
                 break
 
             try:
-                unhealthy = ray.get(self.health_status.get_unhealthy_services.remote())
+                if self.fault_events is None:
+                    unhealthy = ray.get(self.health_status.get_unhealthy_services.remote())
+                else:
+                    snapshot = ray.get(self.health_status.get_unhealthy_services.remote(include_faults=True))
+                    unhealthy = snapshot["roles"]
+                    self.fault_events.observe_snapshot(snapshot)
                 for role in unhealthy:
-                    health_info = ray.get(self.health_status.get_service_health.remote(role))
+                    if self.fault_events is None:
+                        health_info = ray.get(self.health_status.get_service_health.remote(role))
+                    else:
+                        health_info = ray.get(self.health_status.get_service_health.remote(role, include_fault=True))
+                        if health_info.get("observation_error"):
+                            self.fault_events.note_unknown()
+                        self.fault_events.observe_fault(
+                            health_info.get("fault"), role, health_info.get("trace_contexts")
+                        )
                     error_msg = health_info.get("error", "Unknown error")
                     if health_info.get("fatal"):
+                        if self.fault_events is not None:
+                            self.fault_events.special(role, "termination_requested", "fatal_error")
                         # Skip the restart ladder entirely: this error is
                         # deterministic, retrying just delays the inevitable
                         # ``os._exit`` from ``_global_restart`` by ~12 wasted
@@ -318,7 +429,24 @@ class HealthChecker:
                 stale = ray.get(self.health_status.get_stale_services.remote())
                 for role in stale:
                     logger.warning(f"Service {role} heartbeat stale (timeout), triggering restart")
-                    ray.get(self.health_status.mark_unhealthy.remote(role, "Heartbeat timeout"))
+                    if self.fault_events is None:
+                        ray.get(self.health_status.mark_unhealthy.remote(role, "Heartbeat timeout"))
+                    else:
+                        details = ray.get(
+                            self.health_status.mark_unhealthy.remote(
+                                role,
+                                "Heartbeat timeout",
+                                return_fault=True,
+                                reason_code="heartbeat_timeout",
+                                include_trace_context=True,
+                            )
+                        )
+                        fault = details.get("fault") if type(details) is dict else None
+                        if fault is None:
+                            self.fault_events.note_unknown()
+                        self.fault_events.observe_fault(
+                            fault, role, details.get("trace_contexts") if type(details) is dict else None
+                        )
                     self.on_unhealthy(role)
                     if self._stop_event.is_set():
                         logger.info("Stop event set after on_unhealthy callback (stale), exiting check loop")
@@ -348,13 +476,16 @@ class HealthManager:
         check_interval: Seconds between health checks (default: 1.0)
     """
 
-    def __init__(self, check_interval: float = 1.0, config: Optional[Any] = None):
+    def __init__(self, check_interval: float = 1.0, config: Optional[Any] = None, fault_events: Any = None):
         """Initialize health manager.
 
         Args:
             check_interval: Interval for periodic health checks.
         """
-        self.status = HealthStatus.options(**with_control_plane_affinity(config)).remote()
+        self._fault_events = fault_events
+        generation = fault_events.bind_source()[0] if fault_events is not None else None
+        status_class = HealthStatus.options(**with_control_plane_affinity(config))
+        self.status = status_class.remote(fault_generation=generation)
         self._checker: Optional[HealthChecker] = None
         self._check_interval = check_interval
         logger.info("HealthManager initialized")
@@ -381,6 +512,7 @@ class HealthManager:
             on_unhealthy=on_unhealthy,
             check_interval=self._check_interval,
             on_fatal=on_fatal,
+            fault_events=self._fault_events,
         )
         self._checker.start()
         logger.info("Health management system started")

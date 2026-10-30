@@ -57,9 +57,11 @@ def train_loader(monkeypatch):
         ray.is_initialized = lambda: initialized
 
         class CPUController:
-            def __init__(self, config, runtime_env):
+            def __init__(self, config, runtime_env, fault_events=None):
                 events.append("controller_init")
                 assert all(not isinstance(value, runtime_module.FaultEventRuntime) for value in vars(config).values())
+                assert fault_events is module._fault_runtime
+                self._fault_events = fault_events
                 self.config, self.runtime_env = config, runtime_env
                 self._metrics_service_enabled = metrics_enabled
                 if fail_at == "startup":
@@ -234,14 +236,14 @@ def test_train_occupied_query_port_keeps_internal_recording(train_loader, monkey
         assert runtime.query_server is not None
         assert runtime.query_server.available is False
         assert runtime.query_server.url is None
-        append = runtime.store.append
+        append = runtime.store._append_committed
 
         def tracked_append(draft):
             result = append(draft)
             committed.set()
             return result
 
-        monkeypatch.setattr(runtime.store, "append", tracked_append)
+        monkeypatch.setattr(runtime.store, "_append_committed", tracked_append)
         assert runtime.record(
             EventDraft(runtime.run_id, "1" * 32, "2" * 32, "actor", 0, "fault_detected", "reported_error")
         )

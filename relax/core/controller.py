@@ -36,6 +36,7 @@ from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
 from relax.utils.env import Envs
+from relax.utils.fault_events.recovery import expected_evidence
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -179,7 +180,14 @@ def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
 
 
 class Controller:
-    def __init__(self, config: Namespace, runtime_env: dict = None) -> None:
+    # Fault observation is optional; class defaults also cover controllers
+    # built with ``__new__``. ``__init__`` never resets ``_fault_recovery``
+    # because a global restart re-runs it while that recovery is in progress.
+    _fault_events: Any = None
+    _fault_recovery: Any = None
+
+    def __init__(self, config: Namespace, runtime_env: dict = None, fault_events: Any = None) -> None:
+        self._fault_events = fault_events
         self.config = config
         self.serve_dict = {}
         self._teacher_manager = None
@@ -188,7 +196,7 @@ class Controller:
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
-        self._health_manager = HealthManager(check_interval=1.0, config=config)
+        self._health_manager = HealthManager(check_interval=1.0, config=config, fault_events=self._fault_events)
         if not hasattr(self, "_restarting"):
             self._restarting = False  # Flag to indicate a restart is in progress
         # Keep the synchronization object stable across the self.__init__ call
@@ -1519,6 +1527,7 @@ class Controller:
                 self._restart_done_event.clear()
                 self._restart_error = None
                 self._restart_mode = "global"
+                self._fault_recovery = None
                 break
         try:
             self._restart_serve(role)
@@ -1527,6 +1536,8 @@ class Controller:
             logger.exception("Service recovery failed")
         finally:
             if self._restart_error is not None:
+                if self._restart_mode != "local" and self._fault_events is not None:
+                    self._fault_events.finish(self._fault_recovery, "recovery_failed", "restart_exception")
                 checker = getattr(self._health_manager, "_checker", None)
                 if checker is not None:
                     checker._stop_event.set()
@@ -1566,6 +1577,8 @@ class Controller:
         register_extra_roles(self.config, algo)
         cls = algo.get(role)
         if cls is None:
+            if self._fault_events is not None:
+                self._fault_events.special(role, "handling_skipped", "role_unregistered")
             raise RuntimeError(f"No class registered for role '{role}' during recovery")
 
         restart_count = self._health_manager.increment_restart_count(role)
@@ -1585,6 +1598,11 @@ class Controller:
         }
         global_restart = role in full_rewire_roles or restart_count >= 3
         self._restart_mode = "global" if global_restart else "local"
+        self._fault_recovery = None
+        if self._fault_events is not None:
+            self._fault_recovery = self._fault_events.start_recovery(
+                role, self._restart_mode, expected_evidence(self._restart_mode, self.config, self.serve_dict)
+            )
         if global_restart:
             # Perform full Controller re-initialization from zero when:
             # 1. Actor fails (core training service, all other services depend on it)
@@ -1600,9 +1618,23 @@ class Controller:
         else:
             # Delegate in-place restart to Service (reuses PG, restores step, syncs weights, re-runs task)
             service = self.serve_dict[role]
-            service.restart()
-            self._health_manager.mark_healthy(role)
-            logger.info(f"Service '{role}' restarted successfully")
+            recovery_failed = True
+            try:
+                service.restart(
+                    fault_observer=(
+                        lambda observed=0, failed=0: self._fault_events.evidence(
+                            self._fault_recovery, observed=observed, failed=failed, reason="step_restore_failed"
+                        )
+                    )
+                    if self._fault_recovery is not None
+                    else None
+                )
+                self._health_manager.mark_healthy(role)
+                logger.info(f"Service '{role}' restarted successfully")
+                recovery_failed = False
+            finally:
+                if self._fault_recovery is not None:
+                    self._fault_events.complete_local(self._fault_recovery, failed=recovery_failed)
 
     def _run_global_restart(self) -> None:
         """Perform a full global restart by re-initializing the Controller from
@@ -1634,6 +1666,13 @@ class Controller:
             f"(max={self._max_global_restart}, full Controller re-initialization from zero) ==="
         )
         if self._global_restart_count > self._max_global_restart:
+            if self._fault_recovery is not None:
+                self._fault_events.special(
+                    self._fault_recovery.members[0].role,
+                    "termination_requested",
+                    "restart_limit",
+                    self._fault_recovery,
+                )
             error_msg = (
                 f"Global restart count ({self._global_restart_count}) exceeded "
                 f"maximum allowed ({self._max_global_restart}). "
@@ -1785,6 +1824,8 @@ class Controller:
 
         try:
             ray.shutdown()
+            if self._fault_events is not None:
+                self._fault_events.retire_source()
             logger.info("[Global Restart] Ray shutdown completed")
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to shutdown Ray: {e}")
@@ -1814,7 +1855,7 @@ class Controller:
         saved_global_restart_count = self._global_restart_count
 
         try:
-            self.__init__(config, runtime_env)
+            self.__init__(config, runtime_env, fault_events=self._fault_events)
             # Restore fields that __init__ overwrites but must survive across restarts
             self._restarting = saved_restarting
             self._global_restart_count = saved_global_restart_count

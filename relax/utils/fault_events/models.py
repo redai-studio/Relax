@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from enum import Enum, IntFlag
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -26,6 +27,20 @@ REASONS = MappingProxyType(
         "termination_requested": ("fatal_error", "restart_limit"),
     }
 )
+
+
+class RecoveryEvidence(IntFlag):
+    """Recovery operations; runtime admission converts flags to schema ints."""
+
+    DEPLOYED = 1
+    STEP_RESTORED = 2
+    TASK_SUBMITTED = 4
+    ACTOR_WEIGHT_SENT = 8
+    ACTOR_FWD_WEIGHT_RECEIVED = 16
+    REFERENCE_WEIGHT_RECEIVED = 32
+    LOCAL = DEPLOYED | STEP_RESTORED | TASK_SUBMITTED
+
+
 _ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _REQUIRED_FIELDS = frozenset(("run_id", "fault_id", "event_id", "role", "source_generation", "event_type"))
 _DRAFT_FIELDS = _REQUIRED_FIELDS | {
@@ -54,11 +69,65 @@ def valid_uint(value: object, maximum: int = MAX_UINT) -> bool:
     return type(value) is int and 0 <= value <= maximum
 
 
+def service_role(role: str) -> str:
+    """Return the plain role name for a role string or registry enum member."""
+    value = role.value if isinstance(role, Enum) else role
+    if type(value) is not str or value not in ROLES:
+        raise ValueError("INVALID_ROLE: role must be a supported service role")
+    return value
+
+
 def encode(value: dict[str, object]) -> bytes:
     """Encode already validated fields without arbitrary object conversion."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
         "utf-8"
     )
+
+
+@dataclass(frozen=True, slots=True)
+class FaultContext:
+    """One observed unhealthy period and its stable discovery/escalation
+    IDs."""
+
+    role: str
+    fault_id: str
+    source_generation: int
+    event_id: str
+    reason: str
+    fatal: bool = False
+    fatal_event_id: str | None = None
+
+    def validate(self) -> None:
+        # Messages name the violated field and constraint, never the value.
+        if type(self) is not FaultContext:
+            raise ValueError("INVALID_FAULT: subclasses are not accepted")
+        if type(self.role) is not str or len(self.role) > 10 or self.role not in ROLES:
+            raise ValueError("INVALID_FAULT: role must be a supported service role")
+        if not all(valid_id(value) for value in (self.fault_id, self.event_id)):
+            raise ValueError("INVALID_FAULT: fault_id and event_id must be 32 lowercase hex digits")
+        if not valid_uint(self.source_generation):
+            raise ValueError("INVALID_FAULT: source_generation must be an unsigned 64-bit int")
+        if type(self.fatal) is not bool:
+            raise ValueError("INVALID_FAULT: fatal must be a bool")
+        if type(self.reason) is not str or self.reason not in REASONS["fault_detected"]:
+            raise ValueError("INVALID_FAULT: reason must be a fault_detected reason code")
+        if self.reason == "fatal_error":
+            if not self.fatal or self.fatal_event_id is not None:
+                raise ValueError("INVALID_FAULT: a fatal_error discovery is fatal and has no fatal_event_id")
+        elif self.fatal:
+            if not valid_id(self.fatal_event_id) or self.fatal_event_id == self.event_id:
+                raise ValueError("INVALID_FAULT: an escalated fault needs a distinct fatal_event_id")
+        elif self.fatal_event_id is not None:
+            raise ValueError("INVALID_FAULT: a nonfatal fault has no fatal_event_id")
+
+    @classmethod
+    def from_dict(cls, payload: object) -> FaultContext:
+        fields = {"role", "fault_id", "source_generation", "event_id", "reason", "fatal", "fatal_event_id"}
+        if type(payload) is not dict or any(type(key) is not str for key in payload) or payload.keys() != fields:
+            raise ValueError("INVALID_FAULT: payload must be a dict with exactly the FaultContext fields")
+        context = cls(**payload)
+        context.validate()
+        return context
 
 
 @dataclass(frozen=True, slots=True)
