@@ -110,7 +110,8 @@ def test_rollout_metrics_preserve_reward_categories_cache_and_effective_lengths(
     assert metrics["repetition_frac"] == 0.0
     assert metrics["prefix_cache_hit_rate"] == 0.5
     assert metrics["avg_cached_tokens_per_sample"] == 2.0
-    assert metrics["spec_accept_rate"] == pytest.approx((0.5 + 0.75) / 3)
+    # The unscored sample has no counter pair; do not fabricate a zero ratio.
+    assert "spec_accept_rate" not in metrics
     assert metrics["image_count/mean"] == pytest.approx(1 / 3)
     assert metrics["multimodal_token_count/max"] == 4
     assert samples == before

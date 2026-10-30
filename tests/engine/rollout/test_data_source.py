@@ -190,6 +190,14 @@ class TestDataSourceIntegration:
                 if os.path.exists(path):
                     os.unlink(path)
 
+    def test_shallow_copy_drops_generation_export_state(self, data_source_module):
+        from relax.utils.types import Sample
+
+        source = Sample(spec_generations=[{"version": 1, "generation_id": "old"}])
+        copied = data_source_module._shallow_copy_sample(source)
+
+        assert copied.spec_generations is None
+
     @pytest.mark.parametrize("samples_per_prompt", [1, 3])
     @pytest.mark.parametrize("max_length", [None, 5])
     def test_streaming_buffer_resume_preserves_groups_and_prompt_order(
