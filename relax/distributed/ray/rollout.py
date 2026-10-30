@@ -463,6 +463,11 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            # Rollout-only CANN/HCCL performance knobs can hang FSDP backward if training actors inherit them.
+            for spec in Envs.RELAX_ROLLOUT_EXTRA_ENV_VARS.split(","):
+                name, sep, value = spec.strip().partition("=")
+                if name:
+                    env_vars[name] = value
             effective_model_path = self.sglang_overrides.get("model_path", self.args.hf_checkpoint)
             effective_load_format = self.sglang_overrides.get(
                 "load_format", getattr(self.args, "sglang_load_format", "auto")

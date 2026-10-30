@@ -4,6 +4,7 @@ Date: Sat, 29 Aug 2026 03:49:49 +0000
 Subject: [PATCH] sglang optimize for qwen3.5 9B&35B
 
 ---
+ python/sglang/srt/configs/qwen3_asr.py        |  12 +-
  python/sglang/srt/entrypoints/http_server.py  |   2 +-
  python/sglang/srt/environ.py                  |  42 ++
  .../npu/attention/ascend_gdn_backend.py       | 190 +++++--
@@ -35,7 +36,7 @@ Subject: [PATCH] sglang optimize for qwen3.5 9B&35B
  .../srt/utils/torch_memory_saver_adapter.py   |   9 +-
  .../layers/test_conv_weight_cache_refresh.py  | 109 ++++
  .../layers/test_sampler_attach_logprobs.py    | 156 ++++++
- 31 files changed, 3134 insertions(+), 240 deletions(-)
+ 32 files changed, 3146 insertions(+), 242 deletions(-)
  create mode 100644 python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
  create mode 100644 python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
  create mode 100644 python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py
@@ -43,6 +44,28 @@ Subject: [PATCH] sglang optimize for qwen3.5 9B&35B
  create mode 100644 test/registered/unit/layers/test_conv_weight_cache_refresh.py
  create mode 100644 test/registered/unit/layers/test_sampler_attach_logprobs.py
 
+diff --git a/python/sglang/srt/configs/qwen3_asr.py b/python/sglang/srt/configs/qwen3_asr.py
+index cb3252b3d4..3aeb4f96b8 100644
+--- a/python/sglang/srt/configs/qwen3_asr.py
++++ b/python/sglang/srt/configs/qwen3_asr.py
+@@ -164,5 +164,15 @@ class Qwen3ASRConfig(PretrainedConfig):
+         return self.thinker_config.text_config
+ 
+ 
+-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
+-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
++# Newer transformers builds (e.g. the qwen4_exp fork) ship native qwen3_asr
++# configs, making AutoConfig.register raise "already used by a Transformers
++# config"; tolerate that so importing this module stays safe across versions
++# (same pattern as zaya.py / unlimited_ocr.py).
++for _model_type, _config_cls in (
++    ("qwen3_asr", Qwen3ASRConfig),
++    ("qwen3_asr_thinker", Qwen3ASRThinkerConfig),
++):
++    try:
++        AutoConfig.register(_model_type, _config_cls)
++    except ValueError:
++        pass
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
 index bd9d7eafa1..1740283de2 100644
 --- a/python/sglang/srt/entrypoints/http_server.py

@@ -279,6 +279,8 @@ class Service:
         logger.info(f"[{self.role}] Starting in-place restart...")
 
         self._stop_heartbeat_thread()
+        # Mark the task stopped during redeploy/wiring so stale heartbeats cannot trigger another restart.
+        self.healthy.set_task_status.remote(self.role, False)
 
         try:
             self._http_call(self.role, "/stop_service", method="POST")

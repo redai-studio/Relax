@@ -120,6 +120,25 @@ def warmup_static_cp_forward_neighbor_p2p() -> None:
     )
 
 
+def _mpu_is_initialized() -> bool:
+    """Return whether Megatron parallel state is usable; uninitialized
+    fsdp_turbo state means no CP/TP."""
+    if mpu is None:
+        return False
+    checker = getattr(mpu, "is_initialized", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    # Older Megatron without is_initialized(): probe the group instead.
+    try:
+        mpu.get_context_parallel_group()
+        return True
+    except Exception:
+        return False
+
+
 def maybe_padded_total_lengths(
     total_lengths: list[int],
     qkv_format: str,
@@ -133,8 +152,10 @@ def maybe_padded_total_lengths(
     Relax helpers that re-derive those chunks must agree.
 
     Returns None for non-VL/non-CP/non-thd paths so callers fall back to the
-    standard `ceil(total_length / (2*cp))` formula.
+    standard `ceil(total_length / (2*cp))` formula. Uninitialized fsdp_turbo state is non-CP.
     """
+    if not _mpu_is_initialized():
+        return None
     cp_size = mpu.get_context_parallel_world_size()
     if not (is_vl_model and cp_size > 1 and qkv_format == "thd"):
         return None
@@ -521,7 +542,13 @@ def slice_log_prob_with_cp(
         f"response_length={response_length}, total_length={total_length}"
     )
 
-    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    # Uninitialized Megatron state (fsdp_turbo) means cp_size=1.
+    if dynamic_cp_size is not None:
+        cp_size = dynamic_cp_size
+    elif _mpu_is_initialized():
+        cp_size = mpu.get_context_parallel_world_size()
+    else:
+        cp_size = 1
 
     if cp_size == 1:
         return log_prob

@@ -1,0 +1,76 @@
+# ============================================================
+# DeepSeek-V4-Flash (4L/16E) — FSDPTurbo plan for Relax
+#
+# Usage:
+#   --train-backend fsdp_turbo --turbo-config configs/turbo_config/deepseek_v4_4l16e.yaml
+#
+# The model is built by the FSDPTurbo adapter (fsdp_turbo.models.deepseek.
+# deepseek_v4) routed via model_type==deepseek_v4 in the fsdp_turbo actor;
+# real released weights are loaded when --hf-checkpoint points at a
+# DeepSeek-V4-Flash-BF16 safetensors directory (load_weights_into).
+#
+# Relax owns the training loop (rollout via TransferQueue, checkpoints via
+# --save), so data / checkpoint sections of the native FSDPTurbo example are
+# not consumed and are omitted here.
+#
+# Parallel plan for 8 NPUs: FSDP=8. Context parallel must stay 1 (Relax
+# integration rejects CP today). EP off in v1 (keeps HF parameter names for
+# the colocated SGLang weight sync); re-enable later via ep_plan.
+# ============================================================
+
+model:
+  model_name_or_path: "DeepSeek-V4-Flash"
+  tokenizer_name_or_path: "DeepSeek-V4-Flash"
+  torch_dtype: "bf16"
+
+optimizer:
+  optimizer_type: "AdamW"
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1e-8
+  lr: 1.0e-5
+  warmup_ratio: 0.03
+  lr_scheduler_type: "CosineAnnealingLR"
+  min_lr: 1.0e-6
+  clip_grad: 1.0
+  clip_grad_norm_type: 2.0
+
+run:
+  seed: 42
+  max_steps: -1
+  logging_steps: 1
+
+distributed:
+  data_parallel_size: 1
+  fully_shard_parallel_size: 8
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  kcp_parallel_size: 1
+  kv_allgather_parallel_size: 1
+  expert_parallel_size: 1
+  expert_fully_shard_parallel_size: 1
+  expert_data_parallel_size: 1
+
+  fsdp_plan:
+    ignored_modules: []
+    apply_modules:
+      model.model.embed_tokens:
+        {}
+      model.model.layers.{*}:
+        {}
+      model.model.norm:
+        {}
+      lm_head:
+        {}
+    param_dtype: "bf16"
+    reduce_dtype: "fp32"
+    output_dtype: "bf16"
+
+memory:
+  recompute: true
+  recompute_plan:
+    - model.model.layers.{*}
+
+quantization:
+  quantization_plan: null

@@ -98,6 +98,8 @@ class HealthStatus:
         if role not in self.state:
             self.state[role] = ServiceHealthState()
         self.state[role].task_running = running
+        # Treat task-status transitions as liveness events so stale records cannot trigger an immediate restart.
+        self.state[role].last_heartbeat = time.time()
 
     def report_error(self, role: str, error: str, fatal: bool = False) -> None:
         """Report an error for a service.

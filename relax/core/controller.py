@@ -345,9 +345,15 @@ class Controller:
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
-        dp_size = compute_dp_size(self.config)
         from relax.engine.sft.runtime import is_i2i_sft
 
+        if getattr(self.config, "train_backend", "megatron") == "fsdp_turbo":
+            # TQ consumers fetch only their FSDPTurbo dp_rank, so shard by the turbo plan's dp size.
+            from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_dp_size
+
+            dp_size = get_turbo_dp_size(self.config)
+        else:
+            dp_size = compute_dp_size(self.config)
         required_node_resources = with_control_plane_affinity(self.config).get("resources", {})
         required_node_resource = next(iter(required_node_resources), None)
         use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)

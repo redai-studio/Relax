@@ -1,0 +1,560 @@
+diff --git a/fsdp_turbo/distributed/vocab_parallel/vocab_parallel.py b/fsdp_turbo/distributed/vocab_parallel/vocab_parallel.py
+index e26037164f..a89d095bbf 100644
+--- a/fsdp_turbo/distributed/vocab_parallel/vocab_parallel.py
++++ b/fsdp_turbo/distributed/vocab_parallel/vocab_parallel.py
+@@ -110,6 +110,7 @@ def vocab_parallelize_modules(
+         print_rank(
+             logger.info,
+             f"[Vocabulary Parallel]: rank={vp_rank}/{vp_size}, local weight shape={local_shape}, "
+-            f"vocab range=[{module._vp_vocab_start_index}, {module._vp_vocab_end_index})",
++            f"vocab range=[{module._vp_vocab_start_index}, {module._vp_vocab_end_index}), "
++            f"weight device={module.weight.device}, local device={module.weight.to_local().device}",
+         )
+     return model
+diff --git a/fsdp_turbo/distributed/vocab_parallel/vp_dispatcher.py b/fsdp_turbo/distributed/vocab_parallel/vp_dispatcher.py
+index 9047407de2..fccb33214d 100644
+--- a/fsdp_turbo/distributed/vocab_parallel/vp_dispatcher.py
++++ b/fsdp_turbo/distributed/vocab_parallel/vp_dispatcher.py
+@@ -34,6 +34,13 @@ def vocab_parallel_embedding_forward(
+     vp_size = 1 if vp_group is None else dist.get_world_size(vp_group)
+     vp_rank = 0 if vp_group is None else dist.get_rank(vp_group)
+     local_vocab_size = module.num_embeddings // vp_size
++    local_weight = _local_tensor(module.weight)
++    # The HF PLE forward routes ids with `.to(weight.device)`, whose DTensor
++    # wrapper metadata may disagree with the shard's actual device. The
++    # all-to-all runs on the accelerator group and rejects CPU tensors, so
++    # align the input with the local shard's real device.
++    if input_ids.device != local_weight.device:
++        input_ids = input_ids.to(local_weight.device)
+     flat_ids = input_ids.reshape(-1).long()
+     owners = torch.div(flat_ids, local_vocab_size, rounding_mode="floor")
+ 
+@@ -57,7 +64,6 @@ def vocab_parallel_embedding_forward(
+     recv_counts = recv_counts_tensor.cpu().tolist()
+ 
+     received_ids = alltoallv(sorted_local_ids, vp_group, send_counts, recv_counts)
+-    local_weight = _local_tensor(module.weight)
+ 
+     local_padding_idx = None
+     if module.padding_idx is not None:
+diff --git a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
+index d3a0ab3127..d952a0a4aa 100644
+--- a/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
++++ b/fsdp_turbo/models/qwen/modeling_qwen4_exp.py
+@@ -51,6 +51,7 @@ import os
+ from collections.abc import Callable
+ 
+ import torch
++import torch.distributed as dist
+ from torch import nn
+ 
+ from transformers import AutoModel
+@@ -148,6 +149,59 @@ def _apply_indexer_query_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Ten
+     return torch.cat((rotated, passthrough), dim=-1)
+ 
+ 
++def _gather_ulysses_sequence(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
++    """All-gather a ``[batch, local_seq, *]`` tensor along the sequence dim across the Ulysses group."""
++    world_size = dist.get_world_size(group)
++    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
++    dist.all_gather(gathered, tensor.contiguous(), group=group)
++    return torch.cat(gathered, dim=1)
++
++
++def _context_parallel_full_key_mask(
++    attention_mask: torch.Tensor,
++    local_query_length: int,
++    group: dist.ProcessGroup,
++) -> torch.Tensor:
++    """Rebuild the QSA indexer mask as ``[batch, 1, local_q, full_k]`` under Ulysses CP.
++
++    The indexer selects top-k keys across the whole CP-sharded sequence, so its input
++    mask must cover full-sequence keys. Two incoming layouts are handled:
++
++    - local ``[batch, 1, local_q, local_k]`` (post-fusion sharding): per-shard key
++      validity is all-gathered and causality is rebuilt with this rank's global query
++      offset (shards are equal-length because both sharding paths pad first);
++    - full ``[batch, 1, full_q, full_k]`` (MTP materializes the mask before splitting):
++      this rank's query rows are sliced out.
++
++    Bool masks stay bool; additive float masks stay additive float. The last local query
++    row is causal-visible to every local key, so it doubles as the local key-validity row.
++    """
++    ulysses_rank = dist.get_rank(group)
++    ulysses_size = dist.get_world_size(group)
++    query_offset = ulysses_rank * local_query_length
++    is_float_mask = attention_mask.is_floating_point()
++    if attention_mask.shape[-2] == local_query_length:
++        local_key_validity = attention_mask[:, 0, -1, :]
++        if is_float_mask:
++            local_key_validity = local_key_validity == 0
++        gathered_validity = [torch.empty_like(local_key_validity) for _ in range(ulysses_size)]
++        dist.all_gather(gathered_validity, local_key_validity.contiguous(), group=group)
++        key_validity = torch.cat(gathered_validity, dim=-1)
++    else:
++        attention_mask = attention_mask[:, :, query_offset : query_offset + local_query_length, :]
++        key_validity = attention_mask[:, 0, -1, :]
++        if is_float_mask:
++            key_validity = key_validity == 0
++    key_positions = torch.arange(key_validity.shape[-1], device=attention_mask.device)
++    query_positions = query_offset + torch.arange(local_query_length, device=attention_mask.device)
++    visible = (key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
++    visible = visible & key_validity.unsqueeze(1).unsqueeze(1)
++    if not is_float_mask:
++        return visible
++    additive_mask = torch.zeros(visible.shape, device=attention_mask.device, dtype=attention_mask.dtype)
++    return additive_mask.masked_fill(~visible, torch.finfo(attention_mask.dtype).min)
++
++
+ class Qwen4ExpTextRMSNorm(HFQwen4ExpTextRMSNorm):
+     """RMSNorm on the ``fsdp_turbo.ops`` fused kernel (``npu_rms_norm``).
+ 
+@@ -244,6 +298,15 @@ class Qwen4ExpTextQSAIndexer(HFQwen4ExpTextQSAIndexer):
+         query = _apply_indexer_query_rope(self.q_layernorm(query), current_cos, current_sin)
+         if past_key_values is not None:
+             raw_keys = past_key_values.update_indexer(raw_keys, self.layer_idx)
++        else:
++            # Top-k selection must cover the whole CP-sharded sequence, so exchange
++            # each rank's indexer keys (with their RoPE tables) before selection;
++            # queries stay local. Callers guarantee no cache under Ulysses CP.
++            ulysses_group, _, ulysses_size = get_ulysses_context()
++            if ulysses_size > 1:
++                raw_keys = _gather_ulysses_sequence(raw_keys, ulysses_group)
++                full_cos = _gather_ulysses_sequence(full_cos, ulysses_group)
++                full_sin = _gather_ulysses_sequence(full_sin, ulysses_group)
+         return qsa_selected_token_mask(
+             query,
+             raw_keys,
+@@ -276,6 +339,18 @@ class Qwen4ExpTextAttention(HFQwen4ExpTextAttention):
+         past_key_values: Cache | None = None,
+         **kwargs: Unpack[TransformersKwargs],
+     ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        ulysses_group, _, ulysses_size = get_ulysses_context()
++        if (
++            ulysses_size > 1
++            and past_key_values is None
++            and self.indexer.qsa_implementation == "triton"
++        ):
++            # Give the indexer a mask over the full CP sequence so its top-k
++            # selection survives the Ulysses attention wrapper (which preserves
++            # [local_q, full_k] masks but rebuilds local [local_q, local_k] ones).
++            attention_mask = _context_parallel_full_key_mask(
++                attention_mask, hidden_states.shape[1], ulysses_group
++            )
+         selected_token_mask = self.indexer(hidden_states, position_embeddings, attention_mask, past_key_values)
+         # Combine both masks (they are never None, and are always 4D with either bool for sdpa, or float for eager)
+         if attention_mask.is_floating_point():
+@@ -356,11 +431,25 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+                 "gdn_implementation='eager' does not support skip_gdn_recompute; "
+                 "use gdn_implementation='triton' or disable skip_gdn_recompute."
+             )
++        # fla_npu's AscendC causal_conv1d tiles the fused conv channels per head:
++        # the per-head dim must stay <= the tiling planner's MAX_DIM_TILE_SIZE
++        # (4096) and be 16-element aligned. head_num=1 leaves conv_dim > 4096
++        # unsplit, which collapses the planner's dim tile ("invalid dim tile
++        # size selection"). The conv is depthwise, so any channel split is
++        # mathematically exact; head_v_dim-aligned heads match the per-head
++        # channel layout used by the kimi AscendC path.
++        conv_dim = 2 * self.key_dim + self.value_dim
++        head_num = 1
++        if self.head_v_dim % 16 == 0 and conv_dim % self.head_v_dim == 0:
++            head_num = conv_dim // self.head_v_dim
++        while conv_dim // head_num > 4096 and conv_dim % (head_num * 2) == 0:
++            head_num *= 2
++        self.conv1d_head_num = head_num
+         print_rank(
+             logger.info,
+             f"Qwen4ExpTextGatedDeltaNet(layer={layer_idx}) "
+             f"conv1d={self.causal_conv1d_implementation} gdn={self.gdn_implementation} "
+-            f"skip_recompute={self.skip_gdn_recompute}",
++            f"skip_recompute={self.skip_gdn_recompute} conv1d_head={self.conv1d_head_num}",
+         )
+         self.norm = Qwen4ExpTextRMSNormGated(
+             self.head_v_dim, eps=self.layer_norm_epsilon, activation=config.output_gate_type or config.hidden_act
+@@ -429,6 +518,7 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+                     bias=self.conv1d.bias,
+                     activation=self.activation,
+                     cu_seqlens=cu_seqlens,
++                    head_num=self.conv1d_head_num,
+                 )
+             elif conv_impl == "triton_with_transpose":
+                 # Triton-with-transpose path (no contiguous transpose of weight);
+@@ -439,6 +529,7 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
+                     bias=self.conv1d.bias,
+                     activation=self.activation,
+                     cu_seqlens=cu_seqlens,
++                    head_num=self.conv1d_head_num,
+                 )
+             else:
+                 mixed_qkv = mixed_qkv.transpose(1, 2)
+@@ -711,6 +802,14 @@ class Qwen4ExpModel(HFQwen4ExpModel):
+                 past_key_values=past_key_values,
+                 mm_token_type_ids=mm_token_type_ids,
+             )
++            # compute_3d_position_ids returns None for text-only inputs
++            # (no image/video grids): fall back to plain left-to-right ids so
++            # downstream CP sharding and the language model always receive a
++            # concrete position_ids tensor.
++            if position_ids is None:
++                position_ids = torch.arange(inputs_embeds.size(1), device=inputs_embeds.device).unsqueeze(0).expand(
++                    inputs_embeds.size(0), -1
++                )
+ 
+         if ulysses_size > 1:
+             inputs_embeds, position_ids, attention_mask = shard_fused_sequence_inputs(
+@@ -802,6 +901,13 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+         return mtp_loss
+ 
+     def forward(self, *args, **kwargs):
++        # External trainers that compute their own main loss (e.g. Relax's
++        # chunked NLL) pass ``mtp_only_labels=True``: labels are routed to the
++        # MTP head only and popped before the stock forward, which would
++        # otherwise materialize a redundant full-vocab fp32 CE main loss.
++        mtp_only_labels = bool(kwargs.pop("mtp_only_labels", False))
++        labels = kwargs.pop("labels") if mtp_only_labels else kwargs.get("labels")
++
+         # Force hidden_states output so _compute_mtp_loss can access the last
+         # layer's hidden state. Stock forward only returns hidden_states when
+         # output_hidden_states=True; without this the MTP early-returns None.
+@@ -838,6 +944,15 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+             return result
+ 
+         if not self.enable_mtp:
++            self._last_mtp_loss = None
++            return result
++
++        # MTP needs both the token ids and the supervised targets: label-less
++        # forwards (logprob / eval / inference) must skip the MTP loss instead
++        # of crashing inside shift_tensor(). Clear any stale stash so a later
++        # consumer cannot re-consume the previous microbatch's loss.
++        if labels is None or kwargs.get("input_ids") is None:
++            self._last_mtp_loss = None
+             return result
+ 
+         # Prefer output.hidden_states[-1] (full all-layer tuple); fall back to
+@@ -856,7 +971,7 @@ class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
+         mtp_loss = self._compute_mtp_loss(
+             hidden_states,
+             input_ids=kwargs.get("input_ids"),
+-            labels=kwargs.get("labels"),
++            labels=labels,
+             attention_mask=kwargs.get("attention_mask"),
+             position_ids=kwargs.get("position_ids"),
+             past_key_values=output.past_key_values,
+@@ -1106,18 +1221,28 @@ def _share_ngram_table(module, group=None) -> None:
+             print_rank(logger.warning, f"_share_ngram_table /dev/shm failed ({e})")
+             shm_path_list = [None]
+ 
+-    dist.broadcast_object_list(shm_path_list, src=src, group=node_group)
++    # Broadcast the path through the accelerator: Relax initializes the
++    # default process group with a single "hccl" backend (torchrun uses the
++    # mixed "cpu:gloo,npu:hccl"), and broadcast_object_list's default CPU
++    # resolution fails on an accelerator-only group. An explicit device
++    # works on both.
++    device = torch.device("npu", torch.npu.current_device()) if _IS_NPU else None
++    dist.broadcast_object_list(shm_path_list, src=src, group=node_group, device=device)
+     actual_shm_path = shm_path_list[0]
+ 
+     if actual_shm_path is not None:
+         if local_rank != 0:
++            # Install the table exactly as the source rank saved it. This
++            # rank's placeholder weight is a 0-row tensor whose dtype merely
++            # mirrors the master dtype (fp32 under an fp32 master), so casting
++            # the shared table to it would re-introduce fp32 activations into
++            # the PLE branch on every non-source rank (and allocate a private
++            # copy, defeating the mmap page-sharing).
+             shared_weight = torch.load(actual_shm_path, mmap=True, weights_only=True)
+-            if shared_weight.dtype != weight.dtype:
+-                shared_weight = shared_weight.to(weight.dtype)
+             module.ngram_embedding = nn.Embedding(
+                 rows,
+                 cols,
+-                dtype=weight.dtype,
++                dtype=shared_weight.dtype,
+                 device="cpu",
+                 _weight=shared_weight,
+             )
+diff --git a/fsdp_turbo/ops/cuda/gdn.py b/fsdp_turbo/ops/cuda/gdn.py
+index 3190b4742c..b3c85204cb 100644
+--- a/fsdp_turbo/ops/cuda/gdn.py
++++ b/fsdp_turbo/ops/cuda/gdn.py
+@@ -1,12 +1,16 @@
+ # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+ 
+ from fsdp_turbo.ops.registry import register_op
+-from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
++from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
+ 
+ 
+ @register_op("chunk_gated_delta_rule", "cuda")
+ def chunk_gdn_cuda(*args, **kwargs):
+     """Call FLA chunk GDN through the active FLA backend."""
++    from fsdp_turbo.ops.fla_compat import drop_unsupported_kwargs, stock_chunk_gated_delta_rule
++
++    chunk_gated_delta_rule = stock_chunk_gated_delta_rule()
++    drop_unsupported_kwargs(chunk_gated_delta_rule, kwargs)
+     return chunk_gated_delta_rule(*args, **kwargs)
+ 
+ 
+diff --git a/fsdp_turbo/ops/fla_compat.py b/fsdp_turbo/ops/fla_compat.py
+new file mode 100644
+index 0000000000..2dfcd54dd6
+--- /dev/null
++++ b/fsdp_turbo/ops/fla_compat.py
+@@ -0,0 +1,47 @@
++# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
++"""Helpers for calling FLA kernels robustly across environments.
++
++mindspeed's megatron_adaptor (imported by e.g. the Relax serve stack when it
++registers the megatron backend) globally replaces
++fla.ops.gated_delta_rule.chunk_gated_delta_rule — the package attribute —
++with its AscendC flash_gated_delta_rule, whose autograd Function
++unconditionally saves q/k/v/g/beta/A for backward and whose signature lacks
++upstream kwargs such as skip_recompute. Importing from the source submodule
++bypasses the attribute patch (the stock chunk kernel honors
++skip_recompute=True by recomputing the chunked recurrent states in
++backward), and dropping unsupported kwargs keeps both the stock FLA and the
++mindspeed-patched entry points working.
++"""
++
++import inspect
++import logging
++
++logger = logging.getLogger(__name__)
++
++_drop_warned = set()
++
++
++def drop_unsupported_kwargs(fn, kwargs):
++    """Drop kwargs the active FLA backend does not accept."""
++    sig = inspect.signature(fn)
++    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
++        return
++    unsupported = sorted(k for k in kwargs if k not in sig.parameters)
++    for k in unsupported:
++        kwargs.pop(k)
++    if unsupported:
++        key = (getattr(fn, "__name__", repr(fn)), tuple(unsupported))
++        if key not in _drop_warned:
++            _drop_warned.add(key)
++            logger.warning(
++                "fla backend %s does not accept kwargs %s; dropping them",
++                key[0],
++                ", ".join(unsupported),
++            )
++
++
++def stock_chunk_gated_delta_rule():
++    """Return the stock FLA chunk GDN kernel, bypassing attribute patches."""
++    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule
++
++    return chunk_gated_delta_rule
+diff --git a/fsdp_turbo/ops/npu/gdn.py b/fsdp_turbo/ops/npu/gdn.py
+index bac257b3c2..c266634eea 100644
+--- a/fsdp_turbo/ops/npu/gdn.py
++++ b/fsdp_turbo/ops/npu/gdn.py
+@@ -6,7 +6,7 @@ import logging
+ from fsdp_turbo.ops.registry import register_op
+ from fsdp_turbo.utils.device import IS_FLA_NPU_AVAILABLE, IS_MINDSPEED_OPS_AVAILABLE
+ from fsdp_turbo.utils.log import log_warning_once
+-from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
++from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -15,14 +15,29 @@ logger = logging.getLogger(__name__)
+ def chunk_gdn_npu(*args, **kwargs):
+     """Run GDN with the selected NPU implementation."""
+     if IS_FLA_NPU_AVAILABLE and IS_MINDSPEED_OPS_AVAILABLE:
+-        from fsdp_turbo.ops.npu.chunk_gdn_ascendc import chunk_gdn_ascendc
+-
+-        return chunk_gdn_ascendc(*args, **kwargs)
++        try:
++            from fsdp_turbo.ops.npu.chunk_gdn_ascendc import chunk_gdn_ascendc
++        except ImportError as e:
++            # An older fla_npu wheel can pass the IS_FLA_NPU_AVAILABLE probe
++            # yet lack part of the AscendC GDN entry points (e.g.
++            # chunk_gated_delta_rule_bwd); degrade like the sibling NPU ops.
++            log_warning_once(
++                logger,
++                f"AscendC GDN implementation is unavailable ({e}); "
++                "falling back to the triton implementation.",
++            )
++        else:
++            return chunk_gdn_ascendc(*args, **kwargs)
+     else:
+         log_warning_once(
+             logger, "AscendC GDN implementation is unavailable; falling back to the triton implementation."
+         )
+-        return chunk_gated_delta_rule(*args, **kwargs)
++
++    from fsdp_turbo.ops.fla_compat import drop_unsupported_kwargs, stock_chunk_gated_delta_rule
++
++    chunk_gated_delta_rule = stock_chunk_gated_delta_rule()
++    drop_unsupported_kwargs(chunk_gated_delta_rule, kwargs)
++    return chunk_gated_delta_rule(*args, **kwargs)
+ 
+ 
+ @register_op('fused_recurrent_gated_delta_rule', 'npu')
+diff --git a/fsdp_turbo/ops/npu/grouped_matmul.py b/fsdp_turbo/ops/npu/grouped_matmul.py
+index e6e08ddabd..95feac8ea2 100644
+--- a/fsdp_turbo/ops/npu/grouped_matmul.py
++++ b/fsdp_turbo/ops/npu/grouped_matmul.py
+@@ -1,3 +1,5 @@
++import logging
++
+ import torch
+ from fsdp_turbo.ops.registry import register_op
+ 
+@@ -6,6 +8,88 @@ try:
+ except ImportError:
+     torch_npu = None
+ 
++logger = logging.getLogger(__name__)
++
++# aclnnGroupedMatmulV5 rejects weight tensorLists longer than 128 entries
++# ("Length of tensorList should not exceed 128", error 161002 ? hit by
++# Qwen3.5-35B-A3B's 256 experts at expert_parallel_size=1). Passing the stacked
++# expert weights as ONE packed 3D tensor keeps the tensorList length at 1 for
++# any expert count, avoids per-expert transpose views, and needs no
++# device->host group_list sync. The chunked-list path stays as a fallback for
++# stacks whose runtime rejects the packed form.
++_GMM_MAX_GROUPS = 128
++_gmm_packed_ok = None  # None = untested; resolved on the first grouped call
++
++
++def _grouped_matmul_with_fallback(x, weight_packed, bias, group_list, group_list_type):
++    """One grouped matmul (split_item=2): packed 3D weight first, chunked lists on rejection.
++
++    ``x``: packed rows [M, K] ordered by group; ``weight_packed``: [G, K, N]
++    (forward, x @ W[g]) or [G, N, K] (dgrad, x @ W[g] with W[g] in linear
++    convention); ``group_list``: per-group row counts (int64 tensor, len G).
++    """
++    global _gmm_packed_ok
++    if _gmm_packed_ok is not False:
++        try:
++            out = torch_npu.npu_grouped_matmul(
++                [x],
++                [weight_packed],
++                bias=bias,
++                group_list=group_list,
++                split_item=2,
++                group_type=0,
++                group_list_type=group_list_type,
++            )[0]
++            if _gmm_packed_ok is None:
++                _gmm_packed_ok = True
++                logger.info(
++                    "npu_grouped_matmul: packed 3D weight form accepted "
++                    "(tensorList len 1, %s groups) ? no expert-count limit",
++                    weight_packed.shape[0],
++                )
++            return out
++        except RuntimeError as exc:
++            if _gmm_packed_ok:
++                raise  # packed form already proven on this stack: real error
++            _gmm_packed_ok = False
++            logger.warning(
++                "npu_grouped_matmul: packed 3D weight form rejected (%s); "
++                "falling back to <=%s-group chunked calls",
++                exc,
++                _GMM_MAX_GROUPS,
++            )
++
++    # Chunked fallback: <=_GMM_MAX_GROUPS weight entries per call. Needs the
++    # counts on host to slice the packed rows, which syncs the stream once.
++    group_sizes = group_list.tolist() if torch.is_tensor(group_list) else list(group_list)
++    num_groups = len(group_sizes)
++    outputs = []
++    start = 0  # row offset into the packed inputs
++    for g0 in range(0, num_groups, _GMM_MAX_GROUPS):
++        sub_sizes = group_sizes[g0 : g0 + _GMM_MAX_GROUPS]
++        m = sum(sub_sizes)
++        if m == 0:
++            continue  # this expert block has no rows: contributes nothing
++        sub_group_list = (
++            torch.tensor(sub_sizes, device=group_list.device, dtype=group_list.dtype)
++            if torch.is_tensor(group_list)
++            else sub_sizes
++        )
++        sub_weights = [weight_packed[g] for g in range(g0, g0 + len(sub_sizes))]
++        outputs.append(
++            torch_npu.npu_grouped_matmul(
++                [x[start : start + m]],
++                sub_weights,
++                bias=bias,
++                group_list=sub_group_list,
++                split_item=2,
++                group_type=0,
++                group_list_type=group_list_type,
++            )[0]
++        )
++        start += m
++    return torch.cat(outputs, dim=0) if outputs else x.new_empty((0, weight_packed.shape[-1]))
++
+ 
+ class GroupedMatmul(torch.autograd.Function):
+     @staticmethod
+@@ -18,29 +102,18 @@ class GroupedMatmul(torch.autograd.Function):
+ 
+         ctx.group_list_type = group_list_type
+ 
+-        # Get weight chunks
+-        weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
+-
+-        # Weights follow the linear-layer convention [output_dim, input_dim] per expert.
+-        # Transpose to [input_dim, output_dim] so that input [M, K] @ weight.T [K, N] = output [M, N].
+-        # Always transpose rather than guessing from shape, since shape-based detection is
+-        # unreliable when input_dim == output_dim (square weight matrices).
+-        # With one x/weight/y, split-M selects the packed-weight API:
+-        # its sole weight must keep the expert axis [1, K, N].
+-        weights_for_matmul = [weights.transpose(1, 2)] if weights.shape[0] == 1 else [w.T for w in weight_chunks]
++        # Weights follow the linear-layer convention [G, output_dim, input_dim]
++        # stacked per expert. The packed form [G, input_dim, output_dim]
++        # (tensorList length 1) computes x[m] @ W[g] per group ? identical math
++        # to the per-expert [w.T for w in chunks] list, without the 128-entry
++        # tensorList limit or per-expert transpose views.
++        weights_for_matmul = weights.transpose(1, 2)
+ 
+         ctx.save_for_backward(input_tensor, weights)
+ 
+-        fwd_output = torch_npu.npu_grouped_matmul(
+-            [input_tensor],
+-            weights_for_matmul,
+-            bias=weights_bias,
+-            group_list=ctx.group_list,
+-            split_item=2,
+-            group_type=0,
+-            group_list_type=ctx.group_list_type,
+-        )[0]
+-        return fwd_output
++        return _grouped_matmul_with_fallback(
++            input_tensor, weights_for_matmul, weights_bias, ctx.group_list, ctx.group_list_type
++        )
+ 
+     @staticmethod
+     def backward(ctx, grad_output):
+@@ -48,20 +121,9 @@ class GroupedMatmul(torch.autograd.Function):
+         inp, weights = ctx.saved_tensors
+         group_list_type = ctx.group_list_type
+ 
+-        # Get weight chunks (original [output_dim, input_dim] format)
+-        weight_chunks = [weights] if weights.shape[0] == 1 else [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
+-
+-        # Calculate input gradient: grad_output [M, N] @ weight [N, K] = grad_input [M, K].
+-        # Forward used transposed weights, so the original weights are used directly here.
+-        grad = torch_npu.npu_grouped_matmul(
+-            [grad_output],
+-            weight_chunks,
+-            bias=None,
+-            group_list=group_list,
+-            split_item=2,
+-            group_type=0,
+-            group_list_type=group_list_type,
+-        )[0]
++        # Input gradient: grad_output [M, N] @ W[g] [N, K] = grad_input [M, K].
++        # Packed weight is the original [G, N, K] stack (no transpose).
++        grad = _grouped_matmul_with_fallback(grad_output, weights, None, group_list, group_list_type)
+ 
+         # Calculate weight gradient (K split gmm): grad_weight = inp^T @ grad_output = [K, N]
+         grad_weight = torch_npu.npu_grouped_matmul(

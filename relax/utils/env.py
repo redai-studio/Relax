@@ -288,6 +288,12 @@ class Envs(metaclass=_EnvsMeta):
     # Initialization/resume also records a fresh comparison baseline; requires STATS_DIR.
     RELAX_DSV4_FP4_STATS_INTERVAL = EnvProperty("RELAX_DSV4_FP4_STATS_INTERVAL", int, 10)
 
+    # ------------- FSDPTurbo backend checkpointing -------------
+    # DCP sharded checkpoints are the default; set to "0" for legacy rank-0 full-gather HF checkpoints.
+    RELAX_FSDPTURBO_CKPT_DCP = EnvProperty("RELAX_FSDPTURBO_CKPT_DCP", bool, True)
+    # Optional HF export for external consumers; rank-0 gather is expensive and resume never reads it.
+    RELAX_FSDPTURBO_CKPT_EXPORT_HF = EnvProperty("RELAX_FSDPTURBO_CKPT_EXPORT_HF", bool, False)
+
     # ------------- Compiled kernel cache -------------
     RELAX_KERNEL_CACHE_DIR = EnvProperty("RELAX_KERNEL_CACHE_DIR", str, None)
     RELAX_KERNEL_CACHE_LOCAL_DIR = EnvProperty("RELAX_KERNEL_CACHE_LOCAL_DIR", str, None)
@@ -310,6 +316,8 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_EXTRA_MODULES = EnvProperty("RELAX_EXTRA_MODULES", str, "")
     RELAX_PROPAGATE_ENV_VARS = EnvProperty("RELAX_PROPAGATE_ENV_VARS", str, "")
     RELAX_SKIP_NONFINITE_GRAD = EnvProperty("RELAX_SKIP_NONFINITE_GRAD", bool, False)
+    # Rollout-only NAME=VALUE pairs; NPU/CANN performance knobs can hang FSDP backward in training actors.
+    RELAX_ROLLOUT_EXTRA_ENV_VARS = EnvProperty("RELAX_ROLLOUT_EXTRA_ENV_VARS", str, "")
 
     # ------------- Env validation -------------
     RELAX_STRICT_ENV = EnvProperty("RELAX_STRICT_ENV", bool, False)

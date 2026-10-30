@@ -1,0 +1,203 @@
+# ============================================================
+# Qwen3.8-Flash-Next (qwen4_exp) — FSDPTurbo plan for Relax, 8xNPU smoke
+#
+# Usage:
+#   --train-backend fsdp_turbo --turbo-config configs/turbo_config/qwen3_8_flash_next_8npu_smoke.yaml
+#
+# Smoke profile: 2 language layers (set model.num_hidden_layers) + MTP on.
+# For the full 64-NPU run, copy this file and raise
+# distributed.fully_shard_parallel_size / expert_parallel_size to 64 and
+# model.num_hidden_layers to null (full 48 layers).
+#
+# Parallel plan for 8 NPUs: FSDP=8 + EP=8 (512 experts / 8 = 64 per card),
+# dp=1, tp=1, Ulysses CP=2: the 8 ranks all draw the same batch (Regime A) and
+# each CP pair splits the fused sequence in halves (post-fusion, inside the
+# patched Qwen4ExpModel.forward). Loss aggregation is CP-aware in Relax's SFT
+# path (model_utils.sft_microbatch_loss / sft_microbatch_nll_stats); the CP
+# gradient compensation (cp_all_reduce_forward_backward) cancels the FSDP
+# average over the fsdp domain which includes the CP pair.
+# The ~51B-param PLE n-gram embedding is VP-sharded on device and TRAINABLE
+# (distributed.vp_plan; parent module FSDP-ignored, child ngram_embedding
+# managed by vp_plan). Remove the vocab_*/vp_plan section to fall back to the
+# frozen CPU-offload path.
+# ============================================================
+
+# --- Model Configuration ---
+model:
+  model_name_or_path: "Qwen3.8-Flash-Next"
+  tokenizer_name_or_path: "Qwen3.8-Flash-Next"
+  torch_dtype: "bf16"
+  num_hidden_layers: 4          # smoke; null = full 48 layers
+  mtp_num_layers: 1             # MTP head (patched in by the actor)
+  mtp_loss_scaling_factor: 0.1
+
+# --- Optimizer Configuration ---
+# Mirrors the mjy qwen3_8 example (min_lr corrected to stay below lr).
+optimizer:
+  optimizer_type: "AdamW"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1e-8
+  lr: 1.0e-5
+  warmup_ratio: 0.1
+  lr_scheduler_type: "CosineAnnealingLR"
+  min_lr: 1.0e-6
+  clip_grad: 1.0
+  clip_grad_norm_type: 2.0
+
+# --- Run Configuration ---
+run:
+  seed: 42
+  # Relax drives the step count; max_steps <= 0 spans one optimizer step
+  # per rollout (T_max = --num-rollout for SFT).
+  max_steps: -1
+  logging_steps: 1
+
+# --- Distributed Configuration ---
+distributed:
+  data_parallel_size: 1
+  fully_shard_parallel_size: 8
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 2
+  expert_parallel_size: 8
+  expert_fully_shard_parallel_size: 1
+  expert_data_parallel_size: 1
+
+  # VP/VFSDP for the huge PLE n-gram embedding (~51B params bf16): shards
+  # the table's vocab dim across ranks and routes lookups with an all-to-all
+  # dispatcher, keeping the table ON DEVICE and TRAINABLE (materialized
+  # before the FSDPTurbo wrap — see actor.py::_build_qwen4_exp_turbo).
+  # Mirrors the FSDPTurbo qwen3_8 example. vp_plan requires
+  # vocab_parallel_size > 1; remove this whole section to fall back to the
+  # frozen CPU-offload path. Shrink the table for smoke runs with the
+  # NGRAM_VOCAB_SIZE_BASE env var (read by actor.py, same as the example).
+  vocab_parallel_size: 8
+  vocab_fully_shard_parallel_size: 1
+  vocab_data_parallel_size: 1
+  vp_plan:
+    apply_modules:
+      - model.language_model.layers.{*}.ple.ple_embedding.ngram_embedding
+
+  # --- FSDP Plan ---
+  fsdp_plan:
+    ignored_modules:
+      # Parent PLE module stays FSDP-ignored under VP too: the ngram_embedding
+      # child is VP-sharded on device and managed by vp_plan (mjy reference
+      # config keeps this entry with VP enabled).
+      - model.language_model.layers.1.ple.ple_embedding
+    apply_modules:
+      model.visual:
+        {}
+      model.visual.blocks.{*}:
+        {}
+      model.language_model.embed_tokens:
+        {}
+      model.language_model:
+        {}
+      model.language_model.layers.{*}:
+        {}
+      model.language_model.layers.{*}.linear_attn:
+        {}
+      model.language_model.layers.{*}.mlp.experts:
+        {}
+      mtp:
+        {}
+      mtp.hyper_connection_mixer:
+        {}
+      mtp.layers.{*}:
+        {}
+      mtp.layers.{*}.linear_attn:
+        {}
+      mtp.layers.{*}.mlp.experts:
+        {}
+      lm_head:
+        {}
+    param_dtype: "bf16"
+    reduce_dtype: "fp32"
+    output_dtype: "bf16"
+    cast_forward_inputs: true
+    # SFT mode has no weight sync (no colocate engines), so CPU offload of
+    # params/optimizer/gradients is safe and frees NPU memory for the
+    # [positions, vocab] logits. GRPO colocate MUST keep this false — weight
+    # sync requires training weights resident on NPU.
+    cpu_offload: true
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+    hook_modules:
+      - model.language_model.layers.{*}
+      - mtp.layers.{*}
+    fsdp_implementation: "native"
+
+  # --- Tensor Parallel Plan (inert while tensor_parallel_size == 1) ---
+  tp_plan:
+    colwise_parallel: ['*.q_proj', '*.k_proj', '*.v_proj']
+    rowwise_parallel: ['*.o_proj']
+    sequence_parallel: []
+
+  # --- Context Parallel Plan (Ulysses CP) ---
+  # Patches full-attention and GDN (linear-attention) forwards with Ulysses
+  # all-to-all wrappers, and the causal-LM loss with CP-aware cross-entropy.
+  # Full-attention target: the GENERIC sdpa_attention_forward (upstream review
+  # fix; the old modeling_qwen4_exp.eager_attention_forward target was inert
+  # under _attn_implementation="sdpa" — text attn dispatches via
+  # ALL_ATTENTION_FUNCTIONS["sdpa"], which holds the generic function). The CP
+  # patch also rewrites the registry mapping, so every module using "sdpa" gets
+  # the Ulysses wrapper. The vision tower is isolated from this wrapper by the
+  # actor's "sdpa_vision" registration (a passthrough bound to the ORIGINAL
+  # sdpa_attention_forward before patching) — vision must NOT be Ulysses-sharded
+  # (CP happens post-fusion, inside qwen4_exp_model_forward).
+  cp_plan:
+    ulysses_function_patches:
+      - target_functions:
+          - transformers.integrations.sdpa_attention.sdpa_attention_forward
+        type: full_attention
+      - target_functions:
+          - transformers.models.qwen4_exp.modeling_qwen4_exp.Qwen4ExpTextGatedDeltaNet.forward
+        type: gated_delta_net
+    loss_function_patches:
+      - target_functions:
+          - transformers.loss.loss_utils.ForCausalLMLoss
+        type: causal_lm_loss
+
+  # --- Expert Parallel Plan ---
+  ep_plan:
+    apply_modules:
+      - model.language_model.layers.{*}.mlp.experts
+      - mtp.layers.{*}.mlp.experts
+    # New FSDPTurbo renamed dispatcher "eager"/"fused" -> "all2all"; the fused
+    # vs eager permute path is now selected by use_fused_ops (default true).
+    # use_fused_ops: false keeps the exact non-fused numerics of the old
+    # `dispatcher: "eager"` runs (required for the mcore loss-parity baseline).
+    dispatcher: "all2all"
+    use_fused_ops: false
+    apply_efsdp_modules:
+      - model.language_model.layers.{*}.mlp
+      - mtp.layers.{*}.mlp
+
+# --- Module Patch Plan ---
+# Post-fusion Ulysses forward: NOT needed with the latest FSDPTurbo — the
+# model is built from fsdp_turbo's consolidated modeling_qwen4_exp, whose
+# Qwen4ExpModel.forward shards the fused multimodal sequence across the CP
+# pair *after* multimodal fusion (image tokens expand the sequence) and
+# plumbs ple_input_ids into the language model natively. The old mjy recipe
+# replaced the HF class forward via module_patches
+# (fsdp_turbo.models.qwen.qwen4_exp.qwen4_exp_model_forward); that module
+# no longer exists.
+
+# --- Memory Configuration ---
+memory:
+  recompute: true
+  recompute_plan:
+    - model.visual.blocks.{*}
+    - model.language_model.layers.{*}
+  chunk_batch: false
+  swap_activation: true
+  swap_activation_plan:
+    apply_modules:
+      - model.language_model.layers.{*}
+      - mtp.layers.{*}
+
+# --- Quantization Configuration ---
+quantization:
+  quantization_plan: null
