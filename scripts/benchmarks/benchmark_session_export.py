@@ -1,12 +1,46 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU Session export benchmark with real assembly and a simulated backend.
+r"""CPU Session export benchmark with real assembly and a simulated backend.
 
-Run from the repository root with PYTHONPATH=.; model weights and GPUs are not
-needed. The default tokenizer is real, but inference and agent processes are
-simulated. Each measured repetition runs in a fresh subprocess. See
-docs/benchmarks/session-export.md for workload, timing, and interpretation
-details.
+Uses the production finalizer, SessionForest and TrainingFieldArtifact. Inference
+and agent processes are simulated; final cleanup is a result collector. HTTPX
+ASGI runs in-process, so this measures assembly and local scheduling rather
+than Ray transport or GPU inference. Only tokenizer files are needed.
+
+Run on Linux from the repository root with one shared Python environment and
+local tokenizer directory. Each variant imports native code from its own
+checkout in a fresh worker process. To prepare the baseline::
+
+    git worktree add --detach ../Relax-export-baseline BASE_COMMIT
+
+For the original comparison, BASE_COMMIT is
+657f8fb961af9ab4b648e7d58280055dbfe4b626. Example environment::
+
+    export PYTHONPATH=.
+    export CUDA_VISIBLE_DEVICES=""
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export TOKENIZERS_PARALLELISM=false
+
+Usage::
+
+    taskset -c 0-7 python scripts/benchmarks/benchmark_session_export.py \
+        --variants baseline=../Relax-export-baseline optimized=. \
+        --tokenizer /path/to/tokenizer --turns 64 --concurrency 8 \
+        --exports 16 --tokens-per-turn 2048 --observation-tokens 512 \
+        --short-rate 100 --short-requests 500 --probe-ms 2 \
+        --warmups 1 --runs 3 --json-out outputs/session-export.json
+
+Use --turns 8 64 --concurrency 1 8 for the full matrix. All planned long exports
+and short health requests must complete. Request latency includes queue time;
+loop probes retain missed deadlines. Each worker warms assembly and health;
+--warmups additionally discards full runs before measurement. P99 is nearest
+rank within each run, followed by repeated-run median, range and sample stdev.
+
+CPU time includes all worker threads; RSS samples cover the worker, excluding
+its private supervisor. Content digests are compared after timing. --profile
+adds a separate diagnostic CPU profile; its trial is not performance evidence.
+The private supervisor owns subprocess cleanup on success, failure or timeout.
 """
 
 from __future__ import annotations
