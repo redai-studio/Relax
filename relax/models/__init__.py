@@ -61,6 +61,15 @@ except Exception as _e:
     get_logger(__name__).warning("Failed to import relax.models.kimi_k3: %s", _e)
 
 
+# Register Qwen2-VL separately from upstream's Qwen2.5-VL architecture.
+try:
+    from relax.models import qwen2_vl  # noqa: F401
+except Exception as _e:
+    from relax.utils.logging_utils import get_logger
+
+    get_logger(__name__).warning("Failed to import relax.models.qwen2_vl: %s", _e)
+
+
 # Only advertise what actually got bound: exporting an unbound name here makes
 # `from relax.models import *` die with an unrelated AttributeError.
 __all__ = [_name for _name in _OMNI_NAMES if _name in globals()]

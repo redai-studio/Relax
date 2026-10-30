@@ -39,6 +39,8 @@ def make_args(**overrides):
     "overrides,prepack,prefetch,image",
     [
         ({}, True, False, False),
+        ({"task_type": "seq_contrast"}, False, True, False),
+        ({"task_type": "seq_contrast", "max_staleness": 0}, False, False, False),
         ({"loss_type": "dpo"}, False, True, False),
         ({"loss_type": "rm"}, False, True, False),
         ({"loss_type": "dpo", "max_staleness": 0}, False, False, False),
@@ -76,6 +78,15 @@ def test_legacy_switches_do_not_override_automatic_selection(enabled):
     args.max_staleness = 0
     configure_sft_data_pipeline(args)
     assert not args.sft_async_prepack and not args.sft_train_data_prefetch
+
+
+def test_retrieval_pairs_keep_raw_prefetch_when_legacy_prepack_is_requested():
+    args = make_args(task_type="seq_contrast", sft_async_prepack=True)
+    configure_sft_data_pipeline(args)
+
+    assert args.per_rank_fetch and args.sft_train_data_prefetch
+    assert not args.sft_async_prepack
+    assert args.max_staleness == 1
 
 
 @pytest.mark.parametrize("per_rank", [False, True])

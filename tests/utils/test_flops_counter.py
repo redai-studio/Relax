@@ -20,6 +20,22 @@ class Config:
             setattr(self, key, value)
 
 
+@pytest.mark.parametrize("model_type", ["qwen2_vl", "qwen2_5_vl"])
+def test_qwen_vl_nested_text_config_matches_flat_config(model_type, monkeypatch):
+    monkeypatch.setattr("relax.utils.training.flops_counter.get_device_peak_flops", lambda **kwargs: 148.0)
+    text = {
+        "hidden_size": 1536,
+        "vocab_size": 151658,
+        "num_hidden_layers": 28,
+        "num_key_value_heads": 2,
+        "num_attention_heads": 12,
+        "intermediate_size": 8960,
+    }
+    nested = FlopsCounter(Config({"model_type": model_type, "text_config": text}))
+    flat = FlopsCounter(Config({"model_type": model_type, **text}))
+    assert nested.estimate([31, 33], 1.0) == flat.estimate([31, 33], 1.0)
+
+
 # ---------------------------------------------------------------------------
 # GPU peak FLOPS tests
 # Device-name inputs are synthetic fixtures, not measured hardware.

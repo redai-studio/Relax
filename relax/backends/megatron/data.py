@@ -15,7 +15,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.training.global_vars import get_args
 from torch.nn.utils.rnn import pad_sequence
 
-from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
+from relax.engine.sft.runtime import is_preference_mode, is_sequence_contrast_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
@@ -1190,6 +1190,37 @@ def _get_preference_data_iterator(
     return [iterator], [len(branch_bins)]
 
 
+def _get_retrieval_data_iterator(args: Namespace, rollout_data: RolloutBatch) -> tuple[list[DataIterator], list[int]]:
+    """Keep the step's complete DP negative set in one shared-loop
+    microbatch."""
+    local_pairs = int(rollout_data.get("retrieval_pair_count", 0))
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    alignment = int(args.data_pad_size_multiplier)
+    tokens = sum(rollout_data["total_lengths"])
+    required_tokens = (tokens + alignment - 1) // alignment * alignment
+    observations = [None] * dp_size
+    dist.all_gather_object(
+        observations,
+        (local_pairs, int(args.global_batch_size), required_tokens, int(args.max_tokens_per_gpu)),
+        group=mpu.get_data_parallel_group_gloo(with_context_parallel=False),
+    )
+    counts = {value[0] for value in observations}
+    declared = {value[1] for value in observations}
+    if len(counts) != 1 or len(declared) != 1 or local_pairs <= 0 or local_pairs * dp_size != args.global_batch_size:
+        raise ValueError("seq_contrast requires equal complete pair rows on all DP ranks and global_batch_size pairs")
+    if any(value[2] > value[3] for value in observations):
+        raise ValueError(
+            "Complete contrastive batch exceeds max_tokens_per_gpu; increase the budget or reduce global_batch_size. "
+            "Splitting it into independent InfoNCE microbatches changes the negative set."
+        )
+    if len(rollout_data["tokens"]) != 2 * local_pairs:
+        raise ValueError("Every retrieval pair must expand to exactly two adjacent sequences")
+    rollout_data["dynamic_global_batch_size"] = int(args.global_batch_size)
+    rollout_data[ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] = [int(args.global_batch_size)]
+    iterator = DataIterator(rollout_data, micro_batch_indices=[list(range(2 * local_pairs))])
+    return [iterator], [1]
+
+
 def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
@@ -1208,6 +1239,8 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    if is_sequence_contrast_mode(args):
+        return _get_retrieval_data_iterator(args, rollout_data)
     if is_preference_mode(args):
         return _get_preference_data_iterator(args, rollout_data, max_tokens_per_gpu)
 
