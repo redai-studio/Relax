@@ -187,17 +187,30 @@ if [[ "${CE_ENABLE_AFFINITY:-1}" == "0" ]]; then
     MISC_ARGS+=(--no-enable-affinity)
 fi
 
+TRAIN_MODE_ARGS=(--fully-async)
+RESOURCE_CONFIG='{"actor": [1, 4], "rollout": [1, 2], "advantages": [1, 0]}'
+REF_ACTOR_ARGS=(--ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}')
+case "${RELAX_ELASTIC_TRAIN_MODE:-fully-async}" in
+   fully-async) ;;
+   hybrid)
+      TRAIN_MODE_ARGS=(--hybrid)
+      RESOURCE_CONFIG='{"actor": [1, 8], "rollout": [1, 2]}'
+      REF_ACTOR_ARGS=()
+      ;;
+   *) echo "Unsupported RELAX_ELASTIC_TRAIN_MODE" >&2; exit 1 ;;
+esac
+
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 4], "rollout": [1, 2], "advantages": [1, 0]}' \
+   --resource "${RESOURCE_CONFIG}" \
    --max-staleness 2 \
    --num-data-storage-units 1 \
    --num-iters-per-train-update 32 \
-   --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
-   --fully-async \
+   "${REF_ACTOR_ARGS[@]}" \
+   "${TRAIN_MODE_ARGS[@]}" \
    --use-health-check \
    --autoscaler-config "${CE_AUTOSCALER_CONFIG:-${SCRIPT_DIR}/configs/qwen35-9b-elastic-autoscaler.yaml}" \
    "${MODEL_ARGS[@]}" \

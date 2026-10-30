@@ -7,7 +7,7 @@
 - the **streaming data pipeline** of Fully Async (TransferQueue + `max-staleness` for off-policy tolerance), with
 - the **in-process weight sharing** of Colocate (TensorBackuper + `_switch_model`, so ref / actor_fwd / advantages all run on the actor's own GPUs).
 
-Concretely, Actor and Rollout still run on **separate GPU placement groups** (like Fully Async), but the actor no longer ships weights to standalone ActorFwd / Reference / Advantages services. Instead it cycles a single set of weights between `actor`, `ref`, `old_actor`, and `teacher` tags via a CPU/GPU `TensorBackuper`, computing every forward pass locally and pushing weights to rollout through the sync `UpdateWeightFromTensor` path.
+Concretely, Actor and Rollout still run on **separate GPU placement groups** (like Fully Async), but the actor no longer ships weights to standalone ActorFwd / Reference / Advantages services. Instead it cycles a single set of weights between `actor`, `ref`, `old_actor`, and `teacher` tags via a CPU/GPU `TensorBackuper`, computing every forward pass locally and pushing the `actor` snapshot to rollout through DCS (Distributed Checkpoint Service).
 
 ### Mode Comparison
 
@@ -15,7 +15,7 @@ Concretely, Actor and Rollout still run on **separate GPU placement groups** (li
 | ------------------- | ---------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
 | **GPU layout**      | Actor and Rollout time-share same GPUs   | Actor / Rollout / ActorFwd / Reference each have own GPUs    | Actor and Rollout on separate GPUs; ref / actor_fwd / adv share actor's GPUs        |
 | **Data pipeline**   | TransferQueue, batch-synchronous         | TransferQueue + StreamingDataLoader, fully streaming         | TransferQueue + sub-batch streaming (`num-iters-per-train-update`)                  |
-| **Weight sync**     | In-process tensor copy                   | NCCL broadcast via DCS (Checkpoint Engine)                   | Sync `UpdateWeightFromTensor` to rollout; TensorBackuper for ref/actor_fwd          |
+| **Weight sync**     | In-process tensor copy                   | NCCL broadcast via DCS (Checkpoint Engine)                   | DCS to rollout; TensorBackuper for ref/actor_fwd          |
 | **Staleness**       | `max_staleness = 0` (strict on-policy)   | Configurable `max_staleness`                                 | Configurable `max_staleness`                                                        |
 | **Roles deployed**  | `actor`, `critic`, `rollout`             | `actor`, `critic`, `rollout`, `advantages`, `reference`, `actor_fwd` | `actor`, `critic`, `rollout` (same as Colocate; ref/actor_fwd live inside actor)    |
 | **DP token balance**| `--balance-data` on static/seqlen path   | Dynamic batch auto-balances DP tokens; `--balance-data` is accepted with no extra effect | Dynamic batch auto-balances DP tokens; static/seqlen path can use `--balance-data`   |
@@ -97,7 +97,7 @@ Passing `--fully-async --colocate` directly is rejected; use `--hybrid` instead.
 │       │    ├─ advantages    (in-process)  │              │                 │
 │       │    └─ train         (switch:actor)│                                │
 │       └──────────────┬────────────────────┘              │                 │
-│                      │ UpdateWeightFromTensor (sync) ───┘                  │
+│                      │ DCS actor snapshot (sync)    ───┘                   │
 └──────────────────────┼─────────────────────────────────────────────────────┘
                        ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -129,7 +129,7 @@ ______________________________________________________________________
 
 3. **Train on the merged batch and push weights**
 
-   A single `train(...)` call runs the optimizer step on the merged batch. Afterwards the actor backs up the new weights to the `actor` tag and (on the ref-update interval) refreshes the `ref` tag, then calls `self.update_weights()` to push the updated weights to rollout via `UpdateWeightFromTensor`.
+   A single `train(...)` call runs the optimizer step on the merged batch. Afterwards the actor backs up the new weights to the `actor` tag and (on the ref-update interval) refreshes the `ref` tag, then pushes that snapshot to rollout through `update_weights_fully_async(..., rollout_only=True)`. DCS shares its synchronization lock and live engine topology with elastic scale-out and scale-in.
 
 The sub-batched forward keeps peak activation memory bounded — matching Fully Async behavior — while the merged training step preserves Colocate-style global statistics.
 
@@ -224,9 +224,9 @@ With `--fully-async` or `--hybrid` plus `--use-dynamic-batch-size`, DP token bal
 
 ### Rollout sees stale weights for a long time
 
-Hybrid uses the sync `UpdateWeightFromTensor` path at the end of each `train_hybrid` call. If you see large weight-update gaps, check:
+Hybrid pushes its actor snapshot through DCS at the end of each `train_hybrid` call. If you see large weight-update gaps, check:
 
-- `update_weights()` timing in actor logs
+- `update_weights_fully_async()` timing in actor logs
 - Whether rollout health-checks are paging the actor (`_check_services_health()` is called before weight sync)
 
 ______________________________________________________________________
@@ -235,7 +235,6 @@ ______________________________________________________________________
 
 Planned follow-ups for hybrid mode:
 
-- **Integrate DCS for weight sync** — replace the current synchronous `UpdateWeightFromTensor` path with the Distributed Checkpoint Service so weight broadcast to rollout can overlap with the next training iteration, closing the remaining sync gap at the end of every `train_hybrid` call.
 - **Split `train_actor` into `num_iters_per_train_update` iterations** — today `num_iters_per_train_update` only chunks the forward phase; the merged training step still runs once on the full global batch. Extend the actor train step to also iterate `num_iters_per_train_update` times so optimizer updates can be pipelined with TransferQueue consumption and peak training-side memory drops further.
 
 Related docs:
@@ -243,3 +242,5 @@ Related docs:
 - [Fully Async Training Pipeline](./fully-async-training.md) — the streaming-data engine hybrid borrows
 - [Architecture](./architecture.md) — overview of Relax's service layering
 - [Update Weights Pipeline](./update-weights-pipeline.md) — how `UpdateWeightFromTensor` and DCS differ
+
+For the 9B text elastic CE recipe, use `scripts/training/text/run-qwen35-9B-elastic-rollout-hybrid.sh`. It starts eight actor GPUs (TP4, DP2) and two single-GPU rollout engines on two eight-GPU workers, and uses the same autoscaler policy as the full-async elastic recipe. Hybrid requires the weights backuper; `--disable-weights-backuper` is rejected.

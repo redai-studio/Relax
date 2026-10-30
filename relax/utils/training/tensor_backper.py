@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -12,6 +14,17 @@ _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
 
 _NON_BLOCKING = device_utils.use_non_blocking_copy()
 _PIN_MEMORY = device_utils.use_pinned_host_memory()
+
+
+def _attach_tp_attrs(snapshot: torch.Tensor, param: torch.Tensor, backfill_defaults) -> None:
+    """Preserve TP metadata, including Relax's parallel_mode, on snapshots."""
+    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+
+    copy_tensor_model_parallel_attributes(snapshot, param)
+    if hasattr(param, "parallel_mode"):
+        snapshot.parallel_mode = param.parallel_mode
+    # Unmarked parameters need Megatron's non-parallel defaults.
+    backfill_defaults(snapshot)
 
 
 class TensorBackuper(ABC):
@@ -60,10 +73,13 @@ class _TensorBackuperNormal(TensorBackuper):
 
     @torch.no_grad()
     def backup(self, tag: str) -> None:
+        from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
+
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             if name not in backup_dict:
                 backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+                _attach_tp_attrs(backup_dict[name], param, set_defaults_if_not_set_tensor_model_parallel_attributes)
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_module.synchronize()
 
