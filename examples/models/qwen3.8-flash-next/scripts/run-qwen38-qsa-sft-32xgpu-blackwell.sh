@@ -22,10 +22,16 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 # Use the unified image's installed Bridge, Python dependencies and HybridEP.
 # Do not prepend the pre-refactor /opt/qwen38-flash-next runtime.
 : "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}"
+case "${QWEN38_SFT_MODALITY:-multimodal}" in
+    text|multimodal) ;;
+    *) echo "QWEN38_SFT_MODALITY must be text or multimodal" >&2; exit 2 ;;
+esac
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
 export EXP_NAME="${EXP_NAME:-qwen38-qsa-32xb300}" # gitleaks:allow -- stable experiment/checkpoint identity
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa}"
+# Preserve this recipe's setting when ray-job.sh resets the generic variable.
+export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS="${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
@@ -53,14 +59,15 @@ ENV_ARGS=(
     "MEGATRON=${MEGATRON}"
     "RELAX=${RELAX}"
     PYTHONNOUSERSITE=1
-    CUDA_DEVICE_MAX_CONNECTIONS=32
+    "CUDA_DEVICE_MAX_CONNECTIONS=${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS}"
+    "NVTE_USE_CUTLASS_GROUPED_GEMM=${NVTE_USE_CUTLASS_GROUPED_GEMM:-0}"
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
     TOKENIZERS_PARALLELISM=false
     RELAX_QWEN38_QSA_FUSED_ATTENTION=0
     RELAX_QWEN38_RETAIN_QSA_ATTENTION=0
     RELAX_QWEN38_QSA_FIXED_POOL=0
     RELAX_QWEN38_QSA_SPARSE_BLOCKMASK=1
-    RELAX_QWEN38_RECORD_FUNCTION_TAGS=1
+    "RELAX_QWEN38_RECORD_FUNCTION_TAGS=${RELAX_QWEN38_RECORD_FUNCTION_TAGS:-1}"
     RELAX_QWEN38_QSA_LOCAL_QUERY=1
     RELAX_QWEN38_ROUTER_SORTED_REPLAY=1
     RELAX_QWEN38_QSA_ROUTED_QKV=1
@@ -70,6 +77,9 @@ ENV_ARGS=(
     RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG=1
     RELAX_QWEN38_FLA_CONV_CACHE_REUSE=1
     RELAX_QWEN38_QSA_COMMUNITY_BACKEND=mixed
+    "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=${RELAX_QWEN38_QSA_MIXED_LONG_BACKEND:-grouped}"
+    "RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN=${RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN:--1}"
+    "RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS=${RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS:-0}"
     "QWEN38_WORKSPACE=${RELAX}"
     "SAVE_DIR=${SAVE_DIR}"
     RELAX_SFT_RESIDENT_PARAM_OVERLAP=0
@@ -84,7 +94,7 @@ ENV_ARGS=(
     TRITON_CACHE_AUTOTUNING=1
     TORCHINDUCTOR_FX_GRAPH_CACHE=1
     TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE=1
-    "RELAX_AUTOTUNE_LOG_DIR=${SAVE_DIR}/autotune"
+    "RELAX_AUTOTUNE_LOG_DIR=${RELAX_AUTOTUNE_LOG_DIR-${SAVE_DIR}/autotune}"
     RELAX_QWEN38_HC_FUSED_MIX=1
     RELAX_SFT_SELECTIVE_LOGITS=1
     RELAX_QWEN38_QSA_TP_SELECTOR=1
@@ -123,14 +133,15 @@ print(json.dumps(runtime))
 PYRUNTIME
 )
 
-# PP stage layers: 12 / 14 / 14 / 8; DP = 32 / TP2 / PP4 / CP1 = 4.
+# Multimodal default: 12 / 14 / 14 / 8. Text recipe: 14 / 12 / 12 / 10.
+# DP = 32 / TP2 / PP4 / CP1 = 4 in both cases.
 PARALLEL_ARGS=(
     --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 4
     --context-parallel-size 1
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
-    --pipeline-model-parallel-layout 'Et*12|t*14|t*14|t*8mL'
+    --pipeline-model-parallel-layout "${QWEN38_PP_LAYOUT:-Et*12|t*14|t*14|t*8mL}"
     --sequence-parallel
     --moe-token-dispatcher-type flex
     --moe-flex-dispatcher-backend hybridep
@@ -184,17 +195,22 @@ SFT_ARGS=(
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
     --mtp-detach-paths none
-    --eval-interval 100
-    --multimodal-keys '{"image":"images"}'
-    --image-max-token-num 128
-    --sft-image-preprocess-on-rank
+    --eval-interval "${EVAL_INTERVAL:-100}"
+    --sft-packing-strategy balanced
 )
+if [[ "${QWEN38_SFT_MODALITY:-multimodal}" == multimodal ]]; then
+    SFT_ARGS+=(
+        --multimodal-keys '{"image":"images"}'
+        --image-max-token-num 128
+        --sft-image-preprocess-on-rank
+    )
+fi
 
 OPTIMIZER_ARGS=(
     --optimizer adam
     --lr 2e-5
     --lr-decay-style cosine
-    --lr-decay-iters 2023
+    --lr-decay-iters "${LR_DECAY_ITERS:-2023}"
     --min-lr 2e-6
     --lr-warmup-fraction 0.05
     --lr-warmup-init 0
@@ -216,7 +232,6 @@ MISC_ARGS=(
     --attention-softmax-in-fp32
     --attention-backend flash
     --accumulate-allreduce-grads-in-fp32
-    --use-health-check
     --train-env-vars "${TRAIN_ENV_JSON}"
     --moe-flex-dispatcher-num-sms 80
     # Keep the default balanced packing used by this baseline.
@@ -225,6 +240,9 @@ MISC_ARGS=(
     --overlap-grad-reduce
     --overlap-param-gather
 )
+if [[ "${QWEN38_SFT_HEALTH_CHECK:-1}" == 1 ]]; then
+    MISC_ARGS+=(--use-health-check)
+fi
 
 METRICS_ARGS=(
     --use-clearml
@@ -261,7 +279,8 @@ runtime = json.loads(sys.argv[2])
 # Only record explicitly selected training settings, not inherited credentials.
 selected = {key: value for key, value in runtime.get("env_vars", {}).items()
             if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_")) or key in
-            ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT")}
+            ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT",
+             "NVTE_USE_CUTLASS_GROUPED_GEMM")}
 Path(sys.argv[1]).write_text(json.dumps({"argv": sys.argv[3:], "env_vars": selected}, indent=2) + "\n")
 PYCONFIG
 fi

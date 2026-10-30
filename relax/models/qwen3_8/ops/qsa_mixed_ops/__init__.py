@@ -20,9 +20,6 @@ def attention_for_selection(
 ) -> Tensor:
     """Preserve native selected blocks, expanding the causal tail exactly
     once."""
-    from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import attention
-    from relax.models.qwen3_8.ops.qsa_mixed_ops.routes import token_routes
-
     batch, length, heads, width = query.shape
     if width != 256 or heads != 12 or key.shape[2:] != (1, 256):
         raise NotImplementedError("Mixed QSA requires TP2 local geometry 12Q/1KV/D256")
@@ -31,6 +28,18 @@ def attention_for_selection(
     bounds = getattr(selection, "_relax_qsa_mixed_bounds", None) if is_thd else (0, length)
     if bounds is None or bounds[0] != 0 or bounds[-1] != length:
         raise ValueError("Mixed packed QSA requires producer CPU document boundaries")
+    from relax.utils.env import Envs
+
+    long_backend = Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND
+    if long_backend == "cudnn_pr1765":
+        from relax.models.qwen3_8.ops.qsa_mixed_ops.cudnn import attention_for_selection as cudnn_mixed
+
+        return cudnn_mixed(query, key, value, selection, scale, bounds)
+    if long_backend != "grouped":
+        raise ValueError(f"Unknown mixed QSA long backend: {long_backend}")
+    from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import attention
+    from relax.models.qwen3_8.ops.qsa_mixed_ops.routes import token_routes
+
     # The source defines budget=width-4 and reads each selected block at stride 4.
     # token_routes has three possible tail tokens; reserve the fourth column.
     indices = torch.nn.functional.pad(token_routes(selection, batch, length), (0, 1), value=-1)
