@@ -56,6 +56,7 @@ def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mt
         save_hf="export",
         eval_interval=5,
         eval_prompt_data=["validation"],
+        sft_predict_interval=None,
     )
 
     assert should_skip_sft_weight_management(args)
@@ -76,7 +77,9 @@ def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mt
 )
 @pytest.mark.parametrize("mtp_only_training", [False, True])
 def test_sft_keeps_weight_management_for_consumers_and_other_losses(overrides, consumers, mtp_only_training):
-    args = Namespace(**{"loss_type": "sft", "mtp_only_training": mtp_only_training, **overrides})
+    args = Namespace(
+        **{"loss_type": "sft", "mtp_only_training": mtp_only_training, "sft_predict_interval": None, **overrides}
+    )
 
     assert not should_skip_sft_weight_management(args, **consumers)
 
@@ -89,6 +92,7 @@ def test_image_sft_attempt_is_shared_with_workers_and_changes_on_restore():
         global_batch_size=8,
         num_epoch=2,
         num_rollout=None,
+        sft_async_prepack=False,
     )
     resolve_sft_num_rollout(args)
     worker_args = pickle.loads(pickle.dumps(args))
@@ -110,4 +114,4 @@ def test_image_sft_partition_requires_shared_attempt():
 
 @pytest.mark.parametrize("loss_type,prefix", [("sft", "sft_"), ("dpo", "sft_"), ("rm", "sft_"), ("policy", "train_")])
 def test_partition_naming_preserves_non_image_modes(loss_type, prefix):
-    assert sft_partition_id(Namespace(loss_type=loss_type), 10) == f"{prefix}10"
+    assert sft_partition_id(Namespace(loss_type=loss_type, generation_task=None), 10) == f"{prefix}10"

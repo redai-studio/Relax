@@ -52,17 +52,17 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
     Returns:
         Dataset or StreamingDataset instance
     """
-    custom_prompt_path = getattr(args, "custom_prompt_path", None)
+    custom_prompt_path = args.custom_prompt_path
     custom_prompt_func = load_function(custom_prompt_path) if custom_prompt_path else None
 
-    use_streaming = getattr(args, "use_streaming_dataset", False)
+    use_streaming = args.use_streaming_dataset
 
     # === OPSD: resolve teacher-side multimodal_keys ===
     # --opd-teacher-image-key / -video-key / -audio-key are convenience flags
     # that get assembled into the teacher_multimodal_keys dict consumed by
     # build_opd_teacher_sample_fields (which populates sample.teacher_multimodal_inputs).
     teacher_mm_keys = None
-    _t_img = getattr(args, "opd_teacher_image_key", None)
+    _t_img = args.opd_teacher_image_key
     if _t_img is not None:
         teacher_mm_keys = {"image": _t_img}
         logger.info(f"OPSD: teacher_multimodal_keys = {teacher_mm_keys}")
@@ -70,10 +70,10 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
     if use_streaming:
         from relax.utils.data.streaming_dataset import StreamingDataset
 
-        buffer_size = getattr(args, "streaming_buffer_size", 10000)
-        prefetch_chunk_size = getattr(args, "prefetch_chunk_size", 32)
-        prefetch_max_cached = getattr(args, "prefetch_max_cached", 256)
-        prefetch_num_workers = getattr(args, "prefetch_num_workers", 1)
+        buffer_size = args.streaming_buffer_size
+        prefetch_chunk_size = args.prefetch_chunk_size
+        prefetch_max_cached = args.prefetch_max_cached
+        prefetch_num_workers = args.prefetch_num_workers
 
         logger.info(
             f"Using StreamingDataset with buffer_size={buffer_size}, "
@@ -101,7 +101,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             prefetch_num_workers=prefetch_num_workers,
             multimodal_config=multimodal_config,
             custom_prompt_func=custom_prompt_func,
-            teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
+            teacher_prompt_key=args.opd_teacher_prompt_key,
             teacher_multimodal_keys=teacher_mm_keys,
         )
     else:
@@ -123,7 +123,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             seed=args.rollout_seed,
             multimodal_config=multimodal_config,
             custom_prompt_func=custom_prompt_func,
-            teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
+            teacher_prompt_key=args.opd_teacher_prompt_key,
             teacher_multimodal_keys=teacher_mm_keys,
         )
 
@@ -166,11 +166,11 @@ class RolloutDataSource(DataSource):
         self.metadata = {}
 
         # Check if using streaming dataset
-        self._use_streaming = getattr(args, "use_streaming_dataset", False)
+        self._use_streaming = args.use_streaming_dataset
         self.dataset = None
 
         if args.rollout_global_dataset:
-            if getattr(args, "hf_checkpoint", None):
+            if args.hf_checkpoint:
                 prepare_model_maybe_update_args(args, completeness="metadata")
                 tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
                 processor = load_processor(args.hf_checkpoint, trust_remote_code=True)

@@ -46,7 +46,14 @@ def test_index_workers_default_override_and_validation(tmp_path, monkeypatch, wo
 
 def _args(path):
     return Namespace(
-        loss_type="sft", prompt_data=path, rollout_batch_size=2, num_epoch=1, num_rollout=None, eval_size=None
+        loss_type="sft",
+        generation_task=None,
+        sft_wholepack=False,
+        prompt_data=path,
+        rollout_batch_size=2,
+        num_epoch=1,
+        num_rollout=None,
+        eval_size=None,
     )
 
 

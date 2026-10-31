@@ -246,7 +246,7 @@ def save_rollout_result_jsonl(args, rollout_id: int, samples: list) -> None:
         rollout_id: The rollout ID (used as step number in the filename).
         samples: A list of :class:`Sample` objects from the rollout batch.
     """
-    result_dir = getattr(args, "rollout_result_dir", None)
+    result_dir = args.rollout_result_dir
     if result_dir is None:
         return
 
@@ -272,7 +272,7 @@ def save_eval_summary_jsonl(args, rollout_id: int, data: dict) -> None:
         rollout_id: The rollout ID.
         data: Eval data dict — ``{dataset_name: {"samples": list[Sample], ...}}``.
     """
-    result_dir = getattr(args, "rollout_result_dir", None)
+    result_dir = args.rollout_result_dir
     if result_dir is None:
         return
 

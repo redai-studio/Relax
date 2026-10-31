@@ -51,9 +51,9 @@ SUPPORTED_IMAGE_REF_DESCRIPTOR_KINDS = frozenset(
 
 def sft_multimodal_data_fields(args: Namespace) -> list[str]:
     """Use the same multimodal transport schema for SFT train and eval."""
-    if getattr(args, "multimodal_keys", None) is None:
+    if args.multimodal_keys is None:
         return []
-    if getattr(args, "sft_image_preprocess_on_rank", False):
+    if args.sft_image_preprocess_on_rank:
         return list(MULTIMODAL_PAYLOAD_FIELDS)
     return ["multimodal_train_inputs"]
 

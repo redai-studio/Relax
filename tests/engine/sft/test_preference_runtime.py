@@ -14,6 +14,7 @@ from relax.engine.sft.runtime import is_preference_mode, validate_preference_arg
 def _args(**overrides) -> Namespace:
     values = {
         "loss_type": "dpo",
+        "task_type": "causal_lm",
         "custom_dataset_class_path": None,
         "multimodal_keys": None,
         "n_samples_per_prompt": 1,
@@ -25,8 +26,10 @@ def _args(**overrides) -> Namespace:
         "fully_async": False,
         "hybrid": False,
         "use_gloo_process_groups": True,
+        "sft_async_prepack": False,
         "sft_chunked_logits": False,
         "enable_mtp_training": False,
+        "mtp_only_training": False,
         "calculate_per_token_loss": False,
         "lora_rank": 0,
         "hidden_dropout": 0.0,

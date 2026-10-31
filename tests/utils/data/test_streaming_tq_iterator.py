@@ -51,7 +51,7 @@ def _load_stream_module(monkeypatch):
 
 def _make_iterator(stream_module, *, get_data_fn, all_consumed_fn, **kwargs):
     monkeypatch_kwargs = dict(
-        args=Namespace(),
+        args=Namespace(use_rollout_indexer_replay=False),
         tq_client=object(),
         data_fields=["tokens"],
         rollout_id=52,
@@ -107,7 +107,7 @@ def test_get_data_from_transfer_queue_can_skip_per_rank_agreement(monkeypatch):
     monkeypatch.setattr(stream_module, "_agree_on_fetch", fail_agreement)
 
     data, meta = stream_module.get_data_from_transfer_queue(
-        args=Namespace(),
+        args=Namespace(use_rollout_indexer_replay=False),
         tq_client=_Client(),
         data_fields=["tokens"],
         batch_size=1,
@@ -129,7 +129,7 @@ def test_get_data_from_transfer_queue_rejects_disabled_agreement_without_per_ran
 
     with pytest.raises(ValueError, match="requires per_rank_fetch=True"):
         stream_module.get_data_from_transfer_queue(
-            args=Namespace(),
+            args=Namespace(use_rollout_indexer_replay=False),
             tq_client=object(),
             data_fields=["tokens"],
             batch_size=1,
@@ -195,7 +195,7 @@ def test_prefetched_raw_payload_skips_second_tq_rpc(monkeypatch):
 
     meta = _Meta()
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
-        args=Namespace(),
+        args=Namespace(use_rollout_indexer_replay=False),
         tq_client=_Client(),
         data_fields=["tokens"],
         batch_size=2,
@@ -409,7 +409,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
             }
 
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
-        args=Namespace(),
+        args=Namespace(use_rollout_indexer_replay=False),
         tq_client=_TQClient(),
         data_fields=["response_lengths", "total_lengths", "rewards"],
         batch_size=2,
@@ -569,6 +569,9 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
         dynamic_context_parallel=dynamic_cp,
         allgather_cp=allgather_cp,
         rollout_top_logprobs_num=2,
+        # Runtime markers established during parse; direct-read after Task 13.
+        is_vl_model=False,
+        uses_unsplit_forward=False,
     )
 
     stream_module.post_process_rollout_data(args, rollout_data)

@@ -21,7 +21,7 @@ def _check_args(args: Any) -> None:
     assert args.hidden_size == 2048 and args.num_experts == 256
     assert args.bf16 and args.use_distributed_optimizer and args.sequence_parallel
     assert not getattr(args, "use_megatron_fsdp", False)
-    assert getattr(args, "use_precision_aware_optimizer", False)
+    assert args.use_precision_aware_optimizer
     assert getattr(args, "optimizer_cpu_offload", False)
     assert args.optimizer_offload_fraction == 0.0
 
@@ -73,7 +73,7 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
     from relax.utils.env import Envs
 
     _check_args(args)
-    _TEXT_ONLY_CPT = getattr(args, "sft_training_mode", None) == "cpt"
+    _TEXT_ONLY_CPT = args.sft_training_mode == "cpt"
     assert args.max_tokens_per_gpu == 262144
     assert mpu.get_data_parallel_world_size(with_context_parallel=False) == 16
     assert tex.get_cublasLt_version() == 130300

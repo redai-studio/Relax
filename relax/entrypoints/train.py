@@ -146,14 +146,14 @@ def main(args):
     atexit.register(_graceful_shutdown)
 
     try:
-        if getattr(args, "fault_events_enabled", False):
+        if args.fault_events_enabled:
             try:
                 from relax.utils.fault_events.runtime import start_fault_events
 
                 _fault_runtime = start_fault_events(
                     enabled=True,
-                    health_enabled=getattr(args, "use_health_check", False),
-                    port=getattr(args, "fault_events_port", 0),
+                    health_enabled=args.use_health_check,
+                    port=args.fault_events_port,
                 )
             except Exception:
                 try:

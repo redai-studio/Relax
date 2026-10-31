@@ -826,7 +826,7 @@ def read_s3_model_config(args) -> dict:
 
 def _resolve_shm_root(args) -> str:
     """Resolve an existing SHM cache root without falling back to disk."""
-    root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
+    root = args.s3_model_shm_root or "/dev/shm"
     if not os.path.isdir(root):
         raise RuntimeError(
             f"S3 model SHM root does not exist or is not a directory: {root!r}. "
@@ -842,7 +842,7 @@ def remove_stale_s3_model_caches(args) -> tuple[int, int]:
     eligible. The caller must run this before starting the current job's
     prefetch, so no cross-job cache reuse or recovery is attempted.
     """
-    root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
+    root = args.s3_model_shm_root or "/dev/shm"
     if not os.path.isdir(root):
         return 0, 0
     removed_entries = 0
@@ -921,7 +921,7 @@ def maybe_resolve_s3_model_to_shm(uri: str, args) -> str:
         return uri
     root = _resolve_shm_root(args)
     endpoint = _resolve_endpoint(args)
-    workers = getattr(args, "s3_model_download_workers", None) or 20
+    workers = args.s3_model_download_workers or 20
     dest = _shm_dest_dir(uri, root, endpoint)
     _download_model_to_shm_once(
         uri,
@@ -946,7 +946,7 @@ def resolve_s3_model_metadata_to_shm(uri: str, args) -> str:
     root = _resolve_shm_root(args)
     endpoint = _resolve_endpoint(args)
     dest = _shm_dest_dir(uri, root, endpoint)
-    workers = getattr(args, "s3_model_download_workers", None) or 20
+    workers = args.s3_model_download_workers or 20
     _download_model_metadata_to_shm_once(
         uri,
         dest,
@@ -967,7 +967,7 @@ def get_s3_model_cached_path(uri: str, args) -> str | None:
     config = getattr(args, "model_source", None)
     if config is None or uri != config.uri:
         return None
-    root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
+    root = args.s3_model_shm_root or "/dev/shm"
     if not os.path.isdir(root):
         return None
     endpoint = _resolve_endpoint(args)
@@ -996,12 +996,12 @@ def cleanup_s3_model_weights_from_shm(args) -> tuple[int, int]:
     Returns:
         A ``(removed_files, removed_bytes)`` tuple.
     """
-    if getattr(args, "disable_s3_model_cleanup", False):
+    if args.disable_s3_model_cleanup:
         return 0, 0
     config = getattr(args, "model_source", None)
     if config is None or not is_s3_uri(config.uri):
         return 0, 0
-    root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
+    root = args.s3_model_shm_root or "/dev/shm"
     if not os.path.isdir(root):
         return 0, 0
     endpoint = _resolve_endpoint(args)
