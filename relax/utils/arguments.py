@@ -12,6 +12,7 @@ import yaml
 from sglang_router.launch_router import RouterArgs
 
 from relax.algorithms import get_algorithm, list_algorithm_names
+from relax.backends.megatron.compat import megatron_context_parallel_size, megatron_dynamic_context_parallel
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
@@ -3057,6 +3058,31 @@ def _s3_model_download_disabled() -> bool:
     return pre.disable_s3_model_download
 
 
+def init_runtime_args(args, *, model_source=None) -> None:
+    """Establish runtime-only fields that have no CLI declaration.
+
+    ``model_source`` is the driver-derived descriptor serialized with args to
+    every Ray actor. ``is_vl_model`` and ``uses_unsplit_forward`` start False
+    and are overwritten by actor / bridge init, so business code can read them
+    directly before those writers run. The shared test args factory calls this
+    same function instead of keeping its own placeholder table.
+    """
+    args.model_source = model_source
+    args.is_vl_model = False
+    args.uses_unsplit_forward = False
+
+
+def derive_use_critic(args) -> bool:
+    """Return the critic role switch for a run.
+
+    Offline objectives (SFT / DPO / RM) never deploy a critic; RL runs follow
+    the algorithm registry.
+    """
+    if is_offline_mode(args):
+        return False
+    return get_algorithm(args.advantage_estimator).needs_critic
+
+
 def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if any(token.split("=", 1)[0] == "--sft-objective" for token in sys.argv[1:]):
         raise ValueError("--sft-objective has been removed; select the training objective with --loss-type instead.")
@@ -3119,14 +3145,13 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # overriding an intentional --start-rollout-id.
     args._start_rollout_id_explicit = args.start_rollout_id is not None
 
-    # Serialize the driver-derived descriptor with args to every Ray actor.
-    args.model_source = model_source
+    init_runtime_args(args, model_source=model_source)
     # --lora-target-modules is backend-flavoured: Megatron wants Megatron module
     # names, the FSDP generative backend wants diffusers module-name suffixes and
     # gets a per-model-family default from its adapter. Resolve the Megatron
     # fallback here so every downstream Megatron consumer keeps seeing a concrete
     # list, and leave it None for fsdp so the actor can defer to the adapter.
-    if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
+    if args.lora_target_modules is None and args.train_backend != "fsdp":
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
     slime_validate_args(args)
@@ -3143,13 +3168,13 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if not skip_sglang:
         sglang_validate_args(args)
 
-    if getattr(args, "colocate_expert_weight_routing", False) and (
+    if args.colocate_expert_weight_routing and (
         args.train_backend != "megatron" or not args.colocate or args.megatron_to_hf_mode != "bridge"
     ):
         raise ValueError("--colocate-expert-weight-routing requires colocated Megatron Bridge training")
 
     # Only fully-async mode relies on the newer TransferQueue streaming sampler.
-    if getattr(args, "fully_async", False):
+    if args.fully_async:
         check_transfer_queue_version()
 
     return args
@@ -3213,11 +3238,11 @@ def _resolve_genrm_instances(args) -> dict:
     ``model_path``, ``num_gpus``, ``num_gpus_per_engine``, ``engine_config``,
     ``sampling_config``.
     """
-    instances = getattr(args, "genrm_instances", None)
+    instances = args.genrm_instances
     if instances is not None:
         if not isinstance(instances, dict) or not instances:
             raise ValueError("--genrm-instances must be a non-empty JSON object.")
-        if getattr(args, "genrm_model_path", None) is not None:
+        if args.genrm_model_path is not None:
             logger.warning(
                 "Both --genrm-instances and --genrm-model-path are set; --genrm-instances "
                 "takes priority and --genrm-model-path is ignored."
@@ -3250,7 +3275,7 @@ def _resolve_genrm_instances(args) -> dict:
             }
         return resolved
 
-    if getattr(args, "genrm_model_path", None) is None:
+    if args.genrm_model_path is None:
         return {}
 
     return {
@@ -3268,7 +3293,7 @@ def _validate_genrm_resource_config(args, instance_specs: dict) -> None:
     """Require the GenRM placement-group budget to match all instances."""
     if not instance_specs:
         return
-    resource = getattr(args, "resource", None) or {}
+    resource = args.resource or {}
     if "genrm" not in resource:
         raise ValueError("GenRM is enabled, but --resource has no 'genrm' entry.")
     resource_gpus = resource["genrm"][1]
@@ -3282,7 +3307,7 @@ def _validate_genrm_resource_config(args, instance_specs: dict) -> None:
 
 def _normalize_mtp_detach_paths(args) -> None:
     """Validate and canonicalize the MTP auxiliary-loss detach paths."""
-    requested_paths = tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS))
+    requested_paths = tuple(args.mtp_detach_paths)
     if "none" in requested_paths:
         if requested_paths != ("none",):
             raise ValueError("--mtp-detach-paths none cannot be combined with other paths.")
@@ -3297,28 +3322,28 @@ def _normalize_mtp_detach_paths(args) -> None:
 
 def _normalize_mtp_only_training_args(args) -> None:
     """Resolve the public MTP-only mode into existing training primitives."""
-    if not getattr(args, "mtp_only_training", False):
+    if not args.mtp_only_training:
         return
 
     if not is_sft_mode(args):
         raise ValueError("--mtp-only-training requires --loss-type sft.")
 
     conflicts = []
-    if getattr(args, "only_train_params_name_list", None):
+    if args.only_train_params_name_list:
         conflicts.append("--only-train-params-name-list")
-    if getattr(args, "freeze_params_name_list", None):
+    if args.freeze_params_name_list:
         conflicts.append("--freeze-params-name-list")
-    if getattr(args, "lora_rank", 0) > 0:
+    if args.lora_rank > 0:
         conflicts.append("--lora-rank")
-    if getattr(args, "sft_chunked_logits", False):
+    if args.sft_chunked_logits:
         conflicts.append("--sft-chunked-logits")
     if getattr(args, "overlap_moe_expert_parallel_comm", False):
         conflicts.append("--overlap-moe-expert-parallel-comm")
-    if getattr(args, "fully_async", False):
+    if args.fully_async:
         conflicts.append("--fully-async")
-    if getattr(args, "hybrid", False):
+    if args.hybrid:
         conflicts.append("--hybrid")
-    if tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS)) != _MTP_DETACH_PATHS:
+    if tuple(args.mtp_detach_paths) != _MTP_DETACH_PATHS:
         conflicts.append("--mtp-detach-paths")
     if conflicts:
         raise ValueError(f"--mtp-only-training is incompatible with: {', '.join(conflicts)}.")
@@ -3336,28 +3361,28 @@ def _normalize_mtp_only_training_args(args) -> None:
 
 
 def _validate_cpt_args(args) -> None:
-    if getattr(args, "sft_training_mode", "sft") != "cpt":
-        if getattr(args, "sft_cpt_template", "raw") != "raw":
+    if args.sft_training_mode != "cpt":
+        if args.sft_cpt_template != "raw":
             raise ValueError("--sft-cpt-template requires --sft-training-mode cpt.")
         return
-    if not is_sft_mode(args) or getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if not is_sft_mode(args) or args.task_type != "causal_lm":
         raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
     incompatible = {
-        "--label-key": getattr(args, "label_key", None),
-        "--eval-label-key": getattr(args, "eval_label_key", None),
-        "--multimodal-keys": getattr(args, "multimodal_keys", None),
-        "--conversation-key-map": getattr(args, "conversation_key_map", None),
-        "--system-prompt": getattr(args, "system_prompt", None),
-        "--tool-key": getattr(args, "tool_key", None),
-        "--eval-tool-key": getattr(args, "eval_tool_key", None),
-        "--apply-chat-template-kwargs": getattr(args, "apply_chat_template_kwargs", None),
-        "--sft-loss-last-turn-only": getattr(args, "sft_loss_last_turn_only", False),
-        "--sft-ignore-empty-think": getattr(args, "sft_ignore_empty_think", False),
-        "--sft-predict-interval": getattr(args, "sft_predict_interval", None),
-        "--custom-dataset-class": getattr(args, "custom_dataset_class_path", None),
-        "--sft-oversize-strategy custom": getattr(args, "sft_oversize_strategy", None) == "custom",
+        "--label-key": args.label_key,
+        "--eval-label-key": args.eval_label_key,
+        "--multimodal-keys": args.multimodal_keys,
+        "--conversation-key-map": args.conversation_key_map,
+        "--system-prompt": args.system_prompt,
+        "--tool-key": args.tool_key,
+        "--eval-tool-key": args.eval_tool_key,
+        "--apply-chat-template-kwargs": args.apply_chat_template_kwargs,
+        "--sft-loss-last-turn-only": args.sft_loss_last_turn_only,
+        "--sft-ignore-empty-think": args.sft_ignore_empty_think,
+        "--sft-predict-interval": args.sft_predict_interval,
+        "--custom-dataset-class": args.custom_dataset_class_path,
+        "--sft-oversize-strategy custom": args.sft_oversize_strategy == "custom",
     }
-    if getattr(args, "sft_cpt_template", "raw") == "multimodal":
+    if args.sft_cpt_template == "multimodal":
         for name in ("--multimodal-keys", "--conversation-key-map", "--apply-chat-template-kwargs"):
             incompatible.pop(name)
     enabled = [name for name, value in incompatible.items() if value]
@@ -3366,7 +3391,7 @@ def _validate_cpt_args(args) -> None:
 
 
 def _normalize_sft_max_in_flight_steps(args, is_offline: bool) -> None:
-    sft_max_in_flight_steps = getattr(args, "sft_max_in_flight_steps", None)
+    sft_max_in_flight_steps = args.sft_max_in_flight_steps
     if sft_max_in_flight_steps is None:
         return
 
@@ -3380,7 +3405,7 @@ def _normalize_sft_max_in_flight_steps(args, is_offline: bool) -> None:
 def _normalize_sft_tq_timeout(args, is_offline: bool) -> None:
     if not is_offline:
         return
-    timeout = getattr(args, "sft_tq_timeout_minutes", None)
+    timeout = args.sft_tq_timeout_minutes
     if timeout is None:
         args.sft_tq_timeout_minutes = args.distributed_timeout_minutes
     elif timeout <= 0:
@@ -3390,16 +3415,16 @@ def _normalize_sft_tq_timeout(args, is_offline: bool) -> None:
 def validate_save_hf_fp8_args(args) -> None:
     """Validate --save-hf-dtype and its FP8 sub-options; fill block-size
     default."""
-    dtype = getattr(args, "save_hf_dtype", "bf16")
+    dtype = args.save_hf_dtype
     if dtype != "fp8":
         return
-    if not getattr(args, "save_hf", None):
+    if not args.save_hf:
         raise ValueError("--save-hf-dtype fp8 requires --save-hf to be set.")
 
     from relax.utils.quant_cast.fp8 import validate_fp8_options
 
-    strategy = getattr(args, "save_hf_fp8_quant_mode", "block")
-    block_size = getattr(args, "save_hf_fp8_block_size", None)
+    strategy = args.save_hf_fp8_quant_mode
+    block_size = args.save_hf_fp8_block_size
     if strategy == "block" and block_size is None:
         block_size = [128, 128]
         args.save_hf_fp8_block_size = block_size
@@ -3409,10 +3434,10 @@ def validate_save_hf_fp8_args(args) -> None:
 def validate_save_hf_post_hook_args(args) -> None:
     """Validate --save-hf-post-hook-path resolves and is paired with --save-
     hf."""
-    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    hook_path = args.save_hf_post_hook_path
     if not hook_path:
         return
-    if not getattr(args, "save_hf", None):
+    if not args.save_hf:
         raise ValueError("--save-hf-post-hook-path requires --save-hf to be set.")
 
     from relax.utils.misc import load_function
@@ -3423,7 +3448,7 @@ def validate_save_hf_post_hook_args(args) -> None:
 
 
 def validate_save_lora_only_args(args) -> None:
-    if not getattr(args, "save_lora_only", False):
+    if not args.save_lora_only:
         return
 
     incompatible = []
@@ -3504,32 +3529,32 @@ def _validate_reinforce_plus_plus_args(args, is_offline: bool) -> None:
     if is_offline:
         return
 
-    estimator = getattr(args, "advantage_estimator", None)
+    estimator = args.advantage_estimator
     variants = {"reinforce_plus_plus", "reinforce_plus_plus_baseline"}
     if estimator not in variants:
         return
 
-    if not getattr(args, "normalize_advantages", False):
+    if not args.normalize_advantages:
         raise ValueError(f"--advantage-estimator {estimator} requires --normalize-advantages.")
-    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+    if args.fully_async or args.hybrid:
         raise ValueError(
             f"--advantage-estimator {estimator} supports synchronous colocate training only; "
             "--fully-async and --hybrid are not supported because normalization requires a closed global batch."
         )
-    if not getattr(args, "colocate", False):
+    if not args.colocate:
         raise ValueError(f"--advantage-estimator {estimator} currently requires --colocate.")
-    if getattr(args, "context_parallel_size", 1) != 1:
+    if megatron_context_parallel_size(args) != 1:
         raise ValueError(f"--advantage-estimator {estimator} currently requires --context-parallel-size 1.")
-    if getattr(args, "calculate_per_token_loss", False):
+    if args.calculate_per_token_loss:
         raise ValueError(
             f"--advantage-estimator {estimator} uses response-mean loss reduction; "
             "--calculate-per-token-loss is not supported."
         )
 
-    kl_coef = getattr(args, "kl_coef", 0.0)
-    kl_loss_coef = getattr(args, "kl_loss_coef", 0.0)
-    kl_loss_type = getattr(args, "kl_loss_type", "k1")
-    use_kl_loss = getattr(args, "use_kl_loss", False)
+    kl_coef = args.kl_coef
+    kl_loss_coef = args.kl_loss_coef
+    kl_loss_type = args.kl_loss_type
+    use_kl_loss = args.use_kl_loss
 
     if estimator == "reinforce_plus_plus":
         if kl_coef <= 0:
@@ -3542,19 +3567,19 @@ def _validate_reinforce_plus_plus_args(args, is_offline: bool) -> None:
             )
         return
 
-    if getattr(args, "n_samples_per_prompt", 1) <= 1:
+    if args.n_samples_per_prompt <= 1:
         raise ValueError("reinforce_plus_plus_baseline requires --n-samples-per-prompt > 1.")
-    if getattr(args, "custom_reward_post_process_path", None) is not None:
+    if args.custom_reward_post_process_path is not None:
         raise ValueError(
             "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
             "--custom-reward-post-process-path is not supported."
         )
-    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+    if args.agentic_custom_advantage_path is not None:
         raise ValueError(
             "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
             "--agentic-custom-advantage-path is not supported."
         )
-    if not getattr(args, "rewards_normalization", True):
+    if not args.rewards_normalization:
         raise ValueError(
             "reinforce_plus_plus_baseline requires group-mean centering; "
             "--disable-rewards-normalization is not supported."
@@ -3567,7 +3592,7 @@ def _validate_reinforce_plus_plus_args(args, is_offline: bool) -> None:
         )
     if kl_loss_type != "k2":
         raise ValueError("reinforce_plus_plus_baseline requires --kl-loss-type k2.")
-    if getattr(args, "use_unbiased_kl", False):
+    if args.use_unbiased_kl:
         raise ValueError(
             "reinforce_plus_plus_baseline uses the plain k2 estimator; --use-unbiased-kl is not supported."
         )
@@ -3604,10 +3629,10 @@ def _validate_lora_vision_scope(args) -> None:
     Only adapter mode is affected. Merge mode folds the adapter into the base weights
     and syncs those, so the engine never sees LoRA at all and any scope is safe.
     """
-    if not getattr(args, "lora_adapter_mode", False) or getattr(args, "lora_scope", "all") != "all":
+    if not args.lora_adapter_mode or args.lora_scope != "all":
         return
 
-    hf_checkpoint = getattr(args, "hf_checkpoint", None)
+    hf_checkpoint = args.hf_checkpoint
     if not hf_checkpoint:
         return
 
@@ -3642,12 +3667,8 @@ def validate_kl_coefficients(args: argparse.Namespace) -> None:
 
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
-    is_sync_ppo = (
-        getattr(args, "use_critic", False)
-        and not getattr(args, "fully_async", False)
-        and not getattr(args, "hybrid", False)
-    )
-    if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
+    is_sync_ppo = args.use_critic and not args.fully_async and not args.hybrid
+    if not is_sync_ppo or (not args.use_kl_loss and args.kl_coef == 0):
         return False
 
     args.use_kl_loss = False
@@ -3688,13 +3709,13 @@ def _validate_score_centering_args(args: argparse.Namespace) -> None:
         return
     if args.loss_type != "policy_loss":
         raise ValueError("score_centering requires --loss-type policy_loss.")
-    if getattr(args, "multimodal_keys", None):
+    if args.multimodal_keys:
         raise ValueError("score_centering currently accepts text-only training inputs.")
-    if getattr(args, "train_backend", None) == "fsdp":
+    if args.train_backend == "fsdp":
         raise ValueError(
             "score_centering requires a text token policy-loss backend; the current FSDP backend trains diffusion."
         )
-    if getattr(args, "use_opd", False) or getattr(args, "opd_fkl_entropy_gate", False):
+    if args.use_opd or args.opd_fkl_entropy_gate:
         raise ValueError(
             "score_centering and OPD cannot be enabled together: centering the advantage-injected distillation "
             "signal can cancel its update. This release also excludes standalone OPD loss and EOPD."
@@ -3744,11 +3765,11 @@ def validate_algorithm_args(args) -> None:
     # batch. Resolve them here, while the error can still name the culprit.
     _assert_spec_implementations_resolve(spec)
 
-    args.use_critic = spec.needs_critic
+    args.use_critic = derive_use_critic(args)
     _validate_score_centering_args(args)
 
     if not spec.supports_context_parallel and (
-        getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "dynamic_context_parallel", False)
+        megatron_context_parallel_size(args) != 1 or megatron_dynamic_context_parallel(args)
     ):
         raise ValueError(
             f"--advantage-estimator {spec.name} currently requires --context-parallel-size 1 "
@@ -3791,7 +3812,7 @@ def validate_algorithm_args(args) -> None:
         )
 
     if spec.requires_on_policy_updates:
-        if args.fully_async or getattr(args, "hybrid", False):
+        if args.fully_async or args.hybrid:
             raise ValueError(
                 f"--advantage-estimator {spec.name} only supports synchronous (colocate) training. "
                 "Please remove --fully-async / --hybrid."
@@ -3867,7 +3888,7 @@ def derive_global_batch_size(args, *, enforce_consistency: bool = True) -> None:
     ``1`` should get a global batch of ``rollout * n``, but the validator saw
     the stale value derived from 4 and refused it.
     """
-    if getattr(args, "num_steps_per_rollout", None) is None:
+    if args.num_steps_per_rollout is None:
         return
     global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
     if enforce_consistency and args.global_batch_size is not None:
@@ -3913,8 +3934,8 @@ def apply_custom_config_overrides(args) -> None:
     if not args.custom_config_path:
         return
 
-    loss_type_before_override = getattr(args, "loss_type", None)
-    use_critic_before_override = getattr(args, "use_critic", False)
+    loss_type_before_override = args.loss_type
+    use_critic_before_override = args.use_critic
     with open(args.custom_config_path) as f:
         data = yaml.safe_load(f) or {}
     if "sft_objective" in data:
@@ -3924,7 +3945,7 @@ def apply_custom_config_overrides(args) -> None:
             logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
         setattr(args, k, v)
 
-    if getattr(args, "loss_type", None) != loss_type_before_override:
+    if args.loss_type != loss_type_before_override:
         raise ValueError(
             "--custom-config-path cannot change loss_type after the training mode has already been configured. "
             "Pass --loss-type on the command line instead of overriding it from YAML."
@@ -4019,6 +4040,10 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
 
 
 def slime_validate_args(args):
+    # Derived role switch. ``validate_algorithm_args`` overwrites this for RL;
+    # offline mode keeps False. Always present once validate starts.
+    args.use_critic = False
+
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
@@ -4069,18 +4094,18 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
-    if getattr(args, "lora_rank", 0) > 0 and not is_i2i_sft(args):
-        if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
+    if args.lora_rank > 0 and not is_i2i_sft(args):
+        if args.lora_merge_mode and args.lora_adapter_mode:
             raise ValueError(
                 "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
             )
-        if getattr(args, "lora_adapter_mode", False) and getattr(args, "sglang_dp_size", 1) != 1:
+        if args.lora_adapter_mode and getattr(args, "sglang_dp_size", 1) != 1:
             raise ValueError(
                 "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
                 "support dp_size > 1)."
             )
         _validate_lora_vision_scope(args)
-        if "router" in getattr(args, "lora_target_modules", []) and not getattr(args, "lora_adapter_mode", False):
+        if "router" in args.lora_target_modules and not args.lora_adapter_mode:
             # Merge folds each adapter into its base via LoRAMerge, which only transforms
             # LoRALinear modules; the router uses LoRATopKRouter, so its adapter would be
             # silently dropped at sync time. Fail loud instead of training a router LoRA that
@@ -4091,7 +4116,7 @@ def slime_validate_args(args):
                 "the router adapter (LoRAMerge skips non-LoRALinear modules). Remove 'router' from "
                 "--lora-target-modules or switch to --lora-adapter-mode."
             )
-        if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
+        if not args.lora_merge_mode and not args.lora_adapter_mode:
             logger.info(
                 "LoRA enabled (lora_rank=%d): forcing --lora-merge-mode (default supported LoRA rollout path).",
                 args.lora_rank,
@@ -4136,13 +4161,13 @@ def slime_validate_args(args):
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
 
-    if getattr(args, "use_rollout_indexer_replay", False):
+    if args.use_rollout_indexer_replay:
         unsupported = []
         if is_offline:
             unsupported.append(f"offline training ({args.loss_type})")
         if args.train_backend != "megatron":
             unsupported.append(f"train_backend={args.train_backend}")
-        if getattr(args, "multimodal_keys", None) is not None:
+        if args.multimodal_keys is not None:
             unsupported.append("multimodal model")
         if not args.colocate:
             unsupported.append("non-colocated deployment")
@@ -4216,7 +4241,7 @@ def slime_validate_args(args):
                         args.finetune = True
                         args.no_load_optim = True
                         args.no_load_rng = True
-                        if getattr(args, "ref_ckpt_step", None) is not None:
+                        if args.ref_ckpt_step is not None:
                             args.ckpt_step = args.ref_ckpt_step
                 # If is a HF checkpoint, set start_rollout_id to 0 here.
                 args.start_rollout_id = 0
@@ -4242,7 +4267,7 @@ def slime_validate_args(args):
                     f"Under --loss-type {args.loss_type} with --eval-interval set, at most one of "
                     "--eval-prompt-data or --eval-size may be configured."
                 )
-            elif not getattr(args, "custom_dataset_class_path", None):
+            elif not args.custom_dataset_class_path:
                 raise ValueError(
                     f"Under --loss-type {args.loss_type} with --eval-interval set, exactly one of "
                     "--eval-prompt-data or --eval-size must be configured."
@@ -4257,13 +4282,11 @@ def slime_validate_args(args):
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
 
-    if getattr(args, "sft_predict_interval", None) is not None:
+    if args.sft_predict_interval is not None:
         assert is_sft_mode(args), "--sft-predict-interval is only meaningful under --loss-type sft."
         assert args.sft_predict_interval > 0, "--sft-predict-interval must be positive."
         assert args.save is not None, "--sft-predict-interval requires --save (predictions land in <save>/predict/)."
-        has_eval_source = bool(getattr(args, "eval_prompt_data", None)) or (
-            getattr(args, "eval_size", None) is not None
-        )
+        has_eval_source = bool(args.eval_prompt_data) or (args.eval_size is not None)
         assert has_eval_source, (
             "--sft-predict-interval requires either --eval-prompt-data or --eval-size "
             "(the predict pass reuses the SFT eval data source)."
@@ -4360,7 +4383,7 @@ def slime_validate_args(args):
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
 
-        data_pad_size_multiplier = getattr(args, "data_pad_size_multiplier", 128)
+        data_pad_size_multiplier = args.data_pad_size_multiplier
         assert data_pad_size_multiplier > 0, "--data-pad-size-multiplier must be positive."
         tp_size = getattr(args, "tensor_model_parallel_size", 1)
         local_pad_size = tp_size * data_pad_size_multiplier
@@ -4379,11 +4402,11 @@ def slime_validate_args(args):
         # since a sequence is split across CP ranks) must be able to hold the longest
         # possible single sample (rollout_max_context_len). Otherwise an over-long
         # sample produces an oversized micro-batch that OOMs mid-training.
-        max_ctx_len = getattr(args, "rollout_max_context_len", None)
+        max_ctx_len = args.rollout_max_context_len
         if max_ctx_len is not None:
-            cp_size = getattr(args, "context_parallel_size", 1)
+            cp_size = megatron_context_parallel_size(args)
             token_budget = args.max_tokens_per_gpu * cp_size
-            if token_budget < max_ctx_len and not getattr(args, "dynamic_context_parallel", False):
+            if token_budget < max_ctx_len and not megatron_dynamic_context_parallel(args):
                 raise ValueError(
                     f"max_tokens_per_gpu * context_parallel_size ({args.max_tokens_per_gpu} * {cp_size} = "
                     f"{token_budget}) must be >= rollout_max_context_len ({max_ctx_len}); otherwise a single "
@@ -4397,7 +4420,7 @@ def slime_validate_args(args):
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
 
-    rm_type_fallback = getattr(args, "rm_type_fallback", None)
+    rm_type_fallback = args.rm_type_fallback
     if rm_type_fallback is not None and rm_type_fallback != "zero":
         # Lazy import: only pay for the rewards package when the flag is set.
         from relax.engine.rewards.registry import list_reward_types
@@ -4409,7 +4432,7 @@ def slime_validate_args(args):
             )
 
     if hasattr(args, "rollout_result_dir"):
-        if args.rollout_result_dir is None and getattr(args, "save", None):
+        if args.rollout_result_dir is None and args.save:
             args.rollout_result_dir = f"{args.save}/rollout_result"
         elif args.rollout_result_dir == "":
             args.rollout_result_dir = None
@@ -4453,10 +4476,10 @@ def slime_validate_args(args):
 
         validate_preference_args(args)
 
-    elif getattr(args, "sft_async_prepack", False):
+    elif args.sft_async_prepack:
         raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
-    task_type = getattr(args, "task_type", "causal_lm")
+    task_type = args.task_type
     if task_type == "seq_cls":
         if not is_sft_mode(args):
             raise ValueError("--task-type seq_cls requires --loss-type sft.")
@@ -4482,12 +4505,12 @@ def slime_validate_args(args):
         enabled = [name for name, is_enabled in incompatible.items() if is_enabled]
         if enabled:
             raise ValueError(f"--task-type seq_cls does not support: {', '.join(enabled)}.")
-    elif getattr(args, "num_labels", None) is not None:
+    elif args.num_labels is not None:
         raise ValueError("--num-labels is only meaningful under --task-type seq_cls.")
 
     # `use_critic` is set by validate_algorithm_args for RL; offline training has no critic.
     if is_offline:
-        args.use_critic = False
+        args.use_critic = derive_use_critic(args)
     # Synchronous PPO has no producer for
     # `ref_log_probs`: actor's ref forward in backends/megatron/actor.py:800 is
     # gated on `advantage_estimator != "ppo"`, and the sync role set does not
@@ -4634,10 +4657,10 @@ def slime_validate_args(args):
     # the message can still be read. Only the CUDA variable names are checked on purpose:
     # NPU uses a different torch_memory_saver build and its scripts already combine
     # PYTORCH_NPU_ALLOC_CONF=expandable_segments:True with offload successfully.
-    if args.offload_train and not getattr(args, "selective_offload", False):
+    if args.offload_train and not args.selective_offload:
         alloc_conf_sources = {
             **{name: os.environ.get(name, "") for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")},
-            **{key: str(value) for key, value in getattr(args, "train_env_vars", {}).items()},
+            **{key: str(value) for key, value in args.train_env_vars.items()},
         }
         for name, value in alloc_conf_sources.items():
             if "expandable_segments:True" in value:
@@ -4673,11 +4696,7 @@ def slime_validate_args(args):
         f"rollout_batch_size {args.rollout_batch_size}"
     )
 
-    if (
-        args.over_sampling_batch_size > args.rollout_batch_size
-        and not getattr(args, "fully_async", False)
-        and not getattr(args, "partial_rollout", False)
-    ):
+    if args.over_sampling_batch_size > args.rollout_batch_size and not args.fully_async and not args.partial_rollout:
         # Without fully_async/partial_rollout there is no next-step carry path for the
         # over-sampled surplus, so the extra completed groups are discarded each step
         # rather than reused. Surface this so it is not mistaken for free throughput.
@@ -4707,7 +4726,7 @@ def slime_validate_args(args):
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
     # This is a hard assert — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
-    if getattr(args, "sft_chunked_logits", False):
+    if args.sft_chunked_logits:
         # Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked
@@ -4724,7 +4743,7 @@ def slime_validate_args(args):
 
     apply_custom_config_overrides(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
-    if not is_offline and getattr(args, "sft_train_data_prefetch", False):
+    if not is_offline and args.sft_train_data_prefetch:
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
 
     # Custom YAML is applied late and may override any checkpoint option, so

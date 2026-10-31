@@ -6,10 +6,12 @@ dispatcher."""
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
+
+from tests.helpers.relax_args import make_args
 
 
 pytest.importorskip("torch")
@@ -45,7 +47,7 @@ def _args(estimator="grpo", **overrides):
         reward_key=None,
     )
     base.update(overrides)
-    return SimpleNamespace(**base)
+    return make_args(**base)
 
 
 class _Sample:
@@ -94,7 +96,8 @@ def test_reward_key_selects_from_dict(utils_mod):
 
 
 def test_unknown_estimator_raises_from_the_registry(utils_mod):
-    args = _args("not_an_algorithm")
+    # Skip derive_use_critic() registry lookup so construction reaches post_process_rewards.
+    args = _args("not_an_algorithm", use_critic=False)
     samples = [_Sample(0, 1.0) for _ in range(4)]
     with pytest.raises(KeyError, match="Unknown advantage estimator"):
         utils_mod.post_process_rewards(args, samples)

@@ -78,7 +78,7 @@ class _AppriseAdapter(metaclass=SingletonMeta):
 
     def _parse_notify_urls(self, args) -> list:
         """Parse notify URLs from arguments."""
-        notify_urls_str = getattr(args, "notify_urls", None)
+        notify_urls_str = args.notify_urls
         if not notify_urls_str:
             return []
 
@@ -154,8 +154,8 @@ class _AppriseAdapter(metaclass=SingletonMeta):
         if not self.apprise:
             return
 
-        project_name = getattr(args, "tb_project_name", "Unknown Project")
-        experiment_name = getattr(args, "tb_experiment_name", "Unknown Experiment")
+        project_name = args.tb_project_name
+        experiment_name = args.tb_experiment_name
 
         markdown = f"""# 🚀 训练启动通知
 

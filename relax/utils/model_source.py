@@ -70,7 +70,7 @@ def model_source_path_aliases(args: Namespace, source_uri: str) -> set[str]:
 
 def is_model_source_alias(args: Namespace, path: str | None) -> bool:
     """Check whether a path identified the model before localization."""
-    source = getattr(args, "model_source", None)
+    source = args.model_source
     return bool(
         path and source is not None and normalize_model_path(path) in model_source_path_aliases(args, source.uri)
     )

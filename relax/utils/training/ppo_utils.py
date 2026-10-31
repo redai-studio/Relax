@@ -25,16 +25,17 @@ def validate_ppo_config(config: Namespace) -> None:
     if not algorithm_needs_critic(config):
         return
 
-    resource = getattr(config, "resource", None) or {}
+    resource = config.resource or {}
     if "critic" not in resource:
-        estimator = getattr(config, "advantage_estimator", None)
-        raise ValueError(f"--advantage-estimator {estimator} requires a 'critic' entry in --resource.")
+        raise ValueError(
+            f"--advantage-estimator {config.advantage_estimator} requires a 'critic' entry in --resource."
+        )
 
-    if getattr(config, "fully_async", False) or getattr(config, "hybrid", False):
+    if config.fully_async or config.hybrid:
         raise ValueError("PPO does not currently support --fully-async or --hybrid.")
 
-    is_sync_colocate = getattr(config, "colocate", False) and not getattr(config, "fully_async", False)
-    if is_sync_colocate and getattr(config, "max_staleness", 0) != 0:
+    is_sync_colocate = config.colocate and not config.fully_async
+    if is_sync_colocate and config.max_staleness != 0:
         raise ValueError("Synchronous colocate PPO requires --max-staleness 0.")
 
     _validate_actor_critic_resume_consistency(config)
@@ -51,8 +52,8 @@ def _validate_actor_critic_resume_consistency(config: Namespace) -> None:
     have trackers at different iterations, which is a genuine inconsistency the
     user must resolve.
     """
-    actor_load = getattr(config, "load", None)
-    critic_load = getattr(config, "critic_load", None) or actor_load
+    actor_load = config.load
+    critic_load = config.critic_load or actor_load
     actor_iter = _read_latest_iter(actor_load)
     critic_iter = _read_latest_iter(critic_load)
 
@@ -1437,7 +1438,7 @@ def install_sequence_classification_head_in_provider(
     models stash their vocabulary head under an unregistered attribute so HF
     CausalLM loading can temporarily restore it.
     """
-    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+    if args.task_type != "seq_cls" or role != "actor" or not post_process:
         return
 
     owner = _find_output_layer_owner(model)
@@ -1466,7 +1467,7 @@ def ensure_sequence_classification_head_trainable(
     post_process: bool,
 ) -> None:
     """Undo PEFT/freeze wrappers that would otherwise freeze the task head."""
-    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+    if args.task_type != "seq_cls" or role != "actor" or not post_process:
         return
     owner = _find_output_layer_owner(model)
     if owner is None:

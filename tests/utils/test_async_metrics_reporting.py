@@ -2,13 +2,13 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, get_ident
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from relax.utils.metrics.metrics_service_adapter import MetricsServiceAdapter
 from relax.utils.metrics.ordered_reporting import OrderedMetricsReporter
+from tests.helpers.relax_args import make_args
 
 
 @pytest.fixture
@@ -20,7 +20,7 @@ def adapter(monkeypatch):
     module = "relax.utils.metrics.metrics_service_adapter"
     monkeypatch.setattr(f"{module}.get_serve_url", lambda **kwargs: "http://metrics.test")
     monkeypatch.setattr(f"{module}.get_metrics_client", lambda url: client)
-    instance = MetricsServiceAdapter(SimpleNamespace())
+    instance = MetricsServiceAdapter(make_args())
     yield instance
     instance.finish_async_reporting()
 

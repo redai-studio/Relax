@@ -13,6 +13,7 @@ from relax.utils import profile_utils
 @pytest.mark.parametrize("rank,selected", [(0, True), (48, True), (1, False)])
 def test_train_profiler_honors_rank_selection(monkeypatch, rank, selected):
     args = Namespace(
+        profile_output_dir=None,
         profile_ranks=[0, 48],
         use_pytorch_profiler=True,
         record_memory_history=True,

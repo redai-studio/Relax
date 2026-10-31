@@ -40,6 +40,8 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "rollout_batch_size": 32,
         "multimodal_keys": None,
         "seq_length": 8192,
+        "partial_rollout": False,
+        "use_dynamic_global_batch_size": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -61,8 +63,8 @@ def test_validate_config_matrix(overrides: dict[str, Any], expected_error: str |
         assert repr(next(iter(overrides.values()))) not in errors[0]
 
 
-def test_missing_config_attributes_default_to_off() -> None:
-    assert validate_config(argparse.Namespace()) == []
+def test_declared_defaults_produce_valid_config() -> None:
+    assert validate_config(_args()) == []
 
 
 @pytest.mark.parametrize(

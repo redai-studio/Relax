@@ -1,9 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from types import SimpleNamespace
-
 import pytest
 
+from tests.helpers.relax_args import make_args
 from tests.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
 
 
@@ -12,18 +11,25 @@ arguments_module = _arguments_module_fixture
 
 def test_cpt_accepts_the_sft_causal_lm_backend(arguments_module):
     arguments_module._validate_cpt_args(
-        SimpleNamespace(sft_training_mode="cpt", loss_type="sft", task_type="causal_lm")
+        make_args(
+            sft_training_mode="cpt",
+            loss_type="sft",
+            task_type="causal_lm",
+            tool_key=None,
+            apply_chat_template_kwargs=None,
+            sft_oversize_strategy="keep",
+        )
     )
 
 
 def test_default_sft_and_rl_are_unchanged(arguments_module):
-    arguments_module._validate_cpt_args(SimpleNamespace(loss_type="sft"))
-    arguments_module._validate_cpt_args(SimpleNamespace(loss_type="policy_loss"))
+    arguments_module._validate_cpt_args(make_args(loss_type="sft"))
+    arguments_module._validate_cpt_args(make_args(loss_type="policy_loss"))
 
 
 def test_qwen_template_requires_cpt_mode(arguments_module):
     with pytest.raises(ValueError, match="requires --sft-training-mode cpt"):
-        arguments_module._validate_cpt_args(SimpleNamespace(loss_type="sft", sft_cpt_template="qwen3_5"))
+        arguments_module._validate_cpt_args(make_args(loss_type="sft", sft_cpt_template="qwen3_5"))
 
 
 @pytest.mark.parametrize(
@@ -47,7 +53,14 @@ def test_qwen_template_requires_cpt_mode(arguments_module):
     ],
 )
 def test_cpt_rejects_unsupported_options(arguments_module, option, value):
-    args = SimpleNamespace(sft_training_mode="cpt", loss_type="sft", task_type="causal_lm")
+    args = make_args(
+        sft_training_mode="cpt",
+        loss_type="sft",
+        task_type="causal_lm",
+        tool_key=None,
+        apply_chat_template_kwargs=None,
+        sft_oversize_strategy="keep",
+    )
     setattr(args, option, value)
     with pytest.raises(ValueError):
         arguments_module._validate_cpt_args(args)

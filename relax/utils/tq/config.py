@@ -45,8 +45,8 @@ def validate_config(args: Any) -> list[str]:
     a checkpoint or built programmatically.
     """
     errors: list[str] = []
-    mode = getattr(args, "tq_rdma_mode", "off")
-    device = getattr(args, "tq_rdma_device", "")
+    mode = args.tq_rdma_mode
+    device = args.tq_rdma_device
 
     if not isinstance(mode, str) or mode not in TQ_RDMA_MODES:
         errors.append(f"--tq-rdma-mode must be one of {', '.join(sorted(TQ_RDMA_MODES))}.")
@@ -274,8 +274,8 @@ def resolve_tq_capacity_batch_size(args: Any) -> int:
     MooncakeStore's payload capacity.
     """
     rollout_batch = getattr(args, "rollout_batch_size")
-    if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
-        over_sampling_batch = getattr(args, "over_sampling_batch_size", None)
+    if args.partial_rollout and args.use_dynamic_global_batch_size:
+        over_sampling_batch = args.over_sampling_batch_size
         if over_sampling_batch is not None:
             return int(over_sampling_batch)
     return int(rollout_batch)
@@ -300,7 +300,7 @@ def estimate_payload_bytes(args: Any) -> int:
             "the per-sample payload; got a missing or non-positive value."
         )
     per_sample = seq_length * _TEXT_BYTES_PER_TOKEN
-    if getattr(args, "multimodal_keys", None) is not None:
+    if args.multimodal_keys is not None:
         per_sample += seq_length * _MULTIMODAL_BYTES_PER_TOKEN
     return capacity_batch * n_samples * per_sample
 
@@ -311,7 +311,7 @@ def validate_segment_capacity(args: Any) -> str | None:
     Only used for MooncakeStore. Compares the per-client segment size
     (``global_segment_size``) against the estimated in-flight payload.
     """
-    max_staleness = getattr(args, "max_staleness", 0)
+    max_staleness = args.max_staleness
     capacity_batch = resolve_tq_capacity_batch_size(args)
     payload = estimate_payload_bytes(args)
     needed = payload * (max_staleness + 1)

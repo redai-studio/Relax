@@ -367,11 +367,11 @@ class MegatronTrainStateOffloader:
     """
 
     def __init__(self, model: Optional[List], optimizer, args) -> None:
-        self.enabled: bool = bool(getattr(args, "offload_train", False))
+        self.enabled: bool = bool(args.offload_train)
         self.uses_tms: bool = False
 
         # Default is torch_memory_saver; --selective-offload forces the selective path.
-        force_selective = bool(getattr(args, "selective_offload", False))
+        force_selective = bool(args.selective_offload)
         if self.enabled and not force_selective:
             if torch_memory_saver_preloaded():
                 self.uses_tms = self._init_torch_memory_saver(args)
@@ -400,7 +400,7 @@ class MegatronTrainStateOffloader:
         offload."""
         from torch_memory_saver import torch_memory_saver
 
-        margin = max(int(getattr(args, "train_memory_margin_bytes", 0)), 0)
+        margin = max(int(args.train_memory_margin_bytes), 0)
         try:
             torch_memory_saver.memory_margin_bytes = margin
             if margin > 0:

@@ -95,6 +95,7 @@ def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner
         dist=SimpleNamespace(all_reduce=lambda *a, **kw: None, ReduceOp=torch.distributed.ReduceOp),
         device_utils=SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
         is_preference_mode=lambda args: False,
+        megatron_dynamic_context_parallel=lambda args: bool(getattr(args, "dynamic_context_parallel", False)),
         ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY="global_counts",
         ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY="local_counts",
         DataIterator=lambda data, micro_batch_size, indices, **kw: SimpleNamespace(indices=indices, **kw),
@@ -109,6 +110,12 @@ def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner
         sft_packing_strategy=strategy,
         qkv_format="thd",
         dynamic_context_parallel=True,
+        # Parse establishes these; get_data_iterator reads them directly.
+        is_vl_model=False,
+        uses_unsplit_forward=False,
+        partial_rollout=False,
+        balance_data=False,
+        allgather_cp=False,
     )
     lengths = [17, 17]
     data = {"total_lengths": lengths}
@@ -161,6 +168,7 @@ def test_iterator_uses_selected_packing_and_dp_aligned_count(partitioner, strate
         dist=SimpleNamespace(all_reduce=all_reduce, ReduceOp=torch.distributed.ReduceOp),
         device_utils=SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
         is_preference_mode=lambda args: False,
+        megatron_dynamic_context_parallel=lambda args: bool(getattr(args, "dynamic_context_parallel", False)),
         ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY="global_counts",
         ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY="local_counts",
         DataIterator=lambda data, micro_batch_size, indices, **kw: SimpleNamespace(indices=indices, **kw),
@@ -184,6 +192,10 @@ def test_iterator_uses_selected_packing_and_dp_aligned_count(partitioner, strate
         pad_multiplier=1,
         is_vl_model=False,
         uses_unsplit_forward=False,
+        partial_rollout=False,
+        balance_data=False,
+        allgather_cp=False,
+        dynamic_context_parallel=False,
     )
     rollout = {"total_lengths": lengths, "tokens": [torch.zeros(n) for n in lengths]}
     iterators, counts = namespace["get_data_iterator"](args, [], rollout)

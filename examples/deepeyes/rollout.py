@@ -232,7 +232,7 @@ async def _run_inference_step(
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
-    if args and getattr(args, "use_rollout_routing_replay", False):
+    if args and args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
     if image_data:
         payload["image_data"] = image_data
@@ -433,12 +433,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
 
     is_resuming = sample.status == Sample.Status.ABORTED and sample.response_length > 0
 
-    if (
-        getattr(args, "partial_rollout", False)
-        and is_resuming
-        and getattr(args, "mask_offpolicy_in_partial_rollout", False)
-        and sample.response_length > 0
-    ):
+    if args.partial_rollout and is_resuming and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
     (
