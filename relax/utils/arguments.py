@@ -3057,6 +3057,31 @@ def _s3_model_download_disabled() -> bool:
     return pre.disable_s3_model_download
 
 
+def init_runtime_args(args, *, model_source=None) -> None:
+    """Establish runtime-only fields that have no CLI declaration.
+
+    ``model_source`` is the driver-derived descriptor serialized with args to
+    every Ray actor. ``is_vl_model`` and ``uses_unsplit_forward`` start False
+    and are overwritten by actor / bridge init, so business code can read them
+    directly before those writers run. The shared test args factory calls this
+    same function instead of keeping its own placeholder table.
+    """
+    args.model_source = model_source
+    args.is_vl_model = False
+    args.uses_unsplit_forward = False
+
+
+def derive_use_critic(args) -> bool:
+    """Return the critic role switch for a run.
+
+    Offline objectives (SFT / DPO / RM) never deploy a critic; RL runs follow
+    the algorithm registry.
+    """
+    if is_offline_mode(args):
+        return False
+    return get_algorithm(args.advantage_estimator).needs_critic
+
+
 def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if any(token.split("=", 1)[0] == "--sft-objective" for token in sys.argv[1:]):
         raise ValueError("--sft-objective has been removed; select the training objective with --loss-type instead.")
@@ -3119,8 +3144,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # overriding an intentional --start-rollout-id.
     args._start_rollout_id_explicit = args.start_rollout_id is not None
 
-    # Serialize the driver-derived descriptor with args to every Ray actor.
-    args.model_source = model_source
+    init_runtime_args(args, model_source=model_source)
     # --lora-target-modules is backend-flavoured: Megatron wants Megatron module
     # names, the FSDP generative backend wants diffusers module-name suffixes and
     # gets a per-model-family default from its adapter. Resolve the Megatron
@@ -3149,7 +3173,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         raise ValueError("--colocate-expert-weight-routing requires colocated Megatron Bridge training")
 
     # Only fully-async mode relies on the newer TransferQueue streaming sampler.
-    if getattr(args, "fully_async", False):
+    if args.fully_async:
         check_transfer_queue_version()
 
     return args
@@ -3314,9 +3338,9 @@ def _normalize_mtp_only_training_args(args) -> None:
         conflicts.append("--sft-chunked-logits")
     if getattr(args, "overlap_moe_expert_parallel_comm", False):
         conflicts.append("--overlap-moe-expert-parallel-comm")
-    if getattr(args, "fully_async", False):
+    if args.fully_async:
         conflicts.append("--fully-async")
-    if getattr(args, "hybrid", False):
+    if args.hybrid:
         conflicts.append("--hybrid")
     if tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS)) != _MTP_DETACH_PATHS:
         conflicts.append("--mtp-detach-paths")
@@ -3340,7 +3364,7 @@ def _validate_cpt_args(args) -> None:
         if getattr(args, "sft_cpt_template", "raw") != "raw":
             raise ValueError("--sft-cpt-template requires --sft-training-mode cpt.")
         return
-    if not is_sft_mode(args) or getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if not is_sft_mode(args) or args.task_type != "causal_lm":
         raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
     incompatible = {
         "--label-key": getattr(args, "label_key", None),
@@ -3504,14 +3528,14 @@ def _validate_reinforce_plus_plus_args(args, is_offline: bool) -> None:
     if is_offline:
         return
 
-    estimator = getattr(args, "advantage_estimator", None)
+    estimator = args.advantage_estimator
     variants = {"reinforce_plus_plus", "reinforce_plus_plus_baseline"}
     if estimator not in variants:
         return
 
     if not getattr(args, "normalize_advantages", False):
         raise ValueError(f"--advantage-estimator {estimator} requires --normalize-advantages.")
-    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+    if args.fully_async or args.hybrid:
         raise ValueError(
             f"--advantage-estimator {estimator} supports synchronous colocate training only; "
             "--fully-async and --hybrid are not supported because normalization requires a closed global batch."
@@ -3642,11 +3666,7 @@ def validate_kl_coefficients(args: argparse.Namespace) -> None:
 
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
-    is_sync_ppo = (
-        getattr(args, "use_critic", False)
-        and not getattr(args, "fully_async", False)
-        and not getattr(args, "hybrid", False)
-    )
+    is_sync_ppo = getattr(args, "use_critic", False) and not args.fully_async and not args.hybrid
     if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
         return False
 
@@ -3744,7 +3764,7 @@ def validate_algorithm_args(args) -> None:
     # batch. Resolve them here, while the error can still name the culprit.
     _assert_spec_implementations_resolve(spec)
 
-    args.use_critic = spec.needs_critic
+    args.use_critic = derive_use_critic(args)
     _validate_score_centering_args(args)
 
     if not spec.supports_context_parallel and (
@@ -3791,7 +3811,7 @@ def validate_algorithm_args(args) -> None:
         )
 
     if spec.requires_on_policy_updates:
-        if args.fully_async or getattr(args, "hybrid", False):
+        if args.fully_async or args.hybrid:
             raise ValueError(
                 f"--advantage-estimator {spec.name} only supports synchronous (colocate) training. "
                 "Please remove --fully-async / --hybrid."
@@ -3913,7 +3933,7 @@ def apply_custom_config_overrides(args) -> None:
     if not args.custom_config_path:
         return
 
-    loss_type_before_override = getattr(args, "loss_type", None)
+    loss_type_before_override = args.loss_type
     use_critic_before_override = getattr(args, "use_critic", False)
     with open(args.custom_config_path) as f:
         data = yaml.safe_load(f) or {}
@@ -3924,7 +3944,7 @@ def apply_custom_config_overrides(args) -> None:
             logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
         setattr(args, k, v)
 
-    if getattr(args, "loss_type", None) != loss_type_before_override:
+    if args.loss_type != loss_type_before_override:
         raise ValueError(
             "--custom-config-path cannot change loss_type after the training mode has already been configured. "
             "Pass --loss-type on the command line instead of overriding it from YAML."
@@ -4456,7 +4476,7 @@ def slime_validate_args(args):
     elif getattr(args, "sft_async_prepack", False):
         raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
-    task_type = getattr(args, "task_type", "causal_lm")
+    task_type = args.task_type
     if task_type == "seq_cls":
         if not is_sft_mode(args):
             raise ValueError("--task-type seq_cls requires --loss-type sft.")
@@ -4487,7 +4507,7 @@ def slime_validate_args(args):
 
     # `use_critic` is set by validate_algorithm_args for RL; offline training has no critic.
     if is_offline:
-        args.use_critic = False
+        args.use_critic = derive_use_critic(args)
     # Synchronous PPO has no producer for
     # `ref_log_probs`: actor's ref forward in backends/megatron/actor.py:800 is
     # gated on `advantage_estimator != "ppo"`, and the sync role set does not
@@ -4675,7 +4695,7 @@ def slime_validate_args(args):
 
     if (
         args.over_sampling_batch_size > args.rollout_batch_size
-        and not getattr(args, "fully_async", False)
+        and not args.fully_async
         and not getattr(args, "partial_rollout", False)
     ):
         # Without fully_async/partial_rollout there is no next-step carry path for the

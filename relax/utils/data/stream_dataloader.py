@@ -240,9 +240,7 @@ def create_stream_dataloader(
     # Choose the appropriate fetch function based on fully_async mode
     # Use partial to bind the broadcast_pp parameter
     # broadcast_pp is the inverse of fully_async: True for colocate, False for fully async
-    fetch_batch_fn = partial(
-        get_data_from_transfer_queue, args=args, broadcast_pp=not getattr(args, "fully_async", False)
-    )
+    fetch_batch_fn = partial(get_data_from_transfer_queue, args=args, broadcast_pp=not args.fully_async)
     dataset = StreamingDataset(
         config=args.tq_config,
         batch_size=args.micro_batch_size * args.n_samples_per_prompt,
@@ -1190,7 +1188,7 @@ def post_process_rollout_data(args, rollout_data):
 
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
-    if Envs.RELAX_SFT_SELECTIVE_LOGITS and getattr(args, "loss_type", None) == "sft":
+    if Envs.RELAX_SFT_SELECTIVE_LOGITS and args.loss_type == "sft":
         masks = rollout_data["loss_masks"]
         # Per-rank fetch supplies CPU masks. Never copy CUDA masks back in the
         # training path; unsupported producers simply retain the original head.
@@ -1235,9 +1233,7 @@ def post_process_rollout_data(args, rollout_data):
     padded_total_lengths = maybe_padded_total_lengths(
         rollout_data["total_lengths"],
         args.qkv_format,
-        getattr(args, "is_vl_model", False)
-        or "multimodal_train_inputs" in rollout_data
-        or getattr(args, "uses_unsplit_forward", False),
+        args.is_vl_model or "multimodal_train_inputs" in rollout_data or args.uses_unsplit_forward,
     )
 
     response_float_fields = [

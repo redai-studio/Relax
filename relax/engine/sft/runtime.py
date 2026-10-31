@@ -61,7 +61,7 @@ def resolve_sft_split_indices(
 
 def is_sft_mode(args: Namespace) -> bool:
     """Return whether the normalized training objective is SFT."""
-    return getattr(args, "loss_type", None) == "sft"
+    return args.loss_type == "sft"
 
 
 def is_i2i_sft(args: Namespace) -> bool:
@@ -71,12 +71,12 @@ def is_i2i_sft(args: Namespace) -> bool:
 
 def is_dpo_mode(args: Namespace) -> bool:
     """Return whether the normalized training objective is DPO."""
-    return getattr(args, "loss_type", None) == "dpo"
+    return args.loss_type == "dpo"
 
 
 def is_rm_mode(args: Namespace) -> bool:
     """Return whether the normalized training objective is reward modeling."""
-    return getattr(args, "loss_type", None) == "rm"
+    return args.loss_type == "rm"
 
 
 def is_offline_mode(args: Namespace) -> bool:
@@ -85,11 +85,11 @@ def is_offline_mode(args: Namespace) -> bool:
     Shared by argparse, controller wiring, components, and the Megatron
     backend.
     """
-    return getattr(args, "loss_type", None) in {"sft", "dpo", "rm"}
+    return args.loss_type in {"sft", "dpo", "rm"}
 
 
 def is_preference_mode(args: Namespace) -> bool:
-    return getattr(args, "loss_type", None) in {"dpo", "rm"}
+    return args.loss_type in {"dpo", "rm"}
 
 
 def validate_preference_args(args: Namespace) -> None:
@@ -101,7 +101,7 @@ def validate_preference_args(args: Namespace) -> None:
 
     if getattr(args, "sft_async_prepack", False):
         raise ValueError("preference objectives v1 do not support --sft-async-prepack")
-    if getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if args.task_type != "causal_lm":
         raise ValueError("preference objectives require --task-type causal_lm")
     if getattr(args, "mtp_only_training", False):
         raise ValueError("preference objectives v1 do not support MTP-only training")
@@ -123,7 +123,7 @@ def validate_preference_args(args: Namespace) -> None:
         raise ValueError("preference objectives v1 do not support dynamic context parallelism")
     if getattr(args, "qkv_format", "thd") != "thd":
         raise ValueError("preference objectives v1 require --qkv-format thd")
-    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+    if args.fully_async or args.hybrid:
         raise ValueError("preference objectives v1 support synchronous offline training only")
     if not getattr(args, "use_gloo_process_groups", False):
         raise ValueError("preference objectives require --use-gloo-process-groups for DP iterator control data")

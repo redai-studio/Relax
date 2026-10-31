@@ -260,7 +260,14 @@ def test_routing_replay_postprocess_keeps_full_batch_on_cpu(monkeypatch, use_gpu
         "response_lengths": [2, 1],
         "rollout_routed_experts": routes,
     }
-    args = Namespace(qkv_format="thd", use_opd=False, optimize_routing_replay=True)
+    args = Namespace(
+        qkv_format="thd",
+        use_opd=False,
+        optimize_routing_replay=True,
+        # Parse establishes these; post_process_rollout_data reads them directly.
+        is_vl_model=False,
+        uses_unsplit_forward=False,
+    )
 
     post_process(args, data)
 
