@@ -268,7 +268,7 @@ def _bypass_output_layer(
 
 def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dict) -> None:
     """Attach Megatron MTP kwargs for training forwards."""
-    if not getattr(args, "enable_mtp_training", False):
+    if not args.enable_mtp_training:
         return
 
     # VL+THD+CP unsplit path: bridge's preprocess_packed_seqs repacks
@@ -495,8 +495,8 @@ def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> 
     """Install the chunked head's completion policy after DDP builds
     buckets."""
     if not (
-        getattr(args, "loss_type", None) == "sft"
-        and getattr(args, "sft_chunked_logits", False)
+        args.loss_type == "sft"
+        and args.sft_chunked_logits
         and getattr(args, "recompute_loss_function", False)
         and getattr(args, "overlap_grad_reduce", False)
     ):
@@ -974,7 +974,7 @@ def forward_only(
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
 
         # Get the batch.
-        is_vl_model = getattr(args, "is_vl_model", False)
+        is_vl_model = args.is_vl_model
         batch = get_batch(
             data_iterator,
             [
@@ -1004,7 +1004,7 @@ def forward_only(
         # takes the image_grid_thw=None branch.
         mm_kwargs = batch.get("multimodal_train_inputs") or {}
         has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
-        needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
+        needs_unsplit = is_vl_model or has_mm_inputs or args.uses_unsplit_forward
 
         # Bridge Qwen3VLModel.forward (VL or text-only Qwen3.6) does CP+SP
         # splitting internally, so pass unsplit tokens.
@@ -1290,8 +1290,8 @@ def train_one_step(
         """
 
         nonlocal main_loss_has_tokens
-        is_vl_model = getattr(args, "is_vl_model", False)
-        mtp_only = getattr(args, "mtp_only_training", False)
+        is_vl_model = args.is_vl_model
+        mtp_only = args.mtp_only_training
         # Get the batch.
         with timer(f"get_data_batch_{uuid.uuid4().hex[:8]}", keep=False):
             _opd_keys: list[str] = []
@@ -1366,7 +1366,7 @@ def train_one_step(
                 )
         else:
             has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
-            needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
+            needs_unsplit = is_vl_model or has_mm_inputs or args.uses_unsplit_forward
             use_unsplit = needs_unsplit and "unsplit_tokens" in batch
 
             forward_kwargs = {
@@ -1418,18 +1418,18 @@ def train_one_step(
                 # Exception: under fused-linear CE the patch delegates to upstream
                 # process_mtp_loss, which calls the head through the INSTANCE and so
                 # does consume one intercepted call per depth again.
-                mtp_enabled = getattr(args, "enable_mtp_training", False)
+                mtp_enabled = args.enable_mtp_training
                 head_config = get_model_config(model)
                 fused_linear = (
                     head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
                 )
-                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False) and not fused_linear
+                chunked_mtp_on = mtp_enabled and args.sft_chunked_logits and not fused_linear
                 mtp_output_layer_calls = (
                     0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
-                if getattr(args, "sft_chunked_logits", False) and (args.fp16 or args.bf16):
+                if args.sft_chunked_logits and (args.fp16 or args.bf16):
                     forward_kwargs["fp32_output"] = False
                 with _bypass_output_layer(
                     model,
@@ -1482,7 +1482,7 @@ def train_one_step(
     # Forward pass.
     use_streaming = (
         getattr(args, "use_dynamic_batch_size", False)
-        and getattr(args, "fully_async", False)
+        and args.fully_async
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
@@ -1641,7 +1641,7 @@ def train_one_step(
 
         loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
         values = values.tolist()
-        is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+        is_sequence_classification = args.task_type == "seq_cls"
         num_samples_or_tokens = (
             values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
         )
@@ -2044,7 +2044,7 @@ def save(
         args.head_type = REWARD_MODEL_HEAD_TYPE
     elif role == "critic":
         args.head_type = "critic_value_terminal_v1"
-    elif getattr(args, "task_type", "causal_lm") == "seq_cls":
+    elif args.task_type == "seq_cls":
         args.head_type = "sequence_classification_v1"
     else:
         args.head_type = "causal_lm_v1"
@@ -2392,7 +2392,7 @@ def initialize_model_and_optimizer(
     classification_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
     if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
@@ -2417,7 +2417,7 @@ def initialize_model_and_optimizer(
         assert loaded_reward_head_param_ids == reward_head_param_ids, (
             "reward-model head parameter identities changed during checkpoint loading"
         )
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         release_sequence_classification_lm_heads(model)
         loaded_classification_head_param_ids = validate_sequence_classification_head_registration(
             model, optimizer, args

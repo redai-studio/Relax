@@ -18,7 +18,9 @@ except Exception as exc:
 
 
 def _args(*, reference_free: bool = False, beta: float = 0.2) -> Namespace:
-    return Namespace(
+    from tests.helpers.relax_args import make_args
+
+    return make_args(
         loss_type="dpo",
         dpo_reference_free=reference_free,
         dpo_beta=beta,

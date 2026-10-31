@@ -317,7 +317,7 @@ def _lora_checkpoint_metadata(args, trainable_names: tuple[str, ...]) -> dict:
         "lora_target_modules": tuple(args.lora_target_modules or ()),
         "lora_scope": args.lora_scope,
         "lora_merge_mode": args.lora_merge_mode,
-        "lora_adapter_mode": getattr(args, "lora_adapter_mode", False),
+        "lora_adapter_mode": args.lora_adapter_mode,
         "tensor_model_parallel_size": args.tensor_model_parallel_size,
         "pipeline_model_parallel_size": args.pipeline_model_parallel_size,
         "context_parallel_size": args.context_parallel_size,
@@ -976,7 +976,7 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
                 "lora_target_modules": list(args.lora_target_modules),
                 "lora_dropout": args.lora_dropout,
                 "lora_merge_mode": args.lora_merge_mode,
-                "lora_adapter_mode": getattr(args, "lora_adapter_mode", False),
+                "lora_adapter_mode": args.lora_adapter_mode,
             }
             with open(adapter_dir / "relax_lora_meta.json", "w") as f:
                 json.dump(metadata, f)

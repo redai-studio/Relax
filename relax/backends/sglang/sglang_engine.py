@@ -1910,7 +1910,7 @@ class GenRMEngine(SGLangEngine):
 
 
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:
-    if getattr(args, "enable_mtp_training", False):
+    if args.enable_mtp_training:
         return False
 
     speculative_algorithm = getattr(args, "sglang_speculative_algorithm", None)
@@ -2126,7 +2126,7 @@ def _compute_server_args(
     # LoRA adapter mode: launch the engine with SGLang's runtime LoRA serving so the
     # trained adapter can be pushed each step via load_lora_adapter (see
     # UpdateWeightFromTensor._push_lora_adapter) and selected at generation via lora_path.
-    if is_lora_enabled(args) and getattr(args, "lora_adapter_mode", False):
+    if is_lora_enabled(args) and args.lora_adapter_mode:
         kwargs["enable_lora"] = True
         kwargs["max_lora_rank"] = args.lora_rank
         # SGLang matches modules by leaf name; CLI holds canonical Megatron names. Fused

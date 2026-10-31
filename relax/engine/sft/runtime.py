@@ -61,7 +61,7 @@ def resolve_sft_split_indices(
 
 def is_sft_mode(args: Namespace) -> bool:
     """Return whether the normalized training objective is SFT."""
-    return getattr(args, "loss_type", None) == "sft"
+    return args.loss_type == "sft"
 
 
 def is_i2i_sft(args: Namespace) -> bool:
@@ -71,12 +71,12 @@ def is_i2i_sft(args: Namespace) -> bool:
 
 def is_dpo_mode(args: Namespace) -> bool:
     """Return whether the normalized training objective is DPO."""
-    return getattr(args, "loss_type", None) == "dpo"
+    return args.loss_type == "dpo"
 
 
 def is_rm_mode(args: Namespace) -> bool:
     """Return whether the normalized training objective is reward modeling."""
-    return getattr(args, "loss_type", None) == "rm"
+    return args.loss_type == "rm"
 
 
 def is_offline_mode(args: Namespace) -> bool:
@@ -85,11 +85,11 @@ def is_offline_mode(args: Namespace) -> bool:
     Shared by argparse, controller wiring, components, and the Megatron
     backend.
     """
-    return getattr(args, "loss_type", None) in {"sft", "dpo", "rm"}
+    return args.loss_type in {"sft", "dpo", "rm"}
 
 
 def is_preference_mode(args: Namespace) -> bool:
-    return getattr(args, "loss_type", None) in {"dpo", "rm"}
+    return args.loss_type in {"dpo", "rm"}
 
 
 def validate_preference_args(args: Namespace) -> None:
@@ -99,11 +99,11 @@ def validate_preference_args(args: Namespace) -> None:
     if is_rm_mode(args) and getattr(args, "save_hf", None) is not None:
         raise ValueError("RM training does not support --save-hf; use native Megatron checkpoints for RM persistence")
 
-    if getattr(args, "sft_async_prepack", False):
+    if args.sft_async_prepack:
         raise ValueError("preference objectives v1 do not support --sft-async-prepack")
-    if getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if args.task_type != "causal_lm":
         raise ValueError("preference objectives require --task-type causal_lm")
-    if getattr(args, "mtp_only_training", False):
+    if args.mtp_only_training:
         raise ValueError("preference objectives v1 do not support MTP-only training")
     if getattr(args, "custom_dataset_class_path", None):
         raise ValueError("preference objectives do not support --custom-dataset-class")
@@ -123,22 +123,22 @@ def validate_preference_args(args: Namespace) -> None:
         raise ValueError("preference objectives v1 do not support dynamic context parallelism")
     if getattr(args, "qkv_format", "thd") != "thd":
         raise ValueError("preference objectives v1 require --qkv-format thd")
-    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+    if args.fully_async or args.hybrid:
         raise ValueError("preference objectives v1 support synchronous offline training only")
     if not getattr(args, "use_gloo_process_groups", False):
         raise ValueError("preference objectives require --use-gloo-process-groups for DP iterator control data")
-    if getattr(args, "sft_chunked_logits", False) or getattr(args, "enable_mtp_training", False):
+    if args.sft_chunked_logits or args.enable_mtp_training:
         raise ValueError("preference objectives v1 do not support SFT chunked logits or MTP")
     if getattr(args, "calculate_per_token_loss", False):
         raise ValueError("preference objectives use pair reduction and reject --calculate-per-token-loss")
-    if int(getattr(args, "lora_rank", 0) or 0) > 0:
+    if int(args.lora_rank or 0) > 0:
         raise ValueError("preference objectives v1 do not support LoRA")
     if (
         float(getattr(args, "hidden_dropout", 0.0) or 0.0) != 0.0
         or float(getattr(args, "attention_dropout", 0.0) or 0.0) != 0.0
     ):
         raise ValueError("preference objectives require hidden and attention dropout to be 0.0")
-    if getattr(args, "sft_predict_interval", None) is not None:
+    if args.sft_predict_interval is not None:
         raise ValueError("preference objectives do not use SFT generation prediction")
     max_length = int(getattr(args, "preference_max_length", 0) or 0)
     max_completion_length = int(getattr(args, "preference_max_completion_length", 0) or 0)
@@ -181,7 +181,7 @@ def should_skip_sft_weight_management(
     """
     return bool(
         is_sft_mode(args)
-        and getattr(args, "sft_predict_interval", None) is None
+        and args.sft_predict_interval is None
         and not getattr(args, "offload_train", False)
         and not with_ref
         and not with_opd_teacher
@@ -192,13 +192,13 @@ def should_skip_sft_weight_management(
 def should_bypass_main_output_layer(args: Namespace) -> bool:
     """Return whether training needs hidden states instead of main language-
     model logits."""
-    return getattr(args, "mtp_only_training", False) or should_use_sft_chunked(args)
+    return args.mtp_only_training or should_use_sft_chunked(args)
 
 
 def should_use_sft_chunked(args: Namespace) -> bool:
     """Return whether regular SFT explicitly enabled chunked language-model
     logits."""
-    return is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)
+    return is_sft_mode(args) and args.sft_chunked_logits
 
 
 def sft_partition_prefix(args: Namespace) -> str:
@@ -221,7 +221,7 @@ def sft_tq_num_shards(args: Namespace) -> int:
     Kept as an env knob while this path is experimental so launch scripts can
     do A/B tests without adding a public CLI surface.
     """
-    if not is_sft_mode(args) or not getattr(args, "sft_async_prepack", False):
+    if not is_sft_mode(args) or not args.sft_async_prepack:
         return 1
     return max(1, Envs.RELAX_SFT_TQ_SHARDS)
 
@@ -283,7 +283,7 @@ def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:
     """
     if not is_sft_mode(args):
         return False
-    interval = getattr(args, "sft_predict_interval", None)
+    interval = args.sft_predict_interval
     if interval is None or interval <= 0:
         return False
     return completed_steps > 0 and completed_steps % interval == 0

@@ -59,7 +59,7 @@ def log_perf_data_raw(
             freeze_vision_model=getattr(args, "freeze_vision_model", False),
             freeze_vision_projection=getattr(args, "freeze_vision_projection", False),
             freeze_language_model=getattr(args, "freeze_language_model", False),
-            lora_rank=getattr(args, "lora_rank", 0),
+            lora_rank=args.lora_rank,
             freeze_params_name_list=getattr(args, "freeze_params_name_list", None),
             only_train_params_name_list=getattr(args, "only_train_params_name_list", None),
         )

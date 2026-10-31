@@ -310,7 +310,7 @@ def validate_generative_config(args: Namespace) -> None:
     if getattr(args, "train_backend", "megatron") != "fsdp":
         return
 
-    if getattr(args, "loss_type", None) == "sft":
+    if args.loss_type == "sft":
         validate_i2i_sft_config(args)
         return
 
@@ -335,7 +335,7 @@ def validate_generative_config(args: Namespace) -> None:
     # The transport follows the LoRA rollout path. It is DERIVED, not configured:
     # an explicit --weight-sync-mode that contradicts --lora-adapter-mode is an
     # error rather than something this function silently overwrites.
-    adapter_mode = bool(getattr(args, "lora_adapter_mode", False))
+    adapter_mode = bool(args.lora_adapter_mode)
     configured = getattr(args, "weight_sync_mode", "full")
     if adapter_mode and configured != "adapter":
         _fail(
@@ -359,7 +359,7 @@ def validate_generative_config(args: Namespace) -> None:
     # be derived from it, so a half-configured run fails at preflight instead of
     # silently training the wrong parameter set.
     mode = getattr(args, "fsdp_trainable_mode", "full")
-    lora_rank = int(getattr(args, "lora_rank", 0) or 0)
+    lora_rank = int(args.lora_rank or 0)
     _fail(errors, mode not in ("full", "lora"), f"fsdp_trainable_mode must be 'full' or 'lora', got {mode!r}.")
     _fail(
         errors,
@@ -381,7 +381,7 @@ def validate_generative_config(args: Namespace) -> None:
         # log line, just a run that trains and goes nowhere.
         _fail(
             errors,
-            float(getattr(args, "lora_dropout", 0.0) or 0.0) != 0.0,
+            float(args.lora_dropout or 0.0) != 0.0,
             "lora_dropout must be 0.0 for train_backend=fsdp: the FlowGRPO pi_old anchor is a "
             "replay through the live model, so a stochastic forward breaks the ratio==1 invariant "
             "of the first mini-epoch and the clipped loss silently collapses.",
@@ -496,7 +496,7 @@ def validate_generative_config(args: Namespace) -> None:
         _validate_sde_schedule(sampling, errors)
 
     use_critic = bool(getattr(args, "use_critic", False))
-    estimator = getattr(args, "advantage_estimator", "grpo")
+    estimator = args.advantage_estimator
     _fail(
         errors,
         use_critic or estimator == "ppo",
@@ -516,12 +516,12 @@ def validate_generative_config(args: Namespace) -> None:
     # with an opaque AttributeError / NotImplementedError.
     _fail(
         errors,
-        bool(getattr(args, "fully_async", False)),
+        bool(args.fully_async),
         "fully_async is not supported for train_backend=fsdp (generative RL is synchronous colocate only in this release).",
     )
     _fail(
         errors,
-        bool(getattr(args, "hybrid", False)),
+        bool(args.hybrid),
         "hybrid mode is not supported for train_backend=fsdp (synchronous colocate only in this release).",
     )
     _fail(
@@ -763,7 +763,7 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         _fail(errors, getattr(args, field, 1) != 1, f"Image FSDP SFT requires {field}=1.")
     _fail(
         errors,
-        getattr(args, "task_type", "causal_lm") != "causal_lm",
+        args.task_type != "causal_lm",
         "Image SFT does not support text classification",
     )
     _fail(errors, getattr(args, "micro_batch_size", 1) != 1, "Image SFT currently requires --micro-batch-size 1")
@@ -789,8 +789,8 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         args.fsdp_master_dtype = "fp32"
     _fail(errors, args.fsdp_master_dtype != "fp32", "Image SFT requires FP32 optimizer masters")
     if getattr(args, "fsdp_trainable_mode", "full") == "lora":
-        _fail(errors, (getattr(args, "lora_rank", 0) or 0) <= 0, "LoRA mode requires positive --lora-rank")
-    elif getattr(args, "lora_rank", 0):
+        _fail(errors, (args.lora_rank or 0) <= 0, "LoRA mode requires positive --lora-rank")
+    elif args.lora_rank:
         errors.append("Full SFT requires --lora-rank 0")
     if errors:
         raise ValueError("Invalid image SFT configuration:\n- " + "\n- ".join(errors))

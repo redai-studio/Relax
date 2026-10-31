@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
+from tests.helpers.relax_args import make_args
 
 
 @pytest.fixture
@@ -165,7 +166,7 @@ def test_zero_kl_uses_sampling_shape_without_sampling_values(monkeypatch):
     monkeypatch.setattr(loss, "maybe_padded_total_lengths", lambda *args: None)
     monkeypatch.setattr(loss, "compute_advantages_and_returns_impl", compute_impl)
     compute = loss.compute_advantages_and_returns
-    args = SimpleNamespace(
+    args = make_args(
         advantage_estimator="grpo",
         kl_coef=0,
         use_rollout_logprobs=False,
