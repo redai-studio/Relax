@@ -35,6 +35,10 @@ def _load_relax_functions(filename, names):
     module = ModuleType("_gdn_cp_test_" + path.stem)
     module.__package__ = "relax.backends.megatron"
     module.torch = torch
+    # Isolated AST exec does not import compat helpers used by the selected functions.
+    from relax.backends.megatron.compat import megatron_dynamic_context_parallel
+
+    module.megatron_dynamic_context_parallel = megatron_dynamic_context_parallel
     tree = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *selected],
         type_ignores=[],

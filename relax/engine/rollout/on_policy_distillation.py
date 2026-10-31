@@ -86,11 +86,11 @@ def _aiohttp_json_post_kwargs(payload: dict) -> dict:
 
 
 def is_opd_enabled(args, evaluation: bool = False) -> bool:
-    return not evaluation and getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
+    return not evaluation and args.use_opd and args.opd_type == "sglang"
 
 
 def _create_teacher_client_session(args) -> aiohttp.ClientSession:
-    connector_limit = int(getattr(args, "opd_teacher_connector_limit", 256))
+    connector_limit = int(args.opd_teacher_connector_limit)
     connector = aiohttp.TCPConnector(limit=connector_limit)
     timeout = aiohttp.ClientTimeout(total=float(args.opd_teacher_timeout_s))
     return aiohttp.ClientSession(connector=connector, timeout=timeout)
@@ -158,9 +158,9 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
 
 
 def _pick_teacher_url(args, sample=None) -> str:
-    routes_map = getattr(args, "opd_teacher_routes_map", None)
+    routes_map = args.opd_teacher_routes_map
     if routes_map and sample is not None:
-        key_field = getattr(args, "opd_teacher_key", None) or "data_source"
+        key_field = args.opd_teacher_key or "data_source"
         metadata = getattr(sample, "metadata", None) or {}
         routing_value = metadata.get(key_field)
         if routing_value is None:
@@ -178,7 +178,7 @@ def _pick_teacher_url(args, sample=None) -> str:
             )
         return _pick_replica(replicas, sample, routing_value)
     # Single-teacher path: round-robin over replicas if configured.
-    urls = getattr(args, "opd_teacher_urls", None)
+    urls = args.opd_teacher_urls
     if urls and len(urls) > 1:
         return _pick_replica(urls, sample, "__single__")
     return args.opd_teacher_url
@@ -187,11 +187,9 @@ def _pick_teacher_url(args, sample=None) -> str:
 class OpdManager:
     def __init__(self, args):
         self.args = args
-        self.student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
-        self.teacher_eos_token_id = getattr(args, "opd_teacher_eos_token_id", None)
-        self.teacher_response_prefix_token_ids = tuple(
-            getattr(args, "opd_teacher_response_prefix_token_ids", None) or ()
-        )
+        self.student_eos_token_id = args.opd_student_eos_token_id
+        self.teacher_eos_token_id = args.opd_teacher_eos_token_id
+        self.teacher_response_prefix_token_ids = tuple(args.opd_teacher_response_prefix_token_ids or ())
         self.topk_worker: opd_main_worker.TopkWorker | None = None
         self.sampled_worker: opd_main_worker.SampledTokenWorker | None = None  # 仅 student_sampled
         self.opsd_worker: opd_opsd_worker.OpsdWorker | None = None
@@ -199,7 +197,7 @@ class OpdManager:
         token_selection = args.opd_token_selection
         if token_selection != "student_sampled":
             self.topk_worker = opd_main_worker.TopkWorker.from_args(args)
-            if bool(getattr(args, "opd_fkl_entropy_gate", False)):
+            if bool(args.opd_fkl_entropy_gate):
                 # EOPD: sampled-token reverse-KL advantages ride alongside the
                 # entropy-gated top-k forward-KL loss; both workers are active.
                 self.sampled_worker = opd_main_worker.SampledTokenWorker.from_args(args)

@@ -19,7 +19,7 @@ def _resolve_train_actor_class(args):
     Defaults to Megatron so existing token-RL runs are unaffected; ``fsdp``
     selects the FSDP2 actor used by native generative RL (design doc 8.3).
     """
-    backend = getattr(args, "train_backend", "megatron")
+    backend = args.train_backend
     if backend == "fsdp":
         from relax.backends.fsdp.actor import FSDPTrainRayActor
 

@@ -53,7 +53,11 @@ def _batch(monkeypatch, pair_ids=(8, 7), pad_multiplier=1, allgather_cp=False):
         "chosen_total_lengths": [3, 4],
         "rejected_total_lengths": [2, 2],
     }
-    monkeypatch.setattr(data_module, "get_args", lambda: Namespace())
+    monkeypatch.setattr(
+        data_module,
+        "get_args",
+        lambda: Namespace(uses_unsplit_forward=False, is_vl_model=False),
+    )
     monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda: 0)
     monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1)
@@ -98,9 +102,11 @@ def test_reward_model_packing_preserves_terminal_scores_loss_and_gradients(
         assert packed.cu_seqlens_q.tolist() == [*boundaries, *([16] if padding else [])]
         assert packed.cu_seqlens_q_padded is None
 
+    from tests.helpers.relax_args import make_args
+
     flat = (batch["tokens"][0].float() / 10).requires_grad_()
     logits = flat.reshape(1, -1, 1)
-    args = Namespace(
+    args = make_args(
         loss_type="rm",
         qkv_format="thd",
         calculate_per_token_loss=False,
@@ -150,7 +156,9 @@ def test_reward_model_packing_preserves_terminal_scores_loss_and_gradients(
     ],
 )
 def test_reward_model_loss_rejects_mismatched_pairs(monkeypatch, mutation, match):
+    from tests.helpers.relax_args import make_args
+
     batch = _batch(monkeypatch)
     mutation(batch)
     with pytest.raises(ValueError, match=match):
-        reward_model_loss_function(Namespace(), batch, torch.zeros(1, 11, 1), lambda value: value)
+        reward_model_loss_function(make_args(), batch, torch.zeros(1, 11, 1), lambda value: value)

@@ -86,7 +86,7 @@ def _resolve_rollout_engine_class(args):
     ``SGLangEngine`` is returned so existing runs are unaffected (design doc
     8.3).
     """
-    class_path = getattr(args, "rollout_engine_class_path", None)
+    class_path = args.rollout_engine_class_path
     if class_path:
         return load_function(class_path)
     return SGLangEngine
@@ -469,7 +469,7 @@ class EngineGroup:
             )
             env_vars.update(
                 build_runai_streamer_env_for_load(
-                    getattr(self.args, "model_source", None),
+                    self.args.model_source,
                     effective_model_path,
                     effective_load_format,
                 )
@@ -727,14 +727,14 @@ class RolloutServer:
         # is retried. Do not return None slots to the synchronous weight updater.
         for group, dead_indices in zip(groups, dead_per_group, strict=True):
             if not (
-                getattr(group.args, "fully_async", False)
+                group.args.fully_async
                 and group.is_scaled_out
                 and group.pg is not None
                 and group.skip_router_registration
                 and group.lifecycle_status is EngineGroupLifecycle.ACTIVE
                 and group.router_ip
                 and group.router_port
-                and not getattr(group.args, "use_slime_router", False)
+                and not group.args.use_slime_router
                 and group.sglang_overrides.get("dp_size", getattr(group.args, "sglang_dp_size", 1)) == 1
                 and parse(sglang_router.__version__) >= parse("0.3.0")
             ):
@@ -4626,7 +4626,7 @@ def _start_router(
         and not force_new
         and has_pd_disaggregation
         and not args.use_slime_router
-        and not getattr(args, "debug_train_only", False)
+        and not args.debug_train_only
         and getattr(args, "router_decode_policy", None) == "power_of_two"
     ):
         # The owner chooses and binds the endpoint after engines are ready.
@@ -4932,7 +4932,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     routers_before = tuple(_LAUNCHED_ROUTER_PROCESSES)
     try:
         servers = _start_rollout_servers_impl(args, pg, groups)
-        if getattr(args, "use_agentic_rollout", False):
+        if args.use_agentic_rollout:
             from relax.agentic.rollout import bind_agentic_router
 
             bind_agentic_router(args.sglang_router_ip, args.sglang_router_port)
@@ -4979,7 +4979,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
             and not args.debug_train_only
         )
         if defer_router:
-            if args.rollout_external or getattr(args, "rollout_engine_class_path", None):
+            if args.rollout_external or args.rollout_engine_class_path:
                 raise ValueError("Managed static PD startup requires native, framework-launched SGLang engines")
             if getattr(args, "router_dp_aware", False):
                 raise ValueError("Managed static PD startup does not support DP-aware worker identities")
@@ -5041,7 +5041,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
             _wait_engine_init_with_progress(
                 all_init_handles,
                 model_name=model_cfg.name,
-                timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
+                timeout=args.rollout_engine_init_timeout,
                 log_interval=60.0,
             )
 

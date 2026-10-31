@@ -56,12 +56,12 @@ def log_perf_data_raw(
             images_seqlens=images_seqlens,
             audio_seqlens=audio_seqlens,
             image_grid_thw=getattr(timer_instance, "image_grid_thw", None),
-            freeze_vision_model=getattr(args, "freeze_vision_model", False),
-            freeze_vision_projection=getattr(args, "freeze_vision_projection", False),
-            freeze_language_model=getattr(args, "freeze_language_model", False),
-            lora_rank=getattr(args, "lora_rank", 0),
-            freeze_params_name_list=getattr(args, "freeze_params_name_list", None),
-            only_train_params_name_list=getattr(args, "only_train_params_name_list", None),
+            freeze_vision_model=args.freeze_vision_model,
+            freeze_vision_projection=args.freeze_vision_projection,
+            freeze_language_model=args.freeze_language_model,
+            lora_rank=args.lora_rank,
+            freeze_params_name_list=args.freeze_params_name_list,
+            only_train_params_name_list=args.only_train_params_name_list,
         )
         for name in ("enable_mtp_training", "mtp_num_layers", "mtp_detach_paths", "mtp_only_training"):
             if hasattr(args, name):

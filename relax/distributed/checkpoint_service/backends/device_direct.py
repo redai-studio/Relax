@@ -199,7 +199,7 @@ class DeviceDirectBackend(CommBackend):
         device_module.set_device(self.device)
 
         # Bridge-based HF weight converter (lazy-initialized on first use)
-        self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
+        self._use_bridge = args.megatron_to_hf_mode == "bridge"
         self._rollout_bucket_splitter = self._megatron.get_dcs_bucket_splitter(
             model_name, use_bridge=self._use_bridge, has_model=bool(model)
         )

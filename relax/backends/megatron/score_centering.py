@@ -93,7 +93,7 @@ def get_score_centering_chunk(
     vocabulary. Empty CP ranks retain the graph for collective backward.
     """
     logits = _mask_vocab_logits(logits, args)
-    with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
+    with_entropy_grad = with_entropy and args.entropy_coef != 0
     log_probs, entropy = calculate_log_probs_and_entropy(
         logits,
         tokens,

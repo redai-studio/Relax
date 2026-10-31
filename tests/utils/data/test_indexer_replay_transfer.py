@@ -77,20 +77,17 @@ def test_indexer_replay_dynamic_sample_field_round_trips_when_enabled():
     assert np.array_equal(getattr(restored, "rollout_indexer_topk"), replay)
 
 
-def test_indexer_replay_field_is_absent_when_flag_is_false_or_missing():
-    base_args = dict(
+def test_indexer_replay_field_is_absent_when_flag_is_false():
+    args = Namespace(
         advantage_estimator="grpo",
+        fully_async=False,
+        hybrid=False,
         loss_type="policy_loss",
         multimodal_keys=None,
         use_opd=False,
+        use_rollout_indexer_replay=False,
         use_rollout_routing_replay=False,
     )
 
-    without_flag = build_data_fields(Namespace(**base_args), consumer="actor")
-    with_false_flag = build_data_fields(
-        Namespace(**base_args, use_rollout_indexer_replay=False),
-        consumer="actor",
-    )
-
-    assert without_flag == with_false_flag
-    assert "rollout_indexer_topk" not in without_flag
+    fields = build_data_fields(args, consumer="actor")
+    assert "rollout_indexer_topk" not in fields

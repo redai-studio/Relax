@@ -378,8 +378,8 @@ class RewardExecutor:
                 metadata_rm_type=metadata.get("rm_type"),
                 args_rm_type=args.rm_type,
                 label=sample.label,
-                infer=getattr(args, "rm_type_infer", False),
-                fallback=getattr(args, "rm_type_fallback", None),
+                infer=args.rm_type_infer,
+                fallback=args.rm_type_fallback,
                 sample_index=getattr(sample, "index", None),
             )
             if route.zero_reward:
@@ -417,10 +417,10 @@ class RewardExecutor:
 
 
 def _get_reward_executor(args):
-    max_concurrency = getattr(args, "reward_max_concurrency", None)
+    max_concurrency = args.reward_max_concurrency
     if max_concurrency is None:
         max_concurrency = 64
-    num_workers = getattr(args, "reward_num_workers", 16)
+    num_workers = args.reward_num_workers
     return RewardExecutor.get_or_create(
         max_concurrency=max_concurrency,
         num_workers=num_workers,
@@ -432,7 +432,7 @@ async def _dummy_reward(args):
     # scoring is deferred to a post-rollout batch pass. Returns a dict when
     # reward_key is set so downstream sample.reward[reward_key] access does
     # not KeyError before the post-process step overwrites everything.
-    reward_key = getattr(args, "reward_key", None)
+    reward_key = args.reward_key
     if reward_key:
         return {reward_key: 0.0}
     return 0.0

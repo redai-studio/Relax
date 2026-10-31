@@ -11,6 +11,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from tests.helpers.relax_args import make_args
+
 
 ARGS_PATH = pathlib.Path(__file__).resolve().parents[2] / "relax" / "utils" / "arguments.py"
 
@@ -49,6 +51,7 @@ def arguments_module(monkeypatch):
 def _args(estimator="grpo", **overrides):
     base = dict(
         advantage_estimator=estimator,
+        loss_type="policy_loss",
         normalize_advantages=False,
         rewards_normalization=True,
         custom_reward_post_process_path=None,
@@ -66,7 +69,7 @@ def _args(estimator="grpo", **overrides):
         m2po_miniclip_high=0.5,
     )
     base.update(overrides)
-    return SimpleNamespace(**base)
+    return make_args(**base)
 
 
 # ---------------- behaviour ----------------

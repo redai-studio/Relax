@@ -110,13 +110,13 @@ class GenerateState(metaclass=SingletonMeta):
         # Media-encoding thread pool for this rollout worker process, sized by
         # --encode-max-workers (falls back to $RELAX_ENCODE_MAX_WORKERS, then an
         # affinity-aware default). Held on state so consumers use it explicitly.
-        self.encode_executor = configure_encode_executor(getattr(args, "encode_max_workers", None))
+        self.encode_executor = configure_encode_executor(args.encode_max_workers)
 
         # Process pool for running HuggingFace processor without GIL contention.
         # Controlled by --mm-processor-pool-size (0 = disabled).
         self.processor_pool = None
         if self.processor is not None:
-            pool_size = getattr(args, "mm_processor_pool_size", 0)
+            pool_size = args.mm_processor_pool_size
             if pool_size > 0:
                 try:
                     self.processor_pool = ProcessorPool(
@@ -442,7 +442,7 @@ async def generate(
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
-    if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
+    if args.use_rollout_indexer_replay and not evaluation:
         payload["return_indexer_topk"] = True
 
     if state.opd_manager and not evaluation:
@@ -451,7 +451,7 @@ async def generate(
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
     # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
     # base model only and rollouts would not reflect the trained policy.
-    if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+    if args.lora_rank > 0 and args.lora_adapter_mode:
         from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
 
         payload["lora_path"] = LORA_ADAPTER_NAME
@@ -496,7 +496,7 @@ async def generate(
     headers = None
     if args.sglang_router_policy == "consistent_hashing" and sample.session_id:
         headers = {"X-SMG-Routing-Key": sample.session_id}
-    elif getattr(args, "slime_router_sticky", False) and sample.group_index is not None:
+    elif args.slime_router_sticky and sample.group_index is not None:
         # Pin all samples of one prompt group to the same engine so the shared prompt
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
@@ -630,7 +630,7 @@ async def generate(
             args.moe_router_topk,
         )
 
-    if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
+    if args.use_rollout_indexer_replay and not evaluation:
         setattr(
             sample,
             "rollout_indexer_topk",
@@ -966,7 +966,7 @@ async def generate_rollout_async(
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
 
     is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
-    strict_fill_current = args.fully_async and getattr(args, "max_staleness", 1) == 0
+    strict_fill_current = args.fully_async and args.max_staleness == 0
 
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill
@@ -1352,7 +1352,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     state.evaluating += 1
     try:
         coros = []
-        for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+        for dataset_cfg in args.eval_datasets or []:
             coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
         results_list = await asyncio.gather(*coros)
         results = {}
@@ -1528,7 +1528,7 @@ def generate_rollout(
     # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a
     # prefetched generation is almost always aborted by the next step's pause_generation and its
     # truncated samples would pollute the next rollout. Other modes keep the optimization.
-    _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
+    _lora_adapter_mode = args.lora_rank > 0 and args.lora_adapter_mode
     # Match Rollout._maybe_save_data: prefetch advances the saved data cursor, but its
     # ObjectRef is not checkpointed. Leave the next batch unread at save boundaries.
     _save_data = (
