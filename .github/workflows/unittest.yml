@@ -106,8 +106,32 @@ jobs:
         timeout-minutes: 30
         run: |
           docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+            # The image places its assembled Megatron source first in PYTHONPATH.
+            MEGATRON_SOURCE_DIR="${PYTHONPATH%%:*}"
+            : "${MEGATRON_SOURCE_DIR:?image PYTHONPATH must start with the Megatron source root}"
+            export RELAX_MEGATRON_PATCHED_SOURCE="$MEGATRON_SOURCE_DIR"
+            export BLACKWELL_MEGATRON_SOURCE_DIR="$MEGATRON_SOURCE_DIR"
+            FLA_SOURCE_DIR="$(mktemp -d)"
+            uv pip install --no-deps --python "$(command -v python)" --target "$FLA_SOURCE_DIR" \
+              "fla-core==0.5.2" "flash-linear-attention==0.5.2"
+            export BLACKWELL_FLA_SOURCE_DIR="$FLA_SOURCE_DIR"
+            FLA_LEGACY_WHEELS="$(mktemp -d)"
+            # The image constraint applies to installed FLA, not these test inputs.
+            PIP_CONSTRAINT= python -m pip download --no-deps --only-binary=:all: --dest "$FLA_LEGACY_WHEELS" \
+              "fla-core==0.4.2" "flash-linear-attention==0.4.2"
+            export BLACKWELL_FLA042_WHEEL_DIR="$FLA_LEGACY_WHEELS"
             python -m pytest tests/ -v -ra --tb=short --junitxml=/artifacts/junit.xml \
               2>&1 | tee /artifacts/pytest.log
+          '
+
+      - name: Run metrics Serve smoke
+        run: |
+          docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+            export RUN_METRICS_SERVE_SMOKE=1
+            export RAY_TMPDIR="$(mktemp -d)"
+            python -m pytest tests/utils/test_metrics_service_http.py::test_metrics_service_http_scrapes_sglang_without_redirects \
+              -v -ra --tb=short --junitxml=/artifacts/metrics-serve-smoke.xml \
+              2>&1 | tee /artifacts/metrics-serve-smoke.log
           '
 
       - name: Remove test container
