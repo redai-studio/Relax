@@ -277,7 +277,7 @@ def _main_update_token_normalization_enabled() -> bool:
     if mode != "main_update_tokens":
         raise ValueError(f"Unsupported mtp_loss_normalization: {mode!r}")
     if (
-        getattr(args, "loss_type", None) != "sft"
+        args.loss_type != "sft"
         or not getattr(args, "enable_mtp_training", False)
         or not getattr(args, "sft_chunked_logits", False)
         or not getattr(args, "calculate_per_token_loss", False)

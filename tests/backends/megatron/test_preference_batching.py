@@ -83,7 +83,9 @@ def test_dp2_pair_rows_remain_atomic_with_global_pair_denominator(monkeypatch, p
         output[:] = [value, (value[0], value[1], peer_bins)]
 
     monkeypatch.setattr(data_module.dist, "all_gather_object", all_gather_object)
-    args = Namespace(
+    from tests.helpers.relax_args import make_args
+
+    args = make_args(
         global_batch_size=4,
         max_tokens_per_gpu=capacity,
         loss_type="dpo",

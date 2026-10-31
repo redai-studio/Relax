@@ -180,7 +180,7 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     length and therefore remains distinct from a sample whose response exists
     but is fully masked.
     """
-    spec = get_algorithm(getattr(args, "advantage_estimator", None) or "grpo")
+    spec = get_algorithm(args.advantage_estimator or "grpo")
     if spec.reward_normalizer != "group_leave_one_out":
         return {}
     if (

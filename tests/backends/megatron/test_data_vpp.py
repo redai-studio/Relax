@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from relax.utils.data.data import get_first_fit_partitions
+from tests.helpers.relax_args import make_args
 
 
 def _load_data_module(monkeypatch):
@@ -271,7 +272,7 @@ def test_log_rollout_data_creates_collective_stats_on_training_device(monkeypatc
     monkeypatch.setattr(data_module, "gather_log_data", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(data_module, "maybe_padded_total_lengths", lambda *_args, **_kwargs: None)
 
-    args = Namespace(
+    args = make_args(
         qkv_format="thd",
         is_vl_model=False,
         uses_unsplit_forward=False,
@@ -334,7 +335,7 @@ def test_get_data_iterator_uses_rollout_mini_boundaries_with_balance_data(monkey
     monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(data_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
 
-    args = Namespace(
+    args = make_args(
         balance_data=True,
         global_batch_size=32,
         micro_batch_size=4,
@@ -371,7 +372,7 @@ def test_get_data_iterator_balance_data_without_boundaries_uses_regular_steps(mo
     monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(data_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
 
-    args = Namespace(
+    args = make_args(
         balance_data=True,
         global_batch_size=16,
         micro_batch_size=4,

@@ -557,7 +557,9 @@ def test_loss_function_forwards_recompute_checkpoint_mode(monkeypatch, configure
     monkeypatch.setattr(_loss_mod, "get_cp_local_num_tokens", lambda *args, **kwargs: torch.tensor(1))
     monkeypatch.setattr(_loss_mod, "get_sum_of_sample_mean", lambda *args, **kwargs: object())
 
-    args = Namespace(
+    from tests.helpers.relax_args import make_args
+
+    args = make_args(
         loss_type="sft",
         recompute_loss_function=True,
         sft_chunked_logits=False,

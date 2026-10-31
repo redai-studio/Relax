@@ -331,7 +331,7 @@ def get_model_provider_func(
             _install_cp_probe(model)
             return model
 
-        if is_lora_enabled(args) and getattr(args, "task_type", "causal_lm") == "seq_cls":
+        if is_lora_enabled(args) and args.task_type == "seq_cls":
             wrapped_model_provider = wrap_model_provider_with_lora(wrapped_model_provider, args)
         return wrapped_model_provider
 

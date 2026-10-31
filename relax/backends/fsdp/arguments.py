@@ -310,7 +310,7 @@ def validate_generative_config(args: Namespace) -> None:
     if getattr(args, "train_backend", "megatron") != "fsdp":
         return
 
-    if getattr(args, "loss_type", None) == "sft":
+    if args.loss_type == "sft":
         validate_i2i_sft_config(args)
         return
 
@@ -496,7 +496,7 @@ def validate_generative_config(args: Namespace) -> None:
         _validate_sde_schedule(sampling, errors)
 
     use_critic = bool(getattr(args, "use_critic", False))
-    estimator = getattr(args, "advantage_estimator", "grpo")
+    estimator = args.advantage_estimator
     _fail(
         errors,
         use_critic or estimator == "ppo",
@@ -516,12 +516,12 @@ def validate_generative_config(args: Namespace) -> None:
     # with an opaque AttributeError / NotImplementedError.
     _fail(
         errors,
-        bool(getattr(args, "fully_async", False)),
+        bool(args.fully_async),
         "fully_async is not supported for train_backend=fsdp (generative RL is synchronous colocate only in this release).",
     )
     _fail(
         errors,
-        bool(getattr(args, "hybrid", False)),
+        bool(args.hybrid),
         "hybrid mode is not supported for train_backend=fsdp (synchronous colocate only in this release).",
     )
     _fail(
@@ -763,7 +763,7 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         _fail(errors, getattr(args, field, 1) != 1, f"Image FSDP SFT requires {field}=1.")
     _fail(
         errors,
-        getattr(args, "task_type", "causal_lm") != "causal_lm",
+        args.task_type != "causal_lm",
         "Image SFT does not support text classification",
     )
     _fail(errors, getattr(args, "micro_batch_size", 1) != 1, "Image SFT currently requires --micro-batch-size 1")

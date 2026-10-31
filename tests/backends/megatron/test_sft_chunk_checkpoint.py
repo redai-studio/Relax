@@ -56,10 +56,12 @@ def test_chunk_checkpoint_loss_and_gradients(loss_fn, chunk, frozen, temperature
         h = hidden.clone().requires_grad_(not frozen)
         w = weight.clone().requires_grad_()
         args = SimpleNamespace(
+            advantage_estimator=None,
             sft_logits_chunk_size=chunk,
             recompute_loss_function=recompute,
             rollout_temperature=temperature,
             allgather_cp=False,
+            loss_type="sft",
         )
         _, result = loss_fn(
             h,
@@ -92,7 +94,12 @@ def test_checkpoint_does_not_retain_vocab_tensors(loss_fn):
         return x
 
     args = SimpleNamespace(
-        sft_logits_chunk_size=4, recompute_loss_function=True, rollout_temperature=1.0, allgather_cp=False
+        advantage_estimator=None,
+        sft_logits_chunk_size=4,
+        recompute_loss_function=True,
+        rollout_temperature=1.0,
+        allgather_cp=False,
+        loss_type="sft",
     )
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda x: x):
         _, result = loss_fn(

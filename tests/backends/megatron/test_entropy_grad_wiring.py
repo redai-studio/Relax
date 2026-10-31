@@ -30,6 +30,7 @@ def test_get_log_probs_and_entropy_wires_entropy_grad(
     monkeypatch.setattr(loss_module.mpu, "get_tensor_model_parallel_group", lambda: None)
 
     args = Namespace(
+        advantage_estimator="grpo",
         allgather_cp=False,
         entropy_coef=entropy_coef,
         log_probs_chunk_size=-1,
@@ -76,6 +77,7 @@ def test_sft_chunked_lm_head_matches_log_softmax_gradients(monkeypatch: pytest.M
     loss_weights = torch.tensor([0.25, -0.5, 1.5, 0.75], dtype=torch.float32)
     temperature = 0.7
     args = Namespace(
+        advantage_estimator=None,
         allgather_cp=False,
         entropy_coef=0.0,
         loss_type="sft",

@@ -280,32 +280,35 @@ def test_run_step_evaluation_does_not_wait_before_final_step(monkeypatch):
 
 
 def _valid_args(**over):
-    base = dict(
-        train_backend="fsdp",
-        generation_task="t2i",
-        model_adapter_path="relax.models.qwen_image.adapter.QwenImageAdapter",
-        model_path="/models/Qwen-Image",
-        fsdp_trainable_mode="full",
-        weight_sync_wire_dtype="bf16",
-        rollout_num_gpus_per_engine=1,
-        multimodal_keys={},
-        reward_required_components=None,
-        reward_component_weights=None,
-        reward_runtime="cpu",
-        generative_advantage_std_mode=None,
+    from tests.helpers.relax_args import make_args
+
+    values = {
+        "train_backend": "fsdp",
+        "loss_type": "policy_loss",
+        "generation_task": "t2i",
+        "model_adapter_path": "relax.models.qwen_image.adapter.QwenImageAdapter",
+        "model_path": "/models/Qwen-Image",
+        "fsdp_trainable_mode": "full",
+        "weight_sync_wire_dtype": "bf16",
+        "rollout_num_gpus_per_engine": 1,
+        "multimodal_keys": {},
+        "reward_required_components": None,
+        "reward_component_weights": None,
+        "reward_runtime": "cpu",
+        "generative_advantage_std_mode": None,
         # `eta` is required (both the rollout request and the actor replay read
         # it, and they must not disagree); step 0 is excluded because sigma==1
         # makes the sde-type diffusion coefficient singular.
-        sampling_config={"num_inference_steps": 12, "eta": 0.7, "sde_indices": [1, 3, 5]},
+        "sampling_config": {"num_inference_steps": 12, "eta": 0.7, "sde_indices": [1, 3, 5]},
         # Synchronous colocate is the only supported generative deployment mode.
-        colocate=True,
-        fully_async=False,
-        hybrid=False,
-        kl_coef=0.0,
-        use_kl_loss=False,
-    )
-    base.update(over)
-    return Namespace(**base)
+        "colocate": True,
+        "fully_async": False,
+        "hybrid": False,
+        "kl_coef": 0.0,
+        "use_kl_loss": False,
+    }
+    values.update(over)
+    return make_args(**values)
 
 
 def test_validate_requires_eta_in_sampling_config():
