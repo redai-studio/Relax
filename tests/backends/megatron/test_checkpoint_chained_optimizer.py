@@ -141,7 +141,14 @@ def test_checkpoint_chained_optimizer_resumes_adam_and_scheduler(
         for index in range(2):
             prefix = f"chained_{index}.optimizer." if prefixed else "optimizer."
             assert any(key.startswith(prefix) for key in keys)
-        args = Namespace(load=str(tmp_path), ckpt_format="torch_dist", no_load_optim=False, finetune=False)
+        # load_checkpoint → is_rm_mode() reads loss_type directly.
+        args = Namespace(
+            load=str(tmp_path),
+            loss_type="policy_loss",
+            ckpt_format="torch_dist",
+            no_load_optim=False,
+            finetune=False,
+        )
         assert checkpoint_metadata._checkpoint_has_optimizer_state(path, args)
         (tmp_path / "latest_checkpointed_iteration.txt").write_text("3")
         restored = _cpu_chain()

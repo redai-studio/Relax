@@ -72,7 +72,7 @@ def lr_at_step(args, step: int, base_lr: float) -> float:
     if warmup > 0 and step < warmup:
         return base_lr * float(step + 1) / float(warmup)
 
-    style = getattr(args, "fsdp_lr_scheduler", "constant") or "constant"
+    style = args.fsdp_lr_scheduler or "constant"
     if style == "constant":
         return base_lr
     decay_iters = getattr(args, "lr_decay_iters", None)
@@ -356,7 +356,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # policy module), but before fsdp2_wrap (once fully_shard has run every
         # parameter is a DTensor and PEFT's nn.Linear surgery no longer applies)
         # and before the optimizer, which snapshots the trainable parameter list.
-        self._trainable_mode = getattr(args, "fsdp_trainable_mode", "full")
+        self._trainable_mode = args.fsdp_trainable_mode
         self._lora_target_modules: List[str] = []
         self._lora_plan = None
         if self._trainable_mode == "lora":
@@ -368,7 +368,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 rank=int(args.lora_rank),
                 alpha=int(args.lora_alpha),
                 target_modules=self._lora_target_modules,
-                dropout=float(getattr(args, "lora_dropout", 0.0) or 0.0),
+                dropout=float(args.lora_dropout or 0.0),
                 task_type=self._lora_task_type(),
             )
 
@@ -384,8 +384,8 @@ class FSDPTrainRayActor(TrainRayActor):
             reduce_dtype=args.fsdp_reduce_dtype,
             reshard_after_forward=args.fsdp_reshard_after_forward,
             cpu_offload=args.fsdp_cpu_offload,
-            activation_checkpointing=getattr(args, "fsdp_activation_checkpointing", False),
-            master_dtype=getattr(args, "fsdp_master_dtype", None),
+            activation_checkpointing=args.fsdp_activation_checkpointing,
+            master_dtype=args.fsdp_master_dtype,
         )
         if self._trainable_mode == "lora" and not is_i2i_sft(args):
             from relax.backends.fsdp.lora import build_lora_sync_plan
@@ -531,7 +531,7 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             world = 1
             rank = 0
-        wave_size = int(getattr(args, "fsdp_load_wave_size", 0) or 0)
+        wave_size = int(args.fsdp_load_wave_size or 0)
         if wave_size <= 0 or world <= 1:
             return self.adapter.load_train_model(args)
 
@@ -560,7 +560,7 @@ class FSDPTrainRayActor(TrainRayActor):
         Protocol is ``@runtime_checkable`` and is ``isinstance``-asserted by
         the adapter unit tests.
         """
-        explicit = getattr(args, "lora_target_modules", None)
+        explicit = args.lora_target_modules
         if explicit:
             return [str(t) for t in explicit]
         default = getattr(self.adapter, "lora_target_modules", None)
@@ -602,7 +602,7 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
     def _hash_base_model(self, args) -> str:
-        seed = f"{args.model_path}:{getattr(args, 'model_revision', None)}"
+        seed = f"{args.model_path}:{args.model_revision}"
         return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
     def _named_trainable_params(self):

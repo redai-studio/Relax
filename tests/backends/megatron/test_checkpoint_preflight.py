@@ -144,7 +144,8 @@ def _stub_loaders(monkeypatch, args):
 
 def test_checkpoint_missing_iteration_falls_back_to_hf(monkeypatch, tmp_path):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
-    calls = _stub_loaders(monkeypatch, Namespace(load=str(tmp_path)))
+    # load_checkpoint → is_rm_mode() reads loss_type directly.
+    calls = _stub_loaders(monkeypatch, Namespace(load=str(tmp_path), loss_type="policy_loss"))
     assert checkpoint.load_checkpoint(None, None, None, {}, False) == (0, 0)
     assert calls == [("hf", None)]
 
@@ -155,7 +156,13 @@ def test_checkpoint_missing_iteration_falls_back_to_hf(monkeypatch, tmp_path):
 def test_checkpoint_model_only_sets_optimizer_policy(monkeypatch, tmp_path, no_load_optim, finetune, expected):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
     save({"model": torch.zeros(2)}, checkpoint_id=tmp_path / "iter_0000007")
-    args = Namespace(load=str(tmp_path), ckpt_format="torch_dist", no_load_optim=no_load_optim, finetune=finetune)
+    args = Namespace(
+        load=str(tmp_path),
+        loss_type="policy_loss",
+        ckpt_format="torch_dist",
+        no_load_optim=no_load_optim,
+        finetune=finetune,
+    )
     calls = _stub_loaders(monkeypatch, args)
     checkpoint.load_checkpoint(None, object(), None, {}, False)
     assert calls == [("dcp",)]
@@ -206,7 +213,7 @@ def _probe_worker(rank, rendezvous, output):
     try:
         for mode in ("valid", "missing", "permission", "metadata", "tracker", "optimizer"):
             calls = []
-            checkpoint.get_args = lambda: Namespace(load="/shared/checkpoint")
+            checkpoint.get_args = lambda: Namespace(load="/shared/checkpoint", loss_type="policy_loss")
             checkpoint._load_checkpoint_hf = lambda **kw: calls.append("hf")
             checkpoint._load_checkpoint_megatron = lambda **kw: calls.append("dcp")
             checkpoint._load_checkpoint_metadata = lambda *a, **kw: {}

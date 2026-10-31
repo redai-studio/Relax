@@ -132,6 +132,8 @@ class TestMetricsServiceAdapter(unittest.TestCase):
     def setUp(self):
         args_dict = {
             "use_metrics_service": True,
+            # Declared default; MetricsServiceAdapter reads this directly.
+            "timeline_dump_dir": None,
         }
         self.args = create_namespace(args_dict)
 

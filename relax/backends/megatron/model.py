@@ -36,6 +36,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
+from relax.backends.megatron.compat import megatron_context_parallel_size, megatron_dynamic_context_parallel
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
@@ -268,7 +269,7 @@ def _bypass_output_layer(
 
 def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dict) -> None:
     """Attach Megatron MTP kwargs for training forwards."""
-    if not getattr(args, "enable_mtp_training", False):
+    if not args.enable_mtp_training:
         return
 
     # VL+THD+CP unsplit path: bridge's preprocess_packed_seqs repacks
@@ -324,10 +325,8 @@ def _mtp_metric_scales(args: Namespace, num_microbatches: int, *, token_tracker:
     already averages tokens across microbatches. Legacy trackers expose sums of
     microbatch means and do not have a uniform loss-scaling contract.
     """
-    objective_scale = (
-        1.0 if token_tracker and getattr(args, "calculate_per_token_loss", False) else 1 / num_microbatches
-    )
-    factor = getattr(args, "mtp_loss_scaling_factor", 0.0)
+    objective_scale = 1.0 if token_tracker and args.calculate_per_token_loss else 1 / num_microbatches
+    factor = args.mtp_loss_scaling_factor
     raw_scale = objective_scale * args.mtp_num_layers / factor if token_tracker and factor else None
     return objective_scale, raw_scale
 
@@ -429,7 +428,7 @@ def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) 
     """Build Megatron optimizer overrides, including the optional MS-Swift-
     style ViT LR group."""
     if Envs.RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS:
-        if getattr(args, "vit_lr", None) is not None:
+        if args.vit_lr is not None:
             raise ValueError("RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS is incompatible with --vit-lr")
         # The standard Megatron groups set wd_mult=0 for biases and 1-D
         # parameters. The strict AutoModel parity baseline used a single AdamW
@@ -437,7 +436,7 @@ def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) 
         return {}
 
     config_overrides = get_standard_config_overrides(config)
-    vit_lr = getattr(args, "vit_lr", None)
+    vit_lr = args.vit_lr
     if vit_lr is None:
         return config_overrides
 
@@ -472,7 +471,7 @@ def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) 
 def _validate_vit_lr_trainable_params(args: Namespace, model: list[DDP]) -> None:
     """Fail fast when ``--vit-lr`` does not match a trainable parameter on any
     rank."""
-    if getattr(args, "vit_lr", None) is None:
+    if args.vit_lr is None:
         return
 
     global_match_count = sum(
@@ -495,16 +494,16 @@ def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> 
     """Install the chunked head's completion policy after DDP builds
     buckets."""
     if not (
-        getattr(args, "loss_type", None) == "sft"
-        and getattr(args, "sft_chunked_logits", False)
-        and getattr(args, "recompute_loss_function", False)
+        args.loss_type == "sft"
+        and args.sft_chunked_logits
+        and args.recompute_loss_function
         and getattr(args, "overlap_grad_reduce", False)
     ):
         return
     if (
         not getattr(args, "untie_embeddings_and_output_weights", False)
         or getattr(args, "cuda_graph_impl", "none") != "none"
-        or getattr(args, "dynamic_context_parallel", False)
+        or megatron_dynamic_context_parallel(args)
         or getattr(args, "num_distributed_optimizer_instances", 1) != 1
     ):
         raise ValueError("Chunked gradient overlap requires untied head, no graphs/dynamic CP and one optimizer")
@@ -577,7 +576,7 @@ def setup_model_and_optimizer(
             RoutingReplay.all_routing_replays = active_replays
 
     _patch_gdn_cu_seqlens_validation()
-    if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
+    if megatron_dynamic_context_parallel(args) or megatron_context_parallel_size(args) > 1:
         # Global, idempotent GatedDeltaNet patch — apply whenever CP is active
         # (dynamic CP, or static context_parallel_size > 1), incl. weight-only
         # roles that still run forward.
@@ -974,7 +973,7 @@ def forward_only(
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
 
         # Get the batch.
-        is_vl_model = getattr(args, "is_vl_model", False)
+        is_vl_model = args.is_vl_model
         batch = get_batch(
             data_iterator,
             [
@@ -1004,7 +1003,7 @@ def forward_only(
         # takes the image_grid_thw=None branch.
         mm_kwargs = batch.get("multimodal_train_inputs") or {}
         has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
-        needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
+        needs_unsplit = is_vl_model or has_mm_inputs or args.uses_unsplit_forward
 
         # Bridge Qwen3VLModel.forward (VL or text-only Qwen3.6) does CP+SP
         # splitting internally, so pass unsplit tokens.
@@ -1076,7 +1075,7 @@ def forward_only(
             sample_weights=batch.get("sample_weights", None),
         )
 
-        if getattr(args, "dynamic_context_parallel", False) and per_sample_output:
+        if megatron_dynamic_context_parallel(args) and per_sample_output:
             # Carry per-mb dynamic-CP metadata on the result so
             # dynamic_cp_merge_output can reconstruct the full mb (CP
             # all-gather + cross-sub-group gather + reorder) before the write-back.
@@ -1133,7 +1132,7 @@ def forward_only(
     rollout_data = {}
     # Store the results on the last stage
     if mpu.is_pipeline_last_stage():
-        if getattr(args, "dynamic_context_parallel", False) and per_sample_output:
+        if megatron_dynamic_context_parallel(args) and per_sample_output:
             # Reconstruct each mb's full sample set (CP all-gather + cross-sub-group
             # gather + reorder) so the per-sample outputs line up with the full
             # micro_batch_indices used by the write-back below.
@@ -1249,7 +1248,7 @@ def train_one_step(
         and gradient norm for logging.
     """
     args = get_args()
-    use_indexer_replay = getattr(args, "use_rollout_indexer_replay", False)
+    use_indexer_replay = args.use_rollout_indexer_replay
     if use_indexer_replay:
         from relax.utils.training.indexer_replay import IndexerReplay
 
@@ -1290,8 +1289,8 @@ def train_one_step(
         """
 
         nonlocal main_loss_has_tokens
-        is_vl_model = getattr(args, "is_vl_model", False)
-        mtp_only = getattr(args, "mtp_only_training", False)
+        is_vl_model = args.is_vl_model
+        mtp_only = args.mtp_only_training
         # Get the batch.
         with timer(f"get_data_batch_{uuid.uuid4().hex[:8]}", keep=False):
             _opd_keys: list[str] = []
@@ -1366,7 +1365,7 @@ def train_one_step(
                 )
         else:
             has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
-            needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
+            needs_unsplit = is_vl_model or has_mm_inputs or args.uses_unsplit_forward
             use_unsplit = needs_unsplit and "unsplit_tokens" in batch
 
             forward_kwargs = {
@@ -1418,25 +1417,23 @@ def train_one_step(
                 # Exception: under fused-linear CE the patch delegates to upstream
                 # process_mtp_loss, which calls the head through the INSTANCE and so
                 # does consume one intercepted call per depth again.
-                mtp_enabled = getattr(args, "enable_mtp_training", False)
+                mtp_enabled = args.enable_mtp_training
                 head_config = get_model_config(model)
                 fused_linear = (
                     head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
                 )
-                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False) and not fused_linear
-                mtp_output_layer_calls = (
-                    0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
-                )
+                chunked_mtp_on = mtp_enabled and args.sft_chunked_logits and not fused_linear
+                mtp_output_layer_calls = 0 if chunked_mtp_on else (int(args.mtp_num_layers or 0) if mtp_enabled else 0)
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
-                if getattr(args, "sft_chunked_logits", False) and (args.fp16 or args.bf16):
+                if args.sft_chunked_logits and (args.fp16 or args.bf16):
                     forward_kwargs["fp32_output"] = False
                 with _bypass_output_layer(
                     model,
                     mtp_output_layer_calls=mtp_output_layer_calls,
                     gather_passthrough=not mtp_only,
-                    unfused_head_wgrad=(not mtp_enabled and getattr(args, "recompute_loss_function", False)),
-                    recompute_chunks=not mtp_only and getattr(args, "recompute_loss_function", False),
+                    unfused_head_wgrad=(not mtp_enabled and args.recompute_loss_function),
+                    recompute_chunks=not mtp_only and args.recompute_loss_function,
                 ) as lm_head_forward:
                     if use_indexer_replay:
                         with IndexerReplay.forward_stage():
@@ -1473,7 +1470,7 @@ def train_one_step(
     # Dynamic CP: forward_step overwrites pg_collection.cp per micro-batch (VL bridge);
     # save the original static CP group here and restore after forward+backward.
     _dcp_orig_cp_group = None
-    if getattr(args, "dynamic_context_parallel", False):
+    if megatron_dynamic_context_parallel(args):
         inner = model[0]
         while hasattr(inner, "module"):
             inner = inner.module
@@ -1481,8 +1478,8 @@ def train_one_step(
 
     # Forward pass.
     use_streaming = (
-        getattr(args, "use_dynamic_batch_size", False)
-        and getattr(args, "fully_async", False)
+        args.use_dynamic_batch_size
+        and args.fully_async
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
@@ -1641,7 +1638,7 @@ def train_one_step(
 
         loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
         values = values.tolist()
-        is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+        is_sequence_classification = args.task_type == "seq_cls"
         num_samples_or_tokens = (
             values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
         )
@@ -2044,7 +2041,7 @@ def save(
         args.head_type = REWARD_MODEL_HEAD_TYPE
     elif role == "critic":
         args.head_type = "critic_value_terminal_v1"
-    elif getattr(args, "task_type", "causal_lm") == "seq_cls":
+    elif args.task_type == "seq_cls":
         args.head_type = "sequence_classification_v1"
     else:
         args.head_type = "causal_lm_v1"
@@ -2189,7 +2186,7 @@ def _invoke_save_hf_post_hook(args, hf_path, rollout_id, *, is_lora, force_sync=
     background work is still in flight. ``flush()`` is best-effort: absent
     attr is a no-op, and exceptions are swallowed.
     """
-    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    hook_path = args.save_hf_post_hook_path
     if not hook_path:
         return
     try:
@@ -2200,7 +2197,7 @@ def _invoke_save_hf_post_hook(args, hf_path, rollout_id, *, is_lora, force_sync=
             args,
             str(hf_path),
             rollout_id,
-            dtype=getattr(args, "save_hf_dtype", "bf16"),
+            dtype=args.save_hf_dtype,
             is_lora=is_lora,
         )
     except Exception:
@@ -2233,8 +2230,8 @@ def _hf_export_reference(args: Namespace) -> str:
     """Use unquantized shard keys when exporting a BF16 model from FP8
     rollout."""
     reference = args.hf_checkpoint
-    ref_load = getattr(args, "ref_load", None)
-    if getattr(args, "save_hf_dtype", "bf16") == "fp8" or not ref_load:
+    ref_load = args.ref_load
+    if args.save_hf_dtype == "fp8" or not ref_load:
         return reference
     config_path = Path(reference) / "config.json"
     ref_config_path = Path(ref_load) / "config.json"
@@ -2287,14 +2284,14 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
             reference_expects_vision,
         )
 
-        model_has_mtp = bool(getattr(args, "mtp_num_layers", 0))
+        model_has_mtp = bool(args.mtp_num_layers)
         allow_missing_mtp_keys = reference_expects_mtp(export_reference) and not model_has_mtp
         # Short-circuits: a reference without vision weights can never be missing them.
         vision_absent_from_model = reference_expects_vision(export_reference) and not hasattr(
             get_model_config(model[0]), "vision_config"
         )
 
-        save_fp8 = getattr(args, "save_hf_dtype", "bf16") == "fp8"
+        save_fp8 = args.save_hf_dtype == "fp8"
         fp8_writer = None
         restore_save_generator = None
         supplementing_vision = False
@@ -2392,7 +2389,7 @@ def initialize_model_and_optimizer(
     classification_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
     if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
@@ -2417,7 +2414,7 @@ def initialize_model_and_optimizer(
         assert loaded_reward_head_param_ids == reward_head_param_ids, (
             "reward-model head parameter identities changed during checkpoint loading"
         )
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         release_sequence_classification_lm_heads(model)
         loaded_classification_head_param_ids = validate_sequence_classification_head_registration(
             model, optimizer, args

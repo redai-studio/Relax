@@ -53,6 +53,7 @@ def test_repetition_real_rollout_metrics_dump_writers_and_cli(tmp_path, evaluati
         reward_key=None,
         log_passrate=False,
         advantage_estimator="ppo",
+        opd_teacher_key=None,
         save_debug_rollout_data=str(tmp_path / "{rollout_id}.pt"),
         rollout_result_dir=str(tmp_path / "results"),
     )

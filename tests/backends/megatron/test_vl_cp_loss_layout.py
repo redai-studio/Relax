@@ -63,12 +63,15 @@ def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(monkeypatch, cp_s
     )
     expected_grads = torch.autograd.grad(ref, (hidden, weight), retain_graph=True)
     args = Namespace(
+        advantage_estimator=None,
+        opd_log_prob_top_k=0,
         qkv_format="thd",
         loss_type="sft",
         allgather_cp=True,
         rollout_temperature=1.0,
         sft_chunked_logits=chunked,
         recompute_loss_function=recompute,
+        recompute_loss_function_use_reentrant=True,
         sft_logits_chunk_size=3,
         log_probs_chunk_size=3,
     )
@@ -113,7 +116,15 @@ def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(monkeypatch, cp_s
 def test_contiguous_allgather_layout_is_preserved_without_bridge_metadata(monkeypatch):
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 2)
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_rank", lambda: 1)
-    args = Namespace(qkv_format="thd", loss_type="sft", allgather_cp=True, rollout_temperature=1.0)
+    args = Namespace(
+        advantage_estimator=None,
+        opd_log_prob_top_k=0,
+        qkv_format="thd",
+        loss_type="sft",
+        allgather_cp=True,
+        rollout_temperature=1.0,
+        sft_chunked_logits=False,
+    )
     chunks = list(
         loss_module.get_responses(
             torch.arange(8, 16, dtype=torch.float32).reshape(1, 8, 1),

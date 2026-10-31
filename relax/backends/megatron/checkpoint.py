@@ -317,7 +317,7 @@ def _lora_checkpoint_metadata(args, trainable_names: tuple[str, ...]) -> dict:
         "lora_target_modules": tuple(args.lora_target_modules or ()),
         "lora_scope": args.lora_scope,
         "lora_merge_mode": args.lora_merge_mode,
-        "lora_adapter_mode": getattr(args, "lora_adapter_mode", False),
+        "lora_adapter_mode": args.lora_adapter_mode,
         "tensor_model_parallel_size": args.tensor_model_parallel_size,
         "pipeline_model_parallel_size": args.pipeline_model_parallel_size,
         "context_parallel_size": args.context_parallel_size,
@@ -772,10 +772,10 @@ def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:
         f"by changing one of the args that feed into `lr_decay_steps` / `wd_incr_steps`:\n"
         f"    lr_decay_steps = num_rollout * rollout_batch_size * n_samples_per_prompt\n"
         f"Current values:\n"
-        f"    --num-rollout            {getattr(args, 'num_rollout', None)}\n"
-        f"    --rollout-batch-size     {getattr(args, 'rollout_batch_size', None)}\n"
-        f"    --n-samples-per-prompt   {getattr(args, 'n_samples_per_prompt', None)}\n"
-        f"    --global-batch-size      {getattr(args, 'global_batch_size', None)}\n"
+        f"    --num-rollout            {args.num_rollout}\n"
+        f"    --rollout-batch-size     {args.rollout_batch_size}\n"
+        f"    --n-samples-per-prompt   {args.n_samples_per_prompt}\n"
+        f"    --global-batch-size      {args.global_batch_size}\n"
         f"    --lr-decay-iters         {getattr(args, 'lr_decay_iters', None)}\n"
         f"    --lr-warmup-iters        {getattr(args, 'lr_warmup_iters', None)}\n"
         f"    --lr-warmup-fraction     {getattr(args, 'lr_warmup_fraction', None)}\n\n"
@@ -861,7 +861,7 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
         f"Load checkpoint from HuggingFace model into Megatron (requested_path={load_path}, source_path={source_path})"
     )
 
-    if getattr(args, "warm_hf_checkpoint_page_cache", False):
+    if args.warm_hf_checkpoint_page_cache:
         warm_hf_checkpoint_page_cache(source_path)
 
     with use_critic_lm_head_for_hf_load(ddp_model):
@@ -976,7 +976,7 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
                 "lora_target_modules": list(args.lora_target_modules),
                 "lora_dropout": args.lora_dropout,
                 "lora_merge_mode": args.lora_merge_mode,
-                "lora_adapter_mode": getattr(args, "lora_adapter_mode", False),
+                "lora_adapter_mode": args.lora_adapter_mode,
             }
             with open(adapter_dir / "relax_lora_meta.json", "w") as f:
                 json.dump(metadata, f)

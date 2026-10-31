@@ -16,6 +16,7 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.backends.megatron.compat import megatron_dynamic_context_parallel
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
@@ -240,9 +241,7 @@ def create_stream_dataloader(
     # Choose the appropriate fetch function based on fully_async mode
     # Use partial to bind the broadcast_pp parameter
     # broadcast_pp is the inverse of fully_async: True for colocate, False for fully async
-    fetch_batch_fn = partial(
-        get_data_from_transfer_queue, args=args, broadcast_pp=not getattr(args, "fully_async", False)
-    )
+    fetch_batch_fn = partial(get_data_from_transfer_queue, args=args, broadcast_pp=not args.fully_async)
     dataset = StreamingDataset(
         config=args.tq_config,
         batch_size=args.micro_batch_size * args.n_samples_per_prompt,
@@ -933,7 +932,7 @@ def get_data_from_transfer_queue(
     has_routed_experts = "rollout_routed_experts" in data_fields
     routed_experts_values = None
     routed_experts_offsets = None
-    has_indexer_topk = getattr(args, "use_rollout_indexer_replay", False) and "rollout_indexer_topk" in data_fields
+    has_indexer_topk = args.use_rollout_indexer_replay and "rollout_indexer_topk" in data_fields
     indexer_topk_values = None
     indexer_topk_offsets = None
     indexer_topk_extract_error = None
@@ -1190,7 +1189,7 @@ def post_process_rollout_data(args, rollout_data):
 
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
-    if Envs.RELAX_SFT_SELECTIVE_LOGITS and getattr(args, "loss_type", None) == "sft":
+    if Envs.RELAX_SFT_SELECTIVE_LOGITS and args.loss_type == "sft":
         masks = rollout_data["loss_masks"]
         # Per-rank fetch supplies CPU masks. Never copy CUDA masks back in the
         # training path; unsupported producers simply retain the original head.
@@ -1207,11 +1206,7 @@ def post_process_rollout_data(args, rollout_data):
             torch.as_tensor(label, dtype=torch.long, device=cuda_dev) for label in rollout_data["pre_shifted_labels"]
         ]
     if "classification_labels" in rollout_data:
-        label_dtype = (
-            torch.long
-            if getattr(args, "problem_type", "single_label_classification") == "single_label_classification"
-            else torch.float32
-        )
+        label_dtype = torch.long if args.problem_type == "single_label_classification" else torch.float32
         rollout_data["classification_labels"] = [
             torch.as_tensor(label, dtype=label_dtype, device=cuda_dev)
             for label in rollout_data["classification_labels"]
@@ -1235,9 +1230,7 @@ def post_process_rollout_data(args, rollout_data):
     padded_total_lengths = maybe_padded_total_lengths(
         rollout_data["total_lengths"],
         args.qkv_format,
-        getattr(args, "is_vl_model", False)
-        or "multimodal_train_inputs" in rollout_data
-        or getattr(args, "uses_unsplit_forward", False),
+        args.is_vl_model or "multimodal_train_inputs" in rollout_data or args.uses_unsplit_forward,
     )
 
     response_float_fields = [
@@ -1277,7 +1270,7 @@ def post_process_rollout_data(args, rollout_data):
         # static max-CP zig-zag would leave rollout_log_probs (never recomputed) mis-
         # sharded — log_probs/ref_log_probs happen to be overwritten by the merged
         # forward, but rollout_log_probs is not, so it would reach logging CP-split.
-        if getattr(args, "dynamic_context_parallel", False):
+        if megatron_dynamic_context_parallel(args):
             rollout_data[key] = [
                 torch.as_tensor(log_prob, device=cuda_dev, dtype=dtype) for log_prob in rollout_data[key]
             ]
@@ -1320,7 +1313,7 @@ def post_process_rollout_data(args, rollout_data):
             for r in rollout_data["rollout_routed_experts"]
         ]
 
-    if getattr(args, "use_rollout_indexer_replay", False) and "rollout_indexer_topk" in rollout_data:
+    if args.use_rollout_indexer_replay and "rollout_indexer_topk" in rollout_data:
         from tensordict.tensorclass import NonTensorData
 
         rollout_data["rollout_indexer_topk"] = [

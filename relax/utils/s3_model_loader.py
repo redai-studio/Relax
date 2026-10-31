@@ -800,7 +800,7 @@ def _resolve_endpoint(args) -> str | None:
 
 def read_s3_model_config(args) -> dict:
     """Read only ``config.json`` using the resolved model source policy."""
-    source = getattr(args, "model_source", None)
+    source = args.model_source
     if source is None or not is_s3_uri(source.uri):
         raise ValueError("an S3 model source is required to read config.json")
 
@@ -826,7 +826,7 @@ def read_s3_model_config(args) -> dict:
 
 def _resolve_shm_root(args) -> str:
     """Resolve an existing SHM cache root without falling back to disk."""
-    root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
+    root = args.s3_model_shm_root or "/dev/shm"
     if not os.path.isdir(root):
         raise RuntimeError(
             f"S3 model SHM root does not exist or is not a directory: {root!r}. "
@@ -842,7 +842,7 @@ def remove_stale_s3_model_caches(args) -> tuple[int, int]:
     eligible. The caller must run this before starting the current job's
     prefetch, so no cross-job cache reuse or recovery is attempted.
     """
-    root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
+    root = args.s3_model_shm_root or "/dev/shm"
     if not os.path.isdir(root):
         return 0, 0
     removed_entries = 0
@@ -916,12 +916,12 @@ def remove_stale_s3_model_caches(args) -> tuple[int, int]:
 def maybe_resolve_s3_model_to_shm(uri: str, args) -> str:
     if not is_s3_uri(uri):
         return uri
-    config = getattr(args, "model_source", None)
+    config = args.model_source
     if config is None or uri != config.uri:
         return uri
     root = _resolve_shm_root(args)
     endpoint = _resolve_endpoint(args)
-    workers = getattr(args, "s3_model_download_workers", None) or 20
+    workers = args.s3_model_download_workers or 20
     dest = _shm_dest_dir(uri, root, endpoint)
     _download_model_to_shm_once(
         uri,
@@ -940,13 +940,13 @@ def resolve_s3_model_metadata_to_shm(uri: str, args) -> str:
     """Resolve an S3 URI to a local directory without downloading weights."""
     if not is_s3_uri(uri):
         return uri
-    config = getattr(args, "model_source", None)
+    config = args.model_source
     if config is None or uri != config.uri:
         return uri
     root = _resolve_shm_root(args)
     endpoint = _resolve_endpoint(args)
     dest = _shm_dest_dir(uri, root, endpoint)
-    workers = getattr(args, "s3_model_download_workers", None) or 20
+    workers = args.s3_model_download_workers or 20
     _download_model_metadata_to_shm_once(
         uri,
         dest,
@@ -964,10 +964,10 @@ def get_s3_model_cached_path(uri: str, args) -> str | None:
     """Return a complete node-local S3 model path without downloading."""
     if not is_s3_uri(uri):
         return None
-    config = getattr(args, "model_source", None)
+    config = args.model_source
     if config is None or uri != config.uri:
         return None
-    root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
+    root = args.s3_model_shm_root or "/dev/shm"
     if not os.path.isdir(root):
         return None
     endpoint = _resolve_endpoint(args)
@@ -996,12 +996,12 @@ def cleanup_s3_model_weights_from_shm(args) -> tuple[int, int]:
     Returns:
         A ``(removed_files, removed_bytes)`` tuple.
     """
-    if getattr(args, "disable_s3_model_cleanup", False):
+    if args.disable_s3_model_cleanup:
         return 0, 0
-    config = getattr(args, "model_source", None)
+    config = args.model_source
     if config is None or not is_s3_uri(config.uri):
         return 0, 0
-    root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
+    root = args.s3_model_shm_root or "/dev/shm"
     if not os.path.isdir(root):
         return 0, 0
     endpoint = _resolve_endpoint(args)
@@ -1085,7 +1085,7 @@ def prepare_local_model(args, *, completeness: str = "full") -> LocalModel:
     """Prepare a full or metadata-only node-local model view."""
     if completeness not in {"full", "metadata"}:
         raise ValueError(f"Unsupported local model completeness: {completeness!r}")
-    source = getattr(args, "model_source", None)
+    source = args.model_source
     if source is None:
         source = ModelSource(uri=args.hf_checkpoint)
     resolver = maybe_resolve_s3_model_to_shm if completeness == "full" else resolve_s3_model_metadata_to_shm

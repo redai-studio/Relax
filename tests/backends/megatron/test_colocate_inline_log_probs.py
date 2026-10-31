@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
+from tests.helpers.relax_args import make_args
 
 
 @pytest.fixture
@@ -26,6 +27,7 @@ def actor():
         max_staleness=0,
         update_weights_interval=1,
         partial_rollout=False,
+        num_steps_per_rollout=None,
         use_dynamic_global_batch_size=False,
         context_parallel_size=1,
         pipeline_model_parallel_size=1,
@@ -165,13 +167,15 @@ def test_zero_kl_uses_sampling_shape_without_sampling_values(monkeypatch):
     monkeypatch.setattr(loss, "maybe_padded_total_lengths", lambda *args: None)
     monkeypatch.setattr(loss, "compute_advantages_and_returns_impl", compute_impl)
     compute = loss.compute_advantages_and_returns
-    args = SimpleNamespace(
+    args = make_args(
         advantage_estimator="grpo",
         kl_coef=0,
         use_rollout_logprobs=False,
         qkv_format="thd",
         use_opd=False,
         normalize_advantages=False,
+        is_vl_model=False,
+        uses_unsplit_forward=False,
     )
     for value in (-0.1, -100):
         data = {

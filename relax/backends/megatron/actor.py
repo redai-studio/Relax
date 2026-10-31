@@ -1069,7 +1069,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # the forward uses get_batch's per-sample slice_with_cp (2*cp align) + global
             # tp*data_pad_size_multiplier pad, so mirror the corresponding layout here.
             padded_total_lengths = maybe_padded_total_lengths(
-                [t.shape[0] for t in tokens], self.args.qkv_format, getattr(self.args, "is_vl_model", False)
+                [t.shape[0] for t in tokens], self.args.qkv_format, self.args.is_vl_model
             )
             if padded_total_lengths is not None:
                 rollout_routed_experts = [
@@ -1242,7 +1242,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 padded_total_lengths = maybe_padded_total_lengths(
                     [t.shape[0] for t in tokens],
                     self.args.qkv_format,
-                    getattr(self.args, "is_vl_model", False),
+                    self.args.is_vl_model,
                 )
                 if padded_total_lengths is not None:
                     per_sample_topk = [
@@ -2491,8 +2491,8 @@ class MegatronTrainRayActor(TrainRayActor):
         has no pipelined meta tracking across stages.
         """
         return (
-            getattr(self.args, "fully_async", False)
-            and getattr(self.args, "use_dynamic_batch_size", False)
+            self.args.fully_async
+            and self.args.use_dynamic_batch_size
             and mpu.get_pipeline_model_parallel_world_size() == 1
             and (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) == 1
         )
@@ -3165,7 +3165,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # intentionally absent — either true_on_policy_mode (log_probs
             # recomputed inline by train forward) or hybrid mode (actor
             # handles forward via _switch_model, no separate service).
-            if actor_fwd_absent or getattr(self.args, "hybrid", False):
+            if actor_fwd_absent or self.args.hybrid:
                 rollout_only = True
             else:
                 try:
@@ -3797,9 +3797,7 @@ class MegatronTrainRayActor(TrainRayActor):
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             self.args.qkv_format,
-            getattr(self.args, "is_vl_model", False)
-            or "multimodal_train_inputs" in rollout_data
-            or getattr(self.args, "uses_unsplit_forward", False),
+            self.args.is_vl_model or "multimodal_train_inputs" in rollout_data or self.args.uses_unsplit_forward,
         )
         if padded_total_lengths is None:
             padded_total_lengths = [None] * len(total_lengths)

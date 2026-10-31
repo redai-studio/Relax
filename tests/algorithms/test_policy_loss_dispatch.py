@@ -35,6 +35,9 @@ def _args(estimator, **overrides):
         m2po_kl2_budget=0.02,
         m2po_miniclip_low=0.25,
         m2po_miniclip_high=0.4,
+        # Declared argparse defaults; policy_loss_sapo reads these directly.
+        sapo_tau_pos=1.0,
+        sapo_tau_neg=1.05,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
