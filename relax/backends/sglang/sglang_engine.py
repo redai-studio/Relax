@@ -835,6 +835,10 @@ class SGLangEngine(RayActor):
             and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
         )
         config = get_hf_config(layout["model_path"])
+        if layout.get("tp_size", 1) > 1 and "KeyeVL2MoeForConditionalGeneration" in (
+            getattr(config, "architectures", None) or []
+        ):
+            raise ValueError("Keye TP row projections require HF weight loading, not native expert shards")
         text_config = getattr(config, "text_config", None) or config
         if "dtype" in layout:
             from sglang.srt.configs.model_config import _get_and_verify_dtype

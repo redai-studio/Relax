@@ -685,6 +685,11 @@ def get_batch(
         # Python boundaries let attention implementations iterate packed
         # subsequences without synchronizing individual accelerator scalars.
         packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_cpu
+        # Zigzag CP pads each sample separately; valid tokens need not form a prefix.
+        valid_lengths = [sample.numel() for sample in batch["unconcat_tokens"]]
+        packed_seq_params.valid_seqlens_q_cpu = valid_lengths + [0] * (len(cu_seqlens_cpu) - 1 - len(valid_lengths))
+        # Auxiliary attention losses must exclude the optional padding-only tail.
+        packed_seq_params.num_valid_tokens = sum(valid_lengths)
         select_offsets = list(cu_seqlens_cpu)
         if allgather_cp:
             select_offsets[-1] += pad
@@ -908,6 +913,9 @@ def get_batch(
             [rows.numel() for rows in getattr(packed_seq_params, "relax_sft_selective_mtp_rows", ())],
         )
     batch.pop("selective_loss_masks_cpu", None)
+    for packed_key in ("packed_seq_params", "vlm_packed_seq_params"):
+        if batch.get(packed_key) is not None:
+            batch[packed_key].is_dummy = batch.get("__is_dummy__", False)
     batch = move_tensors_to_device(batch, batch["tokens"].device)
     if pack_device is not None:
         batch = PrepackedBatch(batch)

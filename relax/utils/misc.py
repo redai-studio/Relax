@@ -179,4 +179,4 @@ def _chunk_by_size(objects: Iterable[Any], compute_size: Callable[[Any], int], c
 def get_hf_config(hf_checkpoint: str):
     from transformers import AutoConfig
 
-    return AutoConfig.from_pretrained(hf_checkpoint)
+    return AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)

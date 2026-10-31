@@ -121,6 +121,26 @@ def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
     assert _enable_draft_weights_cpu_backup(args, overrides) is expected
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_keye_replicated_down_uses_hf_weight_loading(monkeypatch, expert_sync_engine_module, tp_size):
+    from relax.utils import misc
+
+    module = expert_sync_engine_module
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank, engine.worker_type = 0, "regular"
+    engine.server_host, engine.server_port = "localhost", 1234
+    response = Mock()
+    response.json.return_value = {"model_path": "/test/keye", "tp_size": tp_size}
+    monkeypatch.setattr(module.requests, "get", Mock(return_value=response))
+    config = SimpleNamespace(architectures=["KeyeVL2MoeForConditionalGeneration"], num_experts=128)
+    monkeypatch.setattr(misc, "get_hf_config", lambda _: config)
+    if tp_size > 1:
+        with pytest.raises(ValueError, match="require HF weight loading"):
+            engine.get_expert_weight_sync_layout()
+    else:
+        assert engine.get_expert_weight_sync_layout()["tp_size"] == 1
+
+
 def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engine_module):
     from relax.utils import misc
 
