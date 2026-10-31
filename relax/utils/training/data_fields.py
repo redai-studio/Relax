@@ -49,7 +49,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
         if Envs.RELAX_SFT_PRE_SHIFTED_LABELS:
             fields.append("pre_shifted_labels")
-        if getattr(args, "task_type", "causal_lm") == "seq_cls":
+        if args.task_type == "seq_cls":
             fields.append("classification_labels")
         fields.extend(sft_multimodal_data_fields(args))
         return fields
@@ -70,14 +70,14 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
             if not getattr(args, "use_rollout_logprobs", False) and not getattr(args, "true_on_policy_mode", False):
                 fields.append("log_probs")
             fields.append("ref_log_probs")
-        if getattr(args, "use_opd", False):
+        if args.use_opd:
             from relax.utils.opd.opd_utils import consume_opd_train_data
 
             consume_opd_train_data(fields, args)
         return fields
 
     fields = _base_rollout_fields(args)
-    if getattr(args, "advantage_estimator", None) == "score_centering":
+    if args.advantage_estimator == "score_centering":
         fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
     if getattr(args, "use_rollout_indexer_replay", False):
         fields.append("rollout_indexer_topk")
@@ -85,7 +85,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         # PPO colocate: actor consumes critic's ``values`` and computes GAE
         # inline. Fully_async: standalone Advantages service produces
         # ``advantages``/``returns``, actor just pulls the finished tensors.
-        if getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):
+        if args.fully_async and not args.hybrid:
             fields.extend(["advantages", "returns"])
         else:
             fields.append("values")
@@ -98,7 +98,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         if getattr(args, "kl_coef", 0.0) != 0 or getattr(args, "use_kl_loss", False):
             if "ref_log_probs" not in fields:
                 fields.append("ref_log_probs")
-    if getattr(args, "use_opd", False):
+    if args.use_opd:
         from relax.utils.opd.opd_utils import consume_opd_train_data
 
         consume_opd_train_data(fields, args)

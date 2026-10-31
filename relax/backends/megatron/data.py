@@ -512,7 +512,7 @@ def get_batch(
             raise ValueError("pre-shifted labels are only supported for SFT")
         if cp_size != 1:
             raise ValueError("pre-shifted SFT labels currently require context_parallel_size=1")
-        if getattr(args, "enable_mtp_training", False):
+        if args.enable_mtp_training:
             raise ValueError("pre-shifted SFT labels are incompatible with MTP")
         if any(label.shape != token.shape for label, token in zip(pre_shifted_labels, tokens, strict=True)):
             raise ValueError("pre-shifted labels and tokens must have identical per-sample shapes")
@@ -547,7 +547,7 @@ def get_batch(
         # multimodal_train_inputs, so VL models with text-only batches still
         # land here — bridge skips vision embedding when image_grid_thw is None.
         has_mm_inputs = batch.get("multimodal_train_inputs") is not None
-        needs_unsplit_input = is_vl_model or has_mm_inputs or getattr(get_args(), "uses_unsplit_forward", False)
+        needs_unsplit_input = is_vl_model or has_mm_inputs or get_args().uses_unsplit_forward
         if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
             align_size = tp_size * cp_size * 2
@@ -927,7 +927,7 @@ def prepack_sft_micro_batch_cpu(args: Namespace, batch: RolloutBatch) -> Prepack
         args.data_pad_size_multiplier,
         args.qkv_format,
         args.allgather_cp,
-        getattr(args, "is_vl_model", False),
+        args.is_vl_model,
         pack_device=torch.device("cpu"),
     )
     pinned = pin_tensors(packed)
@@ -1345,14 +1345,12 @@ def get_data_iterator(
         micro_batch_token_capacity = _get_micro_batch_token_capacity(args, _max_tokens, cp_size)
         # calculate the number of mirobatches for each step
         samples = rollout_data["total_lengths"]
-        packing_strategy = getattr(args, "sft_packing_strategy", "balanced")
+        packing_strategy = args.sft_packing_strategy
         assert len(samples) == num_local_samples
         # Bridge pads each THD document before CP splitting, including text-only
         # batches of VL models. Plan with those physical lengths as well.
         needs_unsplit_input = (
-            getattr(args, "is_vl_model", False)
-            or getattr(args, "uses_unsplit_forward", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
+            args.is_vl_model or args.uses_unsplit_forward or rollout_data.get("multimodal_train_inputs") is not None
         )
         if getattr(args, "qkv_format", "thd") == "thd" and cp_size > 1 and needs_unsplit_input:
             alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
@@ -1487,9 +1485,7 @@ def log_rollout_data(
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             args.qkv_format,
-            getattr(args, "is_vl_model", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
-            or getattr(args, "uses_unsplit_forward", False),
+            args.is_vl_model or rollout_data.get("multimodal_train_inputs") is not None or args.uses_unsplit_forward,
         )
 
         for key, val in rollout_data.items():

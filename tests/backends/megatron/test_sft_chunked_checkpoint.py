@@ -36,10 +36,13 @@ def _setup(monkeypatch, labels, chunk_size, temperature):
     monkeypatch.setattr(loss_module, "validate_opd_topk_gather", lambda *_: None)
     monkeypatch.setattr(loss_module, "get_responses", lambda hidden, **_: iter([(hidden.squeeze(0), labels)]))
     return Namespace(
+        advantage_estimator=None,
+        opd_log_prob_top_k=0,
         sft_logits_chunk_size=chunk_size,
         rollout_temperature=temperature,
         entropy_coef=0,
         allgather_cp=False,
+        loss_type="sft",
         recompute_loss_function=True,
     )
 

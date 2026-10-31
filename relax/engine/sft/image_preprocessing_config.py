@@ -11,8 +11,8 @@ def configure_image_preprocessing(args: Namespace, is_sft: bool) -> None:
     args.sft_image_preprocess_on_rank = bool(
         is_sft
         and "image" in (getattr(args, "multimodal_keys", None) or {})
-        and getattr(args, "sft_train_data_prefetch", False)
+        and args.sft_train_data_prefetch
         and getattr(args, "per_rank_fetch", False)
         and getattr(args, "max_staleness", 0) >= 1
-        and not getattr(args, "sft_async_prepack", False)
+        and not args.sft_async_prepack
     )

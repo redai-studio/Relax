@@ -62,7 +62,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
     # that get assembled into the teacher_multimodal_keys dict consumed by
     # build_opd_teacher_sample_fields (which populates sample.teacher_multimodal_inputs).
     teacher_mm_keys = None
-    _t_img = getattr(args, "opd_teacher_image_key", None)
+    _t_img = args.opd_teacher_image_key
     if _t_img is not None:
         teacher_mm_keys = {"image": _t_img}
         logger.info(f"OPSD: teacher_multimodal_keys = {teacher_mm_keys}")
@@ -101,7 +101,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             prefetch_num_workers=prefetch_num_workers,
             multimodal_config=multimodal_config,
             custom_prompt_func=custom_prompt_func,
-            teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
+            teacher_prompt_key=args.opd_teacher_prompt_key,
             teacher_multimodal_keys=teacher_mm_keys,
         )
     else:
@@ -123,7 +123,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             seed=args.rollout_seed,
             multimodal_config=multimodal_config,
             custom_prompt_func=custom_prompt_func,
-            teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
+            teacher_prompt_key=args.opd_teacher_prompt_key,
             teacher_multimodal_keys=teacher_mm_keys,
         )
 

@@ -451,7 +451,7 @@ async def generate(
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
     # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
     # base model only and rollouts would not reflect the trained policy.
-    if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+    if args.lora_rank > 0 and args.lora_adapter_mode:
         from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
 
         payload["lora_path"] = LORA_ADAPTER_NAME
@@ -1352,7 +1352,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     state.evaluating += 1
     try:
         coros = []
-        for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+        for dataset_cfg in args.eval_datasets or []:
             coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
         results_list = await asyncio.gather(*coros)
         results = {}
@@ -1528,7 +1528,7 @@ def generate_rollout(
     # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a
     # prefetched generation is almost always aborted by the next step's pause_generation and its
     # truncated samples would pollute the next rollout. Other modes keep the optimization.
-    _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
+    _lora_adapter_mode = args.lora_rank > 0 and args.lora_adapter_mode
     # Match Rollout._maybe_save_data: prefetch advances the saved data cursor, but its
     # ObjectRef is not checkpointed. Leave the next batch unread at save boundaries.
     _save_data = (

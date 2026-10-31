@@ -569,6 +569,9 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
         dynamic_context_parallel=dynamic_cp,
         allgather_cp=allgather_cp,
         rollout_top_logprobs_num=2,
+        # Runtime markers established during parse; direct-read after Task 13.
+        is_vl_model=False,
+        uses_unsplit_forward=False,
     )
 
     stream_module.post_process_rollout_data(args, rollout_data)

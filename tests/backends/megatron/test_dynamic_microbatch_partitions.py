@@ -109,6 +109,9 @@ def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner
         sft_packing_strategy=strategy,
         qkv_format="thd",
         dynamic_context_parallel=True,
+        # Parse establishes these; get_data_iterator reads them directly.
+        is_vl_model=False,
+        uses_unsplit_forward=False,
     )
     lengths = [17, 17]
     data = {"total_lengths": lengths}

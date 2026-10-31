@@ -368,7 +368,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 rank=int(args.lora_rank),
                 alpha=int(args.lora_alpha),
                 target_modules=self._lora_target_modules,
-                dropout=float(getattr(args, "lora_dropout", 0.0) or 0.0),
+                dropout=float(args.lora_dropout or 0.0),
                 task_type=self._lora_task_type(),
             )
 
@@ -560,7 +560,7 @@ class FSDPTrainRayActor(TrainRayActor):
         Protocol is ``@runtime_checkable`` and is ``isinstance``-asserted by
         the adapter unit tests.
         """
-        explicit = getattr(args, "lora_target_modules", None)
+        explicit = args.lora_target_modules
         if explicit:
             return [str(t) for t in explicit]
         default = getattr(self.adapter, "lora_target_modules", None)

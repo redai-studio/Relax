@@ -96,7 +96,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if custom_convert_path is not None:
         custom_convert_func = load_function(custom_convert_path)
         train_data = custom_convert_func(args, samples)
-        if getattr(args, "advantage_estimator", None) == "score_centering":
+        if args.advantage_estimator == "score_centering":
             from relax.utils.score_centering import SCORE_CENTERING_FIELDS
 
             missing = [field for field in (*SCORE_CENTERING_FIELDS, "rollout_log_probs") if field not in train_data]
@@ -161,7 +161,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if samples[0].rollout_log_probs is not None:
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
-    if getattr(args, "advantage_estimator", None) == "score_centering":
+    if args.advantage_estimator == "score_centering":
         from relax.utils.score_centering import (
             SCORE_CENTERING_FIELDS,
             resolve_score_centering_vocab_size,
@@ -415,7 +415,7 @@ def post_process_env(args, env):
     # Dynamic-batch streaming ends via the producer's is_last signal, not a
     # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
     # The non-dynamic path still pre-allocates the exact count for its .all() check.
-    if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
+    if args.fully_async and getattr(args, "use_dynamic_batch_size", False):
         env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(
             args.rollout_batch_size * args.n_samples_per_prompt
         )  ## * args.max_num_agents

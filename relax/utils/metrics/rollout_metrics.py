@@ -168,9 +168,9 @@ def compute_mopd_metrics(args: Namespace, all_samples: list[Sample]) -> dict[str
       - logp_gap     : student_logp - teacher_logp (→ 0 as student converges)
       - rkl_approx   : E_student[log p_s - log p_t] per token, averaged across samples
 
-    Returns ``{}`` when OPD is disabled (``opd_teacher_key`` absent).
+    Returns ``{}`` when OPD is disabled (``opd_teacher_key`` is None).
     """
-    opd_teacher_key = getattr(args, "opd_teacher_key", None)
+    opd_teacher_key = args.opd_teacher_key
     if not opd_teacher_key:
         return {}
 

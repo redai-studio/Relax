@@ -30,6 +30,7 @@ def make_args(**overrides):
         context_parallel_size=1,
         virtual_pipeline_model_parallel_size=None,
         multimodal_keys=None,
+        sft_wholepack=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -89,17 +90,19 @@ def test_rl_preserves_explicit_per_rank_fetch(per_rank):
 
 
 def test_pipeline_accepts_partial_non_sft_arguments():
-    args = SimpleNamespace(train_backend="megatron", per_rank_fetch=True)
+    # ``loss_type`` is always present after parse (pre-parse default None).
+    args = SimpleNamespace(train_backend="megatron", per_rank_fetch=True, loss_type=None)
     configure_sft_data_pipeline(args)
     assert args.per_rank_fetch is True
     assert args.sft_train_data_prefetch is False
     assert args.sft_image_preprocess_on_rank is False
-    assert not hasattr(args, "loss_type")
     assert not hasattr(args, "sft_async_prepack")
 
 
 def test_pipeline_i2i_fsdp_does_not_require_megatron_arguments():
-    args = SimpleNamespace(loss_type="sft", generation_task="i2i", train_backend="fsdp", max_staleness=1)
+    args = SimpleNamespace(
+        loss_type="sft", generation_task="i2i", train_backend="fsdp", max_staleness=1, sft_wholepack=False
+    )
     configure_sft_data_pipeline(args)
     assert not args.per_rank_fetch
     assert not args.sft_async_prepack

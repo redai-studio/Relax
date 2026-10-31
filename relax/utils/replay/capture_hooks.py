@@ -19,7 +19,7 @@ from relax.utils.replay.schema import ActorStepId, Identity, RecomputeConfig, St
 def build_config_from_args(args: Any) -> RecomputeConfig:
     """Build a RecomputeConfig from the runtime args namespace."""
     return RecomputeConfig(
-        advantage_estimator=str(getattr(args, "advantage_estimator", "grpo")),
+        advantage_estimator=str(args.advantage_estimator),
         kl_loss_type=str(getattr(args, "kl_loss_type", "k1")),
         kl_coef=float(getattr(args, "kl_coef", 0.0)),
         eps_clip=float(getattr(args, "eps_clip", 0.2)),

@@ -71,6 +71,7 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
         allgather_cp=allgather_cp,
         pipeline_model_parallel_size=4,
         is_vl_model=case == "vl_text_only",
+        uses_unsplit_forward=False,
         use_opd=False,
     )
     monkeypatch.setattr(data, "get_args", lambda: args)
