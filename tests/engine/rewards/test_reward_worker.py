@@ -18,6 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.args import build_relax_args
+
 
 # ---------------------------------------------------------------------------
 # Import strategy: try to load the full rm_hub pipeline (requires Ray + math_verify).
@@ -74,18 +76,16 @@ pytestmark = pytest.mark.skipif(not _HAS_MATH_VERIFY, reason="math_verify is not
 # ---------------------------------------------------------------------------
 
 
-def _make_args(**overrides) -> SimpleNamespace:
-    """Create a mock args namespace that mimics the training args structure."""
-    defaults = {
-        "rm_type": "openr1mm",
-        "custom_rm_path": None,
-        "reward_max_concurrency": 64,
-        "reward_num_workers": 4,
-        "rm_url": None,
-        "reward_key": None,
-    }
-    defaults.update(overrides)
-    return SimpleNamespace(**defaults)
+def _make_args(**overrides):
+    """Build a fully populated Relax args object; tests declare only the diff.
+
+    ``rm_type`` and ``reward_num_workers`` keep the historical fixture values
+    that differ from the declared defaults; every other field comes from the
+    real parameter declarations.
+    """
+    overrides.setdefault("rm_type", "openr1mm")
+    overrides.setdefault("reward_num_workers", 4)
+    return build_relax_args(**overrides)
 
 
 def _make_sample(response: str, label: str, metadata: dict | None = None) -> "Sample":

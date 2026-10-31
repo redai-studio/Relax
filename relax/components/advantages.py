@@ -63,9 +63,7 @@ class Advantages(Base):
                 # pre-allocated to global_batch_size, so the tensor-wide .all()
                 # consumption check is unreliable — use the producer-driven drained
                 # predicate (production_completed AND all inserted samples consumed).
-                _stream_drain = getattr(self.config, "fully_async", False) and getattr(
-                    self.config, "use_dynamic_batch_size", False
-                )
+                _stream_drain = self.config.fully_async and self.config.use_dynamic_batch_size
                 _drain_check = (
                     self.data_system_client.async_check_stream_drained
                     if _stream_drain
@@ -83,7 +81,7 @@ class Advantages(Base):
                     ]
                     # log_probs is only needed for KL divergence; in true on-policy mode
                     # the actor_fwd role is absent and log_probs is not produced upstream.
-                    if not getattr(self.config, "true_on_policy_mode", False):
+                    if not self.config.true_on_policy_mode:
                         adv_data_fields.append("log_probs")
                     if self.config.kl_coef != 0 or self.config.use_kl_loss:
                         adv_data_fields.append("ref_log_probs")
@@ -112,7 +110,7 @@ class Advantages(Base):
             error_msg = f"Advantage computation failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
             self.healthy.report_error.remote("advantage", error_msg)
-            if not getattr(self.config, "use_health_check", False):
+            if not self.config.use_health_check:
                 raise
 
     def compute_advantages_and_returns(self, rollout_data: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -183,12 +181,12 @@ class Advantages(Base):
         )
 
         # Optional pure OPD mode: remove all non-OPD reward contribution.
-        if getattr(self.config, "use_opd", False) and getattr(self.config, "opd_only_reward", False):
+        if self.config.use_opd and self.config.opd_only_reward:
             advantages = [torch.zeros_like(a) for a in advantages]
             returns = [torch.zeros_like(r) for r in returns]
 
         # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
-        if getattr(self.config, "use_opd", False):
+        if self.config.use_opd:
             apply_opd_to_advantages(self.config, rollout_data, advantages)
 
         return {

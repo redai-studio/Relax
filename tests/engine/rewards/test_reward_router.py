@@ -14,9 +14,10 @@ Run with: pytest tests/engine/rewards/test_reward_router.py -v
 
 import asyncio
 import logging
-from types import SimpleNamespace
 
 import pytest
+
+from tests.support.args import build_relax_args
 
 
 _HAS_FULL_PIPELINE = False
@@ -45,22 +46,17 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not _HAS_FULL_PIPELINE, reason="Full pipeline requires Ray + relax imports")
 
 
-def _make_args(**overrides) -> SimpleNamespace:
-    """Mock args namespace with the same six keys existing tests use.
+def _make_args(**overrides):
+    """Build a fully populated Relax args object; tests declare only the diff.
 
-    New router flags are intentionally absent from the defaults so these tests
-    double as a guard that the executor reads them with getattr.
+    Defaults below keep the historical fixture values that differ from the
+    declared defaults (``rm_type``/``reward_num_workers``); every other field
+    (including the router flags ``rm_type_infer``/``rm_type_fallback``) comes
+    from the real parameter declarations.
     """
-    defaults = {
-        "rm_type": "openr1mm",
-        "custom_rm_path": None,
-        "reward_max_concurrency": 64,
-        "reward_num_workers": 4,
-        "rm_url": None,
-        "reward_key": None,
-    }
-    defaults.update(overrides)
-    return SimpleNamespace(**defaults)
+    overrides.setdefault("rm_type", "openr1mm")
+    overrides.setdefault("reward_num_workers", 4)
+    return build_relax_args(**overrides)
 
 
 def _make_sample(response: str, label: str, metadata: dict | None = None) -> "Sample":

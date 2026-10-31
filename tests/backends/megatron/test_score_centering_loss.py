@@ -13,6 +13,21 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.support.args import build_relax_args
+
+
+_KNOWN = frozenset(vars(build_relax_args()))
+
+
+def _args(**kw):
+    """Fully populated parameter object; fields not declared by Relax are
+    passed through explicitly."""
+    extra = {k: kw.pop(k) for k in list(kw) if k not in _KNOWN}
+    args = build_relax_args(**kw)
+    for name, value in extra.items():
+        setattr(args, name, value)
+    return args
+
 
 class _TPReduce(torch.autograd.Function):
     """Megatron's forward SUM / backward identity mapping for CPU tests."""
@@ -95,7 +110,11 @@ def _args(**overrides):
         score_centering_mis_high=5.0,
     )
     values.update(overrides)
-    return SimpleNamespace(**values)
+    extra = {k: values.pop(k) for k in list(values) if k not in _KNOWN}
+    args = build_relax_args(**values)
+    for name, value in extra.items():
+        setattr(args, name, value)
+    return args
 
 
 @pytest.mark.parametrize("already_imported", [False, True])

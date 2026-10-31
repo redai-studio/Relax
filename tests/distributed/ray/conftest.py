@@ -156,6 +156,11 @@ def make_mock_args(**overrides):
         sglang_dp_size=1,
         rollout_external=False,
         ci_test=False,
+        rollout_engine_class_path=None,
+        rollout_engine_init_timeout=3600.0,
+        scale_weight_sync_precheck=True,
+        use_slime_router=False,
+        sglang_router_policy=None,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

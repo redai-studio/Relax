@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.support.args import build_relax_args
+
 
 @pytest.mark.parametrize("vision_mode", ["trainable", "frozen", "tp_frozen", "other_model"])
 @pytest.mark.parametrize("prepack", [False, True])
@@ -53,7 +55,7 @@ def test_kimi_k3_processor_batch_model_keeps_only_k3_grid_on_cpu(monkeypatch, vi
     )
     grid = inputs["image_grid_thw"]
     mask = inputs.pop(KIMI_K3_SFT_LOSS_MASK)
-    args = SimpleNamespace(dynamic_context_parallel=False)
+    args = build_relax_args(dynamic_context_parallel=False)
     spec = importlib.util.spec_from_file_location(
         "_k3_grid_configuration", Path(__file__).parents[2] / "relax/models/kimi_k3/configuration.py"
     )
@@ -180,7 +182,7 @@ def test_kimi_k3_cp_layout_consumes_real_prepacked_batch_and_loss_coordinates(mo
         ("get_tensor_model_parallel_world_size", 2),
     ):
         monkeypatch.setattr(mpu, name, lambda value=value: value)
-    monkeypatch.setattr(data, "get_args", lambda: SimpleNamespace(dynamic_context_parallel=False))
+    monkeypatch.setattr(data, "get_args", lambda: build_relax_args(dynamic_context_parallel=False))
     lengths = [9, 5]
     tokens = [torch.arange(1, length + 1) for length in lengths]
     batch = data.get_batch(

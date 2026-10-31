@@ -14,6 +14,7 @@ pytest.importorskip("sglang.srt.utils", reason="Weight sync tests require SGLang
 from relax.backends.megatron.weight_update import update_weight_from_tensor as sync  # noqa: E402
 from relax.backends.megatron.weight_update.expert_layout import DirectExpertLayout  # noqa: E402
 from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import HfWeightIteratorBridge  # noqa: E402
+from tests.support.args import build_relax_args  # noqa: E402
 
 
 def receiver(backend="triton", **overrides):
@@ -53,7 +54,7 @@ def receiver(backend="triton", **overrides):
 @pytest.mark.parametrize("backend", ["triton", "deep_gemm", "flashinfer_cutlass"])
 def test_negotiation_agrees_before_selecting_or_falling_back(monkeypatch, failure, backend):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater.args = SimpleNamespace(colocate=True)
+    updater.args = build_relax_args(colocate=True)
     updater.use_distribute = updater._route_experts = updater.lora_enabled = False
     updater.quantization_config = None
     configured, reductions = [], []
@@ -112,7 +113,7 @@ def test_negotiation_agrees_before_selecting_or_falling_back(monkeypatch, failur
 )
 def test_negotiation_preserves_full_engine_placement_for_expert_parallelism(monkeypatch, topology):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater.args = SimpleNamespace(colocate=True)
+    updater.args = build_relax_args(colocate=True)
     updater.use_distribute = updater._route_experts = updater.lora_enabled = False
     updater.quantization_config = None
     configure = Mock(side_effect=lambda layout: layout is not None)
@@ -133,7 +134,7 @@ def test_negotiation_preserves_full_engine_placement_for_expert_parallelism(monk
 @pytest.mark.parametrize("rank", [0, 3])
 def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, rank):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=2)
+    updater.args = build_relax_args(rollout_num_gpus_per_engine=2)
     updater._route_experts = False
     updater._ipc_placement = updater._ipc_gather_group = updater._ipc_gather_src = updater._ipc_engine = None
     updater._configure_direct_experts = Mock()
@@ -164,7 +165,8 @@ def test_packed_projection_memory_budget_uses_metadata_only(monkeypatch, geometr
 
     e, h, i = geometry
     iterator = HfWeightIteratorBridge.__new__(HfWeightIteratorBridge)
-    iterator.args = SimpleNamespace(num_experts=e, update_weight_buffer_size=512 * 1024**2)
+    iterator.args = build_relax_args(update_weight_buffer_size=512 * 1024**2)
+    iterator.args.num_experts = e
     iterator._packed_expert_sync = False
     iterator._direct_expert_layout = None
     infos = [
@@ -297,7 +299,7 @@ def test_auto_async_plan_reads_gdn_config_only_for_sharded_parameters(monkeypatc
         )
     )
     monkeypatch.setattr(bridge, "get_hf_config", config)
-    iterator = HfWeightIteratorBridge(SimpleNamespace(hf_checkpoint="test"), [], "any-model", None)
+    iterator = HfWeightIteratorBridge(build_relax_args(hf_checkpoint="test"), [], "any-model", None)
     assert iterator._async_weight_gather
     if kind == "sharded":
         config.assert_called_once_with("test")
@@ -322,5 +324,5 @@ def test_expert_eligibility_uses_full_buffer_instead_of_per_owner_quota(monkeypa
     monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_world_size", lambda: 16)
     monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_group", lambda: "ep")
     monkeypatch.setattr(bridge.dist, "get_process_group_ranks", lambda group: list(range(16)))
-    iterator = HfWeightIteratorBridge(SimpleNamespace(update_weight_buffer_size=512 * 1024**2), [], "any-model", None)
+    iterator = HfWeightIteratorBridge(build_relax_args(update_weight_buffer_size=512 * 1024**2), [], "any-model", None)
     assert (iterator._bf16_expert_buckets is not None) is enabled

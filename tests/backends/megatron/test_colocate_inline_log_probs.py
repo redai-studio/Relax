@@ -7,11 +7,35 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
+from tests.support.args import build_relax_args
+
+
+# Fields declared by Megatron and read-only for Relax: the shared builder does
+# not manage these; override them here as needed.
+# Before adding an override, confirm the field is really declared by the
+# Megatron parser and is not a Relax parameter.
+_MEGATRON_FIELDS: dict[str, object] = {
+    "pipeline_model_parallel_size": 1,
+    "hidden_dropout": 0.0,
+    "attention_dropout": 0.0,
+    "moe_input_jitter_eps": None,
+    "bf16": True,
+    "fp16": False,
+    "fp8": None,
+    "fp4": None,
+    "fp8_param_gather": False,
+    "moe_router_enable_expert_bias": False,
+    "moe_aux_loss_coeff": 0.0,
+    "moe_router_load_balancing_type": ["none"],
+    "moe_router_force_load_balancing": False,
+    "moe_router_force_biased": None,
+    "moe_expert_capacity_factor": None,
+}
 
 
 @pytest.fixture
 def actor():
-    args = SimpleNamespace(
+    args = build_relax_args(
         colocate=True,
         true_on_policy_mode=True,
         fully_async=False,
@@ -28,22 +52,7 @@ def actor():
         partial_rollout=False,
         use_dynamic_global_batch_size=False,
         context_parallel_size=1,
-        pipeline_model_parallel_size=1,
         dynamic_context_parallel=False,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        moe_input_jitter_eps=None,
-        bf16=True,
-        fp16=False,
-        fp8=None,
-        fp4=None,
-        fp8_param_gather=False,
-        moe_router_enable_expert_bias=False,
-        moe_aux_loss_coeff=0.0,
-        moe_router_load_balancing_type=["none"],
-        moe_router_force_load_balancing=False,
-        moe_router_force_biased=None,
-        moe_expert_capacity_factor=None,
         kl_coef=0.0,
         use_kl_loss=False,
         use_opd=False,
@@ -66,6 +75,8 @@ def actor():
         custom_megatron_before_log_prob_hook_path=None,
         custom_megatron_before_train_step_hook_path=None,
     )
+    for name, value in _MEGATRON_FIELDS.items():
+        setattr(args, name, value)
     return SimpleNamespace(
         args=args, weights_backuper=SimpleNamespace(backup_tags=["actor"]), rollout_data_postprocess=None
     )
@@ -165,7 +176,7 @@ def test_zero_kl_uses_sampling_shape_without_sampling_values(monkeypatch):
     monkeypatch.setattr(loss, "maybe_padded_total_lengths", lambda *args: None)
     monkeypatch.setattr(loss, "compute_advantages_and_returns_impl", compute_impl)
     compute = loss.compute_advantages_and_returns
-    args = SimpleNamespace(
+    args = build_relax_args(
         advantage_estimator="grpo",
         kl_coef=0,
         use_rollout_logprobs=False,
@@ -173,6 +184,8 @@ def test_zero_kl_uses_sampling_shape_without_sampling_values(monkeypatch):
         use_opd=False,
         normalize_advantages=False,
     )
+    for name, value in _MEGATRON_FIELDS.items():
+        setattr(args, name, value)
     for value in (-0.1, -100):
         data = {
             "rollout_log_probs": [torch.full((3,), value, dtype=torch.float16), torch.full((2,), value)],

@@ -64,13 +64,10 @@ _SGLANG_PASSTHROUGH_SKIP_ARGS = (
 
 def is_managed_opd_teacher_enabled(args: Any) -> bool:
     return (
-        getattr(args, "use_opd", False)
-        and getattr(args, "opd_type", None) == "sglang"
-        and (
-            getattr(args, "teacher_hf_checkpoint", None) is not None
-            or getattr(args, "opd_teacher_routes", None) is not None
-        )
-        and getattr(args, "resource", None) is not None
+        args.use_opd
+        and args.opd_type == "sglang"
+        and (args.teacher_hf_checkpoint is not None or args.opd_teacher_routes is not None)
+        and args.resource is not None
         and "teacher" in args.resource
     )
 
@@ -78,8 +75,8 @@ def is_managed_opd_teacher_enabled(args: Any) -> bool:
 def is_managed_opd_teacher_colocate(args: Any) -> bool:
     return (
         is_managed_opd_teacher_enabled(args)
-        and getattr(args, "colocate", False)
-        and not getattr(args, "hybrid", False)
+        and args.colocate
+        and not args.hybrid
         and "actor" in args.resource
         and "rollout" in args.resource
     )
@@ -183,7 +180,7 @@ def create_managed_opd_teacher_manager(
     urls = ray.get(teacher_manager.get_urls.remote())
     logger.info(f"[OPD teacher] TeacherManager initialized successfully: urls={urls}")
 
-    if shared_pg and getattr(args, "offload_rollout", False):
+    if shared_pg and args.offload_rollout:
         logger.info("[OPD teacher] Offloading teacher engines before actor init")
         ray.get(teacher_manager.offload.remote())
 
@@ -191,11 +188,11 @@ def create_managed_opd_teacher_manager(
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
-    if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
+    if not is_managed_opd_teacher_enabled(args) or args.debug_train_only:
         return None, None
 
     # ── Multi-teacher (MOPD) path: --opd-teacher-routes ────────────────────
-    routes_json = getattr(args, "opd_teacher_routes", None)
+    routes_json = args.opd_teacher_routes
     if routes_json is not None:
         return _start_managed_multi_teacher(args, routes_json, runtime_env=runtime_env)
 
@@ -212,7 +209,7 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
         )
         shared_pg = create_placement_group(
             num_gpus=actor_gpus,
-            node_group_affinity=getattr(args, "enable_affinity", True),
+            node_group_affinity=args.enable_affinity,
         )
 
     # args.resource["teacher"] = [num_cpus, num_gpus]. The teacher replica layout
@@ -220,7 +217,7 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
     # engine). When the per-engine knob is unset, fall back to a single replica
     # that uses all teacher GPUs (backward-compatible with the previous default).
     _, teacher_total_gpus = args.resource["teacher"]
-    gpus_per_replica = getattr(args, "teacher_num_gpus_per_engine", None) or teacher_total_gpus
+    gpus_per_replica = args.teacher_num_gpus_per_engine or teacher_total_gpus
     assert teacher_total_gpus % gpus_per_replica == 0, (
         f"teacher GPUs in --resource ({teacher_total_gpus}) must be divisible by "
         f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
@@ -283,7 +280,7 @@ def _start_managed_multi_teacher(
 
     # Per-teacher replica layout: TP size = --teacher-num-gpus-per-engine (default
     # = all of that teacher's GPUs, i.e. a single replica).
-    gpus_per_replica = getattr(args, "teacher_num_gpus_per_engine", None) or gpus_per_teacher
+    gpus_per_replica = args.teacher_num_gpus_per_engine or gpus_per_teacher
     if gpus_per_teacher % gpus_per_replica != 0:
         raise ValueError(
             f"Per-teacher GPUs ({gpus_per_teacher}) must be divisible by "
@@ -322,7 +319,7 @@ def _start_managed_multi_teacher(
 
     shared_pg = create_placement_group(
         num_gpus=actor_gpus,
-        node_group_affinity=getattr(args, "enable_affinity", True),
+        node_group_affinity=args.enable_affinity,
     )
     logger.info(
         f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
@@ -379,7 +376,7 @@ def _start_managed_multi_teacher(
 
     # Inject the routes map so per-sample routing works via _pick_teacher_url.
     args.opd_teacher_routes_map = url_routes
-    opd_teacher_key = getattr(args, "opd_teacher_key", None) or "data_source"
+    opd_teacher_key = args.opd_teacher_key or "data_source"
     logger.info(f"[MOPD teacher] all teachers ready. key='{opd_teacher_key}', routes={list(url_routes.keys())}")
 
     # Return the shared PG so the controller reuses it for actor/rollout. Second
@@ -745,14 +742,14 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
     if is_offline:
         return
 
-    if not getattr(args, "use_opd", False):
+    if not args.use_opd:
         return
 
     # OPD is enabled here. Backfill the routing key so teacher routing AND the
     # per-source metrics (compute_mopd_metrics) get a consistent value even when
     # the user didn't pass --opd-teacher-key. The arg default stays None so that
     # compute_mopd_metrics remains a no-op in non-OPD runs.
-    if getattr(args, "opd_teacher_key", None) is None:
+    if args.opd_teacher_key is None:
         args.opd_teacher_key = "data_source"
 
     if args.opd_type is None:
@@ -761,13 +758,13 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
         raise ValueError("--opd-teacher-timeout-s must be > 0.")
     if args.opd_log_prob_top_k < 0:
         raise ValueError("--opd-log-prob-top-k must be >= 0.")
-    student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
-    teacher_eos_token_id = getattr(args, "opd_teacher_eos_token_id", None)
+    student_eos_token_id = args.opd_student_eos_token_id
+    teacher_eos_token_id = args.opd_teacher_eos_token_id
     if (student_eos_token_id is None) != (teacher_eos_token_id is None):
         raise ValueError("--opd-student-eos-token-id and --opd-teacher-eos-token-id must be set together.")
     if student_eos_token_id is not None and (student_eos_token_id < 0 or teacher_eos_token_id < 0):
         raise ValueError("OPD EOS token ids must be >= 0.")
-    teacher_response_prefix_token_ids = getattr(args, "opd_teacher_response_prefix_token_ids", None) or ()
+    teacher_response_prefix_token_ids = args.opd_teacher_response_prefix_token_ids or ()
     if any(token_id < 0 for token_id in teacher_response_prefix_token_ids):
         raise ValueError("OPD teacher response prefix token ids must be >= 0.")
     token_selection = args.opd_token_selection
@@ -783,10 +780,10 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
             "(choose reverse_kl or low_var_kl)."
         )
 
-    opd_kl_coef = float(getattr(args, "opd_kl_coef", 0.0) or 0.0)
-    opd_loss_coef = float(getattr(args, "opd_loss_coef", 0.0) or 0.0)
+    opd_kl_coef = float(args.opd_kl_coef or 0.0)
+    opd_loss_coef = float(args.opd_loss_coef or 0.0)
 
-    is_eopd = bool(getattr(args, "opd_fkl_entropy_gate", False))
+    is_eopd = bool(args.opd_fkl_entropy_gate)
     is_adv_mode = opd_kl_coef != 0.0 and opd_loss_coef == 0.0
     is_loss_mode = opd_kl_coef == 0.0 and opd_loss_coef != 0.0
     if is_eopd:
@@ -797,10 +794,10 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
                 "(entropy-gated forward-KL loss). "
                 f"Got opd_kl_coef={opd_kl_coef}, opd_loss_coef={opd_loss_coef}."
             )
-        if getattr(args, "opd_token_selection", None) not in ("teacher_topk", "union"):
+        if args.opd_token_selection not in ("teacher_topk", "union"):
             raise ValueError(
                 "--opd-fkl-entropy-gate requires --opd-token-selection "
-                f"teacher_topk or union, got {getattr(args, 'opd_token_selection', None)}."
+                f"teacher_topk or union, got {args.opd_token_selection}."
             )
     elif not is_adv_mode and not is_loss_mode:
         raise ValueError(
@@ -811,7 +808,7 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
             "--opd-kl-coef=0.0 --opd-loss-coef=X for loss mode."
         )
 
-    if getattr(args, "opd_teacher_prompt_key", None) is not None:
+    if args.opd_teacher_prompt_key is not None:
         if args.opd_type != "sglang":
             raise ValueError(
                 "--opd-teacher-prompt-key currently only supports --opd-type=sglang "
@@ -819,22 +816,22 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
                 "yet rebuild a teacher-side data_iterator from teacher_tokens."
             )
 
-    if getattr(args, "opd_teacher_image_key", None) is not None:
+    if args.opd_teacher_image_key is not None:
         if args.opd_type != "sglang":
             raise ValueError("--opd-teacher-image-key currently only supports --opd-type=sglang.")
-        if not getattr(args, "multimodal_keys", None):
+        if not args.multimodal_keys:
             raise ValueError(
                 "--opd-teacher-image-key requires --multimodal-keys to be set on the "
                 "student side (the dataloader needs a processor and a parallel student field "
                 "to extract teacher-side multimodal inputs)."
             )
 
-    per_token_clip = getattr(args, "opd_per_token_clip", None)
+    per_token_clip = args.opd_per_token_clip
     if per_token_clip is not None:
         if per_token_clip <= 0:
             raise ValueError(f"--opd-per-token-clip must be > 0, got {per_token_clip}.")
 
-    is_clip = getattr(args, "opd_is_clip", None)
+    is_clip = args.opd_is_clip
     if is_clip is not None:
         if is_clip <= 0:
             raise ValueError(f"--opd-is-clip must be > 0, got {is_clip}.")
@@ -870,7 +867,7 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
         # (args.opd_teacher_routes_map) is populated at launch by
         # _start_managed_multi_teacher; here we only validate the spec.
         args.opd_teacher_routes_map = None
-        opd_teacher_routes = getattr(args, "opd_teacher_routes", None)
+        opd_teacher_routes = args.opd_teacher_routes
         if opd_teacher_routes is not None:
             try:
                 routes_map = json.loads(opd_teacher_routes)
@@ -881,29 +878,25 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
             log.info(
                 "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s",
                 len(routes_map),
-                getattr(args, "opd_teacher_key", None) or "data_source",
+                args.opd_teacher_key or "data_source",
                 list(routes_map.keys()),
             )
-            if getattr(args, "teacher_hf_checkpoint", None) is not None:
+            if args.teacher_hf_checkpoint is not None:
                 raise ValueError(
                     "--opd-teacher-routes is mutually exclusive with --teacher-hf-checkpoint. "
                     "Use routes for multi-teacher, or a single checkpoint for single-teacher."
                 )
-            if getattr(args, "resource", None) is None or "teacher" not in args.resource:
+            if args.resource is None or "teacher" not in args.resource:
                 raise ValueError(
                     "--opd-teacher-routes requires a 'teacher' entry in --resource "
                     "specifying the total GPU budget to split among teachers."
                 )
 
         has_managed_teacher = (
-            getattr(args, "teacher_hf_checkpoint", None) is not None
-            and getattr(args, "resource", None) is not None
-            and "teacher" in args.resource
+            args.teacher_hf_checkpoint is not None and args.resource is not None and "teacher" in args.resource
         )
         has_managed_multi_teacher = (
-            opd_teacher_routes is not None
-            and getattr(args, "resource", None) is not None
-            and "teacher" in args.resource
+            opd_teacher_routes is not None and args.resource is not None and "teacher" in args.resource
         )
         if args.opd_teacher_url is None and not has_managed_teacher and not has_managed_multi_teacher:
             raise ValueError(
@@ -920,7 +913,7 @@ def _get_opd_transfer_schema(args: Namespace) -> list[str]:
 
 
 def consume_opd_train_data(data_fields: list[str], args: Namespace) -> None:
-    if not (getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"):
+    if not (args.use_opd and args.opd_type == "sglang"):
         return
     for _f in _get_opd_transfer_schema(args):
         if _f not in data_fields:
@@ -928,7 +921,7 @@ def consume_opd_train_data(data_fields: list[str], args: Namespace) -> None:
 
 
 def consume_opd_advantage_data(data_fields: list[str], args: Namespace) -> None:
-    if not getattr(args, "use_opd", False):
+    if not args.use_opd:
         return
     for _f in _get_opd_transfer_schema(args):
         if _f not in data_fields:
@@ -998,7 +991,7 @@ def build_opd_teacher_sample_fields(
 
 
 def validate_opd_topk_gather(args: Namespace, gather_topk_token_ids: list[torch.Tensor] | None) -> None:
-    if gather_topk_token_ids is not None and getattr(args, "allgather_cp", False):
+    if gather_topk_token_ids is not None and args.allgather_cp:
         raise NotImplementedError(
             "gather_topk_token_ids is not yet compatible with allgather_cp=True; "
             "the OPD top-K path needs an _allgather_cp_redistribute extension for "
@@ -1292,12 +1285,12 @@ def apply_opd_to_advantages(
 
     kl_type = args.opd_kl_type
     jsd_alpha = float(args.opd_jsd_alpha)
-    norm_mode = getattr(args, "opd_norm_mode", "tail")
-    log_prob_min_clamp = getattr(args, "opd_log_prob_min_clamp", None)
+    norm_mode = args.opd_norm_mode
+    log_prob_min_clamp = args.opd_log_prob_min_clamp
     token_selection = args.opd_token_selection
     is_topk = token_selection in ("student_topk", "teacher_topk", "union")
 
-    if bool(getattr(args, "opd_fkl_entropy_gate", False)):
+    if bool(args.opd_fkl_entropy_gate):
         # EOPD: advantages always use the sampled-token reverse-KL signal; the
         # top-k tensors feed the entropy-gated forward-KL loss path instead.
         is_topk = False
@@ -1339,7 +1332,7 @@ def apply_opd_to_advantages(
                 mask=mask,
             )
 
-            per_token_clip = getattr(args, "opd_per_token_clip", None)
+            per_token_clip = args.opd_per_token_clip
             if per_token_clip is not None:
                 kl_term = torch.clamp(kl_term, max=float(per_token_clip))
             advantages[i] = adv - args.opd_kl_coef * kl_term.detach()
@@ -1388,14 +1381,14 @@ def compute_policy_opd_loss(
     old_log_probs: torch.Tensor,
     log_probs_and_entropy: dict[str, list[torch.Tensor]],
 ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
-    opd_loss_coef = float(getattr(args, "opd_loss_coef", 0.0))
+    opd_loss_coef = float(args.opd_loss_coef)
     if opd_loss_coef == 0.0:
         return None, {}
 
     opd_kl_type = args.opd_kl_type
     opd_jsd_alpha = float(args.opd_jsd_alpha)
-    opd_norm_mode = getattr(args, "opd_norm_mode", "tail")
-    opd_log_prob_min_clamp = getattr(args, "opd_log_prob_min_clamp", None)
+    opd_norm_mode = args.opd_norm_mode
+    opd_log_prob_min_clamp = args.opd_log_prob_min_clamp
     token_selection = args.opd_token_selection
     is_topk = token_selection in ("student_topk", "teacher_topk", "union")
 
@@ -1411,8 +1404,8 @@ def compute_policy_opd_loss(
         k_lengths_list = batch.get("opd_topk_ksz") if token_selection == "union" else None
         device = log_probs.device
         per_token_kl_chunks: list[torch.Tensor] = []
-        _eopd = bool(getattr(args, "opd_fkl_entropy_gate", False))
-        _eopd_tau = float(getattr(args, "opd_fkl_entropy_threshold", 0.8))
+        _eopd = bool(args.opd_fkl_entropy_gate)
+        _eopd_tau = float(args.opd_fkl_entropy_threshold)
         _eopd_gate_sum = 0.0
         _eopd_tok_cnt = 0.0
         _eopd_ent_sum = 0.0
@@ -1466,10 +1459,10 @@ def compute_policy_opd_loss(
         ).to(dtype=log_probs.dtype)
 
     reported_loss: dict[str, torch.Tensor] = {}
-    if is_topk and bool(getattr(args, "opd_fkl_entropy_gate", False)) and _eopd_tok_cnt > 0:
+    if is_topk and bool(args.opd_fkl_entropy_gate) and _eopd_tok_cnt > 0:
         reported_loss["opd_fkl_gate_frac"] = torch.tensor(_eopd_gate_sum / _eopd_tok_cnt)
         reported_loss["opd_fkl_teacher_topk_entropy"] = torch.tensor(_eopd_ent_sum / _eopd_tok_cnt)
-    per_token_clip = getattr(args, "opd_per_token_clip", None)
+    per_token_clip = args.opd_per_token_clip
     if per_token_clip is not None:
         tau = float(per_token_clip)
         before_clip = opd_per_token_kl
@@ -1477,7 +1470,7 @@ def compute_policy_opd_loss(
         with torch.no_grad():
             reported_loss["opd_per_token_clip_frac"] = metric_reducer((before_clip > tau).float()).detach()
 
-    is_clip = getattr(args, "opd_is_clip", None)
+    is_clip = args.opd_is_clip
     if is_clip is not None:
         clip = float(is_clip)
         ratio = torch.exp(log_probs.detach() - old_log_probs.detach())

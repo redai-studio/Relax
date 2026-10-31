@@ -930,7 +930,7 @@ class RuntimeDomain:
             handles.append(self._admission_coordinator)
         await asyncio.wait_for(
             asyncio.gather(*(handle.set_router_address.remote(router_ip, router_port) for handle in handles)),
-            timeout=getattr(self.args, "rollout_engine_init_timeout", 3600.0),
+            timeout=self.args.rollout_engine_init_timeout,
         )
 
     @property
@@ -1268,9 +1268,7 @@ class RuntimeDomain:
         }
 
     async def collect_agentic_kv_metrics(self) -> dict[str, float]:
-        if not getattr(self.args, "agentic_program_admission", False) and not getattr(
-            self.args, "agentic_session_lifecycle", False
-        ):
+        if not self.args.agentic_program_admission and not self.args.agentic_session_lifecycle:
             return {}
         shard_metrics = await asyncio.gather(
             *(shard.handle.agentic_kv_metrics.remote(reset=True) for shard in self._shards),

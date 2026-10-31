@@ -132,9 +132,9 @@ class QwenImageAdapter:
         """
         from diffusers import QwenImageTransformer2DModel
 
-        dtype = torch.bfloat16 if getattr(config, "fsdp_param_dtype", "bf16") == "bf16" else torch.float32
+        dtype = torch.bfloat16 if config.fsdp_param_dtype == "bf16" else torch.float32
         load_kwargs: Dict[str, Any] = {"subfolder": "transformer", "torch_dtype": dtype}
-        revision = getattr(config, "model_revision", None)
+        revision = config.model_revision
         if revision:
             load_kwargs["revision"] = str(revision)
         transformer = QwenImageTransformer2DModel.from_pretrained(config.model_path, **load_kwargs)

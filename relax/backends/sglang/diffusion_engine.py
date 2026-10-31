@@ -332,7 +332,7 @@ class SGLangNativeGenerationEngine(RayActor):
         host = host or "127.0.0.1"
         if port is None:
             _ip, port = self._get_current_node_ip_and_free_port(start_port=21000)
-        num_gpus = int(self.num_gpus_per_engine or getattr(self.args, "rollout_num_gpus_per_engine", 1))
+        num_gpus = int(self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine)
 
         server_args_dict = self._compute_server_args(host, int(port), num_gpus, engine_args)
 
@@ -351,11 +351,11 @@ class SGLangNativeGenerationEngine(RayActor):
         # ``--num-gpus-per-node`` (default 8) is the node width. Do NOT fall back
         # to a literal 8 when it is unset/zero: on a 4-GPU node that silently emits
         # device ids 4..7 and only works by accident.
-        total_gpus = int(getattr(self.args, "num_gpus_per_node", 0) or 0)
+        total_gpus = int(self.args.num_gpus_per_node or 0)
         if total_gpus <= 0:
             raise RuntimeError(
                 f"diffusion engine[{self.rank}] cannot pin CUDA_VISIBLE_DEVICES: args.num_gpus_per_node is "
-                f"{getattr(self.args, 'num_gpus_per_node', None)!r}. Set --num-gpus-per-node to this node's GPU count."
+                f"{self.args.num_gpus_per_node!r}. Set --num-gpus-per-node to this node's GPU count."
             )
         cuda_visible_devices: Optional[str] = self._cuda_visible_devices(self.base_gpu_id, num_gpus, total_gpus)
 
@@ -441,7 +441,7 @@ class SGLangNativeGenerationEngine(RayActor):
                 kwargs["scheduler_port"] = int(str(dist_init_addr).rsplit(":", 1)[1])
             except (IndexError, ValueError) as exc:
                 raise ValueError(f"invalid diffusion engine dist_init_addr: {dist_init_addr!r}") from exc
-        revision = getattr(self.args, "model_revision", None)
+        revision = self.args.model_revision
         if revision:
             kwargs["revision"] = str(revision)
         # Multi-GPU diffusion server: force sequence parallelism (ulysses), NOT the
@@ -465,7 +465,7 @@ class SGLangNativeGenerationEngine(RayActor):
         # of the DiT. `lora_path` is deliberately NOT set: the pipeline converts
         # lazily on the first set_lora_from_tensors, so the server boots (and
         # serves the base) exactly as it does for full FT.
-        if getattr(self.args, "lora_adapter_mode", False):
+        if self.args.lora_adapter_mode:
             lora_targets = self._resolve_lora_target_modules()
             # SGLang matches by substring against its module names. Keep the
             # same suffixes PEFT used train-side; shortening "attn.to_out.0" to
@@ -483,11 +483,11 @@ class SGLangNativeGenerationEngine(RayActor):
         return kwargs
 
     def _resolve_lora_target_modules(self) -> List[str]:
-        explicit = getattr(self.args, "lora_target_modules", None)
+        explicit = self.args.lora_target_modules
         if explicit:
             return [str(t) for t in explicit]
 
-        adapter_path = getattr(self.args, "model_adapter_path", None)
+        adapter_path = self.args.model_adapter_path
         if not adapter_path:
             return []
 
@@ -515,9 +515,9 @@ class SGLangNativeGenerationEngine(RayActor):
         """
         model_path = (
             (self.sglang_overrides or {}).get("model_path")
-            or getattr(self.args, "model_path", None)
-            or getattr(self.args, "sglang_hf_checkpoint", None)
-            or getattr(self.args, "hf_checkpoint", None)
+            or self.args.model_path
+            or self.args.sglang_hf_checkpoint
+            or self.args.hf_checkpoint
         )
         if not model_path:
             raise RuntimeError("diffusion engine has no model path — set --model-path (fsdp) or --hf-checkpoint.")

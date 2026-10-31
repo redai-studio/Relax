@@ -6,10 +6,12 @@ dispatcher."""
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
+
+from tests.support.args import build_relax_args
 
 
 pytest.importorskip("torch")
@@ -36,16 +38,18 @@ def utils_mod(monkeypatch):
 
 
 def _args(estimator="grpo", **overrides):
-    base = dict(
-        advantage_estimator=estimator,
-        n_samples_per_prompt=4,
-        rewards_normalization=True,
-        grpo_std_normalization=True,
-        custom_reward_post_process_path=None,
-        reward_key=None,
+    # Declare only the diff this file cares about; the other fields come from the parameter declarations (tests/support/args.py).
+    return build_relax_args(
+        **{
+            "advantage_estimator": estimator,
+            "n_samples_per_prompt": 4,
+            "rewards_normalization": True,
+            "grpo_std_normalization": True,
+            "custom_reward_post_process_path": None,
+            "reward_key": None,
+            **overrides,
+        }
     )
-    base.update(overrides)
-    return SimpleNamespace(**base)
 
 
 class _Sample:

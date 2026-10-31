@@ -528,7 +528,7 @@ def write_hf_peft_adapter(
 
 def is_lora_enabled(args) -> bool:
     """Check if LoRA is enabled in training arguments."""
-    return hasattr(args, "lora_rank") and args.lora_rank > 0
+    return args.lora_rank > 0
 
 
 def is_lora_merge_mode(args) -> bool:
@@ -542,7 +542,7 @@ def is_lora_merge_mode(args) -> bool:
     Returns:
         True if merge mode, False otherwise
     """
-    return hasattr(args, "lora_merge_mode") and args.lora_merge_mode
+    return args.lora_merge_mode
 
 
 def is_lora_adapter_mode(args) -> bool:
@@ -558,7 +558,7 @@ def is_lora_adapter_mode(args) -> bool:
     Returns:
         True if adapter mode, False otherwise
     """
-    return hasattr(args, "lora_adapter_mode") and args.lora_adapter_mode
+    return args.lora_adapter_mode
 
 
 def extract_lora_delta(

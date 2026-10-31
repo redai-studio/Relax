@@ -4,7 +4,6 @@
 Megatron."""
 
 import ast
-from argparse import Namespace
 from contextlib import nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -20,6 +19,7 @@ from relax.engine.sft.runtime import (
     should_skip_sft_weight_management,
 )
 from relax.utils.env import Envs
+from tests.support.args import build_relax_args
 
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -38,21 +38,31 @@ def _functions(path, names, namespace, *, class_method=False):
     return namespace
 
 
+# Fields declared by Megatron and read-only for Relax (including the in-process
+# verification marker): the builder does not manage these; override separately.
+_NON_DECLARED_FIELDS = {
+    "use_distributed_optimizer": True,
+    "overlap_grad_reduce": True,
+    "overlap_param_gather": True,
+    "align_grad_reduce": False,
+    "align_param_gather": True,
+    "manual_gc": False,
+}
+
+
 def _args():
-    return Namespace(
+    values = dict(
         loss_type="sft",
-        use_distributed_optimizer=True,
-        overlap_grad_reduce=True,
-        overlap_param_gather=True,
-        align_grad_reduce=False,
-        align_param_gather=True,
         reset_optimizer_states=False,
-        manual_gc=False,
         enable_mtp_training=False,
         global_batch_size=1536,
         num_rollout=3,
-        _relax_resident_sft_actor_verified=True,
     )
+    args = build_relax_args(**values)
+    for name, value in _NON_DECLARED_FIELDS.items():
+        setattr(args, name, value)
+    args._relax_resident_sft_actor_verified = True
+    return args
 
 
 @pytest.mark.parametrize("enabled", [False, True])

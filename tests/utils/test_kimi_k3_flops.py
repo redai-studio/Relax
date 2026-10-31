@@ -11,6 +11,7 @@ import torch
 
 from relax.utils.training.flops_counter import FlopsCounter
 from relax.utils.training.kimi_k3_flops import _vision_flops
+from tests.support.args import build_relax_args
 
 
 def k3_config():
@@ -236,7 +237,7 @@ def _logged_metrics(monkeypatch, counter, **args):
     monkeypatch.setattr(train_metric_utils, "Timer", lambda: timer)
     monkeypatch.setattr(train_metric_utils.tracking_utils, "log", lambda _, values, **kw: logs.update(values))
     train_metric_utils.log_perf_data_raw(
-        0, SimpleNamespace(wandb_always_use_train_step=False, **args), True, counter, world_size=128
+        0, build_relax_args(wandb_always_use_train_step=False, **args), True, counter, world_size=128
     )
     return logs
 

@@ -86,7 +86,7 @@ def _resolve_rollout_engine_class(args):
     ``SGLangEngine`` is returned so existing runs are unaffected (design doc
     8.3).
     """
-    class_path = getattr(args, "rollout_engine_class_path", None)
+    class_path = args.rollout_engine_class_path
     if class_path:
         return load_function(class_path)
     return SGLangEngine
@@ -727,14 +727,14 @@ class RolloutServer:
         # is retried. Do not return None slots to the synchronous weight updater.
         for group, dead_indices in zip(groups, dead_per_group, strict=True):
             if not (
-                getattr(group.args, "fully_async", False)
+                group.args.fully_async
                 and group.is_scaled_out
                 and group.pg is not None
                 and group.skip_router_registration
                 and group.lifecycle_status is EngineGroupLifecycle.ACTIVE
                 and group.router_ip
                 and group.router_port
-                and not getattr(group.args, "use_slime_router", False)
+                and not group.args.use_slime_router
                 and group.sglang_overrides.get("dp_size", getattr(group.args, "sglang_dp_size", 1)) == 1
                 and parse(sglang_router.__version__) >= parse("0.3.0")
             ):
@@ -1243,7 +1243,7 @@ class RolloutManager(ReloadableMixin):
         self.health_monitoring_resume()
 
         router_base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
-        if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(self.args, "use_slime_router", False):
+        if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
             response = await get(f"{router_base}/list_workers")
             worker_urls = response["urls"]
         else:
@@ -1256,9 +1256,9 @@ class RolloutManager(ReloadableMixin):
         # Reuse the shared --eval-* sampling args (no SFT-predict-specific
         # flags). Defaults preserve the original SFT predict behaviour
         # (greedy, max_new_tokens=512) when --eval-* is not provided.
-        eval_temperature = getattr(self.args, "eval_temperature", None)
-        eval_max_response_len = getattr(self.args, "eval_max_response_len", None)
-        eval_top_p = getattr(self.args, "eval_top_p", None)
+        eval_temperature = self.args.eval_temperature
+        eval_max_response_len = self.args.eval_max_response_len
+        eval_top_p = self.args.eval_top_p
         sampling_params = {
             "temperature": 0.0 if eval_temperature is None else eval_temperature,
             "max_new_tokens": 512 if eval_max_response_len is None else eval_max_response_len,
@@ -2418,7 +2418,7 @@ class RolloutManager(ReloadableMixin):
             engines,
             timeout=sync_timeout,
             model_name=request.model_name,
-            run_precheck=(engine_group is not None and getattr(self.args, "scale_weight_sync_precheck", True)),
+            run_precheck=(engine_group is not None and self.args.scale_weight_sync_precheck),
             reason_sink=sync_reasons,
         )
         if not sync_ok:
@@ -3105,8 +3105,8 @@ class RolloutManager(ReloadableMixin):
                     _record(ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, f"pause error: {e}"))
                     return False
 
-            pp_size = max(getattr(self.args, "sglang_pp_size", 1), 1)
-            rollout_gpus_per_engine = max(getattr(self.args, "rollout_num_gpus_per_engine", 1), 1)
+            pp_size = max(self.args.sglang_pp_size, 1)
+            rollout_gpus_per_engine = max(self.args.rollout_num_gpus_per_engine, 1)
             tp_size = max(rollout_gpus_per_engine // pp_size, 1)
 
             if run_precheck:
@@ -3790,7 +3790,7 @@ class RolloutManager(ReloadableMixin):
             model_name=model_name,
             num_replicas=num_replicas,
             engine_urls=engine_urls or [],
-            timeout_secs=timeout_secs or getattr(self.args, "scale_in_drain_timeout", 30.0) + 60.0,
+            timeout_secs=timeout_secs or self.args.scale_in_drain_timeout + 60.0,
             force=force,
             dry_run=dry_run,
         )
@@ -3892,8 +3892,8 @@ class RolloutManager(ReloadableMixin):
                     return
                 await asyncio.sleep(min(1.0, request.timeout_secs - elapsed))
 
-            drain_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0)
-            shutdown_timeout = getattr(self.args, "scale_in_shutdown_timeout", 20.0)
+            drain_timeout = self.args.scale_in_drain_timeout
+            shutdown_timeout = self.args.scale_in_shutdown_timeout
 
             request.update_status(ScaleInStatus.DRAINING)
             removed, failed = await self._remove_live_engines(
@@ -4431,7 +4431,7 @@ class RolloutManager(ReloadableMixin):
         engine_ids = [f"group_{group.rank_offset}_engine_{idx}" for _, _, group, idx in claimed]
         logger.info("[Eviction] Gracefully removing engines %s", engine_ids)
         try:
-            wait_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0) + 60.0
+            wait_timeout = self.args.scale_in_drain_timeout + 60.0
             deadline = time.monotonic() + wait_timeout
             while self._is_weight_updating:
                 remaining = deadline - time.monotonic()
@@ -4453,8 +4453,8 @@ class RolloutManager(ReloadableMixin):
                         self._remove_live_engines(
                             srv,
                             infos,
-                            drain_timeout=getattr(self.args, "scale_in_drain_timeout", 30.0),
-                            shutdown_timeout=getattr(self.args, "scale_in_shutdown_timeout", 20.0),
+                            drain_timeout=self.args.scale_in_drain_timeout,
+                            shutdown_timeout=self.args.scale_in_shutdown_timeout,
                             force=False,
                         )
                         for _, (srv, infos) in batch_items
@@ -4626,7 +4626,7 @@ def _start_router(
         and not force_new
         and has_pd_disaggregation
         and not args.use_slime_router
-        and not getattr(args, "debug_train_only", False)
+        and not args.debug_train_only
         and getattr(args, "router_decode_policy", None) == "power_of_two"
     ):
         # The owner chooses and binds the endpoint after engines are ready.
@@ -4679,7 +4679,8 @@ def _start_router(
         router_args.log_level = "warn"
         router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
 
-        if hasattr(args, "sglang_router_policy") and args.sglang_router_policy:
+        # sglang_router_policy is declared by the sglang sub-parser; finalize_args guarantees the field exists.
+        if args.sglang_router_policy:
             router_args.policy = args.sglang_router_policy
 
         if has_pd_disaggregation:
@@ -4932,7 +4933,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     routers_before = tuple(_LAUNCHED_ROUTER_PROCESSES)
     try:
         servers = _start_rollout_servers_impl(args, pg, groups)
-        if getattr(args, "use_agentic_rollout", False):
+        if args.use_agentic_rollout:
             from relax.agentic.rollout import bind_agentic_router
 
             bind_agentic_router(args.sglang_router_ip, args.sglang_router_port)
@@ -4979,7 +4980,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
             and not args.debug_train_only
         )
         if defer_router:
-            if args.rollout_external or getattr(args, "rollout_engine_class_path", None):
+            if args.rollout_external or args.rollout_engine_class_path:
                 raise ValueError("Managed static PD startup requires native, framework-launched SGLang engines")
             if getattr(args, "router_dp_aware", False):
                 raise ValueError("Managed static PD startup does not support DP-aware worker identities")
@@ -5041,7 +5042,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
             _wait_engine_init_with_progress(
                 all_init_handles,
                 model_name=model_cfg.name,
-                timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
+                timeout=args.rollout_engine_init_timeout,
                 log_interval=60.0,
             )
 
@@ -5062,7 +5063,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
 
 def _resolve_sglang_config(args) -> SglangConfig:
     """Build a SglangConfig from args, choosing the right source."""
-    if getattr(args, "sglang_config", None) is not None:
+    if args.sglang_config is not None:
         config = SglangConfig.from_yaml(args.sglang_config)
         # Validate total GPUs match.
         expected = args.rollout_num_gpus
@@ -5070,7 +5071,7 @@ def _resolve_sglang_config(args) -> SglangConfig:
         assert actual == expected, f"sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
         return config
 
-    if getattr(args, "prefill_num_servers", None) is not None:
+    if args.prefill_num_servers is not None:
         return SglangConfig.from_prefill_num_servers(args)
 
     # Default: single regular group.

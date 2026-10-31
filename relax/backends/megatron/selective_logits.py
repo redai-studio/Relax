@@ -23,7 +23,7 @@ def prepare_selective_logits(batch: dict, args: Namespace) -> None:
     batch["selective_logit_rows"] = [
         (mask.numel(), torch.nonzero(mask.reshape(-1) != 0, as_tuple=True)[0]) for mask in masks
     ]
-    if not getattr(args, "enable_mtp_training", False):
+    if not args.enable_mtp_training:
         return
 
     # Use exactly MCore's packed roll, on CPU with no process group. The model
@@ -73,6 +73,6 @@ def prepare_selective_logits_from_cpu_masks(batch: dict, args: Namespace) -> Non
     cpu_batch = {"loss_masks": masks, "full_loss_masks": full_mask, "packed_seq_params": cpu_packed}
     prepare_selective_logits(cpu_batch, args)
     batch["selective_logit_rows"] = cpu_batch["selective_logit_rows"]
-    if getattr(args, "enable_mtp_training", False):
+    if args.enable_mtp_training:
         packed.relax_sft_selective_mtp_rows = cpu_packed.relax_sft_selective_mtp_rows
         packed.relax_sft_selective_full_rows = cpu_packed.relax_sft_selective_full_rows

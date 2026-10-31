@@ -4,9 +4,24 @@
 
 import importlib
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
+
+from tests.support.args import build_relax_args
+
+
+_KNOWN = frozenset(vars(build_relax_args()))
+
+
+def _args(**kw):
+    """Fully populated parameter object; fields not declared by Relax are
+    passed through explicitly."""
+    extra = {k: kw.pop(k) for k in list(kw) if k not in _KNOWN}
+    args = build_relax_args(**kw)
+    for name, value in extra.items():
+        setattr(args, name, value)
+    return args
 
 
 torch = pytest.importorskip("torch")
@@ -59,7 +74,7 @@ def test_policy_loss_function_dispatches_rloo_objective(monkeypatch):
         lambda **_kwargs: (None, {}),
     )
 
-    args = SimpleNamespace(
+    args = _args(
         advantage_estimator="rloo",
         true_on_policy_mode=False,
         use_rollout_logprobs=False,
@@ -156,7 +171,7 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
     monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **_kwargs: (None, {}))
 
-    args = SimpleNamespace(
+    args = _args(
         loss_type="policy_loss",
         advantage_estimator="rloo",
         calculate_per_token_loss=True,
@@ -229,7 +244,7 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
 
 
 def test_get_responses_cp1_returns_matching_empty_chunks_for_empty_response():
-    args = SimpleNamespace(
+    args = _args(
         qkv_format="thd",
         allgather_cp=False,
         rollout_temperature=1.0,
@@ -267,7 +282,7 @@ def test_loss_function_exports_effective_tokens_independent_of_metric_denominato
     monkeypatch, is_dummy, calculate_per_token_loss
 ):
     monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1, raising=False)
-    args = SimpleNamespace(
+    args = _args(
         mtp_only_training=True,
         calculate_per_token_loss=calculate_per_token_loss,
         qkv_format="thd",

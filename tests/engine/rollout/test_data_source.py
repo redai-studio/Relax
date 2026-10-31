@@ -12,11 +12,12 @@ import json
 import os
 import sys
 import tempfile
-from argparse import Namespace
 from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
+
+from tests.support.args import build_relax_args
 
 
 @pytest.fixture
@@ -215,7 +216,7 @@ class TestDataSourceIntegration:
         valid_indices = [idx for idx in order if idx not in filtered]
         # Exercise the real buffer/data-source path with a local dataset and no model loading.
         monkeypatch.setattr(data_source, "_create_dataset", lambda *args: dataset)
-        args = Namespace(
+        args = build_relax_args(
             use_streaming_dataset=True,
             rollout_global_dataset=True,
             hf_checkpoint=None,

@@ -19,6 +19,21 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import yaml
 
+from tests.support.args import build_relax_args as _build_relax_args
+
+
+_KNOWN = frozenset(vars(_build_relax_args()))
+
+
+def _args(**kw):
+    """Fully populated parameter object; fields not declared by Relax are
+    passed through explicitly."""
+    extra = {k: kw.pop(k) for k in list(kw) if k not in _KNOWN}
+    args = _build_relax_args(**kw)
+    for name, value in extra.items():
+        setattr(args, name, value)
+    return args
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -88,7 +103,7 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
     ns["serve"].shutdown.side_effect = lambda: events.append("serve")
     ns["ray"].shutdown.side_effect = lambda: events.append("ray")
     with pytest.raises(SystemExit) as exc:
-        ns["main"](SimpleNamespace())
+        ns["main"](_args())
     expected = 1 if fail_at else 0
     assert exc.value.code == expected
     assert ns["_training_completed"] is (fail_at is None)
@@ -110,7 +125,7 @@ def test_train_cleans_up_if_tracking_fails_before_controller(monkeypatch):
     ns["serve"].shutdown.side_effect = lambda: events.append("serve")
     ns["ray"].shutdown.side_effect = lambda: events.append("ray")
     with pytest.raises(SystemExit) as exc:
-        ns["main"](SimpleNamespace())
+        ns["main"](_args())
 
     assert exc.value.code == 1
     assert events == ["serve", "ray", ("exit", 1)]
@@ -122,6 +137,7 @@ def test_train_shutdown_deadline_exits_blocked_process(hang_at, exit_code):
     script = f"""
 import runpy
 import threading
+
 ns = runpy.run_path({str(Path(__file__).resolve())!r})["_train_namespace"]()
 ns["_SHUTDOWN_TIMEOUT_SEC"] = 0.05
 ns["_NORMAL_SHUTDOWN_TIMEOUT_SEC"] = 0.05

@@ -49,7 +49,9 @@ def production_namespace(cp_size, rank, tp_size=2):
         "PackedSeqParams": SimpleNamespace,
         "DataIterator": type("DataIterator", (), {}),
         "PrepackedBatch": type("PrepackedBatch", (dict,), {}),
-        "get_args": lambda: Namespace(enable_mtp_training=True),
+        "get_args": lambda: Namespace(
+            enable_mtp_training=True, dynamic_context_parallel=False, qsa_indexer_loss_coeff=0.0
+        ),
         "mpu": SimpleNamespace(
             get_context_parallel_world_size=lambda: cp_size,
             get_context_parallel_rank=lambda: rank,
@@ -112,7 +114,11 @@ def test_legacy_packing_mask_tokens_ce_and_gradients(cp_size, lengths):
             namespace = production_namespace(cp_size, rank)
             batch = make_batch(namespace, lengths)
             kwargs = legacy_kwargs(batch)
-            namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=True), batch, kwargs)
+            namespace["_attach_mtp_forward_kwargs"](
+                Namespace(enable_mtp_training=True, dynamic_context_parallel=False, qsa_indexer_loss_coeff=0.0),
+                batch,
+                kwargs,
+            )
             labels = kwargs["mtp_kwargs"]["mtp_labels"]
             mask = kwargs["loss_mask"]
             if cp_size > 1:
@@ -172,7 +178,9 @@ def test_single_sequence_mask_matches_bridge_input_mode(rank, position_kind, att
         kwargs["position_ids"] = torch.arange(4432).unsqueeze(0)
     elif position_kind == "mrope":
         kwargs["position_ids"] = torch.arange(4432).reshape(1, 1, -1).expand(3, 1, -1)
-    namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=True), batch, kwargs)
+    namespace["_attach_mtp_forward_kwargs"](
+        Namespace(enable_mtp_training=True, dynamic_context_parallel=False, qsa_indexer_loss_coeff=0.0), batch, kwargs
+    )
     legacy = attention_mask_present and position_kind != "mrope"
     expected = batch["unsplit_mtp_loss_mask"] if legacy else batch["unsplit_full_mtp_loss_mask"]
     assert kwargs["loss_mask"] is expected
@@ -184,9 +192,13 @@ def test_disabled_mtp_preserves_forward_and_existing_mask():
     kwargs = legacy_kwargs(batch)
     existing = object()
     kwargs["loss_mask"] = existing
-    namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=False), batch, kwargs)
+    namespace["_attach_mtp_forward_kwargs"](
+        Namespace(enable_mtp_training=False, dynamic_context_parallel=False, qsa_indexer_loss_coeff=0.0), batch, kwargs
+    )
     assert "mtp_kwargs" not in kwargs
-    namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=True), batch, kwargs)
+    namespace["_attach_mtp_forward_kwargs"](
+        Namespace(enable_mtp_training=True, dynamic_context_parallel=False, qsa_indexer_loss_coeff=0.0), batch, kwargs
+    )
     assert kwargs["loss_mask"] is existing
 
 
@@ -274,7 +286,9 @@ def test_zero_supervision_singleton_keeps_local_mask_and_zero_gradient(rank):
         iter([(raw, None)]), tuple(raw), pad_multiplier=1024, is_vl_model=True, pack_device=torch.device("cpu")
     )
     kwargs = legacy_kwargs(batch)
-    namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=True), batch, kwargs)
+    namespace["_attach_mtp_forward_kwargs"](
+        Namespace(enable_mtp_training=True, dynamic_context_parallel=False, qsa_indexer_loss_coeff=0.0), batch, kwargs
+    )
     labels, mask = kwargs["mtp_kwargs"]["mtp_labels"], kwargs["loss_mask"]
     assert labels.shape == mask.shape == (1, 1108)
     head = CPUHead()

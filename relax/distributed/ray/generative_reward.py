@@ -54,7 +54,7 @@ class LocalGenerativeRewardManager:
 
     def _ensure(self):
         if self._scorer is None:
-            if not getattr(self.args, "reward_scorer_path", None):
+            if not self.args.reward_scorer_path:
                 raise ValueError("reward_scorer_path is required to score generative rewards.")
             self._scorer = _load_scorer(self.args)
         return self._scorer
@@ -87,7 +87,7 @@ class GenerativeRewardManager:
     def score(self, requests: List[Dict[str, Any]]) -> Dict[str, List[float]]:
         import requests as http
 
-        endpoint = getattr(self.args, "reward_endpoint", None)
+        endpoint = self.args.reward_endpoint
         if not endpoint:
             raise ValueError("reward_runtime=remote requires reward_endpoint.")
         resp = http.post(endpoint, json={"requests": requests}, timeout=600)

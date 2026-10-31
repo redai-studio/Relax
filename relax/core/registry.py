@@ -132,7 +132,7 @@ def process_role(config):
         return ROLES_SFT_ONLY
     if algorithm_needs_critic(config):
         if config.fully_async:
-            if getattr(config, "true_on_policy_mode", False):
+            if config.true_on_policy_mode:
                 return ROLES_PPO_FULLY_ASYNC_ON_POLICY
             return ROLES_PPO_FULLY_ASYNC
         return ROLES_PPO_COLOCATE
@@ -141,7 +141,7 @@ def process_role(config):
         # via _switch_model, only need actor + rollout services
         return ROLES_COLOCATE
     if config.fully_async:
-        if getattr(config, "true_on_policy_mode", False):
+        if config.true_on_policy_mode:
             # actor_fwd's log_probs equal the train forward's log_probs in this regime
             # (same weights, deterministic Megatron forward), so we recompute inline.
             return ROLES_FULLY_ASYNC_ON_POLICY

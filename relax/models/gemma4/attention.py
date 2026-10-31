@@ -162,7 +162,7 @@ class Gemma4CoreAttention(nn.Module):
         packed_seq_params=None,
         **kwargs,
     ):
-        cp_size = getattr(self.config, "context_parallel_size", 1) or 1
+        cp_size = self.config.context_parallel_size or 1
         if cp_size > 1:
             raise NotImplementedError(
                 "Gemma4CoreAttention does not implement context parallelism. slime's CP path "

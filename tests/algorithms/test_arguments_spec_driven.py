@@ -11,6 +11,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from tests.support.args import build_relax_args
+
 
 ARGS_PATH = pathlib.Path(__file__).resolve().parents[2] / "relax" / "utils" / "arguments.py"
 
@@ -47,26 +49,28 @@ def arguments_module(monkeypatch):
 
 
 def _args(estimator="grpo", **overrides):
-    base = dict(
-        advantage_estimator=estimator,
-        normalize_advantages=False,
-        rewards_normalization=True,
-        custom_reward_post_process_path=None,
-        n_samples_per_prompt=4,
-        reward_key="score",
-        use_critic=False,
-        kl_coef=0.0,
-        kl_loss_coef=0.0,
-        use_kl_loss=False,
-        fully_async=False,
-        hybrid=False,
-        dynamic_sampling_filter_path=None,
-        m2po_kl2_budget=0.01,
-        m2po_miniclip_low=0.3,
-        m2po_miniclip_high=0.5,
+    # Declare only the diff this file cares about; the other fields come from the parameter declarations (tests/support/args.py).
+    return build_relax_args(
+        **{
+            "advantage_estimator": estimator,
+            "normalize_advantages": False,
+            "rewards_normalization": True,
+            "custom_reward_post_process_path": None,
+            "n_samples_per_prompt": 4,
+            "reward_key": "score",
+            "use_critic": False,
+            "kl_coef": 0.0,
+            "kl_loss_coef": 0.0,
+            "use_kl_loss": False,
+            "fully_async": False,
+            "hybrid": False,
+            "dynamic_sampling_filter_path": None,
+            "m2po_kl2_budget": 0.01,
+            "m2po_miniclip_low": 0.3,
+            "m2po_miniclip_high": 0.5,
+            **overrides,
+        }
     )
-    base.update(overrides)
-    return SimpleNamespace(**base)
 
 
 # ---------------- behaviour ----------------

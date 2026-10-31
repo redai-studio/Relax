@@ -46,8 +46,8 @@ def policy_loss_sapo(
     return compute_sapo_loss(
         ppo_kl=ppo_kl,
         advantages=advantages,
-        tau_pos=getattr(args, "sapo_tau_pos", 1.0),
-        tau_neg=getattr(args, "sapo_tau_neg", 1.05),
+        tau_pos=args.sapo_tau_pos,
+        tau_neg=args.sapo_tau_neg,
     )
 
 

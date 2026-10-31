@@ -57,7 +57,7 @@ class PickScoreScorer(BaseGenerativeScorer):
     def __init__(self, args, *, allow_cuda: bool = True) -> None:
         super().__init__(args, allow_cuda=allow_cuda)
         self._processor = None
-        self._model_id = getattr(args, "reward_model_path", None) or _MODEL_ID
+        self._model_id = args.reward_model_path or _MODEL_ID
 
     def _load_model(self):
         from transformers import CLIPModel, CLIPProcessor

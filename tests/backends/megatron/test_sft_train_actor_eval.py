@@ -110,6 +110,7 @@ def test_sft_lookahead_uses_completed_step_eval_boundaries():
             eval_interval=2,
             eval_size=512,
             sft_predict_interval=None,
+            eval_prompt_data=None,
             save=None,
         )
         assert not namespace["_should_pause_sft_lookahead"](args, 0)

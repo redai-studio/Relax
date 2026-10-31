@@ -23,6 +23,31 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias
 
 
+_KNOWN: frozenset | None = None
+
+
+def _args(**kw):
+    """Fully populated parameter object; fields not declared by Relax are
+    passed through explicitly.
+
+    The declaration set is built lazily: this module gets re-imported by
+    multiprocessing.spawn subprocesses, and heavyweight top-level imports slow
+    the rendezvous enough to time out init_process_group.
+    """
+    global _KNOWN
+    if _KNOWN is None:
+        from tests.support.args import build_relax_args
+
+        _KNOWN = frozenset(vars(build_relax_args()))
+    extra = {k: kw.pop(k) for k in list(kw) if k not in _KNOWN}
+    from tests.support.args import build_relax_args as _build
+
+    args = _build(**kw)
+    for name, value in extra.items():
+        setattr(args, name, value)
+    return args
+
+
 def _load_checkpoint_module():
     """Load real checkpoint routing without optional backend imports.
 
@@ -144,7 +169,7 @@ def _stub_loaders(monkeypatch, args):
 
 def test_checkpoint_missing_iteration_falls_back_to_hf(monkeypatch, tmp_path):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
-    calls = _stub_loaders(monkeypatch, Namespace(load=str(tmp_path)))
+    calls = _stub_loaders(monkeypatch, _args(load=str(tmp_path)))
     assert checkpoint.load_checkpoint(None, None, None, {}, False) == (0, 0)
     assert calls == [("hf", None)]
 
@@ -155,7 +180,7 @@ def test_checkpoint_missing_iteration_falls_back_to_hf(monkeypatch, tmp_path):
 def test_checkpoint_model_only_sets_optimizer_policy(monkeypatch, tmp_path, no_load_optim, finetune, expected):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
     save({"model": torch.zeros(2)}, checkpoint_id=tmp_path / "iter_0000007")
-    args = Namespace(load=str(tmp_path), ckpt_format="torch_dist", no_load_optim=no_load_optim, finetune=finetune)
+    args = _args(load=str(tmp_path), ckpt_format="torch_dist", no_load_optim=no_load_optim, finetune=finetune)
     calls = _stub_loaders(monkeypatch, args)
     checkpoint.load_checkpoint(None, object(), None, {}, False)
     assert calls == [("dcp",)]
@@ -165,7 +190,7 @@ def test_checkpoint_model_only_sets_optimizer_policy(monkeypatch, tmp_path, no_l
 @pytest.mark.parametrize("missing", ["iteration", "optimizer"])
 def test_reward_model_resume_rejects_incomplete_checkpoint(monkeypatch, tmp_path, missing):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
-    args = Namespace(load=str(tmp_path), loss_type="rm", ckpt_format="torch_dist")
+    args = _args(load=str(tmp_path), loss_type="rm", ckpt_format="torch_dist")
     if missing == "optimizer":
         save({"model": torch.zeros(2)}, checkpoint_id=tmp_path / "iter_0000007")
     calls = _stub_loaders(monkeypatch, args)
@@ -188,11 +213,16 @@ def test_checkpoint_lora_metadata_uses_explicit_step(monkeypatch, tmp_path):
     (tmp_path / "iter_0000009").mkdir()
     seen = []
     marker = {"format_version": 1}
-    args = Namespace(**{checkpoint._LORA_CHECKPOINT_METADATA_ATTR: marker})
-    monkeypatch.setattr(dist_checkpointing, "load_common_state_dict", lambda path: seen.append(path) or {"args": args})
+    # The saved checkpoint metadata may stay sparse (only the fields under test),
+    # but the runtime parameter object must be complete: _load_checkpoint_metadata
+    # reads loss_type directly.
+    saved_args = Namespace(**{checkpoint._LORA_CHECKPOINT_METADATA_ATTR: marker})
+    monkeypatch.setattr(
+        dist_checkpointing, "load_common_state_dict", lambda path: seen.append(path) or {"args": saved_args}
+    )
     monkeypatch.setattr(dist_checkpointing, "check_is_distributed_checkpoint", lambda path: True)
     directory = checkpoint._resolve_checkpoint_iteration_dir(tmp_path, ckpt_step=9)
-    common = checkpoint._load_checkpoint_metadata(args, [Namespace(role="actor")], directory)
+    common = checkpoint._load_checkpoint_metadata(_args(), [Namespace(role="actor")], directory)
     assert checkpoint._metadata_value(common["args"], checkpoint._LORA_CHECKPOINT_METADATA_ATTR) == marker
     assert seen == [tmp_path / "iter_0000009"]
 
@@ -206,7 +236,7 @@ def _probe_worker(rank, rendezvous, output):
     try:
         for mode in ("valid", "missing", "permission", "metadata", "tracker", "optimizer"):
             calls = []
-            checkpoint.get_args = lambda: Namespace(load="/shared/checkpoint")
+            checkpoint.get_args = lambda: _args(load="/shared/checkpoint")
             checkpoint._load_checkpoint_hf = lambda **kw: calls.append("hf")
             checkpoint._load_checkpoint_megatron = lambda **kw: calls.append("dcp")
             checkpoint._load_checkpoint_metadata = lambda *a, **kw: {}

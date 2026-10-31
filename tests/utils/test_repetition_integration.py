@@ -9,7 +9,6 @@ import string
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +21,7 @@ from relax.utils.training.train_dump_utils import (
     save_rollout_result_jsonl,
 )
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -48,7 +48,7 @@ def _samples() -> list[Sample]:
 def test_repetition_real_rollout_metrics_dump_writers_and_cli(tmp_path, evaluation) -> None:
     samples = _samples()
     before = [sample.to_dict() for sample in samples]
-    args = SimpleNamespace(
+    args = build_relax_args(
         log_reward_category=None,
         reward_key=None,
         log_passrate=False,
@@ -95,7 +95,7 @@ def test_repetition_real_rollout_metrics_dump_writers_and_cli(tmp_path, evaluati
 
 
 def test_repetition_fixed_fixture_report_matches_stdout(tmp_path, capsys) -> None:
-    save_rollout_result_jsonl(SimpleNamespace(rollout_result_dir=str(tmp_path)), 42, _samples())
+    save_rollout_result_jsonl(build_relax_args(rollout_result_dir=str(tmp_path)), 42, _samples())
     main([str(tmp_path / "train/42.jsonl")])
     report = json.loads(capsys.readouterr().out)
     assert report["summary"]["repetition_frac"] == 0.5

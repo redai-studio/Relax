@@ -2,14 +2,15 @@
 
 """components/actor.py module-level helpers for SFT-aware partition naming."""
 
-from argparse import Namespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from tests.support.args import build_relax_args
+
 
 def _mk_actor_config(loss_type: str):
-    return Namespace(
+    args = build_relax_args(
         loss_type=loss_type,
         dpo_reference_free=False,
         kl_coef=0.0,
@@ -23,8 +24,11 @@ def _mk_actor_config(loss_type: str):
         rotate_ckpt=False,
         num_critic_only_steps=0,
         start_rollout_id=0,
-        tq_config={},
     )
+    # ``tq_config`` is wired at runtime by the controller, not declared by the
+    # Relax parser.
+    args.tq_config = {}
+    return args
 
 
 @pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])

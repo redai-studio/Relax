@@ -7,7 +7,6 @@ import copy
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +16,7 @@ from relax.utils.metrics.rollout_metrics import (
     compute_perf_metrics_from_samples,
 )
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 def _args(**overrides):
@@ -31,7 +31,7 @@ def _args(**overrides):
         rollout_num_gpus=2,
     )
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return build_relax_args(**values)
 
 
 def test_rollout_metrics_and_scale_types_import_without_deployment_dependencies():
@@ -52,8 +52,16 @@ from relax.distributed.ray.rollout_scale_types import ScaleOutRequest, ScaleOutS
 from relax.utils.metrics.rollout_metrics import compute_metrics_from_samples
 from relax.utils.types import Sample
 
-args = SimpleNamespace(advantage_estimator='grpo', reward_key=None,
-                       log_reward_category=None, log_passrate=False, opd_teacher_key='source')
+# The script deliberately depends only on the stdlib: this case verifies that
+# rollout_metrics pulls in no runtime dependencies, so tests.support.args is
+# not used (it imports the declarations, which depend on sglang).
+args = SimpleNamespace(
+    advantage_estimator="grpo",
+    reward_key=None,
+    log_reward_category=None,
+    log_passrate=False,
+    opd_teacher_key="source",
+)
 sample = Sample(response='ok', response_length=1, reward=1.0,
                 metadata={'source': 'fixture'}, teacher_log_probs=[-2.0], rollout_log_probs=[-1.0])
 assert compute_metrics_from_samples(args, [sample])['by_source/fixture/logp_gap'] == 1.0

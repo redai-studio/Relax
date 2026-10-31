@@ -26,6 +26,8 @@ def arguments_module(monkeypatch):
     sglang_arguments = ModuleType("relax.backends.sglang.arguments")
     sglang_arguments.sglang_parse_args = lambda: None
     sglang_arguments.validate_args = lambda args: args
+    # The finalization stage reads the sub-parser's declarations to fill fields (finalize_args), so the test double must provide that entry point too.
+    sglang_arguments.add_sglang_arguments = lambda parser: parser
     monkeypatch.setitem(sys.modules, "relax.backends.sglang.arguments", sglang_arguments)
 
     module_name = "relax.utils.arguments"
@@ -163,10 +165,16 @@ def test_validate_ref_load_without_model_source_still_requires_local_path(tmp_pa
 def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch, arguments_module):
     pytest.importorskip("megatron.training.arguments")
     from relax.backends.megatron import arguments as megatron_arguments
+    from relax.utils.arguments import build_pre_parse_parser
+    from tests.support.args import build_relax_args
 
     logical_uri = "somesource://models/policy"
     source = m.ModelSource("s3://bucket/models/policy/", provider_name="test")
-    parsed = SimpleNamespace(
+    # Parse-stage parameter objects must be complete: pre reuses the pre-parse
+    # declarations and parsed reuses the full builder, declaring only the diff
+    # this case cares about. Sparse objects would fail the direct reads in
+    # _parse_args_impl first.
+    parsed = build_relax_args(
         hf_checkpoint=logical_uri,
         ref_load=logical_uri,
         train_backend="megatron",
@@ -175,12 +183,9 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch,
         actor_num_nodes=1,
         actor_num_gpus_per_node=1,
     )
-    pre = SimpleNamespace(
-        debug_train_only=True,
-        debug_rollout_only=True,
-        load_debug_rollout_data=None,
-        skip_hf_validate=False,
-    )
+    pre = build_pre_parse_parser().parse_args([])
+    pre.debug_train_only = True
+    pre.debug_rollout_only = True
     provider_argv = None
     validated = False
 

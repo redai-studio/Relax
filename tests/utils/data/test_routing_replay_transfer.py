@@ -8,7 +8,6 @@ import ast
 import gc
 import os
 import sys
-from argparse import Namespace
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -17,6 +16,8 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from tests.support.args import build_relax_args
 
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -260,7 +261,7 @@ def test_routing_replay_postprocess_keeps_full_batch_on_cpu(monkeypatch, use_gpu
         "response_lengths": [2, 1],
         "rollout_routed_experts": routes,
     }
-    args = Namespace(qkv_format="thd", use_opd=False, optimize_routing_replay=True)
+    args = build_relax_args(qkv_format="thd", use_opd=False, optimize_routing_replay=True)
 
     post_process(args, data)
 

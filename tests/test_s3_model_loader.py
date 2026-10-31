@@ -290,6 +290,7 @@ def test_s3_policy_dummy_does_not_affect_genrm():
         sglang_load_format="dummy",
         model_source=m.ModelSource("s3://bucket/student/", "http://s3.example"),
     )
+    args.enable_mtp_training = False
 
     server_args, _ = _compute_genrm_server_args(
         args,
@@ -1326,6 +1327,7 @@ def test_get_cached_path_returns_none_when_shm_root_is_missing(tmp_path):
 def test_get_cached_path_requires_complete_manifest(tmp_path):
     config = m.ModelSource("s3://bucket/model/")
     args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args.disable_s3_model_cleanup = False
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(dest)
     Path(dest, "config.json").write_bytes(b"{}")
@@ -1343,6 +1345,7 @@ def test_get_cached_path_requires_complete_manifest(tmp_path):
 def test_cleanup_s3_model_weights_preserves_metadata_and_invalidates_full_cache(tmp_path, monkeypatch):
     config = m.ModelSource("s3://bucket/model/", "http://s3.example")
     args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args.disable_s3_model_cleanup = False
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(os.path.join(dest, "subdir"))
     identity = m._cache_identity(config.uri, config.endpoint)
@@ -1389,6 +1392,7 @@ def test_cleanup_s3_model_weights_preserves_metadata_and_invalidates_full_cache(
 def test_cleanup_s3_model_weights_finishes_interrupted_cleanup(tmp_path):
     config = m.ModelSource("s3://bucket/model/")
     args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args.disable_s3_model_cleanup = False
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(dest)
     with open(dest + ".metadata.done", "w") as marker:
@@ -1430,6 +1434,7 @@ def test_cleanup_s3_model_weights_respects_disable_flag(tmp_path):
 def test_cleanup_s3_model_weights_skips_cache_without_ready_marker(tmp_path):
     config = m.ModelSource("s3://bucket/model/")
     args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args.disable_s3_model_cleanup = False
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(dest)
     weight = os.path.join(dest, "model.safetensors")
@@ -1443,6 +1448,7 @@ def test_cleanup_s3_model_weights_skips_cache_without_ready_marker(tmp_path):
 def test_cleanup_s3_model_weights_skips_invalid_manifest_entry(tmp_path):
     config = m.ModelSource("s3://bucket/model/")
     args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path))
+    args.disable_s3_model_cleanup = False
     dest = m._shm_dest_dir(config.uri, str(tmp_path), config.endpoint)
     os.makedirs(dest)
     identity = m._cache_identity(config.uri, config.endpoint)

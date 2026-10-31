@@ -1,12 +1,25 @@
 import importlib
 import sys
 import types
-from argparse import Namespace
 
 import pytest
 import torch
 
 from relax.utils.data.data import get_first_fit_partitions
+from tests.support.args import build_relax_args
+
+
+_KNOWN = frozenset(vars(build_relax_args()))
+
+
+def _args(**kw):
+    """Fully populated parameter object; Megatron-owned fields (not in the
+    declarations) are passed through explicitly."""
+    extra = {k: kw.pop(k) for k in list(kw) if k not in _KNOWN}
+    args = build_relax_args(**kw)
+    for name, value in extra.items():
+        setattr(args, name, value)
+    return args
 
 
 def _load_data_module(monkeypatch):
@@ -97,7 +110,7 @@ def test_vpp_microbatch_rounding_uses_ceil_multiple(monkeypatch):
 @pytest.mark.parametrize("cp_rank, expected_rows", [(0, [6, 7]), (1, [0, 1, 2, 3, 4, 5])])
 def test_dynamic_cp_microbatch_slices_score_centering_heads_with_sampled_probs(monkeypatch, cp_rank, expected_rows):
     data_module = _load_data_module(monkeypatch)
-    args = Namespace(dynamic_context_parallel=True, max_tokens_per_gpu=6)
+    args = _args(dynamic_context_parallel=True, max_tokens_per_gpu=6)
     monkeypatch.setattr(data_module, "get_args", lambda: args)
     monkeypatch.setattr(data_module, "dynamic_cp_split_data", lambda batch, budget: 2)
     monkeypatch.setattr(data_module, "PackedSeqParams", types.SimpleNamespace)
@@ -164,7 +177,7 @@ def test_seqlen_partitions_respect_capacity(
 
 def test_rollout_minibatch_plan_derives_from_global_batch(monkeypatch):
     data_module = _load_data_module(monkeypatch)
-    args = Namespace(
+    args = _args(
         rollout_batch_size=8,
         n_samples_per_prompt=8,
         global_batch_size=32,
@@ -181,7 +194,7 @@ def test_rollout_minibatch_plan_derives_from_global_batch(monkeypatch):
 
 def test_rollout_minibatch_plan_prefers_explicit_steps(monkeypatch):
     data_module = _load_data_module(monkeypatch)
-    args = Namespace(
+    args = _args(
         rollout_batch_size=12,
         n_samples_per_prompt=8,
         global_batch_size=None,
@@ -198,7 +211,7 @@ def test_rollout_minibatch_plan_prefers_explicit_steps(monkeypatch):
 
 def test_rollout_minibatch_plan_allows_prompt_groups_to_span_dp_ranks(monkeypatch):
     data_module = _load_data_module(monkeypatch)
-    args = Namespace(
+    args = _args(
         rollout_batch_size=9,
         n_samples_per_prompt=8,
         global_batch_size=None,
@@ -216,7 +229,7 @@ def test_rollout_minibatch_plan_allows_prompt_groups_to_span_dp_ranks(monkeypatc
 def test_rollout_minibatch_plan_single_prompt_eight_samples_eight_dp(monkeypatch, steps):
     data_module = _load_data_module(monkeypatch)
     plan = data_module.build_rollout_minibatch_plan(
-        Namespace(
+        _args(
             rollout_batch_size=1,
             n_samples_per_prompt=8,
             global_batch_size=8,
@@ -232,14 +245,14 @@ def test_rollout_minibatch_plan_single_prompt_eight_samples_eight_dp(monkeypatch
 
 def test_rollout_minibatch_plan_still_rejects_non_divisible_sample_count(monkeypatch):
     data_module = _load_data_module(monkeypatch)
-    args = Namespace(rollout_batch_size=1, n_samples_per_prompt=7, global_batch_size=7, num_steps_per_rollout=None)
+    args = _args(rollout_batch_size=1, n_samples_per_prompt=7, global_batch_size=7, num_steps_per_rollout=None)
     with pytest.raises(ValueError, match=r"mini_rollout_batch_size \* n_samples_per_prompt must be divisible"):
         data_module.build_rollout_minibatch_plan(args, dp_size=8)
 
 
 def test_rollout_minibatch_plan_keeps_prompt_groups_within_one_global_mini(monkeypatch):
     data_module = _load_data_module(monkeypatch)
-    args = Namespace(rollout_batch_size=3, n_samples_per_prompt=8, global_batch_size=12, num_steps_per_rollout=None)
+    args = _args(rollout_batch_size=3, n_samples_per_prompt=8, global_batch_size=12, num_steps_per_rollout=None)
     with pytest.raises(ValueError, match="rollout_batch_size must be divisible by num_rollout_minis"):
         data_module.build_rollout_minibatch_plan(args, dp_size=2)
 
@@ -271,7 +284,7 @@ def test_log_rollout_data_creates_collective_stats_on_training_device(monkeypatc
     monkeypatch.setattr(data_module, "gather_log_data", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(data_module, "maybe_padded_total_lengths", lambda *_args, **_kwargs: None)
 
-    args = Namespace(
+    args = _args(
         qkv_format="thd",
         is_vl_model=False,
         uses_unsplit_forward=False,
@@ -334,7 +347,7 @@ def test_get_data_iterator_uses_rollout_mini_boundaries_with_balance_data(monkey
     monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(data_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
 
-    args = Namespace(
+    args = _args(
         balance_data=True,
         global_batch_size=32,
         micro_batch_size=4,
@@ -371,7 +384,7 @@ def test_get_data_iterator_balance_data_without_boundaries_uses_regular_steps(mo
     monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(data_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
 
-    args = Namespace(
+    args = _args(
         balance_data=True,
         global_batch_size=16,
         micro_batch_size=4,
@@ -401,7 +414,7 @@ def test_sft_multimodal_metrics_include_text_samples(monkeypatch, cp_size, text_
         captured.update(metrics=metrics, weights=weights, reductions=reductions)
 
     monkeypatch.setattr(data_module, "gather_log_data", capture)
-    args = Namespace(
+    args = _args(
         loss_type="sft",
         qkv_format="thd",
         use_opd=False,
@@ -471,7 +484,7 @@ def test_gather_multimodal_metrics_weights_dp_samples_and_preserves_extrema(monk
     monkeypatch.setattr(data_module.dist, "gather_object", gather)
     result = data_module.gather_log_data(
         "rollout",
-        Namespace(),
+        _args(),
         2,
         first,
         weights,

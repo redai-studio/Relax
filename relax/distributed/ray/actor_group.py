@@ -19,7 +19,7 @@ def _resolve_train_actor_class(args):
     Defaults to Megatron so existing token-RL runs are unaffected; ``fsdp``
     selects the FSDP2 actor used by native generative RL (design doc 8.3).
     """
-    backend = getattr(args, "train_backend", "megatron")
+    backend = args.train_backend
     if backend == "fsdp":
         from relax.backends.fsdp.actor import FSDPTrainRayActor
 
@@ -90,11 +90,7 @@ class RayTrainGroup:
         # mechanism. --selective-offload uses application-level selective CPU offload
         # and must NOT LD_PRELOAD the TMS hook (its global allocator hook + whole-pool
         # CPU backup would defeat the purpose and confuse torch_memory_saver_preloaded()).
-        if (
-            self.args.offload_train
-            and self.args.train_backend == "megatron"
-            and not getattr(self.args, "selective_offload", False)
-        ):
+        if self.args.offload_train and self.args.train_backend == "megatron" and not self.args.selective_offload:
             import torch_memory_saver
 
             dynlib_path = os.path.join(

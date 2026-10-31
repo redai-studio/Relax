@@ -116,12 +116,12 @@ def _get_trace_base_dir(args):
     Uses ``./traces/<tb_experiment_name>`` as the default location. Falls back
     to ``./traces/<timestamp>`` when ``--tb-experiment-name`` is not set.
     """
-    task_name = getattr(args, "tb_experiment_name", None)
+    task_name = args.tb_experiment_name
     if task_name is None:
         from datetime import datetime
 
         task_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join(getattr(args, "profile_output_dir", None) or "traces", task_name)
+    return os.path.join(args.profile_output_dir or "traces", task_name)
 
 
 def _get_train_trace_dir(args):
@@ -193,7 +193,7 @@ class _BaseMemoryProfiler:
         return c(args)
 
     def __init__(self, args):
-        snapshot_dir = getattr(args, "memory_snapshot_dir", None)
+        snapshot_dir = args.memory_snapshot_dir
         if snapshot_dir is None:
             snapshot_dir = os.path.join(_get_trace_base_dir(args), "memory_snapshot")
         os.makedirs(snapshot_dir, exist_ok=True)
@@ -286,7 +286,7 @@ def _get_sglang_trace_dir(args) -> str:
     Uses the user-specified ``--sglang-profile-output-dir`` if set, otherwise
     falls back to ``./traces/<tb_experiment_name>/sglang_trace``.
     """
-    base_dir = getattr(args, "sglang_profile_output_dir", None)
+    base_dir = args.sglang_profile_output_dir
     if base_dir is None:
         base_dir = os.path.join(_get_trace_base_dir(args), "sglang_trace")
     return base_dir
@@ -303,15 +303,15 @@ def _should_profile_sglang(args, rollout_id: int) -> bool:
        is checked next.  Both bounds are *inclusive* and use absolute rollout IDs.
     4. If neither is set, every step is profiled.
     """
-    if not getattr(args, "sglang_profile", False):
+    if not args.sglang_profile:
         return False
 
-    profile_steps = getattr(args, "sglang_profile_steps", None)
+    profile_steps = args.sglang_profile_steps
     if profile_steps is not None:
         return rollout_id in profile_steps
 
-    step_start = getattr(args, "sglang_profile_step_start", None)
-    step_end = getattr(args, "sglang_profile_step_end", None)
+    step_start = args.sglang_profile_step_start
+    step_end = args.sglang_profile_step_end
     if step_start is not None or step_end is not None:
         lo = step_start if step_start is not None else 0
         hi = step_end if step_end is not None else float("inf")
@@ -328,7 +328,7 @@ async def _get_sglang_worker_urls(args) -> list[str]:
 
     from relax.utils.http_utils import get
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(args, "use_slime_router", False):
+    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
         return router_worker_base_urls(response["urls"])
     else:
@@ -357,7 +357,7 @@ async def start_sglang_profile(args, rollout_id: int) -> None:
     step_dir = os.path.join(base_dir, f"rollout_{rollout_id}")
     os.makedirs(step_dir, exist_ok=True)
 
-    num_steps = getattr(args, "sglang_profile_num_steps", None)
+    num_steps = args.sglang_profile_num_steps
     if num_steps is not None and num_steps < 0:
         num_steps = None
 
@@ -365,10 +365,10 @@ async def start_sglang_profile(args, rollout_id: int) -> None:
     base_payload = {
         "output_dir": step_dir,
         "num_steps": num_steps,
-        "activities": getattr(args, "sglang_profile_activities", None),
-        "profile_by_stage": getattr(args, "sglang_profile_by_stage", False),
-        "with_stack": getattr(args, "sglang_profile_with_stack", False),
-        "record_shapes": getattr(args, "sglang_profile_record_shapes", False),
+        "activities": args.sglang_profile_activities,
+        "profile_by_stage": args.sglang_profile_by_stage,
+        "with_stack": args.sglang_profile_with_stack,
+        "record_shapes": args.sglang_profile_record_shapes,
     }
 
     logger.info(
@@ -394,7 +394,7 @@ async def stop_sglang_profile(args, rollout_id: int) -> None:
         return
 
     # If num_steps was set, SGLang auto-stops — skip explicit stop.
-    if getattr(args, "sglang_profile_num_steps", -1) > 0:
+    if args.sglang_profile_num_steps > 0:
         return
 
     from relax.utils.http_utils import post

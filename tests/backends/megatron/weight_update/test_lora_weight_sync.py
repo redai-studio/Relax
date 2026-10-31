@@ -34,6 +34,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
 )
+from tests.support.args import build_relax_args
 
 
 # ---------------------------------------------------------------------------
@@ -135,15 +136,13 @@ class TestModePredicates:
         assert is_lora_enabled(args_on)
         assert not is_lora_enabled(args_off)
 
-    def test_missing_attrs_default_false(self):
-        # Plain object without the LoRA attributes -> predicates must not raise.
-        class Empty:
-            pass
-
-        empty = Empty()
-        assert not is_lora_adapter_mode(empty)
-        assert not is_lora_merge_mode(empty)
-        assert not is_lora_enabled(empty)
+    def test_default_off_flags_predicates_false(self):
+        # With the declared defaults (--lora-adapter-mode/--lora-merge-mode off,
+        # lora_rank=0) the predicates must all report False.
+        args = build_relax_args()
+        assert not is_lora_adapter_mode(args)
+        assert not is_lora_merge_mode(args)
+        assert not is_lora_enabled(args)
 
 
 class TestCheckpointModeDetection:

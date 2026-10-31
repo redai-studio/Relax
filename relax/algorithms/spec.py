@@ -349,7 +349,7 @@ def algorithm_needs_critic(config) -> bool:
     debug-only role paths reach these call sites with no estimator at all, and
     an unknown name is rejected by argument parsing long before this matters.
     """
-    spec = ALGORITHM_SPECS.get(getattr(config, "advantage_estimator", None))
+    spec = ALGORITHM_SPECS.get(config.advantage_estimator)
     return spec is not None and spec.needs_critic
 
 

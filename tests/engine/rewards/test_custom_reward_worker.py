@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from types import SimpleNamespace
 from typing import Any, Awaitable, Iterator, TypeVar
 
 import pytest
+
+from tests.support.args import build_relax_args
 
 
 try:
@@ -53,18 +54,24 @@ RAY_WORKER_STARTUP_TIMEOUT = 60
 T = TypeVar("T")
 
 
-def _make_args(**overrides: Any) -> SimpleNamespace:
-    defaults = {
-        "rm_type": "openr1mm",
-        "custom_rm_path": None,
-        "group_rm": False,
-        "reward_max_concurrency": 64,
-        "reward_num_workers": 4,
-        "rm_url": None,
-        "reward_key": None,
+def _make_args(**overrides: Any):
+    """Build a fully populated Relax args object; tests declare only the diff.
+
+    ``fail_reward``/``counter_path``/``reward_delay`` are fixture-only knobs
+    consumed by the custom reward fixtures, not declared Relax parameters, so
+    they are assigned explicitly after construction. ``rm_type`` and
+    ``reward_num_workers`` keep the historical fixture defaults that differ
+    from the declared ones.
+    """
+    overrides.setdefault("rm_type", "openr1mm")
+    overrides.setdefault("reward_num_workers", 4)
+    fixture_only = {
+        name: overrides.pop(name) for name in ("fail_reward", "counter_path", "reward_delay") if name in overrides
     }
-    defaults.update(overrides)
-    return SimpleNamespace(**defaults)
+    args = build_relax_args(**overrides)
+    for name, value in fixture_only.items():
+        setattr(args, name, value)
+    return args
 
 
 def _make_sample(
@@ -103,7 +110,7 @@ async def _wait(awaitable: Awaitable[T], timeout: float = RAY_TEST_TIMEOUT) -> T
     return await asyncio.wait_for(awaitable, timeout=timeout)
 
 
-async def _ready_workers(args: SimpleNamespace) -> None:
+async def _ready_workers(args) -> None:
     """Keep worker startup outside the reward execution deadline."""
 
     async def start() -> None:

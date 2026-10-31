@@ -2,13 +2,12 @@
 
 """Production DPO loss regression tests."""
 
-from argparse import Namespace
-
 import pytest
 import torch
 import torch.nn.functional as F
 
 from relax.engine.sft.eval.preference import finalize_pair_metrics, pair_metric_sums
+from tests.support.args import build_relax_args
 
 
 try:
@@ -17,8 +16,8 @@ except Exception as exc:
     pytest.skip(f"relax.backends.megatron unavailable: {exc}", allow_module_level=True)
 
 
-def _args(*, reference_free: bool = False, beta: float = 0.2) -> Namespace:
-    return Namespace(
+def _args(*, reference_free: bool = False, beta: float = 0.2):
+    return build_relax_args(
         loss_type="dpo",
         dpo_reference_free=reference_free,
         dpo_beta=beta,

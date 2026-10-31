@@ -83,7 +83,7 @@ def _needs_rollout_manager_setup(serve_dict: dict) -> bool:
 
 def _is_colocate(config: Namespace) -> bool:
     """True when actor/rollout (and optionally critic) share GPUs."""
-    return not getattr(config, "fully_async", False) and not getattr(config, "hybrid", False)
+    return not config.fully_async and not config.hybrid
 
 
 logger = get_logger(__name__)
@@ -151,14 +151,14 @@ def _can_cleanup_s3_model_weights(config: Namespace, serve_dict: dict) -> bool:
     model_source = getattr(config, "model_source", None)
     if model_source is None:
         return False
-    if getattr(config, "debug_rollout_only", False):
+    if config.debug_rollout_only:
         return False
     has_rollout = any(str(role) == "rollout" for role in serve_dict)
     if not has_rollout:
         return True
-    if getattr(config, "rollout_external", False):
+    if config.rollout_external:
         return False
-    if getattr(config, "sglang_config", None) is not None:
+    if config.sglang_config is not None:
         return False
     return getattr(config, "sglang_load_format", "auto") in _S3_MODEL_CLEANUP_SAFE_LOAD_FORMATS
 
@@ -172,7 +172,7 @@ def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
     roles = list(ACTOR_ROLLOUT_PG_ROLES)
     if not algorithm_needs_critic(config):
         return roles
-    resource = getattr(config, "resource", None) or {}
+    resource = config.resource or {}
     if resource.get("critic") == resource.get("actor"):
         roles.append("critic")
     return roles
@@ -185,8 +185,8 @@ class Controller:
         self._teacher_manager = None
         # Initialize health management system
         self.runtime_env = runtime_env
-        self._health_check_enabled = getattr(config, "use_health_check", False)
-        self._max_global_restart = getattr(config, "max_global_restart", 3)
+        self._health_check_enabled = config.use_health_check
+        self._max_global_restart = config.max_global_restart
         require_control_plane_resource(config)
         self._health_manager = HealthManager(check_interval=1.0, config=config)
         if not hasattr(self, "_restarting"):
@@ -235,7 +235,7 @@ class Controller:
                 ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
             )
 
-            self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
+            self._metrics_service_enabled = config.use_metrics_service
             if self._metrics_service_enabled:
                 self._deploy_metrics_service()
 
@@ -251,7 +251,7 @@ class Controller:
                 self._report_error_to_metrics_service(e)
                 raise
 
-            autoscaler_config_path = getattr(config, "autoscaler_config", None)
+            autoscaler_config_path = config.autoscaler_config
             if autoscaler_config_path:
                 from relax.utils.autoscaler.config import AutoscalerConfig
                 from relax.utils.utils import get_serve_url
@@ -284,7 +284,7 @@ class Controller:
     def _cleanup_s3_model_weights_after_init(self, *, force: bool = False) -> None:
         """Remove policy weight shards after every startup consumer is
         ready."""
-        if getattr(self.config, "disable_s3_model_cleanup", False):
+        if self.config.disable_s3_model_cleanup:
             logger.info("S3 model SHM cleanup is disabled")
             return
         if not _uses_s3_model_prefetch(self.config):
@@ -350,12 +350,8 @@ class Controller:
 
         required_node_resources = with_control_plane_affinity(self.config).get("resources", {})
         required_node_resource = next(iter(required_node_resources), None)
-        use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)
-        if (
-            getattr(self.config, "fully_async", False)
-            and getattr(self.config, "use_dynamic_batch_size", False)
-            and not use_sft_prepack
-        ):
+        use_sft_prepack = algo_key == "sft" and self.config.sft_async_prepack
+        if self.config.fully_async and self.config.use_dynamic_batch_size and not use_sft_prepack:
             sampler = IdentityWindowSampler(
                 dp_size=dp_size,
                 placement="streaming",
@@ -381,7 +377,7 @@ class Controller:
                     dp_size=dp_size,
                 )
             logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
-        elif getattr(self.config, "balance_data", False):
+        elif self.config.balance_data:
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")
             logger.info(f"Using IdentityWindowSampler with balanced row placement, dp_size={dp_size}")
         else:
@@ -404,7 +400,7 @@ class Controller:
             flags={"allow_objects": True},
         )
 
-        if getattr(self.config, "tq_rdma_mode", "off") == "off":
+        if self.config.tq_rdma_mode == "off":
             # Preserve the upstream SimpleStorage ownership model: the first
             # tq.init runs inside Controller and no _TransferQueueOwner actor
             # is created.  Lifecycle hardening still applies: the F10 reaper
@@ -436,7 +432,7 @@ class Controller:
 
         init_result = initialize_tq_with_fallback(
             tq_config,
-            mode=getattr(self.config, "tq_rdma_mode", "off"),
+            mode=self.config.tq_rdma_mode,
             fallback_conf=fallback_config,
         )
         # The owner becomes this Controller's cleanup responsibility before
@@ -497,7 +493,7 @@ class Controller:
             return init_result
 
         detail = "; ".join(failures)
-        mode = getattr(self.config, "tq_rdma_mode", "off")
+        mode = self.config.tq_rdma_mode
         if mode != "auto" or fallback_config is None:
             # ``required`` must fail loudly after cleaning this job's owner.
             _close_owned_attempt()
@@ -543,7 +539,7 @@ class Controller:
         if errors:
             raise ValueError("Invalid TransferQueue RDMA configuration:\n  " + "\n  ".join(errors))
 
-        mode = getattr(self.config, "tq_rdma_mode", "off")
+        mode = self.config.tq_rdma_mode
 
         def _simple_storage() -> dict:
             from relax.utils.tq.config import build_simple_storage_config
@@ -570,7 +566,7 @@ class Controller:
             return _simple_storage()
 
         # 3. Configuration preconditions for the host-RDMA path.
-        device = getattr(self.config, "tq_rdma_device", "")
+        device = self.config.tq_rdma_device
         try:
             validate_mooncake_runtime_contract()
         except RuntimeError as e:
@@ -992,9 +988,9 @@ class Controller:
         role_name = str(role)
         if role_name in {"actor", "critic", "reference", "actor_fwd"}:
             return ModelCompleteness.FULL
-        if role_name != "rollout" or getattr(config, "rollout_external", False):
+        if role_name != "rollout" or config.rollout_external:
             return ModelCompleteness.NONE
-        if getattr(config, "sglang_config", None) is not None:
+        if config.sglang_config is not None:
             return ModelCompleteness.FULL
         load_format = getattr(config, "sglang_load_format", "auto")
         if load_format == "dummy":
@@ -1131,7 +1127,7 @@ class Controller:
         # fills the RL "--num-epoch without --num-rollout" case.
         if self.config.num_rollout is not None:
             return
-        if getattr(self.config, "num_epoch", None) is None:
+        if self.config.num_epoch is None:
             return
         rollout_data_source = None
         for role, _cls, _num_gpus, ds in roles_to_create:

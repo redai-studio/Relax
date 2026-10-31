@@ -13,6 +13,7 @@ from relax.engine.sft.runtime import (
     sft_partition_prefix,
     should_skip_sft_weight_management,
 )
+from tests.support.args import build_relax_args
 
 
 def test_resolve_sft_split_indices_is_deterministic_and_disjoint():
@@ -47,7 +48,7 @@ def test_resolve_sft_split_indices_matches_ms_swift_rng_order():
     [("causal_lm", False), ("seq_cls", False), ("seq_contrast", False), ("causal_lm", True)],
 )
 def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mtp_only_training):
-    args = Namespace(
+    args = build_relax_args(
         loss_type="sft",
         task_type=task_type,
         mtp_only_training=mtp_only_training,
@@ -76,13 +77,13 @@ def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mt
 )
 @pytest.mark.parametrize("mtp_only_training", [False, True])
 def test_sft_keeps_weight_management_for_consumers_and_other_losses(overrides, consumers, mtp_only_training):
-    args = Namespace(**{"loss_type": "sft", "mtp_only_training": mtp_only_training, **overrides})
+    args = build_relax_args(**{"loss_type": "sft", "mtp_only_training": mtp_only_training, **overrides})
 
     assert not should_skip_sft_weight_management(args, **consumers)
 
 
 def test_image_sft_attempt_is_shared_with_workers_and_changes_on_restore():
-    args = Namespace(
+    args = build_relax_args(
         loss_type="sft",
         generation_task="i2i",
         i2i_sft_config={"dataset_size": 19},
@@ -110,4 +111,5 @@ def test_image_sft_partition_requires_shared_attempt():
 
 @pytest.mark.parametrize("loss_type,prefix", [("sft", "sft_"), ("dpo", "sft_"), ("rm", "sft_"), ("policy", "train_")])
 def test_partition_naming_preserves_non_image_modes(loss_type, prefix):
-    assert sft_partition_id(Namespace(loss_type=loss_type), 10) == f"{prefix}10"
+    # is_i2i_sft reads generation_task directly, so the parameter object must be fully built.
+    assert sft_partition_id(build_relax_args(loss_type=loss_type), 10) == f"{prefix}10"

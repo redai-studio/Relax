@@ -36,7 +36,7 @@ class _TensorboardAdapter(metaclass=SingletonMeta):
         assert args.use_tensorboard, f"{args.use_tensorboard=}"
         tb_project_name = args.tb_project_name
         tb_experiment_name = args.tb_experiment_name
-        save_dir = getattr(args, "save", None)
+        save_dir = args.save
         if tb_project_name is None and not Envs.TENSORBOARD_DIR and not save_dir:
             # Nothing user-supplied to locate the run — fall back to a defaulted
             # project + timestamped experiment so tensorboard just works.

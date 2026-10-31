@@ -54,29 +54,29 @@ class MultimodalConfig:
         kwargs = {}
 
         # Image params
-        if hasattr(args, "image_max_token_num") and args.image_max_token_num is not None:
+        if args.image_max_token_num is not None:
             kwargs["image_max_token_num"] = args.image_max_token_num
-        if hasattr(args, "image_min_token_num") and args.image_min_token_num is not None:
+        if args.image_min_token_num is not None:
             kwargs["image_min_token_num"] = args.image_min_token_num
-        if hasattr(args, "image_resize_scale_factor") and args.image_resize_scale_factor is not None:
+        if args.image_resize_scale_factor is not None:
             kwargs["image_resize_scale_factor"] = args.image_resize_scale_factor
 
         # Video params
-        if hasattr(args, "video_min_token_num") and args.video_min_token_num is not None:
+        if args.video_min_token_num is not None:
             kwargs["video_min_token_num"] = args.video_min_token_num
-        if hasattr(args, "video_max_token_num") and args.video_max_token_num is not None:
+        if args.video_max_token_num is not None:
             kwargs["video_max_token_num"] = args.video_max_token_num
-        if hasattr(args, "video_fps") and args.video_fps is not None:
+        if args.video_fps is not None:
             kwargs["video_fps"] = args.video_fps
-        if hasattr(args, "video_fps_min_frames") and args.video_fps_min_frames is not None:
+        if args.video_fps_min_frames is not None:
             kwargs["video_fps_min_frames"] = args.video_fps_min_frames
-        if hasattr(args, "video_fps_max_frames") and args.video_fps_max_frames is not None:
+        if args.video_fps_max_frames is not None:
             kwargs["video_fps_max_frames"] = args.video_fps_max_frames
-        if hasattr(args, "frame_factor") and args.frame_factor is not None:
+        if args.frame_factor is not None:
             kwargs["frame_factor"] = args.frame_factor
 
         # Audio params
-        if hasattr(args, "audio_sample_rate") and args.audio_sample_rate is not None:
+        if args.audio_sample_rate is not None:
             kwargs["audio_sample_rate"] = args.audio_sample_rate
 
         return cls(**kwargs)

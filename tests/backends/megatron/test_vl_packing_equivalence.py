@@ -1,6 +1,5 @@
 """Numerical reference for the SFT packer's document and loss boundaries."""
 
-from argparse import Namespace
 from types import SimpleNamespace
 
 import torch
@@ -8,12 +7,17 @@ import torch.nn.functional as F
 
 from relax.utils.sft_utils import align_loss_mask_for_sft
 from tests.backends.megatron.test_data_vpp import _load_data_module
+from tests.support.args import build_relax_args
 
 
 def test_vl_packing_matches_independent_samples_logits_and_gradients(monkeypatch):
     data_module = _load_data_module(monkeypatch)
     monkeypatch.setattr(data_module, "PackedSeqParams", SimpleNamespace)
-    monkeypatch.setattr(data_module, "get_args", lambda: Namespace(qsa_indexer_loss_coeff=0.0))
+    # qsa_indexer_loss_coeff is a Megatron-parser field: build a full Relax
+    # parameter object, then assign the Megatron-only diff explicitly.
+    fake_args = build_relax_args()
+    fake_args.qsa_indexer_loss_coeff = 0.0
+    monkeypatch.setattr(data_module, "get_args", lambda: fake_args)
     monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 1, raising=False)
     monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda: 0, raising=False)
     monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)

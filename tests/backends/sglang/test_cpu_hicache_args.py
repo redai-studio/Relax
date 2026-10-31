@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
-from types import SimpleNamespace
 
 import pytest
 
 from tests.backends.sglang.test_router_registration import sglang_engine_module as sglang_engine_module
+from tests.support.args import build_relax_args
 
 
 @pytest.mark.parametrize("worker_type", ["regular", "prefill", "decode"])
@@ -19,7 +19,7 @@ def test_cpu_cache_is_independent_of_pd_topology(request, monkeypatch, worker_ty
     ]
     monkeypatch.setattr(module, "ServerArgs", dataclasses.make_dataclass("ServerArgs", fields))
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu: gpu)
-    args = SimpleNamespace(
+    args = build_relax_args(
         rollout_num_gpus_per_engine=2,
         num_gpus_per_node=8,
         hf_checkpoint="model",
@@ -29,10 +29,11 @@ def test_cpu_cache_is_independent_of_pd_topology(request, monkeypatch, worker_ty
         sglang_dp_size=1,
         sglang_ep_size=1,
         use_rollout_routing_replay=False,
-        fp16=False,
         sglang_enable_hierarchical_cache=True,
         sglang_hicache_storage_backend=None,
     )
+    # Field declared by Megatron and read-only for Relax.
+    args.fp16 = False
     overrides = {} if override is None else {"enable_hierarchical_cache": override}
     actual, _ = module._compute_server_args(
         args,

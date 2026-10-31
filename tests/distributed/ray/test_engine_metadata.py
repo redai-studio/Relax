@@ -20,6 +20,8 @@ import pytest
 from ray.core.generated.gcs_pb2 import ActorTableData
 from ray.exceptions import GetTimeoutError
 
+from tests.support.args import build_relax_args
+
 
 ActorState = ActorTableData.ActorState
 rollout = pytest.importorskip("relax.distributed.ray.rollout", exc_type=ModuleNotFoundError)
@@ -78,7 +80,7 @@ def zero_wait_get(monkeypatch):
 
 def make_manager(engines, refs):
     group = rollout.EngineGroup(
-        args=SimpleNamespace(num_gpus_per_node=8),
+        args=build_relax_args(num_gpus_per_node=8),
         pg=None,
         all_engines=engines,
         num_gpus_per_engine=1,
@@ -89,7 +91,7 @@ def make_manager(engines, refs):
     manager = object.__new__(rollout.RolloutManager.__ray_metadata__.modified_class)
     manager._engine_actor_states = ActorState
     manager.servers = {"actor": server}
-    manager.args = SimpleNamespace(
+    manager.args = build_relax_args(
         num_gpus_per_node=8,
         rollout_num_gpus_per_engine=1,
         scale_out_partial_success_policy="keep_partial",
@@ -536,7 +538,7 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
     if mode == "native_recover":
         group.sglang_overrides = {"host": "::1", "port": 32000}
     group.pg = (object(), list(range(8)), list(range(8)))
-    group.args = SimpleNamespace(
+    group.args = build_relax_args(
         num_gpus_per_node=8,
         rollout_num_gpus=8,
         rollout_num_gpus_per_engine=1,
@@ -607,7 +609,7 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
 def test_start_engines_preserves_submitted_record_on_later_synchronous_failure(monkeypatch):
     first, second = make_engine(), make_engine()
     _, group = make_manager([None, None], [])
-    group.args = SimpleNamespace(
+    group.args = build_relax_args(
         num_gpus_per_node=8,
         rollout_num_gpus=8,
         rollout_num_gpus_per_engine=1,

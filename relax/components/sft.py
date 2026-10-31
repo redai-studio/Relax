@@ -112,9 +112,9 @@ def _resolve_classification_sentinel_token_id(tokenizer) -> int:
 
 
 def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict[str, Any]:
-    oversize_strategy = getattr(config, "sft_oversize_strategy", "keep")
-    invalid_multimodal_strategy = getattr(config, "sft_invalid_multimodal_strategy", "error")
-    oversize_custom_path = getattr(config, "sft_oversize_custom_function_path", None)
+    oversize_strategy = config.sft_oversize_strategy
+    invalid_multimodal_strategy = config.sft_invalid_multimodal_strategy
+    oversize_custom_path = config.sft_oversize_custom_function_path
     oversize_custom_fn = None
     if oversize_strategy == "custom":
         if not oversize_custom_path:
@@ -163,13 +163,13 @@ def _create_sft_train_dataset(
             pair_capacity=capacity,
             oversize_strategy=oversize_strategy,
             oversize_custom_fn=oversize_custom_fn,
-            seed=getattr(config, "seed", 42),
+            seed=config.seed,
             prefetch_max_cached=prefetch_buffer_size,
             prefetch_chunk_size=prefetch_chunk_size,
             prefetch_num_workers=prefetch_num_workers,
-            apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
+            apply_chat_template_kwargs=config.apply_chat_template_kwargs,
         )
-    dataset_cls = _load_custom_dataset_class(getattr(config, "custom_dataset_class_path", None))
+    dataset_cls = _load_custom_dataset_class(config.custom_dataset_class_path)
     if dataset_cls is None:
         return SFTStreamingDataset(
             path=config.prompt_data,
@@ -180,11 +180,11 @@ def _create_sft_train_dataset(
             prompt_key=config.input_key,
             label_key=config.label_key,
             multimodal_keys=config.multimodal_keys,
-            conversation_key_map=getattr(config, "conversation_key_map", None),
+            conversation_key_map=config.conversation_key_map,
             metadata_key=config.metadata_key,
             tool_key=config.tool_key,
             system_prompt=config.system_prompt,
-            seed=getattr(config, "seed", 42),
+            seed=config.seed,
             prefetch_max_cached=prefetch_buffer_size,
             prefetch_chunk_size=prefetch_chunk_size,
             prefetch_num_workers=prefetch_num_workers,
@@ -192,16 +192,16 @@ def _create_sft_train_dataset(
             oversize_strategy=oversize_strategy,
             oversize_custom_fn=oversize_custom_fn,
             invalid_multimodal_strategy=invalid_multimodal_strategy,
-            apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
-            training_mode=getattr(config, "sft_training_mode", "sft"),
-            cpt_template=getattr(config, "sft_cpt_template", "raw"),
+            apply_chat_template_kwargs=config.apply_chat_template_kwargs,
+            training_mode=config.sft_training_mode,
+            cpt_template=config.sft_cpt_template,
             require_response=task_type != "seq_cls",
             task_type=task_type,
-            num_labels=getattr(config, "num_labels", None),
-            problem_type=getattr(config, "problem_type", "single_label_classification"),
+            num_labels=config.num_labels,
+            problem_type=config.problem_type,
             classification_sentinel_token_id=classification_sentinel_token_id,
-            loss_last_turn_only=getattr(config, "sft_loss_last_turn_only", False),
-            loss_ignore_empty_think=getattr(config, "sft_ignore_empty_think", False),
+            loss_last_turn_only=config.sft_loss_last_turn_only,
+            loss_ignore_empty_think=config.sft_ignore_empty_think,
             image_preprocess_on_rank=image_preprocess_on_rank,
         )
     return dataset_cls.from_args(
@@ -258,7 +258,7 @@ def _sft_train_partitions_in_flight(partitions: list[str]) -> int:
 
 
 def _sft_prefetch_workers_per_shard(config: Any, num_shards: int) -> int:
-    prefetch_num_workers = max(1, int(getattr(config, "sft_prefetch_num_workers", 4) or 1))
+    prefetch_num_workers = max(1, int(config.sft_prefetch_num_workers or 1))
     if num_shards <= 1:
         return prefetch_num_workers
     return max(1, (prefetch_num_workers + num_shards - 1) // num_shards)
@@ -267,7 +267,7 @@ def _sft_prefetch_workers_per_shard(config: Any, num_shards: int) -> int:
 def _validate_sft_shard_count(config: Any, num_shards: int) -> None:
     if num_shards <= 1:
         return
-    global_batch_size = int(getattr(config, "global_batch_size", 0) or 0)
+    global_batch_size = int(config.global_batch_size or 0)
     if global_batch_size % num_shards != 0:
         raise ValueError(
             f"RELAX_SFT_TQ_SHARDS={num_shards} requires global_batch_size divisible by shard count; "
@@ -311,9 +311,7 @@ def _set_sft_dataset_position(dataset: Any, epoch: int, position: int, prefetch_
 
 
 def _has_sft_eval_work(config: Any) -> bool:
-    return getattr(config, "eval_size", None) is not None or bool(
-        build_named_prompt_data_configs(getattr(config, "eval_prompt_data", None))
-    )
+    return config.eval_size is not None or bool(build_named_prompt_data_configs(config.eval_prompt_data))
 
 
 @ray.remote
@@ -390,10 +388,10 @@ class _SFTBatchProducerActor:
             self._processor_pool = None
 
         pad_token_ids = _resolve_pad_token_ids_from_config(self.config.hf_checkpoint)
-        cp_size = max(1, getattr(self.config, "context_parallel_size", 1) or 1)
+        cp_size = max(1, self.config.context_parallel_size or 1)
         capacity = self.config.max_tokens_per_gpu * cp_size
         dataset_options = _resolve_sft_dataset_options(self.config)
-        task_type = getattr(self.config, "task_type", "causal_lm")
+        task_type = self.config.task_type
         classification_sentinel_token_id = (
             _resolve_classification_sentinel_token_id(self._tokenizer) if task_type == "seq_cls" else None
         )
@@ -403,23 +401,23 @@ class _SFTBatchProducerActor:
             tokenizer=self._tokenizer,
             processor_pool=self._processor_pool,
             capacity=capacity,
-            prefetch_buffer_size=getattr(self.config, "sft_prefetch_buffer_size", 256),
-            prefetch_chunk_size=getattr(self.config, "sft_prefetch_chunk_size", 32),
+            prefetch_buffer_size=self.config.sft_prefetch_buffer_size,
+            prefetch_chunk_size=self.config.sft_prefetch_chunk_size,
             prefetch_num_workers=prefetch_num_workers,
             pad_token_ids=pad_token_ids,
             task_type=task_type,
             classification_sentinel_token_id=classification_sentinel_token_id,
-            image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
+            image_preprocess_on_rank=self.config.sft_image_preprocess_on_rank,
             **dataset_options,
         )
         n_avail = len(self._dataset)
         self._train_size = n_avail
-        eval_size_arg = getattr(self.config, "eval_size", None)
+        eval_size_arg = self.config.eval_size
         if eval_size_arg is not None:
             train_indices, eval_indices = resolve_sft_split_indices(
                 n_avail,
                 eval_size_arg,
-                getattr(self.config, "seed", 42),
+                self.config.seed,
             )
             self._train_size = len(train_indices)
             if eval_indices:
@@ -432,7 +430,7 @@ class _SFTBatchProducerActor:
                 restrict_training_indices(train_indices)
                 self._logger.info(
                     f"--eval-size randomly held out {len(eval_indices)} samples with seed="
-                    f"{getattr(self.config, 'seed', 42)}; remote shard {self._shard_id}/{self._num_shards} "
+                    f"{self.config.seed}; remote shard {self._shard_id}/{self._num_shards} "
                     f"train pool size now {self._train_size}."
                 )
 
@@ -500,7 +498,7 @@ class _SFTBatchProducerActor:
         payload = _prepare_sft_tq_payload(
             samples,
             force_multimodal_field=force_multimodal_field,
-            force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
+            force_image_refs_field=self.config.sft_image_preprocess_on_rank,
         )
         await self.data_system_client.async_put(
             data=payload["data"],
@@ -562,7 +560,7 @@ class SFT(Base):
         self.role = role
         self._runtime_env = runtime_env
         self.healthy = healthy
-        self.step = getattr(config, "start_rollout_id", 0)
+        self.step = config.start_rollout_id
 
         self.data_system_client = attach_tq_client(
             self.config.tq_config,
@@ -585,9 +583,9 @@ class SFT(Base):
         _validate_sft_shard_count(self.config, num_shards)
         if num_shards <= 1:
             return False
-        if not getattr(self.config, "sft_async_prepack", False):
+        if not self.config.sft_async_prepack:
             return False
-        if getattr(self.config, "task_type", "causal_lm") == "seq_cls":
+        if self.config.task_type == "seq_cls":
             self._logger.info(
                 "SFT remote shard producer disabled: sequence classification uses the local producer path."
             )
@@ -595,13 +593,13 @@ class SFT(Base):
         if not ray.is_initialized():
             self._logger.info("SFT remote shard producer disabled: Ray is not initialized.")
             return False
-        if getattr(self.config, "custom_dataset_class_path", None):
+        if self.config.custom_dataset_class_path:
             self._logger.info(
                 "SFT remote shard producer disabled: custom dataset is configured; using local producer path."
             )
             return False
-        oversize_strategy = getattr(self.config, "sft_oversize_strategy", "keep")
-        invalid_multimodal_strategy = getattr(self.config, "sft_invalid_multimodal_strategy", "error")
+        oversize_strategy = self.config.sft_oversize_strategy
+        invalid_multimodal_strategy = self.config.sft_invalid_multimodal_strategy
         if oversize_strategy in {"skip", "custom"} or invalid_multimodal_strategy == "skip":
             self._logger.info(
                 "SFT remote shard producer disabled: skip-capable data filtering is configured "
@@ -638,8 +636,8 @@ class SFT(Base):
         )
 
     def _init_remote_eval_pipeline(self) -> None:
-        eval_prompt_data = build_named_prompt_data_configs(getattr(self.config, "eval_prompt_data", None))
-        eval_size_arg = getattr(self.config, "eval_size", None)
+        eval_prompt_data = build_named_prompt_data_configs(self.config.eval_prompt_data)
+        eval_size_arg = self.config.eval_size
         if eval_size_arg is None and not eval_prompt_data:
             return
 
@@ -655,10 +653,10 @@ class SFT(Base):
         pad_token_ids = _resolve_pad_token_ids_from_config(self.config.hf_checkpoint)
         self._logger.info(f"Resolved multimodal pad token ids from model config: {sorted(pad_token_ids)}")
 
-        cp_size = max(1, getattr(self.config, "context_parallel_size", 1) or 1)
+        cp_size = max(1, self.config.context_parallel_size or 1)
         capacity = self.config.max_tokens_per_gpu * cp_size
-        seed = getattr(self.config, "seed", 42)
-        task_type = getattr(self.config, "task_type", "causal_lm")
+        seed = self.config.seed
+        task_type = self.config.task_type
         classification_sentinel_token_id = (
             _resolve_classification_sentinel_token_id(self._tokenizer) if task_type == "seq_cls" else None
         )
@@ -671,12 +669,12 @@ class SFT(Base):
                 processor_pool=self._processor_pool,
                 capacity=capacity,
                 prefetch_buffer_size=0,
-                prefetch_chunk_size=getattr(self.config, "sft_prefetch_chunk_size", 32),
+                prefetch_chunk_size=self.config.sft_prefetch_chunk_size,
                 prefetch_num_workers=1,
                 pad_token_ids=pad_token_ids,
                 task_type=task_type,
                 classification_sentinel_token_id=classification_sentinel_token_id,
-                image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
+                image_preprocess_on_rank=self.config.sft_image_preprocess_on_rank,
                 **dataset_options,
             )
             n_avail = len(self._dataset)
@@ -703,9 +701,9 @@ class SFT(Base):
                 self._logger.info(f"SFT remote eval split initialized: held out {n_eval} samples with seed={seed}.")
             return
 
-        eval_input_key = getattr(self.config, "eval_input_key", None) or self.config.input_key
-        eval_label_key = getattr(self.config, "eval_label_key", None) or self.config.label_key
-        eval_tool_key = getattr(self.config, "eval_tool_key", None) or self.config.tool_key
+        eval_input_key = self.config.eval_input_key or self.config.input_key
+        eval_label_key = self.config.eval_label_key or self.config.label_key
+        eval_tool_key = self.config.eval_tool_key or self.config.tool_key
         self._eval_dataset = SFTStreamingDataset(
             path=[d.path for d in eval_prompt_data],
             tokenizer=self._tokenizer,
@@ -714,7 +712,7 @@ class SFT(Base):
             prompt_key=eval_input_key,
             label_key=eval_label_key,
             multimodal_keys=self.config.multimodal_keys,
-            conversation_key_map=getattr(self.config, "conversation_key_map", None),
+            conversation_key_map=self.config.conversation_key_map,
             metadata_key=self.config.metadata_key,
             tool_key=eval_tool_key,
             system_prompt=self.config.system_prompt,
@@ -725,15 +723,15 @@ class SFT(Base):
             oversize_strategy=dataset_options["oversize_strategy"],
             oversize_custom_fn=dataset_options["oversize_custom_fn"],
             invalid_multimodal_strategy=dataset_options["invalid_multimodal_strategy"],
-            apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
-            training_mode=getattr(self.config, "sft_training_mode", "sft"),
-            cpt_template=getattr(self.config, "sft_cpt_template", "raw"),
+            apply_chat_template_kwargs=self.config.apply_chat_template_kwargs,
+            training_mode=self.config.sft_training_mode,
+            cpt_template=self.config.sft_cpt_template,
             require_response=task_type != "seq_cls",
             task_type=task_type,
-            num_labels=getattr(self.config, "num_labels", None),
-            problem_type=getattr(self.config, "problem_type", "single_label_classification"),
+            num_labels=self.config.num_labels,
+            problem_type=self.config.problem_type,
             classification_sentinel_token_id=classification_sentinel_token_id,
-            image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
+            image_preprocess_on_rank=self.config.sft_image_preprocess_on_rank,
         )
 
     def _init_data_pipeline(self) -> None:
@@ -759,13 +757,13 @@ class SFT(Base):
         pad_token_ids = _resolve_pad_token_ids_from_config(self.config.hf_checkpoint)
         self._logger.info(f"Resolved multimodal pad token ids from model config: {sorted(pad_token_ids)}")
 
-        cp_size = max(1, getattr(self.config, "context_parallel_size", 1) or 1)
+        cp_size = max(1, self.config.context_parallel_size or 1)
         capacity = self.config.max_tokens_per_gpu * cp_size
-        prefetch_buffer_size = getattr(self.config, "sft_prefetch_buffer_size", 256)
-        prefetch_chunk_size = getattr(self.config, "sft_prefetch_chunk_size", 32)
-        prefetch_num_workers = getattr(self.config, "sft_prefetch_num_workers", 4)
-        seed = getattr(self.config, "seed", 42)
-        task_type = getattr(self.config, "task_type", "causal_lm")
+        prefetch_buffer_size = self.config.sft_prefetch_buffer_size
+        prefetch_chunk_size = self.config.sft_prefetch_chunk_size
+        prefetch_num_workers = self.config.sft_prefetch_num_workers
+        seed = self.config.seed
+        task_type = self.config.task_type
         classification_sentinel_token_id = (
             _resolve_classification_sentinel_token_id(self._tokenizer) if task_type == "seq_cls" else None
         )
@@ -782,14 +780,14 @@ class SFT(Base):
             pad_token_ids=pad_token_ids,
             task_type=task_type,
             classification_sentinel_token_id=classification_sentinel_token_id,
-            image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
+            image_preprocess_on_rank=self.config.sft_image_preprocess_on_rank,
             **dataset_options,
         )
         n_avail = len(self._dataset)
         self._train_size = n_avail
 
-        eval_prompt_data = build_named_prompt_data_configs(getattr(self.config, "eval_prompt_data", None))
-        eval_size_arg = getattr(self.config, "eval_size", None)
+        eval_prompt_data = build_named_prompt_data_configs(self.config.eval_prompt_data)
+        eval_size_arg = self.config.eval_size
         if eval_size_arg is not None:
             # Randomize the split once with a fixed seed. Each epoch reshuffles
             # only the resulting train row IDs; eval membership stays fixed.
@@ -818,9 +816,9 @@ class SFT(Base):
                     f"train pool size now {self._train_size}."
                 )
         elif eval_prompt_data:
-            eval_input_key = getattr(self.config, "eval_input_key", None) or self.config.input_key
-            eval_label_key = getattr(self.config, "eval_label_key", None) or self.config.label_key
-            eval_tool_key = getattr(self.config, "eval_tool_key", None) or self.config.tool_key
+            eval_input_key = self.config.eval_input_key or self.config.input_key
+            eval_label_key = self.config.eval_label_key or self.config.label_key
+            eval_tool_key = self.config.eval_tool_key or self.config.tool_key
             # Eval is small + runs every `eval_interval`; disable prefetch so
             # we don't consume worker threads idly between eval rounds.
             if is_preference_mode(self.config):
@@ -839,7 +837,7 @@ class SFT(Base):
                     oversize_custom_fn=dataset_options["oversize_custom_fn"],
                     seed=seed,
                     prefetch_max_cached=0,
-                    apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+                    apply_chat_template_kwargs=self.config.apply_chat_template_kwargs,
                 )
             else:
                 self._eval_dataset = SFTStreamingDataset(
@@ -850,7 +848,7 @@ class SFT(Base):
                     prompt_key=eval_input_key,
                     label_key=eval_label_key,
                     multimodal_keys=self.config.multimodal_keys,
-                    conversation_key_map=getattr(self.config, "conversation_key_map", None),
+                    conversation_key_map=self.config.conversation_key_map,
                     metadata_key=self.config.metadata_key,
                     tool_key=eval_tool_key,
                     system_prompt=self.config.system_prompt,
@@ -861,17 +859,17 @@ class SFT(Base):
                     oversize_strategy=dataset_options["oversize_strategy"],
                     oversize_custom_fn=dataset_options["oversize_custom_fn"],
                     invalid_multimodal_strategy=dataset_options["invalid_multimodal_strategy"],
-                    apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
-                    training_mode=getattr(self.config, "sft_training_mode", "sft"),
-                    cpt_template=getattr(self.config, "sft_cpt_template", "raw"),
+                    apply_chat_template_kwargs=self.config.apply_chat_template_kwargs,
+                    training_mode=self.config.sft_training_mode,
+                    cpt_template=self.config.sft_cpt_template,
                     require_response=task_type != "seq_cls",
                     task_type=task_type,
-                    num_labels=getattr(self.config, "num_labels", None),
-                    problem_type=getattr(self.config, "problem_type", "single_label_classification"),
+                    num_labels=self.config.num_labels,
+                    problem_type=self.config.problem_type,
                     classification_sentinel_token_id=classification_sentinel_token_id,
-                    loss_last_turn_only=getattr(self.config, "sft_loss_last_turn_only", False),
-                    loss_ignore_empty_think=getattr(self.config, "sft_ignore_empty_think", False),
-                    image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
+                    loss_last_turn_only=self.config.sft_loss_last_turn_only,
+                    loss_ignore_empty_think=self.config.sft_ignore_empty_think,
+                    image_preprocess_on_rank=self.config.sft_image_preprocess_on_rank,
                 )
 
         if isinstance(self._dataset, streaming_dataset.SFTStreamingDataset):
@@ -935,7 +933,7 @@ class SFT(Base):
         if self.step == 0:
             return
         max_in_flight = self.config.max_staleness + 1
-        timeout_sec = float(getattr(self.config, "sft_tq_timeout_minutes", None) or 30) * 60.0
+        timeout_sec = float(self.config.sft_tq_timeout_minutes or 30) * 60.0
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout_sec
         wait_count = 0
@@ -1055,7 +1053,7 @@ class SFT(Base):
             payload = _prepare_sft_tq_payload(
                 shard_samples,
                 force_multimodal_field=self.config.multimodal_keys is not None,
-                force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
+                force_image_refs_field=self.config.sft_image_preprocess_on_rank,
             )
             await self.data_system_client.async_put(
                 data=payload["data"],
@@ -1117,7 +1115,7 @@ class SFT(Base):
         gbs = self.config.global_batch_size
         n_original = len(samples)
         preference_mode = is_preference_mode(self.config)
-        is_classification = getattr(self.config, "task_type", "causal_lm") == "seq_cls"
+        is_classification = self.config.task_type == "seq_cls"
         sample_weights = None
         if is_classification:
             n_chunks = (n_original + gbs - 1) // gbs
@@ -1146,7 +1144,7 @@ class SFT(Base):
             backend_batch = pack_samples_for_tq(
                 samples,
                 force_multimodal_field=self.config.multimodal_keys is not None,
-                force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
+                force_image_refs_field=self.config.sft_image_preprocess_on_rank,
                 sample_weights=sample_weights,
             )
             preference_custom_meta = None

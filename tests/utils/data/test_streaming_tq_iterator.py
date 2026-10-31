@@ -1,10 +1,11 @@
 import importlib
 import sys
 import types
-from argparse import Namespace
 
 import pytest
 import torch
+
+from tests.support.args import build_relax_args
 
 
 def _load_stream_module(monkeypatch):
@@ -51,7 +52,7 @@ def _load_stream_module(monkeypatch):
 
 def _make_iterator(stream_module, *, get_data_fn, all_consumed_fn, **kwargs):
     monkeypatch_kwargs = dict(
-        args=Namespace(),
+        args=build_relax_args(),
         tq_client=object(),
         data_fields=["tokens"],
         rollout_id=52,
@@ -107,7 +108,7 @@ def test_get_data_from_transfer_queue_can_skip_per_rank_agreement(monkeypatch):
     monkeypatch.setattr(stream_module, "_agree_on_fetch", fail_agreement)
 
     data, meta = stream_module.get_data_from_transfer_queue(
-        args=Namespace(),
+        args=build_relax_args(),
         tq_client=_Client(),
         data_fields=["tokens"],
         batch_size=1,
@@ -129,7 +130,7 @@ def test_get_data_from_transfer_queue_rejects_disabled_agreement_without_per_ran
 
     with pytest.raises(ValueError, match="requires per_rank_fetch=True"):
         stream_module.get_data_from_transfer_queue(
-            args=Namespace(),
+            args=build_relax_args(),
             tq_client=object(),
             data_fields=["tokens"],
             batch_size=1,
@@ -195,7 +196,7 @@ def test_prefetched_raw_payload_skips_second_tq_rpc(monkeypatch):
 
     meta = _Meta()
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
-        args=Namespace(),
+        args=build_relax_args(),
         tq_client=_Client(),
         data_fields=["tokens"],
         batch_size=2,
@@ -409,7 +410,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
             }
 
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
-        args=Namespace(),
+        args=build_relax_args(),
         tq_client=_TQClient(),
         data_fields=["response_lengths", "total_lengths", "rewards"],
         batch_size=2,
@@ -508,7 +509,7 @@ def test_sft_token_lengths_count_raw_masks_on_cpu(monkeypatch, as_tensor):
         "response_lengths": [6, 3, 2],
         "loss_masks": [torch.tensor(mask) for mask in masks] if as_tensor else masks,
     }
-    stream_module._add_sft_token_lengths(Namespace(loss_type="sft"), batch)
+    stream_module._add_sft_token_lengths(build_relax_args(loss_type="sft"), batch)
     assert batch["learn_lengths"] == [3, 0, 2]
     assert batch["non_learn_lengths"] == [3, 3, 0]
     assert batch["response_lengths"] == batch["total_lengths"]  # Keep internal alignment semantics.
@@ -520,14 +521,14 @@ def test_sft_token_lengths_count_raw_masks_on_cpu(monkeypatch, as_tensor):
     )
     # Subsequent postprocessing must reuse CPU counts after masks move to a device.
     batch["loss_masks"] = [torch.empty(6, device="meta")]
-    stream_module._add_sft_token_lengths(Namespace(loss_type="sft"), batch)
+    stream_module._add_sft_token_lengths(build_relax_args(loss_type="sft"), batch)
     assert batch["learn_lengths"] == [3, 0, 2]
 
 
 def test_sft_token_lengths_leave_rl_batch_unchanged(monkeypatch):
     stream_module = _load_stream_module(monkeypatch)
     batch = {"total_lengths": [6], "loss_masks": [[1, 1]]}
-    stream_module._add_sft_token_lengths(Namespace(loss_type="policy_loss"), batch)
+    stream_module._add_sft_token_lengths(build_relax_args(loss_type="policy_loss"), batch)
     assert "learn_lengths" not in batch
     assert "non_learn_lengths" not in batch
 
@@ -562,7 +563,7 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
         "rollout_topk_token_ids": [token_ids.flatten().tolist()],
         "rollout_topk_log_probs": [log_probs.flatten().tolist()],
     }
-    args = Namespace(
+    args = build_relax_args(
         loss_type="policy_loss",
         qkv_format="thd",
         use_opd=False,

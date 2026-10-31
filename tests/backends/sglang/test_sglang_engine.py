@@ -8,6 +8,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.support.args import build_relax_args
+
 
 pytest_plugins = ["tests.backends.sglang.test_router_registration"]
 
@@ -113,7 +115,7 @@ def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
 
     from relax.backends.sglang.sglang_engine import _enable_draft_weights_cpu_backup
 
-    args = SimpleNamespace(
+    args = build_relax_args(
         enable_mtp_training=enable_mtp_training,
         sglang_speculative_algorithm=speculative_algorithm,
     )
@@ -272,7 +274,7 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
     )
     monkeypatch.setattr(module, "ServerArgs", server_args)
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
-    args = SimpleNamespace(
+    args = build_relax_args(
         rollout_num_gpus_per_engine=2,
         num_gpus_per_node=8,
         hf_checkpoint="/test/model",
@@ -282,10 +284,11 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
         sglang_dp_size=1,
         sglang_ep_size=1,
         use_rollout_routing_replay=False,
-        fp16=False,
         sglang_disable_shared_experts_fusion=False,
         sglang_enforce_shared_experts_fusion=enforce,
     )
+    # Field declared by Megatron and read-only for Relax.
+    args.fp16 = False
 
     result, _ = module._compute_server_args(
         args, 0, "localhost:8000", 8001, "localhost", 8002, base_gpu_id=0, sglang_overrides=overrides
@@ -301,7 +304,7 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
     module = sglang_engine_module
     monkeypatch.setattr(module, "ServerArgs", make_dataclass("ServerArgs", [("custom_weight_loader", list, None)]))
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda value: value)
-    args = SimpleNamespace(
+    args = build_relax_args(
         rollout_num_gpus_per_engine=2,
         num_gpus_per_node=8,
         hf_checkpoint="/test/model",
@@ -311,8 +314,9 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
         sglang_dp_size=1,
         sglang_ep_size=1,
         use_rollout_routing_replay=False,
-        fp16=False,
     )
+    # Field declared by Megatron and read-only for Relax.
+    args.fp16 = False
     result, _ = module._compute_server_args(
         args,
         0,
@@ -339,7 +343,7 @@ def test_policy_pd_routing_replay_accepts_configured_topology(monkeypatch, sglan
         ),
     )
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
-    args = SimpleNamespace(
+    args = build_relax_args(
         rollout_num_gpus_per_engine=2,
         num_gpus_per_node=8,
         hf_checkpoint="/test/model",
@@ -350,8 +354,9 @@ def test_policy_pd_routing_replay_accepts_configured_topology(monkeypatch, sglan
         sglang_ep_size=1,
         use_rollout_routing_replay=True,
         sglang_disaggregation_mode=None,
-        fp16=False,
     )
+    # Field declared by Megatron and read-only for Relax.
+    args.fp16 = False
     result, _ = module._compute_server_args(
         args,
         0,
@@ -375,7 +380,7 @@ def test_external_pd_routing_replay_registers_native_worker(
 ):
     module = sglang_engine_module
     engine = object.__new__(getattr(module, engine_class))
-    engine.args = SimpleNamespace(use_rollout_routing_replay=True)
+    engine.args = build_relax_args(use_rollout_routing_replay=True)
     engine.rank, engine.worker_type = 0, "regular"
     engine.server_host, engine.server_port = "localhost", 8000
     engine._skip_router_registration = False
@@ -422,7 +427,7 @@ def test_transport_respects_engine_topology_and_native_validation(
     # Keep the real CLI and SGLang validation; isolate only hardware/model discovery.
     parser = add_sglang_arguments(argparse.ArgumentParser(add_help=False))
     parsed = parser.parse_args(cli)
-    args = SimpleNamespace(
+    args = build_relax_args(
         rollout_num_gpus_per_engine=gpus,
         genrm_num_gpus_per_engine=engine_gpus or 2,
         num_gpus_per_node=8,
@@ -435,9 +440,10 @@ def test_transport_respects_engine_topology_and_native_validation(
         sglang_dp_size=1,
         sglang_ep_size=1,
         use_rollout_routing_replay=False,
-        fp16=False,
         sglang_mm_feature_transport=parsed.sglang_mm_feature_transport,
     )
+    # Field declared by Megatron and read-only for Relax.
+    args.fp16 = False
     module = request.getfixturevalue("sglang_engine_module")
     monkeypatch.setattr(module, "ServerArgs", ServerArgs)
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu: gpu)

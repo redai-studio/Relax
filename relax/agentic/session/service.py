@@ -2587,7 +2587,7 @@ class AgenticSessionShard:
             meta_info=result.meta_info,
             token_count=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
         )
-        if getattr(self.args, "use_rollout_routing_replay", False) and result.new_tokens and routed_experts is None:
+        if self.args.use_rollout_routing_replay and result.new_tokens and routed_experts is None:
             raise ValueError("Backend omitted routed experts for newly accepted tokens")
         ir.pending_routed_experts = merge_routed_experts(
             ir.pending_routed_experts,

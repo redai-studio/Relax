@@ -2,7 +2,6 @@
 
 import ast
 import sys
-from argparse import Namespace
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
@@ -13,6 +12,7 @@ import transfer_queue
 from relax.distributed.ray import placement_group as placement_group_module
 from relax.utils import health_system
 from tests.core.controller_test_utils import load_controller_with_stubbed_dependencies
+from tests.support.args import build_relax_args, declared_parameter_names
 
 
 def _elastic_args(tmp_path, **kwargs):
@@ -20,7 +20,14 @@ def _elastic_args(tmp_path, **kwargs):
     config_path.write_text("enabled: true\n")
     values = {"autoscaler_config": str(config_path), "enable_affinity": True}
     values.update(kwargs)
-    return Namespace(**values)
+    # Megatron / internal-only fields (e.g. num_rollout_per_epoch,
+    # _genrm_instances_resolved) are not Relax declarations and must be
+    # assigned explicitly after construction.
+    extras = {name: values.pop(name) for name in list(values) if name not in declared_parameter_names()}
+    args = build_relax_args(**values)
+    for name, value in extras.items():
+        setattr(args, name, value)
+    return args
 
 
 class _FakeActorClass:

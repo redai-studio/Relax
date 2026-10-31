@@ -6,14 +6,21 @@ libraries."""
 import argparse
 import ast
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
+from tests.support.args import build_relax_args
 
 
 _SOURCE = Path(__file__).resolve().parents[3] / "relax/utils/arguments.py"
+
+
+# Fields declared by Megatron and read-only for Relax: the builder does not manage these; override separately.
+_MEGATRON_FIELDS = {
+    "pipeline_model_parallel_size": 1,
+    "virtual_pipeline_model_parallel_size": None,
+}
 
 
 def make_args(**overrides):
@@ -26,13 +33,15 @@ def make_args(**overrides):
         sft_train_data_prefetch=False,
         distributed_backend="nccl",
         qkv_format="thd",
-        pipeline_model_parallel_size=1,
         context_parallel_size=1,
-        virtual_pipeline_model_parallel_size=None,
         multimodal_keys=None,
     )
     values.update(overrides)
-    return SimpleNamespace(**values)
+    megatron = {name: values.pop(name, default) for name, default in _MEGATRON_FIELDS.items()}
+    args = build_relax_args(**values)
+    for name, value in megatron.items():
+        setattr(args, name, value)
+    return args
 
 
 @pytest.mark.parametrize(
@@ -88,18 +97,20 @@ def test_rl_preserves_explicit_per_rank_fetch(per_rank):
     assert not args.sft_image_preprocess_on_rank
 
 
-def test_pipeline_accepts_partial_non_sft_arguments():
-    args = SimpleNamespace(train_backend="megatron", per_rank_fetch=True)
+def test_pipeline_accepts_non_sft_arguments():
+    # The non-SFT path needs no SFT-specific fields, but the parameter object
+    # itself must be complete: loss_type keeps its declared default (not
+    # sft/dpo/rm), so the else branch runs.
+    args = build_relax_args(train_backend="megatron", per_rank_fetch=True)
     configure_sft_data_pipeline(args)
     assert args.per_rank_fetch is True
     assert args.sft_train_data_prefetch is False
     assert args.sft_image_preprocess_on_rank is False
-    assert not hasattr(args, "loss_type")
-    assert not hasattr(args, "sft_async_prepack")
+    assert args.sft_async_prepack is False
 
 
 def test_pipeline_i2i_fsdp_does_not_require_megatron_arguments():
-    args = SimpleNamespace(loss_type="sft", generation_task="i2i", train_backend="fsdp", max_staleness=1)
+    args = build_relax_args(loss_type="sft", generation_task="i2i", train_backend="fsdp", max_staleness=1)
     configure_sft_data_pipeline(args)
     assert not args.per_rank_fetch
     assert not args.sft_async_prepack

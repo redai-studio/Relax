@@ -3,9 +3,10 @@
 """Unit tests for SFT registry entries."""
 
 import importlib
-from types import SimpleNamespace
 
 import pytest
+
+from tests.support.args import build_relax_args
 
 
 # `relax.core.registry` eagerly imports `relax.components.advantages`, which
@@ -15,16 +16,18 @@ pytest.importorskip("megatron.core")
 
 
 def _cfg(**kwargs):
-    defaults = dict(
-        debug_rollout_only=False,
-        debug_train_only=False,
-        fully_async=False,
-        hybrid=False,
-        loss_type="policy_loss",
-        advantage_estimator="grpo",
-    )
-    defaults.update(kwargs)
-    return SimpleNamespace(**defaults)
+    # Defaults only: callers may override any of these via kwargs without
+    # triggering a duplicate-keyword error in the builder.
+    merged = {
+        "debug_rollout_only": False,
+        "debug_train_only": False,
+        "fully_async": False,
+        "hybrid": False,
+        "loss_type": "policy_loss",
+        "advantage_estimator": "grpo",
+    }
+    merged.update(kwargs)
+    return build_relax_args(**merged)
 
 
 def _registry_module():

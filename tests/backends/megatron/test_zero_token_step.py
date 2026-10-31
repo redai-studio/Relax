@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.args import build_relax_args
+
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("megatron.core")
@@ -183,21 +185,24 @@ def test_is_global_zero_token_step_single_host_sync(monkeypatch, pp_size):
     assert len(sync_warnings) == 1
 
 
-def _make_args() -> SimpleNamespace:
-    return SimpleNamespace(
+def _make_args():
+    args = build_relax_args(
         custom_megatron_before_train_step_hook_path=None,
         ci_test=False,
         enable_mtp_training=False,
-        check_for_nan_in_loss_and_grad=True,
         global_batch_size=32,
         dynamic_context_parallel=False,
         use_dynamic_batch_size=False,
         fully_async=False,
         seq_length=512,
         micro_batch_size=1,
-        decoder_seq_length=512,
-        attention_backend="flash",
     )
+    # Megatron/parser-owned fields the shared builder does not declare: keep
+    # the original values as explicit overrides after construction.
+    args.check_for_nan_in_loss_and_grad = True
+    args.decoder_seq_length = 512
+    args.attention_backend = "flash"
+    return args
 
 
 @pytest.mark.parametrize(
@@ -320,8 +325,8 @@ def test_train_one_step_preserves_logical_batch_and_capture(
     assert grad_norm == (0.0 if zero_tokens else 1.0)
 
 
-def _make_opd_policy_args(clip: str, per_token: bool, use_tis: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(
+def _make_opd_policy_args(clip: str, per_token: bool, use_tis: bool = False):
+    return build_relax_args(
         loss_type="policy_loss",
         advantage_estimator="grpo",
         calculate_per_token_loss=per_token,

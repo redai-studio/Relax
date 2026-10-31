@@ -13,6 +13,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("megatron.training.arguments")
 
+from relax.backends.megatron import args_compat  # noqa: E402
 from relax.backends.megatron import arguments as megatron_arguments  # noqa: E402
 from relax.utils.arguments import (  # noqa: E402
     _add_fp16_optimizer_arguments,
@@ -134,8 +135,8 @@ def test_fp16_optimizer_unset_uses_legacy_fallback_and_warns_once(monkeypatch):
     args = _optimizer_args()
     warnings = _capture_warnings(monkeypatch)
 
-    megatron_arguments._resolve_optimizer_precision_args(args)
-    megatron_arguments._resolve_optimizer_precision_args(args)
+    args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
+    args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
 
     assert args.initial_loss_scale == 32768.0
     assert args.min_loss_scale == 1.0
@@ -155,7 +156,7 @@ def test_fp16_optimizer_partial_explicit_values_are_preserved(monkeypatch):
     args = _optimizer_args(initial_loss_scale=65536.0, use_precision_aware_optimizer=False)
     warnings = _capture_warnings(monkeypatch)
 
-    megatron_arguments._resolve_optimizer_precision_args(args)
+    args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
 
     assert args.initial_loss_scale == 65536.0
     assert args.min_loss_scale == 1.0
@@ -176,7 +177,7 @@ def test_fp16_optimizer_fully_explicit_values_do_not_warn(monkeypatch):
     )
     warnings = _capture_warnings(monkeypatch)
 
-    megatron_arguments._resolve_optimizer_precision_args(args)
+    args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
 
     assert args.initial_loss_scale == 65536.0
     assert args.min_loss_scale == 2.0
@@ -193,7 +194,7 @@ def test_static_loss_scale_skips_dynamic_fallbacks_and_validation(monkeypatch):
     )
     warnings = _capture_warnings(monkeypatch)
 
-    megatron_arguments._resolve_optimizer_precision_args(args)
+    args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
 
     assert args.initial_loss_scale == 0
     assert math.isnan(args.min_loss_scale)
@@ -218,7 +219,7 @@ def test_static_loss_scale_leaves_unset_dynamic_values_alone(monkeypatch):
     )
     warnings = _capture_warnings(monkeypatch)
 
-    megatron_arguments._resolve_optimizer_precision_args(args)
+    args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
     config = OptimizerConfig(**_build_optimizer_config_kwargs(args))
 
     assert args.initial_loss_scale is None
@@ -256,7 +257,7 @@ def test_fp16_optimizer_invalid_values_fail_with_parameter_name(overrides, match
     args = _optimizer_args(**values)
 
     with pytest.raises(ValueError, match=match):
-        megatron_arguments._resolve_optimizer_precision_args(args)
+        args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
 
 
 @pytest.mark.parametrize("optimizer, expected_distributed", [("adam", True), ("sgd", False)])
@@ -276,7 +277,7 @@ def test_bf16_unset_values_restore_native_megatron_defaults(monkeypatch, optimiz
 
     assert args.bf16 is True
     assert args.use_distributed_optimizer is expected_distributed
-    for name in megatron_arguments._FP16_OPTIMIZER_FALLBACKS:
+    for name in args_compat.FP16_OPTIMIZER_FALLBACKS:
         assert getattr(args, name) == getattr(native_defaults, name)
     assert warnings == []
 
@@ -291,7 +292,7 @@ def test_non_fp16_explicit_values_are_preserved(monkeypatch):
     )
     warnings = _capture_warnings(monkeypatch)
 
-    megatron_arguments._resolve_optimizer_precision_args(args)
+    args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
 
     assert args.initial_loss_scale == 16384.0
     assert args.min_loss_scale == 2.0
@@ -308,11 +309,11 @@ def test_bf16_fallback_builds_valid_optimizer_config(monkeypatch):
     args = _optimizer_args(fp16=False, bf16=True, params_dtype=torch.bfloat16)
     warnings = _capture_warnings(monkeypatch)
 
-    megatron_arguments._resolve_optimizer_precision_args(args)
+    args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
     config = OptimizerConfig(**_build_optimizer_config_kwargs(args))
 
     native_defaults = OptimizerConfig()
-    for name in megatron_arguments._FP16_OPTIMIZER_FALLBACKS:
+    for name in args_compat.FP16_OPTIMIZER_FALLBACKS:
         assert getattr(config, name) == getattr(native_defaults, name)
     assert config.fp16 is False
     assert config.bf16 is True
@@ -370,7 +371,7 @@ def test_legacy_fp16_fallback_builds_valid_optimizer_config(monkeypatch):
     args = _optimizer_args(use_distributed_optimizer=True, optimizer="adam")
     warnings = _capture_warnings(monkeypatch)
 
-    megatron_arguments._resolve_optimizer_precision_args(args)
+    args_compat.resolve_optimizer_precision_args(args, megatron_arguments.logger)
     config = OptimizerConfig(**_build_optimizer_config_kwargs(args))
 
     assert config.initial_loss_scale == 32768.0

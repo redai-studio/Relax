@@ -9,6 +9,18 @@ import pytest
 
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.engine.sft.runtime import is_preference_mode, validate_preference_args
+from tests.support.args import build_relax_args
+
+
+# Fields not declared by Relax (Megatron fields and legacy aliases): the builder does not manage these; override separately.
+_NON_DECLARED_FIELDS = {
+    "tensor_model_parallel_size": 1,
+    "pipeline_model_parallel_size": 1,
+    "hidden_dropout": 0.0,
+    "attention_dropout": 0.0,
+    # Historical alias, not yet declared by the parameter definitions (leftover, see PR description)
+    "use_gloo_process_groups": True,
+}
 
 
 def _args(**overrides) -> Namespace:
@@ -45,7 +57,11 @@ def _args(**overrides) -> Namespace:
         "seq_length": 2048,
     }
     values.update(overrides)
-    return Namespace(**values)
+    megatron = {name: values.pop(name, default) for name, default in _NON_DECLARED_FIELDS.items()}
+    args = build_relax_args(**values)
+    for name, value in megatron.items():
+        setattr(args, name, value)
+    return args
 
 
 def test_preference_mode_uses_loss_type():

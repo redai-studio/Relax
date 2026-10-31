@@ -60,7 +60,7 @@ def resolve_sft_num_rollout(config: Namespace) -> dict | None:
         config._i2i_sft_attempt_id = uuid4().hex
         return
 
-    custom_dataset_class_path = getattr(config, "custom_dataset_class_path", None)
+    custom_dataset_class_path = config.custom_dataset_class_path
     if custom_dataset_class_path:
         if config.num_rollout is None:
             raise ValueError("--loss-type sft with --custom-dataset-class requires --num-rollout.")
@@ -89,7 +89,7 @@ def resolve_sft_num_rollout(config: Namespace) -> dict | None:
     # Sized-only construction: no tokenizer/processor needed because we never
     # call get_batch — we just need len() to derive num_rollout.
     total_size = len(sizing_dataset)
-    dataset_size, eval_size = resolve_sft_eval_split(total_size, getattr(config, "eval_size", None))
+    dataset_size, eval_size = resolve_sft_eval_split(total_size, config.eval_size)
     assert dataset_size >= config.rollout_batch_size, (
         f"Offline dataset size {dataset_size} < rollout_batch_size {config.rollout_batch_size}"
     )

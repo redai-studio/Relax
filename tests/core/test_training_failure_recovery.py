@@ -14,6 +14,7 @@ from unittest.mock import Mock
 import pytest
 
 from relax.components.background_loop import BackgroundLoopRunner
+from tests.support.args import build_relax_args
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -292,7 +293,7 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
         "os": SimpleNamespace(path=os.path, environ={}),
         "cur_file_dir": str(ROOT),
         "yaml": SimpleNamespace(safe_load=lambda file: {}),
-        "args": SimpleNamespace(),
+        "args": build_relax_args(),
         "post_process_env": lambda args, env: env,
         "ray": SimpleNamespace(is_initialized=lambda: True),
         "init_tracking": Mock(),
@@ -454,7 +455,7 @@ def test_real_controller_initialization_wires_health_callback_and_preserves_rest
     monkeypatch.setattr(module, "create_dcs_deployment", Mock(return_value=(None, None)))
     monkeypatch.setattr(module.Controller, "_initialize_data_system", Mock())
     monkeypatch.setattr(module.Controller, "register_all_serve", Mock())
-    config = SimpleNamespace(use_health_check=True, use_agentic_rollout=False)
+    config = build_relax_args(use_health_check=True, use_agentic_rollout=False)
     controller = module.Controller(config)
     health.start.assert_called_once_with(
         on_unhealthy=controller._on_service_unhealthy, on_fatal=controller._on_service_fatal

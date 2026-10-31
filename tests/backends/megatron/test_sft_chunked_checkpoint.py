@@ -2,8 +2,6 @@
 
 """Chunked SFT must bound saved vocab activations and preserve backward."""
 
-from argparse import Namespace
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -13,6 +11,8 @@ try:
     from relax.backends.megatron import loss as loss_module
 except (ImportError, AttributeError) as exc:
     pytest.skip(f"Requires the pinned Megatron runtime: {exc}", allow_module_level=True)
+
+from tests.support.args import build_relax_args
 
 
 class _MainGradLinear(torch.autograd.Function):
@@ -35,7 +35,7 @@ def _setup(monkeypatch, labels, chunk_size, temperature):
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(loss_module, "validate_opd_topk_gather", lambda *_: None)
     monkeypatch.setattr(loss_module, "get_responses", lambda hidden, **_: iter([(hidden.squeeze(0), labels)]))
-    return Namespace(
+    return build_relax_args(
         sft_logits_chunk_size=chunk_size,
         rollout_temperature=temperature,
         entropy_coef=0,

@@ -2,7 +2,6 @@
 """Image data ordering must survive restart without consuming training RNG."""
 
 import json
-from argparse import Namespace
 
 import pytest
 import torch
@@ -11,6 +10,7 @@ from torch.utils.data import DistributedSampler
 from relax.backends.fsdp.arguments import validate_i2i_sft_config
 from relax.engine.sft.bootstrap import resolve_sft_num_rollout
 from relax.engine.sft.image import ImageBatchSampler, ImageEditDataset
+from tests.support.args import build_relax_args
 
 
 @pytest.mark.parametrize("size", [3, 16, 19, 64])
@@ -30,6 +30,10 @@ def test_sample_order_matches_eight_rank_reference(size):
     assert restored.batch(planner.steps_per_epoch + 1) == planner.batch(planner.steps_per_epoch + 1)
 
 
+# Fields declared by Megatron and read-only for Relax: the builder does not manage these; override explicitly as needed.
+_MEGATRON_FIELDS = {"tensor_model_parallel_size": 1}
+
+
 def _args(**overrides):
     values = dict(
         loss_type="sft",
@@ -45,7 +49,12 @@ def _args(**overrides):
         num_epoch=2,
         seed=42,
     )
-    return Namespace(**{**values, **overrides})
+    values.update(overrides)
+    megatron = {name: values.pop(name, default) for name, default in _MEGATRON_FIELDS.items()}
+    args = build_relax_args(**values)
+    for name, value in megatron.items():
+        setattr(args, name, value)
+    return args
 
 
 def test_head_validation_and_sizing_need_no_worker_mount():

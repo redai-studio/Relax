@@ -12,6 +12,7 @@ import torch
 from relax.engine.sft.dataset.streaming import ProcessedSample
 from relax.engine.sft.runtime import resolve_sft_split_indices
 from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
+from tests.support.args import build_relax_args
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +33,7 @@ def _make_processed(idx: int = 0, n_tokens: int = 8) -> ProcessedSample:
 
 
 def _make_args(global_batch_size=4, max_tokens_per_gpu=128, num_rollout=1):
-    return SimpleNamespace(
+    args = build_relax_args(
         global_batch_size=global_batch_size,
         max_tokens_per_gpu=max_tokens_per_gpu,
         context_parallel_size=1,
@@ -40,7 +41,6 @@ def _make_args(global_batch_size=4, max_tokens_per_gpu=128, num_rollout=1):
         prompt_data="/fake/train.jsonl",
         input_key="messages",
         label_key=None,
-        multimodal_keys=None,
         metadata_key="metadata",
         tool_key=None,
         system_prompt=None,
@@ -50,7 +50,6 @@ def _make_args(global_batch_size=4, max_tokens_per_gpu=128, num_rollout=1):
         sft_prefetch_chunk_size=32,
         sft_prefetch_num_workers=4,
         loss_type="sft",
-        tq_config=SimpleNamespace(),
         hf_checkpoint="/fake/model",
         start_rollout_id=0,
         seed=42,
@@ -59,6 +58,10 @@ def _make_args(global_batch_size=4, max_tokens_per_gpu=128, num_rollout=1):
         sft_image_preprocess_on_rank=False,
         custom_dataset_class_path=None,
     )
+    # ``tq_config`` is wired at runtime by the controller, not declared by the
+    # Relax parser, so it must be assigned after construction.
+    args.tq_config = SimpleNamespace()
+    return args
 
 
 def _patch_pipeline_dependencies(monkeypatch, n_samples: int = 8):
@@ -743,7 +746,7 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real, im
 
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
-    sft.config = SimpleNamespace(
+    sft.config = build_relax_args(
         loss_type="sft",
         eval_size=n_real,
         eval_interval=1,
@@ -751,8 +754,9 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real, im
         task_type="seq_cls",
         multimodal_keys={"image": "images"} if image_preprocess_on_rank else None,
         sft_image_preprocess_on_rank=image_preprocess_on_rank,
-        sft_eval_chunk_drain_timeout_sec=1,
     )
+    # Not a Relax-declared parser field; the component reads it defensively.
+    sft.config.sft_eval_chunk_drain_timeout_sec = 1
     sft.step = 0
     sft.data_system_client = fake_client
     sft._logger_instance = MagicMock()
@@ -799,14 +803,16 @@ async def test_preference_eval_preserves_pairs_and_partial_batches(loss_type, n_
         for idx in reversed(range(n_pairs))
     ]
     sft = SFT.func_or_class.__new__(SFT.func_or_class)
-    sft.config = SimpleNamespace(
+    sft.config = build_relax_args(
         loss_type=loss_type,
         eval_size=n_pairs,
         eval_interval=1,
         global_batch_size=4,
-        data_parallel_size=dp_size,
         multimodal_keys=None,
     )
+    # ``data_parallel_size`` is assigned by the engine wiring at runtime, not
+    # declared by the Relax parser.
+    sft.config.data_parallel_size = dp_size
     sft.step = 20
     sft.data_system_client = SimpleNamespace(async_put=AsyncMock())
     sft._logger_instance = MagicMock()

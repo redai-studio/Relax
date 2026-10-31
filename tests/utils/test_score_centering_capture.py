@@ -23,6 +23,7 @@ from relax.utils.score_centering import (
     validate_score_centering_sample,
 )
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args, declared_parameter_names
 
 
 def _args(**overrides):
@@ -34,7 +35,14 @@ def _args(**overrides):
         score_centering_vocab_size=8,
     )
     values.update(overrides)
-    return SimpleNamespace(**values)
+    # score_centering_vocab_size 等不在 Relax 参数声明表中，不能走 kwargs，
+    # 构造后显式赋回。
+    declared = declared_parameter_names()
+    args = build_relax_args(**{k: v for k, v in values.items() if k in declared})
+    for k, v in values.items():
+        if k not in declared:
+            setattr(args, k, v)
+    return args
 
 
 def _metadata():
