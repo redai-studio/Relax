@@ -720,9 +720,7 @@ def compute_advantages_and_returns(
     padded_total_lengths: list[int] | None = maybe_padded_total_lengths(
         total_lengths,
         args.qkv_format,
-        getattr(args, "is_vl_model", False)
-        or rollout_data.get("multimodal_train_inputs") is not None
-        or getattr(args, "uses_unsplit_forward", False),
+        args.is_vl_model or rollout_data.get("multimodal_train_inputs") is not None or args.uses_unsplit_forward,
     )
 
     # return when not the last pp stage.
@@ -1821,7 +1819,7 @@ def loss_function(
             case "rm":
                 func = reward_model_loss_function
             case "sft":
-                if getattr(args, "task_type", "causal_lm") == "seq_cls":
+                if args.task_type == "seq_cls":
                     func = sequence_classification_loss_function
                 elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
                     # Bind lm_head_forward so chunked path matches the standard
@@ -1903,7 +1901,7 @@ def loss_function(
         # full-count denominator, leaving the final loss/grad unchanged.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
-    is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+    is_sequence_classification = args.task_type == "seq_cls"
     denominator = (
         effective_num_tokens
         if args.calculate_per_token_loss or is_sequence_classification

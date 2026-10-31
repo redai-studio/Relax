@@ -321,7 +321,9 @@ def test_train_one_step_preserves_logical_batch_and_capture(
 
 
 def _make_opd_policy_args(clip: str, per_token: bool, use_tis: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(
+    from tests.helpers.relax_args import make_args
+
+    return make_args(
         loss_type="policy_loss",
         advantage_estimator="grpo",
         calculate_per_token_loss=per_token,

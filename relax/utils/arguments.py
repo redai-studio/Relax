@@ -3057,6 +3057,31 @@ def _s3_model_download_disabled() -> bool:
     return pre.disable_s3_model_download
 
 
+def init_runtime_args(args, *, model_source=None) -> None:
+    """Establish runtime-only fields that have no CLI declaration.
+
+    ``model_source`` is the driver-derived descriptor serialized with args to
+    every Ray actor. ``is_vl_model`` and ``uses_unsplit_forward`` start False
+    and are overwritten by actor / bridge init, so business code can read them
+    directly before those writers run. The shared test args factory calls this
+    same function instead of keeping its own placeholder table.
+    """
+    args.model_source = model_source
+    args.is_vl_model = False
+    args.uses_unsplit_forward = False
+
+
+def derive_use_critic(args) -> bool:
+    """Return the critic role switch for a run.
+
+    Offline objectives (SFT / DPO / RM) never deploy a critic; RL runs follow
+    the algorithm registry.
+    """
+    if is_offline_mode(args):
+        return False
+    return get_algorithm(args.advantage_estimator).needs_critic
+
+
 def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if any(token.split("=", 1)[0] == "--sft-objective" for token in sys.argv[1:]):
         raise ValueError("--sft-objective has been removed; select the training objective with --loss-type instead.")
@@ -3119,8 +3144,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # overriding an intentional --start-rollout-id.
     args._start_rollout_id_explicit = args.start_rollout_id is not None
 
-    # Serialize the driver-derived descriptor with args to every Ray actor.
-    args.model_source = model_source
+    init_runtime_args(args, model_source=model_source)
     # --lora-target-modules is backend-flavoured: Megatron wants Megatron module
     # names, the FSDP generative backend wants diffusers module-name suffixes and
     # gets a per-model-family default from its adapter. Resolve the Megatron
@@ -3340,7 +3364,7 @@ def _validate_cpt_args(args) -> None:
         if getattr(args, "sft_cpt_template", "raw") != "raw":
             raise ValueError("--sft-cpt-template requires --sft-training-mode cpt.")
         return
-    if not is_sft_mode(args) or getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if not is_sft_mode(args) or args.task_type != "causal_lm":
         raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
     incompatible = {
         "--label-key": getattr(args, "label_key", None),
@@ -3744,7 +3768,7 @@ def validate_algorithm_args(args) -> None:
     # batch. Resolve them here, while the error can still name the culprit.
     _assert_spec_implementations_resolve(spec)
 
-    args.use_critic = spec.needs_critic
+    args.use_critic = derive_use_critic(args)
     _validate_score_centering_args(args)
 
     if not spec.supports_context_parallel and (
@@ -4456,7 +4480,7 @@ def slime_validate_args(args):
     elif getattr(args, "sft_async_prepack", False):
         raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
-    task_type = getattr(args, "task_type", "causal_lm")
+    task_type = args.task_type
     if task_type == "seq_cls":
         if not is_sft_mode(args):
             raise ValueError("--task-type seq_cls requires --loss-type sft.")
@@ -4487,7 +4511,7 @@ def slime_validate_args(args):
 
     # `use_critic` is set by validate_algorithm_args for RL; offline training has no critic.
     if is_offline:
-        args.use_critic = False
+        args.use_critic = derive_use_critic(args)
     # Synchronous PPO has no producer for
     # `ref_log_probs`: actor's ref forward in backends/megatron/actor.py:800 is
     # gated on `advantage_estimator != "ppo"`, and the sync role set does not

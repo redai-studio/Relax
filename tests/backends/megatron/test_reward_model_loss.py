@@ -98,9 +98,11 @@ def test_reward_model_packing_preserves_terminal_scores_loss_and_gradients(
         assert packed.cu_seqlens_q.tolist() == [*boundaries, *([16] if padding else [])]
         assert packed.cu_seqlens_q_padded is None
 
+    from tests.helpers.relax_args import make_args
+
     flat = (batch["tokens"][0].float() / 10).requires_grad_()
     logits = flat.reshape(1, -1, 1)
-    args = Namespace(
+    args = make_args(
         loss_type="rm",
         qkv_format="thd",
         calculate_per_token_loss=False,
@@ -150,7 +152,9 @@ def test_reward_model_packing_preserves_terminal_scores_loss_and_gradients(
     ],
 )
 def test_reward_model_loss_rejects_mismatched_pairs(monkeypatch, mutation, match):
+    from tests.helpers.relax_args import make_args
+
     batch = _batch(monkeypatch)
     mutation(batch)
     with pytest.raises(ValueError, match=match):
-        reward_model_loss_function(Namespace(), batch, torch.zeros(1, 11, 1), lambda value: value)
+        reward_model_loss_function(make_args(), batch, torch.zeros(1, 11, 1), lambda value: value)

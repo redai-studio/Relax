@@ -73,29 +73,31 @@ def _backend(monkeypatch, *, rank=0, cp_size=1, tp_size=1):
 
 
 def _args(**overrides):
-    values = dict(
-        advantage_estimator="score_centering",
-        loss_type="policy_loss",
-        score_centering_vocab_size=5,
-        rollout_temperature=0.7,
-        log_probs_chunk_size=-1,
-        qkv_format="thd",
-        allgather_cp=False,
-        entropy_coef=0.1,
-        use_kl_loss=False,
-        true_on_policy_mode=False,
-        use_rollout_logprobs=False,
-        use_opsm=False,
-        use_tis=False,
-        get_mismatch_metrics=False,
-        custom_pg_loss_reducer_function_path=None,
-        score_centering_is="none",
-        score_centering_tis_clip=2.0,
-        score_centering_mis_low=0.5,
-        score_centering_mis_high=5.0,
-    )
+    from tests.helpers.relax_args import make_args
+
+    values = {
+        "advantage_estimator": "score_centering",
+        "loss_type": "policy_loss",
+        "score_centering_vocab_size": 5,
+        "rollout_temperature": 0.7,
+        "log_probs_chunk_size": -1,
+        "qkv_format": "thd",
+        "allgather_cp": False,
+        "entropy_coef": 0.1,
+        "use_kl_loss": False,
+        "true_on_policy_mode": False,
+        "use_rollout_logprobs": False,
+        "use_opsm": False,
+        "use_tis": False,
+        "get_mismatch_metrics": False,
+        "custom_pg_loss_reducer_function_path": None,
+        "score_centering_is": "none",
+        "score_centering_tis_clip": 2.0,
+        "score_centering_mis_low": 0.5,
+        "score_centering_mis_high": 5.0,
+    }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return make_args(**values)
 
 
 @pytest.mark.parametrize("already_imported", [False, True])
