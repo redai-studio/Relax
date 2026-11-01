@@ -311,7 +311,9 @@ COPY requirements.txt /tmp/requirements.txt
 # Align the older Relax pins with the CUDA 13 base: CuPy 14 needs NumPy 2,
 # which requires a compatible PyArrow; kernels also needs Hub >=1.10.
 # ClearML 2.1.4 accepts PyJWT >=2.11 alongside current MCP releases.
+# Install the NVCC wrapper in this layer: the inherited CUDA image is already deep.
 RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq-assignment.patch \
+    --mount=type=bind,source=docker/scripts/nvcc-without-preload.sh,target=/tmp/nvcc-without-preload.sh \
     sed -i \
     -e 's/^clearml==2\.1\.3$/clearml==2.1.4/' \
     -e 's/numpy<2/numpy==2.2.6/g' \
@@ -323,11 +325,8 @@ RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-trans
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
     TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
-    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
-
-# Isolate all NVCC-based JIT compilers from training preloads, including external TRAIN_IMAGE builds.
-COPY docker/scripts/nvcc-without-preload.sh /tmp/nvcc-without-preload.sh
-RUN NVCC_BIN=/usr/local/cuda/bin && \
+    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch && \
+    NVCC_BIN=/usr/local/cuda/bin && \
     if [ -e "$NVCC_BIN/nvcc.real" ]; then \
         cmp /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
     else \
@@ -336,7 +335,7 @@ RUN NVCC_BIN=/usr/local/cuda/bin && \
         mv "$NVCC_BIN/nvcc" "$NVCC_BIN/nvcc.real" && \
         install -m 755 /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
     fi && \
-    "$NVCC_BIN/nvcc" --version && rm /tmp/nvcc-without-preload.sh
+    "$NVCC_BIN/nvcc" --version
 
 # Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
