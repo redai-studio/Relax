@@ -321,6 +321,70 @@ def test_flops_counter_vl_estimation(config_name):
         )
 
 
+@pytest.mark.parametrize(
+    "config_name, block_weights, head_weights",
+    [("qwen3_5", 243_269_632, 1_017_118_720), ("qwen3_5_moe", 64_489_472, 508_559_360)],
+)
+@pytest.mark.parametrize("depth", [1, 3])
+@pytest.mark.parametrize("detach_paths, head_factor", [((), 6), (("embedding", "backbone", "lm-head"), 4)])
+def test_qwen35_mtp_counts_block_and_each_head(
+    config_name, block_weights, head_weights, depth, detach_paths, head_factor
+):
+    # Concrete MTP shapes: eh_proj[H,2H], gated full-attention projections,
+    # dense/active-expert MLP weights, and shared output[V,H]. Both use 16x256 attention.
+    config = Config(FLOPS_TEST_VL_CONFIGS[config_name]["config"])
+    counter = FlopsCounter(config)
+    lengths = [9, 5]
+    base, _ = counter.estimate(lengths, 1.0, images_seqlens=[16])
+    actual, _ = counter.estimate(
+        lengths,
+        2.0,
+        images_seqlens=[16],
+        enable_mtp_training=True,
+        mtp_num_layers=depth,
+        mtp_detach_paths=detach_paths,
+    )
+    added = depth * (14 * (6 * block_weights + head_factor * head_weights) + 24_576 * (9**2 + 5**2))
+    assert (actual * 2 - base) * 1e12 == pytest.approx(added)
+
+
+@pytest.mark.parametrize("enable, depth", [(False, 3), (True, None), (True, 0)])
+def test_qwen35_inactive_mtp_preserves_existing_estimate(enable, depth):
+    counter = FlopsCounter(Config(FLOPS_TEST_VL_CONFIGS["qwen3_5_moe"]["config"]))
+    base, _ = counter.estimate([9, 5], 1.0)
+    actual, _ = counter.estimate([9, 5], 1.0, enable_mtp_training=enable, mtp_num_layers=depth)
+    assert actual == base
+
+
+@pytest.mark.parametrize("mtp_only", [False, True])
+def test_qwen35_forward_only_does_not_count_training_mtp(mtp_only):
+    counter = FlopsCounter(Config(FLOPS_TEST_VL_CONFIGS["qwen3_5_moe"]["config"]))
+    base, _ = counter.estimate([9, 5], 1.0, forward_only=True)
+    actual, _ = counter.estimate(
+        [9, 5], 1.0, forward_only=True, enable_mtp_training=True, mtp_num_layers=1, mtp_only_training=mtp_only
+    )
+    assert actual == base
+
+
+def test_qwen35_mtp_only_freezes_backbone_and_skips_main_head():
+    counter = FlopsCounter(Config(FLOPS_TEST_VL_CONFIGS["qwen3_5_moe"]["config"]))
+    base, _ = counter.estimate([9, 5], 1.0, images_seqlens=[16], forward_only=True)
+    actual, _ = counter.estimate(
+        [9, 5], 1.0, images_seqlens=[16], enable_mtp_training=True, mtp_num_layers=1, mtp_only_training=True
+    )
+    # Frozen main LM head is bypassed; MTP head still performs forward and dX.
+    added = 14 * (6 * 64_489_472 + 4 * 508_559_360) + 24_576 * (9**2 + 5**2)
+    assert actual * 1e12 == pytest.approx(base * 1e12 - 2 * 14 * 508_559_360 + added)
+
+
+def test_qwen35_mtp_defaults_to_detached_head_without_dropping_joint_backbone_backward():
+    counter = FlopsCounter(Config(FLOPS_TEST_VL_CONFIGS["qwen3_5_moe"]["config"]))
+    options = dict(enable_mtp_training=True, mtp_num_layers=1)
+    default, _ = counter.estimate([9, 5], 1.0, **options)
+    head_only, _ = counter.estimate([9, 5], 1.0, **options, mtp_detach_paths=("lm-head",))
+    assert default == head_only
+
+
 @pytest.mark.parametrize("config_name", list(FLOPS_TEST_OMNI_CONFIGS.keys()))
 def test_flops_counter_omni_estimation(config_name):
     test_data = FLOPS_TEST_OMNI_CONFIGS[config_name]
