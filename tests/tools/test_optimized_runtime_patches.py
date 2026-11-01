@@ -18,31 +18,60 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_manifest_patch_hashes_use_files_copied_into_runtime_stage(tmp_path):
+def test_manifest_patch_hashes_use_runtime_stage_inputs(tmp_path):
     """Builder-only files must not satisfy the runtime manifest's inputs."""
     dockerfile = (ROOT / "docker/Dockerfile.cu13").read_text().replace("\\\n", "")
     stage = None
     copied = {}
+    available = {}
     for line in dockerfile.splitlines():
-        if not line.startswith(("FROM ", "COPY ")):
+        if not line.startswith(("FROM ", "COPY ", "RUN ")):
             continue
         words = shlex.split(line)
         if words[0] == "FROM":
             stage = words[-1]
-        if words[0] != "COPY" or stage not in {"relax_build", "relax_ep", "relax_blackwell"}:
+        if stage not in {"relax_build", "relax_ep", "relax_blackwell"}:
             continue
-        if words[1].startswith("--"):
-            continue
-        for source in words[1:-1]:
-            if not source.endswith(".patch") or "$" in source:
+        if words[0] == "COPY":
+            if words[1].startswith("--"):
                 continue
-            destination = words[-1]
-            if destination.endswith("/"):
-                destination += Path(source).name
-            target = tmp_path / destination.lstrip("/")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(ROOT / source, target)
-            copied[destination] = ROOT / source
+            for source in words[1:-1]:
+                if source.endswith(".patch") and "$" not in source:
+                    destination = words[-1]
+                    if destination.endswith("/"):
+                        destination += Path(source).name
+                    copied[destination] = ROOT / source
+        elif words[0] == "RUN":
+            available = copied.copy()
+            for word in words[1:]:
+                if not word.startswith("--mount="):
+                    break
+                mount = dict(item.split("=", 1) for item in word.removeprefix("--mount=").split(",") if "=" in item)
+                if mount.get("type") != "bind" or "from" in mount:
+                    continue
+                source = ROOT / mount["source"]
+                target = Path(mount["target"])
+                for patch in source.rglob("*.patch") if source.is_dir() else [source]:
+                    if patch.suffix == ".patch":
+                        destination = target / patch.relative_to(source) if source.is_dir() else target
+                        available[str(destination)] = patch
+            # Retained patches copied out of a bind mount survive later RUNs.
+            for index, word in enumerate(words):
+                if word != "cp" or words[index - 1] not in {"RUN", "&&"}:
+                    continue
+                end = next((i for i in range(index + 1, len(words)) if words[i] == "&&"), len(words))
+                destination = words[end - 1]
+                for source in words[index + 1 : end - 1]:
+                    if source in available:
+                        path = destination + Path(source).name if destination.endswith("/") else destination
+                        copied[path] = available[path] = available[source]
+            if "/opt/relax/record_qwen35_runtime.py" in words:
+                break
+
+    for destination, source in available.items():
+        target = tmp_path / destination.lstrip("/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
 
     tree = ast.parse((ROOT / "docker/scripts/record_qwen35_runtime.py").read_text())
     report = next(
@@ -58,7 +87,7 @@ def test_manifest_patch_hashes_use_files_copied_into_runtime_stage(tmp_path):
     paths = ast.literal_eval(expression.generators[0].iter.func.value)
     assert set(result) == {"deepep", "fa4", "flashqla", "megatron", "model_operators", "checkpoint"}
     for name, path in paths.items():
-        assert result[name] == hashlib.sha256(copied[path].read_bytes()).hexdigest()
+        assert result[name] == hashlib.sha256(available[path].read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize(
