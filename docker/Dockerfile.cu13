@@ -228,17 +228,14 @@ COPY docker/scripts/ensure_sgl_kernel_sm103.py /tmp/ensure_sgl_kernel_sm103.py
 RUN python /tmp/ensure_sgl_kernel_sm103.py
 
 # TE 2.18 replaces the old 2.14.1 attention selector. Do not apply the old tuple sed patch.
-RUN python -c "import importlib.metadata as m; \
-assert m.version('transformer-engine') == '2.18.0'"
 # Avoid host scalar synchronization when clearing context-parallel gradient padding.
-COPY docker/patch/transformer_engine/2.18.0-cp-padding-no-host-sync.patch /tmp/te-cp-padding-no-host-sync.patch
-RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/te-cp-padding-no-host-sync.patch
-
 # Keep FA4 for supported training heads and use the native fallback for head72.
-COPY docker/patch/transformer_engine/2.18.0-blackwell-fa4-head-dim.patch /tmp/te-blackwell-fa4-head-dim.patch
-RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/te-blackwell-fa4-head-dim.patch
+# Mount build inputs so patches and installation artifacts do not add image layers.
+RUN --mount=type=bind,source=docker/patch/transformer_engine,target=/tmp/te-patches \
+    python -c "import importlib.metadata as m; assert m.version('transformer-engine') == '2.18.0'" && \
+    cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/2.18.0-cp-padding-no-host-sync.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/2.18.0-blackwell-fa4-head-dim.patch
 
 ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
@@ -302,37 +299,37 @@ RUN cd /sgl-workspace/sglang && \
     pip install --no-cache-dir transformers==5.16.0 tokenizers==0.23.2 && \
     rm /tmp/sglang.patch
 
-COPY --from=tree_core_builder /opt/relax-tree-core /opt/relax-tree-core
-COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
-RUN python /tmp/build_sglang_tree_core.py install /opt/relax-tree-core
-
-COPY requirements.txt /tmp/requirements.txt
+RUN --mount=type=bind,from=tree_core_builder,source=/opt/relax-tree-core,target=/tmp/relax-tree-core \
+    --mount=type=bind,source=docker/scripts/build_sglang_tree_core.py,target=/tmp/build_sglang_tree_core.py \
+    python /tmp/build_sglang_tree_core.py install /tmp/relax-tree-core
 
 # Align the older Relax pins with the CUDA 13 base: CuPy 14 needs NumPy 2,
 # which requires a compatible PyArrow; kernels also needs Hub >=1.10.
 # ClearML 2.1.4 accepts PyJWT >=2.11 alongside current MCP releases.
 RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq-assignment.patch \
+    --mount=type=bind,source=requirements.txt,target=/tmp/requirements.in \
+    cp /tmp/requirements.in /tmp/requirements.txt && \
     sed -i \
     -e 's/^clearml==2\.1\.3$/clearml==2.1.4/' \
     -e 's/numpy<2/numpy==2.2.6/g' \
     -e 's/pyarrow==14\.0\.2/pyarrow==20.0.0/g' \
     -e 's/huggingface_hub==1\.7\.2/huggingface_hub==1.10.0/g' \
     /tmp/requirements.txt && \
-    pip install --ignore-installed 'PyJWT>=2.10.1,<3' && \
+    pip install --no-cache-dir --ignore-installed 'PyJWT>=2.10.1,<3' && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
+    pip install --no-cache-dir "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
     TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
-    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
+    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch && \
+    rm /tmp/requirements.txt
 
 # Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
-COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
-RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
+RUN --mount=type=bind,from=router_builder,source=/opt/router-wheels,target=/tmp/router-wheels \
+    python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
     python -c "import json, importlib.resources as r, sglang_router; from sglang_router import sglang_router_rs; \
         b = json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()); \
         assert sglang_router.__version__ == b['version'] == '0.3.2+slime.dpaware'; \
-        assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)" && \
-    rm -rf /tmp/router-wheels
+        assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)"
 
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch \
