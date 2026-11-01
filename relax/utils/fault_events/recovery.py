@@ -2,9 +2,27 @@
 """Evidence required by local and global recovery plans."""
 
 from argparse import Namespace
-from collections.abc import Collection
+from collections.abc import Callable, Collection
+
+from relax.utils.logging_utils import get_logger
 
 from .models import RecoveryEvidence
+
+
+logger = get_logger(__name__)
+
+
+def observe_recovery(observer: Callable[..., None] | None, *, observed: int = 0, failed: int = 0) -> None:
+    if observer is None:
+        return
+    try:
+        observer(observed=observed, failed=failed)
+    except Exception:
+        # A caller-provided observer or a custom logger must not alter restart.
+        try:
+            logger.warning("Fault observation unavailable")
+        except Exception:
+            pass
 
 
 def expected_evidence(mode: str, config: Namespace, roles: Collection[str]) -> int:

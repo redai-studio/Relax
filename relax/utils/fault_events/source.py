@@ -8,6 +8,7 @@ from .context import (
     FaultTraceContext,
     capture_trace_context,
     parse_trace_context,
+    parse_trace_contexts,
 )
 from .models import ROLES, FaultContext, new_id, service_role, valid_uint
 
@@ -147,3 +148,49 @@ class FaultSource:
         except Exception:
             pass
         return result
+
+
+def _validated_trace_contexts(payload: object) -> dict:
+    """Discard invalid optional metadata without changing local health."""
+    try:
+        return {key: value.to_payload() for key, value in parse_trace_contexts(payload).items()}
+    except Exception:
+        return {}
+
+
+def fault_details(fault: object, source: FaultSource | None, role: str, observation_error: bool) -> dict:
+    """Assemble one observed fault and its optional D/U trace sidecars."""
+    # A source replaced by None after a failed observation stays unavailable.
+    unavailable = observation_error or source is None or source.observation_error
+    if fault is not None and type(fault) is not dict:
+        fault, unavailable = None, True
+    result = {
+        "fault": fault,
+        "observation_error": unavailable,
+    }
+    if fault is not None:
+        try:
+            contexts = _validated_trace_contexts(source.trace_contexts(role))
+            ids = (fault.get("event_id"), fault.get("fatal_event_id"))
+            contexts = {key: value for key, value in contexts.items() if key in ids}
+            if contexts:
+                result["trace_contexts"] = contexts
+        except Exception:
+            pass
+    return result
+
+
+def snapshot_details(observed: object, generation: int | None, observation_error: bool) -> dict:
+    """Normalize observation metadata before it joins authoritative health
+    roles."""
+    if type(observed) is not dict or type(observed.get("faults")) is not list or len(observed["faults"]) > 9:
+        observed = {"faults": [], "observation_error": True}
+    result = {
+        "source_generation": generation,
+        "faults": observed["faults"],
+        "observation_error": observation_error or observed.get("observation_error") is not False,
+    }
+    contexts = _validated_trace_contexts(observed.get("trace_contexts"))
+    if contexts:
+        result["trace_contexts"] = contexts
+    return result

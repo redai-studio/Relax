@@ -19,8 +19,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import FaultContext, RecoveryEvidence, new_id
-from relax.utils.fault_events.recovery import expected_evidence
+from relax.utils.fault_events.recovery import expected_evidence, observe_recovery
 from relax.utils.fault_events.runtime import FaultEventRuntime
 
 
@@ -112,23 +113,16 @@ def records(runtime):
     pytest.fail("event consumer failed to drain")
 
 
-def make_service(trace, *, failure=None, observer_log_failure=False):
-    logger = Mock()
-    if observer_log_failure:
-
-        def warning(message, *args, **kwargs):
-            if message == "Fault observation unavailable":
-                raise RuntimeError("observation log failure")
-
-        logger.warning.side_effect = warning
+def make_service(trace, *, failure=None):
     namespace = {
-        "logger": logger,
+        "logger": Mock(),
+        "observe_recovery": observe_recovery,
         "time": SimpleNamespace(sleep=lambda seconds: trace.append(("sleep", seconds))),
         "serve": SimpleNamespace(delete=lambda role: trace.append(("delete", role))),
         "ray": SimpleNamespace(get=lambda value: value),
         "recovery_load_path": lambda config: trace.append("load_path"),
     }
-    cls = load_classes("relax/core/service.py", {"Service", "_observe_recovery"}, namespace)["Service"]
+    cls = load_classes("relax/core/service.py", {"Service"}, namespace)["Service"]
     service = object.__new__(cls)
     service.role = Roles.advantages
     service.config = SimpleNamespace()
@@ -248,9 +242,12 @@ def test_actual_local_restart_preserves_business_trace_and_uses_real_step_eviden
     assert runtime.generation == 0
 
 
-def test_observer_and_its_log_failure_do_not_change_actual_service_restart():
+def test_observer_and_its_log_failure_do_not_change_actual_service_restart(monkeypatch):
+    logger = Mock()
+    logger.warning.side_effect = RuntimeError("observation log failure")
+    monkeypatch.setattr(recovery, "logger", logger)
     trace, baseline = [], []
-    observed_service = make_service(trace, observer_log_failure=True)
+    observed_service = make_service(trace)
     baseline_service = make_service(baseline)
 
     def fail_observation(**kwargs):
@@ -259,6 +256,7 @@ def test_observer_and_its_log_failure_do_not_change_actual_service_restart():
     baseline_service.restart()
     observed_service.restart(fault_observer=fail_observation)
     assert trace == baseline
+    logger.warning.assert_called_with("Fault observation unavailable")
 
 
 def test_default_off_never_evaluates_recovery_plan():
