@@ -2,15 +2,13 @@
 
 """CPU regressions for native GDN and the upgraded GPT MTP boundary.
 
-Set RELAX_MEGATRON_PATCHED_SOURCE to an isolated patched Megatron source root
-or its gpt_model.py file to enable GPT cases. No Megatron packages are
-imported.
+GPT cases exercise the installed patched Megatron model when available.
 """
 
 from __future__ import annotations
 
 import ast
-import os
+import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -21,12 +19,9 @@ import pytest
 _MODEL_SOURCE = Path(__file__).resolve().parents[3] / "relax/backends/megatron/model.py"
 
 
-def _load_functions(source: Path, names: set[str], namespace: dict, class_name: str | None = None) -> dict:
+def _load_functions(source: Path, names: set[str], namespace: dict) -> dict:
     tree = ast.parse(source.read_text())
-    body = tree.body
-    if class_name is not None:
-        body = next(node.body for node in body if isinstance(node, ast.ClassDef) and node.name == class_name)
-    functions = [node for node in body if isinstance(node, ast.FunctionDef) and node.name in names]
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in functions} == names
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
     return namespace
@@ -93,15 +88,11 @@ def test_megatron_upgrade_native_gdn_preserves_config_and_forward(gdn_types, mod
 
 
 @pytest.fixture
-def gpt_postprocess():
-    source_root = os.environ.get("RELAX_MEGATRON_PATCHED_SOURCE")
-    if not source_root:
-        pytest.skip("RELAX_MEGATRON_PATCHED_SOURCE must point to isolated patched Megatron source")
-    source = Path(source_root)
-    if source.is_dir():
-        source = source / "megatron/core/models/gpt/gpt_model.py"
-    assert source.is_file(), f"Patched GPT source does not exist: {source}"
+def gpt_postprocess(monkeypatch):
+    if importlib.util.find_spec("megatron") is None:
+        pytest.skip("Megatron is not installed")
     import torch
+    from megatron.core.models.gpt import gpt_model
 
     calls = {"roll": [], "prepare": [], "prefetch": [], "mtp": [], "loss": [], "output": []}
     state = {"inference": False}
@@ -134,18 +125,11 @@ def gpt_postprocess():
         calls["output"].append(kwargs)
         return kwargs["hidden_states"]
 
-    namespace = _load_functions(
-        source,
-        {"_postprocess"},
-        {
-            "InferenceMode": types.SimpleNamespace(is_active=lambda: state["inference"]),
-            "roll_tensor": roll,
-            "resolve_cp_group": lambda static_group, packed: cp_group,
-            "prepare_mtp_sequence_roll_context": prepare,
-            "process_mtp_loss": loss,
-        },
-        class_name="GPTModel",
-    )
+    monkeypatch.setattr(gpt_model, "InferenceMode", types.SimpleNamespace(is_active=lambda: state["inference"]))
+    monkeypatch.setattr(gpt_model, "roll_tensor", roll)
+    monkeypatch.setattr(gpt_model, "resolve_cp_group", lambda static_group, packed: cp_group)
+    monkeypatch.setattr(gpt_model, "prepare_mtp_sequence_roll_context", prepare)
+    monkeypatch.setattr(gpt_model, "process_mtp_loss", loss)
     model = types.SimpleNamespace(
         config=types.SimpleNamespace(mtp_num_layers=2, use_mup=False),
         post_process=True,
@@ -174,7 +158,7 @@ def gpt_postprocess():
         "output_processor_context": object(),
     }
     return types.SimpleNamespace(
-        fn=namespace["_postprocess"],
+        fn=gpt_model.GPTModel._postprocess,
         model=model,
         kwargs=kwargs,
         calls=calls,
