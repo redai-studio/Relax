@@ -89,8 +89,8 @@ def test_megatron_upgrade_native_gdn_preserves_config_and_forward(gdn_types, mod
 
 @pytest.fixture
 def gpt_postprocess(monkeypatch):
-    if importlib.util.find_spec("megatron") is None:
-        pytest.skip("Megatron is not installed")
+    if importlib.util.find_spec("megatron") is None or importlib.util.find_spec("megatron.core") is None:
+        pytest.skip("Megatron Core is not installed")
     import torch
     from megatron.core.models.gpt import gpt_model
 
