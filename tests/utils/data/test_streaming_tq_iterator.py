@@ -9,6 +9,12 @@ import torch
 
 
 def _load_stream_module(monkeypatch):
+    # Restore the real module through both import paths after each test.
+    parent = importlib.import_module("relax.utils.data")
+    monkeypatch.setattr(parent, "stream_dataloader", None, raising=False)
+    monkeypatch.setitem(sys.modules, "relax.utils.data.stream_dataloader", None)
+    sys.modules.pop("relax.utils.data.stream_dataloader")
+
     megatron = types.ModuleType("megatron")
     core = types.ModuleType("megatron.core")
     mpu = types.ModuleType("megatron.core.mpu")
@@ -46,7 +52,6 @@ def _load_stream_module(monkeypatch):
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    sys.modules.pop("relax.utils.data.stream_dataloader", None)
     return importlib.import_module("relax.utils.data.stream_dataloader")
 
 
@@ -587,9 +592,9 @@ def test_sft_token_lengths_leave_rl_batch_unchanged(monkeypatch):
 def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
     monkeypatch, dynamic_cp, allgather_cp, cp_rank, expected_rows
 ):
-    stream_module = _load_stream_module(monkeypatch)
     from relax.backends.megatron import cp_utils
 
+    stream_module = _load_stream_module(monkeypatch)
     monkeypatch.setattr(cp_utils, "mpu", stream_module.mpu)
     monkeypatch.setattr(stream_module.mpu, "get_context_parallel_world_size", lambda: 2, raising=False)
     monkeypatch.setattr(stream_module.mpu, "get_context_parallel_rank", lambda: cp_rank)

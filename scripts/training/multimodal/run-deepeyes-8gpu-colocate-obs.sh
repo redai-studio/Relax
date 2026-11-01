@@ -23,7 +23,6 @@ TIMESTAMP=$(date "+%Y-%m-%d-%H:%M:%S")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 AGENT_DIR="${RELAX_ROOT}/examples/deepeyes_agentic"
-export MEGATRON=/root/Megatron-LM
 if [ "${DRY_RUN:-0}" != 1 ] && [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi

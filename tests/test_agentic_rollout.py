@@ -1310,8 +1310,17 @@ async def test_score_centering_partial_attempts_commit_aligned_candidates() -> N
 
 
 @pytest.mark.parametrize("capacity_limit", ["budget", "backend_error", "zero_decode"])
-async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_limit: str) -> None:
+@pytest.mark.parametrize("observe", [False, True])
+async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_limit: str, tmp_path, observe) -> None:
+    from relax.agentic.observability import SessionObservation, ShardTrajectoryRecorder
+
     shard, _group, session, ir = _router_recovery_shard()
+    if observe:
+        session.observation = SessionObservation()
+        session.observation.begin_call(ir.request_id)
+        shard._trajectory_recorder = ShardTrajectoryRecorder(
+            Namespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="capacity"), shard_ordinal=0
+        )
     shard.args.agentic_reasoning_parser = None
     shard.args.agentic_tool_call_parser = None
     shard._max_context_len = lambda _group: 100
@@ -1365,6 +1374,12 @@ async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_
         await task
         generate.assert_awaited_once()
 
+    if observe:
+        await shard._trajectory_recorder.aclose()
+        call = session.observation.calls[ir.request_id]
+        assert call["status"] == "completed" and call["finished_at"] is not None
+        assert call["response_length"] == 2 and call["finish_reason"] == "length"
+        assert call["resp_state_hash"] == session.resp_state_hash_by_request_id[ir.request_id]
     payload = ir.waiter.result()
     assert payload["finish_reason"] == "length"
     assert payload["message"]["content"] == "ab"
@@ -1381,8 +1396,17 @@ async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_
 
 
 @pytest.mark.parametrize("backend_error", [False, True])
-async def test_agentic_no_decode_capacity_returns_context_error_without_commit(backend_error: bool) -> None:
+@pytest.mark.parametrize("observe", [False, True])
+async def test_agentic_no_decode_capacity_returns_context_error_without_commit(backend_error: bool, tmp_path, observe):
+    from relax.agentic.observability import SessionObservation, ShardTrajectoryRecorder
+
     shard, _group, session, ir = _router_recovery_shard()
+    if observe:
+        session.observation = SessionObservation()
+        session.observation.begin_call(ir.request_id)
+        shard._trajectory_recorder = ShardTrajectoryRecorder(
+            Namespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="capacity"), shard_ordinal=0
+        )
     shard._max_context_len = lambda _group: 100
     ir.pending_token_delta = []
     ir.history_train_token_prefix = [112]
@@ -1411,6 +1435,11 @@ async def test_agentic_no_decode_capacity_returns_context_error_without_commit(b
     ir.runner_task = task
     await task
 
+    if observe:
+        await shard._trajectory_recorder.aclose()
+        call = session.observation.calls[ir.request_id]
+        assert call["status"] == "failed" and call["finished_at"] is not None
+        assert call["reason_code"] == "context_length_exceeded"
     payload = ir.waiter.result()
     assert payload["error"]["code"] == "context_length_exceeded"
     assert ir not in session.live_irs and not session.queued_irs

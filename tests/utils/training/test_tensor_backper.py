@@ -25,6 +25,7 @@ import torch
 pytest.importorskip("megatron.core")
 
 from relax.utils import device as device_utils
+from relax.utils.training import tensor_backper
 from relax.utils.training.tensor_backper import TensorBackuper, _TensorBackuperNoop
 
 
@@ -44,7 +45,8 @@ def _source_of(params: dict[str, torch.Tensor]):
     return lambda: params.items()
 
 
-def test_backup_cpu_snapshot_attaches_tp_attrs():
+def test_backup_cpu_snapshot_attaches_tp_attrs(monkeypatch):
+    monkeypatch.setattr(tensor_backper, "_PIN_MEMORY", False)
     param = _mark_tp(torch.nn.Parameter(torch.randn(4, 3)))
     backuper = TensorBackuper.create(_source_of({"module.layer.weight": param}), single_tag=None)
 
@@ -59,7 +61,8 @@ def test_backup_cpu_snapshot_attaches_tp_attrs():
     assert torch.equal(snapshot, param.detach())
 
 
-def test_backup_cpu_snapshot_backfills_defaults_for_unmarked_params():
+def test_backup_cpu_snapshot_backfills_defaults_for_unmarked_params(monkeypatch):
+    monkeypatch.setattr(tensor_backper, "_PIN_MEMORY", False)
     param = torch.nn.Parameter(torch.randn(2, 5))
     backuper = TensorBackuper.create(_source_of({"w": param}), single_tag=None)
 
@@ -130,6 +133,10 @@ def test_backup_on_device_second_call_reuses_buffer():
     assert torch.equal(second["p2"], p2.detach())
 
 
+@pytest.mark.skipif(
+    device_utils.get_accelerator_type() == device_utils.AcceleratorType.CPU,
+    reason="Pinned host allocation requires an accelerator runtime",
+)
 def test_backup_default_unchanged_cpu_pinned():
     param = torch.nn.Parameter(torch.randn(3, 4))
     backuper = TensorBackuper.create(_source_of({"w": param}), single_tag=None)

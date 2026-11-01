@@ -48,6 +48,7 @@ def update_block(guard):
 
     def run(optimizer, scheduler, chunks):
         errors = []
+        optimizer_results = []
         context = dict(
             optimizer=optimizer,
             opt_param_scheduler=scheduler,
@@ -65,6 +66,8 @@ def update_block(guard):
             math=math,
             logger=SimpleNamespace(warning=lambda *a: None, error=lambda *a, **kw: errors.append((a, kw))),
             logged_errors=errors,
+            record_optimizer_result=optimizer_results.append,
+            optimizer_results=optimizer_results,
         )
         exec(code, context)
         return context
@@ -151,13 +154,15 @@ def exercise_skip(distributed=False, rank=0, bad=float("nan")):
     scheduler_calls = []
     scheduler = SimpleNamespace(step=lambda increment: scheduler_calls.append(increment))
     opt.param.grad = torch.tensor([0.3, -0.2])
-    run(opt, scheduler, [chunk])
+    result = run(opt, scheduler, [chunk])
+    assert result["optimizer_results"] == [True]
     before_param = opt.param.detach().clone()
     before_state = copy.deepcopy(opt.adam.state_dict())
     opt.param.grad = torch.tensor([bad if rank == 0 else 0.4, 0.5])
     chunk.buffer.fill_(float("nan"))
     result = run(opt, scheduler, [chunk])
     assert result["skipped_nonfinite_grad"] and not result["update_successful"]
+    assert result["optimizer_results"] == [False]
     assert math.isnan(result["grad_norm"])
     assert opt._relax_nonfinite_skip_count == 1
     assert len(result["logged_errors"]) == 1
@@ -182,6 +187,7 @@ def exercise_skip(distributed=False, rank=0, bad=float("nan")):
     opt.param.grad = torch.tensor([-0.1, 0.4])
     result = run(opt, scheduler, [chunk])
     assert result["update_successful"] and not result["skipped_nonfinite_grad"]
+    assert result["optimizer_results"] == [True]
     assert scheduler_calls == [1600, 1600]
     torch.testing.assert_close(opt.param, reference.param, rtol=0, atol=0)
     for key, value in reference.adam.state_dict()["state"][0].items():

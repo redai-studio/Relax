@@ -260,7 +260,7 @@ def test_checkpoint_async_dpo_rotation_requires_sidecar(save_method, monkeypatch
 
 
 @pytest.mark.parametrize("failure", ["write", "previous_async", "final_async"])
-def test_checkpoint_failure_annotation_covers_write_and_async_finalization(monkeypatch, failure):
+def test_checkpoint_failure_annotation_covers_write_and_async_finalization(monkeypatch, tmp_path, failure):
     import sys
     from types import ModuleType
 
@@ -306,6 +306,7 @@ def test_checkpoint_failure_annotation_covers_write_and_async_finalization(monke
             offload_train=False,
             async_save=failure != "write",
             save_hf=None,
+            save=str(tmp_path),
             dump_agentic_obs="unused",
         ),
         model=None,

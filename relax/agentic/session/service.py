@@ -2642,14 +2642,6 @@ class AgenticSessionShard:
                 )
             return
         except BackendContextLengthExceededError:
-            self._observe_session(
-                session,
-                "request",
-                "failed",
-                request_id=ir.request_id,
-                reason_code="context_length_exceeded",
-                category="execution",
-            )
             async with session.lock:
                 if is_current():
                     ir.runner_task = None
@@ -2744,15 +2736,6 @@ class AgenticSessionShard:
                 self._notify_state_change(group)
                 return
             session.live_irs.remove(ir)
-            if session.observation is not None:
-                call = session.observation.calls.get(ir.request_id)
-                if call is not None:
-                    call.update(
-                        resp_state_hash=session.resp_state_hash_by_request_id.get(ir.request_id),
-                        response_length=len(ir.pending_token_delta),
-                        finish_reason=finish_type,
-                    )
-            self._observe_session(session, "request", "completed", request_id=ir.request_id)
             ir.waiter.set_result(payload)
             self._dispatch_queued_irs_locked(session)
         self._notify_state_change(group)
@@ -2795,6 +2778,14 @@ class AgenticSessionShard:
         if ir.pending_token_delta or ir.pending_logprob_delta:
             ir.pending_status = "truncated"
             return self._terminal_response_locked(session=session, ir=ir, finish_type="length")
+        self._observe_session(
+            session,
+            "request",
+            "failed",
+            request_id=ir.request_id,
+            reason_code="context_length_exceeded",
+            category="execution",
+        )
         return _context_length_error_result(
             max_context_len=self._max_context_len(session.group),
             prompt_tokens=len(ir.history_train_token_prefix),
@@ -2821,6 +2812,14 @@ class AgenticSessionShard:
         ):
             # A KV capacity rejection must not become an empty successful
             # response or discard generation retained from earlier attempts.
+            self._observe_session(
+                session,
+                "request",
+                "failed",
+                request_id=ir.request_id,
+                reason_code="context_length_exceeded",
+                category="execution",
+            )
             return _context_length_error_result(
                 max_context_len=self._max_context_len(session.group),
                 prompt_tokens=len(ir.history_rollout_token_prefix),
@@ -2887,6 +2886,15 @@ class AgenticSessionShard:
             },
         }
         response_node.wall_elapsed_s = time.monotonic() - ir.wall_started_at
+        if session.observation is not None:
+            call = session.observation.calls.get(ir.request_id)
+            if call is not None:
+                call.update(
+                    resp_state_hash=response_node.state_hash,
+                    response_length=completion_tokens,
+                    finish_reason=finish_type,
+                )
+        self._observe_session(session, "request", "completed", request_id=ir.request_id)
         return payload
 
     async def _watch_agent_process(

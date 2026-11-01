@@ -18,6 +18,7 @@ def hybrid_actor(monkeypatch, request):
         autoscaler_config=request.param,
         fully_async=True,
         loss_type="policy_loss",
+        advantage_estimator="grpo",
         offload_train=True,
         offload_rollout=False,
         use_critic=False,

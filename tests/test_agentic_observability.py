@@ -20,7 +20,7 @@ from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -91,7 +91,7 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
     return Namespace(**args)
 
 
-def _two_turn_forest() -> tuple[SessionForest, str]:
+def _two_turn_forest(*, with_media: bool = False) -> tuple[SessionForest, str]:
     """Build a forest whose export lineage is root -> obs -> resp -> obs ->
     resp."""
 
@@ -103,11 +103,19 @@ def _two_turn_forest() -> tuple[SessionForest, str]:
         train_metadata={"loss": "grpo"},
         metadata={},
     )
+    first_content = [{"type": "text", "text": "hi"}]
+    if with_media:
+        first_content.extend(
+            [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}},
+                {"type": "image_url", "image_url": {"url": "https://example/a.png"}},
+            ]
+        )
     first_obs = forest.append_obs(
         parent_state_hash=forest.root_state_hash,
         rollout_id=7,
         abort_count=0,
-        messages_delta=check_messages([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]),
+        messages_delta=check_messages([{"role": "user", "content": first_content}]),
         train_token_delta=_chars("hi"),
         rollout_token_delta=_chars("hi"),
     )
@@ -149,14 +157,8 @@ def _two_turn_forest() -> tuple[SessionForest, str]:
 
 @pytest.mark.parametrize("dump_media", [False, True], ids=["references-only", "with-media"])
 def test_trajectory_media_respects_sidecar_switch(tmp_path, dump_media) -> None:
-    forest, leaf_hash = _two_turn_forest()
+    forest, leaf_hash = _two_turn_forest(with_media=True)
     content = forest.lineage(leaf_hash)[1].messages_delta[0]["content"]
-    content.extend(
-        [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}},
-            {"type": "image_url", "image_url": {"url": "https://example/a.png"}},
-        ]
-    )
     sample = forest.build_sample(leaf_state_hash=leaf_hash, tokenizer=_FakeTokenizer())
     args = _obs_args(tmp_path, dump_agentic_obs_media=dump_media)
     config = resolve_agentic_obs_config(args)
@@ -192,11 +194,18 @@ def test_trajectory_media_respects_sidecar_switch(tmp_path, dump_media) -> None:
         assert not config.media_dir.exists()
 
 
-def test_resolve_shard_ordinal_falls_back_outside_a_ray_actor() -> None:
-    # Driver-side unit tests construct the recorder with no actor context; that
-    # must degrade to shard 0 rather than raise into the export path.
-    assert resolve_shard_ordinal() == 0
-    assert resolve_shard_ordinal(default=4) == 4
+@pytest.mark.parametrize(
+    "initialized,actor_name,expected",
+    [(False, None, 4), (True, None, 4), (True, "agentic_session_shard_3", 3), (True, "worker", 4)],
+)
+def test_resolve_shard_ordinal_falls_back_outside_a_ray_actor(monkeypatch, initialized, actor_name, expected) -> None:
+    import ray
+
+    context = Mock(return_value=SimpleNamespace(get_actor_name=lambda: actor_name))
+    monkeypatch.setattr(ray, "is_initialized", lambda: initialized)
+    monkeypatch.setattr(ray, "get_runtime_context", context)
+    assert resolve_shard_ordinal(default=4) == expected
+    assert context.call_count == int(initialized)
 
 
 # --------------------------------------------------------------------------
@@ -539,10 +548,7 @@ def test_trajectory_media_write_leaves_event_loop_free(tmp_path, monkeypatch):
 
     args = _obs_args(tmp_path, dump_agentic_obs_media=True)
     config = resolve_agentic_obs_config(args)
-    forest, leaf_hash = _two_turn_forest()
-    forest.lineage(leaf_hash)[1].messages_delta[0]["content"].append(
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}}
-    )
+    forest, leaf_hash = _two_turn_forest(with_media=True)
     sample = forest.build_sample(leaf_state_hash=leaf_hash, tokenizer=_FakeTokenizer())
     sample.sample_export_id = 42
     entered = threading.Event()
@@ -1734,7 +1740,8 @@ def test_session_attempt_tokens_include_abort_and_cleanup_result(
         session.forest = forest
         session.observation.begin_call("req")
         session.rollout_id = 7
-        shard._terminal_response_locked = lambda **kw: {"ok": True}
+        shard.args.agentic_reasoning_parser = None
+        shard.args.agentic_tool_call_parser = None
 
         @asynccontextmanager
         async def permit(*args):
