@@ -2,10 +2,10 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.5-35B-A3B MTP SFT on pokemon-gpt4o-captions, 8xGPU single-node, ray-submit launch.
+# Qwen3.5-35B-A3B MTP SFT on pokemon-gpt4o-captions, 4xGPU single-node, ray-submit launch.
 #
 # Usage:
-#   bash scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-8xgpu.sh
+#   bash scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-4xgpu.sh
 
 set -ex
 set -o pipefail
@@ -21,7 +21,7 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/sft/pokemon}"
-EXP_NAME=qwen3.5-35B-A3B-mtp-sft-pokemon-gpu8
+EXP_NAME=qwen3.5-35B-A3B-mtp-sft-pokemon-gpu4
 EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
 DATA_DIR="${DATA_DIR:=${SCRIPT_DIR}/data}"
 TRAIN_FILES=(
@@ -47,7 +47,7 @@ SFT_ARGS=(
    --input-key conversations
    --multimodal-keys '{"image":"images"}'
    --conversation-key-map '{"from":"role","value":"content","human":"user","gpt":"assistant"}'
-   --global-batch-size 64
+   --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
    --use-dynamic-batch-size
    --max-tokens-per-gpu 20480
    --balance-data
@@ -78,11 +78,11 @@ PREDICT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
-   --expert-model-parallel-size 8
+   --expert-model-parallel-size 4
    --expert-tensor-parallel-size 1
 
    --recompute-granularity full
@@ -95,10 +95,15 @@ PERF_ARGS=(
 
    --moe-flex-dispatcher-backend deepep
    --moe-token-dispatcher-type flex
+   # While --moe-grouped-gemm enables TE's grouped interface, TE's default backend still issues individual
+   # cuBLASLt GEMMs via a C++ loop, causing severe CPU launch overhead for fine-grained MoE.
+   # NVTE_USE_CUTLASS_GROUPED_GEMM=1 executes supported expert GEMMs (forward & dgrad) in a single batched kernel.
+   # Backward wgrad falls back to cuBLASLt (requires FP32 main_grad output & dynamic K-dim);
+   # NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK=0 suppresses repetitive benign fallback warnings.
+   --train-env-vars '{"NVTE_USE_CUTLASS_GROUPED_GEMM":"1","NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK":"0"}'
 
    --no-rope-fusion
 
-   --colocate
    --cross-entropy-loss-fusion
    --sft-chunked-logits
    --sft-logits-chunk-size ${SFT_LOGITS_CHUNK_SIZE:-2048}
@@ -138,7 +143,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"sft": [1, 0], "actor": [1, 8]}' \
+   --resource '{"sft": [1, 0], "actor": [1, 4]}' \
    --sft-max-in-flight-steps 4 \
    --num-data-storage-units 8 \
    "${MODEL_ARGS[@]}" \
@@ -150,4 +155,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    "${OPTIMIZER_ARGS[@]}" \
    "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3.5-35B-A3B-mtp-sft-pokemon-gpu8-${now}.log
+   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3.5-35B-A3B-mtp-sft-pokemon-gpu4-${now}.log
