@@ -325,6 +325,19 @@ RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-trans
     TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
 
+# Isolate all NVCC-based JIT compilers from training preloads, including external TRAIN_IMAGE builds.
+COPY docker/scripts/nvcc-without-preload.sh /tmp/nvcc-without-preload.sh
+RUN NVCC_BIN=/usr/local/cuda/bin && \
+    if [ -e "$NVCC_BIN/nvcc.real" ]; then \
+        cmp /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
+    else \
+        test -f "$NVCC_BIN/nvcc" && test -x "$NVCC_BIN/nvcc" && \
+        ! cmp -s /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc" && \
+        mv "$NVCC_BIN/nvcc" "$NVCC_BIN/nvcc.real" && \
+        install -m 755 /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
+    fi && \
+    "$NVCC_BIN/nvcc" --version && rm /tmp/nvcc-without-preload.sh
+
 # Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \

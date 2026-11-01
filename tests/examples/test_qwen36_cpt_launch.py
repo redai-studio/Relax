@@ -1,11 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Validate CPT arguments and parent/child lifecycle without Ray or GPUs."""
+"""Validate CPT arguments and Ray CLI submission without Ray or GPUs."""
 
-import io
 import json
 import os
 import subprocess
-import urllib.request
 from pathlib import Path
 
 import pytest
@@ -108,67 +106,17 @@ def test_cpt_launch_rejects_invalid_configuration(name, value):
         render(**{name: value})
 
 
-def test_cpt_launch_rejects_reusing_parent_submission_id():
-    with pytest.raises(subprocess.CalledProcessError):
-        render(SUBMISSION_ID="parent", CPT_PARENT_SUBMISSION_ID="parent")
-
-
-def heredoc(name):
-    return SCRIPT.read_text().split(f"<<'{name}'\n", 1)[1].split(f"\n{name}", 1)[0]
-
-
-@pytest.mark.parametrize("status,code", [("SUCCEEDED", 0), ("FAILED", 1), ("STOPPED", 1)])
-def test_cpt_parent_wait_recovers_status_after_transient_error(monkeypatch, status, code):
-    import time
-
-    monkeypatch.setenv("SUBMISSION_ID", "fixed-child")
-    monkeypatch.setenv("CPT_PARENT_SUBMISSION_ID", "parent")
-    monkeypatch.setenv("RAY_JOBS_ADDRESS", "http://ray-test")
-    replies = iter([OSError("acknowledgement unavailable"), "RUNNING", status])
-    urls = []
-
-    def open_status(url, timeout):
-        urls.append(url)
-        result = next(replies)
-        if isinstance(result, Exception):
-            raise result
-        return io.StringIO(json.dumps({"submission_id": "fixed-child", "status": result}))
-
-    monkeypatch.setattr(urllib.request, "urlopen", open_status)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-    with pytest.raises(SystemExit) as result:
-        exec(compile(heredoc("PY_WAIT"), "<production-cpt-waiter>", "exec"), {})
-    assert result.value.code == code
-    assert urls == ["http://ray-test/api/jobs/fixed-child"] * 3
-
-
 @pytest.mark.parametrize(
-    "parent,submit_code,wait_code,no_wait,expected",
-    [
-        ("parent", 0, 0, "", 0),
-        ("parent", 7, 0, "", 0),
-        ("parent", 7, 1, "1", 1),
-        ("", 7, 0, "", 7),
-        ("", 0, 0, "", 0),
-        ("", 0, 0, "1", 0),
-    ],
+    "submit_code,no_wait",
+    [(0, ""), (7, ""), (0, "1"), (7, "1")],
 )
-def test_cpt_submission_keeps_fixed_child_and_parent_lifecycle(
-    tmp_path, parent, submit_code, wait_code, no_wait, expected
-):
-    # Execute the production submission tail; stub Ray and the separately tested
-    # waiter, without invoking the environment setup or accessing a cluster.
-    for name, content in {
-        "ray": 'printf "%s\\n" "$@" > "$RAY_RECORD"\nexit "$SUBMIT_CODE"\n',
-        "python3": 'printf "%s\\n" "$SUBMISSION_ID" > "$WAIT_RECORD"\nexit "$WAIT_CODE"\n',
-    }.items():
-        path = tmp_path / name
-        path.write_text("#!/bin/bash\n" + content)
-        path.chmod(0o755)
+def test_cpt_submission_propagates_ray_exit_status(tmp_path, submit_code, no_wait):
+    path = tmp_path / "ray"
+    path.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$RAY_RECORD"\nexit "$SUBMIT_CODE"\n')
+    path.chmod(0o755)
     environment = dict(
         os.environ,
         PATH=f"{tmp_path}:{os.environ['PATH']}",
-        CPT_PARENT_SUBMISSION_ID=parent,
         SUBMISSION_ID="fixed-child",
         RAY_JOBS_ADDRESS="http://ray-test",
         RUNTIME_ENV_JSON="{}",
@@ -177,34 +125,17 @@ def test_cpt_submission_keeps_fixed_child_and_parent_lifecycle(
         SCRIPT_DIR=str(tmp_path),
         TASK_NAME="test",
         RAY_RECORD=str(tmp_path / "ray-args"),
-        WAIT_RECORD=str(tmp_path / "wait-id"),
         SUBMIT_CODE=str(submit_code),
-        WAIT_CODE=str(wait_code),
     )
     fragment = "set -euo pipefail\nTRAIN_ARGS=(python3 -m relax.entrypoints.train)\n"
     fragment += "RAY_ARGS=(job submit" + SCRIPT.read_text().split("RAY_ARGS=(job submit", 1)[1]
     result = subprocess.run(["bash", "-c", fragment], env=environment, capture_output=True, text=True)
-    assert result.returncode == expected, result.stderr
+    assert result.returncode == submit_code, result.stderr
     args = (tmp_path / "ray-args").read_text().splitlines()
     assert args.count("job") == 1
     assert "--submission-id=fixed-child" in args
     assert "--working-dir" in args and "/source with spaces" in args
-    assert ("--no-wait" in args) == bool(parent or no_wait)
-    assert (tmp_path / "wait-id").exists() == bool(parent)
-    if parent:
-        assert (tmp_path / "wait-id").read_text().strip() == "fixed-child"
-
-
-def test_cpt_preflight_excludes_parent_but_rejects_other_active_jobs(monkeypatch):
-    monkeypatch.setenv("CPT_PARENT_SUBMISSION_ID", "parent")
-    monkeypatch.setenv("RAY_JOBS_ADDRESS", "http://ray-test")
-    jobs = [{"submission_id": "parent", "status": "RUNNING", "entrypoint": "bash launch.sh"}]
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: io.StringIO(json.dumps(jobs)))
-    code = compile(heredoc("PY_JOBS"), "<production-cpt-preflight>", "exec")
-    exec(code, {})
-    jobs.append({"submission_id": "other", "status": "RUNNING", "entrypoint": "python train.py"})
-    with pytest.raises(RuntimeError, match="other"):
-        exec(code, {})
+    assert ("--no-wait" in args) == bool(no_wait)
 
 
 @pytest.mark.parametrize("value", [None, "0", "1"])
