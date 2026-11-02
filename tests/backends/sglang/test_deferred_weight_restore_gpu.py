@@ -3,8 +3,13 @@
 """GPU evidence for the same-policy, same-round deferred scoring restore.
 
 Two engine loads total: the required backup case and a negative control. No
-training/Ray cluster is needed. CI supplies Qwen3-4B through MODEL_DIR; a local
-checkpoint can be selected with RELAX_GPU_TEST_MODEL.
+training/Ray cluster is needed. The Unit Tests (H20) CI container does not mount
+a model or set MODEL_DIR, so these cases skip there. On a machine with a GPU
+and model checkpoint, set RELAX_GPU_TEST_MODEL or place Qwen3-4B under MODEL_DIR.
+
+The backup case must PASS. For the negative control, XPASS means weight loss
+was observed; XFAIL means unbacked pages happened to retain their contents and
+the result is inconclusive.
 """
 
 import math
