@@ -73,7 +73,8 @@ def validate_microbatch_balance(args: Namespace) -> bool:
 
 
 def validate_dp_balance(args: Namespace) -> bool:
-    """Validate DP placement without changing microbatches or legacy enablement."""
+    """Validate DP placement without changing microbatches or legacy
+    enablement."""
     if not _uses_flops(args, "dp_balance"):
         return False
     _validate_flops_configuration(args)
@@ -88,7 +89,8 @@ def validate_dp_balance(args: Namespace) -> bool:
 
 
 def sample_costs(args: Namespace, rollout_data: dict[str, Any], *, for_dp: bool = False) -> list[float] | None:
-    """Resolve costs only for the explicitly selected microbatch or DP objective."""
+    """Resolve costs only for the explicitly selected microbatch or DP
+    objective."""
     validate = validate_dp_balance if for_dp else validate_microbatch_balance
     if not validate(args):
         return None
