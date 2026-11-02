@@ -106,9 +106,15 @@ class _ManagedHTTPStream(httpx.AsyncByteStream):
     """Preserve the original close receipt even if HTTPX sets is_closed
     early."""
 
-    def __init__(self, stream: httpx.AsyncByteStream, track_cleanup: Callable[[asyncio.Task], asyncio.Task]) -> None:
+    def __init__(
+        self,
+        stream: httpx.AsyncByteStream,
+        track_cleanup: Callable[[asyncio.Task], asyncio.Task],
+        on_close_failure: Callable[[], None] | None = None,
+    ) -> None:
         self._stream = stream
         self._track_cleanup = track_cleanup
+        self._on_close_failure = on_close_failure
         self._close_task: asyncio.Task[None] | None = None
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
@@ -117,10 +123,23 @@ class _ManagedHTTPStream(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:
         if self._close_task is None:
-            self._close_task = self._track_cleanup(asyncio.create_task(self._stream.aclose()))
+
+            async def close() -> None:
+                try:
+                    await self._stream.aclose()
+                except (asyncio.CancelledError, Exception):
+                    # Keep the dispatch evidence even if the frontend stopped
+                    # awaiting close before its failure became known.
+                    if self._on_close_failure is not None:
+                        self._on_close_failure()
+                    raise
+
+            self._close_task = self._track_cleanup(asyncio.create_task(close()))
         try:
             await asyncio.shield(self._close_task)
-        except Exception as error:
+        except (asyncio.CancelledError, Exception) as error:
+            if isinstance(error, asyncio.CancelledError) and not self._close_task.cancelled():
+                raise  # Only the waiter was cancelled; close still owns its receipt.
             raise _UpstreamCloseError("Upstream close did not confirm completion; permit remains held") from error
 
 
@@ -357,7 +376,7 @@ class InferenceGateway:
                     )
                     transferred = True
                     return response
-                return await self.proxy_json(url, forwarded)
+                return await self.proxy_json(url, forwarded, permit=permit)
             except asyncio.CancelledError:
                 cancelled = True
                 raise
@@ -388,7 +407,7 @@ class InferenceGateway:
         client = self._get_proxy_client()
         response = None
         try:
-            response = await self._send(client, client.build_request("POST", url, json=dict(payload)))
+            response = await self._send(client, client.build_request("POST", url, json=dict(payload)), permit)
             await permit.dispatched()
             response.raise_for_status()
         except RoutingError as exc:
@@ -526,17 +545,23 @@ class InferenceGateway:
             self._on_upstream_unreachable(url, e)
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {e}")
 
-    async def _send(self, client: httpx.AsyncClient, request: httpx.Request) -> httpx.Response:
+    async def _send(
+        self, client: httpx.AsyncClient, request: httpx.Request, permit: InferenceRequest | None = None
+    ) -> httpx.Response:
         # Wrap before aread/iteration: HTTPX may close automatically at EOF.
         response = await client.send(request, stream=True)
-        response.stream = _ManagedHTTPStream(response.stream, self._requests._track_cleanup)
+        response.stream = _ManagedHTTPStream(
+            response.stream,
+            self._requests._track_cleanup,
+            permit.start_dispatch_confirmation if permit is not None else None,
+        )
         return response
 
-    async def proxy_json(self, url: str, payload: Mapping[str, Any]) -> Any:
+    async def proxy_json(self, url: str, payload: Mapping[str, Any], *, permit: InferenceRequest | None = None) -> Any:
         response = None
         try:
             client = self._get_proxy_client()
-            response = await self._send(client, client.build_request("POST", url, json=dict(payload)))
+            response = await self._send(client, client.build_request("POST", url, json=dict(payload)), permit)
             await response.aread()
             response.raise_for_status()
             return response.json()
@@ -576,7 +601,7 @@ class InferenceGateway:
         response = None
         try:
             response = await self._send(
-                client, client.build_request("POST", url, content=body, headers=forward_headers)
+                client, client.build_request("POST", url, content=body, headers=forward_headers), permit
             )
             await response.aread()
             response.raise_for_status()
@@ -629,7 +654,7 @@ class InferenceGateway:
                 # Starlette's AnyIO scope may cancel iteration repeatedly.
                 # Keep the actual send/unwind outside that scope and let the
                 # owned close callback await its terminal result before return.
-                sending = asyncio.create_task(self._send(client, req))
+                sending = asyncio.create_task(self._send(client, req, permit))
                 try:
                     response = await asyncio.shield(sending)
                 except asyncio.CancelledError:

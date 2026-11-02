@@ -177,6 +177,8 @@ class InferenceRequest:
         self._selection = selection
         self._manager = None
         self._permit: RequestPermit | None = None
+        self._dispatch_task: asyncio.Task[None] | None = None
+        self._dispatch_cleanup_task: asyncio.Task[None] | None = None
         self._release_task: asyncio.Task[None] | None = None
         self.target: RouteTarget | None = None
         self.served_model_name: str | None = None
@@ -208,14 +210,20 @@ class InferenceRequest:
         self.served_model_name = selected.served_model_name
         return self
 
+    def _start_dispatch(self) -> asyncio.Task[None]:
+        if self._dispatch_task is None:
+            self._dispatch_task = self._client._track_cleanup(
+                asyncio.create_task(_manager_call(self._manager, "confirm_inference_dispatch", self._permit))
+            )
+        return self._dispatch_task
+
     async def dispatched(self) -> None:
         """Call only after upstream response headers, never before send()."""
-        pending = self._client._track_cleanup(
-            asyncio.create_task(_manager_call(self._manager, "confirm_inference_dispatch", self._permit))
-        )
         try:
             await _wait_request_control(
-                pending, "dispatch confirmation", time.monotonic() + Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S
+                self._start_dispatch(),
+                "dispatch confirmation",
+                time.monotonic() + Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S,
             )
         except (asyncio.CancelledError, RoutingError):
             raise
@@ -223,6 +231,39 @@ class InferenceRequest:
             raise ModelUnavailableError(
                 f"Dispatch confirmation for {self._client.role!r} is unavailable: {error}"
             ) from error
+
+    def start_dispatch_confirmation(self) -> None:
+        """Preserve headers evidence after failed close, so engine drain can
+        retire the retained permit.
+
+        Normal close needs only permit return.
+        """
+        if self._dispatch_cleanup_task is None:
+
+            async def confirm() -> None:
+                from ray.exceptions import ActorDiedError
+
+                reported = False
+                while True:
+                    try:
+                        # A foreground timeout/cancellation leaves the raw RPC
+                        # alive. Await that same receipt; never resend in parallel.
+                        await asyncio.shield(self._start_dispatch())
+                        return
+                    except (ActorDiedError, RoutingError):
+                        # The original owner's permit is gone. Never bootstrap
+                        # a replacement owner or mark its new generation.
+                        return
+                    except Exception:
+                        # Inspect the raw failure, not dispatched()'s HTTP-facing
+                        # ModelUnavailableError, which also wraps transient loss.
+                        if not reported:
+                            logger.warning("Inference dispatch confirmation is unconfirmed; retrying", exc_info=True)
+                            reported = True
+                        await asyncio.sleep(max(0.01, Envs.RELAX_INFERENCE_HOLDER_POLL_S))
+                        self._dispatch_task = None
+
+            self._dispatch_cleanup_task = self._client._track_cleanup(asyncio.create_task(confirm()))
 
     async def _return_late_grant(self, pending: asyncio.Task[RequestPermit]) -> None:
         try:
