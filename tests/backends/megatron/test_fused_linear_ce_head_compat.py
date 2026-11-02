@@ -66,6 +66,14 @@ def test_native_logits_head_retains_fused_ce_eligibility(heads):
     assert not heads.supported(heads.NativeAdapter())
 
 
+@pytest.mark.parametrize("head_type", ["Column", "Native"])
+@pytest.mark.parametrize("fp32_output", [False, True])
+def test_fp32_head_falls_back_from_fused_ce(heads, head_type, fp32_output):
+    layer = getattr(heads, head_type)()
+    layer._relax_fp32_output = fp32_output
+    assert heads.supported(layer) is not fp32_output
+
+
 @pytest.mark.parametrize("guard", ["bias", "hook", "gather_output", "disable_grad_reduce", "defer_wgrad"])
 def test_native_head_preserves_fused_ce_safety_guards(heads, guard):
     layer = heads.Native()

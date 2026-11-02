@@ -34,6 +34,9 @@ def supported(
 ) -> bool:
     if not Envs.RELAX_SFT_FUSED_LINEAR_CE or not hidden.is_cuda or weight is None:
         return False
+    # Functional GEMM would bypass the head's direct FP32 output projection.
+    if getattr(layer, "_relax_fp32_output", False):
+        return False
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 
     # Functional GEMM must not bypass adapters, biases, quantization or arbitrary hooks.
