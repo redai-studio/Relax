@@ -171,8 +171,12 @@ MISC_ARGS=(
     --seed "${SEED:-1234}"
 )
 
+if [ -z "${TRAIN_ENV_VARS:-}" ]; then
+    TRAIN_ENV_VARS="{\"FLA_TILELANG\":\"${FLA_TILELANG:-0}\"}"
+fi
+
 TRAIN_ARGS=(
-    --train-env-vars "{\"FLA_TILELANG\":\"${FLA_TILELANG:-0}\"}"
+    --train-env-vars "${TRAIN_ENV_VARS}"
     --resource '{"sft": [1, 0], "actor": [1, 64]}'
     --sft-max-in-flight-steps 1
     --num-data-storage-units 8

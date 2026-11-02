@@ -56,6 +56,9 @@ class MetricsClient:
             service_url: URL of the metrics service
         """
         self.service_url = service_url.rstrip("/")
+        # Internal Ray Serve traffic must bypass external tracking proxies.
+        self._session = requests.Session()
+        self._session.trust_env = False
         self._buffer = defaultdict(list)
         self._lock = threading.Lock()
 
@@ -197,7 +200,7 @@ class MetricsClient:
             True if successful, False otherwise
         """
         try:
-            response = requests.post(
+            response = self._session.post(
                 f"{self.service_url}/log_metric",
                 json={
                     "step": step,
@@ -239,7 +242,7 @@ class MetricsClient:
             # Nonfinite scalars sanitize to null, which the service rejects.
             # Keep valid metrics (including skip counters) in the same batch.
             sanitized = {name: value for name, value in _sanitize_for_json(metrics).items() if value is not None}
-            response = requests.post(
+            response = self._session.post(
                 f"{self.service_url}/log_metrics_batch",
                 json={"step": step, "metrics": sanitized, "tags": tags},
                 timeout=5,
@@ -270,7 +273,7 @@ class MetricsClient:
         """
         try:
             # Then, trigger reporting
-            response = requests.post(f"{self.service_url}/report_step", json={"step": step}, timeout=10)
+            response = self._session.post(f"{self.service_url}/report_step", json={"step": step}, timeout=10)
 
             if response.status_code != 200:
                 print(f"[MetricsClient] report_step failed: HTTP {response.status_code}, response: {response.text}")
@@ -290,7 +293,7 @@ class MetricsClient:
             Dict with health status information
         """
         try:
-            response = requests.get(f"{self.service_url}/health", timeout=5)
+            response = self._session.get(f"{self.service_url}/health", timeout=5)
             if response.status_code != 200:
                 print(f"[MetricsClient] health_check failed: HTTP {response.status_code}, response: {response.text}")
                 return {"status": "error", "message": f"HTTP {response.status_code}: {response.text}"}

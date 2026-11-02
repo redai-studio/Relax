@@ -296,19 +296,11 @@ def _allgather_cp_redistribute(
             e = min(logit_global_end, chunk_end)
 
             if e <= s:
-                # This rank has no response logprobs for this sample. Match the
-                # placeholder's requires_grad to the real data (`value`): forcing
-                # requires_grad=True makes the concatenated all_reduce input require
-                # grad on ranks with an empty chunk while non-empty ranks (F.pad of
-                # a no-grad `value`) do not, so the differentiable dist.nn.all_reduce
-                # below builds a backward graph on some CP ranks but not others and
-                # the collective deadlocks.
-                full_resp = torch.zeros(
-                    (response_length, *value.shape[1:]),
-                    dtype=value.dtype,
-                    device=value.device,
-                    requires_grad=value.requires_grad,
-                )
+                # Pad the empty value itself to preserve its path to logits.
+                # Fresh zeros disconnect this CP rank from collective backward.
+                # Keep trailing top-k dimensions and detached/no-grad metrics.
+                padding = (0, 0) * (value.ndim - 1) + (0, response_length)
+                full_resp = F.pad(value, padding)
             else:
                 resp_start = s - logit_global_start
                 resp_end = e - logit_global_start

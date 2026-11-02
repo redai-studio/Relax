@@ -44,8 +44,8 @@ def test_nonfinite_norm_does_not_drop_skip_counters(monkeypatch, bad_norm, queue
         def post(url, *, json, timeout):
             return transport.post(urlsplit(url).path, json=json)
 
-        monkeypatch.setattr("relax.utils.metrics.client.requests.post", post)
         client = MetricsClient("http://metrics.test")
+        monkeypatch.setattr(client._session, "post", post)
         metrics = {
             "train/grad_norm": bad_norm,
             "train/skipped_nonfinite_grad": 1,

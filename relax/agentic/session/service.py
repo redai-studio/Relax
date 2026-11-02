@@ -2252,15 +2252,14 @@ class AgenticSessionShard:
             ir = session.queued_irs.popleft()
             remaining_tokens = int(ir.sampling_params["max_new_tokens"]) - len(ir.pending_token_delta)
             if remaining_tokens == 0:
-                # Reactivate every aborted IR, then reject a zero remaining
-                # budget before another backend call or Forest commit.
+                # Commit an interrupted response that already used its budget.
+                try:
+                    payload = self._context_exhausted_response_locked(session, ir)
+                except Exception as error:
+                    self._fail_ir_locked(session, ir, error)
+                    continue
                 session.live_irs.remove(ir)
-                ir.waiter.set_result(
-                    _context_length_error_result(
-                        max_context_len=self._max_context_len(group),
-                        prompt_tokens=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
-                    )
-                )
+                ir.waiter.set_result(payload)
                 continue
             ir.rollout_id = session.rollout_id
             ir.backend_started = False
@@ -2486,15 +2485,14 @@ class AgenticSessionShard:
                 if is_current():
                     ir.runner_task = None
                     ir.backend_started = False
-                    session.live_irs.remove(ir)
-                    ir.waiter.set_result(
-                        _context_length_error_result(
-                            max_context_len=self._max_context_len(group),
-                            prompt_tokens=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
-                            requested_completion_tokens=remaining_tokens,
-                        )
-                    )
-                    self._dispatch_queued_irs_locked(session)
+                    try:
+                        payload = self._context_exhausted_response_locked(session, ir, remaining_tokens)
+                    except Exception as error:
+                        self._fail_ir_locked(session, ir, error)
+                    else:
+                        session.live_irs.remove(ir)
+                        ir.waiter.set_result(payload)
+                        self._dispatch_queued_irs_locked(session)
             self._notify_state_change(group)
             return
         except RuntimeGroupError as error:
@@ -2597,6 +2595,22 @@ class AgenticSessionShard:
             expected_rows=max(0, len(ir.history_train_token_prefix) + len(ir.pending_token_delta) - 1),
         )
 
+    def _context_exhausted_response_locked(
+        self,
+        session: _SessionRecord,
+        ir: InflightRequest,
+        requested_tokens: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Keep partial generation when a resumed request exhausts capacity."""
+        if ir.pending_token_delta or ir.pending_logprob_delta:
+            ir.pending_status = "truncated"
+            return self._terminal_response_locked(session=session, ir=ir, finish_type="length")
+        return _context_length_error_result(
+            max_context_len=self._max_context_len(session.group),
+            prompt_tokens=len(ir.history_train_token_prefix),
+            requested_completion_tokens=requested_tokens,
+        )
+
     def _terminal_response_locked(
         self,
         *,
@@ -2607,6 +2621,21 @@ class AgenticSessionShard:
         """Commit one terminal IR to its Forest and build its OpenAI
         response."""
 
+        finish_reason = ir.latest_backend_meta.get("finish_reason") or {}
+        if (
+            finish_type == "length"
+            and finish_reason.get("length") == 0
+            and not ir.pending_token_delta
+            and not ir.pending_logprob_delta
+            and int(ir.sampling_params.get("max_new_tokens", 0)) > 0
+        ):
+            # A KV capacity rejection must not become an empty successful
+            # response or discard generation retained from earlier attempts.
+            return _context_length_error_result(
+                max_context_len=self._max_context_len(session.group),
+                prompt_tokens=len(ir.history_rollout_token_prefix),
+                requested_completion_tokens=int(ir.sampling_params["max_new_tokens"]),
+            )
         mark_agentic_event(agentic_trace_events(ir.pending_export_metadata_patch), "chat_end_at")
         ir.pending_export_metadata_patch.update(
             {

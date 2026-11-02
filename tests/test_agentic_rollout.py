@@ -1301,6 +1301,115 @@ async def test_score_centering_partial_attempts_commit_aligned_candidates() -> N
     np.testing.assert_array_equal(sample.rollout_topk_log_probs, [[-1.0, -2.0], [-0.5, -2.0]])
 
 
+@pytest.mark.parametrize("capacity_limit", ["budget", "backend_error", "zero_decode"])
+async def test_agentic_context_exhaustion_preserves_partial_generation(capacity_limit: str) -> None:
+    shard, _group, session, ir = _router_recovery_shard()
+    shard.args.agentic_reasoning_parser = None
+    shard.args.agentic_tool_call_parser = None
+    shard._max_context_len = lambda _group: 100
+    forest, observation = _forest_with_initial_obs(
+        session_id=session.session_id,
+        messages=[{"role": "user", "content": "p"}],
+        train_token_delta=[112],
+        rollout_token_delta=[112],
+    )
+    session.forest = forest
+    ir.parent_state_hash = observation.state_hash
+    ir.history_train_token_prefix = [112]
+    ir.history_rollout_token_prefix = [112]
+    ir.pending_token_delta = []
+    for token, logprob in ((97, -1.0), (98, -0.5)):
+        shard._apply_generate_result(
+            ir,
+            BackendGenerateResult(
+                new_tokens=[token],
+                new_log_probs=[logprob],
+                finish_type="abort",
+                meta_info={"prompt_tokens": 1},
+                elapsed=0.1,
+                new_topk_token_ids=np.array([[token, 100]], dtype=np.int32),
+                new_topk_log_probs=np.array([[logprob, -2.0]], dtype=np.float32),
+            ),
+        )
+    generate = AsyncMock(
+        side_effect=runtime_mod.BackendContextLengthExceededError("context full")
+        if capacity_limit == "backend_error"
+        else None,
+        return_value=BackendGenerateResult(
+            new_tokens=[],
+            new_log_probs=[],
+            finish_type="length",
+            meta_info={"finish_reason": {"type": "length", "length": 0}, "prompt_tokens": 3},
+            elapsed=0.1,
+        ),
+    )
+    shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
+    if capacity_limit == "budget":
+        ir.sampling_params["max_new_tokens"] = 2
+        session.queued_irs.append(ir)
+        # Exercise dispatch itself; the recovery fixture normally disables it.
+        del shard._dispatch_queued_irs_locked
+        shard._dispatch_queued_irs_locked(session)
+        generate.assert_not_awaited()
+    else:
+        task = asyncio.create_task(shard._run_ir(session, ir))
+        ir.runner_task = task
+        await task
+        generate.assert_awaited_once()
+
+    payload = ir.waiter.result()
+    assert payload["finish_reason"] == "length"
+    assert payload["message"]["content"] == "ab"
+    assert payload["usage"]["completion_tokens"] == 2
+    assert ir not in session.live_irs and not session.queued_irs
+    sample = forest.build_sample(
+        leaf_state_hash=session.resp_state_hash_by_request_id[ir.request_id], tokenizer=_FakeTokenizer()
+    )
+    assert sample.status is Sample.Status.TRUNCATED
+    assert sample.tokens == [112, 97, 98]
+    assert sample.rollout_log_probs == [-1.0, -0.5]
+    np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, 100], [98, 100]])
+    np.testing.assert_array_equal(sample.rollout_topk_log_probs, [[-1.0, -2.0], [-0.5, -2.0]])
+
+
+@pytest.mark.parametrize("backend_error", [False, True])
+async def test_agentic_no_decode_capacity_returns_context_error_without_commit(backend_error: bool) -> None:
+    shard, _group, session, ir = _router_recovery_shard()
+    shard._max_context_len = lambda _group: 100
+    ir.pending_token_delta = []
+    ir.history_train_token_prefix = [112]
+    ir.history_rollout_token_prefix = [112]
+    forest, observation = _forest_with_initial_obs(
+        session_id=session.session_id,
+        messages=[{"role": "user", "content": "p"}],
+        train_token_delta=[112],
+        rollout_token_delta=[112],
+    )
+    session.forest = forest
+    ir.parent_state_hash = observation.state_hash
+    initial_nodes = dict(forest.nodes_by_hash)
+    generate = AsyncMock(
+        side_effect=runtime_mod.BackendContextLengthExceededError("context full") if backend_error else None,
+        return_value=BackendGenerateResult(
+            new_tokens=[],
+            new_log_probs=[],
+            finish_type="length",
+            meta_info={"finish_reason": {"type": "length", "length": 0}},
+            elapsed=0.1,
+        ),
+    )
+    shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await task
+
+    payload = ir.waiter.result()
+    assert payload["error"]["code"] == "context_length_exceeded"
+    assert ir not in session.live_irs and not session.queued_irs
+    assert forest.nodes_by_hash == initial_nodes
+    assert session.resp_state_hash_by_request_id == {}
+
+
 @pytest.mark.asyncio
 async def test_agentic_eval_abort_fails_instead_of_requeueing():
     shard, group, session, ir = _router_recovery_shard()
