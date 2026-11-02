@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import copy
 import os
 import threading
 import time
@@ -82,8 +81,6 @@ class Service:
         if str(role) in {"rollout", "genrm"}:
             # Allocation stays before model prefetch; engine ownership is
             # transferred to the common manager before Serve is deployed.
-            self.config = copy.copy(config)
-            self.config._inference_pg_owned = not self._is_shared_pgs and pgs is not None
             if getattr(config, "_inference_authority", None) is not None:
                 from relax.distributed.ray.inference_manager import ensure_inference_manager
 
@@ -92,7 +89,7 @@ class Service:
                     str(role),
                     pgs,
                     runtime_env=runtime_env,
-                    owns_pg=self.config._inference_pg_owned,
+                    owns_pg=not self._is_shared_pgs and pgs is not None,
                 )
         logger.info(f"[{role}] Placement group initialized: {pgs}")
 

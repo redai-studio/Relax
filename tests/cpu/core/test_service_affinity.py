@@ -82,7 +82,7 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
         captured["strategy"] = strategy
         return MagicMock(name="pg")
 
-    def _fake_ray_get(arg):
+    def _fake_ray_get(arg, timeout=None):
         # Second call passes a list of get_ip_and_gpu_id futures -> return one
         # (ip, gpu_id) tuple per bundle. First call is pg.ready() (unused).
         if isinstance(arg, list):
@@ -378,3 +378,25 @@ def test_sft_data_node_rejects_unschedulable_affinity(monkeypatch, state):
         with pytest.raises((ValueError, RuntimeError), match="not available|conflicts"):
             service._deploy(None)
     service.cls.options.assert_not_called()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_inference_service_transfers_pg_ownership_without_copying_config(shared):
+    config = Namespace(enable_affinity=False, _inference_authority=object())
+    pg = (MagicMock(), [0], [0])
+    with (
+        patch("relax.core.service.create_placement_group", return_value=pg),
+        patch("relax.distributed.ray.inference_manager.ensure_inference_manager") as ensure,
+    ):
+        service = Service(
+            MagicMock(),
+            "genrm",
+            MagicMock(),
+            config,
+            num_gpus=1,
+            actor_rollout_pgs=pg if shared else None,
+            defer_deploy=True,
+        )
+    assert service.config is config
+    assert not hasattr(config, "_inference_pg_owned")
+    assert ensure.call_args.kwargs["owns_pg"] is (not shared)
