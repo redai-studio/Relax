@@ -45,6 +45,7 @@ async def test_managed_teacher_rechecks_state_and_never_falls_back_to_startup(mo
     client = owner.client("teacher")
     monkeypatch.setattr(opd, "get_request_client", lambda role: client)
     manager = object.__new__(opd.OpdManager)
+    manager.args = Namespace(opd_teacher_timeout_s=0.01)
     session = Session()
     sample = Sample(index=0)
 
@@ -78,6 +79,7 @@ async def test_mopd_routes_with_affinity_through_admission(monkeypatch):
     owner = AdmissionManager(current)
     monkeypatch.setattr(opd, "get_request_client", lambda role: owner.client("teacher"))
     manager = object.__new__(opd.OpdManager)
+    manager.args = Namespace(opd_teacher_timeout_s=0.01)
     session = Session()
     args = Namespace(opd_teacher_routes_map={"math": ["old"], "code": ["old"]})
     for source, group in (("math", 0), ("code", 1), ("code", 1), ("code", 2)):

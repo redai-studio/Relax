@@ -1,8 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import json
+from asyncio import sleep
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack
+from email.utils import parsedate_to_datetime
+from time import monotonic, time
 
 import aiohttp
 import numpy as np
@@ -397,22 +401,29 @@ class OpdManager:
         *,
         inference: dict | None = None,
     ) -> opd_main_worker.LogprobResponse | None:
-        try:
+        async def attempt() -> dict:
+            request_url = url
             async with AsyncExitStack() as stack:
                 if inference is not None:
                     selection = dict(inference)
                     permit = await stack.enter_async_context(
                         get_request_client(selection.pop("role")).request(**selection)
                     )
-                    url = f"{permit.target.base_url}/generate"
-                async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
+                    request_url = f"{permit.target.base_url}/generate"
+                async with session.post(request_url, **_aiohttp_json_post_kwargs(payload)) as resp:
                     if resp.status >= 400:
                         body = await resp.text()
                         logger.error(
-                            "OPD %s failed: status=%s, url=%s, body=%s", err_tag, resp.status, url, body[:2048]
+                            "OPD %s failed: status=%s, url=%s, body=%s", err_tag, resp.status, request_url, body[:2048]
                         )
                         resp.raise_for_status()
-                    data = await resp.json()
+                    return await resp.json()
+
+        try:
+            if inference is not None and inference.get("role") == "teacher":
+                data = await self._retry_teacher_request(attempt)
+            else:
+                data = await attempt()
         except RoutingError:
             # A sleeping managed model must never fall back to its startup URL
             # or silently turn into missing teacher scores.
@@ -432,6 +443,47 @@ class OpdManager:
         if expected_input_ids is not None:
             response.validate_native_prefill(expected_input_ids, int(sample.response_length))
         return response
+
+    async def _retry_teacher_request(self, attempt: Callable[[], Awaitable[dict]]) -> dict:
+        """Wait for managed discovery/admission within the teacher HTTP budget.
+
+        Each attempt reacquires a permit and its current endpoint. Unknown
+        models and ordinary HTTP failures keep their existing error semantics.
+        """
+        budget = float(self.args.opd_teacher_timeout_s)
+        deadline = monotonic() + budget
+        backoff = 0.25
+        last_error: Exception | None = None
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise ModelUnavailableError(
+                    f"OPD managed teacher retry budget ({budget:g}s) exhausted: {last_error}"
+                ) from last_error
+            try:
+                return await asyncio.wait_for(attempt(), timeout=remaining)
+            except (ModelUnavailableError, asyncio.TimeoutError) as error:
+                last_error = error
+            except aiohttp.ClientResponseError as error:
+                if error.status not in {429, 503}:
+                    raise
+                last_error = error
+
+            retry_after = 0.0
+            headers = getattr(last_error, "headers", None) or getattr(last_error.__cause__, "headers", None) or {}
+            value = headers.get("Retry-After")
+            if value is not None:
+                try:
+                    retry_after = float(value)
+                except (ValueError, TypeError):
+                    try:
+                        retry_after = parsedate_to_datetime(value).timestamp() - time()
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+            remaining = deadline - monotonic()
+            if remaining > 0:
+                await sleep(min(remaining, max(backoff, retry_after)))
+            backoff = min(backoff * 2, 5.0)
 
     def _validate_image_request(
         self, input_ids: list[int], expanded_ids: list[int], response_length: int, images: list
