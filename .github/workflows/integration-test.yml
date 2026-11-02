@@ -30,7 +30,7 @@ jobs:
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: ${{ matrix.case }}
-    runs-on: [self-hosted, linux, x64, h20, gpu]
+    runs-on: [self-hosted, linux, x64, 910c, gpu]
     # Allow 120 minutes for image preparation plus the existing 65-minute test job budget.
     timeout-minutes: 185
     strategy:
@@ -161,8 +161,8 @@ jobs:
 
   npu-integration:
     needs: bypass
-    # A failed gate must run the tests, never grant an exemption.
-    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
+    # This temporary PR validates only the rebuilt GPU environment.
+    if: ${{ false }}
     name: Qwen3-4B-4xnpu-async
     runs-on: [self-hosted, linux, ARM64, 910c, npu]
     timeout-minutes: 185
