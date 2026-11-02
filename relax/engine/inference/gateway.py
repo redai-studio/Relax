@@ -19,7 +19,7 @@ import asyncio
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Coroutine
 from typing import Any, Callable, Mapping
 
 import httpx
@@ -32,7 +32,6 @@ from relax.engine.inference.client import (
     InferenceRequest,
     InferenceRequestClient,
     SnapshotSource,
-    _settle,
 )
 from relax.engine.inference.discovery import RoleSnapshot
 from relax.engine.inference.routing import (
@@ -74,6 +73,67 @@ def build_forward_headers(original_headers: Mapping[str, str]) -> dict[str, str]
     return {key: value for key, value in original_headers.items() if key.lower() not in _HOP_BY_HOP_HEADERS}
 
 
+async def _run_owned(
+    operation: Coroutine[Any, Any, Any], track_cleanup: Callable[[asyncio.Task], asyncio.Task]
+) -> Any:
+    """Cancel HTTP work once; its unwinding and close remain owned off-
+    caller."""
+    task = asyncio.create_task(operation)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.cancel()
+
+        async def finish() -> None:
+            try:
+                result = await task
+            except (asyncio.CancelledError, Exception):
+                return
+            # Cancellation can win after headers produced a response but before
+            # the frontend received it. Close that otherwise unconsumed stream.
+            if isinstance(result, _PermitStreamingResponse):
+                await result.aclose(cancelled=True)
+
+        track_cleanup(asyncio.create_task(finish()))
+        raise
+
+
+class _UpstreamCloseError(RuntimeError):
+    """Upstream exit is unconfirmed; its permit must remain with the owner."""
+
+
+class _ManagedHTTPStream(httpx.AsyncByteStream):
+    """Preserve the original close receipt even if HTTPX sets is_closed
+    early."""
+
+    def __init__(self, stream: httpx.AsyncByteStream, track_cleanup: Callable[[asyncio.Task], asyncio.Task]) -> None:
+        self._stream = stream
+        self._track_cleanup = track_cleanup
+        self._close_task: asyncio.Task[None] | None = None
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        if self._close_task is None:
+            self._close_task = self._track_cleanup(asyncio.create_task(self._stream.aclose()))
+        try:
+            await asyncio.shield(self._close_task)
+        except Exception as error:
+            raise _UpstreamCloseError("Upstream close did not confirm completion; permit remains held") from error
+
+
+async def _close_upstream(response: httpx.Response) -> None:
+    try:
+        await response.aclose()
+    finally:
+        # Response.aclose() may now be a no-op after an interrupted close.
+        # The stream's one task, not that flag, is the completion evidence.
+        if isinstance(response.stream, _ManagedHTTPStream):
+            await response.stream.aclose()
+
+
 class _NativeStreamingResponse(StreamingResponse):
     """Preserve native SSE framing and close upstream even before iteration."""
 
@@ -101,7 +161,7 @@ class _NativeStreamingResponse(StreamingResponse):
 
     async def aclose(self) -> None:
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._upstream.aclose())
+            self._close_task = asyncio.create_task(_close_upstream(self._upstream))
         await asyncio.shield(self._close_task)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -114,47 +174,73 @@ class _NativeStreamingResponse(StreamingResponse):
 class _PermitStreamingResponse(StreamingResponse):
     """Keep the permit until the upstream is closed, even before iteration."""
 
-    def __init__(self, response: StreamingResponse, permit: InferenceRequest | None) -> None:
+    def __init__(
+        self,
+        response: StreamingResponse,
+        permit: InferenceRequest | None,
+        track_cleanup: Callable[[asyncio.Task], asyncio.Task],
+        close_upstream: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self._response = response
         self._permit = permit
+        self._track_cleanup = track_cleanup
+        self._close_upstream = close_upstream
+        self._cancelled = False
         self._close_task: asyncio.Task[None] | None = None
 
         async def chunks() -> AsyncIterator[str | bytes]:
             try:
                 async for chunk in response.body_iterator:
                     yield chunk
+            except asyncio.CancelledError:
+                self._cancelled = True
+                raise
             finally:
-                await self.aclose()
+                await self.aclose(cancelled=self._cancelled)
 
         super().__init__(
             chunks(), status_code=response.status_code, headers=dict(response.headers), media_type=response.media_type
         )
 
     async def _close(self) -> None:
-        try:
-            close = getattr(self._response.body_iterator, "aclose", None)
-            if close is not None:
-                await close()
-            if isinstance(self._response, _NativeStreamingResponse):
-                await self._response.aclose()
-        finally:
-            if self._permit is not None:
+        close = getattr(self._response.body_iterator, "aclose", None)
+        if close is not None:
+            await close()
+        if self._close_upstream is not None:
+            await self._close_upstream()
+        if isinstance(self._response, _NativeStreamingResponse):
+            await self._response.aclose()
+        # A failed close is not evidence of upstream exit. Leave the permit
+        # fenced in that case; never return it from a finally block.
+        if self._permit is not None:
+            if self._cancelled:
+                self._permit.start_release()
+            else:
                 await self._permit.aclose()
 
-    async def aclose(self) -> None:
+    async def aclose(self, *, cancelled: bool = False) -> None:
+        self._cancelled |= cancelled
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close())
+            self._close_task = self._track_cleanup(asyncio.create_task(self._close()))
+        if self._cancelled:
+            return
         try:
             await asyncio.shield(self._close_task)
         except asyncio.CancelledError:
-            await _settle(self._close_task)
+            self._cancelled = True
             raise
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            await self.aclose()
+        async def pump() -> None:
+            try:
+                await super(_PermitStreamingResponse, self).__call__(scope, receive, send)
+            except asyncio.CancelledError:
+                self._cancelled = True
+                raise
+            finally:
+                await self.aclose(cancelled=self._cancelled)
+
+        await _run_owned(pump(), self._track_cleanup)
 
 
 class InferenceGateway:
@@ -259,18 +345,33 @@ class InferenceGateway:
         if not isinstance(payload, Mapping):
             raise HTTPException(status_code=400, detail="Invalid request body: expected a JSON object")
         forwarded = dict(payload)
-        permit = await self._admit(model=forwarded.pop("model", None), route_key=forwarded.pop("route_key", None))
-        transferred = False
-        try:
-            url = f"{permit.target.base_url}/generate"
-            if forwarded.get("stream"):
-                response = _PermitStreamingResponse(await self._stream_generate(url, forwarded, permit), permit)
-                transferred = True
-                return response
-            return await self.proxy_json(url, forwarded)
-        finally:
-            if not transferred:
-                await permit.aclose()
+
+        async def dispatch() -> Any:
+            permit = await self._admit(model=forwarded.pop("model", None), route_key=forwarded.pop("route_key", None))
+            transferred = cancelled = unconfirmed_close = False
+            try:
+                url = f"{permit.target.base_url}/generate"
+                if forwarded.get("stream"):
+                    response = _PermitStreamingResponse(
+                        await self._stream_generate(url, forwarded, permit), permit, self._requests._track_cleanup
+                    )
+                    transferred = True
+                    return response
+                return await self.proxy_json(url, forwarded)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            except _UpstreamCloseError:
+                unconfirmed_close = True
+                raise
+            finally:
+                if not transferred and not unconfirmed_close:
+                    if cancelled:
+                        permit.start_release()
+                    else:
+                        await permit.aclose()
+
+        return await _run_owned(dispatch(), self._requests._track_cleanup)
 
     async def _admit(self, **selection: Any) -> InferenceRequest:
         permit = self._requests.request(**selection)
@@ -287,12 +388,12 @@ class InferenceGateway:
         client = self._get_proxy_client()
         response = None
         try:
-            response = await client.send(client.build_request("POST", url, json=dict(payload)), stream=True)
+            response = await self._send(client, client.build_request("POST", url, json=dict(payload)))
             await permit.dispatched()
             response.raise_for_status()
         except RoutingError as exc:
             if response is not None:
-                await response.aclose()
+                await _close_upstream(response)
             raise HTTPException(
                 exc.status_code,
                 str(exc),
@@ -309,15 +410,15 @@ class InferenceGateway:
                     else None,
                 ) from exc
             finally:
-                await exc.response.aclose()
+                await _close_upstream(exc.response)
         except httpx.RequestError as exc:
             if response is not None:
-                await response.aclose()
+                await _close_upstream(response)
             self._on_upstream_unreachable(url, exc)
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {exc}") from exc
         except BaseException:
             if response is not None:
-                await response.aclose()
+                await _close_upstream(response)
             raise
         return _NativeStreamingResponse(response)
 
@@ -339,7 +440,7 @@ class InferenceGateway:
 
         async def dispatch() -> Any:
             permit = await self._admit(model=request.get("model"), route_key=request.get("route_key"))
-            transferred = False
+            transferred = cancelled = unconfirmed_close = False
             try:
                 original = dict(request)
                 request.pop("route_key", None)
@@ -352,22 +453,32 @@ class InferenceGateway:
                     permit=permit,
                 )
                 if isinstance(result, StreamingResponse):
-                    result = _PermitStreamingResponse(result, permit)
+                    if not isinstance(result, _PermitStreamingResponse):
+                        result = _PermitStreamingResponse(result, permit, self._requests._track_cleanup)
                     transferred = True
                 return result
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            except _UpstreamCloseError:
+                unconfirmed_close = True
+                raise
             finally:
-                if not transferred:
-                    await permit.aclose()
+                if not transferred and not unconfirmed_close:
+                    if cancelled:
+                        permit.start_release()
+                    else:
+                        await permit.aclose()
 
         if not request.get("stream"):
-            return await dispatch()
+            return await _run_owned(dispatch(), self._requests._track_cleanup)
 
         async def chunks() -> AsyncIterator[str | bytes]:
             response = None
             try:
                 # A StreamingResponse can sit unconsumed across offload/resume.
                 # Admit in the same coroutine that actually starts the send.
-                response = await dispatch()
+                response = await _run_owned(dispatch(), self._requests._track_cleanup)
                 async for chunk in response.body_iterator:
                     yield chunk
             except HTTPException as error:
@@ -380,7 +491,9 @@ class InferenceGateway:
                 if response is not None:
                     await response.aclose()
 
-        return _PermitStreamingResponse(StreamingResponse(chunks(), media_type="text/event-stream"), None)
+        return _PermitStreamingResponse(
+            StreamingResponse(chunks(), media_type="text/event-stream"), None, self._requests._track_cleanup
+        )
 
     # ------------------------------------------------------------------
     # Proxying to an already resolved upstream.
@@ -413,9 +526,18 @@ class InferenceGateway:
             self._on_upstream_unreachable(url, e)
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {e}")
 
+    async def _send(self, client: httpx.AsyncClient, request: httpx.Request) -> httpx.Response:
+        # Wrap before aread/iteration: HTTPX may close automatically at EOF.
+        response = await client.send(request, stream=True)
+        response.stream = _ManagedHTTPStream(response.stream, self._requests._track_cleanup)
+        return response
+
     async def proxy_json(self, url: str, payload: Mapping[str, Any]) -> Any:
+        response = None
         try:
-            response = await self._get_proxy_client().post(url, json=dict(payload))
+            client = self._get_proxy_client()
+            response = await self._send(client, client.build_request("POST", url, json=dict(payload)))
+            await response.aread()
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -429,6 +551,9 @@ class InferenceGateway:
         except httpx.RequestError as e:
             self._on_upstream_unreachable(url, e)
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {e}")
+        finally:
+            if response is not None:
+                await _close_upstream(response)
 
     async def proxy_chat_completions(
         self,
@@ -448,8 +573,12 @@ class InferenceGateway:
         forward_headers = build_forward_headers(headers)
         if stream:
             return self._stream(client, url, body, forward_headers, permit)
+        response = None
         try:
-            response = await client.post(url, content=body, headers=forward_headers)
+            response = await self._send(
+                client, client.build_request("POST", url, content=body, headers=forward_headers)
+            )
+            await response.aread()
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -463,6 +592,9 @@ class InferenceGateway:
         except httpx.RequestError as e:
             self._on_upstream_unreachable(url, e)
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {e}")
+        finally:
+            if response is not None:
+                await _close_upstream(response)
 
     def _stream(
         self,
@@ -472,11 +604,37 @@ class InferenceGateway:
         forward_headers: dict[str, str],
         permit: InferenceRequest | None = None,
     ) -> StreamingResponse:
+        response = None
+        sending: asyncio.Task[httpx.Response] | None = None
+
+        async def close_upstream() -> None:
+            nonlocal response
+            if response is None and sending is not None:
+                try:
+                    response = await asyncio.shield(sending)
+                except asyncio.CancelledError:
+                    if not sending.done():
+                        raise
+                    # The send's one cancellation finished transport unwinding.
+                except Exception:
+                    # A failed send did not transfer an HTTP response to us.
+                    pass
+            if response is not None:
+                await _close_upstream(response)
+
         async def _event_generator():
-            response = None
+            nonlocal response, sending
             try:
                 req = client.build_request("POST", url, content=body, headers=forward_headers)
-                response = await client.send(req, stream=True)
+                # Starlette's AnyIO scope may cancel iteration repeatedly.
+                # Keep the actual send/unwind outside that scope and let the
+                # owned close callback await its terminal result before return.
+                sending = asyncio.create_task(self._send(client, req))
+                try:
+                    response = await asyncio.shield(sending)
+                except asyncio.CancelledError:
+                    sending.cancel()
+                    raise
                 if permit is not None:
                     await permit.dispatched()
                 response.raise_for_status()
@@ -497,10 +655,14 @@ class InferenceGateway:
                 yield f"data: {error_chunk}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
-                if response is not None:
-                    await response.aclose()
+                await close_upstream()
 
-        return StreamingResponse(_event_generator(), media_type="text/event-stream")
+        return _PermitStreamingResponse(
+            StreamingResponse(_event_generator(), media_type="text/event-stream"),
+            permit,
+            self._requests._track_cleanup,
+            close_upstream,
+        )
 
     def _on_upstream_unreachable(self, url: str, error: Exception) -> None:
         logger.error(f"[{self.role}] failed to reach {self._upstream_name} at {url}: {error}")

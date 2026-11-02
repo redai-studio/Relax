@@ -272,12 +272,17 @@ class InferenceRequest:
             # tracked release task and owner still hold the unknown permit.
             logger.warning("Inference permit return timed out for role %s; cleanup remains pending", self._client.role)
 
+    def start_release(self) -> None:
+        """Own the idempotent return without waiting, after upstream has
+        closed."""
+        if self._permit is not None:
+            self._start_release()
+
     async def __aexit__(self, _kind: Any, error: Any, _traceback: Any) -> None:
         if isinstance(error, asyncio.CancelledError):
             # The body already received cancellation. Keep the same owned
             # return task without starting a fresh foreground control budget.
-            if self._permit is not None:
-                self._start_release()
+            self.start_release()
             return
         if isinstance(error, Exception) and self.target is not None:
             # OPD and other lookaside requests report through their actual

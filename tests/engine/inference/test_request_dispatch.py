@@ -99,6 +99,11 @@ async def test_connection_pool_queue_prevents_handoff_until_send_is_cancelled(mo
             pending.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await pending
+            # Cancellation leaves ordered HTTP cleanup/return owned in the
+            # background. Handoff still requires that actual receipt.
+            while client._cleanup_tasks:
+                await asyncio.wait_for(asyncio.gather(*client._cleanup_tasks), 2)
+                await asyncio.sleep(0)
             manager.gate.drain(lambda: None, timeout=0)
             manager.gate.confirm_drained()
             manager.gate.open()
