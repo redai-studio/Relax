@@ -463,7 +463,10 @@ class OpdManager:
                 ) from last_error
             try:
                 return await asyncio.wait_for(attempt(), timeout=remaining)
-            except (ModelUnavailableError, asyncio.TimeoutError) as error:
+            except (ModelUnavailableError, asyncio.TimeoutError, aiohttp.ClientConnectionError) as error:
+                # On connection failure, the permit context has already queued
+                # a hint and returned its permit. Retry without waiting for the
+                # owner; its health task coalesces hints and controls backoff.
                 last_error = error
             except aiohttp.ClientResponseError as error:
                 if error.status not in {429, 503}:

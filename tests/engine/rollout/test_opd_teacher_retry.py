@@ -143,6 +143,50 @@ async def test_external_teacher_does_not_gain_managed_retries(monkeypatch, retry
     assert retry_clock.delays == [] and session.urls == ["external"]
 
 
+@pytest.mark.parametrize("recovers", [True, False])
+async def test_teacher_connection_retries_hint_each_failure_without_holding_permits(
+    monkeypatch, retry_clock, recovers
+):
+    owner = AdmissionManager(snapshot("__default__"))
+    hints = []
+    # Model an owner whose recovery RPC has not replied. Neither permit
+    # cleanup nor a later HTTP attempt may wait for that reply.
+    pending_hint = asyncio.get_running_loop().create_future()
+    owner.report_failure = SimpleNamespace(remote=lambda url: hints.append(url) or pending_hint)
+    monkeypatch.setattr(opd, "get_request_client", lambda role: owner.client(role))
+
+    class Disconnected(Session):
+        @asynccontextmanager
+        async def post(self, url, **kwargs):
+            self.urls.append(url)
+            if len(self.urls) <= 2 or not recovers:
+                raise aiohttp.ClientConnectionError("teacher vanished")
+            yield self
+
+    session = Disconnected()
+
+    def after_wait():
+        assert len(hints) == len(session.urls)
+        assert owner.acquired == owner.released
+        assert not pending_hint.done()
+        if len(hints) == 2 and recovers:
+            owner.snapshot = snapshot("__default__", host="replacement")
+
+    retry_clock.after_wait = after_wait
+    manager = _manager(timeout=2 if recovers else 0.75)
+    if recovers:
+        assert await asyncio.wait_for(_send(manager, session), 5) is not None
+        assert session.urls == ["http://engine:1/generate"] * 2 + ["http://replacement:1/generate"]
+    else:
+        with pytest.raises(ModelUnavailableError, match="retry budget.*exhausted"):
+            await asyncio.wait_for(_send(manager, session), 5)
+        assert session.urls == ["http://engine:1/generate"] * 2
+    assert hints == ["http://engine:1"] * 2
+    assert retry_clock.delays == [0.25, 0.5]
+    assert owner.acquired == owner.released
+    assert not pending_hint.done()
+
+
 async def test_hanging_teacher_discovery_obeys_total_budget(monkeypatch):
     started = asyncio.Event()
 

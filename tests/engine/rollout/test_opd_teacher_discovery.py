@@ -134,11 +134,19 @@ async def test_opd_connection_failure_notifies_owner_without_waiting_for_recover
             yield  # pragma: no cover
 
     manager = object.__new__(opd.OpdManager)
-    assert (
+    manager.args = Namespace(opd_teacher_timeout_s=0.25)
+    clock = [0.0]
+
+    async def backoff(delay):
+        assert hints == ["http://engine:1"]
+        assert owner.released == owner.acquired
+        clock[0] += delay
+
+    monkeypatch.setattr(opd, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(opd, "sleep", backoff)
+    with pytest.raises(ModelUnavailableError, match="retry budget.*exhausted"):
         await manager._post_logprob(
             DisconnectedSession(), "", {}, Sample(index=0), "teacher", inference={"role": "teacher"}
         )
-        is None
-    )
     assert hints == ["http://engine:1"]
     assert owner.released == owner.acquired
