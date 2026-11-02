@@ -246,7 +246,7 @@ finally:
     phase.switch("leave_score")
 ```
 
-Async callbacks use `await phase.aswitch(...)`. Legacy named manager calls such as `manager.offload.remote()` must pass `lease=phase.lease`; a call without a lease now fails. Prefer phase transitions because the authority coordinates every overlapping model. Do not start background GPU requests that outlive the callback. Shared deferred scoring enables SGLang's CPU weight backup so a same-round return to generation restores the synchronized policy; a conflicting `enable_weights_cpu_backup: false` engine override is rejected.
+Async callbacks use `await phase.aswitch(...)`. Legacy named manager calls such as `manager.offload.remote()` remain supported with a deprecation warning per caller. Without an explicit lease, the authority borrows the unique active lease covering the model, or creates a one-shot lease when there is no active owner. Ambiguous or conflicting ownership raises an error. New callbacks should pass `lease=phase.lease` or use phase transitions. Prefer phase transitions because the authority coordinates every overlapping model. Do not start background GPU requests that outlive the callback. Shared deferred scoring enables SGLang's CPU weight backup so a same-round return to generation restores the synchronized policy; a conflicting `enable_weights_cpu_backup: false` engine override is rejected.
 
 ## Training Script and Key Parameters
 

@@ -17,8 +17,13 @@ from typing import Any
 import ray
 
 from relax.engine.inference.discovery import EngineState, RoleSnapshot, role_snapshot_from_payloads
+from relax.engine.inference.holder import HolderIdentity, current_holder
 from relax.engine.inference.ownership import ActivationLease, OwnershipError, ResourceBlockedError
 from relax.engine.inference.phase_client import PhaseSession, await_control, current_phase, wait_control
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 _READ_METHODS = frozenset({"health_check", "is_onloaded", "get_status"})
@@ -64,6 +69,7 @@ class InferenceManager:
         self._acceptance = asyncio.Lock()
         self._owned_resources = set()
         self._closing = False
+        self._legacy_callers: set[HolderIdentity | None] = set()
 
     async def add_model(self, name: str, args: Any, kwargs: dict[str, Any]) -> None:
         if self._closing:
@@ -218,6 +224,23 @@ class InferenceManager:
                 task = asyncio.create_task(execute())
                 self._operations[key] = (signature, task)
         return await asyncio.shield(task)
+
+    async def legacy_apply(self, name: str, action: str, command_id: str, holder: HolderIdentity, *, tags=None) -> Any:
+        if holder not in self._legacy_callers:
+            self._legacy_callers.add(holder)
+            logger.warning("Deprecated lifecycle call without an explicit lease from %s; use PhaseSession", holder)
+
+        async def execute() -> Any:
+            token = uuid.uuid4().hex
+            lease, owned = await self.authority.resolve_legacy.remote(self.role, name, token, holder)
+            try:
+                return await self.apply(name, action, lease, command_id, tags=tags)
+            finally:
+                await self.authority.finish.remote(lease, token)
+                if owned:
+                    await self.authority.release.remote(lease)
+
+        return await asyncio.shield(asyncio.create_task(execute()))
 
     async def call(self, name: str, method: str, args: tuple = (), kwargs: dict | None = None, lease=None) -> Any:
         kwargs = kwargs or {}
@@ -422,6 +445,10 @@ class _RemoteMethod:
             if method in {"onload_weights", "onload_kv"}:
                 tags = ["weights"] if method == "onload_weights" else ["kv_cache", "cuda_graph"]
                 method = "onload"
+            if lease is None:
+                return handle.legacy_apply.remote(
+                    model, method, command or uuid.uuid4().hex, current_holder(), tags=tags
+                )
             return handle.apply.remote(model, method, lease, command or uuid.uuid4().hex, tags=tags)
         return handle.call.remote(model, method, args, kwargs, lease)
 
@@ -469,10 +496,13 @@ def ensure_inference_manager(args: Any, role: str, pg: Any = None, *, runtime_en
 class LegacyInferenceManager:
     """Named lookup compatibility.
 
-    Mutations still require an explicit lease.
+    Old callers borrow a covering lease or receive a one-shot lease.
     """
 
     def __init__(self, manager: ModelManager) -> None:
+        self.manager = manager
+
+    def bind(self, manager: ModelManager) -> None:
         self.manager = manager
 
     async def onload(self, tags=None, *, lease=None, command_id=None):
@@ -497,5 +527,12 @@ class LegacyInferenceManager:
         return await self.manager.health_check.remote()
 
 
+_legacy_facades: dict[str, Any] = {}
+
+
 def register_legacy_name(name: str, manager: ModelManager) -> None:
-    LegacyInferenceManager.options(name=name, get_if_exists=True).remote(manager)
+    # A name is not a lifetime reference in Ray. Keep the facade alive with its
+    # job owner, and rebind it when that owner installs a new resource epoch.
+    facade = LegacyInferenceManager.options(name=name, get_if_exists=True).remote(manager)
+    _legacy_facades[name] = facade
+    wait_control(facade.bind.remote(manager), f"legacy facade {name} registration")

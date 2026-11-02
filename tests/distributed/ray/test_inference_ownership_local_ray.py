@@ -145,7 +145,7 @@ def test_common_owner_drain_keeps_admission_and_discovery_responsive(cluster):
     with pytest.raises(StaleLeaseError):
         ray.get(model.onload.remote(lease=lease), timeout=10)
     with pytest.raises(OwnershipError):
-        ray.get(model.onload.remote(), timeout=10)
+        ray.get(owner.apply.remote("a", "onload", None, "missing"), timeout=10)
     # A retry can return its cached receipt without repeating GPU work.
     ray.get(model.offload.remote(lease=lease, command_id="release"), timeout=10)
     ray.get([authority.release.remote(next_lease), authority.release.remote(other)])
@@ -278,3 +278,64 @@ def test_dead_lease_holder_is_reconciled_by_the_production_manager(cluster):
     assert ray.get(owner.calls.remote("a"), timeout=10) == ["offload"]
     with pytest.raises(StaleLeaseError):
         ray.get(authority.check.remote(lease), timeout=10)
+
+
+def test_main_swap_hook_runs_unchanged_through_legacy_named_facade(local_ray, monkeypatch):
+    from pathlib import Path
+
+    from relax.distributed.ray.inference_manager import register_legacy_name
+    from relax.engine.inference.phase_client import PhaseSession
+    from relax.engine.rollout.workload import RolloutWorkload
+
+    claims = (
+        PlacementClaim("rollout", "default", "actor", 0, 1, frozenset({Phase.GENERATE})),
+        PlacementClaim("genrm", "judge", "actor", 0, 1, frozenset({Phase.SCORE})),
+    )
+    authority = LifecycleAuthority.remote(PlacementPlan((), claims))
+    args = SimpleNamespace(_inference_authority=authority, advantage_estimator="grpo", rewards_normalization=False)
+    rollout, genrm = (owner_class().remote(args, role) for role in ("rollout", "genrm"))
+
+    @ray.remote(num_cpus=0)
+    class Gate:
+        def enter(self):
+            return True
+
+    gate = Gate.remote()
+    facade = None
+    try:
+        for owner, claim in zip((rollout, genrm), claims, strict=True):
+            ray.get(owner.claim_placement.remote(), timeout=10)
+            ray.get(owner.install.remote(claim.model, claim, gate), timeout=10)
+        register_legacy_name("relax_genrm_manager", ModelManager(genrm, "judge"))
+        facade = ray.get_actor("relax_genrm_manager")
+        workload = RolloutWorkload.__ray_metadata__.modified_class.__new__(
+            RolloutWorkload.__ray_metadata__.modified_class
+        )
+        workload.inference_manager = ModelManager(rollout, "default")
+        source = Path(__file__).with_name("fixtures").joinpath("main_genrm_swap.py.txt").read_text()
+        namespace = {"__name__": "main_swap_fixture"}
+        exec(compile(source, "main_genrm_swap.py", "exec"), namespace)
+        namespace["get_local_rollout_manager"] = lambda: workload
+
+        async def score(samples):
+            resident = ray.get(authority.snapshot.remote(), timeout=10)["resident"]
+            assert len(resident) == 1 and resident[0].startswith("genrm/judge")
+            return [1.0] * len(samples)
+
+        namespace["_score_all"] = score
+        samples = [SimpleNamespace(reward=None)]
+        with PhaseSession(authority, "rollout", "original-main-hook") as session:
+            session.switch("generate")
+            assert namespace["custom_reward_post_process"](args, samples) == [1.0]
+        assert samples[0].reward == 1.0
+        assert ray.get(authority.snapshot.remote(), timeout=10)["owners"] == {}
+        assert ray.get(rollout.calls.remote("default")) == ["onload", "offload"]
+        assert ray.get(genrm.calls.remote("judge"))[-2:] == ["onload", "offload"]
+        # A call outside any workload receives a one-shot lease.
+        ray.get(facade.onload.remote(), timeout=10)
+        ray.get(facade.offload.remote(), timeout=10)
+        assert ray.get(authority.snapshot.remote(), timeout=10)["owners"] == {}
+    finally:
+        for actor in (facade, rollout, genrm, authority, gate):
+            if actor is not None:
+                ray.kill(actor, no_restart=True)

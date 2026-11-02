@@ -414,6 +414,38 @@ class OwnershipLedger:
             raise OwnershipError(f"Model ownership is already registered: {key}")
         self._models[key] = (manager, model, claim)
 
+    async def resolve_legacy(
+        self, role: str, model: str, token: str, holder: HolderIdentity | None
+    ) -> tuple[ActivationLease, bool]:
+        """Borrow one unambiguous covering owner, or acquire a one-shot lease.
+
+        Pin the borrowed lease before returning it so a concurrent return waits
+        for the compatibility operation to settle.
+        """
+        claims = tuple(c for c in self.plan.claims if c.role == role and c.model == model)
+        if not claims:
+            raise OwnershipError(f"No placement claims for legacy {role}/{model}")
+        overlapping = [
+            lease for lease in self._active.values() if any(claims_overlap(a, b) for a in claims for b in lease.claims)
+        ]
+        if overlapping:
+            if len(overlapping) != 1:
+                raise OwnershipError(
+                    f"Ambiguous legacy {role}/{model}: {len(overlapping)} active owners; pass a lease"
+                )
+            lease = overlapping[0]
+            if lease.role in _TRAINING_ROLES:
+                raise OwnershipError(
+                    f"Legacy {role}/{model} conflicts with training owner {lease.owner}; pass a lease"
+                )
+            self.check(lease, claims, allow_blocked=True)
+            owned = False
+        else:
+            lease = await self.acquire(f"legacy:{role}/{model}", token, claims, role=role, holder=holder)
+            owned = True
+        self.begin(lease, token)
+        return lease, owned
+
     def reserve_activation(self, lease: ActivationLease, role: str, model: str) -> None:
         keys = [key for key, (_, name, claim) in self._models.items() if claim.role == role and name == model]
         self.check(lease, [self._models[key][2] for key in keys])

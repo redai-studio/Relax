@@ -584,3 +584,37 @@ async def test_training_weight_handoff_allows_its_own_rollout_recovery():
     await ledger.command(lease, "weights", "generate", "weights")
     assert ledger.reserve_maintenance("rollout", "default", lease=lease)
     assert not ledger.reserve_maintenance("rollout", "default")
+
+
+async def test_legacy_resolution_borrows_one_covering_lease_and_protects_return():
+    rollout, judge = claim(), claim("genrm", "judge", phase=Phase.SCORE)
+    ledger = OwnershipLedger(PlacementPlan((), (rollout, judge)))
+    lease = await ledger.acquire("workload", "hook", [rollout, judge], role="rollout")
+    borrowed, owned = await ledger.resolve_legacy("genrm", "judge", "legacy-call", None)
+    assert borrowed == lease and not owned
+    returning = asyncio.create_task(ledger.release(lease))
+    await asyncio.sleep(0)
+    assert not returning.done()
+    await ledger.finish(lease, "legacy-call")
+    await returning
+    one_shot, owned = await ledger.resolve_legacy("genrm", "judge", "outside-hook", None)
+    assert owned and one_shot != lease
+    await ledger.finish(one_shot, "outside-hook")
+    await ledger.release(one_shot)
+
+
+async def test_legacy_resolution_rejects_ambiguous_or_training_owners():
+    from dataclasses import replace
+
+    c = replace(claim("genrm", "judge"), pool="dedicated")
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    first = await ledger.acquire("one", "one", [c], role="genrm")
+    second = await ledger.acquire("two", "two", [c], role="genrm")
+    with pytest.raises(OwnershipError, match="Ambiguous"):
+        await ledger.resolve_legacy("genrm", "judge", "legacy", None)
+    await ledger.release(first)
+    await ledger.release(second)
+    training = await ledger.acquire("training", "train", [c], role="actor")
+    with pytest.raises(OwnershipError, match="training"):
+        await ledger.resolve_legacy("genrm", "judge", "legacy", None)
+    await ledger.release(training)

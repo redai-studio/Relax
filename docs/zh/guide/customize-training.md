@@ -242,7 +242,7 @@ finally:
     phase.switch("leave_score")
 ```
 
-异步回调使用 `await phase.aswitch(...)`。通过旧名称获取的 manager 若直接调用 `manager.offload.remote()`，现在必须传入 `lease=phase.lease`，缺少 lease 会报错。优先使用阶段切换，让 authority 协调所有重叠模型。不要让后台 GPU 请求在回调结束后继续运行。共享资源的 deferred scoring 会启用 SGLang CPU 权重备份，确保同一轮恢复生成时使用已同步的策略权重；冲突的 `enable_weights_cpu_backup: false` 引擎覆盖配置会被拒绝。
+异步回调使用 `await phase.aswitch(...)`。通过旧名称获取的 manager 仍支持直接调用 `manager.offload.remote()`，并对每个调用方记录一次弃用警告。未传 lease 时，authority 会借用唯一覆盖该模型的活跃 lease；没有活跃 owner 时使用一次性 lease。存在歧义或所有权冲突时会报错。新回调应传入 `lease=phase.lease` 或使用阶段切换。优先使用阶段切换，让 authority 协调所有重叠模型。不要让后台 GPU 请求在回调结束后继续运行。共享资源的 deferred scoring 会启用 SGLang CPU 权重备份，确保同一轮恢复生成时使用已同步的策略权重；冲突的 `enable_weights_cpu_backup: false` 引擎覆盖配置会被拒绝。
 
 ## 训练脚本与关键参数概览
 
