@@ -173,6 +173,7 @@ def test_estimator_output_validation(values, monkeypatch):
         )
 
 
+@pytest.mark.parametrize("objective", ["microbatch_balance", "dp_balance"])
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -192,8 +193,110 @@ def test_estimator_output_validation(values, monkeypatch):
         {"moe_router_load_balancing_type": "quantile_balancing"},
     ],
 )
-def test_bypassed_schedulers_reject_flops(overrides):
+def test_bypassed_schedulers_reject_flops(objective, overrides):
+    validator = (
+        microbatch_cost.validate_dp_balance
+        if objective == "dp_balance"
+        else microbatch_cost.validate_microbatch_balance
+    )
     with pytest.raises(ValueError):
-        microbatch_cost.validate_microbatch_balance(
-            Namespace(**{"microbatch_balance": "flops", "use_dynamic_batch_size": True, **overrides})
-        )
+        validator(Namespace(**{objective: "flops", "use_dynamic_batch_size": True, "loss_type": "sft", **overrides}))
+
+
+def test_default_objectives_preserve_configuration_and_do_not_load_model(monkeypatch):
+    from relax.utils import misc
+
+    monkeypatch.setattr(misc, "get_hf_config", lambda *_: pytest.fail("Disabled FLOPs must not load model config"))
+    args = Namespace()
+    batch, metadata = {"total_lengths": [2]}, [{"total_lengths": 2}]
+    microbatch_cost.configure_flops_balance(args)
+    assert vars(args) == {}
+    assert microbatch_cost.sample_costs(args, batch) is None
+    assert microbatch_cost.sample_costs(args, batch, for_dp=True) is None
+    assert microbatch_cost.add_flops_cost_metadata(args, batch, metadata) is metadata
+
+
+@pytest.mark.parametrize("microbatch", ["tokens", "flops"])
+@pytest.mark.parametrize("dp", ["tokens", "flops"])
+@pytest.mark.parametrize("loss_type", ["sft", "grpo"])
+def test_independent_objectives_gate_costs_and_metadata(monkeypatch, microbatch, dp, loss_type):
+    from relax.utils import misc
+
+    calls = []
+
+    def config(*_):
+        calls.append(1)
+        return tiny_config()
+
+    monkeypatch.setattr(misc, "get_hf_config", config)
+    args = Namespace(
+        microbatch_balance=microbatch,
+        dp_balance=dp,
+        balance_data=True,
+        use_dynamic_batch_size=True,
+        loss_type=loss_type,
+        hf_checkpoint="unused",
+    )
+    original = vars(args).copy()
+    microbatch_cost.configure_flops_balance(args)
+    assert vars(args) == original
+    batch, metadata = {"total_lengths": [2, 4]}, [{"total_lengths": 2}, {"total_lengths": 4}]
+    costs = microbatch_cost.sample_costs(args, batch)
+    assert costs == ([14304, 28992] if microbatch == "flops" else None)
+    published = microbatch_cost.add_flops_cost_metadata(args, batch, metadata)
+    if dp == "flops":
+        assert [row["flops_cost"] for row in published] == [14304, 28992]
+    else:
+        assert published is metadata
+    assert len(calls) == int(microbatch == "flops") + int(dp == "flops")
+
+
+def test_dp_only_requires_legacy_RL_enablement_and_never_enables_microbatches():
+    args = Namespace(dp_balance="flops", microbatch_balance="tokens", use_dynamic_batch_size=True)
+    with pytest.raises(ValueError, match="requires --balance-data"):
+        microbatch_cost.configure_flops_balance(args)
+    assert args.microbatch_balance == "tokens" and not hasattr(args, "balance_data")
+    args.balance_data = True
+    microbatch_cost.configure_flops_balance(args)
+    assert args.microbatch_balance == "tokens"
+
+
+@pytest.mark.parametrize("option", ["microbatch_balance", "dp_balance"])
+def test_invalid_independent_objective_is_rejected(option):
+    with pytest.raises(ValueError, match="must be tokens or flops"):
+        microbatch_cost.configure_flops_balance(Namespace(**{option: "invalid"}))
+
+
+@pytest.mark.parametrize("setting", [{"n_samples_per_prompt": 2}, {"sft_image_preprocess_on_rank": True}])
+def test_dp_metadata_restrictions_do_not_disable_microbatch_only_mode(setting):
+    args = Namespace(
+        microbatch_balance="flops",
+        dp_balance="tokens",
+        loss_type="sft",
+        use_dynamic_batch_size=True,
+        **setting,
+    )
+    microbatch_cost.configure_flops_balance(args)
+    args.dp_balance = "flops"
+    with pytest.raises(ValueError):
+        microbatch_cost.configure_flops_balance(args)
+
+
+def test_producer_cost_metadata_uses_the_same_estimator_and_does_not_mutate(monkeypatch):
+    from relax.utils import misc
+
+    monkeypatch.setattr(misc, "get_hf_config", lambda _: tiny_config())
+    args = Namespace(
+        dp_balance="flops",
+        microbatch_balance="tokens",
+        loss_type="sft",
+        use_dynamic_batch_size=True,
+        hf_checkpoint="unused",
+    )
+    batch = {"total_lengths": [2, 4]}
+    metadata = [{"sample_index": 7, "total_lengths": 2}, {"sample_index": 7, "total_lengths": 4}]
+    original = copy.deepcopy(metadata)
+    result = microbatch_cost.add_flops_cost_metadata(args, batch, metadata)
+    assert [row["flops_cost"] for row in result] == [14304, 28992]
+    assert [row["sample_index"] for row in result] == [7, 7]
+    assert metadata == original

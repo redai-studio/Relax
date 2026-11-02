@@ -1614,6 +1614,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--dp-balance",
+                choices=["tokens", "flops"],
+                default="tokens",
+                help=(
+                    "Select tokens or estimated FLOPs for existing synchronous DP assignments. "
+                    "Does not enable --balance-data or change --microbatch-balance."
+                ),
+            )
+            parser.add_argument(
                 "--microbatch-balance",
                 choices=["tokens", "flops"],
                 default="tokens",
@@ -4793,9 +4802,9 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
-    from relax.utils.training.microbatch_cost import validate_microbatch_balance
+    from relax.utils.training.microbatch_cost import configure_flops_balance
 
-    validate_microbatch_balance(args)
+    configure_flops_balance(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")

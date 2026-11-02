@@ -194,28 +194,53 @@ def test_sft_packing_preserves_default_and_archived_recipe(balance_parser, cli, 
     assert balance_parser.parse_args(cli).sft_packing_strategy == expected
 
 
-@pytest.mark.parametrize(
-    "cli,expected",
-    [([], "tokens"), (["--microbatch-balance", "tokens"], "tokens"), (["--microbatch-balance", "flops"], "flops")],
-)
-def test_microbatch_balance_cli_defaults_and_choices(balance_parser, cli, expected):
+@pytest.mark.parametrize("microbatch", [None, "tokens", "flops"])
+@pytest.mark.parametrize("dp", [None, "tokens", "flops"])
+def test_balance_cli_defaults_independent_choices_and_serialization(balance_parser, microbatch, dp):
     import pickle
 
+    cli = ([] if microbatch is None else ["--microbatch-balance", microbatch]) + (
+        [] if dp is None else ["--dp-balance", dp]
+    )
     args = balance_parser.parse_args(cli)
-    assert args.microbatch_balance == expected
+    assert args.microbatch_balance == (microbatch or "tokens")
+    assert args.dp_balance == (dp or "tokens")
+    assert not args.balance_data
     # The ordinary args serialization carries the selection to workers.
-    assert pickle.loads(pickle.dumps(args)).microbatch_balance == expected
+    restored = pickle.loads(pickle.dumps(args))
+    assert (restored.microbatch_balance, restored.dp_balance) == (args.microbatch_balance, args.dp_balance)
 
 
-def test_microbatch_balance_cli_rejects_unknown_value(balance_parser):
+@pytest.mark.parametrize("option", ["--microbatch-balance", "--dp-balance"])
+def test_balance_cli_rejects_unknown_value(balance_parser, option):
     with pytest.raises(SystemExit):
-        balance_parser.parse_args(["--microbatch-balance", "invalid"])
+        balance_parser.parse_args([option, "invalid"])
 
 
-def test_microbatch_balance_is_validated_before_training_setup(arguments_module):
+@pytest.mark.parametrize("objective", ["microbatch_balance", "dp_balance"])
+def test_balance_is_validated_before_training_setup(arguments_module, objective):
     args = _opd_args()
-    args.microbatch_balance = "flops"
+    setattr(args, objective, "flops")
     args.train_backend = "megatron"
     args.use_dynamic_batch_size = False
     with pytest.raises(ValueError, match="use-dynamic-batch-size"):
         arguments_module.slime_validate_args(args)
+
+
+@pytest.mark.parametrize("microbatch", ["tokens", "flops"])
+@pytest.mark.parametrize("dp", ["tokens", "flops"])
+def test_final_yaml_balance_objectives_remain_independent(arguments_module, monkeypatch, microbatch, dp):
+    args = _opd_args()
+    args.train_backend = "megatron"
+    args.use_dynamic_batch_size = True
+    args.max_tokens_per_gpu = 4096
+    args.balance_data = True
+    args.microbatch_balance = args.dp_balance = "invalid_before_override"
+
+    def override(config):
+        config.microbatch_balance = microbatch
+        config.dp_balance = dp
+
+    monkeypatch.setattr(arguments_module, "apply_custom_config_overrides", override)
+    arguments_module.slime_validate_args(args)
+    assert (args.microbatch_balance, args.dp_balance) == (microbatch, dp)

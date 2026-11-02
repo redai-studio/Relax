@@ -156,6 +156,13 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
             train_data["agentic_group_ids"] = (
                 group_ids_to_tensor(encoded) if isinstance(train_data, TensorDict) else encoded
             )
+        if getattr(args, "dp_balance", "tokens") == "flops":
+            from relax.utils.training.microbatch_cost import sample_costs
+
+            costs = sample_costs(args, train_data, for_dp=True)
+            train_data["flops_cost"] = (
+                torch.tensor(costs, dtype=torch.float64) if isinstance(train_data, TensorDict) else costs
+            )
         return train_data
 
     rewards = post_process_rewards(args, samples)
@@ -272,19 +279,27 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
 
     total_lengths = [len(t) for t in train_data["tokens"]]
     train_data["total_lengths"] = total_lengths
+    if getattr(args, "dp_balance", "tokens") == "flops":
+        from relax.utils.training.microbatch_cost import sample_costs
+
+        train_data["flops_cost"] = sample_costs(args, train_data, for_dp=True)
     if args.debug_train_only:
         return train_data
     rollout_batch = dict_to_tensordict(train_data, len(total_lengths))
     return rollout_batch
 
 
-def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int]]:
-    return [
+def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int | float]]:
+    metadata = [
         {"total_lengths": int(total_length), "sample_index": int(sample_index)}
         for total_length, sample_index in zip(
             rollout_batch["total_lengths"], rollout_batch["sample_indices"], strict=True
         )
     ]
+    if "flops_cost" in rollout_batch:
+        for row, cost in zip(metadata, rollout_batch["flops_cost"], strict=True):
+            row["flops_cost"] = float(cost)
+    return metadata
 
 
 def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
