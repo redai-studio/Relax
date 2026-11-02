@@ -109,7 +109,7 @@ def leased_training(function: Callable) -> Callable:
             # lease and quarantine it; a timeout is not a release receipt.
             active = getattr(actor, "_training_session", session)
             if active is not None and not active.closed:
-                active.block(f"Training failed without all-rank release: {error}")
+                active.suspect(f"Training failed without all-rank release: {error}")
             raise
         finally:
             _CURRENT.reset(token)

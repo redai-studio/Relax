@@ -70,6 +70,88 @@ class OwnershipLedger:
         self._phase: dict[str, str] = {}
         self._closing: set[str] = set()
         self._inflight: dict[str, set[str]] = {}
+        self._suspect: dict[str, tuple[ActivationLease, str]] = {}
+        self._training_actors: dict[str, list[Any]] = {}
+        self._restarting = False
+        self._stopped_managers: set[str] = set()
+
+    def register_training_actors(self, role: str, actors: list[Any]) -> None:
+        if self._restarting:
+            raise OwnershipError("Training registration is closed during restart")
+        self._training_actors.setdefault(role, []).extend(actors)
+
+    async def suspect(self, lease: ActivationLease, reason: str) -> None:
+        self.check(lease, allow_blocked=True)
+        async with self._condition:
+            self._suspect[lease.operation_id] = (lease, reason)
+            self._condition.notify_all()
+
+    async def stop_training(self, timeout: float = 60.0) -> None:
+        """Kill registered ranks and discharge only terminal actor receipts."""
+        self._restarting = True
+        async with self._condition:
+            self._condition.notify_all()
+        for role, actors in list(self._training_actors.items()):
+            probes = [actor.termination_probe.remote() for actor in actors]
+            for actor in actors:
+                ray.kill(actor, no_restart=True)
+            try:
+                results = await asyncio.wait_for(asyncio.gather(*probes, return_exceptions=True), timeout=timeout)
+            except TimeoutError as error:
+                raise ResourceBlockedError(
+                    f"Unconfirmed training {role} exit; inspect ranks before checkpoint restart"
+                ) from error
+            if not all(isinstance(result, ray.exceptions.RayActorError) for result in results):
+                raise ResourceBlockedError(f"Unconfirmed training {role} exit; Ray must report every rank DEAD")
+            del self._training_actors[role]
+            async with self._condition:
+                for operation, lease in list(self._operations.items()):
+                    if lease.role == role:
+                        self._active.pop(operation, None)
+                        self._suspect.pop(operation, None)
+                        self._blocked.pop(operation, None)
+                self._condition.notify_all()
+        if self._suspect:
+            raise ResourceBlockedError("Training exit cannot be proved without every registered rank")
+
+    async def acquire_for_shutdown(self, role: str) -> ActivationLease:
+        claims = self.claims_for(role)
+        if not self._restarting:
+            return await self.acquire(f"shutdown:{role}", uuid.uuid4().hex, claims, role=role)
+        if self._training_actors or self._suspect:
+            raise ResourceBlockedError("Training exit is unconfirmed before inference shutdown")
+        self._generation += 1
+        lease = ActivationLease(self.epoch, f"shutdown:{role}", uuid.uuid4().hex, self._generation, claims, role)
+        self._active[lease.operation_id] = self._operations[lease.operation_id] = lease
+        self._locks[lease.operation_id] = asyncio.Lock()
+        return lease
+
+    def confirm_manager_shutdown(self, role: str) -> None:
+        if any(self._models[key][2].role == role for key in self._resident):
+            raise ResourceBlockedError(f"{role} still has unconfirmed resident models")
+        self._stopped_managers.add(role)
+
+    async def new_epoch(self) -> None:
+        if self._training_actors or self._suspect or self._resident or set(self._managers) - self._stopped_managers:
+            raise ResourceBlockedError("Cannot replace epoch before all resource owners confirm release")
+        async with self._condition:
+            for _, _, task in self._pending.values():
+                task.cancel()
+            self.epoch = uuid.uuid4().hex
+            self._active.clear()
+            self._operations.clear()
+            self._pending.clear()
+            self._blocked.clear()
+            self._commands.clear()
+            self._locks.clear()
+            self._inflight.clear()
+            self._closing.clear()
+            self._models.clear()
+            self._managers.clear()
+            self._phase.clear()
+            self._stopped_managers.clear()
+            self._restarting = False
+            self._condition.notify_all()
 
     def managers(self) -> list[Any]:
         return list(self._managers.values())
@@ -121,6 +203,8 @@ class OwnershipLedger:
         self, owner: str, operation_id: str, claims: Iterable[PlacementClaim], *, role: str | None = None
     ) -> ActivationLease:
         claims = tuple(claims)
+        if self._restarting:
+            raise OwnershipError("New ownership is closed during restart")
         previous = self._operations.get(operation_id)
         if previous is not None:
             if previous.owner != owner or previous.claims != claims or previous.role != role:
@@ -135,6 +219,11 @@ class OwnershipLedger:
         async def grant() -> ActivationLease:
             async with self._condition:
                 while True:
+                    if self._restarting:
+                        raise OwnershipError("New ownership is closed during restart")
+                    for suspect, reason in self._suspect.values():
+                        if any(claims_overlap(a, b) for a in claims for b in suspect.claims):
+                            raise ResourceBlockedError(f"Training release awaits all-rank death evidence: {reason}")
                     for blocked, reason in self._blocked.values():
                         if any(claims_overlap(a, b) for a in claims for b in blocked):
                             raise ResourceBlockedError(reason)
@@ -262,6 +351,8 @@ class OwnershipLedger:
         }
 
     async def command(self, lease: ActivationLease, command_id: str, phase: str, stage: str | None = None) -> None:
+        if lease.epoch != self.epoch:
+            raise StaleLeaseError("The command belongs to a previous resource epoch")
         key = (lease.operation_id, command_id)
         signature = (lease, phase, stage)
         previous = self._commands.get(key)
@@ -375,6 +466,7 @@ class OwnershipLedger:
                 key: {"owner": value.owner, "generation": value.generation} for key, value in self._active.items()
             },
             "blocked": {key: reason for key, (_, reason) in self._blocked.items()},
+            "suspect": {key: reason for key, (_, reason) in self._suspect.items()},
             "resources": {
                 key: {k: v for k, v in value.items() if k != "handle"} for key, value in self._resources.items()
             },

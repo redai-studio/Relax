@@ -231,3 +231,30 @@ def test_model_initialization_is_owned_and_settles_before_return(local_ray, fail
     finally:
         for actor in (owner, authority, events):
             ray.kill(actor, no_restart=True)
+
+
+def test_suspect_training_lease_restarts_after_real_rank_death(local_ray):
+    @ray.remote(num_cpus=0)
+    class Rank:
+        async def termination_probe(self):
+            await asyncio.Event().wait()
+
+    c = PlacementClaim("rollout", "default", "actor", 0, 1, frozenset({Phase.GENERATE}))
+    authority = LifecycleAuthority.remote(PlacementPlan((), (c,)))
+    ranks = [Rank.remote(), Rank.remote()]
+    try:
+        ray.get(authority.register_training_actors.remote("actor", ranks), timeout=10)
+        lease = ray.get(authority.acquire.remote("train:actor", "failed", [c], role="actor"), timeout=10)
+        ray.get(authority.suspect.remote(lease, "training failed"), timeout=10)
+        ray.get(authority.stop_training.remote(timeout=10), timeout=15)
+        ray.get(authority.new_epoch.remote(), timeout=10)
+        state = ray.get(authority.snapshot.remote(), timeout=10)
+        assert state["epoch"] != lease.epoch
+        assert state["suspect"] == state["blocked"] == state["owners"] == {}
+        with pytest.raises(StaleLeaseError):
+            ray.get(authority.command.remote(lease, "late", "train"), timeout=10)
+        current = ray.get(authority.acquire.remote("generate", "new", [c], role="rollout"), timeout=10)
+        assert current.epoch == state["epoch"]
+    finally:
+        for actor in [*ranks, authority]:
+            ray.kill(actor, no_restart=True)

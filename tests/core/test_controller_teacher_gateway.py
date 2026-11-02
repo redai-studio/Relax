@@ -111,6 +111,7 @@ def _shutdown(monkeypatch, events, teacher_manager):
         serve_dict={},
         _teacher_manager=teacher_manager,
         stop_health_check=lambda: None,
+        _dispose_rollout_manager=lambda: True,
         _shutdown_agentic_rollout_services=lambda: None,
         _cleanup_s3_model_weights_after_init=lambda force=False: None,
     )

@@ -172,6 +172,10 @@ class PhaseSession:
         if not self.closed:
             ray.get(self.authority.block.remote(self.lease, reason))
 
+    def suspect(self, reason: str) -> None:
+        if not self.closed:
+            ray.get(self.authority.suspect.remote(self.lease, reason))
+
     async def ablock(self, reason: str) -> None:
         if not self.closed:
 

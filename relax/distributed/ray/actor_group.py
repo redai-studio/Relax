@@ -137,6 +137,9 @@ class RayTrainGroup:
         """Allocate GPU resourced and initialize model, optimzier, local ckpt,
         etc."""
         self.args = args
+        authority = getattr(args, "_inference_authority", None)
+        if authority is not None:
+            ray.get(authority.register_training_actors.remote(role, self._actor_handlers), timeout=30)
         return [
             actor.init.remote(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
             for actor in self._actor_handlers

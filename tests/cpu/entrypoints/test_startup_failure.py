@@ -405,6 +405,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
         "logger": Mock(),
         "ROLES": SimpleNamespace(rollout="rollout", sft="sft"),
         "shutdown_managed_opd_teacher": stop_teacher,
+        "shutdown_managed_opd_teacher_gateway": Mock(),
         "asyncio": asyncio,
         "run": asyncio.run,
     }

@@ -1474,6 +1474,9 @@ class Controller:
         if authority is None:
             return True
         try:
+            # Training failures retain suspect leases until every rank exits.
+            # Collect those receipts before inference owners request cleanup.
+            ray.get(authority.stop_training.remote(timeout=min(timeout, 60.0)), timeout=timeout)
             owners = ray.get(authority.managers.remote(), timeout=5)
             # Settle every owner. A failed owner retains its resources and its
             # ledger; global restart must not replace that ledger with empty state.
@@ -1486,6 +1489,7 @@ class Controller:
                     errors.append(error)
             if errors:
                 raise RuntimeError(f"Inference cleanup unconfirmed: {errors}")
+            ray.get(authority.new_epoch.remote(), timeout=5)
             shared = ray.get(authority.resources_for.remote("controller"), timeout=5)
             if shared:
                 ledger = ray.get(authority.snapshot.remote(), timeout=5)
@@ -1756,11 +1760,12 @@ class Controller:
         # ObjectRef streams and ray.shutdown() triggers a fatal C++ crash.
         self._cancel_pending_tasks()
 
-        # The rollout actor owns router subprocesses; dispose before deleting its handle.
-        self._dispose_rollout_manager()
-
         if not self._shutdown_inference_owners():
             raise RuntimeError("Global restart refused: inference resource release is unconfirmed")
+
+        # Workload disposal follows resource cleanup, so a failed training lease
+        # cannot prevent us from reaching the rank termination receipts above.
+        self._dispose_rollout_manager()
 
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():

@@ -27,6 +27,7 @@ def actor(monkeypatch):
         command=SimpleNamespace(remote=lambda *args: events.append("train handoff")),
         release=SimpleNamespace(remote=lambda *args: events.append("release")),
         block=SimpleNamespace(remote=lambda *args: events.append("blocked")),
+        suspect=SimpleNamespace(remote=lambda *args: events.append("suspect")),
     )
     actor = SimpleNamespace(
         args=SimpleNamespace(_inference_authority=authority),
@@ -95,6 +96,6 @@ def test_training_failure_quarantines_without_waiting_on_a_failed_peer(actor, mo
 
     with pytest.raises(RuntimeError, match="NCCL peer lost"):
         train(instance)
-    assert events[-1] == "blocked"
+    assert events[-1] == "suspect"
     assert "release" not in events
     assert not instance._training_session.closed

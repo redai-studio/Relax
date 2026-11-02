@@ -343,10 +343,12 @@ class InferenceManager:
                 remove_placement_group(self.pg[0])
                 await self.authority.confirm_resource_release.remote(self.pg[0].id.hex(), f"inference:{self.role}")
                 self.pg = None
+            await self.authority.confirm_manager_shutdown.remote(self.role)
             return
-        async with PhaseSession(self.authority, self.role, f"shutdown:{self.role}") as session:
+        lease = await self.authority.acquire_for_shutdown.remote(self.role)
+        try:
             for name in self._runtimes:
-                await self.apply(name, "shutdown", session.lease, "shutdown")
+                await self.apply(name, "shutdown", lease, "shutdown")
             for resource in self._owned_resources:
                 await self.authority.confirm_resource_release.remote(resource, f"inference:{self.role}")
             if self._owns_pg and self.pg is not None:
@@ -355,6 +357,9 @@ class InferenceManager:
                 remove_placement_group(self.pg[0])
                 await self.authority.confirm_resource_release.remote(self.pg[0].id.hex(), f"inference:{self.role}")
                 self.pg = None
+            await self.authority.confirm_manager_shutdown.remote(self.role)
+        finally:
+            await self.authority.release.remote(lease)
 
 
 @dataclass(frozen=True)

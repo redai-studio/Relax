@@ -54,9 +54,16 @@ def test_register_all_serve_sft_colocate_uses_optional_roles(
     registry = ModuleType("relax.core.registry")
     registry.resolve_algorithm = Mock(return_value=algo)
     monkeypatch.setitem(sys.modules, registry.__name__, registry)
+    # AST execution omits module imports; supply the new preflight/owner names.
+    ownership = ModuleType("relax.engine.inference.ownership")
+    ownership.LifecycleAuthority = Mock()
+    monkeypatch.setitem(sys.modules, ownership.__name__, ownership)
     namespace = {
+        "plan_placement": Mock(return_value=Namespace(claims=())),
+        "validate_deferred_scoring_args": Mock(),
         "validate_ppo_config": Mock(),
         "maybe_start_managed_opd_teacher": Mock(return_value=(None, None)),
+        "deploy_managed_opd_teacher_gateway": Mock(),
         "resolve_sft_algo_key": Mock(return_value="sft"),
         "ALGOS": {"sft": algo},
         "process_role": Mock(return_value=ROLES_SFT_ONLY),

@@ -251,3 +251,66 @@ async def test_manager_maintenance_does_not_acquire_workload_lease():
     finally:
         complete.set()
         await work
+
+
+async def test_training_failure_can_restart_only_after_every_rank_dies(monkeypatch):
+    import ray
+
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    death = asyncio.Event()
+    killed = []
+
+    class Actor:
+        def __init__(self, rank):
+            self.rank = rank
+            self.termination_probe = SimpleNamespace(remote=self.probe)
+
+        async def probe(self):
+            await death.wait()
+            raise ray.exceptions.RayActorError()
+
+    actors = [Actor(0), Actor(1)]
+    ledger.register_training_actors("actor", actors)
+    monkeypatch.setattr(ray, "kill", lambda actor, **kwargs: killed.append(actor))
+    lease = await ledger.acquire("train:actor", "failed", [c], role="actor")
+    await ledger.suspect(lease, "NCCL peer lost")
+    assert ledger.snapshot()["blocked"] == {}
+    assert ledger.snapshot()["suspect"] == {"failed": "NCCL peer lost"}
+    with pytest.raises(ResourceBlockedError):
+        await ledger.acquire("generate", "waiting", [c], role="rollout")
+    stopping = asyncio.create_task(ledger.stop_training(timeout=1))
+    while len(killed) != 2:
+        await asyncio.sleep(0)  # Yield, no timing assumption; the death event is the barrier.
+    assert not stopping.done()
+    death.set()
+    await stopping
+    old_epoch = ledger.epoch
+    await ledger.new_epoch()
+    assert ledger.epoch != old_epoch
+    assert ledger.snapshot()["suspect"] == {}
+    with pytest.raises(StaleLeaseError):
+        ledger.check(lease)
+    with pytest.raises(StaleLeaseError):
+        await ledger.command(lease, "late", "train")
+    replacement = await ledger.acquire("generate", "new", [c], role="rollout")
+    ledger.check(replacement)
+
+
+async def test_restart_does_not_discharge_unproven_training_exit(monkeypatch):
+    import ray
+
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+
+    async def probe():
+        return None  # A normal reply is not evidence of actor death.
+
+    actor = SimpleNamespace(termination_probe=SimpleNamespace(remote=probe))
+    ledger.register_training_actors("actor", [actor])
+    monkeypatch.setattr(ray, "kill", lambda *args, **kwargs: None)
+    lease = await ledger.acquire("train:actor", "failed", [c], role="actor")
+    await ledger.suspect(lease, "NCCL peer lost")
+    with pytest.raises(ResourceBlockedError, match="training.*exit"):
+        await ledger.stop_training(timeout=1)
+    assert "failed" in ledger.snapshot()["suspect"]

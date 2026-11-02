@@ -66,6 +66,9 @@ def test_controller_releases_shared_placement_only_after_every_owner_confirms(mo
     else:
         remove.assert_not_called()
         authority.confirm_resource_release.remote.assert_not_called()
+    authority.stop_training.remote.assert_called_once()
+    if unconfirmed != "owner":
+        authority.new_epoch.remote.assert_called_once()
 
 
 def _genrm_spec(num_gpus):
