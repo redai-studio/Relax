@@ -163,6 +163,67 @@ def test_flex_global_dispatch_is_opt_in(monkeypatch):
     assert called == [[0, 3, 8]]
 
 
+def _eager_packed_flex(query, key, value, boundaries):
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+    def causal(_batch, _head, query_index, key_index):
+        return query_index >= key_index
+
+    outputs = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        output = flex_attention(
+            query[start:end].transpose(0, 1).unsqueeze(0),
+            key[start:end].transpose(0, 1).unsqueeze(0),
+            value[start:end].transpose(0, 1).unsqueeze(0),
+            block_mask=create_block_mask(causal, None, None, end - start, end - start, device=query.device),
+            scale=1.0,
+            enable_gqa=True,
+        )
+        outputs.append(output.squeeze(0).transpose(0, 1).flatten(1))
+    return torch.cat(outputs)
+
+
+def _packed_sdpa(query, key, value, boundaries):
+    outputs = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        output = torch.nn.functional.scaled_dot_product_attention(
+            query[start:end].transpose(0, 1).unsqueeze(0),
+            key[start:end].transpose(0, 1).unsqueeze(0),
+            value[start:end].transpose(0, 1).unsqueeze(0),
+            scale=1.0,
+            is_causal=True,
+            enable_gqa=True,
+        )
+        outputs.append(output.squeeze(0).transpose(0, 1).flatten(1))
+    return torch.cat(outputs)
+
+
+def _assert_bf16_flex_gradients(output, inputs, upstream, boundaries):
+    # Match PyTorch's FlexAttention accuracy tests: compare compiled and eager
+    # BF16 errors against FP64. Math SDPA retains FP32 intermediates, whereas
+    # Flex backward uses the rounded saved output to compute its softmax delta.
+    # A direct elementwise comparison to SDPA is too strict near zero gradients.
+    eager_inputs = [tensor.detach().clone().requires_grad_() for tensor in inputs]
+    gold_inputs = [tensor.detach().double().requires_grad_() for tensor in inputs]
+    eager = _eager_packed_flex(*eager_inputs, boundaries)
+    gold = _packed_sdpa(*gold_inputs, boundaries)
+    actual_grads = torch.autograd.grad(output, inputs, upstream)
+    eager_grads = torch.autograd.grad(eager, eager_inputs, upstream)
+    gold_grads = torch.autograd.grad(gold, gold_inputs, upstream.double())
+    for name, actual, reference, golden in zip(("query", "key", "value"), actual_grads, eager_grads, gold_grads):
+        assert torch.isfinite(actual).all(), name
+        assert torch.isfinite(reference).all(), f"eager {name}"
+        assert torch.isfinite(golden).all(), f"FP64 {name}"
+        # Check every packed sample separately so one sample cannot hide an
+        # error in another. Upstream allows 2.1x the eager BF16 mean error.
+        for start, end in zip(boundaries, boundaries[1:]):
+            actual_error = (actual[start:end].double() - golden[start:end]).abs().mean()
+            reference_error = (reference[start:end].double() - golden[start:end]).abs().mean()
+            assert actual_error <= 2.1 * reference_error + 1e-7, (
+                f"{name}[{start}:{end}]: compiled error {actual_error}, eager error {reference_error}"
+            )
+
+
 @pytest.mark.parametrize(
     "device,dtype",
     [
@@ -189,26 +250,18 @@ def test_flex_packed_chunk_boundaries_preserve_outputs_and_gradients(monkeypatch
     key = (torch.randn(sum(lengths), 1, 512, device=device, dtype=dtype) * 0.1).requires_grad_(device == "cuda")
     value = torch.randn_like(key, requires_grad=device == "cuda")
     output = attention._thd_flex_per_subseq(query, key, value, boundaries)
-    references = []
-    for start, end in zip(boundaries, boundaries[1:]):
-        expected = torch.nn.functional.scaled_dot_product_attention(
-            query[start:end].transpose(0, 1).unsqueeze(0),
-            key[start:end].transpose(0, 1).unsqueeze(0),
-            value[start:end].transpose(0, 1).unsqueeze(0),
-            scale=1.0,
-            is_causal=True,
-            enable_gqa=True,
-        )
-        references.append(expected.squeeze(0).transpose(0, 1).flatten(1))
-    reference = torch.cat(references)
+    reference = _packed_sdpa(query, key, value, boundaries)
     atol, rtol = (3e-3, 2e-2) if dtype == torch.bfloat16 else (3e-5, 1e-4)
     torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
     if device == "cuda":
         upstream = torch.randn_like(output)
-        actual_grads = torch.autograd.grad(output, (query, key, value), upstream)
-        reference_grads = torch.autograd.grad(reference, (query, key, value), upstream)
-        for actual, expected in zip(actual_grads, reference_grads, strict=True):
-            torch.testing.assert_close(actual, expected, atol=max(atol, 5e-5), rtol=max(rtol, 3e-4))
+        if dtype == torch.bfloat16:
+            _assert_bf16_flex_gradients(output, (query, key, value), upstream, boundaries)
+        else:
+            actual_grads = torch.autograd.grad(output, (query, key, value), upstream)
+            reference_grads = torch.autograd.grad(reference, (query, key, value), upstream)
+            for actual, expected in zip(actual_grads, reference_grads, strict=True):
+                torch.testing.assert_close(actual, expected, atol=max(atol, 5e-5), rtol=max(rtol, 3e-4))
     with torch.no_grad():
         changed_key = key.detach().clone()
         changed_value = value.detach().clone()
