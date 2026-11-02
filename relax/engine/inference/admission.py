@@ -3,19 +3,21 @@
 """Manager-owned request admission, shared by proxy and lookaside clients.
 
 The condition protects admission and the start of a drain, not GPU operations.
-An unreturned permit is never expired: a client could still be about to send.
-Only the owner can release it. An uncertain drain therefore fails closed.
+Permits provide a bounded grace period. Only an engine idle/release receipt
+lets the manager retire outstanding permits and reopen a new generation.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 import uuid
-from dataclasses import dataclass, replace
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from relax.engine.inference.discovery import EngineSnapshot, EngineState, RoleSnapshot
-from relax.engine.inference.holder import HolderIdentity
+from relax.engine.inference.holder import HolderIdentity, holder_alive
 from relax.engine.inference.routing import (
     ModelUnavailableError,
     RouteTarget,
@@ -23,6 +25,7 @@ from relax.engine.inference.routing import (
     select_model,
     select_target,
 )
+from relax.utils.env import Envs
 
 
 ADMISSION_CONCURRENCY_GROUP = "inference_admission"
@@ -40,6 +43,7 @@ class RequestPermit:
     generation: str
     target: RouteTarget
     holder: HolderIdentity | None = None
+    token: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class AdmissionGate:
@@ -62,8 +66,6 @@ class AdmissionGate:
         holder: HolderIdentity | None = None,
     ) -> RequestPermit:
         with self._condition:
-            if request_id in self._permits:
-                return self._permits[request_id]
             current = snapshot()
             selected = select_model(current, model, route_key)
             if self._closed:
@@ -86,31 +88,56 @@ class AdmissionGate:
                 affinity_key=affinity_key,
             )
             permit = RequestPermit(request_id, self._generation, target, holder)
-            self._permits[request_id] = permit
+            self._permits[permit.token] = permit
             return permit
 
     def release(self, permit: RequestPermit) -> None:
         with self._condition:
-            if self._permits.get(permit.request_id) == permit:
-                del self._permits[permit.request_id]
+            if self._permits.get(permit.token) == permit:
+                del self._permits[permit.token]
                 self._condition.notify_all()
 
     def close(self) -> None:
         with self._condition:
             self._closed = True
 
-    def drain(self, abort: Callable[[], None], *, timeout: float = ADMISSION_DRAIN_TIMEOUT_S) -> None:
+    def drain(self, abort: Callable[[], None], *, timeout: float | None = None) -> None:
         self.close()
+        if timeout is None:
+            timeout = Envs.RELAX_INFERENCE_ADMISSION_GRACE_S
         with self._condition:
             if self._condition.wait_for(lambda: not self._permits, timeout=timeout):
                 return
+            outstanding = list(self._permits.values())
+        # Liveness queries cannot consume an unbounded extra drain budget.
+        deadline = time.monotonic() + Envs.RELAX_INFERENCE_HOLDER_CHECK_S
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            for permit in outstanding:
+                if permit.holder is None:
+                    continue
+                future = executor.submit(holder_alive, permit.holder)
+                try:
+                    dead = future.result(timeout=max(0.0, deadline - time.monotonic())) is False
+                except TimeoutError:
+                    break
+                if dead:
+                    self.release(permit)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         # No lock held across engine RPCs; owners must be able to return permits.
+        # The engine's pause/abort/idle protocol remains mandatory in offload,
+        # even when a dead holder's permit was reclaimed here.
         abort()
+
+    def confirm_drained(self) -> None:
+        """Called only after engines confirmed idle and released their
+        memory."""
         with self._condition:
-            if not self._condition.wait_for(lambda: not self._permits, timeout=timeout):
-                raise AdmissionDrainError(
-                    f"Cannot drain inference: {len(self._permits)} request owner(s) have not returned their permits."
-                )
+            if not self._closed:
+                raise AdmissionDrainError("Engine drain receipt requires closed admission")
+            self._permits.clear()
+            self._condition.notify_all()
 
     def open(self) -> None:
         with self._condition:

@@ -267,6 +267,7 @@ class MultiEngineManager:
             lambda: ray.get([e.abort_requests.remote(timeout=30) for e in self.engines if e is not None], timeout=35)
         )
         self._pool.deactivate()
+        self._admission.confirm_drained()
 
     def acquire_inference(self, request_id: str, **selection: Any) -> RequestPermit:
         # Each static-model manager owns one model. Its facade supplies the

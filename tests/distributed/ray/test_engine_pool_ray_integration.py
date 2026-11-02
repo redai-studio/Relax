@@ -48,6 +48,13 @@ def _manager_class():
     class StandInEngine:
         def __init__(self, args, *, rank, worker_type, base_gpu_id):
             self.release_seconds = args.release_seconds
+            self.idle_barrier = None
+
+        def set_idle_barrier(self, barrier):
+            self.idle_barrier = barrier
+
+        def abort_requests(self, timeout=30):
+            return True
 
         def init(self, host, port):
             return True
@@ -67,6 +74,9 @@ def _manager_class():
             }
 
         def release_memory_occupation(self):
+            if self.idle_barrier is not None:
+                ray.get(self.idle_barrier.drain.remote())
+                return
             time.sleep(self.release_seconds)
 
         def resume_memory_occupation(self, tags=None):
@@ -98,6 +108,12 @@ def _manager_class():
 
         def kill_engine(self, rank):
             ray.kill(self.all_engines[rank])
+
+        def install_idle_barrier(self, barrier):
+            import os
+
+            os.environ["RELAX_INFERENCE_ADMISSION_GRACE_S"] = "0"
+            ray.get(self.all_engines[0].set_idle_barrier.remote(barrier))
 
         def _resolve_placement(self, rank):
             return self.pg_tuple, False, rank
@@ -203,6 +219,53 @@ def test_engine_pool_rebuilds_killed_actor_after_node_local_exit_receipt(manager
     ray.get(manager.onload.remote(), timeout=60)
     assert _states(manager) == ["ready", "ready"]
     assert _snapshot(manager)["topology_revision"] > before["topology_revision"]
+
+
+def test_dead_permit_holder_drain_waits_for_engine_idle_on_real_ray(manager):
+    import asyncio
+
+    @ray.remote(num_cpus=0)
+    class Barrier:
+        def __init__(self):
+            self.entered, self.idle = asyncio.Event(), asyncio.Event()
+
+        async def drain(self):
+            self.entered.set()
+            await self.idle.wait()
+
+        async def wait_entered(self):
+            await self.entered.wait()
+
+        def confirm_idle(self):
+            self.idle.set()
+
+    @ray.remote(num_cpus=0)
+    class Holder:
+        async def take(self):
+            from relax.engine.inference.holder import current_holder
+
+            return await manager.acquire_inference.remote("same-id", holder=current_holder())
+
+    barrier, holder = Barrier.remote(), Holder.remote()
+    try:
+        ray.get(manager.install_idle_barrier.remote(barrier), timeout=10)
+        permit = ray.get(holder.take.remote(), timeout=10)
+        ray.kill(holder, no_restart=True)
+        offload = manager.offload.remote()
+        ray.get(barrier.wait_entered.remote(), timeout=10)
+        assert ray.wait([offload], timeout=0)[0] == []
+        assert "draining" in _states(manager)
+        ray.get(barrier.confirm_idle.remote(), timeout=10)
+        ray.get(offload, timeout=15)
+        assert _states(manager) == ["sleeping", "sleeping"]
+        ray.get(manager.onload.remote(), timeout=15)
+        current = ray.get(manager.acquire_inference.remote("same-id"), timeout=10)
+        assert current.token != permit.token
+        ray.get(manager.release_inference.remote(permit), timeout=10)
+        ray.get(manager.release_inference.remote(current), timeout=10)
+    finally:
+        ray.kill(holder, no_restart=True)
+        ray.kill(barrier, no_restart=True)
 
 
 def test_placement_physical_reads_bundle_nodes_from_real_ray(ray_cluster):

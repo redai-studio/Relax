@@ -154,7 +154,7 @@ def test_engine_profile_policy_init_is_unchanged(monkeypatch):
     assert calls["dcs"] == 1
 
 
-def test_engine_profile_only_genrm_drains_before_release(monkeypatch):
+def test_engine_profile_every_role_drains_before_release(monkeypatch):
     drained: list[str] = []
     monkeypatch.setattr(
         m.SGLangEngine, "_drain_and_release_memory_occupation", lambda self: drained.append(self.profile.name)
@@ -165,7 +165,7 @@ def test_engine_profile_only_genrm_drains_before_release(monkeypatch):
         engine, _ = _make_engine(monkeypatch, profile)
         engine.release_memory_occupation()
 
-    assert drained == ["genrm"]
+    assert drained == ["policy", "teacher", "genrm"]
 
 
 def test_engine_profile_names_used_by_managers_exist():

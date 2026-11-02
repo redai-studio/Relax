@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -20,6 +21,72 @@ def snapshot(url="http://engine:1", **kwargs):
     return RoleSnapshot(
         "rollout", 1, models=(build_model_snapshot("default", [(0, url, EngineState.READY)], **kwargs),)
     )
+
+
+def test_duplicate_request_ids_remain_independent_during_drain():
+    gate = AdmissionGate()
+    current = snapshot()
+    first = gate.acquire(lambda: current, "same-client-id")
+    second = gate.acquire(lambda: current, "same-client-id")
+    assert first != second
+    gate.release(first)
+    draining, completed = threading.Event(), threading.Event()
+
+    def drain():
+        gate.close()
+        draining.set()
+        gate.drain(lambda: None, timeout=5)
+        completed.set()
+
+    thread = threading.Thread(target=drain)
+    thread.start()
+    try:
+        assert draining.wait(1)
+        assert not completed.is_set()
+        gate.release(second)
+        assert completed.wait(1)
+    finally:
+        gate.release(second)
+        thread.join(timeout=6)
+
+
+def test_dead_permit_holder_does_not_replace_the_engine_idle_receipt(monkeypatch):
+    from relax.engine.inference import admission
+    from relax.engine.inference.holder import HolderIdentity
+
+    gate = AdmissionGate()
+    current = snapshot()
+    old = gate.acquire(lambda: current, "request", holder=HolderIdentity(actor_id="dead"))
+    monkeypatch.setattr(admission, "holder_alive", lambda holder: False, raising=False)
+    idle, release = threading.Event(), threading.Event()
+    events = []
+
+    def offload():
+        gate.drain(lambda: events.append("abort"), timeout=0)
+        idle.set()
+        release.wait()
+        events.append("engine idle")
+        gate.confirm_drained()
+        events.append("release")
+
+    thread = threading.Thread(target=offload)
+    thread.start()
+    try:
+        assert idle.wait(1)
+        assert "release" not in events
+        with pytest.raises(ModelUnavailableError):
+            gate.acquire(lambda: current, "late")
+        release.set()
+        thread.join(timeout=1)
+        assert events[-2:] == ["engine idle", "release"]
+        gate.open()
+        new = gate.acquire(lambda: current, "request")
+        gate.release(old)
+        assert gate._permits
+        gate.release(new)
+    finally:
+        release.set()
+        thread.join(timeout=1)
 
 
 async def test_proxy_and_lookaside_share_drain_even_with_cached_ready_snapshot(monkeypatch):
@@ -62,26 +129,25 @@ async def test_proxy_and_lookaside_share_drain_even_with_cached_ready_snapshot(m
         assert manager.released == manager.acquired
 
 
-def test_unreturned_permit_never_expires_or_reopens_on_failed_drain():
+def test_unreturned_permit_is_soft_but_reopen_requires_engine_receipt():
     gate = AdmissionGate()
     current = snapshot()
     permit = gate.acquire(lambda: current, "request")
     aborted = []
-    with pytest.raises(AdmissionDrainError):
-        gate.drain(lambda: aborted.append(True), timeout=0)
+    gate.drain(lambda: aborted.append(True), timeout=0)
     assert aborted == [True]
     assert gate.view(current).models[0].state == EngineState.DRAINING
     with pytest.raises(ModelUnavailableError):
         gate.acquire(lambda: current, "next")
     with pytest.raises(AdmissionDrainError):
         gate.open()
-    gate.release(permit)
+    gate.confirm_drained()
     gate.open()
     new = gate.acquire(lambda: current, "request")
     assert new.generation != permit.generation
     gate.release(permit)  # A late duplicate return cannot discharge the new generation.
-    with pytest.raises(AdmissionDrainError):
-        gate.drain(lambda: None, timeout=0)
+    gate.drain(lambda: None, timeout=0)
+    assert len(gate._permits) == 1
     gate.release(new)
     gate.drain(lambda: pytest.fail("already drained"), timeout=0)
 
@@ -194,8 +260,8 @@ async def test_distributed_sender_owns_permit_until_its_transport_finishes(monke
         monkeypatch.setattr(http_utils, "_post_actors", [actor])
         caller = asyncio.create_task(http_utils.post("http://startup:9/generate", {}, inference={"role": "rollout"}))
         await entered.wait()
-        with pytest.raises(AdmissionDrainError):
-            manager.gate.drain(lambda: None, timeout=0)
+        manager.gate.drain(lambda: None, timeout=0)
+        assert manager.gate._permits
         finish.set()
         assert await caller == {"text": "done"}
         manager.gate.drain(lambda: pytest.fail("sender leaked its permit"), timeout=0)
@@ -235,8 +301,8 @@ async def test_native_stream_holds_permit_until_upstream_closes(iterate):
         response = await gateway.generate({"stream": True})
         if iterate:
             assert await anext(response.body_iterator) == b"data: token\n\n"
-        with pytest.raises(AdmissionDrainError):
-            manager.gate.drain(lambda: None, timeout=0)
+        manager.gate.drain(lambda: None, timeout=0)
+        assert manager.gate._permits
         await response.aclose()
         assert stream.closed
         assert manager.acquired == manager.released
