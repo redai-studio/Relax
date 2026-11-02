@@ -74,7 +74,7 @@ class RolloutWorkload(ReloadableMixin):
         self.data_system_client = None
 
     @asynccontextmanager
-    async def _phase(self, owner: str):
+    async def _phase(self, owner: str, *, offload_after: bool = False):
         if self._closing:
             raise RuntimeError("RolloutWorkload is shutting down")
         task = asyncio.current_task()
@@ -85,13 +85,13 @@ class RolloutWorkload(ReloadableMixin):
                     await phase.aswitch("generate")
                     yield phase
                 finally:
-                    if self.args.offload_rollout:
+                    if offload_after and self.args.offload_rollout:
                         await phase.aswitch("train")
         finally:
             self._pending_operations.discard(task)
 
     async def _run_phase(self, fn, *args, evaluation=False):
-        async with self._phase(f"rollout:{self.rollout_id}:{evaluation}"):
+        async with self._phase(f"rollout:{self.rollout_id}:{evaluation}", offload_after=not evaluation):
             if getattr(self.args, "ci_test", False) and getattr(self.args, "use_fault_tolerance", False):
                 await self.inference_manager.inject_fault.remote()
             # The worker thread owns custom callbacks, deferred scoring and
@@ -162,7 +162,8 @@ class RolloutWorkload(ReloadableMixin):
         ``self.generate_predict``, and writes
         ``<args.save>/predict/predictions_step_<train_step>.jsonl``.
 
-        Holds the phase lease until generation and resource release finish.
+        Like eval, keeps the synced weights resident for the next generation.
+        The next training step drives the resource transition.
         """
         from relax.engine.sft.predict.loop import run_predict_loop
 

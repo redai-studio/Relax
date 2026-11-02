@@ -112,5 +112,34 @@ async def test_predict_disposal_waits_for_cleanup_and_rejects_new_work(workload,
     with pytest.raises(asyncio.CancelledError):
         await task
     await disposal
-    assert events == ["onload", "predict closed", "offload", "detach"]
+    assert events == ["onload", "predict closed", "detach"]
+    assert not ledger.snapshot()["owners"]
+
+
+@pytest.mark.parametrize("operation", ["generate", "eval", "predict"])
+async def test_only_generate_releases_policy_weights(workload, monkeypatch, operation):
+    from relax.engine.sft.predict import loop
+
+    instance, ledger, events = workload
+
+    def callback(*args, **kwargs):
+        events.append(operation)
+        return SimpleNamespace(samples=[])
+
+    async def predict(*args):
+        callback()
+
+    monkeypatch.setattr(loop, "run_predict_loop", predict)
+    instance.args.partial_rollout = False
+    instance.generate_rollout = callback
+    if operation == "generate":
+        await instance.generate(1)
+    elif operation == "eval":
+        await instance._run_phase(callback, 1, evaluation=True)
+    else:
+        await instance.run_predict(1)
+
+    # Weight sync precedes eval/predict. Releasing here would discard the
+    # current policy before the next generation, which has no intervening sync.
+    assert events == ["onload", operation] + (["offload"] if operation == "generate" else [])
     assert not ledger.snapshot()["owners"]

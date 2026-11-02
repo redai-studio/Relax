@@ -951,6 +951,21 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+    timer = Timer()
+    timer.start("rollout")
+    try:
+        return await _generate_rollout_async(args, rollout_id, data_source, data_system_client)
+    finally:
+        # A failed deferred switch/publication must not leave the singleton
+        # timer running and poison the next rollout. Success ends it at the
+        # original boundary, before draining surplus and computing metrics.
+        if "rollout" in timer.start_time:
+            timer.end("rollout", keep=False)
+
+
+async def _generate_rollout_async(
+    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
+) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based
     rm rollout generation.
 
@@ -966,7 +981,6 @@ async def generate_rollout_async(
             - aborted_samples: any partial groups collected during abort when partial_rollout is enabled
     """
     timer = Timer()
-    timer.start("rollout")
     assert args.rollout_global_dataset
 
     state = GenerateState(args)

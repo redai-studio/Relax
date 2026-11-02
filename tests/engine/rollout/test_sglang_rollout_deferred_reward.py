@@ -318,6 +318,7 @@ async def test_sglang_rollout_deferred_scoring_publishes_nothing_if_generation_c
 
     with pytest.raises(RuntimeError, match="router unreachable"):
         await generation.run(defer_reward_to_post_process=True)
+    assert "rollout" not in sglang_rollout.Timer().start_time
     # Let the cancelled publishing task unwind, then free the stand-in engine.
     await asyncio.sleep(0)
     generation.state.release.set()
