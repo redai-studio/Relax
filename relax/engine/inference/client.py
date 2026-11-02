@@ -26,6 +26,7 @@ from relax.engine.inference.routing import (
     select_model,
     select_target,
 )
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -153,6 +154,28 @@ async def _manager_call(manager: Any, method: str, *args: Any, **kwargs: Any) ->
     return await asyncio.to_thread(call, *args, **kwargs)
 
 
+async def _wait_request_control(task: asyncio.Task[T], description: str, deadline: float) -> T:
+    """Bound the caller's wait without cancelling an RPC of unknown outcome.
+
+    Repeated cancellation shares the original deadline; the independent task
+    remains responsible for late receipts after the caller has left.
+    """
+    cancelled = None
+    while not task.done():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if cancelled is not None:
+                raise cancelled
+            raise ModelUnavailableError(f"Timed out waiting for {description}; admission cleanup is unconfirmed")
+        try:
+            await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError as error:
+            cancelled = error
+    if cancelled is not None:
+        raise cancelled
+    return task.result()
+
+
 class InferenceRequest:
     """One permit, owned until the HTTP request (including its stream)
     closes."""
@@ -169,7 +192,8 @@ class InferenceRequest:
     async def __aenter__(self) -> InferenceRequest:
         from relax.engine.inference.holder import current_holder
 
-        resources = await self._client.resources()
+        deadline = time.monotonic() + Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S
+        resources = await self._client.resources(deadline=deadline)
         snapshot = RoleSnapshot.from_dict(resources["snapshot"])
         selection = dict(self._selection)
         selection["holder"] = current_holder()
@@ -180,16 +204,13 @@ class InferenceRequest:
             _manager_call(self._manager, "acquire_inference", uuid.uuid4().hex, model=selected.name, **selection)
         )
         try:
-            self._permit = await asyncio.shield(pending)
-        except asyncio.CancelledError as cancelled:
-            # Cancellation does not retract an already queued Ray method. Wait
-            # for its outcome before returning a permit that arrived late.
+            self._permit = await _wait_request_control(pending, "inference admission", deadline)
+        except (asyncio.CancelledError, ModelUnavailableError):
+            cleanup = self._client._track_cleanup(asyncio.create_task(self._return_late_grant(pending)))
             try:
-                self._permit = await _settle(pending)
-            except Exception:
-                raise cancelled from None
-            finally:
-                await self.aclose()
+                await _wait_request_control(cleanup, "cancelled admission cleanup", deadline)
+            except (asyncio.CancelledError, Exception):
+                pass  # The tracked cleanup owns any late grant, never an HTTP send.
             raise
         except RoutingError:
             raise
@@ -201,18 +222,43 @@ class InferenceRequest:
 
     async def dispatched(self) -> None:
         """Call only after upstream response headers, never before send()."""
-        await _manager_call(self._manager, "confirm_inference_dispatch", self._permit)
+        pending = self._client._track_cleanup(
+            asyncio.create_task(_manager_call(self._manager, "confirm_inference_dispatch", self._permit))
+        )
+        await _wait_request_control(
+            pending, "dispatch confirmation", time.monotonic() + Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S
+        )
+
+    async def _return_late_grant(self, pending: asyncio.Task[RequestPermit]) -> None:
+        try:
+            self._permit = await pending
+        except RoutingError:
+            return  # A definitive rejection never created a permit.
+        await asyncio.shield(self._start_release())
+
+    def _start_release(self) -> asyncio.Task[None]:
+        if self._release_task is None:
+
+            async def release() -> None:
+                while True:
+                    try:
+                        await _manager_call(self._manager, "release_inference", self._permit)
+                        return
+                    except Exception:
+                        # A failed acknowledgement does not retire the owner's
+                        # permit. Retry the idempotent return in this one task.
+                        logger.warning("Inference permit return is unconfirmed; retrying", exc_info=True)
+                        await asyncio.sleep(max(0.01, Envs.RELAX_INFERENCE_HOLDER_POLL_S))
+
+            self._release_task = self._client._track_cleanup(asyncio.create_task(release()))
+        return self._release_task
 
     async def aclose(self) -> None:
         if self._permit is None:
             return
-        if self._release_task is None:
-            self._release_task = asyncio.create_task(_manager_call(self._manager, "release_inference", self._permit))
-        try:
-            await asyncio.shield(self._release_task)
-        except asyncio.CancelledError:
-            await _settle(self._release_task)
-            raise
+        await _wait_request_control(
+            self._start_release(), "inference permit return", time.monotonic() + Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S
+        )
 
     async def __aexit__(self, _kind: Any, error: Any, _traceback: Any) -> None:
         if isinstance(error, Exception) and self.target is not None:
@@ -238,6 +284,21 @@ class InferenceRequestClient:
         self._resources_source = resources
         self._resources: dict[str, Any] | None = None
         self._bootstraps: dict[asyncio.AbstractEventLoop, asyncio.Task[dict[str, Any]]] = {}
+        self._cleanup_tasks: set[asyncio.Task] = set()
+
+    def _track_cleanup(self, task: asyncio.Task[T]) -> asyncio.Task[T]:
+        self._cleanup_tasks.add(task)
+
+        def finished(done: asyncio.Task) -> None:
+            if not done.cancelled() and done.exception() is None:
+                self._cleanup_tasks.discard(done)
+            else:
+                # Preserve failed/abandoned work for diagnostics. The owner
+                # still fences its permit until a return or holder-death proof.
+                logger.warning("Inference request cleanup did not confirm completion for role %s", self.role)
+
+        task.add_done_callback(finished)
+        return task
 
     async def _bootstrap(self) -> dict[str, Any]:
         if self._resources_source is not None:
@@ -249,7 +310,7 @@ class InferenceRequestClient:
         self._resources = resources
         return resources
 
-    async def resources(self) -> dict[str, Any]:
+    async def resources(self, *, deadline: float | None = None) -> dict[str, Any]:
         if self._resources is not None:
             return self._resources
         loop = asyncio.get_running_loop()
@@ -266,7 +327,12 @@ class InferenceRequestClient:
 
             pending.add_done_callback(finished)
         try:
-            return await asyncio.shield(pending)
+            # Discovery has no permit to return; cancellation can leave the
+            # shared bootstrap immediately, without cancelling other waiters.
+            return await asyncio.wait_for(
+                asyncio.shield(pending),
+                Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S if deadline is None else max(0.0, deadline - time.monotonic()),
+            )
         except Exception as exc:
             raise ModelUnavailableError(f"Admission for {self.role!r} is unavailable: {exc}") from exc
 
