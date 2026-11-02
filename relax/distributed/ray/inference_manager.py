@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -45,15 +46,60 @@ _CONTROL_METHODS = frozenset(
 )
 
 
+class _RuntimeLoop:
+    """One persistent loop for a runtime's async locks and background work."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self._closing = False
+        self._shutdown_task: asyncio.Task | None = None
+
+        def run() -> None:
+            asyncio.set_event_loop(self.loop)
+            try:
+                self.loop.run_forever()
+            finally:
+                self.loop.close()
+
+        self.thread = threading.Thread(target=run, name="inference-runtime", daemon=True)
+        self.thread.start()
+
+    async def invoke(self, function: Any, *args: Any, **kwargs: Any) -> Any:
+        if self._closing:
+            raise OwnershipError("Inference runtime loop is shutting down")
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(function(*args, **kwargs), self.loop))
+
+    async def aclose(self) -> None:
+        if self._shutdown_task is None:
+
+            async def finish() -> None:
+                self._closing = True
+
+                async def settle() -> None:
+                    # Accepted mutations have already reached their terminal
+                    # state. Also settle runtime children before closing their
+                    # executor; cancellation of shutdown cannot stop them early.
+                    while pending := asyncio.all_tasks() - {asyncio.current_task()}:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    await self.loop.shutdown_asyncgens()
+                    await self.loop.shutdown_default_executor()
+
+                await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(settle(), self.loop))
+                self.loop.call_soon_threadsafe(self.loop.stop)
+                await asyncio.to_thread(self.thread.join)
+
+            self._shutdown_task = asyncio.create_task(finish())
+        await asyncio.shield(self._shutdown_task)
+
+
 async def _invoke(runtime: Any, method: str, *args: Any, **kwargs: Any) -> Any:
     function = getattr(runtime, method)
-
-    def execute():
-        if inspect.iscoroutinefunction(function):
-            return asyncio.run(function(*args, **kwargs))
-        return function(*args, **kwargs)
-
-    return await asyncio.to_thread(execute)
+    if not inspect.iscoroutinefunction(function):
+        return await asyncio.to_thread(function, *args, **kwargs)
+    dispatcher = vars(runtime).get("_owner_runtime_loop")
+    if dispatcher is None:
+        dispatcher = runtime._owner_runtime_loop = _RuntimeLoop()
+    return await dispatcher.invoke(function, *args, **kwargs)
 
 
 @ray.remote(num_cpus=1, max_restarts=0)
@@ -519,6 +565,10 @@ class InferenceManager:
         try:
             for name in self._runtimes:
                 await self.apply(name, "shutdown", lease, "shutdown")
+            for runtime in self._runtimes.values():
+                dispatcher = vars(runtime).get("_owner_runtime_loop")
+                if dispatcher is not None:
+                    await await_control(dispatcher.aclose(), f"{self.role} runtime loop shutdown")
             for resource in self._owned_resources:
                 await self.authority.confirm_resource_release.remote(resource, f"inference:{self.role}")
             if self._owns_pg and self.pg is not None:
