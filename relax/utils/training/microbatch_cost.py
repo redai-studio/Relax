@@ -5,6 +5,7 @@
 import math
 from argparse import Namespace
 from collections.abc import Callable, Sequence
+from numbers import Real
 from typing import Any
 
 
@@ -89,30 +90,36 @@ def validate_dp_balance(args: Namespace) -> bool:
 
 
 def sample_costs(args: Namespace, rollout_data: dict[str, Any], *, for_dp: bool = False) -> list[float] | None:
-    """Resolve costs only for the explicitly selected microbatch or DP
-    objective."""
+    """Resolve the selected objective, reusing DP costs for microbatches."""
     validate = validate_dp_balance if for_dp else validate_microbatch_balance
     if not validate(args):
         return None
     if "_sft_wholepack_v1" in rollout_data:
         raise ValueError("FLOPs balancing cannot consume an existing wholepack plan")
-    from relax.utils.misc import get_hf_config
-
-    config = get_hf_config(args.hf_checkpoint)
-    model_type = config.model_type
-    if model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
-        from relax.utils.training.qwen35_cost import estimate_sample_costs
-
-        estimator = _ESTIMATORS.get(model_type, estimate_sample_costs)
+    if not for_dp and validate_dp_balance(args):
+        costs = rollout_data.get("flops_cost")
+        if not isinstance(costs, (list, tuple)) or any(
+            not isinstance(value, Real) or isinstance(value, bool) for value in costs
+        ):
+            raise ValueError("FLOPs microbatch reuse requires cached CPU numeric scalars")
     else:
+        from relax.utils.misc import get_hf_config
+
+        config = get_hf_config(args.hf_checkpoint)
+        model_type = config.model_type
         estimator = _ESTIMATORS.get(model_type)
-    if estimator is None:
-        option = "--dp-balance" if for_dp else "--microbatch-balance"
-        raise ValueError(
-            f"No FLOPs sample cost estimator for model_type={model_type!r}; "
-            f"register_sample_cost_estimator or use {option} tokens"
-        )
-    costs = [float(value) for value in estimator(config, rollout_data, args)]
+        if estimator is None and model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
+            from relax.utils.training.qwen35_cost import estimate_sample_costs
+
+            estimator = estimate_sample_costs
+        if estimator is None:
+            option = "--dp-balance" if for_dp else "--microbatch-balance"
+            raise ValueError(
+                f"No FLOPs sample cost estimator for model_type={model_type!r}; "
+                f"register_sample_cost_estimator or use {option} tokens"
+            )
+        costs = estimator(config, rollout_data, args)
+    costs = [float(value) for value in costs]
     if len(costs) != len(rollout_data["total_lengths"]):
         raise ValueError("Sample cost count must match total_lengths")
     if any(not math.isfinite(value) or value <= 0 for value in costs):
@@ -124,9 +131,7 @@ def add_flops_cost_metadata(
     args: Namespace | None, batch: dict[str, Any], metadata: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Attach CPU costs before payloads enter the queue's sampling layer."""
-    if args is None or not validate_dp_balance(args):
+    costs = sample_costs(args, batch, for_dp=True) if args is not None else None
+    if costs is None:
         return metadata
-    costs = sample_costs(args, batch, for_dp=True)
-    if costs is None or len(costs) != len(metadata):
-        raise ValueError("FLOPs DP metadata requires one model cost per physical sample")
     return [{**row, "flops_cost": cost} for row, cost in zip(metadata, costs, strict=True)]

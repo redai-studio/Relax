@@ -367,7 +367,22 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     assert iterator._sample_count == 2  # dummies don't count as samples
 
 
-def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(monkeypatch):
+@pytest.mark.parametrize(
+    "dp,per_rank_fetch,post_process,prefetched,metadata",
+    [
+        ("tokens", False, True, False, "unused"),
+        ("flops", False, True, False, "valid"),
+        ("flops", True, True, False, "valid"),
+        ("flops", True, False, False, "valid"),
+        ("flops", True, False, True, "valid"),
+        ("flops", True, False, False, "missing"),
+        ("flops", True, False, False, "wrong-count"),
+        ("flops", True, False, False, "broken"),
+    ],
+)
+def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(
+    monkeypatch, dp, per_rank_fetch, post_process, prefetched, metadata
+):
     stream_module = _load_stream_module(monkeypatch)
     monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
@@ -375,15 +390,32 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(stream_module, "_maybe_log_tgd_pickle_diag", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(stream_module, "post_process_rollout_data", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(stream_module, "_agree_on_fetch", lambda data, *args, **kwargs: data)
 
     class _Meta:
         size = 2
+        global_indexes = [8, 2]  # Metadata follows payload order, not sorted row ids.
+
+        def get_all_custom_meta(self):
+            assert metadata != "unused", "Token mode must not read cost metadata"
+            if metadata == "broken":
+                raise RuntimeError("Unavailable cost metadata")
+            if metadata == "missing":
+                return [{}, {}]
+            rows = [{"flops_cost": 82.5}, {"flops_cost": 21.25}]
+            return rows[:1] if metadata == "wrong-count" else rows
 
     class _TQClient:
+        def __init__(self):
+            self.calls = []
+
         def get_meta(self, **kwargs):
+            self.calls.append("meta")
+            assert "flops_cost" not in kwargs["data_fields"]
             return _Meta()
 
         def get_data(self, batch_meta):
+            self.calls.append("data")
             return {
                 "response_lengths": torch.nested.nested_tensor(
                     [
@@ -408,9 +440,12 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
                 ),
             }
 
+    client = _TQClient()
+    raw = [client.get_data(_Meta()), _Meta()] if prefetched else None
+    client.calls.clear()
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
-        args=Namespace(),
-        tq_client=_TQClient(),
+        args=Namespace(dp_balance=dp),
+        tq_client=client,
         data_fields=["response_lengths", "total_lengths", "rewards"],
         batch_size=2,
         partition_id="train_0",
@@ -418,12 +453,21 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
         sampling_config={},
         batch_index=0,
         broadcast_pp=False,
+        per_rank_fetch=per_rank_fetch,
+        post_process=post_process,
+        prefetched_rollout_data=raw,
     )
 
+    assert client.calls == ([] if prefetched else ["meta", "data"])
     assert batch_meta.size == 2
     assert rollout_data["response_lengths"] == [512, 135]
     assert rollout_data["total_lengths"] == [1309, 842]
     assert rollout_data["rewards"] == [1.5, 2.5]
+    if dp == "tokens":
+        assert "flops_cost" not in rollout_data
+    else:
+        expected = [82.5, 21.25] if metadata == "valid" else [None, None]
+        assert rollout_data["flops_cost"] == expected
 
 
 def test_tensor_to_python_values_dense_tensor(monkeypatch):

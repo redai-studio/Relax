@@ -325,6 +325,10 @@ def dict_to_tensordict(
     for key, value in data.items():
         if not isinstance(value, list):
             raise TypeError(f"Value for key '{key}' must be a list, got {type(value)}")
+        if key == "flops_cost":
+            # Reused scheduling costs must retain the producer's float precision.
+            result[key] = torch.tensor(value, dtype=torch.float64, device=device)
+            continue
         if key == "classification_labels":
             depth = _nesting_depth(value)
             if depth == 1:

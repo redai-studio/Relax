@@ -1129,6 +1129,16 @@ def get_data_from_transfer_queue(
 
         rollout_data = new_rollout_data
 
+    if getattr(args, "dp_balance", "tokens") == "flops":
+        sample_count = len(rollout_data["total_lengths"])
+        # Keep CPU costs in payload order. Defer malformed metadata to packing
+        # so its peer-error propagation runs, including the prepack path.
+        try:
+            cached_costs = [row.get("flops_cost") for row in batch_meta.get_all_custom_meta()]
+        except Exception:  # noqa: BLE001
+            cached_costs = []
+        rollout_data["flops_cost"] = cached_costs if len(cached_costs) == sample_count else [None] * sample_count
+
     # Re-attach routed_experts as a list of 2D tensors (per-sample) — only on
     # the bcast path, where the NestedTensor was extracted into ``routed_experts_values``
     # before broadcast.  per_rank_fetch never strips it (each rank pulls its own
