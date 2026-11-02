@@ -3356,6 +3356,10 @@ class RolloutEngineRuntime:
     def release_inference(self, permit: RequestPermit) -> None:
         self._admission.release(permit)
 
+    @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
+    def confirm_inference_dispatch(self, permit: RequestPermit) -> None:
+        self._admission.confirm_dispatch(permit)
+
     @ray.method(concurrency_group="scale_out")
     def get_inference_snapshot(self) -> dict:
         return self._inference_snapshot().to_dict()

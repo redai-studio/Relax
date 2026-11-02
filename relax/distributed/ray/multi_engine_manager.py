@@ -291,6 +291,9 @@ class MultiEngineManager:
     def release_inference(self, permit: RequestPermit) -> None:
         self._admission.release(permit)
 
+    def confirm_inference_dispatch(self, permit: RequestPermit) -> None:
+        self._admission.confirm_dispatch(permit)
+
     def _fanout(self, method: str, *, skip_ranks: Optional[set] = None, **kwargs) -> list[int]:
         """Call ``method`` on every live engine; return the ranks that are
         dead."""

@@ -436,14 +436,10 @@ class InferenceManager:
                             if method in {"recover", "recover_rollout_engines", "register_recovered_engines"}:
                                 return None
                             raise OwnershipError(f"{self.role}/{name} {method} deferred until its next onload")
-                    try:
-                        return await _invoke(self._runtimes[name], method, *args, **(kwargs or {}))
-                    except BaseException as error:
-                        self._blocked[name] = f"{method} was not confirmed: {error}"
-                        self._runtimes[name]._admission.close()
-                        if lease is not None:
-                            await self.authority.block.remote(lease, self._blocked[name])
-                        raise
+                    # A terminal maintenance failure does not invalidate healthy
+                    # replicas. The runtime fences unknown slots, and the ledger
+                    # retains residency until a later offload confirms release.
+                    return await _invoke(self._runtimes[name], method, *args, **(kwargs or {}))
                 finally:
                     try:
                         await self._record_resources(name)
@@ -471,7 +467,7 @@ class InferenceManager:
         self._runtimes[name].release_inference(permit)
 
     async def confirm_inference_dispatch(self, name: str, permit: Any) -> None:
-        self._runtimes[name]._admission.confirm_dispatch(permit)
+        self._runtimes[name].confirm_inference_dispatch(permit)
 
     async def reconcile_dead_holder(self, name: str, lease: ActivationLease) -> bool:
         async def execute() -> bool:
