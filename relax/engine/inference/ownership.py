@@ -380,6 +380,17 @@ class OwnershipLedger:
             if self._active.get(lease.operation_id) != lease:
                 raise StaleLeaseError("Cannot return another generation's lease")
             del self._active[lease.operation_id]
+            self._locks.pop(lease.operation_id, None)
+            self._inflight.pop(lease.operation_id, None)
+            self._closing.discard(lease.operation_id)
+            completed = [
+                key for key, (_, task) in self._commands.items() if key[0] not in self._active and task.done()
+            ]
+            window = max(1, Envs.RELAX_INFERENCE_COMMAND_RECEIPTS)
+            for key in completed[:-window]:
+                del self._commands[key]
+            # Acquire receipts remain until epoch rollover: unlike commands,
+            # acquire retries do not carry a lease generation to fence replay.
             self._condition.notify_all()
 
     async def _await_inflight(self, lease: ActivationLease) -> None:

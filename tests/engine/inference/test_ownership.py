@@ -618,3 +618,30 @@ async def test_legacy_resolution_rejects_ambiguous_or_training_owners():
     with pytest.raises(OwnershipError, match="training"):
         await ledger.resolve_legacy("genrm", "judge", "legacy", None)
     await ledger.release(training)
+
+
+async def test_completed_command_window_prunes_locks_but_retains_acquire_fencing(monkeypatch):
+    monkeypatch.setenv("RELAX_INFERENCE_COMMAND_RECEIPTS", "2")
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    calls = []
+
+    async def apply(model, action, lease, command, **kwargs):
+        calls.append(lease.operation_id)
+
+    ledger.register_model("rollout", "default", SimpleNamespace(apply=SimpleNamespace(remote=apply)), c)
+    leases = []
+    for i in range(10):
+        lease = await ledger.acquire("owner", f"op-{i}", [c], role="rollout")
+        leases.append(lease)
+        await ledger.command(lease, "generate", "generate")
+        await ledger.release(lease)
+    assert ledger._locks == {} and ledger._inflight == {} and ledger._closing == set()
+    assert len(ledger._commands) == 2
+    with pytest.raises(StaleLeaseError):
+        await ledger.command(leases[0], "generate", "generate")
+    await ledger.command(leases[-1], "generate", "generate")
+    assert len(calls) == 10
+    # Never turn a late acquire retry into a new owner after pruning commands.
+    assert await ledger.acquire("owner", "op-0", [c], role="rollout") == leases[0]
+    assert ledger.snapshot()["owners"] == {}
