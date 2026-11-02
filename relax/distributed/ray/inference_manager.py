@@ -66,6 +66,7 @@ class InferenceManager:
         self._claims: dict[str, Any] = {}
         self._initializations: dict[str, asyncio.Task] = {}
         self._operations: dict[str, tuple[Any, asyncio.Task]] = {}
+        self._mutations: set[asyncio.Task] = set()
         self._locks: dict[str, asyncio.Lock] = {}
         self._blocked: dict[str, str] = {}
         self._acceptance = asyncio.Lock()
@@ -74,6 +75,19 @@ class InferenceManager:
         self._legacy_callers: set[HolderIdentity | None] = set()
         self._health_tasks: dict[str, asyncio.Task] = {}
         self._health_wakeups: dict[str, asyncio.Event] = {}
+
+    def _own_mutation(self, coroutine: Any) -> asyncio.Task:
+        """Keep accepted work alive independently of the RPC waiting for it."""
+        task = asyncio.create_task(coroutine)
+        self._mutations.add(task)
+
+        def settled(done: asyncio.Task) -> None:
+            self._mutations.discard(done)
+            if not done.cancelled():
+                done.exception()  # Observe failures even when the caller has left.
+
+        task.add_done_callback(settled)
+        return task
 
     async def add_model(self, name: str, args: Any, kwargs: dict[str, Any]) -> None:
         if self._closing:
@@ -277,7 +291,7 @@ class InferenceManager:
                         finally:
                             await self.authority.finish.remote(lease, key)
 
-                task = asyncio.create_task(execute())
+                task = self._own_mutation(execute())
                 self._operations[key] = (signature, task)
         return await asyncio.shield(task)
 
@@ -317,13 +331,20 @@ class InferenceManager:
             if method == "health_check":
                 # Probe results update slot observations. A probe started for
                 # the old generation must settle before retirement/replacement.
-                async with self._locks[name]:
-                    return await _invoke(self._runtimes[name], method, *args, **kwargs)
+                async def probe() -> Any:
+                    async with self._locks[name]:
+                        return await _invoke(self._runtimes[name], method, *args, **kwargs)
+
+                async with self._acceptance:
+                    if self._closing:
+                        raise OwnershipError("InferenceManager is shutting down")
+                    task = self._own_mutation(probe())
+                return await asyncio.shield(task)
             return await _invoke(self._runtimes[name], method, *args, **kwargs)
         token = uuid.uuid4().hex
-        await self.authority.begin.remote(lease, token)
 
         async def execute() -> Any:
+            await self.authority.begin.remote(lease, token)
             try:
                 async with self._locks[name]:
                     await self._validate(name, lease)
@@ -339,33 +360,56 @@ class InferenceManager:
                 finally:
                     await self.authority.finish.remote(lease, token)
 
-        return await asyncio.shield(asyncio.create_task(execute()))
+        async with self._acceptance:
+            if self._closing:
+                raise OwnershipError("InferenceManager is shutting down")
+            task = self._own_mutation(execute())
+        return await asyncio.shield(task)
 
     async def maintenance(
         self, name: str, method: str, args: tuple = (), kwargs: dict | None = None, *, lease=None
     ) -> Any:
         if method.startswith("_") or method in _MEMORY_METHODS:
             raise OwnershipError("Memory operations require the caller's explicit phase lease")
-        if lease is not None:
-            await self._validate(name, lease)
-        async with self._locks[name]:
+
+        async def execute() -> Any:
+            token = uuid.uuid4().hex
             if lease is not None:
                 await self._validate(name, lease)
+                await self.authority.begin.remote(lease, token)
+            async with self._locks[name]:
+                try:
+                    if lease is not None:
+                        await self._validate(name, lease)
+                    if method not in {"scale_in", "remove_engine"}:
+                        allowed = await self.authority.reserve_maintenance.remote(
+                            self.role, name, **({"lease": lease} if lease is not None else {})
+                        )
+                        if not allowed:
+                            # Offloaded shared engines are rebuilt at the next onload.
+                            if method in {"recover", "recover_rollout_engines", "register_recovered_engines"}:
+                                return None
+                            raise OwnershipError(f"{self.role}/{name} {method} deferred until its next onload")
+                    try:
+                        return await _invoke(self._runtimes[name], method, *args, **(kwargs or {}))
+                    except BaseException as error:
+                        self._blocked[name] = f"{method} was not confirmed: {error}"
+                        self._runtimes[name]._admission.close()
+                        if lease is not None:
+                            await self.authority.block.remote(lease, self._blocked[name])
+                        raise
+                finally:
+                    try:
+                        await self._record_resources(name)
+                    finally:
+                        if lease is not None:
+                            await self.authority.finish.remote(lease, token)
+
+        async with self._acceptance:
             if self._closing:
                 return None
-            if method not in {"scale_in", "remove_engine"}:
-                allowed = await self.authority.reserve_maintenance.remote(
-                    self.role, name, **({"lease": lease} if lease is not None else {})
-                )
-                if not allowed:
-                    # Offloaded shared engines are rebuilt at the next onload.
-                    if method in {"recover", "recover_rollout_engines", "register_recovered_engines"}:
-                        return None
-                    raise OwnershipError(f"{self.role}/{name} {method} deferred until its next onload")
-            try:
-                return await _invoke(self._runtimes[name], method, *args, **(kwargs or {}))
-            finally:
-                await self._record_resources(name)
+            task = self._own_mutation(execute())
+        return await asyncio.shield(task)
 
     async def acquire_inference(self, name: str, request_id: str, **selection: Any) -> Any:
         initialization = self._initializations.get(name)
@@ -381,12 +425,17 @@ class InferenceManager:
         self._runtimes[name].release_inference(permit)
 
     async def reconcile_dead_holder(self, name: str, lease: ActivationLease) -> bool:
-        async with self._locks[name]:
-            await self._validate(name, lease, cleanup=True)
-            await _invoke(self._runtimes[name], "offload")
-            await self.authority.confirm_deactivation.remote(lease, self.role, name)
-            self._blocked.pop(name, None)
-            return True
+        async def execute() -> bool:
+            async with self._locks[name]:
+                await self._validate(name, lease, cleanup=True)
+                await _invoke(self._runtimes[name], "offload")
+                await self.authority.confirm_deactivation.remote(lease, self.role, name)
+                self._blocked.pop(name, None)
+                return True
+
+        async with self._acceptance:
+            task = self._own_mutation(execute())
+        return await asyncio.shield(task)
 
     def runtime_config(self, name: str) -> dict[str, Any]:
         runtime = self._runtimes[name]
@@ -434,7 +483,8 @@ class InferenceManager:
         ).to_dict()
 
     async def shutdown(self) -> None:
-        self._closing = True
+        async with self._acceptance:
+            self._closing = True
         for wakeup in self._health_wakeups.values():
             wakeup.set()
         await await_control(
@@ -446,6 +496,10 @@ class InferenceManager:
         await await_control(
             asyncio.gather(*(asyncio.shield(task) for task in self._initializations.values()), return_exceptions=True),
             f"{self.role} accepted initializations before shutdown",
+        )
+        await await_control(
+            asyncio.gather(*(asyncio.shield(task) for task in self._mutations), return_exceptions=True),
+            f"{self.role} accepted mutations before shutdown",
         )
         if not self._runtimes:
             for resource in self._owned_resources:
