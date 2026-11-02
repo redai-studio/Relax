@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Late spawn workers remain members after the early follower parent exits."""
+"""Clean up live fork descendants and reparented spawn workers."""
 
 import ast
 import concurrent.futures
@@ -25,7 +25,12 @@ def _worker_identity():
     # Real SGLang schedulers/DP/tokenizer workers rename themselves. The
     # default setproctitle behavior overwrites /proc's exec environment.
     setproctitle.setproctitle("sglang::test-worker")
-    return os.getpid(), os.environ.get(TOKEN_ENV), psutil.Process().environ().get(TOKEN_ENV)
+    return (
+        os.getpid(),
+        os.environ.get(TOKEN_ENV),
+        psutil.Process().environ().get(TOKEN_ENV),
+        multiprocessing.get_start_method(),
+    )
 
 
 def _worker(pipe):
@@ -139,7 +144,7 @@ def follower(monkeypatch, sglang_engine_module, request):
 def _start_late_worker(record):
     record.pipe.send("spawn after capture")
     assert record.pipe.poll(10)
-    pid, environ_token, proc_token = record.pipe.recv()
+    pid, environ_token, proc_token, record.start_method = record.pipe.recv()
     record.worker = psutil.Process(pid)
     return environ_token, proc_token
 
@@ -151,7 +156,7 @@ def _exit_parent(record):
     assert record.worker.is_running() and record.worker.status() != psutil.STATUS_ZOMBIE
 
 
-@pytest.mark.parametrize("follower", ["spawn", "cpu_pool"], indirect=True)
+@pytest.mark.parametrize("follower", ["spawn"], indirect=True)
 def test_follower_shutdown_cleans_late_worker_without_killing_other_incarnation(follower):
     old, other = follower(), follower()
     old_token, old_proc_token = _start_late_worker(old)
@@ -170,7 +175,26 @@ def test_follower_shutdown_cleans_late_worker_without_killing_other_incarnation(
     assert not other.worker.is_running() or other.worker.status() == psutil.STATUS_ZOMBIE
 
 
-@pytest.mark.parametrize("follower", ["spawn", "cpu_pool"], indirect=True)
+@pytest.mark.parametrize("follower", ["cpu_pool"], indirect=True)
+def test_live_parent_shutdown_cleans_fork_cpu_pool_without_killing_other_incarnation(follower):
+    old, other = follower(), follower()
+    _start_late_worker(old)
+    _start_late_worker(other)
+    assert old.start_method == other.start_method == "fork"
+    assert old.process.is_alive() and other.process.is_alive()
+    # These workers appeared after the saved tree; the live parent lets
+    # shutdown find them through descendants without changing the pool mode.
+    assert old.worker in psutil.Process(old.process.pid).children(recursive=True)
+    old.engine.shutdown()
+    assert not old.worker.is_running() or old.worker.status() == psutil.STATUS_ZOMBIE
+    assert old.engine.process is None
+    assert other.process.is_alive()
+    assert other.worker.is_running() and other.worker.status() != psutil.STATUS_ZOMBIE
+    other.engine.shutdown()
+    assert not other.worker.is_running() or other.worker.status() == psutil.STATUS_ZOMBIE
+
+
+@pytest.mark.parametrize("follower", ["spawn"], indirect=True)
 def test_server_incarnation_reaches_spawn_exec_environment_without_tagging_actor(follower):
     actor_token = os.environ.get(TOKEN_ENV)
     record = follower()

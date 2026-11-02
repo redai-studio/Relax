@@ -5,20 +5,10 @@
 import multiprocessing
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable
 
 
 SERVER_INCARNATION_ENV = "RELAX_SGLANG_SERVER_INCARNATION"
-
-
-def _spawn_cpu_executor(_processor: Any) -> ProcessPoolExecutor:
-    # SGLang 0.5.21 otherwise explicitly forks for cpu/cuda_ipc transport.
-    # Spawn also avoids inheriting the tokenizer's CUDA IPC pool into workers.
-    return ProcessPoolExecutor(
-        mp_context=multiprocessing.get_context("spawn"),
-        max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-    )
 
 
 def inherit_server_incarnation() -> None:
@@ -30,11 +20,11 @@ def inherit_server_incarnation() -> None:
     # SGLang workers call setproctitle; its default overwrites /proc/environ.
     # Let their exec environment retain the membership marker after renaming.
     os.environ["SPT_NOENV"] = "1"
-    # /proc/environ sees exec-time state. A fork of this first server would
-    # miss the token set above, so keep its explicit multimodal pool on spawn.
-    from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-
-    BaseMultimodalProcessor._create_cpu_executor = _spawn_cpu_executor
+    # The server's runtime token enters spawn/exec descendants' /proc/environ.
+    # CPU preprocessors forked after this assignment may lack that exec-time
+    # marker; preserve SGLang's pool mode. They cannot use the parent's
+    # initialized CUDA context and hold no CUDA context of their own, so this
+    # does not weaken GPU exit proof. Live-parent traversal still cleans them.
 
 
 class RouterCleanupError(RuntimeError):
