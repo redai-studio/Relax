@@ -250,6 +250,7 @@ export default defineConfig({
               items: [
                 { text: 'Introduction', link: '/en/guide/introduction' },
                 { text: 'Installation', link: '/en/guide/installation' },
+                { text: 'AMD ROCm', link: '/en/guide/rocm' },
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
                 { text: 'Adding an Algorithm', link: '/en/guide/adding-an-algorithm' },
@@ -385,6 +386,7 @@ export default defineConfig({
               items: [
                 { text: '介绍', link: '/zh/guide/introduction' },
                 { text: '安装', link: '/zh/guide/installation' },
+                { text: 'AMD ROCm', link: '/zh/guide/rocm' },
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
                 { text: '接入新算法', link: '/zh/guide/adding-an-algorithm' },
