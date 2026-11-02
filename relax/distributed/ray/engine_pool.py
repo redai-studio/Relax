@@ -492,7 +492,8 @@ class EnginePool:
             if engine is None:
                 continue
             try:
-                ray.get(engine.health_generate.remote(**call_kwargs), **get_kwargs)
+                if ray.get(engine.health_generate.remote(**call_kwargs), **get_kwargs) is False:
+                    failed.add(slot)
             except Exception as exc:
                 logger.warning(self._log(f"engine rank={slot} health check failed: {exc}"))
                 failed.add(slot)

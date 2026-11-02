@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 import uuid
 from dataclasses import dataclass, replace
 from typing import Any
@@ -20,6 +21,7 @@ from relax.engine.inference.discovery import EngineState, RoleSnapshot, role_sna
 from relax.engine.inference.holder import HolderIdentity, current_holder
 from relax.engine.inference.ownership import ActivationLease, OwnershipError, ResourceBlockedError
 from relax.engine.inference.phase_client import PhaseSession, await_control, current_phase, wait_control
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -70,6 +72,8 @@ class InferenceManager:
         self._owned_resources = set()
         self._closing = False
         self._legacy_callers: set[HolderIdentity | None] = set()
+        self._health_tasks: dict[str, asyncio.Task] = {}
+        self._health_wakeups: dict[str, asyncio.Event] = {}
 
     async def add_model(self, name: str, args: Any, kwargs: dict[str, Any]) -> None:
         if self._closing:
@@ -137,6 +141,11 @@ class InferenceManager:
                     self.role != "teacher" or kwargs.get("shared_pg", False)
                 ):
                     await self.apply(name, "offload", session.lease, "initialize:offload")
+                elif self.role != "rollout":
+                    # Rollout replacements also need training weight publication;
+                    # its existing health/recovery path owns that sequencing.
+                    self._health_wakeups[name] = asyncio.Event()
+                    self._health_tasks[name] = asyncio.create_task(self._health_loop(name))
             except BaseException as error:
                 # Keep partially constructed runtimes and their slots reachable.
                 self._blocked[name] = f"Initialization did not complete: {error}"
@@ -152,6 +161,53 @@ class InferenceManager:
                 raise
             finally:
                 await self._record_resources(name)
+
+    def report_failure(self, name: str, endpoint: str | None = None) -> None:
+        """A hint wakes a probe; it is never evidence to kill a generation."""
+        wakeup = self._health_wakeups.get(name)
+        if wakeup is not None and not self._closing:
+            wakeup.set()
+
+    async def _health_loop(self, name: str) -> None:
+        wakeup = self._health_wakeups[name]
+        attempts, next_attempt = 0, 0.0
+        while not self._closing:
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=max(0.01, Envs.RELAX_INFERENCE_HEALTH_INTERVAL_S))
+            except TimeoutError:
+                pass
+            wakeup.clear()
+            # Request bursts cannot bypass the backoff or launch a second task.
+            if self._closing or time.monotonic() < next_attempt:
+                continue
+            try:
+                async with self._locks[name]:
+                    runtime = self._runtimes[name]
+                    if self._closing or name in self._blocked or not runtime.is_onloaded():
+                        continue
+                    if await _invoke(runtime, "health_check"):
+                        attempts = 0
+                        continue
+                    if not await self.authority.reserve_maintenance.remote(self.role, name):
+                        continue
+                    try:
+                        await _invoke(runtime, "recover")
+                    finally:
+                        await self._record_resources(name)
+                    if not await _invoke(runtime, "health_check"):
+                        raise RuntimeError("Engine health is still unconfirmed after recovery")
+                    attempts = 0
+                    # Publish only the completed, healthy incarnation. This never
+                    # opens a gate closed by a lifecycle operation.
+                    self.get_model_snapshot(name)
+            except Exception as error:
+                attempts += 1
+                delay = Envs.RELAX_INFERENCE_RECOVERY_BACKOFF_S * 2 ** (attempts - 1)
+                if attempts >= max(1, Envs.RELAX_INFERENCE_RECOVERY_ATTEMPTS):
+                    delay = max(delay, Envs.RELAX_INFERENCE_RECOVERY_COOLDOWN_S)
+                    attempts = 0
+                next_attempt = time.monotonic() + delay
+                logger.warning("%s/%s recovery deferred for %.1fs: %s", self.role, name, delay, error)
 
     async def _record_resources(self, name: str) -> None:
         runtime = self._runtimes.get(name)
@@ -374,6 +430,12 @@ class InferenceManager:
 
     async def shutdown(self) -> None:
         self._closing = True
+        for wakeup in self._health_wakeups.values():
+            wakeup.set()
+        await await_control(
+            asyncio.gather(*(asyncio.shield(task) for task in self._health_tasks.values()), return_exceptions=True),
+            f"{self.role} health recovery before shutdown",
+        )
         # Initialization can still be allocating after its caller was cancelled.
         # Keep the PG until every accepted initialization has settled.
         await await_control(
@@ -431,7 +493,7 @@ class _RemoteMethod:
         handle, model, method = self.manager.handle, self.manager.model, self.method
         if method == "get_inference_snapshot":
             return handle.get_model_snapshot.remote(model)
-        if method in {"acquire_inference", "release_inference"}:
+        if method in {"acquire_inference", "release_inference", "report_failure"}:
             return getattr(handle, method).remote(model, *args, **kwargs)
         lease = kwargs.pop("lease", None)
         command = kwargs.pop("command_id", None)

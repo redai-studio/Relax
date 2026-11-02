@@ -35,6 +35,7 @@ from relax.engine.inference.discovery import (
     format_base_url,
     role_snapshot_from_payloads,
 )
+from relax.engine.inference.ownership import ResourceBlockedError
 from relax.utils.logging_utils import get_logger
 
 
@@ -300,6 +301,14 @@ class MultiEngineManager:
         (or creating fresh dedicated ones) and probing fresh ports (surviving
         engines' ports are bound, so they're skipped).
         """
+        failed = self._pool.failed_health_checks(
+            [head for head in self._pool.head_slots() if self.all_engines[head] is not None], get_timeout=5.0
+        )
+        for head in failed:
+            try:
+                self._pool.retire([head])
+            except ResourceBlockedError as error:
+                logger.warning("Keeping failed slot isolated during recovery: %s", error)
         return self._pool.recover()
 
     def is_onloaded(self) -> bool:

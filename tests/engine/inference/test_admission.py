@@ -330,3 +330,16 @@ async def test_bootstrap_is_shared_and_one_cancelled_waiter_does_not_cancel_othe
     finish.set()
     assert (await second)["managers"]["default"] is owner
     assert fetches == [True]
+
+
+async def test_managed_connection_failure_reports_without_waiting_for_recovery():
+    manager = AdmissionManager(snapshot())
+    reports = []
+    # A remote submission returns an unresolved reference. Request cleanup
+    # must still return its permit without waiting for the health operation.
+    manager.report_failure = SimpleNamespace(remote=lambda url: reports.append(url) or object())
+    with pytest.raises(ConnectionError):
+        async with manager.client().request():
+            raise ConnectionError("teacher connection lost")
+    assert reports == ["http://engine:1"]
+    assert manager.released == manager.acquired

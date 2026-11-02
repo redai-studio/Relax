@@ -209,7 +209,14 @@ class InferenceRequest:
             await _settle(self._release_task)
             raise
 
-    async def __aexit__(self, *_exc: Any) -> None:
+    async def __aexit__(self, _kind: Any, error: Any, _traceback: Any) -> None:
+        if isinstance(error, Exception) and self.target is not None:
+            # OPD and other lookaside requests report through their actual
+            # owning manager. Queue only; the owner probes and deduplicates.
+            try:
+                self._manager.report_failure.remote(self.target.base_url)
+            except Exception:
+                logger.debug("Unable to submit inference failure hint", exc_info=True)
         await self.aclose()
 
 
