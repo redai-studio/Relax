@@ -673,9 +673,11 @@ class SGLangEngine(RayActor):
     def get_release_evidence(self) -> dict:
         from relax.backends.sglang.process_cleanup import capture_server_identity
 
-        return capture_server_identity(
-            self.process, node_id=ray.get_runtime_context().get_node_id(), port=self.server_port
-        )
+        if getattr(self, "_release_evidence", None) is None:
+            self._release_evidence = capture_server_identity(
+                self.process, node_id=ray.get_runtime_context().get_node_id(), port=self.server_port
+            )
+        return self._release_evidence
 
     def _require_dynamic_weights(self, operation: str) -> None:
         if self.profile.static_weights:
@@ -779,6 +781,8 @@ class SGLangEngine(RayActor):
         )
         self._router_dp_size = server_args.dp_size
         self.process = launch_server_process(server_args)
+        self._release_evidence = None
+        self.get_release_evidence()
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
@@ -1133,7 +1137,7 @@ class SGLangEngine(RayActor):
             if process is not None:
                 from relax.backends.sglang.process_cleanup import terminate_server
 
-                terminate_server(process, kill_process_tree)
+                terminate_server(process, kill_process_tree, identity=getattr(self, "_release_evidence", None))
                 self.process = None
         if router_error is not None:
             from relax.backends.sglang.process_cleanup import RouterCleanupError

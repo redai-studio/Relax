@@ -25,6 +25,7 @@ Two ways to bring engines up:
 from __future__ import annotations
 
 import dataclasses
+import time
 from typing import Any, Callable, Iterable, Optional
 
 import ray
@@ -264,12 +265,22 @@ class EnginePool:
         if node is not None and node["Alive"] is False:
             logger.warning(self._log(f"Node {node_id} is DEAD; releasing slot={slot} on that node"))
             return True
-        try:
-            dead = self.slots[slot]._get_local_state() == ActorTableData.DEAD
-        except Exception:
-            dead = False
-        if node is None or not dead:
+        if node is None:
             return False
+        engine = self.slots[slot]
+        try:
+            state = engine._get_local_state()
+        except Exception:
+            return False
+        if state != ActorTableData.DEAD:
+            # The server may be dead while its control wrapper is still alive.
+            # Stop that wrapper before node-local cleanup can race another init.
+            ray.kill(engine, no_restart=True)
+            deadline = time.monotonic() + self.spec.teardown_timeout_s
+            while engine._get_local_state() != ActorTableData.DEAD:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
         task = ray.remote(num_cpus=0)(cleanup_server_identity).options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)
         )

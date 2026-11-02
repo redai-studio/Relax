@@ -49,6 +49,10 @@ def _manager_class():
         def __init__(self, args, *, rank, worker_type, base_gpu_id):
             self.release_seconds = args.release_seconds
             self.idle_barrier = None
+            self.server_dead = False
+
+        def stop_server(self):
+            self.server_dead = True
 
         def set_idle_barrier(self, barrier):
             self.idle_barrier = barrier
@@ -83,9 +87,11 @@ def _manager_class():
             return True
 
         def health_generate(self, timeout=5.0):
-            return True
+            return not self.server_dead
 
         def shutdown(self):
+            if self.server_dead:
+                raise ConnectionError("server exited but wrapper is alive")
             return True
 
     @ray.remote(concurrency_groups=SNAPSHOT_CONCURRENCY_GROUPS)
@@ -112,6 +118,10 @@ def _manager_class():
 
         def kill_engine(self, rank):
             ray.kill(self.all_engines[rank])
+
+        def stop_server(self, rank):
+            ray.get(self.all_engines[rank].stop_server.remote())
+            return self.all_engines[rank]
 
         def install_idle_barrier(self, barrier):
             import os
@@ -295,3 +305,15 @@ def test_placement_physical_reads_bundle_nodes_from_real_ray(ray_cluster):
             validate_engine_bundles((pg, [0, 1], [0, 2]), 0, 2, label="engine")
     finally:
         remove_placement_group(pg)
+
+
+def test_live_wrapper_is_fenced_before_orphan_proof_recovery_and_shutdown(manager):
+    old = ray.get(manager.stop_server.remote(1), timeout=10)
+    assert ray.get(old.health_generate.remote(), timeout=5) is False
+    assert ray.get(manager.recover.remote(), timeout=30) == {1}
+    with pytest.raises(ray.exceptions.RayActorError):
+        ray.get(old.health_generate.remote(), timeout=5)
+    assert _states(manager) == ["ready", "ready"]
+    # The shutdown path must use the same exit evidence, without a prior recover.
+    ray.get(manager.stop_server.remote(0), timeout=10)
+    ray.get(manager.shutdown.remote(), timeout=30)

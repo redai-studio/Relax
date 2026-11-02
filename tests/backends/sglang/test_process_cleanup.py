@@ -89,3 +89,45 @@ def test_node_cleanup_requires_a_complete_tree_record():
 
     with pytest.raises(RuntimeError, match="identity"):
         cleanup_server_identity({"server_pid": 123})
+
+
+@pytest.mark.parametrize("worker_alive", [False, True])
+def test_saved_tree_cleans_reparented_workers_after_parent_exit(worker_alive):
+    import subprocess
+    import sys
+
+    from relax.backends.sglang.process_cleanup import capture_server_identity
+
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess,sys; p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']); print(p.pid,flush=True); sys.stdin.readline()",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    worker = psutil.Process(int(parent.stdout.readline()))
+    try:
+        identity = capture_server_identity(parent, node_id="node-a", port=1234)
+        assert {p["pid"] for p in identity["processes"]} == {parent.pid, worker.pid}
+        if not worker_alive:
+            worker.kill()
+            psutil.wait_procs([worker], timeout=2)
+        parent.stdin.write("\n")
+        parent.stdin.flush()
+        parent.wait(timeout=5)
+        # The live worker has now been reparented, so walking the parent PID
+        # cannot find it. Only the saved generation identities may be used.
+        terminate_server(parent, _kill_tree, timeout=2, identity=identity)
+        assert not worker.is_running() or worker.status() == psutil.STATUS_ZOMBIE
+        terminate_server(parent, _kill_tree, timeout=2, identity=identity)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+        parent.wait(timeout=5)
+        if worker.is_running() and worker.status() != psutil.STATUS_ZOMBIE:
+            worker.kill()
+        parent.stdin.close()
+        parent.stdout.close()

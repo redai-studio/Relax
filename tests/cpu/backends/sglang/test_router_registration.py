@@ -498,6 +498,7 @@ def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_eng
     engine = _pd_engine(sglang_engine_module)
     engine._skip_router_registration = False
     engine.register_to_router = Mock(return_value=registered)
+    monkeypatch.setattr(engine, "get_release_evidence", lambda: {})  # No actual tree behind the fake PID.
     process = SimpleNamespace(pid=123, is_alive=lambda: False)
     launch = Mock(return_value=process)
     monkeypatch.setattr(sglang_engine_module, "launch_server_process", launch)
@@ -635,7 +636,7 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
     monkeypatch.setattr(sglang_engine_module, "kill_process_tree", killed)
     # The fixture has no real process tree. Keep the original routing contract
     # while substituting the new process-exit verifier at the transport boundary.
-    monkeypatch.setattr(process_cleanup, "terminate_server", lambda process, kill: kill(process.pid))
+    monkeypatch.setattr(process_cleanup, "terminate_server", lambda process, kill, **kwargs: kill(process.pid))
     with pytest.raises(RuntimeError, match="router is unavailable"):
         engine.shutdown()
     unregister.assert_called_once_with(timeout=5.0)
@@ -787,3 +788,38 @@ def test_initial_regular_registration_can_be_removed_after_actor_death(sglang_en
         "http://router:3000", "http://worker:8000", module.RouterWorkerCleanup("replacement-actor"), actor_dead=True
     )
     assert not rows
+
+
+def test_shutdown_reuses_init_tree_receipt_after_server_parent_exits(monkeypatch, sglang_engine_module):
+    import multiprocessing
+    import time
+
+    process = multiprocessing.get_context("spawn").Process(target=time.sleep, args=(60,))
+    process.start()
+    engine = _pd_engine(sglang_engine_module)
+    engine.args.rollout_external = False
+    engine.process = process
+    monkeypatch.setattr(
+        sglang_engine_module.ray, "get_runtime_context", lambda: SimpleNamespace(get_node_id=lambda: "node-a")
+    )
+    monkeypatch.setattr(engine, "unregister_from_router", lambda **kwargs: None)
+    monkeypatch.setattr(sglang_engine_module, "launch_server_process", lambda args: process)
+    monkeypatch.setattr(sglang_engine_module, "ServerArgs", SimpleNamespace)
+    monkeypatch.setattr(sglang_engine_module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    engine._skip_router_registration = True
+    try:
+        engine._init_normal(
+            {"host": "worker", "disaggregation_bootstrap_port": 9000, "dp_size": 1}, apply_policy_load_plan=False
+        )
+        process.kill()
+        process.join(timeout=5)
+        evidence = engine.get_release_evidence()
+        assert evidence["server_pid"] == process.pid
+        assert engine.get_release_evidence() == evidence
+        engine.shutdown()
+        assert engine.process is None
+    finally:
+        if process.is_alive():
+            process.kill()
+        process.join(timeout=5)
+        engine.process = None

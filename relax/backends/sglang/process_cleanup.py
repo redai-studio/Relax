@@ -56,10 +56,17 @@ def cleanup_server_identity(identity: dict, timeout: float = 10.0) -> None:
         raise RuntimeError(f"Server worker exit was not confirmed: {live}")
 
 
-def terminate_server(process: Any, kill_tree: Callable[[int], None], timeout: float = 10.0) -> None:
+def terminate_server(
+    process: Any, kill_tree: Callable[[int], None], timeout: float = 10.0, *, identity: dict | None = None
+) -> None:
     import psutil
 
     if process is None or process.pid is None:
+        return
+    if identity is not None:
+        # A saved tree includes workers reparented after the server died. Its
+        # creation times also prevent signalling a reused parent PID.
+        cleanup_server_identity(identity, timeout=timeout)
         return
     try:
         parent = psutil.Process(process.pid)
