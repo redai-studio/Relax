@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 from concurrent.futures import Future
+from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock, patch
@@ -30,6 +31,72 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
     with path.open("w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
+
+
+@pytest.mark.parametrize(
+    ("role", "flags", "expected"),
+    [
+        ("assistant", {"step_loss_mask": 0}, False),
+        ("assistant", {"step_loss_mask": 1}, True),
+        ("assistant", {"step_loss_mask": None}, True),
+        ("assistant", {"step_loss_mask": 0, "loss": True}, True),
+        ("assistant", {"step_loss_mask": 1, "loss": False}, False),
+        ("assistant", {"step_loss_mask": 0, "loss": False, "learn": True}, True),
+        ("assistant", {"step_loss_mask": 1, "loss": True, "learn": False}, False),
+        ("function_call", {"step_loss_mask": 0}, False),
+        ("function_call", {"step_loss_mask": 1}, True),
+        ("user", {"step_loss_mask": 0}, False),
+        ("user", {"step_loss_mask": 1}, False),
+        ("tool", {"step_loss_mask": 0}, False),
+        ("tool", {"step_loss_mask": 1}, False),
+        ("system", {"step_loss_mask": 1}, False),
+    ],
+)
+def test_step_loss_mask_excludes_turns_without_overriding_explicit_flags(role, flags, expected):
+    assert streaming_module._resolve_learn_flag(flags, role) is expected
+
+
+def test_canonicalize_preserves_excluded_step_context_and_independent_reasoning():
+    raw = [
+        {"role": "user", "content": "Q"},
+        {"role": "assistant", "content": "Excluded", "reasoning_content": "Context reasoning", "step_loss_mask": 0},
+        {"role": "assistant", "content": "Learned", "reasoning_content": "Learned reasoning"},
+    ]
+    original = deepcopy(raw)
+    messages = _canonicalize_messages(raw, require_response=True)
+    assert not messages[1].learn
+    assert messages[1].content == "Excluded"
+    assert messages[1].reasoning_content == "Context reasoning"
+    assert messages[2].learn
+    assert messages[2].reasoning_content == "Learned reasoning"
+    assert raw == original
+
+
+def test_canonicalize_rejects_all_step_masked_training_response():
+    with pytest.raises(ValueError, match="no assistant/function_call response tokens"):
+        _canonicalize_messages(
+            [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "A", "step_loss_mask": 0}],
+            require_response=True,
+        )
+
+
+def test_archived_recipe_key_map_preserves_legacy_supervision_and_explicit_flags():
+    raw = [
+        {"role": "user", "content": "Q", "step_loss_mask": 0},
+        {"role": "assistant", "content": "Legacy target", "step_loss_mask": 0},
+        {"role": "assistant", "content": "Excluded", "step_loss_mask": 0, "learn": False},
+        {"role": "assistant", "content": "Also excluded", "step_loss_mask": 0, "loss": False},
+        {"role": "tool_call", "content": '{"name":"lookup","arguments":{}}', "step_loss_mask": 0, "loss": True},
+    ]
+    original = deepcopy(raw)
+    mapped = streaming_module._apply_conversation_key_map(
+        raw, {"tool_call": "assistant", "step_loss_mask": "legacy_step_loss_mask"}
+    )
+    messages = _canonicalize_messages(mapped, require_response=True)
+    assert [message.learn for message in messages] == [False, True, False, False, True]
+    assert messages[-1].role == "assistant"
+    assert raw == original
+    assert all("step_loss_mask" not in message for message in mapped)
 
 
 def test_restrict_training_size_excludes_held_out_tail_from_every_epoch(tmp_path):
@@ -1389,6 +1456,57 @@ def test_expand_loss_mask_alignment_single_image_pad_run():
     assert out.tolist() == [0, 0, 0, 0, 0, 0, 1]
 
 
+def test_message_loss_mask_preserves_selected_assistant_round(tmp_path):
+    path = tmp_path / "selected.jsonl"
+    row = {
+        "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "assistant", "content": "d"},
+        ],
+        "message_loss_mask": [0, 0, 0, 1],
+    }
+    _write_jsonl(path, [row])
+    dataset = SFTStreamingDataset(str(path), prompt_key="messages", prefetch_max_cached=0)
+    sample = dataset.get_canonical_sample(0)
+    assert [message.learn for message in sample.messages] == [False, False, False, True]
+    assert "learn" not in row["messages"][1]
+
+
+def test_multimodal_tool_call_null_content_normalizes_before_media_resolution(tmp_path):
+    path = tmp_path / "tool.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {"id": "call1", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                        ],
+                    },
+                    {"role": "tool", "content": "result", "tool_call_id": "call1"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "message_loss_mask": [0, 0, 0, 1],
+            }
+        ],
+    )
+    dataset = SFTStreamingDataset(
+        str(path),
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        prefetch_max_cached=0,
+    )
+    sample = dataset.get_canonical_sample(0)
+    assert sample.messages[1].content == []
+    assert sample.messages[1].tool_calls[0]["function"]["arguments"] == {}
+
+
 def test_expand_loss_mask_alignment_multiple_pad_kinds():
     img, aud = 99, 88
     short = torch.tensor([1, img, 2, aud, 3], dtype=torch.long)
@@ -1441,3 +1559,265 @@ def test_canonicalize_messages_extracts_tool_calls():
     assert msgs[0].tool_calls is None
     assert msgs[1].tool_calls == [tool_call]
     assert msgs[2].tool_calls is None
+
+
+@pytest.mark.parametrize("multimodal_keys", [None, {}, {"image": "images"}])
+def test_html_media_tags_remain_literal_training_text(tmp_path, multimodal_keys):
+    text = "Use <audio> and <video> in this HTML example."
+    path = tmp_path / "html.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": text}, {"role": "assistant", "content": "Done"}]}])
+    ds = SFTStreamingDataset(
+        path=str(path), prompt_key="messages", multimodal_keys=multimodal_keys, prefetch_max_cached=0
+    )
+    try:
+        sample = ds.get_canonical_sample(0)
+        content = sample.messages[0].content
+        if isinstance(content, list):
+            content = "".join(item["text"] for item in content)
+        assert content == text
+        assert sample.audios is None
+        assert sample.videos is None
+    finally:
+        ds.stop()
+
+
+@pytest.mark.parametrize("media_name", ["image", "audio", "video"])
+def test_configured_literal_media_still_requires_payload(tmp_path, media_name):
+    path = tmp_path / "missing.jsonl"
+    _write_jsonl(
+        path,
+        [{"messages": [{"role": "user", "content": f"<{media_name}>"}, {"role": "assistant", "content": "Done"}]}],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path), prompt_key="messages", multimodal_keys={media_name: "media"}, prefetch_max_cached=0
+    )
+    try:
+        with pytest.raises(SFTMultimodalContractError, match="contract mismatch"):
+            ds.get_canonical_sample(0)
+    finally:
+        ds.stop()
+
+
+def test_literal_filter_does_not_disable_structured_media_counting():
+    count = streaming_module.count_message_multimodal_items
+    assert count("<audio><video>")["audio"] == 1
+    messages = [{"role": "user", "content": [{"type": "audio", "audio": "clip.wav"}]}]
+    assert count(messages, literal_modalities=set())["audio"] == 1
+    with pytest.raises(SFTMultimodalContractError, match="configure 'audio'"):
+        streaming_module._validate_multimodal_contract(
+            {}, messages, row_index=0, multimodal_keys=None, source_name="test"
+        )
+    with pytest.raises(SFTMultimodalContractError, match="source resolution failed"):
+        streaming_module._validate_resolved_multimodal_contract(
+            [{"role": "user", "content": [{"type": "audio"}]}], row={}, row_index=0, source_name="test"
+        )
+
+
+@pytest.mark.parametrize("encoding", ["objects", "strings", "outer_string"])
+@pytest.mark.parametrize("content", [None, ""])
+def test_tool_json_normalization_reaches_chat_template_without_mutating_row(encoding, content):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    schema = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    tools = [schema, schema] if encoding == "objects" else [json.dumps(schema), schema]
+    if encoding == "outer_string":
+        tools = json.dumps(tools)
+    arguments = {"query": "hello", "limit": 2}
+    row = {
+        "tools": tools,
+        "messages": [
+            {"role": "user", "content": "Find it"},
+            {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": "Choose lookup",
+                "loss": False,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": arguments if encoding == "objects" else json.dumps(arguments),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": "Found"},
+            {"role": "assistant", "content": "Done", "learn": True},
+        ],
+    }
+    original = deepcopy(row)
+    sample = streaming_module._build_canonical_sample_from_row(
+        row,
+        row_index=0,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        metadata_key="metadata",
+        tool_key="tools",
+        system_prompt=None,
+        require_response=True,
+        source_name="test",
+    )
+    assert sample.messages[1].reasoning_content == "Choose lookup"
+    assert sample.tools == [schema, schema]
+    assert sample.messages[1].tool_calls[0]["function"]["arguments"] == arguments
+    assert sample.messages[1].tool_calls[0]["id"] == "call_1"
+    assert [message.learn for message in sample.messages] == [False, False, False, True]
+    assert row == original
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")))
+    # HF rejects string schemas; Qwen-style templates require arguments.items().
+    tokenizer.chat_template = (
+        "{% for tool in tools %}{{ tool.function.name }};{% endfor %}"
+        "{% for message in messages %}{% for call in message.tool_calls | default([]) %}"
+        "{% for key, value in call.function.arguments.items() %}{{ key }}={{ value }};{% endfor %}"
+        "{% endfor %}{% endfor %}"
+    )
+    assert streaming_module.render_to_text(sample, tokenizer=tokenizer) == "lookup;lookup;query=hello;limit=2;"
+
+
+@pytest.mark.parametrize("value", [["null"], ["[]"], [42], {"type": "function"}])
+def test_normalize_tools_rejects_non_object_schemas(value):
+    with pytest.raises(TypeError):
+        streaming_module._normalize_tools(value)
+
+
+@pytest.mark.parametrize("arguments", ["null", "[]", "42", [], 42])
+def test_normalize_tool_calls_rejects_non_object_arguments(arguments):
+    with pytest.raises(TypeError, match="arguments must be a JSON object"):
+        streaming_module._normalize_tool_calls([{"function": {"name": "lookup", "arguments": arguments}}])
+
+
+def test_tool_normalization_rejects_malformed_json_and_preserves_empty_values():
+    assert streaming_module._normalize_tools(None) is None
+    assert streaming_module._normalize_tools([]) == []
+    assert streaming_module._normalize_tool_calls(None) is None
+    assert streaming_module._normalize_tool_calls([]) == []
+    with pytest.raises(json.JSONDecodeError):
+        streaming_module._normalize_tools(["{invalid"])
+    with pytest.raises(json.JSONDecodeError):
+        streaming_module._normalize_tool_calls([{"function": {"arguments": "{invalid"}}])
+
+
+def test_pack_samples_for_tq_preserves_pre_shifted_labels():
+    sample = _make_text_only_sample()
+    sample.pre_shifted_labels = torch.tensor([-100, 2, 3], dtype=torch.long)
+
+    batch = pack_samples_for_tq([sample])
+
+    assert batch is not None
+    assert batch["pre_shifted_labels"][0] is sample.pre_shifted_labels
+
+
+def test_pack_samples_for_tq_rejects_partial_pre_shifted_labels():
+    first = _make_text_only_sample()
+    first.pre_shifted_labels = torch.tensor([-100, 2, 3], dtype=torch.long)
+    second = _make_text_only_sample()
+
+    with pytest.raises(ValueError, match="every sample"):
+        pack_samples_for_tq([first, second])
+
+
+def test_pack_samples_for_tq_validates_pre_shifted_mask():
+    sample = _make_text_only_sample()
+    sample.pre_shifted_labels = torch.tensor([-100, -100, 3], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="loss mask"):
+        pack_samples_for_tq([sample])
+
+
+@pytest.mark.parametrize("field", ["pre_shifted_labels", "loss_mask"])
+def test_pack_samples_for_tq_rejects_pre_shifted_shape_mismatch(field):
+    sample = _make_text_only_sample()
+    sample.pre_shifted_labels = torch.tensor([-100, 2, 3], dtype=torch.long)
+    setattr(sample, field, getattr(sample, field)[:-1])
+    with pytest.raises(ValueError, match="identical shapes"):
+        pack_samples_for_tq([sample])
+
+
+def test_pack_samples_for_tq_rejects_pre_shifted_classification_labels():
+    sample = _make_text_only_sample()
+    sample.pre_shifted_labels = torch.tensor([-100, 2, 3], dtype=torch.long)
+    sample.classification_label = torch.tensor(1)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        pack_samples_for_tq([sample])
+
+
+def test_canonicalize_openai_tool_trace_normalizes_arguments_and_links_response():
+    raw = [
+        {"role": "user", "content": "weather"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"city": "Shanghai"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+        {"role": "assistant", "content": "It is sunny."},
+    ]
+
+    messages = _canonicalize_messages(raw, require_response=True)
+
+    assert messages[1].content == ""
+    assert messages[1].tool_calls[0]["function"]["arguments"] == {"city": "Shanghai"}
+    assert messages[2].tool_call_id == "call_1"
+    assert messages[2].name == "lookup"
+    assert messages[0].learn is False
+    assert messages[1].learn is True
+    assert messages[2].learn is False
+    assert messages[3].learn is True
+
+
+def test_canonicalize_tool_calls_rejects_invalid_json_arguments():
+    raw = [
+        {"role": "user", "content": "weather"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"type": "function", "function": {"name": "lookup", "arguments": "{invalid"}}],
+        },
+    ]
+
+    with pytest.raises(json.JSONDecodeError):
+        _canonicalize_messages(raw, require_response=True)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ('{"city": "Shanghai"}', {"city": "Shanghai"}),
+        ("", {}),
+    ],
+)
+def test_canonicalize_flat_tool_call_normalizes_arguments(arguments, expected):
+    raw = [
+        {"role": "tool_call", "content": json.dumps({"name": "lookup", "arguments": arguments})},
+    ]
+
+    messages = _canonicalize_messages(raw, require_response=True)
+
+    assert messages[0].tool_calls[0]["function"]["arguments"] == expected
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error_type", "message"),
+    [
+        ("{invalid", json.JSONDecodeError, "Expecting property name"),
+        ("[]", TypeError, "function.arguments must be a JSON object"),
+    ],
+)
+def test_canonicalize_flat_tool_call_rejects_invalid_arguments(arguments, error_type, message):
+    raw = [
+        {"role": "tool_call", "content": json.dumps({"name": "lookup", "arguments": arguments})},
+    ]
+
+    with pytest.raises(error_type, match=message):
+        _canonicalize_messages(raw, require_response=True)

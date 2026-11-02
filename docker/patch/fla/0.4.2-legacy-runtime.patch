@@ -1,0 +1,33 @@
+--- a/fla/modules/conv/triton/kernels.py
++++ b/fla/modules/conv/triton/kernels.py
+@@ -25 +25 @@
+-    key=['D', 'W', 'NB'],
++    key=['D', 'W'],
+@@ -48 +47,0 @@
+-    NB: tl.constexpr,
+@@ -142 +141 @@
+-    key=['D', 'W', 'NB'],
++    key=['D', 'W'],
+@@ -171 +169,0 @@
+-    NB: tl.constexpr,
+--- a/fla/modules/conv/triton/ops.py
++++ b/fla/modules/conv/triton/ops.py
+@@ -44 +43,0 @@
+-    NB = triton.cdiv(B*T, 1024)
+@@ -64 +62,0 @@
+-        NB=NB,
+@@ -151 +148,0 @@
+-    NB = triton.cdiv(B*T, 1024)
+@@ -193 +189,0 @@
+-        NB=NB,
+--- a/fla/ops/common/chunk_o.py
++++ b/fla/ops/common/chunk_o.py
+@@ -21,2 +21,6 @@
+-    configs=[
+-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
++    # SM103: the 128x128 output tile fails same-input repeatability at long T.
++    # Keep the two validated native configurations; other devices keep all three.
++    configs=(
++        [triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3)]
++        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3) else []
++    ) + [

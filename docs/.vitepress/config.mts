@@ -254,6 +254,7 @@ export default defineConfig({
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
                 { text: 'Adding an Algorithm', link: '/en/guide/adding-an-algorithm' },
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
+                { text: 'Image-to-Image SFT', link: '/en/guide/i2i-sft' },
                 { text: 'DPO Training', link: '/en/guide/dpo-training' },
                 { text: 'CPT Training', link: '/en/guide/cpt-training' },
                 { text: 'MTP Training', link: '/en/guide/mtp-rl-training' },
@@ -270,6 +271,7 @@ export default defineConfig({
                 { text: 'Dataset Design', link: '/en/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/en/guide/distributed-checkpoint' },
                 { text: 'Health Check Manager', link: '/en/guide/health-check-manager' },
+                { text: 'Fault Event History', link: '/en/guide/fault-events' },
               ],
             },
             {
@@ -277,6 +279,7 @@ export default defineConfig({
               items: [
                 { text: 'Fully Async Training', link: '/en/guide/fully-async-training' },
                 { text: 'Prefill/Decode Disaggregation', link: '/en/guide/pd-disaggregation' },
+                { text: 'CPU Cache', link: '/en/guide/hierarchical-cache' },
                 { text: 'Agentic Rollout', link: '/en/guide/agentic-rollout' },
                 { text: 'Agentic KV Scheduling', link: '/en/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
@@ -386,6 +389,7 @@ export default defineConfig({
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
                 { text: '接入新算法', link: '/zh/guide/adding-an-algorithm' },
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
+                { text: '图像编辑 SFT', link: '/zh/guide/i2i-sft' },
                 { text: 'DPO 训练', link: '/zh/guide/dpo-training' },
                 { text: 'CPT 训练', link: '/zh/guide/cpt-training' },
                 { text: 'MTP 训练', link: '/zh/guide/mtp-rl-training' },
@@ -402,6 +406,7 @@ export default defineConfig({
                 { text: '数据集设计', link: '/zh/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/zh/guide/distributed-checkpoint' },
                 { text: '健康检查管理器', link: '/zh/guide/health-check-manager' },
+                { text: '故障事件历史', link: '/zh/guide/fault-events' },
               ],
             },
             {
@@ -409,6 +414,7 @@ export default defineConfig({
               items: [
                 { text: '全异步训练流水线', link: '/zh/guide/fully-async-training' },
                 { text: 'Prefill/Decode 分离', link: '/zh/guide/pd-disaggregation' },
+                { text: 'CPU 缓存', link: '/zh/guide/hierarchical-cache' },
                 { text: 'Agentic Rollout', link: '/zh/guide/agentic-rollout' },
                 { text: 'Agentic KV 调度', link: '/zh/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },

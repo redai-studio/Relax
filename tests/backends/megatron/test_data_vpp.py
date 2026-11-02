@@ -94,6 +94,37 @@ def test_vpp_microbatch_rounding_uses_ceil_multiple(monkeypatch):
     assert rounded.tolist() == [4, 4, 4, 8]
 
 
+@pytest.mark.parametrize("cp_rank, expected_rows", [(0, [6, 7]), (1, [0, 1, 2, 3, 4, 5])])
+def test_dynamic_cp_microbatch_slices_score_centering_heads_with_sampled_probs(monkeypatch, cp_rank, expected_rows):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(dynamic_context_parallel=True, max_tokens_per_gpu=6)
+    monkeypatch.setattr(data_module, "get_args", lambda: args)
+    monkeypatch.setattr(data_module, "dynamic_cp_split_data", lambda batch, budget: 2)
+    monkeypatch.setattr(data_module, "PackedSeqParams", types.SimpleNamespace)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(
+        data_module.mpu, "get_dynamic_data_context_parallel_groups", lambda group_size: object(), raising=False
+    )
+    monkeypatch.setattr(data_module.dist, "get_rank", lambda group: cp_rank)
+    token_ids = torch.arange(16).reshape(8, 2)
+    log_probs = -torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    batch = {
+        "tokens": [torch.arange(12)],
+        "total_lengths": [12],
+        "response_lengths": [8],
+        "loss_masks": [torch.ones(8, dtype=torch.int)],
+        "rollout_log_probs": [torch.arange(8, dtype=torch.float32)],
+        "rollout_topk_token_ids": [token_ids],
+        "rollout_topk_log_probs": [log_probs],
+    }
+
+    result = data_module.get_batch(iter([(batch, None)]), list(batch), pad_multiplier=1)
+
+    torch.testing.assert_close(result["rollout_topk_token_ids"][0], token_ids[expected_rows])
+    torch.testing.assert_close(result["rollout_topk_log_probs"][0], log_probs[expected_rows])
+    assert result["rollout_log_probs"][0].tolist() == expected_rows
+
+
 @pytest.mark.parametrize(
     "seqlens, capacity, num_partitions, first_fit_count, expect_fallback",
     [
@@ -165,7 +196,7 @@ def test_rollout_minibatch_plan_prefers_explicit_steps(monkeypatch):
     assert plan.mini_local_sample_request == 16
 
 
-def test_rollout_minibatch_plan_rejects_non_divisible_prompt_groups(monkeypatch):
+def test_rollout_minibatch_plan_allows_prompt_groups_to_span_dp_ranks(monkeypatch):
     data_module = _load_data_module(monkeypatch)
     args = Namespace(
         rollout_batch_size=9,
@@ -174,7 +205,42 @@ def test_rollout_minibatch_plan_rejects_non_divisible_prompt_groups(monkeypatch)
         num_steps_per_rollout=3,
     )
 
-    with pytest.raises(ValueError, match="mini_rollout_batch_size must be divisible"):
+    plan = data_module.build_rollout_minibatch_plan(args, dp_size=2)
+    assert plan.num_rollout_minis == 3
+    assert plan.mini_rollout_batch_size == 3
+    assert plan.mini_global_samples == 24
+    assert plan.mini_local_sample_request == 12
+
+
+@pytest.mark.parametrize("steps", [None, 1])
+def test_rollout_minibatch_plan_single_prompt_eight_samples_eight_dp(monkeypatch, steps):
+    data_module = _load_data_module(monkeypatch)
+    plan = data_module.build_rollout_minibatch_plan(
+        Namespace(
+            rollout_batch_size=1,
+            n_samples_per_prompt=8,
+            global_batch_size=8,
+            num_steps_per_rollout=steps,
+        ),
+        dp_size=8,
+    )
+    assert plan.num_rollout_minis == 1
+    assert plan.mini_rollout_batch_size == 1
+    assert plan.mini_global_samples == 8
+    assert plan.mini_local_sample_request == 1
+
+
+def test_rollout_minibatch_plan_still_rejects_non_divisible_sample_count(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(rollout_batch_size=1, n_samples_per_prompt=7, global_batch_size=7, num_steps_per_rollout=None)
+    with pytest.raises(ValueError, match=r"mini_rollout_batch_size \* n_samples_per_prompt must be divisible"):
+        data_module.build_rollout_minibatch_plan(args, dp_size=8)
+
+
+def test_rollout_minibatch_plan_keeps_prompt_groups_within_one_global_mini(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(rollout_batch_size=3, n_samples_per_prompt=8, global_batch_size=12, num_steps_per_rollout=None)
+    with pytest.raises(ValueError, match="rollout_batch_size must be divisible by num_rollout_minis"):
         data_module.build_rollout_minibatch_plan(args, dp_size=2)
 
 

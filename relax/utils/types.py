@@ -44,6 +44,8 @@ class Sample:
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
+    rollout_topk_token_ids: np.ndarray | None = None  # [response_length, K], int32; -1 pads observations
+    rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
     rollout_routed_experts: np.ndarray | None = None  # [seq_len - 1, num_layers, topk]
     remove_sample: bool = False
     abort_count: int = 0  # Number of times this sample has been aborted

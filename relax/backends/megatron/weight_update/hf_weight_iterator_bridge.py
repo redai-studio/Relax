@@ -27,10 +27,13 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
 )
+from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
 from .bridge_converter import BridgeConverter
-from .common import all_gather_param, named_params_and_buffers
+from .common import all_gather_param, all_gather_params_async, gdn_component_sizes, named_params_and_buffers
+from .expert_gather import Bf16ExpertGather, PackedExpertGather, bucket_expert_projections, bucket_experts_by_owner
+from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
@@ -59,6 +62,7 @@ _FUSED_PAIR_FRAGMENTS = (
     (".compressor.wkv.", ".compressor.wgate."),
 )
 _PAIR_SENTINEL = "\x00"
+_QWEN4EXP_PLE_TABLE_SUFFIX = ".per_layer_embedding.ple_embedding.ngram_embedding.weight"
 
 
 def _fused_pair_key(name: str) -> str | None:
@@ -103,6 +107,50 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map, self._adapter_map = buckets_result
         self._expert_broadcast_caches = [({}, {}) for _ in self._expert_buckets]
         self._expert_router: ExpertRouter | None = None
+        self._async_weight_gather = (
+            torch.cuda.is_available()
+            and not self.quantization_config
+            and not self.lora_merge_mode
+            and not self.lora_adapter_mode
+        )
+        self._gdn_split_sizes = {}
+        if self._async_weight_gather:
+            names = {
+                info.name.replace(".to_wrap.", ".")
+                for bucket in self._non_expert_buckets
+                for info in bucket
+                if info.attrs.get("tensor_model_parallel")
+                and info.attrs.get("parallel_mode") != "duplicated"
+                and ("self_attention.conv1d.weight" in info.name or "self_attention.in_proj.weight" in info.name)
+            }
+            if names:
+                config = get_hf_config(self.args.hf_checkpoint)
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+                self._gdn_split_sizes = {name: gdn_component_sizes(config, tp_size, name) for name in names}
+        self._bf16_expert_buckets = None
+        self._bf16_expert_gathers = []
+        self._packed_expert_sync = False
+        self._direct_expert_layout = None
+        # Complete BF16 experts are owned locally at ETP1/PP1. Other layouts
+        # continue through Bridge's existing PP/TP/quantization/LoRA path.
+        if (
+            torch.cuda.is_available()
+            and not self.quantization_config
+            and not self.lora_merge_mode
+            and not self.lora_adapter_mode
+            and mpu.get_pipeline_model_parallel_world_size() == 1
+            and mpu.get_virtual_pipeline_model_parallel_world_size() in (None, 1)
+            and mpu.get_expert_tensor_parallel_world_size() == 1
+            and mpu.get_expert_model_parallel_world_size() > 1
+            and self._expert_buckets
+            and all(info.dtype == torch.bfloat16 for bucket in self._expert_buckets for info in bucket)
+        ):
+            infos = [info for bucket in self._expert_buckets for info in bucket]
+            ranks = dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())
+            budget = self.args.update_weight_buffer_size
+            if all(info.src_rank in ranks and 0 < info.size <= budget for info in infos):
+                self._bf16_expert_buckets = bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, ranks)
+                self._bf16_expert_gathers = [Bf16ExpertGather() for _ in self._bf16_expert_buckets]
         if self.lora_merge_mode:
             self.lora_alpha = self.args.lora_alpha
             self.lora_dim = self.args.lora_rank
@@ -118,6 +166,73 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 "so colocate adapter mode is unaffected by ETP. (Fully-async off-policy adapter mode "
                 "DOES fold expert deltas for actor_fwd and so also needs ETP=1.)"
             )
+
+    def configure_direct_experts(self, layout: DirectExpertLayout | None) -> bool:
+        """Select packed export only after the colocated receiver layout is
+        known."""
+        if self._packed_expert_sync and layout == self._direct_expert_layout:
+            return True
+        if not self._packed_expert_sync and layout is None:
+            return False
+        self._packed_expert_sync = False
+        self._direct_expert_layout = None
+        if self._bf16_expert_buckets is None:
+            return False
+        infos = [info for bucket in self._bf16_expert_buckets for info in bucket]
+        ranks = dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())
+        # Reconnect may disable a previous direct plan. Restore standard HF export.
+        self._bf16_expert_buckets = bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, ranks)
+        self._bf16_expert_gathers = [Bf16ExpertGather() for _ in self._bf16_expert_buckets]
+        if layout is None or layout.num_experts != self.args.num_experts:
+            return False
+        if not self._bridge_converter.supports_packed_experts([info.name for info in infos]):
+            return False
+        try:
+            buckets = bucket_expert_projections(infos, layout.num_experts, ranks)
+        except ValueError:
+            return False
+        packed_buckets, gathers = [], []
+        for bucket in buckets:
+            expected = (
+                (2 * layout.intermediate_size, layout.hidden_size)
+                if ".linear_fc1." in bucket[0].name
+                else (layout.hidden_size, layout.intermediate_size)
+            )
+            if tuple(bucket[0].shape) != expected:
+                return False
+            # Preserve the whole-projection fast path for small layers. Larger
+            # projections use bounded native slices, negotiated with SGLang.
+            if sum(info.size for info in bucket) <= 2 * self.args.update_weight_buffer_size:
+                packed_buckets.append(bucket)
+                gathers.append(PackedExpertGather(layout.num_experts))
+            else:
+                if not layout.supports_expert_slices:
+                    return False
+                # Keep owners loading/packing in parallel. A global contiguous
+                # slice would serialize CPU-to-GPU staging on just one owner.
+                local_count = layout.num_experts // len(ranks)
+                per_owner = max(1, self.args.update_weight_buffer_size // (len(ranks) * bucket[0].size))
+                active_owners = min(len(ranks), self.args.update_weight_buffer_size // (per_owner * bucket[0].size))
+                if not active_owners:
+                    return False
+                for offset in range(0, local_count, per_owner):
+                    for first_owner in range(0, len(ranks), active_owners):
+                        ranges = [
+                            (
+                                owner * local_count + offset,
+                                owner * local_count + min(offset + per_owner, local_count),
+                            )
+                            if first_owner <= owner < first_owner + active_owners
+                            else (owner * local_count, owner * local_count)
+                            for owner in range(len(ranks))
+                        ]
+                        packed_buckets.append([info for start, end in ranges for info in bucket[start:end]])
+                        gathers.append(PackedExpertGather(layout.num_experts, expert_ranges=ranges))
+        self._bf16_expert_buckets = packed_buckets
+        self._bf16_expert_gathers = gathers
+        self._packed_expert_sync = True
+        self._direct_expert_layout = layout
+        return True
 
     def configure_expert_routing(
         self, layout: ExpertLayout, *, payload_group: dist.ProcessGroup, metadata_group: dist.ProcessGroup
@@ -216,12 +331,54 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             )
 
     def get_hf_weight_chunks(self, megatron_local_weights):
+        if self._bf16_expert_buckets is not None:
+            if self._packed_expert_sync:
+                yield from _chunk_with_mla_pairing(
+                    self._iter_hf_params(megatron_local_weights, include_experts=False),
+                    chunk_size=self.args.update_weight_buffer_size,
+                )
+                # Yield each native projection/range immediately
+                # instead of materializing the next layer through chunk lookahead.
+                yield from self._iter_bf16_expert_chunks(megatron_local_weights)
+                return
+            yield from _chunk_with_mla_pairing(
+                self._iter_bf16_expert_params(megatron_local_weights), chunk_size=self.args.update_weight_buffer_size
+            )
+            return
         if self._expert_router is not None:
             yield from self._iter_routed_expert_chunks(megatron_local_weights)
         yield from _chunk_with_mla_pairing(
             self._iter_hf_params(megatron_local_weights, include_experts=self._expert_router is None),
             chunk_size=self.args.update_weight_buffer_size,
         )
+
+    def _iter_bf16_expert_params(self, megatron_local_weights, *, include_non_experts=True):
+        # Preserve the current GDN and vision conversion; only expert ownership
+        # and transport differ. ETP1 owners already hold complete expert tensors.
+        if include_non_experts:
+            yield from self._iter_hf_params(megatron_local_weights, include_experts=False)
+        for chunk in self._iter_bf16_expert_chunks(megatron_local_weights):
+            yield from chunk
+
+    def _iter_bf16_expert_chunks(self, megatron_local_weights):
+        group = mpu.get_expert_model_parallel_group()
+        rank = dist.get_rank(group=dist.group.WORLD)
+        device = device_utils.make_current_torch_device()
+        for infos, gather in zip(self._bf16_expert_buckets, self._bf16_expert_gathers, strict=True):
+            converted = []
+            for info in infos:
+                if info.src_rank == rank:
+                    tensor = (
+                        megatron_local_weights[self._vanilla_key_map[info.name]]
+                        .detach()
+                        .to(device=device, non_blocking=_NON_BLOCKING)
+                    )
+                    converted.extend(self._bridge_converter.convert(info.name, tensor))
+                    del tensor
+            gathered = gather(converted, group=group, device=device)
+            del converted
+            yield gathered
+            del gathered
 
     def _iter_hf_params(self, megatron_local_weights, *, include_experts=True):
         """Yield individual (name, tensor) pairs for all params.
@@ -282,9 +439,41 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             t_b1 = time.monotonic()
             t_bcast_total += t_b1 - t_b0
 
-            for info, param in zip(bucket_infos, params, strict=True):
+            gathered_params = None
+            if self._async_weight_gather:
                 t_g0 = time.monotonic()
-                gathered = all_gather_param(self.args, info.name, param)
+                gathered_params = iter(
+                    all_gather_params_async(
+                        [
+                            (info, param)
+                            for info, param in zip(bucket_infos, params, strict=True)
+                            if not info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
+                        ],
+                        gdn_split_sizes=self._gdn_split_sizes,
+                    )
+                )
+                t_gather_total += time.monotonic() - t_g0
+            for info, param in zip(bucket_infos, params, strict=True):
+                if info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                    # Bridge's PLE mapping assembles one HF shard per TP collective.
+                    # A full TP gather here would materialize the entire n-gram
+                    # table (and convert() would retain all its shard views).
+                    shards = self._bridge_converter.iter_ple_shards(info.name, param)
+                    while True:
+                        t_g0 = time.monotonic()
+                        try:
+                            converted = next(shards)
+                        except StopIteration:
+                            break
+                        t_convert_total += time.monotonic() - t_g0
+                        param_count += 1
+                        yield converted
+                    continue
+
+                t_g0 = time.monotonic()
+                gathered = (
+                    all_gather_param(self.args, info.name, param) if gathered_params is None else next(gathered_params)
+                )
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
 
@@ -295,7 +484,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 yield from converted
                 del gathered, converted
 
-            del params
+            del params, gathered_params
 
         if rank == 0:
             logger.info(

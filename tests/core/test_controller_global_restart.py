@@ -17,39 +17,9 @@ except (ImportError, AssertionError) as exc:
     pytest.skip(f"relax.core.controller requires the full runtime environment: {exc}", allow_module_level=True)
 
 
-def test_global_restart_signals_failure_from_any_phase():
-    controller = object.__new__(Controller)
-    controller._restart_done_event = threading.Event()
-    controller._restart_error = None
-
-    def fail_before_reinit():
-        raise RuntimeError("ray init failed")
-
-    controller._run_global_restart = fail_before_reinit
-
-    controller._global_restart()
-
-    assert controller._restart_done_event.is_set()
-    assert isinstance(controller._restart_error, RuntimeError)
-    assert str(controller._restart_error) == "ray init failed"
-
-
-def test_global_restart_signals_success_on_same_event():
-    controller = object.__new__(Controller)
-    restart_done_event = threading.Event()
-    controller._restart_done_event = restart_done_event
-    controller._restart_error = None
-    controller._run_global_restart = lambda: None
-
-    controller._global_restart()
-
-    assert controller._restart_done_event is restart_done_event
-    assert restart_done_event.is_set()
-    assert controller._restart_error is None
-
-
 def test_restart_cycle_ack_is_published_after_old_state_is_cleared():
     controller = object.__new__(Controller)
+    controller._restart_lock = threading.RLock()
     controller._restart_done_event = threading.Event()
     controller._restart_done_event.set()
     controller._restart_mode = "local"
@@ -126,12 +96,18 @@ def test_global_restart_cleans_both_router_owners(
     controller._max_global_restart = 1
     controller._health_manager = SimpleNamespace(_checker=None, stop=Mock())
     controller._cancel_pending_tasks = Mock()
+    controller._close_data_system = Mock()
     controller.serve_dict = {controller_module.ROLES.rollout: service}
     controller._metrics_service_enabled = False
     controller._autoscaler_config = None
     controller._shutdown_agentic_rollout_services = Mock()
     controller._restart_error = None
     controller._restart_done_event = threading.Event()
+    controller._restart_consumed_event = threading.Event()
+    controller._restart_consumed_event.set()
+    controller._restart_lock = threading.RLock()
+    # Exercise the public recovery wrapper and the actual global teardown.
+    controller._restart_serve = lambda role: controller._run_global_restart()
 
     if manager_pending:
         wait_for = asyncio.wait_for
@@ -160,7 +136,6 @@ def test_global_restart_cleans_both_router_owners(
     monkeypatch.setattr(controller_module.serve, "delete", lambda role: events.append(f"delete {role}"))
     monkeypatch.setattr(controller_module.serve, "shutdown", Mock())
     monkeypatch.setattr(controller_module.serve, "start", Mock())
-    monkeypatch.setattr(controller_module.tq, "close", Mock())
     monkeypatch.setattr(controller_module.time, "sleep", Mock())
 
     def reinit(self, config, runtime_env):
@@ -170,7 +145,7 @@ def test_global_restart_cleans_both_router_owners(
 
     monkeypatch.setattr(Controller, "__init__", reinit)
 
-    controller._global_restart()
+    controller.restart_serve(controller_module.ROLES.rollout)
 
     if manager_pending:
         dispose_remote.assert_not_called()

@@ -31,7 +31,7 @@ import threading
 import time
 from bisect import bisect_right
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any, Iterable, Iterator, Optional
 
 import numpy as np
@@ -48,6 +48,7 @@ from relax.utils.data.data_utils import (
     parse_generalized_path,
     resolve_path_plan,
 )
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.types import Sample
@@ -72,13 +73,16 @@ class StreamingReader:
     access to any line in the file.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, pre_make_index: bool = False, line_offsets_cache: dict | None = None):
         """Initialize the streaming reader.
 
         Args:
             path: Path to the data file (JSONL or Parquet)
         """
         self.path, self.row_slice = parse_generalized_path(path)
+        self._pre_make_index = pre_make_index
+        self._line_offsets_cache = {} if line_offsets_cache is None else line_offsets_cache
+        self._cache_key = path
 
         if not os.path.exists(self.path):
             raise FileNotFoundError(f"Dataset path '{self.path}' does not exist.")
@@ -91,6 +95,13 @@ class StreamingReader:
         # Validate file format
         if not self.path.endswith((".jsonl", ".parquet")):
             raise ValueError(f"Unsupported file format: {self.path}. Supported formats are .jsonl and .parquet.")
+
+        if not pre_make_index and not self._is_parquet and path in self._line_offsets_cache:
+            import ray
+
+            self._line_offsets = ray.get(self._line_offsets_cache[path])
+            self._total_lines = len(self._line_offsets)
+            logger.info(f"Reused data reading index for {self.path}: {self._total_lines} lines")
 
     def _build_index(self) -> None:
         """Build line offset index for JSONL files.
@@ -125,6 +136,11 @@ class StreamingReader:
 
         self._total_lines = len(self._line_offsets)
         logger.info(f"Index built: {self._total_lines} lines")
+        if self._pre_make_index:
+            import ray
+
+            if ray.is_initialized():
+                self._line_offsets_cache[self._cache_key] = ray.put(self._line_offsets)
 
     def _load_parquet(self) -> None:
         """Load parquet file into memory."""
@@ -220,20 +236,23 @@ class CompositeStreamingReader:
     """Compose multiple single-file StreamingReader instances into one logical
     reader with optional slicing over the concatenated sample stream."""
 
-    def __init__(self, paths: list[str], row_slice: Optional[slice] = None):
+    def __init__(self, paths: list[str], row_slice: Optional[slice] = None, **reader_kwargs: Any):
         if not paths:
             raise ValueError("paths must not be empty")
 
         self.paths = paths
         self.row_slice = row_slice
-        self.readers = [StreamingReader(path) for path in paths]
+        self.readers = [StreamingReader(path, **reader_kwargs) for path in paths]
         self._cumulative_lengths: list[int] = []
 
         # JSONL indexing only retains offsets and can overlap shared-filesystem
         # I/O. Keep Parquet loading serial: it materializes full rows in memory.
-        jsonl_readers = [reader for reader in self.readers if not reader._is_parquet]
+        jsonl_readers = [reader for reader in self.readers if not reader._is_parquet and reader._line_offsets is None]
         if len(jsonl_readers) > 1:
-            num_workers = min(16, len(jsonl_readers))
+            num_workers = Envs.RELAX_JSONL_INDEX_WORKERS
+            if num_workers <= 0:
+                raise ValueError("RELAX_JSONL_INDEX_WORKERS must be a positive integer")
+            num_workers = min(num_workers, len(jsonl_readers))
             started = time.monotonic()
             logger.info(f"Building indices for {len(jsonl_readers)} JSONL files with {num_workers} workers...")
             with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="jsonl-index") as executor:
@@ -508,9 +527,9 @@ class PrefetchBuffer:
       for the background worker instead.
     - The cache is bounded by ``max_cached``; when full the prefetch thread
       pauses until consumers free space via ``get()`` calls.
-    - A ``ThreadPoolExecutor`` is used inside the prefetch thread to
-      parallelize video/image decoding across multiple files within a chunk,
-      since PyAV/FFmpeg releases the GIL during C-level decoding.
+    - A bounded rolling window keeps ``ThreadPoolExecutor`` workers busy.
+      Each result is published immediately; consumption still follows the
+      supplied index order, independently of completion order.
 
     Lifecycle::
 
@@ -518,6 +537,8 @@ class PrefetchBuffer:
         buf.set_index_order([3, 7, 1, 5, ...])  # triggers background loading
         sample = buf.get(3)  # instant cache hit
     """
+
+    _PROCESS_TIMEOUT_SECONDS = 120.0
 
     def __init__(
         self,
@@ -531,8 +552,7 @@ class PrefetchBuffer:
         Args:
             process_fn: ``fn(idx: int) -> Optional[Sample]`` — load and
                 process a single sample by index.
-            chunk_size: Number of indices to submit to the thread-pool at
-                a time inside the prefetch loop.
+            chunk_size: Maximum number of outstanding processing tasks.
             max_cached: Maximum number of samples to keep in the cache
                 before the prefetch thread pauses.
             num_workers: Number of parallel workers in the internal
@@ -565,6 +585,7 @@ class PrefetchBuffer:
         # Thread lifecycle
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._finished = True
 
         logger.info(
             f"PrefetchBuffer created: max_cached={max_cached}, chunk_size={chunk_size}, "
@@ -593,6 +614,7 @@ class PrefetchBuffer:
             self._fallback_fetched_indices.clear()
             self._indices = list(indices)
             self._pos = 0
+            self._finished = False
             self._cache_updated.notify_all()
 
         # Create a fresh stop-event for the new thread so the old thread
@@ -647,9 +669,9 @@ class PrefetchBuffer:
         """Wait until *idx* is present in the cache, or timeout/stop occurs."""
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cache_updated:
-            while idx not in self._cache and not self._stop.is_set():
-                thread = self._thread
-                if thread is None or not thread.is_alive():
+            generation = self._stop
+            while idx not in self._cache and generation is self._stop and not generation.is_set():
+                if self._finished:
                     break
                 if deadline is None:
                     self._cache_updated.wait()
@@ -658,7 +680,7 @@ class PrefetchBuffer:
                 if remaining <= 0:
                     break
                 self._cache_updated.wait(timeout=remaining)
-            return idx in self._cache
+            return generation is self._stop and idx in self._cache
 
     @property
     def is_alive(self) -> bool:
@@ -700,113 +722,109 @@ class PrefetchBuffer:
     # -- Background thread -------------------------------------------------
 
     def _run(self, stop_event: threading.Event) -> None:
-        """Background prefetch loop.
-
-        Iterates through ``self._indices`` in order, loading chunks in parallel
-        via a ``ThreadPoolExecutor``.  Pauses when the cache is full and
-        resumes when ``get()`` frees space.
-
-        Args:
-            stop_event: Thread-local stop signal.  Each thread receives its
-                own ``Event`` so that ``set_index_order`` can replace
-                ``self._stop`` for the next thread without accidentally
-                un-stopping this one.
-        """
-        _MAX_SUBMIT_RETRIES = 3
+        """Publish completed samples and refill a bounded processing window."""
+        pending: dict[Future, int] = {}
+        started_at: dict[int, float] = {}
+        expired: set[Future] = set()
         consecutive_failures = 0
+        pool: ThreadPoolExecutor | None = None
 
-        with ThreadPoolExecutor(max_workers=self._num_workers, thread_name_prefix="pf") as pool:
-            while not stop_event.is_set():
-                # 1. Get next chunk of indices
-                with self._lock:
-                    if self._pos >= len(self._indices):
-                        break  # All indices have been dispatched
-                    chunk = self._indices[self._pos : self._pos + self._chunk_size]
-                    self._pos += len(chunk)
+        def process(idx: int) -> Optional[Sample]:
+            with self._lock:
+                if stop_event is not self._stop or stop_event.is_set():
+                    return None
+                started_at[idx] = time.monotonic()
+            return self._process_fn(idx)
 
-                # 2. Filter out indices already in cache
-                with self._lock:
-                    to_fetch = []
-                    for idx in chunk:
-                        if idx in self._cache:
-                            continue
-                        if idx in self._fallback_fetched_indices:
-                            self._fallback_fetched_indices.discard(idx)
-                            self._prefetch_stale_drops += 1
-                            continue
-                        to_fetch.append(idx)
-                if not to_fetch:
-                    continue
-
-                # 3. Wait until cache has room for this chunk
-                while not stop_event.is_set():
-                    with self._lock:
-                        pending = []
-                        for idx in to_fetch:
-                            if idx in self._cache:
-                                continue
-                            if idx in self._fallback_fetched_indices:
-                                self._fallback_fetched_indices.discard(idx)
-                                self._prefetch_stale_drops += 1
-                                continue
-                            pending.append(idx)
-                        to_fetch = pending
-                        if not to_fetch:
-                            break
-                        if len(self._cache) + len(to_fetch) <= self._max_cached:
-                            break
-                        self._space_available.clear()
-                    # Wait for consumers to pop entries
-                    if not self._space_available.wait(timeout=0.1):
-                        continue
-
-                if not to_fetch:
-                    continue
-
-                if stop_event.is_set():
-                    return
-
-                # 4. Parallel-fetch all samples in the chunk
-                try:
-                    futures = {idx: pool.submit(self._process_fn, idx) for idx in to_fetch}
-                    results = {}
-                    for idx, fut in futures.items():
-                        try:
-                            results[idx] = fut.result(timeout=120)
-                        except Exception:
-                            logger.warning(f"Prefetch failed for index {idx}", exc_info=True)
-                            results[idx] = None
-                    consecutive_failures = 0
-                except Exception:
-                    consecutive_failures += 1
-                    logger.exception(
-                        f"Prefetch chunk submission failed (attempt {consecutive_failures}/{_MAX_SUBMIT_RETRIES})"
-                    )
-                    if consecutive_failures >= _MAX_SUBMIT_RETRIES:
-                        logger.error("Prefetch thread aborting after too many consecutive submission failures")
-                        break
-                    time.sleep(0.5)
-                    with self._lock:
-                        self._pos -= len(chunk)
-                    continue
-
-                # 5. Store results in cache
-                with self._cache_updated:
-                    for idx, sample in results.items():
-                        if idx in self._fallback_fetched_indices:
-                            self._fallback_fetched_indices.discard(idx)
-                            self._prefetch_stale_drops += 1
-                            continue
-                        self._cache[idx] = sample
-                    self._cache_updated.notify_all()
-
-        with self._cache_updated:
+        def publish(idx: int, sample: Optional[Sample]) -> None:
+            # Called under the generation lock, including for skipped samples.
+            if idx in self._fallback_fetched_indices:
+                self._fallback_fetched_indices.discard(idx)
+                self._prefetch_stale_drops += 1
+            else:
+                self._cache[idx] = sample
             self._cache_updated.notify_all()
-        logger.info(
-            f"Prefetch thread finished. Hit rate: {self.hit_rate:.1%} "
-            f"(hits={self._prefetch_hits}, misses={self._prefetch_misses}, "
-            f"stale_drops={self._prefetch_stale_drops})"
-        )
+
+        try:
+            pool = ThreadPoolExecutor(max_workers=self._num_workers, thread_name_prefix="pf")
+            while not stop_event.is_set():
+                with self._cache_updated:
+                    if stop_event is not self._stop or stop_event.is_set():
+                        return
+                    # Timed-out tasks keep their slot until they really finish.
+                    # A cached timeout sentinel shares its task's logical slot.
+                    occupied = set(self._cache) | set(pending.values())
+                    while (
+                        self._pos < len(self._indices)
+                        and len(pending) < self._chunk_size
+                        and len(occupied) < self._max_cached
+                    ):
+                        idx = self._indices[self._pos]
+                        if idx in self._cache or idx in pending.values():
+                            self._pos += 1
+                            continue
+                        if idx in self._fallback_fetched_indices:
+                            self._fallback_fetched_indices.discard(idx)
+                            self._prefetch_stale_drops += 1
+                            self._pos += 1
+                            continue
+                        try:
+                            future = pool.submit(process, idx)
+                        except Exception:
+                            consecutive_failures += 1
+                            logger.exception("Prefetch task submission failed for index %s", idx)
+                            if consecutive_failures >= 3:
+                                return
+                            break
+                        pending[future] = idx
+                        occupied.add(idx)
+                        self._pos += 1
+                        consecutive_failures = 0
+                    if not pending and self._pos >= len(self._indices):
+                        return
+                    self._space_available.clear()
+
+                if not pending:
+                    self._space_available.wait(timeout=0.1)
+                    continue
+
+                done, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                with self._cache_updated:
+                    if stop_event is not self._stop or stop_event.is_set():
+                        return
+                    for future in done:
+                        idx = pending.pop(future)
+                        started_at.pop(idx, None)
+                        if future in expired:
+                            expired.remove(future)
+                            continue
+                        try:
+                            sample = future.result()
+                        except Exception:
+                            logger.warning("Prefetch failed for index %s", idx, exc_info=True)
+                            sample = None
+                        publish(idx, sample)
+                    now = time.monotonic()
+                    for future, idx in pending.items():
+                        start = started_at.get(idx)
+                        if (
+                            future not in expired
+                            and not future.done()
+                            and start is not None
+                            and now - start >= self._PROCESS_TIMEOUT_SECONDS
+                        ):
+                            logger.warning("Prefetch processing timed out for index %s", idx)
+                            expired.add(future)
+                            publish(idx, None)
+        finally:
+            # Running calls cannot be killed; they never publish into a new epoch.
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+            with self._cache_updated:
+                if stop_event is self._stop:
+                    self._finished = True
+                    self._cache_updated.notify_all()
+            logger.info("Prefetch thread finished. Hit rate: %.1f%%", self.hit_rate * 100)
 
 
 class StreamingDataset(BaseDataset):
@@ -1022,9 +1040,9 @@ class StreamingDataset(BaseDataset):
         that ``IndexManager.position`` stays exactly in sync with the index
         sequence given to ``PrefetchBuffer.set_index_order()``.
 
-        Without prefetch, indices are fetched in small batches for
-        efficiency (acceptable since there is no ordering contract to
-        honour with a background thread).
+        Without prefetch, indices are fetched in small batches bounded by
+        the remaining sample count, so every fetched index is processed.
+        Filtered samples are replaced in subsequent iterations.
 
         Args:
             n: Number of samples to get
@@ -1094,7 +1112,8 @@ class StreamingDataset(BaseDataset):
 
         while len(samples) < n and attempts < max_attempts:
             need = n - len(samples)
-            fetch_size = min(need * 2, 100)
+            # Every fetched index advances the cursor, so do not over-fetch.
+            fetch_size = min(need, 100)
 
             indices, epoch_crossed = self.index_manager.get_next_indices(fetch_size)
             crossed_epoch = crossed_epoch or epoch_crossed

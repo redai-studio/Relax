@@ -3,12 +3,14 @@
 """Qwen history-thinking template patch tests."""
 
 import hashlib
+import json
+import os
 import re
 
 import pytest
 import torch
 
-from relax.engine.sft.dataset.chat_template import render_to_text, render_with_loss_mask
+from relax.engine.sft.dataset.chat_template import _to_chat_messages, render_to_text, render_with_loss_mask
 from relax.engine.sft.dataset.qwen_chat_template_patch import (
     _QWEN38_PRESERVE_HISTORY_GATE,
     _QWEN_ASSISTANT_TOOL_CALL,
@@ -19,9 +21,12 @@ from relax.engine.sft.dataset.qwen_chat_template_patch import (
     _QWEN_TOOL_CALL_SEPARATOR_PATCH,
     _QWEN_TOOL_CALL_WITH_SEPARATOR,
     _QWEN_UNCONDITIONAL_REASONING_GATE,
+    is_qwen38_chat_template,
+    split_qwen38_leading_thinking,
     try_patch_qwen_chat_template,
 )
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
+from relax.engine.sft.dataset.streaming import SFTStreamingDataset
 
 
 _QWEN35_TEMPLATE = "\n".join(("template-start", _QWEN_HISTORY_GATE, "template-end"))
@@ -322,7 +327,7 @@ def test_qwen35_native_reasoning_gate_is_idempotent(monkeypatch):
     assert result.template == template
 
 
-def test_qwen35_patch_matches_ms_swift_assistant_tool_call_merge():
+def test_qwen35_patch_preserves_native_thinking_and_tool_separator():
     template = "\n".join(
         (
             "reasoning_content",
@@ -335,10 +340,115 @@ def test_qwen35_patch_matches_ms_swift_assistant_tool_call_merge():
 
     assert result is not None
     assert result.changed
-    assert _QWEN_ASSISTANT_TOOL_CALL in result.template
+    assert _QWEN_ASSISTANT_TOOL_CALL not in result.template
     assert result.template.count(_QWEN_ASSISTANT_WITH_THINK) == 1
     assert result.template.count(_QWEN_TOOL_CALL_WITH_SEPARATOR) == 1
-    assert _QWEN_TOOL_CALL_SEPARATOR_PATCH in result.template
+    assert _QWEN_TOOL_CALL_SEPARATOR_PATCH not in result.template
+
+
+def test_qwen35_patch_restores_legacy_tool_rendering_idempotently():
+    template = "\n".join(
+        ("reasoning_content", _QWEN_HISTORY_GATE, _QWEN_ASSISTANT_TOOL_CALL, _QWEN_TOOL_CALL_SEPARATOR_PATCH)
+    )
+    result = try_patch_qwen_chat_template(_make_sample(), template, {"preserve_thinking": True})
+    assert result is not None
+    assert result.changed
+    assert _QWEN_ASSISTANT_TOOL_CALL not in result.template
+    assert _QWEN_TOOL_CALL_SEPARATOR_PATCH not in result.template
+    assert result.template.count(_QWEN_ASSISTANT_WITH_THINK) == 1
+    assert result.template.count(_QWEN_TOOL_CALL_WITH_SEPARATOR) == 1
+
+    repeated = try_patch_qwen_chat_template(_make_sample(), result.template, result.kwargs)
+    assert repeated is not None
+    assert not repeated.changed
+    assert repeated.template == result.template
+
+
+@pytest.mark.parametrize("reasoning", ["", "Need a tool."])
+def test_qwen38_tool_call_preserves_baseline_rendered_text(reasoning):
+    from jinja2 import Environment
+
+    template = "\n".join(
+        (
+            "{%- set ns = namespace(last_query_index=-1) %}",
+            "{%- for message in messages %}",
+            "{%- set content = message.content %}",
+            "{%- set reasoning_content = message.reasoning_content %}",
+            _QWEN38_PRESERVE_HISTORY_GATE,
+            _QWEN_ASSISTANT_WITH_THINK,
+            "{%- endif %}",
+            "{%- for tool_call in message.tool_calls %}",
+            _QWEN_TOOL_CALL_WITH_SEPARATOR,
+            "{{- '</function>\\n</tool_call>' }}",
+            "{%- endfor %}",
+            "{%- endfor %}",
+        )
+    )
+    result = try_patch_qwen_chat_template(_make_sample(), template, {"preserve_thinking": True})
+    assert result is not None
+    message = {
+        "role": "assistant",
+        "content": "Searching.",
+        "reasoning_content": reasoning,
+        "tool_calls": [{"name": "search"}],
+    }
+    rendered = Environment().from_string(result.template).render(messages=[message], **result.kwargs)
+    prefix = f"<think>\n{reasoning}\n</think>\n\n" if reasoning else ""
+    separator = "\n\n" if reasoning else ""
+    assert rendered == (
+        f"<|im_start|>assistant\n{prefix}Searching.{separator}"
+        "<tool_call>\n<function=search>\n</function>\n</tool_call>"
+    )
+    repeated = try_patch_qwen_chat_template(_make_sample(), result.template, result.kwargs)
+    assert repeated is not None
+    assert not repeated.changed
+    assert repeated.template == result.template
+
+
+@pytest.mark.parametrize("legacy_block", [_QWEN_ASSISTANT_TOOL_CALL, _QWEN_TOOL_CALL_SEPARATOR_PATCH])
+def test_qwen35_patch_rejects_partial_legacy_tool_patch(legacy_block):
+    template = "\n".join(("reasoning_content", _QWEN_HISTORY_GATE, legacy_block))
+    with pytest.raises(RuntimeError, match="Cannot safely restore"):
+        try_patch_qwen_chat_template(_make_sample(), template, {})
+
+
+@pytest.mark.parametrize("historical_learn", [True, False])
+@pytest.mark.parametrize("reasoning", [None, "", " \n ", "INDEPENDENT_HISTORY"])
+def test_qwen_patch_auto_preserves_independent_historical_reasoning(historical_learn, reasoning):
+    sample = _make_sample(historical_learn=historical_learn)
+    sample.messages[1].content = "Searching."
+    sample.messages[1].reasoning_content = reasoning
+    result = try_patch_qwen_chat_template(sample, _QWEN35_TEMPLATE, {})
+    assert result is not None
+    assert result.kwargs.get("preserve_thinking", False) is bool(historical_learn and reasoning and reasoning.strip())
+
+    explicit = try_patch_qwen_chat_template(sample, _QWEN35_TEMPLATE, {"preserve_thinking": False})
+    assert explicit is not None
+    assert explicit.kwargs["preserve_thinking"] is False
+
+
+def test_qwen_generation_template_honors_ignore_empty_think_with_fallback():
+    tokenizer = _FakeQwenHistoryTokenizer(_QWEN35_RENDER_TEMPLATE)
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="Q", learn=False),
+            CanonicalMessage(role="assistant", content="A", learn=True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    input_ids, loss_mask = render_with_loss_mask(
+        sample,
+        tokenizer=tokenizer,
+        apply_chat_template_kwargs={"preserve_thinking": True, "add_non_thinking_prefix": True},
+        ignore_empty_think=True,
+    )
+    assert "generation" in tokenizer.last_template
+    assert not tokenizer.used_assistant_mask
+    text = "".join(chr(token) for token in input_ids.tolist())
+    learned = _learned_text(input_ids, loss_mask)
+    assert "<think>\n\n</think>" in text
+    assert "<think>" not in learned and "</think>" not in learned
+    assert "A<|im_end|>" in learned
 
 
 def test_qwen_patch_rejects_ambiguous_gate():
@@ -499,3 +609,281 @@ def test_qwen35_render_to_text_uses_same_patch_dispatcher():
     first_assistant = text.split("<|im_start|>assistant\n", 1)[1].split("<|im_end|>", 1)[0]
     assert "<think>\nNEED_SKILL\n</think>" in first_assistant
     assert tokenizer.last_template != tokenizer.chat_template
+
+
+class _FakeQwen38Tokenizer(_FakeQwenHistoryTokenizer):
+    chat_template = _QWEN38_TEMPLATE
+
+    def apply_chat_template(self, messages, *, tools=None, tokenize=True, **kwargs):  # noqa: ARG002
+        self.last_template = kwargs.get("chat_template", self.chat_template)
+        last_user = max((i for i, message in enumerate(messages) if message["role"] == "user"), default=-1)
+        rendered = ""
+        for index, message in enumerate(messages):
+            role = message["role"]
+            content = message["content"]
+            if role == "assistant" and (kwargs.get("preserve_thinking") is not False or index > last_user):
+                reasoning = (message.get("reasoning_content") or "").strip()
+                content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+            rendered += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+        if not tokenize:
+            return rendered
+        return self._tokenize(rendered)[0]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("answer", None),
+        ("<think>\n\n</think>\n\nanswer", ("", "answer")),
+        ("<think>\nreason\n</think>\n\nanswer", ("reason", "answer")),
+        ("<think>\nreason\n</think>", ("reason", "")),
+        ("<think>reason</think>answer", ("reason", "answer")),
+        ("<think>\nreason\n</think>answer", ("reason", "answer")),
+        ("<think>\nreason\n</think>\nanswer", ("reason", "\nanswer")),
+        ("<think>\nfirst\nsecond\n</think>\n\nanswer", ("first\nsecond", "answer")),
+        ("<think>\nreason\n</think>\n\nThe token </think> closes it.", ("reason", "The token </think> closes it.")),
+    ],
+)
+def test_qwen38_split_leading_think_preserves_answer(content, expected):
+    assert split_qwen38_leading_thinking(content) == expected
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<think>unfinished",
+        " \n<think>\n\n</think>\n\nanswer",
+        "<think>\n<think>nested\n</think>\n\nanswer",
+        "<think>\n\n</think>\n\n<think>\n\n</think>\n\nanswer",
+    ],
+)
+def test_qwen38_split_leading_think_rejects_unknown_format(content):
+    with pytest.raises(ValueError, match="unrecognized leading"):
+        split_qwen38_leading_thinking(content)
+
+
+@pytest.mark.parametrize("answer", ["", "answer"])
+def test_qwen38_compact_thinking_matches_canonical_tokens_and_mask(answer):
+    tokenizer_dir = os.environ.get("QWEN38_TEST_TOKENIZER_DIR")
+    if not tokenizer_dir:
+        pytest.skip("set QWEN38_TEST_TOKENIZER_DIR for the real tokenizer regression")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True, local_files_only=True)
+    results = []
+    for content in (f"<think>\nreason\n</think>{answer}", f"<think>\nreason\n</think>\n\n{answer}"):
+        sample = CanonicalSample(
+            messages=[
+                CanonicalMessage("user", "query", False),
+                CanonicalMessage(
+                    "assistant",
+                    content,
+                    True,
+                    tool_calls=[{"type": "function", "function": {"name": "lookup", "arguments": {}}}],
+                ),
+            ],
+            metadata={"source_dataset": "compact-thinking-regression", "row_index": 0},
+        )
+        results.append(
+            render_with_loss_mask(sample, tokenizer=tokenizer, apply_chat_template_kwargs={"preserve_thinking": True})
+        )
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
+    assert results[0][1].sum() > 0
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_reason"),
+    [
+        ("answer", ""),
+        ("<think>\n\n</think>\n\nanswer", ""),
+        ("<think>\nreason\n</think>\n\nanswer", "reason"),
+    ],
+)
+def test_qwen38_native_scaffold_and_loss_are_not_duplicated(content, expected_reason):
+    tokenizer = _FakeQwen38Tokenizer()
+    sample = CanonicalSample(
+        messages=[CanonicalMessage("user", "query", False), CanonicalMessage("assistant", content, True)],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    kwargs = {"enable_thinking": False, "add_non_thinking_prefix": True, "preserve_thinking": False}
+    rendered = render_to_text(sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs)
+    input_ids, loss_mask = render_with_loss_mask(
+        sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs, ignore_empty_think=True
+    )
+    learned = _learned_text(input_ids, loss_mask)
+
+    assert is_qwen38_chat_template(tokenizer.chat_template)
+    assert rendered.count("<think>") == rendered.count("</think>") == 1
+    assert f"<think>\n{expected_reason}\n</think>\n\nanswer" in rendered
+    assert learned == (f"<think>\n{expected_reason}\n</think>\n\n" if expected_reason else "") + "answer<|im_end|>\n"
+    assert sample.messages[1].content == content
+    assert sample.messages[1].reasoning_content is None
+    assert tokenizer.chat_template == _QWEN38_TEMPLATE
+
+
+@pytest.mark.parametrize("preserve_thinking", [False, True])
+def test_qwen38_multiturn_preserve_policy_and_last_round_loss(preserve_thinking):
+    tokenizer = _FakeQwen38Tokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "q1", False),
+            CanonicalMessage("assistant", "<think>\nold reason\n</think>\n\na1", True),
+            CanonicalMessage("user", "q2", False),
+            CanonicalMessage("assistant", "<think>\n\n</think>\n\na2", True),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    kwargs = {"preserve_thinking": preserve_thinking, "add_non_thinking_prefix": True}
+    rendered = render_to_text(sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs, last_turn_only=True)
+    input_ids, loss_mask = render_with_loss_mask(
+        sample,
+        tokenizer=tokenizer,
+        apply_chat_template_kwargs=kwargs,
+        last_turn_only=True,
+        ignore_empty_think=True,
+    )
+
+    assert ("old reason" in rendered) == preserve_thinking
+    assert rendered.count("<think>") == (2 if preserve_thinking else 1)
+    assert _learned_text(input_ids, loss_mask) == "a2<|im_end|>\n"
+
+
+def test_qwen38_rejects_conflicting_structured_and_embedded_reasoning():
+    tokenizer = _FakeQwen38Tokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "query", False),
+            CanonicalMessage("assistant", "<think>\nraw\n</think>\n\nanswer", True, reasoning_content="structured"),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    with pytest.raises(ValueError, match="both reasoning_content"):
+        render_to_text(sample, tokenizer=tokenizer)
+
+
+@pytest.mark.parametrize("reasoning", ["", "reason"])
+def test_qwen38_dataset_text_item_normalizes_leading_think(tmp_path, reasoning):
+    path = tmp_path / "messages.jsonl"
+    content = f"<think>\n{reasoning}\n</think>\n\nanswer"
+    path.write_text(
+        json.dumps({"messages": [{"role": "user", "content": "query"}, {"role": "assistant", "content": content}]})
+        + "\n"
+    )
+    dataset = SFTStreamingDataset(
+        str(path),
+        tokenizer=_FakeQwen38Tokenizer(),
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        prefetch_max_cached=0,
+    )
+    sample = dataset.get_canonical_sample(0)
+    assert sample.messages[1].content == [{"type": "text", "text": content}]
+
+    messages = _to_chat_messages(sample, normalize_qwen38_reasoning=True)
+    assert messages[1]["reasoning_content"] == reasoning
+    assert messages[1]["content"] == [{"type": "text", "text": "answer"}]
+    assert sample.messages[1].content == [{"type": "text", "text": content}]
+
+
+def test_qwen38_real_tokenizer_dataset_text_item_loss(tmp_path):
+    tokenizer_dir = os.environ.get("QWEN38_TEST_TOKENIZER_DIR")
+    if not tokenizer_dir:
+        pytest.skip("set QWEN38_TEST_TOKENIZER_DIR to the local 8L tokenizer for this integration test")
+    from transformers import AutoTokenizer
+
+    path = tmp_path / "messages.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "query"},
+                    {"role": "assistant", "content": "<think>\n\n</think>\n\nanswer"},
+                ]
+            }
+        )
+        + "\n"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True, local_files_only=True)
+    dataset = SFTStreamingDataset(
+        str(path),
+        tokenizer=tokenizer,
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        apply_chat_template_kwargs={"enable_thinking": False},
+        loss_ignore_empty_think=True,
+        prefetch_max_cached=0,
+    )
+    processed = dataset._process_one(0)
+    assert processed is not None
+    rendered = tokenizer.decode(processed.tokens, skip_special_tokens=False)
+    learned = tokenizer.decode(processed.tokens[processed.loss_mask.bool()], skip_special_tokens=False)
+    assert rendered.count("<think>") == rendered.count("</think>") == 1
+    assert learned == "answer<|im_end|>\n"
+
+
+def test_qwen38_real_tokenizer_empty_and_nonempty_think_loss():
+    tokenizer_dir = os.environ.get("QWEN38_TEST_TOKENIZER_DIR")
+    if not tokenizer_dir:
+        pytest.skip("set QWEN38_TEST_TOKENIZER_DIR to the local 8L tokenizer for this integration test")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True, local_files_only=True)
+    kwargs = {"enable_thinking": False, "add_non_thinking_prefix": True, "preserve_thinking": False}
+    for reasoning, answer, expected_learned in [
+        ("", "answer", "answer<|im_end|>\n"),
+        ("reason", "answer", "<think>\nreason\n</think>\n\nanswer<|im_end|>\n"),
+        ("", "The token </think> closes it.", "The token </think> closes it.<|im_end|>\n"),
+    ]:
+        sample = CanonicalSample(
+            messages=[
+                CanonicalMessage("user", "query", False),
+                CanonicalMessage("assistant", f"<think>\n{reasoning}\n</think>\n\n{answer}", True),
+            ],
+            metadata={"source_dataset": "x", "row_index": 0},
+        )
+        rendered = render_to_text(sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs)
+        input_ids, loss_mask = render_with_loss_mask(
+            sample, tokenizer=tokenizer, apply_chat_template_kwargs=kwargs, ignore_empty_think=True
+        )
+        assert rendered.count("<think>") == 1
+        assert tokenizer.decode(input_ids[loss_mask.bool()], skip_special_tokens=False) == expected_learned
+
+
+@pytest.mark.parametrize("template", [_QWEN35_TEMPLATE, _QWEN36_TEMPLATE, _QWEN38_TEMPLATE])
+@pytest.mark.parametrize("reasoning, expected_preserve", [("", False), ("  \n", False), ("reason", True)])
+def test_qwen_structured_historical_reasoning_only_auto_preserves_nonempty(template, reasoning, expected_preserve):
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "q1", False),
+            CanonicalMessage("assistant", "a1", True, reasoning_content=reasoning),
+            CanonicalMessage("user", "q2", False),
+            CanonicalMessage("assistant", "a2", True),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    result = try_patch_qwen_chat_template(sample, template, {})
+    assert result is not None
+    assert (result.kwargs.get("preserve_thinking") is True) == expected_preserve
+
+
+def test_qwen35_archived_tool_call_content_is_explicit_and_idempotent():
+    template = "\n".join(
+        ("reasoning_content", _QWEN_HISTORY_GATE, _QWEN_ASSISTANT_WITH_THINK, _QWEN_TOOL_CALL_WITH_SEPARATOR)
+    )
+    kwargs = {"preserve_thinking": True, "legacy_tool_call_content": True}
+    result = try_patch_qwen_chat_template(_make_sample(), template, kwargs)
+    assert result is not None
+    assert result.template.count(_QWEN_ASSISTANT_TOOL_CALL) == 1
+    assert result.template.count(_QWEN_TOOL_CALL_SEPARATOR_PATCH) == 1
+    repeated = try_patch_qwen_chat_template(_make_sample(), result.template, result.kwargs)
+    assert repeated is not None
+    assert not repeated.changed
+    assert repeated.template == result.template
+    assert repeated.kwargs["legacy_tool_call_content"] is True
+
+
+def test_qwen_legacy_tool_call_content_requires_boolean():
+    template = "\n".join(("reasoning_content", _QWEN_HISTORY_GATE))
+    with pytest.raises(ValueError, match="legacy_tool_call_content"):
+        try_patch_qwen_chat_template(_make_sample(), template, {"legacy_tool_call_content": "true"})

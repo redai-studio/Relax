@@ -84,6 +84,33 @@ def test_build_messages_uses_top_level_media_without_mutating_input():
     assert collect_message_multimodal_data(first_messages)["image"] == ["/data/image.png"]
 
 
+@pytest.mark.parametrize("multimodal_keys", [None, {"image": "images"}])
+def test_build_messages_accepts_null_tool_body_without_mutating_metadata(multimodal_keys):
+    tool_calls = [{"type": "function", "function": {"name": "lookup", "arguments": "{}"}}]
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": tool_calls,
+        "reasoning_content": "Need a lookup",
+        "loss": False,
+        "learn": False,
+    }
+    row = {"messages": [message], "images": []}
+    result = build_messages(row, "messages", None, True, multimodal_keys)
+    assert result[0]["content"] == ([] if multimodal_keys else "")
+    assert {k: v for k, v in result[0].items() if k != "content"} == {
+        k: v for k, v in message.items() if k != "content"
+    }
+    assert message["content"] is None
+
+
+@pytest.mark.parametrize("content", [None, 123])
+def test_build_messages_does_not_hide_invalid_non_tool_content(content):
+    row = {"messages": [{"role": "assistant", "content": content}]}
+    with pytest.raises(ValueError, match="Unsupported content type"):
+        build_messages(row, "messages", None, True, {"image": "images"})
+
+
 @pytest.fixture
 def complete_prompt_first(monkeypatch):
     """Let only the chosen worker finish before result iteration begins."""

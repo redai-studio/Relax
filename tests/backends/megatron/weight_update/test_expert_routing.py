@@ -2,7 +2,11 @@
 
 """Local CPU tests: no Ray connection, CUDA allocation or cluster jobs."""
 
+import faulthandler
+import importlib.util
+import sys
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -10,13 +14,20 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from relax.backends.megatron.weight_update.expert_routing import (
-    ExpertLayout,
-    ExpertRouter,
-    TensorSpec,
-    build_transfer_plan,
-    validate_server_layout,
-)
+
+# Spawned CPU workers must not run Megatron's model-registration side effects.
+# Load the production module intact; the optional bridge checks still import
+# the real backend below when its runtime is available.
+_ROUTING_PATH = Path(__file__).resolve().parents[4] / "relax/backends/megatron/weight_update/expert_routing.py"
+_ROUTING_SPEC = importlib.util.spec_from_file_location("_expert_routing_cpu_test", _ROUTING_PATH)
+_ROUTING = importlib.util.module_from_spec(_ROUTING_SPEC)
+sys.modules[_ROUTING_SPEC.name] = _ROUTING  # Dataclasses and collective object pickling need a stable module name.
+_ROUTING_SPEC.loader.exec_module(_ROUTING)
+ExpertLayout = _ROUTING.ExpertLayout
+ExpertRouter = _ROUTING.ExpertRouter
+TensorSpec = _ROUTING.TensorSpec
+build_transfer_plan = _ROUTING.build_transfer_plan
+validate_server_layout = _ROUTING.validate_server_layout
 
 
 def _name(expert: int, suffix: str = "packed") -> str:
@@ -98,15 +109,25 @@ def test_expert_routing_checks_resolved_server_overrides(override):
         validate_server_layout(config | override, 2, 2)
 
 
+def _worker_stage(rank: int, stage: str) -> None:
+    sys.stderr.write(f"[expert-routing rank={rank}] {stage}\n")
+    sys.stderr.flush()
+
+
 def _exchange_worker(rank: int, rendezvous: str, with_bridge: bool) -> None:
+    faulthandler.enable(all_threads=True)
+    _worker_stage(rank, f"start python={sys.version.split()[0]} torch={torch.__version__}")
     torch.set_num_threads(1)
+    _worker_stage(rank, "initializing Gloo")
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60))
+    _worker_stage(rank, "Gloo initialized")
     try:
         layout = ExpertLayout(8, 2, (0, 2), 4)
         router = ExpertRouter(layout, payload_group=dist.group.WORLD, metadata_group=dist.group.WORLD)
         previous = []
         gather = dist.all_gather_object
         for step in range(4):
+            _worker_stage(rank, f"exchange step={step}")
             router.reset_metrics()
             # Two common buckets. Some sources and receivers are empty in each.
             for bucket in range(2):
@@ -133,6 +154,7 @@ def _exchange_worker(rank: int, rendezvous: str, with_bridge: bool) -> None:
                     torch.testing.assert_close(old, snapshot)
                 previous.extend((tensor, tensor.clone()) for _, tensor in result)
             assert router.payload_bytes * 2 == router.replicated_bytes
+        _worker_stage(rank, "checking invalid schemas and budgets")
         # All ranks receive the same invalid schema and fail before payload exchange.
         bad = _values(0) if rank in (0, 1) else []
         with pytest.raises(ValueError, match="unique owner"):
@@ -153,8 +175,11 @@ def _exchange_worker(rank: int, rendezvous: str, with_bridge: bool) -> None:
         if with_bridge:
             _check_bridge_chunk_rounds(rank, layout, interleaved=False)
             _check_bridge_chunk_rounds(rank, layout, interleaved=True)
+        _worker_stage(rank, "all assertions passed")
     finally:
+        _worker_stage(rank, "destroying Gloo")
         dist.destroy_process_group()
+        _worker_stage(rank, "Gloo destroyed")
 
 
 def _check_bridge_chunk_rounds(rank: int, layout: ExpertLayout, *, interleaved: bool) -> None:
@@ -183,6 +208,8 @@ def _check_bridge_chunk_rounds(rank: int, layout: ExpertLayout, *, interleaved: 
     iterator._vanilla_key_map = {info.name: info.name for i, info in enumerate(infos) if i % 3 == rank}
     iterator._non_expert_buckets = []
     iterator._expert_broadcast_caches = []
+    iterator._bf16_expert_buckets = None
+    iterator._async_weight_gather = False
     iterator.lora_merge_mode = False
     iterator._bridge_converter = SimpleNamespace(
         init_tasks=lambda: None,
@@ -236,9 +263,11 @@ def _require_bridge_runtime() -> None:
 
 
 @pytest.mark.parametrize("with_bridge", [False, True])
-def test_expert_routing_multirank_values_empty_ranks_and_cache_refresh(tmp_path, with_bridge):
+def test_expert_routing_multirank_values_empty_ranks_and_cache_refresh(tmp_path, with_bridge, monkeypatch):
     if with_bridge:
         _require_bridge_runtime()
+    # Enable native-crash tracebacks before spawned interpreters import torch.
+    monkeypatch.setenv("PYTHONFAULTHANDLER", "1")
     mp.start_processes(
         _exchange_worker,
         args=((tmp_path / "rendezvous").as_uri(), with_bridge),

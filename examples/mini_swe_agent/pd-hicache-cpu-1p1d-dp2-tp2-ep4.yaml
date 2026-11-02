@@ -1,0 +1,41 @@
+# Eight shared GPUs: one P engine and one D engine, four GPUs each.
+# Qwen3.5 Unified Full KV + Mamba. SGLang TP4 = attention DP2 x TP2; EP4.
+# Also pass global DP2/EP4/enable-dp-attention options so the router is DP-aware.
+# Requires the paired router patch documented in docker/patch/sglang-router/README.md.
+sglang:
+  - name: default
+    num_gpus_per_engine: 4
+    engine_groups:
+      - worker_type: prefill
+        num_gpus: 4
+        overrides:
+          dp_size: 2
+          enable_dp_attention: true
+          ep_size: 4
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          # SGLang divides these two capacities across attention-DP ranks.
+          chunked_prefill_size: 16384
+          max_mamba_cache_size: 1332
+          page_size: 64
+          enable_hierarchical_cache: true
+          hicache_ratio: 2.0
+          hicache_size: 0
+          hicache_write_policy: write_through
+          hicache_io_backend: direct
+          hicache_mem_layout: page_first_direct
+          hicache_storage_backend: null
+      - worker_type: decode
+        num_gpus: 4
+        overrides:
+          dp_size: 2
+          enable_dp_attention: true
+          ep_size: 4
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          chunked_prefill_size: 16384
+          max_mamba_cache_size: 1332
+          page_size: 64
+          enable_hierarchical_cache: false
+          hicache_storage_backend: null
+          disaggregation_decode_enable_radix_cache: false

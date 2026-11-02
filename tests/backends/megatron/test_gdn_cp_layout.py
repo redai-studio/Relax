@@ -2,36 +2,25 @@
 """CPU tests for GDN CP partitions, layout routes, and boundary caches.
 
 Checks token ownership, agreement with Relax's sharding, route equivalence, and
-cache reuse/invalidation. Real NCCL layout communication is covered in
+explicit route refresh and version-keyed boundary-cache invalidation. These
+tests require the image's pinned native Megatron API; a missing dependency/API
+must fail, not skip. Real NCCL layout communication is covered in
 ``test_gdn_cp_gpu.py``.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from megatron.core.context_parallel_layout import routes
+from megatron.core.packed_seq_params import PackedSeqParams
 
-
-cpl = pytest.importorskip("megatron.core.context_parallel_layout", reason="requires the patched Megatron-LM")
-
-from megatron.core.packed_seq_params import PackedSeqParams  # noqa: E402
-
-from relax.backends.megatron.cp_utils import gdn_cp_slice, slice_with_cp  # noqa: E402
+from relax.backends.megatron.cp_utils import gdn_cp_slice, slice_with_cp
 
 
 DIRECTIONS = [("zigzag", "contiguous"), ("contiguous", "zigzag")]
-requires_legacy_routes = pytest.mark.skipif(
-    not hasattr(cpl, "build_thd_cp_partition_route"),
-    reason="requires the legacy direction-specific route and cache API",
-)
-
-
-@pytest.fixture(autouse=True)
-def _require_legacy_index_api(request):
-    if not request.node.originalname.startswith(("test_native_", "test_boundary_")) and not hasattr(
-        cpl, "get_thd_context_parallel_rank_indices"
-    ):
-        pytest.skip("legacy index helpers were replaced by native CP layout routes")
 
 
 # Packed boundary shapes worth covering: single sequence, uneven multi-sequence,
@@ -58,22 +47,93 @@ def _tagged_tokens(total: int, width: int = 3) -> torch.Tensor:
     return base + torch.arange(width, dtype=torch.float64).unsqueeze(0) * 1e6
 
 
+def _reference_rank_indices(cu: torch.Tensor, cp_size: int, rank: int, layout: str) -> torch.Tensor:
+    """Independent partition oracle; all ownership tests execute native
+    routes."""
+    if layout == "contiguous":
+        local = int(cu[-1]) // cp_size
+        return torch.arange(rank * local, (rank + 1) * local)
+    assert layout == "zigzag"
+    parts = []
+    for start, end in zip(cu[:-1].tolist(), cu[1:].tolist()):
+        chunk = (end - start) // (2 * cp_size)
+        parts.extend(
+            torch.arange(start + owner * chunk, start + (owner + 1) * chunk)
+            for owner in (rank, 2 * cp_size - rank - 1)
+        )
+    return torch.cat(parts)
+
+
+def _exchange_routes(
+    local_by_rank: list[torch.Tensor], plans: list[routes.ThdCpRoute], source: str, target: str
+) -> list[torch.Tensor]:
+    """Execute native send/split/receive metadata with CPU tensors, not
+    NCCL."""
+    send = []
+    for local, plan in zip(local_by_rank, plans, strict=True):
+        splits = getattr(plan, f"{source}_split_sizes")
+        assert len(splits) == len(plans)
+        assert sum(splits) == local.size(0)
+        index = getattr(plan, f"{source}_index")
+        if index is not None:
+            assert torch.equal(index.sort().values, torch.arange(local.size(0)))
+        send.append(local if index is None else local.index_select(0, index))
+    outputs = []
+    for rank, plan in enumerate(plans):
+        parts = []
+        for peer, peer_plan in enumerate(plans):
+            splits = getattr(peer_plan, f"{source}_split_sizes")
+            assert splits[rank] == getattr(plan, f"{target}_split_sizes")[peer]
+            parts.append(send[peer].narrow(0, sum(splits[:rank]), splits[rank]))
+        received = torch.cat(parts)
+        index = getattr(plan, f"{target}_index")
+        actual = received
+        if index is not None:
+            assert torch.equal(index.sort().values, torch.arange(received.size(0)))
+            actual = torch.empty_like(received)
+            actual.index_copy_(0, index, received)
+        outputs.append(actual)
+    return outputs
+
+
+def _apply_route_across_ranks(
+    x: torch.Tensor,
+    cu: torch.Tensor,
+    cp_size: int,
+    source: str,
+    target: str,
+    plans: list[routes.ThdCpRoute] | None = None,
+) -> list[torch.Tensor]:
+    if plans is None:
+        plans = [routes.build_thd_cp_partition_route(cu, cp_size, rank) for rank in range(cp_size)]
+    local = [x[_reference_rank_indices(cu, cp_size, rank, source)] for rank in range(cp_size)]
+    return _exchange_routes(local, plans, source, target)
+
+
+def _routed_rank_indices(cu: torch.Tensor, cp_size: int, layout: str) -> list[torch.Tensor]:
+    source = "contiguous" if layout == "zigzag" else "zigzag"
+    return _apply_route_across_ranks(torch.arange(int(cu[-1])), cu, cp_size, source, layout)
+
+
 # ---------------------------------------------------------------------------
 # Partition definitions
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("cp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
 @pytest.mark.parametrize("lengths_factor", [[1], [1, 2, 3], [3, 1, 1, 2]])
-def test_thd_rank_indices_partition_all_tokens_exactly_once(cp_size, layout, lengths_factor):
+def test_thd_routes_partition_all_tokens_exactly_once(cp_size, layout, lengths_factor):
     lengths = [2 * cp_size * f for f in lengths_factor]
     cu = _cu(lengths)
-    owned = torch.cat([cpl.get_thd_context_parallel_rank_indices(cu, cp_size, r, layout) for r in range(cp_size)])
+    by_rank = _routed_rank_indices(cu, cp_size, layout)
+    for rank, actual in enumerate(by_rank):
+        assert torch.equal(actual, _reference_rank_indices(cu, cp_size, rank, layout))
+    owned = torch.cat(by_rank)
     assert owned.numel() == int(cu[-1])
     assert torch.equal(torch.sort(owned).values, torch.arange(int(cu[-1])))
 
 
 @pytest.mark.parametrize("cp_size", [2, 4, 8])
-def test_zigzag_rank_indices_match_relax_data_sharding(cp_size):
+def test_zigzag_routes_match_relax_data_sharding(cp_size):
     """MCore's zigzag partition must be token-for-token what Relax's data path
     produces.
 
@@ -84,8 +144,7 @@ def test_zigzag_rank_indices_match_relax_data_sharding(cp_size):
     cu = _cu(lengths)
     full = _tagged_tokens(int(cu[-1])).reshape(-1, 1, 3)  # [s, b=1, C]
 
-    for rank in range(cp_size):
-        mcore_idx = cpl.get_thd_context_parallel_rank_indices(cu, cp_size, rank, "zigzag")
+    for rank, mcore_idx in enumerate(_routed_rank_indices(cu, cp_size, "zigzag")):
         mcore_shard = full[mcore_idx]
 
         # Relax data.py: per-sample slice_with_cp then concat.
@@ -123,9 +182,9 @@ def test_both_layouts_are_permutations_of_each_other(cp_size, lengths_factor):
     total = int(cu[-1])
     zig_by_rank = []
     con_by_rank = []
-    for rank in range(cp_size):
-        zig = cpl.get_thd_context_parallel_rank_indices(cu, cp_size, rank, "zigzag")
-        con = cpl.get_thd_context_parallel_rank_indices(cu, cp_size, rank, "contiguous")
+    zigzag = _routed_rank_indices(cu, cp_size, "zigzag")
+    contiguous = _routed_rank_indices(cu, cp_size, "contiguous")
+    for rank, (zig, con) in enumerate(zip(zigzag, contiguous, strict=True)):
         zig_by_rank.append(zig)
         con_by_rank.append(con)
         assert zig.numel() == con.numel() == total // cp_size
@@ -141,10 +200,10 @@ def test_both_layouts_are_permutations_of_each_other(cp_size, lengths_factor):
 
 
 @pytest.mark.parametrize("cp_size", [2, 4])
-def test_rank_indices_reject_lengths_not_divisible_by_two_cp(cp_size):
+def test_routes_reject_lengths_not_divisible_by_two_cp(cp_size):
     bad = _cu([2 * cp_size, 2 * cp_size + 1])
     with pytest.raises(ValueError, match="divisible by"):
-        cpl.get_thd_context_parallel_rank_indices(bad, cp_size, 0, "zigzag")
+        routes.build_thd_cp_partition_route(bad, cp_size, 0)
 
 
 def test_gdn_rejects_packed_lengths_not_divisible_by_cp():
@@ -155,26 +214,26 @@ def test_gdn_rejects_packed_lengths_not_divisible_by_cp():
         GatedDeltaNet._resolve_cu_seqlens(None, None, cu, int(cu[-1]), "cu_seqlens_q", cp_size=4)
 
 
-def test_rank_indices_reject_unknown_layout():
-    with pytest.raises(ValueError, match="Unsupported context-parallel layout"):
-        cpl.get_thd_context_parallel_rank_indices(_cu([16, 16]), 2, 0, "contiguous_ish")
+def test_routes_reject_unknown_source_layout():
+    with pytest.raises(ValueError, match="Unsupported CP partition mode conversion"):
+        routes.get_thd_cp_partition_route(_packed_seq_params(_cu([16, 16])), "contiguous_ish", "zigzag")
 
 
 @pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
-def test_rank_indices_ignore_duplicate_boundaries(layout):
+def test_routes_ignore_duplicate_boundaries(layout):
     compact = torch.tensor([0, 16, 40], dtype=torch.int64)
     padded = torch.tensor([0, 16, 40, 40, 40], dtype=torch.int64)
+    compact_shards = _routed_rank_indices(compact, 2, layout)
+    padded_shards = _routed_rank_indices(padded, 2, layout)
     for rank in range(2):
-        assert torch.equal(
-            cpl.get_thd_context_parallel_rank_indices(compact, 2, rank, layout),
-            cpl.get_thd_context_parallel_rank_indices(padded, 2, rank, layout),
-        )
+        assert torch.equal(compact_shards[rank], padded_shards[rank])
+        assert torch.equal(padded_shards[rank], _reference_rank_indices(compact, 2, rank, layout))
 
 
 @pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
-def test_rank_indices_reject_decreasing_boundaries(layout):
+def test_routes_reject_decreasing_boundaries(layout):
     with pytest.raises(ValueError, match="nondecreasing"):
-        cpl.get_thd_context_parallel_rank_indices(torch.tensor([0, 16, 8]), 2, 0, layout)
+        _routed_rank_indices(torch.tensor([0, 16, 8]), 2, layout)
 
 
 def _packed_seq_params(cu: torch.Tensor) -> PackedSeqParams:
@@ -187,238 +246,170 @@ def _packed_seq_params(cu: torch.Tensor) -> PackedSeqParams:
     )
 
 
-def _apply_route_across_ranks(
-    x: torch.Tensor, cu: torch.Tensor, cp_size: int, source: str, target: str
-) -> list[torch.Tensor]:
-    """Run the route-driven swap for every rank, emulating the all-to-all
-    locally."""
-    source_by_rank = [cpl.get_thd_context_parallel_rank_indices(cu, cp_size, r, source) for r in range(cp_size)]
-    routes = [cpl.build_thd_cp_partition_route(cu, cp_size, r, source, target) for r in range(cp_size)]
-
-    send_bufs = []
-    for rank, route in enumerate(routes):
-        local = x[source_by_rank[rank]]
-        assert local.size(0) == route.local_source_length
-        send_bufs.append(local if route.send_rows is None else local.index_select(0, route.send_rows))
-
-    outputs = []
-    for dst, route in enumerate(routes):
-        parts = []
-        for src in range(cp_size):
-            offset = sum(routes[src].input_split_sizes[:dst])
-            length = routes[src].input_split_sizes[dst]
-            assert length == route.output_split_sizes[src], "split sizes disagree between peers"
-            parts.append(send_bufs[src][offset : offset + length])
-        recv = torch.cat(parts, dim=0)
-        if route.recv_rows is None:
-            outputs.append(recv)
-        else:
-            out = recv.new_empty((route.local_target_length,) + tuple(x.shape[1:]))
-            out.index_copy_(0, route.recv_rows, recv)
-            outputs.append(out)
-    return outputs
-
-
 # ---------------------------------------------------------------------------
-# The route is the same permutation phase 1 computed
+# The route is the same permutation the independent partition formula defines
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("cp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("source,target", DIRECTIONS)
 @pytest.mark.parametrize("lengths", LENGTH_CASES)
-@requires_legacy_routes
-def test_route_reproduces_index_based_partition(cp_size, source, target, lengths):
+def test_route_reproduces_reference_partition(cp_size, source, target, lengths):
     cu = _cu(lengths, unit=2 * cp_size)
     total = int(cu[-1])
     x = torch.arange(total * 3, dtype=torch.float64).reshape(total, 3)
 
     got = _apply_route_across_ranks(x, cu, cp_size, source, target)
     for rank in range(cp_size):
-        want = x[cpl.get_thd_context_parallel_rank_indices(cu, cp_size, rank, target)]
+        want = x[_reference_rank_indices(cu, cp_size, rank, target)]
         assert torch.equal(got[rank], want), f"cp_size={cp_size} rank={rank} {source}->{target}"
 
 
 # ---------------------------------------------------------------------------
-# Fail-fast parity with the index-based builder
+# Fail-fast validation in the native builder and directional lookup
 # ---------------------------------------------------------------------------
-@requires_legacy_routes
 def test_route_rejects_lengths_not_divisible_by_two_cp():
     cu = torch.tensor([0, 12], dtype=torch.int64)  # 12 % (2 * 4) != 0
     with pytest.raises(ValueError, match="divisible by"):
-        cpl.get_thd_context_parallel_rank_indices(cu, 4, 0, "zigzag")
-    with pytest.raises(ValueError, match="divisible by"):
-        cpl.build_thd_cp_partition_route(cu, 4, 0, "zigzag", "contiguous")
+        routes.build_thd_cp_partition_route(cu, 4, 0)
 
 
-@requires_legacy_routes
 def test_route_rejects_malformed_cu_seqlens():
     with pytest.raises(ValueError, match="must start at 0"):
-        cpl.build_thd_cp_partition_route(torch.tensor([8, 16], dtype=torch.int64), 2, 0, "zigzag", "contiguous")
+        routes.build_thd_cp_partition_route(torch.tensor([8, 16], dtype=torch.int64), 2, 0)
     with pytest.raises(ValueError, match="nondecreasing"):
-        cpl.build_thd_cp_partition_route(torch.tensor([0, 16, 8], dtype=torch.int64), 2, 0, "zigzag", "contiguous")
+        routes.build_thd_cp_partition_route(torch.tensor([0, 16, 8], dtype=torch.int64), 2, 0)
 
 
-@requires_legacy_routes
 def test_route_rejects_unknown_layout():
     cu = _cu([1], unit=4)
-    with pytest.raises(ValueError, match="Unsupported CP layout conversion"):
-        cpl.build_thd_cp_partition_route(cu, 2, 0, "zigzag", "interleaved")
+    with pytest.raises(ValueError, match="Unsupported CP partition mode conversion"):
+        routes.get_thd_cp_partition_route(_packed_seq_params(cu), "zigzag", "interleaved")
 
 
-# ---------------------------------------------------------------------------
-# Caching: reuse only within the micro-batch it was built for
-# ---------------------------------------------------------------------------
-@requires_legacy_routes
+# Native routes are batch-owned, not version-keyed lookup caches. Rebuild at
+# batch preparation after changing boundaries or CP geometry; forward/recompute
+# lookups share one bidirectional plan. Boundary-validation caching below remains
+# version-keyed and is a separate contract.
+def _prebuild(packed: PackedSeqParams, cp_size: int = 4, rank: int = 1) -> routes.ThdCpRoute:
+    packed.cp_group = SimpleNamespace(size=lambda: cp_size, rank=lambda: rank)
+    routes.prebuild_thd_cp_partition_routes(packed)
+    return packed.cp_partition_route
+
+
+def _assert_cached_route(packed: PackedSeqParams, cu: torch.Tensor, cp_size: int = 4, rank: int = 1) -> None:
+    """Check BOTH views and execute the cached plan against tagged-token
+    oracles."""
+    expected = routes.build_thd_cp_partition_route(cu, cp_size, rank)
+    actual = packed.cp_partition_route
+    for layout in ("zigzag", "contiguous"):
+        assert getattr(actual, f"{layout}_split_sizes") == getattr(expected, f"{layout}_split_sizes")
+        got, want = getattr(actual, f"{layout}_index"), getattr(expected, f"{layout}_index")
+        assert (got is None) == (want is None)
+        if want is not None:
+            assert torch.equal(got, want)
+    full = _tagged_tokens(int(cu[-1]))
+    plans = [routes.build_thd_cp_partition_route(cu, cp_size, r) for r in range(cp_size)]
+    plans[rank] = actual
+    for source, target in DIRECTIONS:
+        assert routes.get_thd_cp_partition_route(packed, source, target) is actual
+        outputs = _apply_route_across_ranks(full, cu, cp_size, source, target, plans)
+        for r, output in enumerate(outputs):
+            assert torch.equal(output, full[_reference_rank_indices(cu, cp_size, r, target)])
+
+
 def test_route_is_cached_per_packed_seq_params():
     cu = _cu([3, 1], unit=8)
-    psp = _packed_seq_params(cu)
+    packed = _packed_seq_params(cu)
+    packed.cp_group = SimpleNamespace(size=lambda: 4, rank=lambda: 1)
+    # Native lookup retains a compatibility fallback for packs not prebuilt yet.
+    with pytest.warns(FutureWarning, match="missing precomputed"):
+        first = routes.get_thd_cp_partition_route(packed, "zigzag", "contiguous")
+    for _ in range(2):  # another layer / recompute of the same microbatch
+        assert routes.get_thd_cp_partition_route(packed, "zigzag", "contiguous") is first
+    _assert_cached_route(packed, cu)
+    other_pack = _packed_seq_params(cu)
+    assert _prebuild(other_pack) is not first
 
-    first = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
-    second = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
-    assert second is first, "a second layer of the same micro-batch must reuse the route"
-    assert psp.cp_partition_route_zigzag_to_contiguous is first
 
-
-@requires_legacy_routes
-def test_both_directions_are_cached_separately():
+def test_both_directions_share_one_cached_route():
     cu = _cu([3, 1], unit=8)
-    psp = _packed_seq_params(cu)
-
-    to_contiguous = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
-    to_zigzag = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "contiguous", "zigzag")
-    assert to_contiguous is not to_zigzag
-    assert psp.cp_partition_route_zigzag_to_contiguous is to_contiguous
-    assert psp.cp_partition_route_contiguous_to_zigzag is to_zigzag
+    packed = _packed_seq_params(cu)
+    first = _prebuild(packed)
+    assert routes.get_thd_cp_partition_route(packed, "zigzag", "contiguous") is first
+    assert routes.get_thd_cp_partition_route(packed, "contiguous", "zigzag") is first
+    _assert_cached_route(packed, cu)
 
 
-@requires_legacy_routes
-def test_route_is_rebuilt_for_new_packed_boundaries():
-    """Packed boundaries move every micro-batch; a stale route would corrupt
-    tokens."""
-    cu = _cu([3, 1], unit=8)
-    psp = _packed_seq_params(cu)
-    first = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
-
+def test_prebuild_refreshes_for_new_packed_boundaries():
+    packed = _packed_seq_params(_cu([3, 1], unit=8))
+    first = _prebuild(packed)
     next_cu = _cu([2, 2], unit=8)
-    psp.cu_seqlens_q = next_cu
-    rebuilt = cpl.get_thd_cp_partition_route(psp, next_cu, 4, 1, "zigzag", "contiguous")
-    assert rebuilt is not first
-    assert rebuilt.cu_seqlens is next_cu
-
-    want = cpl.build_thd_cp_partition_route(next_cu, 4, 1, "zigzag", "contiguous")
-    assert rebuilt.input_split_sizes == want.input_split_sizes
-    assert rebuilt.output_split_sizes == want.output_split_sizes
-    for field in ("send_rows", "recv_rows"):
-        got_rows, want_rows = getattr(rebuilt, field), getattr(want, field)
-        assert (got_rows is None) == (want_rows is None)
-        if want_rows is not None:
-            assert torch.equal(got_rows, want_rows)
+    packed.cu_seqlens_q = packed.cu_seqlens_kv = next_cu
+    assert _prebuild(packed) is not first
+    _assert_cached_route(packed, next_cu)
 
 
-@requires_legacy_routes
-def test_route_is_rebuilt_when_cu_seqlens_is_mutated_in_place():
-    """Identity alone would miss a caller refilling a preallocated boundary
-    buffer.
-
-    Megatron already has that pattern elsewhere (persistent ``_cu_seqlens_buffer``
-    written with ``buf[0] = 0``), so the cache also fingerprints autograd's version
-    counter, which every in-place write bumps.
-    """
+def test_prebuild_refreshes_when_cu_seqlens_is_mutated_in_place():
     cu = _cu([3, 1], unit=8)
-    psp = _packed_seq_params(cu)
-    first = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
-
-    # Same tensor object, refilled with different boundaries.
+    packed = _packed_seq_params(cu)
+    first = _prebuild(packed)
     cu.copy_(_cu([2, 2], unit=8))
-    rebuilt = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
-    assert rebuilt is not first, "an in-place refill must invalidate the cached route"
-
-    want = cpl.build_thd_cp_partition_route(cu, 4, 1, "zigzag", "contiguous")
-    assert rebuilt.input_split_sizes == want.input_split_sizes
-    assert rebuilt.output_split_sizes == want.output_split_sizes
+    assert _prebuild(packed) is not first
+    _assert_cached_route(packed, cu)
 
 
-@requires_legacy_routes
-def test_route_is_rebuilt_when_a_view_of_cu_seqlens_is_mutated():
-    """Views share the version counter with their base, so writes through one
-    count."""
+def test_prebuild_refreshes_when_a_view_of_cu_seqlens_is_mutated():
     cu = _cu([3, 1], unit=8)
-    psp = _packed_seq_params(cu)
-    first = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
+    packed = _packed_seq_params(cu)
+    first = _prebuild(packed)
+    cu[1:2].fill_(16)
+    assert _prebuild(packed) is not first
+    _assert_cached_route(packed, cu)
 
-    cu[1:] = _cu([2, 2], unit=8)[1:]
-    assert cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous") is not first
 
-
-@requires_legacy_routes
-def test_route_is_rebuilt_when_the_dynamic_cp_geometry_changes():
-    """Dynamic CP varies cp_size/cp_rank across micro-batches on one module."""
+def test_prebuild_refreshes_when_the_dynamic_cp_geometry_changes():
     cu = _cu([3, 1], unit=8)
-    psp = _packed_seq_params(cu)
-    cp4 = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
-
-    cp2 = cpl.get_thd_cp_partition_route(psp, cu, 2, 1, "zigzag", "contiguous")
+    packed = _packed_seq_params(cu)
+    cp4 = _prebuild(packed)
+    cp2 = _prebuild(packed, cp_size=2)
     assert cp2 is not cp4
-    assert (cp2.cp_size, cp2.cp_rank) == (2, 1)
-
-    other_rank = cpl.get_thd_cp_partition_route(psp, cu, 2, 0, "zigzag", "contiguous")
-    assert other_rank is not cp2
-    assert other_rank.cp_rank == 0
+    _assert_cached_route(packed, cu, cp_size=2)
+    assert _prebuild(packed, cp_size=2, rank=0) is not cp2
+    _assert_cached_route(packed, cu, cp_size=2, rank=0)
 
 
-@requires_legacy_routes
 def test_prebuild_populates_both_directions():
     cu = _cu([3, 1], unit=8)
-    psp = _packed_seq_params(cu)
-
-    class _FakeGroup:
-        def size(self):
-            return 4
-
-        def rank(self):
-            return 2
-
-    psp.cp_group = _FakeGroup()
-    psp.local_cp_size = 4
-    cpl.prebuild_thd_cp_partition_routes(psp)
-
-    for attr in ("cp_partition_route_zigzag_to_contiguous", "cp_partition_route_contiguous_to_zigzag"):
-        route = getattr(psp, attr)
-        assert route is not None
-        assert (route.cp_size, route.cp_rank) == (4, 2)
+    packed = _packed_seq_params(cu)
+    _prebuild(packed, rank=2)
+    _assert_cached_route(packed, cu, rank=2)
 
 
-@requires_legacy_routes
 def test_prebuild_is_a_noop_without_context_parallelism():
-    cu = _cu([3, 1], unit=8)
-    psp = _packed_seq_params(cu)
-    cpl.prebuild_thd_cp_partition_routes(psp)
-    assert getattr(psp, "cp_partition_route_zigzag_to_contiguous", None) is None
+    for packed in (
+        None,
+        PackedSeqParams(qkv_format="sbhd"),
+        _packed_seq_params(_cu([3, 1], unit=8)),
+    ):
+        # Exercise both absent group and an explicit size-one group.
+        for group in (None, SimpleNamespace(size=lambda: 1, rank=lambda: 0)):
+            routes.prebuild_thd_cp_partition_routes(packed, cp_group=group)
+            assert getattr(packed, "cp_partition_route", None) is None
 
-    non_thd = PackedSeqParams(qkv_format="sbhd")
-    cpl.prebuild_thd_cp_partition_routes(non_thd)
-    assert getattr(non_thd, "cp_partition_route_zigzag_to_contiguous", None) is None
 
-
-@requires_legacy_routes
-def test_route_does_not_cache_unversioned_inference_boundaries():
+def test_prebuild_refreshes_unversioned_inference_boundaries():
     with torch.inference_mode():
         cu = _cu([3, 1], unit=8)
-        psp = _packed_seq_params(cu)
-        first = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
+        packed = _packed_seq_params(cu)
+        first = _prebuild(packed)
+        # Unlike the legacy cache, native prebuild does not read tensor._version.
+        assert routes.get_thd_cp_partition_route(packed, "zigzag", "contiguous") is first
         cu.copy_(_cu([2, 2], unit=8))
-        second = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
-        assert second is not first
-        expected = cpl.build_thd_cp_partition_route(cu, 4, 1, "zigzag", "contiguous")
-        assert second.input_split_sizes == expected.input_split_sizes
+        assert _prebuild(packed) is not first
+        _assert_cached_route(packed, cu)
 
 
 def _boundary_resolver():
-    from types import SimpleNamespace
-
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-
-    if not hasattr(GatedDeltaNet, "_resolve_thd_cu_seqlens"):
-        pytest.skip("installed MCore lacks the cached THD boundary resolver from the current Relax patch")
 
     calls = []
     module = SimpleNamespace(cp_size=8)
@@ -499,67 +490,35 @@ def test_boundary_cache_does_not_hide_q_kv_mismatch():
         resolve(module, psp, 32, 2)
 
 
-@pytest.fixture
-def native_routes():
-    return pytest.importorskip("megatron.core.context_parallel_layout.routes", reason="requires native CP routes")
-
-
-def _native_rank_indices(cu, cp_size, rank, layout):
-    if layout == "contiguous":
-        local = int(cu[-1]) // cp_size
-        return torch.arange(rank * local, (rank + 1) * local)
-    parts = []
-    for start, end in zip(cu[:-1].tolist(), cu[1:].tolist()):
-        chunk = (end - start) // (2 * cp_size)
-        parts.extend(
-            torch.arange(start + owner * chunk, start + (owner + 1) * chunk)
-            for owner in (rank, 2 * cp_size - rank - 1)
-        )
-    return torch.cat(parts)
-
-
 @pytest.mark.parametrize("cp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("source,target", DIRECTIONS)
 @pytest.mark.parametrize("lengths", LENGTH_CASES)
-def test_native_route_preserves_token_ownership(native_routes, cp_size, source, target, lengths):
+def test_native_route_round_trip(cp_size, source, target, lengths):
     cu = _cu(lengths, unit=2 * cp_size)
     full = _tagged_tokens(int(cu[-1]))
-    routes = [native_routes.build_thd_cp_partition_route(cu, cp_size, rank) for rank in range(cp_size)]
-    send = []
-    for rank, route in enumerate(routes):
-        local = full[_native_rank_indices(cu, cp_size, rank, source)]
-        index = getattr(route, f"{source}_index")
-        send.append(local if index is None else local.index_select(0, index))
-    for rank, route in enumerate(routes):
-        parts = []
-        for peer, peer_route in enumerate(routes):
-            splits = getattr(peer_route, f"{source}_split_sizes")
-            assert splits[rank] == getattr(route, f"{target}_split_sizes")[peer]
-            parts.append(send[peer].narrow(0, sum(splits[:rank]), splits[rank]))
-        received = torch.cat(parts)
-        index = getattr(route, f"{target}_index")
-        actual = received
-        if index is not None:
-            actual = torch.empty_like(received)
-            actual.index_copy_(0, index, received)
-        assert torch.equal(actual, full[_native_rank_indices(cu, cp_size, rank, target)])
+    plans = [routes.build_thd_cp_partition_route(cu, cp_size, rank) for rank in range(cp_size)]
+    original = [full[_reference_rank_indices(cu, cp_size, rank, source)] for rank in range(cp_size)]
+    converted = _exchange_routes(original, plans, source, target)
+    for rank, actual in enumerate(converted):
+        assert torch.equal(actual, full[_reference_rank_indices(cu, cp_size, rank, target)])
+    restored = _exchange_routes(converted, plans, target, source)
+    for actual, expected in zip(restored, original, strict=True):
+        assert torch.equal(actual, expected)
 
 
-def test_native_prebuild_reuses_both_directions_and_refreshes_for_next_batch(native_routes):
-    from types import SimpleNamespace
-
+def test_native_prebuild_reuses_both_directions_and_refreshes_for_next_batch():
     packed = _packed_seq_params(_cu([3, 1], unit=8))
     packed.cp_group = SimpleNamespace(size=lambda: 4, rank=lambda: 1)
-    native_routes.prebuild_thd_cp_partition_routes(packed)
-    first = native_routes.get_thd_cp_partition_route(packed, "zigzag", "contiguous")
-    assert native_routes.get_thd_cp_partition_route(packed, "contiguous", "zigzag") is first
+    routes.prebuild_thd_cp_partition_routes(packed)
+    first = routes.get_thd_cp_partition_route(packed, "zigzag", "contiguous")
+    assert routes.get_thd_cp_partition_route(packed, "contiguous", "zigzag") is first
 
     packed.cu_seqlens_q = packed.cu_seqlens_kv = _cu([2, 2], unit=8)
     packed.cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
-    native_routes.prebuild_thd_cp_partition_routes(packed)
-    refreshed = native_routes.get_thd_cp_partition_route(packed, "zigzag", "contiguous")
+    routes.prebuild_thd_cp_partition_routes(packed)
+    refreshed = routes.get_thd_cp_partition_route(packed, "zigzag", "contiguous")
     assert refreshed is not first
-    expected = native_routes.build_thd_cp_partition_route(packed.cu_seqlens_q, 2, 0)
+    expected = routes.build_thd_cp_partition_route(packed.cu_seqlens_q, 2, 0)
     assert refreshed.zigzag_split_sizes == expected.zigzag_split_sizes
     assert refreshed.contiguous_split_sizes == expected.contiguous_split_sizes
     for name in ("zigzag_index", "contiguous_index"):
@@ -569,11 +528,11 @@ def test_native_prebuild_reuses_both_directions_and_refreshes_for_next_batch(nat
             assert torch.equal(actual, wanted)
 
 
-def test_native_routes_reject_invalid_packed_boundaries(native_routes):
+def test_native_routes_reject_invalid_packed_boundaries():
     for cu, match in (
         (torch.tensor([8, 16]), "must start at 0"),
         (torch.tensor([0, 16, 8]), "nondecreasing"),
         (torch.tensor([0, 12]), "divisible by"),
     ):
         with pytest.raises(ValueError, match=match):
-            native_routes.build_thd_cp_partition_route(cu, 4, 0)
+            routes.build_thd_cp_partition_route(cu, 4, 0)

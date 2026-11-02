@@ -264,7 +264,7 @@ Users need flexibility to define custom reward logic for their tasks
 
 ## CI
 
-PRs run CPU checks, GPU unit tests, and GPU/NPU integration tests. To operate CI, put one command on the first line of a new PR comment. Rerun and cancel are available to the PR author and contributors with repository write access.
+PRs run pre-commit checks, GPU unit tests, and GPU/NPU integration tests. To operate CI, put one command on the first line of a new PR comment. Rerun and cancel are available to the PR author and contributors with repository write access.
 
 | Command | Usage |
 | --- | --- |
@@ -274,13 +274,12 @@ PRs run CPU checks, GPU unit tests, and GPU/NPU integration tests. To operate CI
 | `/help` | Show commands and targets |
 | `/review` | Request a code review |
 
-Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit/CPU workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
+Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
 
 | Target | Workflow / check |
 | --- | --- |
-| `ci` | All pre-commit and CPU checks |
+| `ci` | All pre-commit checks |
 | `ci/pre-commit` | Pre-commit checks |
-| `ci/cpu-310`, `ci/cpu-311`, `ci/cpu-312` | CPU tests on Python 3.10 / 3.11 / 3.12 |
 | `gpu-unit` | GPU unit tests |
 | `integration` | All GPU/NPU integration tests |
 | `integration/gpu-async` | Qwen3-4B GPU async training |

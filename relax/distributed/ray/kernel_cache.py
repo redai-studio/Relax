@@ -96,7 +96,7 @@ def compute_build_fingerprint() -> str:
     """Hash the compiler ABI, accelerator architecture, and source
     revisions."""
     packages = {}
-    for name in ("torch", "triton", "transformer-engine", "flash-linear-attention", "deep-ep"):
+    for name in ("torch", "triton", "transformer-engine", "flash-linear-attention", "deep-ep", "relax-hybrid-ep"):
         try:
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:

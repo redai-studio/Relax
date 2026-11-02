@@ -666,3 +666,16 @@ Follow [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/te
 - Read [Configuration Reference](./configuration.md) for the full SFT parameter table.
 - Read [Performance Tuning](./performance-tuning.md) for broader throughput tuning.
 - Read [OOM Troubleshooting](./oom-troubleshooting.md) if the job fails during model load or training.
+
+
+### Gemma4 tool-call trajectories
+
+OpenAI tool messages retain `tool_call_id` and `name`; a missing tool name is resolved from the corresponding call ID. Assistant tool calls may omit `content` or set it to `null`. Function arguments encoded as JSON objects are decoded without modifying the source row. An optional row-level `message_loss_mask` selects supervised messages with one `0` or `1` per input message.
+
+Gemma4 template patches are opt-in environment variables and must be propagated to the training workers:
+
+- `GEMMA4_SFT_TOOL_TURN_BOUNDARY=1` adds a supervised end-of-turn after a tool-call batch. Embedded tool responses remain context-only. The fallback loss mask supports all assistant messages or only the final assistant answer; other supervision selections fail explicitly.
+- `GEMMA4_SFT_THINKING=1` inserts an empty thought scaffold at each new model turn without enabling the separate system thinking prefix.
+- `GEMMA4_SFT_MS_SWIFT_COMPAT=1` omits tool correlation fields from template inputs for explicit ms-swift compatibility.
+
+When using these template patches with HF export, pass `--save-hf-post-hook-path scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template`. Keep the same environment flags enabled during export so `chat_template.jinja` preserves the training-time boundaries for serving. The exported template also retains the ms-swift correlation-field filter, so a reloaded tokenizer applies it without Relax preprocessing or environment variables. This hook only patches the template; the existing exporter handles vision weights.

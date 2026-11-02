@@ -22,11 +22,12 @@ class Config:
 
 # ---------------------------------------------------------------------------
 # GPU peak FLOPS tests
+# Device-name inputs are synthetic fixtures, not measured hardware.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "device_name, expected_raw_flops",
     [
-        ("NVIDIA H100 80GB HBM3", 989e12),
+        ("NVIDIA H100 80GB HBM3", 989e12),  # gitleaks:allow
         ("NVIDIA H800", 989e12),
         ("NVIDIA A100-SXM4-80GB", 312e12),
         ("NVIDIA A800-SXM4-80GB", 312e12),
@@ -63,13 +64,13 @@ def test_get_device_peak_flops_defaults_to_cpu_when_device_properties_unavailabl
 
 
 def test_get_device_peak_flops_unit_conversion():
-    tflops = get_device_peak_flops(unit="T", device_name="NVIDIA H100")
-    gflops = get_device_peak_flops(unit="G", device_name="NVIDIA H100")
+    tflops = get_device_peak_flops(unit="T", device_name="NVIDIA H100")  # gitleaks:allow
+    gflops = get_device_peak_flops(unit="G", device_name="NVIDIA H100")  # gitleaks:allow
     assert math.isclose(tflops * 1000, gflops, rel_tol=1e-6)
 
 
 def test_device_flops_table_has_common_gpus():
-    common_keys = ["H100", "H800", "A100", "A800", "H20"]
+    common_keys = ["H100", "H800", "A100", "A800", "H20"]  # gitleaks:allow
     for key in common_keys:
         assert key in _DEVICE_FLOPS, f"Missing common GPU {key} in _DEVICE_FLOPS"
 
@@ -338,7 +339,7 @@ def test_flops_counter_omni_estimation(config_name):
 
 
 def test_mfu_calculation():
-    peak_tflops = get_device_peak_flops(unit="T", device_name="NVIDIA H100 80GB HBM3")
+    peak_tflops = get_device_peak_flops(unit="T", device_name="NVIDIA H100 80GB HBM3")  # gitleaks:allow
     achieved_tflops = 200.0
     mfu = achieved_tflops / peak_tflops
     assert 0 < mfu < 1

@@ -17,23 +17,25 @@ export MODEL_DIR=/shared/models/Kimi-K3
 export DATA_DIR=/shared/data/openr1mm
 export SAVE_DIR=/shared/checkpoints
 export EXP_NAME=kimi-k3-openr1mm-full
-DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300.sh
+DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh
 bash scripts/entrypoint/ray-job.sh \
-  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300.sh
+  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh
 ```
 
-| 脚本文件名                                  |      GPU | 输入                                    |
-| ------------------------------------------- | -------: | --------------------------------------- |
-| `run-kimi-k3-hellaswag-128xb300.sh`         | 128 B300 | `train.jsonl`、`validation.jsonl`       |
-| `run-kimi-k3-hellaswag-128xb300-rawtext.sh` | 128 B300 | 同上；原始 context/target 基线对比      |
-| `run-kimi-k3-openr1mm-128xb300.sh`          | 128 B300 | `train.parquet`                         |
-| `run-kimi-k3-llava-onevision-128xb300.sh`   | 128 B300 | `train/` 下的 JSONL 分片及 `READY.json` |
-| `run-kimi-k3-pokemon-64xb300.sh`            |  64 B300 | `pokemon_gpt4o_zh.parquet`              |
-| `run-kimi-k3-pokemon-128xb300.sh`           | 128 B300 | 同上                                    |
-| `run-kimi-k3-pokemon-192xgpu-b300.sh`       | 192 B300 | 同上                                    |
-| `run-kimi-k3-pokemon-lora-64xb300.sh`       |  64 B300 | 同上；语言主干 LoRA                     |
+| 脚本文件名                                       |                GPU | 输入                                    |
+| ------------------------------------------------ | -----------------: | --------------------------------------- |
+| `run-kimi-k3-hellaswag-128xblackwell.sh`         | 128×280G Blackwell | `train.jsonl`、`validation.jsonl`       |
+| `run-kimi-k3-hellaswag-128xblackwell-rawtext.sh` | 128×280G Blackwell | 同上；原始 context/target 基线对比      |
+| `run-kimi-k3-openr1mm-128xblackwell.sh`          | 128×280G Blackwell | `train.parquet`                         |
+| `run-kimi-k3-llava-onevision-128xblackwell.sh`   | 128×280G Blackwell | `train/` 下的 JSONL 分片及 `READY.json` |
+| `run-kimi-k3-pokemon-64xblackwell.sh`            |  64×280G Blackwell | `pokemon_gpt4o_zh.parquet`              |
+| `run-kimi-k3-pokemon-128xblackwell.sh`           | 128×280G Blackwell | 同上                                    |
+| `run-kimi-k3-pokemon-192xgpu-blackwell.sh`       | 192×280G Blackwell | 同上                                    |
+| `run-kimi-k3-pokemon-lora-64xblackwell.sh`       |  64×280G Blackwell | 同上；语言主干 LoRA                     |
 
 设置 `SAVE_DIR` 后，脚本在固定的 `${SAVE_DIR}/${EXP_NAME}` 目录保存和加载 checkpoint；不设置则不保存。OpenR1-MM 和 OneVision 默认**仅保存模型权重**，不保留 optimizer 和 scheduler 状态。设置 `SAVE_OPTIMIZER=1` 可保存完整状态，但会明显增加主机内存和存储需求。仅模型 checkpoint 不能精确恢复训练状态。
+
+SFT 脚本的默认实验名现已使用架构和显存配置命名。升级后继续旧实验时，请保持 `SAVE_DIR` 不变，并显式设置 `EXP_NAME` 为原实验名。直接使用新的默认值会改变 checkpoint 目录，可能从 HF 权重重新开始训练，无法接续原 checkpoint。
 
 OpenR1-MM 和 OneVision 默认冻结视觉模型；设置 `FREEZE_VISION_TOWER=0` 可联合训练视觉模型，并需重新验证内存。脚本默认向训练 actor 传递 `FLA_TILELANG=0`，支持通过环境变量显式覆盖。ClearML 使用已有运行环境配置。Ray 默认等待任务结束并跟随日志；设置 `RAY_NO_WAIT=1` 可后台提交，此时提交成功不等于训练成功。
 
@@ -96,10 +98,10 @@ Kimi K3 支持共卡 GRPO，rollout 使用原生 MXFP4 权重。训练保留 BF1
 
 **所有 rollout 节点**都必须安装仓库提供的 SGLang v0.5.17 patch。重载钩子在更新 MXFP4 重打包、融合 decode buffer、MLA 投影和 AttnRes 缓存时保持已捕获的运行时存储地址。Router 支持注销和重新注册 worker，旧请求和健康检查不会影响同 URL 的新 worker。PP 权重转换广播清理后的配置副本，避免权重已收集后再次执行 TP/EP 集合通信。
 
-| 脚本                                                                    | 布局                                 | 用途                                                    |
-| ----------------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------------- |
-| `scripts/training/text/run-kimi-k3-5l-8xgpu-grpo.sh`                    | 训练 TP2/EP4/ETP1，rollout TP8；8 卡 | 5 层/128 专家减配 checkpoint，纯文本 DAPO math 冒烟验证 |
-| `examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh` | 训练 TP4/PP4/CP2/EP32/ETP1；128 B300 | 包含视觉联合训练的全参多模 OpenR1-MM GRPO               |
+| 脚本                                                                         | 布局                                           | 用途                                                    |
+| ---------------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------- |
+| `scripts/training/text/run-kimi-k3-5l-8xgpu-grpo.sh`                         | 训练 TP2/EP4/ETP1，rollout TP8；8 卡           | 5 层/128 专家减配 checkpoint，纯文本 DAPO math 冒烟验证 |
+| `examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh` | 训练 TP4/PP4/CP2/EP32/ETP1；128×280G Blackwell | 包含视觉联合训练的全参多模 OpenR1-MM GRPO               |
 
 全参脚本使用 PP 层数 21/24/24/24、8 个各占 16 卡的 rollout engine（attention TP8/DP2、MoE EP16）、CPU optimizer offload（默认比例 0.9），通过 dummy 初始化 rollout 后完整推送权重，不加载参考模型。它清空继承的 allocator 设置、限制编译线程，并在权重同步时保持 Ray Serve 探针可响应。默认训练 200 个 rollout，每 200 个 rollout 保存一次 model-only checkpoint，只保留一份。未设置 `LOAD_DIR` 时从 HF 初始化；仅模型 checkpoint **不能恢复 optimizer 状态**。
 
@@ -110,9 +112,9 @@ export SAVE_DIR=/shared/checkpoints
 export EXP_NAME=kimi-k3-openr1mm-grpo
 export HF_CHECKPOINT="${MODEL_DIR}"
 export PROMPT_SET="${DATA_DIR}/train.parquet"
-DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh
+DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh
 bash scripts/entrypoint/ray-job.sh \
-  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh
+  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh
 ```
 
 全参脚本默认从 `${MODEL_DIR}/Kimi-K3` 读取模型，从 `${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet` 读取数据，字段为 `prompt`、`label` 和 `image`。上例显式设置 `HF_CHECKPOINT` 和 `PROMPT_SET`，以复用 SFT 的目录布局。减配脚本读取 `DATA_DIR` 下的 `dapo-math-17k.jsonl`，`MODEL_DIR` 直接指向减配 checkpoint。其 entropy 系数 0.01 用于在未经重训的冒烟模型 reward 为零时保持梯度，并不构成效果基线。减配脚本可选设置 `SAVE_DIR` 启用完整状态保存和恢复。实验名与 checkpoint 路径固定，时间戳仅用于日志和任务名。ClearML 沿用现有运行环境配置。

@@ -98,6 +98,15 @@ def test_pipeline_accepts_partial_non_sft_arguments():
     assert not hasattr(args, "sft_async_prepack")
 
 
+def test_pipeline_i2i_fsdp_does_not_require_megatron_arguments():
+    args = SimpleNamespace(loss_type="sft", generation_task="i2i", train_backend="fsdp", max_staleness=1)
+    configure_sft_data_pipeline(args)
+    assert not args.per_rank_fetch
+    assert not args.sft_async_prepack
+    assert not args.sft_train_data_prefetch
+    assert not args.sft_image_preprocess_on_rank
+
+
 def test_pipeline_selection_runs_after_custom_and_backend_validation():
     tree = ast.parse(_SOURCE.read_text())
     parse = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_parse_args_impl")
@@ -183,3 +192,24 @@ def test_late_custom_budget_controls_automatic_pipeline(steps, expected):
     configure_sft_data_pipeline(args)
     assert args.max_staleness == expected
     assert args.sft_async_prepack is (steps >= 2)
+
+
+@pytest.mark.parametrize("tp,capacity", [(2, 131072), (4, 262144)])
+def test_wholepack_recipe_keeps_raw_prefetch_and_valid_geometry(tp, capacity):
+    from relax.utils.data.wholepack import config_contract
+
+    args = make_args(
+        sft_wholepack=True,
+        tensor_model_parallel_size=tp,
+        global_batch_size=1600,
+        n_samples_per_prompt=1,
+        expert_model_parallel_size=8,
+        expert_tensor_parallel_size=1,
+        data_pad_size_multiplier=1024,
+        max_tokens_per_gpu=capacity,
+        use_dynamic_batch_size=True,
+    )
+    configure_sft_data_pipeline(args)
+    assert args.sft_async_prepack is False
+    assert args.sft_train_data_prefetch is True
+    assert config_contract(args) == (capacity, tp * 1024)

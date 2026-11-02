@@ -105,6 +105,106 @@ and propagates it to every Ray worker via `--runtime-env-json`. Set
 `APPTAINER_IMAGE_PATH` explicitly to override (e.g. shared NFS path for
 multi-node).
 
+## Text search
+
+Text search defaults to a deterministic, offline mock. No search service, network
+or API key is needed; model inference and the Python sandbox retain their normal
+requirements. Select a real backend with one YAML file:
+
+```bash
+export DEEPEYES_V2_SEARCH_CONFIG=/path/to/search.yaml
+```
+
+For a Search-R1-compatible service:
+
+```yaml
+backend: retriever
+retriever:
+  url: http://your-retriever:8000/retrieve
+```
+
+The client sends `POST {"queries": [query], "topk": k, "return_scores": true}`
+and accepts both raw corpus documents and `document`/`score` wrappers inside
+`result[0]`. It preserves `contents` as the snippet. Missing titles use the first
+line of the passage; missing links remain empty rather than inventing URLs.
+
+For [Tavily](https://docs.tavily.com/documentation/api-reference/endpoint/search),
+set `DEEPEYES_V2_SEARCH_API_KEY` in your environment and use:
+
+```yaml
+backend: external
+external:
+  endpoint: https://api.tavily.com/search
+  method: POST
+  auth:
+    header: Authorization
+    prefix: "Bearer "
+  request_map:
+    query: query
+    size: max_results
+  response_map:
+    results: results
+    title: title
+    link: url
+    snippet: content
+    date: published_date
+```
+
+`external` supports GET query parameters or POST JSON, configurable header
+authentication, and dot-separated response paths. Omit `auth` for an unauthenticated
+endpoint and omit the date mapping when the API does not provide one. Request
+mapping names must be distinct; no provider SDK is required.
+
+Common settings (all optional):
+
+| Setting       | Default | Meaning                                                         |
+| ------------- | ------- | --------------------------------------------------------------- |
+| `backend`     | `mock`  | `mock`, `retriever`, or `external`                              |
+| `top_k`       | `5`     | Maximum results; an explicit `search(query, size)` overrides it |
+| `timeout_s`   | `10`    | HTTP connect/read timeout, not a total wall-clock deadline      |
+| `max_retries` | `2`     | Retries after the first request; zero means one attempt         |
+| `backoff_s`   | `0.5`   | Initial retry delay; doubles up to 2 seconds                    |
+| `trust_env`   | `false` | Enable environment proxy/netrc settings when needed             |
+
+Successful calls return `elapsed_time` in seconds and `data`, a list of
+`{title, link, snippet, date}` records. Date is a string or null. Empty results
+are successful; malformed responses are errors. Connection failures, timeouts,
+HTTP 408/429 and 5xx statuses are retried. Other HTTP failures (including
+redirects), malformed JSON and configuration errors fail immediately. Failure
+returns the existing `"Error"` sentinel, which becomes a non-terminal
+`search_failed` observation. A broken real backend never falls back to mock.
+Diagnostic logs identify the error without printing credentials or response bodies.
+
+Both training launchers forward the configuration path and API key to Ray workers.
+The YAML must be readable at that path on every node; forwarding a path does not
+upload its file. Credentials are excluded from shell tracing, but Ray runtime
+configuration and submission process arguments may be visible to cluster
+administrators. Use worker-provisioned credentials if that exposure is unsuitable.
+
+CPU tests use a local HTTP server for the Search-R1 and external protocols, plus a
+scripted model to exercise the real Agent loop. They need no search service, GPU
+or Apptainer instance:
+
+```bash
+python -m pytest tests/examples/deepeyes_v2_agentic -q
+```
+
+To check your configured service separately, from the repository root:
+
+```bash
+PYTHONPATH=examples/deepeyes_v2_agentic:. python - <<'PYTHON'
+from app.search_utils import search
+
+result = search("What is reinforcement learning?", size=3)
+assert result != "Error", "See the search diagnostic above"
+print(result)
+PYTHON
+```
+
+The protocol tests do not validate a live E5/FAISS deployment or API credentials.
+The repository's native Search-R1 server uses CUDA; the search client itself can
+run on a CPU host, including macOS.
+
 ## Image-search cache (optional, only for the `search` split)
 
 The `<tool_call>image_search</tool_call>` branch hits a precomputed

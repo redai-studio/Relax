@@ -102,11 +102,22 @@ tags = ["internal", "ip", "private"]
     '''^192\.168\.1\.100$''',
   ]
 
+# Blackwell-series and H100 model names use memory + architecture profiles.
+# For reviewed compatibility keys, synthetic fixtures or upstream references, use
+# an inline gitleaks:allow comment with the reason nearby (suppresses the whole line).
+[[rules]]
+id = "nvidia-gpu-model"
+description = "Use GPU memory and architecture instead of Blackwell-series and H100 model names"
+regex = '''(?im)(?:^|[^a-z0-9\r\n])(?:[0-9]+[ \t]*[x×*][ \t]*)?((?:gb[23]00|b[123]00|h100))(?:$|[^a-z0-9\r\n]|[x×*][ \t]*[0-9]+)'''
+secretGroup = 1
+tags = ["hardware", "nvidia"]
+
 # Allowlist: Ignore scanner metadata and generated docs artifacts
 [allowlist]
 description = "Ignore scanner metadata and generated docs artifacts"
 paths = [
   '''\.gitleaks\.toml$''',
+  '''(?:^|/)\.gitleaksignore$''',
   '''docs/Dockerfile''',
   '''\.git/.*''',
   '''docs/\.vitepress/(dist|cache)/.*''',

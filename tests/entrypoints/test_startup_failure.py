@@ -52,6 +52,7 @@ def _train_namespace():
         "maybe_pin_baseline_to_stable": Mock(),
         "_ctrl": None,
         "_shutdown_done": False,
+        "_training_completed": False,
         "_kernel_cache_heartbeat": None,
         "_SHUTDOWN_TIMEOUT_SEC": 60,
         "_NORMAL_SHUTDOWN_TIMEOUT_SEC": 1800,
@@ -90,6 +91,7 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
         ns["main"](SimpleNamespace())
     expected = 1 if fail_at else 0
     assert exc.value.code == expected
+    assert ns["_training_completed"] is (fail_at is None)
     assert events == ["serve", "ray", ("exit", expected)]
     controller.shutdown.assert_called_once()
 
@@ -160,6 +162,7 @@ def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, rem
         "ServiceStartupPhase": _FakePhase,
         "remove_placement_group": remove_pg or (lambda pg: None),
         "Any": object,
+        "os": os,
         "Optional": Optional,
         "Service": object,
     }
@@ -293,6 +296,7 @@ def test_controller_allocate_phase_abort_survives_pg_cleanup_failure():
 def test_service_constructor_failure_is_bounded_and_propagated(has_data_source):
     ns = {
         "Any": object,
+        "os": os,
         "Optional": Optional,
         "Namespace": SimpleNamespace,
         "logger": Mock(),
@@ -321,6 +325,7 @@ def test_service_deploy_failure_releases_owned_pg():
     remove_pg = Mock()
     ns = {
         "Any": object,
+        "os": os,
         "Optional": Optional,
         "Namespace": SimpleNamespace,
         "logger": Mock(),
@@ -382,7 +387,8 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
     assert call.kwargs["args"] == (1,)
 
 
-def test_controller_partial_startup_cleans_teacher_and_driver_routers(monkeypatch):
+@pytest.mark.parametrize("mode", ["missing_config", "text_sft", "i2i", "i2i_stop_failure"])
+def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
     methods = [
@@ -395,19 +401,59 @@ def test_controller_partial_startup_cleans_teacher_and_driver_routers(monkeypatc
         sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
     )
     stop_teacher = Mock()
-    ns = {"logger": Mock(), "ROLES": SimpleNamespace(rollout="rollout"), "shutdown_managed_opd_teacher": stop_teacher}
+    ns = {
+        "logger": Mock(),
+        "ROLES": SimpleNamespace(rollout="rollout", sft="sft"),
+        "shutdown_managed_opd_teacher": stop_teacher,
+        "asyncio": asyncio,
+        "run": asyncio.run,
+    }
     exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
     teacher = object()
     partial_controller = SimpleNamespace(
         serve_dict={},
         _teacher_manager=teacher,
         _shutdown_agentic_rollout_services=Mock(),
+        _close_data_system=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )
     partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
+    stop_image = AsyncMock(side_effect=RuntimeError("producer unavailable") if mode == "i2i_stop_failure" else None)
+    if mode != "missing_config":
+        partial_controller.config = SimpleNamespace(
+            loss_type="sft", generation_task="i2i" if mode.startswith("i2i") else "t2i"
+        )
+        partial_controller.serve_dict["sft"] = SimpleNamespace(
+            handle=SimpleNamespace(stop=SimpleNamespace(remote=stop_image))
+        )
     ns["shutdown"](partial_controller)
+    if mode.startswith("i2i"):
+        stop_image.assert_awaited_once()
+    else:
+        stop_image.assert_not_called()
     stop_teacher.assert_called_once_with(teacher)
     stop_routers.assert_called_once_with()
+    partial_controller._close_data_system.assert_called_once_with()
+    partial_controller._shutdown_agentic_rollout_services.assert_called_once()
+    partial_controller._cleanup_s3_model_weights_after_init.assert_called_once_with(force=True)
+
+
+@pytest.mark.parametrize("health", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "failure", "signal", "atexit"])
+def test_tracking_finishes_only_after_confirmed_training_completion(health, outcome):
+    ns = _train_namespace()
+    events = []
+    ns["_ctrl"] = SimpleNamespace(shutdown=Mock(), _metrics_service_enabled=True, _health_check_enabled=health)
+    ns["_training_completed"] = outcome in {"success", "signal"}
+    ns["_hard_exit"] = Mock()
+    finish = ns["serve"].get_app_handle.return_value.finish_tracking.remote
+    finish.side_effect = lambda: events.append("finish") or Mock(result=Mock(return_value={"status": "success"}))
+    ns["serve"].shutdown.side_effect = lambda: events.append("shutdown")
+    ns["_graceful_shutdown"](
+        sig=signal.SIGTERM if outcome == "signal" else None,
+        exit_code={"success": 0, "failure": 1, "signal": 0, "atexit": None}[outcome],
+    )
+    assert events == (["finish", "shutdown"] if outcome == "success" else ["shutdown"])
 
 
 @pytest.mark.parametrize("manager_fails", [False, True])
@@ -441,6 +487,7 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
         serve_dict={"rollout": service},
         _teacher_manager=None,
         _shutdown_agentic_rollout_services=Mock(),
+        _close_data_system=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )
     controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(controller)
@@ -449,4 +496,5 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
 
     dispose_remote.assert_called_once_with()
     ray_get.assert_called_once_with(dispose_ref, timeout=35.0)
+    controller._close_data_system.assert_called_once_with()
     stop_routers.assert_called_once_with()

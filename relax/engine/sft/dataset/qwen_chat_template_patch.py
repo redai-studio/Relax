@@ -113,6 +113,38 @@ _QWEN_TOOL_CALL_SEPARATOR_PATCH = """{%- if reasoning_content|trim %}
                             {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}
                         {%- endif %}"""
 
+_QWEN38_LEADING_THINK_RE = re.compile(r"\A<think>\n(.*?)\n</think>\n\n(.*)\Z", re.DOTALL)
+
+
+def is_qwen38_chat_template(template: str | None) -> bool:
+    """Recognize the native Qwen3.8 history gate, not older Qwen templates."""
+    return isinstance(template, str) and template.count(_QWEN38_PRESERVE_HISTORY_GATE) == 1
+
+
+def split_qwen38_leading_thinking(content: str) -> tuple[str, str] | None:
+    """Move an already rendered Qwen3.8 think block into message fields.
+
+    The model template supplies this scaffold itself. Keep the answer bytes
+    intact. Also accept complete compact blocks and think-only tool-call turns,
+    whose source data may omit the template's boundary newlines.
+    """
+    if not content.startswith("<think>"):
+        if content.lstrip().startswith("<think>"):
+            raise ValueError("Qwen3.8 assistant content has an unrecognized leading <think> block")
+        return None
+    match = _QWEN38_LEADING_THINK_RE.fullmatch(content)
+    if match is not None:
+        reasoning, answer = match.groups()
+    else:
+        reasoning, separator, answer = content[len("<think>") :].partition("</think>")
+        if not separator:
+            raise ValueError("Qwen3.8 assistant content has an unrecognized leading <think> block")
+        reasoning = reasoning.removeprefix("\n").removesuffix("\n")
+        answer = answer.removeprefix("\n\n")
+    if "<think>" in reasoning or answer.lstrip().startswith("<think>"):
+        raise ValueError("Qwen3.8 assistant content has an unrecognized leading <think> block")
+    return reasoning, answer
+
 
 def _content_as_text(content: str | list[dict] | None) -> str:
     if isinstance(content, str):
@@ -148,7 +180,10 @@ def _has_learnable_historical_thinking(sample: CanonicalSample) -> bool:
         index < last_user_index
         and message.role == "assistant"
         and message.learn
-        and "</think>" in _content_as_text(message.content)
+        and (
+            "</think>" in _content_as_text(message.content)
+            or bool(_content_as_text(message.reasoning_content).strip())
+        )
         for index, message in enumerate(sample.messages)
     )
 
@@ -212,25 +247,42 @@ def _patch_qwen_history_gate(template: str) -> tuple[str, bool] | None:
     )
 
 
-def _patch_qwen_tool_call_content(template: str) -> tuple[str, bool]:
-    """Match baseline_msswift_0625 (ms-swift 4.3.1) assistant/tool-call
-    merging."""
-    prefix_count = template.count(_QWEN_ASSISTANT_WITH_THINK)
-    separator_count = template.count(_QWEN_TOOL_CALL_WITH_SEPARATOR)
+def _patch_legacy_qwen_tool_call_content(template: str) -> tuple[str, bool]:
+    """Preserve archived SFT assistant/tool-call token and supervision
+    boundaries."""
     patched_count = template.count(_QWEN_ASSISTANT_TOOL_CALL)
+    separator_count = template.count(_QWEN_TOOL_CALL_SEPARATOR_PATCH)
     if patched_count == 1 and separator_count == 1:
         return template, False
-    if prefix_count == 1 and separator_count == 1:
-        template = template.replace(_QWEN_ASSISTANT_WITH_THINK, _QWEN_ASSISTANT_TOOL_CALL, 1)
-        template = template.replace(_QWEN_TOOL_CALL_WITH_SEPARATOR, _QWEN_TOOL_CALL_SEPARATOR_PATCH, 1)
-        return template, True
-    if separator_count == 0 and patched_count == 0:
-        return template, False
+    if patched_count == 0 and separator_count == 0:
+        prefix_count = template.count(_QWEN_ASSISTANT_WITH_THINK)
+        native_separator_count = template.count(_QWEN_TOOL_CALL_WITH_SEPARATOR)
+        if prefix_count == 1 and native_separator_count == 1:
+            template = template.replace(_QWEN_ASSISTANT_WITH_THINK, _QWEN_ASSISTANT_TOOL_CALL, 1)
+            return template.replace(_QWEN_TOOL_CALL_WITH_SEPARATOR, _QWEN_TOOL_CALL_SEPARATOR_PATCH, 1), True
+        if native_separator_count == 0:
+            return template, False
     template_hash = hashlib.sha256(template.encode()).hexdigest()[:16]
     raise RuntimeError(
-        "Cannot safely patch Qwen assistant tool-call rendering: "
-        f"expected one prefix and separator, found prefix={prefix_count}, separator={separator_count}, "
-        f"and patched={patched_count} "
+        f"Cannot safely patch legacy Qwen assistant tool-call rendering (template sha256={template_hash})."
+    )
+
+
+def _patch_qwen_tool_call_content(template: str) -> tuple[str, bool]:
+    """Keep native thinking boundaries and tool separators, repairing legacy
+    patches."""
+    patched_count = template.count(_QWEN_ASSISTANT_TOOL_CALL)
+    separator_count = template.count(_QWEN_TOOL_CALL_SEPARATOR_PATCH)
+    if patched_count == 0 and separator_count == 0:
+        return template, False
+    if patched_count == 1 and separator_count == 1:
+        template = template.replace(_QWEN_ASSISTANT_TOOL_CALL, _QWEN_ASSISTANT_WITH_THINK, 1)
+        template = template.replace(_QWEN_TOOL_CALL_SEPARATOR_PATCH, _QWEN_TOOL_CALL_WITH_SEPARATOR, 1)
+        return template, True
+    template_hash = hashlib.sha256(template.encode()).hexdigest()[:16]
+    raise RuntimeError(
+        "Cannot safely restore Qwen assistant tool-call rendering: "
+        f"expected one legacy prefix and separator, found prefix={patched_count}, separator={separator_count} "
         f"(template sha256={template_hash})."
     )
 
@@ -274,7 +326,13 @@ def try_patch_qwen_chat_template(
         return None
 
     patched_template, history_changed = patched
-    patched_template, tool_call_changed = _patch_qwen_tool_call_content(patched_template)
+    legacy_tool_calls = kwargs.get("legacy_tool_call_content", False)
+    if not isinstance(legacy_tool_calls, bool):
+        raise ValueError("apply_chat_template_kwargs.legacy_tool_call_content must be true or false")
+    if is_qwen38_chat_template(template) or legacy_tool_calls:
+        patched_template, tool_call_changed = _patch_legacy_qwen_tool_call_content(patched_template)
+    else:
+        patched_template, tool_call_changed = _patch_qwen_tool_call_content(patched_template)
     changed = history_changed or tool_call_changed
     resolved_kwargs = dict(kwargs)
     preserve_thinking = resolved_kwargs.get("preserve_thinking")

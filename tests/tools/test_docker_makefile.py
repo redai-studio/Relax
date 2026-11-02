@@ -59,8 +59,11 @@ def docker_make(tmp_path: Path) -> Callable[..., MakeResult]:
             "MFLAGS",
             "MAKELEVEL",
             "TRAIN_IMAGE",
+            "DEV_IMAGE",
             "CU13_BLACKWELL_TRAIN_IMAGE",
             "CU13_HOPPER_TRAIN_IMAGE",
+            "CU13_BLACKWELL_DEV_IMAGE",
+            "CU13_HOPPER_DEV_IMAGE",
         ):
             env.pop(name, None)
         env.update(environment or {})
@@ -104,7 +107,7 @@ def test_docker_makefile_pairs_variants(docker_make: Callable[..., MakeResult], 
         assert ("BASE_IMAGE=cu12-base" if is_cu12 else "BASE_IMAGE=cu13-base") in build
         assert "PATCH_VERSION=latest" in build
         if not is_cu12:
-            assert ("GPU_ARCH=b300" if tag.endswith("-blackwell") else "GPU_ARCH=hopper") in build
+            assert ("GPU_ARCH=blackwell" if tag.endswith("-blackwell") else "GPU_ARCH=hopper") in build
         if ":dev-" in tag:
             assert build[build.index("--target") + 1] == "relax"
             assert f"TRAIN_IMAGE={tag.replace(':dev-', ':train-')}" in build
@@ -164,6 +167,106 @@ def test_docker_makefile_keeps_cu12_overrides_out_of_cu13(docker_make: Callable[
         assert "BASE_IMAGE=cu13-base" in build
 
 
+@pytest.mark.parametrize("push", [False, True])
+@pytest.mark.parametrize("cached", [False, True])
+def test_docker_makefile_uses_per_variant_dev_cache_tags(
+    docker_make: Callable[..., MakeResult], push: bool, cached: bool
+) -> None:
+    tags = tuple(f"{IMAGE_PREFIX}:dev-cache-inputs-{variant}" for variant in VARIANTS)
+    trains = tuple(f"{IMAGE_PREFIX}:train-cache-inputs-{variant}" for variant in VARIANTS)
+    result, calls = docker_make(
+        "docker-dev",
+        f"DEV_IMAGE={tags[0]}",
+        push=push,
+        existing=tags if cached else (),
+        environment={
+            "TRAIN_IMAGE": trains[0],
+            "CU13_BLACKWELL_TRAIN_IMAGE": trains[1],
+            "CU13_HOPPER_TRAIN_IMAGE": trains[2],
+            "CU13_BLACKWELL_DEV_IMAGE": tags[1],
+            "CU13_HOPPER_DEV_IMAGE": tags[2],
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [call for call in calls if "inspect" in call] == [
+        ["manifest" if push else "image", "inspect", tag] for tag in tags
+    ]
+    builds = [call for call in calls if call[0] == "build"]
+    assert [call[call.index("-t") + 1] for call in builds] == ([] if cached else list(tags))
+    for build, train in zip(builds, trains):
+        assert build[build.index("--target") + 1] == "relax"
+        assert f"TRAIN_IMAGE={train}" in build
+    assert [call for call in calls if call[0] == "push"] == (
+        [["push", tag] for tag in tags] if push and not cached else []
+    )
+
+
+@pytest.mark.parametrize("variant", ["cu13-blackwell", "cu13-hopper"])
+def test_docker_makefile_cached_dev_only_skips_its_variant(
+    docker_make: Callable[..., MakeResult], variant: str
+) -> None:
+    variable = "CU13_BLACKWELL_DEV_IMAGE" if variant.endswith("blackwell") else "CU13_HOPPER_DEV_IMAGE"
+    tag = f"{IMAGE_PREFIX}:dev-cache-{variant}"
+    result, calls = docker_make("docker-dev", environment={variable: tag}, existing=(tag,))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [call[call.index("-t") + 1] for call in calls if call[0] == "build"] == [
+        image_tag(stage, arch) for arch in VARIANTS if arch != variant for stage in ("train", "dev")
+    ]
+
+
+@pytest.mark.parametrize("source", ["environment", "command-line"])
+@pytest.mark.parametrize("empty", ["", "   "])
+def test_docker_makefile_empty_cu13_dev_overrides_keep_defaults(
+    docker_make: Callable[..., MakeResult], source: str, empty: str
+) -> None:
+    variables = ("CU13_BLACKWELL_DEV_IMAGE", "CU13_HOPPER_DEV_IMAGE")
+    overrides = [f"{variable}={empty}" for variable in variables] if source == "command-line" else []
+    environment = {variable: "ignored-env-tag" if overrides else empty for variable in variables}
+    result, calls = docker_make("docker-dev", *overrides, environment=environment)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [call[call.index("-t") + 1] for call in calls if call[0] == "build"] == [
+        image_tag(stage, variant) for variant in VARIANTS for stage in ("train", "dev")
+    ]
+
+
+def test_docker_makefile_dev_command_line_overrides_environment(docker_make: Callable[..., MakeResult]) -> None:
+    variables = ("DEV_IMAGE", "CU13_BLACKWELL_DEV_IMAGE", "CU13_HOPPER_DEV_IMAGE")
+    tags = tuple(f"registry.example:5000/team/relax:custom-{variant}" for variant in VARIANTS)
+    result, calls = docker_make(
+        "docker-dev",
+        *(f"{variable}={tag}" for variable, tag in zip(variables, tags)),
+        push=True,
+        existing=tuple(image_tag("train", variant) for variant in VARIANTS),
+        environment={variable: "ignored-env-tag" for variable in variables},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [call for call in calls if call[:2] == ["manifest", "inspect"]] == [
+        ["manifest", "inspect", name]
+        for variant, tag in zip(VARIANTS, tags)
+        for name in (tag, image_tag("train", variant))
+    ]
+    builds = [call for call in calls if call[0] == "build"]
+    assert [call[call.index("-t") + 1] for call in builds] == list(tags)
+    assert [call for call in calls if call[0] == "push"] == [["push", tag] for tag in tags]
+    for build, variant in zip(builds, VARIANTS):
+        assert f"TRAIN_IMAGE={image_tag('train', variant)}" in build
+
+
+@pytest.mark.parametrize("variant,arch", [("cu13-blackwell", "blackwell"), ("cu13-hopper", "hopper")])
+@pytest.mark.parametrize("source", ["environment", "command-line"])
+def test_docker_makefile_single_variant_dev_override(
+    docker_make: Callable[..., MakeResult], variant: str, arch: str, source: str
+) -> None:
+    variable = "CU13_BLACKWELL_DEV_IMAGE" if variant.endswith("blackwell") else "CU13_HOPPER_DEV_IMAGE"
+    tag = f"{IMAGE_PREFIX}:custom-{variant}"
+    overrides = [f"{variable}=  {tag}  "] if source == "command-line" else []
+    result, calls = docker_make(
+        f"docker-dev-cu13-{arch}", *overrides, environment={} if overrides else {variable: f"  {tag}  "}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [call[call.index("-t") + 1] for call in calls if call[0] == "build"] == [image_tag("train", variant), tag]
+
+
 def test_docker_makefile_reads_external_images_from_environment(docker_make: Callable[..., MakeResult]) -> None:
     result, calls = docker_make(
         "docker-dev",
@@ -217,7 +320,7 @@ def test_docker_makefile_stops_after_build_failure(docker_make: Callable[..., Ma
 
 
 @pytest.mark.parametrize("kind", ["train", "dev"])
-@pytest.mark.parametrize("variant,arch", [("cu12", None), ("cu13-blackwell", "b300"), ("cu13-hopper", "hopper")])
+@pytest.mark.parametrize("variant,arch", [("cu12", None), ("cu13-blackwell", "blackwell"), ("cu13-hopper", "hopper")])
 def test_docker_makefile_builds_one_variant(
     docker_make: Callable[..., MakeResult], variant: str, arch: str | None, kind: str
 ) -> None:

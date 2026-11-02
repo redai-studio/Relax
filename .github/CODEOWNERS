@@ -1,146 +1,108 @@
-# =============================================================================
-# CODEOWNERS - Relax Project Code Ownership
-# =============================================================================
-#
-# This file defines who owns what parts of the codebase.
-# For more information about CODEOWNERS, see:
-# https://help.github.com/articles/about-codeowners/
-#
-# Format:
-# - Each line is a pattern followed by one or more owners
-# - The last matching pattern takes precedence
-# - Use @username for individuals
-#
-# GitHub usernames inferred from commit history:
-# - 宁本哲 / NINGBENZHE (主要贡献者)
-# - 杨睿 / Yangruipis (主要贡献者)
-# - 李佳兴 / lijiaxing (主要贡献者)
-# - 于笑颜 / yxyOo (主要贡献者)
-# - 张留杰 / Aurelius84 (主要贡献者)
-#
-# =============================================================================
+# GitHub CODEOWNERS — 按维护领域分工
+# 后匹配的规则优先；根路径使用 /，避免误匹配嵌套目录。
+# 未明确归类的文件由 NINGBENZHE 和 Yangruipis 共同负责。
+*                                                       @NINGBENZHE @Yangruipis
 
-# =============================================================================
-# Default Owners (Catch-all)
-# =============================================================================
-*                       @Yangruipis @NINGBENZHE @lijiaxing
+# 整体框架：NINGBENZHE
+/relax/core/                                            @NINGBENZHE
+/relax/components/                                      @NINGBENZHE
+/relax/entrypoints/                                     @NINGBENZHE
+/relax/distributed/checkpoint_service/                   @NINGBENZHE
+/tests/core/                                            @NINGBENZHE
+/tests/components/                                      @NINGBENZHE
+/tests/entrypoints/                                     @NINGBENZHE
+/tests/distributed/checkpoint_service/                   @NINGBENZHE
 
-# =============================================================================
-# Core Framework (relax/)
-# =============================================================================
-relax/                    @NINGBENZHE @lijiaxing
-relax/core/               @NINGBENZHE @Aurelius84
-relax/components/         @NINGBENZHE @Yangruipis
-relax/engine/             @NINGBENZHE @Yangruipis
-relax/backends/           @NINGBENZHE @lijiaxing
-relax/distributed/        @NINGBENZHE @Yangruipis
-relax/entrypoints/        @NINGBENZHE @lijiaxing
-relax/utils/metrics/      @Yangruipis
+# 训练引擎：Lemon-412
+/relax/backends/megatron/                                @Lemon-412
+/relax/backends/fsdp/                                    @Lemon-412
+/relax/models/                                          @Lemon-412
+/relax/engine/sft/                                      @Lemon-412
+/relax/utils/training/                                  @Lemon-412
+/relax/components/actor*.py                              @Lemon-412
+/relax/components/critic.py                              @Lemon-412
+/relax/components/sft.py                                 @Lemon-412
+/relax/components/image_sft.py                           @Lemon-412
+/tests/backends/megatron/                                @Lemon-412
+/tests/backends/fsdp/                                    @Lemon-412
+/tests/models/                                          @Lemon-412
+/tests/engine/sft/                                      @Lemon-412
+/tests/utils/training/                                  @Lemon-412
+/tests/components/test_actor*.py                         @Lemon-412
+/tests/components/test_sft*.py                           @Lemon-412
+/tests/components/test_image_sft.py                      @Lemon-412
+/scripts/models/                                        @Lemon-412
 
+# 推理引擎和 Agentic：yuanlehome
+/relax/backends/sglang/                                  @yuanlehome
+/relax/models/dots_ocr/sglang/                           @yuanlehome
+/relax/engine/rollout/                                  @yuanlehome
+/relax/engine/router/                                   @yuanlehome
+/relax/agentic/                                          @yuanlehome
+/relax/components/rollout.py                             @yuanlehome
+/relax/components/genrm.py                               @yuanlehome
+/relax/utils/genrm_client.py                             @yuanlehome
+/tests/backends/sglang/                                  @yuanlehome
+/tests/engine/rollout/                                  @yuanlehome
+/tests/engine/router/                                   @yuanlehome
+/tests/agentic/                                          @yuanlehome
+/tests/test_agentic_rollout.py                           @yuanlehome
+/tests/components/test_rollout*.py                       @yuanlehome
+/tests/components/test_genrm*.py                         @yuanlehome
+/examples/*agentic*/                                    @yuanlehome
+/examples/codex/                                        @yuanlehome
+/examples/mini_swe_agent/                                @yuanlehome
+/tests/examples/*agentic*/                               @yuanlehome
+/tests/examples/test_mini_swe*.py                        @yuanlehome
 
-# =============================================================================
-# Transfer Queue (transfer_queue/)
-# =============================================================================
-transfer_queue/            @NINGBENZHE @Aurelius84
+# 弹性和平台：RexFlux
+/relax/distributed/ray/                                  @RexFlux
+/relax/distributed/coordination.py                       @RexFlux
+/relax/utils/autoscaler/                                 @RexFlux
+/relax/utils/scale_utils.py                              @RexFlux
+/relax/utils/health_monitor.py                           @RexFlux
+/relax/utils/health_system.py                            @RexFlux
+/relax/utils/fault_events/                               @RexFlux
+/relax/utils/metrics/                                    @RexFlux
+/tests/distributed/ray/                                  @RexFlux
+/tests/utils/test_health*.py                             @RexFlux
+/tests/utils/test_metrics*.py                            @RexFlux
+/docker/                                                @RexFlux
+/configs/                                               @RexFlux
+/scripts/entrypoint/                                     @RexFlux
+/examples/elastic_rollout/                               @RexFlux
 
-# =============================================================================
-# Examples & Scripts
-# =============================================================================
-examples/                  @yxyOo
-scripts/                   @Yangruipis
-configs/                   @NINGBENZHE
+# 社区（GitHub 协作、CI、文档）：SigureMo
+/.github/                                               @SigureMo
+/.pre-commit-config.yaml                                @SigureMo
+/.pre-commit-hooks/                                      @SigureMo
+/.oxfmtrc.json                                          @SigureMo
+/scripts/ci/                                            @SigureMo
+/docs/                                                  @SigureMo
+/assets/                                                @SigureMo
+/README.md                                              @SigureMo
+/README_zh.md                                           @SigureMo
+/CONTRIBUTING.md                                         @SigureMo
+/CITATION.cff                                           @SigureMo
 
-# =============================================================================
-# Documentation - English (docs/en/)
-# =============================================================================
-docs/                      @Yangruipis @NINGBENZHE
-docs/en/                   @Yangruipis
-docs/en/guide/             @Yangruipis
-docs/en/guide/architecture.md               @NINGBENZHE
-docs/en/guide/dataset-design.md             @NINGBENZHE
-docs/en/guide/fully-async-training.md       @NINGBENZHE
-docs/en/guide/health-check-manager.md       @NINGBENZHE
-docs/en/guide/distributed-checkpoint.md     @NINGBENZHE
-docs/en/guide/installation.md               @lijiaxing
-docs/en/guide/configuration.md              @lijiaxing
-docs/en/guide/introduction.md               @lijiaxing
-docs/en/guide/quick-start.md                @yxyOo
-docs/en/guide/how-to-contribute.md          @yxyOo
-docs/en/guide/customize-training.md         @lijiaxing
-docs/en/guide/debugging.md                  @lijiaxing
-docs/en/guide/oom-troubleshooting.md        @Yangruipis
-docs/en/guide/performance-tuning.md         @Yangruipis
-docs/en/guide/update-weights-pipeline.md    @yxyOo
-docs/en/guide/autoscaler-k8s-keda.md        @Yangruipis
-docs/en/guide/elastic-rollout.md            @Yangruipis
-docs/en/guide/generative-reward-model.md    @Yangruipis
-docs/en/guide/metrics-service-detailed.md   @Yangruipis
-docs/en/guide/notification-system.md        @Yangruipis
-docs/en/api/                @lijiaxing
-docs/en/examples/           @yxyOo
-
-# =============================================================================
-# Documentation - Chinese (docs/zh/)
-# =============================================================================
-docs/                      @Yangruipis @NINGBENZHE
-docs/zh/                   @Yangruipis
-docs/zh/guide/             @Yangruipis
-docs/zh/guide/architecture.md               @NINGBENZHE
-docs/zh/guide/dataset-design.md             @NINGBENZHE
-docs/zh/guide/fully-async-training.md       @NINGBENZHE
-docs/zh/guide/health-check-manager.md       @NINGBENZHE
-docs/zh/guide/distributed-checkpoint.md     @NINGBENZHE
-docs/zh/guide/installation.md               @lijiaxing
-docs/zh/guide/configuration.md              @lijiaxing
-docs/zh/guide/introduction.md               @lijiaxing
-docs/zh/guide/quick-start.md                @yxyOo
-docs/zh/guide/how-to-contribute.md          @yxyOo
-docs/zh/guide/customize-training.md         @lijiaxing
-docs/zh/guide/debugging.md                  @lijiaxing
-docs/zh/guide/oom-troubleshooting.md        @Yangruipis
-docs/zh/guide/performance-tuning.md         @Yangruipis
-docs/zh/guide/update-weights-pipeline.md    @yxyOo
-docs/zh/guide/autoscaler-k8s-keda.md        @Yangruipis
-docs/zh/guide/elastic-rollout.md            @Yangruipis
-docs/zh/guide/generative-reward-model.md    @Yangruipis
-docs/zh/guide/metrics-service-detailed.md   @Yangruipis
-docs/zh/guide/notification-system.md        @Yangruipis
-docs/zh/api/                @lijiaxing
-docs/zh/examples/           @yxyOo
-
-# =============================================================================
-# Documentation - Root
-# =============================================================================
-docs/en/index.md           @Yangruipis
-docs/zh/index.md           @Yangruipis
-README.md                  @Aurelius84
-README_zh.md               @Aurelius84
-
-# =============================================================================
-# Testing
-# =============================================================================
-tests/                     @NINGBENZHE @lijiaxing @Yangruipis
-
-# =============================================================================
-# CI/CD & DevOps
-# =============================================================================
-.github/          @NINGBENZHE @Yangruipis @SigureMo
-.gitlab/          @NINGBENZHE @Yangruipis
-
-# =============================================================================
-# Build & Configuration
-# =============================================================================
-docker/                    @lijiaxing
-Makefile                   @Yangruipis
-pyproject.toml             @Yangruipis
-setup.py                   @Yangruipis
-requirements.txt           @Yangruipis
-CONTRIBUTING.md            @Yangruipis
-.pre-commit-config.yaml    @Yangruipis
-
-# =============================================================================
-# Skills & Tools (internal development)
-# =============================================================================
-skills/            @Yangruipis
-.opencode/         @Yangruipis
-.sisyphus/         @Yangruipis
+# 算法：Yangruipis
+# 算法规则置于引擎规则之后，覆盖其中的算法实现。
+/relax/algorithms/                                       @Yangruipis
+/relax/engine/rewards/                                   @Yangruipis
+/relax/engine/filters/                                   @Yangruipis
+/relax/utils/opd/                                        @Yangruipis
+/relax/utils/score_centering.py                          @Yangruipis
+/relax/utils/training/ppo_utils.py                       @Yangruipis
+/relax/utils/training/preference_utils.py                @Yangruipis
+/relax/components/advantages.py                         @Yangruipis
+/relax/models/flow_grpo.py                               @Yangruipis
+/relax/engine/rollout/on_policy_distillation.py           @Yangruipis
+/tests/algorithms/                                       @Yangruipis
+/tests/engine/rewards/                                   @Yangruipis
+/tests/utils/training/test_ppo*.py                       @Yangruipis
+/tests/utils/training/test_rloo*.py                      @Yangruipis
+/tests/utils/training/test_reinforce_plus_plus.py         @Yangruipis
+/tests/utils/training/test_preference_utils.py            @Yangruipis
+/tests/engine/rollout/test_on_policy_distillation*.py     @Yangruipis
+/examples/algorithms/                                   @Yangruipis
+/examples/on_policy_distillation/                        @Yangruipis

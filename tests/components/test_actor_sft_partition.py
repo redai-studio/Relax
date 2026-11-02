@@ -3,6 +3,7 @@
 """components/actor.py module-level helpers for SFT-aware partition naming."""
 
 from argparse import Namespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -10,6 +11,7 @@ import pytest
 def _mk_actor_config(loss_type: str):
     return Namespace(
         loss_type=loss_type,
+        dpo_reference_free=False,
         kl_coef=0.0,
         use_kl_loss=False,
         opd_teacher_load=False,
@@ -60,3 +62,37 @@ def test_actor_cold_start_and_explicit_step_are_preserved():
     assert _resolve_start_rollout_id(0, 200, explicitly_set=True) == 0
     assert _resolve_start_rollout_id(100, 200, explicitly_set=True) == 100
     assert _resolve_start_rollout_id(None, 200, explicitly_set=False) == 200
+
+
+@pytest.mark.parametrize(
+    ("loss_type", "reference_free", "kl_coef", "use_kl_loss", "expected_ref"),
+    [
+        ("dpo", False, 0.0, False, True),
+        ("dpo", True, 0.0, False, False),
+        ("policy_loss", False, 0.1, False, True),
+        ("policy_loss", False, 0.0, True, True),
+        ("sft", False, 0.0, False, False),
+    ],
+)
+def test_actor_initialization_preserves_reference_requirements(
+    monkeypatch, loss_type, reference_free, kl_coef, use_kl_loss, expected_ref
+):
+    from relax.components import actor as actor_module
+
+    config = _mk_actor_config(loss_type)
+    config.dpo_reference_free = reference_free
+    config.kl_coef = kl_coef
+    config.use_kl_loss = use_kl_loss
+    group = MagicMock()
+    group.init_and_wait.return_value = [0]
+    client = MagicMock()
+    actor_class = actor_module.Actor.func_or_class.__mro__[1]
+    # Ray Serve serializes the ingress class with its own globals.
+    init_globals = actor_class.__init__.__globals__
+    monkeypatch.setitem(init_globals, "allocate_train_group", lambda **_: group)
+    monkeypatch.setitem(init_globals, "attach_tq_client", lambda *_args, **_kwargs: client)
+
+    actor = actor_class(None, None, 1, config, "actor")
+
+    group.init_and_wait.assert_called_once_with(config, role="actor", with_ref=expected_ref, with_opd_teacher=False)
+    assert actor.data_system_client is client

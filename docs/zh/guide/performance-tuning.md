@@ -6,7 +6,7 @@ Relax 训练吞吐量最大化实践指南。本文提到的所有参数均可�
 
 ## Kimi K3 TFLOPS 与 MFU
 
-`perf/actor_train_tflops` 估算每卡每秒的有效模型 FLOPs。`perf/mfu/actor_train` 再除以设备 BF16 dense 峰值（B300 为 2250 TFLOPS），记录的是比例，0.4 表示 40%。时间分母是 actor 训练耗时，不是包含 rollout/save 的整轮耗时；训练内部的 optimizer 和 offload 耗时会降低该指标。
+`perf/actor_train_tflops` 估算每卡每秒的有效模型 FLOPs。`perf/mfu/actor_train` 再除以设备 BF16 dense 峰值（280G Blackwell 配置为 2250 TFLOPS），记录的是比例，0.4 表示 40%。时间分母是 actor 训练耗时，不是包含 rollout/save 的整轮耗时；训练内部的 optimizer 和 offload 耗时会降低该指标。
 
 K3 分别计算 KDA 投影、卷积和状态递推；MLA 低秩/输出门投影及因果注意力；latent MoE 激活专家、router 和共享专家；词表输出；以及 MoonViT-V2 和 PatchMergerMLPV2。使用每条样本的实际长度和原始图片 `(T,H,W)` 网格：视觉编码器先对所有帧做注意力，再进行时间池化。沿不包含 CP 副本的 DP 组汇总样本元数据后，只除一次训练 GPU 数量。
 

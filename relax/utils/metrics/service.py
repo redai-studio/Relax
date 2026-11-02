@@ -128,6 +128,7 @@ class MetricsService:
         self._rollout_handle_task: asyncio.Task[Any] | None = None
         self._sglang_exporter = SGLangMetricsExporter(self._discover_sglang_engines)
         self._adapters = {}
+        self._tracking_finish_task: Optional[asyncio.Task] = None
 
         if getattr(config, "use_tensorboard", False):
             try:
@@ -361,6 +362,46 @@ class MetricsService:
         format."""
         body = await self._sglang_exporter.scrape()
         return Response(content=body, headers={"Content-Type": CONTENT_TYPE_LATEST})
+
+    async def finish_tracking(self) -> Dict[str, Any]:
+        """Persist queued tracking events after successful training, before
+        Serve exits.
+
+        Called through the deployment handle after training services have
+        stopped. This is deliberately separate from replica destruction: a
+        replica may also be removed during a failed run or a global restart.
+        """
+        if self._tracking_finish_task is None:
+
+            def close_backends() -> Dict[str, str]:
+                results = {}
+                for name in ("tensorboard", "clearml"):
+                    if name not in self._adapters:
+                        continue
+                    try:
+                        self._adapters[name].finish()
+                        results[name] = "success"
+                    except Exception as error:
+                        results[name] = f"error: {error}"
+                        logger.exception(f"Failed to finish tracking backend {name}")
+                if self._use_wandb:
+                    try:
+                        wandb.finish()
+                        results["wandb"] = "success"
+                    except Exception as error:
+                        results["wandb"] = f"error: {error}"
+                        logger.exception("Failed to finish tracking backend wandb")
+                return results
+
+            # Keep the replica event loop responsive to health checks while an
+            # asynchronous reporter drains. Concurrent/retried calls share the
+            # same operation, even if an individual request is cancelled.
+            self._tracking_finish_task = asyncio.create_task(asyncio.to_thread(close_backends))
+        results = dict(await asyncio.shield(self._tracking_finish_task))
+        return {
+            "status": "success" if all(value == "success" for value in results.values()) else "error",
+            "results": results,
+        }
 
     @app.get("/health")
     async def health(self) -> Dict[str, Any]:

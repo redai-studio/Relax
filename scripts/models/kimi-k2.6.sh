@@ -5,7 +5,7 @@
 # KimiK25VLBridge from the HF text_config / vision_config; no extra MODEL_ARGS are
 # required on the Relax side.
 
-NLAYERS=61
+NLAYERS=${NLAYERS:-61}
 FIRST_K_DENSE_REPLACE=1
 
 NHIDDEN=7168

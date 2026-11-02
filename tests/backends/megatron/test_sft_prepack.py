@@ -108,6 +108,7 @@ def test_sft_train_prefetch_pauses_at_step_boundary(monkeypatch):
     actor.args = Namespace(num_rollout=10)
     actor._sft_train_prefetch_executor = MagicMock()
     actor._sft_train_prefetch = None
+    actor._sft_train_prefetch_cancel = None
     actor._sft_train_prefetch_rollout_id = None
     monkeypatch.setattr(actor_module, "_should_pause_sft_lookahead", lambda *_args: True)
 
@@ -122,6 +123,7 @@ def test_sft_train_prefetch_matching_failure_falls_back_and_clears_slot(monkeypa
     actor._sft_train_prefetch_executor = MagicMock()
     actor._sft_train_prefetch = MagicMock()
     actor._sft_train_prefetch.result.side_effect = RuntimeError("fetch failed")
+    actor._sft_train_prefetch_cancel = None
     actor._sft_train_prefetch_rollout_id = 4
 
     assert actor._take_sft_train_prefetch(4) is None
@@ -136,6 +138,7 @@ def test_sft_train_prefetch_running_stale_future_fails_fast(monkeypatch):
     actor._sft_train_prefetch = MagicMock()
     actor._sft_train_prefetch.done.return_value = False
     actor._sft_train_prefetch.cancel.return_value = False
+    actor._sft_train_prefetch_cancel = None
     actor._sft_train_prefetch_rollout_id = 3
 
     with pytest.raises(RuntimeError, match="Cannot cancel stale"):
@@ -147,6 +150,7 @@ def test_sft_train_prefetch_shutdown_is_idempotent():
     future = MagicMock()
     executor = MagicMock()
     actor._sft_train_prefetch = future
+    actor._sft_train_prefetch_cancel = None
     actor._sft_train_prefetch_rollout_id = 3
     actor._sft_train_prefetch_executor = executor
 

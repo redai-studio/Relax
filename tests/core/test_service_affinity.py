@@ -236,6 +236,37 @@ def test_service_deferred_deploy_keeps_placement_group_ownership():
         service.deploy()
 
 
+@pytest.mark.parametrize("role", ["sft", "actor"])
+def test_sft_data_node_affinity_is_role_specific_and_preserves_resources(monkeypatch, role):
+    monkeypatch.setenv("RELAX_SFT_DATA_NODE_IP", "10.0.0.1")
+    service = object.__new__(Service)
+    service.cls = MagicMock()
+    service.config = Namespace()
+    service.runtime_env = None
+    service.healthy = MagicMock()
+    service.num_gpus = 0
+    service.role = role
+    service.data_source = None
+    with (
+        patch("relax.core.service.with_control_plane_affinity", return_value={"resources": {"stable_cpu": 1}}),
+        patch(
+            "relax.core.service.ray.nodes",
+            return_value=[
+                {
+                    "NodeID": "data",
+                    "NodeManagerAddress": "10.0.0.1",
+                    "Alive": True,
+                    "Resources": {"node:10.0.0.1": 1, "stable_cpu": 1},
+                }
+            ],
+        ),
+        patch("relax.core.service.serve.run", return_value=MagicMock()),
+    ):
+        service._deploy(None)
+    resources = service.cls.options.call_args.kwargs["ray_actor_options"]["resources"]
+    assert resources == ({"stable_cpu": 1, "node:10.0.0.1": 0.001} if role == "sft" else {"stable_cpu": 1})
+
+
 def test_placement_factory_legacy_exports_are_identical():
     from relax.distributed.ray import placement_group as placement
 
@@ -287,3 +318,29 @@ def test_service_reuses_shared_pg_without_factory_or_cleanup():
         assert service._ensure_placement_group() is shared_pg
     factory.assert_not_called()
     remove.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["missing", "dead", "wrong_group"])
+def test_sft_data_node_rejects_unschedulable_affinity(monkeypatch, state):
+    monkeypatch.setenv("RELAX_SFT_DATA_NODE_IP", "192.0.2.1")
+    service = object.__new__(Service)
+    service.cls = MagicMock()
+    service.config = Namespace(_relax_control_plane_node_group="stable", enable_affinity=True)
+    service.runtime_env = None
+    service.role = "sft"
+    nodes = (
+        []
+        if state == "missing"
+        else [
+            {
+                "NodeID": "data",
+                "NodeManagerAddress": "192.0.2.1",
+                "Alive": state != "dead",
+                "Resources": {"node:192.0.2.1": 1},
+            }
+        ]
+    )
+    with patch("relax.core.service.ray.nodes", return_value=nodes):
+        with pytest.raises((ValueError, RuntimeError), match="not available|conflicts"):
+            service._deploy(None)
+    service.cls.options.assert_not_called()

@@ -7,6 +7,7 @@ launch script + smoke dataset (Task 6).
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -55,3 +56,12 @@ def test_encode_image_data_uri_returns_png_data_url():
 
     uri = encode_image_data_uri(Image.new("RGB", (4, 4)))
     assert uri.startswith("data:image/png;base64,")
+
+
+def test_extract_tool_call_preserves_open_tag_in_json():
+    text = '<tool_call>{"name":"search","arguments":{"query":"explain <tool_call> tags"}}</tool_call>'
+    assert extract_tool_call(text)["arguments"]["query"] == "explain <tool_call> tags"
+    assert extract_tool_call(text + "<tool_call>{") == extract_tool_call(text)
+    code = "print('<tool_call>')"
+    text = "<tool_call>" + json.dumps({"name": "python_exec", "arguments": {"code": code}}) + "</tool_call>"
+    assert extract_code(text) == code

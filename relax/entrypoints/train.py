@@ -32,7 +32,9 @@ logger = get_logger(__name__)
 # Global reference so signal handlers / atexit can reach the controller.
 _ctrl: Controller | None = None
 _shutdown_done = False
+_training_completed = False
 _kernel_cache_heartbeat = None
+_fault_runtime = None
 _SHUTDOWN_TIMEOUT_SEC = 60
 _NORMAL_SHUTDOWN_TIMEOUT_SEC = 1800
 
@@ -75,6 +77,16 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
         sig_name = signal.Signals(sig).name if sig else "atexit"
         logger.info(f"Graceful shutdown triggered ({sig_name}) — cleaning up SGLang engines...")
 
+        fault_runtime = globals().get("_fault_runtime")
+        if fault_runtime is not None:
+            try:
+                fault_runtime.close()
+            except Exception:
+                try:
+                    logger.warning("Fault event runtime shutdown unavailable")
+                except Exception:
+                    pass
+
         # Detached cache agents are outside the Ray Job's process tree. Notify them
         # first so a short Ray Job SIGTERM grace period cannot prevent publishing;
         # the normal path waits for a final snapshot after Serve stops train actors.
@@ -91,6 +103,21 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                 logger.warning(f"Controller shutdown error during {sig_name}: {e}")
 
         if ray.is_initialized():
+            # Only the successful return of the training loop closes trackers.
+            if (
+                sig is None
+                and exit_code == 0
+                and getattr(_ctrl, "_metrics_service_enabled", False)
+                and _training_completed
+            ):
+                try:
+                    result = serve.get_app_handle("metrics").finish_tracking.remote().result(timeout_s=600)
+                    if result.get("status") != "success":
+                        logger.warning(f"Tracking finalization reported an error: {result}")
+                except Exception as error:
+                    # Tracking must not prevent GPU/Serve cleanup. Only normal
+                    # completion closes tracking tasks as successful.
+                    logger.warning(f"Tracking finalization failed: {error}")
             try:
                 serve.shutdown()
                 if _kernel_cache_heartbeat is not None:
@@ -111,7 +138,7 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
 
 
 def main(args):
-    global _ctrl, _kernel_cache_heartbeat
+    global _ctrl, _fault_runtime, _kernel_cache_heartbeat, _training_completed
 
     # Startup failures need the same cleanup as failures in the training loop.
     signal.signal(signal.SIGTERM, _graceful_shutdown)
@@ -119,6 +146,21 @@ def main(args):
     atexit.register(_graceful_shutdown)
 
     try:
+        if getattr(args, "fault_events_enabled", False):
+            try:
+                from relax.utils.fault_events.runtime import start_fault_events
+
+                _fault_runtime = start_fault_events(
+                    enabled=True,
+                    health_enabled=getattr(args, "use_health_check", False),
+                    port=getattr(args, "fault_events_port", 0),
+                )
+            except Exception:
+                try:
+                    logger.warning("Fault event runtime unavailable")
+                except Exception:
+                    pass
+
         # Load runtime_env from config so we can both pass it to ray.init and
         # explicitly to the Serve deployment. Ensure it's available even if Ray
         # is already initialized.
@@ -155,6 +197,7 @@ def main(args):
         _ctrl = Controller.__new__(Controller)
         _ctrl.__init__(args, runtime_env)
         _ctrl.training_loop()
+        _training_completed = True
     except Exception as e:
         logger.exception(f"Training startup or loop failed with error: {e}")
         _graceful_shutdown(exit_code=1)

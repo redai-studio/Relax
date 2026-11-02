@@ -11,48 +11,30 @@ Covers:
 """
 
 from argparse import Namespace
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+# Bridge and MCore are required by this suite. Missing dependencies or API drift
+# must fail collection rather than silently removing real conversion coverage.
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
+from megatron.bridge.models.conversion.param_mapping import (
+    FusedExpertMapping,
+    FusedGatedExpertMapping,
+    GatedMLPMapping,
+    MegatronParamMapping,
+    ReplicatedMapping,
+)
+from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import Qwen3VLMoEBridge
+from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge
 
-# Skip the whole module when Megatron (or its Bridge) isn't installed — e.g. on
-# the CPU-only CI runner. All tests here exercise real Bridge mapping objects
-# and BridgeConverter, which imports ``megatron.core`` at module level.
-pytest.importorskip("megatron.core")
-pytest.importorskip("megatron.bridge")
-pytest.importorskip("megatron.bridge.models.conversion.param_mapping")
-
-# Real Bridge mapping classes. The model-specific ExpertMLP*ProjMapping
-# classes were unified into the generic Fused{,Gated}ExpertMapping classes
-# in megatron-bridge. We alias the new names to the old test-local names so
-# the rest of this file keeps reading naturally; the Qwen3-VL / Qwen3.5
-# variants now resolve to the *same* class object.
-try:
-    from megatron.bridge.models.conversion.param_mapping import (
-        FusedExpertMapping as ExpertMLPDownProjMapping,
-    )
-    from megatron.bridge.models.conversion.param_mapping import (
-        FusedGatedExpertMapping as ExpertMLPGateUpProjMapping,
-    )
-    from megatron.bridge.models.conversion.param_mapping import (  # noqa: E402
-        GatedMLPMapping,
-        MegatronParamMapping,
-        ReplicatedMapping,
-    )
-except ImportError as _exc:
-    pytest.skip(f"megatron bridge mapping API unavailable: {_exc}", allow_module_level=True)
-
-
-Qwen35ExpertMLPDownProjMapping = ExpertMLPDownProjMapping
-Qwen35ExpertMLPGateUpProjMapping = ExpertMLPGateUpProjMapping
-
-from relax.backends.megatron.misc_utils import strip_param_name_prefix  # noqa: E402
-from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding  # noqa: E402
-from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter  # noqa: E402
+from relax.backends.megatron.misc_utils import strip_param_name_prefix
+from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding
+from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -89,21 +71,7 @@ def _patch_gather_from_ep_ranks():
         return {str(hf_param_name): megatron_weights}
 
     saved_originals: dict = {}
-    # Dedupe via dict.fromkeys: Qwen35* aliases now resolve to the same class
-    # objects as the non-Qwen35 variants, so listing both would re-patch the
-    # same class twice and break the save/restore bookkeeping.
-    patched_classes = list(
-        dict.fromkeys(
-            [
-                MegatronParamMapping,
-                GatedMLPMapping,
-                ExpertMLPGateUpProjMapping,
-                ExpertMLPDownProjMapping,
-                Qwen35ExpertMLPGateUpProjMapping,
-                Qwen35ExpertMLPDownProjMapping,
-            ]
-        )
-    )
+    patched_classes = [MegatronParamMapping, GatedMLPMapping, FusedGatedExpertMapping, FusedExpertMapping]
     for cls in patched_classes:
         if "gather_from_ep_ranks" in cls.__dict__:
             saved_originals[cls] = cls.__dict__["gather_from_ep_ranks"]
@@ -118,51 +86,95 @@ def _patch_gather_from_ep_ranks():
                 del cls.gather_from_ep_ranks
 
 
-def _make_expert_gate_up_mapping(layer_idx: int, expert_id: int) -> ExpertMLPGateUpProjMapping:
-    """Create a real ExpertMLPGateUpProjMapping for testing."""
-    return ExpertMLPGateUpProjMapping(
-        megatron_param=f"decoder.layers.{layer_idx}.mlp.experts.linear_fc1.weight{expert_id}",
-        hf_param=f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj",
+@lru_cache
+def _expert_registry(qwen35: bool):
+    """Build the real model registry with a tiny packed-expert checkpoint
+    schema."""
+    keys = [
+        "model.language_model.layers.0.mlp.experts.gate_up_proj",
+        "model.language_model.layers.0.mlp.experts.down_proj",
+    ]
+    source = SimpleNamespace(get_all_keys=lambda: keys)
+    bridge = SimpleNamespace(hf_pretrained=SimpleNamespace(state=SimpleNamespace(source=source)))
+    bridge_cls = Qwen35VLMoEBridge if qwen35 else Qwen3VLMoEBridge
+    return bridge_cls.mapping_registry(bridge)
+
+
+def _expert_mapping(layer_idx: int, expert_id: int, fc: int, qwen35: bool = False):
+    name = f"language_model.decoder.layers.{layer_idx}.mlp.experts.linear_fc{fc}.weight{expert_id}"
+    mapping = _expert_registry(qwen35).megatron_to_hf_lookup(name)
+    expected_type = FusedGatedExpertMapping if fc == 1 else FusedExpertMapping
+    assert isinstance(mapping, expected_type)
+    assert mapping.transpose_on_export is (not qwen35)
+    # The same eager AutoMapping initialization as BridgeConverter.init_tasks.
+    mapping._detected_type = "replicated"
+    mapping._mapping = mapping._get_or_create_mapping("replicated")
+    return mapping
+
+
+def _make_expert_gate_up_mapping(layer_idx: int, expert_id: int) -> FusedGatedExpertMapping:
+    return _expert_mapping(layer_idx, expert_id, fc=1)
+
+
+def _make_expert_down_mapping(layer_idx: int, expert_id: int) -> FusedExpertMapping:
+    return _expert_mapping(layer_idx, expert_id, fc=2)
+
+
+def _make_qwen35_expert_gate_up_mapping(layer_idx: int, expert_id: int) -> FusedGatedExpertMapping:
+    return _expert_mapping(layer_idx, expert_id, fc=1, qwen35=True)
+
+
+def _make_qwen35_expert_down_mapping(layer_idx: int, expert_id: int) -> FusedExpertMapping:
+    return _expert_mapping(layer_idx, expert_id, fc=2, qwen35=True)
+
+
+def _expert_task(mapping, param: torch.Tensor) -> WeightConversionTask:
+    return WeightConversionTask(
+        param_name=mapping.megatron_param,
+        global_param_name=mapping.megatron_param,
+        mapping=mapping,
+        megatron_module=None,
+        param_weight=param,
     )
 
 
-def _make_expert_down_mapping(layer_idx: int, expert_id: int) -> ExpertMLPDownProjMapping:
-    """Create a real ExpertMLPDownProjMapping with eagerly initialized inner
-    mapping."""
-    m = ExpertMLPDownProjMapping(
-        megatron_param=f"decoder.layers.{layer_idx}.mlp.experts.linear_fc2.weight{expert_id}",
-        hf_param=f"model.language_model.layers.{layer_idx}.mlp.experts.down_proj",
+def _convert_real_mapping(mapping, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    """Exercise real initialization, mapping and Relax post-processing.
+
+    Only checkpoint/model discovery is supplied locally: no model download or
+    distributed model construction. Mapping outputs and transpose detection are
+    not mocked or manually overridden.
+    """
+    task = _expert_task(mapping, param)
+    bridge = SimpleNamespace(
+        get_conversion_tasks=lambda model: [task],
+        _model_bridge=SimpleNamespace(mapping_registry=lambda: _expert_registry(False)),
     )
-    # Same as production code in _init_bridge_tasks: eagerly init AutoMapping delegate
-    m._detected_type = "replicated"
-    m._mapping = m._get_or_create_mapping("replicated")
-    return m
+    converter = BridgeConverter(_make_args(), model=[], quantization_config=None)
+    with (
+        patch("megatron.bridge.AutoBridge.from_hf_pretrained", return_value=bridge),
+        patch("relax.utils.megatron_bridge_utils.patch_megatron_model", return_value=nullcontext()),
+        patch("relax.backends.megatron.weight_update.bridge_converter.named_params_and_buffers", return_value=[]),
+    ):
+        converter.init_tasks()
+    # transpose_on_export is a grouped-export flag, not a per-expert transpose.
+    assert converter._bridge_expert_transposes_down is False
+    return converter.convert(mapping.megatron_param, param)
 
 
-def _make_qwen35_expert_gate_up_mapping(layer_idx: int, expert_id: int) -> Qwen35ExpertMLPGateUpProjMapping:
-    """Create a real Qwen3.5 ExpertMLPGateUpProjMapping for testing."""
-    return Qwen35ExpertMLPGateUpProjMapping(
-        megatron_param=f"language_model.decoder.layers.{layer_idx}.mlp.experts.linear_fc1.weight{expert_id}",
-        hf_param=f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj",
+def _grouped_export(mapping, param: torch.Tensor, buffers: dict, num_experts: int, hf_state: dict):
+    """Call Bridge's real collector; inputs are already EP-gathered (EP=1)."""
+    with _patch_gather_from_ep_ranks():
+        output = mapping.megatron_to_hf(param, None)
+    return MegatronModelBridge._accumulate_grouped_export(
+        None, _expert_task(mapping, param), output, SimpleNamespace(num_moe_experts=num_experts), buffers, hf_state
     )
-
-
-def _make_qwen35_expert_down_mapping(layer_idx: int, expert_id: int) -> Qwen35ExpertMLPDownProjMapping:
-    """Create a real Qwen3.5 ExpertMLPDownProjMapping with eagerly initialized
-    inner mapping."""
-    m = Qwen35ExpertMLPDownProjMapping(
-        megatron_param=f"language_model.decoder.layers.{layer_idx}.mlp.experts.linear_fc2.weight{expert_id}",
-        hf_param=f"model.language_model.layers.{layer_idx}.mlp.experts.down_proj",
-    )
-    m._detected_type = "replicated"
-    m._mapping = m._get_or_create_mapping("replicated")
-    return m
 
 
 def _convert_mapping_output(
     converted_dict: dict[str, torch.Tensor],
     megatron_param_name: str,
-    bridge_expert_transposes_down: bool = True,
+    bridge_expert_transposes_down: bool = False,
 ) -> list[tuple[str, torch.Tensor]]:
     """Run actual conversion with a supplied Bridge mapping result.
 
@@ -221,43 +233,51 @@ class TestBridgeMappingOutput:
         assert torch.equal(result["model.layers.0.mlp.gate_proj.weight"], gate_expected)
         assert torch.equal(result["model.layers.0.mlp.up_proj.weight"], up_expected)
 
-    @pytest.mark.skip(
-        reason="Bridge unification: FusedGatedExpertMapping.megatron_to_hf now "
-        "returns a 2-D cat ([2H, D]) instead of the old [2, D, H] stacked-transpose. "
-        "Any transpose for HF export is deferred to grouped-export post-processing."
-    )
-    def test_expert_gate_up_mapping_outputs_fused_transposed(self):
-        """ExpertMLPGateUpProjMapping outputs fused [2, D, H] with
-        transpose."""
+    @pytest.mark.parametrize("qwen35", [False, True], ids=["qwen3-vl", "qwen3.5"])
+    def test_expert_gate_up_mapping_outputs_untransposed_until_grouped_export(self, qwen35):
+        """Per-expert output is [2H,D]; only grouped export applies the
+        flag."""
+        H, D = 3, 5
+        fused = torch.arange(2 * H * D, dtype=torch.float32).reshape(2 * H, D)
+        m = _expert_mapping(0, 0, fc=1, qwen35=qwen35)
+        key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
         with _patch_gather_from_ep_ranks():
-            m = _make_expert_gate_up_mapping(layer_idx=0, expert_id=3)
-            H, D = 768, 2048
-            fused = torch.randn(H * 2, D)
             result = m.megatron_to_hf(fused, None)
+        assert list(result) == [key]
+        assert result[key].shape == (2 * H, D)
+        assert torch.equal(result[key], fused)  # gate precedes up, without transpose
 
-        assert list(result.keys()) == ["model.language_model.layers.0.mlp.experts.gate_up_proj"]
-        tensor = result["model.language_model.layers.0.mlp.experts.gate_up_proj"]
-        # Bridge transposes each of gate/up from [H, D] to [D, H] then stacks
-        assert tensor.shape == (2, D, H)
+        grouped = _grouped_export(m, fused, {}, 1, {})
+        expected = fused.unsqueeze(0) if qwen35 else fused.T.unsqueeze(0)
+        assert list(grouped) == [key]
+        assert grouped[key].shape == expected.shape
+        assert torch.equal(grouped[key], expected)
+        assert grouped[key].is_contiguous()
 
-    @pytest.mark.skip(
-        reason="Bridge unification: FusedExpertMapping.megatron_to_hf (inherited "
-        "from AutoMapping) no longer transposes; transpose_on_export is honoured "
-        "by the grouped-export collector, not the per-expert megatron_to_hf call."
-    )
-    def test_expert_down_mapping_outputs_transposed(self):
-        """ExpertMLPDownProjMapping outputs transposed tensor [H, D]."""
+    @pytest.mark.parametrize("qwen35", [False, True], ids=["qwen3-vl", "qwen3.5"])
+    @pytest.mark.parametrize("hf_layout", ["unknown", "native", "transposed"])
+    def test_expert_down_mapping_outputs_untransposed_until_grouped_export(self, qwen35, hf_layout):
+        """Collector transposes adaptively to the original checkpoint shape."""
+        D, H = 5, 3
+        param = torch.arange(D * H, dtype=torch.float32).reshape(D, H)
+        m = _expert_mapping(0, 0, fc=2, qwen35=qwen35)
+        key = "model.language_model.layers.0.mlp.experts.down_proj"
         with _patch_gather_from_ep_ranks():
-            m = _make_expert_down_mapping(layer_idx=0, expert_id=3)
-            D, H = 2048, 768
-            param = torch.randn(D, H)
             result = m.megatron_to_hf(param, None)
+        assert list(result) == [key]
+        assert result[key].shape == (D, H)
+        assert torch.equal(result[key], param)
 
-        assert list(result.keys()) == ["model.language_model.layers.0.mlp.experts.down_proj"]
-        tensor = result["model.language_model.layers.0.mlp.experts.down_proj"]
-        # Bridge transposes from [D, H] to [H, D]
-        assert tensor.shape == (H, D)
-        assert torch.allclose(tensor, param.transpose(-1, -2).contiguous())
+        hf_state = (
+            {} if hf_layout == "unknown" else {key: torch.empty((1, D, H) if hf_layout == "native" else (1, H, D))}
+        )
+        grouped = _grouped_export(m, param, {}, 1, hf_state)
+        transpose = not qwen35 and hf_layout != "native"
+        expected = (param.T if transpose else param).unsqueeze(0)
+        assert list(grouped) == [key]
+        assert grouped[key].shape == expected.shape
+        assert torch.equal(grouped[key], expected)
+        assert grouped[key].is_contiguous()
 
 
 # ─── Tests for Bridge + post-processing output correctness ───────────────────
@@ -300,84 +320,68 @@ class TestBridgePostProcessingCorrectness:
         assert torch.allclose(postprocessed[0][1], expected_gate)
         assert torch.allclose(postprocessed[1][1], expected_up)
 
-    @pytest.mark.skip(
-        reason="Bridge unification: FusedExpertMapping.megatron_to_hf no longer "
-        "transposes down_proj, so the default bridge_expert_transposes_down=True "
-        "post-processing path now double-counts and returns megatron_param.T. "
-        "Production device_direct.py uses runtime introspection of the bridge "
-        "class to decide whether to undo the transpose; both that code and this "
-        "test need to be ported to the new transpose_on_export semantics."
-    )
-    def test_expert_down_proj_postprocessed_matches_expected(self):
-        """Bridge down_proj + post-processing produces correct passthrough."""
-        D, H = 2048, 768
+    @pytest.mark.parametrize("qwen35", [False, True], ids=["qwen3-vl", "qwen3.5"])
+    def test_expert_down_proj_postprocessed_matches_expected(self, qwen35):
+        """Real per-expert mapping + Relax is identity, regardless of export
+        flag."""
+        D, H = 5, 3
         expert_id = 5
-        megatron_param = torch.randn(D, H)
-
-        # Expected: identity (Megatron expert down_proj is already in HF layout)
-        expected = megatron_param
-
-        # Bridge + post-processing
-        with _patch_gather_from_ep_ranks():
-            mapping = _make_expert_down_mapping(layer_idx=0, expert_id=expert_id)
-            bridge_output = mapping.megatron_to_hf(megatron_param, None)
-
-        postprocessed = _convert_mapping_output(
-            bridge_output, f"decoder.layers.0.mlp.experts.linear_fc2.weight{expert_id}"
-        )
-
+        param = torch.arange(D * H, dtype=torch.float32).reshape(D, H)
+        mapping = _expert_mapping(0, expert_id, fc=2, qwen35=qwen35)
+        postprocessed = _convert_real_mapping(mapping, param)
         assert len(postprocessed) == 1
         assert postprocessed[0][0] == "model.language_model.layers.0.mlp.experts.5.down_proj.weight"
         assert postprocessed[0][1].shape == (D, H)
-        assert torch.allclose(postprocessed[0][1], expected)
+        assert torch.equal(postprocessed[0][1], param)
+        assert postprocessed[0][1].is_contiguous()
 
-    @pytest.mark.skip(
-        reason="Bridge unification: down branch of this test relies on the same "
-        "pre-transpose-in-megatron_to_hf behavior removed in the new bridge "
-        "(see test_expert_down_proj_postprocessed_matches_expected). The gate/up "
-        "branch still passes; re-enable after device_direct.py post-processing "
-        "is updated for transpose_on_export."
-    )
-    def test_correctness_across_layers_and_experts(self):
-        """Correctness holds across different layer indices and expert IDs."""
-        H, D = 768, 2048
-
+    @pytest.mark.parametrize("qwen35", [False, True], ids=["qwen3-vl", "qwen3.5"])
+    def test_correctness_across_layers_and_experts(self, qwen35):
+        """Preserve all original layers/IDs and check grouped expert
+        ordering."""
+        H, D = 3, 5
         for layer_idx in [0, 5, 27]:
-            for expert_id in [0, 7, 42]:
-                megatron_fc1 = torch.randn(H * 2, D)
-                megatron_fc2 = torch.randn(D, H)
+            buffers = {1: {}, 2: {}}
+            originals = {1: {}, 2: {}}
+            # Out-of-order arrival must not change final expert axis order.
+            for expert_id in [42, 7, 0, *[i for i in range(43) if i not in (0, 7, 42)]]:
+                fc1 = torch.arange(2 * H * D, dtype=torch.float32).reshape(2 * H, D)
+                fc1 = fc1 + layer_idx * 10000 + expert_id * 100
+                fc2 = torch.arange(D * H, dtype=torch.float32).reshape(D, H) + layer_idx * 10000 + expert_id * 100
+                expected_gate, expected_up = fc1[:H], fc1[H:]
+                base = f"model.language_model.layers.{layer_idx}.mlp.experts"
+                mapping_fc1 = _expert_mapping(layer_idx, expert_id, fc=1, qwen35=qwen35)
+                post_fc1 = _convert_real_mapping(mapping_fc1, fc1)
+                assert [name for name, _ in post_fc1] == [
+                    f"{base}.{expert_id}.gate_proj.weight",
+                    f"{base}.{expert_id}.up_proj.weight",
+                ]
+                for (_, tensor), expected in zip(post_fc1, (expected_gate, expected_up)):
+                    assert tensor.shape == (H, D)
+                    assert torch.equal(tensor, expected)
+                    assert tensor.is_contiguous()
+                mapping_fc2 = _expert_mapping(layer_idx, expert_id, fc=2, qwen35=qwen35)
+                post_fc2 = _convert_real_mapping(mapping_fc2, fc2)
+                assert len(post_fc2) == 1
+                assert post_fc2[0][0] == f"{base}.{expert_id}.down_proj.weight"
+                assert post_fc2[0][1].shape == (D, H)
+                assert torch.equal(post_fc2[0][1], fc2)
 
-                expected_gate, expected_up = megatron_fc1.chunk(2, dim=0)
-
-                # gate/up
-                with _patch_gather_from_ep_ranks():
-                    mapping_fc1 = _make_expert_gate_up_mapping(layer_idx, expert_id)
-                    bridge_fc1 = mapping_fc1.megatron_to_hf(megatron_fc1, None)
-                post_fc1 = _convert_mapping_output(
-                    bridge_fc1, f"decoder.layers.{layer_idx}.mlp.experts.linear_fc1.weight{expert_id}"
-                )
-                assert (
-                    post_fc1[0][0]
-                    == f"model.language_model.layers.{layer_idx}.mlp.experts.{expert_id}.gate_proj.weight"
-                )
-                assert (
-                    post_fc1[1][0] == f"model.language_model.layers.{layer_idx}.mlp.experts.{expert_id}.up_proj.weight"
-                )
-                assert torch.allclose(post_fc1[0][1], expected_gate)
-                assert torch.allclose(post_fc1[1][1], expected_up)
-
-                # down
-                with _patch_gather_from_ep_ranks():
-                    mapping_fc2 = _make_expert_down_mapping(layer_idx, expert_id)
-                    bridge_fc2 = mapping_fc2.megatron_to_hf(megatron_fc2, None)
-                post_fc2 = _convert_mapping_output(
-                    bridge_fc2, f"decoder.layers.{layer_idx}.mlp.experts.linear_fc2.weight{expert_id}"
-                )
-                assert (
-                    post_fc2[0][0]
-                    == f"model.language_model.layers.{layer_idx}.mlp.experts.{expert_id}.down_proj.weight"
-                )
-                assert torch.allclose(post_fc2[0][1], megatron_fc2)
+                for fc, mapping, param in [(1, mapping_fc1, fc1), (2, mapping_fc2, fc2)]:
+                    originals[fc][expert_id] = param
+                    grouped = _grouped_export(mapping, param, buffers[fc], 43, {})
+                    if len(originals[fc]) < 43:
+                        assert grouped is None
+                    else:
+                        key = f"{base}.{'gate_up_proj' if fc == 1 else 'down_proj'}"
+                        expected = torch.stack([originals[fc][i] for i in range(43)])
+                        if not qwen35:
+                            expected = expected.transpose(-1, -2).contiguous()
+                        assert list(grouped) == [key]
+                        assert grouped[key].shape == expected.shape
+                        assert torch.equal(grouped[key], expected)
+                        assert grouped[key].is_contiguous()
+                        assert buffers[fc] == {}
 
     def test_non_expert_replicated_no_postprocessing(self):
         """Non-expert params (e.g. layernorm) pass through without post-
@@ -568,7 +572,7 @@ class TestQwen35BridgeMappingOutput:
     """Test Qwen3.5 Bridge mapping output format (2D cat, no transpose)."""
 
     def test_qwen35_gate_up_outputs_2d_cat(self):
-        """Qwen3.5 ExpertMLPGateUpProjMapping outputs 2D [2*H, D] via cat."""
+        """Qwen3.5 FusedGatedExpertMapping outputs 2D [2*H, D] via cat."""
         with _patch_gather_from_ep_ranks():
             m = _make_qwen35_expert_gate_up_mapping(layer_idx=0, expert_id=3)
             H, D = 768, 2048
@@ -582,7 +586,7 @@ class TestQwen35BridgeMappingOutput:
         assert tensor.shape == (H * 2, D)
 
     def test_qwen35_down_proj_no_transpose(self):
-        """Qwen3.5 ExpertMLPDownProjMapping does not transpose."""
+        """Qwen3.5 FusedExpertMapping does not transpose."""
         with _patch_gather_from_ep_ranks():
             m = _make_qwen35_expert_down_mapping(layer_idx=0, expert_id=3)
             D, H = 2048, 768
@@ -595,16 +599,23 @@ class TestQwen35BridgeMappingOutput:
         assert tensor.shape == (D, H)
         assert torch.allclose(tensor, param)
 
-    @pytest.mark.skip(
-        reason="Bridge unification: Qwen3.5 and Qwen3-VL now share the same "
-        "FusedExpertMapping class, so per-class megatron_to_hf override detection "
-        "is no longer meaningful. The transpose distinction lives on the "
-        "transpose_on_export instance flag instead."
-    )
     def test_qwen35_expert_transposes_down_detection(self):
-        """Qwen3.5 ExpertMLPDownProjMapping lacks megatron_to_hf override."""
-        assert "megatron_to_hf" not in Qwen35ExpertMLPDownProjMapping.__dict__
-        assert "megatron_to_hf" in ExpertMLPDownProjMapping.__dict__
+        """Real registries share mapping classes, but carry different export
+        flags."""
+        for fc in [1, 2]:
+            vl = _expert_mapping(0, 3, fc=fc)
+            qwen35 = _expert_mapping(0, 3, fc=fc, qwen35=True)
+            assert type(vl) is type(qwen35)
+            assert vl.transpose_on_export is True
+            assert qwen35.transpose_on_export is False
+            param = torch.arange(30 if fc == 1 else 15, dtype=torch.float32).reshape(-1, 5)
+            # Neither instance transposes in per-parameter conversion.
+            vl_output = _convert_real_mapping(vl, param)
+            qwen35_output = _convert_real_mapping(qwen35, param)
+            assert [name for name, _ in vl_output] == [name for name, _ in qwen35_output]
+            for (_, actual), (_, expected) in zip(vl_output, qwen35_output):
+                assert actual.shape == expected.shape
+                assert torch.equal(actual, expected)
 
 
 class TestQwen35PostProcessingCorrectness:

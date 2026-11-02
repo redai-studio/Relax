@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Build the FlashInfer AOT sampling kernel for B300."""
+"""Build the FlashInfer AOT sampling kernel for Blackwell."""
 
+import importlib.metadata as md
 import os
 import pathlib
 import re
@@ -10,13 +11,15 @@ import sys
 
 
 def main() -> None:
-    if os.environ.get("GPU_ARCH") != "b300":
+    if os.environ.get("GPU_ARCH") != "blackwell":
         sys.stdout.write(f"skip flashinfer sampling sm_103a rebuild (GPU_ARCH={os.environ.get('GPU_ARCH')})\n")
         raise SystemExit(0)
 
     from flashinfer.jit.sampling import gen_sampling_module
 
-    aot = pathlib.Path("/usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache/jit_cache/sampling/sampling.so")
+    aot = pathlib.Path(
+        md.distribution("flashinfer-jit-cache").locate_file("flashinfer_jit_cache/jit_cache/sampling/sampling.so")
+    )
     if not aot.parent.is_dir():
         raise SystemExit(
             f"flashinfer AOT sampling dir not found: {aot.parent}. flashinfer layout changed; update this build step."
