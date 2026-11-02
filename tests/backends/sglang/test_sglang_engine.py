@@ -1,8 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import importlib.util
 import sys
 from dataclasses import make_dataclass
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -122,30 +124,43 @@ def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 8])
-def test_keye_replicated_down_uses_hf_weight_loading(monkeypatch, expert_sync_engine_module, tp_size):
+@pytest.mark.parametrize("architectures", [["KeyeVL2MoeForConditionalGeneration"], ["Qwen3MoeForCausalLM"], None])
+def test_keye_replicated_down_uses_hf_weight_loading(monkeypatch, expert_sync_engine_module, tp_size, architectures):
     from relax.utils import misc
 
     module = expert_sync_engine_module
     engine = object.__new__(module.SGLangEngine)
+    # Load the real package hook without importing optional Megatron bridges.
+    spec = importlib.util.spec_from_file_location(
+        "keye_external", Path(__file__).resolve().parents[3] / "relax/models/keye_vl2/sglang/__init__.py"
+    )
+    package = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(package)
+    monkeypatch.setitem(sys.modules, spec.name, package)
+    engine.args = SimpleNamespace(sglang_external_model_package=spec.name)
     engine.node_rank, engine.worker_type = 0, "regular"
     engine.server_host, engine.server_port = "localhost", 1234
     response = Mock()
     response.json.return_value = {"model_path": "/test/keye", "tp_size": tp_size}
     monkeypatch.setattr(module.requests, "get", Mock(return_value=response))
-    config = SimpleNamespace(architectures=["KeyeVL2MoeForConditionalGeneration"], num_experts=128)
+    config = SimpleNamespace(architectures=architectures, num_experts=128)
     monkeypatch.setattr(misc, "get_hf_config", lambda _: config)
-    if tp_size > 1:
+    if tp_size > 1 and architectures == ["KeyeVL2MoeForConditionalGeneration"]:
         with pytest.raises(ValueError, match="require HF weight loading"):
             engine.get_expert_weight_sync_layout()
     else:
-        assert engine.get_expert_weight_sync_layout()["tp_size"] == 1
+        assert engine.get_expert_weight_sync_layout()["tp_size"] == tp_size
 
 
-def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engine_module):
+@pytest.mark.parametrize("external_pkg", [None, "external_without_layout_hook"])
+def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engine_module, external_pkg):
     from relax.utils import misc
 
     module = expert_sync_engine_module
     engine = object.__new__(module.SGLangEngine)
+    engine.args = SimpleNamespace(sglang_external_model_package=external_pkg)
+    if external_pkg:
+        monkeypatch.setitem(sys.modules, external_pkg, ModuleType(external_pkg))
     engine.node_rank = 0
     engine.worker_type = "regular"
     engine.server_host, engine.server_port = "localhost", 1234
@@ -209,6 +224,7 @@ def test_expert_sync_auto_uses_scheduler_config_and_dtype_resolver(
 
     module = expert_sync_engine_module
     engine = object.__new__(module.SGLangEngine)
+    engine.args = SimpleNamespace()
     engine.node_rank, engine.worker_type = 0, "regular"
     engine.server_host, engine.server_port = "localhost", 1234
     if local_engine:
