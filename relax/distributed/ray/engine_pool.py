@@ -118,6 +118,10 @@ class EnginePool:
         # Exit is a fact about this actor/incarnation and its recorded process
         # identity, even when another slot cannot yet confirm its own exit.
         self._exit_receipts: dict[int, tuple[Any, int, Any]] = {}
+        # A timed-out ray.get does not end the node-local cleanup. Consume its
+        # eventual proof/partial evidence before submitting another attempt.
+        self._orphan_cleanups: dict[int, tuple[Any, int, dict, Any]] = {}
+        self._pending_shutdowns: dict[int, tuple[Any, int, Any, Any]] = {}
         # How many times each slot has been built.
         self.incarnations: dict[int, int] = {}
         self._states: dict[int, EngineState] = {}
@@ -228,6 +232,8 @@ class EnginePool:
             self.init_metadata.pop(slot, None)
             self.release_evidence.pop(slot, None)
             self._exit_receipts.pop(slot, None)
+            self._orphan_cleanups.pop(slot, None)
+            self._pending_shutdowns.pop(slot, None)
             self.incarnations[slot] = self.incarnations.get(slot, 0) + 1
             if slot % self.nodes_per_engine == 0:
                 self._states[slot] = EngineState.STARTING
@@ -265,31 +271,90 @@ class EnginePool:
         if not isinstance(identity, dict):
             identity = ray.get(identity, timeout=self.spec.teardown_timeout_s)
             self.release_evidence[slot] = identity
-        node_id = identity["node_id"]
-        node = next((node for node in ray.nodes() if node["NodeID"] == node_id), None)
-        if node is None or not node["Alive"]:
-            # GCS liveness says nothing about a partitioned node's server tree
-            # or GPU allocations. Retry node-local proof when it is reachable.
-            return False
         engine = self.slots[slot]
+        pending = self._orphan_cleanups.get(slot)
+        if pending is not None and (
+            pending[0] is not engine or pending[1] != self.incarnations.get(slot, 0) or pending[2] != identity
+        ):
+            self._orphan_cleanups.pop(slot, None)
+            pending = None
+        if pending is None:
+            node_id = identity["node_id"]
+            node = next((node for node in ray.nodes() if node["NodeID"] == node_id), None)
+            if node is None or not node["Alive"]:
+                # GCS liveness says nothing about a partitioned server's GPU.
+                return False
+            try:
+                state = engine._get_local_state()
+            except Exception:
+                return False
+            if state != ActorTableData.DEAD:
+                # Stop the wrapper before node-local proof can race another init.
+                ray.kill(engine, no_restart=True)
+                deadline = time.monotonic() + self.spec.teardown_timeout_s
+                while engine._get_local_state() != ActorTableData.DEAD:
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            task = ray.remote(num_cpus=0)(cleanup_server_identity).options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)
+            )
+            ref = task.remote(identity)
+            pending = (engine, self.incarnations.get(slot, 0), deepcopy(identity), ref)
+            self._orphan_cleanups[slot] = pending
         try:
-            state = engine._get_local_state()
-        except Exception:
-            return False
-        if state != ActorTableData.DEAD:
-            # The server may be dead while its control wrapper is still alive.
-            # Stop that wrapper before node-local cleanup can race another init.
-            ray.kill(engine, no_restart=True)
-            deadline = time.monotonic() + self.spec.teardown_timeout_s
-            while engine._get_local_state() != ActorTableData.DEAD:
-                if time.monotonic() >= deadline:
-                    return False
-                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
-        task = ray.remote(num_cpus=0)(cleanup_server_identity).options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)
-        )
-        ray.get(task.remote(identity), timeout=self.spec.teardown_timeout_s)
+            ray.get(pending[3], timeout=self.spec.teardown_timeout_s)
+        except ray.exceptions.GetTimeoutError:
+            raise
+        except Exception as error:
+            self._orphan_cleanups.pop(slot, None)
+            self._merge_cleanup_evidence(slot, error)
+            raise
+        self._orphan_cleanups.pop(slot, None)
         return True
+
+    def _merge_cleanup_evidence(self, slot: int, error: Exception) -> None:
+        from relax.backends.sglang.process_cleanup import ServerCleanupError
+
+        if not isinstance(error, ServerCleanupError):
+            return
+        identity = self.release_evidence.get(slot)
+        if identity is None:
+            return
+        if not isinstance(identity, dict):
+            try:
+                identity = ray.get(identity, timeout=self.spec.teardown_timeout_s)
+            except Exception:
+                return
+            self.release_evidence[slot] = identity
+        learned = error.identity
+        # Partial proof belongs to this exact server, not just its slot or PID.
+        if all(identity.get(key) == learned.get(key) for key in ("node_id", "server_pid", "incarnation", "processes")):
+            for key in ("pgid", "released_process_group"):
+                if key in learned:
+                    identity[key] = deepcopy(learned[key])
+
+    def _wait_engine_shutdown(self, slot: int, engine: Any) -> None:
+        identity = self.release_evidence.get(slot)
+        pending = self._pending_shutdowns.get(slot)
+        if pending is None or (
+            pending[0] is not engine or pending[1] != self.incarnations.get(slot, 0) or pending[2] != identity
+        ):
+            pending = (
+                engine,
+                self.incarnations.get(slot, 0),
+                deepcopy(identity) if isinstance(identity, dict) else identity,
+                engine.shutdown.remote(),
+            )
+            self._pending_shutdowns[slot] = pending
+        try:
+            ray.get(pending[3], timeout=self.spec.teardown_timeout_s)
+        except ray.exceptions.GetTimeoutError:
+            raise
+        except Exception:
+            self._pending_shutdowns.pop(slot, None)
+            raise
+        self._pending_shutdowns.pop(slot, None)
 
     def _cleanup_error(self, slot: int, error: Any) -> str:
         identity = self.release_evidence.get(slot)
@@ -541,15 +606,34 @@ class EnginePool:
                     # must run before ray.kill or the scheduler subprocesses are
                     # orphaned and keep holding GPU memory.
                     try:
-                        ray.get(getattr(engine, method).remote(), timeout=self.spec.teardown_timeout_s)
+                        if method == "shutdown":
+                            self._wait_engine_shutdown(slot, engine)
+                        else:
+                            ray.get(getattr(engine, method).remote(), timeout=self.spec.teardown_timeout_s)
                     except Exception as exc:
+                        if method == "shutdown" and isinstance(exc, ray.exceptions.GetTimeoutError):
+                            identity = self.release_evidence.get(slot)
+                            if identity is not None and (
+                                not isinstance(identity, dict)
+                                or identity.get("incarnation")
+                                or identity.get("pgid") is not None
+                            ):
+                                # Killing a managed server's actor now could
+                                # lose newly learned group proof. Legacy
+                                # engines without group evidence can still
+                                # use their independent node-local receipt.
+                                errors.append(self._cleanup_error(slot, exc))
+                                failed = True
+                                break
                         # Routing/DCS bookkeeping is not a GPU release receipt.
                         if method != "shutdown" or getattr(exc, "released", False):
                             logger.warning(self._log(f"slot={slot} {method}: {exc}"))
                             continue
+                        self._merge_cleanup_evidence(slot, exc)
                         try:
                             released = self._confirm_orphan_release(slot)
                         except Exception as proof_error:
+                            self._merge_cleanup_evidence(slot, proof_error)
                             released = False
                             exc = proof_error
                         if not released:
@@ -585,6 +669,8 @@ class EnginePool:
             self._remove_owned_pg(slot)
             self.slots[slot] = None
             self._exit_receipts.pop(slot, None)
+            self._orphan_cleanups.pop(slot, None)
+            self._pending_shutdowns.pop(slot, None)
         for head in self.head_slots():
             if all(engine is None for engine in self.slots[head : head + self.nodes_per_engine]):
                 self._states[head] = EngineState.DEAD

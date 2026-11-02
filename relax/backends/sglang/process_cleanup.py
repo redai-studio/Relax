@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import signal
 import time
+from copy import deepcopy
 from typing import Any, Callable
 
 from relax.utils.logging_utils import get_logger
@@ -26,15 +27,57 @@ def inherit_server_incarnation() -> None:
     os.environ["SPT_NOENV"] = "1"
     # The server's runtime token enters spawn/exec descendants' /proc/environ.
     # CPU preprocessors forked after this assignment may lack that exec-time
-    # marker; preserve SGLang's pool mode. They cannot use the parent's
-    # initialized CUDA context and hold no CUDA context of their own, so this
-    # does not weaken GPU exit proof. Live-parent traversal still cleans them.
+    # marker; preserve SGLang's pool mode. The isolated process group also
+    # accounts for these workers after their server has exited.
 
 
 class RouterCleanupError(RuntimeError):
     """Routing cleanup failed after the server tree confirmed exit."""
 
     released = True
+
+
+class ServerCleanupError(RuntimeError):
+    """Unconfirmed exit with generation-bound partial evidence for retry."""
+
+    def __init__(self, message: str, identity: dict) -> None:
+        super().__init__(message)
+        self.identity = deepcopy(identity)
+
+    def __reduce__(self) -> tuple:
+        return ServerCleanupError, (str(self), self.identity)
+
+
+def _process_is_live(process: Any) -> bool:
+    import psutil
+
+    try:
+        # Linux can retain a zombie thread-group leader while its other
+        # threads still run (or wait in D state). Only a lone zombie is done.
+        return process.is_running() and (process.status() != psutil.STATUS_ZOMBIE or process.num_threads() > 1)
+    except psutil.NoSuchProcess:
+        return False
+
+
+def wait_server_process_group(process: Any, timeout: float) -> int | None:
+    """Wait for this spawn child to become a leader, without reaping it."""
+    import psutil
+
+    deadline = time.monotonic() + timeout
+    try:
+        parent = psutil.Process(process.pid)
+        while True:
+            pgid = os.getpgid(parent.pid)
+            if not _process_is_live(parent):
+                return None
+            if pgid == parent.pid:
+                return pgid
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(0.01, remaining))
+    except (psutil.NoSuchProcess, ProcessLookupError):
+        return None
 
 
 def capture_server_identity(process: Any, *, node_id: str, port: int, timeout: float = 5.0) -> dict:
@@ -56,23 +99,12 @@ def capture_server_identity(process: Any, *, node_id: str, port: int, timeout: f
         ),
     }
     if identity.get("incarnation"):
-        # Followers return before the child enters its target. Never capture
-        # the inherited Ray actor PGID; only this same server can be leader.
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                pgid = os.getpgid(parent.pid)
-                if not parent.is_running() or parent.status() == psutil.STATUS_ZOMBIE:
-                    break
-                if pgid == parent.pid:
-                    identity["pgid"] = pgid
-                    return identity
-            except (psutil.NoSuchProcess, ProcessLookupError):
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.01, remaining))
+        # Never capture the inherited Ray actor PGID, including after a
+        # bounded follower startup wait expired before the target ran.
+        pgid = wait_server_process_group(parent, timeout=timeout)
+        if pgid is not None:
+            identity["pgid"] = pgid
+            return identity
         logger.warning(
             "Server pid=%s node=%s did not establish its own process group within %.2fs; "
             "falling back to PID/token evidence",
@@ -87,6 +119,15 @@ def cleanup_server_identity(
     identity: dict, timeout: float = 10.0, *, _reap_server: Callable[[], None] | None = None
 ) -> None:
     """Node-local exit proof; never signal a PID belonging to a new process."""
+    try:
+        _cleanup_server_identity(identity, timeout, _reap_server=_reap_server)
+    except Exception as error:
+        # Ray task arguments are copies. Return learned PGID/exit facts even
+        # on failure so the owner can retry without losing partial evidence.
+        raise ServerCleanupError(str(error), identity) from error
+
+
+def _cleanup_server_identity(identity: dict, timeout: float, *, _reap_server: Callable[[], None] | None) -> None:
     import psutil
 
     records = identity.get("processes")
@@ -94,11 +135,35 @@ def cleanup_server_identity(
         raise RuntimeError("Missing server process-tree identity")
     token = identity.get("incarnation")
     pgid = identity.get("pgid")
+    server_record = next((record for record in records if record["pid"] == identity.get("server_pid")), None)
+    if pgid is None and token and server_record is not None:
+        try:
+            parent = psutil.Process(server_record["pid"])
+            if (
+                parent.create_time() == server_record["create_time"]
+                and _process_is_live(parent)
+                and os.getpgid(parent.pid) == parent.pid
+            ):
+                # A cached fallback identity may predate the slow spawn's
+                # setpgid. Upgrade only the same, still-live server.
+                pgid = parent.pid
+                identity["pgid"] = pgid
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            pass
     if pgid is not None and (
         type(pgid) is not int or pgid <= 1 or pgid != identity.get("server_pid") or pgid in (os.getpgrp(), os.getpid())
     ):
         raise RuntimeError(f"Unsafe server process group: {pgid!r}")
+    if pgid is not None and server_record is None:
+        raise RuntimeError("Missing server creation time for process group")
     deadline = time.monotonic() + timeout
+    group_key = [pgid, server_record["create_time"] if server_record is not None else None, token]
+    group_released = pgid is None or identity.get("released_process_group") == group_key
+
+    def record_group_release() -> None:
+        nonlocal group_released
+        group_released = True
+        identity["released_process_group"] = group_key
 
     def members() -> list:
         processes = {}
@@ -123,59 +188,59 @@ def cleanup_server_identity(
         return list(processes.values())
 
     def live(processes: list) -> list:
-        result = []
-        for process in processes:
-            try:
-                if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
-                    result.append(process)
-            except psutil.NoSuchProcess:
-                pass
-        return result
+        return [process for process in processes if _process_is_live(process)]
 
-    def group_exists() -> bool:
-        if pgid is None:
-            return False
+    def group_retired() -> bool:
+        if not group_released:
+            try:
+                # Linux cannot reuse this PID while the old group exists.
+                # A different leader proves the old group was emptied. Latch
+                # that proof even if this new leader subsequently disappears.
+                leader = psutil.Process(pgid)
+                if leader.create_time() != server_record["create_time"]:
+                    record_group_release()
+            except psutil.NoSuchProcess:
+                # A dead leader does not disown its surviving fork workers,
+                # which may have no exec-time token in /proc/environ.
+                pass
+        return group_released
+
+    def live_group_after_kill() -> list:
+        if group_retired():
+            return []
         try:
             os.killpg(pgid, 0)
         except ProcessLookupError:
-            return False
-        # EPERM and zombies are not exit proof. Only ESRCH means empty.
-        return True
-
-    def owns_group(processes: list) -> bool:
-        # Revalidate each signal, including group membership: a token-bearing
-        # escapee cannot authorize killing a different generation's reused PGID.
-        for record in records:
-            if record["pid"] != pgid:
-                continue
+            record_group_release()
+            return []
+        # This fresh enumeration is AFTER a successful group SIGKILL. Linux
+        # checks pending fatal signals before publishing a fork into its group,
+        # so membership can only shrink now. Zombies hold no GPU resources;
+        # init need not reap them for release. D/stopped/unreadable members
+        # still prevent proof. Never substitute the earlier PID/token snapshot.
+        remaining = []
+        # process_iter caches Process identities by PID. A reused cached PID
+        # could make is_running() hide a current, still-live group member.
+        for pid in psutil.pids():
             try:
-                parent = psutil.Process(record["pid"])
-                if parent.create_time() == record["create_time"] and os.getpgid(parent.pid) == pgid:
-                    return True
+                process = psutil.Process(pid)
+                if os.getpgid(process.pid) == pgid:
+                    remaining.extend(live([process]))
             except (psutil.NoSuchProcess, ProcessLookupError):
                 pass
-        if token:
-            for process in processes:
-                try:
-                    if (
-                        process.is_running()
-                        and process.environ().get(SERVER_INCARNATION_ENV) == token
-                        and os.getpgid(process.pid) == pgid
-                    ):
-                        return True
-                except (psutil.AccessDenied, psutil.NoSuchProcess, ProcessLookupError):
-                    pass
-        return False
+        if not remaining:
+            record_group_release()
+        return remaining
 
     processes = members()
     while True:
-        if group_exists() and owns_group(processes):
+        if not group_retired():
             try:
                 # Unlike a PID snapshot, group SIGKILL also covers descendants
                 # born while enumerating. SGLang does not leave its group.
                 os.killpg(pgid, signal.SIGKILL)
             except ProcessLookupError:
-                pass
+                record_group_release()
         for process in reversed(processes):
             try:
                 process.kill()  # psutil also guards against PID reuse after lookup.
@@ -184,7 +249,9 @@ def cleanup_server_identity(
         if _reap_server is not None:
             _reap_server()
         remaining = max(0.0, deadline - time.monotonic())
-        waiting = [p for p in live(processes) if pgid is None or p.pid != identity["server_pid"]]
+        waiting = [
+            p for p in live(processes) if (pgid is None and _reap_server is None) or p.pid != identity["server_pid"]
+        ]
         # The actor's multiprocessing.Process must reap its own server. A
         # psutil waitpid here would steal its exit status and prevent join.
         _, alive = psutil.wait_procs(waiting, timeout=min(0.1, remaining) if token or pgid else remaining)
@@ -194,18 +261,18 @@ def cleanup_server_identity(
         # Re-scan in the same budget after stopping the known members.
         # An unreadable later scan cannot revoke a known member's still-live
         # identity. Retain it until exit is confirmed, even after reparenting.
-        processes = list({p.pid: p for p in live([*alive, *members()])}.values()) if token or pgid else live(alive)
-        if not processes and not group_exists():
+        processes = (
+            list({p.pid: p for p in live([*alive, *members(), *live_group_after_kill()])}.values())
+            if token or pgid
+            else live(alive)
+        )
+        if not processes and group_released:
             return
         if not (token or pgid) or time.monotonic() >= deadline:
             raise RuntimeError(
                 f"Server worker exit was not confirmed: {[p.pid for p in processes]}; process group={pgid} "
-                "(requires a current generation member to signal and ESRCH to confirm exit)"
+                "(requires exit of PID/token escapees and no live group members after SIGKILL)"
             )
-        if not processes:
-            # A group containing only zombies, or without a readable anchor,
-            # remains fenced while its parent/init gets time to reap it.
-            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
 
 def terminate_server(
@@ -221,7 +288,10 @@ def terminate_server(
         cleanup_server_identity(
             identity,
             timeout=timeout,
-            _reap_server=(lambda: process.join(timeout=0)) if identity.get("pgid") is not None else None,
+            _reap_server=(lambda: process.join(timeout=0))
+            if (identity.get("incarnation") or identity.get("pgid") is not None)
+            and callable(getattr(process, "join", None))
+            else None,
         )
         return
     try:

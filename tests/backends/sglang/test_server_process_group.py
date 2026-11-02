@@ -103,7 +103,10 @@ def _recv(pipe):
 
 
 def _alive(proc):
-    return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    try:
+        return proc.is_running() and (proc.status() != psutil.STATUS_ZOMBIE or proc.num_threads() > 1)
+    except psutil.NoSuchProcess:
+        return False
 
 
 class Follower:
@@ -122,7 +125,11 @@ class Follower:
             "os": os,
             "uuid": uuid,
             "ServerArgs": SimpleNamespace,
-            "Envs": SimpleNamespace(RELAX_OPTIMIZE_ROUTING_REPLAY=False, RELAX_OPD_PER_POS_TOKEN_IDS=False),
+            "Envs": SimpleNamespace(
+                RELAX_OPTIMIZE_ROUTING_REPLAY=False,
+                RELAX_OPD_PER_POS_TOKEN_IDS=False,
+                RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S=900.0,
+            ),
             "logger": get_logger(__name__),
             "_launch_server_with_patches": _entry,
             "_wait_server_healthy": lambda **kw: pytest.fail("follower unexpectedly waited for readiness"),
@@ -406,7 +413,7 @@ def test_terminate_reaps_zombie_server_before_confirming_empty_group(delayed_ser
 
 
 @pytest.mark.parametrize("escaped_token", [False, True])
-def test_cleanup_never_signals_reused_group_even_with_token_outside_it(delayed_server, monkeypatch, escaped_token):
+def test_cleanup_treats_reused_group_as_empty_without_signalling_it(delayed_server, monkeypatch, escaped_token):
     import subprocess
 
     from relax.backends.sglang.process_cleanup import cleanup_server_identity
@@ -442,10 +449,9 @@ def test_cleanup_never_signals_reused_group_even_with_token_outside_it(delayed_s
                 env={**os.environ, TOKEN: identity["incarnation"]},
             )
             assert escaped.stdout.readline().strip() == "ready"
-        with pytest.raises(RuntimeError, match="group"):
-            cleanup_server_identity(identity, timeout=0.03)
+        cleanup_server_identity(identity, timeout=0.5)
         assert foreign.is_alive()
-        assert signals and all(sig == 0 for _, sig in signals)
+        assert signals == []
         if escaped is not None:
             assert escaped.wait(timeout=2) is not None
     finally:

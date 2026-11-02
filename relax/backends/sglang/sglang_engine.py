@@ -421,6 +421,18 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     p.start()
 
     if server_args.node_rank != 0:
+        from relax.backends.sglang.process_cleanup import wait_server_process_group
+
+        # Spawn imports SGLang/torch and unpickles ServerArgs before the target
+        # can isolate its group. Wait on the startup scale, not capture's short
+        # fallback budget. Keep the handle even on timeout so cleanup owns it.
+        timeout = Envs.RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S
+        if wait_server_process_group(p, timeout=timeout) is None:
+            logger.warning(
+                "Server pid=%s did not establish its own process group within %.2fs; preserving PID/token evidence",
+                p.pid,
+                timeout,
+            )
         return p
 
     _wait_server_healthy(

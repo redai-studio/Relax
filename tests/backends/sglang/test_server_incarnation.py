@@ -6,6 +6,7 @@ import ast
 import concurrent.futures
 import multiprocessing
 import os
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -17,6 +18,13 @@ import pytest
 
 pytest_plugins = ["tests.backends.sglang.test_router_registration"]
 TOKEN_ENV = "RELAX_SGLANG_SERVER_INCARNATION"
+
+
+def _alive(process):
+    try:
+        return process.is_running() and (process.status() != psutil.STATUS_ZOMBIE or process.num_threads() > 1)
+    except psutil.NoSuchProcess:
+        return False
 
 
 def _worker_identity():
@@ -98,6 +106,7 @@ def follower(monkeypatch, sglang_engine_module, request):
     monkeypatch.setattr(module, "ServerArgs", SimpleNamespace)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
     monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S", 900.0, raising=False)
     monkeypatch.setattr(
         module, "_wait_server_healthy", lambda **kwargs: pytest.fail("a follower must still return before readiness")
     )
@@ -153,7 +162,7 @@ def _exit_parent(record):
     record.pipe.send("parent exits")
     record.process.join(timeout=5)
     assert not record.process.is_alive()
-    assert record.worker.is_running() and record.worker.status() != psutil.STATUS_ZOMBIE
+    assert _alive(record.worker)
 
 
 @pytest.mark.parametrize("follower", ["spawn"], indirect=True)
@@ -165,14 +174,14 @@ def test_follower_shutdown_cleans_late_worker_without_killing_other_incarnation(
     _exit_parent(other)
 
     old.engine.shutdown()
-    assert not old.worker.is_running() or old.worker.status() == psutil.STATUS_ZOMBIE
+    assert not _alive(old.worker)
     assert old.engine.process is None
-    assert other.worker.is_running() and other.worker.status() != psutil.STATUS_ZOMBIE
+    assert _alive(other.worker)
     assert old_token == old_proc_token == old.engine._release_evidence["incarnation"]
     assert other_token == other_proc_token == other.engine._release_evidence["incarnation"]
     assert old_token != other_token
     other.engine.shutdown()
-    assert not other.worker.is_running() or other.worker.status() == psutil.STATUS_ZOMBIE
+    assert not _alive(other.worker)
 
 
 @pytest.mark.parametrize("follower", ["cpu_pool"], indirect=True)
@@ -186,12 +195,150 @@ def test_live_parent_shutdown_cleans_fork_cpu_pool_without_killing_other_incarna
     # shutdown find them through descendants without changing the pool mode.
     assert old.worker in psutil.Process(old.process.pid).children(recursive=True)
     old.engine.shutdown()
-    assert not old.worker.is_running() or old.worker.status() == psutil.STATUS_ZOMBIE
+    assert not _alive(old.worker)
     assert old.engine.process is None
     assert other.process.is_alive()
-    assert other.worker.is_running() and other.worker.status() != psutil.STATUS_ZOMBIE
+    assert _alive(other.worker)
     other.engine.shutdown()
-    assert not other.worker.is_running() or other.worker.status() == psutil.STATUS_ZOMBIE
+    assert not _alive(other.worker)
+
+
+@pytest.mark.parametrize("follower", ["cpu_pool"], indirect=True)
+def test_reaped_server_group_still_owns_fork_workers_without_proc_token(follower):
+    from relax.backends.sglang.process_cleanup import cleanup_server_identity
+
+    old, other = follower(), follower()
+    for record in (old, other):
+        token, proc_token = _start_late_worker(record)
+        assert record.start_method == "fork"
+        assert token == record.engine._release_evidence["incarnation"]
+        assert proc_token is None
+        _exit_parent(record)
+        assert not psutil.pid_exists(record.process.pid)
+        assert os.getpgid(record.worker.pid) == record.process.pid
+    cleanup_server_identity(old.engine._release_evidence, timeout=0.5)
+    assert not _alive(old.worker)
+    assert _alive(other.worker)
+    cleanup_server_identity(other.engine._release_evidence, timeout=0.5)
+    assert not _alive(other.worker)
+
+
+@pytest.mark.parametrize("split_retry", [False, True])
+@pytest.mark.parametrize("follower", ["cpu_pool"], indirect=True)
+def test_reused_group_stays_retired_when_new_leader_exits_while_cleaning_escapee(follower, monkeypatch, split_retry):
+    import subprocess
+
+    from relax.backends.sglang.process_cleanup import cleanup_server_identity
+
+    foreign = follower()
+    _start_late_worker(foreign)
+    identity = {
+        "server_pid": foreign.process.pid,
+        "pgid": foreign.process.pid,
+        "incarnation": "retired-server-generation",
+        "processes": [
+            {"pid": foreign.process.pid, "create_time": psutil.Process(foreign.process.pid).create_time() - 100}
+        ],
+    }
+    escaped = subprocess.Popen(
+        [sys.executable, "-c", 'import sys; print("ready", flush=True); sys.stdin.read()'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        env={**os.environ, TOKEN_ENV: identity["incarnation"]},
+    )
+    try:
+        assert escaped.stdout.readline().strip() == "ready"
+        kill = psutil.Process.kill
+        attempts = []
+        retrying = False
+
+        def delay_escapee_exit(proc):
+            if proc.pid == escaped.pid:
+                attempts.append(proc.pid)
+                if len(attempts) == 1:
+                    # Group reuse has already been observed, then its new
+                    # leader exits. Its foreign fork worker must stay alive.
+                    _exit_parent(foreign)
+                    return
+                if split_retry and not retrying:
+                    return
+            return kill(proc)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(os, "killpg", lambda *a: pytest.fail("signalled a retired/reused group"))
+            patcher.setattr(psutil.Process, "kill", delay_escapee_exit)
+            if split_retry:
+                with pytest.raises(RuntimeError, match="exit was not confirmed"):
+                    cleanup_server_identity(identity, timeout=0)
+                retrying = True
+            cleanup_server_identity(identity, timeout=10)
+        assert len(attempts) >= 2
+        assert escaped.wait(timeout=2) is not None
+        assert not psutil.pid_exists(foreign.process.pid)
+        assert _alive(foreign.worker)
+        assert os.getpgid(foreign.worker.pid) == identity["pgid"]
+    finally:
+        if escaped.poll() is None:
+            escaped.kill()
+        escaped.wait(timeout=2)
+        escaped.stdin.close()
+        escaped.stdout.close()
+
+
+@pytest.mark.parametrize("follower", ["cpu_pool"], indirect=True)
+def test_post_kill_group_scan_ignores_stale_process_iter_identity(follower, monkeypatch):
+    from relax.backends.sglang.process_cleanup import cleanup_server_identity
+
+    record = follower()
+    _start_late_worker(record)
+    _exit_parent(record)
+    stale = psutil.Process(record.worker.pid)
+    stale._ident = (stale.pid, stale.create_time() - 100)
+    killpg = os.killpg
+
+    def delayed_group_kill(pgid, sig):
+        if pgid == record.process.pid and sig == signal.SIGKILL:
+            return
+        return killpg(pgid, sig)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(psutil, "process_iter", lambda: iter([stale]))
+        patcher.setattr(os, "killpg", delayed_group_kill)
+        patcher.setattr(psutil.Process, "kill", lambda proc: None)
+        with pytest.raises(RuntimeError, match="exit was not confirmed"):
+            cleanup_server_identity(record.engine._release_evidence, timeout=0)
+        assert _alive(record.worker)
+    cleanup_server_identity(record.engine._release_evidence, timeout=2)
+    assert not _alive(record.worker)
+
+
+@pytest.mark.parametrize("follower", ["cpu_pool"], indirect=True)
+def test_upgraded_group_evidence_survives_exit_pending_timeout(follower, monkeypatch):
+    from relax.backends.sglang.process_cleanup import cleanup_server_identity
+
+    record = follower()
+    _start_late_worker(record)
+    identity = record.engine._release_evidence
+    identity.pop("pgid")
+    killpg = os.killpg
+
+    def delayed_group_kill(pgid, sig):
+        if pgid == record.process.pid and sig == signal.SIGKILL:
+            _exit_parent(record)
+            return
+        return killpg(pgid, sig)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(os, "killpg", delayed_group_kill)
+        patcher.setattr(psutil.Process, "kill", lambda proc: None)
+        with pytest.raises(RuntimeError, match="exit was not confirmed"):
+            cleanup_server_identity(identity, timeout=0)
+    assert identity["pgid"] == record.process.pid
+    assert _alive(record.worker)
+    cleanup_server_identity(identity, timeout=2)
+    assert not _alive(record.worker)
 
 
 @pytest.mark.parametrize("follower", ["spawn"], indirect=True)
@@ -222,7 +369,7 @@ def test_shutdown_rescans_workers_spawned_during_the_first_membership_scan(follo
     monkeypatch.setattr(psutil, "process_iter", enumerate_processes)
     record.engine.shutdown()
     assert len(enumerations) >= 2
-    assert not record.worker.is_running() or record.worker.status() == psutil.STATUS_ZOMBIE
+    assert not _alive(record.worker)
 
 
 def test_cleanup_keeps_known_live_worker_when_its_environment_becomes_unreadable(monkeypatch):
