@@ -225,6 +225,49 @@ def test_initialized_data_system_preserves_storage_and_affinity(
     assert closed == (["mooncake-owner"] if stage == "attach" else [])
 
 
+@pytest.mark.parametrize(
+    ("fully_async", "hybrid", "balance_data", "placement"),
+    [
+        (True, True, True, "balanced"),
+        (True, True, False, "streaming"),
+        (True, False, False, "streaming"),
+        (True, False, True, "streaming"),
+        (False, False, True, "balanced"),
+        (False, False, False, "sequential"),
+    ],
+)
+def test_controller_hybrid_balance_selects_count_window_placement(
+    monkeypatch: pytest.MonkeyPatch, fully_async: bool, hybrid: bool, balance_data: bool, placement: str
+) -> None:
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = _config(
+        tq_rdma_mode="off",
+        fully_async=fully_async,
+        hybrid=hybrid,
+        balance_data=balance_data,
+        use_dynamic_batch_size=True,
+        polling_mode=False,
+    )
+    selected: list[str] = []
+
+    def sampler(**kwargs: Any) -> object:
+        selected.append(kwargs["placement"])
+        assert kwargs["dp_size"] == 2
+        return object()
+
+    monkeypatch.setattr(controller, "resolve_sft_algo_key", lambda _config: "grpo")
+    monkeypatch.setattr(controller, "compute_dp_size", lambda _config: 2)
+    monkeypatch.setattr(controller, "IdentityWindowSampler", sampler)
+    monkeypatch.setattr(controller, "with_control_plane_affinity", lambda _: {})
+    monkeypatch.setattr(controller, "reap_unusable_tq_controller", lambda: None)
+    monkeypatch.setattr(instance, "_resolve_tq_backend", lambda: {"storage_backend": "SimpleStorage"})
+    monkeypatch.setattr(controller.tq, "init", lambda conf: conf)
+
+    instance._initialize_data_system()
+
+    assert selected == [placement]
+
+
 def test_cli_exposes_only_mode_and_device(arguments_module: Any) -> None:
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = argparse.ArgumentParser()

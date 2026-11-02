@@ -45,8 +45,8 @@ def test_image_recipe_three_path_environment(script):
     assert rendered["runtime_env"]["env_vars"]["RELAX_SKIP_NONFINITE_GRAD"] == "1"
 
 
-@pytest.mark.parametrize("script,busy", [(SFT, False), (CPT, False), (QSA, False), (QSA, True)])
-def test_recipe_delegates_without_cluster_cleanup(tmp_path, script, busy):
+@pytest.mark.parametrize("script", [SFT, CPT, QSA])
+def test_recipe_delegates_without_cluster_cleanup(tmp_path, script):
     import shutil
 
     target = tmp_path / script
@@ -63,13 +63,12 @@ def test_recipe_delegates_without_cluster_cleanup(tmp_path, script, busy):
     env.update(MEGATRON="/runtime/megatron", RAY_JOBS_ADDRESS="http://127.0.0.1:8265")
     fake_ray = tmp_path / "bin/ray"
     fake_ray.parent.mkdir()
-    fake_ray.write_text("#!/bin/sh\nprintf RUNNING\n" if busy else "#!/bin/sh\nexit 0\n")
+    ray_trace = tmp_path / "ray-called"
+    env["MOCK_RAY_TRACE"] = str(ray_trace)
+    fake_ray.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$MOCK_RAY_TRACE"\nexit 1\n')
     fake_ray.chmod(0o755)
     env["PATH"] = str(fake_ray.parent) + os.pathsep + env["PATH"]
     result = subprocess.run(["bash", str(target)], env=env, capture_output=True, text=True, timeout=10)
-    if busy:
-        assert result.returncode == 2
-        assert "refusing concurrent training" in result.stderr
-        return
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["1", "http://127.0.0.1:8265"]
+    assert not ray_trace.exists(), "Recipes must delegate Ray operations to the entrypoint"

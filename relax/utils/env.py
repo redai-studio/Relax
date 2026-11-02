@@ -225,6 +225,10 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_QWEN38_HC_FUSED_COMBINE = EnvProperty("RELAX_QWEN38_HC_FUSED_COMBINE", bool, False)
     RELAX_QWEN38_PLE_FUSED_CONV = EnvProperty("RELAX_QWEN38_PLE_FUSED_CONV", bool, False)
     RELAX_SFT_FUSED_LINEAR_CE = EnvProperty("RELAX_SFT_FUSED_LINEAR_CE", bool, False)
+    # Independent opt-ins for K3 training operator benchmarks and deployment.
+    RELAX_KIMI_K3_EXPERT_SPLIT = EnvProperty("RELAX_KIMI_K3_EXPERT_SPLIT", bool, False)
+    RELAX_KIMI_K3_FUSED_SITU = EnvProperty("RELAX_KIMI_K3_FUSED_SITU", bool, False)
+    RELAX_KIMI_K3_FUSED_ATTN_RES = EnvProperty("RELAX_KIMI_K3_FUSED_ATTN_RES", bool, False)
     NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN = EnvProperty("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", str, "")
     RELAX_QWEN38_RETAIN_QSA_ATTENTION = EnvProperty("RELAX_QWEN38_RETAIN_QSA_ATTENTION", bool, False)
     RELAX_QWEN38_ROUTER_SORTED_REPLAY = EnvProperty("RELAX_QWEN38_ROUTER_SORTED_REPLAY", bool, False)

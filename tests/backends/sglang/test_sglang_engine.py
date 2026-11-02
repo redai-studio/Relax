@@ -192,7 +192,7 @@ def test_expert_sync_auto_uses_scheduler_config_and_dtype_resolver(
     engine.node_rank, engine.worker_type = 0, "regular"
     engine.server_host, engine.server_port = "localhost", 1234
     if local_engine:
-        engine.process = object()
+        engine.process = Mock(is_alive=Mock(return_value=False))
     startup = dict(
         model_path="/test/model",
         dtype="auto",

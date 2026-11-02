@@ -354,6 +354,7 @@ class Controller:
         if (
             getattr(self.config, "fully_async", False)
             and getattr(self.config, "use_dynamic_batch_size", False)
+            and not (getattr(self.config, "hybrid", False) and getattr(self.config, "balance_data", False))
             and not use_sft_prepack
         ):
             sampler = IdentityWindowSampler(
@@ -1343,7 +1344,9 @@ class Controller:
                         handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async())
                     if ROLES.reference in self.serve_dict:
                         handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async())
-                    [await handle for handle in handles]
+                    # Start senders and receivers together, and await the real
+                    # Serve responses before set_step or generation can start.
+                    await asyncio.gather(*handles)
                 if ROLES.actor in self.serve_dict:
                     step = await self.serve_dict[ROLES.actor].get_step()
                     for service in self.serve_dict.values():
