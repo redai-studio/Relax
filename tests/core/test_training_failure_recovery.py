@@ -299,6 +299,7 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
         "maybe_pin_baseline_to_stable": Mock(),
         "logger": logging.getLogger(__name__),
         "_graceful_shutdown": shutdown,
+        "_run_recorder": Mock(),
     }
     with pytest.raises(SystemExit) as caught:
         exec(code, scope)

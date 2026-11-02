@@ -180,6 +180,7 @@ def _opd_args() -> SimpleNamespace:
         colocate=False,
         hybrid=False,
         fully_async=False,
+        enable_weights_backuper=True,
     )
 
 
