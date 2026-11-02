@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
@@ -343,6 +344,10 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
       installs ``_patched_run_scheduler_process``, which applies the
       routing-replay patch unconditionally.
     """
+    from relax.backends.sglang.process_cleanup import inherit_server_incarnation
+
+    inherit_server_incarnation()
+
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
@@ -403,6 +408,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     )
 
     p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
+    # Spawn carries Process metadata into current_process() without tagging the
+    # Ray actor or its unrelated children with this server's generation.
+    p._relax_server_incarnation = uuid.uuid4().hex
     p.start()
 
     if server_args.node_rank != 0:
