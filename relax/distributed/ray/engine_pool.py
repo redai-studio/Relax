@@ -262,10 +262,9 @@ class EnginePool:
             self.release_evidence[slot] = identity
         node_id = identity["node_id"]
         node = next((node for node in ray.nodes() if node["NodeID"] == node_id), None)
-        if node is not None and node["Alive"] is False:
-            logger.warning(self._log(f"Node {node_id} is DEAD; releasing slot={slot} on that node"))
-            return True
-        if node is None:
+        if node is None or not node["Alive"]:
+            # GCS liveness says nothing about a partitioned node's server tree
+            # or GPU allocations. Retry node-local proof when it is reachable.
             return False
         engine = self.slots[slot]
         try:
@@ -293,7 +292,8 @@ class EnginePool:
         return (
             f"slot={slot} node={identity.get('node_id', 'unknown')} "
             f"pid={identity.get('server_pid', 'unknown')} port={identity.get('port', self.addresses.get(slot, {}).get('port'))}: "
-            f"{error}. On that node, inspect the recorded PID creation time and its SGLang workers "
+            f"{error}. GCS node DEAD is not server/GPU release evidence. "
+            "On that node, inspect the recorded PID creation time and its SGLang workers "
             "with ps and nvidia-smi; confirm or terminate only that process tree, then retry recovery/shutdown. "
             "If proof remains unavailable, stop the job and restart from checkpoint after node cleanup."
         )

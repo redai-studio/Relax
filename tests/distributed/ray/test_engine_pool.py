@@ -151,6 +151,65 @@ def test_dead_actor_can_retire_after_node_local_release_proof(cluster, monkeypat
     assert pool.incarnations[0] == 2
 
 
+@pytest.mark.parametrize("owns_pg", [False, True])
+def test_dead_node_keeps_live_server_fenced_until_node_local_proof(cluster, monkeypatch, owns_pg):
+    import subprocess
+
+    from ray.core.generated.gcs_pb2 import ActorTableData
+
+    from relax.backends.sglang.process_cleanup import capture_server_identity
+    from relax.engine.inference.ownership import ResourceBlockedError
+
+    process = subprocess.Popen(["sleep", "60"])
+    try:
+        pool = _make_pool(cluster, 2, owns_pg=owns_pg)
+        pool.start()
+        engine = pool.slots[0]
+        engine.fail.update(
+            release_memory_occupation=engine_pool.ray.exceptions.RayActorError(),
+            shutdown=engine_pool.ray.exceptions.RayActorError(),
+        )
+        engine._get_local_state = lambda: ActorTableData.DEAD
+        pool.release_evidence[0] = capture_server_identity(process, node_id="ab" * 28, port=18000)
+        node = {"NodeID": "ab" * 28, "Alive": False}
+        monkeypatch.setattr(engine_pool.ray, "nodes", lambda: [node])
+        monkeypatch.setattr(engine_pool.ray, "kill", lambda handle, **kwargs: cluster.killed.append(handle))
+        proofs = []
+        receipt = object()
+
+        def node_task(function):
+            def run(identity):
+                proofs.append(identity)
+                function(identity)
+                return receipt
+
+            return SimpleNamespace(options=lambda **kwargs: SimpleNamespace(remote=run))
+
+        monkeypatch.setattr(engine_pool.ray, "remote", lambda **kwargs: node_task)
+        monkeypatch.setattr(
+            engine_pool.ray, "get", lambda ref, timeout=None: None if ref is receipt else cluster.get(ref, timeout)
+        )
+        with pytest.raises(ResourceBlockedError, match="checkpoint"):
+            pool.deactivate()
+        assert process.poll() is None
+        assert pool.slots[0] is engine and 0 in pool.placements
+        assert pool.state(0) is EngineState.BLOCKED and pool.is_active()
+        assert pool.state(1) is not EngineState.BLOCKED
+        assert cluster.removed_pgs == [] and proofs == []
+
+        node["Alive"] = True
+        assert pool.deactivate() == [0]
+        assert process.poll() is not None and len(proofs) == 1
+        assert 0 not in pool.placements
+        assert cluster.removed_pgs == (["pg-0"] if owns_pg else [])
+        assert pool.activate() == {0}
+        assert pool.state(0) is READY
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+
+
 def test_failed_onload_still_releases_every_partially_resident_engine(cluster):
     pool = _make_pool(cluster, 2)
     pool.start()
