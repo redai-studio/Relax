@@ -252,9 +252,10 @@ class GenRM(Base):
             return next(iter(self.genrm_managers))
         key = route_key or _DEFAULT_INSTANCE_KEY
         if key not in self.genrm_managers:
-            raise RuntimeError(
-                f"No GenRM instance registered for route_key={key!r}; available={list(self.genrm_managers)}"
-            )
+            detail = f"No GenRM instance registered for route_key={key!r}; available={list(self.genrm_managers)}"
+            if route_key is None:
+                raise RuntimeError(detail)  # Preserve ambiguous programmatic lookup.
+            raise HTTPException(status_code=400, detail=detail)
         return key
 
     async def _call_engine(
@@ -305,7 +306,7 @@ class GenRM(Base):
         instances = {}
         for key, manager in self.genrm_managers.items():
             try:
-                is_healthy = ray.get(manager.health_check.remote())
+                is_healthy = await asyncio.wait_for(manager.health_check.remote(), timeout=SNAPSHOT_FETCH_TIMEOUT_S)
                 instances[key] = {"status": "healthy" if is_healthy else "unhealthy"}
             except Exception as e:
                 self._logger.error(f"GenRM health check failed for instance '{key}': {e}")

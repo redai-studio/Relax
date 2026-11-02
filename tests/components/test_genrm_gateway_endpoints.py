@@ -37,7 +37,11 @@ class _Manager:
     def _call(self, method: str):
         self.calls.append(method)
         if method == "health_check":
-            return True
+
+            async def result():
+                return True
+
+            return result()
         if method != "get_inference_snapshot":
             return None
         return {
@@ -248,7 +252,7 @@ async def test_genrm_gateway_and_legacy_path_select_same_instance(monkeypatch, i
 
     try:
         legacy = genrm._resolve_instance_key(route_key)
-    except RuntimeError:
+    except (RuntimeError, HTTPException):
         legacy = None
     try:
         unified = (await genrm._gateway.resolve(route_key=route_key)).model
@@ -268,3 +272,33 @@ def test_genrm_registers_unified_routes_alongside_legacy_ones():
 
     assert {"/engines", "/v1/models", "/generate", "/chat/completions", "/v1/chat/completions"} <= paths
     assert {"/health", "/metrics"} <= paths
+
+
+async def test_genrm_health_awaits_backend_without_blocking_admission(monkeypatch):
+    import asyncio
+
+    genrm = _make_genrm(monkeypatch, "quality")
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def health():
+        entered.set()
+        await finish.wait()
+        return True
+
+    genrm.genrm_managers["quality"].health_check.remote = health
+    task = asyncio.create_task(genrm.health())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not task.done()
+        # Another request can execute while the health probe is held.
+        assert genrm.get_genrm_manager("quality") is genrm.genrm_managers["quality"]
+    finally:
+        finish.set()
+        await task
+
+
+def test_genrm_unknown_instance_key_returns_http_400(monkeypatch):
+    genrm = _make_genrm(monkeypatch, "quality")
+    with pytest.raises(HTTPException) as error:
+        genrm.get_genrm_manager("unknown")
+    assert error.value.status_code == 400
