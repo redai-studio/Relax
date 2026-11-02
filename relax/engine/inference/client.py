@@ -167,9 +167,12 @@ class InferenceRequest:
         self.served_model_name: str | None = None
 
     async def __aenter__(self) -> InferenceRequest:
+        from relax.engine.inference.holder import current_holder
+
         resources = await self._client.resources()
         snapshot = RoleSnapshot.from_dict(resources["snapshot"])
         selection = dict(self._selection)
+        selection["holder"] = current_holder()
         selected = select_model(snapshot, selection.pop("model", None), selection.pop("route_key", None))
         self._manager = resources["managers"][selected.name]
         pending = asyncio.create_task(

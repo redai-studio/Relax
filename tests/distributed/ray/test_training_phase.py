@@ -15,8 +15,8 @@ def actor(monkeypatch):
     events = []
     leases = []
 
-    def acquire(owner, operation, claims, *, role=None):
-        lease = ActivationLease("epoch", owner, operation, len(leases) + 1, tuple(claims), role)
+    def acquire(owner, operation, claims, *, role=None, holder=None, expires_at=None):
+        lease = ActivationLease("epoch", owner, operation, len(leases) + 1, tuple(claims), role, holder)
         leases.append(lease)
         events.append("acquire")
         return lease
@@ -34,7 +34,7 @@ def actor(monkeypatch):
         role="actor",
         _inference_train_resident=False,
     )
-    monkeypatch.setattr(training_phase.ray, "get", lambda value: value)
+    monkeypatch.setattr("ray.get", lambda value, **kwargs: value)
     group = object()
     monkeypatch.setattr(training_phase, "get_gloo_group", lambda: group)
     monkeypatch.setattr(training_phase.dist, "get_rank", lambda g: 0 if g is group else pytest.fail("missing group"))

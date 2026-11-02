@@ -5,10 +5,9 @@
 from functools import wraps
 from typing import Any, Callable
 
-import ray
 import torch.distributed as dist
 
-from relax.engine.inference.phase_client import _CURRENT, PhaseSession
+from relax.engine.inference.phase_client import _CURRENT, PhaseSession, wait_control
 from relax.utils.distributed_utils import get_gloo_group
 
 
@@ -23,12 +22,10 @@ def begin_training_phase(actor: Any) -> PhaseSession | None:
     if rank == 0:
         try:
             if session is None or session.closed:
-                claims = ray.get(authority.claims_for.remote(actor.role))
+                claims = wait_control(authority.claims_for.remote(actor.role), f"training {actor.role} claims")
                 if claims:
                     session = PhaseSession(authority, actor.role, f"train:{actor.role}")
-                    session.lease = ray.get(
-                        authority.acquire.remote(session.owner, session.operation_id, claims, role=actor.role)
-                    )
+                    session.acquire(claims)
                     session.switch("train")
             receipt[0] = session.lease if session is not None and not session.closed else None
         except Exception as error:

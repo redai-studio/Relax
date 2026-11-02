@@ -10,6 +10,7 @@ no expiry: loss of a caller is not evidence that its GPU work has stopped.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -17,6 +18,8 @@ from typing import Any, Iterable
 import ray
 
 from relax.distributed.ray.placement_planner import ACTOR_POOL, Phase, PlacementClaim, PlacementPlan, claims_overlap
+from relax.engine.inference.holder import HolderIdentity, holder_alive
+from relax.utils.env import Envs
 
 
 _TRAINING_ROLES = frozenset({"actor", "critic", "reference", "actor_fwd"})
@@ -42,6 +45,7 @@ class ActivationLease:
     generation: int
     claims: tuple[PlacementClaim, ...]
     role: str | None = None
+    holder: HolderIdentity | None = None
 
 
 def model_key(role: str, model: str) -> str:
@@ -59,7 +63,9 @@ class OwnershipLedger:
         self._condition = asyncio.Condition()
         self._active: dict[str, ActivationLease] = {}
         self._operations: dict[str, ActivationLease] = {}
-        self._pending: dict[str, tuple[str, tuple[PlacementClaim, ...], asyncio.Task]] = {}
+        self._pending: dict[str, tuple[tuple, asyncio.Task]] = {}
+        self._reconciliations: dict[str, asyncio.Task] = {}
+        self._abandoned: dict[str, HolderIdentity | None] = {}
         self._blocked: dict[str, tuple[tuple[PlacementClaim, ...], str]] = {}
         self._resources: dict[str, dict[str, Any]] = {}
         self._models: dict[str, tuple[Any, str, PlacementClaim]] = {}
@@ -135,12 +141,13 @@ class OwnershipLedger:
         if self._training_actors or self._suspect or self._resident or set(self._managers) - self._stopped_managers:
             raise ResourceBlockedError("Cannot replace epoch before all resource owners confirm release")
         async with self._condition:
-            for _, _, task in self._pending.values():
+            for _, task in self._pending.values():
                 task.cancel()
             self.epoch = uuid.uuid4().hex
             self._active.clear()
             self._operations.clear()
             self._pending.clear()
+            self._reconciliations.clear()
             self._blocked.clear()
             self._commands.clear()
             self._locks.clear()
@@ -200,25 +207,37 @@ class OwnershipLedger:
         )
 
     async def acquire(
-        self, owner: str, operation_id: str, claims: Iterable[PlacementClaim], *, role: str | None = None
+        self,
+        owner: str,
+        operation_id: str,
+        claims: Iterable[PlacementClaim],
+        *,
+        role: str | None = None,
+        holder: HolderIdentity | None = None,
+        expires_at: float | None = None,
     ) -> ActivationLease:
         claims = tuple(claims)
+        if operation_id in self._abandoned or (expires_at is not None and time.time() >= expires_at):
+            raise StaleLeaseError("The ownership request was abandoned or expired before dispatch")
         if self._restarting:
             raise OwnershipError("New ownership is closed during restart")
         previous = self._operations.get(operation_id)
         if previous is not None:
-            if previous.owner != owner or previous.claims != claims or previous.role != role:
+            if (previous.owner, previous.claims, previous.role, previous.holder) != (owner, claims, role, holder):
                 raise OwnershipError("An operation ID cannot be reused with different ownership arguments")
             return previous
         pending = self._pending.get(operation_id)
         if pending is not None:
-            if pending[:2] != (owner, claims):
+            if pending[0] != (owner, claims, role, holder):
                 raise OwnershipError("Conflicting retry of a pending ownership operation")
-            return await asyncio.shield(pending[2])
+            return await asyncio.shield(pending[1])
 
         async def grant() -> ActivationLease:
-            async with self._condition:
-                while True:
+            deadline = time.monotonic() + Envs.RELAX_INFERENCE_LEASE_WAIT_S
+            while True:
+                async with self._condition:
+                    if operation_id in self._abandoned or (expires_at is not None and time.time() >= expires_at):
+                        raise StaleLeaseError("The ownership request was abandoned or expired before grant")
                     if self._restarting:
                         raise OwnershipError("New ownership is closed during restart")
                     for suspect, reason in self._suspect.values():
@@ -227,27 +246,115 @@ class OwnershipLedger:
                     for blocked, reason in self._blocked.values():
                         if any(claims_overlap(a, b) for a in claims for b in blocked):
                             raise ResourceBlockedError(reason)
-                    if not self._needs_handoff(role, claims) or not any(
-                        self._conflicts(role, lease.role) and claims_overlap(a, b)
+                    blockers = [
+                        lease
                         for lease in self._active.values()
-                        for a in lease.claims
-                        for b in claims
-                    ):
-                        break
-                    await self._condition.wait()
-                self._generation += 1
-                lease = ActivationLease(self.epoch, owner, operation_id, self._generation, claims, role)
-                self._active[operation_id] = self._operations[operation_id] = lease
-                self._locks[operation_id] = asyncio.Lock()
-                return lease
+                        if self._needs_handoff(role, claims)
+                        and self._conflicts(role, lease.role)
+                        and any(claims_overlap(a, b) for a in lease.claims for b in claims)
+                    ]
+                    if not blockers:
+                        self._generation += 1
+                        lease = ActivationLease(
+                            self.epoch, owner, operation_id, self._generation, claims, role, holder
+                        )
+                        self._active[operation_id] = self._operations[operation_id] = lease
+                        self._locks[operation_id] = asyncio.Lock()
+                        return lease
+                    remaining = deadline - time.monotonic()
+                    detail = "; ".join(
+                        f"{lease.owner} ({lease.holder}, operation={lease.operation_id})" for lease in blockers
+                    )
+                    if remaining <= 0:
+                        raise OwnershipError(f"Timed out acquiring {owner}; waiting for {detail}")
+                    try:
+                        await asyncio.wait_for(
+                            self._condition.wait(), min(remaining, Envs.RELAX_INFERENCE_HOLDER_POLL_S)
+                        )
+                    except TimeoutError:
+                        pass
+                # Never await manager callbacks under the ledger condition.
+                for lease in blockers:
+                    if self._active.get(lease.operation_id) != lease or lease.holder is None:
+                        continue
+                    try:
+                        alive = await asyncio.wait_for(
+                            self._holder_alive(lease.holder), max(0.001, deadline - time.monotonic())
+                        )
+                        if alive is False:
+                            task = self._reconciliations.get(lease.operation_id)
+                            if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+                                task = asyncio.create_task(self._reconcile_dead_holder(lease))
+                                self._reconciliations[lease.operation_id] = task
+                            await asyncio.wait_for(asyncio.shield(task), max(0.001, deadline - time.monotonic()))
+                    except TimeoutError as error:
+                        raise OwnershipError(f"Timed out acquiring {owner}; waiting for {detail}") from error
 
         task = asyncio.create_task(grant())
-        self._pending[operation_id] = (owner, claims, task)
+        self._pending[operation_id] = ((owner, claims, role, holder), task)
         try:
             return await asyncio.shield(task)
         finally:
             if task.done():
                 self._pending.pop(operation_id, None)
+
+    async def abandon(self, operation_id: str, holder: HolderIdentity | None) -> None:
+        """Fence a timed-out request, including grants whose reply was lost."""
+        async with self._condition:
+            lease = self._active.get(operation_id)
+            if lease is not None and lease.holder != holder:
+                raise OwnershipError("Cannot abandon another holder's lease")
+            if self._inflight.get(operation_id) or any(op == operation_id for op, _ in self._commands):
+                raise OwnershipError("Cannot abandon a lease with accepted GPU operations")
+            self._abandoned[operation_id] = holder
+            self._active.pop(operation_id, None)
+            self._condition.notify_all()
+
+    async def _holder_alive(self, holder: HolderIdentity) -> bool | None:
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(holder_alive, holder), Envs.RELAX_INFERENCE_HOLDER_CHECK_S)
+        except TimeoutError:
+            return None
+
+    async def _reconcile_dead_holder(self, lease: ActivationLease) -> None:
+        if lease.role in _TRAINING_ROLES:
+            await self.suspect(lease, f"Holder {lease.holder} died; all training ranks must exit before restart")
+            return
+        self._closing.add(lease.operation_id)
+        await self._await_inflight(lease)
+        if lease.epoch != self.epoch:
+            return
+        covered = {
+            key: record
+            for key, record in self._models.items()
+            if any(
+                c.pool == record[2].pool and c.start <= record[2].start and c.stop >= record[2].stop
+                for c in lease.claims
+            )
+            and (key in self._resident or lease.role is None or record[2].role == lease.role)
+        }
+        if not covered:
+            await self.block(
+                lease,
+                f"Dead holder {lease.holder}: no manager can confirm residency; inspect nodes before checkpoint restart",
+            )
+            return
+        for key, (manager, name, claim) in covered.items():
+            try:
+                confirmed = await asyncio.wait_for(
+                    manager.reconcile_dead_holder.remote(name, lease), Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S
+                )
+                if confirmed is not True:
+                    raise ResourceBlockedError("Manager did not confirm release")
+            except Exception as error:
+                if lease.epoch != self.epoch:
+                    return
+                self._blocked[f"{lease.operation_id}:{key}"] = ((claim,), f"Dead holder {lease.holder}: {error}")
+            else:
+                if lease.epoch != self.epoch:
+                    return
+                self._resident.discard(key)
+        await self.release(lease)
 
     def check(
         self, lease: ActivationLease, claims: Iterable[PlacementClaim] = (), *, allow_blocked: bool = False
@@ -266,19 +373,33 @@ class OwnershipLedger:
         if self._operations.get(lease.operation_id) == lease and lease.operation_id not in self._active:
             return
         self._closing.add(lease.operation_id)
-        # Stop new commands, then settle accepted commands and direct mutations.
-        pending = [task for (operation, _), (_, task) in self._commands.items() if operation == lease.operation_id]
-        if pending:
-            await asyncio.gather(*(asyncio.shield(task) for task in pending), return_exceptions=True)
+        await self._await_inflight(lease)
         async with self._condition:
-            while self._inflight.get(lease.operation_id):
-                await self._condition.wait()
             if self._operations.get(lease.operation_id) == lease and lease.operation_id not in self._active:
                 return
             if self._active.get(lease.operation_id) != lease:
                 raise StaleLeaseError("Cannot return another generation's lease")
             del self._active[lease.operation_id]
             self._condition.notify_all()
+
+    async def _await_inflight(self, lease: ActivationLease) -> None:
+        # Stop new commands, then settle accepted commands and direct mutations.
+        pending = [task for (operation, _), (_, task) in self._commands.items() if operation == lease.operation_id]
+
+        async def settle() -> None:
+            if pending:
+                await asyncio.gather(*(asyncio.shield(task) for task in pending), return_exceptions=True)
+            async with self._condition:
+                while self._inflight.get(lease.operation_id):
+                    await self._condition.wait()
+
+        try:
+            await asyncio.wait_for(settle(), Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S)
+        except TimeoutError as error:
+            raise OwnershipError(
+                f"Timed out returning lease held by {lease.owner} ({lease.holder}); "
+                f"waiting for commands {sorted(self._inflight.get(lease.operation_id, ())) or 'phase transition'}"
+            ) from error
 
     async def block(self, lease: ActivationLease, reason: str) -> None:
         if self._active.get(lease.operation_id) != lease:

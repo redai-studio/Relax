@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from relax.engine.inference.discovery import EngineSnapshot, EngineState, RoleSnapshot
+from relax.engine.inference.holder import HolderIdentity
 from relax.engine.inference.routing import (
     ModelUnavailableError,
     RouteTarget,
@@ -38,6 +39,7 @@ class RequestPermit:
     request_id: str
     generation: str
     target: RouteTarget
+    holder: HolderIdentity | None = None
 
 
 class AdmissionGate:
@@ -57,6 +59,7 @@ class AdmissionGate:
         route_key: str | None = None,
         affinity_key: Any = None,
         direct: bool = False,
+        holder: HolderIdentity | None = None,
     ) -> RequestPermit:
         with self._condition:
             if request_id in self._permits:
@@ -82,7 +85,7 @@ class AdmissionGate:
                 model=selected.name,
                 affinity_key=affinity_key,
             )
-            permit = RequestPermit(request_id, self._generation, target)
+            permit = RequestPermit(request_id, self._generation, target, holder)
             self._permits[request_id] = permit
             return permit
 

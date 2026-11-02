@@ -18,7 +18,7 @@ import ray
 
 from relax.engine.inference.discovery import EngineState, RoleSnapshot, role_snapshot_from_payloads
 from relax.engine.inference.ownership import ActivationLease, OwnershipError, ResourceBlockedError
-from relax.engine.inference.phase_client import PhaseSession, current_phase
+from relax.engine.inference.phase_client import PhaseSession, await_control, current_phase, wait_control
 
 
 _READ_METHODS = frozenset({"health_check", "is_onloaded", "get_status"})
@@ -282,6 +282,14 @@ class InferenceManager:
     async def release_inference(self, name: str, permit: Any) -> None:
         self._runtimes[name].release_inference(permit)
 
+    async def reconcile_dead_holder(self, name: str, lease: ActivationLease) -> bool:
+        async with self._locks[name]:
+            await self._validate(name, lease, cleanup=True)
+            await _invoke(self._runtimes[name], "offload")
+            await self.authority.confirm_deactivation.remote(lease, self.role, name)
+            self._blocked.pop(name, None)
+            return True
+
     def runtime_config(self, name: str) -> dict[str, Any]:
         runtime = self._runtimes[name]
         return {key: getattr(runtime.args, key, None) for key in ("sglang_router_ip", "sglang_router_port")}
@@ -331,8 +339,9 @@ class InferenceManager:
         self._closing = True
         # Initialization can still be allocating after its caller was cancelled.
         # Keep the PG until every accepted initialization has settled.
-        await asyncio.gather(
-            *(asyncio.shield(task) for task in self._initializations.values()), return_exceptions=True
+        await await_control(
+            asyncio.gather(*(asyncio.shield(task) for task in self._initializations.values()), return_exceptions=True),
+            f"{self.role} accepted initializations before shutdown",
         )
         if not self._runtimes:
             for resource in self._owned_resources:
@@ -414,7 +423,7 @@ def create_model_manager(
     **kwargs: Any,
 ) -> ModelManager:
     manager = ensure_inference_manager(args, role, pg, runtime_env=runtime_env, owns_pg=owns_pg)
-    ray.get(manager.add_model.remote(model, args, kwargs))
+    wait_control(manager.add_model.remote(model, args, kwargs), f"{role}/{model} initialization")
     return ModelManager(manager, model)
 
 
@@ -438,7 +447,7 @@ def ensure_inference_manager(args: Any, role: str, pg: Any = None, *, runtime_en
 
         options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(_get_head_node_id(), soft=False)
     manager = InferenceManager.options(**options).remote(args, role, pg, owns_pg)
-    ray.get(manager.claim_placement.remote())
+    wait_control(manager.claim_placement.remote(), f"{role} placement registration")
     return manager
 
 

@@ -346,3 +346,200 @@ async def test_restart_does_not_discharge_unproven_training_exit(monkeypatch):
     with pytest.raises(ResourceBlockedError, match="training.*exit"):
         await ledger.stop_training(timeout=1)
     assert "failed" in ledger.snapshot()["suspect"]
+
+
+async def test_acquire_timeout_names_holder_and_never_grants_late(monkeypatch):
+    monkeypatch.setenv("RELAX_INFERENCE_LEASE_WAIT_S", "0.01")
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    first = await ledger.acquire("busy-worker", "held", [c])
+    with pytest.raises(OwnershipError, match="busy-worker"):
+        await asyncio.wait_for(ledger.acquire("waiting", "pending", [c]), timeout=1)
+    await ledger.release(first)
+    assert ledger.snapshot()["owners"] == {}
+
+
+async def test_dead_holder_requires_manager_release_receipt(monkeypatch):
+    monkeypatch.setenv("RELAX_INFERENCE_HOLDER_POLL_S", "0.001")
+    from relax.engine.inference.holder import HolderIdentity
+
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    entered, confirmed = asyncio.Event(), asyncio.Event()
+
+    async def reconcile(name, lease):
+        entered.set()
+        await confirmed.wait()
+        return True
+
+    async def dead(holder):
+        return False
+
+    monkeypatch.setattr(ledger, "_holder_alive", dead)
+    manager = SimpleNamespace(reconcile_dead_holder=SimpleNamespace(remote=reconcile))
+    ledger.register_model("rollout", "default", manager, c)
+    held = await ledger.acquire("dead-worker", "held", [c], holder=HolderIdentity(actor_id="dead"))
+    waiting = asyncio.create_task(ledger.acquire("next", "next", [c]))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert not waiting.done()
+    confirmed.set()
+    current = await asyncio.wait_for(waiting, timeout=1)
+    assert current.generation > held.generation
+    with pytest.raises(StaleLeaseError):
+        ledger.check(held)
+
+
+async def test_release_has_a_deadline_for_inflight_commands(monkeypatch):
+    monkeypatch.setenv("RELAX_INFERENCE_CONTROL_TIMEOUT_S", "0.01")
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    lease = await ledger.acquire("busy-worker", "held", [c])
+    ledger.begin(lease, "unfinished-onload")
+    with pytest.raises(OwnershipError, match="busy-worker.*unfinished-onload"):
+        await asyncio.wait_for(ledger.release(lease), timeout=1)
+    assert "held" in ledger.snapshot()["owners"]
+    await ledger.finish(lease, "unfinished-onload")
+    await ledger.release(lease)
+
+
+async def test_dead_holder_reconciliation_retries_after_inflight_work_settles(monkeypatch):
+    from relax.engine.inference.holder import HolderIdentity
+
+    monkeypatch.setenv("RELAX_INFERENCE_HOLDER_POLL_S", "0.001")
+    monkeypatch.setenv("RELAX_INFERENCE_CONTROL_TIMEOUT_S", "0.01")
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+
+    async def dead(holder):
+        return False
+
+    async def confirmed(name, lease):
+        return True
+
+    monkeypatch.setattr(ledger, "_holder_alive", dead)
+    ledger.register_model(
+        "rollout", "default", SimpleNamespace(reconcile_dead_holder=SimpleNamespace(remote=confirmed)), c
+    )
+    lease = await ledger.acquire("dead", "held", [c], holder=HolderIdentity(actor_id="dead"))
+    ledger.begin(lease, "unfinished-onload")
+    with pytest.raises(OwnershipError, match="unfinished-onload"):
+        await ledger.acquire("waiting", "first-attempt", [c])
+    await ledger.finish(lease, "unfinished-onload")
+    current = await asyncio.wait_for(ledger.acquire("waiting", "retry", [c]), timeout=1)
+    ledger.check(current)
+
+
+async def test_dead_narrow_teacher_does_not_quarantine_offloaded_rollout(monkeypatch):
+    from dataclasses import replace
+
+    from relax.engine.inference.holder import HolderIdentity
+
+    monkeypatch.setenv("RELAX_INFERENCE_HOLDER_POLL_S", "0.001")
+    rollout, teacher = replace(claim(), size=8), replace(claim("teacher", phase=Phase.SCORE), size=2)
+    ledger = OwnershipLedger(PlacementPlan((), (rollout, teacher)))
+    calls = []
+
+    async def reconcile(name, lease):
+        calls.append(name)
+        ledger.check(lease, [teacher if name == "teacher" else rollout])
+        return True
+
+    async def dead(holder):
+        return False
+
+    monkeypatch.setattr(ledger, "_holder_alive", dead)
+    manager = SimpleNamespace(reconcile_dead_holder=SimpleNamespace(remote=reconcile))
+    ledger.register_model("rollout", "rollout", manager, rollout)
+    ledger.register_model("teacher", "teacher", manager, teacher)
+    lease = await ledger.acquire("teacher", "lost", [teacher], role="teacher", holder=HolderIdentity(actor_id="dead"))
+    ledger.reserve_activation(lease, "teacher", "teacher")
+    current = await ledger.acquire("rollout", "next", [rollout, teacher], role="rollout")
+    ledger.check(current)
+    assert calls == ["teacher"]
+    assert ledger.snapshot()["blocked"] == {}
+
+
+async def test_control_rpc_deadline_does_not_abandon_owned_rollout_thread(monkeypatch):
+    import threading
+
+    from relax.engine.inference.phase_client import control_call
+
+    monkeypatch.setenv("RELAX_INFERENCE_CONTROL_TIMEOUT_S", "0.01")
+    entered, finish = threading.Event(), threading.Event()
+
+    def work():
+        entered.set()
+        finish.wait()
+        return "settled"
+
+    task = asyncio.create_task(control_call(asyncio.to_thread(work)))
+    assert await asyncio.to_thread(entered.wait, 1)
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.03)
+        assert not task.done()
+    finally:
+        finish.set()
+    assert await task == "settled"
+
+
+async def test_acquire_lost_reply_abandons_its_unused_grant(monkeypatch):
+    from relax.engine.inference.phase_client import PhaseSession
+
+    monkeypatch.setenv("RELAX_INFERENCE_LEASE_WAIT_S", "0.01")
+    monkeypatch.setenv("RELAX_INFERENCE_HOLDER_CHECK_S", "0.01")
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    reply = asyncio.Event()
+    transport = []
+
+    async def acquire(*args, **kwargs):
+        lease = await ledger.acquire(*args, **kwargs)
+        await reply.wait()
+        return lease
+
+    def remote(*args, **kwargs):
+        task = asyncio.create_task(acquire(*args, **kwargs))
+        transport.append(task)
+        return asyncio.shield(task)  # Ray work survives local wait cancellation.
+
+    async def claims(role):
+        return [c]
+
+    authority = SimpleNamespace(
+        claims_for=SimpleNamespace(remote=claims),
+        acquire=SimpleNamespace(remote=remote),
+        abandon=SimpleNamespace(remote=ledger.abandon),
+    )
+    session = PhaseSession(authority, "rollout", "lost-reply")
+    try:
+        with pytest.raises(OwnershipError, match="lease grant"):
+            await session.__aenter__()
+        assert ledger.snapshot()["owners"] == {}
+        with pytest.raises(StaleLeaseError, match="abandoned"):
+            await ledger.acquire(session.owner, session.operation_id, [c], role="rollout", holder=session.holder)
+    finally:
+        reply.set()
+        await asyncio.gather(*transport)
+
+
+async def test_late_reconciliation_cannot_quarantine_new_epoch():
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    entered, reply = asyncio.Event(), asyncio.Event()
+
+    async def reconcile(name, lease):
+        entered.set()
+        await reply.wait()
+        raise RuntimeError("old response arrived late")
+
+    ledger.register_model(
+        "rollout", "default", SimpleNamespace(reconcile_dead_holder=SimpleNamespace(remote=reconcile)), c
+    )
+    lease = await ledger.acquire("old", "old", [c])
+    task = asyncio.create_task(ledger._reconcile_dead_holder(lease))
+    await entered.wait()
+    await ledger.new_epoch()  # No resident resource remains after owner shutdown.
+    reply.set()
+    await task
+    assert ledger.snapshot()["blocked"] == {}

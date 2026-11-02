@@ -254,7 +254,11 @@ class EnginePool:
         if node is not None and node["Alive"] is False:
             logger.warning(self._log(f"Node {node_id} is DEAD; releasing slot={slot} on that node"))
             return True
-        if node is None or self.slots[slot]._get_local_state() != ActorTableData.DEAD:
+        try:
+            dead = self.slots[slot]._get_local_state() == ActorTableData.DEAD
+        except Exception:
+            dead = False
+        if node is None or not dead:
             return False
         task = ray.remote(num_cpus=0)(cleanup_server_identity).options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)
@@ -445,7 +449,7 @@ class EnginePool:
         errors = []
         for head, handle in handles.items():
             try:
-                ray.get(handle)
+                ray.get(handle, timeout=self.spec.start_timeout_s or 900.0)
             except Exception as exc:
                 if not is_engine_dead(exc):
                     errors.append(exc)

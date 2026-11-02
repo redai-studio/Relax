@@ -258,3 +258,23 @@ def test_suspect_training_lease_restarts_after_real_rank_death(local_ray):
     finally:
         for actor in [*ranks, authority]:
             ray.kill(actor, no_restart=True)
+
+
+def test_dead_lease_holder_is_reconciled_by_the_production_manager(cluster):
+    authority, owner, _, claims = cluster
+
+    @ray.remote(num_cpus=0)
+    class Holder:
+        async def acquire(self):
+            from relax.engine.inference.holder import current_holder
+
+            return await authority.acquire.remote("holder", "lost", [claims[0]], holder=current_holder())
+
+    holder = Holder.remote()
+    lease = ray.get(holder.acquire.remote(), timeout=10)
+    ray.kill(holder, no_restart=True)
+    replacement = ray.get(authority.acquire.remote("replacement", "next", [claims[0]]), timeout=15)
+    assert replacement.generation > lease.generation
+    assert ray.get(owner.calls.remote("a"), timeout=10) == ["offload"]
+    with pytest.raises(StaleLeaseError):
+        ray.get(authority.check.remote(lease), timeout=10)

@@ -10,16 +10,33 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import time
 import uuid
 from typing import Any, Awaitable, Iterable
 
 import ray
 
 from relax.engine.inference.client import _settle
+from relax.engine.inference.holder import current_holder
 from relax.engine.inference.ownership import ActivationLease, OwnershipError
+from relax.utils.env import Envs
 
 
 _CURRENT: contextvars.ContextVar[PhaseSession | None] = contextvars.ContextVar("inference_phase", default=None)
+
+
+def wait_control(ref: Any, description: str, *, timeout: float | None = None) -> Any:
+    try:
+        return ray.get(ref, timeout=Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S if timeout is None else timeout)
+    except ray.exceptions.GetTimeoutError as error:
+        raise OwnershipError(f"Timed out waiting for {description}; resource release is unconfirmed") from error
+
+
+async def await_control(call: Awaitable[Any], description: str, *, timeout: float | None = None) -> Any:
+    try:
+        return await asyncio.wait_for(call, Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S if timeout is None else timeout)
+    except TimeoutError as error:
+        raise OwnershipError(f"Timed out waiting for {description}; resource release is unconfirmed") from error
 
 
 def current_phase() -> PhaseSession:
@@ -80,6 +97,7 @@ class PhaseSession:
         self._token = None
         self._parent = None
         self._safe_to_release = False
+        self.holder = current_holder()
 
     @classmethod
     def from_args(cls, args: Any, role: str, owner: str, **kwargs: Any) -> PhaseSession:
@@ -94,10 +112,30 @@ class PhaseSession:
             self._parent = parent
             return parent
         if self.lease is None:
-            claims = ray.get(self.authority.claims_for.remote(self.role))
-            self.lease = ray.get(self.authority.acquire.remote(self.owner, self.operation_id, claims, role=self.role))
+            claims = wait_control(self.authority.claims_for.remote(self.role), f"{self.owner} placement claims")
+            self.acquire(claims)
         self._token = _CURRENT.set(self)
         return self
+
+    def acquire(self, claims: Iterable[Any]) -> None:
+        try:
+            self.lease = wait_control(
+                self.authority.acquire.remote(
+                    self.owner,
+                    self.operation_id,
+                    claims,
+                    role=self.role,
+                    holder=self.holder,
+                    expires_at=time.time() + Envs.RELAX_INFERENCE_LEASE_WAIT_S,
+                ),
+                f"{self.owner} lease grant",
+                timeout=Envs.RELAX_INFERENCE_LEASE_WAIT_S + Envs.RELAX_INFERENCE_HOLDER_CHECK_S,
+            )
+        except BaseException:
+            wait_control(
+                self.authority.abandon.remote(self.operation_id, self.holder), f"{self.owner} abandoned grant"
+            )
+            raise
 
     def __exit__(self, kind: Any, error: Any, traceback: Any) -> None:
         if self._parent is not None:
@@ -117,16 +155,40 @@ class PhaseSession:
             return parent
 
         async def acquire() -> ActivationLease:
-            claims = await self.authority.claims_for.remote(self.role)
-            return await self.authority.acquire.remote(self.owner, self.operation_id, claims, role=self.role)
+            claims = await await_control(self.authority.claims_for.remote(self.role), f"{self.owner} placement claims")
+            return await await_control(
+                self.authority.acquire.remote(
+                    self.owner,
+                    self.operation_id,
+                    claims,
+                    role=self.role,
+                    holder=self.holder,
+                    expires_at=time.time() + Envs.RELAX_INFERENCE_LEASE_WAIT_S,
+                ),
+                f"{self.owner} lease grant",
+                timeout=Envs.RELAX_INFERENCE_LEASE_WAIT_S + Envs.RELAX_INFERENCE_HOLDER_CHECK_S,
+            )
 
         if self.lease is None:
             pending = asyncio.create_task(acquire())
             try:
                 self.lease = await asyncio.shield(pending)
-            except asyncio.CancelledError:
-                self.lease = await _settle(pending)
+            except asyncio.CancelledError as cancelled:
+                try:
+                    self.lease = await _settle(pending)
+                except Exception:
+                    await await_control(
+                        self.authority.abandon.remote(self.operation_id, self.holder), f"{self.owner} abandoned grant"
+                    )
+                    self.closed = True
+                    raise cancelled from None
                 await self.aclose()
+                raise
+            except Exception:
+                await await_control(
+                    self.authority.abandon.remote(self.operation_id, self.holder), f"{self.owner} abandoned grant"
+                )
+                self.closed = True
                 raise
         self._token = _CURRENT.set(self)
         return self
@@ -150,14 +212,16 @@ class PhaseSession:
 
     def switch(self, phase: str, stage: str | None = None) -> None:
         command = self.command_id(phase)
-        ray.get(self.authority.command.remote(self.lease, command, phase, stage))
+        wait_control(self.authority.command.remote(self.lease, command, phase, stage), f"{self.owner} {phase}")
         self._safe_to_release = phase in {"train", "leave_score"}
 
     async def aswitch(self, phase: str, stage: str | None = None) -> None:
         command = self.command_id(phase)
 
         async def switch() -> None:
-            await self.authority.command.remote(self.lease, command, phase, stage)
+            await await_control(
+                self.authority.command.remote(self.lease, command, phase, stage), f"{self.owner} {phase}"
+            )
 
         pending = asyncio.create_task(switch())
         try:
@@ -170,30 +234,30 @@ class PhaseSession:
 
     def block(self, reason: str) -> None:
         if not self.closed:
-            ray.get(self.authority.block.remote(self.lease, reason))
+            wait_control(self.authority.block.remote(self.lease, reason), f"{self.owner} quarantine")
 
     def suspect(self, reason: str) -> None:
         if not self.closed:
-            ray.get(self.authority.suspect.remote(self.lease, reason))
+            wait_control(self.authority.suspect.remote(self.lease, reason), f"{self.owner} suspect receipt")
 
     async def ablock(self, reason: str) -> None:
         if not self.closed:
 
             async def block() -> None:
-                await self.authority.block.remote(self.lease, reason)
+                await await_control(self.authority.block.remote(self.lease, reason), f"{self.owner} quarantine")
 
             await _settle(asyncio.create_task(block()))
 
     def close(self) -> None:
         if not self.closed and self.lease is not None:
-            ray.get(self.authority.release.remote(self.lease))
+            wait_control(self.authority.release.remote(self.lease), f"{self.owner} lease return")
             self.closed = True
 
     async def aclose(self) -> None:
         if not self.closed and self.lease is not None:
 
             async def release() -> None:
-                await self.authority.release.remote(self.lease)
+                await await_control(self.authority.release.remote(self.lease), f"{self.owner} lease return")
 
             await _settle(asyncio.create_task(release()))
             self.closed = True
