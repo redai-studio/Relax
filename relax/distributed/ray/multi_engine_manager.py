@@ -281,6 +281,7 @@ class MultiEngineManager:
         # public name; the manager's local name is deliberately private.
         selection.pop("model", None)
         selection.pop("route_key", None)
+        selection["dispatch_tracked"] = True
         return self._admission.acquire(
             self._inference_snapshot,
             request_id,
@@ -387,5 +388,7 @@ class MultiEngineManager:
     def shutdown(self) -> None:
         """Tear down every engine and remove any placement group this manager
         created for it."""
-        self._admission.close()
+        self._admission.drain(
+            lambda: ray.get([e.abort_requests.remote(timeout=30) for e in self.engines if e is not None], timeout=35)
+        )
         self._pool.shutdown()

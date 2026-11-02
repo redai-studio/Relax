@@ -173,6 +173,7 @@ class InferenceRequest:
         snapshot = RoleSnapshot.from_dict(resources["snapshot"])
         selection = dict(self._selection)
         selection["holder"] = current_holder()
+        selection["dispatch_tracked"] = True
         selected = select_model(snapshot, selection.pop("model", None), selection.pop("route_key", None))
         self._manager = resources["managers"][selected.name]
         pending = asyncio.create_task(
@@ -197,6 +198,10 @@ class InferenceRequest:
         self.target = replace(self._permit.target, model=selected.name)
         self.served_model_name = selected.served_model_name
         return self
+
+    async def dispatched(self) -> None:
+        """Call only after upstream response headers, never before send()."""
+        await _manager_call(self._manager, "confirm_inference_dispatch", self._permit)
 
     async def aclose(self) -> None:
         if self._permit is None:

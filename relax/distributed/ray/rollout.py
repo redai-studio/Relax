@@ -1116,7 +1116,7 @@ class RolloutEngineRuntime:
         self._try_ci_fault_injection()
 
     def dispose(self):
-        self._admission.close()
+        self._admission.drain(self._abort_inference_requests)
         self._stop_eviction_monitor(timeout=0.0)
         for monitor in self._health_monitors:
             monitor.stop(timeout=0.0)
@@ -1188,22 +1188,22 @@ class RolloutEngineRuntime:
             logger.info("Rollout already offloaded; skipping")
             return
         self.health_monitoring_pause()
-        self._admission.drain(
-            lambda: ray.get(
-                [
-                    e.abort_requests.remote(timeout=30)
-                    for srv in self.servers.values()
-                    for e in srv.engines
-                    if e is not None
-                ],
-                timeout=35,
-            )
-        )
+        self._admission.drain(self._abort_inference_requests)
         self._missing_memory = {GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH}
         for srv in self.servers.values():
             srv.offload()
         self._admission.confirm_drained()
         self.status = "offload"
+
+    def _abort_inference_requests(self) -> None:
+        handles = [
+            e.abort_requests.remote(timeout=30)
+            for srv in getattr(self, "servers", {}).values()
+            for e in srv.engines
+            if e is not None
+        ]
+        if handles:
+            ray.get(handles, timeout=35)
 
     async def onload(self, tags: list[str] | None = None):
         await asyncio.to_thread(self._onload_local, tags)
@@ -3349,6 +3349,7 @@ class RolloutEngineRuntime:
 
     @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
     def acquire_inference(self, request_id: str, **selection: Any) -> RequestPermit:
+        selection["dispatch_tracked"] = True
         return self._admission.acquire(self._inference_snapshot, request_id, **selection)
 
     @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)

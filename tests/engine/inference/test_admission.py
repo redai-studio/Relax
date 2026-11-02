@@ -260,7 +260,8 @@ async def test_distributed_sender_owns_permit_until_its_transport_finishes(monke
         monkeypatch.setattr(http_utils, "_post_actors", [actor])
         caller = asyncio.create_task(http_utils.post("http://startup:9/generate", {}, inference={"role": "rollout"}))
         await entered.wait()
-        manager.gate.drain(lambda: None, timeout=0)
+        with pytest.raises(AdmissionDrainError):
+            manager.gate.drain(lambda: None, timeout=0)
         assert manager.gate._permits
         finish.set()
         assert await caller == {"text": "done"}

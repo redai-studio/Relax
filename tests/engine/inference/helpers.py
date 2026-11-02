@@ -27,6 +27,9 @@ class AdmissionManager:
         self.released.append(permit)
         self.gate.release(permit)
 
+    def confirm_inference_dispatch(self, permit):
+        self.gate.confirm_dispatch(permit)
+
     def client(self, role="rollout", **extra):
         async def resources():
             snapshot = self.fetch()

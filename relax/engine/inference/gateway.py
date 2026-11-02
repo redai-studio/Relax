@@ -110,7 +110,7 @@ class _NativeStreamingResponse(StreamingResponse):
 class _PermitStreamingResponse(StreamingResponse):
     """Keep the permit until the upstream is closed, even before iteration."""
 
-    def __init__(self, response: StreamingResponse, permit: InferenceRequest) -> None:
+    def __init__(self, response: StreamingResponse, permit: InferenceRequest | None) -> None:
         self._response = response
         self._permit = permit
         self._close_task: asyncio.Task[None] | None = None
@@ -134,7 +134,8 @@ class _PermitStreamingResponse(StreamingResponse):
             if isinstance(self._response, _NativeStreamingResponse):
                 await self._response.aclose()
         finally:
-            await self._permit.aclose()
+            if self._permit is not None:
+                await self._permit.aclose()
 
     async def aclose(self) -> None:
         if self._close_task is None:
@@ -259,7 +260,7 @@ class InferenceGateway:
         try:
             url = f"{permit.target.base_url}/generate"
             if forwarded.get("stream"):
-                response = _PermitStreamingResponse(await self._stream_generate(url, forwarded), permit)
+                response = _PermitStreamingResponse(await self._stream_generate(url, forwarded, permit), permit)
                 transferred = True
                 return response
             return await self.proxy_json(url, forwarded)
@@ -276,12 +277,19 @@ class InferenceGateway:
         except RoutingError as exc:
             raise HTTPException(exc.status_code, str(exc)) from exc
 
-    async def _stream_generate(self, url: str, payload: Mapping[str, Any]) -> StreamingResponse:
+    async def _stream_generate(
+        self, url: str, payload: Mapping[str, Any], permit: InferenceRequest
+    ) -> StreamingResponse:
         client = self._get_proxy_client()
         response = None
         try:
             response = await client.send(client.build_request("POST", url, json=dict(payload)), stream=True)
+            await permit.dispatched()
             response.raise_for_status()
+        except RoutingError as exc:
+            if response is not None:
+                await response.aclose()
+            raise HTTPException(exc.status_code, str(exc)) from exc
         except httpx.HTTPStatusError as exc:
             try:
                 detail = (await exc.response.aread()).decode(errors="replace")
@@ -299,6 +307,10 @@ class InferenceGateway:
                 await response.aclose()
             self._on_upstream_unreachable(url, exc)
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {exc}") from exc
+        except BaseException:
+            if response is not None:
+                await response.aclose()
+            raise
         return _NativeStreamingResponse(response)
 
     async def chat_completions(self, body: bytes, headers: Mapping[str, str]) -> Any:
@@ -308,25 +320,48 @@ class InferenceGateway:
                 raise ValueError("request body must be a JSON object")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}") from exc
-        permit = await self._admit(model=request.get("model"), route_key=request.get("route_key"))
-        transferred = False
-        try:
-            original = dict(request)
-            request.pop("route_key", None)
-            request["model"] = permit.served_model_name or permit.target.model
-            result = await self.proxy_chat_completions(
-                permit.target.base_url,
-                body if request == original else json.dumps(request).encode(),
-                headers,
-                stream=bool(request.get("stream")),
-            )
-            if isinstance(result, StreamingResponse):
-                result = _PermitStreamingResponse(result, permit)
-                transferred = True
-            return result
-        finally:
-            if not transferred:
-                await permit.aclose()
+
+        async def dispatch() -> Any:
+            permit = await self._admit(model=request.get("model"), route_key=request.get("route_key"))
+            transferred = False
+            try:
+                original = dict(request)
+                request.pop("route_key", None)
+                request["model"] = permit.served_model_name or permit.target.model
+                result = await self.proxy_chat_completions(
+                    permit.target.base_url,
+                    body if request == original else json.dumps(request).encode(),
+                    headers,
+                    stream=bool(request.get("stream")),
+                    permit=permit,
+                )
+                if isinstance(result, StreamingResponse):
+                    result = _PermitStreamingResponse(result, permit)
+                    transferred = True
+                return result
+            finally:
+                if not transferred:
+                    await permit.aclose()
+
+        if not request.get("stream"):
+            return await dispatch()
+
+        async def chunks() -> AsyncIterator[str | bytes]:
+            response = None
+            try:
+                # A StreamingResponse can sit unconsumed across offload/resume.
+                # Admit in the same coroutine that actually starts the send.
+                response = await dispatch()
+                async for chunk in response.body_iterator:
+                    yield chunk
+            except HTTPException as error:
+                yield f"data: {make_error_chunk(error.status_code, str(error.detail))}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                if response is not None:
+                    await response.aclose()
+
+        return _PermitStreamingResponse(StreamingResponse(chunks(), media_type="text/event-stream"), None)
 
     # ------------------------------------------------------------------
     # Proxying to an already resolved upstream.
@@ -377,7 +412,13 @@ class InferenceGateway:
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {e}")
 
     async def proxy_chat_completions(
-        self, base_url: str, body: bytes, headers: Mapping[str, str], *, stream: bool
+        self,
+        base_url: str,
+        body: bytes,
+        headers: Mapping[str, str],
+        *,
+        stream: bool,
+        permit: InferenceRequest | None = None,
     ) -> Any:
         """Forward a chat-completions request body unmodified.
 
@@ -387,7 +428,7 @@ class InferenceGateway:
         client = self._get_proxy_client()
         forward_headers = build_forward_headers(headers)
         if stream:
-            return self._stream(client, url, body, forward_headers)
+            return self._stream(client, url, body, forward_headers, permit)
         try:
             response = await client.post(url, content=body, headers=forward_headers)
             response.raise_for_status()
@@ -405,17 +446,27 @@ class InferenceGateway:
             raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {e}")
 
     def _stream(
-        self, client: httpx.AsyncClient, url: str, body: bytes, forward_headers: dict[str, str]
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        body: bytes,
+        forward_headers: dict[str, str],
+        permit: InferenceRequest | None = None,
     ) -> StreamingResponse:
         async def _event_generator():
             response = None
             try:
                 req = client.build_request("POST", url, content=body, headers=forward_headers)
                 response = await client.send(req, stream=True)
+                if permit is not None:
+                    await permit.dispatched()
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if line:
                         yield f"{line}\n\n"
+            except RoutingError as error:
+                yield f"data: {make_error_chunk(error.status_code, str(error))}\n\n"
+                yield "data: [DONE]\n\n"
             except httpx.HTTPStatusError as e:
                 error_body = await e.response.aread()
                 error_chunk = make_error_chunk(e.response.status_code, error_body.decode(errors="replace"))

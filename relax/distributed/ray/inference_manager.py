@@ -424,6 +424,9 @@ class InferenceManager:
     async def release_inference(self, name: str, permit: Any) -> None:
         self._runtimes[name].release_inference(permit)
 
+    async def confirm_inference_dispatch(self, name: str, permit: Any) -> None:
+        self._runtimes[name]._admission.confirm_dispatch(permit)
+
     async def reconcile_dead_holder(self, name: str, lease: ActivationLease) -> bool:
         async def execute() -> bool:
             async with self._locks[name]:
@@ -552,7 +555,7 @@ class _RemoteMethod:
         handle, model, method = self.manager.handle, self.manager.model, self.method
         if method == "get_inference_snapshot":
             return handle.get_model_snapshot.remote(model)
-        if method in {"acquire_inference", "release_inference", "report_failure"}:
+        if method in {"acquire_inference", "release_inference", "confirm_inference_dispatch", "report_failure"}:
             return getattr(handle, method).remote(model, *args, **kwargs)
         lease = kwargs.pop("lease", None)
         command = kwargs.pop("command_id", None)

@@ -44,6 +44,7 @@ class RequestPermit:
     target: RouteTarget
     holder: HolderIdentity | None = None
     token: str = field(default_factory=lambda: uuid.uuid4().hex)
+    dispatch_tracked: bool = False
 
 
 class AdmissionGate:
@@ -52,6 +53,7 @@ class AdmissionGate:
         self._generation = uuid.uuid4().hex
         self._closed = False
         self._permits: dict[str, RequestPermit] = {}
+        self._dispatched: set[str] = set()
         self._routing = RoutingState()
 
     def acquire(
@@ -64,6 +66,7 @@ class AdmissionGate:
         affinity_key: Any = None,
         direct: bool = False,
         holder: HolderIdentity | None = None,
+        dispatch_tracked: bool = False,
     ) -> RequestPermit:
         with self._condition:
             current = snapshot()
@@ -87,7 +90,7 @@ class AdmissionGate:
                 model=selected.name,
                 affinity_key=affinity_key,
             )
-            permit = RequestPermit(request_id, self._generation, target, holder)
+            permit = RequestPermit(request_id, self._generation, target, holder, dispatch_tracked=dispatch_tracked)
             self._permits[permit.token] = permit
             return permit
 
@@ -95,7 +98,17 @@ class AdmissionGate:
         with self._condition:
             if self._permits.get(permit.token) == permit:
                 del self._permits[permit.token]
+                self._dispatched.discard(permit.token)
                 self._condition.notify_all()
+
+    def confirm_dispatch(self, permit: RequestPermit) -> None:
+        """Upstream response headers prove this request passed the send
+        queue."""
+        with self._condition:
+            if self._permits.get(permit.token) != permit:
+                raise ModelUnavailableError("Request admission was revoked before dispatch was confirmed")
+            self._dispatched.add(permit.token)
+            self._condition.notify_all()
 
     def close(self) -> None:
         with self._condition:
@@ -129,6 +142,28 @@ class AdmissionGate:
         # The engine's pause/abort/idle protocol remains mandatory in offload,
         # even when a dead holder's permit was reclaimed here.
         abort()
+        # A queued transport may not have reached the engine when abort/idle
+        # succeeds. Only its terminal client receipt (or proven holder death)
+        # can retire that sender. Give aborted requests a bounded cleanup grace.
+        with self._condition:
+            self._condition.wait_for(
+                lambda: not self._pending_senders(),
+                timeout=min(max(0.0, timeout), Envs.RELAX_INFERENCE_HOLDER_CHECK_S),
+            )
+            self._check_senders()
+
+    def _pending_senders(self) -> list[RequestPermit]:
+        return [p for p in self._permits.values() if p.dispatch_tracked and p.token not in self._dispatched]
+
+    def _check_senders(self) -> None:
+        pending = self._pending_senders()
+        if pending:
+            raise AdmissionDrainError(
+                f"HTTP dispatch is unconfirmed for {len(pending)} request(s): "
+                f"{[(p.request_id, p.holder) for p in pending[:5]]}. "
+                "Cancel/close these requests or confirm holder exit, then retry offload/shutdown. "
+                "Engine idle alone cannot retire a queued sender."
+            )
 
     def confirm_drained(self) -> None:
         """Called only after engines confirmed idle and released their
@@ -136,7 +171,9 @@ class AdmissionGate:
         with self._condition:
             if not self._closed:
                 raise AdmissionDrainError("Engine drain receipt requires closed admission")
+            self._check_senders()
             self._permits.clear()
+            self._dispatched.clear()
             self._condition.notify_all()
 
     def open(self) -> None:
