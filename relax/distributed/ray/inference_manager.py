@@ -308,10 +308,10 @@ class InferenceManager:
                 task = old[1]
             else:
                 cleanup = action in {"offload", "shutdown", "dispose"}
-                await self._validate(name, lease, cleanup=cleanup)
-                await self.authority.begin.remote(lease, key, parent_command)
 
                 async def execute() -> Any:
+                    await self._validate(name, lease, cleanup=cleanup)
+                    await self.authority.begin.remote(lease, key, parent_command)
                     try:
                         async with self._locks[name]:
                             await self._validate(name, lease, cleanup=cleanup)

@@ -41,7 +41,9 @@ def owner_class():
             self.events.append("mutation terminal")
             self.done.set()
 
-        execute_scale_out = recover
+        async def execute_scale_out(self):
+            # Exercise the real async dispatch branch as well as sync recover.
+            await asyncio.to_thread(self.recover)
 
         def offload(self):
             self.resident = False
@@ -119,3 +121,54 @@ def test_cancelled_maintenance_remains_owned_until_handoff_finishes(local_ray, m
             ray.get(authority.release.remote(lease), timeout=10)
         for handle in (owner, authority):
             ray.kill(handle, no_restart=True)
+
+
+async def test_cancelled_apply_keeps_begin_receipt_and_lease_return_owned():
+    from relax.engine.inference.ownership import OwnershipLedger
+    from tests.engine.inference.test_coresidency import Handle
+
+    args = SimpleNamespace(resource={"rollout": [1, 1]}, colocate=False)
+    plan = plan_placement(args)
+    ledger = OwnershipLedger(plan)
+    registered, receipt = asyncio.Event(), asyncio.Event()
+    authority = Handle(ledger)
+
+    async def begin(lease, token, parent_command=None):
+        ledger.begin(lease, token, parent_command)
+        registered.set()
+        await receipt.wait()
+
+    authority.begin = SimpleNamespace(remote=begin)
+    args._inference_authority = authority
+    owner = InferenceManager.__ray_metadata__.modified_class(args, "rollout")
+    name = "__default__"
+    owner._claims[name] = (plan.claim("rollout"),)
+    owner._locks[name] = asyncio.Lock()
+    calls = []
+    owner._runtimes[name] = SimpleNamespace(
+        onload=lambda **kwargs: calls.append("onloaded"), _admission=AdmissionGate()
+    )
+    ledger.register_model("rollout", name, Handle(owner), plan.claim("rollout"))
+    lease = await ledger.acquire("phase", "caller", plan.claims, role="rollout")
+    caller = asyncio.create_task(owner.apply(name, "onload", lease, "load"))
+    try:
+        await registered.wait()
+        caller.cancel()
+        await asyncio.sleep(0)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert owner._mutations, "accepted begin lost its owner before the receipt arrived"
+        returning = asyncio.create_task(ledger.release(lease))
+        await asyncio.sleep(0)
+        assert not returning.done()
+        receipt.set()
+        await asyncio.wait_for(returning, 2)
+        assert calls == ["onloaded"]
+        assert not ledger.snapshot()["owners"]
+    finally:
+        receipt.set()
+        await asyncio.gather(*owner._mutations, return_exceptions=True)
+        for token in list(ledger._inflight.get(lease.operation_id, ())):
+            await ledger.finish(lease, token)
+        await ledger.release(lease)
