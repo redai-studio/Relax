@@ -121,7 +121,8 @@ def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
     assert _enable_draft_weights_cpu_backup(args, overrides) is expected
 
 
-def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engine_module):
+@pytest.mark.parametrize("omni", [False, True])
+def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engine_module, omni):
     from relax.utils import misc
 
     module = expert_sync_engine_module
@@ -139,14 +140,22 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
         "ignored_server_field": "ignored",
         "json_model_override_args": "{}",
         "custom_weight_loader": ["relax.backends.sglang.weight_loader.load_expert_slices"],
+        "speculative_draft_model_path": "/test/runtime-model",
     }
     get = Mock(return_value=response)
-    config = Mock(return_value=SimpleNamespace(text_config=SimpleNamespace(num_experts=896)))
+    text = SimpleNamespace(num_experts=896, n_shared_experts=1)
+    config = Mock(
+        return_value=SimpleNamespace(thinker_config=SimpleNamespace(text_config=text))
+        if omni
+        else SimpleNamespace(text_config=text)
+    )
     monkeypatch.setattr(module.requests, "get", get)
     monkeypatch.setattr(misc, "get_hf_config", config)
     result = engine.get_expert_weight_sync_layout()
     assert result["enable_eplb"] is True
     assert result["num_experts"] == 896
+    assert result["num_shared_experts"] == 1
+    assert result["speculative_draft_model_path"] == "/test/runtime-model"
     assert result["custom_weight_loader"] == ["relax.backends.sglang.weight_loader.load_expert_slices"]
     assert "ignored_server_field" not in result
     config.assert_called_once_with("/test/runtime-model")

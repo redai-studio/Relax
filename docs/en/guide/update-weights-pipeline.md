@@ -8,6 +8,24 @@ This optimization introduces **inter-chunk pipelining** (deferring `ray.get` so 
 
 ______________________________________________________________________
 
+## Automatic MoE synchronization
+
+For colocated Megatron MoE training with Bridge export and train-state offload on CUDA, Relax automatically retains the PP/EP/TP/ETP communicators used by weight export. Weight updates reload only this agreed subset; training still restores all its process groups. This also applies when quantized weights or expert tensor parallelism require the ordinary export path. LoRA, external or mixed remote rollout engines, and unknown iterator/group layouts keep the original lifecycle.
+
+BF16 expert routing is negotiated separately. It sends each complete expert only to the rollout EP ranks that own it, while keeping Bridge conversion and the SGLang HF loader. Selection uses mapping and runtime layout capabilities, rather than model names:
+
+| Side | Requirements |
+|---|---|
+| Trainer | Bridge, BF16 experts, ETP1 and EP greater than one; TP/PP may be greater than one. Expert-DP replicas must have matching parameter metadata; one real owner is elected. |
+| Receiver | CUDA BF16, static contiguous EP, TP=EP, PP1 and MoE DP1; no quantization, EPLB, redundant experts, elastic remapping or fused shared experts. Models with no shared experts need no fusion override. |
+| Conversion | Recognized per-expert `gate/up/down_proj` or `w1/w2/w3` HF weights, including `model.language_model` prefixes and fused mappings handled by Bridge. MTP, tower and unrecognized expert tensors retain ordinary export. |
+
+Same-checkpoint NEXTN/EAGLE is supported. Separate draft checkpoints and unknown model overrides fall back to the existing export path. A rejected routing plan does not disable compatible communicator retention. The existing Kimi K3 MXFP4 routing option retains its own protocol and conservative staging budget.
+
+No new switch is required. Startup logs report `Weight sync communicator plan` and `Weight sync BF16 expert routing`. Receiver capability failures or unsupported geometry use the existing direct/gather/HF selection.
+
+`--update-weight-buffer-size` remains the staging limit, in bytes; its default remains 512 MiB. Larger buckets reduce synchronization rounds when memory permits. For example, `--update-weight-buffer-size 8589934592` selects 8 GiB buckets. Retained communicators occupy device memory between phases, and several staging buffers can coexist, so choose the bucket size for the available memory. Synchronization latency depends on the model, parallel layout and hardware.
+
 ## Background
 
 ### Scenario
