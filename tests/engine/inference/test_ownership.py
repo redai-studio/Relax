@@ -183,3 +183,71 @@ async def test_valid_lease_cannot_activate_overlapping_models_without_release_re
     ledger.confirm_deactivation(lease, "rollout", "default")
     ledger.reserve_activation(lease, "genrm", "judge")
     assert len(ledger.snapshot()["resident"]) == 1
+
+
+async def test_dedicated_leases_do_not_queue_same_role_operations():
+    from dataclasses import replace
+
+    c = replace(claim(), pool="rollout")
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    first = await ledger.acquire("generate", "one", [c], role="rollout")
+    second = await asyncio.wait_for(ledger.acquire("recover", "two", [c], role="rollout"), timeout=1)
+    ledger.check(first, [c])
+    ledger.check(second, [c])
+
+
+async def test_training_roles_do_not_conflict_with_each_other():
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+    first = await ledger.acquire("train", "actor", [c], role="actor")
+    second = await asyncio.wait_for(ledger.acquire("train", "critic", [c], role="critic"), timeout=1)
+    ledger.check(first)
+    ledger.check(second)
+
+
+async def test_maintenance_defers_only_for_other_resident_roles():
+    rollout, teacher = claim(), claim("teacher", phase=Phase.SCORE)
+    ledger = OwnershipLedger(PlacementPlan((), (rollout, teacher)))
+    ledger.register_model("rollout", "default", None, rollout)
+    ledger.register_model("teacher", "default", None, teacher)
+    lease = await ledger.acquire("generate", "one", [rollout, teacher], role="rollout")
+    ledger.reserve_activation(lease, "teacher", "default")
+    assert not ledger.reserve_maintenance("rollout", "default")
+    ledger.confirm_deactivation(lease, "teacher", "default")
+    assert ledger.reserve_maintenance("rollout", "default")
+
+
+async def test_manager_maintenance_does_not_acquire_workload_lease():
+    from relax.distributed.ray.inference_manager import InferenceManager
+
+    entered, complete = asyncio.Event(), asyncio.Event()
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("maintenance waited for workload lease")
+
+    async def reserve(*args):
+        return True
+
+    authority = SimpleNamespace(
+        claims_for=SimpleNamespace(remote=forbidden),
+        acquire=SimpleNamespace(remote=forbidden),
+        reserve_maintenance=SimpleNamespace(remote=reserve),
+    )
+    cls = InferenceManager.__ray_metadata__.modified_class
+    manager = cls(SimpleNamespace(_inference_authority=authority), "rollout")
+    manager._locks["default"] = asyncio.Lock()
+    manager._runtimes["default"] = SimpleNamespace(recover=lambda: "recovered", scale_out=lambda: "scaled")
+
+    async def generate():
+        entered.set()
+        await complete.wait()
+
+    work = asyncio.create_task(generate())
+    await entered.wait()
+    try:
+        assert await asyncio.wait_for(manager.maintenance("default", "recover"), timeout=1) == "recovered"
+        assert await asyncio.wait_for(manager.maintenance("default", "scale_out"), timeout=1) == "scaled"
+        assert not work.done()
+    finally:
+        complete.set()
+        await work

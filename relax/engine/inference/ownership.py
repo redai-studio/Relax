@@ -19,6 +19,9 @@ import ray
 from relax.distributed.ray.placement_planner import ACTOR_POOL, Phase, PlacementClaim, PlacementPlan, claims_overlap
 
 
+_TRAINING_ROLES = frozenset({"actor", "critic", "reference", "actor_fwd"})
+
+
 class OwnershipError(RuntimeError):
     """A resource operation cannot establish exclusive ownership."""
 
@@ -38,6 +41,7 @@ class ActivationLease:
     operation_id: str
     generation: int
     claims: tuple[PlacementClaim, ...]
+    role: str | None = None
 
 
 def model_key(role: str, model: str) -> str:
@@ -88,7 +92,7 @@ class OwnershipLedger:
 
     def claims_for(self, role: str) -> tuple[PlacementClaim, ...]:
         own = tuple(c for c in self.plan.claims if c.role == role)
-        if role in {"actor", "critic", "reference", "actor_fwd"}:
+        if role in _TRAINING_ROLES:
             shared = tuple(c for c in self.plan.claims if c.pool == ACTOR_POOL)
             return shared
         # A rollout step owns its deferred scoring window as well. Dedicated
@@ -98,11 +102,28 @@ class OwnershipLedger:
             return tuple(c for c in self.plan.claims if c.pool in pools)
         return own
 
-    async def acquire(self, owner: str, operation_id: str, claims: Iterable[PlacementClaim]) -> ActivationLease:
+    def _conflicts(self, role: str | None, other: str | None) -> bool:
+        # Old explicit callers without role metadata retain conservative fencing.
+        if role is None or other is None:
+            return True
+        return role != other and not (role in _TRAINING_ROLES and other in _TRAINING_ROLES)
+
+    def _needs_handoff(self, role: str | None, claims: tuple[PlacementClaim, ...]) -> bool:
+        if role is None:
+            return True
+        return any(
+            claim.pool == ACTOR_POOL
+            or any(other.role != role and claims_overlap(claim, other) for other in self.plan.claims)
+            for claim in claims
+        )
+
+    async def acquire(
+        self, owner: str, operation_id: str, claims: Iterable[PlacementClaim], *, role: str | None = None
+    ) -> ActivationLease:
         claims = tuple(claims)
         previous = self._operations.get(operation_id)
         if previous is not None:
-            if previous.owner != owner or previous.claims != claims:
+            if previous.owner != owner or previous.claims != claims or previous.role != role:
                 raise OwnershipError("An operation ID cannot be reused with different ownership arguments")
             return previous
         pending = self._pending.get(operation_id)
@@ -117,13 +138,16 @@ class OwnershipLedger:
                     for blocked, reason in self._blocked.values():
                         if any(claims_overlap(a, b) for a in claims for b in blocked):
                             raise ResourceBlockedError(reason)
-                    if not any(
-                        claims_overlap(a, b) for lease in self._active.values() for a in lease.claims for b in claims
+                    if not self._needs_handoff(role, claims) or not any(
+                        self._conflicts(role, lease.role) and claims_overlap(a, b)
+                        for lease in self._active.values()
+                        for a in lease.claims
+                        for b in claims
                     ):
                         break
                     await self._condition.wait()
                 self._generation += 1
-                lease = ActivationLease(self.epoch, owner, operation_id, self._generation, claims)
+                lease = ActivationLease(self.epoch, owner, operation_id, self._generation, claims, role)
                 self._active[operation_id] = self._operations[operation_id] = lease
                 self._locks[operation_id] = asyncio.Lock()
                 return lease
@@ -189,6 +213,27 @@ class OwnershipLedger:
                     raise OwnershipError(f"{resident} must confirm release before activating {role}/{model}")
         # Reserve before dispatch, so concurrent activations cannot both pass.
         self._resident.update(keys)
+
+    def reserve_maintenance(self, role: str, model: str) -> bool:
+        """Serialize allocation with cross-role residency, not workload leases.
+
+        Once reserved, training handoff goes through the manager's model lock
+        and waits for this maintenance before offloading the model.
+        """
+        keys = [key for key, (_, name, claim) in self._models.items() if claim.role == role and name == model]
+        claims = [self._models[key][2] for key in keys]
+        for blocked, _ in self._blocked.values():
+            if any(claims_overlap(a, b) for a in claims for b in blocked):
+                return False
+        for lease in self._active.values():
+            if lease.role in _TRAINING_ROLES and any(claims_overlap(a, b) for a in claims for b in lease.claims):
+                return False
+        for key in self._resident.difference(keys):
+            other = self._models[key][2]
+            if other.role != role and any(claims_overlap(claim, other) for claim in claims):
+                return False
+        self._resident.update(keys)
+        return True
 
     def confirm_deactivation(self, lease: ActivationLease, role: str, model: str) -> None:
         keys = [key for key, (_, name, claim) in self._models.items() if claim.role == role and name == model]

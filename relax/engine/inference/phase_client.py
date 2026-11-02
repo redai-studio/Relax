@@ -95,7 +95,7 @@ class PhaseSession:
             return parent
         if self.lease is None:
             claims = ray.get(self.authority.claims_for.remote(self.role))
-            self.lease = ray.get(self.authority.acquire.remote(self.owner, self.operation_id, claims))
+            self.lease = ray.get(self.authority.acquire.remote(self.owner, self.operation_id, claims, role=self.role))
         self._token = _CURRENT.set(self)
         return self
 
@@ -118,7 +118,7 @@ class PhaseSession:
 
         async def acquire() -> ActivationLease:
             claims = await self.authority.claims_for.remote(self.role)
-            return await self.authority.acquire.remote(self.owner, self.operation_id, claims)
+            return await self.authority.acquire.remote(self.owner, self.operation_id, claims, role=self.role)
 
         if self.lease is None:
             pending = asyncio.create_task(acquire())

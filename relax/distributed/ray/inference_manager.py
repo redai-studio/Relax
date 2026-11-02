@@ -254,10 +254,20 @@ class InferenceManager:
     async def maintenance(self, name: str, method: str, args: tuple = (), kwargs: dict | None = None) -> Any:
         if method.startswith("_") or method in _MEMORY_METHODS:
             raise OwnershipError("Memory operations require the caller's explicit phase lease")
-        async with PhaseSession(self.authority, self.role, f"maintenance:{self.role}:{method}") as session:
+        async with self._locks[name]:
             if self._closing:
                 return None
-            return await self.call(name, method, args, kwargs, session.lease)
+            if method not in {"scale_in", "remove_engine"}:
+                allowed = await self.authority.reserve_maintenance.remote(self.role, name)
+                if not allowed:
+                    # Offloaded shared engines are rebuilt at the next onload.
+                    if method in {"recover", "register_recovered_engines"}:
+                        return None
+                    raise OwnershipError(f"{self.role}/{name} {method} deferred until its next onload")
+            try:
+                return await _invoke(self._runtimes[name], method, *args, **(kwargs or {}))
+            finally:
+                await self._record_resources(name)
 
     async def acquire_inference(self, name: str, request_id: str, **selection: Any) -> Any:
         initialization = self._initializations.get(name)

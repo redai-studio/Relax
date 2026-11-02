@@ -15,8 +15,8 @@ def actor(monkeypatch):
     events = []
     leases = []
 
-    def acquire(owner, operation, claims):
-        lease = ActivationLease("epoch", owner, operation, len(leases) + 1, tuple(claims))
+    def acquire(owner, operation, claims, *, role=None):
+        lease = ActivationLease("epoch", owner, operation, len(leases) + 1, tuple(claims), role)
         leases.append(lease)
         events.append("acquire")
         return lease

@@ -26,7 +26,9 @@ def begin_training_phase(actor: Any) -> PhaseSession | None:
                 claims = ray.get(authority.claims_for.remote(actor.role))
                 if claims:
                     session = PhaseSession(authority, actor.role, f"train:{actor.role}")
-                    session.lease = ray.get(authority.acquire.remote(session.owner, session.operation_id, claims))
+                    session.lease = ray.get(
+                        authority.acquire.remote(session.owner, session.operation_id, claims, role=actor.role)
+                    )
                     session.switch("train")
             receipt[0] = session.lease if session is not None and not session.closed else None
         except Exception as error:
