@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
+from copy import deepcopy
 from typing import Any, Callable, Iterable, Optional
 
 import ray
@@ -114,6 +115,9 @@ class EnginePool:
         self.addresses: dict[int, dict] = {}
         self.init_metadata: dict[int, dict] = {}
         self.release_evidence: dict[int, Any] = {}
+        # Exit is a fact about this actor/incarnation and its recorded process
+        # identity, even when another slot cannot yet confirm its own exit.
+        self._exit_receipts: dict[int, tuple[Any, int, Any]] = {}
         # How many times each slot has been built.
         self.incarnations: dict[int, int] = {}
         self._states: dict[int, EngineState] = {}
@@ -223,6 +227,7 @@ class EnginePool:
             self.slots[slot] = engine
             self.init_metadata.pop(slot, None)
             self.release_evidence.pop(slot, None)
+            self._exit_receipts.pop(slot, None)
             self.incarnations[slot] = self.incarnations.get(slot, 0) + 1
             if slot % self.nodes_per_engine == 0:
                 self._states[slot] = EngineState.STARTING
@@ -520,6 +525,16 @@ class EnginePool:
         for slot in slots:
             engine = self.slots[slot]
             if engine is not None:
+                receipt = self._exit_receipts.get(slot)
+                if (
+                    receipt is not None
+                    and receipt[0] is engine
+                    and receipt[1] == self.incarnations.get(slot, 0)
+                    and receipt[2] == self.release_evidence.get(slot)
+                ):
+                    confirmed.append(slot)
+                    continue
+                self._exit_receipts.pop(slot, None)
                 failed = False
                 for method in self.spec.teardown_calls:
                     # The engine's own shutdown kills the SGLang process tree. It
@@ -545,6 +560,12 @@ class EnginePool:
                     self._states[head] = EngineState.BLOCKED
                     failed_heads.add(head)
                     continue
+                identity = self.release_evidence.get(slot)
+                self._exit_receipts[slot] = (
+                    engine,
+                    self.incarnations.get(slot, 0),
+                    deepcopy(identity) if isinstance(identity, dict) else identity,
+                )
             confirmed.append(slot)
         # A multi-slot replica keeps its complete allocation until every child
         # has confirmed shutdown. No kill request is an exit acknowledgement.
@@ -563,6 +584,7 @@ class EnginePool:
         for slot in confirmed:
             self._remove_owned_pg(slot)
             self.slots[slot] = None
+            self._exit_receipts.pop(slot, None)
         for head in self.head_slots():
             if all(engine is None for engine in self.slots[head : head + self.nodes_per_engine]):
                 self._states[head] = EngineState.DEAD
