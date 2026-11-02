@@ -115,6 +115,7 @@ def test_discovery_pd_routing_requires_both_stages(prefill, decode, expected, re
 
 
 def test_discovery_model_state_follows_its_most_available_replica():
+    assert aggregate_state([EngineState.BLOCKED, READY, DEAD]) is READY
     assert aggregate_state([SLEEPING, READY, DEAD]) is READY
     assert aggregate_state([SLEEPING, EngineState.ONLOADING]) is EngineState.ONLOADING
     assert aggregate_state([SLEEPING, EngineState.DRAINING]) is EngineState.DRAINING

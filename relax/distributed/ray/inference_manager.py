@@ -225,8 +225,14 @@ class InferenceManager:
             raise OwnershipError("Use the leased lifecycle interface for this operation")
         read = method.startswith(("get_", "list_")) or method in _READ_METHODS or method in _CONTROL_METHODS
         if not read:
-            if lease is None:
-                return await self.maintenance(name, method, args, kwargs)
+            if lease is None or method in {
+                "recover",
+                "recover_rollout_engines",
+                "scale_out",
+                "scale_in",
+                "register_recovered_engines",
+            }:
+                return await self.maintenance(name, method, args, kwargs, lease=lease)
             await self._validate(name, lease)
         if read:
             return await _invoke(self._runtimes[name], method, *args, **kwargs)
@@ -251,17 +257,23 @@ class InferenceManager:
 
         return await asyncio.shield(asyncio.create_task(execute()))
 
-    async def maintenance(self, name: str, method: str, args: tuple = (), kwargs: dict | None = None) -> Any:
+    async def maintenance(
+        self, name: str, method: str, args: tuple = (), kwargs: dict | None = None, *, lease=None
+    ) -> Any:
         if method.startswith("_") or method in _MEMORY_METHODS:
             raise OwnershipError("Memory operations require the caller's explicit phase lease")
+        if lease is not None:
+            await self._validate(name, lease)
         async with self._locks[name]:
+            if lease is not None:
+                await self._validate(name, lease)
             if self._closing:
                 return None
             if method not in {"scale_in", "remove_engine"}:
                 allowed = await self.authority.reserve_maintenance.remote(self.role, name)
                 if not allowed:
                     # Offloaded shared engines are rebuilt at the next onload.
-                    if method in {"recover", "register_recovered_engines"}:
+                    if method in {"recover", "recover_rollout_engines", "register_recovered_engines"}:
                         return None
                     raise OwnershipError(f"{self.role}/{name} {method} deferred until its next onload")
             try:

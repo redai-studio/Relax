@@ -133,6 +133,13 @@ class EnginePool:
     def state(self, head_slot: int) -> EngineState:
         if self.slots[head_slot] is None:
             return EngineState.DEAD
+        try:
+            from ray.core.generated.gcs_pb2 import ActorTableData
+
+            if self.slots[head_slot]._get_local_state() == ActorTableData.DEAD:
+                return EngineState.BLOCKED
+        except Exception:
+            pass  # Unknown local actor observation never changes ownership.
         return self._states.get(head_slot, EngineState.READY if self._active else EngineState.SLEEPING)
 
     def _move(self, head_slot: int, target: EngineState) -> None:
@@ -196,7 +203,10 @@ class EnginePool:
         # Appends as it goes so a caller can roll back a call that fails midway.
         actor_class = self.spec.actor_class()
         for slot in range(len(self.slots)) if slots is None else slots:
-            if self.slots[slot] is not None:
+            if (
+                self.slots[slot] is not None
+                or self._states.get(slot // self.nodes_per_engine * self.nodes_per_engine) is EngineState.BLOCKED
+            ):
                 continue
 
             pg_tuple, owns_pg, gpu_index = self.spec.resolve_placement(slot)
@@ -355,7 +365,7 @@ class EnginePool:
         handles = []
         for head in self.head_slots():
             engine = self.slots[head]
-            if engine is None:
+            if engine is None or self.state(head) is EngineState.BLOCKED:
                 continue
             self._move(head, EngineState.ONLOADING)
             handles.append(engine.resume_memory_occupation.remote(tags=tags))
@@ -441,7 +451,11 @@ class EnginePool:
         handles = {}
         for head in self.head_slots():
             engine = self.slots[head]
-            if engine is None or head in skipped:
+            if (
+                engine is None
+                or head in skipped
+                or (method == "resume_memory_occupation" and self.state(head) is EngineState.BLOCKED)
+            ):
                 continue
             handles[head] = getattr(engine, method).remote(**kwargs)
 
@@ -547,8 +561,14 @@ class EnginePool:
         """Tear down the given logical engines, all their slots, so ``recover``
         rebuilds them."""
         heads = sorted({slot // self.nodes_per_engine * self.nodes_per_engine for slot in head_slots})
+        errors = []
         for head in heads:
-            self.teardown(range(head, head + self.nodes_per_engine))
+            try:
+                self.teardown(range(head, head + self.nodes_per_engine))
+            except ResourceBlockedError as error:
+                errors.append(str(error))
+        if errors:
+            raise ResourceBlockedError("; ".join(errors))
 
     def recover(self) -> set[int]:
         """Rebuild every empty slot. Returns the slots rebuilt.
@@ -556,6 +576,12 @@ class EnginePool:
         Degrades rather than escalates: running on fewer engines beats a global
         restart. Only a pool with no engine left raises.
         """
+        for head in self.head_slots():
+            if self.state(head) is EngineState.BLOCKED:
+                try:
+                    self.retire([head])
+                except ResourceBlockedError as error:
+                    logger.warning(self._log(str(error)))
         dead = [
             slot
             for slot, engine in enumerate(self.slots)

@@ -35,8 +35,8 @@ class EngineState(str, Enum):
 # A model with replicas in mixed states reports the first of these that any
 # replica is in: one ready replica is enough to serve.
 _MODEL_STATE_PRECEDENCE = (
-    EngineState.BLOCKED,
     EngineState.READY,
+    EngineState.BLOCKED,
     EngineState.ONLOADING,
     EngineState.STARTING,
     EngineState.DRAINING,

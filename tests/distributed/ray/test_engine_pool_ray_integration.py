@@ -106,6 +106,10 @@ def _manager_class():
         def release_inference(self, permit):
             super().release_inference(permit)
 
+        @ray.method(concurrency_group=SNAPSHOT_CONCURRENCY_GROUP)
+        def health_check(self):
+            return super().health_check()
+
         def kill_engine(self, rank):
             ray.kill(self.all_engines[rank])
 
@@ -255,6 +259,13 @@ def test_dead_permit_holder_drain_waits_for_engine_idle_on_real_ray(manager):
         ray.get(barrier.wait_entered.remote(), timeout=10)
         assert ray.wait([offload], timeout=0)[0] == []
         assert "draining" in _states(manager)
+        for _ in range(3):
+            # The busy backend cannot answer health checks yet. Neither health
+            # nor discovery may reopen the independently responsive gate.
+            ray.get(manager.health_check.remote(), timeout=15)
+            with pytest.raises(ModelUnavailableError):
+                ray.get(manager.acquire_inference.remote("during-drain"), timeout=10)
+            assert "draining" in _states(manager)
         ray.get(barrier.confirm_idle.remote(), timeout=10)
         ray.get(offload, timeout=15)
         assert _states(manager) == ["sleeping", "sleeping"]

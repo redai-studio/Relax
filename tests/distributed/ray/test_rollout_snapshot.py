@@ -4,7 +4,6 @@
 the unified discovery schema."""
 
 import asyncio
-import threading
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -27,7 +26,7 @@ from conftest import (
     mock_ray_get,
 )
 
-from relax.engine.inference.discovery import RoleSnapshot
+from relax.engine.inference.discovery import EngineState, RoleSnapshot
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
@@ -41,8 +40,16 @@ def _manager(monkeypatch, groups, status=None):
             for slot, engine in enumerate(group.all_engines)
             if engine is not None
         }
+        from ray.core.generated.gcs_pb2 import ActorTableData
+
+        for slot, url in group._engine_urls.items():
+            group.all_engines[slot]._get_local_state.return_value = ActorTableData.ALIVE
+            group.engine_init_records.setdefault(
+                slot, rollout._EngineInitRecord({"url": url, "pid": 1, "node_id": "node"})
+            )
     manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=groups)})
     manager.status = status
+    manager.rollout_engine_lock = object()
     return manager
 
 
@@ -82,6 +89,83 @@ def test_rollout_snapshot_reports_actual_served_name_from_engine_init(monkeypatc
     group = make_engine_group(engines=_engines("http://engine:1"))
     group._served_model_names[0] = "/materialized/model"
     assert _snapshot(_manager(monkeypatch, [group])).models[0].served_model_name == "/materialized/model"
+
+
+def test_rollout_observation_cannot_rewrite_lifecycle_intent(monkeypatch):
+    group = make_engine_group(engines=_engines("http://engine:1"))
+    manager = _manager(monkeypatch, [group], status="onload")
+    pool = group._engine_pool()
+    pool._active = False
+    manager._admission.close()
+    for _ in range(5):
+        assert _snapshot(manager).models[0].state is not EngineState.READY
+        assert pool.is_active() is False
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_rollout_recovers_or_isolates_one_failed_slot_while_survivor_serves(monkeypatch, confirmed):
+    from relax.engine.inference.routing import RoutingState, select_target
+
+    group = make_engine_group(engines=_engines("http://old:1", "http://survivor:2"))
+    group.pg = (object(), [0, 1], [0, 1])
+    group.router_ip = group.router_port = None
+    manager = _manager(monkeypatch, [group], status="onload")
+    manager.servers["default"].router_ip = manager.servers["default"].router_port = None
+    pool = group._engine_pool()
+    group.health_failures = {0: pool.incarnations.get(0, 0)}
+    failed = object()
+    group.all_engines[0].shutdown.remote.return_value = failed
+
+    def get(ref, **kwargs):
+        if ref is failed:
+            raise RuntimeError("actor died")
+        return mock_ray_get(ref, **kwargs)
+
+    monkeypatch.setattr(rollout.ray, "get", get)
+    monkeypatch.setattr(rollout.ray, "kill", lambda *a, **kw: None)
+    monkeypatch.setattr(pool, "_confirm_orphan_release", lambda slot: confirmed)
+
+    def start(cursors):
+        group.num_new_engines = int(group.all_engines[0] is None)
+        if group.num_new_engines:
+            group.all_engines[0] = make_mock_engine(url="http://new:3")
+            pool._states[0] = EngineState.READY
+            pool.incarnations[0] = 1
+            group.engine_init_records[0] = rollout._EngineInitRecord(
+                {"url": "http://new:3", "pid": 3, "node_id": "node"}
+            )
+        return [], cursors
+
+    monkeypatch.setattr(group, "start_engines", start)
+    manager.recover_rollout_engines()
+    snapshot = _snapshot(manager)
+    assert snapshot.models[0].state is EngineState.READY
+    urls = {select_target(snapshot, RoutingState()).base_url for _ in range(5)}
+    assert "http://old:1" not in urls
+    assert group.all_engines[0] is not None
+    assert snapshot.models[0].engines[0].state is (EngineState.READY if confirmed else EngineState.BLOCKED)
+
+
+def test_rollout_failed_route_is_removed_using_init_record(monkeypatch):
+    from ray.core.generated.gcs_pb2 import ActorTableData
+
+    engine = make_mock_engine(url="http://old:1")
+    engine._get_local_state.return_value = ActorTableData.DEAD
+    group = make_engine_group(engines=[engine])
+    group.engine_init_records[0] = rollout._EngineInitRecord(
+        {"url": "http://old:1", "pid": 1, "node_id": "node"},
+        router_cleanup=rollout.RouterWorkerCleanup("old-generation"),
+    )
+    removed = []
+    monkeypatch.setattr(
+        rollout,
+        "remove_dead_router_worker",
+        lambda router, url, cleanup, **kw: removed.append((url, cleanup.actor_id)) or True,
+    )
+    monkeypatch.setattr(rollout.ray, "get", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("actor died")))
+    assert group.remove_failed_route(0)
+    assert removed == [("http://old:1", "old-generation")]
+    engine.get_url.remote.assert_not_called()
 
 
 async def test_rollout_split_resume_keeps_admission_closed_until_all_tags_return(monkeypatch):
@@ -178,7 +262,8 @@ def test_rollout_snapshot_leaves_legacy_engines_info_shape(monkeypatch):
 
     legacy = manager.get_engines_info()
 
-    assert set(legacy) == {"models", "total_engines"}
+    # upstream/main already exposes observation in this legacy projection.
+    assert set(legacy) == {"models", "total_engines", "observation"}
     assert set(legacy["models"]["default"]) == {"router_ip", "router_port", "engine_groups", "total_engines"}
     assert legacy["models"]["default"]["engine_groups"][0]["engines"][0]["url"] == "http://n0:15000"
 
@@ -233,7 +318,9 @@ async def test_rollout_snapshot_external_scale_out_caches_only_successful_engine
     engines = _engines("http://failed:18000", "http://second:18001", "http://third:18002")
     engines[0].init.remote.side_effect = RuntimeError("connection failed")
     for engine in engines[1:]:
-        engine.init.remote.return_value = AwaitableValue(None)
+        engine.init.remote.return_value = AwaitableValue(
+            {"url": mock_ray_get(engine.get_url.remote.return_value), "pid": 1, "node_id": "node"}
+        )
     actor = MagicMock()
     actor.options.return_value.remote.side_effect = engines
     monkeypatch.setattr(rollout.ray, "remote", lambda cls: actor)
@@ -257,32 +344,33 @@ async def test_rollout_snapshot_external_scale_out_caches_only_successful_engine
     ]
     engines[0].get_url.remote.assert_not_called()
     for engine in engines[1:]:
-        engine.get_url.remote.assert_called_once_with()
+        engine.get_url.remote.assert_not_called()
 
 
 async def test_rollout_snapshot_remains_available_during_scale_out_url_capture(monkeypatch):
     manager = _manager(monkeypatch, [make_engine_group()], status="onload")
     manager._health_check_engines = AsyncMock(return_value=True)
     manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
-    entered, release = threading.Event(), threading.Event()
+    entered, release = asyncio.Event(), asyncio.Event()
 
-    def capture_urls(refs, timeout=None):
+    async def initialization():
         entered.set()
-        if not release.wait(timeout=5):
-            raise TimeoutError("test URL capture was not released")
-        return mock_ray_get(refs)
+        await release.wait()
+        return {"url": "http://new:18000", "pid": 2, "node_id": "node"}
 
-    monkeypatch.setattr(rollout.ray, "get", capture_urls)
+    engine = make_mock_engine(url="http://new:18000")
+    init = asyncio.create_task(initialization())
     task = asyncio.create_task(
         manager._finalize_engine_group_registration(
             request=rollout.ScaleOutRequest(request_id="external", status=rollout.ScaleOutStatus.CREATING),
             srv=manager.servers["default"],
-            engines=[make_mock_engine(url="http://new:18000")],
+            engines=[engine],
+            engine_init_pairs=[(engine, init)],
             rank_offset=1,
         )
     )
     try:
-        assert await asyncio.to_thread(entered.wait, 5)
+        await asyncio.wait_for(entered.wait(), timeout=5)
         assert not task.done()
         # No partially registered group is visible while URL capture is pending.
         assert len(_snapshot(manager).model("default").engines) == 1
@@ -291,3 +379,28 @@ async def test_rollout_snapshot_remains_available_during_scale_out_url_capture(m
         result = await task
     assert result.success
     assert _snapshot(manager).model("default").engines[1].base_url == "http://new:18000"
+
+
+def test_rollout_uses_survivor_directly_until_failed_route_is_removed(monkeypatch):
+    from relax.engine.inference.routing import RoutingState, select_target
+
+    group = make_engine_group(engines=_engines("http://old:1", "http://survivor:2"))
+    manager = _manager(monkeypatch, [group], status="onload")
+    group.health_failures = {0: 0}
+    snapshot = _snapshot(manager)
+    assert snapshot.models[0].router_url is None
+    assert select_target(snapshot, RoutingState()).base_url == "http://survivor:2"
+    assert group.remove_failed_route(0)
+    assert _snapshot(manager).models[0].router_url == "http://127.0.0.1:3000"
+
+
+def test_router_fallback_excludes_replacement_awaiting_weight_sync(monkeypatch):
+    from relax.engine.inference.routing import RoutingState, select_target
+
+    group = make_engine_group(engines=_engines("http://old:1", "http://unsynced:2", "http://survivor:3"))
+    manager = _manager(monkeypatch, [group], status="onload")
+    group.health_failures = {0: 0}
+    group.engine_init_records[1].pending_router_registration = True
+    snapshot = _snapshot(manager)
+    routing = RoutingState()
+    assert {select_target(snapshot, routing).base_url for _ in range(6)} == {"http://survivor:3"}

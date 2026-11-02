@@ -762,3 +762,28 @@ def test_pd_id_cleanup_rejects_url_shared_with_another_generation(monkeypatch, s
     )
     assert not sglang_engine_module.remove_dead_router_worker("http://router:3000", old["url"], cleanup)
     assert requests.deletes == []
+
+
+def test_initial_regular_registration_can_be_removed_after_actor_death(sglang_engine_module, monkeypatch):
+    module = sglang_engine_module
+    engine = _make_engine(module)
+    engine._is_scaled_out = False
+    rows = []
+
+    def post(url, json, **kwargs):
+        rows.append({"id": "initial", "url": json["url"], "is_healthy": True, "metadata": json.get("labels", {})})
+        return _Response(202, {"worker_id": "initial"})
+
+    monkeypatch.setattr(module.requests, "post", post)
+    monkeypatch.setattr(module.requests, "get", lambda *a, **kw: _Response(200, {"workers": list(rows)}))
+
+    def delete(*args, **kwargs):
+        rows.clear()
+        return _Response(202)
+
+    monkeypatch.setattr(module.requests, "delete", delete)
+    assert engine.register_to_router()
+    assert module.remove_dead_router_worker(
+        "http://router:3000", "http://worker:8000", module.RouterWorkerCleanup("replacement-actor"), actor_dead=True
+    )
+    assert not rows

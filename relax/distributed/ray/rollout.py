@@ -40,6 +40,7 @@ from relax.engine.inference.discovery import (
     build_model_snapshot,
     format_base_url,
 )
+from relax.engine.inference.ownership import ResourceBlockedError
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -502,11 +503,55 @@ class EngineGroup:
         the manager has not recorded as finished shows as draining / onloading.
         """
         pool = self._engine_pool()
-        pool.settle(resident)
-        return [
-            EngineState.BLOCKED if head in getattr(self, "health_failures", {}) else pool.state(head)
-            for head in pool.head_slots()
-        ]
+        in_flight = EngineState.DRAINING if resident is EngineState.READY else EngineState.ONLOADING
+        unchanged = {in_flight, EngineState.STARTING, EngineState.DEAD, EngineState.BLOCKED}
+        states = []
+        for head in pool.head_slots():
+            state = pool.state(head)
+            states.append(
+                EngineState.BLOCKED
+                if head in getattr(self, "health_failures", {})
+                else state
+                if state in unchanged
+                else resident
+            )
+        return states
+
+    def remove_failed_route(self, head: int) -> bool:
+        """Remove a failed generation without querying its discovery
+        endpoint."""
+        if not (self.router_ip and self.router_port):
+            return True
+        pool = self._engine_pool()
+        key = (head, pool.incarnations.get(head, 0))
+        excluded = self.__dict__.setdefault("_excluded_routes", set())
+        if key in excluded:
+            return True
+        removed = False
+        engine = self.all_engines[head]
+        if engine is not None:
+            try:
+                removed = (
+                    ray.get(engine.unregister_from_router.remote(wait_for_removal=True, timeout=10), timeout=15)
+                    is True
+                )
+            except Exception:
+                pass
+        record = self.engine_init_records.get(head)
+        if not removed and record is not None and record.router_cleanup is not None:
+            metadata = record.value if isinstance(record.value, dict) else {}
+            url = metadata.get("url") or record.router_url
+            if url:
+                try:
+                    dead = engine is None or _read_local_actor_state(engine, _get_engine_actor_states())[0] == "DEAD"
+                    removed = remove_dead_router_worker(
+                        f"http://{self.router_ip}:{self.router_port}", url, record.router_cleanup, actor_dead=dead
+                    )
+                except Exception as error:
+                    logger.warning("Failed route cleanup for rank=%s: %s", self.rank_offset + head, error)
+        if removed:
+            excluded.add(key)
+        return removed
 
     def _cache_engine_urls(self, slots: list[int] | None = None) -> None:
         """Record actual head URLs once init completes, before publication.
@@ -762,13 +807,16 @@ class RolloutServer:
     def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
         groups = list(self.engine_groups)
-        for group in groups:
-            pool = group._engine_pool()
-            if any(pool.state(head) is EngineState.BLOCKED for head in pool.head_slots()):
-                from relax.engine.inference.ownership import ResourceBlockedError
-
-                raise ResourceBlockedError("Cannot recover rollout before the previous incarnation exits")
-        dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
+        dead_per_group = [
+            [
+                i
+                for i, engine in enumerate(g.all_engines)
+                if engine is None
+                and g._engine_pool()._states.get(i // g.nodes_per_engine * g.nodes_per_engine)
+                is not EngineState.BLOCKED
+            ]
+            for g in groups
+        ]
 
         # Managed PD retains static IDs outside the engine actor. Confirm old
         # registrations are gone before replacements can reuse their endpoints.
@@ -913,11 +961,16 @@ class RolloutServer:
             )
 
     def offload(self):
-        """Release memory occupation across all groups (concurrent)."""
-        handles = []
+        """Release every group and collect all shutdown evidence before
+        returning."""
+        errors = []
         for g in self.engine_groups:
-            handles.extend(g.offload())
-        return _settle_engine_calls(handles)
+            try:
+                g._engine_pool().deactivate()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
 
     def onload(self, tags: list[str] | None = None):
         """Resume memory occupation across all groups (concurrent)."""
@@ -1194,10 +1247,23 @@ class RolloutEngineRuntime:
         if srv is not None:
             for group in srv.engine_groups:
                 pool = group._engine_pool()
-                for head, incarnation in list(getattr(group, "health_failures", {}).items()):
-                    if pool.incarnations.get(head, 0) == incarnation:
+                failures = getattr(group, "health_failures", {})
+                heads = set(failures) | {head for head in pool.head_slots() if pool.state(head) is EngineState.BLOCKED}
+                for head in sorted(heads):
+                    if head in failures and pool.incarnations.get(head, 0) != failures[head]:
+                        failures.pop(head, None)
+                        continue
+                    if not group.remove_failed_route(head):
+                        failures[head] = pool.incarnations.get(head, 0)
+                        group.health_failures = failures
+                        logger.warning("Deferring failed slot until its router entry is removed: rank=%s", head)
+                        continue
+                    try:
                         pool.retire([head])
-                    group.health_failures.pop(head, None)
+                    except ResourceBlockedError as error:
+                        logger.warning("Keeping failed rollout slot isolated: %s", error)
+                    else:
+                        failures.pop(head, None)
         if srv is None:
             engines = srv.engines if srv else []
             gpu_counts = srv.engine_gpu_counts if srv else []
@@ -3304,6 +3370,7 @@ class RolloutEngineRuntime:
         for name, srv in self.servers.items():
             router_url = format_base_url(srv.router_ip, srv.router_port) if srv.router_ip and srv.router_port else None
             replicas, workers = [], []
+            unsafe_router = False
             for group in srv.engine_groups:
                 if group.lifecycle_status in (EngineGroupLifecycle.REMOVING, EngineGroupLifecycle.REMOVED):
                     continue
@@ -3315,6 +3382,14 @@ class RolloutEngineRuntime:
                     rank = group.rank_offset + slot
                     url = group._engine_urls.get(slot) if engine is not None else None
                     state = states[i]
+                    record = group.engine_init_records.get(slot)
+                    if state is EngineState.READY and record is not None and record.pending_router_registration:
+                        state = EngineState.STARTING
+                    if state in {EngineState.BLOCKED, EngineState.DEAD} and (
+                        slot,
+                        group._engine_pool().incarnations.get(slot, 0),
+                    ) not in getattr(group, "_excluded_routes", set()):
+                        unsafe_router = True
                     if engine is not None and group.lifecycle_status is EngineGroupLifecycle.DRAINING:
                         state = EngineState.DRAINING
                     if group.worker_type in ("prefill", "decode"):
@@ -3338,6 +3413,11 @@ class RolloutEngineRuntime:
                 or overrides.get("model_path")
                 or getattr(self.args, "hf_checkpoint", None)
             )
+            if unsafe_router:
+                # Regular survivors can serve directly until route removal is
+                # confirmed. PD requires a safe router and remains retryable.
+                router_url = None
+                workers = [(label, url, EngineState.BLOCKED) for label, url, _ in workers]
             models.append(
                 build_model_snapshot(
                     name, replicas, router_url=router_url, diagnostic_workers=workers, served_model_name=served_name

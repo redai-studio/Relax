@@ -51,6 +51,11 @@ def test_rollout_snapshot_returns_before_engine_memory_switch_finishes(snapshot_
         def get_url(self):
             return "http://127.0.0.1:18000"
 
+        def init(self):
+            import os
+
+            return {"url": self.get_url(), "pid": os.getpid(), "node_id": ray.get_runtime_context().get_node_id()}
+
         def release_memory_occupation(self):
             ray.get(self.gate.block.remote())
 
@@ -61,6 +66,9 @@ def test_rollout_snapshot_returns_before_engine_memory_switch_finishes(snapshot_
     engine = Engine.remote(gate)
     try:
         group = make_engine_group(engines=[engine])
+        from relax.distributed.ray.rollout import _EngineInitRecord
+
+        group.engine_init_records[0] = _EngineInitRecord(ray.get(engine.init.remote(), timeout=10))
         group._cache_engine_urls()
         manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
         manager.status = "onload" if switch == "offload" else "offload"

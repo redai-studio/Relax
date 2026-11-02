@@ -63,7 +63,7 @@ class RouterWorkerCleanup:
 
 
 def remove_dead_router_worker(
-    router_url: str, worker_url: str, cleanup: RouterWorkerCleanup, timeout: float = 10.0
+    router_url: str, worker_url: str, cleanup: RouterWorkerCleanup, timeout: float = 10.0, *, actor_dead: bool = False
 ) -> bool:
     """Remove one dead generation before its replacement is created.
 
@@ -99,7 +99,9 @@ def remove_dead_router_worker(
             if cleanup.worker_id is not None:
                 return str(row["id"]) == cleanup.worker_id
             return row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
-        return row.get("is_healthy") is False and row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
+        return (actor_dead or row.get("is_healthy") is False) and row.get("metadata", {}).get(
+            "relax_actor_id"
+        ) == cleanup.actor_id
 
     try:
         rows = workers()
@@ -1279,9 +1281,7 @@ class SGLangEngine(RayActor):
                     "url": worker_url,
                     "worker_type": self.worker_type,
                 }
-                if (required or getattr(self, "_is_scaled_out", False)) and parse(sglang_router.__version__) >= parse(
-                    "0.3.0"
-                ):
+                if parse(sglang_router.__version__) >= parse("0.3.0"):
                     payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
                 if self.worker_type == "prefill" and bootstrap_port is not None:
                     payload["bootstrap_port"] = bootstrap_port

@@ -543,3 +543,26 @@ async def test_late_reconciliation_cannot_quarantine_new_epoch():
     reply.set()
     await task
     assert ledger.snapshot()["blocked"] == {}
+
+
+async def test_role_maintenance_rejects_a_returned_explicit_lease():
+    from relax.distributed.ray.inference_manager import InferenceManager
+
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+
+    async def check(*args, **kwargs):
+        return ledger.check(*args, **kwargs)
+
+    manager = InferenceManager.__ray_metadata__.modified_class(
+        SimpleNamespace(_inference_authority=SimpleNamespace(check=SimpleNamespace(remote=check))), "rollout"
+    )
+    called = []
+    manager._runtimes["default"] = SimpleNamespace(scale_in=lambda: called.append("scaled"))
+    manager._claims["default"] = (c,)
+    manager._locks["default"] = asyncio.Lock()
+    lease = await ledger.acquire("old", "old", [c], role="rollout")
+    await ledger.release(lease)
+    with pytest.raises(StaleLeaseError):
+        await manager.call("default", "scale_in", lease=lease)
+    assert called == []
