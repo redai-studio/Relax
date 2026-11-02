@@ -7,6 +7,7 @@ from argparse import Namespace
 from pathlib import Path
 
 import pytest
+import torch
 
 
 # This helper only consumes host metadata; execute its actual source without
@@ -17,7 +18,7 @@ _function = next(
     for node in ast.parse(_source.read_text()).body
     if isinstance(node, ast.FunctionDef) and node.name == "_attach_mtp_forward_kwargs"
 )
-_namespace = {"Namespace": Namespace}
+_namespace = {"Namespace": Namespace, "torch": torch}
 exec(compile(ast.Module(body=[_function], type_ignores=[]), str(_source), "exec"), _namespace)
 _attach_mtp_forward_kwargs = _namespace["_attach_mtp_forward_kwargs"]
 

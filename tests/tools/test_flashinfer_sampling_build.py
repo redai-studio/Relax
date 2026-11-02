@@ -31,7 +31,7 @@ def test_sampling_hopper_skips_build_and_package_lookup(monkeypatch):
     "layout", ["opt/sglang/lib/python3.12/site-packages", "usr/local/lib/python3.12/dist-packages"]
 )
 def test_sampling_installs_into_active_distribution(monkeypatch, tmp_path, layout):
-    monkeypatch.setenv("GPU_ARCH", "b300")
+    monkeypatch.setenv("GPU_ARCH", "blackwell")
     root = tmp_path / layout
     aot = root / "flashinfer_jit_cache/jit_cache/sampling/sampling.so"
     aot.parent.mkdir(parents=True)

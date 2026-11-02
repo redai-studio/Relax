@@ -61,7 +61,17 @@ def test_load_checkpoint_preserves_valid_megatron_resume(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     "case",
-    ["full", "template", "other_sharding", "partial_offload", "non_precision_aware", "non_hdo", "no_optim", "error"],
+    [
+        "full",
+        "template",
+        "other_sharding",
+        "partial_offload",
+        "zero_offload",
+        "non_precision_aware",
+        "non_hdo",
+        "no_optim",
+        "error",
+    ],
 )
 def test_full_checkpoint_preserves_hdo_step_only_when_applicable(monkeypatch, tmp_path, case):
     HybridDeviceOptimizer = pytest.importorskip(
@@ -77,8 +87,11 @@ def test_full_checkpoint_preserves_hdo_step_only_when_applicable(monkeypatch, tm
     hdo = SimpleNamespace() if case == "non_hdo" else object.__new__(HybridDeviceOptimizer)
     hdo.param_update_in_fp32 = True
     hdo.offload_fraction = 0.5 if case == "partial_offload" else 1.0
+    if case == "zero_offload":
+        hdo.offload_fraction = 0.0
     hdo.gpu_optimizer = None
     hdo.cpu_optimizers = [cpu_optimizer]
+    hdo.param_groups = [{"params": [parameter], "step": 7}]
     hdo.state = {parameter: state}
     hdo.inner_param_to_orig_param = {inner: parameter}
     optimizer = object.__new__(DistributedOptimizer)
@@ -128,7 +141,8 @@ def test_full_checkpoint_preserves_hdo_step_only_when_applicable(monkeypatch, tm
         assert checkpoint.load_checkpoint(None, optimizer, None, {}, False) == (7, 0)
     assert DistributedOptimizer.load_state_dict is original_load
     assert calls == ([] if case == "no_optim" else ["load"])
-    assert state["step"].item() == (7 if case == "full" else 1)
+    assert state["step"].item() == (7 if case in ("full", "partial_offload") else 1)
+    assert ("step" not in hdo.param_groups[0]) == (case in ("full", "partial_offload"))
     assert cpu_optimizer.state[inner] is state
     assert state["exp_avg"] is moment and torch.equal(moment, torch.ones(1))
     assert torch.equal(parameter, torch.zeros(1))

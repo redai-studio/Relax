@@ -45,7 +45,7 @@ make docker-train
 make docker-dev
 
 # Build only the Blackwell dev image locally.
-DO_PUSH=0 make docker-dev-cu13-b300
+DO_PUSH=0 make docker-dev-cu13-blackwell
 ```
 
 `make train` is an alias for `make docker-train`. Each variant checks its own image tag, so an existing cu12 image does not skip missing cu13 images.
@@ -55,10 +55,10 @@ DO_PUSH=0 make docker-dev-cu13-b300
 | Variant | Dockerfile | Train target | Dev target |
 | --- | --- | --- | --- |
 | CUDA 12.9 | `docker/Dockerfile` | `docker-train-cu12` | `docker-dev-cu12` |
-| CUDA 13.0 Blackwell | `docker/Dockerfile.cu13` | `docker-train-cu13-b300` | `docker-dev-cu13-b300` |
+| CUDA 13.0 Blackwell | `docker/Dockerfile.cu13` | `docker-train-cu13-blackwell` | `docker-dev-cu13-blackwell` |
 | CUDA 13.0 Hopper | `docker/Dockerfile.cu13` | `docker-train-cu13-hopper` | `docker-dev-cu13-hopper` |
 
-Blackwell uses `GPU_ARCH=b300`; Hopper uses `GPU_ARCH=hopper`. The suffixes in image tags are `cu12`, `cu13-blackwell`, and `cu13-hopper`. Default image names are `<REGISTRY>/<IMAGE_REPOSITORY>:train-YYYYMMDD-<hash8>-<suffix>` and `<REGISTRY>/<IMAGE_REPOSITORY>:dev-YYYYMMDD-<hash8>-<suffix>`, using the build date and the current Git commit's first eight characters.
+Blackwell uses `GPU_ARCH=blackwell`; Hopper uses `GPU_ARCH=hopper`. The suffixes in image tags are `cu12`, `cu13-blackwell`, and `cu13-hopper`. Default image names are `<REGISTRY>/<IMAGE_REPOSITORY>:train-YYYYMMDD-<hash8>-<suffix>` and `<REGISTRY>/<IMAGE_REPOSITORY>:dev-YYYYMMDD-<hash8>-<suffix>`, using the build date and the current Git commit's first eight characters.
 
 `DO_PUSH=1` is the default: existing remote images are skipped, and new images are pushed. With `DO_PUSH=0`, existing local images are skipped and nothing is pushed. `REGISTRY` is required in both modes.
 
@@ -75,11 +75,11 @@ Unset base overrides use the corresponding Dockerfile's pinned base. `CU13_BASE_
 ```bash
 # Reuse an existing Blackwell train image; replace the date/hash placeholders.
 CU13_BLACKWELL_TRAIN_IMAGE="$REGISTRY/relax:train-YYYYMMDD-HASH8-cu13-blackwell" \
-  DO_PUSH=0 make docker-dev-cu13-b300
+  DO_PUSH=0 make docker-dev-cu13-blackwell
 ```
 
 ::: warning CUDA 13 validation status
-`docker/Dockerfile.cu13` is a candidate build configuration. Full image builds and GPU validation, including B300 forward/backward validation, are required before promotion. These build targets do not establish Blackwell support in the published `latest` image.
+`docker/Dockerfile.cu13` provides candidate compilation configurations for Hopper and Blackwell. Full image builds and GPU runtime validation, including forward/backward checks, require separate verification. These build targets alone do not establish Blackwell support in the published `latest` image.
 :::
 
 #### Build Directly with Docker

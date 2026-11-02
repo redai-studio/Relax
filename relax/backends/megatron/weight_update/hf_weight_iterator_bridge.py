@@ -62,6 +62,7 @@ _FUSED_PAIR_FRAGMENTS = (
     (".compressor.wkv.", ".compressor.wgate."),
 )
 _PAIR_SENTINEL = "\x00"
+_QWEN4EXP_PLE_TABLE_SUFFIX = ".per_layer_embedding.ple_embedding.ngram_embedding.weight"
 
 
 def _fused_pair_key(name: str) -> str | None:
@@ -441,16 +442,37 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             gathered_params = None
             if self._async_weight_gather:
                 t_g0 = time.monotonic()
-                gathered_params = all_gather_params_async(
-                    list(zip(bucket_infos, params, strict=True)), gdn_split_sizes=self._gdn_split_sizes
+                gathered_params = iter(
+                    all_gather_params_async(
+                        [
+                            (info, param)
+                            for info, param in zip(bucket_infos, params, strict=True)
+                            if not info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
+                        ],
+                        gdn_split_sizes=self._gdn_split_sizes,
+                    )
                 )
                 t_gather_total += time.monotonic() - t_g0
-            for index, (info, param) in enumerate(zip(bucket_infos, params, strict=True)):
+            for info, param in zip(bucket_infos, params, strict=True):
+                if info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                    # Bridge's PLE mapping assembles one HF shard per TP collective.
+                    # A full TP gather here would materialize the entire n-gram
+                    # table (and convert() would retain all its shard views).
+                    shards = self._bridge_converter.iter_ple_shards(info.name, param)
+                    while True:
+                        t_g0 = time.monotonic()
+                        try:
+                            converted = next(shards)
+                        except StopIteration:
+                            break
+                        t_convert_total += time.monotonic() - t_g0
+                        param_count += 1
+                        yield converted
+                    continue
+
                 t_g0 = time.monotonic()
                 gathered = (
-                    all_gather_param(self.args, info.name, param)
-                    if gathered_params is None
-                    else gathered_params[index]
+                    all_gather_param(self.args, info.name, param) if gathered_params is None else next(gathered_params)
                 )
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0

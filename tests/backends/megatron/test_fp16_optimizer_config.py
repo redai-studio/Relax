@@ -259,10 +259,11 @@ def test_fp16_optimizer_invalid_values_fail_with_parameter_name(overrides, match
         megatron_arguments._resolve_optimizer_precision_args(args)
 
 
-def test_bf16_unset_values_restore_native_megatron_defaults(monkeypatch):
+@pytest.mark.parametrize("optimizer, expected_distributed", [("adam", True), ("sgd", False)])
+def test_bf16_unset_values_restore_native_megatron_defaults(monkeypatch, optimizer, expected_distributed):
     from megatron.core.optimizer import OptimizerConfig
 
-    args = _optimizer_args(fp16=False)
+    args = _optimizer_args(fp16=False, optimizer=optimizer)
     args.seq_length = None
     args.vocab_size = None
     args.padded_vocab_size = None
@@ -274,6 +275,7 @@ def test_bf16_unset_values_restore_native_megatron_defaults(monkeypatch):
     megatron_arguments._set_default_megatron_args(args)
 
     assert args.bf16 is True
+    assert args.use_distributed_optimizer is expected_distributed
     for name in megatron_arguments._FP16_OPTIMIZER_FALLBACKS:
         assert getattr(args, name) == getattr(native_defaults, name)
     assert warnings == []

@@ -6,21 +6,23 @@ import inspect
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.training.kimi_k3_flops import estimate_kimi_k3_flops
+from relax.utils.training.qwen38_flops import _estimate_qwen38_flops
 
 
 logger = get_logger(__name__)
 
 # BF16 theoretical peak FLOPS per device (raw FLOPS).
+# Model names are compatibility keys, not a record of deployed hardware.
 _DEVICE_FLOPS = {
     "CPU": 448e9,
-    "GB200": 2.5e15,
-    "B200": 2.25e15,
-    "GB300": 2.5e15,
-    "B300": 2.25e15,
+    "GB200": 2.5e15,  # gitleaks:allow
+    "B200": 2.25e15,  # gitleaks:allow
+    "GB300": 2.5e15,  # gitleaks:allow
+    "B300": 2.25e15,  # gitleaks:allow
     "MI300X": 1307e12,
     "MI350X": 2300e12,
     "MI355X": 2500e12,
-    "H100": 989e12,
+    "H100": 989e12,  # gitleaks:allow
     "H800": 989e12,
     "L20Y": 989e12,
     "H200": 989e12,
@@ -529,6 +531,8 @@ _ESTIMATE_FUNC = {
     "qwen2_5_vl": _estimate_qwen2_flops,
     "qwen3_vl": _estimate_qwen3_vl_flops,
     "qwen3_vl_moe": _estimate_qwen3_vl_moe_flops,
+    "qwen4_exp": _estimate_qwen38_flops,
+    "qwen4_exp_text": _estimate_qwen38_flops,
 }
 
 

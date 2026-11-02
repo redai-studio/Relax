@@ -89,6 +89,7 @@ def reference_actor_methods():
     tree = ast.parse(source.read_text())
     actor = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "MegatronTrainRayActor")
     method_names = {
+        "_flush_resident_sft_parameters",
         "_switch_model",
         "_is_standard_dpo",
         "_assert_dpo_reference_identity",

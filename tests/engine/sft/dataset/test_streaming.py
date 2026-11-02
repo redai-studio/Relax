@@ -1456,6 +1456,57 @@ def test_expand_loss_mask_alignment_single_image_pad_run():
     assert out.tolist() == [0, 0, 0, 0, 0, 0, 1]
 
 
+def test_message_loss_mask_preserves_selected_assistant_round(tmp_path):
+    path = tmp_path / "selected.jsonl"
+    row = {
+        "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "assistant", "content": "d"},
+        ],
+        "message_loss_mask": [0, 0, 0, 1],
+    }
+    _write_jsonl(path, [row])
+    dataset = SFTStreamingDataset(str(path), prompt_key="messages", prefetch_max_cached=0)
+    sample = dataset.get_canonical_sample(0)
+    assert [message.learn for message in sample.messages] == [False, False, False, True]
+    assert "learn" not in row["messages"][1]
+
+
+def test_multimodal_tool_call_null_content_normalizes_before_media_resolution(tmp_path):
+    path = tmp_path / "tool.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {"id": "call1", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                        ],
+                    },
+                    {"role": "tool", "content": "result", "tool_call_id": "call1"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "message_loss_mask": [0, 0, 0, 1],
+            }
+        ],
+    )
+    dataset = SFTStreamingDataset(
+        str(path),
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        prefetch_max_cached=0,
+    )
+    sample = dataset.get_canonical_sample(0)
+    assert sample.messages[1].content == []
+    assert sample.messages[1].tool_calls[0]["function"]["arguments"] == {}
+
+
 def test_expand_loss_mask_alignment_multiple_pad_kinds():
     img, aud = 99, 88
     short = torch.tensor([1, img, 2, aud, 3], dtype=torch.long)
@@ -1693,3 +1744,80 @@ def test_pack_samples_for_tq_rejects_pre_shifted_classification_labels():
     sample.classification_label = torch.tensor(1)
     with pytest.raises(ValueError, match="cannot be combined"):
         pack_samples_for_tq([sample])
+
+
+def test_canonicalize_openai_tool_trace_normalizes_arguments_and_links_response():
+    raw = [
+        {"role": "user", "content": "weather"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"city": "Shanghai"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+        {"role": "assistant", "content": "It is sunny."},
+    ]
+
+    messages = _canonicalize_messages(raw, require_response=True)
+
+    assert messages[1].content == ""
+    assert messages[1].tool_calls[0]["function"]["arguments"] == {"city": "Shanghai"}
+    assert messages[2].tool_call_id == "call_1"
+    assert messages[2].name == "lookup"
+    assert messages[0].learn is False
+    assert messages[1].learn is True
+    assert messages[2].learn is False
+    assert messages[3].learn is True
+
+
+def test_canonicalize_tool_calls_rejects_invalid_json_arguments():
+    raw = [
+        {"role": "user", "content": "weather"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"type": "function", "function": {"name": "lookup", "arguments": "{invalid"}}],
+        },
+    ]
+
+    with pytest.raises(json.JSONDecodeError):
+        _canonicalize_messages(raw, require_response=True)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ('{"city": "Shanghai"}', {"city": "Shanghai"}),
+        ("", {}),
+    ],
+)
+def test_canonicalize_flat_tool_call_normalizes_arguments(arguments, expected):
+    raw = [
+        {"role": "tool_call", "content": json.dumps({"name": "lookup", "arguments": arguments})},
+    ]
+
+    messages = _canonicalize_messages(raw, require_response=True)
+
+    assert messages[0].tool_calls[0]["function"]["arguments"] == expected
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error_type", "message"),
+    [
+        ("{invalid", json.JSONDecodeError, "Expecting property name"),
+        ("[]", TypeError, "function.arguments must be a JSON object"),
+    ],
+)
+def test_canonicalize_flat_tool_call_rejects_invalid_arguments(arguments, error_type, message):
+    raw = [
+        {"role": "tool_call", "content": json.dumps({"name": "lookup", "arguments": arguments})},
+    ]
+
+    with pytest.raises(error_type, match=message):
+        _canonicalize_messages(raw, require_response=True)

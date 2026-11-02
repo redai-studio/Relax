@@ -574,11 +574,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "logits. Default off — legacy external-loss SFT path materializes full logits "
                 "and runs CE externally. Set --sft-chunked-logits to opt in. MTP head calls "
                 "continue to use the real output_layer before the main head is deferred. "
-                "Incompatible when embeddings are tied "
-                "(--untie-embeddings-and-output-weights not set: output_layer is built with "
-                "skip_weight_param_allocation=True so output_layer.weight is None and the "
-                "chunked path's lm_head matmul has nothing to multiply against; tied models "
-                "are small enough that the chunked path's memory win is marginal anyway).",
+                "Tied embeddings reuse the explicit shared weight passed to the main output layer. "
+                "Chunked recomputation with tied embeddings does not support overlapping "
+                "gradient reduction.",
             )
             parser.add_argument(
                 "--only-train-params-name-list",
@@ -4704,27 +4702,13 @@ def slime_validate_args(args):
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
-    # --sft-chunked-logits incompatibilities. Both are flagged here so
+    # --sft-chunked-logits incompatibilities are flagged here so
     # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
-    # Both are hard asserts — the user must remove --sft-chunked-logits
+    # This is a hard assert — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
     if getattr(args, "sft_chunked_logits", False):
-        # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
-        #    Output_layer is built with skip_weight_param_allocation=True →
-        #    output_layer.weight is None → chunked path's lm_head matmul
-        #    crashes on NoneType. The chunked memory win is marginal on the
-        #    small models that ship with tied embeddings anyway, so the user
-        #    should just drop the flag.
-        assert getattr(args, "untie_embeddings_and_output_weights", False), (
-            "--sft-chunked-logits is incompatible with tied embeddings "
-            "(HF config.tie_word_embeddings=true → "
-            "--untie-embeddings-and-output-weights not set; output_layer.weight "
-            "is None and the chunked path's lm_head matmul has nothing to "
-            "multiply against). Remove --sft-chunked-logits; the chunked "
-            "memory win is marginal on tied-weight models."
-        )
-        # 2) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        # Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked
         #    silently degrades to the full-logits path.

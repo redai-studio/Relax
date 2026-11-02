@@ -56,6 +56,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     gpt = types.ModuleType("megatron.core.models.gpt")
     gpt_layer_specs = types.ModuleType("megatron.core.models.gpt.gpt_layer_specs")
     transformer = types.ModuleType("megatron.core.transformer")
+    multi_token_prediction = types.ModuleType("megatron.core.transformer.multi_token_prediction")
     spec_utils = types.ModuleType("megatron.core.transformer.spec_utils")
     transformer_config = types.ModuleType("megatron.core.transformer.transformer_config")
     training = types.ModuleType("megatron.training")
@@ -69,6 +70,9 @@ def _install_fake_megatron(monkeypatch, provider=None):
         pass
 
     class _FakeTransformerConfig:
+        pass
+
+    class _FakeMultiTokenPredictionBlock(torch.nn.Module):
         pass
 
     class _FakeAutoBridge:
@@ -93,6 +97,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     gpt_layer_specs.get_gpt_layer_with_transformer_engine_spec = lambda *args, **kwargs: object()
     spec_utils.import_module = lambda path: object()
     transformer_config.TransformerConfig = _FakeTransformerConfig
+    multi_token_prediction.MultiTokenPredictionBlock = _FakeMultiTokenPredictionBlock
     arguments.core_transformer_config_from_args = lambda args: _FakeTransformerConfig()
     arguments.parse_args = lambda *args, **kwargs: None
     arguments.validate_args = lambda *args, **kwargs: None
@@ -110,6 +115,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
         "megatron.core.models.gpt": gpt,
         "megatron.core.models.gpt.gpt_layer_specs": gpt_layer_specs,
         "megatron.core.transformer": transformer,
+        "megatron.core.transformer.multi_token_prediction": multi_token_prediction,
         "megatron.core.transformer.spec_utils": spec_utils,
         "megatron.core.transformer.transformer_config": transformer_config,
         "megatron.training": training,
@@ -534,6 +540,38 @@ def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
 
 
+@pytest.mark.parametrize("cp_comm_type", ["p2p", "a2a", ["p2p"], ["a2a"], ["p2p", "a2a"] * 30])
+def test_bridge_provider_preserves_requested_cp_communication_after_finalize(monkeypatch, cp_comm_type):
+    provider = _FakeProvider()
+    provider.cp_comm_type = "p2p"
+    provider.num_layers = 60
+    original_finalize = provider.finalize
+
+    def validate_and_finalize():
+        if isinstance(provider.cp_comm_type, list):
+            assert len(provider.cp_comm_type) == provider.num_layers
+        original_finalize()
+
+    provider.finalize = validate_and_finalize
+    module, provider = _load_model_provider(monkeypatch, provider)
+    build_model = module.get_model_provider_func(
+        _bridge_args(cp_comm_type=cp_comm_type, context_parallel_size=4, num_layers=60), role="actor"
+    )
+    build_model(pre_process=True, post_process=True)
+    assert provider.finalized
+    expected = cp_comm_type[0] if isinstance(cp_comm_type, list) and len(cp_comm_type) == 1 else cp_comm_type
+    assert provider.cp_comm_type == expected
+
+
+def test_bridge_provider_keeps_cp_communication_default_when_argument_absent(monkeypatch):
+    provider = _FakeProvider()
+    provider.cp_comm_type = "p2p"
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(), role="actor")
+    assert provider.finalized
+    assert provider.cp_comm_type == "p2p"
+
+
 @pytest.mark.parametrize("wrapper", ["freeze", "lora", "freeze_lora"])
 @pytest.mark.parametrize("signature", ["modern", "kwargs", "legacy"])
 def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrapper, signature):
@@ -655,3 +693,38 @@ def test_raw_provider_uses_supplied_config_and_process_groups(monkeypatch, expli
     assert constructed[0]["config"] is config
     assert constructed[0]["pg_collection"] is pg_collection
     assert constructed[0]["vp_stage"] == 2
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("moe_hybridep_pad_variable_tokens", True),
+        ("gdn_pre_gated_delta_rule_fusion", True),
+        ("gdn_conv_pad_alignment", 8192),
+    ],
+)
+def test_bridge_forwards_blackwell_runtime_configuration(monkeypatch, name, value):
+    provider = _FakeProvider()
+    setattr(provider, name, None)
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(**{name: value}))(pre_process=True, post_process=True)
+    assert getattr(provider, name) == value
+
+
+def test_bridge_provider_preserves_native_offload_policy(monkeypatch):
+    policy = {
+        "fine_grained_activation_offloading": True,
+        "offload_modules": ["moe_act", "core_attn"],
+        "min_offloaded_tensor_size": 4096,
+        "activation_offload_fraction": 0.5,
+        "delta_offload_bytes_across_pp_ranks": 1024,
+        "delay_offload_until_cuda_graph": True,
+        "fine_grained_offloading_max_inflight_offloads": 2,
+    }
+    provider = _FakeProvider()
+    for name in policy:
+        setattr(provider, name, None)
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(**policy), role="actor")
+    assert provider.finalized
+    assert {name: getattr(provider, name) for name in policy} == policy

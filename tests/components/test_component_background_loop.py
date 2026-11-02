@@ -29,7 +29,9 @@ def component(request, monkeypatch):
     obj.config = Namespace(num_rollout=1, fully_async=True, loss_type="policy_loss", use_health_check=False)
     obj.healthy = Mock()
     obj.data_system_client = Mock()
-    return obj
+    yield obj
+    # Detach while this fixture still owns the process-global lifecycle mock.
+    obj.__del__()
 
 
 @pytest.mark.parametrize("health_check", [False, True])
@@ -165,7 +167,10 @@ async def test_component_constructor_initializes_shared_runner(component, monkey
         num_rollout=0,
     )
     initialized = type(component)(healthy=Mock(), pgs=None, num_gpus=1, config=config, role=component.role)
-    assert isinstance(initialized._loop_runner, BackgroundLoopRunner)
-    await initialized.run()
-    assert await initialized._loop_runner.join(1)
-    assert initialized.step == 0
+    try:
+        assert isinstance(initialized._loop_runner, BackgroundLoopRunner)
+        await initialized.run()
+        assert await initialized._loop_runner.join(1)
+        assert initialized.step == 0
+    finally:
+        initialized.__del__()

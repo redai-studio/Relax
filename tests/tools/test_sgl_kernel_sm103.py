@@ -31,7 +31,7 @@ def build(monkeypatch, tmp_path):
     metadata = SimpleNamespace(version=Mock(return_value="0.4.7"), distribution=Mock(return_value=dist))
     monkeypatch.setattr(kernel, "md", metadata)
     monkeypatch.setattr(kernel, "SGLANG_SOURCE", tmp_path / "source")
-    monkeypatch.setenv("GPU_ARCH", "b300")
+    monkeypatch.setenv("GPU_ARCH", "blackwell")
     monkeypatch.setenv("PIP_CONSTRAINT", str(tmp_path / "constraints.txt"))
     commands = Mock()
     monkeypatch.setattr(kernel.subprocess, "run", commands)

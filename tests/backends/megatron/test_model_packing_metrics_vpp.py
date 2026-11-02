@@ -3,16 +3,20 @@
 """Packing metrics follow the logical final stage under VPP."""
 
 from argparse import Namespace
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
+
+from relax.utils.training.indexer_replay import IndexerReplay
 
 
 class _FakeModel:
     role = "actor"
 
     def __call__(self, **_kwargs) -> torch.Tensor:
-        return torch.ones(1)
+        return torch.ones(1, dtype=torch.bfloat16 if _kwargs.get("fp32_output") is False else torch.float32)
 
     def zero_grad_buffer(self) -> None:
         pass
@@ -32,11 +36,25 @@ class _FakeScheduler:
 
 
 @pytest.mark.parametrize("num_model_chunks", [1, 2])
-def test_train_one_step_counts_each_logical_microbatch_once(monkeypatch, num_model_chunks):
+@pytest.mark.parametrize(
+    ("chunked", "bf16", "replay", "expected_dtype"),
+    [
+        (False, True, False, torch.float32),
+        (True, True, False, torch.bfloat16),
+        (True, True, True, torch.bfloat16),
+        (True, False, False, torch.float32),
+    ],
+)
+def test_train_one_step_counts_each_logical_microbatch_once(
+    monkeypatch, num_model_chunks, chunked, bf16, replay, expected_dtype
+):
     model_module = pytest.importorskip("relax.backends.megatron.model")
 
     args = Namespace(
         allgather_cp=False,
+        bf16=bf16,
+        fp16=False,
+        sft_chunked_logits=chunked,
         calculate_per_token_loss=False,
         check_for_nan_in_loss_and_grad=True,
         ci_test=False,
@@ -52,7 +70,7 @@ def test_train_one_step_counts_each_logical_microbatch_once(monkeypatch, num_mod
         seq_length=8,
         task_type="causal_lm",
         use_opd=False,
-        use_rollout_indexer_replay=False,
+        use_rollout_indexer_replay=replay,
         uses_unsplit_forward=False,
     )
     batch = {
@@ -66,7 +84,10 @@ def test_train_one_step_counts_each_logical_microbatch_once(monkeypatch, num_mod
 
     monkeypatch.setattr(model_module, "get_args", lambda: args)
     monkeypatch.setattr(model_module, "get_batch", lambda *_args, **_kwargs: dict(batch))
-    monkeypatch.setattr(model_module, "should_bypass_main_output_layer", lambda _args: False)
+    monkeypatch.setattr(model_module, "should_bypass_main_output_layer", lambda _args: chunked)
+    monkeypatch.setattr(model_module, "_bypass_output_layer", lambda *a, **k: nullcontext(None))
+    monkeypatch.setattr(model_module, "get_model_config", lambda _: SimpleNamespace(cross_entropy_loss_fusion=False))
+    monkeypatch.setattr(IndexerReplay, "forward_stage", lambda: nullcontext())
     monkeypatch.setattr(model_module.capture_hooks, "begin_step_for", lambda *_args: None)
     monkeypatch.setattr(model_module.capture_hooks, "end_step_for", lambda: None)
     monkeypatch.setattr(model_module, "maybe_verify_critic_value_head_movement", lambda *_args: None)
@@ -79,6 +100,7 @@ def test_train_one_step_counts_each_logical_microbatch_once(monkeypatch, num_mod
     monkeypatch.setattr(model_module.torch.distributed, "get_world_size", lambda _group: 1)
 
     def fake_loss_function(_args, _batch, _num_microbatches, logits, **_kwargs):
+        assert logits.dtype == expected_dtype
         return (
             logits.sum() * 0,
             1,

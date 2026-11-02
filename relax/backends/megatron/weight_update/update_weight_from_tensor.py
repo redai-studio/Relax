@@ -33,6 +33,7 @@ from .expert_layout import DirectExpertLayout, direct_expert_chunk, expert_slice
 from .expert_routing import ExpertLayout, validate_server_layout
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .ipc import dispatch_typed_buckets
+from .ipc_allocator import IpcBucketAllocator
 from .lora_adapter_sync import LoraAdapterSync
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
@@ -73,6 +74,8 @@ class UpdateWeightFromTensor:
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = 0
+        self._ipc_allocator_version: int | None = None
+        self._ipc_bucket_allocator: IpcBucketAllocator | None = None
 
         self.lora_enabled = is_lora_enabled(args)
         self.lora_merge_mode = is_lora_merge_mode(args) if self.lora_enabled else False
@@ -753,9 +756,13 @@ class UpdateWeightFromTensor:
 
         long_lived_tensors = None
         if self._ipc_engine is not None:
+            if self._ipc_allocator_version != self.weight_version:
+                self._ipc_bucket_allocator = IpcBucketAllocator(make_current_torch_device())
+                self._ipc_allocator_version = self.weight_version
             refs_colocated, long_lived_tensors = _send_to_colocated_engine(
                 hf_named_tensors,
                 ipc_engine=self._ipc_engine,
+                bucket_allocator=self._ipc_bucket_allocator,
                 ipc_gather_src=self._ipc_gather_src,
                 ipc_gather_group=self._ipc_gather_group,
                 weight_version=None if self._route_experts else self.weight_version,
@@ -785,6 +792,7 @@ def _send_to_colocated_engine(
     ipc_gather_src,
     ipc_gather_group,
     weight_version,
+    bucket_allocator: IpcBucketAllocator | None = None,
     dispatch_errors: list[str] | None = None,
     direct_layout: DirectExpertLayout | None = None,
 ) -> tuple[list[ObjectRef], Any]:
@@ -830,12 +838,15 @@ def _send_to_colocated_engine(
                 converted_named_tensors_by_dtypes[dtype] = []
             converted_named_tensors_by_dtypes[dtype].append((name, tensor))
 
+    bucket_allocator = bucket_allocator or IpcBucketAllocator(cur_device)
     serialized_tensors = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         if direct_chunk is not None:
             payload, load_format = named_tensors, direct_format
         else:
-            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            # Bucket-owned allocations use ordinary CUDA storage for inexpensive IPC.
+            with bucket_allocator.allocation():
+                flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
             payload = {
                 "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
                 "metadata": flattened_tensor_bucket.get_metadata(),

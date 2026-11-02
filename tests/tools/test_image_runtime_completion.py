@@ -57,9 +57,9 @@ def test_hybridep_validation_preserves_sglang_package(tmp_path):
 
 def test_legacy_fla_rebuilds_complete_validated_closure(tmp_path):
     installer = load_script("install_legacy_fla")
-    directory = os.environ.get("B300_FLA042_WHEEL_DIR")
+    directory = os.environ.get("BLACKWELL_FLA042_WHEEL_DIR")
     if not directory:
-        pytest.skip("Set B300_FLA042_WHEEL_DIR to the two checksum-pinned 0.4.2 wheels")
+        pytest.skip("Set BLACKWELL_FLA042_WHEEL_DIR to the two checksum-pinned 0.4.2 wheels")
     wheels = [Path(directory) / url.rsplit("/", 1)[1] for url, _ in installer.WHEELS]
     target = tmp_path / "compat"
     report = installer.install(target, ROOT / "docker/patch/fla/0.4.2-legacy-runtime.patch", wheels)
@@ -86,9 +86,9 @@ def test_final_dependency_check_rejects_ray_numpy_conflict():
 @pytest.mark.parametrize("backend", ["v2", "hybrid"])
 def test_deepep_namespace_patch_isolates_real_event_type(tmp_path, backend):
     hybrid = backend == "hybrid"
-    source = os.environ.get("B300_HYBRIDEP_SOURCE_DIR" if hybrid else "B300_DEEPEP_V2_SOURCE_DIR")
+    source = os.environ.get("BLACKWELL_HYBRIDEP_SOURCE_DIR" if hybrid else "BLACKWELL_DEEPEP_V2_SOURCE_DIR")
     if not source:
-        pytest.skip("Set B300_DEEPEP_V2_SOURCE_DIR to pinned unpatched v2 sources")
+        pytest.skip("Set BLACKWELL_DEEPEP_V2_SOURCE_DIR to pinned unpatched v2 sources")
     import sysconfig
 
     import torch
