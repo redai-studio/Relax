@@ -21,7 +21,8 @@ import pytest
         "streaming_forward_backward_pipelining_without_interleaving",
     ],
 )
-def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch, schedule_name):
+@pytest.mark.parametrize("offload_enabled", [None, False])
+def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch, schedule_name, offload_enabled):
     """New Megatron finalization needs the combined TP/DP/CP reduction
     group."""
     source = Path(__file__).resolve().parents[3] / "relax/backends/megatron/streaming_schedules.py"
@@ -63,6 +64,8 @@ def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch
         grad_sync_func=None,
         deallocate_pipeline_outputs=False,
     )
+    if offload_enabled is not None:
+        config.fine_grained_activation_offloading = offload_enabled
     communicator = types.SimpleNamespace(
         total_stages=2,
         current_stage=1,
@@ -124,3 +127,38 @@ def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch
     assert groups.cp is cp
     assert groups.dp_cp is dp_cp
     assert groups.tp_dp_cp is tp_dp_cp
+
+
+@pytest.mark.parametrize(
+    "schedule_name",
+    [
+        "streaming_forward_backward_no_pipelining",
+        "streaming_forward_backward_pipelining_without_interleaving",
+    ],
+)
+@pytest.mark.parametrize("forward_only", [False, True])
+def test_streaming_schedules_reject_activation_offload_before_consuming_data(schedule_name, forward_only):
+    source = Path(__file__).resolve().parents[3] / "relax/backends/megatron/streaming_schedules.py"
+    tree = ast.parse(source.read_text())
+    schedule = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == schedule_name)
+    config = types.SimpleNamespace(fine_grained_activation_offloading=True)
+    # No CUDA or distributed doubles: the guard must run before either is used.
+    namespace = {"get_model_config": lambda model: config}
+    exec(compile(ast.Module(body=[schedule], type_ignores=[]), str(source), "exec"), namespace)
+
+    # Reject the first call and later calls regardless of changing microbatch counts.
+    for count in (2, 4, 1):
+        data_iterator = iter(range(count))
+        with pytest.raises(
+            ValueError, match="Disable --fine-grained-activation-offloading or --use-dynamic-batch-size"
+        ):
+            namespace[schedule_name](
+                forward_step_func=None,
+                data_iterator=data_iterator,
+                model=object(),
+                num_microbatches=99,
+                seq_length=8,
+                micro_batch_size=1,
+                forward_only=forward_only,
+            )
+        assert list(data_iterator) == list(range(count))
