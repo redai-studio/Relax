@@ -191,25 +191,32 @@ def test_engine_group_caches_actual_head_urls_only_after_initialization(monkeypa
     monkeypatch.setattr(rollout.ray, "get", mock_ray_get)
     creations, _handles, _cursors, _allocation = _start(monkeypatch, group)
     # Effective URLs may differ from allocated addresses (overrides/custom engines).
-    creations[0]["engine"].get_url.remote.return_value.value = "http://[2001:db8::1]:18000"
-    creations[2]["engine"].get_url.remote.return_value.value = "http://custom-engine:19000"
-
     assert group.lifecycle_states(EngineState.READY) == [EngineState.STARTING] * 2
     assert group.lifecycle_states(EngineState.READY) == [EngineState.STARTING] * 2
+    # Complete init with the same metadata a real engine returns. Discovery
+    # must use this receipt instead of queuing a new get_url actor call.
+    for slot, url in ((0, "http://[2001:db8::1]:18000"), (2, "http://custom-engine:19000")):
+        group.engine_init_records[slot].value = {"url": url, "pid": 123 + slot, "node_id": "node1"}
     group._cache_engine_urls()
 
     assert group._engine_urls == {0: "http://[2001:db8::1]:18000", 2: "http://custom-engine:19000"}
     assert group.lifecycle_states(EngineState.READY) == [EngineState.READY] * 2
     creations[1]["engine"].get_url.remote.assert_not_called()
     creations[3]["engine"].get_url.remote.assert_not_called()
+    creations[0]["engine"].get_url.remote.assert_not_called()
+    creations[2]["engine"].get_url.remote.assert_not_called()
 
 
 def test_engine_group_recovery_refreshes_only_rebuilt_engine_urls(monkeypatch):
     group = _group(engines=[None, None])
     monkeypatch.setattr(rollout.ray, "get", mock_ray_get)
     creations, _handles, _cursors, _allocation = _start(monkeypatch, group)
-    for index, creation in enumerate(creations):
-        creation["engine"].get_url.remote.return_value.value = f"http://original:{18000 + index}"
+    for index in range(len(creations)):
+        group.engine_init_records[index].value = {
+            "url": f"http://original:{18000 + index}",
+            "pid": 123 + index,
+            "node_id": "node1",
+        }
     group._cache_engine_urls()
     survivor = group.all_engines[1]
     survivor.get_url.remote.reset_mock()
@@ -220,6 +227,7 @@ def test_engine_group_recovery_refreshes_only_rebuilt_engine_urls(monkeypatch):
         if refs and isinstance(refs[0], tuple) and refs[0][0] == "init-handle":
             waiting_states.append(group.lifecycle_states(EngineState.READY))
             assert 0 not in group._engine_urls
+            group.engine_init_records[0].value = {"url": "http://localhost:30000", "pid": 125, "node_id": "node1"}
         return mock_ray_get(refs, timeout=timeout)
 
     monkeypatch.setattr(rollout.ray, "get", wait_for_init)
@@ -229,6 +237,7 @@ def test_engine_group_recovery_refreshes_only_rebuilt_engine_urls(monkeypatch):
     assert group._engine_urls == {0: "http://localhost:30000", 1: "http://original:18001"}
     assert group.lifecycle_states(EngineState.READY) == [EngineState.READY] * 2
     survivor.get_url.remote.assert_not_called()
+    group.all_engines[0].get_url.remote.assert_not_called()
 
 
 def test_engine_group_offload_and_onload_fan_out_to_head_engines():
