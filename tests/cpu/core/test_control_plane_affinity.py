@@ -181,7 +181,7 @@ def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
 
     monkeypatch.setattr(inference_manager, "InferenceManager", FakeOwner)
     monkeypatch.setattr(inference_manager, "register_legacy_name", lambda *a: None)
-    monkeypatch.setattr(inference_manager.ray, "get", lambda ref: None)
+    monkeypatch.setattr(inference_manager.ray, "get", lambda ref, **kwargs: None)
     args = _elastic_args(tmp_path, offload_rollout=False)
 
     placement_group_module.create_genrm_manager(args, "pg", runtime_env={"env_vars": {"A": "B"}})
