@@ -35,9 +35,18 @@ jobs:
     timeout-minutes: 190
     env:
       CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
+      CPU_CONTAINER_NAME: relax-cpu-unittest-${{ github.run_id }}-${{ github.run_attempt }}
       HOST_UV_CACHE_DIR: /home/relax-ci/.cache/uv
       UV_CACHE_DIR: /uv-cache
       UV_LINK_MODE: copy
+      CPU_TEST_FILES: |-
+        tests/tools/test_convert_checkpoint_to_hf_cpu.py
+        tests/backends/megatron/test_score_centering_loss.py
+        tests/backends/megatron/test_gdn_cp_reassembly.py
+        tests/backends/megatron/test_rloo_cp_reduction.py
+        tests/utils/training/test_ppo_logprob_entropy.py
+        tests/utils/training/test_logprob_fast_path.py
+        tests/utils/test_distributed_masked_normalize.py
     steps:
       - name: Initialize runtime paths
         run: |
@@ -60,6 +69,40 @@ jobs:
           build-args: GPU_ARCH=hopper
           # Include patch targets as well as the symlinks under patch/latest.
           hash-key: ${{ hashFiles('docker/Dockerfile.cu13', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'docker/scripts/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
+
+      - name: Start CPU tests
+        id: cpu-tests
+        # Report launch failures after GPU tests so they do not suppress diagnostics.
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          CI_IMAGE: ${{ steps.image.outputs.image-id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOST_UV_CACHE_DIR" "$ARTIFACT_DIR"
+          # Keep the exited container so docker wait can report setup/test failures.
+          docker create --pull never --init \
+            --name "$CPU_CONTAINER_NAME" \
+            --shm-size=4g \
+            -v "$GITHUB_WORKSPACE:/source:ro" \
+            -v "$ARTIFACT_DIR:/artifacts" \
+            -v "$HOST_UV_CACHE_DIR:$UV_CACHE_DIR" \
+            --workdir /workspace/Relax \
+            --env CUDA_VISIBLE_DEVICES= --env NVIDIA_VISIBLE_DEVICES=void \
+            --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env OPENBLAS_NUM_THREADS=1 \
+            --env CPU_TEST_FILES --env UV_CACHE_DIR --env UV_LINK_MODE \
+            --env http_proxy --env https_proxy --env no_proxy \
+            --entrypoint /usr/bin/timeout "$CI_IMAGE" --kill-after=30s 15m bash -euo pipefail -c '
+              cp -a --no-preserve=ownership /source/. /workspace/Relax/
+              uv pip install --system --break-system-packages -r requirements.txt \
+                --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+              mapfile -t cpu_tests <<< "$CPU_TEST_FILES"
+              python -m pytest "${cpu_tests[@]}" \
+                --deselect=tests/tools/test_convert_checkpoint_to_hf_cpu.py::test_cpu_export_isolates_initialized_parent \
+                -v -ra --tb=short --durations=30 --junitxml=/artifacts/cpu-junit.xml \
+                2>&1 | tee /artifacts/cpu-pytest.log
+            '
+          docker start "$CPU_CONTAINER_NAME"
 
       - name: Identify kernel cache
         id: kernel-key
@@ -118,6 +161,7 @@ jobs:
             --env TORCHINDUCTOR_CACHE_DIR=/kernel-cache/inductor \
             --env UV_CACHE_DIR \
             --env UV_LINK_MODE \
+            --env CPU_TEST_FILES \
             --env http_proxy \
             --env https_proxy \
             --env no_proxy \
@@ -133,39 +177,69 @@ jobs:
           '
 
       - name: Install dependencies
+        id: dependencies
         run: |
           docker exec "$CI_CONTAINER_NAME" uv pip install \
             --system --break-system-packages -r requirements.txt \
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
-      - name: Run unittest
-        timeout-minutes: 40
+      - name: Run checkpoint export isolation test
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        timeout-minutes: 6
         run: |
-          docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
-            # Batch CPU export cases without a fresh CUDA-isolated child per case.
-            CUDA_VISIBLE_DEVICES= python -m pytest tests/tools/test_convert_checkpoint_to_hf_cpu.py \
-              --deselect=tests/tools/test_convert_checkpoint_to_hf_cpu.py::test_cpu_export_isolates_initialized_parent \
-              -v -ra --tb=short --durations=10 --junitxml=/artifacts/cpu-export.xml \
-              2>&1 | tee /artifacts/cpu-export.log
+          docker exec "$CI_CONTAINER_NAME" timeout --kill-after=30s 5m bash -euo pipefail -c '
             # Keep the real CUDA/Gloo parent-isolation regression on visible GPUs.
             python -m pytest \
               tests/tools/test_convert_checkpoint_to_hf_cpu.py::test_cpu_export_isolates_initialized_parent \
               -v -ra --tb=short --durations=10 --junitxml=/artifacts/cpu-export-isolation.xml \
               2>&1 | tee /artifacts/cpu-export-isolation.log
+          '
+
+      - name: Run unittest
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        timeout-minutes: 40
+        run: |
+          docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+            mapfile -t cpu_tests <<< "$CPU_TEST_FILES"
+            ignored=()
+            for path in "${cpu_tests[@]}"; do
+              ignored+=("--ignore=$path")
+            done
             QSA_MIXED_TEST_LOG=/artifacts/qsa-mixed.log \
-              python -m pytest tests/ \
-              --ignore=tests/tools/test_convert_checkpoint_to_hf_cpu.py \
+              python -m pytest tests/ "${ignored[@]}" \
               -v -ra --tb=short --durations=50 --junitxml=/artifacts/junit.xml \
               2>&1 | tee /artifacts/pytest.log
           '
 
-      - name: Stop test container
+      - name: Check CPU results
+        if: ${{ !cancelled() && steps.cpu-tests.outcome != 'skipped' }}
+        timeout-minutes: 17
+        env:
+          CPU_START_OUTCOME: ${{ steps.cpu-tests.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$CPU_START_OUTCOME" != success ]]; then
+            echo "::error::CPU test container failed to start"
+            exit 1
+          fi
+          exit_code="$(docker wait "$CPU_CONTAINER_NAME")"
+          docker logs "$CPU_CONTAINER_NAME" > "$ARTIFACT_DIR/cpu-container.log" 2>&1
+          if [[ "$exit_code" != 0 ]]; then
+            tail -n 200 "$ARTIFACT_DIR/cpu-container.log"
+            echo "::error::CPU test container exited with $exit_code"
+            exit 1
+          fi
+          test -s "$ARTIFACT_DIR/cpu-junit.xml"
+
+      - name: Stop test containers
         if: always()
         run: |
-          if docker inspect "$CI_CONTAINER_NAME" >/dev/null 2>&1; then
-            docker logs "$CI_CONTAINER_NAME" > "$ARTIFACT_DIR/container.log" 2>&1 || true
-            docker rm --force "$CI_CONTAINER_NAME"
-          fi
+          for container in "$CI_CONTAINER_NAME" "$CPU_CONTAINER_NAME"; do
+            if docker inspect "$container" >/dev/null 2>&1; then
+              docker logs "$container" > "$ARTIFACT_DIR/$container.log" 2>&1 || true
+              docker rm --force "$container"
+            fi
+          done
 
       - name: Restore kernel cache ownership
         if: ${{ always() && steps.kernel-key.outcome == 'success' }}

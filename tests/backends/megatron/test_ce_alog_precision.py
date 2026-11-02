@@ -4,6 +4,7 @@
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -18,9 +19,7 @@ sm100 = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("backport_first", [False, True])
-def test_ce_dispatch_preserves_entrypoint_identity(enabled, backport_first):
+def _check_ce_dispatch_entrypoint(enabled: bool, backport_first: bool) -> None:
     script = f"""
 import importlib
 if {backport_first!r}:
@@ -41,7 +40,22 @@ assert fused_linear_ce.linear_cross_entropy is original
 """
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", RELAX_SFT_FUSED_LINEAR_CE=str(int(enabled)))
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=90)
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, (
+        f"enabled={enabled}, backport_first={backport_first}\n{result.stdout}{result.stderr}"
+    )
+
+
+def test_ce_dispatch_preserves_entrypoint_identity() -> None:
+    # Each import order and initial environment needs a fresh interpreter.
+    # Bound CPU-only subprocess concurrency without sharing import state.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cases = [
+            executor.submit(_check_ce_dispatch_entrypoint, enabled, backport_first)
+            for backport_first in (False, True)
+            for enabled in (False, True)
+        ]
+        for case in cases:
+            case.result()
 
 
 @pytest.fixture
