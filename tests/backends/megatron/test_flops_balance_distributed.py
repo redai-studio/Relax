@@ -65,6 +65,12 @@ def _worker(rank, rendezvous, output):
         bad = {"total_lengths": [8], "test_costs": [-1 if rank == 0 else 1]}
         with pytest.raises(ValueError, match="FLOPs sample cost estimation failed"):
             data._get_synchronised_sample_costs(args, bad)
+
+        args.dp_balance, args.loss_type = "flops", "sft"
+        cached = {"total_lengths": [8], "flops_cost": [float("nan") if rank == 0 else 1.0]}
+        with pytest.raises(ValueError, match="FLOPs sample cost estimation failed") as failure:
+            data._get_synchronised_sample_costs(args, cached)
+        assert ("positive and finite" if rank == 0 else "peer estimator failed") in str(failure.value)
         Path(output, f"rank-{rank}.json").write_text(json.dumps({"counts": counts, "peer_error": True}))
     finally:
         mpu.destroy_model_parallel()

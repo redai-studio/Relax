@@ -214,6 +214,7 @@ def test_default_objectives_preserve_configuration_and_do_not_load_model(monkeyp
     assert microbatch_cost.sample_costs(args, batch) is None
     assert microbatch_cost.sample_costs(args, batch, for_dp=True) is None
     assert microbatch_cost.add_flops_cost_metadata(args, batch, metadata) is metadata
+    assert microbatch_cost.add_flops_cost_metadata(None, batch, metadata) is metadata
 
 
 @pytest.mark.parametrize("microbatch", ["tokens", "flops"])
@@ -241,14 +242,62 @@ def test_independent_objectives_gate_costs_and_metadata(monkeypatch, microbatch,
     microbatch_cost.configure_flops_balance(args)
     assert vars(args) == original
     batch, metadata = {"total_lengths": [2, 4]}, [{"total_lengths": 2}, {"total_lengths": 4}]
-    costs = microbatch_cost.sample_costs(args, batch)
-    assert costs == ([14304, 28992] if microbatch == "flops" else None)
     published = microbatch_cost.add_flops_cost_metadata(args, batch, metadata)
     if dp == "flops":
         assert [row["flops_cost"] for row in published] == [14304, 28992]
+        batch["flops_cost"] = [row["flops_cost"] for row in published]
     else:
         assert published is metadata
-    assert len(calls) == int(microbatch == "flops") + int(dp == "flops")
+        batch["flops_cost"] = [-1, -1]  # Without DP FLOPs, ignore any unrelated cache.
+    costs = microbatch_cost.sample_costs(args, batch)
+    assert costs == ([14304, 28992] if microbatch == "flops" else None)
+    assert len(calls) == int(microbatch == "flops" or dp == "flops")
+
+
+@pytest.mark.parametrize(
+    "cached", [[90.5, 20.25], None, [], [1], [None, 1], [0, 1], [-1, 1], [float("nan"), 1], [float("inf"), 1]]
+)
+def test_cached_costs_are_validated_and_reusable_without_estimation(monkeypatch, cached):
+    from relax.utils import misc
+
+    monkeypatch.setattr(misc, "get_hf_config", lambda *_: pytest.fail("Cache reuse must not load model config"))
+    args = Namespace(microbatch_balance="flops", dp_balance="flops", loss_type="sft", use_dynamic_batch_size=True)
+    batch = {"total_lengths": [2, 4]}
+    if cached is not None:
+        batch["flops_cost"] = cached
+    if cached != [90.5, 20.25]:
+        with pytest.raises(ValueError):
+            microbatch_cost.sample_costs(args, batch)
+        return
+    for _ in range(2):  # Repacking must not consume or mutate cached costs.
+        costs = microbatch_cost.sample_costs(args, batch)
+        assert costs == cached and costs is not cached
+    assert batch == {"total_lengths": [2, 4], "flops_cost": [90.5, 20.25]}
+
+
+def test_cached_costs_reject_tensors_without_converting_them(monkeypatch):
+    import torch
+
+    def fail_conversion(*_):
+        pytest.fail("Cache validation must not convert tensor scalars")
+
+    monkeypatch.setattr(torch.Tensor, "__float__", fail_conversion)
+    args = Namespace(microbatch_balance="flops", dp_balance="flops", loss_type="sft", use_dynamic_batch_size=True)
+    with pytest.raises(ValueError, match="CPU numeric scalars"):
+        microbatch_cost.sample_costs(args, {"total_lengths": [2], "flops_cost": [torch.tensor(1.0)]})
+
+
+def test_queue_payload_preserves_cost_precision():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("ray")
+    pytest.importorskip("tensordict")
+
+    from relax.utils.utils import build_rollout_custom_meta, dict_to_tensordict
+
+    costs = [1_000_000_000_000.125, 1_000_000_000_000.25]
+    batch = dict_to_tensordict({"total_lengths": [2, 4], "sample_indices": [8, 2], "flops_cost": costs}, batch_size=2)
+    assert batch["flops_cost"].dtype == torch.float64
+    assert [row["flops_cost"] for row in build_rollout_custom_meta(batch)] == costs
 
 
 def test_dp_only_requires_legacy_RL_enablement_and_never_enables_microbatches():
@@ -293,10 +342,12 @@ def test_producer_cost_metadata_uses_the_same_estimator_and_does_not_mutate(monk
         use_dynamic_batch_size=True,
         hf_checkpoint="unused",
     )
-    batch = {"total_lengths": [2, 4]}
+    batch = {"total_lengths": [2, 4], "flops_cost": [1, 1]}
     metadata = [{"sample_index": 7, "total_lengths": 2}, {"sample_index": 7, "total_lengths": 4}]
     original = copy.deepcopy(metadata)
     result = microbatch_cost.add_flops_cost_metadata(args, batch, metadata)
     assert [row["flops_cost"] for row in result] == [14304, 28992]
     assert [row["sample_index"] for row in result] == [7, 7]
     assert metadata == original
+    with pytest.raises(ValueError):
+        microbatch_cost.add_flops_cost_metadata(args, batch, metadata[:1])
