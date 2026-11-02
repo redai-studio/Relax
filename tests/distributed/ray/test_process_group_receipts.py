@@ -24,7 +24,7 @@ pytest_plugins = [
 
 
 @pytest.mark.parametrize("follower", ["cpu_pool"], indirect=True)
-def test_node_group_upgrade_survives_serialization_and_pending_ray_wait(follower, monkeypatch):
+def test_node_group_evidence_survives_serialization_and_pending_ray_wait(follower, monkeypatch):
     record = follower()
     _start_late_worker(record)
     cluster = _Cluster(monkeypatch)
@@ -34,7 +34,7 @@ def test_node_group_upgrade_survives_serialization_and_pending_ray_wait(follower
     engine._get_local_state = lambda: ActorTableData.DEAD
     engine.fail["shutdown"] = engine_pool.ray.exceptions.ActorDiedError()
     identity = pickle.loads(pickle.dumps(record.engine._release_evidence))
-    identity.pop("pgid")
+    assert identity["pgid"] == record.process.pid
     identity["node_id"] = "01" * 28
     pool.release_evidence[0] = identity
     node = {"NodeID": identity["node_id"], "Alive": True}
@@ -83,7 +83,7 @@ def test_node_group_upgrade_survives_serialization_and_pending_ray_wait(follower
         patcher.setattr(psutil.Process, "kill", lambda proc: None)
         with pytest.raises(ResourceBlockedError):
             pool.shutdown()
-        assert len(refs) == 1 and "pgid" not in pool.release_evidence[0]
+        assert len(refs) == 1 and pool.release_evidence[0]["pgid"] == record.process.pid
         assert pool.slots == [engine] and record.worker.is_running()
         # An already submitted proof must still settle when GCS says DEAD.
         node["Alive"] = False

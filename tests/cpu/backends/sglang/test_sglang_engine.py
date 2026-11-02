@@ -14,8 +14,6 @@ pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
 
 @pytest.mark.parametrize("node_rank", [0, 1])
 def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeypatch, sglang_engine_module, node_rank):
-    from relax.backends.sglang import process_cleanup
-
     module = sglang_engine_module
     events = []
 
@@ -30,10 +28,6 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     monkeypatch.setattr(module.os, "getpid", lambda: 123)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
     monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
-    # A mock Process has no OS PID/group; real spawn waiting is covered by the
-    # process-group integration tests. Preserve the HTTP-readiness assertions.
-    monkeypatch.setattr(module.Envs, "RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S", 900.0, raising=False)
-    monkeypatch.setattr(process_cleanup, "wait_server_process_group", Mock(return_value=1234))
     server_args = SimpleNamespace(node_rank=node_rank, url=lambda: "http://worker:8000", api_key="api_key")
 
     assert module.launch_server_process(server_args) is process

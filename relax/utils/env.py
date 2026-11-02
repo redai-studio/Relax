@@ -195,8 +195,6 @@ class Envs(metaclass=_EnvsMeta):
     ROLLOUT_IMAGE_FETCH_ATTEMPTS = EnvProperty("ROLLOUT_IMAGE_FETCH_ATTEMPTS", int, 3)
     ROLLOUT_IMAGE_FETCH_TIMEOUT_S = EnvProperty("ROLLOUT_IMAGE_FETCH_TIMEOUT_S", float, 10.0)
     ROLLOUT_IMAGE_FETCH_BACKOFF_S = EnvProperty("ROLLOUT_IMAGE_FETCH_BACKOFF_S", float, 0.5)
-    # Cold spawn imports must finish before followers can persist group evidence.
-    RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S = EnvProperty("RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S", float, 900.0)
 
     # ------------- Inference gateway -------------
     INFERENCE_GATEWAY_SERVE_MAX_ONGOING_REQUESTS = EnvProperty(

@@ -344,6 +344,8 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
       installs ``_patched_run_scheduler_process``, which applies the
       routing-replay patch unconditionally.
     """
+    # Keep setpgid as the FIRST executable statement: captured PGID = server
+    # PID relies on group isolation preceding all possible descendant births.
     # Match standalone SGLang: isolate its inherited process group before any
     # workers can spawn. Like agentic.runner.ipc._ProcessGroup, kernel group
     # membership closes the birth-during-enumeration hole in exit proof.
@@ -421,18 +423,6 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     p.start()
 
     if server_args.node_rank != 0:
-        from relax.backends.sglang.process_cleanup import wait_server_process_group
-
-        # Spawn imports SGLang/torch and unpickles ServerArgs before the target
-        # can isolate its group. Wait on the startup scale, not capture's short
-        # fallback budget. Keep the handle even on timeout so cleanup owns it.
-        timeout = Envs.RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S
-        if wait_server_process_group(p, timeout=timeout) is None:
-            logger.warning(
-                "Server pid=%s did not establish its own process group within %.2fs; preserving PID/token evidence",
-                p.pid,
-                timeout,
-            )
         return p
 
     _wait_server_healthy(

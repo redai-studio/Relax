@@ -128,7 +128,6 @@ class Follower:
             "Envs": SimpleNamespace(
                 RELAX_OPTIMIZE_ROUTING_REPLAY=False,
                 RELAX_OPD_PER_POS_TOKEN_IDS=False,
-                RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S=900.0,
             ),
             "logger": get_logger(__name__),
             "_launch_server_with_patches": _entry,
@@ -344,50 +343,35 @@ def delayed_server():
 
 
 @pytest.mark.parametrize("exit_before_group", [False, True])
-def test_capture_waits_for_own_group_without_recording_actor_group(delayed_server, monkeypatch, exit_before_group):
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Event
-
+def test_capture_derives_group_without_observing_actor_group(delayed_server, monkeypatch, exit_before_group):
     from relax.backends.sglang.process_cleanup import capture_server_identity
 
     process, pipe = delayed_server
     actor_pgid = os.getpgrp()
     assert os.getpgid(process.pid) == actor_pgid
-    observed = Event()
-    getpgid = os.getpgid
-
-    def observe(pid):
-        pgid = getpgid(pid)
-        if pid == process.pid:
-            observed.set()
-        return pgid
-
-    monkeypatch.setattr(os, "getpgid", observe)
-    with ThreadPoolExecutor() as executor:
-        future = executor.submit(capture_server_identity, process, node_id="follower", port=1234)
-        assert observed.wait(2), "capture never waited for the server to leave the actor group"
-        assert not future.done()
-        pipe.send("exit" if exit_before_group else "group")
-        if not exit_before_group:
-            assert _recv(pipe) == "group-ready"
-        identity = future.result(timeout=3)
     if exit_before_group:
-        assert "pgid" not in identity
-    else:
-        assert identity["pgid"] == process.pid != actor_pgid
+        pipe.send("exit")
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+    monkeypatch.setattr(os, "getpgid", lambda pid: pytest.fail("capture observed PGID instead of deriving it"))
+    identity = capture_server_identity(process, node_id="follower", port=1234)
+    assert identity["pgid"] == process.pid != actor_pgid
     assert identity["incarnation"] == process._relax_server_incarnation
     assert identity["processes"][0]["pid"] == process.pid
     assert os.getpgrp() == actor_pgid and psutil.Process().is_running()
 
 
-def test_capture_group_wait_is_bounded_and_logs_fallback(delayed_server, caplog):
-    from relax.backends.sglang.process_cleanup import capture_server_identity
+def test_capture_no_longer_uses_observation_budget(delayed_server, monkeypatch):
+    from relax.backends.sglang import process_cleanup
 
     process, _ = delayed_server
-    identity = capture_server_identity(process, node_id="follower", port=1234, timeout=0.02)
-    assert "pgid" not in identity
+    monkeypatch.setattr(
+        process_cleanup,
+        "time",
+        SimpleNamespace(monotonic=lambda: pytest.fail("capture started a wait budget")),
+    )
+    identity = process_cleanup.capture_server_identity(process, node_id="follower", port=1234)
+    assert identity["pgid"] == process.pid
     assert identity["incarnation"] == process._relax_server_incarnation
-    assert "PID/token" in caplog.text
     assert process.is_alive()
 
 

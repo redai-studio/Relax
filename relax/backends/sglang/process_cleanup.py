@@ -9,11 +9,8 @@ import time
 from copy import deepcopy
 from typing import Any, Callable
 
-from relax.utils.logging_utils import get_logger
-
 
 SERVER_INCARNATION_ENV = "RELAX_SGLANG_SERVER_INCARNATION"
-logger = get_logger(__name__)
 
 
 def inherit_server_incarnation() -> None:
@@ -59,30 +56,12 @@ def _process_is_live(process: Any) -> bool:
         return False
 
 
-def wait_server_process_group(process: Any, timeout: float) -> int | None:
-    """Wait for this spawn child to become a leader, without reaping it."""
-    import psutil
-
-    deadline = time.monotonic() + timeout
-    try:
-        parent = psutil.Process(process.pid)
-        while True:
-            pgid = os.getpgid(parent.pid)
-            if not _process_is_live(parent):
-                return None
-            if pgid == parent.pid:
-                return pgid
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            time.sleep(min(0.01, remaining))
-    except (psutil.NoSuchProcess, ProcessLookupError):
-        return None
-
-
 def capture_server_identity(process: Any, *, node_id: str, port: int, timeout: float = 5.0) -> dict:
-    """Keep worker identities outside the actor, including reparented
-    workers."""
+    """Keep worker identities outside the actor, including reparented workers.
+
+    ``timeout`` remains accepted for callers of the former observation API;
+    capture no longer waits for process-group setup.
+    """
     import psutil
 
     parent = psutil.Process(process.pid)
@@ -99,19 +78,10 @@ def capture_server_identity(process: Any, *, node_id: str, port: int, timeout: f
         ),
     }
     if identity.get("incarnation"):
-        # Never capture the inherited Ray actor PGID, including after a
-        # bounded follower startup wait expired before the target ran.
-        pgid = wait_server_process_group(parent, timeout=timeout)
-        if pgid is not None:
-            identity["pgid"] = pgid
-            return identity
-        logger.warning(
-            "Server pid=%s node=%s did not establish its own process group within %.2fs; "
-            "falling back to PID/token evidence",
-            parent.pid,
-            node_id,
-            timeout,
-        )
+        # The managed entry executes setpgid(0, 0) before anything else. If
+        # entry never runs, this server cannot have created any descendants.
+        # Retain the candidate even before entry or after the leader exits.
+        identity["pgid"] = parent.pid
     return identity
 
 
@@ -122,7 +92,7 @@ def cleanup_server_identity(
     try:
         _cleanup_server_identity(identity, timeout, _reap_server=_reap_server)
     except Exception as error:
-        # Ray task arguments are copies. Return learned PGID/exit facts even
+        # Ray task arguments are copies. Return generation-bound exit facts even
         # on failure so the owner can retry without losing partial evidence.
         raise ServerCleanupError(str(error), identity) from error
 
@@ -136,20 +106,6 @@ def _cleanup_server_identity(identity: dict, timeout: float, *, _reap_server: Ca
     token = identity.get("incarnation")
     pgid = identity.get("pgid")
     server_record = next((record for record in records if record["pid"] == identity.get("server_pid")), None)
-    if pgid is None and token and server_record is not None:
-        try:
-            parent = psutil.Process(server_record["pid"])
-            if (
-                parent.create_time() == server_record["create_time"]
-                and _process_is_live(parent)
-                and os.getpgid(parent.pid) == parent.pid
-            ):
-                # A cached fallback identity may predate the slow spawn's
-                # setpgid. Upgrade only the same, still-live server.
-                pgid = parent.pid
-                identity["pgid"] = pgid
-        except (psutil.NoSuchProcess, ProcessLookupError):
-            pass
     if pgid is not None and (
         type(pgid) is not int or pgid <= 1 or pgid != identity.get("server_pid") or pgid in (os.getpgrp(), os.getpid())
     ):
@@ -234,6 +190,17 @@ def _cleanup_server_identity(identity: dict, timeout: float, *, _reap_server: Ca
 
     processes = members()
     while True:
+        # Preserve visible reuse before cleaning an escapee can coincide with
+        # the replacement leader's exit and hide that evidence.
+        group_retired()
+        # Stop the recorded server before treating an absent candidate group
+        # as retired: it could otherwise setpgid/fork between ESRCH and PID
+        # kill. The final group signal covers children born before PID kill.
+        for process in reversed(processes):
+            try:
+                process.kill()  # psutil also guards against PID reuse after lookup.
+            except psutil.NoSuchProcess:
+                pass
         if not group_retired():
             try:
                 # Unlike a PID snapshot, group SIGKILL also covers descendants
@@ -241,11 +208,6 @@ def _cleanup_server_identity(identity: dict, timeout: float, *, _reap_server: Ca
                 os.killpg(pgid, signal.SIGKILL)
             except ProcessLookupError:
                 record_group_release()
-        for process in reversed(processes):
-            try:
-                process.kill()  # psutil also guards against PID reuse after lookup.
-            except psutil.NoSuchProcess:
-                pass
         if _reap_server is not None:
             _reap_server()
         remaining = max(0.0, deadline - time.monotonic())

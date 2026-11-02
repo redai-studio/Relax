@@ -1,16 +1,15 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""R4b: delayed spawn, unreaped zombies, and late process-group evidence."""
+"""Managed spawn identities, unreaped zombies, and process-group exit proof."""
 
 import ast
 import ctypes
 import multiprocessing
 import os
 import signal
-import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Thread
+from threading import Thread
 from types import SimpleNamespace
 
 import psutil
@@ -87,75 +86,37 @@ def slow_launch(monkeypatch):
 
 
 @pytest.mark.parametrize("exit_before_target", [False, True])
-def test_follower_waits_through_slow_unpickle_before_returning(slow_launch, monkeypatch, exit_before_target):
-    first_poll, second_poll, advance, finish = Event(), Event(), Event(), Event()
-    getpgid = os.getpgid
-    monotonic = time.monotonic
-    polls = []
-
-    def observe(pid):
-        pgid = getpgid(pid)
-        if slow_launch.processes and pid == slow_launch.processes[0].pid:
-            polls.append(pgid)
-            if len(polls) == 1:
-                first_poll.set()
-                assert advance.wait(5)
-            elif len(polls) == 2:
-                second_poll.set()
-                assert finish.wait(5)
-        return pgid
-
-    monkeypatch.setattr(os, "getpgid", observe)
-    # Advance ten seconds while unpickling remains blocked: the former 5s
-    # capture budget cannot cover this, but the startup budget must do so.
-    monkeypatch.setattr(
-        process_cleanup,
-        "time",
-        SimpleNamespace(monotonic=lambda: monotonic() + (10 if advance.is_set() else 0), sleep=time.sleep),
-    )
-    future = slow_launch.start()
-    try:
-        assert _recv(slow_launch.pipe) == "unpickling"
-        assert first_poll.wait(2), "follower returned before waiting for its process group"
-        assert not future.done()
-        advance.set()
-        assert second_poll.wait(2), "startup used the short capture budget"
-        assert not future.done()
-        slow_launch.pipe.send("exit" if exit_before_target else "continue")
-        if not exit_before_target:
-            assert _recv(slow_launch.pipe) == "ready"
-        finish.set()
-        process = future.result(timeout=5)
-        identity = process_cleanup.capture_server_identity(process, node_id="follower", port=1234, timeout=0)
-        if exit_before_target:
-            assert "pgid" not in identity
-        else:
-            assert identity["pgid"] == process.pid != os.getpgrp()
-        assert os.getpgrp() != process.pid and psutil.Process().is_running()
-    finally:
-        advance.set()
-        finish.set()
-
-
-def test_follower_group_wait_timeout_preserves_process_for_later_cleanup(slow_launch, monkeypatch, caplog):
-    monkeypatch.setenv("RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S", "0.03")
+def test_follower_returns_during_slow_unpickle_with_derived_identity(slow_launch, exit_before_target):
     future = slow_launch.start()
     assert _recv(slow_launch.pipe) == "unpickling"
-    process = future.result(timeout=3)
-    assert process.is_alive()
-    assert "process group" in caplog.text and "0.03" in caplog.text
-    identity = process_cleanup.capture_server_identity(process, node_id="follower", port=1234, timeout=0)
-    assert "pgid" not in identity
-    slow_launch.pipe.send("continue")
-    assert _recv(slow_launch.pipe) == "ready"
+    process = future.result(timeout=2)  # The child remains at its unpickle barrier.
+    assert process.is_alive() and os.getpgid(process.pid) == os.getpgrp()
+    identity = process_cleanup.capture_server_identity(process, node_id="follower", port=1234)
+    assert identity["pgid"] == process.pid != os.getpgrp()
+    slow_launch.pipe.send("exit" if exit_before_target else "continue")
+    if exit_before_target:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+    else:
+        assert _recv(slow_launch.pipe) == "ready"
+    process_cleanup.terminate_server(process, lambda pid: pytest.fail("legacy kill"), identity=identity, timeout=2)
+    assert process.exitcode == (0 if exit_before_target else -signal.SIGKILL)
+    assert os.getpgrp() != process.pid and psutil.Process().is_running()
+
+
+def test_follower_unpickle_can_be_terminated_without_waiting_for_group(slow_launch):
+    future = slow_launch.start()
+    assert _recv(slow_launch.pipe) == "unpickling"
+    process = future.result(timeout=2)
+    identity = process_cleanup.capture_server_identity(process, node_id="follower", port=1234)
+    assert identity["pgid"] == process.pid
     process_cleanup.terminate_server(process, lambda pid: pytest.fail("legacy kill"), identity=identity, timeout=2)
     assert process.exitcode == -signal.SIGKILL
 
 
-def test_cleanup_upgrades_token_identity_and_joins_its_server(delayed_server, monkeypatch):
+def test_early_identity_joins_its_server_after_group_creation(delayed_server, monkeypatch):
     process, pipe = delayed_server
-    identity = process_cleanup.capture_server_identity(process, node_id="follower", port=1234, timeout=0)
-    assert "pgid" not in identity
+    identity = process_cleanup.capture_server_identity(process, node_id="follower", port=1234)
+    assert identity["pgid"] == process.pid
     pipe.send("group")
     assert _recv(pipe) == "group-ready"
     killpg = os.killpg

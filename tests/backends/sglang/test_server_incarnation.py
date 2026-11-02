@@ -106,7 +106,6 @@ def follower(monkeypatch, sglang_engine_module, request):
     monkeypatch.setattr(module, "ServerArgs", SimpleNamespace)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
     monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
-    monkeypatch.setattr(module.Envs, "RELAX_SGLANG_PROCESS_GROUP_TIMEOUT_S", 900.0, raising=False)
     monkeypatch.setattr(
         module, "_wait_server_healthy", lambda **kwargs: pytest.fail("a follower must still return before readiness")
     )
@@ -315,13 +314,13 @@ def test_post_kill_group_scan_ignores_stale_process_iter_identity(follower, monk
 
 
 @pytest.mark.parametrize("follower", ["cpu_pool"], indirect=True)
-def test_upgraded_group_evidence_survives_exit_pending_timeout(follower, monkeypatch):
+def test_derived_group_evidence_survives_exit_pending_timeout(follower, monkeypatch):
     from relax.backends.sglang.process_cleanup import cleanup_server_identity
 
     record = follower()
     _start_late_worker(record)
     identity = record.engine._release_evidence
-    identity.pop("pgid")
+    assert identity["pgid"] == record.process.pid
     killpg = os.killpg
 
     def delayed_group_kill(pgid, sig):
