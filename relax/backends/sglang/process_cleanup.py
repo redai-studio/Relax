@@ -78,8 +78,10 @@ def capture_server_identity(process: Any, *, node_id: str, port: int, timeout: f
         ),
     }
     if identity.get("incarnation"):
-        # The managed entry executes setpgid(0, 0) before anything else. If
-        # entry never runs, this server cannot have created any descendants.
+        # The managed entry executes setpgid(0, 0) before anything else. Before
+        # entry, only synchronous import-time helpers (for example Triton's
+        # ldconfig or compiler probes) can run, and they finish before the
+        # target starts; no server worker can exist outside this group.
         # Retain the candidate even before entry or after the leader exits.
         identity["pgid"] = parent.pid
     return identity

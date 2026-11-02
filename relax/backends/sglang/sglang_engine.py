@@ -345,7 +345,8 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
       routing-replay patch unconditionally.
     """
     # Keep setpgid as the FIRST executable statement: captured PGID = server
-    # PID relies on group isolation preceding all possible descendant births.
+    # PID relies on group isolation preceding every SGLang worker. Only
+    # synchronous import-time helpers of the spawn bootstrap run earlier.
     # Match standalone SGLang: isolate its inherited process group before any
     # workers can spawn. Like agentic.runner.ipc._ProcessGroup, kernel group
     # membership closes the birth-during-enumeration hole in exit proof.
