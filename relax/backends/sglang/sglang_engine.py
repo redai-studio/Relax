@@ -2,7 +2,6 @@
 
 import dataclasses
 import functools
-import importlib
 import ipaddress
 import json
 import multiprocessing
@@ -836,13 +835,6 @@ class SGLangEngine(RayActor):
             and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
         )
         config = get_hf_config(layout["model_path"])
-        external_pkg = getattr(self.args, "sglang_external_model_package", None)
-        if external_pkg:
-            validate_layout = getattr(
-                importlib.import_module(external_pkg), "validate_expert_weight_sync_layout", None
-            )
-            if validate_layout is not None:
-                validate_layout(layout, config)
         text_config = getattr(config, "text_config", None) or config
         if "dtype" in layout:
             from sglang.srt.configs.model_config import _get_and_verify_dtype
