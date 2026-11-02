@@ -68,7 +68,7 @@ def test_gdn_image_patch_preserves_configured_beta_values_and_gradients(
     method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_compute_gates")
     scope = {"torch": torch, "F": F}
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(target), "exec"), scope)
-    beta = torch.linspace(-7, 7, 4112, dtype=dtype).reshape(257, 16).requires_grad_()
+    beta = torch.linspace(-8, 8, 4112, dtype=dtype).reshape(257, 16).requires_grad_()
     alpha = torch.linspace(-2, 2, 4112, dtype=dtype).reshape(257, 16).requires_grad_()
     a_log = torch.linspace(-1, 1, 16, requires_grad=True)
     dt_bias = torch.linspace(-0.5, 0.5, 16, requires_grad=True)
@@ -91,8 +91,20 @@ def test_gdn_image_patch_preserves_configured_beta_values_and_gradients(
     torch.testing.assert_close(decay, expected_decay, rtol=0, atol=0)
     for actual, expected in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if beta_in_fp32:
+        assert actual_grads[0][-1, -1] > 0
     if dtype == torch.bfloat16 and not beta_in_fp32:
         promoted = beta.float().sigmoid()
         promoted_grad = torch.autograd.grad(promoted, beta, upstream)[0]
         assert not torch.equal(promoted, features["beta"])
         assert not torch.equal(promoted_grad, actual_grads[0])
+
+
+def test_projection_dtype_beta_is_opted_in_only_by_qwen38_providers():
+    root = Path(__file__).resolve().parents[3]
+    patch = (root / "docker/patch/megatron/20261016-qwen38-models.patch").read_text()
+    assert "+    linear_attention_beta_in_fp32: bool = True" in patch
+    sections = [s for s in patch.split("diff --git ") if "provider.linear_attention_beta_in_fp32 = False" in s]
+    assert len(sections) == 2
+    for section in sections:
+        assert "qwen4" in section.splitlines()[0].lower()

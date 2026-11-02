@@ -319,8 +319,17 @@ def _distributed_scoring_worker(rank, init_file, kind):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("kind", ["tp", "cp", "cp_empty_rank", "cp_dynamic"])
-def test_scoring_distributed_selected_probabilities_and_gradients(tmp_path, kind):
+def _distributed_scoring_matrix_worker(rank: int, init_dir: str) -> None:
+    # Reuse interpreters; keep fresh process groups and monkeypatch scopes per case.
+    torch.set_num_threads(1)
+    for kind in ("tp", "cp", "cp_empty_rank", "cp_dynamic"):
+        try:
+            _distributed_scoring_worker(rank, f"{init_dir}/{kind}", kind)
+        except Exception as exc:
+            raise RuntimeError(f"SC scenario {kind} failed on rank {rank}") from exc
+
+
+def test_scoring_distributed_selected_probabilities_and_gradients(tmp_path):
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("CPU distributed Gloo is unavailable")
-    mp.spawn(_distributed_scoring_worker, args=(str(tmp_path / "rendezvous"), kind), nprocs=2, join=True)
+    mp.spawn(_distributed_scoring_matrix_worker, args=(str(tmp_path),), nprocs=2, join=True)

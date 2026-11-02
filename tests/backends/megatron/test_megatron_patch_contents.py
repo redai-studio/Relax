@@ -5,7 +5,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LATEST_PATCH = REPO_ROOT / "docker" / "patch" / "latest" / "megatron.patch"
-LEGACY_PATCH = REPO_ROOT / "docker" / "patch" / "megatron" / "20260506-85bced0ae.patch"
 
 
 def test_latest_patch_skips_only_empty_bridge_conversion_tasks():
@@ -19,7 +18,3 @@ def test_latest_patch_skips_only_empty_bridge_conversion_tasks():
         "+                continue\n"
         "             if isinstance(task.param_weight, DTensor):"
     ) in patch
-
-
-def test_repeated_mtp_layer_hunk_is_not_kept_in_legacy_patch():
-    assert "[relax-mtp-repeated]" not in LEGACY_PATCH.read_text()

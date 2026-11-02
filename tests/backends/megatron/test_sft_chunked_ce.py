@@ -1,22 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Unit tests for the chunked-CE SFT loss optimization.
+"""Production bypass and loss dispatch for chunked SFT.
 
-Covers two concerns:
-
-1. **Math equivalence** — running the lm_head + per-token CE in chunks along
-   the sequence dimension produces the same loss and the same gradients as
-   running it on the full sequence in one shot. This is a pure-math invariant
-   tested with plain torch primitives (no distributed init / no Megatron
-   fused kernels needed).
-
-2. **Bypass plumbing** — ``_bypass_output_layer`` correctly (a) finds the
-   lm_head through DDP / VL wrappers, (b) keeps MTP head calls intact and
-   replaces only the main ``output_layer.forward`` with a passthrough,
-   (c) restores the original forward on exit, (d) handles missing output_layer
-   as a no-op, and (e) passes ``tensor_parallel_output_grad=False`` to the SP
-   gather so gradients are not silently scaled by TP (regression guard for the
-   bug discovered 2026-06-17).
+Numerical loss and gradient checks live in test_sft_chunked_checkpoint.py.
+These tests cover output-layer discovery, MTP call handling, flag restoration,
+and sequence-parallel gather behavior.
 """
 
 from __future__ import annotations
@@ -36,107 +24,8 @@ try:
         _bypass_output_layer,
         _find_lm_output_layer,
     )
-except Exception as exc:
+except ImportError as exc:
     pytest.skip(f"relax.backends.megatron unavailable: {exc}", allow_module_level=True)
-
-
-# ---------------------------------------------------------------------------
-# 1. Math equivalence: chunked lm_head + CE ≡ unchunked lm_head + CE
-# ---------------------------------------------------------------------------
-
-
-def _full_loss_and_grads(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor):
-    """Reference: materialize logits, CE in one pass."""
-    h = hidden.detach().clone().requires_grad_(True)
-    w = weight.detach().clone().requires_grad_(True)
-    logits = (h @ w.t()).float()  # [T, V] fp32 — same upcast pattern as the real path
-    loss = torch.nn.functional.cross_entropy(logits, labels, reduction="mean")
-    loss.backward()
-    return loss.detach(), h.grad.detach(), w.grad.detach()
-
-
-def _chunked_loss_and_grads(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, chunk_size: int):
-    """Mirrors the chunking pattern in sft_loss_function_chunked:
-
-    per-chunk matmul, per-chunk CE (no reduction), concat, mean.
-    """
-    h = hidden.detach().clone().requires_grad_(True)
-    w = weight.detach().clone().requires_grad_(True)
-    T = h.size(0)
-    per_token_losses: list[torch.Tensor] = []
-    for s in range(0, T, chunk_size):
-        e = min(s + chunk_size, T)
-        # cast to match weight dtype (matches the _chunked_call downcast)
-        h_sub = h[s:e].to(w.dtype)
-        logits_sub = (h_sub @ w.t()).float()
-        # per-token CE — fused_vocab_parallel_cross_entropy is also per-token
-        ce_sub = torch.nn.functional.cross_entropy(logits_sub, labels[s:e], reduction="none")
-        per_token_losses.append(ce_sub)
-    loss = torch.cat(per_token_losses, dim=0).mean()
-    loss.backward()
-    return loss.detach(), h.grad.detach(), w.grad.detach()
-
-
-@pytest.mark.parametrize("chunk_size", [1, 13, 64, 128, 256])
-def test_chunked_ce_loss_matches_unchunked(chunk_size: int):
-    """Chunked CE must produce the same loss as one-shot CE, for any chunk
-    size."""
-    torch.manual_seed(0)
-    T, H, V = 256, 32, 64
-    hidden = torch.randn(T, H, dtype=torch.float32)
-    weight = torch.randn(V, H, dtype=torch.float32) * 0.02
-    labels = torch.randint(0, V, (T,))
-
-    loss_ref, _, _ = _full_loss_and_grads(hidden, weight, labels)
-    loss_chunk, _, _ = _chunked_loss_and_grads(hidden, weight, labels, chunk_size)
-
-    torch.testing.assert_close(loss_ref, loss_chunk, atol=1e-6, rtol=1e-6)
-
-
-@pytest.mark.parametrize("chunk_size", [1, 13, 64, 128, 256])
-def test_chunked_ce_gradients_match_unchunked(chunk_size: int):
-    """Per-parameter gradients (hidden_states and lm_head.weight) must be
-    identical between chunked and unchunked.
-
-    This is the invariant that the `gather_from_sequence_parallel_region(...,
-    tensor_parallel_output_grad=False)` fix protects in the real distributed
-    path.
-    """
-    torch.manual_seed(0)
-    T, H, V = 256, 32, 64
-    hidden = torch.randn(T, H, dtype=torch.float32)
-    weight = torch.randn(V, H, dtype=torch.float32) * 0.02
-    labels = torch.randint(0, V, (T,))
-
-    _, gh_ref, gw_ref = _full_loss_and_grads(hidden, weight, labels)
-    _, gh_chunk, gw_chunk = _chunked_loss_and_grads(hidden, weight, labels, chunk_size)
-
-    # fp32 → tight tolerance
-    torch.testing.assert_close(gh_ref, gh_chunk, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(gw_ref, gw_chunk, atol=1e-5, rtol=1e-5)
-
-
-def test_chunked_ce_bf16_within_tolerance():
-    """Same equivalence under bf16 (matches the actual runtime dtype), with a
-    looser tolerance reflecting bf16 accumulation order sensitivity."""
-    torch.manual_seed(0)
-    T, H, V = 256, 32, 64
-    hidden = torch.randn(T, H, dtype=torch.bfloat16)
-    weight = torch.randn(V, H, dtype=torch.bfloat16) * 0.02
-    labels = torch.randint(0, V, (T,))
-
-    loss_ref, gh_ref, gw_ref = _full_loss_and_grads(hidden, weight, labels)
-    loss_chunk, gh_chunk, gw_chunk = _chunked_loss_and_grads(hidden, weight, labels, chunk_size=64)
-
-    # bf16 accumulation order varies between chunked and unchunked; widen tolerance.
-    torch.testing.assert_close(loss_ref.float(), loss_chunk.float(), atol=2e-3, rtol=2e-3)
-    torch.testing.assert_close(gh_ref.float(), gh_chunk.float(), atol=5e-3, rtol=5e-3)
-    torch.testing.assert_close(gw_ref.float(), gw_chunk.float(), atol=5e-3, rtol=5e-3)
-
-
-# ---------------------------------------------------------------------------
-# 2. Bypass plumbing
-# ---------------------------------------------------------------------------
 
 
 class _FakeLmHead(torch.nn.Module):

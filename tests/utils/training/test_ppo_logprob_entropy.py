@@ -418,26 +418,24 @@ def _distributed_vocab_worker(
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize(
-    "with_mask,with_entropy,chunk_size",
-    [
-        pytest.param(False, True, -1, id="unmasked_entropy_no_chunks"),
-        pytest.param(True, True, 2, id="masked_entropy_chunks"),
-        pytest.param(True, False, -1, id="masked_logprob_only_no_chunks"),
-        pytest.param(False, False, 2, id="unmasked_logprob_only_chunks"),
-    ],
-)
-def test_calculate_log_probs_and_entropy_matches_unfused_reference_vocab_parallel(
-    with_mask: bool,
-    with_entropy: bool,
-    chunk_size: int,
-):
+def _distributed_vocab_matrix_worker(rank: int, world_size: int, ports: list[int]) -> None:
+    scenarios = [(False, True, -1), (True, True, 2), (True, False, -1), (False, False, 2)]
+    for (with_mask, with_entropy, chunk_size), port in zip(scenarios, ports, strict=True):
+        try:
+            _distributed_vocab_worker(rank, world_size, with_mask, with_entropy, chunk_size, port)
+        except Exception as exc:
+            raise RuntimeError(
+                f"PPO TP scenario mask={with_mask}, entropy={with_entropy}, chunk={chunk_size}, rank={rank}"
+            ) from exc
+
+
+def test_calculate_log_probs_and_entropy_matches_unfused_reference_vocab_parallel():
     import torch.multiprocessing as mp
 
     world_size = 2
     mp.spawn(
-        _distributed_vocab_worker,
-        args=(world_size, with_mask, with_entropy, chunk_size, _free_port()),
+        _distributed_vocab_matrix_worker,
+        args=(world_size, [_free_port() for _ in range(4)]),
         nprocs=world_size,
         join=True,
     )

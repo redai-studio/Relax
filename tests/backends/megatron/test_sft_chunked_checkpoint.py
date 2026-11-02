@@ -102,25 +102,61 @@ def test_sft_fused_ce_keeps_response_rows_temperature_without_duplicate_recomput
     assert len(calls) == 3  # The fused Function handles its own recomputation.
 
 
+@pytest.mark.parametrize("recompute", [False, True])
 @pytest.mark.parametrize("chunk_size", [1, 7, 32])
 @pytest.mark.parametrize("temperature", [0.7, 1.0])
 @pytest.mark.parametrize("frozen_hidden", [False, True])
-def test_sft_chunk_checkpoint_loss_and_gradients(monkeypatch, chunk_size, temperature, frozen_hidden):
+def test_sft_chunk_checkpoint_loss_and_gradients(monkeypatch, chunk_size, temperature, frozen_hidden, recompute):
     torch.manual_seed(36)
-    hidden = torch.randn(23, 9, requires_grad=not frozen_hidden)
+    hidden = torch.randn(17, 9, requires_grad=not frozen_hidden)
     weight = torch.randn(31, 9, requires_grad=True)
-    labels = torch.randint(0, 31, (23,))
-    mask = (torch.arange(23) % 3 != 0).float()
+    labels = torch.randint(0, 31, (17,))
+    mask = (torch.arange(17) % 3 != 0).float()
     args = _setup(monkeypatch, labels, chunk_size, temperature)
+    args.recompute_loss_function = recompute
+    labels_per_sample = list(labels.split([7, 10]))
+    monkeypatch.setattr(
+        loss_module,
+        "get_responses",
+        lambda hidden, **_: iter(zip(hidden.squeeze(0).split([7, 10]), labels_per_sample, strict=True)),
+    )
     expected = F.cross_entropy(F.linear(hidden, weight) / temperature, labels, reduction="none")
     params = (weight,) if frozen_hidden else (hidden, weight)
     expected_grad = torch.autograd.grad((expected * mask).sum(), params)
-    actual = -_run(args, hidden, weight, labels)
+    _, result = loss_module.get_log_probs_and_entropy(
+        hidden.unsqueeze(0),
+        args=args,
+        unconcat_tokens=labels_per_sample,
+        total_lengths=[7, 10],
+        response_lengths=[7, 10],
+        with_entropy=False,
+        lm_head_forward=lambda values: (F.linear(values, weight), None),
+    )
+    assert [len(values) for values in result["log_probs"]] == [7, 10]
+    actual = -torch.cat(result["log_probs"])
     (actual * mask).sum().backward()
     actual_grad = tuple(param.grad for param in params)
     torch.testing.assert_close(actual, expected)
     for got, want in zip(actual_grad, expected_grad, strict=True):
         torch.testing.assert_close(got, want, atol=3e-6, rtol=3e-5)
+
+
+def test_sft_chunk_checkpoint_bf16_loss_and_gradients(monkeypatch):
+    torch.manual_seed(0)
+    hidden = torch.randn(256, 32, dtype=torch.bfloat16).requires_grad_()
+    weight = (torch.randn(64, 32, dtype=torch.bfloat16) * 0.02).requires_grad_()
+    labels = torch.randint(0, 64, (256,))
+    args = _setup(monkeypatch, labels, 64, 1.0)
+    expected = F.cross_entropy(F.linear(hidden, weight).float(), labels)
+    expected_grads = torch.autograd.grad(expected, (hidden, weight))
+
+    actual = -_run(args, hidden, weight, labels).mean()
+    actual.backward()
+
+    # BF16 gradient accumulation can round differently across chunk boundaries.
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+    for got, want in zip((hidden.grad, weight.grad), expected_grads, strict=True):
+        torch.testing.assert_close(got.float(), want.float(), atol=5e-3, rtol=5e-3)
 
 
 def test_sft_chunk_checkpoint_retains_no_vocab_activations(monkeypatch):

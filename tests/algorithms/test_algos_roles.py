@@ -84,6 +84,12 @@ def test_registered_algorithms_have_the_expected_role_classes(load_registry):
     assert registry.ALGOS["sft"] == {"sft": classes["SFT"], "actor": classes["Actor"]}
 
 
+@pytest.mark.parametrize("name", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])
+def test_reinforce_plus_plus_uses_sync_colocate_roles(load_registry, name):
+    registry, _ = load_registry()
+    assert registry.process_role(_args_for(name, loss_type="policy_loss")) is registry.ROLES_COLOCATE
+
+
 @pytest.mark.parametrize("needs_critic", [False, True])
 def test_new_algorithm_is_registered_without_editing_role_tables(monkeypatch, load_registry, needs_critic):
     name = "new_algorithm"
