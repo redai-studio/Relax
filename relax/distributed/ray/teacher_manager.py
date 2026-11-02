@@ -165,7 +165,11 @@ class TeacherEngineRuntime(MultiEngineManager):
             try:
                 # PACK is best effort: on a busy cluster the group may straddle nodes or skip GPUs.
                 validate_engine_bundles(
-                    pg_tuple, 0, self.gpus_per_replica, label=f"teacher replica {replica} (dedicated placement group)"
+                    pg_tuple,
+                    0,
+                    self.gpus_per_replica,
+                    label=f"teacher replica {replica} (dedicated placement group)",
+                    num_gpus_per_node=self.args.num_gpus_per_node,
                 )
             except Exception:
                 remove_placement_group(pg_tuple[0])

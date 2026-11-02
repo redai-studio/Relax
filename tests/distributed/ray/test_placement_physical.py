@@ -138,13 +138,82 @@ def test_placement_physical_checks_a_multi_node_engine_node_by_node():
         validate_physical_placement(plan, "genrm", pg_tuple, num_gpus_per_node=8, bundle_nodes=bundle_nodes)
 
 
-def test_placement_physical_still_checks_gpu_ids_when_nodes_are_unknown():
+def test_placement_physical_rejects_unknown_nodes(monkeypatch):
+    monkeypatch.setattr(placement_physical, "bundle_nodes_of", lambda pg: None)
     pg_tuple, _bundle_nodes = _pg(_one_node())
-    validate_engine_bundles(pg_tuple, 0, 2, label="teacher replica 0", bundle_nodes=None)
+    with pytest.raises(PlacementError, match="Cannot verify.*teacher replica 0"):
+        validate_engine_bundles(pg_tuple, 0, 2, label="teacher replica 0", bundle_nodes=None)
 
     pg_tuple, _bundle_nodes = _pg([(NODE_A, 3), (NODE_A, 5)])
-    with pytest.raises(PlacementError, match="teacher replica 0.*not contiguous"):
+    with pytest.raises(PlacementError, match="Cannot verify.*teacher replica 0"):
         validate_engine_bundles(pg_tuple, 0, 2, label="teacher replica 0", bundle_nodes=None)
+
+
+@pytest.fixture(autouse=True)
+def retry_delays(monkeypatch):
+    delays = []
+    monkeypatch.setattr("time.sleep", delays.append)
+    return delays
+
+
+@pytest.mark.parametrize("table", [None, {}, {"bundles_to_node_id": {}}, {"bundles_to_node_id": {0: NODE_A}}, "error"])
+def test_placement_physical_requires_complete_node_evidence(monkeypatch, retry_delays, table):
+    import ray.util
+
+    reads = []
+
+    def read(pg):
+        reads.append(pg)
+        if table == "error":
+            raise RuntimeError("GCS unavailable")
+        return table
+
+    monkeypatch.setattr(ray.util, "placement_group_table", read)
+    with pytest.raises(PlacementError, match="Cannot verify.*teacher"):
+        validate_engine_bundles(("pg", [0, 1], [0, 1]), 0, 2, label="teacher")
+    assert reads == ["pg"] * 3
+    assert retry_delays == [1.0, 1.0]
+
+
+def test_placement_physical_retries_until_complete_without_permanent_block(monkeypatch, retry_delays):
+    tables = iter([None, {0: NODE_A}, {0: NODE_A, 1: NODE_A}])
+    monkeypatch.setattr(placement_physical, "bundle_nodes_of", lambda pg: next(tables))
+    validate_engine_bundles(("pg", [0, 1], [0, 1]), 0, 2, label="teacher")
+    assert retry_delays == [1.0, 1.0]
+
+
+def test_placement_physical_rejects_contiguous_ids_spanning_nodes():
+    pg, nodes = _pg([(NODE_A, 0), (NODE_B, 1)])
+    with pytest.raises(PlacementError, match="cross a node boundary"):
+        validate_engine_bundles(pg, 0, 2, label="teacher", bundle_nodes=nodes)
+
+
+@pytest.mark.parametrize("layout", ["valid", "same_node", "wrong_size", "short", "gap"])
+def test_placement_physical_multinode_replica_segments(layout):
+    gpus = [(NODE_A, gpu) for gpu in range(8)] + [(NODE_B, gpu) for gpu in range(8)]
+    if layout == "same_node":
+        gpus = [(NODE_A, gpu) for gpu in range(16)]
+    elif layout == "short":
+        gpus.pop()
+    elif layout == "gap":
+        gpus[-1] = (NODE_B, 9)
+    pg, nodes = _pg(gpus)
+
+    def validate():
+        validate_engine_bundles(
+            pg,
+            0,
+            12 if layout == "wrong_size" else 16,
+            num_gpus_per_node=8,
+            label="teacher replica",
+            bundle_nodes=nodes,
+        )
+
+    if layout == "valid":
+        validate()
+    else:
+        with pytest.raises(PlacementError):
+            validate()
 
 
 def test_placement_physical_asks_ray_for_the_nodes_once_per_check(monkeypatch):

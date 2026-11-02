@@ -21,6 +21,10 @@ def _install_teacher_manager_stubs(monkeypatch):
     # Import the real factory before installing the optional engine stubs.
     placement = importlib.import_module("relax.distributed.ray.placement_group")
     monkeypatch.setattr(placement, "create_placement_group", MagicMock())
+    physical = importlib.import_module("relax.distributed.ray.placement_physical")
+    # Fake PGs still need complete physical binding evidence. Dedicated TP16
+    # replicas occupy two distinct eight-GPU nodes; smaller slices use node 0.
+    monkeypatch.setattr(physical, "bundle_nodes_of", lambda pg: {i: f"node-{i // 8}" for i in range(160)})
 
     rollout = ModuleType("relax.distributed.ray.rollout")
     rollout._allocate_rollout_engine_addr_and_ports_normal = MagicMock()
