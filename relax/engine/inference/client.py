@@ -228,10 +228,17 @@ class InferenceRequest:
         if self._release_task is None:
 
             async def release() -> None:
+                from ray.exceptions import ActorDiedError
+
                 reported = False
                 while True:
                     try:
                         await _manager_call(self._manager, "release_inference", self._permit)
+                        return
+                    except ActorDiedError:
+                        # The non-restarting owner's gate was the only permit
+                        # ledger. Its death leaves no record to return to.
+                        logger.warning("Inference owner died; stopping permit return")
                         return
                     except Exception:
                         # A failed acknowledgement does not retire the owner's
@@ -281,12 +288,11 @@ class InferenceRequestClient:
         self._cleanup_tasks.add(task)
 
         def finished(done: asyncio.Task) -> None:
-            if not done.cancelled() and done.exception() is None:
-                self._cleanup_tasks.discard(done)
-            else:
-                # Preserve failed/abandoned work for diagnostics. The owner
-                # still fences its permit until a return or holder-death proof.
+            if done.cancelled() or done.exception() is not None:
+                # The owner retains any unknown permit; retaining a completed
+                # client task and its traceback cannot help return it.
                 logger.warning("Inference request cleanup did not confirm completion for role %s", self.role)
+            self._cleanup_tasks.discard(done)
 
         task.add_done_callback(finished)
         return task
