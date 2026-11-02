@@ -344,6 +344,13 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
       installs ``_patched_run_scheduler_process``, which applies the
       routing-replay patch unconditionally.
     """
+    # Match standalone SGLang: isolate its inherited process group before any
+    # workers can spawn. Like agentic.runner.ipc._ProcessGroup, kernel group
+    # membership closes the birth-during-enumeration hole in exit proof.
+    # Ray worker group cleanup no longer covers this server on an unexpected
+    # worker exit; that case relies on SGLang's PR_SET_PDEATHSIG chain below.
+    os.setpgid(0, 0)
+
     from relax.backends.sglang.process_cleanup import inherit_server_incarnation
 
     inherit_server_incarnation()

@@ -58,6 +58,8 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     module = sglang_engine_module
     events = []
     http_server = ModuleType("sglang.srt.entrypoints.http_server")
+    # This unit fixture runs the child entry in pytest's own process.
+    monkeypatch.setattr(module.os, "setpgid", Mock())
     http_server.launch_server = Mock(side_effect=lambda *_args, **_kwargs: events.append("launch"))
     monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.http_server", http_server)
     monkeypatch.setattr(
