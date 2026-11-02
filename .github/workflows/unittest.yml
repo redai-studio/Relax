@@ -35,12 +35,17 @@ jobs:
     timeout-minutes: 190
     env:
       CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
-      ARTIFACT_DIR: ${{ runner.temp }}/unittest-${{ github.run_id }}-${{ github.run_attempt }}
-      KERNEL_CACHE_DIR: ${{ runner.temp }}/relax-unittest-kernels
       HOST_UV_CACHE_DIR: /home/relax-ci/.cache/uv
       UV_CACHE_DIR: /uv-cache
       UV_LINK_MODE: copy
     steps:
+      - name: Initialize runtime paths
+        run: |
+          {
+            echo "ARTIFACT_DIR=$RUNNER_TEMP/unittest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "KERNEL_CACHE_DIR=$RUNNER_TEMP/relax-unittest-kernels"
+          } >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
