@@ -30,7 +30,7 @@ jobs:
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: ${{ matrix.case }}
-    runs-on: [self-hosted, linux, x64, 910c, gpu]
+    runs-on: [self-hosted, linux, x64, h20, gpu]
     # Allow 120 minutes for image preparation plus the existing 65-minute test job budget.
     timeout-minutes: 185
     strategy:
