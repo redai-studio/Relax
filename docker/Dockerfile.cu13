@@ -495,6 +495,17 @@ ENV FI_PROVIDER=efa \
 
 FROM relax_${GPU_ARCH} as relax
 
+# Keye/DSA indexers require this CUDA extension; use the same source pin as CUDA 12.
+# Force a local build: upstream's wheel lookup maps CUDA 13 to CUDA 12 wheels.
+RUN . /etc/relax_build.env && \
+    CUDA_VISIBLE_DEVICES="" FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE MAX_JOBS=32 \
+    NVCC_APPEND_FLAGS="-gencode arch=compute_${RELAX_EXPECT_SM},code=sm_${RELAX_EXPECT_SM}" \
+    pip install --no-cache-dir --no-build-isolation --no-deps --force-reinstall \
+        git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca && \
+    python -c "from fast_hadamard_transform import hadamard_transform; assert callable(hadamard_transform)" && \
+    HADAMARD_SO="$(python -c 'import torch, fast_hadamard_transform_cuda as m; print(m.__file__)')" && \
+    /usr/local/cuda/bin/cuobjdump --list-elf "$HADAMARD_SO" | grep -q "sm_${RELAX_EXPECT_SM}"
+
 # Restore the unified image runtime after all dependency resolution.
 # Its DeepEP binaries require NCCL 2.30.7; Torch metadata still pins 2.29.7.
 # pip check above validates every other dependency before this explicit override.
