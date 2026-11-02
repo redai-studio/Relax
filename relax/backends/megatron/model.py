@@ -553,7 +553,7 @@ def setup_model_and_optimizer(
     skip_nonfinite = configure_nonfinite_guard(args)
 
     model = get_model(
-        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
+        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args, role=role),
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )

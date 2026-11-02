@@ -851,7 +851,7 @@ def wrap_model_provider_with_lora(original_provider, args):
     return wrapped_provider
 
 
-def wrap_model_provider_with_freeze(original_provider, args):
+def wrap_model_provider_with_freeze(original_provider, args, role="actor"):
     def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
         if vp_stage is None and mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
             vp_stage = mpu.get_virtual_pipeline_model_parallel_rank()
@@ -865,6 +865,13 @@ def wrap_model_provider_with_freeze(original_provider, args):
         )
 
         freeze_model_params(model, args)
+        if Envs.RELAX_FP32_LM_HEAD and role == "actor":
+            if getattr(args, "task_type", "causal_lm") != "causal_lm" or getattr(args, "loss_type", "") == "rm":
+                raise ValueError("RELAX_FP32_LM_HEAD is only supported for language-model heads")
+            from relax.backends.megatron.fp32_head import configure_fp32_lm_head
+
+            logger.info("Direct FP32 LM heads configured: %s", configure_fp32_lm_head(model))
+
         ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
 
         return model
