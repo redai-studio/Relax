@@ -181,12 +181,44 @@ def test_i2i_sft_preserves_native_checkpoint_and_image_batching(arguments_module
     assert not args.finetune
 
 
-@pytest.mark.parametrize("cli,expected", [([], "balanced"), (["--sft-packing-strategy", "binpack"], "binpack")])
-def test_sft_packing_preserves_default_and_archived_recipe(arguments_module, cli, expected):
+@pytest.fixture
+def balance_parser(arguments_module):
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = argparse.ArgumentParser()
     arguments_module.get_slime_extra_args_provider()(parser)
-    assert parser.parse_args(cli).sft_packing_strategy == expected
+    return parser
+
+
+@pytest.mark.parametrize("cli,expected", [([], "balanced"), (["--sft-packing-strategy", "binpack"], "binpack")])
+def test_sft_packing_preserves_default_and_archived_recipe(balance_parser, cli, expected):
+    assert balance_parser.parse_args(cli).sft_packing_strategy == expected
+
+
+@pytest.mark.parametrize(
+    "cli,expected",
+    [([], "tokens"), (["--microbatch-balance", "tokens"], "tokens"), (["--microbatch-balance", "flops"], "flops")],
+)
+def test_microbatch_balance_cli_defaults_and_choices(balance_parser, cli, expected):
+    import pickle
+
+    args = balance_parser.parse_args(cli)
+    assert args.microbatch_balance == expected
+    # The ordinary args serialization carries the selection to workers.
+    assert pickle.loads(pickle.dumps(args)).microbatch_balance == expected
+
+
+def test_microbatch_balance_cli_rejects_unknown_value(balance_parser):
+    with pytest.raises(SystemExit):
+        balance_parser.parse_args(["--microbatch-balance", "invalid"])
+
+
+def test_microbatch_balance_is_validated_before_training_setup(arguments_module):
+    args = _opd_args()
+    args.microbatch_balance = "flops"
+    args.train_backend = "megatron"
+    args.use_dynamic_batch_size = False
+    with pytest.raises(ValueError, match="use-dynamic-batch-size"):
+        arguments_module.relax_validate_args(args)
 
 
 @pytest.mark.parametrize("mode", ["bridge", "raw"])
@@ -213,3 +245,4 @@ def test_art_preserves_native_checkpoint_and_defers_the_cursor_to_its_backend(
     assert args.load == str(tmp_path / "art")
     assert args.start_rollout_id == configured
     assert not args.no_load_optim and not args.no_load_rng and not args.finetune
+
