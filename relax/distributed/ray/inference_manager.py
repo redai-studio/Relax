@@ -314,6 +314,11 @@ class InferenceManager:
                 return await self.maintenance(name, method, args, kwargs, lease=lease)
             await self._validate(name, lease)
         if read:
+            if method == "health_check":
+                # Probe results update slot observations. A probe started for
+                # the old generation must settle before retirement/replacement.
+                async with self._locks[name]:
+                    return await _invoke(self._runtimes[name], method, *args, **kwargs)
             return await _invoke(self._runtimes[name], method, *args, **kwargs)
         token = uuid.uuid4().hex
         await self.authority.begin.remote(lease, token)

@@ -29,6 +29,7 @@ from relax.distributed.ray.placement_physical import validate_physical_placement
 from relax.distributed.ray.placement_planner import plan_placement
 from relax.engine.inference.admission import ADMISSION_CONCURRENCY_GROUP, AdmissionGate, RequestPermit
 from relax.engine.inference.discovery import (
+    EngineState,
     RoleSnapshot,
     TopologyRevision,
     build_model_snapshot,
@@ -95,6 +96,7 @@ class MultiEngineManager:
         self.nodes_per_engine = max(1, nodes_per_engine)
         self._log_prefix = log_prefix
         self._admission = AdmissionGate()
+        self._unhealthy: set[int] = set()
 
         self.all_engines: list[Any] = [None] * num_slots
         # The hooks are looked up at call time, so subclasses only override them.
@@ -244,7 +246,12 @@ class MultiEngineManager:
         heads = self._pool.head_slots()
         if any(self.all_engines[rank] is None for rank in heads):
             return False
-        return not self._pool.failed_health_checks(heads, get_timeout=5.0)
+        failed = self._pool.failed_health_checks(heads, get_timeout=5.0)
+        self._unhealthy.update(failed)
+        self._unhealthy.difference_update(
+            head for head in heads if head not in failed and self._pool.state(head) is EngineState.READY
+        )
+        return not failed and not self._unhealthy
 
     def onload(self, tags: Optional[list[str]] = None) -> None:
         """Load engine weights to GPU.
@@ -304,12 +311,18 @@ class MultiEngineManager:
         failed = self._pool.failed_health_checks(
             [head for head in self._pool.head_slots() if self.all_engines[head] is not None], get_timeout=5.0
         )
-        for head in failed:
+        self._unhealthy.update(failed)
+        self._unhealthy.update(head for head in self._pool.head_slots() if self.all_engines[head] is None)
+        for head in tuple(self._unhealthy):
             try:
                 self._pool.retire([head])
             except ResourceBlockedError as error:
                 logger.warning("Keeping failed slot isolated during recovery: %s", error)
-        return self._pool.recover()
+        rebuilt = self._pool.recover()
+        heads = {slot // self.nodes_per_engine * self.nodes_per_engine for slot in rebuilt}
+        failed = self._pool.failed_health_checks(sorted(heads), get_timeout=5.0)
+        self._unhealthy.difference_update(heads - failed)
+        return rebuilt
 
     def is_onloaded(self) -> bool:
         return self._pool.is_active()
@@ -329,6 +342,8 @@ class MultiEngineManager:
         for index, rank in enumerate(range(0, len(self.all_engines), self.nodes_per_engine)):
             address = self._engine_addr_and_ports.get(rank) or {}
             state = self._pool.state(rank)
+            if rank in self._unhealthy and state is EngineState.READY:
+                state = EngineState.BLOCKED
             base_url = None
             if self.all_engines[rank] is not None and "host" in address:
                 base_url = format_base_url(address["host"], address["port"])

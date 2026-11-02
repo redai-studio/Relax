@@ -624,3 +624,66 @@ def test_multi_engine_manager_without_a_planned_pool_skips_the_physical_check(_p
     monkeypatch.setattr(placement_physical, "bundle_nodes_of", lambda pg: pytest.fail("nothing to check"))
 
     assert len(_FakeManager(num_slots=2).all_engines) == 2
+
+
+def test_live_actor_failure_is_quarantined_through_cleanup_and_replacement_health(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=2)
+    old, survivor = manager.all_engines
+    cleanup, finish_cleanup = threading.Event(), threading.Event()
+    probing, finish_probe = threading.Event(), threading.Event()
+    get = mem.ray.get
+
+    def guarded_get(ref, **kwargs):
+        if isinstance(ref, tuple):
+            engine, method = ref
+            if engine is old and method == "health_generate":
+                return False
+            if engine is old and method == "shutdown":
+                cleanup.set()
+                assert finish_cleanup.wait(5)
+            if engine is not old and engine is not survivor and method == "health_generate":
+                probing.set()
+                assert finish_probe.wait(5)
+        return get(ref, **kwargs)
+
+    monkeypatch.setattr(mem.ray, "get", guarded_get)
+    assert not manager.health_check()
+    with ThreadPoolExecutor(1) as executor:
+        recovery = executor.submit(manager.recover)
+        try:
+            assert cleanup.wait(3)
+            permit = manager.acquire_inference("during-cleanup")
+            assert permit.target.engine_id == "_/1"
+            manager.release_inference(permit)
+            finish_cleanup.set()
+            assert probing.wait(3)
+            snapshot = manager.get_inference_snapshot()
+            assert snapshot["engines"][0]["state"] != "ready"
+            assert snapshot["engines"][1]["state"] == "ready"
+            manager._admission.close()
+            finish_probe.set()
+            recovery.result(timeout=5)
+            assert manager.get_inference_snapshot()["state"] == "draining"
+        finally:
+            finish_cleanup.set()
+            finish_probe.set()
+
+
+def test_health_recovery_clears_transient_observation_without_rebuilding(monkeypatch):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+    get = mem.ray.get
+    monkeypatch.setattr(mem.ray, "get", lambda *a, **kw: False)
+    assert not manager.health_check()
+    assert manager.get_inference_snapshot()["state"] == "blocked"
+    monkeypatch.setattr(mem.ray, "get", get)
+    assert manager.health_check()
+    assert manager.get_inference_snapshot()["state"] == "ready"
+    assert manager.all_engines[0] is engine

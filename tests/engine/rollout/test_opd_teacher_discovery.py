@@ -115,3 +115,30 @@ def test_managed_teacher_discovery_cannot_be_used_as_permission_to_send():
         opd._pick_teacher_url(
             Namespace(opd_teacher_discovery_url="http://serve:1/engines", opd_teacher_url="http://startup:1/generate")
         )
+
+
+async def test_opd_connection_failure_notifies_owner_without_waiting_for_recovery(monkeypatch):
+    from types import SimpleNamespace
+
+    import aiohttp
+
+    owner = AdmissionManager(snapshot("__default__"))
+    hints = []
+    owner.report_failure = SimpleNamespace(remote=lambda url: hints.append(url) or object())
+    monkeypatch.setattr(opd, "get_request_client", lambda role: owner.client("teacher"))
+
+    class DisconnectedSession:
+        @asynccontextmanager
+        async def post(self, *args, **kwargs):
+            raise aiohttp.ClientConnectionError("teacher vanished")
+            yield  # pragma: no cover
+
+    manager = object.__new__(opd.OpdManager)
+    assert (
+        await manager._post_logprob(
+            DisconnectedSession(), "", {}, Sample(index=0), "teacher", inference={"role": "teacher"}
+        )
+        is None
+    )
+    assert hints == ["http://engine:1"]
+    assert owner.released == owner.acquired
