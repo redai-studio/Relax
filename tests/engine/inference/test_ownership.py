@@ -205,6 +205,38 @@ async def test_training_roles_do_not_conflict_with_each_other():
     ledger.check(second)
 
 
+async def test_same_role_shared_lease_waits_while_peer_is_scoring():
+    rollout, scorer = claim(), claim("genrm", phase=Phase.SCORE)
+    ledger = OwnershipLedger(PlacementPlan((), (rollout, scorer)))
+    scoring, finish_score, checked = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def apply(model, action, lease, command, **kwargs):
+        if model == "judge" and action == "onload":
+            scoring.set()
+            await finish_score.wait()
+
+    ledger.register_model("genrm", "judge", SimpleNamespace(apply=SimpleNamespace(remote=apply)), scorer)
+    first = await ledger.acquire("generate", "one", [rollout, scorer], role="rollout")
+    switching = asyncio.create_task(ledger.command(first, "score", "score"))
+    await scoring.wait()
+
+    conflicts = ledger._conflicts
+
+    def check_conflict(role, other):
+        checked.set()
+        return conflicts(role, other)
+
+    ledger._conflicts = check_conflict
+    second = asyncio.create_task(ledger.acquire("eval", "two", [rollout, scorer], role="rollout"))
+    await checked.wait()
+    assert "two" not in ledger.snapshot()["owners"]
+    finish_score.set()
+    await switching
+    assert not second.done()
+    await ledger.release(first)
+    ledger.check(await asyncio.wait_for(second, timeout=1))
+
+
 async def test_maintenance_defers_only_for_other_resident_roles():
     rollout, teacher = claim(), claim("teacher", phase=Phase.SCORE)
     ledger = OwnershipLedger(PlacementPlan((), (rollout, teacher)))

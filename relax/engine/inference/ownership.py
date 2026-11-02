@@ -188,7 +188,7 @@ class OwnershipLedger:
         # Old explicit callers without role metadata retain conservative fencing.
         if role is None or other is None:
             return True
-        return role != other and not (role in _TRAINING_ROLES and other in _TRAINING_ROLES)
+        return not (role in _TRAINING_ROLES and other in _TRAINING_ROLES)
 
     def _needs_handoff(self, role: str | None, claims: tuple[PlacementClaim, ...]) -> bool:
         if role is None:
