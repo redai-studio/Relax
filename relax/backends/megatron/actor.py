@@ -95,6 +95,7 @@ from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
+from relax.utils.training.microbatch_cost import sample_costs, validate_microbatch_balance
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -398,6 +399,7 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
         with_opd_teacher: bool = False,
     ) -> int | None:
+        validate_microbatch_balance(args)
         monkey_patch_torch_dist(args)
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
@@ -1657,7 +1659,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.args, self.args.max_tokens_per_gpu, mpu.get_context_parallel_world_size()
                 )
                 micro_batch_indices = _get_capacity_safe_balanced_partitions(
-                    window.rollout_data["total_lengths"], max_k, capacity
+                    window.rollout_data["total_lengths"], max_k, capacity, sample_costs(self.args, window.rollout_data)
                 )
                 packed_micro_batches = [
                     (
@@ -1824,7 +1826,9 @@ class MegatronTrainRayActor(TrainRayActor):
         cp_size = mpu.get_context_parallel_world_size()
         max_tokens = _get_micro_batch_token_capacity(self.args, self.args.max_tokens_per_gpu, cp_size)
         k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
-        micro_batch_indices = _get_capacity_safe_balanced_partitions(samples, k_local, max_tokens)
+        micro_batch_indices = _get_capacity_safe_balanced_partitions(
+            samples, k_local, max_tokens, sample_costs(self.args, rollout_data)
+        )
         packed_cpu = [
             (prepack_sft_micro_batch_cpu(self.args, _select_rollout_samples(rollout_data, indices)), None)
             for indices in micro_batch_indices

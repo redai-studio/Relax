@@ -24,7 +24,10 @@ def _execute(nodes, namespace):
 
 @pytest.fixture
 def partitioning():
+    from relax.utils.training.microbatch_cost import sample_costs
+
     namespace = {
+        "sample_costs": sample_costs,
         "logger": Mock(),
         "mpu": SimpleNamespace(
             get_tensor_model_parallel_world_size=lambda: 2,
@@ -45,21 +48,7 @@ def partitioning():
     return namespace
 
 
-@pytest.mark.parametrize("repack", [False, True])
-@pytest.mark.parametrize("allgather_cp", [False, True])
-def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgather_cp):
-    # The original KK-only partition produces [11, 10, 9, 9, 9] with K=5.
-    lengths = [3, 9, 7, 6, 2, 5, 2, 5, 9]
-    args = SimpleNamespace(max_tokens_per_gpu=10, allgather_cp=allgather_cp, data_pad_size_multiplier=2)
-    capacity = 8 if allgather_cp else 10
-    local_k = partitioning["get_minimum_num_micro_batch_size"](lengths, capacity)
-    partitioning.update(
-        self=SimpleNamespace(args=args),
-        samples=lengths,
-        cp_size=1,
-        window=SimpleNamespace(rollout_data={"total_lengths": lengths}),
-        max_k=local_k + 1,
-    )
+def _run_actor_partitions(namespace, repack):
     actor = next(
         node
         for node in _tree("relax/backends/megatron/actor.py").body
@@ -71,12 +60,10 @@ def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgath
             for node in ast.walk(actor)
             if isinstance(node, ast.If) and ast.unparse(node.test) == "local_k < max_k"
         )
-        nodes = condition.body[0].body
-        names = {"capacity", "micro_batch_indices"}
+        nodes, names = condition.body[0].body, {"capacity", "micro_batch_indices"}
     else:
         nodes = next(node for node in actor.body if getattr(node, "name", None) == "_pack_sft_prepack_window").body
         names = {"max_tokens", "k_local", "micro_batch_indices"}
-    # Execute the actor's real partition call sites, stopping before tensor packing.
     _execute(
         [
             node
@@ -84,9 +71,28 @@ def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgath
             if isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
         ],
-        partitioning,
+        namespace,
     )
-    partitions = partitioning["micro_batch_indices"]
+    return namespace["micro_batch_indices"]
+
+
+@pytest.mark.parametrize("repack", [False, True])
+@pytest.mark.parametrize("allgather_cp", [False, True])
+def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgather_cp):
+    # The original KK-only partition produces [11, 10, 9, 9, 9] with K=5.
+    lengths = [3, 9, 7, 6, 2, 5, 2, 5, 9]
+    args = SimpleNamespace(max_tokens_per_gpu=10, allgather_cp=allgather_cp, data_pad_size_multiplier=2)
+    capacity = 8 if allgather_cp else 10
+    local_k = partitioning["get_minimum_num_micro_batch_size"](lengths, capacity)
+    partitioning.update(
+        self=SimpleNamespace(args=args),
+        samples=lengths,
+        rollout_data={"total_lengths": lengths},
+        cp_size=1,
+        window=SimpleNamespace(rollout_data={"total_lengths": lengths}),
+        max_k=local_k + 1,
+    )
+    partitions = _run_actor_partitions(partitioning, repack)
     assert len(partitions) == local_k + int(repack)
     assert sorted(index for partition in partitions for index in partition) == list(range(len(lengths)))
     assert all(
@@ -103,3 +109,33 @@ def test_allgather_capacity_rejects_budget_smaller_than_padding(partitioning):
     args = SimpleNamespace(allgather_cp=True, data_pad_size_multiplier=8)
     with pytest.raises(ValueError, match="padding must fit"):
         partitioning["_get_micro_batch_token_capacity"](args, 10, 1)
+
+
+@pytest.mark.parametrize("repack", [False, True])
+def test_prepack_and_repack_use_same_flops_objective(partitioning, repack):
+    lengths = [8] * 6
+    costs = [100, 74, 99, 75, 80, 79]
+    calls = []
+    rollout = {"total_lengths": lengths}
+
+    def estimator(args, data):
+        assert data is rollout
+        calls.append(1)
+        return costs
+
+    partitioning.update(
+        sample_costs=estimator,
+        self=SimpleNamespace(args=SimpleNamespace(max_tokens_per_gpu=16)),
+        rollout_data=rollout,
+        samples=lengths,
+        cp_size=1,
+        max_k=4,
+        window=SimpleNamespace(rollout_data=rollout),
+    )
+    k = 4 if repack else 3
+    actual = _run_actor_partitions(partitioning, repack)
+    reference = partitioning["_get_capacity_safe_balanced_partitions"](lengths, k, 16)
+    assert calls == [1]
+    assert actual != reference
+    worst = lambda groups: max(sum(costs[i] for i in group) for group in groups)
+    assert worst(actual) < worst(reference)

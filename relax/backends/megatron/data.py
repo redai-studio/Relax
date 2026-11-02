@@ -19,7 +19,7 @@ from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
-from relax.utils.data.packing import get_binpack_partitions
+from relax.utils.data.packing import get_binpack_partitions, get_flops_packing_seed
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -30,6 +30,7 @@ from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
 from relax.utils.training.flops_counter import FlopsCounter
+from relax.utils.training.microbatch_cost import sample_costs, validate_microbatch_balance
 from relax.utils.training.preference_utils import pack_preference_pair_indices
 from relax.utils.types import RolloutBatch
 
@@ -245,22 +246,37 @@ def _partitions_fit_capacity_or_singleton_oversize(
 
 
 def _get_capacity_safe_balanced_partitions(
-    total_lengths: Sequence[int], num_partitions: int, capacity: int
+    total_lengths: Sequence[int],
+    num_partitions: int,
+    capacity: int,
+    costs: Sequence[float] | None = None,
 ) -> list[list[int]]:
-    partitions = get_seqlen_balanced_partitions(total_lengths, num_partitions, equal_size=False)
-    partition_token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
-    if _partitions_fit_capacity_or_singleton_oversize(partitions, partition_token_counts, total_lengths, capacity):
-        return partitions
-
-    balanced_max_tokens = max(partition_token_counts)
-    partitions = _get_first_fit_partitions(total_lengths, capacity)
+    if costs is not None:
+        if len(costs) != len(total_lengths):
+            raise ValueError("Sample costs and lengths must have the same size")
+        partitions = get_seqlen_balanced_partitions(costs, num_partitions, equal_size=False)
+        token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
+        if _partitions_fit_capacity_or_singleton_oversize(partitions, token_counts, total_lengths, capacity):
+            return partitions
+        balanced_max_tokens = max(token_counts)
+        # K was derived from this feasible seed before the DP/VPP rounding.
+        # Input-order first fit may need more bins than the new smaller K.
+        partitions = get_flops_packing_seed(total_lengths, costs, capacity)
+    else:
+        # Keep the established token-only path unchanged.
+        partitions = get_seqlen_balanced_partitions(total_lengths, num_partitions, equal_size=False)
+        partition_token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
+        if _partitions_fit_capacity_or_singleton_oversize(partitions, partition_token_counts, total_lengths, capacity):
+            return partitions
+        balanced_max_tokens = max(partition_token_counts)
+        partitions = _get_first_fit_partitions(total_lengths, capacity)
     partition_token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
     if len(partitions) > num_partitions or not _partitions_fit_capacity_or_singleton_oversize(
         partitions, partition_token_counts, total_lengths, capacity
     ):
         raise RuntimeError(
-            "first-fit dynamic microbatch partitions cannot satisfy the synchronised schedule: "
-            f"first_fit_partitions={len(partitions)}, num_partitions={num_partitions}, capacity={capacity}"
+            "capacity-safe dynamic microbatch partitions cannot satisfy the synchronised schedule: "
+            f"seed_partitions={len(partitions)}, num_partitions={num_partitions}, capacity={capacity}"
         )
 
     while len(partitions) < num_partitions:
@@ -286,7 +302,7 @@ def _get_capacity_safe_balanced_partitions(
         raise RuntimeError("capacity-safe dynamic microbatch partitioning produced an invalid partition")
 
     logger.warning(
-        "Balanced dynamic microbatches violated token capacity; using first-fit partitions with any oversized "
+        "Balanced dynamic microbatches violated token capacity; using capacity-safe partitions with any oversized "
         "samples isolated: "
         f"balanced_max_tokens={balanced_max_tokens}, capacity={capacity}, num_partitions={num_partitions}"
     )
@@ -298,19 +314,23 @@ def _get_seqlen_partitions_with_dummy_padding(
     num_partitions: int,
     capacity: int,
     packing_strategy: str = "balanced",
+    costs: Sequence[float] | None = None,
 ) -> tuple[list[list[int]], set[int]]:
     if packing_strategy == "binpack":
+        if costs is not None:
+            raise ValueError("FLOPs balancing does not support binpack")
         partitions = get_binpack_partitions(seqlens, capacity)
     else:
         real_partition_count = min(len(seqlens), num_partitions)
-        partitions = _get_capacity_safe_balanced_partitions(seqlens, real_partition_count, capacity)
+        partitions = _get_capacity_safe_balanced_partitions(seqlens, real_partition_count, capacity, costs)
     real_partition_count = len(partitions)
     assert real_partition_count <= num_partitions, (
         f"{real_partition_count} partitions > num_partitions={num_partitions}"
     )
     dummy_offsets: set[int] = set()
     if real_partition_count < num_partitions:
-        shortest_partition = min(partitions, key=lambda partition: sum(seqlens[index] for index in partition))
+        objective = costs if costs is not None else seqlens
+        shortest_partition = min(partitions, key=lambda partition: sum(objective[index] for index in partition))
         for offset in range(real_partition_count, num_partitions):
             partitions.append(list(shortest_partition))
             dummy_offsets.add(offset)
@@ -1190,6 +1210,30 @@ def _get_preference_data_iterator(
     return [iterator], [len(branch_bins)]
 
 
+def _get_synchronised_sample_costs(args: Namespace, rollout_data: RolloutBatch) -> list[float] | None:
+    """Agree estimator failures before any rank starts the microbatch schedule.
+
+    This runs on the training thread, never inside CPU prefetch. Model-parallel
+    then DP-with-CP reductions carry any error to every training rank.
+    """
+    if not validate_microbatch_balance(args):
+        return None
+    costs = None
+    error = None
+    try:
+        costs = sample_costs(args, rollout_data)
+    except Exception as caught:
+        error = caught
+    failed = torch.tensor([int(error is not None)], dtype=torch.int, device=device_utils.make_current_torch_device())
+    for group in (mpu.get_model_parallel_group(), mpu.get_data_parallel_group(with_context_parallel=True)):
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+    if failed.item():
+        raise ValueError(
+            f"FLOPs sample cost estimation failed on a training rank: {error or 'peer estimator failed'}"
+        ) from error
+    return costs
+
+
 def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
@@ -1208,6 +1252,7 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    costs = _get_synchronised_sample_costs(args, rollout_data)
     if is_preference_mode(args):
         return _get_preference_data_iterator(args, rollout_data, max_tokens_per_gpu)
 
@@ -1364,6 +1409,10 @@ def get_data_iterator(
             end = step_offsets[i + 1]
             if packing_strategy == "binpack":
                 num_microbatches.append(len(get_binpack_partitions(samples[start:end], micro_batch_token_capacity)))
+            elif costs is not None:
+                num_microbatches.append(
+                    len(get_flops_packing_seed(samples[start:end], costs[start:end], micro_batch_token_capacity))
+                )
             else:
                 num_microbatches.append(
                     get_minimum_num_micro_batch_size(samples[start:end], micro_batch_token_capacity)
@@ -1396,6 +1445,7 @@ def get_data_iterator(
                 num_mbs,
                 micro_batch_token_capacity,
                 packing_strategy=packing_strategy,
+                costs=costs[start:end] if costs is not None else None,
             )
             base_offset = len(micro_batch_indices)
             micro_batch_indices.extend([[idx + start for idx in partition] for partition in partitions])
