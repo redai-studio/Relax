@@ -770,9 +770,10 @@ def test_cpu_export_prefetch_overlaps_and_joins_on_failure(
     assert active == 0 and peak == 1
 
 
+@pytest.mark.parametrize("copy_buffer_bytes", [None, 31], ids=["planned-buffer", "small-buffer"])
 @_cpu_only
 def test_cpu_export_streams_frozen_payloads_without_materializing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, copy_buffer_bytes: int | None
 ) -> None:
     import safetensors
 
@@ -788,6 +789,54 @@ def test_cpu_export_streams_frozen_payloads_without_materializing(
         {**{key: torch.zeros_like(value) for key, value in expected.items()}, **frozen}, model / "model.safetensors"
     )
     expected.update(frozen)
+    allocated: list[int] = []
+    reads: list[tuple[int, int, int]] = []
+    original_open = Path.open
+    original_copy = exporter.ShardWriter.copy_frozen
+
+    def allocate_buffer(size: int) -> bytearray:
+        buffer = bytearray(size)
+        allocated.append(len(buffer))
+        return buffer
+
+    class TrackedSource:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> "TrackedSource":
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.handle, name)
+
+        def readinto(self, buffer: memoryview) -> int:
+            offset = self.handle.tell()
+            count = self.handle.readinto(buffer)
+            reads.append((offset, len(buffer), count))
+            return count
+
+    def tracked_open(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = original_open(path, mode, *args, **kwargs)
+        return TrackedSource(handle) if path == model / "model.safetensors" and mode == "rb" else handle
+
+    if copy_buffer_bytes is not None:
+
+        def copy_with_small_buffer(
+            self: exporter.ShardWriter,
+            model: Path,
+            files: dict[str, list[str]],
+            schema: dict[str, dict[str, Any]],
+            buffer_bytes: int,
+        ) -> None:
+            original_copy(self, model, files, schema, copy_buffer_bytes)
+
+        monkeypatch.setattr(exporter.ShardWriter, "copy_frozen", copy_with_small_buffer)
+
+    monkeypatch.setattr(exporter, "bytearray", allocate_buffer, raising=False)
+    monkeypatch.setattr(Path, "open", tracked_open)
 
     class MetadataOnly:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -808,7 +857,23 @@ def test_cpu_export_streams_frozen_payloads_without_materializing(
     result = export_checkpoint(
         checkpoint, model, output, shard_bytes=128, memory_budget=1024**2, allow_base_fallback=("vision",)
     )
-    assert result["copy_buffer_bytes"] <= 64 * 1024**2
+    buffer_bytes = result["copy_buffer_bytes"] if copy_buffer_bytes is None else copy_buffer_bytes
+    assert allocated == [buffer_bytes]
+    assert 0 < allocated[0] <= result["copy_buffer_bytes"] <= result["memory_budget_bytes"]
+    assert reads and all(0 < count <= requested <= allocated[0] for _, requested, count in reads)
+    if copy_buffer_bytes is not None:
+        import struct
+
+        data = (model / "model.safetensors").read_bytes()
+        header_bytes = struct.unpack("<Q", data[:8])[0]
+        header = json.loads(data[8 : 8 + header_bytes])
+        begin, end = header["model.visual.large"]["data_offsets"]
+        start, length = 8 + header_bytes + begin, end - begin
+        payload_reads = [(offset, count) for offset, _, count in reads if start <= offset < start + length]
+        assert length > buffer_bytes
+        assert payload_reads == [
+            (start + offset, min(buffer_bytes, length - offset)) for offset in range(0, length, buffer_bytes)
+        ]
     index = json.loads((output / "model.safetensors.index.json").read_text())
     assert index["metadata"]["total_size"] == sum(value.numel() * value.element_size() for value in expected.values())
     assert index["weight_map"].keys() == expected.keys()
