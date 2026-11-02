@@ -111,7 +111,11 @@ class TrainingFieldArtifact:
 
 
 def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    compacted = copy.deepcopy(payload)
+    # Numeric lists become independently owned arrays below. Deep-copying
+    # them first duplicates every Python element immediately before discarding
+    # the intermediate lists. Keep deepcopy for all other (including dynamic)
+    # Sample fields so the transport retains its ownership boundary.
+    compacted = dict(payload)
 
     tokens = compacted.get("tokens")
     rollout_tokens = compacted.get("rollout_tokens")
@@ -119,11 +123,14 @@ def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
         compacted["rollout_tokens"] = None
         compacted["_rollout_tokens_shared"] = True
 
+    arrays: dict[str, np.ndarray] = {}
     for field_name, dtype in _TRAINING_ARTIFACT_ARRAY_FIELDS:
         value = compacted.get(field_name)
         if not isinstance(value, list) or not value:
             continue
-        compacted[field_name] = np.asarray(value, dtype=dtype)
+        arrays[field_name] = np.asarray(value, dtype=dtype)
+    compacted = copy.deepcopy({key: value for key, value in compacted.items() if key not in arrays})
+    compacted.update(arrays)
     return compacted
 
 
