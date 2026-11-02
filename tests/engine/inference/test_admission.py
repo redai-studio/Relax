@@ -183,6 +183,7 @@ async def test_cancelled_acquire_returns_a_late_permit_even_after_repeated_cance
     complete.set()
     with pytest.raises(asyncio.CancelledError):
         await task
+    await asyncio.gather(*permit._client._cleanup_tasks)
     assert len(manager.acquired) == (0 if reject else 1)
     assert manager.released == manager.acquired
     manager.gate.drain(lambda: pytest.fail("permit leaked"), timeout=0)

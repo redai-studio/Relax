@@ -157,22 +157,14 @@ async def _manager_call(manager: Any, method: str, *args: Any, **kwargs: Any) ->
 async def _wait_request_control(task: asyncio.Task[T], description: str, deadline: float) -> T:
     """Bound the caller's wait without cancelling an RPC of unknown outcome.
 
-    Repeated cancellation shares the original deadline; the independent task
-    remains responsible for late receipts after the caller has left.
+    Cancellation ends only this wait, so an outer deadline (such as OPD's total
+    budget) is respected. Tracked tasks still own every late receipt.
     """
-    cancelled = None
     while not task.done():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            if cancelled is not None:
-                raise cancelled
             raise ModelUnavailableError(f"Timed out waiting for {description}; admission cleanup is unconfirmed")
-        try:
-            await asyncio.wait({task}, timeout=remaining)
-        except asyncio.CancelledError as error:
-            cancelled = error
-    if cancelled is not None:
-        raise cancelled
+        await asyncio.wait({task}, timeout=remaining)
     return task.result()
 
 
@@ -206,11 +198,7 @@ class InferenceRequest:
         try:
             self._permit = await _wait_request_control(pending, "inference admission", deadline)
         except (asyncio.CancelledError, ModelUnavailableError):
-            cleanup = self._client._track_cleanup(asyncio.create_task(self._return_late_grant(pending)))
-            try:
-                await _wait_request_control(cleanup, "cancelled admission cleanup", deadline)
-            except (asyncio.CancelledError, Exception):
-                pass  # The tracked cleanup owns any late grant, never an HTTP send.
+            self._client._track_cleanup(asyncio.create_task(self._return_late_grant(pending)))
             raise
         except RoutingError:
             raise
@@ -240,6 +228,7 @@ class InferenceRequest:
         if self._release_task is None:
 
             async def release() -> None:
+                reported = False
                 while True:
                     try:
                         await _manager_call(self._manager, "release_inference", self._permit)
@@ -247,7 +236,9 @@ class InferenceRequest:
                     except Exception:
                         # A failed acknowledgement does not retire the owner's
                         # permit. Retry the idempotent return in this one task.
-                        logger.warning("Inference permit return is unconfirmed; retrying", exc_info=True)
+                        if not reported:
+                            logger.warning("Inference permit return is unconfirmed; retrying", exc_info=True)
+                            reported = True
                         await asyncio.sleep(max(0.01, Envs.RELAX_INFERENCE_HOLDER_POLL_S))
 
             self._release_task = self._client._track_cleanup(asyncio.create_task(release()))
