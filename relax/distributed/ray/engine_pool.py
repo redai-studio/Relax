@@ -296,6 +296,10 @@ class EnginePool:
                     if time.monotonic() >= deadline:
                         return False
                     time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+        # This wrapper is dead, or its matching node-local proof is already
+        # pending. Its queued shutdown receipt can no longer add evidence.
+        self._pending_shutdowns.pop(slot, None)
+        if pending is None:
             task = ray.remote(num_cpus=0)(cleanup_server_identity).options(
                 scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)
             )
@@ -602,29 +606,14 @@ class EnginePool:
                 self._exit_receipts.pop(slot, None)
                 failed = False
                 for method in self.spec.teardown_calls:
-                    # The engine's own shutdown kills the SGLang process tree. It
-                    # must run before ray.kill or the scheduler subprocesses are
-                    # orphaned and keep holding GPU memory.
+                    # Prefer engine-owned shutdown. If it fails or cannot run,
+                    # fence the wrapper and prove exit independently on its node.
                     try:
                         if method == "shutdown":
                             self._wait_engine_shutdown(slot, engine)
                         else:
                             ray.get(getattr(engine, method).remote(), timeout=self.spec.teardown_timeout_s)
                     except Exception as exc:
-                        if method == "shutdown" and isinstance(exc, ray.exceptions.GetTimeoutError):
-                            identity = self.release_evidence.get(slot)
-                            if identity is not None and (
-                                not isinstance(identity, dict)
-                                or identity.get("incarnation")
-                                or identity.get("pgid") is not None
-                            ):
-                                # Killing a managed server's actor now could
-                                # lose newly learned group proof. Legacy
-                                # engines without group evidence can still
-                                # use their independent node-local receipt.
-                                errors.append(self._cleanup_error(slot, exc))
-                                failed = True
-                                break
                         # Routing/DCS bookkeeping is not a GPU release receipt.
                         if method != "shutdown" or getattr(exc, "released", False):
                             logger.warning(self._log(f"slot={slot} {method}: {exc}"))

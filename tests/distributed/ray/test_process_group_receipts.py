@@ -153,35 +153,30 @@ def test_partial_group_evidence_crosses_real_ray_exception_transport(ray_cluster
     assert caught.value.identity == {"pgid": 12345, "released_process_group": [12345, 1.0, "original"]}
 
 
-@pytest.mark.parametrize("partial", [False, True])
-def test_shutdown_wait_timeout_keeps_actor_and_ref_until_evidence_arrives(monkeypatch, partial):
-    from relax.backends.sglang.process_cleanup import ServerCleanupError
-
+@pytest.mark.parametrize("proof_timeout", [False, True])
+def test_shutdown_timeout_retires_wrapper_and_preserves_pending_node_proof(monkeypatch, proof_timeout):
     cluster = _Cluster(monkeypatch)
-    pool = _make_pool(cluster, 1, teardown_timeout_s=0.01)
+    pool = _make_pool(cluster, 1, owns_pg=True, teardown_timeout_s=0.01)
     pool.start()
     engine = pool.slots[0]
     identity = {
         "node_id": "01" * 28,
         "server_pid": 12345,
+        "pgid": 12345,
         "incarnation": "original",
         "processes": [{"pid": 12345, "create_time": 1.0}],
     }
     pool.release_evidence[0] = identity
     engine._get_local_state = lambda: ActorTableData.DEAD if cluster.killed else ActorTableData.ALIVE
-    shutdown_ref, orphan_ref = object(), object()
-    submitted, gets, orphans = [], [], []
-
-    def shutdown():
-        submitted.append(shutdown_ref)
-        return shutdown_ref
-
-    engine.shutdown = SimpleNamespace(remote=shutdown)
+    shutdown_ref, dead_ref, orphan_ref = object(), object(), object()
+    shutdown_gets, proof_gets, orphans, wrapper_stops = [], [], [], []
+    engine.shutdown = SimpleNamespace(remote=lambda: dead_ref if cluster.killed else shutdown_ref)
 
     def node_task(function):
         def run(saved):
-            assert len(gets) == 2, "killed actor/submitted orphan before its pending shutdown settled"
-            assert saved["pgid"] == 12345
+            assert wrapper_stops == [engine]
+            assert 0 not in pool._pending_shutdowns, "abandoned shutdown receipt remained reachable"
+            assert saved == identity
             orphans.append(saved)
             return orphan_ref
 
@@ -189,26 +184,36 @@ def test_shutdown_wait_timeout_keeps_actor_and_ref_until_evidence_arrives(monkey
 
     def get(ref, timeout=None):
         if ref is shutdown_ref:
-            gets.append(ref)
-            if len(gets) == 1:
-                raise engine_pool.ray.exceptions.GetTimeoutError()
-            if partial:
-                raise ServerCleanupError("worker still alive", {**identity, "pgid": 12345})
-            return None
+            shutdown_gets.append(ref)
+            raise engine_pool.ray.exceptions.GetTimeoutError()  # Never settles.
+        if ref is dead_ref:
+            raise engine_pool.ray.exceptions.ActorDiedError()
         if ref is orphan_ref:
+            proof_gets.append(ref)
+            if proof_timeout and len(proof_gets) == 1:
+                raise engine_pool.ray.exceptions.GetTimeoutError()
             return None
         return cluster.get(ref, timeout)
+
+    def kill(actor, **kwargs):
+        if kwargs.get("no_restart"):
+            wrapper_stops.append(actor)
+        cluster.killed.append(actor)
 
     monkeypatch.setattr(engine_pool.ray, "get", get)
     monkeypatch.setattr(engine_pool.ray, "remote", lambda **kwargs: node_task)
     monkeypatch.setattr(engine_pool.ray, "nodes", lambda: [{"NodeID": identity["node_id"], "Alive": True}])
-    monkeypatch.setattr(engine_pool.ray, "kill", lambda actor, **kw: cluster.killed.append(actor))
-    with pytest.raises(ResourceBlockedError):
-        pool.shutdown()
-    assert cluster.killed == [] and orphans == []
-    assert submitted == [shutdown_ref] and gets == [shutdown_ref]
-    assert pool.slots == [engine]
+    monkeypatch.setattr(engine_pool.ray, "kill", kill)
+    if proof_timeout:
+        with pytest.raises(ResourceBlockedError):
+            pool.shutdown()
+        assert wrapper_stops == [engine] and orphans == [identity]
+        assert 0 not in pool._pending_shutdowns
+        assert pool._orphan_cleanups[0][3] is orphan_ref
+        assert pool.slots == [engine] and not cluster.removed_pgs
     pool.shutdown()
-    assert submitted == [shutdown_ref] and gets == [shutdown_ref, shutdown_ref]
-    assert bool(orphans) is partial
-    assert pool.slots == [None]
+    assert shutdown_gets == [shutdown_ref]
+    assert wrapper_stops == [engine] and orphans == [identity]
+    assert len(proof_gets) == (2 if proof_timeout else 1)
+    assert pool.slots == [None] and cluster.removed_pgs == ["pg-0"]
+    assert not pool._pending_shutdowns and not pool._orphan_cleanups
