@@ -7,8 +7,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-import ray
-
 from relax.utils.env import Envs
 
 
@@ -23,6 +21,7 @@ class HolderIdentity:
 
 def current_holder() -> HolderIdentity:
     import psutil
+    import ray
 
     process = psutil.Process(os.getpid())
     if not ray.is_initialized():
@@ -51,6 +50,8 @@ def holder_alive(holder: HolderIdentity | None) -> bool | None:
     """Only a terminal receipt returns False; unreachable means unknown."""
     if holder is None:
         return None
+    import ray
+
     try:
         if holder.actor_id:
             from ray._private.state import actors
