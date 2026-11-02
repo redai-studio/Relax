@@ -196,7 +196,6 @@ SFT_ARGS=(
     --mtp-loss-scaling-factor 0.1
     --mtp-detach-paths none
     --eval-interval "${EVAL_INTERVAL:-100}"
-    --sft-packing-strategy balanced
 )
 if [[ "${QWEN38_SFT_MODALITY:-multimodal}" == multimodal ]]; then
     SFT_ARGS+=(
