@@ -288,3 +288,47 @@ def test_loss_function_exports_effective_tokens_independent_of_metric_denominato
 
     assert logging["num_tokens"].item() == (0 if is_dummy else 2)
     assert logging["values"][0].item() == (2 if calculate_per_token_loss and not is_dummy else 0)
+
+
+@pytest.mark.parametrize("kl_loss_type", ["low_var_kl", "k3"])
+@pytest.mark.parametrize(("coefficient", "values"), [(0.0, [-100.0, -1.0]), (0.1, [-0.5, -1.0])])
+def test_kl_coefficient_preserves_policy_gradient(monkeypatch, kl_loss_type, coefficient, values):
+    log_probs = torch.tensor(values, requires_grad=True)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *_args, **_kwargs: (None, {"log_probs": [log_probs], "entropy": [torch.zeros_like(log_probs)]}),
+    )
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **_kwargs: (None, {}))
+    args = SimpleNamespace(
+        advantage_estimator="rloo",
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=False,
+        custom_pg_loss_reducer_function_path=None,
+        entropy_coef=0.0,
+        use_kl_loss=True,
+        kl_loss_coef=coefficient,
+        kl_loss_type=kl_loss_type,
+        use_unbiased_kl=False,
+    )
+    batch = {
+        "advantages": torch.ones_like(log_probs),
+        "log_probs": [log_probs.detach()],
+        "ref_log_probs": [torch.zeros_like(log_probs)],
+        "response_lengths": [2],
+        "total_lengths": [3],
+        "unconcat_tokens": [torch.arange(3)],
+        "loss_masks": [torch.ones_like(log_probs)],
+    }
+    value, metrics = loss_module.policy_loss_function(args, batch, torch.empty(1, 1, 1), lambda values: values.sum())
+    assert value.isfinite()
+    assert "kl_loss" in metrics
+    value.backward()
+    expected = -torch.ones_like(log_probs)
+    if coefficient:
+        expected = expected + coefficient * (1 - (-log_probs.detach()).exp())
+    torch.testing.assert_close(log_probs.grad, expected)

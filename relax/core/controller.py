@@ -362,6 +362,7 @@ class Controller:
         if (
             getattr(self.config, "fully_async", False)
             and getattr(self.config, "use_dynamic_batch_size", False)
+            and not (getattr(self.config, "hybrid", False) and getattr(self.config, "balance_data", False))
             and not use_sft_prepack
         ):
             sampler = IdentityWindowSampler(
