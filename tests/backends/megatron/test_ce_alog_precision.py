@@ -20,7 +20,8 @@ sm100 = pytest.mark.skipif(
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("backport_first", [False, True])
-def test_ce_dispatch_preserves_entrypoint_identity(enabled, backport_first):
+@pytest.mark.parametrize("cli", [False, True])
+def test_ce_dispatch_preserves_entrypoint_identity(enabled, backport_first, cli):
     script = f"""
 import importlib
 if {backport_first!r}:
@@ -35,8 +36,8 @@ fused_linear_ce._LinearCE.apply = lambda *args: fallback_result
 fused_linear_ce._log_enabled = lambda *args: None
 import torch
 hidden = torch.ones(1)
-expected = backport_result if {enabled!r} else fallback_result
-assert fused_linear_ce.linear_cross_entropy(hidden, hidden, hidden, None) is expected
+expected = backport_result if {enabled or cli!r} else fallback_result
+assert fused_linear_ce.linear_cross_entropy(hidden, hidden, hidden, None, enabled={cli!r}) is expected
 assert fused_linear_ce.linear_cross_entropy is original
 """
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", RELAX_SFT_FUSED_LINEAR_CE=str(int(enabled)))

@@ -663,3 +663,36 @@ def test_tied_weight_gradients_survive_per_chunk_checkpoint(use_reentrant):
 
     torch.testing.assert_close(loss, reference_loss)
     torch.testing.assert_close(shared_weight.grad, reference_weight.grad, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fused_cli_reaches_head_eligibility_and_temperature_dispatch(monkeypatch, enabled):
+    from relax.backends.megatron import fused_linear_ce as fused
+
+    model = torch.nn.Module()
+    model.output_layer = _FakeLmHead()
+    model.output_layer.gradient_accumulation_fusion = False
+    hidden = torch.randn(3, 4)
+    labels = torch.tensor([1, 2, 3])
+    observed = []
+
+    def supported(layer, values, weight, *, enabled):
+        observed.append(("eligibility", enabled))
+        return enabled
+
+    def linear(values, weight, targets, group, **kwargs):
+        observed.append(("kernel", kwargs["enabled"]))
+        loss = torch.nn.functional.cross_entropy(values @ weight.T, targets, reduction="none")
+        return loss, None
+
+    monkeypatch.setattr(fused, "supported", supported)
+    monkeypatch.setattr(fused, "linear_cross_entropy", linear)
+    with _bypass_output_layer(model, fused_linear_ce=enabled) as head:
+        model.output_layer(hidden)
+        actual = head._relax_fused_linear_ce(hidden, labels, 1.0)
+    assert observed == ([("eligibility", True), ("kernel", True)] if enabled else [("eligibility", False)])
+    if enabled:
+        expected = torch.nn.functional.cross_entropy(hidden @ model.output_layer.weight.T, labels, reduction="none")
+        torch.testing.assert_close(actual, expected)
+    else:
+        assert actual is None
