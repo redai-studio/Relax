@@ -34,7 +34,6 @@ from relax.engine.inference.discovery import (
     TopologyRevision,
     build_model_snapshot,
     format_base_url,
-    role_snapshot_from_payloads,
 )
 from relax.engine.inference.ownership import ResourceBlockedError
 from relax.utils.logging_utils import get_logger
@@ -283,7 +282,7 @@ class MultiEngineManager:
         selection.pop("model", None)
         selection.pop("route_key", None)
         return self._admission.acquire(
-            lambda: role_snapshot_from_payloads("inference", {"_": self.get_inference_snapshot()}),
+            self._inference_snapshot,
             request_id,
             **selection,
         )
@@ -327,7 +326,7 @@ class MultiEngineManager:
     def is_onloaded(self) -> bool:
         return self._pool.is_active()
 
-    def get_inference_snapshot(self) -> dict:
+    def _inference_snapshot(self) -> RoleSnapshot:
         """Describe this manager's logical replicas for discovery.
 
         Only head slots are listed: followers of a multi-node engine serve no
@@ -350,11 +349,21 @@ class MultiEngineManager:
             rows.append((index, base_url, state))
             incarnations[f"_/{index}"] = self._pool.incarnations.get(rank, 0)
 
-        model = build_model_snapshot("_", rows)
-        revision = self._topology_revision.observe([model], incarnations)
-        model = self._admission.view(RoleSnapshot("inference", revision, models=(model,))).models[0]
+        signature = (tuple(rows), tuple(incarnations.values()))
+        cached = getattr(self, "_snapshot_cache", None)
+        if cached is None or cached[0] != signature:
+            model = build_model_snapshot("_", rows)
+            revision = self._topology_revision.observe([model], incarnations)
+            cached = (signature, RoleSnapshot("inference", revision, models=(model,)))
+            self._snapshot_cache = cached
+        # Observation is checked every time; admission intent is never cached.
+        return self._admission.view(cached[1])
+
+    def get_inference_snapshot(self) -> dict:
+        snapshot = self._inference_snapshot()
+        model = snapshot.models[0]
         return {
-            "topology_revision": revision,
+            "topology_revision": snapshot.topology_revision,
             "state": model.state.value,
             "router_url": None,
             "served_model_name": next(

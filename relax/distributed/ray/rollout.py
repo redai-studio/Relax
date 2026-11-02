@@ -3348,9 +3348,7 @@ class RolloutEngineRuntime:
 
     @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
     def acquire_inference(self, request_id: str, **selection: Any) -> RequestPermit:
-        return self._admission.acquire(
-            lambda: RoleSnapshot.from_dict(self.get_inference_snapshot()), request_id, **selection
-        )
+        return self._admission.acquire(self._inference_snapshot, request_id, **selection)
 
     @ray.method(concurrency_group=ADMISSION_CONCURRENCY_GROUP)
     def release_inference(self, permit: RequestPermit) -> None:
@@ -3358,6 +3356,9 @@ class RolloutEngineRuntime:
 
     @ray.method(concurrency_group="scale_out")
     def get_inference_snapshot(self) -> dict:
+        return self._inference_snapshot().to_dict()
+
+    def _inference_snapshot(self) -> RoleSnapshot:
         """Topology of every rollout model in the unified discovery schema.
 
         Read-only companion of ``get_engines_info``, whose legacy shape is left
@@ -3367,6 +3368,8 @@ class RolloutEngineRuntime:
         """
         resident_state = EngineState.SLEEPING if self.status in {"offload", "onloading"} else EngineState.READY
         models = []
+        incarnations = {}
+        cache = self.__dict__.setdefault("_model_snapshot_cache", {})
         for name, srv in self.servers.items():
             router_url = format_base_url(srv.router_ip, srv.router_port) if srv.router_ip and srv.router_port else None
             replicas, workers = [], []
@@ -3380,6 +3383,8 @@ class RolloutEngineRuntime:
                     # The head slot's global rank is stable across scale-in of other groups.
                     slot = i * group.nodes_per_engine
                     rank = group.rank_offset + slot
+                    label = f"{group.worker_type}-{rank}" if group.worker_type in ("prefill", "decode") else str(rank)
+                    incarnations[f"{name}/{label}"] = group._engine_pool().incarnations.get(slot, 0)
                     url = group._engine_urls.get(slot) if engine is not None else None
                     state = states[i]
                     record = group.engine_init_records.get(slot)
@@ -3418,23 +3423,41 @@ class RolloutEngineRuntime:
                 # confirmed. PD requires a safe router and remains retryable.
                 router_url = None
                 workers = [(label, url, EngineState.BLOCKED) for label, url, _ in workers]
-            models.append(
-                build_model_snapshot(
-                    name, replicas, router_url=router_url, diagnostic_workers=workers, served_model_name=served_name
+            signature = (tuple(replicas), tuple(workers), router_url, served_name)
+            cached = cache.get(name)
+            if cached is None or cached[0] != signature:
+                cached = (
+                    signature,
+                    build_model_snapshot(
+                        name,
+                        replicas,
+                        router_url=router_url,
+                        diagnostic_workers=workers,
+                        served_model_name=served_name,
+                    ),
                 )
-            )
+                cache[name] = cached
+            models.append(cached[1])
 
         revision = getattr(self, "_topology_revision", None)
         if revision is None:
             revision = self._topology_revision = TopologyRevision()
-        return self._admission.view(
-            RoleSnapshot(
-                role="rollout",
-                topology_revision=revision.observe(models),
-                models=tuple(models),
-                default_model="default" if "default" in self.servers else None,
+        for removed in cache.keys() - self.servers.keys():
+            del cache[removed]
+        signature = (tuple(id(model) for model in models), tuple(incarnations.items()))
+        cached = getattr(self, "_role_snapshot_cache", None)
+        if cached is None or cached[0] != signature:
+            cached = (
+                signature,
+                RoleSnapshot(
+                    role="rollout",
+                    topology_revision=revision.observe(models, incarnations),
+                    models=tuple(models),
+                    default_model="default" if "default" in self.servers else None,
+                ),
             )
-        ).to_dict()
+            self._role_snapshot_cache = cached
+        return self._admission.view(cached[1])
 
     @ray.method(concurrency_group="scale_out")
     def list_all_scale_out_requests(

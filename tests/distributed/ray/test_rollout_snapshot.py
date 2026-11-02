@@ -404,3 +404,28 @@ def test_router_fallback_excludes_replacement_awaiting_weight_sync(monkeypatch):
     snapshot = _snapshot(manager)
     routing = RoutingState()
     assert {select_target(snapshot, routing).base_url for _ in range(6)} == {"http://survivor:3"}
+
+
+def test_rollout_admission_cache_observes_health_and_same_endpoint_replacement(monkeypatch):
+    from relax.engine.inference.routing import ModelUnavailableError
+
+    group = make_engine_group(engines=_engines("http://engine:1"))
+    manager = _manager(monkeypatch, [group], status="onload")
+    builds = []
+    build = rollout.build_model_snapshot
+
+    def record(*args, **kwargs):
+        builds.append(True)
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(rollout, "build_model_snapshot", record)
+    for i in range(4):
+        permit = manager.acquire_inference(str(i))
+        manager.release_inference(permit)
+    assert len(builds) == 1
+    before = _snapshot(manager).topology_revision
+    group._engine_pool().incarnations[0] = 1
+    assert _snapshot(manager).topology_revision > before
+    group.health_failures = {0: 1}
+    with pytest.raises(ModelUnavailableError):
+        manager.acquire_inference("failed")

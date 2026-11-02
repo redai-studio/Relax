@@ -687,3 +687,36 @@ def test_health_recovery_clears_transient_observation_without_rebuilding(monkeyp
     assert manager.health_check()
     assert manager.get_inference_snapshot()["state"] == "ready"
     assert manager.all_engines[0] is engine
+
+
+def test_admission_reuses_topology_until_observation_or_generation_changes(monkeypatch):
+    import relax.distributed.ray.multi_engine_manager as mem
+    from relax.engine.inference.routing import ModelUnavailableError
+
+    manager = _FakeManager(num_slots=1)
+    builds = []
+    build = mem.build_model_snapshot
+
+    def record(*args, **kwargs):
+        builds.append(True)
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(mem, "build_model_snapshot", record)
+    for i in range(4):
+        permit = manager.acquire_inference(str(i))
+        manager.release_inference(permit)
+    assert len(builds) == 1
+    manager._admission.close()
+    with pytest.raises(ModelUnavailableError):
+        manager.acquire_inference("closed")
+    manager._admission.open()
+    manager._unhealthy.add(0)
+    with pytest.raises(ModelUnavailableError):
+        manager.acquire_inference("failed")
+    manager._unhealthy.clear()
+    before = manager.get_inference_snapshot()["topology_revision"]
+    manager._pool.incarnations[0] += 1
+    manager._pool.addresses[0] = {"host": "replacement", "port": 2}
+    permit = manager.acquire_inference("replacement")
+    assert permit.target.base_url == "http://replacement:2"
+    assert manager.get_inference_snapshot()["topology_revision"] > before

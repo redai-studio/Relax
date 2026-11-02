@@ -277,7 +277,10 @@ class TopologyRevision:
                     (engine.engine_id, engine.base_url, incarnations.get(engine.engine_id, 0))
                     for engine in model.engines
                 ),
-                tuple((worker.engine_id, worker.base_url) for worker in model.diagnostic_workers),
+                tuple(
+                    (worker.engine_id, worker.base_url, incarnations.get(worker.engine_id, 0))
+                    for worker in model.diagnostic_workers
+                ),
             )
             for model in models
         )
