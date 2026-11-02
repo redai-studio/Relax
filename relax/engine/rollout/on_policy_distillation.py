@@ -383,7 +383,8 @@ class OpdManager:
         session: aiohttp.ClientSession,
         encode_multimodal_inputs: EncodeMultimodalInputs | None,
     ) -> None:
-        await gather_owned(self._student_prefill(s, session, encode_multimodal_inputs) for s in samples)
+        results = await gather_owned(self._student_prefill(s, session, encode_multimodal_inputs) for s in samples)
+        self._raise_if_all_failed(samples, results, stage="student")
 
     def assemble_stage(self, samples: list[Sample]) -> None:
         """Combine what the two models returned into the fields training
@@ -635,11 +636,12 @@ class OpdManager:
 
     async def _student_prefill(
         self, sample: Sample, session: aiohttp.ClientSession, encode_mm_fn: EncodeMultimodalInputs | None
-    ) -> None:
+    ) -> bool:
 
         response_length = int(sample.response_length or 0)
         if response_length <= 0:
-            return
+            return True
+        sample.student_at_teacher_topk_log_probs = None
         teacher_topk_ids = sample.teacher_topk_token_ids
 
         prompt_length = len(sample.tokens) - response_length
@@ -652,6 +654,8 @@ class OpdManager:
         mm_fields = await encode_image_inputs(sample.multimodal_inputs)
         if native:
             self._validate_query_ids(teacher_topk_ids, response_length)
+        elif teacher_topk_ids is None:
+            return False
 
         payload = self.topk_worker.build_student_payload(
             input_ids=student_input_ids,
@@ -674,7 +678,7 @@ class OpdManager:
             inference={"role": "rollout"},
         )
         if resp_obj is None:
-            return
+            return False
         sample.student_at_teacher_topk_log_probs = (
             resp_obj.strict_topk(
                 "input_token_ids_logprobs", response_length, self.topk_worker.top_k, teacher_topk_ids
@@ -682,6 +686,7 @@ class OpdManager:
             if native
             else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
         )
+        return sample.student_at_teacher_topk_log_probs is not None
 
     def _assemble_transfer(self, samples: list[Sample]) -> None:
         if self.topk_worker is None:
@@ -709,12 +714,12 @@ class OpdManager:
             sample.opd_topk_ksz = channels.get(opd_main_worker.TopkWorker.TRANSFER_K_LENGTHS)
 
     @staticmethod
-    def _raise_if_all_failed(samples: list[Sample], fetch_results: list[bool]) -> None:
+    def _raise_if_all_failed(samples: list[Sample], fetch_results: list[bool], *, stage: str = "teacher") -> None:
         eligible = [(s, ok) for s, ok in zip(samples, fetch_results) if int(getattr(s, "response_length", 0) or 0) > 0]
         if not eligible or any(ok for _, ok in eligible):
             return
         raise RuntimeError(
-            f"All OPD teacher fetches failed for {len(eligible)} non-empty samples "
+            f"All OPD {stage} fetches failed for {len(eligible)} non-empty samples "
             f"(total={len(samples)}); url={getattr(samples[0], 'opd_teacher_url', None) if samples else None}"
         )
 

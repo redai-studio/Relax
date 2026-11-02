@@ -31,8 +31,9 @@ def manager(monkeypatch):
         calls.append(f"teacher {sample.index}")
         return True
 
-    async def student_prefill(sample, session, encode_multimodal_inputs) -> None:
+    async def student_prefill(sample, session, encode_multimodal_inputs) -> bool:
         calls.append(f"student {sample.index}")
+        return True
 
     monkeypatch.setattr(opd, "_create_teacher_client_session", fake_session)
     manager = object.__new__(opd.OpdManager)
