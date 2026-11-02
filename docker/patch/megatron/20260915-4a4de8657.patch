@@ -781,7 +781,28 @@ index e0f7c9f..1d3c4e4 100644
 diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 --- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 +++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-@@ -249,6 +249,11 @@
+@@ -225,8 +225,8 @@
+
+     @staticmethod
+     def build_cpu_optimizer_list(cpu_optimizer_cls, cpu_param_groups):
+-        """Build several cpu optimizers to enable overlap. Currently we naively
+-        assign each parameter to an individual optimizer.
++        """Build overlapping CPU optimizers, grouping expert parameters in batches
++        of 16 while keeping dense parameters in individual optimizers.
+
+         Args:
+             cpu_optimizer_cls (Type[torch.optim.Optimizer]): A torch optimizer class
+@@ -242,13 +242,19 @@
+             params = group_defaults.pop("params")
+             if isinstance(params, torch.Tensor):
+                 params = [params]
+-            for param in params:
++            batch_size = 16 if group.get("is_expert_parallel", False) else 1
++            for start in range(0, len(params), batch_size):
+                 _cpu_param_group = group_defaults.copy()
+-                _cpu_param_group["params"] = [param]
++                _cpu_param_group["params"] = params[start : start + batch_size]
+                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
          return cpu_optimizers
  
      def _get_sub_optimizer_param_groups(self, offload_fraction: float):
@@ -793,7 +814,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
          params = []
          for group in self.param_groups:
              params.extend(group["params"])
-@@ -276,6 +281,8 @@
+@@ -276,6 +282,8 @@
                      cpu_copy = True
                  if self.param_update_in_fp32 and param.dtype != torch.float32:
                      param = param.detach().clone().float()
@@ -802,7 +823,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
                      param_to_fp32_param[orig_param] = param
 
                  if cpu_copy:
-@@ -370,11 +377,11 @@
+@@ -370,11 +378,11 @@
          if not self.param_update_in_fp32:
              return
          for param, v in self.state.items():
@@ -819,7 +840,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
  
      def update_fp32_param_by_new_param(self):
          """
-@@ -382,6 +389,16 @@
+@@ -382,6 +390,16 @@
          """
          for param, fp32_param in self.param_to_fp32_param.items():
              fp32_param.data.copy_(param)
