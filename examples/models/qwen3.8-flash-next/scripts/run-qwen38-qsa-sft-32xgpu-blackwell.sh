@@ -29,13 +29,9 @@ export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
-# This branch must precede the standard entrypoint: that helper cleans old jobs.
+# Use an exclusive Ray cluster; the operator must prevent concurrent training.
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
     : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs HTTP endpoint}"
-    # Training shares Serve state even when startup cleanup is disabled.
-    running_jobs=$(timeout 20s ray job list --address "${RAY_JOBS_ADDRESS}")
-    running_jobs=$(printf '%s\n' "${running_jobs}" | grep RUNNING || true)
-    [[ -z "${running_jobs}" ]] || { echo "Other Ray Jobs are RUNNING; refusing concurrent training" >&2; exit 2; }
     exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$@"
 fi
 

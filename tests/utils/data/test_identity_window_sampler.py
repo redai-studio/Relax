@@ -27,6 +27,39 @@ class _Partition:
         return {index: self._custom_meta[index] for index in global_indexes}
 
 
+@pytest.mark.parametrize("first_rank", [0, 1])
+def test_identity_window_sampler_balances_count_windows_after_delayed_arrival(first_rank: int) -> None:
+    sampler = IdentityWindowSampler(dp_size=2, placement="balanced")
+    lengths = {index: 1000 if index % 8 < 4 else 7000 for index in range(16)}
+    partition = _Partition(lengths)
+    common = {
+        "batch_size": 4,
+        "task_name": "train",
+        "partition_id": "train_0",
+        "partition": partition,
+    }
+    consumed: list[int] = []
+    for batch_index in range(2):
+        start = batch_index * 8
+        ready = list(range(start + 4))
+        assert sampler.sample(ready, dp_rank=first_rank, batch_index=batch_index, **common)[0] == []
+        ready = list(range(start + 8))
+        rank_rows = {}
+        for rank in (first_rank, 1 - first_rank):
+            rows = sampler.sample(ready, dp_rank=rank, batch_index=batch_index, **common)[0]
+            rank_rows[rank] = rows
+            assert len(rows) == 4
+            # Model-parallel partners and checkpoint recovery must replay the same assignment.
+            restored = IdentityWindowSampler(dp_size=2, placement="balanced")
+            restored.load_checkpoint(sampler.save_checkpoint())
+            assert restored.sample(ready, dp_rank=rank, batch_index=batch_index, **common)[0] == rows
+        assert set(rank_rows[0]).isdisjoint(rank_rows[1])
+        assert sum(lengths[index] for index in rank_rows[0]) == sum(lengths[index] for index in rank_rows[1])
+        consumed.extend(rank_rows[0] + rank_rows[1])
+        assert sampler.is_window_drained("train_0", "train", batch_index, 8, False, False)
+    assert sorted(consumed) == list(range(16))
+
+
 def test_identity_window_sampler_backfills_lagging_dp_dummy_round() -> None:
     """A DP that revisits an old empty round must not be blocked by window
     closure."""

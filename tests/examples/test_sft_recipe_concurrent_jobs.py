@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Check concurrent-job protection through both recipe entrypoints."""
+"""Check operator-managed exclusive-cluster launches through both recipe
+entrypoints."""
 
 import json
 import os
@@ -11,13 +12,21 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RECIPE = "examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-256k-32xgpu-blackwell.sh"
+RECIPES = (
+    "examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-256k-32xgpu-blackwell.sh",
+    "examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh",
+)
 ENTRYPOINT = "scripts/entrypoint/ray-job.sh"
 
 
+@pytest.fixture(params=RECIPES, ids=["256k", "standard"])
+def recipe(request: pytest.FixtureRequest) -> str:
+    return request.param
+
+
 @pytest.fixture
-def recipe_env(tmp_path: Path) -> dict[str, str]:
-    for relative in (RECIPE, ENTRYPOINT, "scripts/models/qwen38-flash-next.sh", "scripts/entrypoint/kernel-cache.sh"):
+def recipe_env(tmp_path: Path, recipe: str) -> dict[str, str]:
+    for relative in (recipe, ENTRYPOINT, "scripts/models/qwen38-flash-next.sh", "scripts/entrypoint/kernel-cache.sh"):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / relative, target)
@@ -34,15 +43,7 @@ import sys
 args = sys.argv[1:]
 with open(os.environ["MOCK_RAY_TRACE"], "a") as trace:
     trace.write(json.dumps(args) + "\n")
-if args[:2] == ["job", "list"]:
-    status = os.environ["MOCK_RAY_JOB_STATUS"]
-    if status == "unavailable":
-        sys.exit("Ray Jobs endpoint unavailable")
-    if status == "running":
-        print("JobDetails(status='RUNNING', submission_id='existing-training')")
-    else:
-        print("[]")
-elif args[:2] == ["list", "nodes"]:
+if args[:2] == ["list", "nodes"]:
     print('[{"state":"ALIVE","resources_total":{"GPU":8},"is_head_node":true,"node_ip":"127.0.0.1"}]')
 elif args[:2] != ["job", "submit"]:
     sys.exit("Unexpected Ray action: " + repr(args))
@@ -73,12 +74,10 @@ elif args[:2] != ["job", "submit"]:
 
 
 @pytest.mark.parametrize("via_entrypoint", [False, True], ids=["direct", "ray-job"])
-@pytest.mark.parametrize("job_status", ["running", "unavailable", "idle"])
-def test_sft_recipe_checks_jobs_before_submission(
-    tmp_path: Path, recipe_env: dict[str, str], via_entrypoint: bool, job_status: str
+def test_sft_recipe_submits_without_querying_other_jobs(
+    tmp_path: Path, recipe_env: dict[str, str], recipe: str, via_entrypoint: bool
 ) -> None:
-    recipe_env["MOCK_RAY_JOB_STATUS"] = job_status
-    command = ["bash", str(tmp_path / RECIPE)]
+    command = ["bash", str(tmp_path / recipe)]
     if via_entrypoint:
         command.insert(1, str(tmp_path / ENTRYPOINT))
     result = subprocess.run(command, cwd=tmp_path, env=recipe_env, capture_output=True, text=True, timeout=30)
@@ -86,26 +85,24 @@ def test_sft_recipe_checks_jobs_before_submission(
     assert trace.exists(), result.stderr
     calls = [json.loads(line) for line in trace.read_text().splitlines()]
     job_calls = [call for call in calls if call[0] == "job"]
-    assert job_calls and job_calls[0][:2] == ["job", "list"], result.stderr
+    assert job_calls and all(call[:2] == ["job", "submit"] for call in job_calls), result.stderr
     for call in job_calls:
-        assert call[call.index("--address") + 1] == recipe_env["RAY_JOBS_ADDRESS"]
+        if "--address" in call:
+            address = call[call.index("--address") + 1]
+        else:
+            address = next(arg.split("=", 1)[1] for arg in call if arg.startswith("--address="))
+        assert address == recipe_env["RAY_JOBS_ADDRESS"]
     submissions = [call for call in job_calls if call[:2] == ["job", "submit"]]
-    if job_status == "idle":
-        assert result.returncode == 0, result.stderr
-        assert len(submissions) == 1
-        assert "--no-wait" not in submissions[0]
-        assert sum(call[:2] == ["list", "nodes"] for call in calls) == 1
-    else:
-        assert result.returncode == (2 if job_status == "running" else 1), result.stderr
-        assert not submissions
-        expected = "refusing concurrent training" if job_status == "running" else "Ray Jobs endpoint unavailable"
-        assert expected in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert len(submissions) == 1
+    assert "--no-wait" not in submissions[0]
+    assert sum(call[:2] == ["list", "nodes"] for call in calls) == 1
 
 
-def test_sft_recipe_dry_run_does_not_contact_ray(tmp_path: Path, recipe_env: dict[str, str]) -> None:
-    recipe_env.update(DRY_RUN="1", MOCK_RAY_JOB_STATUS="running")
+def test_sft_recipe_dry_run_does_not_contact_ray(tmp_path: Path, recipe_env: dict[str, str], recipe: str) -> None:
+    recipe_env.update(DRY_RUN="1")
     result = subprocess.run(
-        ["bash", str(tmp_path / RECIPE)],
+        ["bash", str(tmp_path / recipe)],
         cwd=tmp_path,
         env=recipe_env,
         capture_output=True,

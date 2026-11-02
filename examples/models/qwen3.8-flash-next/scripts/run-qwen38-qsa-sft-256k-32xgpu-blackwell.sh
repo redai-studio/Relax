@@ -74,14 +74,7 @@ if [[ -n "${RAY_JOBS_ADDRESS:-}" ]]; then
     RAY_JOB_ADDRESS_ARGS=(--address "${RAY_JOBS_ADDRESS}")
 fi
 
-# Check both direct launches and launches through the standard entrypoint.
-if [[ "${DRY_RUN:-0}" != 1 ]]; then
-    # Training shares Serve state even when startup cleanup is disabled.
-    running_jobs=$(timeout 20s ray job list "${RAY_JOB_ADDRESS_ARGS[@]}")
-    running_jobs=$(printf '%s\n' "${running_jobs}" | grep RUNNING || true)
-    [[ -z "${running_jobs}" ]] || { echo "Other Ray Jobs are RUNNING; refusing concurrent training" >&2; exit 2; }
-fi
-
+# Use an exclusive Ray cluster; the operator must prevent concurrent training.
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
     exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$@"
 fi
