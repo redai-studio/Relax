@@ -45,6 +45,53 @@ def _is_simple(backend: dict[str, Any]) -> bool:
     return backend["storage_backend"] == "SimpleStorage"
 
 
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
+@pytest.mark.parametrize("microbatch", ["tokens", "flops"])
+@pytest.mark.parametrize("dp", [None, "tokens", "flops"])
+def test_dp_objective_selects_sampler_independently_before_queue_publication(monkeypatch, algorithm, microbatch, dp):
+    from relax.utils.data import flops_balancing
+
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = _config(
+        loss_type="sft" if algorithm == "sft" else "grpo",
+        task_type="causal_lm",
+        tq_rdma_mode="off",
+        fully_async=False,
+        balance_data=True,
+        microbatch_balance=microbatch,
+        polling_mode=False,
+    )
+    if dp is not None:
+        instance.config.dp_balance = dp
+    enabled = dp == "flops"
+    selected, published = [], []
+
+    def constructor(kind):
+        def make(**kwargs):
+            selected.append((kind, kwargs))
+            return object()
+
+        return make
+
+    monkeypatch.setattr(controller, "resolve_sft_algo_key", lambda _: algorithm)
+    monkeypatch.setattr(controller, "compute_dp_size", lambda _: 4)
+    monkeypatch.setattr(controller, "with_control_plane_affinity", lambda _: {})
+    monkeypatch.setattr(controller, "reap_unusable_tq_controller", lambda: None)
+    monkeypatch.setattr(controller, "SeqlenBalancedSampler", constructor("tokens"))
+    monkeypatch.setattr(flops_balancing, "FlopsBalancedSampler", constructor("flops"))
+    monkeypatch.setattr(controller, "IdentityWindowSampler", constructor("identity"))
+    monkeypatch.setattr(instance, "_resolve_tq_backend", lambda: {"storage_backend": "SimpleStorage"})
+    monkeypatch.setattr(controller.tq, "init", lambda conf: published.append(conf) or conf)
+    instance._initialize_data_system()
+    assert len(published) == 1
+    if algorithm == "sft":
+        assert selected == [("flops" if enabled else "tokens", {"dp_size": 4, "n_samples_per_prompt": 1})]
+    else:
+        assert selected == [
+            ("identity", {"dp_size": 4, "placement": "balanced", "cost_key": "flops_cost" if enabled else None})
+        ]
+
+
 class _DecisionHarness:
     def __init__(self, monkeypatch: pytest.MonkeyPatch, failure: str | None, *, stub_backend: bool = True) -> None:
         self.calls: list[str] = []

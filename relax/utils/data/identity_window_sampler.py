@@ -15,6 +15,7 @@ except ImportError as e:
         "or use the latest image."
     ) from e
 
+from relax.utils.data.flops_balancing import validated_cost_weights
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 
 
@@ -55,7 +56,7 @@ class _PartitionTaskState:
 
 class _BalancedRowPlacement:
     @staticmethod
-    def place(rows: list[int], lengths: dict[int, int], dp_size: int) -> list[list[int]]:
+    def place(rows: list[int], lengths: dict[int, int | float], dp_size: int) -> list[list[int]]:
         positions = get_seqlen_balanced_partitions(
             [lengths[index] for index in rows],
             dp_size,
@@ -95,10 +96,14 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         dp_size: int,
         placement: Literal["sequential", "balanced", "streaming"],
         balance_unit_multiplier: int = 1,
+        cost_key: str | None = None,
     ) -> None:
         super().__init__(n_samples_per_prompt=1, balance_unit_multiplier=balance_unit_multiplier)
         self.dp_size = dp_size
         self.placement = placement
+        if cost_key is not None and placement != "balanced":
+            raise ValueError("FLOPs costs require synchronous balanced placement")
+        self.cost_key = cost_key
         self._partition_task_states: dict[tuple[str, str], _PartitionTaskState] = {}
         self._cache_window_by_key: dict[tuple[str, str, int, int], int] = {}
         self._window_buckets: dict[tuple[str, str, int], dict[int, list[int]]] = {}
@@ -210,12 +215,15 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
 
         window = self._window(task_state, batch_index, target_identity_count)
         selected_identities = identity_order[:target_identity_count]
+        selected_rows = [index for identity in selected_identities for index in rows_by_identity[identity]]
+        lengths = (
+            validated_cost_weights(selected_rows, custom_meta, self.cost_key)
+            if self.cost_key is not None
+            else {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows}
+        )
+        rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
         self._admit_identities(task_state, window, selected_identities, rows_by_identity)
         window.admission_closed = True
-
-        selected_rows = [index for identity in selected_identities for index in rows_by_identity[identity]]
-        lengths = {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows}
-        rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
 
         for rank, rows in enumerate(rank_rows):
             self._cache_result(partition_id, task_name, rank, batch_index, (rows, rows.copy()))
@@ -496,11 +504,18 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
                 "resolved_lengths": self._resolved_lengths,
                 "dispatched": self._dispatched,
                 "dummy_rounds": self._dummy_rounds,
+                "balance_geometry": (self.dp_size, self.placement, self.cost_key),
             }
         )
         return state
 
     def load_checkpoint(self, state: dict) -> None:
+        if state.get("balance_geometry", (self.dp_size, self.placement, None)) != (
+            self.dp_size,
+            self.placement,
+            self.cost_key,
+        ):
+            raise ValueError("Sampler checkpoint DP geometry or cost mode differs")
         super().load_checkpoint(state)
         self._partition_task_states = state["partition_task_states"]
         self._cache_window_by_key = state["cache_window_by_key"]
