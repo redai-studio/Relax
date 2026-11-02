@@ -489,9 +489,11 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
 
     with pytest.raises(ResourceBlockedError, match="Cleanup unconfirmed"):
         server.recover()
-    assert group.all_engines == surviving + replacements
+    # Only the replica lacking a receipt stays quarantined; its independent
+    # sibling confirmed shutdown and must not be held by that failure.
+    assert group.all_engines == surviving + replacements[:nodes_per_engine] + [None] * nodes_per_engine
     assert group.engine_init_records == records
-    kill.assert_not_called()
+    assert [call.args[0] for call in kill.call_args_list] == replacements[nodes_per_engine:]
     for engine in surviving:
         engine.shutdown.remote.assert_not_called()
 

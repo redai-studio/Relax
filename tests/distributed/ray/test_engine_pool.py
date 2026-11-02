@@ -124,6 +124,33 @@ def _states(pool: EnginePool) -> list[EngineState]:
     return [pool.state(head) for head in pool.head_slots()]
 
 
+def test_cleanup_failure_isolates_only_its_replica(cluster, monkeypatch):
+    from relax.engine.inference.ownership import ResourceBlockedError
+
+    pool = _make_pool(cluster, 3)
+    pool.start()
+    pool.slots[0].fail["shutdown"] = RuntimeError("node probe timed out")
+    with pytest.raises(ResourceBlockedError, match="node.*pid.*checkpoint"):
+        pool.teardown([0, 1])
+    assert pool.state(0) is EngineState.BLOCKED
+    assert pool.slots[1] is None
+    assert pool.state(2) is READY
+    assert pool.recover() == {1}
+    assert pool.state(0) is EngineState.BLOCKED
+
+
+def test_dead_actor_can_retire_after_node_local_release_proof(cluster, monkeypatch):
+    pool = _make_pool(cluster, 2)
+    pool.start()
+    old = pool.slots[0]
+    old.fail["shutdown"] = RuntimeError("actor died")
+    monkeypatch.setattr(pool, "_confirm_orphan_release", lambda slot: True, raising=False)
+    pool.teardown([0])
+    assert pool.recover() == {0}
+    assert pool.slots[0] is not old
+    assert pool.incarnations[0] == 2
+
+
 def test_failed_onload_still_releases_every_partially_resident_engine(cluster):
     pool = _make_pool(cluster, 2)
     pool.start()

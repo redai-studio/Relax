@@ -112,6 +112,7 @@ class EnginePool:
         self.placements: dict[int, tuple] = {}
         self.addresses: dict[int, dict] = {}
         self.init_metadata: dict[int, dict] = {}
+        self.release_evidence: dict[int, Any] = {}
         # How many times each slot has been built.
         self.incarnations: dict[int, int] = {}
         self._states: dict[int, EngineState] = {}
@@ -210,6 +211,7 @@ class EnginePool:
             created.append((slot, engine))
             self.slots[slot] = engine
             self.init_metadata.pop(slot, None)
+            self.release_evidence.pop(slot, None)
             self.incarnations[slot] = self.incarnations.get(slot, 0) + 1
             if slot % self.nodes_per_engine == 0:
                 self._states[slot] = EngineState.STARTING
@@ -222,7 +224,54 @@ class EnginePool:
         """
         for slot, _ in engines:
             self.addresses[slot] = addresses[slot]
-        return [engine.init.remote(**self.spec.init_kwargs(slot, addresses[slot])) for slot, engine in engines]
+        handles = []
+        for slot, engine in engines:
+            handles.append(engine.init.remote(**self.spec.init_kwargs(slot, addresses[slot])))
+            self.record_release_evidence(slot, engine)
+        return handles
+
+    def record_release_evidence(self, slot: int, engine: Any) -> None:
+        # Submitted at initialization, never from discovery. Older/custom engines
+        # without this receipt can still confirm shutdown themselves.
+        methods = getattr(engine, "_ray_method_signatures", {})
+        if isinstance(methods, dict) and "get_release_evidence" in methods:
+            self.release_evidence[slot] = engine.get_release_evidence.remote()
+
+    def _confirm_orphan_release(self, slot: int) -> bool:
+        from ray.core.generated.gcs_pb2 import ActorTableData
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        from relax.backends.sglang.process_cleanup import cleanup_server_identity
+
+        identity = self.release_evidence.get(slot)
+        if identity is None:
+            return False
+        if not isinstance(identity, dict):
+            identity = ray.get(identity, timeout=self.spec.teardown_timeout_s)
+            self.release_evidence[slot] = identity
+        node_id = identity["node_id"]
+        node = next((node for node in ray.nodes() if node["NodeID"] == node_id), None)
+        if node is not None and node["Alive"] is False:
+            logger.warning(self._log(f"Node {node_id} is DEAD; releasing slot={slot} on that node"))
+            return True
+        if node is None or self.slots[slot]._get_local_state() != ActorTableData.DEAD:
+            return False
+        task = ray.remote(num_cpus=0)(cleanup_server_identity).options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)
+        )
+        ray.get(task.remote(identity), timeout=self.spec.teardown_timeout_s)
+        return True
+
+    def _cleanup_error(self, slot: int, error: Any) -> str:
+        identity = self.release_evidence.get(slot)
+        identity = identity if isinstance(identity, dict) else self.init_metadata.get(slot, {})
+        return (
+            f"slot={slot} node={identity.get('node_id', 'unknown')} "
+            f"pid={identity.get('server_pid', 'unknown')} port={identity.get('port', self.addresses.get(slot, {}).get('port'))}: "
+            f"{error}. On that node, inspect the recorded PID creation time and its SGLang workers "
+            "with ps and nvidia-smi; confirm or terminate only that process tree, then retry recovery/shutdown. "
+            "If proof remains unavailable, stop the job and restart from checkpoint after node cleanup."
+        )
 
     def start(self, slots: Optional[Iterable[int]] = None) -> list[int]:
         """Bring up every empty slot (of ``slots``) and wait until its engine
@@ -437,6 +486,7 @@ class EnginePool:
         slots = list(slots)
         errors = []
         confirmed = []
+        failed_heads = set()
         for slot in slots:
             engine = self.slots[slot]
             if engine is not None:
@@ -448,23 +498,37 @@ class EnginePool:
                     try:
                         ray.get(getattr(engine, method).remote(), timeout=self.spec.teardown_timeout_s)
                     except Exception as exc:
-                        errors.append(f"slot={slot} {method}: {exc}")
-                        failed = True
+                        # Routing/DCS bookkeeping is not a GPU release receipt.
+                        if method != "shutdown" or getattr(exc, "released", False):
+                            logger.warning(self._log(f"slot={slot} {method}: {exc}"))
+                            continue
+                        try:
+                            released = self._confirm_orphan_release(slot)
+                        except Exception as proof_error:
+                            released = False
+                            exc = proof_error
+                        if not released:
+                            errors.append(self._cleanup_error(slot, exc))
+                            failed = True
                 if failed:
-                    self._states[slot // self.nodes_per_engine * self.nodes_per_engine] = EngineState.BLOCKED
+                    head = slot // self.nodes_per_engine * self.nodes_per_engine
+                    self._states[head] = EngineState.BLOCKED
+                    failed_heads.add(head)
                     continue
             confirmed.append(slot)
         # A multi-slot replica keeps its complete allocation until every child
         # has confirmed shutdown. No kill request is an exit acknowledgement.
-        if errors:
-            raise ResourceBlockedError(self._log("Cleanup unconfirmed: " + "; ".join(errors)))
+        confirmed = [
+            slot for slot in confirmed if slot // self.nodes_per_engine * self.nodes_per_engine not in failed_heads
+        ]
         for slot in confirmed:
             if self.slots[slot] is not None:
                 try:
                     ray.kill(self.slots[slot])
                 except Exception as exc:
-                    self._states[slot // self.nodes_per_engine * self.nodes_per_engine] = EngineState.BLOCKED
-                    raise ResourceBlockedError(f"slot={slot} actor cleanup: {exc}") from exc
+                    # shutdown / node-local proof already confirmed the server
+                    # tree exited; failure to kill its empty actor is not residency.
+                    logger.warning(self._log(f"slot={slot} actor cleanup after server exit: {exc}"))
                 logger.info(self._log(f"engine rank={slot} retired"))
         for slot in confirmed:
             self._remove_owned_pg(slot)
@@ -472,6 +536,8 @@ class EnginePool:
         for head in self.head_slots():
             if all(engine is None for engine in self.slots[head : head + self.nodes_per_engine]):
                 self._states[head] = EngineState.DEAD
+        if errors:
+            raise ResourceBlockedError(self._log("Cleanup unconfirmed: " + "; ".join(errors)))
 
     def retire(self, head_slots: Iterable[int]) -> None:
         """Tear down the given logical engines, all their slots, so ``recover``
@@ -486,9 +552,12 @@ class EnginePool:
         Degrades rather than escalates: running on fewer engines beats a global
         restart. Only a pool with no engine left raises.
         """
-        if EngineState.BLOCKED in self._states.values():
-            raise ResourceBlockedError("Cannot rebuild a pool with unconfirmed engine cleanup")
-        dead = [slot for slot, engine in enumerate(self.slots) if engine is None]
+        dead = [
+            slot
+            for slot, engine in enumerate(self.slots)
+            if engine is None
+            and self._states.get(slot // self.nodes_per_engine * self.nodes_per_engine) is not EngineState.BLOCKED
+        ]
         if not dead:
             return set()
 

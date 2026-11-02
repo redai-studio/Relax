@@ -624,6 +624,8 @@ def test_required_pd_registration_needs_router(sglang_engine_module):
 def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, sglang_engine_module):
     from unittest.mock import Mock
 
+    from relax.backends.sglang import process_cleanup
+
     engine = _pd_engine(sglang_engine_module)
     engine.args.rollout_external = False
     engine.process = SimpleNamespace(pid=123)
@@ -631,6 +633,9 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
     killed = Mock()
     monkeypatch.setattr(engine, "unregister_from_router", unregister)
     monkeypatch.setattr(sglang_engine_module, "kill_process_tree", killed)
+    # The fixture has no real process tree. Keep the original routing contract
+    # while substituting the new process-exit verifier at the transport boundary.
+    monkeypatch.setattr(process_cleanup, "terminate_server", lambda process, kill: kill(process.pid))
     with pytest.raises(RuntimeError, match="router is unavailable"):
         engine.shutdown()
     unregister.assert_called_once_with(timeout=5.0)

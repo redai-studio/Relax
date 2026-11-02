@@ -52,6 +52,20 @@ def _manager_class():
         def init(self, host, port):
             return True
 
+        def get_release_evidence(self):
+            import os
+
+            import psutil
+
+            # This stand-in owns no child processes; its own identity is the
+            # complete tree, and it is gone after ray.kill.
+            process = psutil.Process(os.getpid())
+            return {
+                "node_id": ray.get_runtime_context().get_node_id(),
+                "server_pid": process.pid,
+                "processes": [{"pid": process.pid, "create_time": process.create_time()}],
+            }
+
         def release_memory_occupation(self):
             time.sleep(self.release_seconds)
 
@@ -181,15 +195,14 @@ def test_manager_returns_permits_while_default_group_waits_for_drain(manager):
     ray.get(manager.release_inference.remote(current), timeout=10)
 
 
-def test_engine_pool_keeps_killed_actor_blocked_without_child_exit_receipt(manager):
+def test_engine_pool_rebuilds_killed_actor_after_node_local_exit_receipt(manager):
     before = _snapshot(manager)
     ray.get(manager.kill_engine.remote(1), timeout=30)
-    with pytest.raises(ResourceBlockedError, match="Cleanup unconfirmed"):
-        ray.get(manager.offload.remote(), timeout=60)
-    assert "blocked" in _states(manager)
-    with pytest.raises(ResourceBlockedError):
-        ray.get(manager.onload.remote(), timeout=30)
-    assert _snapshot(manager)["topology_revision"] == before["topology_revision"]
+    ray.get(manager.offload.remote(), timeout=60)
+    assert _states(manager) == ["sleeping", "dead"]
+    ray.get(manager.onload.remote(), timeout=60)
+    assert _states(manager) == ["ready", "ready"]
+    assert _snapshot(manager)["topology_revision"] > before["topology_revision"]
 
 
 def test_placement_physical_reads_bundle_nodes_from_real_ray(ray_cluster):

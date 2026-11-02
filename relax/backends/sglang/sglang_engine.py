@@ -665,9 +665,15 @@ class SGLangEngine(RayActor):
             self.register_dcs()
         return {
             "url": self.get_url(),
-            "served_model_name": getattr(self, "_served_model_name", None),
             **self.get_pid_and_node_id(),
         }
+
+    def get_release_evidence(self) -> dict:
+        from relax.backends.sglang.process_cleanup import capture_server_identity
+
+        return capture_server_identity(
+            self.process, node_id=ray.get_runtime_context().get_node_id(), port=self.server_port
+        )
 
     def _require_dynamic_weights(self, operation: str) -> None:
         if self.profile.static_weights:
@@ -720,7 +726,6 @@ class SGLangEngine(RayActor):
         )
         actual_server_args = _get_actual_server_args()
         _sanity_check_server_args(actual_server_args, expect_server_args)
-        self._served_model_name = actual_server_args.get("served_model_name") or actual_server_args.get("model_path")
 
         if not self._skip_router_registration:
             self.register_to_router()
@@ -767,7 +772,6 @@ class SGLangEngine(RayActor):
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
         server_args = ServerArgs(**server_args_dict)
-        self._served_model_name = server_args.served_model_name or server_args.model_path
         self._router_bootstrap_port = (
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
@@ -1117,8 +1121,11 @@ class SGLangEngine(RayActor):
             return
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
+        router_error = None
         try:
             self.unregister_from_router(timeout=5.0)
+        except Exception as error:
+            router_error = error
         finally:
             process = getattr(self, "process", None)
             if process is not None:
@@ -1126,6 +1133,10 @@ class SGLangEngine(RayActor):
 
                 terminate_server(process, kill_process_tree)
                 self.process = None
+        if router_error is not None:
+            from relax.backends.sglang.process_cleanup import RouterCleanupError
+
+            raise RouterCleanupError(str(router_error)) from router_error
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-

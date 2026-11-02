@@ -326,8 +326,6 @@ def _read_engine_metadata(
                             and isinstance(value["node_id"], str)
                         ):
                             metadata = {key: value[key] for key in ("url", "pid", "node_id")}
-                            if value.get("served_model_name"):
-                                metadata["served_model_name"] = value["served_model_name"]
                             record.value = metadata
                         else:
                             issue = "metadata_invalid"
@@ -522,16 +520,28 @@ class EngineGroup:
             for slot in (pool.head_slots() if slots is None else slots)
             if slot % self.nodes_per_engine == 0 and self.all_engines[slot] is not None
         ]
-        if heads:
-            urls = ray.get([self.all_engines[slot].get_url.remote() for slot in heads], timeout=10)
-            self._engine_urls.update(zip(heads, urls, strict=True))
-            for slot in heads:
-                record = self.engine_init_records.get(slot)
-                if record is not None:
-                    metadata = record.value if isinstance(record.value, dict) else ray.get(record.value, timeout=10)
-                    if isinstance(metadata, dict) and metadata.get("served_model_name"):
-                        self._served_model_names[slot] = metadata["served_model_name"]
-            pool.mark_initialized(heads)
+        for slot in heads:
+            record = self.engine_init_records.get(slot)
+            if record is None:
+                continue
+            metadata = record.value
+            if isinstance(metadata, ray.ObjectRef):
+                try:
+                    metadata = ray.get(metadata, timeout=0)
+                except Exception:
+                    continue  # Discovery owns the pending/unreadable observation.
+            if isinstance(metadata, dict):
+                self._engine_urls[slot] = metadata.get("url")
+                pool.init_metadata[slot] = metadata
+        pool.mark_initialized(heads)
+
+    async def cache_engine_urls_async(self) -> None:
+        for slot, record in self.engine_init_records.items():
+            metadata = record.value if isinstance(record.value, dict) else await record.value
+            if isinstance(metadata, dict):
+                self._engine_urls[slot] = metadata.get("url")
+                self._engine_pool().init_metadata[slot] = metadata
+        self._engine_pool().mark_initialized(self.engine_init_records)
 
     def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()``
@@ -627,6 +637,7 @@ class EngineGroup:
                     bootstrap_port=engine_addr.get("disaggregation_bootstrap_port"),
                 ),
             )
+            pool.record_release_evidence(rank - self.rank_offset, engine)
             init_handles.append(init_ref)
         return init_handles, port_cursors
 
@@ -2335,7 +2346,7 @@ class RolloutEngineRuntime:
             record.pending_router_registration = False
 
         # Step 6: Add to server
-        await asyncio.to_thread(engine_group._cache_engine_urls)
+        await engine_group.cache_engine_urls_async()
         srv.engine_groups.append(engine_group)
         engine_group.num_new_engines = 0
 
