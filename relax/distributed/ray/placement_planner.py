@@ -132,8 +132,17 @@ _CO_RESIDENT_ROLE_PAIRS: frozenset[frozenset[str]] = frozenset({frozenset({ROLLO
 _CAPACITY_CHECKED_ROLES: frozenset[str] = frozenset({GENRM_ROLE, TEACHER_ROLE})
 
 
-def _may_co_reside(a: PlacementClaim, b: PlacementClaim) -> bool:
-    return frozenset({a.role, b.role}) in _CO_RESIDENT_ROLE_PAIRS
+def may_co_reside(a: PlacementClaim, b: PlacementClaim, phase: Phase) -> bool:
+    """Only approved inline roles may share residency during generation.
+
+    Deferred scorers have a different phase and must release the overlapping
+    generation role before activation. Training has no co-residency exception.
+    """
+    return (
+        phase == Phase.GENERATE
+        and phase in a.phases & b.phases
+        and frozenset({a.role, b.role}) in _CO_RESIDENT_ROLE_PAIRS
+    )
 
 
 def _phase_names(phases: frozenset[Phase]) -> list[str]:
@@ -172,7 +181,7 @@ def validate_placement(plan: PlacementPlan) -> None:
         if not claims_overlap(a, b):
             continue
         shared_phases = a.phases & b.phases
-        if not shared_phases or _may_co_reside(a, b):
+        if not shared_phases or all(may_co_reside(a, b, phase) for phase in shared_phases):
             continue
         raise PlacementError(
             f"Placement conflict in pool '{a.pool}': {_describe(a)} and {_describe(b)} both hold GPU memory "

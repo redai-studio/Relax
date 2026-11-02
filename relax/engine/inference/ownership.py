@@ -17,7 +17,14 @@ from typing import Any, Iterable
 
 import ray
 
-from relax.distributed.ray.placement_planner import ACTOR_POOL, Phase, PlacementClaim, PlacementPlan, claims_overlap
+from relax.distributed.ray.placement_planner import (
+    ACTOR_POOL,
+    Phase,
+    PlacementClaim,
+    PlacementPlan,
+    claims_overlap,
+    may_co_reside,
+)
 from relax.engine.inference.holder import HolderIdentity, holder_alive
 from relax.utils.env import Envs
 
@@ -462,7 +469,8 @@ class OwnershipLedger:
         self.check(lease, [self._models[key][2] for key in keys])
         for key in keys:
             for resident in self._resident.difference(keys):
-                if claims_overlap(self._models[key][2], self._models[resident][2]):
+                claim, other = self._models[key][2], self._models[resident][2]
+                if claims_overlap(claim, other) and not may_co_reside(claim, other, Phase.GENERATE):
                     raise OwnershipError(f"{resident} must confirm release before activating {role}/{model}")
         # Reserve before dispatch, so concurrent activations cannot both pass.
         self._resident.update(keys)
@@ -491,7 +499,9 @@ class OwnershipLedger:
                 return False
         for key in self._resident.difference(keys):
             other = self._models[key][2]
-            if other.role != role and any(claims_overlap(claim, other) for claim in claims):
+            if other.role != role and any(
+                claims_overlap(claim, other) and not may_co_reside(claim, other, Phase.GENERATE) for claim in claims
+            ):
                 return False
         self._resident.update(keys)
         return True
