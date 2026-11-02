@@ -8,6 +8,7 @@
 # Keep SAVE_DIR/EXP_NAME stable to resume; save every 50 steps and retain 2.
 # Usage: MODEL_DIR=... DATA_DIR=... SAVE_DIR=... MEGATRON=... bash <this-script>
 # All dependency paths must exist at the same location on every worker node.
+# Set RELAX_SKIP_NONFINITE_GRAD=0 for fail-fast diagnostics.
 set -eo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +23,7 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 # Do not prepend the pre-refactor /opt/qwen38-flash-next runtime.
 : "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
+export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
 export EXP_NAME="${EXP_NAME:-qwen38-qsa-32xb300}" # gitleaks:allow -- stable experiment/checkpoint identity
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa}"
 now=$(date "+%Y%m%d-%H%M%S")
@@ -30,21 +32,22 @@ export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 # This branch must precede the standard entrypoint: that helper cleans old jobs.
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
     : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs HTTP endpoint}"
-    # The shared entrypoint cleans workers across the cluster: require no other jobs.
+    # Training shares Serve state even when startup cleanup is disabled.
     running_jobs=$(timeout 20s ray job list --address "${RAY_JOBS_ADDRESS}")
     running_jobs=$(printf '%s\n' "${running_jobs}" | grep RUNNING || true)
-    [[ -z "${running_jobs}" ]] || { echo "Other Ray Jobs are RUNNING; refusing cluster cleanup" >&2; exit 2; }
+    [[ -z "${running_jobs}" ]] || { echo "Other Ray Jobs are RUNNING; refusing concurrent training" >&2; exit 2; }
     exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$@"
 fi
 
 # Explicit driver/actor settings override entrypoint defaults (notably connections=1).
 ENV_ARGS=(
+    "RELAX_SKIP_NONFINITE_GRAD=${RELAX_SKIP_NONFINITE_GRAD:-1}"
     MCORE_QSA_SPARSE_BACKEND=id_sparse
     TORCHINDUCTOR_COMPILE_THREADS=1
     QWEN38_PLE_CPU_OFFLOAD=1
     "RELAX_HYBRID_EP_COMMIT=${RELAX_HYBRID_EP_COMMIT}"
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
-    RELAX_PROPAGATE_ENV_VARS=QWEN38_WORKSPACE,SAVE_DIR,RELAX_PROFILE_DIR,TENSORBOARD_DIR,CLEARML_CACHE_DIR,CLEARML_OFFLINE_MODE,PYTHONDONTWRITEBYTECODE,RELAX_HYBRID_EP_COMMIT,LD_LIBRARY_PATH,NVLINK_DOMAIN_SIZE,USE_MNNVL,CUDA_DEVICE_MAX_CONNECTIONS,QWEN38_RUN_DIR
+    RELAX_PROPAGATE_ENV_VARS=QWEN38_WORKSPACE,SAVE_DIR,RELAX_PROFILE_DIR,TENSORBOARD_DIR,CLEARML_CACHE_DIR,CLEARML_OFFLINE_MODE,PYTHONDONTWRITEBYTECODE,RELAX_HYBRID_EP_COMMIT,LD_LIBRARY_PATH,NVLINK_DOMAIN_SIZE,USE_MNNVL,CUDA_DEVICE_MAX_CONNECTIONS,QWEN38_RUN_DIR,RELAX_SKIP_NONFINITE_GRAD
     NCCL_NVLS_ENABLE=0
     "PYTHONPATH=${RELAX}:${MEGATRON}"
     "MEGATRON=${MEGATRON}"

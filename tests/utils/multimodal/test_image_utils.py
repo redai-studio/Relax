@@ -133,7 +133,9 @@ def test_decode_data_uri_rejects_missing_payload():
         decode_data_uri("data:image/png;base64,")
 
 
-@pytest.mark.parametrize("input_kind", ["pil", "bytes", "bytearray", "dict_bytes", "dict_base64", "data_uri"])
+@pytest.mark.parametrize(
+    "input_kind", ["pil", "bytes", "bytearray", "dict_bytes", "dict_bytes_base64", "dict_base64", "data_uri"]
+)
 def test_load_image_supports_memory_input_types(input_kind):
     source = Image.new("RGB", (3, 2), (1, 2, 3))
     encoded = _png_bytes(source)
@@ -142,6 +144,7 @@ def test_load_image_supports_memory_input_types(input_kind):
         "bytes": encoded,
         "bytearray": bytearray(encoded),
         "dict_bytes": {"bytes": encoded},
+        "dict_bytes_base64": {"bytes": base64.b64encode(encoded).decode(), "path": None},
         "dict_base64": {"base64": base64.b64encode(encoded).decode()},
         "data_uri": "data:image/png;base64," + base64.b64encode(encoded).decode(),
     }

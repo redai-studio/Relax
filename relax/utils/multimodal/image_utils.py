@@ -269,6 +269,8 @@ def load_image(image: ImageInput, **kwargs: Any) -> Image.Image:
         raw = image.get("bytes")
         if isinstance(raw, (bytes, bytearray)):
             return load_image_from_bytes(bytes(raw), **kwargs)
+        if isinstance(raw, str):
+            return load_image_from_bytes(base64.b64decode(raw), **kwargs)
         b64 = image.get("base64")
         if isinstance(b64, str):
             return load_image_from_bytes(base64.b64decode(b64), **kwargs)

@@ -45,6 +45,25 @@ _EMPTY_PREFIX_CACHE_DELTA = {
 }
 
 
+def merge_routed_experts(
+    previous: np.ndarray | None, incoming: np.ndarray | None, *, expected_rows: int
+) -> np.ndarray | None:
+    """Preserve routes of accepted tokens across resumed attempts and turns."""
+    if incoming is None:
+        if previous is None:
+            return None
+        if previous.shape[0] != expected_rows:
+            raise ValueError("Missing routed experts for newly accepted tokens")
+        return previous.copy()
+    if incoming.ndim != 3 or incoming.shape[0] != expected_rows:
+        raise ValueError(f"Routed experts shape {incoming.shape} does not cover {expected_rows} token rows")
+    if previous is None:
+        return incoming.copy()
+    if previous.ndim != 3 or previous.shape[1:] != incoming.shape[1:] or len(previous) > expected_rows:
+        raise ValueError("Routed experts changed shape or lost previously accepted token rows")
+    return np.concatenate((previous, incoming[len(previous) :]), axis=0)
+
+
 def _canonical_json_value(value: Any, *, field: str) -> Any:
     if isinstance(value, dict):
         if any(not isinstance(key, str) for key in value):
@@ -689,6 +708,16 @@ class SessionForest:
         rollout_routed_experts: Any = None,
         export_metadata_patch: dict[str, Any] | None = None,
     ) -> MsgNode:
+        lineage = self.lineage(parent_state_hash)
+        previous_routes = next(
+            (node.rollout_routed_experts for node in reversed(lineage) if node.rollout_routed_experts is not None),
+            None,
+        )
+        rollout_routed_experts = merge_routed_experts(
+            previous_routes,
+            rollout_routed_experts,
+            expected_rows=max(0, sum(len(node.train_token_delta) for node in lineage) + len(token_delta) - 1),
+        )
         state_hash = self._next_state_hash(
             parent_state_hash=parent_state_hash,
             messages_delta=messages_delta,

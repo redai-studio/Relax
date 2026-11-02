@@ -5,6 +5,9 @@
 import unittest
 from unittest.mock import Mock, patch
 
+import pytest
+import requests
+
 # MetricsBuffer is defined inside metrics.py, we need to import it correctly
 from relax.utils.metrics.client import MetricsClient
 from relax.utils.metrics.metrics_service_adapter import MetricsServiceAdapter
@@ -75,7 +78,7 @@ class TestMetricsClient(unittest.TestCase):
     def setUp(self):
         self.client = MetricsClient("http://test-server:8000/metrics")
 
-    @patch("requests.post")
+    @patch("requests.Session.post")
     def test_log_metric_buffered(self, mock_post):
         """Test logging metrics with buffering."""
         # Log metrics with buffering (immediate=False)
@@ -91,7 +94,7 @@ class TestMetricsClient(unittest.TestCase):
         self.assertEqual(self.client.get_buffered_metrics_count(step=1), 1)
         self.assertEqual(self.client.get_buffered_metrics_count(), 1)
 
-    @patch("requests.post")
+    @patch("requests.Session.post")
     def test_log_metrics_batch_buffered(self, mock_post):
         """Test logging batch metrics with buffering."""
         metrics = {
@@ -269,6 +272,34 @@ class TestTrackingUtilsIntegration(unittest.TestCase):
 
         self.assertEqual(result, {"status": "success"})
         mock_adapter.direct_log.assert_called_once_with(100, metrics)
+
+
+@pytest.mark.parametrize("operation", ["metric", "batch", "report", "health"])
+def test_metrics_requests_bypass_external_proxy(monkeypatch, operation):
+    monkeypatch.setenv("HTTP_PROXY", "http://external-proxy.invalid:9999")
+    monkeypatch.setenv("NO_PROXY", "")
+    observed = []
+
+    def send(_session, request, **kwargs):
+        observed.append((request, kwargs))
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'{"status":"healthy"}' if operation == "health" else b'{"status":"success"}'
+        return response
+
+    monkeypatch.setattr(requests.Session, "send", send)
+    client = MetricsClient("http://internal-head:8000/metrics")
+    if operation == "metric":
+        assert client._send_metric(1, "loss", 0.5)
+    elif operation == "batch":
+        assert client._send_metrics_batch(1, {"loss": 0.5})
+    elif operation == "report":
+        assert client._send_report_step(1)["status"] == "success"
+    else:
+        assert client.health_check()["status"] == "healthy"
+    assert len(observed) == 1
+    assert not observed[0][1]["proxies"]
+    assert observed[0][1]["timeout"] == (10 if operation == "report" else 5)
 
 
 if __name__ == "__main__":

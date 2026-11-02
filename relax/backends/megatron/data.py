@@ -108,13 +108,9 @@ def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBa
     mini_rollout_batch_size = rollout_batch_size // num_rollout_minis
     if mini_rollout_batch_size <= 0:
         raise ValueError(f"mini_rollout_batch_size must be positive, got {mini_rollout_batch_size}")
-    if mini_rollout_batch_size % dp_size != 0:
-        raise ValueError(
-            "mini_rollout_batch_size must be divisible by data parallel size when using current "
-            "sample-count TransferQueue API, "
-            f"got mini_rollout_batch_size={mini_rollout_batch_size}, dp_size={dp_size}"
-        )
-
+    # IdentityWindowSampler requests logical Sample.index identities, then
+    # places their context rows across DPs. A prompt group may span DPs;
+    # only the global sample count (after n_samples_per_prompt) must divide DP.
     mini_global_samples = mini_rollout_batch_size * n_samples_per_prompt
     if mini_global_samples % dp_size != 0:
         raise ValueError(

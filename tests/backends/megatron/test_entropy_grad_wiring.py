@@ -112,3 +112,55 @@ def test_sft_chunked_lm_head_matches_log_softmax_gradients(monkeypatch: pytest.M
     torch.testing.assert_close(actual_log_probs, expected_log_probs, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(hidden.grad, reference_hidden.grad, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(weight.grad, reference_weight.grad, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("entropy_grad", [False, True])
+def test_empty_response_keeps_logit_graph_and_entropy_grad_policy(entropy_grad):
+    from relax.utils.training.ppo_utils import calculate_log_probs_and_entropy
+
+    logits = torch.empty(0, 5, requires_grad=True)
+    tokens = torch.empty(0, dtype=torch.long)
+    log_probs, entropy = calculate_log_probs_and_entropy(
+        logits, tokens, None, with_entropy=True, with_entropy_grad=entropy_grad
+    )
+    assert log_probs.requires_grad
+    assert entropy.requires_grad is entropy_grad
+    (log_probs.sum() + entropy.sum()).backward()
+    assert logits.grad is not None
+    assert logits.grad.shape == logits.shape
+    with torch.no_grad():
+        log_probs, entropy = calculate_log_probs_and_entropy(
+            logits, tokens, None, with_entropy=True, with_entropy_grad=entropy_grad
+        )
+    assert not log_probs.requires_grad
+    assert not entropy.requires_grad
+
+
+@pytest.mark.parametrize("trailing_shape", [(), (3,)])
+@pytest.mark.parametrize("requires_grad", [False, True])
+def test_allgather_cp_empty_response_keeps_graph_and_topk_shape(monkeypatch, trailing_shape, requires_grad):
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: object())
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(loss_module.dist.nn, "all_reduce", lambda value, group: value)
+    monkeypatch.setattr(loss_module, "slice_log_prob_with_cp", lambda value, *args, **kwargs: value)
+
+    # Rank 0 holds tokens [0, 2), while response prediction starts at token 5.
+    # Empty values must remain connected to the originating logits even when
+    # the route carries trailing score-centering top-k dimensions.
+    origin = torch.empty((0, *trailing_shape, 5), requires_grad=requires_grad)
+    values = {"log_probs": [origin.sum(dim=-1)]}
+    loss_module._allgather_cp_redistribute(
+        values,
+        logits=torch.empty(1, 2, 5),
+        args=Namespace(qkv_format="thd"),
+        total_lengths=[10],
+        response_lengths=[4],
+    )
+    result = values["log_probs"][0]
+    assert result.shape == (4, *trailing_shape)
+    assert result.requires_grad is requires_grad
+    assert torch.count_nonzero(result) == 0
+    if requires_grad:
+        result.sum().backward()
+        assert origin.grad is not None
+        assert origin.grad.shape == origin.shape
