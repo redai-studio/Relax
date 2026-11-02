@@ -928,7 +928,7 @@ class RolloutServer:
 
         if all_handles:
             try:
-                ray.get(all_handles)
+                ray.get(all_handles, timeout=Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S)
             except Exception:
                 # init() may fail after the server is healthy but before its
                 # required router registration is ready. Retire the entire
@@ -955,9 +955,10 @@ class RolloutServer:
                 new_engines_all.extend(new_engines)
 
         if release_handles:
-            ray.get(release_handles)
+            ray.get(release_handles, timeout=Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S)
             ray.get(
-                [engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]) for engine in new_engines_all]
+                [engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]) for engine in new_engines_all],
+                timeout=Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S,
             )
 
     def offload(self):
@@ -986,7 +987,7 @@ def _settle_engine_calls(handles: list) -> list:
     results, errors = [], []
     for handle in handles:
         try:
-            results.append(ray.get(handle))
+            results.append(ray.get(handle, timeout=Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S))
         except Exception as error:
             errors.append(error)
     if errors:

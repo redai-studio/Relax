@@ -429,3 +429,19 @@ def test_rollout_admission_cache_observes_health_and_same_endpoint_replacement(m
     group.health_failures = {0: 1}
     with pytest.raises(ModelUnavailableError):
         manager.acquire_inference("failed")
+
+
+def test_rollout_memory_switch_wait_is_bounded_and_checks_every_receipt(monkeypatch):
+    seen = []
+
+    def get(ref, *, timeout=None):
+        assert timeout is not None and timeout > 0
+        seen.append(ref)
+        if ref == "hung":
+            raise rollout.ray.exceptions.GetTimeoutError("memory switch pending")
+        return "released"
+
+    monkeypatch.setattr(rollout.ray, "get", get)
+    with pytest.raises(rollout.ray.exceptions.GetTimeoutError):
+        rollout._settle_engine_calls(["hung", "done"])
+    assert seen == ["hung", "done"]
