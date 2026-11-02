@@ -40,6 +40,7 @@ from relax.engine.inference.routing import (
     RouteTarget,
     RoutingError,
     RoutingState,
+    select_model,
     select_target,
 )
 from relax.utils.logging_utils import get_logger
@@ -320,6 +321,14 @@ class InferenceGateway:
                 raise ValueError("request body must be a JSON object")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}") from exc
+
+        if request.get("stream"):
+            # Validate the public model before sending SSE response headers.
+            # This identity lookup grants no permission to dispatch later.
+            try:
+                select_model(await self.snapshot(), request.get("model"), request.get("route_key"))
+            except RoutingError as exc:
+                raise HTTPException(exc.status_code, str(exc)) from exc
 
         async def dispatch() -> Any:
             permit = await self._admit(model=request.get("model"), route_key=request.get("route_key"))
