@@ -1116,7 +1116,7 @@ class RolloutEngineRuntime:
         self._try_ci_fault_injection()
 
     def dispose(self):
-        self._admission.drain(self._abort_inference_requests)
+        self._admission.close_for_shutdown(self._abort_inference_requests)
         self._stop_eviction_monitor(timeout=0.0)
         for monitor in self._health_monitors:
             monitor.stop(timeout=0.0)

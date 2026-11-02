@@ -26,7 +26,10 @@ from relax.engine.inference.routing import (
     select_target,
 )
 from relax.utils.env import Envs
+from relax.utils.logging_utils import get_logger
 
+
+logger = get_logger(__name__)
 
 ADMISSION_CONCURRENCY_GROUP = "inference_admission"
 ADMISSION_DRAIN_TIMEOUT_S = 120.0
@@ -52,6 +55,7 @@ class AdmissionGate:
         self._condition = threading.Condition(threading.RLock())
         self._generation = uuid.uuid4().hex
         self._closed = False
+        self._shutdown = False
         self._permits: dict[str, RequestPermit] = {}
         self._dispatched: set[str] = set()
         self._routing = RoutingState()
@@ -113,6 +117,31 @@ class AdmissionGate:
     def close(self) -> None:
         with self._condition:
             self._closed = True
+
+    def close_for_shutdown(self, abort: Callable[[], None]) -> None:
+        """Retire admission without making server exit depend on senders."""
+        with self._condition:
+            self._closed = self._shutdown = True
+            outstanding = bool(self._permits)
+        # Preserve the existing no-request fast path; server shutdown does not
+        # need an abort acknowledgement when there is no registered sender.
+        if outstanding:
+            try:
+                abort()
+            except Exception:
+                logger.warning("Inference abort failed during shutdown; continuing engine shutdown", exc_info=True)
+        with self._condition:
+            if self._permits:
+                logger.warning(
+                    "Retiring %d unreturned inference permits at shutdown; first five request/holder pairs: %s",
+                    len(self._permits),
+                    [(p.request_id, p.holder) for p in list(self._permits.values())[:5]],
+                )
+            # This gate can never admit a new generation. Process-tree exit,
+            # checked by the caller, remains the only resource release proof.
+            self._permits.clear()
+            self._dispatched.clear()
+            self._condition.notify_all()
 
     def drain(self, abort: Callable[[], None], *, timeout: float | None = None) -> None:
         self.close()
@@ -178,6 +207,8 @@ class AdmissionGate:
 
     def open(self) -> None:
         with self._condition:
+            if self._shutdown:
+                raise AdmissionDrainError("Cannot reopen inference admission after shutdown")
             if not self._closed:
                 return
             if self._permits:

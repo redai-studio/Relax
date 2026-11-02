@@ -119,6 +119,7 @@ def test_shutdown_keeps_queued_senders_fenced(monkeypatch, runtime_kind):
 
     from relax.distributed.ray.multi_engine_manager import MultiEngineManager
     from relax.distributed.ray.rollout import RolloutEngineRuntime
+    from relax.engine.inference.routing import ModelUnavailableError
 
     monkeypatch.setenv("RELAX_INFERENCE_ADMISSION_GRACE_S", "0")
     manager = AdmissionManager(snapshot())
@@ -140,12 +141,16 @@ def test_shutdown_keeps_queued_senders_fenced(monkeypatch, runtime_kind):
         runtime._pool = SimpleNamespace(shutdown=lambda: events.append("released"))
         shutdown = runtime.shutdown
     permit = runtime.acquire_inference("queued")
-    with pytest.raises(AdmissionDrainError, match="request"):
-        shutdown()
-    assert events == []
-    runtime.release_inference(permit)
+    generation = permit.generation
     shutdown()
     assert events == ["released"]
+    runtime.release_inference(permit)
+    with pytest.raises(ModelUnavailableError):
+        runtime.acquire_inference("queued-after-shutdown")
+    with pytest.raises(AdmissionDrainError):
+        manager.gate.open()
+    assert manager.gate._generation == generation
+    assert not manager.gate._permits
 
 
 def test_dead_sender_is_reclaimed_but_stale_dispatch_receipt_cannot_authorize_a_send(monkeypatch):

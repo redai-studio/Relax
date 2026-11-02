@@ -391,7 +391,11 @@ class MultiEngineManager:
     def shutdown(self) -> None:
         """Tear down every engine and remove any placement group this manager
         created for it."""
-        self._admission.drain(
-            lambda: ray.get([e.abort_requests.remote(timeout=30) for e in self.engines if e is not None], timeout=35)
-        )
+
+        def abort() -> None:
+            handles = [e.abort_requests.remote(timeout=30) for e in self.engines if e is not None]
+            if handles:
+                ray.get(handles, timeout=35)
+
+        self._admission.close_for_shutdown(abort)
         self._pool.shutdown()
