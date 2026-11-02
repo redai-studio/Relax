@@ -54,6 +54,19 @@ class KeyeVLModel(MegatronModule):
         cp = self.pg_collection.cp
         size, rank = cp.size(), cp.rank()
         widths = [end - start for start, end in zip(boundaries, boundaries[1:])]
+        image_mask = input_ids == self.config.hf_config.image_token_id
+        prompt_lengths = getattr(packed_seq_params, "prompt_lengths", None)
+        if prompt_lengths is not None:
+            # A generated image token is a language token: retain its embedding,
+            # text position and loss, without consuming a prompt image/grid.
+            prompt_mask = torch.zeros_like(image_mask)
+            if input_ids.shape[0] == len(widths):
+                for row, length in enumerate(prompt_lengths):
+                    prompt_mask[row, :length] = True
+            else:
+                for start, length in zip(boundaries, prompt_lengths):
+                    prompt_mask[0, start : start + length] = True
+            image_mask = image_mask & prompt_mask
         if input_ids.shape[0] == len(widths):
             ids = torch.cat([row[:length] for row, length in zip(input_ids, widths)]).unsqueeze(0)
             valid = (
@@ -63,14 +76,15 @@ class KeyeVLModel(MegatronModule):
                 < getattr(packed_seq_params, "num_valid_tokens", ids.numel())
             )
             # Keep document resets while computing coordinates in the padded BSHD layout.
-            positions = image_positions(input_ids, grid_thws, self.config.hf_config.image_token_id)
+            positions = image_positions(input_ids, grid_thws, self.config.hf_config.image_token_id, image_mask)
             positions = torch.cat([positions[:, row, :length] for row, length in enumerate(widths)], -1)
+            image_mask = torch.cat([row[:length] for row, length in zip(image_mask, widths)]).unsqueeze(0)
         else:
             ids = input_ids
             valid = torch.arange(ids.numel(), device=ids.device) < getattr(
                 packed_seq_params, "num_valid_tokens", ids.numel()
             )
-            positions = image_positions(ids, grid_thws, self.config.hf_config.image_token_id)[:, 0]
+            positions = image_positions(ids, grid_thws, self.config.hf_config.image_token_id, image_mask)[:, 0]
             positions = torch.cat(
                 [
                     positions[:, start:end] - positions[:, start : start + 1]
@@ -81,9 +95,8 @@ class KeyeVLModel(MegatronModule):
         hidden = self.language_model.embedding(input_ids=ids, position_ids=None).transpose(0, 1)
         if pixel_values is not None:
             features = image_features(self.visual, self.mlp_AR, pixel_values, grid_thws)
-            mask = ids == self.config.hf_config.image_token_id
-            torch._assert_async(mask.sum() == features.shape[0], "Keye image token/feature counts differ")
-            hidden = hidden.masked_scatter(mask.unsqueeze(-1), features.to(hidden))
+            torch._assert_async(image_mask.sum() == features.shape[0], "Keye image token/feature counts differ")
+            hidden = hidden.masked_scatter(image_mask.unsqueeze(-1), features.to(hidden))
         elif self.training and torch.is_grad_enabled():
             p = next(self.visual.parameters())
             patch = self.config.hf_config.vision_config.patch_size

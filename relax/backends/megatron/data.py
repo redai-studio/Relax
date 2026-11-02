@@ -920,6 +920,12 @@ def get_batch(
     for packed_key in ("packed_seq_params", "vlm_packed_seq_params"):
         if batch.get(packed_key) is not None:
             batch[packed_key].is_dummy = batch.get("__is_dummy__", False)
+            if not is_sft_mode(get_args()) and not is_preference_mode(get_args()) and "response_lengths" in batch:
+                # Visual placeholders belong to the prompt, not generated token IDs.
+                batch[packed_key].prompt_lengths = [
+                    total - response
+                    for total, response in zip(batch["total_lengths"], batch["response_lengths"], strict=True)
+                ]
     batch = move_tensors_to_device(batch, batch["tokens"].device)
     if pack_device is not None:
         batch = PrepackedBatch(batch)

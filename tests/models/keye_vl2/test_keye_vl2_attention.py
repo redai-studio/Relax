@@ -79,6 +79,37 @@ def test_keye_sparse_recompute_has_indexer_gradients_and_no_future_leak():
     torch.testing.assert_close(actual[:-1], changed[:-1], atol=0, rtol=0)
 
 
+def test_keye_frozen_indexer_skips_auxiliary_and_preserves_attention(monkeypatch):
+    from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
+
+    attention = _attention()
+    attention.sa_indexer.requires_grad_(False)
+    q, k, v, hidden = _inputs(2113)
+    packed = SimpleNamespace(cu_seqlens_q_cpu=[0, 2113], num_valid_tokens=2113)
+    before = {name: parameter.detach().clone() for name, parameter in attention.sa_indexer.named_parameters()}
+    with torch.no_grad():
+        expected = attention(q, k, v, packed_seq_params=packed, hidden_states=hidden)
+    monkeypatch.setattr(
+        DSAIndexerLossAutoScaler, "apply", lambda *args: pytest.fail("Frozen indexer ran auxiliary loss")
+    )
+    monkeypatch.setattr(F, "kl_div", lambda *args, **kwargs: pytest.fail("Frozen indexer computed teacher KL"))
+    actual = checkpoint(
+        lambda q, k, v, hidden: attention(q, k, v, packed_seq_params=packed, hidden_states=hidden),
+        q,
+        k,
+        v,
+        hidden,
+        use_reentrant=True,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    actual.float().square().mean().backward()
+    assert hidden.grad is None
+    assert all(tensor.grad.isfinite().all() and torch.count_nonzero(tensor.grad) > 0 for tensor in (q, k, v))
+    for name, parameter in attention.sa_indexer.named_parameters():
+        assert parameter.grad is None
+        torch.testing.assert_close(parameter, before[name], atol=0, rtol=0)
+
+
 def test_keye_dummy_microbatch_keeps_hooks_without_auxiliary_gradient():
     attention = _attention()
     q, k, v, hidden = _inputs(31)

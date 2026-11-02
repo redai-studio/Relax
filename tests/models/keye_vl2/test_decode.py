@@ -129,13 +129,12 @@ def test_train_rope_matches_rollout_rounding_at_long_positions():
     from types import SimpleNamespace
 
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-    from megatron.core.transformer.transformer_config import TransformerConfig
 
     from relax.models.keye_vl2.provider import KeyeModelProvider
     from relax.models.keye_vl2.sglang.ops import rope
 
-    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=1, apply_rope_fusion=True)
-    KeyeModelProvider.configure_runtime(config, SimpleNamespace(multimodal_keys=None))
+    config = KeyeModelProvider(num_layers=1, hidden_size=128, num_attention_heads=1, apply_rope_fusion=True)
+    config.configure_runtime(SimpleNamespace(multimodal_keys=None))
     x = torch.randn(4, 16, 128, device="cuda", dtype=torch.bfloat16)
     positions = torch.tensor([0, 73, 8001, 32767], device="cuda")
     frequencies = 1 / (1e7 ** (torch.arange(0, 128, 2, device="cuda", dtype=torch.float32) / 128))

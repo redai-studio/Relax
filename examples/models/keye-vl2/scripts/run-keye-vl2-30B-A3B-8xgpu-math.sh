@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Text-only Keye DAPO Math RL, 200 rollouts; checkpoint every 20 updates.
+# Text-only Keye DAPO Math RL, TP1/CP2/EP8 training and TP2 rollout; 200 updates.
 # Save/resume the stable SAVE_DIR/EXP_NAME checkpoint; SAVE_CHECKPOINT=0 disables it.
 # Usage: MODEL_DIR=/models DATA_DIR=/data SAVE_DIR=/checkpoints bash examples/models/keye-vl2/scripts/run-keye-vl2-30B-A3B-8xgpu-math.sh
 
@@ -15,6 +15,9 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${RELAX_ROOT}/scripts/entrypoint/local.sh"
 fi
 source "${SCRIPT_DIR}/keye-vl2-30B-A3B.sh"
+MODEL_ARGS+=(
+    --freeze-params-name-list '\.sa_indexer\.'
+)
 
 PROJECT_NAME="${PROJECT_NAME:-Relax/rl/dapo-math}"
 EXP_NAME="${EXP_NAME:-keye-vl2-30b-a3b-dapo-8xgpu-colocate}"
@@ -43,6 +46,7 @@ CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}/Keye-VL-2.0-30B-A3B"
     --ref-load "${MODEL_DIR}/Keye-VL-2.0-30B-A3B"
     --megatron-to-hf-mode bridge
+    --warm-hf-checkpoint-page-cache
 )
 if [ "${SAVE_CHECKPOINT}" = 1 ]; then
     CKPT_ARGS+=(
@@ -64,11 +68,15 @@ ROLLOUT_ARGS=(
     --reward-key score
     --num-rollout "${NUM_ROLLOUT:-200}"
     --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-16}"
+    --over-sampling-batch-size 32
+    --dynamic-sampling-filter-path relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std
     --n-samples-per-prompt "${N_SAMPLES:-8}"
     --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
     --rollout-max-response-len "${RESPONSE_LEN:-8192}"
+    --rollout-max-prompt-len 2048
     --rollout-temperature 1
     --balance-data
+    --use-fault-tolerance
 )
 EVAL_ARGS=(
     --skip-eval-before-train
@@ -81,10 +89,10 @@ EVAL_ARGS=(
 )
 PERF_ARGS=(
     --no-rope-fusion
-    --tensor-model-parallel-size 4
-    --sequence-parallel
+    --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
-    --context-parallel-size 1
+    --context-parallel-size 2
+    --cp-partition-mode zigzag
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
     --recompute-granularity full
@@ -92,19 +100,19 @@ PERF_ARGS=(
     --recompute-num-layers 1
     --micro-batch-size 1
     --use-dynamic-batch-size
-    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-32768}"
-    --log-probs-max-tokens-per-gpu "${LOGPROBS_MAX_TOKENS:-32768}"
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-8192}"
+    --log-probs-max-tokens-per-gpu "${LOGPROBS_MAX_TOKENS:-8192}"
     --calculate-per-token-loss
     --moe-token-dispatcher-type alltoall
     --moe-router-dtype fp32
     --moe-router-load-balancing-type none
+    --moe-router-bias-update-rate 0.0
     --moe-aux-loss-coeff 0
 )
 ALGORITHM_ARGS=(
     --advantage-estimator grpo
-    --use-kl-loss
+    --true-on-policy-mode
     --kl-loss-coef 0
-    --kl-loss-type low_var_kl
     --entropy-coef 0
     --eps-clip 0.2
     --eps-clip-high 0.28

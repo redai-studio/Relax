@@ -55,43 +55,6 @@ def rope(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor
     return output
 
 
-@triton.jit
-def _index_scores(
-    Q,
-    K,
-    W,
-    TABLE,
-    REQUESTS,
-    LENGTHS,
-    OUT,
-    QS: tl.constexpr,
-    WS: tl.constexpr,
-    TS: tl.constexpr,
-    WIDTH: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row, tile = tl.program_id(0), tl.program_id(1)
-    n = tile * BLOCK + tl.arange(0, BLOCK)
-    length = tl.load(LENGTHS + row)
-    result = tl.full((BLOCK,), float("-inf"), tl.float32)
-    if tile * BLOCK < length:
-        request = tl.load(REQUESTS + row)
-        slots = tl.load(TABLE + request * TS + n, mask=(n < length) & (n < WIDTH), other=0)
-        h = tl.arange(0, 16)
-        d = tl.arange(0, 64)
-        q = tl.load(Q + row * QS + h[:, None] * 64 + d[None, :])
-        k = tl.load(K + slots[None, :] * 64 + d[:, None], mask=n[None, :] < length, other=0)
-        # Keep every BF16 rounding boundary of indexer_scores, including
-        # matmul -> scale -> head weight -> reduction, to preserve top-k.
-        dots = tl.dot(q, k).to(q.dtype).to(tl.float32)
-        scores = (dots * 0.125).to(q.dtype).to(tl.float32)
-        weights = tl.load(W + row * WS + h)
-        weighted = (tl.maximum(scores, 0) * weights[:, None].to(tl.float32)).to(q.dtype)
-        result = tl.sum(weighted.to(tl.float32), axis=0)
-        result = tl.where(n < length, result, float("-inf"))
-    tl.store(OUT + row * WIDTH + n, result, mask=n < WIDTH)
-
-
 def paged_scores(
     query: torch.Tensor,
     cache: torch.Tensor,
@@ -101,23 +64,9 @@ def paged_scores(
     lengths: torch.Tensor,
     width: int,
 ) -> torch.Tensor:
-    scores = torch.empty((query.shape[0], width), device=query.device, dtype=query.dtype)
-    _index_scores[(query.shape[0], triton.cdiv(width, 128))](
-        query,
-        cache,
-        weights,
-        table,
-        requests,
-        lengths,
-        scores,
-        query.stride(0),
-        weights.stride(0),
-        table.stride(0),
-        width,
-        128,
-        enable_fp_fusion=False,
-    )
-    return scores
+    from relax.models.keye_vl2.indexer_scores import paged_indexer_scores
+
+    return paged_indexer_scores(query, cache, weights, table, requests, lengths, width)
 
 
 def paged_decode(
@@ -134,9 +83,10 @@ def paged_decode(
 ) -> torch.Tensor:
     """Keep KV paged while using the same sparse forward as training."""
     from relax.models.keye_vl2.sparse_attention import compact_indices, sparse_attention
+    from relax.models.keye_vl2.topk import dsa_topk_indices
 
     scores = paged_scores(index_query, index_cache, weights, table, requests, lengths, width)
-    selected = scores.topk(min(2048, width), dim=-1).indices
+    selected = dsa_topk_indices(scores)
     ordered, counts = compact_indices(selected, selected < lengths[:, None])
     slots = table[requests.long()[:, None], ordered.long()].int().contiguous()
     return sparse_attention(query, key, value, slots, counts).flatten(1)

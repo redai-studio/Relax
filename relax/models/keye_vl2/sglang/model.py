@@ -27,9 +27,10 @@ from sglang.srt.runtime_context import get_model, get_parallel
 from relax.models.keye_vl2.indexer import KeyeIndexer, indexer_scores
 from relax.models.keye_vl2.norm import RMSNorm as StableRMSNorm
 from relax.models.keye_vl2.sparse_attention import compact_indices, sparse_attention
+from relax.models.keye_vl2.topk import dsa_topk_indices
 from relax.models.keye_vl2.vision import build_vision, image_features
 
-from .ops import expert_forward, paged_decode, rope
+from .ops import expert_forward, paged_decode, paged_scores, rope
 
 
 try:
@@ -97,10 +98,19 @@ def decode_attention(
     key = key.masked_fill(~valid[:, :, None, None], 0)
     value = value.masked_fill(~valid[:, :, None, None], 0)
     index_key = index_key.masked_fill(~valid[:, :, None], 0)
-    scores = torch.einsum("bhd,bkd->bhk", index_query, index_key) * 0.125
-    scores = (scores.relu() * weights[:, :, None]).sum(1)
+    batch, width = index_key.shape[:2]
+    table = torch.arange(batch * width, device=query.device, dtype=torch.int32).reshape(batch, width)
+    scores = paged_scores(
+        index_query,
+        index_key.reshape(-1, index_key.shape[-1]),
+        weights,
+        table,
+        torch.arange(batch, device=query.device, dtype=torch.int32),
+        lengths,
+        width,
+    )
     scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
-    support = torch.zeros_like(valid).scatter_(1, scores.topk(min(2048, key.shape[1]), -1).indices, True) & valid
+    support = torch.zeros_like(valid).scatter_(1, dsa_topk_indices(scores), True) & valid
     repeats = query.shape[1] // key.shape[2]
     output = F.scaled_dot_product_attention(
         query[:, :, None],
@@ -183,7 +193,7 @@ class KeyeAttention(Qwen3MoeAttention):
                 scores = indexer_scores(iq[start:end], keys, iw[start:end])
                 causal = torch.arange(length, device=q.device)[None, :] <= positions[start:end, None]
                 scores.masked_fill_(~causal, torch.finfo(scores.dtype).min)
-                selected = scores.topk(min(2048, length), -1).indices
+                selected = dsa_topk_indices(scores)
                 selected_slots, counts = compact_indices(selected, causal.gather(1, selected))
                 result = sparse_attention(q[start:end], all_k, all_v, selected_slots, counts)
                 outputs.append(result.reshape(end - start, -1))

@@ -70,5 +70,9 @@ class KeyeIndexer(nn.Module):
 def indexer_scores(query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """Match the public BF16 reference's matmul, scale, ReLU, and head
     reduction."""
+    if query.is_cuda and query.dtype == key.dtype == weights.dtype == torch.bfloat16:
+        from .indexer_scores import dense_indexer_scores
+
+        return dense_indexer_scores(query, key, weights)
     scores = torch.einsum("qhd,kd->hqk", query, key.squeeze(-2)) * 0.125
     return (scores.relu() * weights.transpose(0, 1).unsqueeze(-1)).sum(0)

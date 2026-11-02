@@ -14,6 +14,7 @@ from torch import nn
 
 from .indexer import KeyeIndexer, indexer_scores
 from .sparse_attention import compact_indices, sparse_attention
+from .topk import dsa_topk_indices
 
 
 def query_chunks(length: int, cp_size: int, cp_rank: int, chunk_size: int) -> Iterator[tuple[int, int, int]]:
@@ -100,10 +101,13 @@ class KeyeCoreAttention(nn.Module):
             if valid_lengths is None:
                 valid = indices < getattr(packed_seq_params, "num_valid_tokens", boundaries[-1])
             else:
+                # A packed batch may have CP padding after every document and
+                # an additional padding-only tail. Preserve each real prefix.
+                valid_lengths = tuple(valid_lengths) + (0,) * (len(boundaries) - 1 - len(valid_lengths))
                 valid = torch.cat(
                     [
-                        indices[start:end] - start < length
-                        for start, end, length in zip(boundaries[:-1], boundaries[1:], valid_lengths, strict=True)
+                        torch.arange(end - start, device=query.device) < real_length
+                        for start, end, real_length in zip(boundaries[:-1], boundaries[1:], valid_lengths, strict=True)
                     ]
                 )
         local_indices = gdn_cp_slice(indices, boundaries, size, rank) if size > 1 else indices
@@ -115,7 +119,12 @@ class KeyeCoreAttention(nn.Module):
             ]
         outputs = []
         auxiliary = query.new_zeros((), dtype=torch.float32)
-        train_indexer = self.training and torch.is_grad_enabled()
+        train_indexer = (
+            self.training
+            and torch.is_grad_enabled()
+            and self.config.keye_indexer_loss_coeff > 0
+            and any(parameter.requires_grad for parameter in self.sa_indexer.parameters())
+        )
         local_start = 0
         for start, end in zip(boundaries, boundaries[1:]):
             length = (end - start) // size
@@ -134,7 +143,7 @@ class KeyeCoreAttention(nn.Module):
                     start : start + prefix
                 ][None]
                 scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
-                selected = scores.detach().topk(min(2048, prefix), -1).indices
+                selected = dsa_topk_indices(scores)
                 support = torch.zeros_like(causal).scatter_(1, selected, True) & causal
                 slots, counts = compact_indices(selected, causal.gather(1, selected))
                 chunk_q = q[offset:stop].transpose(0, 1)

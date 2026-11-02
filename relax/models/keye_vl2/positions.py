@@ -5,14 +5,19 @@
 import torch
 
 
-def image_positions(input_ids: torch.Tensor, grid: torch.Tensor, image_token_id: int) -> torch.Tensor:
+def image_positions(
+    input_ids: torch.Tensor,
+    grid: torch.Tensor,
+    image_token_id: int,
+    image_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Return [3, B, T] positions without copying token metadata to the host.
 
     Rows are individual documents; right padding is excluded by the caller.
     """
     batch, width = input_ids.shape
     linear = torch.arange(width, device=input_ids.device).expand(batch, -1)
-    image = input_ids == image_token_id
+    image = input_ids == image_token_id if image_mask is None else image_mask
     starts = image & ~torch.nn.functional.pad(image[:, :-1], (1, 0), value=False)
     if grid is None or grid.shape[0] == 0:
         torch._assert_async(~image.any(), "Keye image placeholders require image grids")

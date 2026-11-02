@@ -90,6 +90,14 @@ class KeyeModelProvider(GPTModelProvider):
             self.position_embedding_type = "mrope"
             args.multimodal_input_key_map = {"image_grid_thw": "grid_thws"}
             args.uses_unsplit_forward = True
+        elif self.position_embedding_type == "rope":
+            # Text RoPE is a reusable position table, not per-token mRoPE.
+            # Leaving VL sections enabled misroutes packed text into the VL path.
+            self.mrope_section = None
+            # The HF directory contains a processor, but this provider returns
+            # plain GPT for text training. It requires already-packed CP input.
+            args.is_vl_model = False
+            args.uses_unsplit_forward = False
 
     def provide(
         self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None

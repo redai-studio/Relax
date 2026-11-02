@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import re
+from importlib import import_module
 from typing import Any
 
 import torch
@@ -23,6 +24,34 @@ class KeyeProcessor(BaseMultimodalProcessor):
             image_token_id=self.hf_config.image_token_id,
             image_token_regex=re.compile(r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"),
         ).build(self._processor)
+
+    def resolve_image_token_counts(self, images: list[Any]) -> list[int]:
+        """Expand placeholders without decoding and re-tokenizing the supplied
+        IDs."""
+        from transformers.image_transforms import convert_to_rgb
+        from transformers.image_utils import get_image_size, to_numpy_array
+
+        processor = self._processor.image_processor
+        smart_resize = import_module(type(processor).__module__).smart_resize
+        counts = []
+        for image in images:
+            if processor.do_convert_rgb:
+                image = convert_to_rgb(image)
+            height, width = get_image_size(to_numpy_array(image))
+            if processor.do_resize:
+                if "height" in processor.size:
+                    height, width = processor.size["height"], processor.size["width"]
+                else:
+                    height, width = smart_resize(
+                        height,
+                        width,
+                        factor=processor.patch_size * processor.merge_size,
+                        min_pixels=processor.min_pixels,
+                        max_pixels=processor.max_pixels,
+                    )
+            grid_h, grid_w = height // processor.patch_size, width // processor.patch_size
+            counts.append(grid_h * grid_w // processor.merge_size**2)
+        return counts
 
     async def process_mm_data_async(
         self, image_data: list[Any], input_text: str | list[int], request_obj: Any, **kwargs: Any

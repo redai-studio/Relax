@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Keye OpenR1-MM RL; 64 x 8 samples per update, TP1/PP1/CP2/EP8 training and TP2 rollout.
+# Keye OpenR1-MM RL; 16 x 8 samples per update, TP1/PP1/CP2/EP8 training and TP2 rollout.
 # Usage: MODEL_DIR=/models DATA_DIR=/data SAVE_DIR=/checkpoints bash examples/models/keye-vl2/scripts/run-keye-vl2-30B-A3B-8xgpu-openr1mm.sh
 
 set -eo pipefail
@@ -18,6 +18,7 @@ MODEL_ARGS+=(
     --position-embedding-type mrope
     --mrope-section 16 24 24
     --no-rope-fusion
+    --freeze-params-name-list '\.sa_indexer\.'
 )
 
 PROJECT_NAME="${PROJECT_NAME:-Relax/rl/openr1mm}"
@@ -74,10 +75,11 @@ ROLLOUT_ARGS=(
     --custom-prompt-path relax.models.keye_vl2.prompts.openr1_prompt
     --rm-type openr1mm
     --num-rollout "${NUM_ROLLOUT:-200}"
-    # Match the Qwen3.5-35B-A3B OpenR1-MM sampling and update batch.
-    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-64}"
+    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-16}"
+    --over-sampling-batch-size 32
+    --dynamic-sampling-filter-path relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std
     --n-samples-per-prompt "${N_SAMPLES:-8}"
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-512}"
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
     --rollout-max-response-len "${RESPONSE_LEN:-2048}"
     --rollout-max-prompt-len 2048
     --rollout-max-context-len 4096
@@ -112,6 +114,7 @@ PERF_ARGS=(
     --moe-token-dispatcher-type alltoall
     --moe-router-dtype fp32
     --moe-router-load-balancing-type none
+    --moe-router-bias-update-rate 0.0
     --moe-aux-loss-coeff 0
 )
 ALGORITHM_ARGS=(
