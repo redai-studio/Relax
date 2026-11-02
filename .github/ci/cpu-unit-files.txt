@@ -1,7 +1,0 @@
-tests/tools/test_convert_checkpoint_to_hf_cpu.py
-tests/backends/megatron/test_score_centering_loss.py
-tests/backends/megatron/test_gdn_cp_reassembly.py
-tests/backends/megatron/test_rloo_cp_reduction.py
-tests/utils/training/test_ppo_logprob_entropy.py
-tests/utils/training/test_logprob_fast_path.py
-tests/utils/test_distributed_masked_normalize.py
