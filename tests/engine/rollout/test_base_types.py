@@ -10,14 +10,13 @@ and must also apply when the rollout fn returns the legacy (unwrapped)
 Run with: pytest tests/engine/rollout/test_base_types.py -v
 """
 
-from argparse import Namespace
-
 from relax.engine.rollout.base_types import (
     RolloutFnEvalOutput,
     RolloutFnTrainOutput,
     call_rollout_fn,
 )
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 def _mark_even_index(args, groups):
@@ -49,7 +48,7 @@ def _build_groups(n: int) -> list[list[Sample]]:
 class TestCallRolloutFnFilter:
     def test_filter_applied_on_train_output(self):
         groups = _build_groups(4)
-        args = Namespace(rollout_sample_filter_path=f"{_FILTER_MODULE}._mark_even_index")
+        args = build_relax_args(rollout_sample_filter_path=f"{_FILTER_MODULE}._mark_even_index")
 
         def rollout_fn(a, evaluation):
             return RolloutFnTrainOutput(samples=groups)
@@ -63,7 +62,7 @@ class TestCallRolloutFnFilter:
         """Rollout fn returning a bare ``list[list[Sample]]`` is wrapped, then
         filtered."""
         groups = _build_groups(3)
-        args = Namespace(rollout_sample_filter_path=f"{_FILTER_MODULE}._mark_all")
+        args = build_relax_args(rollout_sample_filter_path=f"{_FILTER_MODULE}._mark_all")
 
         def rollout_fn(a, evaluation):
             return groups
@@ -75,7 +74,7 @@ class TestCallRolloutFnFilter:
 
     def test_filter_skipped_when_path_none(self):
         groups = _build_groups(3)
-        args = Namespace(rollout_sample_filter_path=None)
+        args = build_relax_args(rollout_sample_filter_path=None)
 
         def rollout_fn(a, evaluation):
             return RolloutFnTrainOutput(samples=groups)
@@ -87,7 +86,8 @@ class TestCallRolloutFnFilter:
     def test_filter_skipped_when_attr_missing(self):
         """``getattr(..., None)`` must swallow the missing attribute."""
         groups = _build_groups(2)
-        args = Namespace()  # no rollout_sample_filter_path at all
+        # A missing field is no longer a legal state: rollout_sample_filter_path keeps its declared default None.
+        args = build_relax_args()
 
         def rollout_fn(a, evaluation):
             return RolloutFnTrainOutput(samples=groups)
@@ -98,7 +98,7 @@ class TestCallRolloutFnFilter:
 
     def test_filter_skipped_on_eval(self):
         """Even if a path is set, eval must not invoke the filter."""
-        args = Namespace(rollout_sample_filter_path=f"{_FILTER_MODULE}._raise_filter")
+        args = build_relax_args(rollout_sample_filter_path=f"{_FILTER_MODULE}._raise_filter")
 
         def rollout_fn(a, evaluation):
             return RolloutFnEvalOutput(data={"bench": {"score": [1.0]}})
@@ -111,7 +111,7 @@ class TestCallRolloutFnFilter:
     def test_filter_skipped_on_legacy_eval_return(self):
         """Legacy eval return (bare dict) is wrapped as EvalOutput; filter must
         not run."""
-        args = Namespace(rollout_sample_filter_path=f"{_FILTER_MODULE}._raise_filter")
+        args = build_relax_args(rollout_sample_filter_path=f"{_FILTER_MODULE}._raise_filter")
 
         def rollout_fn(a, evaluation):
             return {"bench": {"score": [1.0]}}
@@ -133,7 +133,7 @@ class TestCallRolloutFnFilter:
         globals()["_capture"] = _capture
 
         groups = _build_groups(1)
-        args = Namespace(rollout_sample_filter_path=f"{_FILTER_MODULE}._capture")
+        args = build_relax_args(rollout_sample_filter_path=f"{_FILTER_MODULE}._capture")
 
         def rollout_fn(a, evaluation):
             return RolloutFnTrainOutput(samples=groups)

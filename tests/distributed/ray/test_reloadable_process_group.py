@@ -40,7 +40,11 @@ try:
     # Exercise the multi-rank NCCL selection branch using a real CPU group;
     # group creation itself is substituted because this is a CPU regression.
     dist.new_group = lambda *args, **kwargs: native
-    args = SimpleNamespace(offload_train=mode == "offload") if mode != "unspecified" else None
+    args = (
+        SimpleNamespace(offload_train=mode == "offload", enable_cuda_memory_check=False)
+        if mode != "unspecified"
+        else None
+    )
     namespace["monkey_patch_torch_dist"](args)
     group = dist.new_group(ranks=[0, 1], backend="nccl")
     if mode == "resident":

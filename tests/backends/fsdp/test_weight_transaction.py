@@ -25,6 +25,7 @@ from relax.backends.fsdp.actor import (
     _raise_weight_sync_errors,
 )
 from relax.models.generative import FullWeightManifest
+from tests.support.args import build_relax_args
 
 
 class _Ref:
@@ -77,7 +78,7 @@ def _manifest():
 
 def _shell():
     shell = object.__new__(FSDPTrainRayActor)
-    shell.args = SimpleNamespace(fsdp_trainable_attr="transformer")
+    shell.args = build_relax_args(fsdp_trainable_attr="transformer")
     return shell
 
 

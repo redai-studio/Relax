@@ -196,7 +196,7 @@ def test_train_default_off_does_not_start_runtime(train_loader, monkeypatch):
     factory = Mock(side_effect=AssertionError("default-off observer must not start"))
     monkeypatch.setattr(runtime_module, "start_fault_events", factory)
     with pytest.raises(SystemExit) as exc:
-        module.main(SimpleNamespace())
+        module.main(SimpleNamespace(fault_events_enabled=False))
     assert exc.value.code == 0
     factory.assert_not_called()
     assert module._fault_runtime is None

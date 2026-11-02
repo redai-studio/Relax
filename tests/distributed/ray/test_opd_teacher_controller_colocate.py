@@ -1,8 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import sys
-from argparse import Namespace
 from types import ModuleType
+
+from tests.support.args import build_relax_args
 
 
 def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
@@ -34,15 +35,15 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
 
     monkeypatch.setattr(opd_utils, "create_managed_opd_teacher_manager", fake_create_teacher_manager)
 
-    config = Namespace(
+    config = build_relax_args(
         use_opd=True,
         opd_type="sglang",
         colocate=True,
         hybrid=False,
         debug_train_only=False,
-        resource={"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]},
         teacher_hf_checkpoint="/teacher",
     )
+    config.resource = {"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]}
 
     shared_pg, teacher_manager = opd_utils.maybe_start_managed_opd_teacher(
         config,

@@ -3,12 +3,12 @@
 import asyncio
 import importlib
 import threading
-from argparse import Namespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
 from relax.components.background_loop import BackgroundLoopRunner
+from tests.support.args import build_relax_args
 
 
 @pytest.fixture(params=[("actor", "Actor"), ("actor_fwd", "ActorFwd"), ("critic", "Critic")])
@@ -26,7 +26,7 @@ def component(request, monkeypatch):
     obj._logger_instance = Mock()
     obj.role = module_name
     obj.step = 0
-    obj.config = Namespace(num_rollout=1, fully_async=True, loss_type="policy_loss", use_health_check=False)
+    obj.config = build_relax_args(num_rollout=1, fully_async=True, loss_type="policy_loss", use_health_check=False)
     obj.healthy = Mock()
     obj.data_system_client = Mock()
     yield obj
@@ -157,8 +157,7 @@ async def test_component_constructor_initializes_shared_runner(component, monkey
     train_group.init_and_wait.return_value = [0]
     monkeypatch.setitem(namespace, "allocate_train_group", Mock(return_value=train_group))
     monkeypatch.setitem(namespace, "attach_tq_client", Mock(return_value=Mock()))
-    config = Namespace(
-        tq_config={},
+    config = build_relax_args(
         kl_coef=0,
         use_kl_loss=False,
         opd_teacher_load=None,
@@ -166,6 +165,9 @@ async def test_component_constructor_initializes_shared_runner(component, monkey
         loss_type="policy_loss",
         num_rollout=0,
     )
+    # ``tq_config`` is wired at runtime by the controller, not declared by the
+    # Relax parser.
+    config.tq_config = {}
     initialized = type(component)(healthy=Mock(), pgs=None, num_gpus=1, config=config, role=component.role)
     try:
         assert isinstance(initialized._loop_runner, BackgroundLoopRunner)

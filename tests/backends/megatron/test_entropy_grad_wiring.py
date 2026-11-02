@@ -13,6 +13,8 @@ try:
 except Exception as exc:
     pytest.skip(f"relax.backends.megatron unavailable: {exc}", allow_module_level=True)
 
+from tests.support.args import build_relax_args
+
 
 @pytest.mark.parametrize(
     "entropy_coef,expected_entropy_grad",
@@ -29,7 +31,7 @@ def test_get_log_probs_and_entropy_wires_entropy_grad(
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(loss_module.mpu, "get_tensor_model_parallel_group", lambda: None)
 
-    args = Namespace(
+    args = build_relax_args(
         allgather_cp=False,
         entropy_coef=entropy_coef,
         log_probs_chunk_size=-1,
@@ -75,7 +77,7 @@ def test_sft_chunked_lm_head_matches_log_softmax_gradients(monkeypatch: pytest.M
     tokens = torch.tensor([2, 4, 1, 3], dtype=torch.long)
     loss_weights = torch.tensor([0.25, -0.5, 1.5, 0.75], dtype=torch.float32)
     temperature = 0.7
-    args = Namespace(
+    args = build_relax_args(
         allgather_cp=False,
         entropy_coef=0.0,
         loss_type="sft",

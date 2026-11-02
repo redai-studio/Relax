@@ -2,12 +2,11 @@
 
 """Reward-model loss, pooling, and metric contracts."""
 
-from argparse import Namespace
-
 import pytest
 import torch
 
 from relax.engine.sft.eval.preference import compute_reward_model_eval_step
+from tests.support.args import build_relax_args
 
 
 try:
@@ -53,7 +52,7 @@ def _batch(monkeypatch, pair_ids=(8, 7), pad_multiplier=1, allgather_cp=False):
         "chosen_total_lengths": [3, 4],
         "rejected_total_lengths": [2, 2],
     }
-    monkeypatch.setattr(data_module, "get_args", lambda: Namespace())
+    monkeypatch.setattr(data_module, "get_args", lambda: build_relax_args())
     monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda: 0)
     monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1)
@@ -100,7 +99,7 @@ def test_reward_model_packing_preserves_terminal_scores_loss_and_gradients(
 
     flat = (batch["tokens"][0].float() / 10).requires_grad_()
     logits = flat.reshape(1, -1, 1)
-    args = Namespace(
+    args = build_relax_args(
         loss_type="rm",
         qkv_format="thd",
         calculate_per_token_loss=False,
@@ -153,4 +152,4 @@ def test_reward_model_loss_rejects_mismatched_pairs(monkeypatch, mutation, match
     batch = _batch(monkeypatch)
     mutation(batch)
     with pytest.raises(ValueError, match=match):
-        reward_model_loss_function(Namespace(), batch, torch.zeros(1, 11, 1), lambda value: value)
+        reward_model_loss_function(build_relax_args(), batch, torch.zeros(1, 11, 1), lambda value: value)

@@ -9,6 +9,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.support.args import build_relax_args
+
 
 pytest.importorskip("megatron.training.arguments", exc_type=ImportError)
 
@@ -63,7 +65,7 @@ def test_configure_mtp_detach_paths_updates_all_module_configs(detach_paths, exp
     model.child = _ConfiguredModule(Namespace())
     model.shared_child = _ConfiguredModule(shared_config)
 
-    configure_mtp_detach_paths(Namespace(mtp_detach_paths=detach_paths), model)
+    configure_mtp_detach_paths(build_relax_args(mtp_detach_paths=detach_paths), model)
 
     for config in (model.config, model.child.config, model.shared_child.config):
         assert (config.mtp_detach_embedding, config.mtp_detach_backbone, config.mtp_detach_lm_head) == expected
@@ -72,7 +74,7 @@ def test_configure_mtp_detach_paths_updates_all_module_configs(detach_paths, exp
 def test_configure_mtp_detach_paths_defaults_to_all_detached():
     model = _ConfiguredModule(Namespace())
 
-    configure_mtp_detach_paths(Namespace(), model)
+    configure_mtp_detach_paths(build_relax_args(), model)
 
     assert model.config.mtp_detach_embedding is True
     assert model.config.mtp_detach_backbone is True
@@ -81,7 +83,7 @@ def test_configure_mtp_detach_paths_defaults_to_all_detached():
 
 def test_mtp_only_freeze_exposes_only_mtp_parameters():
     model = _MtpOnlyModel()
-    args = Namespace(
+    args = build_relax_args(
         only_train_params_name_list=[r"(^|\.)mtp(\.|$)"],
         freeze_params_name_list=None,
     )
@@ -96,7 +98,7 @@ def test_mtp_only_trainable_validation_accepts_frozen_backbone():
     model = _MtpOnlyModel()
     freeze_model_params(
         model,
-        Namespace(only_train_params_name_list=[r"(^|\.)mtp(\.|$)"], freeze_params_name_list=None),
+        build_relax_args(only_train_params_name_list=[r"(^|\.)mtp(\.|$)"], freeze_params_name_list=None),
     )
 
     validate_mtp_only_trainable_params(Namespace(mtp_only_training=True), [model])
@@ -186,7 +188,9 @@ def _actor_args(**overrides) -> Namespace:
         "keep_old_actor": False,
     }
     defaults.update(overrides)
-    return Namespace(**defaults)
+    # The actor train path reads many more declared parameters directly
+    # (GPU/TE branches included), so the runtime args must be complete.
+    return build_relax_args(**defaults)
 
 
 @pytest.mark.parametrize("prepacked", [False, True])

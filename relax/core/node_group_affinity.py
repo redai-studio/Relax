@@ -31,26 +31,26 @@ def _autoscaler_enabled(config_path: str) -> bool:
 
 def maybe_pin_baseline_to_stable(args) -> None:
     """Pin an elastic job's baseline roles to the stable worker group."""
-    config_path = getattr(args, "autoscaler_config", None)
+    config_path = args.autoscaler_config
     autoscaler_enabled = bool(config_path and _autoscaler_enabled(config_path))
     if autoscaler_enabled and not os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip():
         os.environ["RELAX_INITIAL_NODE_GROUP"] = "stable"
 
     node_group = None
-    if autoscaler_enabled and getattr(args, "enable_affinity", True):
+    if autoscaler_enabled and args.enable_affinity:
         node_group = os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip() or "stable"
     setattr(args, _CONTROL_PLANE_NODE_GROUP_ATTR, node_group)
 
 
 def _get_elastic_node_group(args: Any) -> Optional[str]:
     """Return the baseline node group for an enabled Relax autoscaler job."""
-    if args is None or not getattr(args, "enable_affinity", True):
+    if args is None or not args.enable_affinity:
         return None
 
     if hasattr(args, _CONTROL_PLANE_NODE_GROUP_ATTR):
         return getattr(args, _CONTROL_PLANE_NODE_GROUP_ATTR) or None
 
-    config_path = getattr(args, "autoscaler_config", None)
+    config_path = args.autoscaler_config
     if not config_path or not _autoscaler_enabled(config_path):
         return None
 

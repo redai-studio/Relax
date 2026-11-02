@@ -20,6 +20,7 @@ from relax.utils.opd.opd_multimodal import (
 )
 from relax.utils.opd.opd_opsd_worker import OpsdWorker
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 @pytest.fixture
@@ -57,6 +58,12 @@ def _sample() -> Sample:
 
 def _manager(**overrides) -> OpdManager:
     args = dict(
+        opd_student_eos_token_id=None,
+        opd_teacher_eos_token_id=None,
+        opd_teacher_response_prefix_token_ids=None,
+        opd_fkl_entropy_gate=False,
+        opd_teacher_prompt_key=None,
+        opd_teacher_image_key=None,
         opd_token_selection="student_sampled",
         opd_log_prob_top_k=2,
         opd_kl_coef=1.0,
@@ -348,7 +355,7 @@ def test_image_contract_rejects_expanded_payload_missing_prompt_ids_and_unsuppor
 @pytest.fixture
 def native_generate(monkeypatch):
     sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
-    args = SimpleNamespace(
+    args = build_relax_args(
         ci_test=False,
         sglang_router_ip="unused",
         sglang_router_port=1,
@@ -357,6 +364,8 @@ def native_generate(monkeypatch):
         sglang_router_policy="round_robin",
         sglang_speculative_algorithm=None,
     )
+    args.num_layers = 2
+    args.moe_router_topk = 2
     state = SimpleNamespace(
         tokenizer=SimpleNamespace(
             image_token_id=99,

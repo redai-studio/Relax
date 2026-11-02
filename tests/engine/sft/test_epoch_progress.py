@@ -9,6 +9,7 @@ from types import ModuleType
 import pytest
 
 from relax.engine.sft.bootstrap import resolve_sft_num_rollout
+from tests.support.args import build_relax_args
 
 
 @pytest.fixture
@@ -61,7 +62,7 @@ def _reported_metrics(args: Namespace, step: int, steps_per_rollout: int = 1) ->
 
 @pytest.mark.parametrize("step", [0, 17, 240, 241, 722])
 def test_sft_epoch_progress_reports_nondivisible_dataset(sized_dataset, step):
-    args = Namespace(loss_type="sft", prompt_data=30890, rollout_batch_size=128, num_epoch=3, num_rollout=1000)
+    args = build_relax_args(loss_type="sft", prompt_data=30890, rollout_batch_size=128, num_epoch=3, num_rollout=1000)
     resolve_sft_num_rollout(args)
 
     assert args.num_rollout == 723
@@ -71,7 +72,7 @@ def test_sft_epoch_progress_reports_nondivisible_dataset(sized_dataset, step):
 
 @pytest.mark.parametrize("eval_size,train_size,interval", [(None, 1024, 8), (128, 896, 7), (42, 982, None)])
 def test_sft_epoch_progress_uses_training_split(sized_dataset, eval_size, train_size, interval):
-    args = Namespace(
+    args = build_relax_args(
         loss_type="sft", prompt_data=1024, rollout_batch_size=128, num_epoch=3, num_rollout=1000, eval_size=eval_size
     )
     resolve_sft_num_rollout(args)
@@ -81,13 +82,14 @@ def test_sft_epoch_progress_uses_training_split(sized_dataset, eval_size, train_
 
 
 def test_sft_epoch_progress_custom_dataset_clears_unknown_denominator():
-    args = Namespace(
+    args = build_relax_args(
         loss_type="sft",
         custom_dataset_class_path="custom.Dataset",
         num_rollout=10,
         num_epoch=None,
-        num_rollout_per_epoch_for_metrics=2,
     )
+    # Runtime-derived attribute: written by resolve_sft_num_rollout; seed an "unknown denominator" here.
+    args.num_rollout_per_epoch_for_metrics = 2
     resolve_sft_num_rollout(args)
 
     assert args.num_rollout_per_epoch_for_metrics is None
@@ -95,5 +97,6 @@ def test_sft_epoch_progress_custom_dataset_clears_unknown_denominator():
 
 
 def test_epoch_progress_preserves_rl_multiple_updates_per_rollout():
-    args = Namespace(num_rollout_per_epoch=10)
+    args = build_relax_args()
+    args.num_rollout_per_epoch = 10
     assert _reported_metrics(args, 7, steps_per_rollout=4)["train/cur_epoch"] == pytest.approx(0.2)

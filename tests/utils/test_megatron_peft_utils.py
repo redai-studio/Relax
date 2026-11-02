@@ -17,7 +17,6 @@ notice when broken:
 import json
 import sys
 import types
-from argparse import Namespace
 
 import pytest
 import torch
@@ -33,6 +32,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_merge_mode,
     write_hf_peft_adapter,
 )
+from tests.support.args import build_relax_args
 
 
 def test_exclude_frozen_lora_target_modules_keeps_vision_merger() -> None:
@@ -66,7 +66,7 @@ class TestBuildLoraPeft:
         self._install_create_peft_stub(monkeypatch)
         monkeypatch.setenv("RELAX_LORA_A_INIT_METHOD", "kaiming")
         monkeypatch.setenv("RELAX_LORA_SHARE_EXPERT_ADAPTERS", "false")
-        args = Namespace(
+        args = build_relax_args(
             lora_rank=32,
             lora_alpha=64,
             lora_target_modules=["linear_qkv", "linear_fc1"],
@@ -81,7 +81,7 @@ class TestBuildLoraPeft:
     def test_invalid_expert_adapter_override_fails_fast(self, monkeypatch):
         self._install_create_peft_stub(monkeypatch)
         monkeypatch.setenv("RELAX_LORA_SHARE_EXPERT_ADAPTERS", "sometimes")
-        args = Namespace(lora_rank=8, lora_alpha=16, lora_target_modules=["linear_qkv"], lora_dropout=0.0)
+        args = build_relax_args(lora_rank=8, lora_alpha=16, lora_target_modules=["linear_qkv"], lora_dropout=0.0)
 
         with pytest.raises(ValueError, match="RELAX_LORA_SHARE_EXPERT_ADAPTERS"):
             build_lora_peft(args)
@@ -202,16 +202,16 @@ class TestWriteHfPeftAdapter:
 
 class TestLoraPredicates:
     def test_is_lora_enabled_true_when_rank_positive(self):
-        assert is_lora_enabled(Namespace(lora_rank=8)) is True
+        assert is_lora_enabled(build_relax_args(lora_rank=8)) is True
 
     def test_is_lora_enabled_false_when_rank_zero_or_missing(self):
-        assert is_lora_enabled(Namespace(lora_rank=0)) is False
-        assert is_lora_enabled(Namespace()) is False
+        assert is_lora_enabled(build_relax_args(lora_rank=0)) is False
+        assert is_lora_enabled(build_relax_args()) is False
 
     def test_is_lora_merge_mode(self):
-        assert is_lora_merge_mode(Namespace(lora_merge_mode=True)) is True
-        assert is_lora_merge_mode(Namespace(lora_merge_mode=False)) is False
-        assert is_lora_merge_mode(Namespace()) is False
+        assert is_lora_merge_mode(build_relax_args(lora_merge_mode=True)) is True
+        assert is_lora_merge_mode(build_relax_args(lora_merge_mode=False)) is False
+        assert is_lora_merge_mode(build_relax_args()) is False
 
 
 class TestCountAdapterParameters:

@@ -218,7 +218,7 @@ class Actor(Base):
             except Exception:
                 self._logger.exception("Failed to report actor training failure")
                 raise e
-            if getattr(self.config, "use_health_check", False):
+            if self.config.use_health_check:
                 # Keep run() pending until recovery stops/deletes this replica.
                 # Returning here races the health checker and reports false success.
                 self._stop_event.wait()
@@ -258,7 +258,7 @@ class Actor(Base):
         if (
             self._peer_barrier is not None
             and not self._peer_barrier.is_empty()
-            and self.step >= getattr(self.config, "num_critic_only_steps", 0)
+            and self.step >= self.config.num_critic_only_steps
         ):
             self._peer_barrier.wait_completed_round_sync(self.step)
 
@@ -283,8 +283,8 @@ class Actor(Base):
         # (push is idempotent since actor didn't train, but not optional).
         if self.step < self.config.num_critic_only_steps:
             if (
-                getattr(self.config, "use_critic", False)
-                and getattr(self.config, "offload_rollout", False)
+                self.config.use_critic
+                and self.config.offload_rollout
                 and (not self.config.fully_async or self.config.hybrid)
             ):
                 # Wait for critic to finish this round before triggering

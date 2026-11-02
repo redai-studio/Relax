@@ -17,6 +17,20 @@ import pytest
 import torch
 
 from relax.utils.training.nonfinite_grad import configure_nonfinite_guard, install_nonfinite_guard
+from tests.support.args import build_relax_args
+
+
+_KNOWN = frozenset(vars(build_relax_args()))
+
+
+def _args(**kw):
+    """Fully populated parameter object; fields not declared by Relax are
+    passed through explicitly."""
+    extra = {k: kw.pop(k) for k in list(kw) if k not in _KNOWN}
+    args = build_relax_args(**kw)
+    for name, value in extra.items():
+        setattr(args, name, value)
+    return args
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -52,7 +66,7 @@ def update_block(guard):
             optimizer=optimizer,
             opt_param_scheduler=scheduler,
             model=chunks,
-            args=SimpleNamespace(check_for_nan_in_loss_and_grad=False),
+            args=_args(check_for_nan_in_loss_and_grad=False),
             losses_reduced=[],
             _is_global_zero_token_step=lambda _: False,
             step_id=128,
@@ -228,7 +242,7 @@ def test_one_bad_rank_causes_all_ranks_to_skip_and_continue(tmp_path):
 def test_generic_guard_defaults_off_without_changing_bucket_checks(monkeypatch):
     monkeypatch.delenv("RELAX_SKIP_NONFINITE_GRAD", raising=False)
     monkeypatch.delenv("RELAX_QWEN35_SKIP_NONFINITE_GRAD", raising=False)
-    args = SimpleNamespace(check_for_nan_in_loss_and_grad=True)
+    args = _args(check_for_nan_in_loss_and_grad=True)
     assert configure_nonfinite_guard(args) is False
     assert args.check_for_nan_in_loss_and_grad is True
 
@@ -236,7 +250,7 @@ def test_generic_guard_defaults_off_without_changing_bucket_checks(monkeypatch):
 @pytest.mark.parametrize("tp,pp,cp,ep", [(1, 1, 4, 8), (4, 1, 1, 8), (2, 4, 1, 8), (2, 4, 4, 8)])
 def test_generic_guard_configuration_does_not_restrict_topology(monkeypatch, tp, pp, cp, ep):
     monkeypatch.setenv("RELAX_SKIP_NONFINITE_GRAD", "1")
-    args = SimpleNamespace(
+    args = _args(
         bf16=True,
         fp16=False,
         check_for_nan_in_loss_and_grad=True,
@@ -252,7 +266,7 @@ def test_generic_guard_configuration_does_not_restrict_topology(monkeypatch, tp,
 @pytest.mark.parametrize("option", ["fp8", "use_megatron_fsdp", "chunked_optimizer_state_offload"])
 def test_unvalidated_storage_modes_fail_explicitly(monkeypatch, option):
     monkeypatch.setenv("RELAX_SKIP_NONFINITE_GRAD", "1")
-    args = SimpleNamespace(bf16=True, fp16=False, check_for_nan_in_loss_and_grad=True)
+    args = _args(bf16=True, fp16=False, check_for_nan_in_loss_and_grad=True)
     setattr(args, option, True)
     with pytest.raises(ValueError, match=option):
         configure_nonfinite_guard(args)

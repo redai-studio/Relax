@@ -47,9 +47,11 @@ def test_wholepack_peer_timeout_is_collective():
 
 
 def test_wholepack_scope_requires_explicit_recipe():
-    assert not wp.enabled(SimpleNamespace())
+    assert not wp.enabled(SimpleNamespace(sft_wholepack=False))
     assert not wp.enabled(
-        SimpleNamespace(custom_megatron_before_train_step_hook_path="relax.models.qwen3_5.recipe.before_step")
+        SimpleNamespace(
+            sft_wholepack=False, custom_megatron_before_train_step_hook_path="relax.models.qwen3_5.recipe.before_step"
+        )
     )
     assert wp.enabled(SimpleNamespace(sft_wholepack=True))
     assert wp.enabled(

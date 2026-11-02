@@ -1,10 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from argparse import Namespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+
+from tests.support.args import build_relax_args
 
 
 try:
@@ -53,7 +54,7 @@ def test_sft_peer_error_agreement_propagates_peer_failure(monkeypatch):
 def test_sft_lookahead_pauses_on_checkpoint_boundary(monkeypatch):
     monkeypatch.setattr(actor_module, "should_run_sft_eval", lambda *_args: False)
     monkeypatch.setattr(actor_module, "should_run_sft_predict", lambda *_args: False)
-    args = Namespace(num_rollout=100, save="/checkpoint", rotate_ckpt=False, save_interval=20)
+    args = build_relax_args(num_rollout=100, save="/checkpoint", rotate_ckpt=False, save_interval=20)
 
     assert actor_module._should_pause_sft_lookahead(args, rollout_id=19) is True
     assert actor_module._should_pause_sft_lookahead(args, rollout_id=18) is False
@@ -105,7 +106,7 @@ def test_sft_train_prefetch_peer_fatal_raises_together(monkeypatch):
 
 def test_sft_train_prefetch_pauses_at_step_boundary(monkeypatch):
     actor = object.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = Namespace(num_rollout=10)
+    actor.args = build_relax_args(num_rollout=10)
     actor._sft_train_prefetch_executor = MagicMock()
     actor._sft_train_prefetch = None
     actor._sft_train_prefetch_cancel = None
@@ -185,7 +186,7 @@ def test_sft_prepack_fetch_concatenates_ready_tq_shards(monkeypatch):
     monkeypatch.setattr(actor_module, "get_data_from_transfer_queue", _get_data_from_transfer_queue)
 
     actor = object.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = Namespace(global_batch_size=8, loss_type="sft", sft_async_prepack=True)
+    actor.args = build_relax_args(global_batch_size=8, loss_type="sft", sft_async_prepack=True)
     actor.data_system_client = MagicMock()
     actor.data_system_client.async_get_partition_list.return_value = partition_ids
 
@@ -209,7 +210,7 @@ def test_sft_prepack_fetch_waits_until_all_tq_shards_are_ready(monkeypatch):
     monkeypatch.setattr(actor_module, "get_data_from_transfer_queue", fetch)
 
     actor = object.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = Namespace(global_batch_size=8, loss_type="sft", sft_async_prepack=True)
+    actor.args = build_relax_args(global_batch_size=8, loss_type="sft", sft_async_prepack=True)
     actor.data_system_client = MagicMock()
     actor.data_system_client.async_get_partition_list.return_value = ["sft_3_shard_0_of_2"]
 
@@ -228,7 +229,7 @@ def test_sft_actor_routes_empty_and_ready_fetches_through_rank_image_resolution(
     )
 
     actor = object.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = Namespace(per_rank_fetch=True, use_rollout_indexer_replay=False)
+    actor.args = build_relax_args(per_rank_fetch=True, use_rollout_indexer_replay=False)
     actor.data_system_client = MagicMock()
     actor.model = MagicMock()
     actor._sft_image_preprocess_on_rank = True
@@ -256,7 +257,7 @@ def test_sft_actor_surfaces_rank_image_resolution_failure(monkeypatch):
     )
 
     actor = object.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = Namespace(per_rank_fetch=True, use_rollout_indexer_replay=False)
+    actor.args = build_relax_args(per_rank_fetch=True, use_rollout_indexer_replay=False)
     actor.data_system_client = MagicMock()
     actor.model = MagicMock()
     actor._sft_image_preprocess_on_rank = True

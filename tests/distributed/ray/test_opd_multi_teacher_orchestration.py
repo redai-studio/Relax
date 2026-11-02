@@ -11,8 +11,9 @@ non-overlapping bundle_offset, and a ``(pg, list[manager])`` return shape.
 
 import json
 import sys
-from argparse import Namespace
 from types import ModuleType
+
+from tests.support.args import build_relax_args
 
 
 def _install_fake_teacher_manager(monkeypatch, captured):
@@ -69,7 +70,9 @@ def _base_args(**overrides):
         resource={"actor": [1, 16], "rollout": [1, 8], "teacher": [1, 8]},
     )
     defaults.update(overrides)
-    return Namespace(**defaults)
+    args = build_relax_args(**{k: v for k, v in defaults.items() if k != "resource"})
+    args.resource = defaults["resource"]
+    return args
 
 
 def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monkeypatch):

@@ -180,13 +180,10 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     length and therefore remains distinct from a sample whose response exists
     but is fully masked.
     """
-    spec = get_algorithm(getattr(args, "advantage_estimator", None) or "grpo")
+    spec = get_algorithm(args.advantage_estimator or "grpo")
     if spec.reward_normalizer != "group_leave_one_out":
         return {}
-    if (
-        getattr(args, "custom_reward_post_process_path", None) is not None
-        or getattr(args, "agentic_custom_advantage_path", None) is not None
-    ):
+    if args.custom_reward_post_process_path is not None or args.agentic_custom_advantage_path is not None:
         # These hooks can replace the advantages consumed by training. Raw
         # rewards are insufficient to reconstruct that custom signal here, so
         # suppress the standard RLOO diagnostics instead of publishing values
@@ -251,7 +248,7 @@ def compute_rollout_reward_metrics(
     reward_values = [sample.get_reward_value(args) for sample in samples if sample.reward is not None]
     log_dict = {"raw_reward": np.mean(reward_values).item()} if reward_values else {}
     reward_metric_values: dict[str, list[float]] = {}
-    primary_reward_key = getattr(args, "reward_key", None)
+    primary_reward_key = args.reward_key
     for sample in samples:
         reward = sample.reward
         if not isinstance(reward, dict):

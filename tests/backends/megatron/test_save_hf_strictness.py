@@ -25,6 +25,7 @@ pytest.importorskip("megatron.bridge")
 
 import relax.utils.hf_export as hf_export  # noqa: E402
 from relax.backends.megatron import model as model_mod  # noqa: E402
+from tests.support.args import build_relax_args  # noqa: E402
 
 
 class _NullCtx:
@@ -63,7 +64,7 @@ def _install_fakes(monkeypatch, recorded):
 
 
 def _args(tmp_path):
-    return SimpleNamespace(
+    return build_relax_args(
         save_hf=str(tmp_path / "hf_out/iter_{rollout_id}"),
         save_hf_dtype="bf16",
         hf_checkpoint="/tmp/fake-hf",
@@ -91,7 +92,7 @@ def test_export_reference_preserves_quantized_rollout_config(tmp_path, save_dtyp
     quantized = {"quantization_config": {"quant_method": "fp8"}}
     (rollout / "config.json").write_text(json.dumps(quantized))
     (original / "config.json").write_text(json.dumps(quantized if quantized_reference else {}))
-    args = SimpleNamespace(hf_checkpoint=str(rollout), ref_load=str(original), save_hf_dtype=save_dtype)
+    args = build_relax_args(hf_checkpoint=str(rollout), ref_load=str(original), save_hf_dtype=save_dtype)
     expected = original if save_dtype == "bf16" and not quantized_reference else rollout
     assert model_mod._hf_export_reference(args) == str(expected)
     assert args.hf_checkpoint == str(rollout)

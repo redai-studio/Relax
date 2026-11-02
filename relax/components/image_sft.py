@@ -21,7 +21,7 @@ class ImageSFT(Base):
         super().__init__()
         self.config, self.role, self.healthy = config, role, healthy
         self._partition_prefix = sft_partition_prefix(config)
-        self.step = getattr(config, "start_rollout_id", 0) or 0
+        self.step = config.start_rollout_id or 0
         self.sampler = ImageBatchSampler(config.i2i_sft_config["dataset_size"], config.global_batch_size, config.seed)
         self.data_system_client = attach_tq_client(config.tq_config, role=role)
         self.client = self.data_system_client
@@ -35,7 +35,7 @@ class ImageSFT(Base):
 
     async def _wait_for_capacity(self) -> None:
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + float(getattr(self.config, "sft_tq_timeout_minutes", None) or 30) * 60
+        deadline = loop.time() + float(self.config.sft_tq_timeout_minutes or 30) * 60
         while not self._stop_event.is_set():
             partitions = await self.client.async_get_partition_list()
             pending = sum(str(part).startswith(self._partition_prefix) for part in (partitions or []))

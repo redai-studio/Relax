@@ -32,6 +32,7 @@ except (ImportError, AssertionError) as _exc:
     pytest.skip(f"relax.backends.megatron.model unavailable: {_exc}", allow_module_level=True)
 
 from relax.utils.quant_cast import fp8_checkpoint as checkpoint_mod  # noqa: E402
+from tests.support.args import build_relax_args  # noqa: E402
 
 
 class _FakeSource:
@@ -135,7 +136,7 @@ class TestSaveHfDtypeValidation:
     def test_fp8_without_save_hf_is_rejected(self):
         from relax.utils.arguments import validate_save_hf_fp8_args
 
-        args = SimpleNamespace(
+        args = build_relax_args(
             save_hf=None,
             save_hf_dtype="fp8",
             save_hf_fp8_quant_mode="block",
@@ -147,7 +148,7 @@ class TestSaveHfDtypeValidation:
     def test_fp8_with_save_hf_and_block_defaults_ok(self):
         from relax.utils.arguments import validate_save_hf_fp8_args
 
-        args = SimpleNamespace(
+        args = build_relax_args(
             save_hf="/tmp/hf_out/iter_{rollout_id}",
             save_hf_dtype="fp8",
             save_hf_fp8_quant_mode="block",
@@ -159,7 +160,7 @@ class TestSaveHfDtypeValidation:
     def test_bf16_default_is_noop(self):
         from relax.utils.arguments import validate_save_hf_fp8_args
 
-        args = SimpleNamespace(
+        args = build_relax_args(
             save_hf=None,
             save_hf_dtype="bf16",
             save_hf_fp8_quant_mode="block",
@@ -171,7 +172,7 @@ class TestSaveHfDtypeValidation:
     def test_tensor_mode_with_block_size_is_rejected(self):
         from relax.utils.arguments import validate_save_hf_fp8_args
 
-        args = SimpleNamespace(
+        args = build_relax_args(
             save_hf="/tmp/out",
             save_hf_dtype="fp8",
             save_hf_fp8_quant_mode="tensor",
@@ -236,7 +237,7 @@ class TestSaveHfModelFp8Branch:
         )
         monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: False)
 
-        args = SimpleNamespace(
+        args = build_relax_args(
             save_hf=str(tmp_path / "hf_out/iter_{rollout_id}"),
             save_hf_dtype="fp8",
             save_hf_fp8_quant_mode="tensor",

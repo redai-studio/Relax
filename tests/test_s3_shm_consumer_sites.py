@@ -16,12 +16,24 @@ import pytest
 from relax.agentic.pipeline import runtime
 from relax.engine.sft.predict import loop as predict_loop
 from relax.utils import s3_model_loader
+from tests.support.args import build_relax_args, declared_parameter_names
 
 
 def _model_source(uri: str, *, enabled: bool = True):
     if not enabled:
         return None
     return s3_model_loader.ModelSource(uri, "http://s3.example")
+
+
+def _relax_config(**overrides):
+    """Fully populated Relax config; undeclared fields are assigned
+    explicitly."""
+    declared = declared_parameter_names()
+    args = build_relax_args(**{k: v for k, v in overrides.items() if k in declared})
+    for k, v in overrides.items():
+        if k not in declared:
+            setattr(args, k, v)
+    return args
 
 
 @pytest.fixture()
@@ -170,7 +182,7 @@ def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch, sft_module):
     fake_cls.from_args = MagicMock(return_value=_FakeDataset())
     monkeypatch.setattr(sft_module, "_load_custom_dataset_class", MagicMock(return_value=fake_cls))
 
-    config = SimpleNamespace(
+    config = _relax_config(
         hf_checkpoint="s3://bkt/sftmodel/",
         model_source=_model_source("s3://bkt/sftmodel/"),
         context_parallel_size=1,
@@ -184,6 +196,10 @@ def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch, sft_module):
         eval_prompt_data=None,
         eval_size=None,
         global_batch_size=1,
+        loss_type="policy_loss",
+        sft_async_prepack=False,
+        sft_invalid_multimodal_strategy="error",
+        task_type="causal_lm",
     )
     obj = _make_sft_instance(config, sft_module)
 
@@ -220,7 +236,7 @@ def test_sft_init_data_pipeline_noop_when_S3_disabled(monkeypatch, sft_module):
     fake_cls.from_args = MagicMock(return_value=_FakeDataset())
     monkeypatch.setattr(sft_module, "_load_custom_dataset_class", MagicMock(return_value=fake_cls))
 
-    config = SimpleNamespace(
+    config = _relax_config(
         hf_checkpoint="s3://bkt/sftmodel/",
         model_source=None,
         context_parallel_size=1,
@@ -234,6 +250,10 @@ def test_sft_init_data_pipeline_noop_when_S3_disabled(monkeypatch, sft_module):
         eval_prompt_data=None,
         eval_size=None,
         global_batch_size=1,
+        loss_type="policy_loss",
+        sft_async_prepack=False,
+        sft_invalid_multimodal_strategy="error",
+        task_type="causal_lm",
     )
     obj = _make_sft_instance(config, sft_module)
 
@@ -277,6 +297,10 @@ def _predict_config(*, enabled: bool):
         tool_key="tools",
         system_prompt=None,
         apply_chat_template_kwargs=None,
+        loss_type="policy_loss",
+        sft_async_prepack=False,
+        sft_invalid_multimodal_strategy="error",
+        task_type="causal_lm",
     )
 
 

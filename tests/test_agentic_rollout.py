@@ -54,6 +54,7 @@ from relax.agentic.session.service import (
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 # ``relax.agentic.rollout`` only needs this logging helper at import time. Keep
@@ -686,7 +687,7 @@ async def test_transfer_preserves_original_sample_refs_and_training_fields() -> 
 
 def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
     adapter = object.__new__(SGLangBackendAdapter)
-    adapter._args = SimpleNamespace(
+    adapter._args = build_relax_args(
         sglang_router_ip="10.0.0.1",
         sglang_router_port=8000,
         use_rollout_routing_replay=False,
@@ -1175,7 +1176,7 @@ async def test_admission_lease_uses_train_prefix_and_releases_after_backend_atte
 
 def _shard_new():
     shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
-    shard.args = SimpleNamespace(fully_async=True, partial_rollout=False)
+    shard.args = build_relax_args(fully_async=True, partial_rollout=False)
     return shard
 
 
@@ -1200,13 +1201,9 @@ def _router_503() -> httpx.HTTPStatusError:
 
 def _router_recovery_shard():
     shard = _shard_new()
-    shard.args = SimpleNamespace(
-        fully_async=True,
-        partial_rollout=False,
-        partial_rollout_max_aborted_count=None,
-        use_slime_router=False,
-        router_cb_timeout_duration_secs=0,
-    )
+    shard.args.partial_rollout_max_aborted_count = None
+    shard.args.use_slime_router = False
+    shard.args.router_cb_timeout_duration_secs = 0
     shard._train_generation_open = True
     shard._state_revision = 0
     shard._state_changed = asyncio.Event()

@@ -125,7 +125,7 @@ def get_responses(
     # this slicer — slicing itself is dtype-agnostic; that caller casts to fp32
     # per sub-chunk. All other paths (RL, SFT legacy logits, SFT eval PPL)
     # produce real fp32 logits and must stay strict.
-    if is_sft_mode(args) and getattr(args, "sft_chunked_logits", False):
+    if is_sft_mode(args) and args.sft_chunked_logits:
         assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
     else:
         assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -234,7 +234,7 @@ def get_responses(
         if (
             apply_temperature
             and args.rollout_temperature != 1.0
-            and not (is_sft_mode(args) and getattr(args, "sft_chunked_logits", False))
+            and not (is_sft_mode(args) and args.sft_chunked_logits)
         ):
             logits_chunk = logits_chunk / args.rollout_temperature
 
@@ -413,7 +413,7 @@ def get_log_probs_and_entropy(
     assert non_loss_data
 
     is_score_centering = (
-        getattr(args, "advantage_estimator", None) is not None
+        args.advantage_estimator is not None
         and get_algorithm(args.advantage_estimator).policy_loss_fn == "score_centering"
     )
     if not is_score_centering:
@@ -438,8 +438,8 @@ def get_log_probs_and_entropy(
             "lm_head_forward chunked path doesn't materialize full vocab — entropy/topk unavailable."
         )
         unfused_wgrad = getattr(lm_head_forward, "_relax_unfused_head_wgrad", False)
-        if getattr(args, "recompute_loss_function", False) and not unfused_wgrad:
-            if not getattr(args, "recompute_loss_function_use_reentrant", True):
+        if args.recompute_loss_function and not unfused_wgrad:
+            if not args.recompute_loss_function_use_reentrant:
                 raise ValueError("Chunked SFT recomputation requires reentrant checkpointing to preserve main_grad")
             if getattr(args, "overlap_grad_reduce", False) and not getattr(
                 lm_head_forward, "_relax_chunked_grad_overlap_safe", False
@@ -447,10 +447,10 @@ def get_log_probs_and_entropy(
                 raise ValueError("Chunked SFT recomputation requires deferred head-bucket sync for gradient overlap")
             if getattr(args, "defer_embedding_wgrad_compute", False):
                 raise ValueError("Chunked SFT recomputation requires deferred embedding wgrad off")
-        sft_chunk_size = getattr(args, "sft_logits_chunk_size", 1024)
+        sft_chunk_size = args.sft_logits_chunk_size
         if sft_chunk_size <= 0:
             sft_chunk_size = 1024
-    resolved_topk_k = topk_k if topk_k is not None else getattr(args, "opd_log_prob_top_k", 0)
+    resolved_topk_k = topk_k if topk_k is not None else args.opd_log_prob_top_k
     tp_group = mpu.get_tensor_model_parallel_group()
 
     def chunk_log_probs(hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -467,7 +467,7 @@ def get_log_probs_and_entropy(
 
     # Keep entropy metrics, but skip saving entropy-backward activations when
     # the entropy term cannot affect the loss.
-    with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
+    with_entropy_grad = with_entropy and args.entropy_coef != 0
     log_probs_list = []
     entropy_list = []
     topk_token_ids_list = []
@@ -536,7 +536,7 @@ def get_log_probs_and_entropy(
                     # recomputes GEMM in backward. An outer checkpoint would
                     # redundantly run another projection before that backward.
                     log_prob_sub = -fused_losses.squeeze(-1)
-                elif getattr(args, "recompute_loss_function", False) and torch.is_grad_enabled():
+                elif args.recompute_loss_function and torch.is_grad_enabled():
                     use_reentrant = not unfused_wgrad
                     h_checkpoint = (
                         h_sub.detach().requires_grad_(True) if use_reentrant and not h_sub.requires_grad else h_sub
@@ -720,9 +720,7 @@ def compute_advantages_and_returns(
     padded_total_lengths: list[int] | None = maybe_padded_total_lengths(
         total_lengths,
         args.qkv_format,
-        getattr(args, "is_vl_model", False)
-        or rollout_data.get("multimodal_train_inputs") is not None
-        or getattr(args, "uses_unsplit_forward", False),
+        args.is_vl_model or rollout_data.get("multimodal_train_inputs") is not None or args.uses_unsplit_forward,
     )
 
     # return when not the last pp stage.
@@ -766,7 +764,7 @@ def compute_advantages_and_returns(
 
     # Optional pure OPD mode: remove all non-OPD reward contribution.
     # This keeps only the OPD KL term injected below.
-    if args.use_opd and getattr(args, "opd_only_reward", False):
+    if args.use_opd and args.opd_only_reward:
         assert isinstance(advantages, list), f"Expected list advantages, got {type(advantages)}"
         assert isinstance(returns, list), f"Expected list returns, got {type(returns)}"
         advantages = [torch.zeros_like(a) for a in advantages]
@@ -783,7 +781,7 @@ def compute_advantages_and_returns(
         # (dynamic_cp_merge_output), so advantages/masks are already full — use cp=1
         # (no zig-zag chunking). The whitening stats are unchanged by the CP-group
         # replication (uniform duplication doesn't move mean/std).
-        cp_size = 1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size()
+        cp_size = 1 if args.dynamic_context_parallel else mpu.get_context_parallel_world_size()
         if cp_size == 1:
             all_masks = torch.cat(loss_masks)
         else:
@@ -1001,7 +999,7 @@ def policy_loss_function(
     if is_token_global:
         sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(sum_of_sample_mean, batch["loss_masks"])
 
-    true_on_policy = getattr(args, "true_on_policy_mode", False)
+    true_on_policy = args.true_on_policy_mode
     # In true on-policy mode, actor_fwd is absent so batch["log_probs"] is missing;
     # old_log_probs is derived inline from this forward (assigned after the pass below).
     if not true_on_policy:
@@ -1192,7 +1190,7 @@ def policy_loss_function(
             )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
-    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+    if args.custom_pg_loss_reducer_function_path is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
         # Determine which loss_masks to use for pg_loss reducer
         pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
@@ -1808,7 +1806,7 @@ def loss_function(
     )
 
     chunked_sft_loss = False
-    if getattr(args, "mtp_only_training", False):
+    if args.mtp_only_training:
         func = mtp_only_loss_function
     else:
         match args.loss_type:
@@ -1821,9 +1819,9 @@ def loss_function(
             case "rm":
                 func = reward_model_loss_function
             case "sft":
-                if getattr(args, "task_type", "causal_lm") == "seq_cls":
+                if args.task_type == "seq_cls":
                     func = sequence_classification_loss_function
-                elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
+                elif args.sft_chunked_logits and lm_head_forward is not None:
                     # Bind lm_head_forward so chunked path matches the standard
                     # inner-func signature; outer body (recompute, CP guard,
                     # Megatron scaling, return-tuple) is then shared with legacy.
@@ -1845,7 +1843,7 @@ def loss_function(
             batch,
             logits,
             sum_of_sample_mean,
-            use_reentrant=getattr(args, "recompute_loss_function_use_reentrant", True),
+            use_reentrant=args.recompute_loss_function_use_reentrant,
         )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
@@ -1853,7 +1851,7 @@ def loss_function(
     # Preserve the pre-registry scalar logging convention: only per-token
     # aggregation compensates for the framework's token denominator.
     if args.calculate_per_token_loss:
-        algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
+        algorithm = ALGORITHM_SPECS.get(args.advantage_estimator)
         if algorithm is not None:
             for key in algorithm.policy_scalar_metric_names:
                 if key in log:
@@ -1903,7 +1901,7 @@ def loss_function(
         # full-count denominator, leaving the final loss/grad unchanged.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
-    is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+    is_sequence_classification = args.task_type == "seq_cls"
     denominator = (
         effective_num_tokens
         if args.calculate_per_token_loss or is_sequence_classification

@@ -152,7 +152,7 @@ class TeacherManager(MultiEngineManager):
         if owns_pg:
             pg_tuple = create_placement_group(
                 num_gpus=self.gpus_per_replica,
-                node_group_affinity=getattr(self.args, "enable_affinity", True),
+                node_group_affinity=self.args.enable_affinity,
             )
         else:
             pg_tuple = self._engine_placements[replica * self.nodes_per_engine][0]

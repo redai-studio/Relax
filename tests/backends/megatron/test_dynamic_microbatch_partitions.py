@@ -7,6 +7,21 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.support.args import build_relax_args
+
+
+_KNOWN = frozenset(vars(build_relax_args()))
+
+
+def _args(**kw):
+    """Fully populated parameter object; Megatron-owned fields are passed
+    through explicitly."""
+    extra = {k: kw.pop(k) for k in list(kw) if k not in _KNOWN}
+    args = build_relax_args(**kw)
+    for name, value in extra.items():
+        setattr(args, name, value)
+    return args
+
 
 @pytest.fixture
 def partitioner():
@@ -102,7 +117,7 @@ def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner
     module = ast.Module(body=[ast.parse("from __future__ import annotations").body[0], *nodes], type_ignores=[])
     exec(compile(module, "data.py", "exec"), namespace)
     # With CP4, raw lengths fit one 48-token pack, but physical lengths are 32+32.
-    args = SimpleNamespace(
+    args = _args(
         global_batch_size=2,
         use_dynamic_batch_size=True,
         max_tokens_per_gpu=12 if cp_size > 1 else 48,
@@ -174,7 +189,7 @@ def test_iterator_uses_selected_packing_and_dp_aligned_count(partitioner, strate
         namespace,
     )
     lengths = [4, 3, 5, 5, 11, 14, 12, 14, 14, 15, 6, 2]
-    args = SimpleNamespace(
+    args = _args(
         global_batch_size=12,
         use_dynamic_batch_size=True,
         max_tokens_per_gpu=20,

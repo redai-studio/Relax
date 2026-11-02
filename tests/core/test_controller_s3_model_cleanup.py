@@ -8,6 +8,7 @@ import pytest
 import transfer_queue
 
 from tests.core.controller_test_utils import load_controller_with_stubbed_dependencies
+from tests.support.args import build_relax_args
 
 
 if not hasattr(transfer_queue, "StreamingTokenBudgetSampler"):
@@ -80,7 +81,8 @@ class _FakeCleanupTask:
 
 def test_controller_s3_cleanup_runs_once_on_each_alive_node(monkeypatch):
     monkeypatch.setenv("RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S", "17.5")
-    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
+    config = build_relax_args(disable_s3_model_cleanup=False)
+    config.model_source = SimpleNamespace(uri="s3://bucket/model/")
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
     instance.serve_dict = {}
@@ -117,12 +119,8 @@ def test_controller_s3_cleanup_runs_once_on_each_alive_node(monkeypatch):
 
 
 def test_controller_s3_cleanup_skips_shm_backed_rollout():
-    config = SimpleNamespace(
-        model_source=SimpleNamespace(),
-        sglang_load_format="auto",
-        rollout_external=False,
-        sglang_config=None,
-    )
+    config = build_relax_args(sglang_load_format="auto", rollout_external=False, sglang_config=None)
+    config.model_source = SimpleNamespace()
 
     assert not controller._can_cleanup_s3_model_weights(config, {"rollout": object()})
     config.sglang_load_format = "dummy"
@@ -142,12 +140,8 @@ def test_controller_s3_cleanup_skips_shm_backed_rollout():
 
 
 def test_controller_s3_cleanup_without_rollout_is_safe():
-    config = SimpleNamespace(
-        model_source=SimpleNamespace(),
-        sglang_load_format="auto",
-        rollout_external=False,
-        sglang_config=None,
-    )
+    config = build_relax_args(sglang_load_format="auto", rollout_external=False, sglang_config=None)
+    config.model_source = SimpleNamespace()
 
     assert controller._can_cleanup_s3_model_weights(config, {"actor": object()})
 
@@ -178,7 +172,8 @@ def test_controller_s3_cleanup_requires_model_source():
 
 def test_controller_s3_cleanup_timeout_cancels_pending_tasks(monkeypatch):
     monkeypatch.setenv("RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S", "2.5")
-    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
+    config = build_relax_args(disable_s3_model_cleanup=False)
+    config.model_source = SimpleNamespace(uri="s3://bucket/model/")
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
     instance.serve_dict = {}
@@ -210,7 +205,8 @@ def test_controller_s3_cleanup_timeout_cancels_pending_tasks(monkeypatch):
 
 
 def test_controller_s3_cleanup_timeout_raises_when_cancel_remains_pending(monkeypatch):
-    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
+    config = build_relax_args(disable_s3_model_cleanup=False)
+    config.model_source = SimpleNamespace(uri="s3://bucket/model/")
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
     instance.serve_dict = {}
@@ -231,7 +227,8 @@ def test_controller_s3_cleanup_timeout_raises_when_cancel_remains_pending(monkey
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_controller_s3_cleanup_rejects_non_positive_task_timeout(monkeypatch, value):
     monkeypatch.setenv("RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S", value)
-    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
+    config = build_relax_args(disable_s3_model_cleanup=False)
+    config.model_source = SimpleNamespace(uri="s3://bucket/model/")
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
     instance.serve_dict = {}

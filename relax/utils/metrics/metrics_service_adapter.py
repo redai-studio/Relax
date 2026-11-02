@@ -35,7 +35,7 @@ class MetricsServiceAdapter:
             )
 
         # Check if timeline tracing is enabled
-        self._timeline_enabled = getattr(args, "timeline_dump_dir", None) is not None
+        self._timeline_enabled = args.timeline_dump_dir is not None
         if self._timeline_enabled:
             logger.info(f"MetricsServiceAdapter: Timeline tracing enabled, dump dir: {args.timeline_dump_dir}")
 

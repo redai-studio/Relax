@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from types import SimpleNamespace
 
 import pytest
 
 from relax.utils.metrics.metric_utils import compute_rollout_stop_reason_and_turn_metrics
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 def _sample(*, stop_reason=None, turns=None):
@@ -136,7 +136,12 @@ def test_compute_metrics_from_samples_reports_agentic_metrics():
         ),
     ]
 
-    args = SimpleNamespace(log_reward_category=None, reward_key=None, log_passrate=False, advantage_estimator="ppo")
+    args = build_relax_args(
+        log_reward_category=None,
+        reward_key=None,
+        log_passrate=False,
+        advantage_estimator="ppo",
+    )
     metrics = rollout_module.compute_metrics_from_samples(args, samples)
 
     assert metrics["stop_reason/env_done/count"] == 1

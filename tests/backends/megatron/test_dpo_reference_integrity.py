@@ -6,7 +6,6 @@ import ast
 import json
 import os
 import types
-from argparse import Namespace
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock
@@ -24,6 +23,7 @@ from relax.backends.megatron.reference_integrity import (
 from relax.engine.sft.runtime import is_dpo_mode
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.training import tensor_backper
+from tests.support.args import build_relax_args
 
 
 def test_megatron_resume_detection_ignores_fresh_output_directory(tmp_path):
@@ -165,17 +165,19 @@ def test_reference_rebuild_preserves_actor_and_optimizer(
         if source == "iteration":
             reference_path = iteration_dir
     instance = actor_type()
-    instance.args = Namespace(
+    args = build_relax_args(
         load=str(tmp_path / "actor-checkpoint"),
         hf_checkpoint=str(reference_path),
-        ckpt_step=123,
         ref_ckpt_step=ref_ckpt_step,
-        non_persistent_ckpt_type="global",
-        no_load_optim=False,
-        no_load_rng=False,
-        finetune=False,
         megatron_to_hf_mode="bridge",
     )
+    # Megatron-owned checkpoint switches the shared builder does not declare.
+    args.ckpt_step = 123
+    args.non_persistent_ckpt_type = "global"
+    args.no_load_optim = False
+    args.no_load_rng = False
+    args.finetune = False
+    instance.args = args
     original_args = vars(instance.args).copy()
     instance.model = [object()]
     instance.optimizer = optimizer
@@ -276,15 +278,16 @@ def test_reference_rebuild_rejects_missing_or_ambiguous_checkpoint(tmp_path, ref
         (iteration_dir / "common.pt").write_bytes(b"reference checkpoint")
         error = "Megatron cannot select this reference step"
     instance = actor_type()
-    instance.args = Namespace(
+    args = build_relax_args(
         load=str(tmp_path / "actor-checkpoint"),
-        ckpt_step=123,
         ref_ckpt_step=ref_ckpt_step,
-        non_persistent_ckpt_type="global",
-        no_load_optim=False,
-        no_load_rng=False,
-        finetune=False,
     )
+    args.ckpt_step = 123
+    args.non_persistent_ckpt_type = "global"
+    args.no_load_optim = False
+    args.no_load_rng = False
+    args.finetune = False
+    instance.args = args
     original_args = vars(instance.args).copy()
     instance.model = [object()]
     instance._active_model_tag = "actor"
@@ -302,7 +305,7 @@ def test_reference_rebuild_rejects_missing_or_ambiguous_checkpoint(tmp_path, ref
 def test_save_model_persists_reference_identity(tmp_path, reference_actor_methods):
     actor_type, namespace = reference_actor_methods
     instance = actor_type()
-    instance.args = Namespace(
+    args = build_relax_args(
         loss_type="dpo",
         dpo_reference_free=False,
         debug_rollout_only=False,
@@ -311,6 +314,8 @@ def test_save_model_persists_reference_identity(tmp_path, reference_actor_method
         save=str(tmp_path),
         save_hf=None,
     )
+    args.save_lora_only = False
+    instance.args = args
     instance.role = "actor"
     instance.model = [object()]
     instance.optimizer = instance.opt_param_scheduler = None

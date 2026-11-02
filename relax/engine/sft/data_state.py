@@ -55,7 +55,7 @@ def _state_path(root: str, step: int) -> Path:
 def restore_data_state(config: Any, dataset: Any, step: int, size: int) -> None:
     """Select the exact checkpoint boundary; future prefetched states are
     ignored."""
-    root = getattr(config, "load", None)
+    root = config.load
     path = _state_path(root, step) if root and step else None
     if path is not None and path.exists():
         state = json.loads(path.read_text())
@@ -94,7 +94,7 @@ def restore_data_state(config: Any, dataset: Any, step: int, size: int) -> None:
 def save_data_state(config: Any, dataset: Any, next_step: int, size: int, samples: list[Any]) -> None:
     """Write before publishing a batch, so a model save always has its
     boundary."""
-    root = getattr(config, "save", None)
+    root = config.save
     if not root:
         return
     ids_hash = hashlib.sha256(json.dumps([sample.source_idx for sample in samples]).encode()).hexdigest()

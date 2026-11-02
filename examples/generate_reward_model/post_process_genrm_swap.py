@@ -162,7 +162,7 @@ def custom_reward_post_process(args, samples):
     finally:
         ray.get(genrm.offload.remote())
 
-    reward_key = getattr(args, "reward_key", None)
+    reward_key = args.reward_key
     for sample, score in zip(flat_samples, raw_rewards, strict=True):
         sample.reward = {reward_key: score} if reward_key else score
 

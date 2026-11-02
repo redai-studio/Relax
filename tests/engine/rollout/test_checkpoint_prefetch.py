@@ -3,7 +3,6 @@
 memory."""
 
 import asyncio
-from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,6 +10,7 @@ import pytest
 
 from relax.engine.rollout.data_source import RolloutDataSource
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 try:
@@ -24,7 +24,7 @@ except ModuleNotFoundError as exc:
 @pytest.mark.parametrize("interval,rotate,total", [(3, False, 5), (10, False, 3), (10, True, 5)])
 @pytest.mark.parametrize("dataset_size", [10, 100])
 def test_resume_reads_next_unconsumed_group(monkeypatch, tmp_path, interval, rotate, total, dataset_size):
-    args = Namespace(
+    args = build_relax_args(
         rollout_global_dataset=False,
         save=str(tmp_path),
         load=str(tmp_path),

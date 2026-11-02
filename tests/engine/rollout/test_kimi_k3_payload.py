@@ -7,6 +7,7 @@ import pytest
 
 from relax.utils.data import kimi_k3
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 class Tokenizer:
@@ -73,7 +74,7 @@ def test_generate_keeps_training_ids_separate_and_resumes_rollout_ids(monkeypatc
     monkeypatch.setattr(rollout, "_run_image_processor", processor)
     monkeypatch.setattr(rollout, "_encode_multimodal_inputs", encode)
     monkeypatch.setattr(rollout, "post", post)
-    args = SimpleNamespace(
+    args = build_relax_args(
         ci_test=False,
         fully_async=False,
         sglang_router_ip="localhost",

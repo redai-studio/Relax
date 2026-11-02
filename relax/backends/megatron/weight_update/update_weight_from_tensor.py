@@ -85,7 +85,7 @@ class UpdateWeightFromTensor:
         # shared LoraAdapterSync helper; the backend keeps only its in-memory transport below.
         self._lora_sync = LoraAdapterSync(args, model) if self.lora_adapter_mode else None
 
-        self._route_experts = getattr(args, "colocate_expert_weight_routing", False)
+        self._route_experts = args.colocate_expert_weight_routing
         self._expert_routing_placement = None
         self._expert_routing_group = None
         if self._route_experts and (
@@ -94,7 +94,7 @@ class UpdateWeightFromTensor:
             or "kimik3" not in model_name.lower().replace("_", "").replace("-", "")
             or self.lora_enabled
             or (quantization_config or {}).get("format") != "mxfp4-pack-quantized"
-            or getattr(args, "rollout_external", False)
+            or args.rollout_external
         ):
             raise ValueError("Expert routing supports only colocated Kimi K3 MXFP4 Bridge full-parameter training")
 

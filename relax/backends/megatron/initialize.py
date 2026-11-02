@@ -39,7 +39,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     extra_args = dict()
-    if getattr(args, "dynamic_context_parallel", False):
+    if args.dynamic_context_parallel:
         extra_args["dynamic_context_parallel"] = True
     mpu.initialize_model_parallel(
         args.tensor_model_parallel_size,
@@ -137,7 +137,7 @@ def init(args):
 
         _initialize_tp_communicators()
 
-    if getattr(args, "custom_megatron_init_path", None):
+    if args.custom_megatron_init_path:
         from relax.utils.misc import load_function
 
         custom_init = load_function(args.custom_megatron_init_path)

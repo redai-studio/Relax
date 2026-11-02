@@ -3,14 +3,15 @@
 """SFT-mode train() must request a smaller data_fields list and use sft_*
 partition naming."""
 
-from argparse import Namespace
-
 import pytest
 import torch
 
+from tests.support.args import build_relax_args
+
 
 def _mk_actor_args(loss_type: str):
-    return Namespace(
+    # Declare only the diff this case cares about; the other fields come from the declarations.
+    return build_relax_args(
         loss_type=loss_type,
         compute_advantages_and_returns=(loss_type not in {"sft", "dpo", "rm"}),
         debug_train_only=False,
@@ -65,6 +66,7 @@ def test_preference_data_fields_keep_pairs_atomic(loss_type):
 
 def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypatch):
     pytest.importorskip("megatron.core")
+    pytest.importorskip("megatron.training")
     from relax.utils.data import stream_dataloader
 
     rollout_data = {
@@ -76,7 +78,13 @@ def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypat
         "chosen_total_lengths": [3],
         "rejected_total_lengths": [2],
     }
-    args = Namespace(qkv_format="thd", is_vl_model=False, uses_unsplit_forward=False, use_opd=False)
+    args = build_relax_args()
+    # qkv_format / is_vl_model / uses_unsplit_forward are Megatron-parser
+    # fields, not Relax parameters: assign them explicitly after construction.
+    args.qkv_format = "thd"
+    args.is_vl_model = False
+    args.uses_unsplit_forward = False
+    args.use_opd = False
     monkeypatch.setattr(stream_dataloader.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
 
     stream_dataloader.post_process_rollout_data(args, rollout_data)

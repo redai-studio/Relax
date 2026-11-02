@@ -93,7 +93,7 @@ class ActorFwd(Base):
             error_msg = f"{self.role} failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
             self.healthy.report_error.remote(self.role, error_msg)
-            if not getattr(self.config, "use_health_check", False):
+            if not self.config.use_health_check:
                 raise
 
     async def stop(self) -> None:

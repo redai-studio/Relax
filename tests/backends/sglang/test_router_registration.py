@@ -10,6 +10,13 @@ import pytest
 from requests import ConnectTimeout, ReadTimeout
 
 from relax.utils.http_utils import router_worker_base_url
+from tests.support.args import build_relax_args
+
+
+# Warm the shared defaults cache at import (collection) time: the fixture below
+# swaps sys.modules stubs such as relax.utils.http_utils, which would break the
+# lazy relax imports that build_relax_args performs on its first call.
+build_relax_args()
 
 
 @pytest.fixture()
@@ -148,7 +155,9 @@ class _Clock:
 
 def _make_engine(sglang_engine_module):
     engine = sglang_engine_module.SGLangEngine.__new__(sglang_engine_module.SGLangEngine)
-    engine.args = SimpleNamespace(use_slime_router=False)
+    # sglang_-prefixed declarations come from the sglang sub-parser, invisible to
+    # CPU CI without sglang; the builder requires their values to be given here.
+    engine.args = build_relax_args(use_slime_router=False, sglang_external_model_package=None)
     engine.node_rank = 0
     engine.worker_type = "regular"
     engine.router_ip = "router"

@@ -1,10 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import math
-from argparse import Namespace
 from unittest.mock import Mock
 
 from relax.utils.training import train_metric_utils
+from tests.support.args import build_relax_args
 
 
 class FakeTimer:
@@ -38,7 +38,7 @@ def _collect_perf_metrics(monkeypatch, peak_tflops):
         lambda _args, metrics, step_key: logged_metrics.update(metrics),
     )
 
-    args = Namespace(wandb_always_use_train_step=False)
+    args = build_relax_args(wandb_always_use_train_step=False)
     train_metric_utils.log_perf_data_raw(
         rollout_id=3,
         args=args,

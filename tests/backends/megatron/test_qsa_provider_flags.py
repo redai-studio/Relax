@@ -23,8 +23,8 @@ def test_bridge_forwards_qsa_force_sparse(force_sparse):
             if ast.unparse(node.iter) == "vars(provider)":
                 statements["override_loop"] = node
     namespace = {
-        "args": SimpleNamespace(qsa_force_sparse=force_sparse),
-        "provider": SimpleNamespace(qsa_force_sparse=not force_sparse),
+        "args": SimpleNamespace(qsa_force_sparse=force_sparse, dynamic_context_parallel=False),
+        "provider": SimpleNamespace(qsa_force_sparse=not force_sparse, dynamic_context_parallel=False),
         "logger": Mock(),
         "is_kimi_k3": False,
     }

@@ -12,6 +12,7 @@ import torch
 
 from relax.engine.rollout import native_generation as ng
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 def test_group_sidecar_write_and_hydrate_round_trip(tmp_path):
@@ -130,7 +131,7 @@ def _sample(group_index, slot, policy_version, reward):
 
 
 def test_convert_samples_to_train_data_numeric_row_only():
-    args = SimpleNamespace(
+    args = build_relax_args(
         debug_train_only=True,
         custom_reward_post_process_path=None,
         reward_key=None,
@@ -167,7 +168,7 @@ def test_convert_samples_to_train_data_numeric_row_only():
 
 
 def test_convert_samples_to_train_data_uses_normalized_advantages():
-    args = SimpleNamespace(
+    args = build_relax_args(
         debug_train_only=True,
         custom_reward_post_process_path=None,
         reward_key=None,
@@ -187,7 +188,7 @@ def test_convert_samples_to_train_data_accepts_processed_rewards(monkeypatch):
     from relax.utils import utils
 
     monkeypatch.setattr(utils, "post_process_rewards", lambda _args, _samples: [-1.0, 1.0])
-    args = SimpleNamespace(debug_train_only=True)
+    args = build_relax_args(debug_train_only=True)
     samples = [_sample(0, 0, 7, 1.0), _sample(0, 1, 7, 3.0)]
 
     row = ng.convert_samples_to_train_data(args, samples)
@@ -327,7 +328,7 @@ def _write_two_groups(tmp_path, group_size=4, shared_conditions=False):
         "advantages": torch.tensor([g * 100 + s for g in (0, 1) for s in range(group_size)]).float(),
         "skip_optimizer_step": torch.zeros(2 * group_size, dtype=torch.long),
     }
-    args = SimpleNamespace(artifact_root=str(tmp_path), generation_task="t2i")
+    args = build_relax_args(artifact_root=str(tmp_path), generation_task="t2i", micro_batch_size=0)
     return args, rows
 
 

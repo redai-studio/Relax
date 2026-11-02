@@ -10,7 +10,9 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from relax.algorithms import get_algorithm
 from relax.utils.env import Envs
+from tests.support.args import build_relax_args
 
 
 @pytest.fixture
@@ -31,6 +33,8 @@ def loss_fn():
     namespace = {
         "torch": torch,
         "Envs": Envs,
+        # The extracted function body references loss.py's top-level get_algorithm directly.
+        "get_algorithm": get_algorithm,
         "ce_implementation": lambda branch: "native",
         "checkpoint": checkpoint,
         "mpu": SimpleNamespace(get_tensor_model_parallel_group=lambda: None),
@@ -55,7 +59,7 @@ def test_chunk_checkpoint_loss_and_gradients(loss_fn, chunk, frozen, temperature
     for recompute in (False, True):
         h = hidden.clone().requires_grad_(not frozen)
         w = weight.clone().requires_grad_()
-        args = SimpleNamespace(
+        args = build_relax_args(
             sft_logits_chunk_size=chunk,
             recompute_loss_function=recompute,
             rollout_temperature=temperature,
@@ -91,7 +95,7 @@ def test_checkpoint_does_not_retain_vocab_tensors(loss_fn):
         saved.append(tuple(x.shape))
         return x
 
-    args = SimpleNamespace(
+    args = build_relax_args(
         sft_logits_chunk_size=4, recompute_loss_function=True, rollout_temperature=1.0, allgather_cp=False
     )
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda x: x):

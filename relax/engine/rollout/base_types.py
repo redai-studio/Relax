@@ -31,7 +31,7 @@ def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):
     # (ReloadScope.IMMEDIATE per reload_utils.py:180) to support hot-swap.
     if not evaluation and isinstance(output, RolloutFnTrainOutput):
         train_args = args[0] if args else kwargs.get("args")
-        filter_path = getattr(train_args, "rollout_sample_filter_path", None)
+        filter_path = train_args.rollout_sample_filter_path
         if filter_path:
             load_function(filter_path)(train_args, output.samples)
 

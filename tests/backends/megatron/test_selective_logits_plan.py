@@ -1,17 +1,16 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from argparse import Namespace
-
 import pytest
 import torch
 
 from relax.backends.megatron.selective_logits import prepare_selective_logits
+from tests.support.args import build_relax_args
 
 
 def test_main_selection_preserves_weights_and_empty_rows():
     masks = [torch.tensor([0.0, 0.5, 0.0, 1.0]), torch.zeros(2)]
     batch = {"loss_masks": masks, "full_loss_masks": torch.cat(masks)[None]}
-    prepare_selective_logits(batch, Namespace(enable_mtp_training=False))
+    prepare_selective_logits(batch, build_relax_args(enable_mtp_training=False))
     assert [n for n, _ in batch["selective_logit_rows"]] == [4, 2]
     assert batch["selective_logit_rows"][0][1].tolist() == [1, 3]
     assert batch["selective_logit_rows"][1][1].numel() == 0
@@ -34,7 +33,7 @@ def test_mtp_plan_respects_document_and_physical_padding():
         "full_loss_masks": torch.tensor([[0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0]]),
         "packed_seq_params": packed,
     }
-    prepare_selective_logits(batch, Namespace(enable_mtp_training=True, mtp_num_layers=2))
+    prepare_selective_logits(batch, build_relax_args(enable_mtp_training=True, mtp_num_layers=2))
     assert [x.tolist() for x in packed.relax_sft_selective_mtp_rows] == [[0, 1, 5, 6], [0, 4, 5]]
     mapped = move_tensors_to_device(batch, torch.device("cpu"))["packed_seq_params"]
     assert mapped is not packed
@@ -62,17 +61,18 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
     from relax.utils.data import stream_dataloader
 
     monkeypatch.setenv("RELAX_SFT_SELECTIVE_LOGITS", "1")
-    args = Namespace(
+    args = build_relax_args(
         loss_type="sft",
         qkv_format="thd",
         sft_chunked_logits=True,
         enable_mtp_training=True,
         mtp_num_layers=2,
         allgather_cp=allgather_cp,
-        pipeline_model_parallel_size=4,
         is_vl_model=case == "vl_text_only",
         use_opd=False,
     )
+    # Field declared by the Megatron parser and read-only for Relax.
+    args.pipeline_model_parallel_size = 4
     monkeypatch.setattr(data, "get_args", lambda: args)
     monkeypatch.setattr(data.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(data.mpu, "get_context_parallel_rank", lambda: 0)

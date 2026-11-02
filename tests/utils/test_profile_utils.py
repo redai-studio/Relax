@@ -2,17 +2,17 @@
 
 import gzip
 import json
-from argparse import Namespace
 from unittest.mock import Mock
 
 import pytest
 
 from relax.utils import profile_utils
+from tests.support.args import build_relax_args
 
 
 @pytest.mark.parametrize("rank,selected", [(0, True), (48, True), (1, False)])
 def test_train_profiler_honors_rank_selection(monkeypatch, rank, selected):
-    args = Namespace(
+    args = build_relax_args(
         profile_ranks=[0, 48],
         use_pytorch_profiler=True,
         record_memory_history=True,
@@ -41,9 +41,10 @@ def test_train_profiler_honors_rank_selection(monkeypatch, rank, selected):
 
 
 def test_train_profiler_without_rank_filter_preserves_legacy_behavior(monkeypatch):
+    # The declared default is [] (matching MCore's ProfilingConfig), so "no rank filtering" needs an explicit None.
     get_rank = Mock(side_effect=AssertionError("No distributed state is needed without a rank filter"))
     monkeypatch.setattr(profile_utils.torch.distributed, "get_rank", get_rank)
-    assert profile_utils._should_profile_train_rank(Namespace())
+    assert profile_utils._should_profile_train_rank(build_relax_args(profile_ranks=None))
     get_rank.assert_not_called()
 
 
@@ -69,7 +70,7 @@ def test_train_profiler_exports_python_operator_call_stacks(monkeypatch, tmp_pat
     monkeypatch.setattr(torch.profiler, "profile", cpu_profile)
     monkeypatch.setattr(profile_utils, "_get_rank_tag", lambda: "rank0_dp0_tp0_pp0")
     monkeypatch.setattr(profile_utils, "_get_train_trace_dir", lambda args: str(tmp_path))
-    args = Namespace(
+    args = build_relax_args(
         profile_step_start=0,
         profile_step_end=0,
         profile_with_stack=True,

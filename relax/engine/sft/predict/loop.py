@@ -96,11 +96,11 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
 
     prepare_model_maybe_update_args(config, completeness="metadata")
     tokenizer = AutoTokenizer.from_pretrained(config.hf_checkpoint, trust_remote_code=True)
-    cp_size = max(1, getattr(config, "context_parallel_size", 1) or 1)
+    cp_size = max(1, config.context_parallel_size or 1)
     capacity = config.max_tokens_per_gpu * cp_size
-    seed = getattr(config, "seed", 42)
-    eval_prompt_data = build_named_prompt_data_configs(getattr(config, "eval_prompt_data", None))
-    eval_size_arg = getattr(config, "eval_size", None)
+    seed = config.seed
+    eval_prompt_data = build_named_prompt_data_configs(config.eval_prompt_data)
+    eval_size_arg = config.eval_size
 
     if eval_size_arg is not None:
         dataset = SFTStreamingDataset(
@@ -111,7 +111,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             prompt_key=config.input_key,
             label_key=config.label_key,
             multimodal_keys=config.multimodal_keys,
-            conversation_key_map=getattr(config, "conversation_key_map", None),
+            conversation_key_map=config.conversation_key_map,
             metadata_key=config.metadata_key,
             tool_key=config.tool_key,
             system_prompt=config.system_prompt,
@@ -119,15 +119,15 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
-            invalid_multimodal_strategy=getattr(config, "sft_invalid_multimodal_strategy", "error"),
-            apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
+            invalid_multimodal_strategy=config.sft_invalid_multimodal_strategy,
+            apply_chat_template_kwargs=config.apply_chat_template_kwargs,
         )
         n_avail = len(dataset)
         _, eval_indices = resolve_sft_split_indices(n_avail, eval_size_arg, seed)
     elif eval_prompt_data:
-        eval_input_key = getattr(config, "eval_input_key", None) or config.input_key
-        eval_label_key = getattr(config, "eval_label_key", None) or config.label_key
-        eval_tool_key = getattr(config, "eval_tool_key", None) or config.tool_key
+        eval_input_key = config.eval_input_key or config.input_key
+        eval_label_key = config.eval_label_key or config.label_key
+        eval_tool_key = config.eval_tool_key or config.tool_key
         dataset = SFTStreamingDataset(
             path=[d.path for d in eval_prompt_data],
             tokenizer=tokenizer,
@@ -136,7 +136,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             prompt_key=eval_input_key,
             label_key=eval_label_key,
             multimodal_keys=config.multimodal_keys,
-            conversation_key_map=getattr(config, "conversation_key_map", None),
+            conversation_key_map=config.conversation_key_map,
             metadata_key=config.metadata_key,
             tool_key=eval_tool_key,
             system_prompt=config.system_prompt,
@@ -145,8 +145,8 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
-            invalid_multimodal_strategy=getattr(config, "sft_invalid_multimodal_strategy", "error"),
-            apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
+            invalid_multimodal_strategy=config.sft_invalid_multimodal_strategy,
+            apply_chat_template_kwargs=config.apply_chat_template_kwargs,
         )
         eval_indices = tuple(range(len(dataset)))
     else:
@@ -223,7 +223,7 @@ async def run_predict_loop(rollout_manager, config, train_step: int) -> None:
     rollout manager must already have KV/cuda-graph onloaded; the caller
     (``RolloutManager.run_predict``) handles onload/offload coordination.
     """
-    assert getattr(config, "save", None), "run_predict_loop requires config.save"
+    assert config.save, "run_predict_loop requires config.save"
     out_path = Path(config.save) / "predict" / f"predictions_step_{train_step}.jsonl"
 
     prompts_and_refs = render_eval_prompts(config)

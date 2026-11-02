@@ -1,10 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
+from tests.support.args import build_relax_args
 
 
 pytest.importorskip("megatron.core", exc_type=ImportError)
@@ -39,14 +40,15 @@ def test_train_one_step_releases_cache_before_optimizer_collectives(monkeypatch,
     from relax.backends.megatron import model as module
 
     events = []
-    args = Namespace(
-        empty_unused_memory_level=level,
+    args = build_relax_args(
         custom_megatron_before_train_step_hook_path=None,
         ci_test=False,
         seq_length=8,
         micro_batch_size=1,
-        decoder_seq_length=None,
     )
+    # Fields declared by Megatron and read-only for Relax.
+    args.empty_unused_memory_level = level
+    args.decoder_seq_length = None
     monkeypatch.setattr(module, "get_args", lambda: args)
     monkeypatch.setattr(module.capture_hooks, "begin_step_for", Mock())
     monkeypatch.setattr(module.capture_hooks, "end_step_for", Mock())

@@ -202,6 +202,7 @@ def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
     engine.server_host = "engine-b"
     engine.server_port = 30000
     engine.args = SimpleNamespace(fully_async=True, coordinator_url="http://coordinator")
+    engine.args.scale_weight_sync_precheck = False
     create_client = AsyncMock()
     monkeypatch.setattr(sglang_engine, "create_client", create_client)
     monkeypatch.setattr(sglang_engine, "run", asyncio.run)

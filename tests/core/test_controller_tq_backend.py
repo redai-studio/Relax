@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests.core.test_controller_s3_model_cleanup import controller
+from tests.support.args import build_relax_args
 from tests.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
 
 
@@ -20,7 +21,7 @@ arguments_module = _arguments_module_fixture
 _MASTER = "master.invalid:50051"
 
 
-def _config(**overrides: Any) -> SimpleNamespace:
+def _config(**overrides: Any) -> argparse.Namespace:
     values = {
         "tq_rdma_mode": "auto",
         "tq_rdma_device": "",
@@ -32,7 +33,7 @@ def _config(**overrides: Any) -> SimpleNamespace:
         "max_staleness": 0,
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return build_relax_args(**values)
 
 
 def _resolve(config: SimpleNamespace) -> dict[str, Any]:
@@ -117,9 +118,11 @@ def test_invalid_config_fails_before_preconditions(monkeypatch: pytest.MonkeyPat
 
 def test_missing_mode_defaults_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
     harness = _DecisionHarness(monkeypatch, None)
-    config = _config()
-    del config.tq_rdma_mode
-    assert _is_simple(_resolve(config))
+    # PR #521 reads config fields directly, so a field can never be absent on a
+    # production parse; the "defaults to off" contract now comes from the
+    # declared default itself.
+    assert build_relax_args().tq_rdma_mode == "off"
+    assert _is_simple(_resolve(_config(tq_rdma_mode="off")))
     assert harness.calls == []
 
 
@@ -375,7 +378,7 @@ def test_constructor_and_repeated_cleanup_preserve_owner_boundary(monkeypatch: p
     monkeypatch.setattr(controller.Controller, "_initialize_data_system", fail_init)
     monkeypatch.setattr(controller.Controller, "_close_data_system", close)
     with pytest.raises(RuntimeError, match="initialization failed"):
-        controller.Controller(SimpleNamespace(use_health_check=False, max_global_restart=3))
+        controller.Controller(build_relax_args(use_health_check=False, max_global_restart=3))
     assert events == ["owner"]
 
     monkeypatch.setattr(controller.Controller, "_close_data_system", close_data_system)

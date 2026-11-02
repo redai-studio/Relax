@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from relax.core.service import Service, _require_node_group_markers, create_placement_group
+from tests.support.args import build_relax_args
 
 
 def test_missing_markers_raise_after_retries():
@@ -241,7 +242,7 @@ def test_sft_data_node_affinity_is_role_specific_and_preserves_resources(monkeyp
     monkeypatch.setenv("RELAX_SFT_DATA_NODE_IP", "10.0.0.1")
     service = object.__new__(Service)
     service.cls = MagicMock()
-    service.config = Namespace()
+    service.config = build_relax_args()
     service.runtime_env = None
     service.healthy = MagicMock()
     service.num_gpus = 0

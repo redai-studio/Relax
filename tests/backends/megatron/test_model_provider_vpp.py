@@ -7,6 +7,13 @@ import pytest
 import torch
 
 from relax.utils.training import ppo_utils
+from tests.support.args import build_relax_args, declared_parameter_names
+
+
+# Warm the shared defaults cache at import (collection) time: _install_fake_megatron
+# swaps sys.modules entries such as relax.utils.misc, which would break the lazy
+# relax imports that build_relax_args performs on its first call.
+declared_parameter_names()
 
 
 class _FakeProvider:
@@ -58,6 +65,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     transformer = types.ModuleType("megatron.core.transformer")
     spec_utils = types.ModuleType("megatron.core.transformer.spec_utils")
     transformer_config = types.ModuleType("megatron.core.transformer.transformer_config")
+    multi_token_prediction = types.ModuleType("megatron.core.transformer.multi_token_prediction")
     training = types.ModuleType("megatron.training")
     arguments = types.ModuleType("megatron.training.arguments")
     tokenizer_package = types.ModuleType("megatron.training.tokenizer")
@@ -70,6 +78,11 @@ def _install_fake_megatron(monkeypatch, provider=None):
 
     class _FakeTransformerConfig:
         pass
+
+    class _FakeMultiTokenPredictionBlock:
+        pass
+
+    multi_token_prediction.MultiTokenPredictionBlock = _FakeMultiTokenPredictionBlock
 
     class _FakeAutoBridge:
         @classmethod
@@ -112,6 +125,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
         "megatron.core.transformer": transformer,
         "megatron.core.transformer.spec_utils": spec_utils,
         "megatron.core.transformer.transformer_config": transformer_config,
+        "megatron.core.transformer.multi_token_prediction": multi_token_prediction,
         "megatron.training": training,
         "megatron.training.arguments": arguments,
         "megatron.training.tokenizer": tokenizer_package,
@@ -134,52 +148,71 @@ def _load_model_provider(monkeypatch, provider=None):
     return module, provider
 
 
+# Fields declared by Megatron and read-only for Relax: the shared builder does
+# not manage these; the bridge provider path reads them directly. Values mirror
+# the original sparse fixture.
+_BRIDGE_MEGATRON_FIELDS: dict[str, object] = {
+    "attention_backend": "flash",
+    "tensor_model_parallel_size": 2,
+    "sequence_parallel": True,
+    "pipeline_model_parallel_size": 4,
+    "virtual_pipeline_model_parallel_size": 2,
+    "expert_model_parallel_size": 1,
+    "expert_tensor_parallel_size": 1,
+    "variable_seq_lengths": True,
+    "dsa_indexer_loss_coeff": None,
+    "dsa_indexer_use_sparse_loss": None,
+    "attention_softmax_in_fp32": True,
+    "bias_dropout_fusion": True,
+    "apply_rope_fusion": False,
+    "recompute_granularity": None,
+    "recompute_method": None,
+    "recompute_num_layers": None,
+    "distribute_saved_activations": False,
+    "moe_router_load_balancing_type": "none",
+    "moe_router_dtype": None,
+    "moe_aux_loss_coeff": None,
+    "moe_token_dispatcher_type": "alltoall",
+    "moe_shared_expert_overlap": False,
+    "moe_enable_deepep": False,
+    "moe_flex_dispatcher_backend": None,
+    "vision_dp_when_cp": False,
+    "num_layers": 8,
+    "moe_layer_freq": None,
+    "decoder_first_pipeline_num_layers": None,
+    "decoder_last_pipeline_num_layers": None,
+    "fp16": False,
+    "bf16": True,
+}
+
+# Relax-declared bridge fixtures: pass them through the shared builder.
+_BRIDGE_KWARGS: dict[str, object] = {
+    "megatron_to_hf_mode": "bridge",
+    "hf_checkpoint": "fake-hf",
+    "context_parallel_size": 1,
+    "use_audio_in_video": False,
+    "freeze_language_model": False,
+    "freeze_vision_model": False,
+    "freeze_vision_projection": False,
+    "vision_dp_when_tp": False,
+    "calculate_per_token_loss": False,
+    "save": None,
+}
+
+
 def _bridge_args(**overrides):
-    values = {
-        "megatron_to_hf_mode": "bridge",
-        "hf_checkpoint": "fake-hf",
-        "attention_backend": "flash",
-        "tensor_model_parallel_size": 2,
-        "sequence_parallel": True,
-        "pipeline_model_parallel_size": 4,
-        "virtual_pipeline_model_parallel_size": 2,
-        "context_parallel_size": 1,
-        "expert_model_parallel_size": 1,
-        "expert_tensor_parallel_size": 1,
-        "variable_seq_lengths": True,
-        "dsa_indexer_loss_coeff": None,
-        "dsa_indexer_use_sparse_loss": None,
-        "attention_softmax_in_fp32": True,
-        "bias_dropout_fusion": True,
-        "apply_rope_fusion": False,
-        "recompute_granularity": None,
-        "recompute_method": None,
-        "recompute_num_layers": None,
-        "distribute_saved_activations": False,
-        "moe_router_load_balancing_type": "none",
-        "moe_router_dtype": None,
-        "moe_aux_loss_coeff": None,
-        "moe_token_dispatcher_type": "alltoall",
-        "moe_shared_expert_overlap": False,
-        "moe_enable_deepep": False,
-        "moe_flex_dispatcher_backend": None,
-        "use_audio_in_video": False,
-        "freeze_language_model": False,
-        "freeze_vision_model": False,
-        "freeze_vision_projection": False,
-        "vision_dp_when_tp": False,
-        "vision_dp_when_cp": False,
-        "calculate_per_token_loss": False,
-        "num_layers": 8,
-        "moe_layer_freq": None,
-        "decoder_first_pipeline_num_layers": None,
-        "decoder_last_pipeline_num_layers": None,
-        "fp16": False,
-        "bf16": True,
-        "save": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+    kwargs = dict(_BRIDGE_KWARGS)
+    megatron_fields = dict(_BRIDGE_MEGATRON_FIELDS)
+    declared = declared_parameter_names()
+    for name, value in overrides.items():
+        if name in declared:
+            kwargs[name] = value
+        else:
+            megatron_fields[name] = value
+    args = build_relax_args(**kwargs)
+    for name, value in megatron_fields.items():
+        setattr(args, name, value)
+    return args
 
 
 def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
@@ -496,7 +529,7 @@ def test_wrapper_derives_vp_stage_from_parallel_state(monkeypatch):
 
     wrapped_provider = module.wrap_model_provider_with_freeze(
         original_provider,
-        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None),
+        build_relax_args(only_train_params_name_list=None, freeze_params_name_list=None),
     )
     wrapped_provider(pre_process=True, post_process=False)
 
@@ -514,7 +547,7 @@ def test_freeze_wrapper_forwards_post_process_to_classification_head(monkeypatch
 
     wrapped_provider = module.wrap_model_provider_with_freeze(
         lambda **kwargs: SimpleNamespace(named_parameters=lambda: []),
-        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None),
+        build_relax_args(only_train_params_name_list=None, freeze_params_name_list=None),
     )
     wrapped_provider(post_process=False)
 
@@ -527,7 +560,7 @@ def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):
     bridge_provider = module.get_model_provider_func(_bridge_args(), role="actor")
     wrapped_provider = module.wrap_model_provider_with_freeze(
         bridge_provider,
-        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None),
+        build_relax_args(only_train_params_name_list=None, freeze_params_name_list=None),
     )
     wrapped_provider(pre_process=True, post_process=False)
 
@@ -589,7 +622,7 @@ def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrappe
 
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
     monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
-    args = SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None)
+    args = build_relax_args(only_train_params_name_list=None, freeze_params_name_list=None)
     provider = {"modern": modern_provider, "kwargs": kwargs_provider, "legacy": legacy_provider}[signature]
     if "lora" in wrapper:
         provider = module.wrap_model_provider_with_lora(provider, args)

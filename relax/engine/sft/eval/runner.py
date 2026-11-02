@@ -114,7 +114,7 @@ def run_sft_eval(actor, rollout_id: int) -> None:
     from relax.backends.megatron.model import forward_only
     from relax.utils.data.image_refs import sft_multimodal_data_fields
 
-    is_classification = getattr(actor.args, "task_type", "causal_lm") == "seq_cls"
+    is_classification = actor.args.task_type == "seq_cls"
     if is_classification:
         from relax.engine.sft.eval.classification import (
             compute_classification_eval_step,

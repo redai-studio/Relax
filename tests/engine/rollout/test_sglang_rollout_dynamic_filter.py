@@ -14,6 +14,7 @@ import pytest
 
 from relax.engine.filters.dynamic_sampling_filters import check_reward_nonzero_std
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 try:
@@ -25,6 +26,19 @@ except ModuleNotFoundError as exc:
 
 
 Group = list[Sample]
+
+
+@pytest.fixture(autouse=True)
+def _release_rollout_timer():
+    """A failing rollout must not keep the singleton "rollout" timer running,
+    otherwise every later test in this file trips "Timer already started"."""
+    yield
+    from relax.utils.timer import Timer
+
+    timer = Timer()
+    timer.start_time.pop("rollout", None)
+    timer.start_info.pop("rollout", None)
+    timer.timers.pop("rollout", None)
 
 
 def _group(
@@ -63,7 +77,7 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
         rollout_batch_size: int = 1,
         dp_size: int = 1,
     ) -> SimpleNamespace:
-        args = Namespace(
+        args = build_relax_args(
             rollout_global_dataset=True,
             dynamic_sampling_filter_path="test_filter" if filter_fn else None,
             fully_async=fully_async,

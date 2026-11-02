@@ -10,6 +10,7 @@ import torch
 from relax.backends.megatron import compat
 from relax.utils.model_source import ModelSource
 from tests.backends.megatron.test_checkpoint_preflight import _load_checkpoint_module
+from tests.support.args import build_relax_args
 
 
 checkpoint = _load_checkpoint_module()
@@ -42,7 +43,7 @@ def test_load_checkpoint_preserves_valid_megatron_resume(monkeypatch, tmp_path):
     resume_path.mkdir()
     (resume_path / "latest_checkpointed_iteration.txt").write_text("1")
     (resume_path / "iter_0000001").mkdir()
-    args = SimpleNamespace(load=str(resume_path))
+    args = build_relax_args(load=str(resume_path))
     expected = (1, 2)
 
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
@@ -126,7 +127,9 @@ def test_full_checkpoint_preserves_hdo_step_only_when_applicable(monkeypatch, tm
     resume_path.mkdir()
     (resume_path / "latest_checkpointed_iteration.txt").write_text("7")
     (resume_path / "iter_0000007").mkdir()
-    args = SimpleNamespace(load=str(resume_path), optimizer_cpu_offload=True, no_load_optim=case == "no_optim")
+    args = build_relax_args(load=str(resume_path))
+    args.optimizer_cpu_offload = True
+    args.no_load_optim = case == "no_optim"
     monkeypatch.setattr(DistributedOptimizer, "load_state_dict", original_load)
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)
@@ -150,7 +153,8 @@ def test_full_checkpoint_preserves_hdo_step_only_when_applicable(monkeypatch, tm
 
 def test_hf_initialization_does_not_install_optimizer_step_fix(monkeypatch, tmp_path):
     (tmp_path / "config.json").write_text("{}")
-    args = SimpleNamespace(load=str(tmp_path), optimizer_cpu_offload=True)
+    args = build_relax_args(load=str(tmp_path))
+    args.optimizer_cpu_offload = True
 
     def unexpected_fix():
         raise AssertionError("HF initialization must not install optimizer resume fixes")

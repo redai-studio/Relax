@@ -308,6 +308,7 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer as DO
 from megatron.core.extensions.transformer_engine import TEGroupedLinear
 from megatron.core.transformer.experimental_attention_variant import csa, dsa_kernels
 from transformer_engine.pytorch.module.base import TransformerEngineBaseModule as TEBase
+from tests.support.args import build_relax_args
 score_kernels = dsa_kernels
 topk_attr, namespace_attr = '_indexer_topk_core', '_DSA'
 if not hasattr(dsa_kernels, '_ensure_dsa_namespace'):
@@ -327,9 +328,13 @@ for precision in (None, 'e4m3'):
     provider = SimpleNamespace(fp8=None, fp8_recipe='delayed', provide=lambda **kw: None)
     provider.finalize = lambda: setattr(provider, 'finalized', True)
     bridge = SimpleNamespace(to_megatron_provider=lambda **kw: provider)
-    args = SimpleNamespace(custom_model_provider_path=None, megatron_to_hf_mode='bridge',
-        hf_checkpoint='unused', fp16=False, bf16=True, fp8=precision,
-        fp8_recipe='blockwise' if precision else 'delayed')
+    # fp16/bf16/fp8/fp8_recipe are Megatron-owned fields (not Relax declarations),
+    # so they are assigned explicitly after the fully populated build.
+    args = build_relax_args(megatron_to_hf_mode='bridge', hf_checkpoint='unused')
+    args.custom_model_provider_path = None
+    args.fp16, args.bf16 = False, True
+    args.fp8 = precision
+    args.fp8_recipe = 'blockwise' if precision else 'delayed'
     with patch.object(AutoBridge, 'from_hf_pretrained', return_value=bridge), \
          patch.object(model_provider, '_dump_provider_config'):
         selected = model_provider.get_model_provider_func(args)

@@ -4,9 +4,24 @@
 
 import importlib
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
+
+from tests.support.args import build_relax_args
+
+
+_KNOWN = frozenset(vars(build_relax_args()))
+
+
+def _args(**kw):
+    """Fully populated parameter object; fields not declared by Relax are
+    passed through explicitly."""
+    extra = {k: kw.pop(k) for k in list(kw) if k not in _KNOWN}
+    args = build_relax_args(**kw)
+    for name, value in extra.items():
+        setattr(args, name, value)
+    return args
 
 
 torch = pytest.importorskip("torch")
@@ -53,11 +68,12 @@ def _stub_policy_forward(monkeypatch, log_probs):
     monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **_kwargs: 1, raising=False)
 
 
-def _args(*, calculate_per_token_loss):
-    return SimpleNamespace(
+def _m2po_args(*, calculate_per_token_loss):
+    """Fully populated parameter object for the M2PO cases: only the diff this
+    algorithm cares about, on top of the declarations."""
+    return _args(
         loss_type="policy_loss",
         advantage_estimator="m2po",
-        calculate_per_token_loss=calculate_per_token_loss,
         qkv_format="thd",
         recompute_loss_function=False,
         allgather_cp=False,
@@ -73,6 +89,7 @@ def _args(*, calculate_per_token_loss):
         m2po_kl2_budget=0.01,
         m2po_miniclip_low=0.3,
         m2po_miniclip_high=0.5,
+        calculate_per_token_loss=calculate_per_token_loss,
     )
 
 
@@ -104,7 +121,7 @@ def test_m2po_scalar_metrics_preserve_legacy_denominator_and_mask_semantics(monk
     _stub_policy_forward(monkeypatch, log_probs)
 
     _, normalizer, logging = loss_module.loss_function(
-        _args(calculate_per_token_loss=calculate_per_token_loss),
+        _m2po_args(calculate_per_token_loss=calculate_per_token_loss),
         batch,
         num_microbatches=1,
         logits=torch.empty(1, 1, 1),
@@ -162,7 +179,7 @@ def test_policy_scalar_metrics_cannot_overwrite_core_metrics(monkeypatch):
             {"loss": torch.tensor(1.0)},
         ),
     )
-    args = _args(calculate_per_token_loss=True)
+    args = _m2po_args(calculate_per_token_loss=True)
     batch = {
         "advantages": advantages,
         "log_probs": [old_log_probs],
@@ -195,7 +212,7 @@ def test_m2po_metrics_preserve_legacy_aggregation_with_unequal_microbatches(
         return zeros, zeros, {"ppo_kl_m2_before": torch.tensor(next(local_m2_values))}
 
     monkeypatch.setattr(loss_module, "compute_policy_loss_for", fake_policy_loss)
-    args = _args(calculate_per_token_loss=calculate_per_token_loss)
+    args = _m2po_args(calculate_per_token_loss=calculate_per_token_loss)
     args.global_batch_size = 3
     metric_numerators = []
     token_denominator = 0

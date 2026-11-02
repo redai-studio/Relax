@@ -21,12 +21,11 @@ Covers two concerns:
 
 from __future__ import annotations
 
-from argparse import Namespace
-
 import pytest
 import torch
 
 from relax.engine.sft.runtime import should_use_sft_chunked
+from tests.support.args import build_relax_args
 
 
 try:
@@ -513,7 +512,7 @@ def test_chunked_loss_delegates_to_get_log_probs_and_entropy(monkeypatch):
     monkeypatch.setattr(_loss_mod, "get_log_probs_and_entropy", spy_glpae)
 
     lm_head_marker = object()
-    args = Namespace(qkv_format="thd", calculate_per_token_loss=False)
+    args = build_relax_args(qkv_format="thd", calculate_per_token_loss=False)
     batch = {
         "unconcat_tokens": [torch.zeros(3, dtype=torch.long)],
         "total_lengths": [3],
@@ -557,7 +556,7 @@ def test_loss_function_forwards_recompute_checkpoint_mode(monkeypatch, configure
     monkeypatch.setattr(_loss_mod, "get_cp_local_num_tokens", lambda *args, **kwargs: torch.tensor(1))
     monkeypatch.setattr(_loss_mod, "get_sum_of_sample_mean", lambda *args, **kwargs: object())
 
-    args = Namespace(
+    args = build_relax_args(
         loss_type="sft",
         recompute_loss_function=True,
         sft_chunked_logits=False,
@@ -598,7 +597,7 @@ def test_should_use_sft_chunked(loss_type, chunked_flag, expected):
     we reach this gate sft_chunked_logits=True is guaranteed compatible.
     Functional check on the helper extracted from ``forward_step``.
     """
-    args = Namespace(
+    args = build_relax_args(
         loss_type=loss_type,
         sft_chunked_logits=chunked_flag,
     )

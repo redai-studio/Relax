@@ -3,11 +3,11 @@
 """Bridge's per-document zigzag output must retain next-token loss
 alignment."""
 
-from argparse import Namespace
-
 import pytest
 import torch
 import torch.nn.functional as F
+
+from tests.support.args import build_relax_args
 
 
 try:
@@ -62,7 +62,7 @@ def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(monkeypatch, cp_s
         for values, labels, mask in zip(hidden.split(lengths), tokens, masks, strict=True)
     )
     expected_grads = torch.autograd.grad(ref, (hidden, weight), retain_graph=True)
-    args = Namespace(
+    args = build_relax_args(
         qkv_format="thd",
         loss_type="sft",
         allgather_cp=True,
@@ -113,7 +113,7 @@ def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(monkeypatch, cp_s
 def test_contiguous_allgather_layout_is_preserved_without_bridge_metadata(monkeypatch):
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 2)
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_rank", lambda: 1)
-    args = Namespace(qkv_format="thd", loss_type="sft", allgather_cp=True, rollout_temperature=1.0)
+    args = build_relax_args(qkv_format="thd", loss_type="sft", allgather_cp=True, rollout_temperature=1.0)
     chunks = list(
         loss_module.get_responses(
             torch.arange(8, 16, dtype=torch.float32).reshape(1, 8, 1),

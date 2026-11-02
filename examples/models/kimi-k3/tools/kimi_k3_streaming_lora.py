@@ -111,10 +111,10 @@ def read_checkpoint_spec(checkpoint: str, base_hf: str) -> dict[str, Any]:
     metadata = FileSystemReader(checkpoint).read_metadata()
     common = read_common_state(checkpoint, metadata)
     args = common["args"]
-    base = getattr(args, "hf_checkpoint", None)
+    base = args.hf_checkpoint
     if base is None or Path(base).resolve() != Path(base_hf).resolve():
         raise ValueError(f"Base differs from training hf_checkpoint: {base!r}")
-    rank, alpha = getattr(args, "lora_rank", None), getattr(args, "lora_alpha", None)
+    rank, alpha = args.lora_rank, args.lora_alpha
     if not isinstance(rank, int) or rank <= 0 or not isinstance(alpha, (int, float)) or not math.isfinite(alpha):
         raise ValueError("Missing or invalid saved LoRA rank/alpha")
     if getattr(args, "normalize_moe_lora", False):

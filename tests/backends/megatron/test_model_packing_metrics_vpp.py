@@ -2,7 +2,6 @@
 
 """Packing metrics follow the logical final stage under VPP."""
 
-from argparse import Namespace
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -10,6 +9,7 @@ import pytest
 import torch
 
 from relax.utils.training.indexer_replay import IndexerReplay
+from tests.support.args import build_relax_args
 
 
 class _FakeModel:
@@ -50,17 +50,13 @@ def test_train_one_step_counts_each_logical_microbatch_once(
 ):
     model_module = pytest.importorskip("relax.backends.megatron.model")
 
-    args = Namespace(
+    args = build_relax_args(
         allgather_cp=False,
-        bf16=bf16,
-        fp16=False,
         sft_chunked_logits=chunked,
         calculate_per_token_loss=False,
-        check_for_nan_in_loss_and_grad=True,
         ci_test=False,
         custom_megatron_before_train_step_hook_path=None,
         data_pad_size_multiplier=1,
-        decoder_seq_length=None,
         dynamic_context_parallel=False,
         enable_mtp_training=False,
         is_vl_model=False,
@@ -73,6 +69,11 @@ def test_train_one_step_counts_each_logical_microbatch_once(
         use_rollout_indexer_replay=replay,
         uses_unsplit_forward=False,
     )
+    # Fields declared by Megatron and read-only for Relax.
+    args.bf16 = bf16
+    args.fp16 = False
+    args.check_for_nan_in_loss_and_grad = True
+    args.decoder_seq_length = None
     batch = {
         "full_loss_masks": None,
         "packed_seq_params": None,

@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from relax.utils.types import Sample
+from tests.support.args import build_relax_args
 
 
 sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
@@ -90,7 +91,7 @@ async def test_standard_post_keeps_unrelated_499_visible(monkeypatch):
 def _router_args(**overrides):
     values = {"fully_async": True, "use_slime_router": False, "router_cb_timeout_duration_secs": -1.99}
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return build_relax_args(**values)
 
 
 _NO_WORKERS_503 = lambda: _status_error(503, body={"error": {"code": "no_available_workers"}})  # noqa: E731
@@ -257,7 +258,7 @@ def _rollout_args(**overrides):
         "use_dynamic_global_batch_size": False,
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return build_relax_args(**values)
 
 
 def _patch_rollout(monkeypatch, state, transfer):
