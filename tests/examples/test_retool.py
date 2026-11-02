@@ -159,6 +159,20 @@ def test_retool_unknown_executor_status_is_not_negative_reward():
         parse_result(dict(status="InternalError"))
 
 
+@pytest.mark.parametrize("return_code,expected", [(0, "ok"), (1, "code_error")])
+def test_retool_sandbox_finished_checks_process_exit_code(return_code, expected):
+    result = parse_result(
+        dict(status="Success", run_result=dict(status="Finished", return_code=return_code, stderr="execution output"))
+    )
+    assert result["status"] == expected and result["stderr"] == "execution output"
+    assert score("Answer: 2", "2", {result["status"]: 1})["score"] == (1 if expected == "ok" else 0.9)
+
+
+def test_retool_unexpected_process_signal_is_infrastructure_failure():
+    with pytest.raises(RuntimeError, match="Unexpected sandbox process termination"):
+        parse_result(dict(status="Success", run_result=dict(status="Finished", return_code=-9)))
+
+
 def test_retool_http_client_uses_actual_response():
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from threading import Thread

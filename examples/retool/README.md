@@ -1,12 +1,36 @@
 # ReTool：原生 SGLang + GRPO
 
-[English](README_en.md)
-
 本例使用 Relax 原生 Megatron、SGLang、checkpoint 和周期评测。模型在生成 `</code>` 后暂停，将新代码交给独立的 SandboxFusion 服务，把实际返回放入 `<interpreter>` 后继续生成。模型 token 参与 loss，反馈 token 仅作为上下文。
 
 默认算法与 `liyuanfan/retool@691aa8062` 的作者数据主线对齐：Qwen2.5-7B-Instruct、作者 SFT 两轮/50 步、GRPO 200 步；每步 64 次有放回抽题，每次生成 16 条轨迹。温度/top-p 为 1，top-k 为 -1，clip 两侧均为 0.2，lr 为 1e-6，KL/entropy 为 0。答案判分保留该分支固定 DAPO verifier 的 `Answer:` 优先、boxed 回退规则。总奖励为答案 ±1 减去每次工具失败的 0.1，没有下限、调用奖励或成功奖励。这是该分支的 GRPO 变体；原论文使用 PPO 和纯答案奖励。
 
 一次调用是无状态 Python 程序，限 30 秒/1 GiB；代码错误和超时作为反馈返回模型，非法调用也计失败。HTTP、服务故障等基础设施异常直接报错，不重试执行或转换成模型负奖励。执行服务必须独立部署并提供符合上述约束的隔离；这个 HTTP 客户端本身不提供代码隔离。
+
+## Apptainer 沙箱与直接 RL 验证
+
+可以直接用公开的 Qwen2.5-7B-Instruct 验证 RL 链路，无需先跑 SFT。在 rollout 主机上单独启动不占 GPU 的沙箱：
+
+```bash
+apptainer pull /path/to/sandboxfusion.sif \
+  docker://vemlp-cn-beijing.cr.volces.com/preset-images/code-sandbox:server-20250609
+export SANDBOX_IMAGE=/path/to/sandboxfusion.sif
+bash examples/retool/scripts/run-sandbox-apptainer.sh
+```
+
+驱动需要 root 建立 namespace 和 cgroup；模型代码实际以 uid/gid 65534、no-new-privs 运行。适配固定镜像的 SandboxFusion lite runner，每次调用使用独立 overlay 和 PID/network namespace，限制 1 GiB/30 秒，禁止创建进程和线程。仅绑定可信启动文件及 cgroup 控制目录，不挂载宿主机 home、仓库、模型、数据或 GPU。启动器修复 Apptainer 根挂载与脚本目录的嵌套挂载问题，收紧镜像原有的 4 GiB 和桥接网络默认值；不能直接使用镜像默认的 isolation=none。
+
+默认监听 `127.0.0.1:8080`，可用 `SANDBOX_HOST`、`SANDBOX_PORT` 覆盖。在另一个终端中，准备好下面的数据后提交：
+
+```bash
+export MODEL_DIR=/path/to/Qwen2.5-7B-Instruct
+export DATA_DIR=/path/to/retool-data
+export SAVE_DIR=/path/to/checkpoints
+export SANDBOX_FUSION_URL=http://127.0.0.1:8080/run_code
+export RAY_ADDRESS=http://ray-head:8265
+bash scripts/entrypoint/ray-job.sh examples/retool/scripts/run-qwen25-7B-grpo-8xgpu.sh
+```
+
+直接 RL 使用相同正式参数：200 步、每步 64 次抽题、每题 16 条轨迹，response/context 为 8192/10240。更换为公开基座不代表已复现作者 SFT 后的训练效果。跨容器或节点时，URL 必须对实际 rollout worker 可达。
 
 ## 数据准备
 

@@ -5,6 +5,7 @@ import functools
 import math
 import os
 import re
+import time
 from typing import Any
 
 from examples.retool.sandbox import SandboxClient
@@ -157,7 +158,9 @@ async def run_episode(
                 sample.status = statuses.TRUNCATED
                 meta["retool_stop_reason"] = "max_turns_or_budget"
                 break
+            tool_started = time.perf_counter()
             feedback, code = await feedback_for_turn(text, client)
+            tool_seconds = time.perf_counter() - tool_started
             status = feedback["status"]
             counts = meta["tool_feedback_counts"]
             counts[status] = counts.get(status, 0) + 1
@@ -168,6 +171,7 @@ async def run_episode(
                     exact_executed_code=code,
                     feedback=feedback,
                     new_online_execution=code is not None,
+                    wall_seconds=tool_seconds,
                 )
             )
             observation = feedback["stdout"] if status == "ok" else feedback["stderr"] or status

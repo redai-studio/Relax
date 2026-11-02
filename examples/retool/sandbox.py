@@ -17,6 +17,14 @@ def parse_result(value: dict) -> dict[str, str]:
     status = result.get("status")
     if status not in {"Finished", "Error", "TimeLimitExceeded"}:
         raise RuntimeError("Sandbox returned no recognized execution result")
+    # SandboxFusion's Finished means the process exited, including Python
+    # exceptions. The Landlock-compatible service omits return_code.
+    if status == "Finished":
+        return_code = result.get("return_code", 0)
+        if type(return_code) is not int or return_code < 0:
+            raise RuntimeError(f"Unexpected sandbox process termination: {return_code}")
+        if return_code:
+            status = "Error"
     return {
         "status": {"Finished": "ok", "Error": "code_error", "TimeLimitExceeded": "timeout"}[status],
         "stdout": result.get("stdout") or "",
