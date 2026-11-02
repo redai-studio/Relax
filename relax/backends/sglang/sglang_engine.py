@@ -1945,7 +1945,10 @@ class SGLangEngine(RayActor):
 
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:
     if getattr(args, "enable_mtp_training", False):
-        return False
+        from relax.engine.inference.deferred import needs_rollout_cpu_backup
+
+        # Deferred scoring can resume the same policy without another MTP sync.
+        return needs_rollout_cpu_backup(args)
 
     speculative_algorithm = getattr(args, "sglang_speculative_algorithm", None)
     if sglang_overrides and "speculative_algorithm" in sglang_overrides:
@@ -2219,6 +2222,10 @@ def _compute_server_args(
         if (sglang_overrides or {}).get("enable_weights_cpu_backup") is False:
             raise ValueError("Shared deferred scoring cannot disable enable_weights_cpu_backup")
         kwargs["enable_weights_cpu_backup"] = True
+        if getattr(args, "enable_mtp_training", False):
+            if (sglang_overrides or {}).get("enable_draft_weights_cpu_backup") is False:
+                raise ValueError("Shared deferred scoring cannot disable enable_draft_weights_cpu_backup")
+            kwargs["enable_draft_weights_cpu_backup"] = True
 
     # Use CUDA IPC only for engines confined to one node; multi-node engines
     # retain SGLang's auto policy, including CUDA VMM where supported.

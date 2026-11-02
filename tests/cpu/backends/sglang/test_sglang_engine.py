@@ -369,12 +369,11 @@ def test_policy_pd_routing_replay_accepts_configured_topology(monkeypatch, sglan
     assert result["enable_return_routed_experts"] is True
 
 
-@pytest.mark.parametrize("engine_class,actual_mode", [("SGLangEngine", "prefill"), ("GenRMEngine", "decode")])
-def test_external_pd_routing_replay_registers_native_worker(
-    monkeypatch, sglang_engine_module, engine_class, actual_mode
-):
+@pytest.mark.parametrize("profile,actual_mode", [("policy", "prefill"), ("genrm", "decode")])
+def test_external_pd_routing_replay_registers_native_worker(monkeypatch, sglang_engine_module, profile, actual_mode):
     module = sglang_engine_module
-    engine = object.__new__(getattr(module, engine_class))
+    engine = object.__new__(module.SGLangEngine)
+    engine.profile = module.resolve_engine_profile(profile)
     engine.args = SimpleNamespace(use_rollout_routing_replay=True)
     engine.rank, engine.worker_type = 0, "regular"
     engine.server_host, engine.server_port = "localhost", 8000
