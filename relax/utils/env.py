@@ -185,7 +185,6 @@ class _EnvsMeta(type):
 
 
 class Envs(metaclass=_EnvsMeta):
-    RELAX_FP32_LM_HEAD = EnvProperty("RELAX_FP32_LM_HEAD", bool, False)
     # ------------- GenRM -------------
     GENRM_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("GENRM_SERVE_MAX_ONGOING_REQUESTS", int, 256)
     GENRM_ENGINE_RETRY_ATTEMPTS = EnvProperty("GENRM_ENGINE_RETRY_ATTEMPTS", int, 3)
@@ -263,6 +262,7 @@ class Envs(metaclass=_EnvsMeta):
 
     # ------------- Device / Training -------------
     RELAX_DEVICE_TYPE = EnvProperty("RELAX_DEVICE_TYPE", str, "")
+    RELAX_FP32_LM_HEAD = EnvProperty("RELAX_FP32_LM_HEAD", bool, False)
     RELAX_EMPTY_POLL_SLEEP_MS = EnvProperty("RELAX_EMPTY_POLL_SLEEP_MS", float, 50.0)
     RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 20)
     RELAX_SFT_TQ_SHARDS = EnvProperty("RELAX_SFT_TQ_SHARDS", int, 1)
