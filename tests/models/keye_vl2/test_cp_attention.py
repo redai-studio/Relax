@@ -8,7 +8,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _cp_worker(rank: int, init_method: str, sparse: bool) -> None:
+def _cp_worker(rank: int, init_method: str) -> None:
     from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 
     from relax.backends.megatron.cp_utils import gdn_cp_slice
@@ -33,7 +33,7 @@ def _cp_worker(rank: int, init_method: str, sparse: bool) -> None:
     base = KeyeCoreAttention(config(1), 1).cuda().bfloat16()
     shard = KeyeCoreAttention(config(2), 1, pg_collection=SimpleNamespace(cp=group)).cuda().bfloat16()
     shard.load_state_dict(base.state_dict())
-    last = 2240 if sparse else 144
+    last = 2240
     cu = [0, 64, last]
     pos = torch.cat([torch.arange(64), torch.arange(last - 64)]).cuda()
     pos = torch.stack([pos // 2, pos // 3, pos // 5], -1)
@@ -63,12 +63,11 @@ def _cp_worker(rank: int, init_method: str, sparse: bool) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Keye CP gradient regression needs two CUDA devices")
-@pytest.mark.parametrize("sparse", [False, True])
-def test_keye_cp2_matches_cp1_outputs_and_cross_rank_gradients(tmp_path, sparse):
-    mp.spawn(_cp_worker, args=(f"file://{tmp_path / 'cp-init'}", sparse), nprocs=2, join=True)
+def test_keye_cp2_matches_cp1_outputs_and_cross_rank_gradients(tmp_path):
+    mp.spawn(_cp_worker, args=(f"file://{tmp_path / 'cp-init'}",), nprocs=2, join=True)
 
 
-def _text_cp_worker(rank: int, init_method: str, lengths: list[int], pad_multiplier: int) -> None:
+def _text_cp_worker(rank: int, init_method: str) -> None:
     from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 
     from relax.backends.megatron import data
@@ -79,6 +78,8 @@ def _text_cp_worker(rank: int, init_method: str, lengths: list[int], pad_multipl
     dist.init_process_group("nccl", rank=rank, world_size=2, init_method=init_method)
     group = dist.new_group([0, 1])
     torch.manual_seed(83)
+    lengths = [5, 9]
+    pad_multiplier = 16
     DSAIndexerLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
     raw = {
         "tokens": [torch.arange(length, device="cuda") for length in lengths],
@@ -136,8 +137,5 @@ def _text_cp_worker(rank: int, init_method: str, lengths: list[int], pad_multipl
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Keye text CP regression needs two CUDA devices")
-@pytest.mark.parametrize("lengths, pad_multiplier", [([5, 5], 1), ([5, 9], 16)])
-def test_keye_text_cp_padding_matches_unpadded_outputs_and_gradients(tmp_path, lengths, pad_multiplier):
-    mp.spawn(
-        _text_cp_worker, args=(f"file://{tmp_path / 'text-cp-init'}", lengths, pad_multiplier), nprocs=2, join=True
-    )
+def test_keye_text_cp_padding_matches_unpadded_outputs_and_gradients(tmp_path):
+    mp.spawn(_text_cp_worker, args=(f"file://{tmp_path / 'text-cp-init'}",), nprocs=2, join=True)

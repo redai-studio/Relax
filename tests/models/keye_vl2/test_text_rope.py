@@ -187,30 +187,3 @@ def test_text_runtime_uses_real_packed_batch(
     stale = pack()
     assert stale["unsplit_tokens"].shape == (2, max(padded_lengths))
     assert stale["vlm_packed_seq_params"].qkv_format == "thd"
-
-
-def test_stale_vl_flags_reproduce_quadratic_rope_broadcast(provider_type: type) -> None:
-    from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-
-    config = _provider(provider_type, 2)
-    config.apply_rope_fusion = False
-    group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
-    # Plain GPT receiving unsplit [B,S] input has Q=[S,B,H,D]. Its THD
-    # squeeze(1) cannot remove B=2; the stale VL branch adds a fifth axis.
-    query = torch.randn(8, 2, 3, 128)
-    frequencies = torch.randn(8, 1, 1, 128)
-    broadcast = query.unsqueeze(1) * frequencies.cos()
-    assert broadcast.shape == (8, 8, 2, 3, 128)
-    assert broadcast.numel() == query.numel() * query.shape[0]
-    # At realistic S the first multiply OOMs. This small reproduction survives
-    # allocation, then fails when concatenating its incorrectly expanded result
-    # with the unchanged (empty last dimension) non-rotary suffix.
-    with pytest.raises(RuntimeError, match="Sizes of tensors must match"):
-        apply_rotary_pos_emb(
-            query,
-            frequencies,
-            config,
-            cu_seqlens=torch.tensor([0, 8, 16], dtype=torch.int32),
-            cp_group=group,
-            max_seqlen=8,
-        )

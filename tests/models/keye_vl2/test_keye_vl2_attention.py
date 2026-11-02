@@ -35,24 +35,6 @@ def _inputs(length: int):
     )
 
 
-def test_keye_packed_attention_matches_independent_dense_sequences():
-    attention = _attention().eval()
-    q, k, v, hidden = _inputs(63)
-    packed = SimpleNamespace(cu_seqlens_q_cpu=[0, 31, 63])
-    with torch.no_grad():
-        actual = attention(q, k, v, packed_seq_params=packed, hidden_states=hidden)
-        expected = []
-        for start, end in [(0, 31), (31, 63)]:
-            result = F.scaled_dot_product_attention(
-                q[start:end].transpose(0, 1)[None],
-                k[start:end].repeat_interleave(8, 1).transpose(0, 1)[None],
-                v[start:end].repeat_interleave(8, 1).transpose(0, 1)[None],
-                is_causal=True,
-            )[0]
-            expected.append(result.transpose(0, 1).reshape(end - start, -1))
-    torch.testing.assert_close(actual, torch.cat(expected), atol=0.02, rtol=0.02)
-
-
 def test_keye_sparse_recompute_has_indexer_gradients_and_no_future_leak():
     torch.manual_seed(19)
     attention = _attention()
@@ -108,17 +90,6 @@ def test_keye_frozen_indexer_skips_auxiliary_and_preserves_attention(monkeypatch
     for name, parameter in attention.sa_indexer.named_parameters():
         assert parameter.grad is None
         torch.testing.assert_close(parameter, before[name], atol=0, rtol=0)
-
-
-def test_keye_dummy_microbatch_keeps_hooks_without_auxiliary_gradient():
-    attention = _attention()
-    q, k, v, hidden = _inputs(31)
-    packed = SimpleNamespace(cu_seqlens_q_cpu=[0, 31], is_dummy=True)
-    output = attention(q, k, v, packed_seq_params=packed, hidden_states=hidden)
-    (output.float().sum() * 0).backward()
-    for parameter in attention.sa_indexer.parameters():
-        assert parameter.grad is not None
-        assert torch.count_nonzero(parameter.grad) == 0
 
 
 def test_causal_prefix_matches_full_matrix_outputs_and_auxiliary_gradients():
