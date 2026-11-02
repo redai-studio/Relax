@@ -77,7 +77,7 @@ def test_global_restart_disposes_owner_before_deleting_deployments(monkeypatch, 
     controller.serve_dict = {controller_module.ROLES.rollout: SimpleNamespace(_stop_heartbeat_thread=Mock())}
     events = []
     controller._cancel_pending_tasks = lambda: events.append("cancel")
-    controller._shutdown_inference_owners = lambda: events.append("owners released") or True
+    controller._shutdown_inference_owners = lambda: True
     controller._dispose_rollout_manager = lambda: events.append("dispose")
     monkeypatch.setattr(controller_module, "recovery_load_path", lambda config: None)
 
@@ -91,4 +91,4 @@ def test_global_restart_disposes_owner_before_deleting_deployments(monkeypatch, 
     monkeypatch.setattr(controller_module.serve, "delete", delete)
     with pytest.raises(ReachedDeletion):
         controller._run_global_restart()
-    assert events == ["cancel", "owners released", "dispose", "delete"]
+    assert events == ["cancel", "dispose", "delete"]

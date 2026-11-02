@@ -434,6 +434,9 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
         worker_type="decode",
     )
     group.require_router_registration = True
+    # This fake's shutdown timeout now has a node-local process-exit receipt.
+    # Preserve main's rollback assertions while proving release before kill.
+    monkeypatch.setattr(group._engine_pool(), "_confirm_orphan_release", lambda slot: True)
     group.pg = (object(), list(range(3 * nodes_per_engine)), list(range(3 * nodes_per_engine)))
     slots = list(range(nodes_per_engine, 3 * nodes_per_engine))
     records = {
@@ -449,7 +452,7 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
     monkeypatch.setattr(rollout_module, "remove_dead_router_worker", cleanup)
     pending, failed = object(), object()
     replacements = [make_mock_engine() for _ in slots]
-    # A shutdown queued behind pending init can time out; retain the whole allocation.
+    # A shutdown queued behind pending init can time out; every actor must still be killed.
     shutdown_ref = object()
     replacements[0].shutdown.remote.return_value = shutdown_ref
     attempts = []
@@ -485,17 +488,23 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
     monkeypatch.setattr(rollout_module.ray, "kill", kill)
     server = make_rollout_server(engine_groups=[group])
 
-    from relax.engine.inference.ownership import ResourceBlockedError
-
-    with pytest.raises(ResourceBlockedError, match="Cleanup unconfirmed"):
+    with pytest.raises(RuntimeError, match="Required PD router registration failed") as caught:
         server.recover()
-    # Only the replica lacking a receipt stays quarantined; its independent
-    # sibling confirmed shutdown and must not be held by that failure.
-    assert group.all_engines == surviving + replacements[:nodes_per_engine] + [None] * nodes_per_engine
+
+    assert caught.value is failure
+    assert group.all_engines == surviving + [None] * len(slots)
+    assert server.num_new_engines == 0
     assert group.engine_init_records == records
-    assert [call.args[0] for call in kill.call_args_list] == replacements[nodes_per_engine:]
+    assert [call.args[0] for call in kill.call_args_list] == replacements
     for engine in surviving:
         engine.shutdown.remote.assert_not_called()
+
+    server.recover()
+    assert group.all_engines == surviving + replacements
+    assert server.num_new_engines == len(slots)
+    assert [call.args[2].actor_id for call in cleanup.call_args_list] == [
+        f"{generation}-{slot}" for generation in ("old", "new") for slot in slots[::nodes_per_engine]
+    ]
 
 
 def test_owner_signals_all_monitors_before_bounded_join(monkeypatch, rollout_module):
