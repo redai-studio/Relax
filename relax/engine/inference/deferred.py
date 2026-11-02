@@ -22,7 +22,6 @@ import json
 import weakref
 from typing import Any, Iterable
 
-from relax.engine.inference.client import _settle
 from relax.engine.inference.lifecycle import (
     LifecycleCoordinator,
     local_rollout_participant,
@@ -272,6 +271,11 @@ async def run_deferred_scoring(
         return
 
     async with _scoring_lock():
+        from relax.engine.rewards import RewardExecutor
+
+        executor = RewardExecutor._instance
+        if executor is not None:
+            await control_call(executor.settle_cancelled_calls())
         if coordinator is None:
             coordinator = build_local_coordinator(args)
         if teacher_samples and opd_manager is None:
@@ -295,9 +299,17 @@ async def run_deferred_scoring(
         finally:
             # Also on failure: a scorer left awake would sit in the GPU memory
             # the next phase needs.
-            await _settle(asyncio.create_task(asyncio.to_thread(coordinator.leave_score)))
-            if evaluation or (scored and needs_student):
-                await _settle(asyncio.create_task(asyncio.to_thread(coordinator.enter_generate)))
+            async def cleanup() -> None:
+                executor = RewardExecutor._instance
+                if executor is not None:
+                    await executor.settle_cancelled_calls()
+                await asyncio.to_thread(coordinator.leave_score)
+                if evaluation or (scored and needs_student):
+                    await asyncio.to_thread(coordinator.enter_generate)
+
+            # Settle the entire handoff on repeated cancellation, but preserve
+            # cancellation so the caller cannot publish a cancelled batch.
+            await control_call(cleanup())
         logger.info("Deferred scoring: left the score phase")
 
         if teacher_samples:

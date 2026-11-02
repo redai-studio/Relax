@@ -176,10 +176,20 @@ class LifecycleCoordinator:
         """Issue the switches together and wait until every one is
         confirmed."""
         refs: list = []
-        for switch in switches:
-            refs.extend(switch())
-        if refs:
-            self._wait(refs)
+        try:
+            for switch in switches:
+                refs.extend(switch())
+            if refs:
+                self._wait(refs)
+        except BaseException:
+            # A later submission or one ref may fail while earlier switches
+            # are still running. Compensation must not race those switches.
+            for ref in refs:
+                try:
+                    self._wait([ref])
+                except BaseException:
+                    pass
+            raise
 
     # ------------------------------------------------------------------
     # Phase entries.
@@ -219,7 +229,26 @@ class LifecycleCoordinator:
             if p not in residents and any(self._shares_bundles(p, resident) for resident in residents)
         ]
         self._run(p.deactivate for p in yielding)
-        self._run(p.activate for p in residents)
+        attempted: list[LifecycleParticipant] = []
+
+        def activate(participant: LifecycleParticipant) -> list:
+            attempted.append(participant)
+            return participant.activate()
+
+        try:
+            self._run(lambda p=p: activate(p) for p in residents)
+        except BaseException:
+            cleanup_error = None
+            for participant in reversed(attempted):
+                try:
+                    self._run([participant.deactivate])
+                except BaseException as error:
+                    cleanup_error = error
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    "Score activation failed and scorer release could not be confirmed"
+                ) from cleanup_error
+            raise
 
     def leave_score(self) -> None:
         """Put the models that only live in the score phase back to sleep."""

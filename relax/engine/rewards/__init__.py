@@ -9,6 +9,7 @@ import aiohttp
 import ray
 
 from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.engine.inference.phase_client import control_call, gather_owned
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
@@ -23,6 +24,7 @@ _shared_session: aiohttp.ClientSession | None = None
 _MAX_CONTEXT_VALUE_LENGTH = 64
 _MAX_GROUP_CONTEXT_SAMPLES = 4
 _MAX_GROUP_CONTEXT_LENGTH = 2048
+_REWARD_CANCEL_TIMEOUT_S = 120.0
 
 
 class RewardExecutionError(RuntimeError):
@@ -212,6 +214,7 @@ class RewardExecutor:
         self._custom_reward_functions: dict[str, Callable[..., Any]] = {}
         self._custom_reward_is_async: dict[str, bool] = {}
         self._submission_cleanup_tasks: set[asyncio.Task] = set()
+        self._cancelled_worker_calls: dict[Any, tuple[Any, str]] = {}
 
     # -- singleton access -----------------------------------------------------
 
@@ -264,7 +267,7 @@ class RewardExecutor:
             )
 
     def _next_worker(self):
-        worker = self._workers[self._worker_index % self._num_workers]
+        worker = self._workers[self._worker_index % len(self._workers)]
         self._worker_index += 1
         return worker
 
@@ -287,14 +290,65 @@ class RewardExecutor:
         ray.get([worker.reload_custom_reward.remote(path) for worker in self._workers])
 
     @staticmethod
-    def _cancel_worker_call(ref, *, custom_rm_path: str) -> None:
+    def _cancel_worker_call(ref, *, worker: Any, custom_rm_path: str) -> bool:
         try:
             ray.cancel(ref, force=False)
         except Exception as exc:
             logger.warning("Failed to request cancellation for custom reward %r: %s", custom_rm_path, exc)
+        terminal_errors = (
+            ray.exceptions.TaskCancelledError,
+            ray.exceptions.RayTaskError,
+            ray.exceptions.RayActorError,
+        )
+        try:
+            ray.get(ref, timeout=_REWARD_CANCEL_TIMEOUT_S)
+        except terminal_errors:
+            return False
+        except ray.exceptions.GetTimeoutError:
+            # Synchronous custom functions need not cooperate with ray.cancel.
+            # Retire only their CPU worker and require a terminal ObjectRef.
+            ray.kill(worker, no_restart=True)
+            try:
+                ray.get(ref, timeout=_REWARD_CANCEL_TIMEOUT_S)
+            except terminal_errors:
+                pass
+            return True
+        return False
 
-    @classmethod
-    async def _cancel_after_submission(cls, submission_task: asyncio.Task, *, custom_rm_path: str) -> None:
+    async def _cancel_and_wait(self, ref: Any, *, worker: Any, custom_rm_path: str) -> None:
+        self._cancelled_worker_calls[ref] = (worker, custom_rm_path)
+        retired = True
+        try:
+            retired = await control_call(
+                asyncio.to_thread(self._cancel_worker_call, ref, worker=worker, custom_rm_path=custom_rm_path)
+            )
+        finally:
+            # A kill whose terminal evidence timed out must not leave a dead
+            # worker in the pool. Keep its ref for a later bounded retry.
+            if retired and worker in self._workers:
+                self._workers.remove(worker)
+        self._cancelled_worker_calls.pop(ref, None)
+
+    async def settle_cancelled_calls(self) -> None:
+        """Confirm old custom calls ended before a deferred GPU handoff.
+
+        Unconfirmed refs remain available for another bounded attempt. A new
+        batch must obtain this evidence before it can enter the score phase.
+        """
+        tasks = tuple(self._submission_cleanup_tasks)
+        if tasks:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(*tasks, return_exceptions=True)), _REWARD_CANCEL_TIMEOUT_S
+            )
+            self._submission_cleanup_tasks.difference_update(tasks)
+        await gather_owned(
+            self._cancel_and_wait(ref, worker=worker, custom_rm_path=path)
+            for ref, (worker, path) in list(self._cancelled_worker_calls.items())
+        )
+
+    async def _cancel_after_submission(
+        self, submission_task: asyncio.Task, *, worker: Any, custom_rm_path: str
+    ) -> None:
         try:
             ref = await submission_task
         except Exception as exc:
@@ -304,18 +358,25 @@ class RewardExecutor:
                 exc,
             )
             return
-        cls._cancel_worker_call(ref, custom_rm_path=custom_rm_path)
+        await self._cancel_and_wait(ref, worker=worker, custom_rm_path=custom_rm_path)
 
-    async def _submit_worker_call(self, submit: Callable[[], Any], *, custom_rm_path: str) -> Any:
+    async def _submit_worker_call(self, submit: Callable[[], Any], *, worker: Any, custom_rm_path: str) -> Any:
         submission_task = asyncio.create_task(asyncio.to_thread(submit))
         try:
             return await asyncio.shield(submission_task)
         except asyncio.CancelledError:
             cleanup_task = asyncio.create_task(
-                self._cancel_after_submission(submission_task, custom_rm_path=custom_rm_path)
+                self._cancel_after_submission(submission_task, worker=worker, custom_rm_path=custom_rm_path)
             )
             self._submission_cleanup_tasks.add(cleanup_task)
-            cleanup_task.add_done_callback(self._submission_cleanup_tasks.discard)
+
+            def completed(task: asyncio.Task) -> None:
+                # Consume exceptions, but retain unresolved cleanup for the
+                # next batch's evidence check instead of silently forgetting it.
+                if not task.cancelled() and task.exception() is None:
+                    self._submission_cleanup_tasks.discard(task)
+
+            cleanup_task.add_done_callback(completed)
             raise
 
     async def _execute_custom(
@@ -332,15 +393,18 @@ class RewardExecutor:
                 return await function(args, sample, **kwargs)
 
             await self._ensure_workers(args)
+            await self.settle_cancelled_calls()
+            await self._ensure_workers(args)
             worker = self._next_worker()
             ref = await self._submit_worker_call(
                 lambda: worker.compute_custom.remote(path, args, sample, kwargs),
+                worker=worker,
                 custom_rm_path=path,
             )
             try:
                 return await ref
             except asyncio.CancelledError:
-                self._cancel_worker_call(ref, custom_rm_path=path)
+                await control_call(self._cancel_and_wait(ref, worker=worker, custom_rm_path=path))
                 raise
         except asyncio.CancelledError:
             raise
@@ -489,4 +553,4 @@ async def batched_async_rm(
     """
     if args.custom_rm_path is not None and not kwargs.get("ignore_custom", False):
         return await _get_reward_executor(args)._execute_custom_with_concurrency(args, samples, **kwargs)
-    return await asyncio.gather(*(async_rm(args, sample, **kwargs) for sample in samples))
+    return await gather_owned(async_rm(args, sample, **kwargs) for sample in samples)
