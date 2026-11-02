@@ -231,10 +231,12 @@ def test_flops_seed_randomized_capacity_coverage_and_determinism(partitioner):
         assert all(sum(lengths[i] for i in group) <= 20 or len(group) == 1 for group in groups)
 
 
-def test_iterator_slices_costs_at_each_optimizer_step(iterator_data, monkeypatch):
+@pytest.mark.parametrize("microbatch", ["tokens", "flops"])
+@pytest.mark.parametrize("dp", ["tokens", "flops"])
+def test_iterator_slices_only_enabled_microbatch_costs_at_each_optimizer_step(
+    iterator_data, monkeypatch, microbatch, dp
+):
     from types import SimpleNamespace
-
-    microbatch = "flops"
 
     costs = [100, 74, 99, 75, 80, 79, 1, 90, 2, 91, 3, 92]
     cost_calls, sync_groups = [], []
@@ -247,6 +249,7 @@ def test_iterator_slices_costs_at_each_optimizer_step(iterator_data, monkeypatch
     monkeypatch.setattr(iterator_data.dist, "all_reduce", lambda *args, **kw: sync_groups.append(kw["group"]))
     args = SimpleNamespace(
         microbatch_balance=microbatch,
+        dp_balance=dp,
         global_batch_size=6,
         use_dynamic_batch_size=True,
         max_tokens_per_gpu=16,

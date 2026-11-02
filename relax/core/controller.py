@@ -376,13 +376,22 @@ class Controller:
                     pad_size=pad_size,
                 )
             else:
-                sampler = SeqlenBalancedSampler(
+                sampler_class = SeqlenBalancedSampler
+                if getattr(self.config, "dp_balance", "tokens") == "flops":
+                    from relax.utils.data.flops_balancing import FlopsBalancedSampler
+
+                    sampler_class = FlopsBalancedSampler
+                sampler = sampler_class(
                     n_samples_per_prompt=self.config.n_samples_per_prompt,
                     dp_size=dp_size,
                 )
             logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
         elif getattr(self.config, "balance_data", False):
-            sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")
+            sampler = IdentityWindowSampler(
+                dp_size=dp_size,
+                placement="balanced",
+                cost_key="flops_cost" if getattr(self.config, "dp_balance", "tokens") == "flops" else None,
+            )
             logger.info(f"Using IdentityWindowSampler with balanced row placement, dp_size={dp_size}")
         else:
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")

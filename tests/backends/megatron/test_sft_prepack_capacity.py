@@ -78,18 +78,23 @@ def _run_actor_partitions(namespace, repack):
 
 @pytest.mark.parametrize("repack", [False, True])
 @pytest.mark.parametrize("allgather_cp", [False, True])
-def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgather_cp):
+@pytest.mark.parametrize("dp", [None, "tokens", "flops"])
+def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgather_cp, dp):
     # The original KK-only partition produces [11, 10, 9, 9, 9] with K=5.
     lengths = [3, 9, 7, 6, 2, 5, 2, 5, 9]
     args = SimpleNamespace(max_tokens_per_gpu=10, allgather_cp=allgather_cp, data_pad_size_multiplier=2)
+    if dp is not None:
+        args.dp_balance = dp
     capacity = 8 if allgather_cp else 10
     local_k = partitioning["get_minimum_num_micro_batch_size"](lengths, capacity)
     partitioning.update(
         self=SimpleNamespace(args=args),
         samples=lengths,
-        rollout_data={"total_lengths": lengths},
+        rollout_data={"total_lengths": lengths, "flops_cost": [float(length * length) for length in lengths]},
         cp_size=1,
-        window=SimpleNamespace(rollout_data={"total_lengths": lengths}),
+        window=SimpleNamespace(
+            rollout_data={"total_lengths": lengths, "flops_cost": [float(length * length) for length in lengths]}
+        ),
         max_k=local_k + 1,
     )
     partitions = _run_actor_partitions(partitioning, repack)

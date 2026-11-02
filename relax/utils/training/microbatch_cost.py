@@ -12,6 +12,12 @@ SampleCostEstimator = Callable[[Any, dict[str, Any], Namespace], Sequence[float]
 _ESTIMATORS: dict[str, SampleCostEstimator] = {}
 
 
+def configure_flops_balance(args: Namespace) -> None:
+    """Validate independent objectives after the final CLI/YAML overrides."""
+    validate_microbatch_balance(args)
+    validate_dp_balance(args)
+
+
 def register_sample_cost_estimator(model_type: str, estimator: SampleCostEstimator) -> None:
     """Register a CPU-only estimator(config, rollout_data, args).
 
@@ -66,9 +72,25 @@ def validate_microbatch_balance(args: Namespace) -> bool:
     return True
 
 
-def sample_costs(args: Namespace, rollout_data: dict[str, Any]) -> list[float] | None:
-    """Resolve costs only when rank-local FLOPs balancing is selected."""
-    if not validate_microbatch_balance(args):
+def validate_dp_balance(args: Namespace) -> bool:
+    """Validate DP placement without changing microbatches or legacy enablement."""
+    if not _uses_flops(args, "dp_balance"):
+        return False
+    _validate_flops_configuration(args)
+    if getattr(args, "loss_type", None) == "sft":
+        if getattr(args, "n_samples_per_prompt", 1) != 1:
+            raise ValueError("FLOPs DP balancing for SFT requires n_samples_per_prompt=1")
+        if getattr(args, "sft_image_preprocess_on_rank", False):
+            raise ValueError("FLOPs DP balancing requires CPU media metadata before queue publication")
+    elif not getattr(args, "balance_data", False):
+        raise ValueError("--dp-balance flops requires --balance-data for non-SFT training")
+    return True
+
+
+def sample_costs(args: Namespace, rollout_data: dict[str, Any], *, for_dp: bool = False) -> list[float] | None:
+    """Resolve costs only for the explicitly selected microbatch or DP objective."""
+    validate = validate_dp_balance if for_dp else validate_microbatch_balance
+    if not validate(args):
         return None
     if "_sft_wholepack_v1" in rollout_data:
         raise ValueError("FLOPs balancing cannot consume an existing wholepack plan")
@@ -83,7 +105,7 @@ def sample_costs(args: Namespace, rollout_data: dict[str, Any]) -> list[float] |
     else:
         estimator = _ESTIMATORS.get(model_type)
     if estimator is None:
-        option = "--microbatch-balance"
+        option = "--dp-balance" if for_dp else "--microbatch-balance"
         raise ValueError(
             f"No FLOPs sample cost estimator for model_type={model_type!r}; "
             f"register_sample_cost_estimator or use {option} tokens"
@@ -94,3 +116,15 @@ def sample_costs(args: Namespace, rollout_data: dict[str, Any]) -> list[float] |
     if any(not math.isfinite(value) or value <= 0 for value in costs):
         raise ValueError("Sample costs must be positive and finite")
     return costs
+
+
+def add_flops_cost_metadata(
+    args: Namespace | None, batch: dict[str, Any], metadata: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Attach CPU costs before payloads enter the queue's sampling layer."""
+    if args is None or not validate_dp_balance(args):
+        return metadata
+    costs = sample_costs(args, batch, for_dp=True)
+    if costs is None or len(costs) != len(metadata):
+        raise ValueError("FLOPs DP metadata requires one model cost per physical sample")
+    return [{**row, "flops_cost": cost} for row, cost in zip(metadata, costs, strict=True)]
