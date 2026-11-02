@@ -435,6 +435,9 @@ class BridgeConverter:
             global_name = _normalize_global_name(name)
             task = self._bridge_task_map.get(global_name)
             mapping = task.mapping if task is not None else self._lookup_mapping(global_name)[1]
+            # Native expert packing bypasses the mapping's export transformation.
+            if getattr(mapping, "transpose_on_export", False):
+                return False
             hf_param = getattr(mapping, "hf_param", None)
             outputs = list(hf_param.values()) if isinstance(hf_param, dict) else [hf_param]
             projections = set()
