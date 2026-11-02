@@ -566,3 +566,21 @@ async def test_role_maintenance_rejects_a_returned_explicit_lease():
     with pytest.raises(StaleLeaseError):
         await manager.call("default", "scale_in", lease=lease)
     assert called == []
+
+
+async def test_training_weight_handoff_allows_its_own_rollout_recovery():
+    c = claim()
+    ledger = OwnershipLedger(PlacementPlan((), (c,)))
+
+    async def apply(model, action, lease, command, **kwargs):
+        if action == "onload":
+            ledger.reserve_activation(lease, "rollout", "default")
+        else:
+            ledger.confirm_deactivation(lease, "rollout", "default")
+
+    ledger.register_model("rollout", "default", SimpleNamespace(apply=SimpleNamespace(remote=apply)), c)
+    lease = await ledger.acquire("update_weights", "training", [c], role="actor")
+    assert not ledger.reserve_maintenance("rollout", "default", lease=lease)
+    await ledger.command(lease, "weights", "generate", "weights")
+    assert ledger.reserve_maintenance("rollout", "default", lease=lease)
+    assert not ledger.reserve_maintenance("rollout", "default")

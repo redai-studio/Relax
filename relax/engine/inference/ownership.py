@@ -424,7 +424,7 @@ class OwnershipLedger:
         # Reserve before dispatch, so concurrent activations cannot both pass.
         self._resident.update(keys)
 
-    def reserve_maintenance(self, role: str, model: str) -> bool:
+    def reserve_maintenance(self, role: str, model: str, *, lease: ActivationLease | None = None) -> bool:
         """Serialize allocation with cross-role residency, not workload leases.
 
         Once reserved, training handoff goes through the manager's model lock
@@ -435,8 +435,16 @@ class OwnershipLedger:
         for blocked, _ in self._blocked.values():
             if any(claims_overlap(a, b) for a in claims for b in blocked):
                 return False
-        for lease in self._active.values():
-            if lease.role in _TRAINING_ROLES and any(claims_overlap(a, b) for a in claims for b in lease.claims):
+        if lease is not None:
+            self.check(lease, claims)
+        for active in self._active.values():
+            if active.role in _TRAINING_ROLES and any(claims_overlap(a, b) for a in claims for b in active.claims):
+                # update_weights still owns its training lease after it has
+                # handed memory to inference. Permit its recovery before sync.
+                if active == lease and all(
+                    key in self._resident and self._phase.get(key) == "generate" for key in keys
+                ):
+                    continue
                 return False
         for key in self._resident.difference(keys):
             other = self._models[key][2]

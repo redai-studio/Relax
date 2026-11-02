@@ -270,7 +270,9 @@ class InferenceManager:
             if self._closing:
                 return None
             if method not in {"scale_in", "remove_engine"}:
-                allowed = await self.authority.reserve_maintenance.remote(self.role, name)
+                allowed = await self.authority.reserve_maintenance.remote(
+                    self.role, name, **({"lease": lease} if lease is not None else {})
+                )
                 if not allowed:
                     # Offloaded shared engines are rebuilt at the next onload.
                     if method in {"recover", "recover_rollout_engines", "register_recovered_engines"}:
