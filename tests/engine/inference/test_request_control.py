@@ -61,8 +61,11 @@ async def test_request_control_deadline_keeps_unknown_permits_until_late_receipt
                 await asyncio.sleep(0)
         done, _ = await asyncio.wait({task}, timeout=0.3)
         assert done, "control RPC exceeded its budget, even after repeated cancellation"
-        with pytest.raises(asyncio.CancelledError if cancel else ModelUnavailableError):
+        if stall == "release" and not cancel:
             await task
+        else:
+            with pytest.raises(asyncio.CancelledError if cancel else ModelUnavailableError):
+                await task
         assert sent == (["HTTP completed"] if stall == "release" else [])
         assert client._cleanup_tasks, "late RPC cleanup must remain owned after the caller exits"
         if stall != "acquire":

@@ -213,9 +213,16 @@ class InferenceRequest:
         pending = self._client._track_cleanup(
             asyncio.create_task(_manager_call(self._manager, "confirm_inference_dispatch", self._permit))
         )
-        await _wait_request_control(
-            pending, "dispatch confirmation", time.monotonic() + Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S
-        )
+        try:
+            await _wait_request_control(
+                pending, "dispatch confirmation", time.monotonic() + Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S
+            )
+        except (asyncio.CancelledError, RoutingError):
+            raise
+        except Exception as error:
+            raise ModelUnavailableError(
+                f"Dispatch confirmation for {self._client.role!r} is unavailable: {error}"
+            ) from error
 
     async def _return_late_grant(self, pending: asyncio.Task[RequestPermit]) -> None:
         try:
@@ -254,9 +261,16 @@ class InferenceRequest:
     async def aclose(self) -> None:
         if self._permit is None:
             return
-        await _wait_request_control(
-            self._start_release(), "inference permit return", time.monotonic() + Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S
-        )
+        try:
+            await _wait_request_control(
+                self._start_release(),
+                "inference permit return",
+                time.monotonic() + Envs.RELAX_INFERENCE_CONTROL_TIMEOUT_S,
+            )
+        except ModelUnavailableError:
+            # A missing cleanup receipt cannot rewrite the HTTP result. The
+            # tracked release task and owner still hold the unknown permit.
+            logger.warning("Inference permit return timed out for role %s; cleanup remains pending", self._client.role)
 
     async def __aexit__(self, _kind: Any, error: Any, _traceback: Any) -> None:
         if isinstance(error, Exception) and self.target is not None:

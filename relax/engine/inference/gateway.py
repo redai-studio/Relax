@@ -85,6 +85,9 @@ class _NativeStreamingResponse(StreamingResponse):
             try:
                 async for chunk in upstream.aiter_bytes():
                     yield chunk
+            except RoutingError as error:
+                yield f"data: {make_error_chunk(error.status_code, str(error))}\n\n".encode()
+                yield b"data: [DONE]\n\n"
             finally:
                 await self.aclose()
 
@@ -290,7 +293,11 @@ class InferenceGateway:
         except RoutingError as exc:
             if response is not None:
                 await response.aclose()
-            raise HTTPException(exc.status_code, str(exc)) from exc
+            raise HTTPException(
+                exc.status_code,
+                str(exc),
+                headers={"Retry-After": str(self._retry_after_s)} if isinstance(exc, ModelUnavailableError) else None,
+            ) from exc
         except httpx.HTTPStatusError as exc:
             try:
                 detail = (await exc.response.aread()).decode(errors="replace")
@@ -365,6 +372,9 @@ class InferenceGateway:
                     yield chunk
             except HTTPException as error:
                 yield f"data: {make_error_chunk(error.status_code, str(error.detail))}\n\n"
+                yield "data: [DONE]\n\n"
+            except RoutingError as error:
+                yield f"data: {make_error_chunk(error.status_code, str(error))}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 if response is not None:
