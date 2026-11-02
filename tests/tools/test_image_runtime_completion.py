@@ -261,4 +261,47 @@ def test_default_dockerfile_installs_shared_repairs_without_cu13_libraries():
     assert "nvidia-nvshmem-cu12==3.4.5" in source
     assert "nvidia-nvshmem-cu13" not in source
     assert "nvidia-nccl-cu13" not in source
-    assert "v0.5.17-cu129" in source
+    assert "ARG BASE_IMAGE=ghcr.io/redai-studio/relaxrl:sglang-v0.5.21-cu129" in source
+
+
+def test_cached_training_wheel_replaces_installed_same_version(tmp_path):
+    """Exercise the Dockerfile's pip command with different same-version
+    payloads."""
+    import venv
+
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=True).create(environment)
+    python = environment / "bin/python"
+    info = "torch_memory_saver-0.0.9.post1.dist-info"
+    wheels = []
+    for directory, payload in (("base", "ORIGIN = 'upstream'\n"), ("cache", "def get_cpu_backup(): return 'fork'\n")):
+        wheel = tmp_path / directory / "torch_memory_saver-0.0.9.post1-py3-none-any.whl"
+        wheel.parent.mkdir()
+        entries = {
+            "torch_memory_saver/__init__.py": payload,
+            f"{info}/METADATA": "Metadata-Version: 2.1\nName: torch-memory-saver\nVersion: 0.0.9.post1\n",
+            f"{info}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        }
+        entries[f"{info}/RECORD"] = "".join(f"{name},,\n" for name in entries)
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for name, content in entries.items():
+                archive.writestr(name, content)
+        wheels.append(wheel)
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "--no-index", "--no-deps", str(wheels[0])],
+        check=True,
+        capture_output=True,
+    )
+    # Use the first cache-wheel install's options with an isolated artifact and
+    # Python environment; other runtime dependencies are outside this fixture.
+    source = (ROOT / "docker/Dockerfile").read_text().replace("\\\n", " ")
+    install = next(command.strip() for command in source.split("&&") if "/tmp/train-wheels/*.whl" in command)
+    args = shlex.split(install)
+    args = args[: args.index("/tmp/train-wheels/*.whl") + 1]
+    args[-1] = str(wheels[1])
+    subprocess.run([str(python), "-m", *args, "--no-index"], check=True, capture_output=True)
+    subprocess.run(
+        [str(python), "-c", "from torch_memory_saver import get_cpu_backup; assert get_cpu_backup() == 'fork'"],
+        check=True,
+        capture_output=True,
+    )
