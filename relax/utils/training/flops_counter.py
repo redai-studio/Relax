@@ -420,6 +420,26 @@ def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kar
         vit_flops = 0
 
     flops_all_token = dense_N_flops + attn_qkv_flops + gdn_recurrence_flops + vit_flops
+    mtp_num_layers = kargs.get("mtp_num_layers") or 0
+    if kargs.get("enable_mtp_training", False) and mtp_num_layers > 0 and not kargs.get("forward_only", False):
+        # Qwen3.5 MTP uses full attention.
+        mtp_attn_N = hidden_size * head_dim * (3 * num_attention_heads + 2 * text_config.num_key_value_heads)
+        mtp_attn_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads
+
+        mtp_only = kargs.get("mtp_only_training", False)
+        if mtp_only:
+            # Frozen backbone/vision run forward only; the main LM head is bypassed.
+            # Keep the existing embedding estimate unchanged within that forward.
+            flops_all_token = flops_all_token / 3 - 2 * tokens_sum * hidden_size * vocab_size
+
+        detach_paths = kargs.get("mtp_detach_paths", ("embedding", "backbone", "lm-head"))
+        # Detached LM-head weights still require dX, but not dW. Backbone detach
+        # does not remove the main-loss backward in joint training.
+        head_factor = 4 if mtp_only or "lm-head" in detach_paths else 6
+        mtp_flops = 6 * tokens_sum * (2 * hidden_size**2 + mtp_attn_N + mlp_N // num_hidden_layers) + mtp_attn_flops
+        mtp_flops += head_factor * tokens_sum * hidden_size * vocab_size
+        # Count prediction depths even with shared MTP weights; exclude recomputation.
+        flops_all_token += mtp_num_layers * mtp_flops
     return flops_all_token / delta_time / 1e12
 
 
@@ -561,8 +581,8 @@ class FlopsCounter:
         """Return (estimated_tflops, peak_device_tflops).
 
         ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``. K3
-        honors independent frozen-region flags; other estimators retain their
-        existing 3x-forward training convention.
+        honors independent frozen-region flags; Qwen3.5 honors MTP training
+        settings. Other estimators retain their 3x-forward training convention.
         """
         tokens_sum = sum(batch_seqlens)
         model_type = getattr(self.config, "model_type", None)
@@ -582,6 +602,9 @@ class FlopsCounter:
                     )
                     self._warned_unsupported_trainability = True
                 return float("nan"), get_device_peak_flops(unit="T")
+            kwargs["forward_only"] = forward_only
+        elif func is _estimate_qwen3_5_flops:
+            # log_probs/ref inference does not execute the training-only MTP path.
             kwargs["forward_only"] = forward_only
         sig = inspect.signature(func)
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
