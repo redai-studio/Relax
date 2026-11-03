@@ -31,6 +31,7 @@ from .processing import (
     build_image_token_block,
     build_thw_indexes,
     create_block_causal_mask,
+    image_resize_geometry,
     load_image_native,
     patchify,
     unpatchify,
@@ -305,11 +306,11 @@ class SenseNovaU1ImageUnit_ShapeChecker(PipelineUnit):
 class SenseNovaU1ImageUnit_EditImageEmbedder(PipelineUnit):
     def __init__(self) -> None:
         super().__init__(
-            input_params=("edit_image",),
+            input_params=("edit_image", "prepared_prefix"),
             output_params=("edit_pixel_values", "edit_grid_hw"),
         )
 
-    def process(self, pipe: SenseNovaU1ImagePipeline, edit_image: Any) -> Any:
+    def process(self, pipe: SenseNovaU1ImagePipeline, edit_image: Any, prepared_prefix: Any = None) -> Any:
         if edit_image is None:
             return {"edit_pixel_values": None, "edit_grid_hw": None}
         if isinstance(edit_image, Image.Image):
@@ -317,7 +318,7 @@ class SenseNovaU1ImageUnit_EditImageEmbedder(PipelineUnit):
 
         max_pixels = min(2048 * 2048, (4096 * 4096) // len(edit_image))
         pixel_values, grid_hw = [], []
-        for image in edit_image:
+        for index, image in enumerate(edit_image):
             cur_pixel_values, cur_grid_hw = load_image_native(
                 image,
                 pipe.dit.patch_size,
@@ -326,6 +327,13 @@ class SenseNovaU1ImageUnit_EditImageEmbedder(PipelineUnit):
                 max_pixels=max_pixels,
                 upscale=False,
             )
+            if prepared_prefix is not None:
+                # Both tensors are still on CPU. Never synchronize GPU grids
+                # back to the host merely to validate a prepared cache key.
+                if cur_grid_hw.device.type != "cpu" or not torch.equal(
+                    cur_grid_hw, prepared_prefix["grid_hw"][index : index + 1]
+                ):
+                    raise ValueError("Prepared SenseNova reference geometry differs from native preprocessing")
             pixel_values.append(cur_pixel_values.to(device=pipe.device, dtype=pipe.torch_dtype))
             grid_hw.append(cur_grid_hw.to(pipe.device))
         return {"edit_pixel_values": torch.cat(pixel_values), "edit_grid_hw": torch.cat(grid_hw)}
@@ -343,6 +351,7 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
                 "think_mode",
                 "use_gradient_checkpointing",
                 "use_gradient_checkpointing_offload",
+                "prepared_prefix",
             ),
             input_params_posi={"prompt": "prompt", "is_positive": "is_positive"},
             input_params_nega={"prompt": "prompt", "is_positive": "is_positive"},
@@ -367,15 +376,23 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
         return query
 
     @staticmethod
-    def build_prefix_inputs(pipe: Any, query: Any, pixel_values: Any, grid_hw: Any) -> Any:
-        input_ids = pipe.tokenizer(query, return_tensors="pt")["input_ids"].to(pipe.device)
-        indexes = build_thw_indexes(
-            input_ids[0],
-            pipe.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN),
-            pipe.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN),
-            grid_hw=grid_hw,
-            merge_size=pipe.dit.merge_size,
-        )
+    def build_prefix_inputs(
+        pipe: Any, query: Any, pixel_values: Any, grid_hw: Any, prepared_prefix: Any = None
+    ) -> Any:
+        if prepared_prefix is None:
+            input_ids = pipe.tokenizer(query, return_tensors="pt")["input_ids"].to(pipe.device)
+            context_token_id = pipe.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+            indexes = build_thw_indexes(
+                input_ids[0],
+                pipe.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN),
+                context_token_id,
+                grid_hw=grid_hw,
+                merge_size=pipe.dit.merge_size,
+            )
+        else:
+            input_ids = prepared_prefix["input_ids"].to(pipe.device)
+            indexes = prepared_prefix["indexes"].to(pipe.device)
+            context_token_id = prepared_prefix["special_token_ids"]["image_context"]
         attention_mask = create_block_causal_mask(indexes[0])
         if pixel_values is None:
             return input_ids, None, indexes, attention_mask
@@ -383,10 +400,70 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
         inputs_embeds = pipe.dit.embed_tokens(input_ids)
         batch_size, num_tokens, channels = inputs_embeds.shape
         vision_embeds = pipe.dit.extract_und_feature(pixel_values, grid_hw)
-        selected = input_ids.reshape(-1) == pipe.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        selected = input_ids.reshape(-1) == context_token_id
         inputs_embeds = inputs_embeds.reshape(-1, channels)
         inputs_embeds[selected] = vision_embeds.reshape(-1, channels).to(inputs_embeds.device)
         return input_ids, inputs_embeds.reshape(batch_size, num_tokens, channels), indexes, attention_mask
+
+    @classmethod
+    def build_query(cls, pipe: Any, prompt: str, grid_hw: Any, *, is_positive: bool, reasoning: bool) -> str:
+        num_images = 0 if grid_hw is None else grid_hw.shape[0]
+        if is_positive:
+            query = build_conversation_prompt(
+                cls.insert_image_placeholders(prompt, num_images),
+                system_message=SYSTEM_MESSAGE_FOR_GEN,
+                append_text=THINK_PREFIX if reasoning else NON_THINK_PREFIX + IMG_START_TOKEN,
+            )
+        else:
+            query = build_conversation_prompt(
+                IMAGE_PLACEHOLDER * num_images,
+                system_message="",
+                append_text=IMG_START_TOKEN,
+            )
+        return cls.expand_image_placeholders(query, grid_hw, pipe.dit.downsample_ratio) if num_images else query
+
+    @classmethod
+    def prepare_sft_inputs(cls, pipe: Any, prompt: str, edit_images: list[Any]) -> dict[str, Any]:
+        """Build exact positive SFT encoder inputs on CPU, without pixel work.
+
+        Tokenizer configuration may mutate. The key and the online encoder
+        consume this same result, so the key covers effective mathematical
+        inputs instead of serializing the tokenizer's entire vocabulary.
+        """
+        max_pixels = min(2048 * 2048, (4096 * 4096) // max(1, len(edit_images)))
+        grids = []
+        for image in edit_images:
+            height, width = image_resize_geometry(
+                image.width,
+                image.height,
+                patch_size=pipe.dit.patch_size,
+                downsample_ratio=pipe.dit.downsample_ratio,
+                min_pixels=512 * 512,
+                max_pixels=max_pixels,
+            )
+            grids.append([height // pipe.dit.patch_size, width // pipe.dit.patch_size])
+        grid_hw = torch.tensor(grids, dtype=torch.long, device="cpu") if grids else None
+        query = cls.build_query(pipe, prompt, grid_hw, is_positive=True, reasoning=False)
+        tokens = pipe.tokenizer(query, return_tensors=None)["input_ids"]
+        input_ids = torch.tensor([tokens], dtype=torch.long, device="cpu")
+        special_token_ids = {
+            "image_start": pipe.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN),
+            "image_context": pipe.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN),
+        }
+        indexes = build_thw_indexes(
+            input_ids[0],
+            special_token_ids["image_start"],
+            special_token_ids["image_context"],
+            grid_hw=grid_hw,
+            merge_size=pipe.dit.merge_size,
+        )
+        return {
+            "query": query,
+            "input_ids": input_ids,
+            "indexes": indexes,
+            "grid_hw": grid_hw,
+            "special_token_ids": special_token_ids,
+        }
 
     @staticmethod
     def build_image_indexes(token_h: Any, token_w: Any, text_len: Any, device: Any) -> Any:
@@ -408,31 +485,23 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
         think_mode: Any,
         use_gradient_checkpointing: Any,
         use_gradient_checkpointing_offload: Any,
+        prepared_prefix: Any = None,
     ) -> Any:
         pipe.load_models_to_device(self.onload_model_names)
-        num_images = 0 if edit_grid_hw is None else edit_grid_hw.shape[0]
         reasoning = bool(think_mode) and is_positive and not pipe.scheduler.training
-
-        if is_positive:
-            query = build_conversation_prompt(
-                self.insert_image_placeholders(prompt, num_images),
-                system_message=SYSTEM_MESSAGE_FOR_GEN,
-                append_text=THINK_PREFIX if reasoning else NON_THINK_PREFIX + IMG_START_TOKEN,
-            )
+        if prepared_prefix is not None:
+            if not pipe.scheduler.training or not is_positive or reasoning:
+                raise ValueError("Prepared SenseNova conditions support only positive training prefixes")
+            query = prepared_prefix["query"]
         else:
-            query = build_conversation_prompt(
-                IMAGE_PLACEHOLDER * num_images,
-                system_message="",
-                append_text=IMG_START_TOKEN,
-            )
-        if num_images > 0:
-            query = self.expand_image_placeholders(query, edit_grid_hw, pipe.dit.downsample_ratio)
+            query = self.build_query(pipe, prompt, edit_grid_hw, is_positive=bool(is_positive), reasoning=reasoning)
 
         input_ids, inputs_embeds, indexes, attention_mask = self.build_prefix_inputs(
             pipe,
             query,
             edit_pixel_values,
             edit_grid_hw,
+            prepared_prefix,
         )
         if reasoning:
             past_key_values, text_len, token_ids = pipe.dit.generate_think(

@@ -669,10 +669,15 @@ def validate_i2i_sft_config(args: Namespace) -> None:
             "image_prefetch_workers",
             "dp_tier_micro_balance",
             "dp_tier_rank_rotation",
+            "fsdp_branch_groups",
         }
     )
     _fail(errors, bool(unknown), f"Unknown i2i_sft_config keys: {sorted(unknown)}")
     args.i2i_sft_config = config = {**defaults, **config}
+    _fail(errors, type(config.get("fsdp_branch_groups", False)) is not bool, "fsdp_branch_groups must be boolean")
+    # The disabled policy keeps the historical checkpoint configuration.
+    if config.get("fsdp_branch_groups") is False:
+        config.pop("fsdp_branch_groups")
     depth, workers = config.get("image_prefetch_depth", 0), config.get("image_prefetch_workers", 2)
     _fail(errors, type(depth) is not int or depth < 0, "image_prefetch_depth must be a nonnegative integer")
     _fail(errors, type(workers) is not int or workers <= 0, "image_prefetch_workers must be a positive integer")
@@ -758,6 +763,7 @@ def validate_t2i_sft_config(args: Namespace) -> None:
         "width": 512,
         "max_sequence_length": 512,
         "text_encoder_placement": "sharded",
+        "cache_vae_posterior": False,
         "gradient_checkpointing": True,
         "deterministic_attention": False,
         "caption_dropout": 0.0,
@@ -786,7 +792,7 @@ def validate_t2i_sft_config(args: Namespace) -> None:
         config["text_encoder_placement"] not in ("sharded", "replicated"),
         "text_encoder_placement must be sharded or replicated",
     )
-    for field in ("gradient_checkpointing", "deterministic_attention", "random_crop"):
+    for field in ("gradient_checkpointing", "deterministic_attention", "random_crop", "cache_vae_posterior"):
         _fail(errors, type(config[field]) is not bool, f"{field} must be boolean")
     dropout = config["caption_dropout"]
     _fail(errors, type(dropout) not in (int, float) or not 0 <= dropout <= 1, "caption_dropout must be in [0, 1]")

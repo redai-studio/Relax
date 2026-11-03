@@ -22,7 +22,9 @@ logger = get_logger(__name__)
 __all__ = [
     "resolve_block_classes",
     "resolve_fine_grained_modules",
+    "resolve_module_groups",
     "resolve_replicated_modules",
+    "resolve_conditioning_execution_policy",
     "fsdp2_wrap",
     "upcast_trainable_params",
     "offload_module_to_cpu",
@@ -69,6 +71,41 @@ def resolve_fine_grained_modules(model: torch.nn.Module) -> List[torch.nn.Module
     of a broad class such as ``Linear``.
     """
     return [module for module in model.modules() if getattr(module, "_fsdp_fine_grained", False)]
+
+
+def resolve_module_groups(model: torch.nn.Module) -> List[List[torch.nn.Module]]:
+    """Validate optional adapter-declared sibling communication groups.
+
+    Members must be called through ``Module.__call__``. Grouping siblings does
+    not move/register them again, so checkpoint names remain unchanged. Groups
+    and existing fine-grained boundaries must have disjoint module/parameter
+    ownership; their common parents are sharded afterwards.
+    """
+    declared = getattr(model, "_fsdp_module_groups", ())
+    if not isinstance(declared, (list, tuple)):
+        raise ValueError("_fsdp_module_groups must be a sequence of module sequences")
+    available = set(model.modules()) - {model}
+    owned_modules: set[torch.nn.Module] = set()
+    owned_parameters: set[torch.nn.Parameter] = set()
+    for module in resolve_fine_grained_modules(model):
+        owned_modules.update(module.modules())
+        owned_parameters.update(module.parameters())
+    groups = []
+    for members in declared:
+        if not isinstance(members, (list, tuple)) or not members:
+            raise ValueError("Each FSDP module group must be a nonempty module sequence")
+        group = []
+        for module in members:
+            if not isinstance(module, torch.nn.Module) or module not in available:
+                raise ValueError("FSDP group members must be non-root modules belonging to the model")
+            descendants, parameters = set(module.modules()), set(module.parameters())
+            if owned_modules.intersection(descendants) or owned_parameters.intersection(parameters):
+                raise ValueError("FSDP module groups must have disjoint module and parameter ownership")
+            owned_modules.update(descendants)
+            owned_parameters.update(parameters)
+            group.append(module)
+        groups.append(group)
+    return groups
 
 
 def _parameter_storage_identity(parameter: torch.nn.Parameter) -> tuple[torch.device, int] | None:
@@ -120,11 +157,12 @@ def resolve_replicated_modules(model: torch.nn.Module) -> List[torch.nn.Module]:
     blocks = tuple(resolve_block_classes(model))
     boundaries = [
         *resolve_fine_grained_modules(model),
+        *(module for group in resolve_module_groups(model) for module in group),
         *(module for module in model.modules() if isinstance(module, blocks)),
     ]
     for boundary in boundaries:
         if owned_modules.intersection(boundary.modules()) or owned_parameters.intersection(boundary.parameters()):
-            raise ValueError("FSDP replicated modules overlap a fine-grained or block sharding boundary")
+            raise ValueError("FSDP replicated modules overlap a fine-grained, grouped or block sharding boundary")
 
     try:
         registrations = list(model.named_modules(remove_duplicate=False))
@@ -146,6 +184,37 @@ def resolve_replicated_modules(model: torch.nn.Module) -> List[torch.nn.Module]:
             if parameter in owned_parameters or _parameter_storage_identity(parameter) in owned_storage:
                 raise ValueError("FSDP replicated parameter has an alias outside its declared subtree")
     return replicated
+
+
+def resolve_conditioning_execution_policy(model: torch.nn.Module, replicated_modules: List[torch.nn.Module]) -> str:
+    """Validate an adapter's collective-free conditioning declaration.
+
+    Declared modules must be complete, validated frozen replica roots. The
+    adapter also promises that every conditioning compute/restore callback uses
+    only those modules and performs no explicit distributed operations.
+    Ownership checks cannot prove arbitrary callback code to be collective-
+    free. The backend grants the policy only after wrapping succeeds; changing
+    it during training is unsupported.
+    """
+    declared = getattr(model, "_conditioning_collective_free_modules", ())
+    if not isinstance(declared, (list, tuple)):
+        raise ValueError("Collective-free conditioning must declare a sequence of replicated modules")
+    if not declared:
+        return "unanimous"
+    if any(not isinstance(module, torch.nn.Module) for module in declared) or len(set(declared)) != len(declared):
+        raise ValueError("Collective-free conditioning modules must be distinct registered modules")
+    if any(module not in replicated_modules for module in declared):
+        raise ValueError("Collective-free conditioning requires complete validated FSDP replicated roots")
+
+    from torch.distributed.fsdp import FSDPModule
+    from torch.distributed.tensor import DTensor
+
+    for module in declared:
+        if any(child.training or isinstance(child, FSDPModule) for child in module.modules()):
+            raise ValueError("Collective-free conditioning requires eval modules without nested FSDP boundaries")
+        if any(isinstance(value, DTensor) for value in (*module.parameters(), *module.buffers())):
+            raise ValueError("Collective-free conditioning cannot use distributed parameters or buffers")
+    return "rank_local"
 
 
 @torch.no_grad()
@@ -223,12 +292,14 @@ def fsdp2_wrap(
         kwargs["offload_policy"] = offload_policy
 
     replicated_modules = resolve_replicated_modules(model)
+    conditioning_execution_policy = resolve_conditioning_execution_policy(model, replicated_modules)
     if master_dtype is not None:
         promoted = upcast_trainable_params(model, _DTYPES[master_dtype])
         logger.info(f"fsdp2_wrap: promoted {promoted} trainable param(s) to {master_dtype} optimizer masters")
 
     block_classes = tuple(resolve_block_classes(model))
     fine_grained_modules = resolve_fine_grained_modules(model)
+    module_groups = resolve_module_groups(model)
     shard_targets: tuple = block_classes
     if block_classes and activation_checkpointing:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -249,6 +320,8 @@ def fsdp2_wrap(
 
     for module in fine_grained_modules:
         fully_shard(module, **kwargs)
+    for modules in module_groups:
+        fully_shard(modules, **kwargs)
     if block_classes:
         for module in model.modules():
             if isinstance(module, shard_targets):
@@ -258,9 +331,11 @@ def fsdp2_wrap(
         fully_shard(model, ignored_params=ignored_params, **kwargs)
     else:
         fully_shard(model, **kwargs)
+    model._conditioning_execution_policy = conditioning_execution_policy
     logger.info(
         f"FSDP2 wrapped model; fine-grained modules: {len(fine_grained_modules)} "
         f"({sorted({type(m).__name__ for m in fine_grained_modules})}); "
+        f"module groups: {len(module_groups)}; "
         f"block classes: {[c.__name__ for c in block_classes]}; "
         f"activation_checkpointing={activation_checkpointing}, cpu_offload={cpu_offload}, "
         f"master_dtype={master_dtype}"

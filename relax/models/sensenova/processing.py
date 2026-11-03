@@ -197,6 +197,24 @@ def smart_resize(height: int, width: int, factor: int = 32, min_pixels: int = 65
     return h_bar, w_bar
 
 
+def image_resize_geometry(
+    width: int,
+    height: int,
+    patch_size: int = 16,
+    downsample_ratio: float = 0.5,
+    min_pixels: int = 65536,
+    max_pixels: int = 4194304,
+) -> tuple[int, int]:
+    """Return the exact native resize dimensions without processing pixels."""
+    return smart_resize(
+        height,
+        width,
+        factor=int(patch_size // downsample_ratio),
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+
+
 def preprocess_pixel_values(pixel_values: torch.Tensor, patch_size: int = 16) -> Any:
     c, h, w = pixel_values.shape
     grid_h = h // patch_size
@@ -242,10 +260,11 @@ def load_image_native(
         ]
     )
 
-    resized_height, resized_width = smart_resize(
-        image.height,
+    resized_height, resized_width = image_resize_geometry(
         image.width,
-        factor=int(patch_size // downsample_ratio),
+        image.height,
+        patch_size=patch_size,
+        downsample_ratio=downsample_ratio,
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )

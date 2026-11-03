@@ -42,6 +42,7 @@ def test_t2i_validation_and_sizing_require_no_model_or_data_mount():
     assert args.fsdp_master_dtype == "fp32"
     assert args.t2i_sft_config["height"] == args.t2i_sft_config["width"] == 512
     assert args.t2i_sft_config["text_encoder_placement"] == "sharded"
+    assert args.t2i_sft_config["cache_vae_posterior"] is False
     assert "conditioning_images" not in args.t2i_sft_config
     assert not hasattr(args, "i2i_sft_config")
 
@@ -69,6 +70,9 @@ def test_t2i_validation_and_sizing_require_no_model_or_data_mount():
         ("caption_dropout", float("inf")),
         ("random_crop", "true"),
         ("gradient_checkpointing", 1),
+        ("cache_vae_posterior", 1),
+        ("cache_vae_posterior", "true"),
+        ("cache_vae_posterior", None),
         ("deterministic_attention", 0),
         ("image_prefetch_depth", 1),
         ("image_prefetch_depth", False),
@@ -117,6 +121,14 @@ def test_t2i_accepts_explicit_text_encoder_placement(placement):
     args.t2i_sft_config["text_encoder_placement"] = placement
     validate_generative_config(args)
     assert args.t2i_sft_config["text_encoder_placement"] == placement
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_t2i_accepts_explicit_posterior_bundle_policy(enabled):
+    args = _args()
+    args.t2i_sft_config["cache_vae_posterior"] = enabled
+    validate_generative_config(args)
+    assert args.t2i_sft_config["cache_vae_posterior"] is enabled
 
 
 def test_t2i_metadata_contains_only_caption_and_target(tmp_path):

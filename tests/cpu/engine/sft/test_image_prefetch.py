@@ -33,6 +33,31 @@ def test_image_prefetch_rejects_cursor_mismatch():
         prefetch.close()
 
 
+def test_ready_samples_does_not_advance_cursor_or_surface_future_errors():
+    from concurrent.futures import Future
+
+    prefetch = ImagePrefetch(list(range(8)), ImageBatchSampler(8, 8, 42), 0, 4, 0, 1, depth=2)
+    try:
+        # Synchronize existing reads so the assertions are independent of thread
+        # scheduling, then substitute one unfinished/failed read in the queue.
+        for entry in prefetch.pending:
+            entry[3].result()
+        before = list(prefetch.pending)
+        assert len(prefetch.ready_samples(limit=1)) == 1
+        assert list(prefetch.pending) == before
+        first, second = before
+        pending = Future()
+        prefetch.pending[1] = (*second[:3], pending)
+        assert prefetch.ready_samples() == [(*first[:3], first[3].result())]
+        pending.set_exception(OSError("future decode failed"))
+        assert prefetch.ready_samples() == [(*first[:3], first[3].result())]
+        assert prefetch.get(*first[:3]) == first[3].result()
+        with pytest.raises(OSError, match="future decode failed"):
+            prefetch.get(*second[:3])
+    finally:
+        prefetch.close()
+
+
 def test_image_prefetch_propagates_decode_error_and_closes():
     class Dataset:
         def __getitem__(self, index):
