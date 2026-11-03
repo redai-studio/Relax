@@ -9,9 +9,13 @@
 /relax/entrypoints/                                     @NINGBENZHE
 /relax/distributed/checkpoint_service/                   @NINGBENZHE
 /tests/core/                                            @NINGBENZHE
+/tests/cpu/core/                                       @NINGBENZHE
 /tests/components/                                      @NINGBENZHE
+/tests/cpu/components/                                 @NINGBENZHE
 /tests/entrypoints/                                     @NINGBENZHE
+/tests/cpu/entrypoints/                                @NINGBENZHE
 /tests/distributed/checkpoint_service/                   @NINGBENZHE
+/tests/cpu/distributed/checkpoint_service/             @NINGBENZHE
 
 # 训练引擎：Lemon-412
 /relax/backends/megatron/                                @Lemon-412
@@ -24,13 +28,21 @@
 /relax/components/sft.py                                 @Lemon-412
 /relax/components/image_sft.py                           @Lemon-412
 /tests/backends/megatron/                                @Lemon-412
+/tests/cpu/backends/megatron/                          @Lemon-412
 /tests/backends/fsdp/                                    @Lemon-412
+/tests/cpu/backends/fsdp/                              @Lemon-412
 /tests/models/                                          @Lemon-412
+/tests/cpu/models/                                     @Lemon-412
 /tests/engine/sft/                                      @Lemon-412
+/tests/cpu/engine/sft/                                 @Lemon-412
 /tests/utils/training/                                  @Lemon-412
+/tests/cpu/utils/training/                             @Lemon-412
 /tests/components/test_actor*.py                         @Lemon-412
+/tests/cpu/components/test_actor*.py                   @Lemon-412
 /tests/components/test_sft*.py                           @Lemon-412
+/tests/cpu/components/test_sft*.py                     @Lemon-412
 /tests/components/test_image_sft.py                      @Lemon-412
+/tests/cpu/components/test_image_sft.py                @Lemon-412
 /scripts/models/                                        @Lemon-412
 
 # 推理引擎和 Agentic：yuanlehome
@@ -43,17 +55,26 @@
 /relax/components/genrm.py                               @yuanlehome
 /relax/utils/genrm_client.py                             @yuanlehome
 /tests/backends/sglang/                                  @yuanlehome
+/tests/cpu/backends/sglang/                            @yuanlehome
 /tests/engine/rollout/                                  @yuanlehome
+/tests/cpu/engine/rollout/                             @yuanlehome
 /tests/engine/router/                                   @yuanlehome
+/tests/cpu/engine/router/                              @yuanlehome
 /tests/agentic/                                          @yuanlehome
+/tests/cpu/agentic/                                    @yuanlehome
 /tests/test_agentic_rollout.py                           @yuanlehome
+/tests/cpu/test_agentic_rollout.py                     @yuanlehome
 /tests/components/test_rollout*.py                       @yuanlehome
+/tests/cpu/components/test_rollout*.py                 @yuanlehome
 /tests/components/test_genrm*.py                         @yuanlehome
+/tests/cpu/components/test_genrm*.py                   @yuanlehome
 /examples/*agentic*/                                    @yuanlehome
 /examples/codex/                                        @yuanlehome
 /examples/mini_swe_agent/                                @yuanlehome
 /tests/examples/*agentic*/                               @yuanlehome
+/tests/cpu/examples/*agentic*/                         @yuanlehome
 /tests/examples/test_mini_swe*.py                        @yuanlehome
+/tests/cpu/examples/test_mini_swe*.py                  @yuanlehome
 
 # 弹性和平台：RexFlux
 /relax/distributed/ray/                                  @RexFlux
@@ -65,8 +86,11 @@
 /relax/utils/fault_events/                               @RexFlux
 /relax/utils/metrics/                                    @RexFlux
 /tests/distributed/ray/                                  @RexFlux
+/tests/cpu/distributed/ray/                            @RexFlux
 /tests/utils/test_health*.py                             @RexFlux
+/tests/cpu/utils/test_health*.py                       @RexFlux
 /tests/utils/test_metrics*.py                            @RexFlux
+/tests/cpu/utils/test_metrics*.py                      @RexFlux
 /docker/                                                @RexFlux
 /configs/                                               @RexFlux
 /scripts/entrypoint/                                     @RexFlux
@@ -98,11 +122,18 @@
 /relax/models/flow_grpo.py                               @Yangruipis
 /relax/engine/rollout/on_policy_distillation.py           @Yangruipis
 /tests/algorithms/                                       @Yangruipis
+/tests/cpu/algorithms/                                 @Yangruipis
 /tests/engine/rewards/                                   @Yangruipis
+/tests/cpu/engine/rewards/                             @Yangruipis
 /tests/utils/training/test_ppo*.py                       @Yangruipis
+/tests/cpu/utils/training/test_ppo*.py                 @Yangruipis
 /tests/utils/training/test_rloo*.py                      @Yangruipis
+/tests/cpu/utils/training/test_rloo*.py                @Yangruipis
 /tests/utils/training/test_reinforce_plus_plus.py         @Yangruipis
+/tests/cpu/utils/training/test_reinforce_plus_plus.py  @Yangruipis
 /tests/utils/training/test_preference_utils.py            @Yangruipis
+/tests/cpu/utils/training/test_preference_utils.py     @Yangruipis
 /tests/engine/rollout/test_on_policy_distillation*.py     @Yangruipis
+/tests/cpu/engine/rollout/test_on_policy_distillation*.py @Yangruipis
 /examples/algorithms/                                   @Yangruipis
 /examples/on_policy_distillation/                        @Yangruipis

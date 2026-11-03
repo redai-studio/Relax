@@ -1,0 +1,52 @@
+--- a/megatron/core/transformer/multi_token_prediction.py
++++ b/megatron/core/transformer/multi_token_prediction.py
+@@ -1700,6 +1700,22 @@
+                                   matches the scale of the main_loss.
+         """
+         MTPLossAutoScaler.main_loss_backward_scale = scale
++
++
++def get_mtp_normalization_counts(num_tokens, original_num_tokens, cp_group=None):
++    """Use complete-sequence counts, including CP ranks with no local targets.
++
++    Default DDP averages over CP, so auxiliary microbatch means need a CP
++    multiplier. Per-token training instead normalizes gradients once at the
++    end of the step and needs the global pre-roll/post-roll count ratio.
++    """
++    cp_size = cp_group.size() if cp_group is not None else 1
++    if cp_size == 1:
++        return num_tokens, original_num_tokens, cp_size
++    original = torch.zeros_like(num_tokens) if original_num_tokens is None else original_num_tokens
++    counts = torch.stack((num_tokens, original))
++    torch.distributed.all_reduce(counts, group=cp_group)
++    return counts[0], counts[1], cp_size
+ 
+ 
+ def process_mtp_loss(hidden_states: Tensor, labels: Optional[Tensor], loss_mask: Optional[Tensor], output_layer: Callable, output_weight: Optional[Tensor], runtime_gather_output: Optional[bool], is_training: bool, compute_language_model_loss: Callable, config: TransformerConfig, cp_group: Optional[torch.distributed.ProcessGroup]=None, tp_group: Optional[torch.distributed.ProcessGroup]=None, packed_seq_params: Optional[PackedSeqParams]=None, scale_logits_fn: Optional[Callable[[Tensor], Tensor]]=None, input_ids: Optional[Tensor]=None, sequence_roll_context: Optional[MTPSequenceRollContext]=None, mtp_input_mask: Optional[Tensor]=None) -> Tensor:
+@@ -1780,20 +1796,21 @@
+             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+         mtp_loss = layer_loss_mask * mtp_loss
+         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
++        global_num_tokens, global_original_num_tokens, cp_size = get_mtp_normalization_counts(num_tokens, original_num_tokens, cp_group)
+         if is_training:
+             correct = None
+             total = None
+             if mtp_logits is not None and MTPLossLoggingHelper.should_collect_acceptance():
+                 correct, total = _compute_mtp_acceptance_counts(mtp_logits, mtp_labels, layer_loss_mask, output_layer, runtime_gather_output, tp_group)
+-            MTPLossLoggingHelper.save_loss_to_tracker(mtp_loss_scale * torch.sum(mtp_loss), num_tokens, mtp_layer_number, config.mtp_num_layers, correct=correct, total=total, avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True), calculate_per_token_loss=config.calculate_per_token_loss)
++            MTPLossLoggingHelper.save_loss_to_tracker(mtp_loss_scale * torch.sum(mtp_loss) * (1 if config.calculate_per_token_loss else cp_size), num_tokens if config.calculate_per_token_loss else global_num_tokens, mtp_layer_number, config.mtp_num_layers, correct=correct, total=total, avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True), calculate_per_token_loss=config.calculate_per_token_loss)
+         if config.calculate_per_token_loss:
+             assert original_num_tokens is not None
+-            num_tokens_safe = torch.clamp(num_tokens, min=1)
+-            mtp_loss_normalized = mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
++            num_tokens_safe = torch.clamp(global_num_tokens, min=1)
++            mtp_loss_normalized = mtp_loss_scale * mtp_loss * (global_original_num_tokens / num_tokens_safe)
+             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
+         else:
+-            safe_num_tokens = num_tokens.clamp(min=1)
+-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens)
++            safe_num_tokens = global_num_tokens.clamp(min=1)
++            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss * cp_size / safe_num_tokens)
+     return hidden_states
+ 
+ 
