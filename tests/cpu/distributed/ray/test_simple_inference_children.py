@@ -4,6 +4,7 @@
 
 import ast
 import asyncio
+import os
 import sys
 import threading
 from pathlib import Path
@@ -164,7 +165,7 @@ def test_cancelled_generate_await_does_not_claim_thread_idle():
 
 @pytest.mark.parametrize("node_rank", [0, 1])
 def test_server_launch_preserves_process_handle_for_recovery(monkeypatch, node_rank):
-    path = Path(__file__).parents[3] / "relax/backends/sglang/sglang_engine.py"
+    path = Path(__file__).parents[4] / "relax/backends/sglang/sglang_engine.py"
     launch = next(
         node for node in ast.parse(path.read_text()).body if getattr(node, "name", None) == "launch_server_process"
     )
@@ -173,6 +174,7 @@ def test_server_launch_preserves_process_handle_for_recovery(monkeypatch, node_r
     namespace = {
         "ServerArgs": SimpleNamespace,
         "multiprocessing": SimpleNamespace(Process=Mock(return_value=process), set_start_method=Mock()),
+        "os": os,
         "Envs": SimpleNamespace(
             RELAX_OPTIMIZE_ROUTING_REPLAY=False, RELAX_OPD_PREEXPANDED_PATCH=False, RELAX_OPD_PER_POS_TOKEN_IDS=False
         ),
@@ -205,7 +207,7 @@ def test_server_launch_preserves_process_handle_for_recovery(monkeypatch, node_r
 
     _method("relax/backends/sglang/sglang_engine.py", "SGLangEngine", "shutdown_for_recovery")(engine, timeout=7)
 
-    engine.unregister_from_router.assert_called_once_with()
+    engine.unregister_from_router.assert_called_once_with(timeout=5.0)
     kill.assert_called_once_with(process.pid)
     wait.assert_called_once_with([root, child], timeout=7)
 
