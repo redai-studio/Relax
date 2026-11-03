@@ -13,9 +13,11 @@ Provides:
 
 import asyncio
 import time
+from collections.abc import Callable, Mapping
 from typing import Any, Dict, Optional, Sequence
 
 import httpx
+import torch
 import torch.distributed as dist
 
 from relax.distributed.checkpoint_service.backends import CommBackend, DeviceDirectBackend
@@ -61,6 +63,7 @@ class CheckpointEngineClient:
         model_name: Optional[str] = None,
         quantization_config: Optional[Dict[str, int | str | list[str]]] = None,
         lock: Any = None,
+        weights_getter: Optional[Callable[[], Mapping[str, torch.Tensor]]] = None,
     ):
         """Initialize checkpoint engine client.
 
@@ -99,6 +102,7 @@ class CheckpointEngineClient:
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.lock = lock
+        self.weights_getter = weights_getter
 
         # State
         self._registered = False
@@ -252,6 +256,7 @@ class CheckpointEngineClient:
                 quantization_config=self.quantization_config,
                 coordinator_url=self.coordinator_url,
                 lock=lock,
+                weights_getter=self.weights_getter,
             )
 
     async def init_process_groups_for_actor_fwd_ref(self, rollout_id: int) -> None:
@@ -284,10 +289,22 @@ class CheckpointEngineClient:
     async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> list[str]:
         """Update rollout weights; rank 0 returns the actual recipient Actor
         IDs."""
-        response = await self._http_client.get(f"{self.coordinator_url}/topology")
-        response.raise_for_status()
-        data = response.json()
+        group = get_gloo_group()
+        topology = [None]
+        if dist.get_rank(group=group) == 0:
+            try:
+                response = await self._http_client.get(f"{self.coordinator_url}/topology")
+                response.raise_for_status()
+                topology[0] = (response.json(), None)
+            except Exception as exc:
+                topology[0] = (None, str(exc))
+        dist.broadcast_object_list(topology, src=0, group=group)
+        data, error = topology[0]
+        if error is not None:
+            raise RuntimeError(f"Failed to fetch rollout topology: {error}")
         logger.info(f"get topology: {data}")
+        if not actor_fwd_only and not data.get("nodes", {}).get("rollout"):
+            logger.warning("update_weights_for_rollout: no rollout nodes in DCS topology; push will be a no-op")
         if not actor_fwd_only:
             self._backend.init_process_group_for_rollout(data)
         self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
@@ -304,7 +321,6 @@ class CheckpointEngineClient:
                 for info in self._backend.rollout_topology.values()
                 if (actor_id := (info.get("metadata") or {}).get("actor_id"))
             }
-        group = get_gloo_group()
         all_recipients = [None] * dist.get_world_size(group=group)
         dist.all_gather_object(all_recipients, recipients, group=group)
         sources = [ids for ids in all_recipients if ids is not None]

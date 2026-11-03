@@ -180,6 +180,7 @@ def _opd_args() -> SimpleNamespace:
         colocate=False,
         hybrid=False,
         fully_async=False,
+        enable_weights_backuper=True,
     )
 
 
@@ -243,3 +244,13 @@ def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
     assert args.dynamic_context_parallel is True
     assert args.eval_interval == 10
     assert args.eval_size == 0.1
+
+
+@pytest.mark.parametrize("elastic", [False, True])
+def test_hybrid_requires_metadata_preserving_weights_backuper(arguments_module, elastic):
+    args = _opd_args()
+    args.hybrid = True
+    args.enable_weights_backuper = False
+    args.autoscaler_config = "elastic.yaml" if elastic else None
+    with pytest.raises(ValueError, match="Hybrid training requires the weights backuper"):
+        arguments_module.slime_validate_args(args)

@@ -4536,6 +4536,13 @@ def slime_validate_args(args):
             "hybrid mode: actor/reference/actor_fwd/advantages will share GPUs "
             "via offload/onload role switching, while rollout uses separate GPUs."
         )
+        if not args.enable_weights_backuper:
+            raise ValueError(
+                "Hybrid training requires the weights backuper for DCS synchronization: with "
+                "--disable-weights-backuper the DCS push would read detached live tensors that "
+                "carry no Megatron TP attributes, so all_gather_param would silently treat TP "
+                "shards as replicated weights. Remove --disable-weights-backuper."
+            )
     elif args.fully_async and args.colocate:
         raise ValueError(
             "--fully-async and --colocate cannot be combined directly. "

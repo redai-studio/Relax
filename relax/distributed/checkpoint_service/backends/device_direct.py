@@ -18,7 +18,7 @@ import logging
 import re
 import socket
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from functools import lru_cache
@@ -150,6 +150,7 @@ class DeviceDirectBackend(CommBackend):
         coordinator_url=None,
         lock: Any = None,
         timeout_seconds: int = 300,
+        weights_getter: Optional[Callable[[], Mapping[str, torch.Tensor]]] = None,
     ) -> None:
         """Initialize DeviceDirectBackend.
 
@@ -168,6 +169,7 @@ class DeviceDirectBackend(CommBackend):
         self._megatron = _load_megatron_dependencies()
         self.args = args
         self.model = model
+        self._weights_getter = weights_getter
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = 0
@@ -221,6 +223,63 @@ class DeviceDirectBackend(CommBackend):
         self._lora_adapter_full = None  # merge mode: per-call {base_prefix: {"in","out"}} full tensors
         self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
         self._lora_moe_etp_checked = False  # guard the (actor-side) MoE ETP=1 assertion to run once
+
+        # Snapshot names are rank-local; bridge conversion needs global PP/VP names.
+        # Track live Parameter names because snapshots are plain Tensors.
+        self._vanilla_to_global_name: Optional[Dict[str, str]] = None
+        self._live_param_global_names: Optional[frozenset] = None
+        if weights_getter is not None and self._use_bridge:
+            vanilla_items = list(
+                self._megatron.named_params_and_buffers(
+                    self.args, self.model, convert_to_global_name=False, include_persistent_buffers=True
+                )
+            )
+            global_items = list(
+                self._megatron.named_params_and_buffers(
+                    self.args, self.model, convert_to_global_name=True, include_persistent_buffers=True
+                )
+            )
+            self._vanilla_to_global_name = {
+                v_name: g_name for (v_name, _), (g_name, _) in zip(vanilla_items, global_items, strict=True)
+            }
+            self._live_param_global_names = frozenset(
+                g_name
+                for (_, v_param), (g_name, _) in zip(vanilla_items, global_items, strict=True)
+                if isinstance(v_param, torch.nn.Parameter)
+            )
+
+    def _named_params_and_buffers(
+        self, name_filter: Callable[[str], bool] | None = None
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield live weights or snapshots, translating names and preserving TP
+        metadata.
+
+        Filter before H2D so expert/non-expert pushes only stage their own
+        subset.
+        """
+        if self._weights_getter is not None:
+            from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+
+            for name, tensor in self._weights_getter().items():
+                vanilla_to_global = getattr(self, "_vanilla_to_global_name", None)
+                if vanilla_to_global is not None:
+                    name = vanilla_to_global.get(name, name)
+                if name_filter is not None and not name_filter(name):
+                    continue
+                if tensor.device != self.device:
+                    moved = tensor.to(self.device)
+                    copy_tensor_model_parallel_attributes(moved, tensor)
+                    if hasattr(tensor, "parallel_mode"):
+                        moved.parallel_mode = tensor.parallel_mode
+                    tensor = moved
+                yield name, tensor
+            return
+        for name, tensor in self._megatron.named_params_and_buffers(
+            self.args, self.model, include_persistent_buffers=self._use_bridge
+        ):
+            if name_filter is not None and not name_filter(name):
+                continue
+            yield name, tensor
 
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
@@ -706,12 +765,8 @@ class DeviceDirectBackend(CommBackend):
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
 
-        for name, param in self._megatron.named_params_and_buffers(
-            self.args, self.model, include_persistent_buffers=self._use_bridge
-        ):
+        for name, param in self._named_params_and_buffers(name_filter=lambda n: ".experts." not in n):
             if not self._should_sync_tensor(name, param):
-                continue
-            if ".experts." in name:
                 continue
             buffer_size = self._update_weight_from_distributed(
                 name,
@@ -829,8 +884,13 @@ class DeviceDirectBackend(CommBackend):
         device_module.empty_cache()
 
     def _should_sync_tensor(self, name: str, tensor: torch.Tensor) -> bool:
+        # Preserve live Parameter eligibility for detached snapshots.
+        live_param_names = getattr(self, "_live_param_global_names", None)
         return (
-            not self._use_bridge or isinstance(tensor, torch.nn.Parameter) or self._bridge_converter.can_convert(name)
+            not self._use_bridge
+            or isinstance(tensor, torch.nn.Parameter)
+            or (live_param_names is not None and name in live_param_names)
+            or self._bridge_converter.can_convert(name)
         )
 
     def _update_weight_from_distributed(
@@ -898,12 +958,8 @@ class DeviceDirectBackend(CommBackend):
         """
         buffer_size = 0
         named_tensors: list[tuple[str, torch.Tensor]] = []
-        for name, param in self._megatron.named_params_and_buffers(
-            self.args, self.model, include_persistent_buffers=self._use_bridge
-        ):
+        for name, param in self._named_params_and_buffers(name_filter=lambda n: ".experts." in n):
             if not self._should_sync_tensor(name, param):
-                continue
-            if ".experts." not in name:
                 continue
             buffer_size = self._update_expert_weight_from_distributed(
                 name, param, named_tensors, buffer_size, rollout_only, actor_fwd_only, pbar=pbar
