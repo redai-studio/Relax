@@ -415,9 +415,9 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
 
     actor, rollout, forward = [service(role) for role in ("actor", "rollout", "actor_fwd")]
     actor.get_step = AsyncMock(return_value=2)
-    # Initial wrappers return responses, just as Service's async wrappers do.
-    actor.update_weights_fully_async = AsyncMock(side_effect=lambda: completed())
-    forward.recv_weight_fully_async = AsyncMock(side_effect=lambda: completed())
+    # Current Service wrappers await the actual deployment response.
+    actor.update_weights_fully_async = AsyncMock()
+    forward.recv_weight_fully_async = AsyncMock()
     rollout.step = rollout_step
 
     async def observe_rollout_step():
@@ -439,14 +439,13 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
     controller._activate_inference_recovery = AsyncMock(side_effect=lambda *args: asyncio.create_task(completed()))
 
     def global_restart():
-        controller._restart_error = RuntimeError("test reached original global restart")
-        controller._restart_done_event.set()
+        raise RuntimeError("test reached original global restart")
 
-    controller._global_restart = Mock(side_effect=global_restart)
+    controller._run_global_restart = Mock(side_effect=global_restart)
     if needs_global:
         with pytest.raises(RuntimeError, match="test reached original global restart"):
             controller.training_loop()
-        controller._global_restart.assert_called_once_with()
+        controller._run_global_restart.assert_called_once_with()
         clear.assert_not_awaited()
         discard.assert_not_awaited()
         reset.assert_not_awaited()
@@ -454,7 +453,7 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
         controller._activate_inference_recovery.assert_not_awaited()
     else:
         controller.training_loop()
-        controller._global_restart.assert_not_called()
+        controller._run_global_restart.assert_not_called()
         clear.assert_awaited_once_with(client, "train_2", [1, 2])
         discard.assert_awaited_once_with()
         reset.assert_awaited_once_with()

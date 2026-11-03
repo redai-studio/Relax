@@ -8,15 +8,27 @@ import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import Mock
 
 import pytest
 
 from relax.components.background_loop import BackgroundLoopRunner
+from relax.core.inference_recovery import RecoveryGate
 
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def restart_required_type():
+    tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "GlobalRestartRequired")
+    namespace = {"Any": object}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), "controller.py", "exec"), namespace)
+    return namespace["GlobalRestartRequired"]
+
+
+GlobalRestartRequired = restart_required_type()
 
 
 def load_methods(path, class_name, names, namespace):
@@ -52,12 +64,14 @@ def actor_fixture(health=True, fail=True, report_fail=False):
     cls = load_methods("relax/components/actor.py", "Actor", {"run", "_background_run", "_reset_consumption"}, ns)
     actor = cls()
     actor.config = SimpleNamespace(num_rollout=2, fully_async=True, use_health_check=health)
+    actor._recovery = RecoveryGate(actor.config, "actor")
     actor.step = 0
     actor._loop_runner = BackgroundLoopRunner()
     actor._lock = threading.Lock()
     actor._stop_event = threading.Event()
     actor._logger = logging.getLogger(__name__)
     actor.healthy = SimpleNamespace(report_error=SimpleNamespace(remote=report), update_heartbeat=Mock())
+    actor.data_system_client = Mock()
     actor._execute_training = Mock(side_effect=error if fail else None, return_value=False)
     return actor, reported, error
 
@@ -106,8 +120,16 @@ def test_actor_early_stop_is_not_success_or_health_failure(health):
 def controller_fixture():
     from relax.utils.fault_events.recovery import GlobalStartup
 
-    ns = dict(logger=logging.getLogger(__name__), run=asyncio.run, asyncio=asyncio, Optional=Optional)
-    ns["GlobalStartup"] = GlobalStartup
+    ns = dict(
+        logger=logging.getLogger(__name__),
+        run=asyncio.run,
+        asyncio=asyncio,
+        Optional=Optional,
+        Any=Any,
+        threading=threading,
+        GlobalRestartRequired=GlobalRestartRequired,
+        GlobalStartup=GlobalStartup,
+    )
     cls = load_methods(
         "relax/core/controller.py", "Controller", {"restart_serve", "training_loop", "_consume_restart_cycle"}, ns
     )
@@ -123,6 +145,11 @@ def controller_fixture():
     ctrl._health_manager = SimpleNamespace(_checker=SimpleNamespace(_stop_event=threading.Event()))
     ctrl._restart_error = None
     ctrl._restarting = False
+    ctrl._inference_recovery = None
+    ctrl._global_restart_count = 0
+    ctrl._local_recovery_thread = None
+    ctrl._training_wait_done = threading.Event()
+    ctrl._training_wait_done.set()
     ctrl._pending_task_refs_lock = threading.Lock()
     ctrl._pending_task_refs = []
     ctrl.config = SimpleNamespace(debug_train_only=True)
@@ -137,7 +164,7 @@ def test_restart_publishes_state_and_signals_on_every_exit(failure):
     ctrl = controller_fixture()
     error = ValueError("checkpoint or teardown failed")
 
-    def restart(role):
+    def restart(role, worker=None):
         assert ctrl._restarting
         assert not ctrl._restart_done_event.is_set()
         if failure:
@@ -158,7 +185,7 @@ def test_controller_retries_recovery_but_never_reports_failed_recovery_as_succes
     calls = []
     error = ValueError("reinitialization failed")
 
-    def restart(role):
+    def restart(role, worker=None):
         if recovery_fails:
             raise error
 
@@ -211,7 +238,7 @@ def test_next_recovery_waits_until_previous_error_is_consumed():
     assert mode == "global" and failure is error
     next_cycle.join(2)
     assert not next_cycle.is_alive()
-    ctrl._restart_serve.assert_called_once_with("another role")
+    ctrl._restart_serve.assert_called_once_with("another role", None)
     assert ctrl._restart_error is None
 
 
@@ -370,6 +397,7 @@ def test_failed_recovery_cancels_a_pending_serve_response_and_unblocks_training(
 def test_early_recovery_failure_signals_and_cancels(failure):
     ctrl = controller_fixture()
     ns = dict(
+        threading=threading,
         logger=logging.getLogger(__name__),
         resolve_sft_algo_key=lambda config: "sft",
         ALGOS={"sft": {"actor": object}},
@@ -392,7 +420,7 @@ def test_local_recovery_resumes_existing_task_without_restarting_service():
     async def resumed():
         consumed.append(True)
 
-    def restart(role):
+    def restart(role, worker=None):
         ctrl._restart_mode = "local"
         service._task_ref = resumed()
 
@@ -416,6 +444,7 @@ def test_recovery_dispatch_signals_only_after_work_finishes(role, global_restart
     ctrl = controller_fixture()
     roles = SimpleNamespace(**{name: name for name in ("actor", "rollout", "actor_fwd", "critic", "reference")})
     ns = dict(
+        threading=threading,
         logger=logging.getLogger(__name__),
         resolve_sft_algo_key=lambda config: "sft",
         ALGOS={"sft": {role: object}},
@@ -425,6 +454,24 @@ def test_recovery_dispatch_signals_only_after_work_finishes(role, global_restart
     )
     cls = load_methods("relax/core/controller.py", "Controller", {"_restart_serve"}, ns)
     ctrl._restart_serve = cls._restart_serve.__get__(ctrl)
+    import time
+
+    def unexpected_exit(code):
+        raise AssertionError(f"unexpected drain timeout: {code}")
+
+    helper_cls = load_methods(
+        "relax/core/controller.py",
+        "Controller",
+        {"_wait_recovery_exit"},
+        {
+            "threading": threading,
+            "time": time,
+            "logger": logging.getLogger(__name__),
+            "os": SimpleNamespace(_exit=unexpected_exit),
+        },
+    )
+    ctrl._wait_recovery_exit = helper_cls._wait_recovery_exit.__get__(ctrl)
+    ctrl._inference_recovery_timeout = 1
     ctrl._health_manager.increment_restart_count = Mock(return_value=1)
     ctrl._health_manager.mark_healthy = Mock()
 
@@ -470,7 +517,7 @@ def test_real_controller_initialization_wires_health_callback_and_preserves_rest
     restart = Mock()
     monkeypatch.setattr(controller, "restart_serve", restart)
     health.start.call_args.kwargs["on_unhealthy"]("actor")
-    restart.assert_called_once_with("actor")
+    restart.assert_called_once_with("actor", expected_state=None)
     done, consumed = controller._restart_done_event, controller._restart_consumed_event
     controller._restart_mode = "global"
     controller._restarting = True
