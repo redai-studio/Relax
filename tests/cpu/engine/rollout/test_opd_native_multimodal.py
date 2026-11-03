@@ -21,7 +21,7 @@ from relax.utils.opd.opd_multimodal import (
 )
 from relax.utils.opd.opd_opsd_worker import OpsdWorker
 from relax.utils.types import Sample
-from tests.engine.inference.helpers import AdmissionManager
+from tests.cpu.engine.inference.helpers import AdmissionManager
 
 
 @pytest.fixture
