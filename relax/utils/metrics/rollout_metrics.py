@@ -13,6 +13,7 @@ from relax.utils.metrics.metric_utils import (
     dict_add_prefix,
     has_repetition,
 )
+from relax.utils.metrics.speculative_metrics import compute_speculative_log_metrics
 from relax.utils.misc import group_by
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.types import Sample
@@ -126,14 +127,11 @@ def _compute_zero_std_metrics(args: Namespace, all_samples: list[Sample]) -> dic
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
 
 
-def _compute_spec_metrics(args: Namespace, all_samples: list[Sample]) -> dict[str, float]:
-    if getattr(args, "sglang_speculative_algorithm", None) is None:
-        return {}
-    num_samples = len(all_samples)
-    metrics = {}
-    metrics["spec_accept_rate"] = sum(sample.spec_info.spec_accept_rate for sample in all_samples) / num_samples
-    metrics["spec_accept_length"] = sum(sample.spec_info.spec_accept_length for sample in all_samples) / num_samples
-    return metrics
+def _compute_spec_metrics(args: Namespace, all_samples: list[Sample]) -> dict[str, int | float]:
+    return compute_speculative_log_metrics(
+        all_samples,
+        enabled=getattr(args, "sglang_speculative_algorithm", None) is not None,
+    )
 
 
 def _compute_prefix_cache_metrics(args: Namespace, all_samples: list[Sample]) -> dict[str, float]:
