@@ -17,6 +17,7 @@ from relax.backends.sglang.arguments import validate_args as sglang_validate_arg
 from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
 from relax.engine.sft.runtime import is_dpo_mode, is_offline_mode, is_sft_mode
 from relax.utils import device as device_utils
+from relax.utils.args_finalize import finalize_args
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias, is_model_uri
@@ -2997,6 +2998,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
     return add_slime_arguments
 
 
+def build_pre_parse_parser():
+    """构造只含"解析流程控制参数"的解析器。
+
+    这些参数决定后续走哪条解析路径，因此必须先于 megatron/sglang 解析出来，并从 ``add_slime_arguments``
+    中移除以免重复注册。单独暴露解析器是为了让测试可以复用同 一份声明取默认值（见
+    ``tests/support/args.py``），不再手抄默认值表。
+    """
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
+    parser.add_argument("--debug-rollout-only", action="store_true", default=False)
+    parser.add_argument("--debug-train-only", action="store_true", default=False)
+    parser.add_argument("--load-debug-rollout-data", type=str, default=None)
+    parser.add_argument("--skip-hf-validate", action="store_true", default=False)
+    parser.add_argument("--loss-type", default=None)
+    parser.add_argument("--generation-task", default=None)
+    return parser
+
+
 def _pre_parse_mode():
     """Pre-parse CLI to extract arguments that control parsing flow.
 
@@ -3004,15 +3023,7 @@ def _pre_parse_mode():
     them twice.  The returned namespace is merged into the final ``args`` after
     Phase 2 parsing.
     """
-    temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
-    temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
-    temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
-    temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
-    temp_parser.add_argument("--skip-hf-validate", action="store_true", default=False)
-    temp_parser.add_argument("--loss-type", default=None)
-    temp_parser.add_argument("--generation-task", default=None)
-    temp_args, _ = temp_parser.parse_known_args()
+    temp_args, _ = build_pre_parse_parser().parse_known_args()
     return temp_args
 
 
@@ -3118,6 +3129,11 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # this provenance to recover from a checkpoint-readiness race without
     # overriding an intentional --start-rollout-id.
     args._start_rollout_id_explicit = args.start_rollout_id is not None
+
+    # 参数解析到此完成：合并后可能存在"本次路径未解析"的字段（例如跳过 sglang 时
+    # 缺失的 sglang_*），也可能存在"解析期无法确定、运行期才写入"的派生属性。
+    # 统一在收尾阶段补齐，下游即可直接读 args.xxx。
+    finalize_args(args)
 
     # Serialize the driver-derived descriptor with args to every Ray actor.
     args.model_source = model_source

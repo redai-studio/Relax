@@ -1,11 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import ast
-import math
 from argparse import Namespace
 from typing import Optional
 
-from megatron.core.optimizer import OptimizerConfig
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
 
@@ -17,6 +15,14 @@ except ModuleNotFoundError:
 
 from transformers import AutoConfig
 
+from relax.backends.megatron.args_compat import (
+    fill_missing_boolean_fields,
+    resolve_aliased_field,
+    resolve_optimizer_precision_args,
+    set_rope_type_default,
+    supports_dynamic_context_parallel,
+    uses_canonical_norm_epsilon,
+)
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import ModelSource
@@ -26,87 +32,9 @@ __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = get_logger(__name__)
 
-_FP16_OPTIMIZER_FALLBACKS = {
-    "initial_loss_scale": 32768.0,
-    "min_loss_scale": 1.0,
-    "use_precision_aware_optimizer": True,
-    "store_param_remainders": False,
-}
-_DYNAMIC_LOSS_SCALE_FIELDS = ("initial_loss_scale", "min_loss_scale")
-
-
-def _optimizer_option(name: str) -> str:
-    return f"--{name.replace('_', '-')}"
-
-
-def _format_optimizer_fallback(name: str, value: object) -> str:
-    option = _optimizer_option(name)
-    if isinstance(value, bool):
-        return option if value else f"--no-{option[2:]}"
-    return f"{option} {value!r}"
-
-
-def _validate_fp16_optimizer_args(args) -> None:
-    if getattr(args, "loss_scale", None) is None:
-        for name in _DYNAMIC_LOSS_SCALE_FIELDS:
-            value = getattr(args, name)
-            option = _optimizer_option(name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise ValueError(f"{option} must be a finite number greater than 0, got {value!r}.")
-
-        if args.min_loss_scale > args.initial_loss_scale:
-            raise ValueError(
-                "--min-loss-scale must be less than or equal to --initial-loss-scale, "
-                f"got {args.min_loss_scale!r} > {args.initial_loss_scale!r}."
-            )
-
-    for name, fallback in _FP16_OPTIMIZER_FALLBACKS.items():
-        if not isinstance(fallback, bool):
-            continue
-        value = getattr(args, name)
-        if not isinstance(value, bool):
-            option = _optimizer_option(name)
-            raise ValueError(f"{option} must resolve to a boolean, got {value!r}.")
-
-
-def _resolve_optimizer_precision_args(args):
-    """Resolve precision optimizer arguments before Megatron validates them."""
-    native_defaults = None if args.fp16 else OptimizerConfig()
-    missing = []
-    for name, fp16_fallback in _FP16_OPTIMIZER_FALLBACKS.items():
-        if args.fp16 and getattr(args, "loss_scale", None) is not None and name in _DYNAMIC_LOSS_SCALE_FIELDS:
-            continue
-        if getattr(args, name, None) is None:
-            fallback = fp16_fallback if args.fp16 else getattr(native_defaults, name)
-            setattr(args, name, fallback)
-            if args.fp16:
-                missing.append(name)
-
-    if not args.fp16:
-        return args
-
-    _validate_fp16_optimizer_args(args)
-    if missing:
-        fallback_text = ", ".join(_format_optimizer_fallback(name, getattr(args, name)) for name in missing)
-        logger.warning(
-            "FP16 optimizer options were not explicitly configured; using Relax compatibility fallbacks: %s. "
-            "Pass the active FP16 optimizer options explicitly to silence this warning.",
-            fallback_text,
-        )
-    return args
-
 
 def _validate_dynamic_context_parallel(args):
-    import inspect
-
-    from megatron.core import mpu
-
-    assert "dynamic_context_parallel" in inspect.signature(mpu.initialize_model_parallel).parameters, (
+    assert supports_dynamic_context_parallel(), (
         "dynamic_context_parallel is not supported in your megatron version, "
         "please update your megatron version to the corresponding version"
     )
@@ -150,10 +78,8 @@ def _validate_linear_cp_mode(args: Namespace, config: Optional[object] = None) -
     if getattr(model_config, "experimental_attention_variant", None) not in {"gated_delta_net", "gdn"}:
         return
 
-    cp_may_exceed_one = (
-        getattr(args, "dynamic_context_parallel", False) or getattr(model_config, "context_parallel_size", 1) > 1
-    )
-    if cp_may_exceed_one and getattr(args, "allgather_cp", False):
+    cp_may_exceed_one = args.dynamic_context_parallel or getattr(model_config, "context_parallel_size", 1) > 1
+    if cp_may_exceed_one and args.allgather_cp:
         raise ValueError(
             "GDN CP requires zig-zag THD packing in every linear_cp_mode; --allgather-cp uses "
             "contiguous per-rank packing and is incompatible with GDN CP>1. --allgather-cp is a "
@@ -172,7 +98,10 @@ def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron
     validations."""
 
-    if getattr(args, "dynamic_context_parallel", False):
+    # 兼容直接从上游 parser 拿到、未经过 megatron_parse_args 的参数对象。
+    fill_missing_boolean_fields(args)
+
+    if args.dynamic_context_parallel:
         _validate_dynamic_context_parallel(args)
 
     if not device_utils.is_available():
@@ -210,7 +139,7 @@ def validate_args(args):
 
     # Megatron-Bridge requires --calculate-per-token-loss when context parallelism is enabled.
     # See https://github.com/NVIDIA-NeMo/Megatron-Bridge
-    if args.context_parallel_size > 1 or getattr(args, "dynamic_context_parallel", False):
+    if args.context_parallel_size > 1 or args.dynamic_context_parallel:
         assert args.calculate_per_token_loss, (
             "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )
@@ -248,6 +177,20 @@ def _is_moe_config(hf_config):
     )
 
 
+# HF config 与 Megatron 参数的一致性对照表。仅在 Megatron 以规范名暴露 epsilon 的版本上
+# 启用（见 _hf_validate_args 的说明），因此这里保持"逐项严格相等"的语义。
+_HF_FIELD_CHECKS = [
+    ("hidden_size", "hidden_size", lambda x, y: x == y),
+    ("num_attention_heads", "num_attention_heads", lambda x, y: x == y),
+    ("num_hidden_layers", "num_layers", lambda x, y: x == y),
+    ("intermediate_size", "ffn_hidden_size", lambda x, y: x == y),
+    ("moe_intermediate_size", "moe_ffn_hidden_size", lambda x, y: x == y),
+    ("shared_expert_intermediate_size", "moe_shared_expert_intermediate_size", lambda x, y: x == y),
+    ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
+    ("rope_theta", "rotary_base", lambda x, y: x == y),
+]
+
+
 def _hf_validate_args(args, hf_config):
     def equal(x, y):
         return x == y
@@ -275,22 +218,20 @@ def _hf_validate_args(args, hf_config):
         hf_config = hf_config.text_config
 
     validate_dense_ffn = not _is_moe_config(hf_config) or _has_dense_moe_layers(args)
+    # Megatron 不同版本把 RMSNorm epsilon 暴露为 norm_epsilon 或 layernorm_epsilon，
+    # 改名关系与判定条件集中在 args_compat.FIELD_ALIASES。
+    norm_epsilon_field, _ = resolve_aliased_field(args, "norm_epsilon")
 
-    for hf_config_name, megatron_config_name, compare_fn in (
-        [
-            ("hidden_size", "hidden_size", equal),
-            ("num_attention_heads", "num_attention_heads", equal),
-            ("num_hidden_layers", "num_layers", equal),
-            ("intermediate_size", "ffn_hidden_size", equal),
-            ("moe_intermediate_size", "moe_ffn_hidden_size", equal),
-            ("shared_expert_intermediate_size", "moe_shared_expert_intermediate_size", equal),
-            ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
-            ("rope_theta", "rotary_base", equal),
-        ]
-        + [("rms_norm_eps", "norm_epsilon", equal)]
-        if hasattr(args, "norm_epsilon")
-        else [("rms_norm_eps", "layernorm_epsilon", equal)]
-    ):
+    # 比较范围与提取前保持一致：原代码把整张模型对照表和 epsilon 改名判断写在同一个条件
+    # 表达式里，由于表达式优先级，只有暴露 norm_epsilon 的版本才会比较整张表，旧名版本
+    # （含固定镜像 MCore 4a4de865）实际只比较 epsilon。
+    # 本函数运行在 Megatron 默认值派生与 Bridge provider 之前：未显式给出的字段仍是
+    # None（例如省略 --ffn-hidden-size 时的 ffn_hidden_size），--num-layers 还允许减层
+    # 训练覆盖，无条件比较会拒绝原本合法的启动配置。扩大比较范围需先解决派生时序，另行跟进。
+    epsilon_checks = [("rms_norm_eps", norm_epsilon_field, equal)]
+    field_checks = _HF_FIELD_CHECKS + epsilon_checks if uses_canonical_norm_epsilon(args) else epsilon_checks
+
+    for hf_config_name, megatron_config_name, compare_fn in field_checks:
         if hf_config_name == "intermediate_size" and not validate_dense_ffn:
             continue
 
@@ -310,7 +251,7 @@ def _set_default_megatron_args(args):
     args.use_distributed_optimizer = getattr(args, "optimizer", "adam") != "sgd"
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
-    _resolve_optimizer_precision_args(args)
+    resolve_optimizer_precision_args(args, logger)
     # placeholders
     if args.seq_length is None:
         args.seq_length = 4096
@@ -318,8 +259,7 @@ def _set_default_megatron_args(args):
     # TODO: revisit this when megatron(dev) have solved the optimizer-cpu-offload ckpt saving bug
     args.dist_ckpt_save_pre_mcore_014 = True
     # compatible for megatron
-    if hasattr(args, "rope_type") and args.rope_type is None:
-        args.rope_type = "yarn" if args.multi_latent_attention else "rope"
+    set_rope_type_default(args)
 
     if args.vocab_size and not args.padded_vocab_size:
         args.padded_vocab_size = vocab_size_with_padding(args.vocab_size, args)
@@ -347,7 +287,7 @@ def _derive_cluster_args_from_resource(args):
     if args.resource is None:
         return
 
-    num_gpus_per_node = getattr(args, "num_gpus_per_node", 8)
+    num_gpus_per_node = args.num_gpus_per_node
 
     # --- actor ---
     if "actor" in args.resource:
@@ -388,7 +328,7 @@ def _derive_cluster_args_from_resource(args):
     # --- genrm ---
     if "genrm" in args.resource:
         _, genrm_total_gpus = args.resource["genrm"]
-        if getattr(args, "genrm_num_gpus", 1) == 1 and genrm_total_gpus != 1:
+        if args.genrm_num_gpus == 1 and genrm_total_gpus != 1:
             args.genrm_num_gpus = genrm_total_gpus
             logger.info(f"Derived genrm_num_gpus={args.genrm_num_gpus} from --resource")
 
@@ -400,6 +340,9 @@ def megatron_parse_args(
 ):
     """Parse megatron args, validate HF config, and set defaults."""
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
+    # 上游某些分支（NPU 侧 Megatron）没有声明 Relax 会读取的布尔开关，
+    # 在校验与任何直读之前统一补齐，避免 AttributeError。
+    fill_missing_boolean_fields(args)
 
     if model_source is not None:
         # Keep the CLI path so node-local materialization can remap other
