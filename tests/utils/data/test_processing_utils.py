@@ -71,6 +71,32 @@ def adapt_processor_kwargs(processing_utils_module):
     return fn
 
 
+@pytest.mark.parametrize(
+    ("value", "explicit", "expected"),
+    [
+        (None, {}, {}),
+        ("0", {}, {"use_fast": False}),
+        ("1", {}, {"use_fast": True}),
+        ("0", {"use_fast": True}, {"use_fast": True}),
+        ("0", {"backend": "torchvision"}, {"backend": "torchvision"}),
+    ],
+)
+def test_load_processor_backend_choice(monkeypatch, processing_utils_module, value, explicit, expected):
+    if value is None:
+        monkeypatch.delenv("RELAX_HF_PROCESSOR_USE_FAST", raising=False)
+    else:
+        monkeypatch.setenv("RELAX_HF_PROCESSOR_USE_FAST", value)
+    calls = []
+    processor = processing_utils_module.ProcessorMixin()
+    monkeypatch.setattr(
+        processing_utils_module.AutoProcessor,
+        "from_pretrained",
+        lambda path, **kwargs: calls.append((path, kwargs)) or processor,
+    )
+    assert processing_utils_module.load_processor("model", **explicit) is processor
+    assert calls == [("model", expected)]
+
+
 class _FakeQwenVLProcessor:
     """Stand-in for a standard HF VLM processor (Qwen-VL / Qwen-Omni shape)."""
 

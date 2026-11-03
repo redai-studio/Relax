@@ -17,6 +17,7 @@ import soundfile as sf
 import torch
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -378,6 +379,9 @@ def build_processor_kwargs(multimodal_inputs: dict | None = None) -> dict:
 
 
 def load_processor(name_or_path: str, **kwargs):
+    use_fast = Envs.RELAX_HF_PROCESSOR_USE_FAST
+    if use_fast is not None and "backend" not in kwargs:
+        kwargs.setdefault("use_fast", use_fast)
     try:
         proc = AutoProcessor.from_pretrained(name_or_path, **kwargs)
     except (OSError, ValueError) as e:

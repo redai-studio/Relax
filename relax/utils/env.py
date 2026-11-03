@@ -185,6 +185,9 @@ class _EnvsMeta(type):
 
 
 class Envs(metaclass=_EnvsMeta):
+    # Unset preserves the Transformers default; recipes can pin reference image preprocessing.
+    RELAX_HF_PROCESSOR_USE_FAST = EnvProperty("RELAX_HF_PROCESSOR_USE_FAST", bool, None)
+
     # ------------- GenRM -------------
     GENRM_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("GENRM_SERVE_MAX_ONGOING_REQUESTS", int, 256)
     GENRM_ENGINE_RETRY_ATTEMPTS = EnvProperty("GENRM_ENGINE_RETRY_ATTEMPTS", int, 3)
