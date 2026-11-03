@@ -1223,18 +1223,22 @@ def policy_loss_function(
         ref_log_probs = torch.cat(ref_log_probs, dim=0)
         if is_score_centering:
             ref_log_probs = torch.where(sc_valid, ref_log_probs, 0)
-        importance_ratio = None
-        if args.use_unbiased_kl:
-            importance_ratio = torch.exp(log_probs - old_log_probs)
-        kl = compute_approx_kl(
-            log_probs,
-            ref_log_probs,
-            kl_loss_type=args.kl_loss_type,
-            importance_ratio=importance_ratio,
-        )
-        kl_loss = sum_of_sample_mean(kl)
+        # A zero coefficient makes KL diagnostic-only. Attaching its graph
+        # can still produce NaN gradients through 0 * exp(large_log_ratio).
+        with torch.set_grad_enabled(torch.is_grad_enabled() and args.kl_loss_coef != 0):
+            importance_ratio = None
+            if args.use_unbiased_kl:
+                importance_ratio = torch.exp(log_probs - old_log_probs)
+            kl = compute_approx_kl(
+                log_probs,
+                ref_log_probs,
+                kl_loss_type=args.kl_loss_type,
+                importance_ratio=importance_ratio,
+            )
+            kl_loss = sum_of_sample_mean(kl)
 
-        loss = loss + args.kl_loss_coef * kl_loss
+        if args.kl_loss_coef != 0:
+            loss = loss + args.kl_loss_coef * kl_loss
 
     opd_loss, opd_reported_loss = compute_policy_opd_loss(
         args=args,

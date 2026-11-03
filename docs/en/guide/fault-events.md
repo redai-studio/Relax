@@ -91,10 +91,10 @@ Run from the repository root in an environment with its existing test and HTTP d
 
 ```bash
 PYTHONPATH=. pytest -q \
-  tests/utils/test_fault_event_store.py \
-  tests/utils/test_fault_event_runtime.py \
-  tests/utils/test_fault_query_server.py \
-  tests/entrypoints/test_fault_events_lifecycle.py
+  tests/cpu/utils/test_fault_event_store.py \
+  tests/cpu/utils/test_fault_event_runtime.py \
+  tests/cpu/utils/test_fault_query_server.py \
+  tests/cpu/entrypoints/test_fault_events_lifecycle.py
 pre-commit run --all-files
 ```
 

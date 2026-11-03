@@ -123,7 +123,8 @@ def _run_case(lengths: tuple[int, ...], budget: int) -> None:
     source = os.environ.get("QSA_MIXED_REFERENCE_RUNTIME")
     # Empty-document handling is an intentional fix to the source mixed dispatcher.
     if source and all(lengths):
-        sys.path.insert(0, source)
+        if source not in sys.path:
+            sys.path.insert(0, source)
         from qsa_mixed_tp2 import attention as source_attention
 
         source_inputs = [value.detach().clone().requires_grad_() for value in values]
@@ -157,17 +158,8 @@ def _run_case(lengths: tuple[int, ...], budget: int) -> None:
         ((7, 2052, 16385), 512),
     ],
 )
-def test_qsa_mixed_output_and_gradients(lengths: tuple[int, ...], budget: int) -> None:
-    environment = os.environ.copy()
-    environment.update(
-        RELAX_QWEN38_QSA_COMMUNITY_BACKEND="mixed",
-        MCORE_QSA_SPARSE_BACKEND="id_sparse",
-        RELAX_QWEN38_QSA_FUSED_ATTENTION="0",
-        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
-    )
-    subprocess.run(
-        [sys.executable, __file__, json.dumps(lengths), str(budget)], env=environment, check=True, timeout=600
-    )
+def check_qsa_mixed_output_and_gradients(lengths: tuple[int, ...], budget: int) -> None:
+    _run_case(lengths, budget)
 
 
 def _check_layout_binding() -> None:
@@ -195,7 +187,14 @@ def _check_layout_binding() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Mixed QSA adapter validation requires CUDA")
-def test_qsa_mixed_packed_binding_preserves_dispatch() -> None:
+def check_qsa_mixed_packed_binding_preserves_dispatch() -> None:
+    _check_layout_binding()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mixed QSA precision requires CUDA BF16")
+def test_qsa_mixed_in_isolated_process() -> None:
+    # Keep backend configuration isolated, but reuse imports and compiled kernels
+    # across all shapes. The child pytest retains individual case diagnostics.
     environment = os.environ.copy()
     environment.update(
         RELAX_QWEN38_QSA_COMMUNITY_BACKEND="mixed",
@@ -203,7 +202,27 @@ def test_qsa_mixed_packed_binding_preserves_dispatch() -> None:
         RELAX_QWEN38_QSA_FUSED_ATTENTION="0",
         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
     )
-    subprocess.run([sys.executable, __file__, "--layout-binding"], env=environment, check=True, timeout=120)
+    environment.pop("PYTEST_ADDOPTS", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(Path(__file__).resolve()),
+            "-o",
+            "python_functions=check_qsa_mixed_*",
+            "-v",
+            "--tb=short",
+            "--durations=10",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "10 passed" in result.stdout and " skipped" not in result.stdout, output
 
 
 if __name__ == "__main__":
