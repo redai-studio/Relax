@@ -49,7 +49,7 @@ set +x
 set -x
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
+    source "${SCRIPT_DIR}/../../scripts/entrypoint/local-klx.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen36-35B-A3B.sh"
 
