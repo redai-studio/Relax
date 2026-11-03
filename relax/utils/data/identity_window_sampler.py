@@ -15,7 +15,11 @@ except ImportError as e:
         "or use the latest image."
     ) from e
 
-from relax.utils.data.flops_balancing import validated_cost_weights
+from relax.utils.data.flops_balancing import (
+    checked_packing_geometry,
+    select_packing_aware_assignment,
+    validated_cost_weights,
+)
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 
 
@@ -104,6 +108,7 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         if cost_key is not None and placement != "balanced":
             raise ValueError("FLOPs costs require synchronous balanced placement")
         self.cost_key = cost_key
+        self._packing_geometries: dict[str, dict[str, Any] | None] = {}
         self._partition_task_states: dict[tuple[str, str], _PartitionTaskState] = {}
         self._cache_window_by_key: dict[tuple[str, str, int, int], int] = {}
         self._window_buckets: dict[tuple[str, str, int], dict[int, list[int]]] = {}
@@ -173,6 +178,11 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
             sampled = [index for identity in identity_order[:batch_size] for index in rows_by_identity[identity]]
             return sampled, sampled.copy()
 
+        geometry = (
+            checked_packing_geometry(self._packing_geometries, task_name, kwargs.get("packing_geometry"))
+            if self.cost_key is not None
+            else None
+        )
         cached = self._cached_result(partition_id, task_name, dp_rank, batch_index)
         if cached is not None:
             self._mark_cache_served(partition_id, task_name, dp_rank, batch_index, cached[0])
@@ -222,6 +232,13 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
             else {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows}
         )
         rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
+        if geometry is not None:
+            original = _BalancedRowPlacement.place(
+                selected_rows,
+                {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows},
+                self.dp_size,
+            )
+            rank_rows = select_packing_aware_assignment(original, rank_rows, lengths, custom_meta, geometry)
         self._admit_identities(task_state, window, selected_identities, rows_by_identity)
         window.admission_closed = True
 
@@ -505,6 +522,7 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
                 "dispatched": self._dispatched,
                 "dummy_rounds": self._dummy_rounds,
                 "balance_geometry": (self.dp_size, self.placement, self.cost_key),
+                "packing_geometries": self._packing_geometries.copy(),
             }
         )
         return state
@@ -525,6 +543,7 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         self._resolved_lengths = state["resolved_lengths"]
         self._dispatched = state["dispatched"]
         self._dummy_rounds = state["dummy_rounds"]
+        self._packing_geometries = state.get("packing_geometries", {}).copy()
         for key, task_state in self._partition_task_states.items():
             self._assigned_global[key] = task_state.reserved_indexes
 
