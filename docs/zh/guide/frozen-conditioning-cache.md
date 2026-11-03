@@ -1,6 +1,6 @@
 # 冻结条件缓存
 
-图像 SFT 可在有效输入相同时复用冻结编码器的确定性特征。SenseNova 复用理解分支前缀 K/V 和图像索引，Qwen-Image 复用文本特征，两者共用有界的节点本地缓存。VAE 编码与采样、扩散噪声、timestep 及可训练分支仍在线执行。本期不接入 RL。
+图像 SFT 可在有效输入相同时复用冻结编码器的确定性特征。SenseNova 复用理解分支前缀 K/V 和图像索引，Qwen-Image 复用文本特征及确定性的 VAE 后验分布参数，两者共用有界的节点本地缓存。后验采样、扩散噪声、timestep 及可训练分支仍在线执行。本期不接入 RL。
 
 ## 启动
 
@@ -35,7 +35,7 @@ Qwen 使用 `run-qwen-image-sft-condition-cache.sh`，它在基础在线训练�
 
 ## 复用与失效
 
-键覆盖 checkpoint/tokenizer 文件内容、适配层 schema、有效输入内容、预处理、dtype 和影响输出的设置，不按文件名复用。随机裁剪、增强和 caption dropout 保持执行与随机数流顺序，使用实际结果构键。Qwen 的 VAE 编码和后验采样每次在线执行。
+键覆盖 checkpoint/tokenizer 文件内容、适配层 schema、有效输入内容、预处理、dtype 和影响输出的设置，不按文件名复用。随机裁剪、增强和 caption dropout 保持执行与随机数流顺序，使用实际结果构键。Qwen 将实际图像像素和 VAE 设置纳入键；缓存后验分布参数时保留 dtype 和影响采样的内存布局，后验采样仍按原随机数顺序每次在线执行。在线与缓存路径均将冻结 VAE 保留为副本，避免重复聚合权重。后验复用支持 contiguous 与 channels-last-3d 布局，其他布局需关闭缓存。解冻副本编码器需重建其 FSDP 所有权。
 
 适配器声明冻结参数边界；参数替换、正常原地修改、解冻、buffer 或语义配置变化后停用复用并回退在线。SenseNova 检查 RoPE 等条件状态，同时允许确定性的懒初始化。生成侧 LoRA 更新不影响与它无关的冻结条件。状态检查位于 FSDP forward 外，避免将临时参数视图误判为替换。该防护不能识别 `.data` 等绕过版本计数器的写入；运行期间 checkpoint 文件也须保持不变。
 

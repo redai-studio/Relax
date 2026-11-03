@@ -80,9 +80,9 @@ python examples/diffusion/export_i2i_sft.py \
 ## 可选冻结条件缓存
 
 使用 `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh`，沿用上面的训练设置。
-`RELAX_CONDITION_CACHE=1` 启用冻结文本复用，`RELAX_CONDITION_CACHE_MAX_BYTES`
+`RELAX_CONDITION_CACHE=1` 启用冻结文本特征与 VAE 后验分布参数复用，`RELAX_CONDITION_CACHE_MAX_BYTES`
 设置每节点 payload 预算（默认 1 GiB），每次使用新的 `RELAX_CONDITION_CACHE_RUN_DIR`。
-`RELAX_CONDITION_CACHE=0` 保留在线基线。VAE 编码与后验采样仍在线执行，随机裁剪和
+`RELAX_CONDITION_CACHE=0` 保留在线基线。后验采样仍在线执行，保留原随机数顺序与张量布局；在线与缓存路径均使用冻结 VAE 副本。随机裁剪和
 caption dropout 保持随机数流顺序，使用实际结果构键。
 
 在线/缓存对照和 checkpoint 恢复使用相同编码器放置、checkpointing 和 FSDP reshard 设置。

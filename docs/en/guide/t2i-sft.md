@@ -97,11 +97,12 @@ and use the exported directory for model loading.
 ## Optional frozen conditioning cache
 
 Use `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh` with the same
-training settings as above. Set `RELAX_CONDITION_CACHE=1` for frozen text reuse,
+training settings as above. Set `RELAX_CONDITION_CACHE=1` to reuse frozen text embeddings and VAE posterior parameters,
 `RELAX_CONDITION_CACHE_MAX_BYTES` for the per-node payload budget (default 1 GiB),
 and a fresh `RELAX_CONDITION_CACHE_RUN_DIR`. Set `RELAX_CONDITION_CACHE=0` for the
-online baseline. VAE encoding and posterior sampling remain online; crops and
-caption dropout keep their RNG order and key their actual outputs.
+online baseline. Posterior sampling remains online with the same RNG order and
+tensor layout; crops and caption dropout key their actual outputs. The frozen
+VAE is replicated in both modes.
 
 Keep encoder placement, checkpointing and FSDP reshard settings identical across
 the comparison and on checkpoint resume. All ranks agree before skipping an

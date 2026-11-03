@@ -1,6 +1,6 @@
 # Frozen Conditioning Cache
 
-Image SFT can reuse deterministic features when the same effective input reaches a frozen encoder. SenseNova reuses the understanding prefix K/V and image indexes; Qwen-Image reuses text embeddings. Both use the same bounded, node-local cache. VAE encoding and sampling, diffusion noise, timesteps and trainable branches remain online. RL integration is outside this implementation.
+Image SFT can reuse deterministic features when the same effective input reaches a frozen encoder. SenseNova reuses the understanding prefix K/V and image indexes; Qwen-Image reuses text embeddings and deterministic VAE posterior parameters. Both use the same bounded, node-local cache. Posterior sampling, diffusion noise, timesteps and trainable branches remain online. RL integration is outside this implementation.
 
 ## Launch
 
@@ -35,7 +35,7 @@ The launchers forward these settings to Ray workers; custom launchers must do th
 
 ## Reuse and invalidation
 
-Keys cover checkpoint/tokenizer file contents, the adapter schema, effective input contents, preprocessing, dtype and output-affecting settings. A filename alone never authorizes reuse. Random crops, augmentation and caption dropout keep their execution and RNG order; the key uses the resulting input. Qwen VAE encoding and posterior sampling run every time.
+Keys cover checkpoint/tokenizer file contents, the adapter schema, effective input contents, preprocessing, dtype and output-affecting settings. A filename alone never authorizes reuse. Random crops, augmentation and caption dropout keep their execution and RNG order; the key uses the resulting input. Qwen keys the actual image pixels and VAE settings. It caches posterior parameters with their dtype and sampling-relevant memory layout; posterior sampling still runs every time in the original RNG order. The frozen VAE is replicated in both online and cache runs to avoid repeated parameter gathering. Posterior reuse supports contiguous and channels-last-3d layouts; other layouts require disabling the cache. Unfreezing a replicated encoder requires rebuilding its FSDP ownership.
 
 The adapter declares the frozen parameter boundary. Parameter replacement, normal in-place mutation, unfreezing, buffer changes and semantic configuration changes disable reuse and fall back online. SenseNova checks RoPE and other conditioning state while allowing its deterministic lazy initialization. Changes to generation-only LoRA do not invalidate independent frozen conditions. State checks run outside FSDP forward to avoid confusing temporary parameter views with replacement. The guard cannot detect writes that bypass version counters through `.data`; checkpoint files must also remain unchanged during a run.
 

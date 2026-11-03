@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Add bounded text-conditioning reuse and measurements to the online Qwen recipe.
+# Add bounded frozen-conditioning reuse and measurements to the online Qwen recipe.
 # Invoke through scripts/entrypoint/ray-job.sh; DRY_RUN=1 only prints the command.
 set -euo pipefail
 
