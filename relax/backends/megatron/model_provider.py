@@ -44,6 +44,7 @@ from relax.utils.megatron_peft_utils import (
     summarize_lora_modules,
 )
 from relax.utils.misc import load_function
+from relax.utils.model_routing import resolve_is_vl_model
 from relax.utils.training.ppo_utils import (
     ensure_sequence_classification_head_trainable,
     install_critic_value_head_in_provider,
@@ -302,6 +303,16 @@ def get_model_provider_func(
 
         ensure_backend(args)
 
+    provider = None
+    if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
+    # Resolve once, after provider selection and before model/data setup. A VL
+    # checkpoint can produce a text-only provider despite its processor files.
+    args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
+
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -336,10 +347,6 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
-
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        provider = bridge.to_megatron_provider(load_weights=False)
         is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
         if is_kimi_k3:
             from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime

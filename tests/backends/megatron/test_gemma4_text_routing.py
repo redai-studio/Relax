@@ -1,51 +1,70 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Exercise checkpoint routing without constructing a Ray/Megatron actor."""
+"""Exercise model routing without constructing a Ray/Megatron actor."""
 
-import ast
-import os
+import importlib.util
+import sys
+from dataclasses import dataclass, fields
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from relax.utils.model_routing import resolve_is_vl_model
+
 
 @pytest.mark.parametrize("config_name", ["processor_config.json", "preprocessor_config.json"])
-@pytest.mark.parametrize(
-    "model_type,mode,processor,expected",
-    [
-        ("gemma4", "text", True, False),
-        ("gemma4", "vl", True, True),
-        ("gemma4", None, True, True),
-        ("qwen3_vl", "text", True, True),
-        ("gemma4", "text", False, False),
-        ("qwen3", None, False, False),
-    ],
-)
-def test_checkpoint_routing_respects_explicit_gemma4_text_conversion(
-    tmp_path, monkeypatch, config_name, model_type, mode, processor, expected
-):
+@pytest.mark.parametrize("processor", [False, True])
+@pytest.mark.parametrize("declared", [None, False, True])
+def test_provider_declaration_overrides_checkpoint_metadata(tmp_path, config_name, processor, declared):
     if processor:
         (tmp_path / config_name).write_text("{}")
-    if mode is None:
-        monkeypatch.delenv("GEMMA4_CONVERSION_MODE", raising=False)
-    else:
-        monkeypatch.setenv("GEMMA4_CONVERSION_MODE", mode)
-    source = Path(__file__).resolve().parents[3] / "relax/backends/megatron/actor.py"
-    # Run the production routing assignments with only their lightweight inputs.
-    # Importing the complete actor would require unrelated Ray/Megatron services.
-    assignments = []
-    for node in ast.walk(ast.parse(source.read_text())):
-        if not isinstance(node, ast.Assign):
-            continue
-        target = node.targets[0]
-        if isinstance(target, ast.Name) and target.id in {"has_processor_config", "gemma4_text_conversion"}:
-            assignments.append(node)
-        elif isinstance(target, ast.Attribute) and target.attr == "is_vl_model":
-            assignments.append(node)
-    assert len(assignments) == 3
-    args = SimpleNamespace(hf_checkpoint=str(tmp_path))
-    namespace = {"os": os, "args": args, "self": SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))}
-    module = ast.Module(body=sorted(assignments, key=lambda node: node.lineno), type_ignores=[])
-    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
-    assert args.is_vl_model is expected
+    provider = SimpleNamespace(relax_is_multimodal=declared)
+    assert resolve_is_vl_model(provider, str(tmp_path)) is (processor if declared is None else declared)
+
+
+@pytest.mark.parametrize("provider", [None, SimpleNamespace()])
+def test_unknown_provider_without_checkpoint_is_text_only(provider):
+    assert resolve_is_vl_model(provider, None) is False
+
+
+def test_non_boolean_provider_declaration_fails_loudly(tmp_path):
+    with pytest.raises(TypeError, match="must be bool or None"):
+        resolve_is_vl_model(SimpleNamespace(relax_is_multimodal="false"), str(tmp_path))
+
+
+@pytest.mark.parametrize("variant,expected", [("dense", False), ("dense_vl", True), ("moe", False), ("moe_vl", True)])
+def test_gemma4_provider_declarations_preserve_in_place_conversion(monkeypatch, tmp_path, variant, expected):
+    # The CI image need not ship Gemma4 Bridge classes. Load the production
+    # provider subclasses against small dataclass bases to exercise the actual
+    # declarations and Bridge's in-place class replacement without a model.
+    @dataclass
+    class BaseProvider:
+        rotary_base: int = 10000
+
+    text = ModuleType("megatron.bridge.models.gemma.gemma4_provider")
+    vl = ModuleType("megatron.bridge.models.gemma_vl.gemma4_vl_provider")
+    text.Gemma4DenseProvider = type("Gemma4DenseProvider", (BaseProvider,), {})
+    text.Gemma4ModelProvider = type("Gemma4ModelProvider", (BaseProvider,), {})
+    vl.Gemma4DenseVLProvider = type("Gemma4DenseVLProvider", (BaseProvider,), {})
+    vl.Gemma4VLModelProvider = type("Gemma4VLModelProvider", (BaseProvider,), {})
+    monkeypatch.setitem(sys.modules, text.__name__, text)
+    monkeypatch.setitem(sys.modules, vl.__name__, vl)
+    path = Path(__file__).parents[3] / "relax/models/gemma4/gemma4_provider.py"
+    spec = importlib.util.spec_from_file_location("_gemma4_routing_provider", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    upstream = {
+        "dense": text.Gemma4DenseProvider,
+        "dense_vl": vl.Gemma4DenseVLProvider,
+        "moe": text.Gemma4ModelProvider,
+        "moe_vl": vl.Gemma4VLModelProvider,
+    }[variant]
+    provider = upstream(rotary_base=123)
+    provider.extra_bridge_metadata = object()
+    original_state = vars(provider).copy()
+    provider.__class__ = module.RELAX_PROVIDERS[upstream]
+    assert vars(provider) == original_state
+    assert [field.name for field in fields(provider)] == ["rotary_base"]
+    (tmp_path / "processor_config.json").write_text("{}")
+    assert resolve_is_vl_model(provider, str(tmp_path)) is expected

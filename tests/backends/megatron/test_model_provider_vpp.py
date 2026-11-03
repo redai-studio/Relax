@@ -199,6 +199,29 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
 
 
+@pytest.mark.parametrize("path", ["bridge", "custom", "raw"])
+@pytest.mark.parametrize("processor", [False, True])
+@pytest.mark.parametrize("declared", [None, False, True])
+def test_model_routing_is_resolved_before_model_construction(monkeypatch, tmp_path, path, processor, declared):
+    if processor:
+        (tmp_path / "processor_config.json").write_text("{}")
+    provider = _FakeProvider()
+    provider.relax_is_multimodal = declared
+    module, provider = _load_model_provider(monkeypatch, provider)
+    args = _bridge_args(
+        hf_checkpoint=str(tmp_path),
+        megatron_to_hf_mode="raw" if path == "raw" else "bridge",
+        custom_model_provider_path="custom.provider" if path == "custom" else None,
+        is_vl_model=not processor,
+        uses_unsplit_forward=True,
+    )
+    module.get_model_provider_func(args)
+    expected = declared if path == "bridge" and declared is not None else processor
+    assert args.is_vl_model is expected
+    assert args.uses_unsplit_forward is True
+    assert provider.calls == []
+
+
 def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
     module, provider = _load_model_provider(monkeypatch)
 
