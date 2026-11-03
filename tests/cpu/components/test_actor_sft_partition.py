@@ -64,6 +64,45 @@ def test_actor_cold_start_and_explicit_step_are_preserved():
     assert _resolve_start_rollout_id(None, 200, explicitly_set=False) == 200
 
 
+@pytest.mark.parametrize("backend_step", [0, 1, 2, 200])
+def test_actor_image_sft_uses_exact_backend_cursor(backend_step):
+    from relax.components.actor import _resolve_start_rollout_id
+
+    assert _resolve_start_rollout_id(0, backend_step, explicitly_set=False, image_sft=True) == backend_step
+
+
+@pytest.mark.parametrize("configured_step", [0, 1, 100])
+def test_actor_image_sft_preserves_explicit_step(configured_step):
+    from relax.components.actor import _resolve_start_rollout_id
+
+    assert _resolve_start_rollout_id(configured_step, 1, explicitly_set=True, image_sft=True) == configured_step
+
+
+@pytest.mark.parametrize(
+    ("generation_task", "backend_step", "expected_step"),
+    [("t2i", 1, 1), ("i2i", 1, 1), ("t2i", 0, 0), ("i2i", 0, 0), (None, 1, 0)],
+)
+def test_actor_initialization_uses_image_sft_checkpoint_cursor(
+    monkeypatch, generation_task, backend_step, expected_step
+):
+    from relax.components import actor as actor_module
+
+    config = _mk_actor_config("sft")
+    config.generation_task = generation_task
+    config._start_rollout_id_explicit = False
+    group = MagicMock()
+    group.init_and_wait.return_value = [backend_step]
+    actor_class = actor_module.Actor.func_or_class.__mro__[1]
+    init_globals = actor_class.__init__.__globals__
+    monkeypatch.setitem(init_globals, "allocate_train_group", lambda **_: group)
+    monkeypatch.setitem(init_globals, "attach_tq_client", lambda *_args, **_kwargs: MagicMock())
+
+    actor = actor_class(None, None, 1, config, "actor")
+
+    assert actor.step == expected_step
+    assert config.start_rollout_id == expected_step
+
+
 @pytest.mark.parametrize(
     ("loss_type", "reference_free", "kl_coef", "use_kl_loss", "expected_ref"),
     [

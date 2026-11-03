@@ -18,12 +18,12 @@ import torch
 import torch.distributed as dist
 
 from relax.backends.fsdp import checkpoint
-from relax.engine.sft.image import ImageBatchSampler, ImageEditDataset, assign_image_batch
+from relax.engine.sft.image import ImageBatchSampler, ImageSFTDataset, assign_image_batch
+from relax.engine.sft.runtime import get_image_sft_config, image_sft_task
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
-TASK = "i2i_sft"
 
 
 def _report_sft_metrics(args: Any, values: dict[str, Any]) -> None:
@@ -81,11 +81,12 @@ class FSDPSFTTrainer:
         from relax.backends.fsdp.actor import _collect_rank_objects, _collect_weight_sync_errors
 
         self.actor, self.args = actor, actor.args
+        self.task = image_sft_task(self.args)
         self.group = actor._device_group()
         self.world, self.rank = dist.get_world_size(self.group), dist.get_rank(self.group)
         if self.args.global_batch_size % self.world:
             raise ValueError("Image SFT global batch size must be divisible by the FSDP world size")
-        config = self.args.i2i_sft_config
+        config = get_image_sft_config(self.args)
         if config.get("dp_tier_micro_balance", False) and actor.adapter.family != "sensenova":
             raise ValueError("DP tier micro balancing currently requires the SenseNova per-row tier policy")
         from relax.utils.profile_utils import TrainProfiler
@@ -94,7 +95,7 @@ class FSDPSFTTrainer:
         self.step = 0
         dataset_error = None
         try:
-            self.dataset = ImageEditDataset(self.args, actor.adapter)
+            self.dataset = ImageSFTDataset(self.args, actor.adapter)
         except Exception as exc:
             dataset_error = f"{type(exc).__name__}: {exc}"
         errors = _collect_weight_sync_errors(dataset_error)
@@ -137,6 +138,8 @@ class FSDPSFTTrainer:
             "master_dtype": self.args.fsdp_master_dtype,
             "torch_version": torch.__version__,
         }
+        if self.args.generation_task == "t2i":
+            self.contract["generation_task"] = "t2i"
         # JSON roundtrip canonicalizes optimizer tuples before disk comparison.
         import json
 
@@ -147,7 +150,7 @@ class FSDPSFTTrainer:
         if self.args.load:
             self._resume()
         else:
-            if self.args.save and checkpoint.find_latest_committed(self.args.save, TASK) is not None:
+            if self.args.save and checkpoint.find_latest_committed(self.args.save, self.task) is not None:
                 raise FileExistsError("Output already contains SFT checkpoints; use --load or a fresh --save")
             seed_training(self.args.seed + self.rank)
         self.prefetch = None
@@ -173,14 +176,14 @@ class FSDPSFTTrainer:
         self.profiler.on_init_end()
 
     def _resume(self) -> None:
-        latest = checkpoint.find_latest_committed(self.args.load, TASK)
+        latest = checkpoint.find_latest_committed(self.args.load, self.task)
         if latest is None:
             raise FileNotFoundError(f"No committed image SFT checkpoint under {self.args.load}")
-        if checkpoint.read_adapter_contract(self.args.load, TASK, latest) != self.contract:
+        if checkpoint.read_adapter_contract(self.args.load, self.task, latest) != self.contract:
             raise ValueError("Checkpoint model/data/optimizer contract differs; refusing SFT resume")
         state = checkpoint.load_checkpoint(
             self.args.load,
-            TASK,
+            self.task,
             latest,
             self.actor.model,
             self.actor.optimizer,
@@ -193,7 +196,7 @@ class FSDPSFTTrainer:
         explicit = getattr(self.args, "_start_rollout_id_explicit", False)
         if explicit and self.args.start_rollout_id != self.step:
             raise ValueError("--start-rollout-id disagrees with the restored SFT cursor")
-        restore_rng(Path(self.args.load) / TASK / checkpoint.iter_dir_name(latest), self.rank)
+        restore_rng(Path(self.args.load) / self.task / checkpoint.iter_dir_name(latest), self.rank)
 
     def train(self, step: int) -> None:
         try:
@@ -225,7 +228,7 @@ class FSDPSFTTrainer:
         from relax.utils.distributed_utils import get_gloo_group
 
         dist.broadcast_object_list(holder, src=0, group=get_gloo_group())
-        ids = assign_image_batch(holder[0], self.args.i2i_sft_config, step=step, world=self.world)[
+        ids = assign_image_batch(holder[0], get_image_sft_config(self.args), step=step, world=self.world)[
             self.rank :: self.world
         ]
         started = time.monotonic()
@@ -285,7 +288,8 @@ class FSDPSFTTrainer:
             values["train/step"] = self.step
             _report_sft_metrics(self.args, values)
             logger.info(
-                "i2i SFT step=%s loss=%.8f grad_norm=%.8f lr=%g peak_allocated=%d peak_reserved=%d",
+                "%s SFT step=%s loss=%.8f grad_norm=%.8f lr=%g peak_allocated=%d peak_reserved=%d",
+                self.args.generation_task,
                 self.step,
                 *metrics,
                 lr,
@@ -306,7 +310,7 @@ class FSDPSFTTrainer:
     def _save_checkpoint(self) -> None:
         checkpoint.save_checkpoint(
             self.args.save,
-            TASK,
+            self.task,
             self.step,
             self.actor.model,
             self.actor.optimizer,
@@ -321,7 +325,7 @@ class FSDPSFTTrainer:
 
         self.actor._rank0_then_agree(
             lambda: rotate_ckpt(
-                self.args, global_step=self.step, save_dir=os.path.join(self.args.save, TASK), committed_only=True
+                self.args, global_step=self.step, save_dir=os.path.join(self.args.save, self.task), committed_only=True
             ),
             what=f"SFT checkpoint rotation at step {self.step}",
         )

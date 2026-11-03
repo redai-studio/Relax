@@ -138,10 +138,16 @@ def add_generative_arguments(parser: ArgumentParser) -> ArgumentParser:
         default=None,
         help="Image SFT JSON: data_root, dataset_size, max_pixels, conditioning_images, attention settings.",
     )
+    group.add_argument(
+        "--t2i-sft-config",
+        type=json.loads,
+        default=None,
+        help="Text-to-image SFT JSON: data_root, dataset_size, height, width, max_sequence_length.",
+    )
     group.add_argument("--model-path", type=str, default=None, help="HF-format model directory for the adapter.")
     group.add_argument("--model-revision", type=str, default=None)
     group.add_argument(
-        "--model-adapter-path", type=str, default=None, help="Dotpath to a GenerativeModelAdapter implementation."
+        "--model-adapter-path", type=str, default=None, help="Dotpath to a generative RL or SFT model adapter."
     )
 
     # Rollout engine / driver hooks (resolved in rollout.py / utils.py)
@@ -311,7 +317,10 @@ def validate_generative_config(args: Namespace) -> None:
         return
 
     if getattr(args, "loss_type", None) == "sft":
-        validate_i2i_sft_config(args)
+        if getattr(args, "generation_task", None) == "t2i":
+            validate_t2i_sft_config(args)
+        else:
+            validate_i2i_sft_config(args)
         return
 
     errors: List[str] = []
@@ -634,7 +643,8 @@ def validate_generative_config(args: Namespace) -> None:
 def validate_i2i_sft_config(args: Namespace) -> None:
     """Validate supervision independently of rollout/reward configuration."""
     errors: list[str] = []
-    _fail(errors, getattr(args, "generation_task", None) != "i2i", "FSDP SFT currently supports generation_task=i2i.")
+    _fail(errors, getattr(args, "generation_task", None) != "i2i", "Image-edit SFT requires generation_task=i2i.")
+    _fail(errors, getattr(args, "t2i_sft_config", None) is not None, "Image-edit SFT does not use --t2i-sft-config.")
     for field in ("model_path", "prompt_data"):
         _fail(errors, not getattr(args, field, None), f"Image SFT requires --{field.replace('_', '-')}.")
     config = getattr(args, "i2i_sft_config", None)
@@ -726,6 +736,79 @@ def validate_i2i_sft_config(args: Namespace) -> None:
     args.model_adapter_path = (
         getattr(args, "model_adapter_path", None) or "relax.models.sensenova.adapter.SenseNovaSFTAdapter"
     )
+    _validate_image_sft_training(args, errors)
+    if errors:
+        raise ValueError("Invalid image SFT configuration:\n- " + "\n- ".join(errors))
+
+
+def validate_t2i_sft_config(args: Namespace) -> None:
+    """Validate caption/target supervision without rollout dependencies."""
+    errors: list[str] = []
+    _fail(errors, getattr(args, "generation_task", None) != "t2i", "Text-to-image SFT requires generation_task=t2i.")
+    _fail(
+        errors, getattr(args, "i2i_sft_config", None) is not None, "Text-to-image SFT does not use --i2i-sft-config."
+    )
+    for field in ("model_path", "prompt_data"):
+        _fail(errors, not getattr(args, field, None), f"Image SFT requires --{field.replace('_', '-')}.")
+    config = getattr(args, "t2i_sft_config", None)
+    if not isinstance(config, dict):
+        raise ValueError("Text-to-image SFT requires --t2i-sft-config with data_root and dataset_size")
+    defaults = {
+        "height": 512,
+        "width": 512,
+        "max_sequence_length": 512,
+        "text_encoder_placement": "sharded",
+        "gradient_checkpointing": True,
+        "deterministic_attention": False,
+        "caption_dropout": 0.0,
+        "random_crop": False,
+    }
+    unknown = (
+        set(config) - set(defaults) - {"data_root", "dataset_size", "image_prefetch_depth", "image_prefetch_workers"}
+    )
+    _fail(errors, bool(unknown), f"Unknown t2i_sft_config keys: {sorted(unknown)}")
+    args.t2i_sft_config = config = {**defaults, **config}
+    _fail(
+        errors,
+        not isinstance(config.get("data_root"), str) or not config.get("data_root"),
+        "t2i_sft_config.data_root must be a non-empty path",
+    )
+    for field in ("dataset_size", "height", "width", "max_sequence_length"):
+        value = config.get(field)
+        _fail(errors, type(value) is not int or value <= 0, f"t2i_sft_config.{field} must be a positive integer")
+    for field in ("height", "width"):
+        value = config[field]
+        _fail(errors, type(value) is int and value % 16 != 0, f"t2i_sft_config.{field} must be a multiple of 16")
+    maximum = config["max_sequence_length"]
+    _fail(errors, type(maximum) is int and maximum > 512, "max_sequence_length must be at most 512")
+    _fail(
+        errors,
+        config["text_encoder_placement"] not in ("sharded", "replicated"),
+        "text_encoder_placement must be sharded or replicated",
+    )
+    for field in ("gradient_checkpointing", "deterministic_attention", "random_crop"):
+        _fail(errors, type(config[field]) is not bool, f"{field} must be boolean")
+    dropout = config["caption_dropout"]
+    _fail(errors, type(dropout) not in (int, float) or not 0 <= dropout <= 1, "caption_dropout must be in [0, 1]")
+    depth, workers = config.get("image_prefetch_depth", 0), config.get("image_prefetch_workers", 2)
+    _fail(errors, type(depth) is not int or depth != 0, "Text-to-image SFT currently requires image_prefetch_depth=0")
+    _fail(errors, type(workers) is not int or workers <= 0, "image_prefetch_workers must be a positive integer")
+    _fail(
+        errors,
+        getattr(args, "fsdp_trainable_mode", "full") != "lora",
+        "Text-to-image SFT currently supports only --fsdp-trainable-mode lora with frozen condition encoders",
+    )
+    args.model_adapter_path = (
+        getattr(args, "model_adapter_path", None) or "relax.models.qwen_image.sft_adapter.QwenImageSFTAdapter"
+    )
+    _validate_image_sft_training(args, errors)
+    if errors:
+        raise ValueError("Invalid text-to-image SFT configuration:\n- " + "\n- ".join(errors))
+
+
+def _validate_image_sft_training(args: Namespace, errors: list[str]) -> None:
+    """Common optimizer/distribution contract; model preprocessing stays task-
+    specific."""
     # These controls have no implementation in the supervised image path.
     for field in (
         "fully_async",
@@ -792,5 +875,3 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         _fail(errors, (getattr(args, "lora_rank", 0) or 0) <= 0, "LoRA mode requires positive --lora-rank")
     elif getattr(args, "lora_rank", 0):
         errors.append("Full SFT requires --lora-rank 0")
-    if errors:
-        raise ValueError("Invalid image SFT configuration:\n- " + "\n- ".join(errors))

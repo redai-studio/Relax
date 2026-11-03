@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -152,11 +153,12 @@ def test_dpo_initial_reference_and_resume_keep_separate_checkpoint_roles(
 
 
 @pytest.mark.parametrize("mode", ["bridge", "raw"])
-def test_i2i_sft_preserves_native_checkpoint_and_image_batching(arguments_module, tmp_path, mode):
+@pytest.mark.parametrize("task", ["i2i", "t2i"])
+def test_image_sft_preserves_native_checkpoint_and_image_batching(arguments_module, tmp_path, mode, task):
     args = _opd_args()
     vars(args).update(
         loss_type="sft",
-        generation_task="i2i",
+        generation_task=task,
         train_backend="fsdp",
         prompt_data=["/train.jsonl"],
         use_dynamic_batch_size=False,
@@ -164,7 +166,7 @@ def test_i2i_sft_preserves_native_checkpoint_and_image_batching(arguments_module
         n_samples_per_prompt=1,
         sft_oversize_strategy="keep",
         sft_oversize_custom_function_path=None,
-        load=str(tmp_path / "i2i_sft"),
+        load=str(tmp_path / f"{task}_sft"),
         start_rollout_id=7,
         megatron_to_hf_mode=mode,
         no_load_optim=False,
@@ -172,13 +174,42 @@ def test_i2i_sft_preserves_native_checkpoint_and_image_batching(arguments_module
         finetune=False,
     )
     arguments_module.slime_validate_args(args)
-    assert args.load == str(tmp_path / "i2i_sft")
+    assert args.load == str(tmp_path / f"{task}_sft")
     assert args.start_rollout_id == 7
     assert not args.balance_data
     assert not args.use_dynamic_batch_size
     assert not args.no_load_optim
     assert not args.no_load_rng
     assert not args.finetune
+
+
+@pytest.mark.parametrize("task", ["i2i", "t2i"])
+def test_image_sft_parser_skips_rollout_and_language_model_validation(arguments_module, monkeypatch, task):
+    calls = []
+
+    class ParsedEnough(Exception):
+        pass
+
+    def parse_backend(**kwargs):
+        calls.append(kwargs)
+        raise ParsedEnough
+
+    def forbidden():
+        pytest.fail("Image supervision must not parse SGLang rollout arguments")
+
+    backend = ModuleType("relax.backends.megatron.arguments")
+    backend.megatron_parse_args = parse_backend
+    backend.validate_args = forbidden
+    monkeypatch.setitem(sys.modules, backend.__name__, backend)
+    monkeypatch.setattr(arguments_module, "sglang_parse_args", forbidden)
+    monkeypatch.setattr(arguments_module, "teacher_sglang_parse_args", forbidden)
+    monkeypatch.setattr(
+        sys, "argv", ["train", "--train-backend", "fsdp", "--loss-type", "sft", "--generation-task", task]
+    )
+    with pytest.raises(ParsedEnough):
+        arguments_module._parse_args_impl()
+    assert len(calls) == 1
+    assert calls[0]["skip_hf_validate"] is True
 
 
 @pytest.mark.parametrize("cli,expected", [([], "balanced"), (["--sft-packing-strategy", "binpack"], "binpack")])
