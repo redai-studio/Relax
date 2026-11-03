@@ -52,6 +52,7 @@ from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.async_utils import run
 from relax.utils.data.data import get_minimum_num_micro_batch_size
+from relax.utils.data.flops_balancing import get_dp_packing_geometry
 from relax.utils.data.micro_batch_ring import (
     PrefetchedSFTWindow,
     SFTWindowPrefetcher,
@@ -3580,6 +3581,10 @@ class MegatronTrainRayActor(TrainRayActor):
             "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
             "task_name": task_name,
         }
+        if getattr(self.args, "dp_balance", "tokens") == "flops":
+            geometry = get_dp_packing_geometry(self.args, task_name)
+            if geometry is not None:
+                sampling_config["packing_geometry"] = geometry
         cancel_event = Event()
         self._sft_train_prefetch_cancel = cancel_event
         self._sft_train_prefetch_rollout_id = next_rollout_id
