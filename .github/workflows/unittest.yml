@@ -116,7 +116,7 @@ jobs:
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Unit Tests (H20, 4 GPUs)
     runs-on: [self-hosted, linux, x64, h20, gpu]
-    # Allow time for image preparation, device acquisition, and the 40-minute test budget.
+    # Allow time for image preparation, device acquisition, and the 20-minute test budget.
     timeout-minutes: 190
     env:
       CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
@@ -193,7 +193,7 @@ jobs:
 
       - name: Run unittest
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        timeout-minutes: 40
+        timeout-minutes: 20
         run: |
           docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
             QSA_MIXED_TEST_LOG=/artifacts/qsa-mixed.log \
