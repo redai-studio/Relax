@@ -24,8 +24,10 @@ paths above. Set `MODEL_PATH`, `DATA_ROOT`, `METADATA_PATH`, `DATASET_SIZE`,
 without submitting a job.
 
 Before measuring performance, enable `RELAX_CONDITION_CACHE=1`,
-`RELAX_CONDITION_VERIFY=1`, `RELAX_CONDITION_VERIFY_RTOL=0`,
-`DETERMINISTIC_ATTENTION=1` and `LR_WARMUP_ITERS=0`. The shared verifier restores
+`RELAX_CONDITION_VERIFY=1`, `RELAX_CONDITION_VERIFY_RTOL=0` and
+`DETERMINISTIC_ATTENTION=1`. For a nonzero first-step update, set
+`LR_WARMUP_ITERS=0` for Qwen; for SenseNova append `--lr-warmup-iters 0`
+after the launcher path in the submission command. The shared verifier restores
 initial model, optimizer and RNG state, exercises the actual cache branch, and
 compares loss, complete effective-batch reduced gradients and actual FP32
 parameter updates. It writes `conditioning-verification.json` in the run
