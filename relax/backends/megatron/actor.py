@@ -60,6 +60,7 @@ from relax.utils.data.micro_batch_ring import (
     SFTWindowPrefetcher,
     is_sft_async_prepack_enabled,
 )
+from relax.utils.data.packing import get_flops_packing_seed
 from relax.utils.data.stream_dataloader import (
     MicroBatchListIterator,
     StreamingTQIterator,
@@ -1847,10 +1848,13 @@ class MegatronTrainRayActor(TrainRayActor):
         # but kept explicit to mirror get_data_iterator's formula.
         cp_size = mpu.get_context_parallel_world_size()
         max_tokens = _get_micro_batch_token_capacity(self.args, self.args.max_tokens_per_gpu, cp_size)
-        k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
-        micro_batch_indices = _get_capacity_safe_balanced_partitions(
-            samples, k_local, max_tokens, sample_costs(self.args, rollout_data)
+        costs = sample_costs(self.args, rollout_data)
+        k_local = (
+            len(get_flops_packing_seed(samples, costs, max_tokens))
+            if costs is not None
+            else get_minimum_num_micro_batch_size(samples, max_tokens)
         )
+        micro_batch_indices = _get_capacity_safe_balanced_partitions(samples, k_local, max_tokens, costs)
         packed_cpu = [
             (prepack_sft_micro_batch_cpu(self.args, _select_rollout_samples(rollout_data, indices)), None)
             for indices in micro_batch_indices
