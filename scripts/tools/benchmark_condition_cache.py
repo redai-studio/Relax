@@ -6,13 +6,14 @@ wall_seconds includes the complete, synchronized training loop. Throughput uses
 the slowest rank at each step and counts global_samples once. Encoding timings
 are diagnostic only. Missing measurements remain null; incomplete or different
 workloads never produce a speedup claim. Use separate --low-reuse-* runs to
-report cache overhead when conditions rarely repeat.
+report cache overhead when conditions rarely repeat. Record the exact source
+commit and environment in the experiment manifest; this parser validates the
+training events rather than an external source-archive format.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import statistics
@@ -91,10 +92,8 @@ def _semantic_config(value: Any) -> Any:
 
 
 def read_events(path: Path) -> list[dict[str, Any]]:
-    """Prefer raw JSONL over duplicated copies embedded in driver logs."""
+    """Read the runtime's raw JSONL events, ignoring unrelated driver logs."""
     paths = sorted(path.glob("events-rank*.jsonl")) if path.is_dir() else [path]
-    if path.is_dir() and not paths:
-        paths = sorted(path.glob("*.log"))
     if not paths:
         raise ValueError(f"No event files in {path}")
     result = []
@@ -102,26 +101,11 @@ def read_events(path: Path) -> list[dict[str, Any]]:
         for line_number, raw in enumerate(source.read_text().splitlines(), 1):
             if not raw.strip():
                 continue
-            text = raw.strip()
-            if source.suffix != ".jsonl":
-                start = text.find("{")
-                if start < 0:
-                    continue
-                text = text[start:]
             try:
-                event = json.loads(text)
+                event = json.loads(raw)
             except json.JSONDecodeError as exc:
-                if source.suffix != ".jsonl":
-                    continue
                 raise ValueError(f"Malformed JSON at {source}:{line_number}") from exc
             if isinstance(event, dict) and event.get("stage") in ("init", "step", "close"):
-                for old, new in (
-                    ("gpu_allocated", "gpu_allocated_bytes"),
-                    ("gpu_reserved", "gpu_reserved_bytes"),
-                    ("gpu_peak", "gpu_peak_allocated_bytes"),
-                ):
-                    if new not in event and old in event:
-                        event[new] = event[old]
                 result.append(event)
     if not result:
         raise ValueError(f"No condition-cache events in {path}")
@@ -157,33 +141,6 @@ def _job_measurement(path: Path) -> tuple[str | None, float | None, bool | None]
     if end <= start:
         raise ValueError("Succeeded Ray job must have end_time after start_time")
     return status, (end - start) / 1000, True
-
-
-def _source_provenance(path: Path) -> tuple[str | None, bool | None, list[str]]:
-    directory = path if path.is_dir() else path.parent
-    source = directory / "request.json"
-    if not source.is_file():
-        return None, None, []
-    try:
-        request = json.loads(source.read_text())
-    except (json.JSONDecodeError, UnicodeError):
-        return None, False, ["malformed source provenance request.json"]
-    if not isinstance(request, dict):
-        return None, False, ["source provenance request.json must be an object"]
-    digest = request.get("implementation_sha256")
-    if digest is None:
-        return None, None, []
-    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-        return None, False, ["source provenance implementation_sha256 is not a SHA256 digest"]
-    patch, base = directory / "implementation.patch", request.get("base_commit")
-    if patch.is_file() and base is not None:
-        if not isinstance(base, str) or not base:
-            return digest, False, ["source provenance base_commit must be a nonempty string"]
-        actual = hashlib.sha256(base.encode() + b"\n" + patch.read_bytes()).hexdigest()
-        if actual != digest:
-            return digest, False, ["implementation.patch and base_commit do not match implementation_sha256"]
-        return digest, True, []
-    return digest, None, []
 
 
 def summarize_run(path: Path, cold_steps: int = 16) -> dict[str, Any]:
@@ -297,8 +254,6 @@ def summarize_run(path: Path, cold_steps: int = 16) -> dict[str, Any]:
     job_status, job_seconds, job_complete = _job_measurement(path)
     if job_complete is False:
         issues.append("Ray job did not finish successfully")
-    implementation_sha256, source_artifact_verified, source_issues = _source_provenance(path)
-    issues.extend(source_issues)
     totals = {}
     coverage = {}
     for field in COUNTERS:
@@ -349,8 +304,6 @@ def summarize_run(path: Path, cold_steps: int = 16) -> dict[str, Any]:
         "validation_lane": validation_lane,
         "fresh_initialization": fresh_initialization,
         "resume_checkpoint": resume_checkpoint,
-        "implementation_sha256": implementation_sha256,
-        "source_artifact_verified": source_artifact_verified,
         "complete": not issues,
         "issues": sorted(set(issues)),
         "comparison_signature": signature,
@@ -403,16 +356,6 @@ def compare_runs(online: list[dict[str, Any]], cached: list[dict[str, Any]]) -> 
         reasons.append("numerical validation lane cannot be used as a performance comparison")
     if any(not run.get("fresh_initialization") for run in runs):
         reasons.append("automatic speedup requires fresh initialization without a resume checkpoint")
-    source_hashes = [run.get("implementation_sha256") for run in runs]
-    known_hashes = [value for value in source_hashes if value is not None]
-    source_provenance_verified = bool(runs) and len(known_hashes) == len(runs) and len(set(known_hashes)) == 1
-    if any(run.get("source_artifact_verified") is False for run in runs):
-        reasons.append("implementation source provenance validation failed")
-        source_provenance_verified = False
-    if known_hashes and len(known_hashes) != len(runs):
-        reasons.append("implementation source provenance is missing for some runs")
-    if len(set(known_hashes)) > 1:
-        reasons.append("implementation source hashes differ")
     if any(run["mode"] not in ("online", "cached") for run in runs):
         reasons.append("unknown run mode")
     if any(run["mode"] != "online" for run in online) or any(run["mode"] != "cached" for run in cached):
@@ -435,9 +378,6 @@ def compare_runs(online: list[dict[str, Any]], cached: list[dict[str, Any]]) -> 
         "reasons": reasons,
         "sample_order_verified": order_known
         and not any(run["sample_order"] != runs[0]["sample_order"] for run in runs[1:]),
-        "source_provenance_verified": source_provenance_verified,
-        "source_artifacts_verified": source_provenance_verified
-        and all(run.get("source_artifact_verified") is True for run in runs),
     }
     if reasons:
         return result

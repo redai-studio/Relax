@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import hashlib
 import json
 
 import pytest
@@ -100,65 +99,6 @@ def test_speedup_and_payback_use_e2e_not_encoding_time(tmp_path):
     assert cached["phase_counter_totals"]["cold"]["encoding_calls"] == 8
     assert cached["phase_counter_totals"]["steady"]["effective_hit"] == 16
     assert not result["repeated_measurements"]
-    assert not result["source_provenance_verified"]
-
-
-def write_source_provenance(path, patch=b"the implementation patch\n"):
-    base = "1" * 40
-    digest = hashlib.sha256(base.encode() + b"\n" + patch).hexdigest()
-    (path / "request.json").write_text(json.dumps({"base_commit": base, "implementation_sha256": digest}))
-    (path / "implementation.patch").write_bytes(patch)
-    return digest
-
-
-def test_matching_implementation_hashes_and_artifacts_are_verified(tmp_path):
-    paths = [write_run(tmp_path / "online"), write_run(tmp_path / "cached", mode="cached")]
-    expected = [write_source_provenance(path) for path in paths]
-    runs = [summarize_run(path, 1) for path in paths]
-    assert [run["implementation_sha256"] for run in runs] == expected
-    assert all(run["source_artifact_verified"] for run in runs)
-    result = compare_runs([runs[0]], [runs[1]])
-    assert result["comparable"]
-    assert result["source_provenance_verified"] and result["source_artifacts_verified"]
-
-
-def test_different_implementations_cannot_produce_speedup(tmp_path):
-    paths = [write_run(tmp_path / "online"), write_run(tmp_path / "cached", mode="cached")]
-    write_source_provenance(paths[0], b"old implementation\n")
-    write_source_provenance(paths[1], b"different implementation\n")
-    online, cached = [summarize_run(path, 1) for path in paths]
-    result = compare_runs([online], [cached])
-    assert not result["comparable"] and not result["source_provenance_verified"]
-    assert "implementation source hashes differ" in result["reasons"]
-    assert "steady_throughput_improvement" not in result
-
-
-def test_mixed_known_and_missing_implementation_provenance_is_rejected(tmp_path):
-    paths = [write_run(tmp_path / "online"), write_run(tmp_path / "cached", mode="cached")]
-    write_source_provenance(paths[0])
-    online, cached = [summarize_run(path, 1) for path in paths]
-    result = compare_runs([online], [cached])
-    assert not result["comparable"] and not result["source_provenance_verified"]
-    assert "implementation source provenance is missing for some runs" in result["reasons"]
-
-
-def test_modified_patch_is_reported_as_invalid_source_provenance(tmp_path):
-    path = write_run(tmp_path / "online")
-    write_source_provenance(path)
-    (path / "implementation.patch").write_bytes(b"modified after the run\n")
-    run = summarize_run(path, 1)
-    assert not run["complete"] and run["source_artifact_verified"] is False
-    assert "implementation.patch and base_commit do not match implementation_sha256" in run["issues"]
-
-
-@pytest.mark.parametrize("request_text", ["{broken", "[]", '{"implementation_sha256":"invalid"}'])
-def test_malformed_source_provenance_never_becomes_a_verified_comparison(tmp_path, request_text):
-    path = write_run(tmp_path / "online")
-    (path / "request.json").write_text(request_text)
-    run = summarize_run(path, 1)
-    assert not run["complete"]
-    assert run["implementation_sha256"] is None and run["source_artifact_verified"] is False
-    assert any("source provenance" in issue for issue in run["issues"])
 
 
 @pytest.mark.parametrize("change", [{"seed": 43, "prefetch": 4}, {"seed": 42, "prefetch": 0}])
@@ -359,16 +299,8 @@ def test_repeated_run_variation_is_reported(tmp_path):
     assert result["online_steady_samples_per_second"]["stdev"] > 0
 
 
-def test_log_input_and_malformed_raw_events(tmp_path):
+def test_malformed_raw_events_are_rejected(tmp_path):
     path = write_run(tmp_path / "online")
-    log = tmp_path / "driver.log"
-    log.write_text(
-        "irrelevant log\n"
-        + "\n".join(
-            "event: " + line for source in sorted(path.glob("*.jsonl")) for line in source.read_text().splitlines()
-        )
-    )
-    assert summarize_run(log, 1)["complete"]
     (path / "events-rank0.jsonl").write_text("{broken\n")
     with pytest.raises(ValueError, match="Malformed JSON"):
         summarize_run(path, 1)

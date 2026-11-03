@@ -7,7 +7,6 @@ rank updates so public cache and full-effective-batch verification run without
 mocks.
 """
 
-import hashlib
 import json
 from types import SimpleNamespace
 
@@ -129,57 +128,6 @@ def _model(dtype=torch.bfloat16):
     return model
 
 
-class TinyPosteriorVAE(TinyVAE):
-    """Deterministic encoder with the actual Diffusers posterior/sampler."""
-
-    def __init__(self):
-        from diffusers.configuration_utils import FrozenDict
-
-        super().__init__()
-        self.config = FrozenDict(vars(self.config))
-        self.use_tiling = self.use_slicing = False
-        self.calls = self.clear_calls = 0
-        self.fail_encode = False
-        self._feat_cache = []
-        self.posterior = None
-        self.posterior_memory_format = torch.contiguous_format
-        self.register_buffer("offset", torch.tensor(0.0))
-
-    def clear_cache(self):
-        self.clear_calls += 1
-        self._feat_cache = []
-
-    def encode(self, pixels):
-        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-
-        self.calls += 1
-        base = torch.nn.functional.avg_pool2d(pixels.squeeze(2).float(), 8)[:, :2].unsqueeze(2)
-        base = (base * self.scale + self.offset).to(pixels.dtype)
-        self._feat_cache = [base]
-        if self.fail_encode:
-            raise RuntimeError("VAE encode interrupted")
-        parameters = torch.cat((base, torch.full_like(base, -4.0)), dim=1)
-        parameters = torch.empty_like(parameters, memory_format=self.posterior_memory_format).copy_(parameters)
-        self.posterior = DiagonalGaussianDistribution(parameters)
-        self.clear_cache()
-        return SimpleNamespace(latent_dist=self.posterior)
-
-
-def _posterior_model(dtype=torch.bfloat16, *, placement="sharded"):
-    torch.manual_seed(31)
-    pipeline = TinyPipeline(dtype)
-    pipeline.text_encoder.to(dtype)
-    pipeline.vae = TinyPosteriorVAE().to(dtype)
-    pipeline.vae_scale_factor = 8
-    model = QwenImageSFTModel(
-        pipeline,
-        {"max_sequence_length": 4, "cache_vae_posterior": True, "text_encoder_placement": placement},
-        dtype=dtype,
-    )
-    model.train()
-    return model
-
-
 def _sample(prompt="red boat", offset=0):
     pixels = (np.arange(16 * 16 * 3).reshape(16, 16, 3) + offset).astype(np.uint8)
     return {"prompt": prompt, "image": Image.fromarray(pixels)}
@@ -191,7 +139,6 @@ def cache_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("RELAX_CONDITION_CACHE_MAX_BYTES", str(1024**2))
     monkeypatch.setenv("RELAX_CONDITION_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "0")
-    monkeypatch.setenv("RELAX_CONDITION_VERIFY_SNAPSHOT", "0")
     monkeypatch.delenv("RELAX_CONDITION_CACHE_RUN_DIR", raising=False)
     runtimes = []
 
@@ -437,10 +384,9 @@ def test_frozen_encoder_mutation_disables_reuse_and_keeps_gradients(cache_runtim
             QwenImageSFTAdapter().prepare_for_sharding(model)
 
 
-@pytest.mark.parametrize("posterior_bundle", [False, True])
 @pytest.mark.parametrize("mutation", ["inplace", "replace"])
-def test_text_buffer_mutation_disables_old_text_and_joint_cache(cache_runtime, posterior_bundle, mutation):
-    model = (_posterior_model if posterior_bundle else _model)(dtype=torch.float32)
+def test_text_buffer_mutation_disables_old_cache(cache_runtime, mutation):
+    model = _model(dtype=torch.float32)
     runtime = cache_runtime(model)
     runtime.sample(0)
     data = _sample()
@@ -463,8 +409,6 @@ def test_text_buffer_mutation_disables_old_text_and_joint_cache(cache_runtime, p
     assert model.text_encoder.calls == 2 and runtime._step["effective_hit"] == 1
     assert torch.equal(actual, original + 1)
     assert not torch.equal(actual, original)
-    if posterior_bundle:
-        assert model.vae.calls == 2
 
 
 def test_train_mode_keeps_condition_encoder_and_vae_in_eval():
@@ -605,16 +549,8 @@ def test_scheduler_timestep_is_divided_in_fp32_before_transformer_compute(monkey
     assert not torch.equal(rounded_early, expected), "Fixture must expose early BF16 timestep rounding"
 
 
-@pytest.mark.parametrize(
-    "posterior_bundle,memory_format",
-    [(False, None), (True, torch.contiguous_format), (True, torch.channels_last_3d)],
-)
-def test_public_verifier_compares_complete_two_sample_batch_and_fp32_update(
-    cache_runtime, tmp_path, posterior_bundle, memory_format
-):
-    model = (_posterior_model if posterior_bundle else _model)(dtype=torch.float32)
-    if posterior_bundle:
-        model.vae.posterior_memory_format = memory_format
+def test_public_verifier_compares_complete_two_sample_batch_and_fp32_update(cache_runtime, tmp_path):
+    model = _model(dtype=torch.float32)
     runtime = cache_runtime(model)
     parameters = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW([parameter for _, parameter in parameters], lr=0.01)
@@ -682,15 +618,12 @@ def test_deterministic_preprocessing_does_not_consume_training_rng(tmp_path):
     assert torch.equal(torch.get_rng_state(), state)
 
 
-@pytest.mark.parametrize("posterior_bundle", [False, True])
-def test_online_and_cached_normal_micro_loops_preserve_random_augmentation_order(
-    cache_runtime, tmp_path, posterior_bundle
-):
+def test_online_and_cached_normal_micro_loops_preserve_random_augmentation_order(cache_runtime, tmp_path):
     source = Image.fromarray(np.arange(24 * 48 * 3).reshape(24, 48, 3).astype(np.uint8))
     source.save(tmp_path / "target.png")
     config = {"height": 16, "width": 16, "random_crop": True, "caption_dropout": 0.5}
     row = {"image": "target.png", "prompt": "red boat"}
-    model = _posterior_model() if posterior_bundle else _model()
+    model = _model()
     runtime = cache_runtime(model)
     adapter = QwenImageSFTAdapter()
     runs, states = [], []
@@ -716,295 +649,9 @@ def test_online_and_cached_normal_micro_loops_preserve_random_augmentation_order
     assert runtime._step["encoding_calls"] == runtime._step["effective_hit"] == 6
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])
-@pytest.mark.parametrize("degenerate", [False, True])
-def test_joint_bundle_preserves_posterior_bits_and_original_cold_object(
-    cache_runtime, dtype, memory_format, degenerate
-):
-    model = _posterior_model(dtype)
-    model.vae.posterior_memory_format = memory_format
-    runtime = cache_runtime(model)
-    runtime.sample(0)
-    data = _sample()
-    if degenerate:
-        data["image"] = data["image"].resize((8, 8))
-    initial_rng = torch.get_rng_state().clone()
-    runtime.force_online = True
-    cold = model._conditioning_features(data)
-    assert cold["posterior"] is model.vae.posterior
-    parameters = cold["posterior"].parameters
-    assert parameters.is_contiguous(memory_format=memory_format)
-    if degenerate:
-        # Both formats describe the same element order when spatial axes are 1.
-        assert parameters.is_contiguous() and parameters.is_contiguous(memory_format=torch.channels_last_3d)
-    else:
-        assert parameters.is_contiguous() is (memory_format == torch.contiguous_format)
-    field = "posterior_parameters" if parameters.is_contiguous() else "posterior_parameters_channels_last_3d"
-    key = runtime._conditioning_key(model.conditioning_spec(data))
-    with runtime.cache.lookup(key) as lease:
-        assert set(lease.data) == {"prompt_embeds", field}
-        assert lease.data[field].is_contiguous(), "The real public store canonicalizes both layouts"
-    runtime.force_online = False
-    hot = model._conditioning_features(data)
-    assert hot["posterior"] is not cold["posterior"]
-    assert hot["posterior"].parameters.is_contiguous(memory_format=memory_format)
-    if not degenerate:
-        assert hot["posterior"].parameters.stride() == parameters.stride()
-    elif memory_format == torch.channels_last_3d:
-        assert hot["posterior"].parameters.stride() != parameters.stride()
-    assert model.text_encoder.calls == model.vae.calls == 1
-    assert runtime._step["encoding_calls"] == runtime._step["effective_hit"] == 1
-    assert torch.equal(initial_rng, torch.get_rng_state()), "Neither branch may sample while resolving"
-    for reference, actual in (
-        (cold["prompt_embeds"], hot["prompt_embeds"]),
-        (cold["posterior"].parameters, hot["posterior"].parameters),
-    ):
-        assert reference.dtype == actual.dtype == dtype
-        assert torch.equal(reference.reshape(-1).view(torch.uint8), actual.reshape(-1).view(torch.uint8))
-    # Sampling and the next random draw retain logical element correspondence,
-    # including the ambiguous-format singleton case.
-    sampled, noises, states = [], [], []
-    for features in (cold, hot):
-        torch.manual_seed(73)
-        sampled.append(features["posterior"].sample())
-        noises.append(torch.randn_like(sampled[-1]))
-        states.append(torch.get_rng_state().clone())
-    assert torch.equal(sampled[0], sampled[1]) and torch.equal(noises[0], noises[1])
-    assert torch.equal(states[0], states[1])
-    for actual in (hot["prompt_embeds"], hot["posterior"].parameters):
-        actual.zero_()
-    fresh = model._conditioning_features(data)
-    assert torch.equal(fresh["posterior"].parameters, cold["posterior"].parameters)
-    assert torch.equal(fresh["prompt_embeds"], cold["prompt_embeds"])
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])
-def test_joint_bundle_samples_noise_and_timestep_online_with_identical_rng(
-    cache_runtime, monkeypatch, dtype, memory_format
-):
-    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-
-    model = _posterior_model(dtype)
-    model.vae.posterior_memory_format = memory_format
-    runtime = cache_runtime(model)
-    runtime.sample(0)
-    captured = []
-    sampled = []
-    objective = sft_adapter.flow_matching_loss
-    original_sample = DiagonalGaussianDistribution.sample
-
-    def sample(posterior, *args, **kwargs):
-        value = original_sample(posterior, *args, **kwargs)
-        sampled.append(value.detach().clone())
-        return value
-
-    def record(transformer, clean, prompt, noise, sigma, timestep):
-        captured.append(tuple(value.detach().clone() for value in (clean, noise, sigma, timestep)))
-        return objective(transformer, clean, prompt, noise, sigma, timestep)
-
-    monkeypatch.setattr(sft_adapter, "flow_matching_loss", record)
-    monkeypatch.setattr(DiagonalGaussianDistribution, "sample", sample)
-    states, losses = [], []
-    for force_online in (True, False):
-        runtime.force_online = force_online
-        torch.manual_seed(73)
-        losses.append(torch.stack([model(_sample()) for _ in range(4)]))
-        states.append(torch.get_rng_state().clone())
-    assert model.vae.calls == model.text_encoder.calls == 4
-    assert runtime._step["encoding_calls"] == runtime._step["effective_hit"] == 4
-    assert torch.equal(losses[0], losses[1]) and torch.equal(states[0], states[1])
-    for reference, actual in zip(sampled[:4], sampled[4:]):
-        assert torch.equal(reference, actual) and reference.stride() == actual.stride()
-    for reference, actual in zip(captured[:4], captured[4:]):
-        assert all(torch.equal(left, right) for left, right in zip(reference, actual))
-        assert all(left.stride() == right.stride() for left, right in zip(reference, actual))
-    assert not torch.equal(captured[0][0], captured[1][0])
-    assert not torch.equal(captured[0][1], captured[1][1])
-
-
-@pytest.mark.parametrize("field", ["pixels", "shape", "prompt", "vae_config", "dtype", "scale_factor"])
-def test_joint_bundle_dependencies_cover_actual_augmented_image_and_vae(field):
-    model = _posterior_model()
-    data = _sample()
-    reference = model.conditioning_spec(data)
-    if field == "pixels":
-        data["image"].putpixel((0, 0), (123, 45, 67))
-    elif field == "shape":
-        data["image"] = data["image"].resize((32, 16))
-    elif field == "prompt":
-        data["prompt"] = "blue bird"
-    elif field == "vae_config":
-        model.vae.config.latents_mean[0] += 0.25
-    elif field == "dtype":
-        model.compute_dtype = torch.float32
-    else:
-        model.pipe.vae_scale_factor = 16
-    assert model.conditioning_spec(data).name == reference.name == "qwen_image.text_vae_posterior.v2"
-    assert build_key(model.conditioning_spec(data).dependencies) != build_key(reference.dependencies)
-
-
-def test_joint_bundle_reuses_image_content_and_effective_tokens_not_filenames(cache_runtime):
-    model = _posterior_model()
-    runtime = cache_runtime(model)
-    runtime.sample(0)
-    first = _sample("abcdefghijklmnop-first")
-    first["filename"] = "first.png"
-    same = _sample("abcdefghijklmnop-second")
-    same["filename"] = "second.png"
-    assert model.conditioning_spec(first).dependencies == model.conditioning_spec(same).dependencies
-    model._condition(first)
-    model._condition(same)
-    assert runtime._step["effective_hit"] == 1
-    # A different image is a distinct bundle even when the effective text is identical.
-    model._condition(_sample("abcdefghijklmnop-third", offset=7))
-    assert model.vae.calls == model.text_encoder.calls == 2
-
-
-@pytest.mark.parametrize("fault", ["dtype", "shape", "fields", "both_layouts", "missing", "corrupt"])
-def test_bad_joint_bundle_falls_back_to_online_without_leases_or_rng_changes(cache_runtime, fault):
-    model = _posterior_model()
-    runtime = cache_runtime(model)
-    runtime.sample(0)
-    data = _sample()
-    expected = model._conditioning_features(data)
-    key = runtime._conditioning_key(model.conditioning_spec(data))
-    if fault == "missing":
-        runtime.cache.invalidate(key)
-    elif fault == "corrupt":
-        digest = hashlib.sha256(key.encode()).hexdigest()
-        (runtime.cache.directory / f"{digest}.safetensors").write_bytes(b"corrupt")
-    else:
-        runtime.cache.invalidate(key)
-        parameters = expected["posterior"].parameters
-        invalid = parameters.float() if fault == "dtype" else parameters[:, :1] if fault == "shape" else parameters
-        payload = {
-            "prompt_embeds": expected["prompt_embeds"],
-            "wrong" if fault == "fields" else "posterior_parameters": invalid,
-        }
-        if fault == "both_layouts":
-            payload["posterior_parameters_channels_last_3d"] = parameters
-        runtime.cache.put(key, payload)
-    initial_rng = torch.get_rng_state().clone()
-    actual = model._conditioning_features(data)
-    assert torch.equal(actual["posterior"].parameters, expected["posterior"].parameters)
-    assert torch.equal(initial_rng, torch.get_rng_state())
-    assert model.vae.calls == model.text_encoder.calls == 2
-    assert runtime._step["effective_hit"] == 0
-    assert runtime.cache.stats()["leased_bytes"] == 0
-
-
-@pytest.mark.parametrize("layout", ["transpose", "holes"])
-def test_joint_bundle_rejects_unsupported_posterior_layout_before_storage(cache_runtime, monkeypatch, layout):
-    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-
-    model = _posterior_model()
-    runtime = cache_runtime(model)
-    runtime.sample(0)
-    original_encode = model.vae.encode
-
-    def encode(pixels):
-        parameters = original_encode(pixels).latent_dist.parameters
-        if layout == "transpose":
-            parameters = parameters.transpose(-2, -1)
-        else:
-            parameters = parameters.repeat_interleave(2, dim=-1)[..., ::2]
-        assert not parameters.is_contiguous()
-        assert not parameters.is_contiguous(memory_format=torch.channels_last_3d)
-        return SimpleNamespace(latent_dist=DiagonalGaussianDistribution(parameters))
-
-    monkeypatch.setattr(model.vae, "encode", encode)
-    initial_rng = torch.get_rng_state().clone()
-    with pytest.raises(ValueError, match="only contiguous or channels_last_3d"):
-        model(_sample())
-    assert runtime.cache.stats()["entries"] == 0
-    assert torch.equal(torch.get_rng_state(), initial_rng)
-    assert model.vae._feat_cache == []
-
-
-def test_joint_bundle_guard_exposes_parameter_and_buffer_stride_without_readback():
-    model = _posterior_model()
-    tensor = torch.zeros(1, 2, 1, 2, 2)
-    model.vae.register_parameter("layout_parameter", torch.nn.Parameter(tensor.clone(), requires_grad=False))
-    model.vae.register_buffer("layout_buffer", tensor.clone())
-    before = model.conditioning_state()["parameters"]
-    model.vae.to(memory_format=torch.channels_last_3d)
-    after = model.conditioning_state()["parameters"]
-    for name in ("vae.parameters.layout_parameter", "vae.buffers.layout_buffer"):
-        assert before[name]["stride"] != after[name]["stride"]
-        assert before[name]["shape"] == after[name]["shape"]
-
-
-@pytest.mark.parametrize("mutation", ["weight", "buffer", "train_mode", "trainable"])
-def test_joint_bundle_guard_covers_frozen_vae_and_refuses_old_posteriors(cache_runtime, mutation):
-    model = _posterior_model(dtype=torch.float32)
-    runtime = cache_runtime(model)
-    runtime.sample(0)
-    expected = model._conditioning_features(_sample())
-    if mutation in ("weight", "buffer"):
-        with torch.no_grad():
-            (model.vae.scale if mutation == "weight" else model.vae.offset).add_(1)
-    elif mutation == "train_mode":
-        model.vae.train()
-    else:
-        model.vae.scale.requires_grad_(True)
-    runtime.sample(1)
-    assert runtime._cache_guard_disabled
-    if mutation == "trainable":
-        with pytest.raises(ValueError, match="Replicated Qwen VAE is frozen-only"):
-            model(_sample())
-        assert model.vae.calls == 1
-    else:
-        actual = model._conditioning_features(_sample())
-        assert model.vae.calls == 2
-        if mutation != "train_mode":
-            assert not torch.equal(actual["posterior"].parameters, expected["posterior"].parameters)
-    assert runtime._step["effective_hit"] == 0
-
-
 @pytest.mark.parametrize("placement", ["sharded", "replicated"])
-def test_joint_bundle_composes_replica_ownership_and_collective_contract(placement):
-    model = _posterior_model(placement=placement)
-    state = model.state_dict()
-    QwenImageSFTAdapter().prepare_for_sharding(model)
-    expected = (model.text_encoder, model.vae) if placement == "replicated" else (model.vae,)
-    assert model._fsdp_replicated_modules == expected
-    assert model._conditioning_collective_free_modules == (expected if placement == "replicated" else ())
-    assert model.text_encoder._fsdp_fine_grained is (placement == "sharded")
-    assert model.state_dict().keys() == state.keys()
-
-
-@pytest.mark.parametrize("case", ["dtype", "device", "train_mode"])
-def test_joint_bundle_validates_resident_vae_device_dtype_and_mode(case):
-    model = _posterior_model()
-    if case == "dtype":
-        model.vae.float()
-    elif case == "device":
-        model.device = torch.device("meta")
-    else:
-        model.vae.train()
-    with pytest.raises(ValueError, match="Replicated VAE"):
-        QwenImageSFTAdapter().prepare_for_sharding(model)
-    assert not getattr(model, "_fsdp_replicated_modules", ())
-
-
-@pytest.mark.parametrize("mode", ["use_tiling", "use_slicing", "change_policy"])
-def test_joint_bundle_rejects_unsupported_or_changed_execution_policy(mode):
-    model = _posterior_model()
-    if mode == "change_policy":
-        model.config["cache_vae_posterior"] = False
-    else:
-        setattr(model.vae, mode, True)
-    with pytest.raises(ValueError, match="requires a new model|tiling and slicing disabled"):
-        model(_sample())
-    assert model.vae.calls == model.text_encoder.calls == 0
-
-
-@pytest.mark.parametrize("posterior_bundle", [False, True])
-@pytest.mark.parametrize("placement", ["sharded", "replicated"])
-def test_qwen_rejects_text_placement_changes_after_sharding(posterior_bundle, placement):
-    model = _posterior_model(dtype=torch.float32, placement=placement) if posterior_bundle else _model(torch.float32)
+def test_qwen_rejects_text_placement_changes_after_sharding(placement):
+    model = _model(torch.float32)
     model.config["text_encoder_placement"] = placement
     QwenImageSFTAdapter().prepare_for_sharding(model)
     model.config["text_encoder_placement"] = "replicated" if placement == "sharded" else "sharded"
@@ -1012,33 +659,6 @@ def test_qwen_rejects_text_placement_changes_after_sharding(posterior_bundle, pl
     with pytest.raises(ValueError, match="Changing text_encoder_placement requires a new model"):
         model(_sample())
     assert model.text_encoder.calls == 0
-
-
-@pytest.mark.parametrize("status", ["cancelled", "error", "complete"])
-def test_joint_bundle_releases_temporal_cache_and_storage_across_runs(cache_runtime, status):
-    model = _posterior_model()
-    runtime = cache_runtime(model)
-    runtime.sample(0)
-    model.vae.fail_encode = True
-    with pytest.raises(RuntimeError, match="VAE encode interrupted"):
-        model(_sample())
-    assert model.vae.clear_calls == 1 and model.vae._feat_cache == []
-    assert runtime.cache.stats()["entries"] == 0
-    model.vae.fail_encode = False
-    owned = model._conditioning_features(_sample())
-    reference = owned["posterior"].parameters.clone()
-    directory = runtime.cache.directory
-    assert runtime.cache.stats()["entries"] == 1
-    runtime.close(2 if status == "complete" else 0, status=status)
-    assert model.conditioning_cache is None and not list(directory.glob("*.safetensors"))
-    assert torch.equal(owned["posterior"].parameters, reference)
-    assert model.vae._feat_cache == []
-    second = cache_runtime(model)
-    second.sample(0)
-    model(_sample())
-    assert second._step["encoding_calls"] == 1 and second._step["effective_hit"] == 0
-    second.close(0, status="cancelled")
-    assert not list(second.cache.directory.glob("*.safetensors"))
 
 
 def test_online_effective_batch_matches_pipeline_text_reference_and_fp32_update():
@@ -1087,3 +707,17 @@ def test_replicated_text_encoder_unfreeze_fails_before_encoding():
         model(_sample())
     assert model.text_encoder.calls == 0
     assert model.text_encoder.embedding.weight.grad is None
+
+
+def test_online_vae_error_clears_temporal_state(monkeypatch):
+    model = _model()
+    model.vae._feat_cache = [torch.ones(1)]
+
+    def fail(_pixels):
+        raise RuntimeError("VAE encode interrupted")
+
+    monkeypatch.setattr(model.vae, "encode", fail)
+    monkeypatch.setattr(model.vae, "clear_cache", lambda: model.vae._feat_cache.clear(), raising=False)
+    with pytest.raises(RuntimeError, match="VAE encode interrupted"):
+        model(_sample())
+    assert model.vae._feat_cache == []

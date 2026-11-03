@@ -24,7 +24,6 @@ __all__ = [
     "resolve_fine_grained_modules",
     "resolve_module_groups",
     "resolve_replicated_modules",
-    "resolve_conditioning_execution_policy",
     "fsdp2_wrap",
     "upcast_trainable_params",
     "offload_module_to_cpu",
@@ -186,37 +185,6 @@ def resolve_replicated_modules(model: torch.nn.Module) -> List[torch.nn.Module]:
     return replicated
 
 
-def resolve_conditioning_execution_policy(model: torch.nn.Module, replicated_modules: List[torch.nn.Module]) -> str:
-    """Validate an adapter's collective-free conditioning declaration.
-
-    Declared modules must be complete, validated frozen replica roots. The
-    adapter also promises that every conditioning compute/restore callback uses
-    only those modules and performs no explicit distributed operations.
-    Ownership checks cannot prove arbitrary callback code to be collective-
-    free. The backend grants the policy only after wrapping succeeds; changing
-    it during training is unsupported.
-    """
-    declared = getattr(model, "_conditioning_collective_free_modules", ())
-    if not isinstance(declared, (list, tuple)):
-        raise ValueError("Collective-free conditioning must declare a sequence of replicated modules")
-    if not declared:
-        return "unanimous"
-    if any(not isinstance(module, torch.nn.Module) for module in declared) or len(set(declared)) != len(declared):
-        raise ValueError("Collective-free conditioning modules must be distinct registered modules")
-    if any(module not in replicated_modules for module in declared):
-        raise ValueError("Collective-free conditioning requires complete validated FSDP replicated roots")
-
-    from torch.distributed.fsdp import FSDPModule
-    from torch.distributed.tensor import DTensor
-
-    for module in declared:
-        if any(child.training or isinstance(child, FSDPModule) for child in module.modules()):
-            raise ValueError("Collective-free conditioning requires eval modules without nested FSDP boundaries")
-        if any(isinstance(value, DTensor) for value in (*module.parameters(), *module.buffers())):
-            raise ValueError("Collective-free conditioning cannot use distributed parameters or buffers")
-    return "rank_local"
-
-
 @torch.no_grad()
 def upcast_trainable_params(model: torch.nn.Module, dtype: torch.dtype) -> int:
     """Promote only the TRAINABLE parameters to ``dtype``; return the count.
@@ -292,7 +260,6 @@ def fsdp2_wrap(
         kwargs["offload_policy"] = offload_policy
 
     replicated_modules = resolve_replicated_modules(model)
-    conditioning_execution_policy = resolve_conditioning_execution_policy(model, replicated_modules)
     if master_dtype is not None:
         promoted = upcast_trainable_params(model, _DTYPES[master_dtype])
         logger.info(f"fsdp2_wrap: promoted {promoted} trainable param(s) to {master_dtype} optimizer masters")
@@ -331,7 +298,6 @@ def fsdp2_wrap(
         fully_shard(model, ignored_params=ignored_params, **kwargs)
     else:
         fully_shard(model, **kwargs)
-    model._conditioning_execution_policy = conditioning_execution_policy
     logger.info(
         f"FSDP2 wrapped model; fine-grained modules: {len(fine_grained_modules)} "
         f"({sorted({type(m).__name__ for m in fine_grained_modules})}); "

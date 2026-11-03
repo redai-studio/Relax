@@ -11,7 +11,7 @@ The payload budget includes leased entries and temporary file reservations.
 A separate staging budget bounds all writers' CPU tensor/serialization
 buffers before copying begins. Writers reserve bytes under the namespace lock,
 then copy and serialize independently. JSON/client metadata is bounded by entries/live
-workers and reported separately. The final client removes its namespace. One
+workers and measured by external resource sampling. The final client removes its namespace. One
 stable lock remains per directory, avoiding split locks on namespace recreation.
 After hard process termination, the next cache initialization reclaims abandoned
 namespaces once all client and payload locks are free; no cleanup daemon runs.
@@ -33,13 +33,17 @@ import uuid
 import weakref
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 from relax.utils.logging_utils import get_logger
 
 
+if TYPE_CHECKING:
+    import torch
+
+
 logger = get_logger(__name__)
-_FORMAT = 1
+_FORMAT = 2
 _OWNER = "relax-conditioning-v1"
 _PACKED_DTYPES = {
     "BOOL": "bool",
@@ -98,47 +102,10 @@ def fingerprint_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def _flatten(value: Any, tensors: dict[str, Any]) -> Any:
-    import torch
-
-    if isinstance(value, torch.Tensor):
-        if value.layout != torch.strided or value.is_quantized:
-            raise TypeError("Conditioning cache requires dense, unquantized tensors")
-        name = f"t{len(tensors)}"
-        tensors[name] = value
-        return ["tensor", name]
-    if isinstance(value, dict):
-        if not all(isinstance(key, str) for key in value):
-            raise TypeError("Conditioning dictionaries require string keys")
-        return ["dict", [[key, _flatten(item, tensors)] for key, item in value.items()]]
-    if isinstance(value, (tuple, list)):
-        return ["tuple" if isinstance(value, tuple) else "list", [_flatten(item, tensors) for item in value]]
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return ["value", value]
-    raise TypeError(f"Unsupported conditioning value: {type(value).__name__}")
-
-
-def _restore(schema: Any, reader: Any, collected: dict[str, Any] | None = None) -> Any:
-    kind, value = schema
-    if kind == "tensor":
-        tensor = reader[value] if isinstance(reader, dict) else reader.get_tensor(value)
-        if collected is not None:
-            collected[value] = tensor
-        return tensor
-    if kind == "dict":
-        return {key: _restore(item, reader, collected) for key, item in value}
-    if kind in ("list", "tuple"):
-        items = [_restore(item, reader, collected) for item in value]
-        return tuple(items) if kind == "tuple" else items
-    if kind == "value":
-        return value
-    raise ValueError("Unknown conditioning tree node")
-
-
-def _serialization_bound(tensors: dict[str, Any], schema: str, tensor_bytes: int) -> int:
-    # Overestimate dtype strings and every offset's decimal length. Metadata is
-    # already ASCII JSON, so Python/Rust JSON escaping cannot increase this.
-    header: dict[str, Any] = {"__metadata__": {"format": str(_FORMAT), "tree": schema}}
+def _serialization_bound(tensors: dict[str, torch.Tensor], tensor_bytes: int) -> int:
+    # Overestimate dtype strings and every offset's decimal length. Python
+    # ASCII JSON also bounds the serializer's escaping of tensor names.
+    header: dict[str, Any] = {"__metadata__": {"format": str(_FORMAT)}}
     for name, value in tensors.items():
         header[name] = {"dtype": "X" * 32, "shape": list(value.shape), "data_offsets": [tensor_bytes, tensor_bytes]}
     header_bytes = len(json.dumps(header, separators=(",", ":"), allow_nan=False).encode())
@@ -166,22 +133,20 @@ def _valid_entry(key: str, entry: Any) -> bool:
 
 
 class ConditioningLease:
-    """A borrowed CPU tensor tree protected from eviction until close()."""
+    """Borrowed CPU tensors protected from eviction until close()."""
 
     def __init__(
         self,
         cache: ConditioningCache,
         descriptor: Any,
         reader: Any,
-        data: Any,
-        schema: Any,
-        tensors: dict[str, Any],
+        tensors: dict[str, torch.Tensor],
         metadata: dict[str, str],
     ) -> None:
         self._cache = weakref.ref(cache)
         self._descriptor, self._reader = descriptor, reader
-        self.data = data
-        self._schema, self._tensors, self._metadata = schema, tensors, metadata
+        self.data = tensors
+        self._tensors, self._metadata = tensors, metadata
         self._file_size, self._file_header = self._read_header()
         self._identity = self._stat_identity(os.fstat(descriptor.fileno()))
         self._copy_started = False
@@ -235,7 +200,7 @@ class ConditioningLease:
         if not isinstance(header, dict) or header.get("__metadata__") != self._metadata:
             raise ValueError("Conditioning header metadata differs from the validated reader")
         if set(header) - {"__metadata__"} != set(self._tensors):
-            raise ValueError("Conditioning header fields differ from its tensor tree")
+            raise ValueError("Conditioning header fields differ from its tensors")
         data_start, intervals, layout, compatible = len(self._file_header), [], {}, True
         for name, tensor in self._tensors.items():
             item = header[name]
@@ -276,7 +241,7 @@ class ConditioningLease:
             raise ValueError("Conditioning payload contains unreferenced bytes")
         return layout if compatible else None
 
-    def copy_to(self, device: Any) -> tuple[Any, int]:
+    def copy_to(self, device: Any) -> tuple[dict[str, torch.Tensor], int]:
         """Copy once, retaining CPU DMA sources until the caller closes its
         lease.
 
@@ -296,13 +261,13 @@ class ConditioningLease:
         self._copy_started = True
         layout = self._packed_layout()
         if not self._tensors:
-            return _restore(self._schema, {}), 0
+            return {}, 0
         if layout is None:
             self._transfer_sources = list(self._tensors.values())
             moved = {
                 name: value.to(device=device, copy=True, non_blocking=True) for name, value in self._tensors.items()
             }
-            return _restore(self._schema, moved), sum(value.numel() * value.element_size() for value in moved.values())
+            return moved, sum(value.numel() * value.element_size() for value in moved.values())
         raw = torch.from_file(
             self._descriptor.name, shared=False, size=self._file_size, dtype=torch.uint8, device="cpu"
         )
@@ -313,7 +278,7 @@ class ConditioningLease:
             name: packed.narrow(0, offset, length).view(self._tensors[name].dtype).reshape(self._tensors[name].shape)
             for name, (offset, length) in layout.items()
         }
-        return _restore(self._schema, moved), data.numel()
+        return moved, data.numel()
 
     def __enter__(self) -> ConditioningLease:
         if self._descriptor is None:
@@ -329,7 +294,7 @@ class ConditioningLease:
         self.data = None
         self._tensors.clear()
         self._transfer_sources.clear()
-        self._schema, self._metadata, self._file_header = None, {}, b""
+        self._metadata, self._file_header = {}, b""
         try:
             self._reader.__exit__(None, None, None)
         finally:
@@ -400,7 +365,6 @@ class ConditioningCache:
             ),
             0,
         )
-        self._last_storage = self._empty_storage()
         if not max_bytes:
             return
         try:
@@ -451,22 +415,6 @@ class ConditioningCache:
                 with self._lifecycle:
                     self._active_operations -= 1
                     self._lifecycle.notify_all()
-
-    @staticmethod
-    def _empty_storage() -> dict[str, int]:
-        return dict.fromkeys(
-            (
-                "entries",
-                "resident_bytes",
-                "leased_bytes",
-                "bytes_reserved",
-                "staging_reserved_bytes",
-                "inflight_writes",
-                "metadata_bytes",
-                "total_bytes",
-            ),
-            0,
-        )
 
     def _error(self, operation: str, error: Exception) -> None:
         self._count("errors", 1)
@@ -740,8 +688,7 @@ class ConditioningCache:
             metadata = reader.metadata() or {}
             if metadata.get("format") != str(_FORMAT):
                 raise ValueError("Invalid conditioning payload format")
-            schema, tensors = json.loads(metadata["tree"]), {}
-            data = _restore(schema, reader, tensors)
+            tensors = {name: reader.get_tensor(name) for name in reader.keys()}
             self._count("map_seconds", time.perf_counter() - map_started)
             with self._locked():
                 index = self._index(recover=False)
@@ -750,7 +697,7 @@ class ConditioningCache:
                     raise ValueError("Conditioning payload invalidated during read")
                 current["access"] = time.time_ns()
                 self._save_index(index)
-            lease = ConditioningLease(self, descriptor, reader, data, schema, tensors, metadata)
+            lease = ConditioningLease(self, descriptor, reader, tensors, metadata)
             if lease._identity != identity or not lease.is_unchanged():
                 raise ValueError("Conditioning payload changed during validation")
             self._leases.add(lease)
@@ -791,23 +738,32 @@ class ConditioningCache:
                 self._count("misses", 1)
         return None
 
-    def put(self, key: str, tree: Any) -> bool:
+    def put(self, key: str, tensors: dict[str, torch.Tensor]) -> bool:
+        """Snapshot the adapter's flat named tensor features."""
         with self._operation() as active:
             if not active:
                 self._count("bypasses", 1)
                 return False
-            return self._put(key, tree)
+            return self._put(key, tensors)
 
-    def _put(self, key: str, tree: Any) -> bool:
+    def _put(self, key: str, tensors: dict[str, torch.Tensor]) -> bool:
+        import torch
+
         started = time.perf_counter()
         identity, writer = uuid.uuid4().hex, None
         host_bytes = 0
         temporary = self.directory / f"writer-{identity}.pending"
         try:
-            tensors: dict[str, Any] = {}
-            schema = json.dumps(_flatten(tree, tensors), separators=(",", ":"), allow_nan=False)
+            if not isinstance(tensors, dict) or not all(
+                isinstance(name, str)
+                and isinstance(tensor, torch.Tensor)
+                and tensor.layout == torch.strided
+                and not tensor.is_quantized
+                for name, tensor in tensors.items()
+            ):
+                raise TypeError("Conditioning features require string keys and dense, unquantized tensors")
             tensor_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors.values())
-            if tensor_bytes + len(schema.encode()) > self.max_bytes:
+            if tensor_bytes > self.max_bytes:
                 self._count("bypasses", 1)
                 return False
             digest = hashlib.sha256(key.encode()).hexdigest()
@@ -822,7 +778,7 @@ class ConditioningCache:
                 if any(item["key"] == digest for item in index["writers"].values()):
                     self._count("bypasses", 1)
                     return False
-                staging = 3 * tensor_bytes + 2 * _serialization_bound(tensors, schema, tensor_bytes)
+                staging = 3 * tensor_bytes + 2 * _serialization_bound(tensors, tensor_bytes)
                 if staging + index["staging_reserved_bytes"] > self.max_staging_bytes:
                     self._count("bypasses", 1)
                     return False
@@ -853,7 +809,7 @@ class ConditioningCache:
                 cpu_tensors[name] = value
             self._count("d2h_seconds", time.perf_counter() - copy_started)
             serialize_started = time.perf_counter()
-            payload = save(cpu_tensors, metadata={"format": str(_FORMAT), "tree": schema})
+            payload = save(cpu_tensors, metadata={"format": str(_FORMAT)})
             self._count("serialize_seconds", time.perf_counter() - serialize_started)
             size = len(payload)
             self._host_staging(size)
@@ -923,88 +879,37 @@ class ConditioningCache:
                         writer.close()
             self._count("save_seconds", time.perf_counter() - started)
 
-    def _storage(self, index: dict[str, Any]) -> dict[str, int]:
-        result = self._empty_storage()
-        result["entries"] = len(index["entries"])
-        result["resident_bytes"] = sum(entry["size"] for entry in index["entries"].values())
-        result["bytes_reserved"] = index["reserved_bytes"]
-        result["staging_reserved_bytes"] = index["staging_reserved_bytes"]
-        result["inflight_writes"] = len(index["writers"])
-        for key, entry in index["entries"].items():
-            with (self.directory / f"{key}.safetensors").open("rb") as descriptor:
-                try:
-                    fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    result["leased_bytes"] += entry["size"]
-        result["metadata_bytes"] = sum(
-            path.stat().st_size
-            for path in self.directory.iterdir()
-            if path.suffix != ".safetensors"
-            and path.name != "payload.pending"
-            and not (path.name.startswith("writer-") and path.suffix == ".pending" and ".json." not in path.name)
-        )
-        result["total_bytes"] = result["resident_bytes"] + result["bytes_reserved"] + result["metadata_bytes"]
-        return result
+    def stats(self) -> dict[str, int | float | str | None]:
+        """Read accounting without scanning payloads or changing cache state.
 
-    def stats(self) -> dict[str, int | float | str]:
-        with self._operation():
-            return self._stats()
-
-    def _stats(self) -> dict[str, int | float | str]:
-        scope = "last_detailed_snapshot"
-        if not self._closed and not self._closing and self._client_file is not None:
-            try:
-                with self._locked():
-                    self._reap_clients()
-                    index = self._index()
-                    self._save_index(index)
-                    self._last_storage = self._storage(index)
-                    scope = "filesystem"
-            except Exception as error:
-                self._error("stats", error)
-        return {
-            **self._counters,
-            **self._last_storage,
-            "storage_scope": scope,
-            "max_bytes": self.max_bytes,
-            "max_staging_bytes": self.max_staging_bytes,
-            "max_payload_and_staging_bytes": self.max_bytes + self.max_staging_bytes,
-        }
-
-    def stats_light(self) -> dict[str, int | float | str | None]:
-        """Read index accounting without probing payloads or recovering files.
-
-        Missing/corrupt files can make accounted bytes differ from actual disk
-        use until detailed stats/recovery. Lease and metadata sizes require a
-        filesystem scan and are explicitly unknown here. Closed clients also
-        report unknown accounting rather than a stale snapshot.
+        Bytes describe the index, not physical disk/shared-memory usage or
+        outstanding lease mappings. Closed clients and unreadable/corrupt
+        indexes report unknown values; normal lookup/put performs recovery.
         """
-        with self._operation():
-            return self._stats_light()
-
-    def _stats_light(self) -> dict[str, int | float | str | None]:
-        storage: dict[str, int | None] = dict.fromkeys(self._empty_storage(), None)
+        storage: dict[str, int | None] = dict.fromkeys(
+            ("entries", "resident_bytes", "bytes_reserved", "staging_reserved_bytes", "inflight_writes"), None
+        )
         scope = "unavailable"
-        if not self._closed and not self._closing and self._client_file is not None:
-            try:
-                with self._locked():
-                    index = self._index(recover=False)
-                    if not all(
-                        isinstance(entry, dict) and type(entry.get("size")) is int and entry["size"] >= 0
-                        for entry in index["entries"].values()
-                    ):
-                        raise ValueError("Invalid conditioning cache accounting")
-                    storage.update(
-                        entries=len(index["entries"]),
-                        resident_bytes=sum(entry["size"] for entry in index["entries"].values()),
-                        bytes_reserved=index["reserved_bytes"],
-                        staging_reserved_bytes=index["staging_reserved_bytes"],
-                        inflight_writes=len(index["writers"]),
-                    )
-                    scope = "index_accounting"
-            except Exception as error:
-                self._error("light stats", error)
-                return self.stats()  # Detailed recovery validates every entry before summing.
+        with self._operation() as active:
+            if active:
+                try:
+                    with self._locked():
+                        index = self._index(recover=False)
+                        if not all(
+                            isinstance(entry, dict) and type(entry.get("size")) is int and entry["size"] >= 0
+                            for entry in index["entries"].values()
+                        ):
+                            raise ValueError("Invalid conditioning cache accounting")
+                        storage.update(
+                            entries=len(index["entries"]),
+                            resident_bytes=sum(entry["size"] for entry in index["entries"].values()),
+                            bytes_reserved=index["reserved_bytes"],
+                            staging_reserved_bytes=index["staging_reserved_bytes"],
+                            inflight_writes=len(index["writers"]),
+                        )
+                        scope = "index_accounting"
+                except Exception as error:
+                    self._error("stats", error)
         return {
             **self._counters,
             **storage,
@@ -1088,7 +993,6 @@ class ConditioningCache:
                     self._client_path.unlink(missing_ok=True)
                     if self.directory.exists() and not self._reap_clients():
                         shutil.rmtree(self.directory)
-                        self._last_storage = self._empty_storage()
                 self._lock_file.close()
                 self._lock_file = None
             completed = True

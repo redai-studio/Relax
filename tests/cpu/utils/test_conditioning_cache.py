@@ -25,28 +25,18 @@ def _cache(capacity: int, directory: str | Path, namespace: str) -> Conditioning
     return ConditioningCache(capacity, directory, namespace, max_staging_bytes=max(1 << 20, 8 * capacity))
 
 
-def _payload() -> dict:
+def _payload() -> dict[str, torch.Tensor]:
     value = torch.arange(128, dtype=torch.bfloat16).reshape(8, 16)
-    return {"prefix": (value, value[:, ::2]), "mask": [torch.tensor([True, False]), None], "count": 2}
+    return {"prefix": value, "strided": value[:, ::2], "mask": torch.tensor([True, False])}
 
 
-def _assert_exact(actual, reference) -> None:
-    if isinstance(reference, torch.Tensor):
-        assert actual.dtype == reference.dtype
-        assert actual.shape == reference.shape
-        assert not actual.requires_grad
-        assert torch.equal(actual.reshape(-1).view(torch.uint8), reference.contiguous().reshape(-1).view(torch.uint8))
-    elif isinstance(reference, dict):
-        assert actual.keys() == reference.keys()
-        for name, value in reference.items():
-            _assert_exact(actual[name], value)
-    elif isinstance(reference, (list, tuple)):
-        assert type(actual) is type(reference)
-        assert len(actual) == len(reference)
-        for item, value in zip(actual, reference, strict=True):
-            _assert_exact(item, value)
-    else:
-        assert actual == reference
+def _assert_exact(actual: dict[str, torch.Tensor], reference: dict[str, torch.Tensor]) -> None:
+    assert actual.keys() == reference.keys()
+    for name, expected in reference.items():
+        tensor = actual[name]
+        assert tensor.dtype == expected.dtype and tensor.shape == expected.shape
+        assert not tensor.requires_grad
+        assert torch.equal(tensor.reshape(-1).view(torch.uint8), expected.contiguous().reshape(-1).view(torch.uint8))
 
 
 def _entry_size(directory: Path, payload: dict) -> int:
@@ -125,7 +115,7 @@ def test_key_covers_content_versions_preprocessing_and_dtype(tmp_path: Path) -> 
         build_key({"invalid": {1: "not a string key"}})
 
 
-def test_tensor_tree_roundtrip_is_bit_exact_and_put_owns_snapshot(tmp_path: Path) -> None:
+def test_tensor_roundtrip_is_bit_exact_and_put_owns_snapshot(tmp_path: Path) -> None:
     original = _payload()
     original["fp32"] = torch.tensor([float("nan"), float("inf"), -0.0, 1.25], requires_grad=True)
     with _cache(1 << 20, tmp_path, "roundtrip") as cache:
@@ -134,14 +124,12 @@ def test_tensor_tree_roundtrip_is_bit_exact_and_put_owns_snapshot(tmp_path: Path
         assert lease is not None
         with lease:
             _assert_exact(lease.data, original)
-            assert cache.stats()["leased_bytes"] > 0
         assert lease.data is None
-        original["prefix"][0].fill_(99)
+        original["prefix"].fill_(99)
         with cache.lookup("item") as second:
-            assert second.data["prefix"][0][0, 0] == 0
+            assert second.data["prefix"][0, 0] == 0
         stats = cache.stats()
         assert stats["hits"] == 2 and stats["misses"] == 0
-        assert stats["leased_bytes"] == 0
         assert stats["checksum_bytes"] == stats["read_bytes"]
         assert stats["bytes_reserved"] == stats["inflight_writes"] == 0
 
@@ -158,7 +146,6 @@ def test_lru_and_capacity_include_current_leases(tmp_path: Path) -> None:
         with cache.lookup("a"), cache.lookup("c"):
             assert not cache.put("d", payload)
             assert not cache.clear()
-            assert cache.stats()["leased_bytes"] == size * 2
         assert cache.put("d", payload)
         stats = cache.stats()
         assert stats["resident_bytes"] <= size * 2
@@ -190,7 +177,6 @@ def test_recovery_bills_leased_payload_actual_size_before_new_write(tmp_path: Pa
             assert recovered["entries"][digest]["invalid"] is True
             detailed = cache.stats()
             assert detailed["resident_bytes"] == actual_bytes
-            assert detailed["leased_bytes"] == size
             _assert_exact(lease.data, payload)
         assert cache.lookup("a") is None  # Damaged metadata cannot authorize a cached read.
         assert cache.put("a", payload)
@@ -356,7 +342,6 @@ def test_other_process_lease_prevents_eviction_and_dead_writer_is_reaped(tmp_pat
         worker.start()
         try:
             assert ready.wait(30)
-            assert cache.stats()["leased_bytes"] == size
             assert not cache.put("replacement", _payload())
             release.set()
             assert queue.get(timeout=30) is None
@@ -375,10 +360,10 @@ def test_other_process_lease_prevents_eviction_and_dead_writer_is_reaped(tmp_pat
             abandoned.kill()
             abandoned.join()
         assert abandoned.exitcode == 0
+        assert cache.put("recovered", _payload())  # A normal write recovers dead writer reservations.
         assert cache.stats()["bytes_reserved"] == 0
         assert not list(cache.directory.glob("*.pending"))
-        assert len(list(cache.directory.glob("client-*"))) == 1
-        with cache.lookup("replacement") as lease:
+        with cache.lookup("recovered") as lease:
             _assert_exact(lease.data, _payload())
 
 
@@ -419,51 +404,36 @@ def test_hot_lookup_does_not_recover_or_probe_other_payloads(tmp_path: Path, mon
         assert cache.stats()["checksum_bytes"] - checksum_before == 2 * target.stat().st_size
 
 
-def test_light_stats_accounts_index_without_claiming_lease_or_disk_sizes(tmp_path: Path, monkeypatch) -> None:
-    cache = _cache(1 << 20, tmp_path, "light-stats")
-    try:
+def test_stats_is_readonly_and_reports_unknown_after_damage_or_close(tmp_path: Path, monkeypatch) -> None:
+    fields = ("entries", "resident_bytes", "bytes_reserved", "staging_reserved_bytes", "inflight_writes")
+    with _cache(1 << 20, tmp_path, "stats") as cache:
         assert cache.put("item", _payload())
-        with cache.lookup("item"):
-            detailed = cache.stats()
-            assert detailed["storage_scope"] == "filesystem"
-            assert detailed["leased_bytes"] == detailed["resident_bytes"] > 0
+        path = cache.directory / "index.json"
+        before = path.read_bytes()
+        with monkeypatch.context() as patch:
 
             def fail_scan(*args, **kwargs):
-                raise AssertionError("Light statistics must only read the index")
+                pytest.fail("Statistics must not scan payloads or write the index")
 
-            with monkeypatch.context() as patch:
-                patch.setattr(Path, "glob", fail_scan)
-                patch.setattr(Path, "iterdir", fail_scan)
-                patch.setattr(Path, "stat", fail_scan)
-                patch.setattr(cache, "_storage", fail_scan)
-                light = cache.stats_light()
-            assert light["storage_scope"] == "index_accounting"
-            for field in ("entries", "resident_bytes", "bytes_reserved", "staging_reserved_bytes", "inflight_writes"):
-                assert light[field] == detailed[field]
-            assert all(light[field] is None for field in ("leased_bytes", "metadata_bytes", "total_bytes"))
-        assert cache.stats()["leased_bytes"] == 0
-    finally:
-        cache.close()
-    closed = cache.stats_light()
-    assert closed["storage_scope"] == "unavailable"
-    assert all(closed[field] is None for field in cache._empty_storage())
-
-
-@pytest.mark.parametrize("bad_size", [-1, "invalid", True])
-def test_light_stats_repairs_corrupt_non_target_accounting(tmp_path: Path, bad_size) -> None:
-    with _cache(1 << 20, tmp_path, "bad-accounting") as cache:
-        assert cache.put("target", _payload()) and cache.put("other", _payload())
-        path = cache.directory / "index.json"
-        index = json.loads(path.read_text())
-        index["entries"][hashlib.sha256(b"other").hexdigest()]["size"] = bad_size
-        path.write_text(json.dumps(index))
-        with cache.lookup("target") as lease:
-            _assert_exact(lease.data, _payload())  # A hit validates only its own entry.
-        stats = cache.stats_light()
-        assert stats["storage_scope"] == "filesystem"
-        assert stats["resident_bytes"] == stats["entries"] == 0
-        assert stats["corruptions"] > 0 and stats["errors"] > 0
-        assert cache.put("target", _payload())
+            patch.setattr(Path, "glob", fail_scan)
+            patch.setattr(Path, "iterdir", fail_scan)
+            patch.setattr(Path, "stat", fail_scan)
+            patch.setattr(cache, "_save_index", fail_scan)
+            stats = cache.stats()
+        assert stats["storage_scope"] == "index_accounting"
+        assert stats["entries"] == 1 and stats["resident_bytes"] > 0
+        assert path.read_bytes() == before
+        damaged = json.loads(before)
+        damaged["entries"][hashlib.sha256(b"item").hexdigest()]["size"] = -1
+        path.write_text(json.dumps(damaged))
+        before = path.read_bytes()
+        stats = cache.stats()
+        assert stats["storage_scope"] == "unavailable"
+        assert all(stats[field] is None for field in fields)
+        assert path.read_bytes() == before
+    stats = cache.stats()
+    assert stats["storage_scope"] == "unavailable"
+    assert all(stats[field] is None for field in fields)
 
 
 @pytest.mark.parametrize("field,value", [("sha256", "bad"), ("tensor_bytes", -1), ("size", True), ("access", -1)])
@@ -511,14 +481,15 @@ def test_new_run_reclaims_dead_namespaces_but_preserves_live_and_borrowed(tmp_pa
             assert (foreign / "keep").read_text() == "not owned by the conditioning cache"
 
 
-def test_packed_copy_is_one_transfer_and_owns_aligned_nested_storage(tmp_path: Path, monkeypatch) -> None:
+def test_packed_copy_is_one_transfer_and_owns_aligned_storage(tmp_path: Path, monkeypatch) -> None:
     shared = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
     payload = {
-        "alias": [shared, shared.view(-1), shared[:, ::2]],
-        "nested": (torch.empty((0, 3), dtype=torch.float16), None),
+        "alias": shared,
+        "view": shared.view(-1),
+        "strided": shared[:, ::2],
+        "empty": torch.empty((0, 3), dtype=torch.float16),
         "index": torch.arange(4, dtype=torch.int64),
         "mask": torch.ones(16, dtype=torch.bool),
-        "none": None,
     }
     original, calls = torch.Tensor.to, []
 
@@ -535,9 +506,7 @@ def test_packed_copy_is_one_transfer_and_owns_aligned_nested_storage(tmp_path: P
                 moved, transferred = lease.copy_to("cpu")
             assert calls == [(torch.uint8, size)] and transferred == size
             _assert_exact(moved, payload)
-            assert (
-                moved["alias"][0].untyped_storage().data_ptr() != lease.data["alias"][0].untyped_storage().data_ptr()
-            )
+            assert moved["alias"].untyped_storage().data_ptr() != lease.data["alias"].untyped_storage().data_ptr()
             assert len(lease._transfer_sources) == 1
             assert all(offset % 16 == 0 for offset, length in lease._packed_layout().values() if length)
             with pytest.raises(RuntimeError, match="only one"):
@@ -574,11 +543,13 @@ def test_packed_copy_preserves_dense_dtype_bytes(tmp_path: Path, dtype) -> None:
 def test_mixed_unaligned_layout_falls_back_with_exact_owned_tensors(tmp_path: Path) -> None:
     shared = torch.arange(24, dtype=torch.bfloat16).reshape(4, 6)
     payload = {
-        "alias": [shared, shared.view(-1), shared[:, ::2]],
-        "nested": (torch.tensor(1.25, dtype=torch.float64), torch.empty((0, 3), dtype=torch.float16)),
+        "alias": shared,
+        "view": shared.view(-1),
+        "strided": shared[:, ::2],
+        "scalar": torch.tensor(1.25, dtype=torch.float64),
+        "empty": torch.empty((0, 3), dtype=torch.float16),
         "index": torch.arange(3, dtype=torch.int64),
         "mask": torch.tensor([True, False]),
-        "none": None,
     }
     with _cache(1 << 20, tmp_path, "mixed-layout") as cache:
         assert cache.put("item", payload)
@@ -588,9 +559,7 @@ def test_mixed_unaligned_layout_falls_back_with_exact_owned_tensors(tmp_path: Pa
             assert size == sum(tensor.numel() * tensor.element_size() for tensor in lease._tensors.values())
             assert len(lease._transfer_sources) == len(lease._tensors)
             _assert_exact(moved, payload)
-            assert (
-                moved["alias"][0].untyped_storage().data_ptr() != lease.data["alias"][0].untyped_storage().data_ptr()
-            )
+            assert moved["alias"].untyped_storage().data_ptr() != lease.data["alias"].untyped_storage().data_ptr()
         assert not lease._transfer_sources
     _assert_exact(moved, payload)
 
@@ -601,7 +570,7 @@ def test_packed_layout_rejects_bad_tensor_headers(tmp_path: Path, field: str) ->
         assert cache.put("item", {"value": torch.arange(8, dtype=torch.int64)})
         with cache.lookup("item") as lease:
             header = json.loads(lease._file_header[8:])
-            item = header["t0"]
+            item = header["value"]
             if field == "shape":
                 item["shape"] = [9]
             elif field == "dtype":
@@ -766,6 +735,7 @@ def test_live_writer_survives_index_recovery_and_keeps_staging_charged(tmp_path:
                 assert before == required_staging > 0
                 with cache._locked():
                     (cache.directory / "index.json").write_text("damaged index")
+                assert cache.lookup("missing") is None  # The normal read path repairs the damaged index.
                 recovered = cache.stats()
                 assert recovered["inflight_writes"] == 1
                 assert recovered["staging_reserved_bytes"] == before
@@ -863,12 +833,12 @@ def test_dead_writer_partial_file_and_reservations_are_reclaimed(tmp_path: Path)
             worker.join()
         assert worker.exitcode == 0
         assert list(cache.directory.glob("writer-*.pending"))
+        assert cache.put("unfinished", _payload())  # Recovery is part of the next normal operation.
         state = cache.stats()
         assert state["inflight_writes"] == state["bytes_reserved"] == state["staging_reserved_bytes"] == 0
         assert not list(cache.directory.glob("writer-*"))
         with cache.lookup("kept") as lease:
             _assert_exact(lease.data, _payload())
-        assert cache.put("unfinished", _payload())
 
 
 def test_lookup_byte_budget_is_checked_before_checksum_and_borrow(tmp_path: Path, monkeypatch) -> None:

@@ -4,8 +4,6 @@
 
 The adapter calls resolve inside its normal FSDP root forward. A unanimous
 decision on the existing Gloo group keeps sharded forward collectives aligned.
-Only backend-validated collective-free conditioning can decide rank-locally;
-that execution policy is agreed once and fixed for the runtime lifetime.
 Storage is node-local and run-scoped; it never contains noise or optimizer
 data.
 """
@@ -74,29 +72,6 @@ def unanimous_ready(ready: bool, group: Any) -> bool:
     return bool(flag.item())
 
 
-def agree_execution_policy(model: Any, group: Any) -> str:
-    """Agree once before any rank can take a different collective path.
-
-    The backend grants this capability after checking replica ownership. A
-    cache miss, changed input or poisoned weight guard never changes the
-    execution policy: those conditions may differ between ranks.
-    """
-    try:
-        policy = getattr(model, "_conditioning_execution_policy", "unanimous")
-    except Exception:
-        policy = None
-    local = policy if isinstance(policy, str) and policy in ("unanimous", "rank_local") else None
-    policies = [local]
-    if dist.is_initialized():
-        policies = [None] * dist.get_world_size(group)
-        dist.all_gather_object(policies, local, group=group)
-    if any(value not in ("unanimous", "rank_local") for value in policies):
-        raise ValueError("Invalid backend conditioning execution policy")
-    if any(value != policies[0] for value in policies):
-        raise ValueError("Conditioning execution policy differs between training ranks")
-    return policies[0]
-
-
 def _tensor_bytes(features: dict[str, torch.Tensor]) -> int:
     return sum(tensor.numel() * tensor.element_size() for tensor in features.values())
 
@@ -134,7 +109,6 @@ class ConditioningRuntime:
         self.world_size = world_size
         self._conditioning_started = time.monotonic()
         self._started = self._conditioning_started if trainer_started is None else trainer_started
-        self._execution_policy = agree_execution_policy(model, group)
         self._closed = False
         self._close_event_written = False
         self._events: list[tuple[Any, Any]] = []
@@ -206,7 +180,6 @@ class ConditioningRuntime:
                     "conditioning_init_seconds": time.monotonic() - self._conditioning_started,
                     "total_seconds_scope": "trainer lifetime; model and Ray startup excluded (see external job.json)",
                     "cache_enabled": self.enabled,
-                    "conditioning_execution_policy": self._execution_policy,
                     "prefetch_depth": self.prefetch_depth if self.enabled else 0,
                     "prefetch_max_bytes": prefetch_bytes if self._prefetch is not None else 0,
                     "prefetch_scope": "validated CPU leases; device copies remain on the training thread",
@@ -247,10 +220,8 @@ class ConditioningRuntime:
         """Fail closed on a conditioning-master change outside FSDP forward.
 
         The adapter optionally declares ``frozen``, named tensor metadata and
-        CPU-only ``semantic`` configuration. Sharded encoders still enter
-        unanimous_ready: one poisoned
-        shard owner makes the whole group compute. A collective-free replica
-        instead bypasses reuse locally without changing its execution policy.
+        CPU-only ``semantic`` configuration. Every rank enters unanimous_ready:
+        one poisoned shard owner makes the whole group compute.
         """
         if self._cache_guard_disabled:
             return
@@ -365,16 +336,7 @@ class ConditioningRuntime:
                         copy_event = torch.cuda.Event() if self.device.type == "cuda" else None
                         enqueue_started = time.perf_counter()
                         try:
-                            copy_to = getattr(lease, "copy_to", None)
-                            if copy_to is not None:
-                                features, copied_bytes = copy_to(self.device)
-                            else:
-                                features = {}
-                                for name, tensor in lease.data.items():
-                                    features[name] = tensor.to(
-                                        self.device, non_blocking=True, copy=self.device.type == "cpu"
-                                    )
-                                    copied_bytes += tensor.numel() * tensor.element_size()
+                            features, copied_bytes = lease.copy_to(self.device)
                         finally:
                             self._step["h2d_enqueue_seconds"] += time.perf_counter() - enqueue_started
                             if copy_event is not None:
@@ -397,14 +359,12 @@ class ConditioningRuntime:
                 self._step["cache_errors"] += 1
                 if key is not None and self.cache is not None:
                     self.cache.invalidate(key)
-                logger.warning(
-                    "Conditioning read failed; using online encoding (%s): %s", self._execution_policy, error
-                )
+                logger.warning("Conditioning read failed; using online encoding: %s", error)
         self._step["cache_lookup_seconds"] += time.perf_counter() - lookup_started
         self._step["local_hit"] += int(local_hit)
         coordinate_started = time.perf_counter()
         ready = local_hit and not self.force_online
-        if self.enabled and self._execution_policy == "unanimous":
+        if self.enabled:
             self._step["coordinate_calls"] += 1
             ready = unanimous_ready(ready, self.group)
         self._step["coordinate_seconds"] += time.perf_counter() - coordinate_started
@@ -446,8 +406,7 @@ class ConditioningRuntime:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         self._step["encode_seconds"] += sum(start.elapsed_time(end) / 1000 for start, end in self._events)
-        detailed = step == self._start_step or step % 16 == 0 or step + 1 >= self._num_steps
-        resources = self._resources(detailed=detailed)
+        resources = self._resources()
         ended = time.monotonic()
         counters = {
             name: self._step[name]
@@ -499,26 +458,23 @@ class ConditioningRuntime:
         )
         self._last_end = ended
 
-    def _resources(self, *, detailed: bool = True) -> dict[str, Any]:
+    def _resources(self) -> dict[str, Any]:
         cache: dict[str, Any] = {}
         scope = "disabled"
         if self.cache is not None:
-            light = getattr(self.cache, "stats_light", None)
-            use_light = not detailed and callable(light)
             try:
-                cache = light() if use_light else self.cache.stats()
-                scope = cache.get("storage_scope", "index_accounting" if use_light else "filesystem")
+                cache = self.cache.stats()
+                scope = cache["storage_scope"]
             except Exception as error:
                 scope = "unavailable"
                 cache = {"storage_scope": scope, "error": f"{type(error).__name__}: {error}"}
                 logger.warning("Conditioning resource snapshot unavailable: %s", error)
-        current = scope in {"filesystem", "index_accounting"}
+        current = scope == "index_accounting"
         result = {
             "cpu_rss_bytes": _rss_bytes(),
             "cache_bytes": cache.get("resident_bytes") if current else (0 if self.cache is None else None),
             "cache_stats": cache,
             "cache_storage_scope": scope,
-            "cache_stats_detailed": scope == "filesystem",
             "disk_bytes": 0,
             "prefetch_stats": self._prefetch.stats() if self._prefetch is not None else {},
         }
@@ -537,7 +493,7 @@ class ConditioningRuntime:
                 }
             )
         if self.cache is not None and not str(self.cache.directory).startswith("/dev/shm/"):
-            result["disk_bytes"] = cache.get("total_bytes") if current else None
+            result["disk_bytes"] = None  # Physical disk use is measured by the external monitor.
         return result
 
     def close(self, completed_step: int, *, status: str | None = None) -> None:
@@ -560,7 +516,7 @@ class ConditioningRuntime:
                     "status": status or ("complete" if completed_step >= self._num_steps else "error"),
                     "total_seconds": time.monotonic() - self._started,
                     "close_seconds": time.monotonic() - started,
-                    **self._resources(detailed=True),
+                    **self._resources(),
                 }
             )
             self._close_event_written = True

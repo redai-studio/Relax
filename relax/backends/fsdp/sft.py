@@ -61,24 +61,6 @@ def restore_rng(directory: Path, rank: int) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _canonical_resume_contract(contract: dict[str, Any]) -> dict[str, Any]:
-    """Treat the Qwen online-only checkpoint's absent cache option as false.
-
-    Normalize only the comparison, never the persisted contract or live model
-    configuration. Enabled posterior reuse changes FSDP ownership and remains a
-    strict mismatch, as do all other contract fields.
-    """
-    config = contract.get("config")
-    if (
-        contract.get("family") == "qwen_image"
-        and contract.get("generation_task") == "t2i"
-        and isinstance(config, dict)
-        and config.get("cache_vae_posterior") is False
-    ):
-        return {**contract, "config": {key: value for key, value in config.items() if key != "cache_vae_posterior"}}
-    return contract
-
-
 def clip_sharded_gradients(parameters: list[torch.nn.Parameter], max_norm: float, group: Any) -> torch.Tensor:
     """Global L2 norm of disjoint FSDP2 shards, with no scalar host
     transfers."""
@@ -235,7 +217,7 @@ class FSDPSFTTrainer:
         if latest is None:
             raise FileNotFoundError(f"No committed image SFT checkpoint under {self.args.load}")
         saved_contract = checkpoint.read_adapter_contract(self.args.load, self.task, latest)
-        if _canonical_resume_contract(saved_contract) != _canonical_resume_contract(self.contract):
+        if saved_contract != self.contract:
             raise ValueError("Checkpoint model/data/optimizer contract differs; refusing SFT resume")
         state = checkpoint.load_checkpoint(
             self.args.load,

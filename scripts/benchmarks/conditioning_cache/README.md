@@ -1,8 +1,8 @@
 # Frozen-conditioning cache validation
 
 Use the normal training entrypoints and the shared numerical verifier. Fixed
-experiment plans, cluster orchestration, raw logs and tensor snapshots belong
-in the separately versioned experiment evidence, not the training library.
+experiment plans, cluster orchestration and raw logs belong in the separately
+versioned experiment evidence, not the training library.
 
 ## Launch and verify
 
@@ -42,8 +42,7 @@ not be included in performance measurements.
 Disable verification and run separate online (`RELAX_CONDITION_CACHE=0`) and
 cached (`RELAX_CONDITION_CACHE=1`) jobs. Keep data order, effective batch,
 resolution, optimizer, initialization, encoder placement and other training
-settings identical; only the cache switch changes. Qwen's
-`CACHE_VAE_POSTERIOR` must also match across both jobs. Use multiple independent
+settings identical; only the cache switch changes. Use multiple independent
 pairs, alternate their order, and retain low-reuse results as well.
 
 ```bash

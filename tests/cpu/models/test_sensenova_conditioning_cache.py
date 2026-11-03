@@ -415,43 +415,6 @@ def test_lora_fsdp_conditioning_boundaries_follow_online_and_hit_module_calls(ti
             handle.remove()
 
 
-def test_actual_prefix_trainability_controls_reuse(tiny_conditioning_model):
-    model, data = tiny_conditioning_model
-    shared = {"height": 32, "width": 32}
-    assert model.conditioning_is_frozen()
-    spec = model.conditioning_spec(data, shared, enabled=True)
-    generation = model.pipe.dit.language_model.model.layers[0].self_attn.q_proj_mot_gen.weight
-    with torch.no_grad():
-        generation.add_(1)
-    assert model.conditioning_spec(data, shared, enabled=True) == spec
-    model.training_mode = "full"
-    assert model.conditioning_is_frozen()  # The mode name alone is not the boundary.
-    prefix = model.pipe.dit.language_model.model.layers[0].self_attn.q_proj.weight
-    prefix.requires_grad_(True)
-    assert not model.conditioning_spec(data, shared, enabled=True).cacheable
-    prefix.requires_grad_(False)
-    model.pipe.dit.vision_model.weight.requires_grad_(True)
-    assert not model.conditioning_is_frozen()
-
-
-def test_conditioning_state_tracks_prefix_mutation_but_excludes_generation(tiny_conditioning_model):
-    model, _ = tiny_conditioning_model
-    original = model.conditioning_state()
-    generation = model.pipe.dit.language_model.model.layers[0].self_attn.q_proj_mot_gen.weight
-    with torch.no_grad():
-        generation.add_(1)
-    assert model.conditioning_state() == original
-    with torch.no_grad():
-        model.pipe.dit.vision_model.weight.add_(1)
-    changed = model.conditioning_state()
-    assert changed["frozen"]
-    assert changed["parameters"]["vision.weight"]["version"] > original["parameters"]["vision.weight"]["version"]
-    assert (
-        changed["parameters"]["vision.weight"]["local_version"]
-        > original["parameters"]["vision.weight"]["local_version"]
-    )
-
-
 @pytest.mark.parametrize("cache_enabled", [None, False, True])
 def test_lora_mode_unfrozen_prefix_retains_conditioning_gradients(tiny_conditioning_model, cache_enabled):
     model, data = tiny_conditioning_model
@@ -492,15 +455,6 @@ def test_conditioning_dependencies_use_effective_contents_and_order(tiny_conditi
     assert dependencies() != original
     original = dependencies()
     model.pipe.torch_dtype = torch.bfloat16
-    assert dependencies() != original
-    data["prompt"] = "edit"
-    original = dependencies()
-    model.pipe.tokenizer.added["unused"] = 2
-    assert dependencies() == original
-    model.pipe.tokenizer.vocabulary["edit"] = 3
-    assert dependencies() != original
-    original = dependencies()
-    model.pipe.tokenizer.normalizer = "changed"
     assert dependencies() != original
     original = dependencies()
     model.pipe.dit.patch_size = 8

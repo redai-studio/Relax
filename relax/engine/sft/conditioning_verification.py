@@ -4,12 +4,9 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import math
-import os
 import random
-import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -263,135 +260,6 @@ def _write_report(report: dict[str, Any], directory: Path, rank: int, gloo_group
         raise RuntimeError(f"Writing conditioning verification report failed: {error[0]}")
 
 
-def _fingerprint(value: Any) -> str:
-    """Hash verification inputs by value, including CPU tensor bytes and RNG
-    state."""
-    digest = hashlib.sha256()
-
-    def update(item: Any) -> None:
-        if isinstance(item, _TensorState):
-            update(item.value)
-        elif isinstance(item, torch.Tensor):
-            tensor = _local(item).detach().cpu().contiguous()
-            update(("tensor", str(tensor.dtype), tuple(tensor.shape)))
-            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
-        elif isinstance(item, np.ndarray):
-            update(("numpy", item.dtype.str, tuple(item.shape)))
-            digest.update(item.tobytes(order="C"))
-        elif isinstance(item, np.generic):
-            update(("numpy-scalar", item.dtype.str, item.item()))
-        elif isinstance(item, Mapping):
-            update(("mapping", len(item)))
-            for key in sorted(item, key=lambda entry: (type(entry).__name__, str(entry))):
-                update(key)
-                update(item[key])
-        elif isinstance(item, (tuple, list)):
-            digest.update(f"{type(item).__name__}:{len(item)}:".encode())
-            for entry in item:
-                update(entry)
-        elif item is None or isinstance(item, (str, bool, int, float)):
-            payload = json.dumps(item, allow_nan=False).encode()
-            digest.update(f"{type(item).__name__}:{len(payload)}:".encode())
-            digest.update(payload)
-        elif isinstance(item, Path):
-            update(("path", str(item)))
-        else:
-            from PIL import Image
-
-            if not isinstance(item, Image.Image):
-                raise TypeError(f"Unsupported verification fingerprint value: {type(item).__name__}")
-            update(("PIL.Image", item.mode, item.size))
-            digest.update(item.tobytes())
-
-    update(value)
-    return digest.hexdigest()
-
-
-def _snapshot_agreement(value: dict[str, Any], group: Any) -> list[dict[str, Any]]:
-    values = [value]
-    if _world(group) > 1:
-        values = [None] * _world(group)
-        dist.all_gather_object(values, value, group=group)
-    return values
-
-
-def _write_reference_snapshot(
-    directory: Path,
-    rank: int,
-    gloo_group: Any,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-    """Publish rank files first and a manifest last; every I/O error reaches
-    all ranks."""
-    filename = f"reference-rank{rank:05d}.pt"
-    final = directory / filename
-    temporary = None
-    published = False
-    status = {"rank": rank, "file": filename, "error": None}
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        if final.exists() or (directory / "manifest.json").exists():
-            raise FileExistsError("Reference snapshots require a fresh output directory")
-        descriptor, path = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=directory)
-        temporary = Path(path)
-        with os.fdopen(descriptor, "wb") as stream:
-            torch.save(payload, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        digest = hashlib.sha256()
-        with temporary.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        status.update(sha256=digest.hexdigest(), bytes=temporary.stat().st_size)
-        temporary.replace(final)
-        published = True
-    except Exception as exc:
-        status["error"] = f"{type(exc).__name__}: {exc}"
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError as exc:
-                status["error"] = status["error"] or f"Temporary snapshot cleanup failed: {exc}"
-
-    statuses = _snapshot_agreement(status, gloo_group)
-    errors = [f"rank {item['rank']}: {item['error']}" for item in statuses if item["error"]]
-    if sorted(item["rank"] for item in statuses) != list(range(_world(gloo_group))):
-        errors.append("Snapshot ranks do not cover the verification process group")
-    manifest = {
-        "schema_version": 1,
-        "world_size": _world(gloo_group),
-        "quantity": "reference online pass; full reduced gradients and FP32 theta_after - theta_before",
-        "files": sorted(statuses, key=lambda item: item["rank"]),
-    }
-    commit_error = ["; ".join(errors) if errors else None]
-    if rank == 0 and not errors:
-        try:
-            descriptor, path = tempfile.mkstemp(prefix=".manifest.", suffix=".tmp", dir=directory)
-            temporary = Path(path)
-            with os.fdopen(descriptor, "w") as stream:
-                json.dump(manifest, stream, indent=2, allow_nan=False)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            temporary.replace(directory / "manifest.json")
-        except Exception as exc:
-            commit_error[0] = f"{type(exc).__name__}: {exc}"
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError as exc:
-                    commit_error[0] = commit_error[0] or f"Temporary manifest cleanup failed: {exc}"
-    if _world(gloo_group) > 1:
-        dist.broadcast_object_list(commit_error, src=0, group=gloo_group)
-    if commit_error[0] is not None:
-        if published:
-            final.unlink(missing_ok=True)
-        raise RuntimeError(f"Writing reference snapshots failed: {commit_error[0]}")
-    return {"directory": str(directory), "manifest": "manifest.json", "world_size": _world(gloo_group)}
-
-
 def verify_update(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -409,7 +277,6 @@ def verify_update(
     clip_fn: Callable[[], Any] | None = None,
     relative_tolerance: float = 0.01,
     cache_statistics: Callable[[], dict[str, Any]] | None = None,
-    snapshot_directory: str | Path | None = None,
 ) -> dict[str, Any]:
     """Compare online and warm-cache updates from exactly the same initial
     state.
@@ -430,13 +297,6 @@ def verify_update(
     Every rank must execute the cached branch for every sample with no online
     encoding in the second pass. Without this callback only numerical equality
     is checked, and the report explicitly leaves cache_branch_verified false.
-
-    Optional reference snapshots support comparisons across separate training
-    configurations. Set ``snapshot_directory`` or
-    ``RELAX_CONDITION_VERIFY_SNAPSHOT=1`` to publish CPU gradients and actual
-    FP32 updates, with fingerprints of initial weights, optimizer, inputs and
-    RNG. All ranks must enable this option together; existing snapshots are
-    never overwritten. Disabled verification keeps its original output/work.
     """
     device = torch.device(device)
     parameters = [(name, parameter) for name, parameter in named_parameters if parameter.requires_grad]
@@ -446,8 +306,6 @@ def verify_update(
         raise ValueError("Distributed verification requires an explicit Gloo group")
     if not 0 <= relative_tolerance <= 0.01:
         raise ValueError("Verification relative tolerance must be between zero and one percent")
-    if snapshot_directory is None and os.environ.get("RELAX_CONDITION_VERIFY_SNAPSHOT", "0") == "1":
-        snapshot_directory = Path(output_dir) / "reference-snapshots"
     if any(_local(parameter).dtype != torch.float32 for _, parameter in parameters):
         raise ValueError("Parameter-update verification requires actual FP32 optimizer master parameters")
     names = [name for name, _ in parameters]
@@ -455,10 +313,9 @@ def verify_update(
         raise ValueError("Verification parameter names must be unique")
     if _world(gloo_group) > 1:
         schemas = [None] * _world(gloo_group)
-        schema = (names, snapshot_directory is not None)
-        dist.all_gather_object(schemas, schema, group=gloo_group)
-        if any(item != schema for item in schemas):
-            raise ValueError("Verification parameter order or snapshot configuration differs between ranks")
+        dist.all_gather_object(schemas, names, group=gloo_group)
+        if any(item != names for item in schemas):
+            raise ValueError("Verification parameter order differs between ranks")
 
     _reshard(model)
     initial = {name: _local(parameter).detach().cpu().clone() for name, parameter in parameters}
@@ -502,45 +359,9 @@ def verify_update(
         return {"loss": float(loss_cpu), "gradients": gradients, "updates": updates, "clip_norm": norm}
 
     try:
-        snapshot_metadata = None
-        if snapshot_directory is not None:
-            error = None
-            try:
-                parameter_names = {id(parameter): name for name, parameter in parameters}
-                snapshot_metadata = {
-                    "schema_version": 1,
-                    "rank": rank,
-                    "world_size": _world(group),
-                    "local_samples": len(samples),
-                    "loss_scale": loss_scale,
-                    "samples_sha256": _fingerprint(samples),
-                    "rng_initial_sha256": _fingerprint(rng),
-                    "optimizer_initial_sha256": _fingerprint(optimizer_state),
-                    "optimizer_type": f"{type(optimizer).__module__}.{type(optimizer).__qualname__}",
-                    "optimizer_parameter_names": [
-                        [parameter_names[id(parameter)] for parameter in param_group["params"]]
-                        for param_group in optimizer.param_groups
-                    ],
-                    "initial_parameters": {
-                        name: {
-                            "sha256": _fingerprint(initial[name]),
-                            "dtype": str(initial[name].dtype),
-                            "local_shape": list(initial[name].shape),
-                            "global_shape": list(parameter.shape),
-                            "placements": [str(value) for value in getattr(parameter, "placements", ())],
-                        }
-                        for name, parameter in parameters
-                    },
-                }
-            except Exception as exc:
-                error = f"rank {rank}: {type(exc).__name__}: {exc}"
-            errors = [item["error"] for item in _snapshot_agreement({"error": error}, gloo_group) if item["error"]]
-            if errors:
-                raise RuntimeError(f"Preparing reference snapshots failed: {'; '.join(errors)}")
         cache_before = _cache_snapshot(cache_statistics)
         set_force_online(True)
         reference = run_pass()
-        reference_rng = _rng_state(device) if snapshot_directory is not None else None
         cache_after_reference = _cache_snapshot(cache_statistics)
         restore()
         set_force_online(False)
@@ -576,23 +397,6 @@ def verify_update(
                 and (cache_statistics is None or cache_validation["branch_verified"])
             ),
         }
-        if snapshot_directory is not None and report["passed"]:
-            error = None
-            try:
-                snapshot_metadata.update(
-                    rng_after_reference_sha256=_fingerprint(reference_rng),
-                    global_loss=reference["loss"],
-                    gradients=reference["gradients"],
-                    parameter_updates=reference["updates"],
-                )
-            except Exception as exc:
-                error = f"rank {rank}: {type(exc).__name__}: {exc}"
-            errors = [item["error"] for item in _snapshot_agreement({"error": error}, gloo_group) if item["error"]]
-            if errors:
-                raise RuntimeError(f"Preparing reference snapshots failed: {'; '.join(errors)}")
-            report["reference_snapshot"] = _write_reference_snapshot(
-                Path(snapshot_directory), rank, gloo_group, snapshot_metadata
-            )
         _write_report(report, Path(output_dir), rank, gloo_group)
         if not report["passed"]:
             raise VerificationError(report)

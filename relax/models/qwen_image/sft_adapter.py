@@ -81,8 +81,6 @@ class QwenImageSFTModel(torch.nn.Module):
         self.vae = pipeline.vae
         self.pipe = pipeline  # DiffusionPipeline is not an nn.Module.
         self.config = dict(config)
-        # This changes FSDP ownership, so it cannot be toggled on a live model.
-        self._cache_vae_posterior = self.config.get("cache_vae_posterior", False)
         self.device = torch.device("cpu")
         self.compute_dtype = dtype
         self.conditioning_cache: ConditioningResolver | None = None
@@ -100,16 +98,12 @@ class QwenImageSFTModel(torch.nn.Module):
         return self
 
     def conditioning_is_frozen(self) -> bool:
-        modules = (self.text_encoder, self.vae) if self._cache_vae_posterior else (self.text_encoder,)
-        return all(not module.training and not any(p.requires_grad for p in module.parameters()) for module in modules)
+        return not self.text_encoder.training and not any(p.requires_grad for p in self.text_encoder.parameters())
 
     def conditioning_state(self) -> dict[str, Any]:
         parameters = {}
         tensors = list(self.text_encoder.named_parameters())
         tensors.extend((f"text_encoder.buffers.{name}", value) for name, value in self.text_encoder.named_buffers())
-        if self._cache_vae_posterior:
-            tensors.extend((f"vae.parameters.{name}", value) for name, value in self.vae.named_parameters())
-            tensors.extend((f"vae.buffers.{name}", value) for name, value in self.vae.named_buffers())
         for name, parameter in tensors:
             local = parameter.to_local() if hasattr(parameter, "to_local") else parameter
             parameters[name] = {
@@ -147,7 +141,6 @@ class QwenImageSFTModel(torch.nn.Module):
         *,
         prepared: dict[str, torch.Tensor] | None = None,
         enabled: bool = True,
-        pixels: torch.Tensor | None = None,
     ) -> ConditioningSpec:
         cacheable = self.conditioning_is_frozen()
         dependencies: dict[str, Any] = {}
@@ -173,27 +166,9 @@ class QwenImageSFTModel(torch.nn.Module):
                 "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
                 "hidden_layer": -1,
             }
-            if self._cache_vae_posterior:
-                import hashlib
-
-                pixels = self._prepare_pixels(data) if pixels is None else pixels
-                if pixels.device.type != "cpu" or pixels.dtype != torch.uint8:
-                    raise ValueError("Posterior dependencies require CPU RGB uint8 pixels")
-                dependencies.update(
-                    image_sha256=hashlib.sha256(pixels.contiguous().numpy()).hexdigest(),
-                    image_shape=list(pixels.shape),
-                    image_preprocessing="RGB.uint8.float32.div127.5.sub1.BC1HW.v1",
-                    vae_class=type(self.vae).__name__,
-                    vae_config=json.dumps(dict(self.vae.config), sort_keys=True, allow_nan=False),
-                    vae_dtype=str(self.compute_dtype),
-                    vae_scale_factor=self.pipe.vae_scale_factor,
-                    vae_use_slicing=self.vae.use_slicing,
-                    vae_use_tiling=self.vae.use_tiling,
-                )
         # Checkpoint content identity and mutation guards are supplied by the
         # public runtime; filenames and image identities never authorize reuse.
-        schema = "qwen_image.text_vae_posterior.v2" if self._cache_vae_posterior else "qwen_image.text.v1"
-        return ConditioningSpec(schema, dependencies, cacheable)
+        return ConditioningSpec("qwen_image.text.v1", dependencies, cacheable)
 
     def conditioning_prefetch_spec(self, data: dict[str, Any]) -> ConditioningSpec:
         return self.conditioning_spec(data)
@@ -212,14 +187,6 @@ class QwenImageSFTModel(torch.nn.Module):
     def _condition(self, data: dict[str, Any]) -> torch.Tensor:
         return self._conditioning_features(data)["prompt_embeds"]
 
-    @staticmethod
-    def _prepare_pixels(data: dict[str, Any]) -> torch.Tensor:
-        import numpy as np
-
-        if data["image"].mode != "RGB":
-            raise ValueError("Qwen posterior reuse requires the prepared RGB image")
-        return torch.from_numpy(np.array(data["image"], dtype=np.uint8))
-
     def _encode_posterior(self, pixels: torch.Tensor) -> Any:
         try:
             return self.vae.encode(pixels.to(device=self.device, dtype=self.compute_dtype)).latent_dist
@@ -232,37 +199,25 @@ class QwenImageSFTModel(torch.nn.Module):
     def _conditioning_features(self, data: dict[str, Any]) -> dict[str, Any]:
         import time
 
-        if self.config.get("cache_vae_posterior", False) != self._cache_vae_posterior:
-            raise ValueError("Changing cache_vae_posterior requires a new model and FSDP ownership")
         placement = self.config.get("text_encoder_placement", "sharded")
-        if placement != getattr(self, "_conditioning_text_encoder_placement", placement):
+        if placement != getattr(self, "_text_encoder_placement", placement):
             raise ValueError("Changing text_encoder_placement requires a new model and FSDP ownership")
-        if self._cache_vae_posterior:
-            if any(parameter.requires_grad for parameter in self.vae.parameters()):
-                raise ValueError("Replicated Qwen VAE is frozen-only; training its parameters requires a new model")
-            if self.vae.use_tiling or self.vae.use_slicing:
-                raise ValueError("Qwen posterior reuse currently requires VAE tiling and slicing disabled")
         if placement == "replicated" and any(parameter.requires_grad for parameter in self.text_encoder.parameters()):
             raise ValueError(
                 "Replicated Qwen conditioning is frozen-only; training its parameters requires a new model"
             )
         started = time.perf_counter()
         prepared = self._prepare_conditioning(data["prompt"])
-        pixels = self._prepare_pixels(data) if self._cache_vae_posterior else None
         resolver = self.conditioning_cache
-        spec = self.conditioning_spec(
-            data, prepared=prepared, enabled=bool(resolver and resolver.enabled), pixels=pixels
-        )
+        spec = self.conditioning_spec(data, prepared=prepared, enabled=bool(resolver and resolver.enabled))
         start = self.pipe.prompt_template_encode_start_idx
         length = min(prepared["input_ids"].shape[1] - start, self.config["max_sequence_length"])
         if length <= 0:
             raise ValueError("Prompt template produced no conditioning tokens")
         if resolver is not None and hasattr(resolver, "record_prepare"):
             resolver.record_prepare(time.perf_counter() - started)
-        online_posterior = None
 
         def compute() -> dict[str, torch.Tensor]:
-            nonlocal online_posterior
             if resolver is not None:
                 resolver.record_input_transfer(
                     sum(value.numel() * value.element_size() for value in prepared.values())
@@ -285,59 +240,10 @@ class QwenImageSFTModel(torch.nn.Module):
                         logits_to_keep=1,  # Hidden states do not need vocabulary logits for every token.
                     )
                     embeds = output.hidden_states[-1][:, start : start + length].to(self.compute_dtype)
-            features = {"prompt_embeds": embeds.contiguous()}
-            if pixels is not None:
-                normalized = pixels.to(torch.float32).permute(2, 0, 1).div(127.5).sub(1).unsqueeze(0).unsqueeze(2)
-                if resolver is not None:
-                    resolver.record_input_transfer(normalized.numel() * (torch.finfo(self.compute_dtype).bits // 8))
-                with torch.no_grad():
-                    online_posterior = self._encode_posterior(normalized)
-                # Cache deterministic distribution parameters, never a sample.
-                # Storage canonicalizes tensors, so encode the original dense
-                # layout in the field name without reading GPU metadata tensors.
-                parameters = online_posterior.parameters
-                if parameters.is_contiguous():
-                    field = "posterior_parameters"
-                elif parameters.ndim == 5 and parameters.is_contiguous(memory_format=torch.channels_last_3d):
-                    field = "posterior_parameters_channels_last_3d"
-                else:
-                    raise ValueError("Qwen posterior reuse supports only contiguous or channels_last_3d parameters")
-                features[field] = parameters
-            return features
+            return {"prompt_embeds": embeds.contiguous()}
 
-        def restore(features: dict[str, torch.Tensor]) -> dict[str, Any]:
-            if pixels is None:
-                return self._restore_conditioning(features, length)
-            if set(features) == {"prompt_embeds", "posterior_parameters"}:
-                field, memory_format = "posterior_parameters", torch.contiguous_format
-            elif set(features) == {"prompt_embeds", "posterior_parameters_channels_last_3d"}:
-                field, memory_format = "posterior_parameters_channels_last_3d", torch.channels_last_3d
-            else:
-                raise ValueError("Cached Qwen-Image joint conditioning fields differ from the model")
-            self._restore_conditioning({"prompt_embeds": features["prompt_embeds"]}, length)
-            parameters = features[field]
-            expected = (
-                1,
-                2 * len(self.vae.config.latents_mean),
-                1,
-                pixels.shape[0] // self.pipe.vae_scale_factor,
-                pixels.shape[1] // self.pipe.vae_scale_factor,
-            )
-            if (
-                parameters.shape != expected
-                or parameters.dtype != self.compute_dtype
-                or parameters.device != self.device
-            ):
-                raise ValueError("Cached Qwen-Image posterior has an invalid shape, dtype or device")
-            if online_posterior is not None and parameters is online_posterior.parameters:
-                posterior = online_posterior
-            else:
-                from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-
-                # Preserve sample/clean layout: the following randn_like(clean)
-                # maps random draws to elements according to that layout.
-                posterior = DiagonalGaussianDistribution(parameters.contiguous(memory_format=memory_format))
-            return {"prompt_embeds": features["prompt_embeds"], "posterior": posterior}
+        def restore(features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            return self._restore_conditioning(features, length)
 
         return restore(compute()) if resolver is None else resolver.resolve(spec, compute, restore)
 
@@ -347,15 +253,11 @@ class QwenImageSFTModel(torch.nn.Module):
         features = self._conditioning_features(data)
         prompt_embeds = features["prompt_embeds"]
         with torch.no_grad():
-            if self._cache_vae_posterior:
-                posterior = features["posterior"]
-            else:
-                pixels = torch.from_numpy(np.array(data["image"], dtype=np.float32)).permute(2, 0, 1)
-                pixels = pixels.div(127.5).sub(1).unsqueeze(0).unsqueeze(2)
-                posterior = self._encode_posterior(pixels)
+            pixels = torch.from_numpy(np.array(data["image"], dtype=np.float32)).permute(2, 0, 1)
+            pixels = pixels.div(127.5).sub(1).unsqueeze(0).unsqueeze(2)
+            posterior = self._encode_posterior(pixels)
             # Always sample here, on the original RNG stream, for every micro.
             clean = posterior.sample()
-            features.pop("posterior", None)
             del posterior
             # The official training recipe normalizes in FP32 and only then
             # rounds to the training dtype. BF16 statistics change the target.
@@ -418,8 +320,6 @@ class QwenImageSFTAdapter:
         replicas = []
         if placement == "replicated":
             replicas.append(("text encoder", model.text_encoder))
-        if model._cache_vae_posterior:
-            replicas.append(("VAE", model.vae))
         for name, module in replicas:
             # The native ignored-parameter policy keeps normal module ownership,
             # state names and mutation guards. It does not move/cast parameters.
@@ -430,16 +330,10 @@ class QwenImageSFTAdapter:
                 raise ValueError(f"Replicated {name} must already use the model device and compute dtype")
             if module.training:
                 raise ValueError(f"Replicated {name} must be in eval mode")
-        # Gather a sharded encoder once per online encode, without per-layer
-        # boundaries. The optional posterior bundle always keeps the VAE resident.
+        # Gather a sharded encoder once per online encode, without per-layer boundaries.
         model.text_encoder._fsdp_fine_grained = placement == "sharded"
         model._fsdp_replicated_modules = tuple(module for _, module in replicas)
-        # Every module used by the single resolver must be a verified replica.
-        # A sharded text encoder still requires unanimous hit/miss decisions.
-        model._conditioning_collective_free_modules = (
-            model._fsdp_replicated_modules if placement == "replicated" else ()
-        )
-        model._conditioning_text_encoder_placement = placement
+        model._text_encoder_placement = placement
 
     def on_device_ready(self, model: QwenImageSFTModel, device: torch.device) -> None:
         model.device = device

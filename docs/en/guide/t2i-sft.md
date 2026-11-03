@@ -96,26 +96,14 @@ and use the exported directory for model loading.
 
 ## Optional frozen conditioning cache
 
-Use `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh` with the
-same data and training settings as above. Set `RELAX_CONDITION_CACHE=1` to reuse
-frozen text features, `RELAX_CONDITION_CACHE_MAX_BYTES` for the payload budget
-(default 1 GiB per node), and a fresh `RELAX_CONDITION_CACHE_RUN_DIR` per run.
-`RELAX_CONDITION_CACHE=0` keeps the online baseline. Random crops and caption
-dropout run on every occurrence; keys cover their effective outputs.
+Use `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh` with the same
+training settings as above. Set `RELAX_CONDITION_CACHE=1` for frozen text reuse,
+`RELAX_CONDITION_CACHE_MAX_BYTES` for the per-node payload budget (default 1 GiB),
+and a fresh `RELAX_CONDITION_CACHE_RUN_DIR`. Set `RELAX_CONDITION_CACHE=0` for the
+online baseline. VAE encoding and posterior sampling remain online; crops and
+caption dropout keep their RNG order and key their actual outputs.
 
-`CACHE_VAE_POSTERIOR=1` optionally stores deterministic VAE posterior parameters
-with the text features for each effective image/caption pair. Posterior sampling,
-diffusion noise and timesteps remain online. VAE tiling/slicing must be disabled;
-posterior layout is recorded and restored before sampling to preserve RNG element
-mapping. Supported layouts are contiguous and `channels_last_3d`. This option
-keeps the frozen VAE resident on each GPU.
-
-Use identical `TEXT_ENCODER_PLACEMENT`, `CACHE_VAE_POSTERIOR`, checkpointing and
-FSDP reshard settings in online/cache comparisons. Sharded encoders require
-unanimous hits; validated frozen replicas can decide per rank. Placement changes
-must not be counted as cache gains. Keep placement and posterior policy unchanged
-on checkpoint resume; an absent posterior flag from the basic online entry point
-is equivalent to `False`. A warm cache is not required to resume.
-
-See [Frozen conditioning cache](./frozen-conditioning-cache.md) for ownership,
-limits, invalidation, numerical verification and complete training-loop timing.
+Keep encoder placement, checkpointing and FSDP reshard settings identical across
+the comparison and on checkpoint resume. All ranks agree before skipping an
+encoder; a warm cache is not required to resume. See [Frozen conditioning cache](./frozen-conditioning-cache.md)
+for ownership, limits, invalidation and numerical/performance validation.

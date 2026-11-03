@@ -79,20 +79,12 @@ python examples/diffusion/export_i2i_sft.py \
 
 ## 可选冻结条件缓存
 
-使用 `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh`，沿用上面的
-数据与训练配置。`RELAX_CONDITION_CACHE=1` 启用冻结文本特征复用，
-`RELAX_CONDITION_CACHE_MAX_BYTES` 设置 payload 预算（默认每节点 1 GiB），
-每次运行使用新的 `RELAX_CONDITION_CACHE_RUN_DIR`。设置 `RELAX_CONDITION_CACHE=0`
-保留在线基线。随机裁剪和 caption dropout 仍逐次执行，缓存键使用其实际输出。
+使用 `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh`，沿用上面的训练设置。
+`RELAX_CONDITION_CACHE=1` 启用冻结文本复用，`RELAX_CONDITION_CACHE_MAX_BYTES`
+设置每节点 payload 预算（默认 1 GiB），每次使用新的 `RELAX_CONDITION_CACHE_RUN_DIR`。
+`RELAX_CONDITION_CACHE=0` 保留在线基线。VAE 编码与后验采样仍在线执行，随机裁剪和
+caption dropout 保持随机数流顺序，使用实际结果构键。
 
-可选 `CACHE_VAE_POSTERIOR=1`，按有效图像与描述联合缓存确定性的 VAE 后验参数和文本特征。
-后验采样、扩散噪声及 timestep 仍在线执行；要求关闭 VAE tiling/slicing。缓存记录并在
-采样前恢复 posterior 的 contiguous 或 `channels_last_3d` 布局，保持随机数的元素映射。
-该选项使冻结 VAE 在每张 GPU 常驻。
-
-在线与缓存对照须保持 `TEXT_ENCODER_PLACEMENT`、`CACHE_VAE_POSTERIOR`、checkpointing
-和 FSDP reshard 配置相同，不将放置策略变化计为缓存收益。分片编码器需要全组一致命中，
-后端确认完整冻结副本后才可按 rank 独立决定。恢复 checkpoint 时保持相同的放置和
-posterior 策略；基础在线入口缺省的 posterior 标志与 `False` 等价，恢复不要求已有热缓存。
-
-所有权、容量、失效、数值验证及完整训练循环计时见[冻结条件缓存](./frozen-conditioning-cache.md)。
+在线/缓存对照和 checkpoint 恢复使用相同编码器放置、checkpointing 和 FSDP reshard 设置。
+跳过编码器前全部 rank 一致同意，恢复不要求热缓存。所有权、容量、失效和数值/性能验证
+见[冻结条件缓存](./frozen-conditioning-cache.md)。
