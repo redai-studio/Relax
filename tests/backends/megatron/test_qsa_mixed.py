@@ -221,8 +221,6 @@ def test_qsa_mixed_in_isolated_process() -> None:
         timeout=600,
     )
     output = result.stdout + result.stderr
-    if destination := os.environ.get("QSA_MIXED_TEST_LOG"):
-        Path(destination).write_text(output)
     assert result.returncode == 0, output
     assert "10 passed" in result.stdout and " skipped" not in result.stdout, output
 

@@ -196,8 +196,7 @@ jobs:
         timeout-minutes: 20
         run: |
           docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
-            QSA_MIXED_TEST_LOG=/artifacts/qsa-mixed.log \
-              python -m pytest tests/ --ignore=tests/cpu \
+            python -m pytest tests/ --ignore=tests/cpu \
               -v -ra --tb=short --durations=50 --junitxml=/artifacts/junit.xml \
               2>&1 | tee /artifacts/pytest.log
           '
