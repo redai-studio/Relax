@@ -177,7 +177,7 @@ custom reward 将 YAML 中带 `eval_benchmark` 标记的评测样本交给本地
 CPU 回归测试命令：
 
 ```bash
-python -m pytest tests/engine/rewards/test_openr1mm.py tests/tools/test_process_openr1.py
+python -m pytest tests/cpu/engine/rewards/test_openr1mm.py tests/cpu/tools/test_process_openr1.py
 ```
 
 ---
