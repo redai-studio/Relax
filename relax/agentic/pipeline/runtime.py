@@ -36,10 +36,16 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
-from relax.utils.http_utils import get, init_http_client, post, router_worker_base_urls
+from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.score_centering import (
+    configure_score_centering_request,
+    parse_score_centering_response,
+    resolve_score_centering_vocab_size,
+    score_centering_enabled,
+)
 from relax.utils.types import Sample
 
 
@@ -179,6 +185,8 @@ class BackendGenerateResult:
     finish_type: str
     meta_info: dict[str, Any]
     elapsed: float
+    new_topk_token_ids: np.ndarray | None = None
+    new_topk_log_probs: np.ndarray | None = None
 
 
 class BackendContextLengthExceededError(RuntimeError):
@@ -558,6 +566,8 @@ class SGLangBackendAdapter:
         init_http_client(args)
         self._args = args
         self._resources = load_agentic_compiler_resources(args)
+        if score_centering_enabled(args):
+            resolve_score_centering_vocab_size(args)
         self._session_lifecycle = args.agentic_session_lifecycle
         self.tokenizer = self._resources.tokenizer
         self.compiler = SGLangMessageCompiler(
@@ -585,6 +595,8 @@ class SGLangBackendAdapter:
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
         return_logprob: bool = True,
+        collect_score_centering: bool = True,
+        fail_fast_no_workers: bool = False,
     ) -> BackendGenerateResult:
         payload = {
             "input_ids": input_ids,
@@ -592,6 +604,11 @@ class SGLangBackendAdapter:
             "rid": request_id,
             "return_logprob": return_logprob,
         }
+        sc_sampling_mode = (
+            configure_score_centering_request(self._args, payload)
+            if return_logprob and collect_score_centering
+            else None
+        )
         if self._args.use_rollout_routing_replay:
             payload["return_routed_experts"] = True
         if image_data:
@@ -609,21 +626,51 @@ class SGLangBackendAdapter:
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         try:
-            output = await post(f"{self._router_url}/generate", payload, headers=headers)
+            output = await post(
+                f"{self._router_url}/generate",
+                payload,
+                headers=headers,
+                fail_fast_no_workers=fail_fast_no_workers,
+            )
         except httpx.HTTPStatusError as error:
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error
+            if is_expected_sglang_499(error):
+                return BackendGenerateResult(
+                    new_tokens=[],
+                    new_log_probs=[],
+                    finish_type="abort",
+                    meta_info={},
+                    elapsed=time.monotonic() - started,
+                )
             raise
         elapsed = time.monotonic() - started
         meta_info = dict(output["meta_info"])
         token_logprobs = list(meta_info.get("output_token_logprobs") or ())
         tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
+        sampled_logprobs = [float(item[0]) for item in token_logprobs]
+        topk_token_ids = topk_log_probs = None
+        if sc_sampling_mode is not None:
+            tokens, sampled_logprobs, topk_token_ids, topk_log_probs = parse_score_centering_response(
+                meta_info,
+                self._args.rollout_top_logprobs_num,
+                sampling_mode=sc_sampling_mode,
+                expected_tokens=tokens,
+                vocab_size=self._args.score_centering_vocab_size,
+            )
+        sanitized_tokens = _sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor)
+        if sc_sampling_mode is not None and sanitized_tokens != tokens:
+            raise ValueError(
+                "Score Centering requires the original sampled token IDs; token sanitization changed them."
+            )
         return BackendGenerateResult(
-            new_tokens=_sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor),
-            new_log_probs=[float(item[0]) for item in token_logprobs],
+            new_tokens=sanitized_tokens,
+            new_log_probs=sampled_logprobs,
             finish_type=str(meta_info["finish_reason"]["type"]),
             meta_info=meta_info,
             elapsed=elapsed,
+            new_topk_token_ids=topk_token_ids,
+            new_topk_log_probs=topk_log_probs,
         )
 
     async def abort_request(self, request_id: str) -> None:
@@ -875,6 +922,16 @@ class RuntimeDomain:
         """Derive Runtime residency from Shard group capabilities."""
 
         return sum(len(shard.group_streams) for shard in self._shards)
+
+    async def bind_router(self, router_ip: str, router_port: int) -> None:
+        """Wait until all Session owners can use the verified endpoint."""
+        handles = [shard.handle for shard in self._shards]
+        if self._admission_coordinator is not None:
+            handles.append(self._admission_coordinator)
+        await asyncio.wait_for(
+            asyncio.gather(*(handle.set_router_address.remote(router_ip, router_port) for handle in handles)),
+            timeout=getattr(self.args, "rollout_engine_init_timeout", 3600.0),
+        )
 
     @property
     def interrupted_group_ids(self) -> Tuple[str, ...]:

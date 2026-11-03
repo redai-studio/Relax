@@ -1,0 +1,18 @@
+name: Review Signal
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions: {}
+
+jobs:
+  signal:
+    runs-on: ubuntu-slim
+    timeout-minutes: 1
+    steps:
+      - name: Record review update
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+        run: echo "Review updated on PR ${PR_NUMBER} (${REVIEW_STATE})"

@@ -269,9 +269,10 @@ def test_train_one_step_preserves_logical_batch_and_capture(
         model_module,
         pp_size=1 if is_last_stage else 2,
         is_last_stage=is_last_stage,
-        all_reduce_impl=lambda tensor, group=None: None,
+        all_reduce_impl=lambda tensor, group=None, op=None: None,
         broadcast_impl=broadcast,
     )
+    monkeypatch.setattr(model_module.torch.distributed, "get_world_size", lambda _group: 1)
     monkeypatch.setattr(
         model_module.capture_hooks,
         "begin_step_for",
@@ -300,7 +301,12 @@ def test_train_one_step_preserves_logical_batch_and_capture(
     assert calls["capture_begin"] == calls["capture_end"] == 1
     # A skipped zero-token step is not a successful update for critic movement checks.
     assert calls["critic_update_successful"] == [not zero_tokens]
-    expected_metrics = {"loss": 0.0 if zero_tokens else (3.0 if calculate_per_token_loss else 6.0)}
+    expected_metrics = {
+        "loss": 0.0 if zero_tokens else (3.0 if calculate_per_token_loss else 6.0),
+        "num_microbatches_mean": 0.0,
+        "pack_tokens_mean": 0.0,
+        "pack_tokens_max": 0.0,
+    }
     if reward_model:
         expected_metrics.update(
             {

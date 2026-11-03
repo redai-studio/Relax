@@ -1,8 +1,10 @@
+# syntax=docker/dockerfile:1.7
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.17-cu129
 ARG TRAIN_IMAGE=train
+ARG HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
 FROM ${BASE_IMAGE} as base
 
 ENV NVIDIA_PYTORCH_VERSION=25.06 \
@@ -29,6 +31,9 @@ RUN apt-get update && apt-get install -y locales tzdata && \
     locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
+# Optional build-time package mirror; keep the base pip configuration by default.
+ARG PIP_INDEX_URL
+
 FROM base as sglang
 
 WORKDIR /sgl-workspace/sglang
@@ -37,7 +42,8 @@ RUN pip install nvidia-cudnn-cu12==9.16.0.29
 
 FROM base as train
 
-RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
+# Build for the base Torch ABI without relying on a guessed GitHub wheel URL.
+RUN FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
     pip install --no-cache-dir flash-linear-attention==0.4.2 && \
     pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 
@@ -82,10 +88,9 @@ RUN MAX_JOBS=64 \
     cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'stray top-level flash_attn_interface still importable'; import flash_attn_config" && \
     rm -rf /opt/flash-attention/
 
-RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
+RUN NVTE_PYTORCH_FORCE_BUILD=TRUE pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
-    pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
-    pip install megatron-energon fsspec==2024.3.1 --no-cache-dir&& \
+    pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir && \
     pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \
@@ -102,14 +107,61 @@ RUN cd /tmp/int4_qat && \
     rm -rf /tmp/int4_qat
 
 ARG TRAIN_IMAGE=train
+# Build the CUDA 12 HybridEP wheel against the same Torch ABI as the final image.
+FROM ${TRAIN_IMAGE} as hybridep_builder
+COPY docker/patch/deepep/eb9cee7-hybridep-namespace.patch /tmp/hybridep-namespace.patch
+ARG HYBRID_EP_COMMIT
+ARG HYBRID_EP_CUDA_ARCH_LIST=9.0
+RUN pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
+    git clone --no-checkout https://github.com/deepseek-ai/DeepEP.git /tmp/HybridEP && \
+    cd /tmp/HybridEP && git checkout --detach "$HYBRID_EP_COMMIT" && \
+    test "$(git rev-parse HEAD)" = "$HYBRID_EP_COMMIT" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/hybridep-namespace.patch && \
+    CUDA_VISIBLE_DEVICES="" TORCH_CUDA_ARCH_LIST="$HYBRID_EP_CUDA_ARCH_LIST" HYBRID_EP_MULTINODE=0 \
+        CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}" \
+        LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+        MAX_JOBS=16 pip wheel --no-build-isolation --no-deps --wheel-dir /opt/ep-wheels .
+
+# Build the patched router against the same Python/libc as the final image.
+FROM ${TRAIN_IMAGE} as router_builder
+
+ARG ROUTER_RUST_VERSION=1.97.1
+# Override these build args when CI requires an approved Rust mirror.
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+ARG ROUTER_RUSTUP_INIT_URL=https://sh.rustup.rs
+ARG ROUTER_BUILD_JOBS=16
+ENV PATH=/root/.cargo/bin:${PATH} \
+    CARGO_BUILD_JOBS=${ROUTER_BUILD_JOBS} \
+    CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git libssl-dev pkg-config protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --retry-all-errors \
+        --connect-timeout 30 --max-time 300 "$ROUTER_RUSTUP_INIT_URL" -o /tmp/rustup-init.sh && \
+    (for attempt in 1 2 3; do \
+        if sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${ROUTER_RUST_VERSION}"; then \
+            exit 0; \
+        fi; \
+        if [ "$attempt" -eq 3 ]; then exit 1; fi; \
+        sleep 5; \
+    done) && \
+    python -m pip install --no-cache-dir "maturin==1.9.6"
+COPY docker/patch/sglang-router /tmp/router-patch
+COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
+RUN bash /tmp/build_sglang_router.sh /tmp/router-patch /opt/router-wheels
+
 FROM ${TRAIN_IMAGE} as relax
 
 WORKDIR /root
 
 ARG PATCH_VERSION=latest
 ARG ENABLE_SGLANG_PATCH=1
+ARG HYBRID_EP_COMMIT
+ENV RELAX_HYBRID_EP_COMMIT=${HYBRID_EP_COMMIT}
 
-ARG MEGATRON_BRIDGE_COMMIT=af17edf52c514c58c79cd291b04a9b42bc5c57f3
+ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
 
@@ -129,34 +181,76 @@ RUN wget -q https://github.com/apptainer/apptainer/releases/download/v1.4.1/appt
 
 COPY requirements.txt /tmp/requirements.txt
 
-RUN pip install --ignore-installed PyJWT && \
+RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq-assignment.patch \
+    pip install --no-cache-dir "ray[default,serve]==2.56.1" && \
+    pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
+    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
+    TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
 
-# sgl-router: override the official wheel (pulled by requirements.txt above) with
-# slime's r3-capable fork. The official sglang-router drops the routed_experts
-# field on the /generate round-trip, breaking R3 (rollout routing replay,
-# --use-rollout-routing-replay) with a step-0 deadlock; this fork carries the
-# `support r3` passthrough patch. Must run AFTER the requirements install so it
-# wins.
+# MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
+# Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.
+# The final stage also covers externally supplied TRAIN_IMAGE builds.
+RUN pip install --no-cache-dir \
+    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
+
+# Pin both FLA distributions in the final stage, including external TRAIN_IMAGE builds.
 RUN pip install --no-cache-dir --force-reinstall --no-deps \
-        https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl && \
-    python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
+    "fla-core==0.5.2" "flash-linear-attention==0.5.2"
+
+# Preserve small KDA gate gradients in FP32 dot products inside the backward kernel.
+COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-precision.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
+    patch --batch --forward -p1 < /tmp/fla-kda-backward-precision.patch
+
+# Install all convolution entries; each training process selects its mode at import.
+ENV RELAX_FLA_CONV_NB_MODE=auto
+COPY docker/patch/fla/0.5.2-qwen38-output-config.patch /tmp/fla-output-config.patch
+COPY docker/patch/fla/0.5.2-conv-static-entries.patch /tmp/fla-conv-entries.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-output-config.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-conv-entries.patch && \
+    python -m compileall -q fla/modules/conv/triton && \
+    rm /tmp/fla-output-config.patch /tmp/fla-conv-entries.patch
+
+# Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
+COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
+RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
+    python -c "import json, importlib.resources as r, sglang_router; from sglang_router import sglang_router_rs; \
+        b = json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()); \
+        assert sglang_router.__version__ == b['version'] == '0.3.2+slime.dpaware'; \
+        assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)" && \
+    rm -rf /tmp/router-wheels
 
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
+COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
+COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    rm megatron.patch && \
+    patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
+    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
+    sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
+    sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
+    python -m compileall -q megatron && \
+    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     cd /sgl-workspace/sglang && git add . && \
     git update-index --refresh && \
@@ -165,5 +259,37 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    rm sglang.patch; \
+    git apply --check sglang_per_pos_topk.patch && \
+    git apply sglang_per_pos_topk.patch && \
+    rm sglang.patch sglang_per_pos_topk.patch; \
 fi
+
+# Shared MCore model sources are installed above, but this CUDA 12 image retains
+# its SGLang 0.5.17/TE 2.14 runtime. The optimized 280G Blackwell TP4 recipe and Qwen3.8
+# SGLang 0.5.20 rollout require Dockerfile.cu13; Torch stays on CUDA 12.
+
+# Shared experiment fixes belong in the default CUDA 12 build as well. Keep its
+# NumPy<2, TE 2.14 and CUDA 12 libraries; do not install the 280G Blackwell cu13/v2 stack.
+COPY docker/scripts/install_legacy_fla.py \
+    docker/scripts/validate_hybridep_install.py \
+    docker/scripts/record_qwen35_runtime.py \
+    docker/scripts/validate_final_runtime.py \
+    docker/scripts/check_gpu_imports.py \
+    docker/scripts/repair_te_wheel_metadata.py /opt/relax/
+COPY docker/patch/fla/0.4.2-legacy-runtime.patch /tmp/fla042.patch
+RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2 \
+        --patch /tmp/fla042.patch --manifest /etc/relax-fla042-runtime.json && \
+    rm /tmp/fla042.patch
+COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
+COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
+COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
+# Resolve late so existing compiled layers remain cached. NIXL packages both
+# backends, but dispatches to cu12 based on Torch; this does not change CUDA.
+RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt && \
+    pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt -r /opt/relax/cu12-runtime-requirements.txt && \
+    python /opt/relax/repair_te_wheel_metadata.py /opt/relax/te-wheel-tag.patch && \
+    pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
+    pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
+    rm -r /tmp/ep-wheels && \
+    python /opt/relax/validate_hybridep_install.py && \
+    python /opt/relax/validate_final_runtime.py --profile cu12

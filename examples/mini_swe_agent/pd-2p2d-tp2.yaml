@@ -1,0 +1,23 @@
+# 8 shared GPUs: two prefill engines and two decode engines, each with TP2.
+sglang:
+  - name: default
+    num_gpus_per_engine: 2
+    engine_groups:
+      - worker_type: prefill
+        num_gpus: 4
+        overrides:
+          # Qwen3.5 no_buffer forces page_size=1 on prefill.
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          page_size: 64
+          enable_hierarchical_cache: false
+          hicache_storage_backend: null
+      - worker_type: decode
+        num_gpus: 4
+        overrides:
+          # Qwen3.5 no_buffer forces page_size=1 on prefill.
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          page_size: 64
+          enable_hierarchical_cache: false
+          hicache_storage_backend: null

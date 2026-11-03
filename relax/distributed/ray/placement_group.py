@@ -1,19 +1,24 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 import socket
+import time
 
 import ray
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from ray.util.placement_group import PlacementGroup, placement_group
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
 from relax.engine.sft.runtime import is_offline_mode
+from relax.utils import device as device_utils
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
+from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .actor_group import RayTrainGroup
 
@@ -73,6 +78,82 @@ def sort_key(x):
             node_ip_parts = [ord(c) for c in node_identifier]
 
     return (node_ip_parts, int(gpu_id))
+
+
+def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: float = 2.0) -> None:
+    """Raise if the node-group marker resources remain unavailable."""
+    required = {f"{node_group}_gpu", f"{node_group}_cpu"}
+    last_available: dict = {}
+    for attempt in range(retries):
+        cluster_resources = ray.cluster_resources()
+        last_available = cluster_resources
+        missing = {r for r in required if cluster_resources.get(r, 0) <= 0}
+        if not missing:
+            return
+        if attempt < retries - 1:
+            logger.warning(
+                f"[Affinity] Node-group marker resources {sorted(missing)} not yet present "
+                f"(attempt {attempt + 1}/{retries}); retrying in {retry_delay}s..."
+            )
+            time.sleep(retry_delay)
+
+    missing = sorted(r for r in required if last_available.get(r, 0) <= 0)
+    raise RuntimeError(
+        f"Node-group affinity is enabled (RELAX_INITIAL_NODE_GROUP='{node_group}'), but the "
+        f"required custom marker resources {missing} are not declared anywhere in this cluster. "
+        f"Baseline placement groups would hang forever waiting for them. This usually means the "
+        f"cluster has no '{node_group}' worker-group declaring '{node_group}_gpu'/'{node_group}_cpu' "
+        f"custom resources. Please check your cluster environment; if this cluster intentionally has "
+        f"no such marker resources, disable affinity by passing --no-enable-affinity."
+    )
+
+
+def create_placement_group(
+    num_gpus: int, node_group_affinity: bool = True
+) -> tuple[PlacementGroup, list[int], list[int]]:
+    """Create a packed GPU placement group with optional node-group
+    affinity."""
+    accel_resource = device_utils.get_ray_accelerator_name()
+    base_bundle = {accel_resource: 1, "CPU": 1}
+    node_group = os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip()
+    if node_group_affinity and node_group:
+        _require_node_group_markers(node_group)
+        base_bundle = {**base_bundle, f"{node_group}_gpu": 1, f"{node_group}_cpu": 1}
+    bundles = [dict(base_bundle) for _ in range(num_gpus)]
+    pg = placement_group(bundles, strategy="PACK")
+    num_bundles = len(bundles)
+    ray.get(pg.ready())
+    # use info actor to get the GPU id
+    info_actors = []
+    accelerator_kwargs = get_ray_accelerator_kwargs(1)
+    for i in range(num_bundles):
+        info_actors.append(
+            InfoActor.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=i,
+                ),
+                **accelerator_kwargs,
+            ).remote()
+        )
+    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+    for actor in info_actors:
+        ray.kill(actor)
+
+    bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
+    sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
+    pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
+    # Map from logical index -> physical GPU ID
+    pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
+
+    for i in range(num_bundles):
+        actual_bundle_index = pg_reordered_bundle_indices[i]
+        logger.info(
+            f"  bundle {i:4}, actual_bundle_index: {actual_bundle_index:4}, "
+            f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
+        )
+
+    return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
 
 
 def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):

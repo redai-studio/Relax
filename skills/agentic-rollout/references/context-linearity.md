@@ -68,8 +68,9 @@ For changing tools:
   design.
 
 Implicit export is reserved for an audited strictly linear history. Any retained nonlinear topology uses explicit
-export. Explicit records use canonical Chat-shaped messages and tools even when requests used Responses or Messages.
-Multiple exported contexts require custom advantage and dynamic batching.
+export. Custom advantage uses named explicit export records. Explicit records use canonical Chat-shaped messages and
+tools even when requests used Responses or Messages. Multiple exported contexts require custom advantage and dynamic
+batching.
 
 ## Audit output
 

@@ -27,7 +27,7 @@ Start every response with the current stage letter and name, evidence available,
 - Treat reasoning and tool-call parsers as part of the model/chat-template contract. A basic text response does not
   prove parser compatibility.
 - Distinguish logical prompt Groups, resident Sessions, model requests, exported contexts, and physical training rows.
-- Apply export, credit, and dynamic-batching rules to exported contexts per Session. The number of resident Sessions is a different dimension.
+- Apply export, advantage, and dynamic-batching rules to exported contexts per Session. The number of resident Sessions is a different dimension.
 - Choosing resident Agentic rollout (`--use-agentic-rollout`) gives Agentic ownership of train and Eval generation;
   `--custom-generate-function-path` is ignored on this path.
 - Distinguish the timeout of each Relax-facing model API request from `--agent-timeout`. The former must let one request
@@ -93,12 +93,15 @@ Enter only when the user asks for implementation and Stage A has no unresolved b
    for empty tool results, and reuse the canonical payload in later turns and explicit export.
 7. Configure `--agentic-reasoning-parser` and `--agentic-tool-call-parser` when required by the verified model/template
    format. Do not copy parser names from a different model recipe.
-8. Use [agentic-training-contract.md](references/agentic-training-contract.md) for export, credit, logical identity, and dynamic-batching decisions. Implicit export is reserved for audited linear history; nonlinear history requires explicit export.
+8. Use [agentic-training-contract.md](references/agentic-training-contract.md) for export, advantage, logical identity, and dynamic-batching decisions. Nonlinear history requires explicit export. Custom advantage uses named explicit export records.
    Explicit export remains canonical Chat-shaped `messages`, nested function `tools`, and `chat_template_kwargs`
    regardless of the request protocol.
-9. Define reward ownership. One exported context needs an exported reward or configured reward producer. Multiple
-   exported contexts require `--agentic-custom-advantage-path` and dynamic batching; ordinarily avoid
-   `--custom-rm-path` in this mode.
+   Custom advantage returns `None` or a list with one result mapping per sampled Session. In each mapping, an export's
+   advantage is a scalar shared by all assistant turns or a list with one value per assistant turn. Keep every normalization
+   input in export metadata.
+9. Decide where reward and advantages come from. For one implicitly exported context, write `reward` in the agent
+   output or configure `--custom-rm-path`. When using `--agentic-custom-advantage-path`, use explicit export and keep its
+   inputs in export metadata. Multiple exported contexts require custom advantage and dynamic batching.
 10. Keep the change at the adapter and recipe boundary unless the verified contract requires a core `relax/agentic/**` change.
 
 Start with:
@@ -124,7 +127,7 @@ Goal: produce a launch verdict without starting the job.
    large enough to approach or exceed a fixed internal width or known validated scale envelope.
    Otherwise report `Internal scale: N/A`; prelaunch, production use, or a "large-scale" label alone does not activate
    this check.
-7. When the agent uses explicit export, nonlinear history, multiple contexts, custom credit, `--log-passrate`, a reward
+7. When the agent uses explicit export, nonlinear history, multiple contexts, custom advantage, `--log-passrate`, a reward
    object or `--reward-key`, a configured RM, or `--group-rm`, read
    [agentic-training-contract.md](references/agentic-training-contract.md).
 8. Read [runtime-operations.md](references/runtime-operations.md). Verify protocol and transport compatibility, the
@@ -146,7 +149,7 @@ Internal scale: PASS | UNSAFE | UNVERIFIED | N/A
 Internal width changes: N/A | see conditional large-scale result
 Relax-facing per-request timeout: PASS | UNSAFE | UNVERIFIED
 Reasoning/tool-call parsers: PASS | NEEDS_CHANGES | UNVERIFIED | N/A
-Export/credit/batching: PASS | NEEDS_CHANGES | UNVERIFIED
+Export/advantage/batching: PASS | NEEDS_CHANGES | UNVERIFIED
 Required slots:
 Configured slots:
 Blocking items:
@@ -164,7 +167,7 @@ Validate in order:
    usage, and protocol-specific JSON or Buffered SSE terminal shape in the Relax response;
 3. request payloads preserve context lineage and stable tools/template arguments;
 4. SessionForest commits the intended leaf or branches;
-5. export, reward, and custom credit match the selected contexts; if custom advantage can return `None`, the whole-Group drop and replenishment path is observed;
+5. export, reward, and custom advantage match the selected contexts; if custom advantage can return `None`, the whole-Group drop and replenishment path is observed;
 6. agent and external resources clean up;
 7. a meaningful multi-sample run reaches transfer and an optimizer step;
 8. partial/resume or Eval overlap behavior is exercised when configured.
@@ -196,5 +199,5 @@ Stay in Agentic diagnosis for context mismatches, external slot exhaustion, firs
 - [parameter-preflight.md](references/parameter-preflight.md): effective Agentic flags, dependencies, and evidence
 - [resident-lifecycle.md](references/resident-lifecycle.md): resident Group and Session lifecycle
 - [partial-and-async-lifecycle.md](references/partial-and-async-lifecycle.md): cross-step park, resume, protection, and close semantics
-- [agentic-training-contract.md](references/agentic-training-contract.md): Agentic export fanout, identity, credit, Eval, and batching
+- [agentic-training-contract.md](references/agentic-training-contract.md): Agentic export fanout, identity, advantage, Eval, and batching
 - [runtime-operations.md](references/runtime-operations.md): process, API, timeout, optional controls, errors, and evidence

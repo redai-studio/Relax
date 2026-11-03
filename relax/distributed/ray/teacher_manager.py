@@ -4,8 +4,8 @@
 import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
-from relax.core.service import create_placement_group
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
+from relax.distributed.ray.placement_group import create_placement_group
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.utils.env import Envs
@@ -35,12 +35,9 @@ def _resolve_teacher_gpu_index(
 
 def _build_teacher_engine_env(args) -> dict[str, str]:
     env_vars = dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1") | {
-        # OPD patches default off; enabled only when the corresponding env flag is
-        # passed through from the driver. RELAX_OPD_PREEXPANDED_PATCH affects the
-        # teacher engine only; RELAX_OPD_PER_POS_TOKEN_IDS affects teacher + student.
-        "RELAX_OPD_PREEXPANDED_PATCH": str(int(Envs.RELAX_OPD_PREEXPANDED_PATCH)),
+        # Native multimodal OPD must preserve the supplied response token IDs.
+        "SGLANG_MM_AVOID_RETOKENIZE": "true",
         "RELAX_OPD_PER_POS_TOKEN_IDS": str(int(Envs.RELAX_OPD_PER_POS_TOKEN_IDS)),
-        "RELAX_OPD_TOKEN_IDS_LOGPROB_K": Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
         "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
@@ -70,6 +67,12 @@ class TeacherManager(MultiEngineManager):
     ) -> None:
         assert num_replicas >= 1, f"num_replicas must be >= 1, got {num_replicas}."
         assert gpus_per_replica > 0, f"gpus_per_replica must be > 0, got {gpus_per_replica}."
+        if gpus_per_replica > args.num_gpus_per_node:
+            assert gpus_per_replica % args.num_gpus_per_node == 0, (
+                f"Multi-node teacher GPUs ({gpus_per_replica}) must be divisible by "
+                f"num_gpus_per_node ({args.num_gpus_per_node})."
+            )
+        nodes_per_engine = max(1, gpus_per_replica // args.num_gpus_per_node)
         if shared_pg:
             assert pg is not None, "shared_pg=True requires the full actor/rollout placement group."
             _pg, bundle_indices, gpu_ids = pg
@@ -90,14 +93,14 @@ class TeacherManager(MultiEngineManager):
         self._teacher_args = build_teacher_engine_args(args, overrides)
         logger.info(
             f"[OPD teacher] launching {num_replicas} replica(s), "
-            f"TP={gpus_per_replica}, model={overrides['model_path']}, "
+            f"TP={gpus_per_replica}, nodes_per_engine={nodes_per_engine}, model={overrides['model_path']}, "
             f"shared_pg={shared_pg}, mem_fraction_static={overrides.get('mem_fraction_static')}"
         )
 
         super().__init__(
             args,
-            num_slots=num_replicas,
-            nodes_per_engine=1,
+            num_slots=num_replicas * nodes_per_engine,
+            nodes_per_engine=nodes_per_engine,
             engine_actor_cls=SGLangEngine,
             log_prefix="[OPD teacher]",
         )
@@ -130,7 +133,8 @@ class TeacherManager(MultiEngineManager):
     # ------------------------------------------------------------------
 
     def _resolve_placement(self, rank: int):
-        replica = rank
+        replica = rank // self.nodes_per_engine
+        node_gpu_offset = (rank % self.nodes_per_engine) * self.args.num_gpus_per_node
         if self._shared_pg:
             # Colocate: teachers share the actor placement group, which the
             # controller owns and removes → owns_pg=False.
@@ -141,20 +145,24 @@ class TeacherManager(MultiEngineManager):
                 shared_pg=True,
                 bundle_offset=self._bundle_offset,
             )
-            return self._shared_pg_tuple, False, gpu_index
+            return self._shared_pg_tuple, False, gpu_index + node_gpu_offset
 
-        # Dedicated: this replica creates and owns its own placement group.
-        pg_tuple = create_placement_group(
-            num_gpus=self.gpus_per_replica,
-            node_group_affinity=getattr(self.args, "enable_affinity", True),
-        )
+        # Only the replica head owns its PG; follower slots borrow that same PG.
+        owns_pg = rank % self.nodes_per_engine == 0
+        if owns_pg:
+            pg_tuple = create_placement_group(
+                num_gpus=self.gpus_per_replica,
+                node_group_affinity=getattr(self.args, "enable_affinity", True),
+            )
+        else:
+            pg_tuple = self._engine_placements[replica * self.nodes_per_engine][0]
         gpu_index = _resolve_teacher_gpu_index(
             args=self.args,
             replica=replica,
             gpus_per_replica=self.gpus_per_replica,
             shared_pg=False,
         )
-        return pg_tuple, True, gpu_index
+        return pg_tuple, owns_pg, gpu_index + node_gpu_offset
 
     def _ray_resource_kwargs(self, rank: int) -> dict:
         return {"num_cpus": 0.2, "num_gpus": 0.2}
@@ -185,6 +193,7 @@ class TeacherManager(MultiEngineManager):
 
     def _allocate_engine_addr_and_ports(self, *, new_engines: list[tuple]) -> dict[int, dict]:
         addr_and_ports: dict[int, dict] = {}
+        unallocated_replicas: dict[int, list[tuple]] = {}
         for rank, engine in new_engines:
             # OPD consumers receive teacher URLs once during startup. Preserve
             # the original endpoint across recovery instead of silently moving
@@ -192,14 +201,16 @@ class TeacherManager(MultiEngineManager):
             if self._shared_pg and rank in self._engine_addr_and_ports:
                 addr_and_ports[rank] = dict(self._engine_addr_and_ports[rank])
                 continue
+            unallocated_replicas.setdefault(rank // self.nodes_per_engine, []).append((rank, engine))
+        for replica, engines in unallocated_replicas.items():
             base_port = find_available_port(15000)
             per_engine_addr_and_ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
                 args=self._teacher_args,
-                rollout_engines=[(0, engine)],
+                rollout_engines=engines,
                 worker_type="regular",
                 num_gpus_per_engine=self.gpus_per_replica,
-                rank_offset=0,
+                rank_offset=replica * self.nodes_per_engine,
                 base_port=base_port,
             )
-            addr_and_ports[rank] = per_engine_addr_and_ports[0]
+            addr_and_ports.update({rank: per_engine_addr_and_ports[rank] for rank, _ in engines})
         return addr_and_ports

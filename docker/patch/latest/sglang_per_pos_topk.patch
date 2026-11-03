@@ -1,311 +1,190 @@
-diff --git a/python/sglang/srt/layers/utils/logprob.py b/python/sglang/srt/layers/utils/logprob.py
-index 3b14b25..f98ab15 100644
---- a/python/sglang/srt/layers/utils/logprob.py
-+++ b/python/sglang/srt/layers/utils/logprob.py
-@@ -154,9 +154,26 @@ def get_token_ids_logprobs_raw(
+diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/layers/logprob_processor.py
+--- a/python/sglang/srt/layers/logprob_processor.py
++++ b/python/sglang/srt/layers/logprob_processor.py
+@@ -123,6 +123,8 @@
+                 vals.append([])
+                 idxs.append([])
+             else:
++                if token_ids and isinstance(token_ids[0], list):
++                    token_ids = token_ids[-1]
+                 token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
+                     logprobs.device, non_blocking=True
+                 )
+@@ -147,9 +149,15 @@
              token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
                  logprobs.device, non_blocking=True
              )
 -            pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
--            vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
--            idxs.append([token_ids for _ in range(pruned_len)])
-+            # Per-position token IDs: when len(token_ids) == pruned_len * K,
-+            # each position has K token IDs. Use batch gather to avoid
-+            # creating a [pruned_len, K*pruned_len] tensor (OOM with large K).
-+            if (
-+                pruned_len > 0
-+                and len(token_ids) % pruned_len == 0
-+                and len(token_ids) != pruned_len
-+            ):
-+                K = len(token_ids) // pruned_len
-+                ids_2d = token_ids_tensor.view(pruned_len, K)
-+                seg = logprobs[pt : pt + pruned_len]  # [pruned_len, vocab]
-+                pos_logprobs = torch.gather(seg, 1, ids_2d)  # [pruned_len, K]
-+                vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
-+                idxs.append(
-+                    [token_ids[j * K : (j + 1) * K] for j in range(pruned_len)]
-+                )
++            if token_ids_tensor.ndim == 2:
++                assert token_ids_tensor.shape[0] == pruned_len
++                pos_logprobs = torch.gather(logprobs[pt : pt + pruned_len], 1, token_ids_tensor)
++                row_ids = token_ids
 +            else:
 +                pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
-+                vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
-+                idxs.append([token_ids for _ in range(pruned_len)])
++                row_ids = [token_ids for _ in range(pruned_len)]
+             vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
+-            idxs.append([token_ids for _ in range(pruned_len)])
++            idxs.append(row_ids)
              pt += pruned_len
      return vals, idxs
-
-diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 51e5669..fe014d6 100644
---- a/python/sglang/srt/managers/io_struct.py
-+++ b/python/sglang/srt/managers/io_struct.py
-@@ -165,6 +165,8 @@ class GenerateReqInput(BaseReq):
-     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
-     # Whether to detokenize tokens in text in the returned logprobs.
-     return_text_in_logprobs: bool = False
-+    # Whether to return logprob arrays as base64 binary (for compact transfer).
-+    return_logprobs_in_base64: bool = False
-     # Whether to stream output.
-     stream: bool = False
-     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
-@@ -648,6 +650,7 @@ class GenerateReqInput(BaseReq):
-             top_logprobs_num=self.top_logprobs_num[i],
-             token_ids_logprob=self.token_ids_logprob[i],
-             return_text_in_logprobs=self.return_text_in_logprobs,
-+            return_logprobs_in_base64=self.return_logprobs_in_base64,
-             stream=self.stream,
-             log_metrics=self.log_metrics,
-             return_hidden_states=(
-@@ -727,6 +730,8 @@ class TokenizedGenerateReqInput(BaseReq):
-     token_ids_logprob: List[int]
-     # Whether to stream output
-     stream: bool
-+    # Whether to return logprob arrays as base64 binary (see GenerateReqInput)
-+    return_logprobs_in_base64: bool = False
-
-     # Whether to return hidden states
-     return_hidden_states: bool = False
+ 
+@@ -279,14 +287,24 @@
+         # Get the token ids logprobs
+         val = []
+         idx = []
+-        for j in range(pruned_len):
+-            # Handle remaining tokens in next chunk if any
+-            if pt + j >= logprobs.shape[0]:
+-                next_split_pruned_len = split_pruned_len + j
+-                break
+-            if token_ids is not None:
+-                val.append(logprobs[pt + j, token_ids].tolist())
+-                idx.append(token_ids)
++        if token_ids and isinstance(token_ids[0], list):
++            assert len(token_ids) == pruned_len + split_pruned_len
++            take = min(pruned_len, max(logprobs.shape[0] - pt, 0))
++            idx = token_ids[split_pruned_len : split_pruned_len + take]
++            if take:
++                query = torch.tensor(idx, dtype=torch.long, device=logprobs.device)
++                val = torch.gather(logprobs[pt : pt + take], 1, query).tolist()
++            if take < pruned_len:
++                next_split_pruned_len = split_pruned_len + take
++        else:
++            for j in range(pruned_len):
++                # Handle remaining tokens in next chunk if any
++                if pt + j >= logprobs.shape[0]:
++                    next_split_pruned_len = split_pruned_len + j
++                    break
++                if token_ids is not None:
++                    val.append(logprobs[pt + j, token_ids].tolist())
++                    idx.append(token_ids)
+ 
+         # Split-sequence continuations extend; everyone else owns a fresh
+         # (possibly empty) entry.
+@@ -597,6 +615,9 @@
+         # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
+         # indices = [[1, 3], [2], [0, 2, 4]]
+     """
++    # Prefill-only requests still score a final sampling position. Nested
++    # queries describe the prefill rows; only the final dummy row belongs here.
++    token_ids_logprobs = [ids[-1] if ids and isinstance(ids[0], list) else ids for ids in token_ids_logprobs]
+     batch_size = len(token_ids_logprobs)
+     device = logprobs.device
+ 
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 28b189c..453f217 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -38,6 +38,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
- import copy
- import dataclasses
- import logging
-+import os
- import re
- from concurrent.futures import Future
- from enum import Enum, auto
-@@ -1961,7 +1962,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-
+@@ -2517,7 +2517,24 @@
+ 
          if self.return_logprob:
-             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
--            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
-+            # OPD per-pos topk: slice token_ids_logprob for chunked prefill.
-+            # Relax sends a flat [total_positions * K] array. With chunked
-+            # prefill, pruned_len < total_positions, so we must slice to
-+            # [pruned_len * K] for the current chunk. K is passed via env var
-+            # RELAX_OPD_TOKEN_IDS_LOGPROB_K (Rust router strips payload fields).
-+            opd_k = int(os.environ.get("RELAX_OPD_TOKEN_IDS_LOGPROB_K", "0"))
-+            chunked_token_ids_logprobs: list = []
-+            for req in reqs:
-+                full_ids = req.token_ids_logprob
-+                if full_ids is None or opd_k <= 0:
-+                    chunked_token_ids_logprobs.append(full_ids)
+             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+-            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
++            self.token_ids_logprobs = []
++            for i, req in enumerate(reqs):
++                ids = req.logprob.token_ids_logprob
++                opd_k = (req.sampling_params.custom_params or {}).get("relax_opd_token_ids_logprob_k")
++                if opd_k is None:
++                    self.token_ids_logprobs.append(ids)
 +                    continue
-+                pruned_len = req.extend_input_len - req.extend_logprob_start_len
-+                if pruned_len <= 0:
-+                    chunked_token_ids_logprobs.append(full_ids)
++                rows = req.extend_range.length - extend_logprob_start_lens[i]
++                if rows == 0:
++                    self.token_ids_logprobs.append([])
 +                    continue
-+                total_positions = len(full_ids) // opd_k
-+                if total_positions == pruned_len:
-+                    chunked_token_ids_logprobs.append(full_ids)
-+                    continue
-+                # Chunked prefill: compute position offset
-+                if req.logprob_start_len == -1:
-+                    abs_start = len(req.origin_input_ids)
-+                else:
-+                    abs_start = req.logprob_start_len
-+                pos_off = len(req.prefix_indices) + req.extend_logprob_start_len - abs_start
-+                if pos_off < 0:
-+                    pos_off = 0
-+                start = pos_off * opd_k
-+                end = start + pruned_len * opd_k
-+                if 0 <= start < end <= len(full_ids):
-+                    chunked_token_ids_logprobs.append(full_ids[start:end])
-+                else:
-+                    chunked_token_ids_logprobs.append(full_ids)
-+            self.token_ids_logprobs = chunked_token_ids_logprobs
-
-         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
++                first = len(req.prefix_indices) + extend_logprob_start_lens[i] - req.logprob_start_len
++                assert 0 <= first and (first + rows) * opd_k <= len(ids)
++                # A nested query is unambiguously per-position, including K=1.
++                # Keep the complete request query intact for subsequent chunks.
++                self.token_ids_logprobs.append(
++                    [ids[j * opd_k : (j + 1) * opd_k] for j in range(first, first + rows)]
++                )
+ 
+         self.extend_logprob_start_lens = extend_logprob_start_lens
          self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
-diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-index 496e7bc..4deb670 100644
---- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-+++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-@@ -1,6 +1,7 @@
- from __future__ import annotations
-
- import logging
-+import os
- from typing import TYPE_CHECKING, List, Optional, Tuple, Union
-
- import torch
-@@ -227,7 +228,7 @@ class SchedulerOutputProcessorMixin:
-                     ]
-                 if logits_output.next_token_token_ids_logprobs_val:
-                     logits_output.next_token_token_ids_logprobs_val = [
--                        v.tolist()
-+                        v.tolist() if torch.is_tensor(v) else v
-                         for v in logits_output.next_token_token_ids_logprobs_val
-                     ]
-
-@@ -505,7 +506,7 @@ class SchedulerOutputProcessorMixin:
-
-                 if logits_output.next_token_token_ids_logprobs_val:
-                     logits_output.next_token_token_ids_logprobs_val = [
--                        v.tolist()
-+                        v.tolist() if torch.is_tensor(v) else v
-                         for v in logits_output.next_token_token_ids_logprobs_val
-                     ]
-         # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
-@@ -1174,11 +1175,19 @@ class SchedulerOutputProcessorMixin:
-                         input_token_logprobs_idx.append(req.input_token_logprobs_idx)
-                         input_top_logprobs_val.append(req.input_top_logprobs_val)
-                         input_top_logprobs_idx.append(req.input_top_logprobs_idx)
-+                        # Source-side drop: when RELAX_FORCE_LOGPROBS_BASE64=1,
-+                        # idx is needed for safe decoding; otherwise drop to
-+                        # save IPC payload.
-+                        _drop_tid_idx = (
-+                            req.token_ids_logprob is not None
-+                            and not getattr(req, "return_text_in_logprobs", False)
-+                            and os.environ.get("RELAX_FORCE_LOGPROBS_BASE64", "0") == "1"
-+                        )
-                         input_token_ids_logprobs_val.append(
-                             req.input_token_ids_logprobs_val
-                         )
-                         input_token_ids_logprobs_idx.append(
--                            req.input_token_ids_logprobs_idx
-+                            [] if _drop_tid_idx else req.input_token_ids_logprobs_idx
-                         )
-                         req.input_logprob_sent = True
-                     else:
-@@ -1216,8 +1225,16 @@ class SchedulerOutputProcessorMixin:
-                                 send_output_token_logprobs_offset:logprob_end
-                             ]
-                         )
-+                        # Source-side drop (see the input block above for rationale).
-+                        _drop_tid_idx = (
-+                            req.token_ids_logprob is not None
-+                            and not getattr(req, "return_text_in_logprobs", False)
-+                            and os.environ.get("RELAX_FORCE_LOGPROBS_BASE64", "0") == "1"
-+                        )
-                         output_token_ids_logprobs_idx.append(
--                            req.output_token_ids_logprobs_idx[
-+                            []
-+                            if _drop_tid_idx
-+                            else req.output_token_ids_logprobs_idx[
-                                 send_output_token_logprobs_offset:logprob_end
-                             ]
-                         )
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 3fc175e..48ae2da 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1702,6 +1702,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-                     and not self.server_args.skip_tokenizer_init,
-                     recv_obj,
-                     i,
-+                    getattr(state.obj, "return_logprobs_in_base64", False),
-                 )
-
-             if not isinstance(recv_obj, BatchEmbeddingOutput):
-@@ -2001,6 +2002,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-         return_text_in_logprobs: bool,
-         recv_obj: BatchStrOutput,
-         recv_obj_index: int,
-+        return_logprobs_in_base64: bool = False,
-     ):
-         if recv_obj.input_token_logprobs_val is None:
-             return
-@@ -2052,6 +2054,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-                 recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
-             )
-
-+        if return_logprobs_in_base64:
-+            self._add_logprob_to_meta_info_base64(
-+                meta_info, state, top_logprobs_num, token_ids_logprob,
-+            )
-+            return
-+
-         self.add_logprob_to_meta_info(
-             meta_info,
-             state,
-@@ -2060,6 +2068,73 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-             return_text_in_logprobs,
-         )
-
-+    @staticmethod
-+    def _encode_flat_b64(flat_vals, dtype_str):
-+        """Encode a flat list of scalars into a base64 string of the given dtype."""
-+        import numpy as np
-+        import pybase64
-+
-+        arr = np.asarray(flat_vals, dtype=np.dtype(dtype_str))
-+        return pybase64.b64encode(arr.tobytes()).decode("utf-8")
-+
-+    def _add_logprob_to_meta_info_base64(
-+        self,
-+        meta_info: dict,
-+        state: ReqState,
-+        top_logprobs_num: int,
-+        token_ids_logprob: List[int],
-+    ):
-+        """Base64 fast path: emit flat val/idx arrays as base64 strings.
-+
-+        Reads from ``state`` (accumulated across all chunks) so that long
-+        sequences split across multiple chunked-prefill / decode batches
-+        produce the FULL logprob array, not just the last chunk.
-+        """
-+        def _flatten_pos_list(pos_list):
-+            if not pos_list:
-+                return [], []
-+            flat, lens = [], []
-+            for pos in pos_list:
-+                if pos:
-+                    flat.extend(pos)
-+                    lens.append(len(pos))
-+                else:
-+                    lens.append(0)
-+            return flat, lens
-+
-+        in_val = state.input_token_logprobs_val or []
-+        in_idx = state.input_token_logprobs_idx or []
-+        out_val = state.output_token_logprobs_val or []
-+        out_idx = state.output_token_logprobs_idx or []
-+        meta_info["input_token_logprobs_val_b64"] = self._encode_flat_b64(in_val, "float32")
-+        meta_info["input_token_logprobs_idx_b64"] = self._encode_flat_b64(in_idx, "int32")
-+        meta_info["output_token_logprobs_val_b64"] = self._encode_flat_b64(out_val, "float32")
-+        meta_info["output_token_logprobs_idx_b64"] = self._encode_flat_b64(out_idx, "int32")
-+
-+        if top_logprobs_num > 0:
-+            in_flat_v, in_k = _flatten_pos_list(state.input_top_logprobs_val or [])
-+            in_flat_i, _ = _flatten_pos_list(state.input_top_logprobs_idx or [])
-+            out_flat_v, out_k = _flatten_pos_list(state.output_top_logprobs_val or [])
-+            out_flat_i, _ = _flatten_pos_list(state.output_top_logprobs_idx or [])
-+            meta_info["input_top_logprobs_val_b64"] = self._encode_flat_b64(in_flat_v, "float32")
-+            meta_info["input_top_logprobs_idx_b64"] = self._encode_flat_b64(in_flat_i, "int32")
-+            meta_info["input_top_logprobs_k"] = in_k
-+            meta_info["output_top_logprobs_val_b64"] = self._encode_flat_b64(out_flat_v, "float32")
-+            meta_info["output_top_logprobs_idx_b64"] = self._encode_flat_b64(out_flat_i, "int32")
-+            meta_info["output_top_logprobs_k"] = out_k
-+
-+        if token_ids_logprob is not None:
-+            in_flat_v, in_tid_len = _flatten_pos_list(state.input_token_ids_logprobs_val or [])
-+            in_flat_i, _ = _flatten_pos_list(state.input_token_ids_logprobs_idx or [])
-+            out_flat_v, out_tid_len = _flatten_pos_list(state.output_token_ids_logprobs_val or [])
-+            out_flat_i, _ = _flatten_pos_list(state.output_token_ids_logprobs_idx or [])
-+            meta_info["input_token_ids_logprobs_val_b64"] = self._encode_flat_b64(in_flat_v, "float32")
-+            meta_info["input_token_ids_logprobs_idx_b64"] = self._encode_flat_b64(in_flat_i, "int32")
-+            meta_info["input_token_ids_logprobs_len"] = in_tid_len
-+            meta_info["output_token_ids_logprobs_val_b64"] = self._encode_flat_b64(out_flat_v, "float32")
-+            meta_info["output_token_ids_logprobs_idx_b64"] = self._encode_flat_b64(out_flat_i, "int32")
-+            meta_info["output_token_ids_logprobs_len"] = out_tid_len
-+
-     def detokenize_logprob_tokens(
-         self,
-         token_logprobs_val: List[float],
-@@ -2591,6 +2666,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-         for rid, sub_obj, bootstrap_room in items:
-             if rid in self.rid_to_state:
-                 raise ValueError(f"Duplicate request ID detected: {rid}")
-+            # Environment override: force base64 logprob path. Rust router
-+            # discards return_logprobs_in_base64 during re-serialization, so
-+            # we set it here on the server side to ensure the base64 path
-+            # is always taken when the env var is enabled.
+@@ -1340,6 +1340,35 @@
+         sampling_params.normalize(self.tokenizer)
+         sampling_params.verify(self.model_config.vocab_size)
+ 
++        # Relax OPD queries K different token IDs at each prefill position.
++        # Validate after multimodal expansion and before scheduler admission.
++        opd_k = (sampling_params.custom_params or {}).get("relax_opd_token_ids_logprob_k")
++        if opd_k is not None:
++            if isinstance(opd_k, bool) or not isinstance(opd_k, int) or opd_k <= 0:
++                raise ValueError("relax_opd_token_ids_logprob_k must be a positive integer")
 +            if (
-+                os.environ.get("RELAX_FORCE_LOGPROBS_BASE64", "0") == "1"
-+                and hasattr(sub_obj, "return_logprobs_in_base64")
++                not isinstance(obj, GenerateReqInput)
++                or not obj.return_logprob
++                or sampling_params.max_new_tokens != 0
++                or input_ids is None
++                or obj.logprob_start_len is None
++                or not 0 <= obj.logprob_start_len < len(input_ids)
 +            ):
-+                sub_obj.return_logprobs_in_base64 = True
-             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
-             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
-             self.rid_to_state[rid] = state
++                raise ValueError("Per-position OPD queries require prefill-only input logprobs with a valid start")
++            query_ids = obj.token_ids_logprob
++            expected = (len(input_ids) - obj.logprob_start_len) * opd_k
++            if (
++                not isinstance(query_ids, list)
++                or len(query_ids) != expected
++                or any(
++                    isinstance(token, bool)
++                    or not isinstance(token, int)
++                    or not 0 <= token < self.model_config.vocab_size
++                    for token in query_ids
++                )
++            ):
++                raise ValueError(f"Per-position OPD query must contain exactly {expected} valid token IDs")
++
+         # Build return object
+         if isinstance(obj, GenerateReqInput):
+             session_params = (
+@@ -2486,6 +2515,9 @@
+         token_ids_logprob: List[int],
+         return_text_in_logprobs: bool,
+     ):
++        if os.environ.get("RELAX_FORCE_LOGPROBS_BASE64", "0") == "1" and not return_text_in_logprobs:
++            self._add_relax_logprob_base64(meta_info, state, top_logprobs_num, token_ids_logprob)
++            return
+         # 1. Handle regular logprobs
+         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
+             state.input_token_logprobs.extend(
+@@ -2619,6 +2651,38 @@
+             meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
+             meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
+ 
++    @staticmethod
++    def _add_relax_logprob_base64(meta_info, state, top_k, query_ids):
++        """Compact OPD transport, retaining IDs needed for alignment checks."""
++        def encode(values, dtype):
++            return pybase64.b64encode(np.asarray(values, dtype=dtype).tobytes()).decode("ascii")
++
++        def pack_rows(prefix, values, ids, length_suffix):
++            lengths = [len(row) if row else 0 for row in values]
++            flat_values = [value for row in values if row for value in row]
++            flat_ids = [token for row in ids if row for token in row]
++            meta_info[f"{prefix}_val_b64"] = encode(flat_values, "float32")
++            meta_info[f"{prefix}_idx_b64"] = encode(flat_ids, "int32")
++            meta_info[f"{prefix}_{length_suffix}"] = lengths
++
++        for side in ("input", "output"):
++            prefix = f"{side}_token_logprobs"
++            meta_info[f"{prefix}_val_b64"] = encode(getattr(state, f"{prefix}_val"), "float32")
++            meta_info[f"{prefix}_idx_b64"] = encode(getattr(state, f"{prefix}_idx"), "int32")
++            if top_k > 0:
++                prefix = f"{side}_top_logprobs"
++                if side == "input" and state.input_top_logprobs_scheduler_flat is not None:
++                    values, ids, null_prefix = state.input_top_logprobs_scheduler_flat
++                    meta_info[f"{prefix}_val_b64"] = encode(values, "float32")
++                    meta_info[f"{prefix}_idx_b64"] = encode(ids, "int32")
++                    meta_info[f"{prefix}_k"] = [0] * null_prefix + [top_k] * len(values)
++                else:
++                    pack_rows(prefix, getattr(state, f"{prefix}_val"), getattr(state, f"{prefix}_idx"), "k")
++            if query_ids is not None:
++                prefix = f"{side}_token_ids_logprobs"
++                pack_rows(prefix, getattr(state, f"{prefix}_val"), getattr(state, f"{prefix}_idx"), "len")
++        meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs_val)
++
+     def convert_logprob_style(
+         self,
+         meta_info: dict,

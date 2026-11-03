@@ -131,7 +131,13 @@ def add_generative_arguments(parser: ArgumentParser) -> ArgumentParser:
     group = parser.add_argument_group("generative")
 
     # Task & model
-    group.add_argument("--generation-task", type=str, default=None, choices=[None, *GENERATION_TASKS])
+    group.add_argument("--generation-task", type=str, default=None, choices=[None, *GENERATION_TASKS, "i2i"])
+    group.add_argument(
+        "--i2i-sft-config",
+        type=json.loads,
+        default=None,
+        help="Image SFT JSON: data_root, dataset_size, max_pixels, conditioning_images, attention settings.",
+    )
     group.add_argument("--model-path", type=str, default=None, help="HF-format model directory for the adapter.")
     group.add_argument("--model-revision", type=str, default=None)
     group.add_argument(
@@ -302,6 +308,10 @@ def validate_generative_config(args: Namespace) -> None:
     by the runtime.
     """
     if getattr(args, "train_backend", "megatron") != "fsdp":
+        return
+
+    if getattr(args, "loss_type", None) == "sft":
+        validate_i2i_sft_config(args)
         return
 
     errors: List[str] = []
@@ -619,3 +629,168 @@ def validate_generative_config(args: Namespace) -> None:
 
     if errors:
         raise ValueError("Generative RL config validation failed:\n  - " + "\n  - ".join(errors))
+
+
+def validate_i2i_sft_config(args: Namespace) -> None:
+    """Validate supervision independently of rollout/reward configuration."""
+    errors: list[str] = []
+    _fail(errors, getattr(args, "generation_task", None) != "i2i", "FSDP SFT currently supports generation_task=i2i.")
+    for field in ("model_path", "prompt_data"):
+        _fail(errors, not getattr(args, field, None), f"Image SFT requires --{field.replace('_', '-')}.")
+    config = getattr(args, "i2i_sft_config", None)
+    if not isinstance(config, dict):
+        raise ValueError("Image SFT requires --i2i-sft-config with data_root and dataset_size")
+    defaults = {
+        "max_pixels": 1048576,
+        "conditioning_images": 1,
+        "attention_implementation": "flash_attention_2",
+        "deterministic_attention": False,
+        "prefix_gradient_checkpointing": True,
+        "fixed_pixels_tiers": None,
+        "seed": None,
+    }
+    unknown = (
+        set(config)
+        - set(defaults)
+        - {
+            "data_root",
+            "dataset_size",
+            "image_prefetch_depth",
+            "image_prefetch_workers",
+            "dp_tier_micro_balance",
+            "dp_tier_rank_rotation",
+        }
+    )
+    _fail(errors, bool(unknown), f"Unknown i2i_sft_config keys: {sorted(unknown)}")
+    args.i2i_sft_config = config = {**defaults, **config}
+    depth, workers = config.get("image_prefetch_depth", 0), config.get("image_prefetch_workers", 2)
+    _fail(errors, type(depth) is not int or depth < 0, "image_prefetch_depth must be a nonnegative integer")
+    _fail(errors, type(workers) is not int or workers <= 0, "image_prefetch_workers must be a positive integer")
+    _fail(
+        errors, type(config.get("dp_tier_micro_balance", False)) is not bool, "dp_tier_micro_balance must be boolean"
+    )
+    # Explicit false has the same checkpoint contract as historical absence.
+    if config.get("dp_tier_micro_balance") is False:
+        config.pop("dp_tier_micro_balance")
+    _fail(
+        errors, type(config.get("dp_tier_rank_rotation", False)) is not bool, "dp_tier_rank_rotation must be boolean"
+    )
+    _fail(
+        errors,
+        config.get("dp_tier_rank_rotation", False) and not config.get("dp_tier_micro_balance", False),
+        "dp_tier_rank_rotation requires dp_tier_micro_balance",
+    )
+    if config.get("dp_tier_rank_rotation") is False:
+        config.pop("dp_tier_rank_rotation")
+    _fail(
+        errors,
+        not isinstance(config.get("data_root"), str) or not config.get("data_root"),
+        "i2i_sft_config.data_root must be a non-empty path",
+    )
+    for field in ("dataset_size", "max_pixels", "conditioning_images"):
+        value = config.get(field)
+        _fail(errors, type(value) is not int or value <= 0, f"i2i_sft_config.{field} must be a positive integer")
+    _fail(errors, config["conditioning_images"] not in (1, 2), "conditioning_images must be 1 or 2")
+    _fail(
+        errors,
+        config["attention_implementation"] not in ("flash_attention_2", "torch"),
+        "Unsupported image attention implementation",
+    )
+    _fail(errors, type(config["deterministic_attention"]) is not bool, "deterministic_attention must be boolean")
+    _fail(
+        errors,
+        type(config["prefix_gradient_checkpointing"]) is not bool,
+        "prefix_gradient_checkpointing must be boolean",
+    )
+    _fail(
+        errors,
+        config["deterministic_attention"] and config["attention_implementation"] != "flash_attention_2",
+        "Deterministic image SFT currently requires flash_attention_2",
+    )
+    tiers = config.get("fixed_pixels_tiers")
+    _fail(
+        errors,
+        tiers is not None
+        and (not isinstance(tiers, list) or not tiers or not all(type(v) is int and v > 0 for v in tiers)),
+        "i2i_sft_config.fixed_pixels_tiers must be a non-empty list of positive integers",
+    )
+    seed = config.get("seed")
+    _fail(
+        errors,
+        config.get("dp_tier_micro_balance", False) and (not isinstance(tiers, list) or len(tiers) < 2),
+        "dp_tier_micro_balance requires at least two fixed_pixels_tiers",
+    )
+    if isinstance(tiers, list) and len(tiers) > 1 and seed is None:
+        seed = config["seed"] = getattr(args, "seed", 42)
+    _fail(errors, seed is not None and type(seed) is not int, "i2i_sft_config.seed must be an integer when set")
+    args.model_adapter_path = (
+        getattr(args, "model_adapter_path", None) or "relax.models.sensenova.adapter.SenseNovaSFTAdapter"
+    )
+    # These controls have no implementation in the supervised image path.
+    for field in (
+        "fully_async",
+        "hybrid",
+        "offload_train",
+        "fsdp_cpu_offload",
+        "fsdp_activation_checkpointing",
+        "use_dynamic_batch_size",
+        "balance_data",
+        "sft_async_prepack",
+        "sft_chunked_logits",
+        "sft_predict_interval",
+        "eval_prompt_data",
+        "eval_size",
+        "custom_dataset_class_path",
+        "use_routing_replay",
+        "use_rollout_routing_replay",
+        "use_opd",
+        "enable_mtp_training",
+        "debug_train_only",
+        "debug_rollout_only",
+        "lora_merge_mode",
+        "lora_adapter_mode",
+        "num_critic_only_steps",
+        "sft_train_data_prefetch",
+        "fsdp_debug_fingerprint",
+    ):
+        _fail(errors, bool(getattr(args, field, None)), f"Image SFT does not support --{field.replace('_', '-')}.")
+    for field in (
+        "tensor_model_parallel_size",
+        "pipeline_model_parallel_size",
+        "context_parallel_size",
+        "expert_model_parallel_size",
+    ):
+        _fail(errors, getattr(args, field, 1) != 1, f"Image FSDP SFT requires {field}=1.")
+    _fail(
+        errors,
+        getattr(args, "task_type", "causal_lm") != "causal_lm",
+        "Image SFT does not support text classification",
+    )
+    _fail(errors, getattr(args, "micro_batch_size", 1) != 1, "Image SFT currently requires --micro-batch-size 1")
+    _fail(errors, getattr(args, "n_samples_per_prompt", 1) != 1, "Image SFT requires --n-samples-per-prompt 1")
+    _fail(errors, getattr(args, "num_updates_per_batch", 1) != 1, "Image SFT takes one optimizer update per batch")
+    batch = getattr(args, "global_batch_size", 0) or 0
+    _fail(
+        errors,
+        batch <= 0 or batch != getattr(args, "rollout_batch_size", None),
+        "Image SFT requires equal positive global_batch_size and rollout_batch_size",
+    )
+    _fail(
+        errors,
+        getattr(args, "fsdp_lr_scheduler", "constant") != "constant",
+        "Image SFT currently supports linear warmup followed by constant LR",
+    )
+    _fail(
+        errors,
+        getattr(args, "fsdp_param_dtype", "bf16") != "bf16" or getattr(args, "fsdp_reduce_dtype", "fp32") != "fp32",
+        "Image SFT requires BF16 compute and FP32 reduction",
+    )
+    if getattr(args, "fsdp_master_dtype", None) is None:
+        args.fsdp_master_dtype = "fp32"
+    _fail(errors, args.fsdp_master_dtype != "fp32", "Image SFT requires FP32 optimizer masters")
+    if getattr(args, "fsdp_trainable_mode", "full") == "lora":
+        _fail(errors, (getattr(args, "lora_rank", 0) or 0) <= 0, "LoRA mode requires positive --lora-rank")
+    elif getattr(args, "lora_rank", 0):
+        errors.append("Full SFT requires --lora-rank 0")
+    if errors:
+        raise ValueError("Invalid image SFT configuration:\n- " + "\n- ".join(errors))

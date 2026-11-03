@@ -11,7 +11,7 @@ The agent may run standalone or through a centralized execution platform.**
 ::: tip Recommended workflow
 For agent app (harness) assessment, integration, launch checks, and experiments, we recommend using the repository's
 `agentic-rollout` skill under `skills/agentic-rollout/`. It checks the current checkout and guides context topology,
-parsers, export and credit, timeouts, concurrency, and runtime evidence by stage. Experiments still require explicit
+parsers, export and advantage, timeouts, concurrency, and runtime evidence by stage. Experiments still require explicit
 user authorization, and this guide remains the contract reference for model API request and response formats, APIs,
 and export.
 
@@ -19,8 +19,8 @@ For manual reading:
 
 - To start from an existing agent, read [Prepare Your Agent](#prepare-your-agent), then
   [Connect Your Agent](#connect-your-agent).
-- For multi-agent training, exporting several contexts, or defining per-context credit, read
-  [Select Training Contexts and Credit](#select-training-contexts-and-credit).
+- For multi-agent training, exporting several contexts, or defining per-context advantage, read
+  [Choose Training Contexts and Scores](#choose-training-contexts-and-scores).
 - To tune concurrency or cross-step execution, read [Configure Runtime Behavior](#configure-runtime-behavior).
 - To learn how SessionForest and scheduling work, read
   [Understand How Agentic Rollout Works](#understand-how-agentic-rollout-works).
@@ -358,21 +358,29 @@ When the first rollout step completes, look for `accounting_end`:
 AGENTIC ROLLOUT event=accounting_end rollout=0 ...
 ```
 
-The progress bar reports completed sessions as `scored`. At this point an application that exports its final
-conversation as one training context is ready to train.
+`scored` in the progress bar means sample scoring is complete. The next section explains how to produce rewards and
+assign advantages in different scenarios.
 
-## Select Training Contexts and Credit
+## Choose Training Contexts and Scores
 
-| Contexts exported by each session | Required training credit |
-| --- | --- |
-| One context | Write `reward`, or omit it and configure `--custom-rm-path` |
-| More than one context | Configure `--agentic-custom-advantage-path`; custom RM is generally discouraged and requires deliberate Group RM review |
+After an Agent completes a task, decide which contexts enter training and how reward/advantage is produced. The common
+case is one reward/advantage per sample, with its value coming from the environment or a reward function.
 
-### Export the Final Conversation
+![How to choose Agentic rewards and advantages](/agentic/agentic-reward-advantage-en.svg)
 
-For a single final training context, omit `RELAX_OUTPUT_JSON`, leave it empty, or write an object with optional
-`metadata` and `reward`. Relax exports the unique committed conversation context. When the output does not contain
-`reward`, the training command must configure `--custom-rm-path`.
+| Example | Task score | Training contexts | Advantage |
+| --- | --- | --- | --- |
+| [`mini_swe_agent`](../../../examples/mini_swe_agent/README.md) | Score comes from the environment's test script and is stored in `reward` | One context | Reward post-processing is selected by `--advantage-estimator` |
+| [DeepEyes Agentic](../../../examples/deepeyes_agentic/run_deepeyes_agentic.sh) | [`reward_deepeyes.reward_func`](../../../examples/deepeyes_agentic/reward_deepeyes.py) through `--custom-rm-path` | One context | Reward post-processing is selected by `--advantage-estimator` |
+| [Search-R1 multiagent](../../../examples/search_r1/app/multiagent.py) | Agent-side exact-match scoring stored in export metadata | `main + searcher_*` | [Custom advantage](../../../examples/search_r1/advantage_search_r1.py) assigns a scalar advantage to each export |
+
+### One Training Context
+
+When a Session exports only its final context, Relax uses the recorded conversation directly. If the environment scores
+the task, write the result to the `reward` field in `RELAX_OUTPUT_JSON`. If a reward function scores it, configure
+`--custom-rm-path`. To record additional information, put it in the `metadata` field of the same JSON object. Relax
+keeps the complete metadata in rollout dumps and reports its top-level numeric fields as metrics to enabled tracking
+backends such as ClearML and TensorBoard.
 
 ```json
 {
@@ -381,22 +389,29 @@ For a single final training context, omit `RELAX_OUTPUT_JSON`, leave it empty, o
 }
 ```
 
+When `reward` has one value, write a number. To record several scoring results, use a JSON object and select the field
+used as the training reward with the following option. Other top-level numeric fields are reported as reward metrics:
+
+```bash
+--reward-key <primary-key>
+```
+
 Use implicit export only for an audited strictly linear history. Any nonlinear history requires explicit export, even
 when it currently has one exportable leaf.
 
 ### Explicitly Export One or More Contexts
 
-Multi-agent training is a common use of explicit export. For example, one session can export a `main` context and
-several `searcher` contexts so each receives its own training credit. Explicit export also supports one agent with
-several conversation branches. Each JSONL record describes one training context, not one agent process. Exporting more
-than one context requires `--agentic-custom-advantage-path`.
+When a Session's conversation history is no longer strictly append-only, such as in multi-agent workflows or after
+history compression, it may contain several linear contexts. Explicit export lets users choose which contexts enter
+training and assign an advantage to each export through `--agentic-custom-advantage-path`.
 
-Write one JSONL record for each context selected for training:
+Write one JSONL record for each context selected for training to the file named by `RELAX_OUTPUT_JSON`. For example, a
+Session that selects `main` and two `searcher` contexts writes:
 
 ```jsonl
-{"name":"main","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"role":"main","outcome":1.0},"reward":1.0}
-{"name":"searcher_0","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"role":"searcher","outcome":1.0}}
-{"name":"searcher_1","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"role":"searcher","outcome":1.0}}
+{"name":"main","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"outcome":1.0}}
+{"name":"searcher_0","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"usefulness":0.6}}
+{"name":"searcher_1","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"usefulness":0.4}}
 ```
 
 | Field | Required | Meaning |
@@ -405,134 +420,92 @@ Write one JSONL record for each context selected for training:
 | `messages` | Yes | Complete message history used during generation |
 | `tools` | When used | Exact tools used by that context |
 | `chat_template_kwargs` | When used | Exact template arguments used by that context |
-| `metadata` | No | Per-context metrics and custom-credit inputs |
+| `metadata` | No | Per-context metrics and inputs for custom advantage |
 | `reward` | No | Per-context task outcome; number, object, or `null` |
 
-Each record must match a committed SessionForest state. Include the full assistant messages, reasoning content, tool
-calls, tools, and template arguments used during generation. Relax trains the records present in the JSONL output.
-Omitted contexts are not trained.
+Relax trains the records present in the JSONL output; omitted contexts are not trained. For explicit export, keep the
+agent on Chat Completions and reuse the complete `messages`, `tools`, and `chat_template_kwargs` from generation in each
+export record so it matches the SessionForest state recorded by Relax.
 
-Explicit export records always use the canonical Chat-shaped `messages`, nested function `tools`, and
-`chat_template_kwargs` shown above, including when the agent called Responses or Messages. Reuse the normalized values
-that matched the committed SessionForest state; a raw Responses `input` list or Anthropic block list is not an explicit
-export record.
-
-The context count does not depend on the process count. One process can export several contexts. A multi-agent
-application can export one context or several. Evaluation can export only `main` while training exports more contexts.
-
-### Standard Reward
-
-Standard reward is supported when each session exports one context. Either write `reward` in the output, or omit it and
-configure `--custom-rm-path`. A numeric reward is a scalar outcome. A reward object can contain a primary reward and
-numeric helper metrics. When `reward` is an object, configure:
+::: warning Multi-Context Training Parameters
+When one Session exports several contexts, the training command also requires:
 
 ```bash
---reward-key <primary-key>
+--use-dynamic-batch-size
+--max-tokens-per-gpu <token-budget>
 ```
 
-### Custom Advantage for Multi-Agent Credit
+This is a batching requirement for multiple physical training rows and is independent of the reward source or advantage
+granularity.
+:::
 
-When one session exports several contexts, one task outcome does not say how much training credit each context should
-receive. Custom advantage turns export metadata into one number for each context.
+::: warning Export One Context During Eval
+Default Eval metrics treat every export as one sample. Exporting several contexts from one Session changes the
+denominator of the mean reward and disrupts `--log-passrate` grouping by `n_samples_per_eval_prompt`. Eval should
+therefore export one representative context, usually `main`. Search-R1 multiagent follows this rule: training exports
+`main + searcher_*`, while Eval exports only `main`. Export several Eval contexts only when a custom Eval logger
+explicitly regroups them by Session.
+:::
 
-Put every input used by the function in each export's `metadata`, then configure:
+### Custom Advantage
+
+Search-R1 multiagent demonstrates scalar advantages: it exports `main` and `searcher_*`, normalizes the main scores across
+the sampled Group, and assigns one scalar to every export.
+
+Custom advantage uses named explicit export records, even when one Session exports one context.
+
+Configure the function with:
 
 ```bash
 --agentic-custom-advantage-path my_package.advantage.advantage_func
 ```
 
-Suppose the first sampled session writes these explicit records to `RELAX_OUTPUT_JSON`:
-
-```jsonl
-{"name":"main","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"outcome":1.0},"reward":1.0}
-{"name":"searcher_0","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"usefulness":0.6}}
-```
-
-Suppose the second sampled session exports the same names with `outcome=0.0` and `usefulness=0.2`.
-
-Relax builds the function input directly from the contexts exported above:
-
-- each export `name` becomes a mapping key;
-- that export's final metadata becomes the mapping value;
-- the outer list follows the sampled session order in the Group.
-
-Only export metadata is passed through this mapping. The function signature is:
+`advantage_func` receives the exports from every Session in the current Group. The `name` and `metadata` from each JSONL
+record become a `{name: metadata}` entry. This minimal example reads the `outcome` and `usefulness` fields from the
+JSONL above, centers the main outcome within the current Group, and produces a scalar advantage for every export:
 
 ```python
+import statistics
 from typing import Any
 
 
 def advantage_func(
-    metadata_by_slot: list[dict[str | None, dict[str, Any]]],
-) -> list[dict[str | None, float]] | None:
-    ...
+    metadata_by_slot: list[dict[str, dict[str, Any]]],
+) -> list[dict[str, float | list[float]]] | None:
+    main_scores = [float(exports["main"]["outcome"]) for exports in metadata_by_slot]
+    mean = statistics.fmean(main_scores)
+    return [
+        {
+            name: (score - mean) * float(metadata.get("usefulness", 1.0))
+            for name, metadata in exports.items()
+        }
+        for exports, score in zip(metadata_by_slot, main_scores)
+    ]
 ```
 
-The two sampled sessions become this hook input:
+`advantage_func` returns `None` or a list aligned with the input Sessions. Item i in that list belongs to Session i and
+uses the export names from the explicit records.
 
-```python
-[
-    {"main": {"outcome": 1.0}, "searcher_0": {"usefulness": 0.6}},
-    {"main": {"outcome": 0.0}, "searcher_0": {"usefulness": 0.2}},
-]
-```
+The advantage for each export can be:
 
-The return value keeps the same outer order and the same context names:
+- a scalar, shared by all assistant turns;
+- a list with one score per assistant turn. Its length must equal the number of assistant turns.
 
-```python
-[
-    {"main": 1.0, "searcher_0": 0.6},
-    {"main": 0.0, "searcher_0": 0.0},
-]
-```
+Relax applies each turn's score to that turn's tokens, while observation tokens receive zero. If the whole function
+returns `None`, Relax drops and replenishes the complete Group. Eval does not call `advantage_func`.
 
-This example gives `main` the task outcome and gives `searcher_0` `outcome × usefulness`. Metadata field names and
-credit formulas can differ between contexts.
+::: warning
+Custom advantage bypasses standard reward post-processing such as GRPO Group normalization. Perform any required
+Group-level comparison or normalization inside `advantage_func`.
 
-Output item `i` always belongs to input session `i`; the function must not reorder the outer list. Inside one mapping,
-contexts are matched by name, so dictionary order does not matter. Every exported name needs one numeric value. That
-value is the training credit for the whole context. `0.0` keeps the context and gives it zero credit. Returning top-level
-`None` filters the complete sampled Group; it does not filter one context. An implicit single-context export uses `None`
-as its context name. Evaluation does not call this function.
-
-::: warning Normalize inside the custom advantage function
-The custom path bypasses standard GRPO reward normalization. Standard GRPO normalization has one scalar reward per
-trajectory and cannot express context roles or turn-level credit structures. Perform every required comparison,
-centering, scaling, or normalization inside this function. This includes normalization across trajectories in the
-sampled Group, across contexts or roles, and over turn-level signals stored in metadata. The current function returns one
-scalar for each exported context, so turn-level signals must be reduced to that scalar before returning.
-
-`--normalize-advantages` is a separate, later whitening step. It does not replace role-aware or turn-aware normalization
-inside this function.
+`--normalize-advantages` is unrelated to GRPO normalization. It applies masked whitening to valid advantage tokens in
+the data-parallel group after advantages have been produced. GRPO normalization is an earlier reward post-processing
+step over the sampled Group for each prompt; whether it runs is not controlled by `--normalize-advantages`.
 :::
 
-#### What Happens After Custom Advantage
-
-Despite the option name, the returned scalar is the base credit for one context. It is produced before training builds
-token advantages and before policy-loss corrections. It is not the final loss weight.
-
-```text
-export metadata
-→ custom advantage and task-specific normalization
-→ one base scalar per exported context
-→ returns and token advantages, with estimator-specific KL shaping when used
-→ optional generic advantage whitening
-→ policy ratio and estimator-specific clipping
-→ OPSM, TIS, or other off-policy masks
-→ entropy, independent KL, and optional distillation terms
-→ loss reduction and backpropagation
-```
-
-The word KL can refer to three different downstream operations:
-
-- reference-policy KL used while an estimator builds returns, when that estimator supports KL reward shaping;
-- the old-policy/current-policy log ratio reported as `ppo_kl` and used by policy clipping;
-- an independent reference-policy KL loss enabled by `--use-kl-loss`.
-
-::: warning Reward configuration with custom advantage
-Generally avoid `--custom-rm-path` with `--agentic-custom-advantage-path`. Without `--group-rm`, the ordinary custom RM
-path is skipped. A deliberately reviewed Group RM may still write reward for metrics or filtering while custom advantage
-provides training credit. Store every signal used by the advantage function in export metadata.
+::: warning
+Training uses the values returned by custom advantage. Put every value needed by the function in export metadata. When
+Eval or reward metrics also need `reward`, keep the corresponding `reward` field in `RELAX_OUTPUT_JSON`.
 :::
 
 ### Metrics and Passrate
@@ -542,23 +515,11 @@ provides training credit. Store every signal used by the advantage function in e
 - Top-level numeric fields in output metadata use `<field>/mean|median|max|min`, without a `rollout/` prefix.
 - Complete metadata remains available in rollout dumps.
 
-With `--log-passrate`, multi-context Sessions use explicit export and attach reward to exactly one representative
-context, usually `main`. Set the selected primary reward value to `1` for success or `0` otherwise; for a reward object,
-`--reward-key` selects that value. Leave reward unset on sibling contexts. Other contexts can carry the outcome in
-metadata when the custom advantage function needs it. A Group RM that writes reward to every exported row requires a
-custom logger that restores logical-Session grouping. In multi-context training, reward reports the outcome while
-custom advantage provides training credit.
-
-### Multi-Context Dynamic Batching
-
-A recipe that may export more than one context from a session **must** configure
-`--agentic-custom-advantage-path` and **must** enable dynamic batching. Custom RM is generally discouraged; use it only
-as a deliberately reviewed Group RM for reporting or filtering.
-
-```bash
---use-dynamic-batch-size
---max-tokens-per-gpu <token-budget>
-```
+With `--log-passrate`, multi-context Sessions use explicit export and attach reward to one representative context,
+usually `main`. Set its primary reward value to `1` for success or `0` otherwise; for a reward object, `--reward-key`
+selects that value. Leave reward unset on sibling contexts. Put any outcome needed by custom advantage in their
+metadata. In multi-context training, reward reports the task outcome and custom advantage determines each export's
+advantage.
 
 ## Configure Runtime Behavior
 
@@ -622,7 +583,7 @@ Session KV lifecycle and program-aware admission are optional controls for long-
 
 One dataset sample creates one Session. The Session owns one agent process, one SessionForest, its rollout mode,
 and its active-time budget. The process can make sequential or concurrent model API requests. When the process
-exits, Relax selects the requested Forest states, computes training credit, and sends the samples to training.
+exits, Relax selects the requested Forest states, computes advantages, and sends the samples to training.
 
 The main runtime path is:
 

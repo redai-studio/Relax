@@ -4,6 +4,8 @@
 
 from argparse import Namespace
 
+from relax.engine.sft.runtime import is_sft_mode
+
 
 GENRM_ROLE = "genrm"
 
@@ -34,7 +36,7 @@ def register_sft_rollout(config: Namespace, algo: dict) -> list:
     Rollout is only spun up when ``--sft-predict-interval`` is set — that is
     the sole consumer of generative eval under SFT today.
     """
-    if getattr(config, "loss_type", None) != "sft":
+    if not is_sft_mode(config):
         return []
     if getattr(config, "sft_predict_interval", None) is None:
         return []

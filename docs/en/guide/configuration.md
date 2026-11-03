@@ -31,7 +31,7 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--num-data-storage-units` | int | 1 | Number of TransferQueue SimpleStorageUnit actors |
-| `--per-rank-fetch` | flag | False | Let every TP/PP rank pull its own copy from TransferQueue in parallel instead of paying one rank-0 pickle + one TP/PP broadcast. Cross-rank consistency relies on the TQ sampler's `(partition_id, task_name, dp_rank, batch_index)` cache, which is PP/TP-invariant. Auto-disabled when `rollout_routed_experts` is in `data_fields` (jagged NestedTensor broadcast path is incompatible). Recommended for multi-GPU training together with `--num-data-storage-units >= TP world size`. Wins when pickle dominates `tgd_bcast_tp_time`. |
+| `--per-rank-fetch` (RL compatibility; automatic for SFT) | flag | RL: False / Megatron SFT: True | Let every TP/PP rank pull its own copy from TransferQueue in parallel instead of paying one rank-0 pickle + one TP/PP broadcast. Cross-rank consistency relies on the TQ sampler's `(partition_id, task_name, dp_rank, batch_index)` cache, which is PP/TP-invariant. Auto-disabled when `rollout_routed_experts` is in `data_fields` (jagged NestedTensor broadcast path is incompatible). Recommended for multi-GPU training together with `--num-data-storage-units >= TP world size`. Wins when pickle dominates `tgd_bcast_tp_time`. |
 | `--max-staleness` | int | 0 | Maximum staleness for TransferQueue data system (0=on-policy) |
 | `--polling-mode` | bool | True | Whether to use polling mode when fetching metadata |
 | `--num-iters-per-train-update` | int | 1 | Number of iterations per global batch in fully async pipeline |
@@ -299,7 +299,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--advantage-estimator` | str | grpo | generated from `ALGORITHM_SPECS` in `relax/algorithms/spec.py`; currently `grpo`, `gspo`, `sapo`, `cispo`, `rloo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` | Advantage estimator. `--help` is authoritative: the choices are read from the registry, so a new algorithm appears there without this table being edited. OPD is independent of this choice; enable it with `--use-opd` and its KL/loss coefficient |
+| `--advantage-estimator` | str | grpo | generated from `ALGORITHM_SPECS` in `relax/algorithms/spec.py`; currently `grpo`, `score_centering`, `gspo`, `sapo`, `cispo`, `rloo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` | Advantage estimator. `--help` is authoritative: the choices are read from the registry, so a new algorithm appears there without this table being edited. OPD is independent of this choice; enable it with `--use-opd` and its KL/loss coefficient |
 | `--normalize-advantages` | flag | False | - | Whether to normalize advantages |
 | `--disable-grpo-std-normalization` | flag | - | - | Disable GRPO standard deviation normalization (from [Dr.GRPO](https://arxiv.org/pdf/2503.20783)) |
 | `--disable-rewards-normalization` | flag | - | - | Disable reward normalization |
@@ -444,7 +444,7 @@ The offline producer uses its own `PrefetchBuffer` for SFT samples or preference
 | `RELAX_SFT_TQ_SHARDS` | int | 1 | Number of SFT TransferQueue shards. Values less than or equal to 0 are treated as 1. |
 
 ::: warning Activation requirement
-This variable does not enable prepacking. It is effective only with `--loss-type sft --sft-async-prepack`; otherwise Relax uses one partition. Async prepacking also requires `--per-rank-fetch`, at least two in-flight steps (`--max-staleness >= 1` or `--sft-max-in-flight-steps >= 2`), PP=1, CP=1, VPP=1, and THD QKV format.
+This variable takes effect only when SFT automatically selects async prepacking; otherwise Relax uses one partition. Selection requires Megatron, NCCL, THD, at least two in-flight steps (`--max-staleness >= 1` or `--sft-max-in-flight-steps >= 2`), PP=1, CP=1, no VPP, no dynamic CP, no routing/indexer replay, and no image data. Per-rank fetch is automatic and needs no extra switch.
 :::
 
 With `N > 1`, step `K` uses partitions `sft_K_shard_0_of_N` through `sft_K_shard_<N-1>_of_N`; the existing `sft_K` name is used only when `N == 1`. The consumer waits until all shard partitions are ready, then reads an equal slice from each. Consequently, both `global_batch_size` and each DP-local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`.
@@ -476,6 +476,18 @@ How the SFT producer handles samples whose tokenized + media-expanded length exc
 |-----------|------|---------|---------|-------------|
 | `--sft-oversize-strategy` | str | keep | `skip`, `keep`, `truncate_left`, `truncate_right`, `custom` | `skip` drops the sample; `keep` returns it unchanged (may OOM downstream); `truncate_left` keeps the last `capacity` tokens; `truncate_right` keeps the first `capacity` tokens; `custom` delegates to `--sft-oversize-custom-function-path`. ⚠ Truncating multimodal samples in-place may misalign `multimodal_train_inputs` — use `custom` if you also need to trim media inputs. |
 | `--sft-oversize-custom-function-path` | str | None | - | Required when `--sft-oversize-strategy custom`. Importable path to a function with signature `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) \| None`. Returning `None` is treated as `skip`. |
+
+To keep complete SFT samples above the packing budget but skip samples beyond `--seq-length`, add these options to the training command:
+
+```bash
+--seq-length 262144 \
+--use-dynamic-batch-size \
+--max-tokens-per-gpu 131072 \
+--sft-oversize-strategy custom \
+--sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
+```
+
+This policy reads `--seq-length` directly; no additional environment variable is needed. With CP=1, samples above 131072 and up to 262144 expanded tokens stay intact in their own micro-batches; longer samples are skipped. Keep `0 < max_tokens_per_gpu × context_parallel_size <= seq_length`, because samples within the packing budget bypass the oversize hook. The policy preserves tokens and loss masks; it does not reduce the memory required by a long sample.
 
 Preference training uses these same options after applying `--preference-max-length` and `--preference-max-completion-length`. The capacity counts both branches together: `keep` preserves the pair in its own micro-batch, while `skip` drops the whole pair.
 

@@ -14,6 +14,7 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
+from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
 from relax.utils import device as device_utils
 from relax.utils import megatron_bridge_utils
 from relax.utils.device import make_current_torch_device
@@ -28,7 +29,11 @@ from relax.utils.megatron_peft_utils import (
 )
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
+from .expert_layout import DirectExpertLayout, direct_expert_chunk, expert_slice_chunk
+from .expert_routing import ExpertLayout, validate_server_layout
 from .hf_weight_iterator_base import HfWeightIteratorBase
+from .ipc import dispatch_typed_buckets
+from .ipc_allocator import IpcBucketAllocator
 from .lora_adapter_sync import LoraAdapterSync
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
@@ -69,6 +74,8 @@ class UpdateWeightFromTensor:
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = 0
+        self._ipc_allocator_version: int | None = None
+        self._ipc_bucket_allocator: IpcBucketAllocator | None = None
 
         self.lora_enabled = is_lora_enabled(args)
         self.lora_merge_mode = is_lora_merge_mode(args) if self.lora_enabled else False
@@ -78,11 +85,27 @@ class UpdateWeightFromTensor:
         # shared LoraAdapterSync helper; the backend keeps only its in-memory transport below.
         self._lora_sync = LoraAdapterSync(args, model) if self.lora_adapter_mode else None
 
+        self._route_experts = getattr(args, "colocate_expert_weight_routing", False)
+        self._expert_routing_placement = None
+        self._expert_routing_group = None
+        if self._route_experts and (
+            not args.colocate
+            or args.megatron_to_hf_mode != "bridge"
+            or "kimik3" not in model_name.lower().replace("_", "").replace("-", "")
+            or self.lora_enabled
+            or (quantization_config or {}).get("format") != "mxfp4-pack-quantized"
+            or getattr(args, "rollout_external", False)
+        ):
+            raise ValueError("Expert routing supports only colocated Kimi K3 MXFP4 Bridge full-parameter training")
+
         self._hf_weight_iterator = HfWeightIteratorBase.create(
             args=args, model=model, model_name=model_name, quantization_config=quantization_config
         )
 
+        self._direct_expert_layout: DirectExpertLayout | None = None
+
         self._ipc_gather_group = None
+        self._ipc_placement = None
         self._ipc_gather_src = None
         self._ipc_engine = None
         self._model_update_groups = None
@@ -101,6 +124,8 @@ class UpdateWeightFromTensor:
         to colocated IPC engines.
         """
         self.rollout_engines = rollout_engines
+        if self._route_experts and (engine_gpu_counts is None or engine_gpu_offsets is None):
+            raise ValueError("Expert routing requires explicit engine GPU counts and offsets")
 
         if engine_gpu_counts is None:
             engine_gpu_counts = [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)
@@ -130,6 +155,8 @@ class UpdateWeightFromTensor:
             colocate_engine_nums += 1
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
+        if self._route_experts and self.use_distribute:
+            raise ValueError("Expert routing does not support mixed remote/colocated engines")
 
         if self.use_distribute:
             self.rollout_engines = rollout_engines[:colocate_engine_nums]
@@ -156,23 +183,142 @@ class UpdateWeightFromTensor:
 
         colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]
         colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]
+        placement = (tuple(colocate_gpu_offsets), tuple(colocate_gpu_counts))
+        if self._ipc_placement not in (None, placement):
+            raise ValueError("Weight sync cannot reconnect with changed IPC GPU placement")
+
+        if self._route_experts:
+            placement = (tuple(colocate_gpu_offsets), tuple(colocate_gpu_counts))
+            if self._expert_routing_placement not in (None, placement):
+                raise ValueError("Expert routing cannot reconnect with changed IPC GPU placement")
+            # Query the resolved runtime layout once, not once per trainer rank.
+            # Broadcast failures as data so peers do not hang after a rank-0 RPC error.
+            status = [None]
+            if dist.get_rank(get_gloo_group()) == 0:
+                try:
+                    layouts = ray.get(
+                        [engine.get_expert_weight_sync_layout.remote() for engine in self.rollout_engines]
+                    )
+                    status[0] = (layouts, None)
+                except Exception as error:
+                    status[0] = (None, str(error))
+            dist.broadcast_object_list(status, src=0, group=get_gloo_group())
+            layouts, error = status[0]
+            if error is not None:
+                raise RuntimeError(f"Expert routing layout query failed: {error}")
+            for config, gpu_count in zip(layouts, colocate_gpu_counts, strict=True):
+                validate_server_layout(config, gpu_count, self.args.sglang_ep_size, self.args.num_experts)
+            layout = ExpertLayout(
+                self.args.num_experts,
+                self.args.sglang_ep_size,
+                tuple(colocate_gpu_offsets),
+                dist.get_world_size(get_gloo_group()),
+            )
+            if self._expert_routing_group is None:
+                # Use the standard reloadable-group factory so colocate sleep
+                # releases NCCL resources and wake-up restores this same proxy.
+                self._expert_routing_group = dist.new_group(
+                    ranks=list(range(layout.world_size)), backend=device_utils.get_dist_backend()
+                )
+            self._hf_weight_iterator.configure_expert_routing(
+                layout, payload_group=self._expert_routing_group, metadata_group=get_gloo_group()
+            )
+            self._expert_routing_placement = placement
+
+        self._configure_direct_experts(colocate_gpu_counts)
 
         # Create IPC Gloo gather groups (only on first call; partitioning is
         # fixed across reconnects).
-        if self._ipc_gather_group is None:
+        if self._ipc_placement is None:
             for i in range(colocate_engine_nums):
                 group_ranks = list(range(colocate_gpu_offsets[i], colocate_gpu_offsets[i] + colocate_gpu_counts[i]))
                 new_group = dist.new_group(ranks=group_ranks, backend="gloo")
                 if dist.get_rank() in group_ranks:
                     self._ipc_gather_group = new_group
                     self._ipc_gather_src = colocate_gpu_offsets[i]
+            # Nonmembers also record creation: every world rank must enter
+            # new_group in the same order, including on engine reconnect.
+            self._ipc_placement = placement
 
         # Map training ranks to colocated engine actors.
+        self._ipc_engine = None
         for i, engine in enumerate(self.rollout_engines):
             start = colocate_gpu_offsets[i]
             end = start + colocate_gpu_counts[i]
             if start <= dist.get_rank() < end:
                 self._ipc_engine = engine
+
+    def _configure_direct_experts(self, gpu_counts: Sequence[int]) -> None:
+        """Negotiate one fast path using actual training and receiver
+        capabilities."""
+        configure = getattr(self._hf_weight_iterator, "configure_direct_experts", None)
+        self._direct_expert_layout = None
+        if (
+            not self.args.colocate
+            or self.use_distribute
+            or self._route_experts
+            or self.lora_enabled
+            or self.quantization_config
+        ):
+            if configure is not None:
+                configure(None)
+            return
+        group = get_gloo_group()
+        ready = torch.tensor(
+            [int(configure is not None and bool(getattr(self._hf_weight_iterator, "_bf16_expert_buckets", None)))],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=group)
+        if not ready.item():
+            if configure is not None:
+                configure(None)
+            return
+        status = [None]
+        if dist.get_rank(group=group) == 0:
+            try:
+                status[0] = (
+                    ray.get([engine.get_expert_weight_sync_layout.remote() for engine in self.rollout_engines]),
+                    None,
+                )
+            except Exception as error:
+                status[0] = ([], str(error))
+        dist.broadcast_object_list(status, src=0, group=group)
+        receivers, reason = status[0]
+        layout = None
+        if reason is None:
+            try:
+                layouts = [DirectExpertLayout.from_receiver(config) for config in receivers]
+                if (
+                    not layouts
+                    or len(layouts) != len(gpu_counts)
+                    or any(item != layouts[0] for item in layouts)
+                    or any(item.tp_size != count for item, count in zip(layouts, gpu_counts, strict=True))
+                ):
+                    raise ValueError("Direct experts require identical receiver geometry and matching TP placement")
+                layout = layouts[0]
+            except (ValueError, TypeError) as error:
+                reason = str(error)
+        try:
+            enabled = configure(layout)
+        except Exception as error:
+            # Mapping/schema validation is local. Reject collectively before
+            # any rank starts a packed gather with a different source plan.
+            enabled = False
+            reason = str(error)
+            logger.warning("Direct expert source rejected: %s", reason)
+        agreed = torch.tensor([int(enabled)], dtype=torch.int32, device="cpu")
+        dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=group)
+        if agreed.item():
+            self._direct_expert_layout = layout
+        else:
+            configure(None)
+        if dist.get_rank(group=group) == 0:
+            logger.info(
+                "Weight sync selected %s: %s",
+                "packed BF16 direct" if self._direct_expert_layout else "standard HF",
+                self._direct_expert_layout or reason or "source expert mapping/geometry requires HF loading",
+            )
 
     @torch.no_grad()
     def update_weights(self) -> None:
@@ -181,7 +327,9 @@ class UpdateWeightFromTensor:
         Pipelining: overlap chunk N's IPC transfer with chunk N+1's HF
         conversion + serialization + Gloo gather.  At most two chunks'
         GPU tensors are alive simultaneously (bounded by
-        ``update_weight_buffer_size``).
+        ``update_weight_buffer_size``). Routed expert mode instead completes
+        each IPC before advancing the iterator, so conversion failures cannot
+        release buffers that a receiver is still reading.
 
         In LoRA merge mode the adapters are folded into the base weights during
         HF export so the rollout engine serves one merged model; otherwise all
@@ -199,7 +347,16 @@ class UpdateWeightFromTensor:
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
 
         rank = dist.get_rank()
-        if rank == 0:
+        if self._route_experts:
+            self._routed_engine_call(all_engines, "pause_generation")
+            self._routed_engine_call(all_engines, "flush_cache")
+            self._routed_engine_call(
+                all_engines,
+                "post_process_weights",
+                restore_weights_before_load=True,
+                post_process_quantization=False,
+            )
+        elif rank == 0:
             ray.get([engine.pause_generation.remote() for engine in all_engines])
             ray.get([engine.flush_cache.remote() for engine in all_engines])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
@@ -208,6 +365,7 @@ class UpdateWeightFromTensor:
                     post_process_quantization=False,
                     rollout_engines=all_engines,
                 )
+            ray.get([engine.begin_weight_update.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
 
         megatron_local_weights = self.weights_getter()
@@ -241,23 +399,40 @@ class UpdateWeightFromTensor:
         # two stages overlap.
         prev_refs: list[ObjectRef] = []
         prev_long_lived_tensors = None
-        with export_ctx:
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-                refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-                # Wait for the *previous* chunk's IPC to finish before
-                # releasing its GPU tensors.
-                if prev_refs:
-                    ray.get(prev_refs)
-                del prev_long_lived_tensors
-                prev_refs = refs
-                prev_long_lived_tensors = long_lived_tensors
-                # Backend-specific per-chunk synchronization is handled in device
-                # utils so this path stays hardware-agnostic.
-                device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
-            # Drain the last chunk.
-            if prev_refs:
-                ray.get(prev_refs)
-            del prev_long_lived_tensors
+        current_refs: list[ObjectRef] = []
+        long_lived_tensors = None
+        try:
+            with export_ctx:
+                for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                    dispatch_errors = []
+                    current_refs, long_lived_tensors = self._send_hf_params(
+                        hf_named_tensors, dispatch_errors=dispatch_errors
+                    )
+                    # Routed export agrees on failures before advancing its
+                    # collective generator. Ordinary export keeps two chunks
+                    # overlapped, including the previous chunk's storage.
+                    if self._route_experts:
+                        self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors) or None)
+                        current_refs = []
+                    else:
+                        self._wait_for_ipc(prev_refs)
+                        prev_refs = []
+                        if dispatch_errors:
+                            self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors))
+                    prev_long_lived_tensors = long_lived_tensors
+                    prev_refs, current_refs = current_refs, []
+                    if self._route_experts:
+                        prev_long_lived_tensors = long_lived_tensors = None
+                        del hf_named_tensors
+                    device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
+                self._wait_for_ipc(prev_refs)
+                prev_refs = []
+        finally:
+            # Conversion or ACK failures must not release storage while an
+            # already submitted receiver is still reading it. No additional
+            # waits occur on the successful pipelined path.
+            _drain_ipc_refs(prev_refs + current_refs)
+            del prev_long_lived_tensors, long_lived_tensors
 
         # All ranks must finish sending before rank 0 triggers Marlin repack,
         # otherwise engines in slower gather groups may still be processing
@@ -265,15 +440,60 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
         # int4/fp4 post_process
-        if rank == 0:
+        if self._route_experts:
+            self._routed_engine_call(
+                all_engines,
+                "post_process_weights",
+                restore_weights_before_load=False,
+                post_process_quantization=True,
+            )
+            self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
+            self._routed_engine_call(all_engines, "continue_generation")
+        elif rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
                     rollout_engines=all_engines,
                 )
+            ray.get([engine.end_weight_update.remote() for engine in all_engines])
             ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
+
+    def _routed_engine_call(self, engines: Sequence[ActorHandle], method: str, **kwargs) -> None:
+        refs = []
+        error = None
+        if dist.get_rank(get_gloo_group()) == 0:
+            try:
+                for engine in engines:
+                    refs.append(getattr(engine, method).remote(**kwargs))
+            except Exception as exc:
+                error = str(exc)
+        self._wait_for_ipc(refs, error=error)
+
+    def _wait_for_ipc(self, refs: list[ObjectRef], *, error: str | None = None) -> None:
+        try:
+            results = ray.get(refs) if refs else []
+            for result in results:
+                if isinstance(result, Mapping) and result.get("success") is False:
+                    raise RuntimeError(f"SGLang rejected weights: {result}")
+        except Exception as exc:
+            error = str(exc)
+            # ray.get(list) may raise before other requests finish. Keep source
+            # buffers alive until every submitted reader has completed/failed.
+            _drain_ipc_refs(refs)
+        if not self._route_experts:
+            if error is not None:
+                raise RuntimeError(f"Weight load failed: {error}")
+            return
+        # All ranks finish the same IPC rounds. Propagate a receiver failure
+        # before anyone proceeds to another all-to-all or publishes a version.
+        failed = torch.tensor([int(error is not None)], dtype=torch.int32, device="cpu")
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=get_gloo_group())
+        if failed.item():
+            errors = [None] * dist.get_world_size(get_gloo_group())
+            dist.all_gather_object(errors, error, group=get_gloo_group())
+            raise RuntimeError(f"Routed weight load failed: {errors}")
 
     def _update_weights_adapter_mode(self) -> None:
         """LoRA adapter mode: sync base once, then push only the adapter each
@@ -315,6 +535,7 @@ class UpdateWeightFromTensor:
                     post_process_quantization=False,
                     rollout_engines=self.rollout_engines,
                 )
+            ray.get([engine.begin_weight_update.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
         # Weights include base + LoRA adapter params (adapters are ordinary parameters).
@@ -363,6 +584,7 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
+            ray.get([engine.end_weight_update.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
         # 2) Register the LoRA adapter on the engines via SGLang's LoRA API. first_sync gates the
@@ -527,17 +749,25 @@ class UpdateWeightFromTensor:
         finally:
             set_sharing_strategy(prev_strategy)
 
-    def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
+    def _send_hf_params(
+        self, hf_named_tensors, *, dispatch_errors: list[str] | None = None
+    ) -> tuple[list[ObjectRef], Any]:
         all_refs = []
 
         long_lived_tensors = None
         if self._ipc_engine is not None:
+            if self._ipc_allocator_version != self.weight_version:
+                self._ipc_bucket_allocator = IpcBucketAllocator(make_current_torch_device())
+                self._ipc_allocator_version = self.weight_version
             refs_colocated, long_lived_tensors = _send_to_colocated_engine(
                 hf_named_tensors,
                 ipc_engine=self._ipc_engine,
+                bucket_allocator=self._ipc_bucket_allocator,
                 ipc_gather_src=self._ipc_gather_src,
                 ipc_gather_group=self._ipc_gather_group,
-                weight_version=self.weight_version,
+                weight_version=None if self._route_experts else self.weight_version,
+                dispatch_errors=dispatch_errors,
+                direct_layout=getattr(self, "_direct_expert_layout", None),
             )
             all_refs.extend(refs_colocated)
 
@@ -562,6 +792,9 @@ def _send_to_colocated_engine(
     ipc_gather_src,
     ipc_gather_group,
     weight_version,
+    bucket_allocator: IpcBucketAllocator | None = None,
+    dispatch_errors: list[str] | None = None,
+    direct_layout: DirectExpertLayout | None = None,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -582,7 +815,18 @@ def _send_to_colocated_engine(
         (name, tensor.to(cur_device) if tensor.device != cur_device else tensor) for name, tensor in hf_named_tensors
     ]
 
-    if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+    direct_chunk = None
+    direct_format = "direct"
+    if direct_layout is not None:
+        if dist.get_world_size(ipc_gather_group) != direct_layout.tp_size:
+            raise ValueError("Expert layout does not match the receiver TP group")
+        direct_chunk = direct_expert_chunk(hf_named_tensors, direct_layout, dist.get_rank(group=ipc_gather_group))
+        if direct_chunk is None and direct_layout.supports_expert_slices:
+            direct_chunk = expert_slice_chunk(hf_named_tensors, direct_layout, dist.get_rank(group=ipc_gather_group))
+            direct_format = EXPERT_SLICE_LOADER
+    if direct_chunk is not None:
+        converted_named_tensors_by_dtypes = {"direct": direct_chunk}
+    elif getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         # An empty local chunk contributes no bucket; FlattenedTensorBucket
         # rejects an empty named_tensors list, so skip building one.
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors} if hf_named_tensors else {}
@@ -594,16 +838,23 @@ def _send_to_colocated_engine(
                 converted_named_tensors_by_dtypes[dtype] = []
             converted_named_tensors_by_dtypes[dtype].append((name, tensor))
 
+    bucket_allocator = bucket_allocator or IpcBucketAllocator(cur_device)
     serialized_tensors = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        metadata = flattened_tensor_bucket.get_metadata()
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-            "metadata": metadata,
-        }
-        long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+        if direct_chunk is not None:
+            payload, load_format = named_tensors, direct_format
+        else:
+            # Bucket-owned allocations use ordinary CUDA storage for inexpensive IPC.
+            with bucket_allocator.allocation():
+                flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            payload = {
+                "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+                "metadata": flattened_tensor_bucket.get_metadata(),
+            }
+            load_format = "flattened_bucket"
+        long_live_tensors.append(payload)
+        serialized = MultiprocessingSerializer.serialize(payload, output_str=True)
+        serialized_tensors.append((load_format, serialized))
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -616,31 +867,20 @@ def _send_to_colocated_engine(
     )
 
     refs = []
-    if dist.get_rank() == ipc_gather_src:
-        # Ranks can contribute uneven bucket counts: under PP/EP/MoE layouts a TP
-        # rank may legitimately hold no HF tensors for a chunk. Pad short ranks
-        # with an empty bucket so every engine call gets one entry per rank. When
-        # all ranks are empty num_buckets is 0 and no update is issued.
-        num_buckets = max(len(tensors) for tensors in serialized_named_tensors)
-        empty_serialized_tensor = None
-        for i in range(num_buckets):
-            serialized_tensors_for_bucket = []
-            for tensors in serialized_named_tensors:
-                if i < len(tensors):
-                    serialized_tensors_for_bucket.append(tensors[i])
-                    continue
-                if empty_serialized_tensor is None:
-                    empty_tensor_data = _empty_flattened_tensor_data(cur_device)
-                    long_live_tensors.append(empty_tensor_data)
-                    empty_serialized_tensor = MultiprocessingSerializer.serialize(empty_tensor_data, output_str=True)
-                serialized_tensors_for_bucket.append(empty_serialized_tensor)
-            kwargs = {
-                "serialized_named_tensors": serialized_tensors_for_bucket,
-                "load_format": "flattened_bucket",
-                "weight_version": str(weight_version),
-            }
-            refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
-
+    errors = dispatch_errors if dispatch_errors is not None else []
+    if dist.get_rank(group=ipc_gather_group) == 0:
+        refs = dispatch_typed_buckets(
+            serialized_named_tensors,
+            engine=ipc_engine,
+            version=weight_version,
+            serializer=MultiprocessingSerializer,
+            empty_flattened=lambda: _empty_flattened_tensor_data(cur_device),
+            held=long_live_tensors,
+            dispatch_errors=errors,
+        )
+        if errors and dispatch_errors is None:
+            _drain_ipc_refs(refs)
+            raise RuntimeError(f"Weight dispatch failed: {errors}")
     return refs, long_live_tensors
 
 
@@ -649,3 +889,11 @@ def _empty_flattened_tensor_data(device):
         "flattened_tensor": torch.empty(0, dtype=torch.uint8, device=device),
         "metadata": [],
     }
+
+
+def _drain_ipc_refs(refs: Sequence[ObjectRef]) -> None:
+    for ref in refs:
+        try:
+            ray.get(ref)
+        except Exception:
+            pass

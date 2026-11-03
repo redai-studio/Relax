@@ -90,7 +90,7 @@ After changing the code, add tests for new or fixed behavior and choose the test
 pytest tests/
 
 # Run a specific test file
-pytest tests/utils/test_metrics_service.py
+pytest tests/cpu/utils/test_metrics_service.py
 
 # Run with coverage
 pytest --cov=relax tests/
@@ -116,8 +116,11 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/) for commit m
 - `docs:` - Documentation changes
 - `style:` - Code style changes (formatting, etc.)
 - `refactor:` - Code refactoring
+- `perf:` - Performance improvements
 - `test:` - Adding or updating tests
-- `chore:` - Maintenance tasks
+- `ci:` - CI configuration and workflow changes
+- `build:` - Build system or dependency changes
+- `chore:` - Other maintenance tasks
 
 ### 5. Open a PR
 
@@ -261,7 +264,7 @@ Users need flexibility to define custom reward logic for their tasks
 
 ## CI
 
-PRs run CPU checks, GPU unit tests, and GPU/NPU integration tests. To operate CI, put one command on the first line of a new PR comment. Rerun and cancel are available to the PR author and contributors with repository write access.
+PRs run pre-commit checks, GPU unit tests, and GPU/NPU integration tests. To operate CI, put one command on the first line of a new PR comment. Rerun and cancel are available to the PR author and contributors with repository write access.
 
 | Command | Usage |
 | --- | --- |
@@ -271,13 +274,12 @@ PRs run CPU checks, GPU unit tests, and GPU/NPU integration tests. To operate CI
 | `/help` | Show commands and targets |
 | `/review` | Request a code review |
 
-Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit/CPU workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
+Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
 
 | Target | Workflow / check |
 | --- | --- |
-| `ci` | All pre-commit and CPU checks |
+| `ci` | All pre-commit checks |
 | `ci/pre-commit` | Pre-commit checks |
-| `ci/cpu-310`, `ci/cpu-311`, `ci/cpu-312` | CPU tests on Python 3.10 / 3.11 / 3.12 |
 | `gpu-unit` | GPU unit tests |
 | `integration` | All GPU/NPU integration tests |
 | `integration/gpu-async` | Qwen3-4B GPU async training |

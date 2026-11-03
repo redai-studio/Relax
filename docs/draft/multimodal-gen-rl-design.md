@@ -347,7 +347,6 @@ tracks.image_x_next
     "trajectory_slots": int64[N],
     "policy_versions": int64[N],
     "advantages": float32[N],
-    "raw_reward": float32[N],
     "total_lengths": int64[N],
     "skip_optimizer_step": int64[N],   # 退化轮标记（初版设计未包含）
 }
@@ -667,21 +666,21 @@ scripts/training/diffusion/
 ### 8.5 测试
 
 ```text
-tests/backends/fsdp/test_actor_lifecycle.py
-tests/backends/fsdp/test_checkpoint.py
-tests/backends/fsdp/test_full_weight_update.py
-tests/backends/fsdp/test_lora.py
+tests/cpu/backends/fsdp/test_actor_lifecycle.py
+tests/cpu/backends/fsdp/test_checkpoint.py
+tests/cpu/backends/fsdp/test_full_weight_update.py
+tests/cpu/backends/fsdp/test_lora.py
 tests/backends/fsdp/test_offload.py
-tests/backends/fsdp/test_save_and_validation.py
-tests/backends/sglang/test_diffusion_engine.py
-tests/models/test_flow_grpo.py
-tests/models/test_generative_contract.py
-tests/models/qwen_image/test_adapter.py
-tests/engine/rollout/test_native_generation.py
-tests/engine/rewards/test_generative.py
-tests/engine/rewards/test_pickscore.py
-tests/examples/test_diffusion_data.py
-tests/distributed/ray/test_generative_reward.py
+tests/cpu/backends/fsdp/test_save_and_validation.py
+tests/cpu/backends/sglang/test_diffusion_engine.py
+tests/cpu/models/test_flow_grpo.py
+tests/cpu/models/test_generative_contract.py
+tests/cpu/models/qwen_image/test_adapter.py
+tests/cpu/engine/rollout/test_native_generation.py
+tests/cpu/engine/rewards/test_generative.py
+tests/cpu/engine/rewards/test_pickscore.py
+tests/cpu/examples/test_diffusion_data.py
+tests/cpu/distributed/ray/test_generative_reward.py
 ```
 
 共 15 个测试文件。`test_diffusion_engine.py` 覆盖 diffusion engine 的数据映射、health/offload 合约，以及一个合成 sglang 模块上的静态 patch 契约检查。
@@ -1090,18 +1089,18 @@ eval 发射：`eval_time`。
 
 必须覆盖：
 
-1. adapter 的 condition、trajectory 和 artifact contract round-trip（`tests/models/qwen_image/test_adapter.py`、`tests/models/test_generative_contract.py`）。
-2. rollout/replay 单 transition log-prob parity 与 clipped loss（`tests/models/test_flow_grpo.py`）。
-3. `resolve_sde_indices` 的显式 / 推导 / 每轮重抽样 / 空四条分支（`tests/models/test_generative_contract.py`）。
-4. TQ converter 与 `hydrate_micro_batches` 的数值 round-trip、DP 分片（`tests/engine/rollout/test_native_generation.py`）。
-5. reward group barrier、component 归一化、退化判定（`tests/engine/rewards/test_generative.py`）。
-6. CPU reward 路径不初始化 CUDA（`tests/distributed/ray/test_generative_reward.py`）。
-7. full-weight iterator 只覆盖完整 transformer、manifest hash 稳定、包装层名字被剥离（`tests/backends/fsdp/test_full_weight_update.py`）。
-8. DCP 恢复 model、optimizer、task contract 和 policy version；commit 协商与配置校验（`tests/backends/fsdp/test_checkpoint.py`、`test_save_and_validation.py`）。
-9. LoRA 注入、merge 折叠与全参形状一致、键名映射、contract 比对（`tests/backends/fsdp/test_lora.py`）。
+1. adapter 的 condition、trajectory 和 artifact contract round-trip（`tests/cpu/models/qwen_image/test_adapter.py`、`tests/cpu/models/test_generative_contract.py`）。
+2. rollout/replay 单 transition log-prob parity 与 clipped loss（`tests/cpu/models/test_flow_grpo.py`）。
+3. `resolve_sde_indices` 的显式 / 推导 / 每轮重抽样 / 空四条分支（`tests/cpu/models/test_generative_contract.py`）。
+4. TQ converter 与 `hydrate_micro_batches` 的数值 round-trip、DP 分片（`tests/cpu/engine/rollout/test_native_generation.py`）。
+5. reward group barrier、component 归一化、退化判定（`tests/cpu/engine/rewards/test_generative.py`）。
+6. CPU reward 路径不初始化 CUDA（`tests/cpu/distributed/ray/test_generative_reward.py`）。
+7. full-weight iterator 只覆盖完整 transformer、manifest hash 稳定、包装层名字被剥离（`tests/cpu/backends/fsdp/test_full_weight_update.py`）。
+8. DCP 恢复 model、optimizer、task contract 和 policy version；commit 协商与配置校验（`tests/cpu/backends/fsdp/test_checkpoint.py`、`test_save_and_validation.py`）。
+9. LoRA 注入、merge 折叠与全参形状一致、键名映射、contract 比对（`tests/cpu/backends/fsdp/test_lora.py`）。
 10. offload 真的释放了设备存储（`tests/backends/fsdp/test_offload.py`）—— 这条是为了钉住那个「`param.data` 赋值在 `fully_shard` 下释放零字节」的回归。
-11. actor lifecycle、engine 包装与 SGLang 静态 patch 契约检查（`tests/backends/fsdp/test_actor_lifecycle.py`、`tests/backends/sglang/test_diffusion_engine.py`）。
-12. 数据准备脚本的确定性与产出文件名（`tests/examples/test_diffusion_data.py`）。
+11. actor lifecycle、engine 包装与 SGLang 静态 patch 契约检查（`tests/cpu/backends/fsdp/test_actor_lifecycle.py`、`tests/cpu/backends/sglang/test_diffusion_engine.py`）。
+12. 数据准备脚本的确定性与产出文件名（`tests/cpu/examples/test_diffusion_data.py`）。
 13. 默认 Megatron、token SGLang 和 Controller 行为无回归。
 
 备份分支上另有多 track（T2AV joint log-prob + component 权重）、mixed-aspect Qwen Edit 分 bucket、WAN frame factor/FPS/video hash 的对应用例 —— 注意多 track 的被测代码本身已经删除（§0.2）。

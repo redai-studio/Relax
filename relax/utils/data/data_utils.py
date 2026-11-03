@@ -26,7 +26,7 @@ import multiprocessing
 import os
 import re
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -117,8 +117,14 @@ def _normalize_inline_multimodal_items(prompt: Any) -> Any:
     return normalized_messages
 
 
-def count_message_multimodal_items(prompt: str | list[Any]) -> dict[str, int]:
-    """Count literal placeholders and structured media items in messages."""
+def count_message_multimodal_items(
+    prompt: str | list[Any], *, literal_modalities: set[str] | None = None
+) -> dict[str, int]:
+    """Count structured media and selected literal placeholders.
+
+    None preserves counting all literal modalities for existing callers.
+    Structured items are always counted, even when literals are disabled.
+    """
     counts = {media.name: 0 for media in MultimodalTypes.all()}
     if isinstance(prompt, str):
         contents: list[Any] = [prompt]
@@ -128,7 +134,8 @@ def count_message_multimodal_items(prompt: str | list[Any]) -> dict[str, int]:
     for content in contents:
         if isinstance(content, str):
             for media in MultimodalTypes.all():
-                counts[media.name] += content.count(media.placeholder)
+                if literal_modalities is None or media.name in literal_modalities:
+                    counts[media.name] += content.count(media.placeholder)
         elif isinstance(content, list):
             for item in content:
                 if not isinstance(item, dict):
@@ -221,6 +228,20 @@ def build_messages(
         else:
             prompt = [{"role": "user", "content": prompt}]
 
+    # OpenAI tool-only assistant turns may explicitly have no text body.
+    # Preserve all tool/supervision metadata without mutating the reader cache.
+    if isinstance(prompt, list):
+        prompt = [
+            {**message, "content": ""}
+            if isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and "content" in message
+            and message["content"] is None
+            and isinstance(message.get("tool_calls"), list)
+            and message["tool_calls"]
+            else message
+            for message in prompt
+        ]
     prompt = _normalize_inline_multimodal_items(prompt)
 
     # TODO(xide): audio in video special case
@@ -583,7 +604,7 @@ def filter_long_prompts(
                     executor.submit(_check_sample_length_worker, sample, max_length): sample for sample in samples
                 }
                 for future in tqdm.tqdm(
-                    as_completed(futures),
+                    futures,
                     total=len(futures),
                     desc=f"check sample length...(num_proc={actual_workers})",
                 ):

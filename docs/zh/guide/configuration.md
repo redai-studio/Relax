@@ -31,7 +31,7 @@
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--num-data-storage-units` | int | 1 | TransferQueue SimpleStorageUnit Actor 数量 |
-| `--per-rank-fetch` | flag | False | 让每个 TP/PP rank 都并行地各自从 TransferQueue 拉一份数据，省掉 rank-0 pickle + TP/PP broadcast。跨 rank 一致性依赖 TQ sampler 的 `(partition_id, task_name, dp_rank, batch_index)` 缓存（PP/TP 不变量）。当 `rollout_routed_experts` 出现在 `data_fields` 时自动禁用（jagged NestedTensor broadcast 路径不兼容）。多卡训练推荐配合 `--num-data-storage-units >= TP world size` 使用。在 pickle 主导 `tgd_bcast_tp_time` 时有收益。 |
+| `--per-rank-fetch`（RL 兼容选项；SFT 自动选择） | flag | RL: False / Megatron SFT: True | 让每个 TP/PP rank 都并行地各自从 TransferQueue 拉一份数据，省掉 rank-0 pickle + TP/PP broadcast。跨 rank 一致性依赖 TQ sampler 的 `(partition_id, task_name, dp_rank, batch_index)` 缓存（PP/TP 不变量）。当 `rollout_routed_experts` 出现在 `data_fields` 时自动禁用（jagged NestedTensor broadcast 路径不兼容）。多卡训练推荐配合 `--num-data-storage-units >= TP world size` 使用。在 pickle 主导 `tgd_bcast_tp_time` 时有收益。 |
 | `--max-staleness` | int | 0 | TransferQueue 数据系统的最大陈旧度（0=on-policy） |
 | `--polling-mode` | bool | True | 获取 metadata 时是否使用轮询模式 |
 | `--num-iters-per-train-update` | int | 1 | 全异步流水线中每个 global batch 的迭代次数 |
@@ -299,7 +299,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--advantage-estimator` | str | grpo | 由 `relax/algorithms/spec.py` 的 `ALGORITHM_SPECS` 生成，当前为 `grpo`、`gspo`、`sapo`、`cispo`、`rloo`、`ppo`、`reinforce_plus_plus`、`reinforce_plus_plus_baseline` | 优势估计器。以 `--help` 为准：取值直接读注册表，新增算法无需改这张表即可出现。OPD 独立于该选项，使用 `--use-opd` 及对应 KL/loss 系数启用 |
+| `--advantage-estimator` | str | grpo | 由 `relax/algorithms/spec.py` 的 `ALGORITHM_SPECS` 生成，当前为 `grpo`、`score_centering`、`gspo`、`sapo`、`cispo`、`rloo`、`ppo`、`reinforce_plus_plus`、`reinforce_plus_plus_baseline` | 优势估计器。以 `--help` 为准：取值直接读注册表，新增算法无需改这张表即可出现。OPD 独立于该选项，使用 `--use-opd` 及对应 KL/loss 系数启用 |
 | `--normalize-advantages` | flag | False | - | 是否归一化优势 |
 | `--disable-grpo-std-normalization` | flag | - | - | 禁用 GRPO 标准差归一化（来自 [Dr.GRPO](https://arxiv.org/pdf/2503.20783)） |
 | `--disable-rewards-normalization` | flag | - | - | 禁用 reward 归一化 |
@@ -444,7 +444,7 @@ PPO 当前支持同步 colocate 模式，并要求在 `--resource` 中包含 `cr
 | `RELAX_SFT_TQ_SHARDS` | int | 1 | SFT TransferQueue shard 数。小于等于 0 的值按 1 处理。 |
 
 ::: warning 生效条件
-这个变量本身不会开启 prepack。它仅在使用 `--loss-type sft --sft-async-prepack` 时生效，否则 Relax 只使用一个分区。Async prepack 还要求开启 `--per-rank-fetch`、至少允许两个 in-flight step（`--max-staleness >= 1` 或 `--sft-max-in-flight-steps >= 2`）、PP=1、CP=1、VPP=1，并使用 THD QKV 格式。
+这个变量本身不会开启 prepack，仅在 SFT 自动选中 async prepack 时生效，否则 Relax 只使用一个分区。自动选择要求 Megatron 后端、NCCL、THD、至少两个在途 step（`--max-staleness >= 1` 或 `--sft-max-in-flight-steps >= 2`）、PP=1、CP=1、VPP 关闭，且无动态 CP、routing/indexer replay 和图片数据。per-rank fetch 自动开启，无需额外开关。
 :::
 
 当 `N > 1` 时，step `K` 使用从 `sft_K_shard_0_of_N` 到 `sft_K_shard_<N-1>_of_N` 的分区；原有的 `sft_K` 名称只会在 `N == 1` 时使用。Consumer 会等待所有 shard 分区就绪，然后从每个分区读取相同数量的样本。因此，`global_batch_size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。
@@ -476,6 +476,18 @@ SFT producer 如何处理 tokenize + 多模态展开后长度超过单卡容量�
 |------|------|--------|--------|------|
 | `--sft-oversize-strategy` | str | keep | `skip`, `keep`, `truncate_left`, `truncate_right`, `custom` | `skip` 丢弃样本；`keep` 原样返回（可能下游 OOM）；`truncate_left` 保留末尾 `capacity` 个 token；`truncate_right` 保留开头 `capacity` 个 token；`custom` 委托给 `--sft-oversize-custom-function-path`。⚠ 直接截多模态样本可能导致 `multimodal_train_inputs` 错位——需要同时裁剪媒体输入时请用 `custom`。 |
 | `--sft-oversize-custom-function-path` | str | None | - | 在 `--sft-oversize-strategy custom` 时必填。指向一个 Python 可导入函数，签名为 `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) \| None`。返回 `None` 等同于 `skip`。 |
+
+如果希望完整保留超过打包预算的 SFT 样本，同时跳过超过 `--seq-length` 的样本，可在训练命令中加入：
+
+```bash
+--seq-length 262144 \
+--use-dynamic-batch-size \
+--max-tokens-per-gpu 131072 \
+--sft-oversize-strategy custom \
+--sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
+```
+
+该策略直接读取 `--seq-length`，无需额外环境变量。CP=1 时，展开后长度超过 131072、但不超过 262144 tokens 的样本会完整保留并单独组成微批次，更长的样本会被跳过。需要满足 `0 < max_tokens_per_gpu × context_parallel_size <= seq_length`，因为未超过打包预算的样本不会进入 oversize hook。该策略保留原始 tokens 和 loss mask，但不会降低长样本本身的显存需求。
 
 偏好训练先应用 `--preference-max-length` 和 `--preference-max-completion-length`，再使用上述选项处理超长样本对。容量按两条分支的总长度计算：`keep` 保留整对样本并单独组成一个微批次，`skip` 丢弃整对样本。
 

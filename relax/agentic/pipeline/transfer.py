@@ -113,6 +113,12 @@ class TransferDomain:
             if partition is not None
         )
 
+    @property
+    def previous_debt(self) -> int:
+        """Return debt that must be filled before another partition opens."""
+
+        return self._previous_partition.remaining_groups if self._previous_partition is not None else 0
+
     def open_partition(self, partition_id: int, target_groups: int, *, accepts_surplus: bool = False) -> None:
         """Open one physical partition with its target Group count."""
 
