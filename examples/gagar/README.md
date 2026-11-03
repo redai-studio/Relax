@@ -53,7 +53,7 @@ cap 生效时不再补回全部正优势；最终减均值也会改变失败候�
 ## 验证
 
 ```bash
-pytest -q tests/examples/test_gagar.py
+pytest -q tests/cpu/examples/test_gagar.py
 ```
 
 测试直接经过 Relax 的生产组归一化函数，覆盖 cap 前后、零权重、全通过/全失败、候选顺序和不修改输入。
