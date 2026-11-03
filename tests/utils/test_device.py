@@ -17,9 +17,6 @@ from relax.utils import device
 from relax.utils.device import AcceleratorType, BackendSpec, device_module
 
 
-_CPU_ONLY = device.get_device_name() == "cpu"
-
-
 # ---------------------------------------------------------------------------
 # Backend table integrity
 # ---------------------------------------------------------------------------
@@ -181,8 +178,17 @@ def test_device_is_klx_probes_xpuctrl_node(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 # Config-query APIs (stable on a Ray-less host: CUDA-default fallback)
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(not _CPU_ONLY, reason="expects a CPU-only host without a Ray runtime")
 class TestDeviceCpuHost:
+    @pytest.fixture(autouse=True)
+    def cpu_host(self, monkeypatch):
+        # Exercise the real fallback logic regardless of the runner's hardware.
+        monkeypatch.delenv("RELAX_DEVICE_TYPE", raising=False)
+        monkeypatch.setattr(device, "_is_torch_device_module_available", lambda name: False)
+        device._detect_accelerator.cache_clear()
+        yield
+        # Do not leave the simulated CPU result cached for later tests.
+        device._detect_accelerator.cache_clear()
+
     def test_get_device_name(self) -> None:
         assert device.get_device_name() == "cpu"
 
@@ -194,14 +200,16 @@ class TestDeviceCpuHost:
 
     def test_config_query_apis_use_cuda_default(self, monkeypatch) -> None:
         # Pin the Ray state: other modules' collection-time ray.init() would flip this to "gloo".
-        ray = pytest.importorskip("ray")
+        import ray
+
         monkeypatch.setattr(ray, "is_initialized", lambda: False)
         assert device.get_dist_backend() == "nccl"
         assert device.get_visible_devices_env_var() == "CUDA_VISIBLE_DEVICES"
         assert device.get_ray_accelerator_name() == "GPU"
 
     def test_config_query_apis_use_gloo_on_initialized_cpu_cluster(self, monkeypatch) -> None:
-        ray = pytest.importorskip("ray")
+        import ray
+
         monkeypatch.setattr(ray, "is_initialized", lambda: True)
         monkeypatch.setattr(ray, "cluster_resources", lambda: {"CPU": 8})
         assert device.get_dist_backend() == "gloo"
