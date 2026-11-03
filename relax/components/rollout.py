@@ -549,7 +549,7 @@ class Rollout(Base):
         # facade is replaced. Engines remain with the common inference owner.
         from relax.engine.inference.phase_client import control_call
 
-        await control_call(self.rollout_manager.dispose.remote())
+        await control_call(self.rollout_manager.dispose.remote(release_inference=False))
 
     # --- HTTP endpoints for restart / recovery (bypass Ray Serve handle) ---
 

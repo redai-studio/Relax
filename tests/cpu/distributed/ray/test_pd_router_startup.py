@@ -349,7 +349,7 @@ def test_router_cleanup_retains_failed_process_for_retry(rollout_module):
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_rollout_resource_owner_retains_routers_on_unconfirmed_engine_cleanup(monkeypatch, rollout_module, failure):
+def test_rollout_resource_owner_stops_routers_on_unconfirmed_engine_cleanup(monkeypatch, rollout_module, failure):
     from relax.engine.inference.admission import AdmissionGate
 
     manager = object.__new__(rollout_module.RolloutEngineRuntime)
@@ -362,10 +362,9 @@ def test_rollout_resource_owner_retains_routers_on_unconfirmed_engine_cleanup(mo
     if failure:
         with pytest.raises(RuntimeError, match="unconfirmed"):
             manager.dispose()
-        router_cleanup.assert_not_called()
     else:
         manager.dispose()
-        router_cleanup.assert_called_once()
+    router_cleanup.assert_called_once_with()
 
 
 def test_rollout_shutdown_keeps_unconfirmed_engine_groups(rollout_module):
@@ -527,5 +526,5 @@ def test_owner_signals_all_monitors_before_bounded_join(monkeypatch, rollout_mod
     monkeypatch.setattr(rollout_module, "stop_launched_routers", lambda: events.append(("routers", None)))
     manager.dispose()
     assert events[:5] == [("eviction", 0.0)] + [(f"health-{i}", 0.0) for i in range(4)]
-    assert rollout_module.time.now == 0.0
+    assert rollout_module.time.now == 5.0
     assert events[-2:] == [("engines", None), ("routers", None)]

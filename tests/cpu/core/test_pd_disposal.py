@@ -67,6 +67,61 @@ def test_controller_shutdown_disposes_rollout_owner(monkeypatch, controller_modu
     assert events == ["dispose", "teacher", "agentic", "routers"]
 
 
+def test_controller_shutdown_proves_training_exit_before_public_disposal(monkeypatch, controller_module):
+    controller = object.__new__(controller_module.Controller)
+    events = []
+
+    def stop_training(*, timeout):
+        assert timeout == 60.0
+        events.append("training stopped")
+
+    def stop_owner():
+        assert events == ["gateway stopped", "training stopped"]
+        events.append("owner stopped")
+
+    def dispose_workload():
+        assert events == ["gateway stopped", "training stopped", "owner stopped", "new epoch"]
+        events.append("workload disposed")
+
+    owner = SimpleNamespace(shutdown=SimpleNamespace(remote=stop_owner))
+    controller._inference_authority = SimpleNamespace(
+        stop_training=SimpleNamespace(remote=stop_training),
+        managers=SimpleNamespace(remote=lambda: [owner]),
+        new_epoch=SimpleNamespace(remote=lambda: events.append("new epoch")),
+        resources_for=SimpleNamespace(remote=lambda role: {}),
+    )
+    workload = SimpleNamespace(dispose=SimpleNamespace(remote=dispose_workload))
+    controller.serve_dict = {
+        controller_module.ROLES.rollout: SimpleNamespace(get_rollout_manager=AsyncMock(return_value=workload))
+    }
+    controller._teacher_manager = object()
+    controller._shutdown_agentic_rollout_services = lambda: events.append("agentic")
+    controller._close_data_system = Mock()
+    controller._cleanup_s3_model_weights_after_init = Mock()
+    monkeypatch.setattr(controller_module, "run", asyncio.run)
+    monkeypatch.setattr(controller_module.ray, "get", lambda ref, timeout: ref)
+    monkeypatch.setattr(
+        controller_module, "shutdown_managed_opd_teacher_gateway", lambda _: events.append("gateway stopped")
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "relax.distributed.ray.rollout",
+        SimpleNamespace(stop_launched_routers=lambda: events.append("routers") or 0),
+    )
+
+    controller.shutdown()
+
+    assert events == [
+        "gateway stopped",
+        "training stopped",
+        "owner stopped",
+        "new epoch",
+        "workload disposed",
+        "agentic",
+        "routers",
+    ]
+
+
 def test_global_restart_disposes_owner_before_deleting_deployments(monkeypatch, controller_module):
     controller = object.__new__(controller_module.Controller)
     controller._global_restart_count = 0

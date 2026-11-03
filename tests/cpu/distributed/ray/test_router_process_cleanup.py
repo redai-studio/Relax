@@ -15,6 +15,7 @@ pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang depende
 @pytest.mark.parametrize("shutdown_fails", [False, True])
 def test_rollout_manager_dispose_stops_owned_router_even_if_engine_shutdown_fails(monkeypatch, shutdown_fails):
     from relax.distributed.ray import rollout
+    from relax.engine.inference.admission import AdmissionGate
 
     process = multiprocessing.Process(target=time.sleep, args=(30,))
     process.daemon = True
@@ -27,6 +28,8 @@ def test_rollout_manager_dispose_stops_owned_router_even_if_engine_shutdown_fail
             raise RuntimeError("engine shutdown failed")
 
     manager = SimpleNamespace(
+        _admission=AdmissionGate(),
+        _abort_inference_requests=Mock(),
         _stop_eviction_monitor=Mock(),
         _health_monitors=[],
         _shutdown_all_engines=Mock(side_effect=shutdown_engines),
@@ -34,9 +37,9 @@ def test_rollout_manager_dispose_stops_owned_router_even_if_engine_shutdown_fail
     try:
         if shutdown_fails:
             with pytest.raises(RuntimeError, match="engine shutdown failed"):
-                rollout.RolloutManager.dispose.__func__(manager)
+                rollout.RolloutEngineRuntime.dispose(manager)
         else:
-            rollout.RolloutManager.dispose.__func__(manager)
+            rollout.RolloutEngineRuntime.dispose(manager)
 
         assert not process.is_alive()
         assert rollout._LAUNCHED_ROUTER_PROCESSES == []

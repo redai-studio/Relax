@@ -63,15 +63,21 @@ class RolloutWorkload(ReloadableMixin):
     def get_inference_manager(self):
         return self.inference_manager
 
-    async def dispose(self):
+    async def dispose(self, *, release_inference: bool = True) -> None:
         self._closing = True
         for task in tuple(self._pending_operations):
             try:
                 await _settle(task)
             except BaseException:
                 pass
-        detach_tq_client()
-        self.data_system_client = None
+        try:
+            if release_inference:
+                # Preserve the public manager cleanup API through the single
+                # resource owner; its rollout adapter owns the router registry.
+                await control_call(self.inference_manager.handle.shutdown.remote())
+        finally:
+            detach_tq_client()
+            self.data_system_client = None
 
     @asynccontextmanager
     async def _phase(self, owner: str, *, offload_after: bool = False):

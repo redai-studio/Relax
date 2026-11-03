@@ -118,6 +118,7 @@ class InferenceManager:
         self._acceptance = asyncio.Lock()
         self._owned_resources = set()
         self._closing = False
+        self._shutdown_task: asyncio.Task | None = None
         self._legacy_callers: set[HolderIdentity | None] = set()
         self._health_tasks: dict[str, asyncio.Task] = {}
         self._health_wakeups: dict[str, asyncio.Event] = {}
@@ -528,6 +529,15 @@ class InferenceManager:
         ).to_dict()
 
     async def shutdown(self) -> None:
+        task = self._shutdown_task
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+            # Controller and workload cleanup may overlap. Keep successful
+            # shutdown receipts across epoch changes, while allowing retries
+            # after an unconfirmed release. Caller cancellation owns no cleanup.
+            task = self._shutdown_task = asyncio.create_task(self._shutdown())
+        await asyncio.shield(task)
+
+    async def _shutdown(self) -> None:
         async with self._acceptance:
             self._closing = True
         for wakeup in self._health_wakeups.values():

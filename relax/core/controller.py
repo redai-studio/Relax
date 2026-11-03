@@ -1528,13 +1528,19 @@ class Controller:
             except Exception as exc:
                 logger.warning(f"Image SFT producer shutdown failed: {exc}")
 
-        self._dispose_rollout_manager()
+        owns_inference = getattr(self, "_inference_authority", None) is not None
+        if not owns_inference:
+            self._dispose_rollout_manager()
 
         # The gateway only fronts the teacher's engines; take it down first so
         # it never routes to engines that are being shut down.
-        shutdown_managed_opd_teacher_gateway(self._teacher_manager)
-        if getattr(self, "_inference_authority", None) is not None:
+        if self._teacher_manager is not None:
+            shutdown_managed_opd_teacher_gateway(self._teacher_manager)
+        if owns_inference:
             self._shutdown_inference_owners()
+            # Training exit must precede the public workload disposal facade,
+            # which reuses the owner's completed shutdown receipt.
+            self._dispose_rollout_manager()
         else:
             shutdown_managed_opd_teacher(self._teacher_manager)
 

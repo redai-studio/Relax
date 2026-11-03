@@ -1116,12 +1116,20 @@ class RolloutEngineRuntime:
         self._try_ci_fault_injection()
 
     def dispose(self):
-        self._admission.close_for_shutdown(self._abort_inference_requests)
-        self._stop_eviction_monitor(timeout=0.0)
-        for monitor in self._health_monitors:
-            monitor.stop(timeout=0.0)
-        self._shutdown_all_engines()
-        stop_launched_routers()
+        try:
+            self._admission.close_for_shutdown(self._abort_inference_requests)
+            self._stop_eviction_monitor(timeout=0.0)
+            for monitor in self._health_monitors:
+                monitor.stop(timeout=0.0)
+            deadline = time.monotonic() + 5.0
+            self._stop_eviction_monitor(timeout=max(0.0, deadline - time.monotonic()))
+            for monitor in self._health_monitors:
+                monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
+            self._shutdown_all_engines()
+        finally:
+            # The inference owner holds the process-local router registry even
+            # when engine shutdown cannot prove that GPU resources were freed.
+            stop_launched_routers()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         errors = []

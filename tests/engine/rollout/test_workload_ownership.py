@@ -3,13 +3,18 @@
 import asyncio
 import threading
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from relax.distributed.ray.inference_manager import InferenceManager, ModelManager
 from relax.distributed.ray.placement_planner import Phase, PlacementClaim, PlacementPlan
+from relax.distributed.ray.rollout import RolloutEngineRuntime
+from relax.engine.inference.admission import AdmissionGate
 from relax.engine.inference.ownership import OwnershipLedger
 from relax.engine.inference.phase_client import current_phase
 from relax.engine.rollout import workload as workload_module
+from tests.engine.inference.test_coresidency import Handle
 
 
 @pytest.fixture
@@ -42,6 +47,7 @@ def workload(monkeypatch):
     instance._closing = False
     instance.data_source = None
     instance.data_system_client = object()
+    instance.inference_manager = SimpleNamespace(handle=SimpleNamespace(shutdown=SimpleNamespace(remote=AsyncMock())))
     monkeypatch.setattr(workload_module, "detach_tq_client", lambda: events.append("detach"))
     return instance, ledger, events
 
@@ -114,6 +120,103 @@ async def test_predict_disposal_waits_for_cleanup_and_rejects_new_work(workload,
     await disposal
     assert events == ["onload", "predict closed", "detach"]
     assert not ledger.snapshot()["owners"]
+
+
+@pytest.mark.parametrize("release_inference", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+async def test_public_disposal_delegates_cleanup_and_detaches_on_owner_failure(workload, release_inference, failure):
+    instance, _, events = workload
+    shutdown = instance.inference_manager.handle.shutdown.remote
+    if failure:
+        shutdown.side_effect = RuntimeError("engine exit unconfirmed")
+    if release_inference and failure:
+        with pytest.raises(RuntimeError, match="engine exit unconfirmed"):
+            await instance.dispose(release_inference=release_inference)
+    else:
+        await instance.dispose(release_inference=release_inference)
+    if release_inference:
+        shutdown.assert_awaited_once_with()
+    else:
+        shutdown.assert_not_called()
+    assert instance._closing
+    assert events == ["detach"]
+    assert instance.data_system_client is None
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_public_disposal_preserves_owner_receipts_across_retries_and_epochs(workload, monkeypatch, failure):
+    instance, initial_ledger, events = workload
+    ledger = OwnershipLedger(initial_ledger.plan)
+    instance.args._inference_authority = Handle(ledger)
+    owner = InferenceManager.__ray_metadata__.modified_class(instance.args, "rollout")
+    runtime = object.__new__(RolloutEngineRuntime)
+    runtime._admission = AdmissionGate()
+    runtime._stop_eviction_monitor = Mock()
+    runtime._health_monitors = []
+    runtime._shutdown_all_engines = Mock(side_effect=RuntimeError("engine exit unconfirmed") if failure else None)
+    stop_routers = Mock()
+    monkeypatch.setattr("relax.distributed.ray.rollout.stop_launched_routers", stop_routers)
+    owner._runtimes["__default__"] = runtime
+    owner._claims["__default__"] = ledger.claims_for("rollout")
+    owner._locks["__default__"] = asyncio.Lock()
+    handle = Handle(owner)
+    ledger.register_manager("rollout", handle)
+    ledger.register_model("rollout", "__default__", handle, owner._claims["__default__"][0])
+    instance.inference_manager = ModelManager(handle, "__default__")
+    # Global recovery first proves training exit, then retries blocked owners.
+    await ledger.stop_training()
+
+    if failure:
+        with pytest.raises(RuntimeError, match="engine exit unconfirmed"):
+            await instance.dispose()
+        assert ledger.snapshot()["blocked"]
+        stop_routers.assert_called_once_with()
+        runtime._shutdown_all_engines.side_effect = None
+    await instance.dispose()
+    assert runtime._admission._closed
+    assert not ledger.snapshot()["owners"]
+    assert not owner._blocked
+    assert bool(ledger.snapshot()["blocked"]) is failure
+    calls = runtime._shutdown_all_engines.call_count
+    assert calls == (2 if failure else 1)
+    assert stop_routers.call_count == calls
+
+    await ledger.new_epoch()
+    epoch = ledger.epoch
+    await instance.dispose()
+    assert ledger.epoch == epoch
+    assert runtime._shutdown_all_engines.call_count == calls
+    assert stop_routers.call_count == calls
+    assert not ledger.snapshot()["owners"]
+    assert not ledger.snapshot()["blocked"]
+    assert events == ["detach"] * (3 if failure else 2)
+
+
+async def test_concurrent_owner_shutdown_survives_caller_cancellation(workload, monkeypatch):
+    instance, _, _ = workload
+    owner = InferenceManager.__ray_metadata__.modified_class(instance.args, "rollout")
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def shutdown():
+        entered.set()
+        await finish.wait()
+
+    cleanup = AsyncMock(side_effect=shutdown)
+    monkeypatch.setattr(owner, "_shutdown", cleanup)
+    first = asyncio.create_task(owner.shutdown())
+    await entered.wait()
+    second = asyncio.create_task(owner.shutdown())
+    first.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not second.done()
+        cleanup.assert_awaited_once_with()
+    finally:
+        finish.set()
+    await second
+    await owner.shutdown()
+    cleanup.assert_awaited_once_with()
 
 
 @pytest.mark.parametrize("operation", ["generate", "eval", "predict"])
