@@ -10,7 +10,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from relax.utils.model_routing import resolve_is_vl_model
+from relax.utils.misc import resolve_is_vl_model
 
 
 @pytest.mark.parametrize("config_name", ["processor_config.json", "preprocessor_config.json"])

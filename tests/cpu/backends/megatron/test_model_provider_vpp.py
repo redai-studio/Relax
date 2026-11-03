@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from relax.utils.misc import resolve_is_vl_model
 from relax.utils.training import ppo_utils
 
 
@@ -104,6 +105,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     tokenizer._vocab_size_with_padding = lambda *args, **kwargs: None
     bridge.AutoBridge = _FakeAutoBridge
     misc.load_function = lambda path: None
+    misc.resolve_is_vl_model = resolve_is_vl_model
 
     modules = {
         "megatron": megatron,

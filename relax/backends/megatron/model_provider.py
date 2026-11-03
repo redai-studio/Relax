@@ -43,8 +43,7 @@ from relax.utils.megatron_peft_utils import (
     scope_target_modules_to_region,
     summarize_lora_modules,
 )
-from relax.utils.misc import load_function
-from relax.utils.model_routing import resolve_is_vl_model
+from relax.utils.misc import load_function, resolve_is_vl_model
 from relax.utils.training.ppo_utils import (
     ensure_sequence_classification_head_trainable,
     install_critic_value_head_in_provider,
