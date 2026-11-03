@@ -2135,6 +2135,16 @@ def _compute_genrm_server_args(
         # prefill backend cannot initialize while memory saver is enabled.
         kwargs["cuda_graph_backend_prefill"] = "disabled"
 
+    # CUDA IPC cannot cross nodes. Resolve the default after GenRM's own topology
+    # and overrides; an explicit None retains SGLang's automatic selection.
+    if (
+        "mm_feature_transport" in server_arg_fields
+        and "mm_feature_transport" not in (args.genrm_engine_config or {})
+        and kwargs.get("mm_feature_transport") is None
+        and kwargs["nnodes"] == 1
+    ):
+        kwargs["mm_feature_transport"] = "cuda_ipc"
+
     # for compatibility with old args
     if len(unused_keys) > 0:
         logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
@@ -2256,6 +2266,16 @@ def _compute_server_args(
 
     if getattr(args, "opd_teacher_defer", False) or getattr(args, "defer_reward_to_post_process", False):
         kwargs["enable_weights_cpu_backup"] = True
+
+    # Use CUDA IPC only for engines confined to one node; multi-node engines
+    # retain SGLang's auto policy, including CUDA VMM where supported.
+    if (
+        "mm_feature_transport" in server_arg_field_names
+        and "mm_feature_transport" not in (sglang_overrides or {})
+        and kwargs.get("mm_feature_transport") is None
+        and kwargs["nnodes"] == 1
+    ):
+        kwargs["mm_feature_transport"] = "cuda_ipc"
 
     # Repeated policy updates benefit from keeping shared and routed experts
     # separate. Explicit per-engine settings or enforced fusion take precedence.

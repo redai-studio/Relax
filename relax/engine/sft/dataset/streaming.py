@@ -219,7 +219,7 @@ def _normalize_tool_calls(value: Any) -> list[dict] | None:
             if "arguments" in function:
                 arguments = function["arguments"]
                 if isinstance(arguments, str):
-                    arguments = json.loads(arguments)
+                    arguments = json.loads(arguments) if arguments.strip() else {}
                 if not isinstance(arguments, dict):
                     raise TypeError(
                         f"tool_calls[{index}].function.arguments must be a JSON object, got {type(arguments)}"
@@ -265,14 +265,25 @@ def _apply_conversation_key_map(messages: list[Any], key_map: dict[str, str]) ->
 def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) -> list[CanonicalMessage]:
     messages: list[CanonicalMessage] = []
     has_learn = False
+    tool_names_by_id = {}
+    for raw in raw_messages:
+        for tool_call in raw.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if tool_call.get("id") and isinstance(function, dict) and function.get("name"):
+                tool_names_by_id[tool_call["id"]] = function["name"]
+
     for raw in raw_messages:
         role = raw.get("role")
         if role is None:
             raise ValueError(f"SFT message missing role: {raw}")
-        if "content" not in raw:
+        if "content" not in raw and not (role == "assistant" and raw.get("tool_calls")):
             raise ValueError(f"SFT message missing content: {raw}")
+        content = raw.get("content")
+        if content is None and role == "assistant" and raw.get("tool_calls"):
+            content = ""
         if role == "tool_call":
-            content = raw["content"]
             # Multimodal build_messages wraps string content in text parts.
             if isinstance(content, list):
                 if any(not isinstance(part, dict) or part.get("type") != "text" for part in content):
@@ -285,6 +296,9 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
                 "type": "function",
                 "function": {"name": call["name"], "arguments": call.get("arguments", {})},
             }
+            normalized_tool_calls = _normalize_tool_calls([tool_call])
+            assert normalized_tool_calls is not None
+            tool_call = normalized_tool_calls[0]
             learn = _resolve_learn_flag(raw, "assistant")
             has_learn = has_learn or learn
             if messages and messages[-1].role == "assistant" and messages[-1].learn == learn:
@@ -297,12 +311,15 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
             role = "tool"
         learn = _resolve_learn_flag(raw, role)
         has_learn = has_learn or learn
+        tool_call_id = raw.get("tool_call_id")
         messages.append(
             CanonicalMessage(
                 role=role,
-                content=raw["content"],
+                content=content,
                 learn=learn,
                 tool_calls=_normalize_tool_calls(raw.get("tool_calls")),
+                tool_call_id=tool_call_id,
+                name=raw.get("name") or tool_names_by_id.get(tool_call_id),
                 reasoning_content=raw.get("reasoning_content"),
             )
         )
@@ -344,6 +361,23 @@ def _build_canonical_sample_from_row(
             # mutate the reader's cache.
             prompt = _apply_conversation_key_map(prompt, conversation_key_map)
             row = {**row, prompt_key: prompt}
+        if "message_loss_mask" in row:
+            message_mask = row["message_loss_mask"]
+            if not isinstance(message_mask, list) or len(message_mask) != len(prompt):
+                raise ValueError("message_loss_mask must have exactly one entry per input message")
+            if any(not isinstance(value, (bool, Integral)) or value not in (0, 1) for value in message_mask):
+                raise ValueError("message_loss_mask entries must be 0 or 1")
+            prompt = [{**message, "learn": bool(value)} for message, value in zip(prompt, message_mask, strict=True)]
+            row = {**row, prompt_key: prompt}
+        # OpenAI tool-call messages may have null content. Normalize before
+        # build_messages walks multimodal parts; canonicalization happens later.
+        prompt = [
+            {**message, "content": ""}
+            if message.get("role") == "assistant" and message.get("content") is None and message.get("tool_calls")
+            else message
+            for message in prompt
+        ]
+        row = {**row, prompt_key: prompt}
         _validate_multimodal_contract(
             row,
             prompt,

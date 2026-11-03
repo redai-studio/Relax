@@ -297,7 +297,7 @@ def test_static_dispatch_retains_native_fallback(monkeypatch, enabled, fused):
 def test_chunked_mtp_roll_preserves_depth_labels_mask_and_context(monkeypatch, batched_roll):
     """Both roll APIs must produce the same successive MTP targets and
     masks."""
-    cp_group, packed_seq_params, context = object(), object(), object()
+    cp_group, packed_seq_params, context = types.SimpleNamespace(size=lambda: 1), object(), object()
     calls = []
 
     def roll_one(tensor, shifts, dims):
@@ -423,7 +423,7 @@ def test_chunked_mtp_acceptance_obeys_logging_gate(monkeypatch, is_training, col
     monkeypatch.setattr(
         _patch,
         "_save_mtp_loss_to_tracker",
-        lambda loss, num_tokens, layer, cfg, correct, total: logged.append((correct, total)),
+        lambda loss, num_tokens, layer, cfg, correct, total, **kwargs: logged.append((correct, total)),
     )
     _run_and_capture(
         _patch.process_mtp_loss,

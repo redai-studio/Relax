@@ -666,3 +666,16 @@ _CHAT_TEMPLATE_PATCHERS = (
 - 阅读[配置参考手册](./configuration.md)，查看完整 SFT 参数表。
 - 阅读[性能调优](./performance-tuning.md)，了解更完整的吞吐优化方法。
 - 如果任务在模型加载或训练中 OOM，阅读[OOM 排查](./oom-troubleshooting.md)。
+
+
+### Gemma4 工具调用轨迹
+
+OpenAI 工具消息保留 `tool_call_id` 和 `name`；缺失的工具名称会根据调用 ID 从对应的工具调用中补齐。助手工具调用允许省略 `content` 或设置为 `null`。以 JSON 对象字符串编码的工具参数会被解析，原始数据行不变。可选的行级字段 `message_loss_mask` 为每条输入消息提供一个 `0` 或 `1`，选择参与监督的消息。
+
+Gemma4 模板补丁通过环境变量显式启用，需要将这些变量传入训练 worker：
+
+- `GEMMA4_SFT_TOOL_TURN_BOUNDARY=1` 在一批工具调用后加入受监督的回合结束标记，内嵌工具响应仅作为上下文。fallback loss mask 支持监督全部助手消息或仅最后一条助手回答，其他监督选择会明确报错。
+- `GEMMA4_SFT_THINKING=1` 在每个新模型回合开始时插入空思考结构，不启用独立的系统思考前缀。
+- `GEMMA4_SFT_MS_SWIFT_COMPAT=1` 在传给模板的消息中省略工具关联字段，用于显式对齐 ms-swift。
+
+启用模板补丁并导出 HF 模型时，传入 `--save-hf-post-hook-path scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template`，并在导出时保留相同环境变量，使 `chat_template.jinja` 为推理保留训练时的回合边界。导出模板同时保存 ms-swift 的关联字段过滤逻辑，重载后的 tokenizer 无需 Relax 预处理或环境变量即可应用。该 hook 只修改模板，视觉权重由现有导出器处理。

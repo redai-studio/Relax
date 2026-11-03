@@ -131,6 +131,27 @@ class TestIsCorrectStrictBox:
 
 
 class TestComputeScore:
+    @pytest.mark.parametrize(
+        ("response", "label", "correct"),
+        [
+            ("### Final Answer:\n\nAnswer: \\boxed{-8}", "-8", True),
+            ("### Final Answer:\n\n\\boxed{-8}", "-8", True),
+            ("Answer: \\boxed{2}; final correction: \\boxed{-1}", "-1", True),
+            ("Answer: \\boxed{\\text{-8}}", "-8", True),
+            ("Answer: \\boxed{34.00}", "34", True),
+            ("Answer: -8.0", "-8", True),
+            ("Answer: 34.5", "34", False),
+            ("Answer: 34.001", "34", False),
+        ],
+    )
+    def test_default_path_extracts_final_answer_and_compares_integer_values(self, response, label, correct):
+        result = math_dapo_utils.compute_score(response, label)
+
+        assert result["acc"] is correct
+        assert result["score"] == (1.0 if correct else -1.0)
+        if correct:
+            assert result["pred"] == label
+
     def test_returns_positive_dict_for_strict_boxed_answer(self):
         response = "reasoning steps... final answer is \\boxed{9}"
 

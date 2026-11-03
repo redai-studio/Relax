@@ -37,6 +37,7 @@ def load_functions(path, names, namespace):
 
 
 def production_namespace(cp_size, rank, tp_size=2):
+    from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
     from relax.utils.env import Envs
 
     namespace = {
@@ -50,6 +51,8 @@ def production_namespace(cp_size, rank, tp_size=2):
         "DataIterator": type("DataIterator", (), {}),
         "PrepackedBatch": type("PrepackedBatch", (dict,), {}),
         "get_args": lambda: Namespace(enable_mtp_training=True),
+        "is_preference_mode": is_preference_mode,
+        "is_sft_mode": is_sft_mode,
         "mpu": SimpleNamespace(
             get_context_parallel_world_size=lambda: cp_size,
             get_context_parallel_rank=lambda: rank,

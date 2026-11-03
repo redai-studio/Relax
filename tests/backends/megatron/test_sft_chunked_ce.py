@@ -603,3 +603,63 @@ def test_should_use_sft_chunked(loss_type, chunked_flag, expected):
         sft_chunked_logits=chunked_flag,
     )
     assert should_use_sft_chunked(args) is expected
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_tied_weight_gradients_survive_per_chunk_checkpoint(use_reentrant):
+    """Checkpoint recomputation must retain the deferred shared weight."""
+
+    class TiedHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = None
+            self.sequence_parallel = False
+            self.tp_group = object()
+
+        def forward(self, input_, weight=None, runtime_gather_output=None):
+            assert weight is not None
+            logits = torch.nn.functional.linear(input_, weight)
+            return 30.0 * torch.tanh(logits / 30.0), None
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.output_layer = TiedHead()
+
+    torch.manual_seed(7)
+    token_ids = torch.tensor([1, 3, 2, 7, 4, 1, 8])
+    labels = torch.arange(token_ids.numel()) % 11
+    shared_weight = torch.nn.Parameter(torch.randn(11, 5))
+    reference_weight = shared_weight.detach().clone().requires_grad_(True)
+
+    model = M()
+    hidden = torch.nn.functional.embedding(token_ids, shared_weight)
+    losses = []
+    with _bypass_output_layer(model) as lm_head_forward:
+        hidden, _ = model.output_layer(hidden, weight=shared_weight)
+        for start in range(0, hidden.size(0), 3):
+            end = min(start + 3, hidden.size(0))
+
+            def chunk_loss(hidden_chunk, target_chunk):
+                logits, _ = lm_head_forward(hidden_chunk)
+                return torch.nn.functional.cross_entropy(logits, target_chunk, reduction="sum")
+
+            losses.append(
+                torch.utils.checkpoint.checkpoint(
+                    chunk_loss,
+                    hidden[start:end],
+                    labels[start:end],
+                    use_reentrant=use_reentrant,
+                )
+            )
+    loss = sum(losses) / token_ids.numel()
+    loss.backward()
+
+    reference_hidden = torch.nn.functional.embedding(token_ids, reference_weight)
+    reference_logits = torch.nn.functional.linear(reference_hidden, reference_weight)
+    reference_logits = 30.0 * torch.tanh(reference_logits / 30.0)
+    reference_loss = torch.nn.functional.cross_entropy(reference_logits, labels)
+    reference_loss.backward()
+
+    torch.testing.assert_close(loss, reference_loss)
+    torch.testing.assert_close(shared_weight.grad, reference_weight.grad, atol=1e-6, rtol=1e-6)
