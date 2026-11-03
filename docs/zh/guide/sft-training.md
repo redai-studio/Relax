@@ -650,7 +650,7 @@ _CHAT_TEMPLATE_PATCHERS = (
 
 ### 测试
 
-参考 [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/test_qwen_chat_template_patch.py)，至少覆盖：
+参考 [`test_qwen_chat_template_patch.py`](../../../tests/cpu/engine/sft/dataset/test_qwen_chat_template_patch.py)，至少覆盖：
 
 1. 无关模板严格 no-op。
 2. legacy 模板正确 patch，native 模板保持幂等。
