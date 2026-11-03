@@ -4,6 +4,42 @@ Relax 训练吞吐量最大化实践指南。本文提到的所有参数均可�
 
 ---
 
+## 按 FLOPs 平衡动态微批
+
+Megatron 后端可用每条样本的估算 FLOPs 平衡动态微批。相同 token 数的文本、图像和视频样本可能有不同计算成本；该模式在每个 DP rank 已取得的样本内调整微批划分，不负责跨 DP rank 重新分发样本。
+
+默认 `--microbatch-balance tokens`，保持原有行为。启用 FLOPs 平衡时，在训练脚本的参数数组中添加：
+
+```bash
+--use-dynamic-batch-size \
+--microbatch-balance flops
+```
+
+packing 使用默认的 `balanced`。该选项通过训练 `args` 传入各 worker，无需设置环境变量。切回 `--microbatch-balance tokens` 即恢复 token 平衡。A/B 实验使用独立保存目录，保持模型、数据、seed、token 预算和其他参数相同。
+
+微批数仍由 token 容量确定，再按现有 DP/VPP 规则对齐。FLOPs 只改变固定微批数内的平衡目标；硬容量继续使用训练路径的物理长度，包括 unsplit THD 的 TP/CP padding。若 FLOPs 候选超出容量，回退原有 token 平衡及 first-fit 保护。单条不可拆分的超长样本仍单独成批，开关不会使它自动满足显存预算。样本身份、optimizer-step 边界和原有 loss 归一化不变。
+
+内置成本估算支持 `qwen3_5`、`qwen3_5_moe`、`qwen3_5_text` 和 `qwen3_5_moe_text`，覆盖 dense/MoE、full attention/GatedDeltaNet、图像和视频。多模态样本须携带 processor 产生的 CPU `image_grid_thw` / `video_grid_thw`；缺失或不完整时明确报错，不用 token 数冒充媒体成本。普通动态微批及同步 SFT 的 CPU async-prepack、DP 对齐后重打包使用同一成本接口。
+
+Qwen3.5 成本包含 Q/gate 投影、active top-k/shared experts、LM head、视觉逐帧 attention 和合并后的 projector；embedding lookup 不按词表 GEMM 计费。视觉塔、projector、语言模型的冻结标志独立影响反向成本，冻结权重但仍需向上游传梯度时保留 dX。启用 MTP 时按执行 depth 计费，包括重复共享层；当前要求语言模型可训练、末层为 full attention，且没有自定义 PP layout。detached MTP head 仍计入输入梯度成本。
+
+这是用于调度的计算量估算，不是实际 CUDA 指令数，也不改变现有 MFU 统计。GDN 按每 token 的三次状态 contraction 建模，LM head 使用 all-token 估算；不计 chunk/WY 开销、padding、重算、通信、归一化及逐元素运算。初版不支持 LoRA、自定义参数冻结列表、偏好样本对、binpack、wholepack 和 fully-async streaming/drain；这些组合会明确拒绝。纯文本且长度接近时，FLOPs 平衡可能与 token 平衡相同，是否改善耗时需要固定负载的 A/B 测量。
+
+### 扩展其他模型
+
+分桶逻辑不依赖模型结构。扩展包提供 `estimator(config, rollout_data, args) -> Sequence[float]`，为 `rollout_data["total_lengths"]` 中的每条样本按原顺序返回一个正且有限的 CPU 成本。函数负责模型结构、媒体和训练配置的校验，不修改输入、不访问 CUDA tensor、不运行 collective。
+
+在扩展模块中注册估算函数，例如 `my_package.costs` 提供自己的 `estimate_sample_costs`：
+
+```python
+from relax.utils.training.microbatch_cost import register_sample_cost_estimator
+from my_package.costs import estimate_sample_costs
+
+register_sample_cost_estimator("your_hf_model_type", estimate_sample_costs)
+```
+
+通过已有的 `RELAX_EXTRA_MODULES=my_package.registration` 在每个 Megatron worker 加载注册模块。返回数量不匹配、NaN/Inf、非正成本或未知 model type 都会报错；普通训练入口会先在模型并行组和含 CP 的 DP 组传播成本估算失败，再一致退出，避免其他 rank 继续进入训练 collective。未知模型可以注册自己的估算器，或显式选择 `tokens`。
+
 ## Kimi K3 TFLOPS 与 MFU
 
 `perf/actor_train_tflops` 估算每卡每秒的有效模型 FLOPs。`perf/mfu/actor_train` 再除以设备 BF16 dense 峰值（280G Blackwell 配置为 2250 TFLOPS），记录的是比例，0.4 表示 40%。时间分母是 actor 训练耗时，不是包含 rollout/save 的整轮耗时；训练内部的 optimizer 和 offload 耗时会降低该指标。

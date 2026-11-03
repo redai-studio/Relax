@@ -24,7 +24,10 @@ def _execute(nodes, namespace):
 
 @pytest.fixture
 def partitioning():
+    from relax.utils.training.microbatch_cost import sample_costs
+
     namespace = {
+        "sample_costs": sample_costs,
         "logger": Mock(),
         "mpu": SimpleNamespace(
             get_tensor_model_parallel_world_size=lambda: 2,
@@ -56,6 +59,7 @@ def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgath
     partitioning.update(
         self=SimpleNamespace(args=args),
         samples=lengths,
+        rollout_data={"total_lengths": lengths},
         cp_size=1,
         window=SimpleNamespace(rollout_data={"total_lengths": lengths}),
         max_k=local_k + 1,
@@ -103,3 +107,58 @@ def test_allgather_capacity_rejects_budget_smaller_than_padding(partitioning):
     args = SimpleNamespace(allgather_cp=True, data_pad_size_multiplier=8)
     with pytest.raises(ValueError, match="padding must fit"):
         partitioning["_get_micro_batch_token_capacity"](args, 10, 1)
+
+
+@pytest.mark.parametrize("repack", [False, True])
+def test_prepack_and_repack_use_same_flops_objective(partitioning, repack):
+    lengths = [8] * 6
+    costs = [100, 74, 99, 75, 80, 79]
+    calls = []
+    rollout = {"total_lengths": lengths}
+
+    def estimator(args, data):
+        assert data is rollout
+        calls.append(1)
+        return costs
+
+    partitioning.update(
+        sample_costs=estimator,
+        self=SimpleNamespace(args=SimpleNamespace(max_tokens_per_gpu=16)),
+        rollout_data=rollout,
+        samples=lengths,
+        cp_size=1,
+        max_k=4,
+        window=SimpleNamespace(rollout_data=rollout),
+    )
+    actor = next(
+        node
+        for node in _tree("relax/backends/megatron/actor.py").body
+        if isinstance(node, ast.ClassDef) and node.name == "MegatronTrainRayActor"
+    )
+    if repack:
+        condition = next(
+            node
+            for node in ast.walk(actor)
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "local_k < max_k"
+        )
+        nodes = condition.body[0].body
+        names = {"capacity", "micro_batch_indices"}
+    else:
+        nodes = next(node for node in actor.body if getattr(node, "name", None) == "_pack_sft_prepack_window").body
+        names = {"max_tokens", "k_local", "micro_batch_indices"}
+    _execute(
+        [
+            node
+            for node in nodes
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
+        ],
+        partitioning,
+    )
+    k = 4 if repack else 3
+    actual = partitioning["micro_batch_indices"]
+    reference = partitioning["_get_capacity_safe_balanced_partitions"](lengths, k, 16)
+    assert calls == [1]
+    assert actual != reference
+    worst = lambda groups: max(sum(costs[i] for i in group) for group in groups)
+    assert worst(actual) < worst(reference)

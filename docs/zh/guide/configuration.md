@@ -206,6 +206,7 @@
 | `--micro-batch-size` | int | 1 | 微批次大小。开启 `--use-dynamic-batch-size` 后该值被忽略 |
 | `--num-steps-per-rollout` | int | None | 每次 Rollout 的训练步数。等效于设置 GBS = `rollout_batch_size * n_samples_per_prompt / num_steps_per_rollout` |
 | `--use-dynamic-batch-size` | flag | False | 启用动态批处理。根据样本长度动态打包，使每个 micro-batch 的总 Token 数接近 `--max-tokens-per-gpu` 限制 |
+| `--microbatch-balance` | str | tokens | 动态微批的平衡目标：`tokens` 或 `flops`。FLOPs 模式要求 Megatron、动态批、balanced packing 及模型成本估算器；token 硬容量不变，详见[性能调优](./performance-tuning.md#按-flops-平衡动态微批)。 |
 | `--max-tokens-per-gpu` | int | None | 每个 GPU 的最大 Token 数。启用动态批处理时必须设置。使用 CP 时应设为约 `max_response_len / cp_size` |
 | `--log-probs-max-tokens-per-gpu` | int | None | 计算 log probs 时每个 GPU 的最大 Token 数。None 时等于 `max-tokens-per-gpu` |
 | `--balance-data` | flag | False | 在静态/序列长度均衡路径上使用 `karmarkar_karp` 在数据并行 rank 间平衡 Token 数量。全异步结合 `--use-dynamic-batch-size` 时，动态 batch 路径会通过 `StreamingTokenBudgetSampler` 自动做 DP token 均衡；该 flag 可传入但不会额外改变行为。注意同一 Prompt 的不同响应可能被分到不同训练步 |
