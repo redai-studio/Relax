@@ -1,4 +1,4 @@
-name: GPU Unit Tests
+name: Unit Tests
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: gpu-unittest-${{ github.ref }}
+  group: unittest-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -25,16 +25,105 @@ jobs:
     with:
       target: gpu-unit
 
+  cpu-unittest:
+    needs: bypass
+    # Both test jobs depend only on the gate; a sibling failure must not skip tests.
+    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
+    name: CPU Unit Tests
+    # Reuse the existing Docker-capable runner pool without acquiring GPU devices.
+    runs-on: [self-hosted, linux, x64, h20, gpu]
+    timeout-minutes: 180
+    env:
+      CI_CONTAINER_NAME: relax-cpu-unittest-${{ github.run_id }}-${{ github.run_attempt }}
+      HOST_UV_CACHE_DIR: /home/relax-ci/.cache/uv
+      UV_CACHE_DIR: /uv-cache
+      UV_LINK_MODE: copy
+      ARTIFACT_NAME: unittest-cpu-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare local test image
+        id: image
+        uses: ./.github/actions/prepare-image
+        timeout-minutes: 120
+        with:
+          dockerfile: docker/Dockerfile.cu13
+          build-args: GPU_ARCH=hopper
+          # Include patch targets as well as the symlinks under patch/latest.
+          hash-key: ${{ hashFiles('docker/Dockerfile.cu13', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'docker/scripts/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
+
+      - name: Create CPU test container
+        env:
+          CI_IMAGE: ${{ steps.image.outputs.image-id }}
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOST_UV_CACHE_DIR" "$ARTIFACT_DIR"
+          docker create --pull never --rm --init \
+            --name "$CI_CONTAINER_NAME" \
+            --shm-size=32g \
+            -v "$GITHUB_WORKSPACE:/source:ro" \
+            -v "$ARTIFACT_DIR:/artifacts" \
+            -v "$HOST_UV_CACHE_DIR:$UV_CACHE_DIR" \
+            --workdir /workspace/Relax \
+            --env CUDA_VISIBLE_DEVICES= --env NVIDIA_VISIBLE_DEVICES=void \
+            --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env OPENBLAS_NUM_THREADS=1 \
+            --env UV_CACHE_DIR --env UV_LINK_MODE \
+            --env http_proxy --env https_proxy --env no_proxy \
+            --entrypoint /bin/bash "$CI_IMAGE" -c 'sleep infinity'
+          docker start "$CI_CONTAINER_NAME"
+          docker exec "$CI_CONTAINER_NAME" cp -a --no-preserve=ownership /source/. /workspace/Relax/
+
+      - name: Install dependencies
+        run: |
+          docker exec "$CI_CONTAINER_NAME" uv pip install \
+            --system --break-system-packages -r requirements.txt \
+            --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+      - name: Run CPU unit tests
+        timeout-minutes: 31
+        run: |
+          docker exec "$CI_CONTAINER_NAME" timeout --kill-after=30s 30m bash -euo pipefail -c '
+            python -m pytest tests/cpu -v -ra --tb=short --durations=50 \
+              --junitxml=/artifacts/junit.xml 2>&1 | tee /artifacts/pytest.log
+          '
+
+      - name: Stop CPU test container
+        if: always()
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
+        run: |
+          if docker inspect "$CI_CONTAINER_NAME" >/dev/null 2>&1; then
+            docker logs "$CI_CONTAINER_NAME" > "$ARTIFACT_DIR/container.log" 2>&1 || true
+            docker rm --force "$CI_CONTAINER_NAME"
+          fi
+
+      - name: Upload CPU test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}/
+          if-no-files-found: warn
+          retention-days: 14
+
   unittest:
     needs: bypass
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Unit Tests (H20, 4 GPUs)
     runs-on: [self-hosted, linux, x64, h20, gpu]
-    # Allow time for image preparation, device acquisition, and the 30-minute test budget.
+    # Allow time for image preparation, device acquisition, and the 20-minute test budget.
     timeout-minutes: 190
     env:
       CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
+      HOST_UV_CACHE_DIR: /home/relax-ci/.cache/uv
+      UV_CACHE_DIR: /uv-cache
+      UV_LINK_MODE: copy
+      ARTIFACT_NAME: unittest-gpu-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -64,10 +153,7 @@ jobs:
         env:
           CI_IMAGE: ${{ steps.image.outputs.image-id }}
           CI_DEVICES: ${{ steps.devices.outputs.devices }}
-          HOST_UV_CACHE_DIR: /home/relax-ci/.cache/uv
-          UV_CACHE_DIR: /uv-cache
-          UV_LINK_MODE: copy
-          ARTIFACT_DIR: ${{ runner.temp }}/unittest-${{ github.run_id }}-${{ github.run_attempt }}
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
         run: |
           set -euo pipefail
           mkdir -p "$HOST_UV_CACHE_DIR" "$ARTIFACT_DIR"
@@ -99,23 +185,29 @@ jobs:
           '
 
       - name: Install dependencies
+        id: dependencies
         run: |
           docker exec "$CI_CONTAINER_NAME" uv pip install \
             --system --break-system-packages -r requirements.txt \
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
       - name: Run unittest
-        timeout-minutes: 30
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        timeout-minutes: 20
         run: |
           docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
-            python -m pytest tests/ -v -ra --tb=short --junitxml=/artifacts/junit.xml \
+            python -m pytest tests/ --ignore=tests/cpu \
+              -v -ra --tb=short --durations=50 --junitxml=/artifacts/junit.xml \
               2>&1 | tee /artifacts/pytest.log
           '
 
-      - name: Remove test container
+      - name: Stop test container
         if: always()
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
         run: |
           if docker inspect "$CI_CONTAINER_NAME" >/dev/null 2>&1; then
+            docker logs "$CI_CONTAINER_NAME" > "$ARTIFACT_DIR/container.log" 2>&1 || true
             docker rm --force "$CI_CONTAINER_NAME"
           fi
 
@@ -123,7 +215,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: unittest-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/unittest-${{ github.run_id }}-${{ github.run_attempt }}/
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}/
           if-no-files-found: warn
           retention-days: 14
