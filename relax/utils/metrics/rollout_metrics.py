@@ -16,6 +16,7 @@ from relax.utils.metrics.metric_utils import (
 from relax.utils.misc import group_by
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.types import Sample
+from relax.utils.weight_version import compute_policy_provenance_metrics
 
 
 def compute_metrics_from_samples(
@@ -63,6 +64,16 @@ def compute_metrics_from_samples(
         log_dict["staleness/max"] = np.max(staleness_gaps).item()
         log_dict["staleness/min"] = np.min(staleness_gaps).item()
         log_dict["global_batch_size"] = len({sample.index for sample in samples})
+    # Side-channel policy provenance for async / agentic weight-version audit.
+    # Does not alter sampling or GRPO group selection.
+    if any(sample.weight_versions for sample in samples):
+        current_version = getattr(args, "current_weight_version", None)
+        if current_version is not None:
+            current_version = int(current_version)
+        log_dict |= dict_add_prefix(
+            compute_policy_provenance_metrics(samples, current_version=current_version),
+            "policy_provenance/",
+        )
     return log_dict
 
 

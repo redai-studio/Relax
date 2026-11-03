@@ -202,6 +202,11 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
 
+    if any(sample.weight_versions for sample in samples):
+        from relax.utils.weight_version import encode_weight_versions_for_train
+
+        train_data["weight_versions"] = [encode_weight_versions_for_train(sample) for sample in samples]
+
     if args.multimodal_keys is not None:
         train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 

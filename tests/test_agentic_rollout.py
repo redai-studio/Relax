@@ -1241,7 +1241,9 @@ async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix
     ir.pending_logprob_delta = [-0.5]
     ir.pending_topk_token_ids_delta = [np.array([[300, 301]], dtype=np.int32)]
     ir.pending_topk_logprob_delta = [np.array([[-0.5, -2.0]], dtype=np.float32)]
-    ir.pending_weight_version_delta = ["v1"]
+    from relax.utils.weight_version import WeightVersionSpan
+
+    ir.pending_weight_version_delta = [WeightVersionSpan("v1", 0, 1)]
     ir.pending_spec_delta["completion_token_num"] = 1
     ir.pending_prefix_cache_delta["cached_tokens"] = 2
 
@@ -1258,7 +1260,7 @@ async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix
     assert ir.pending_logprob_delta == [-0.5]
     np.testing.assert_array_equal(ir.pending_topk_token_ids_delta[0], [[300, 301]])
     np.testing.assert_array_equal(ir.pending_topk_logprob_delta[0], [[-0.5, -2.0]])
-    assert ir.pending_weight_version_delta == ["v1"]
+    assert ir.pending_weight_version_delta == [WeightVersionSpan("v1", 0, 1)]
     assert ir.pending_spec_delta["completion_token_num"] == 1
     assert ir.pending_prefix_cache_delta["cached_tokens"] == 2
 

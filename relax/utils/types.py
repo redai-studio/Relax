@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from relax.utils.weight_version import WeightVersionSpan, WeightVersionsPerCall, parse_numeric_version
+
 
 _SPEC_TOKEN_COUNT_KEYS = (
     ("spec_num_correct_drafts", "spec_num_proposed_drafts"),
@@ -42,7 +44,10 @@ class Sample:
     reward: float | dict[str, Any] | None = None
     custom_advantage: float | list[float] | list[list[float]] | None = None
     loss_mask: list[int] | None = None
-    weight_versions: list[str] = field(default_factory=list)
+    # One entry per successful generation call / agentic turn. Spans use absolute
+    # token indices in ``tokens``. Empty calls preserve turn alignment when a
+    # call was not stamped; cancelled/replaced prefixes never appear here.
+    weight_versions: list[WeightVersionsPerCall] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_topk_token_ids: np.ndarray | None = None  # [response_length, K], int32; -1 pads observations
     rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
@@ -167,6 +172,7 @@ class Sample:
         value["status"] = self.status.value
         value["spec_info"] = self.spec_info.to_dict()
         value["prefix_cache_info"] = self.prefix_cache_info.to_dict()
+        value["weight_versions"] = [call.to_dicts() for call in self.weight_versions]
         return value
 
     @staticmethod
@@ -175,6 +181,8 @@ class Sample:
         data["status"] = Sample.Status(data["status"])
         data["spec_info"] = Sample.SpecInfo.from_dict(data.get("spec_info", {}))
         data["prefix_cache_info"] = Sample.PrefixCacheInfo.from_dict(data.get("prefix_cache_info", {}))
+        if "weight_versions" in data:
+            data["weight_versions"] = _decode_weight_versions(data["weight_versions"])
 
         field_names = set(Sample.__dataclass_fields__.keys())
         init_data = {k: v for k, v in data.items() if k in field_names}
@@ -193,7 +201,24 @@ class Sample:
     def effective_response_length(self):
         return sum(self.loss_mask) if self.loss_mask is not None else self.response_length
 
-    def update_from_meta_info(self, args, meta_info: dict):
+    @property
+    def all_weight_version_spans(self) -> list[WeightVersionSpan]:
+        spans: list[WeightVersionSpan] = []
+        for call in self.weight_versions:
+            spans.extend(call.spans)
+        return spans
+
+    @property
+    def oldest_weight_version(self) -> int | None:
+        versions = [v for span in self.all_weight_version_spans if (v := parse_numeric_version(span.version)) is not None]
+        return min(versions) if versions else None
+
+    @property
+    def newest_weight_version(self) -> int | None:
+        versions = [v for span in self.all_weight_version_spans if (v := parse_numeric_version(span.version)) is not None]
+        return max(versions) if versions else None
+
+    def update_from_meta_info(self, args, meta_info: dict, *, output_end: int | None = None):
         """Update the sample with new information from meta_info returned by
         the rollout engine.
 
@@ -206,8 +231,9 @@ class Sample:
         # Collect prefix cache statistics
         self.prefix_cache_info.add(meta_info=meta_info)
 
-        if "weight_version" in meta_info:
-            self.weight_versions.append(meta_info["weight_version"])
+        if "weight_versions" in meta_info or "weight_version" in meta_info:
+            end = len(self.tokens) if output_end is None else output_end
+            self.weight_versions.append(WeightVersionsPerCall.from_meta_info(meta_info, output_end=end))
 
         match meta_info["finish_reason"]["type"]:
             case "length":
@@ -216,6 +242,29 @@ class Sample:
                 self.status = Sample.Status.ABORTED
             case "stop":
                 self.status = Sample.Status.COMPLETED
+
+
+
+def _decode_weight_versions(raw: Any) -> list[WeightVersionsPerCall]:
+    """Decode Sample.weight_versions from dict / legacy string payloads."""
+    if not raw:
+        return []
+    decoded: list[WeightVersionsPerCall] = []
+    for item in raw:
+        if isinstance(item, WeightVersionsPerCall):
+            decoded.append(item)
+        elif isinstance(item, list):
+            if item and isinstance(item[0], str):
+                decoded.append(WeightVersionsPerCall(spans=[]))
+            else:
+                decoded.append(WeightVersionsPerCall.from_dicts(item))
+        elif isinstance(item, dict) and "spans" in item:
+            decoded.append(WeightVersionsPerCall.from_dicts(item["spans"]))
+        elif isinstance(item, str):
+            decoded.append(WeightVersionsPerCall(spans=[]))
+        else:
+            raise TypeError(f"unsupported weight_versions entry: {type(item)!r}")
+    return decoded
 
 
 @dataclass(frozen=True)
