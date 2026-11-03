@@ -1,117 +1,67 @@
-# Frozen-conditioning cache benchmark tools
+# Frozen-conditioning cache validation
 
-This directory contains the reusable parts of the multi-model SFT cache
-validation workflow. Raw measurements, fixed experimental plans, model/data
-manifests, and large tensor snapshots belong in a separately versioned evidence
-package. Do not add model weights or historical experiment directories here.
+Use the normal training entrypoints and the shared numerical verifier. Fixed
+experiment plans, cluster orchestration, raw logs and tensor snapshots belong
+in the separately versioned experiment evidence, not the training library.
 
-The training entry points remain:
+## Launch and verify
 
-- `scripts/entrypoint/ray-job.sh` with
-  `scripts/training/diffusion/run-sensenova-condition-cache.sh`.
-- `scripts/entrypoint/ray-job.sh` with
-  `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh`.
+Prepare worker-visible models, data and output directories as described in
+[SenseNova SFT](../../../docs/en/guide/frozen-conditioning-cache.md) or
+[Qwen-Image SFT](../../../docs/en/guide/t2i-sft.md). Select the corresponding
+launcher:
 
-## Tools
+| Model      | Training script                                                    |
+| ---------- | ------------------------------------------------------------------ |
+| SenseNova  | `scripts/training/diffusion/run-sensenova-condition-cache.sh`      |
+| Qwen-Image | `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh` |
 
-| Tool                     | Responsibility                                                                                                                                                                      |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `prepare_experiments.py` | Validate a frozen model-neutral plan and render reviewable launch requests; no network or Ray calls.                                                                                |
-| `run_experiments.py`     | Execute a prepared plan on an existing dedicated single-node **8-GPU** Ray cluster, preserving source/request/harness identities. Defaults to preparation only.                     |
-| `owned_serve.py`         | Internal ownership checks for the runner. Identify applications using names, deployment timestamps/configuration, and live replica run markers before any name-scoped cleanup.      |
-| `summarize_plan.py`      | Check declared run coverage/configuration and call the existing [raw benchmark parser](../../tools/benchmark_condition_cache.py); do not pool independent models or configurations. |
-| `compare_snapshots.py`   | Verify snapshot manifests and compare complete FP32 gradient/update tensors across all shards, including initial-state/input/RNG preconditions. CPU only.                           |
+Submit through `bash scripts/entrypoint/ray-job.sh "$CONDITIONING_LAUNCHER"`
+on an existing Ray cluster after setting `CONDITIONING_LAUNCHER` to one of the
+paths above. Set `MODEL_PATH`, `DATA_ROOT`, `METADATA_PATH`, `DATASET_SIZE`,
+`SAVE_DIR` and the Ray endpoint for the workload. Use a new experiment name and
+`RELAX_CONDITION_CACHE_RUN_DIR` for every run. `DRY_RUN=1` previews a launcher
+without submitting a job.
 
-The runner deliberately retains its tested dedicated eight-GPU restriction. It
-is not a new general cluster scheduler. It requires one shared node lock, no
-other active jobs or Serve applications at launch, and idle GPU/Ray resources.
-It does not start or stop Ray, kill training processes, or globally delete Serve
-applications. Successful jobs permit cleanup only of applications whose live
-ownership was captured and is still valid. Failed/timed-out jobs remain for
-inspection. Cancellation, component probes, stage profiling, and archive
-packaging use the separately pinned evidence harness appropriate to that run.
+Before measuring performance, enable `RELAX_CONDITION_CACHE=1`,
+`RELAX_CONDITION_VERIFY=1`, `RELAX_CONDITION_VERIFY_RTOL=0`,
+`DETERMINISTIC_ATTENTION=1` and `LR_WARMUP_ITERS=0`. The shared verifier restores
+initial model, optimizer and RNG state, exercises the actual cache branch, and
+compares loss, complete effective-batch reduced gradients and actual FP32
+parameter updates. It writes `conditioning-verification.json` in the run
+directory. Every compared value must be finite; zero references require exact
+zeros. Deterministic runs require exact agreement. A non-deterministic result
+needs repeated online references and a justified absolute tolerance in addition
+to the 1% relative ceiling. Verification performs extra training work and must
+not be included in performance measurements.
 
-## Plan and execution
+## Measure repeated workloads
 
-Use the fixed plan supplied with the evidence as a schema example; create a new
-plan with new output directories and job names for every reproduction. Do not
-rerun a completed plan in place. A plan records:
-
-- `schema_version: 1` and `status: "ready"` after preparation is complete;
-- `cluster`: Ray/dashboard addresses, expected GPUs, dependency Python paths,
-  shared node lock, and exact expected Serve deployment names;
-- `workloads`: model identity/path/content SHA, dataset selection/metadata SHA,
-  frozen source/launcher SHA, effective batch/training configuration, and
-  independent payload/prefetch byte limits;
-- `runs_root` and ordered `runs`: unique name, workload, purpose, repeat, cache
-  setting, number of updates, and predeclared cold window.
-
-Performance groups require complete online/cache pairs. Keep all relevant
-training settings identical within each pair, including existing optimizations;
-only the cache switch differs. Preserve low-reuse and failed results. A prepared
-request is not evidence that execution or acceptance passed.
+Disable verification and run separate online (`RELAX_CONDITION_CACHE=0`) and
+cached (`RELAX_CONDITION_CACHE=1`) jobs. Keep data order, effective batch,
+resolution, optimizer, initialization, encoder placement and other training
+settings identical; only the cache switch changes. Qwen's
+`CACHE_VAE_POSTERIOR` must also match across both jobs. Use multiple independent
+pairs, alternate their order, and retain low-reuse results as well.
 
 ```bash
-python scripts/benchmarks/conditioning_cache/prepare_experiments.py \
-  --plan /path/to/new-plan.json --check-local --output /path/to/new-prepared.json
-
-# The default runner command validates/prepares without submitting jobs.
-python scripts/benchmarks/conditioning_cache/run_experiments.py \
-  --plan /path/to/new-plan.json
-
-# Execute only on the authorized idle cluster after reviewing the new plan.
-python scripts/benchmarks/conditioning_cache/run_experiments.py \
-  --plan /path/to/new-plan.json --execute
+python scripts/tools/benchmark_condition_cache.py \
+  --online /path/to/online-r01 /path/to/online-r02 /path/to/online-r03 \
+  --cached /path/to/cached-r01 /path/to/cached-r02 /path/to/cached-r03 \
+  --cold-steps "${COLD_STEPS:?Set the predeclared cold-window step count}" \
+  --output /path/to/summary.json
 ```
 
-`--check-local` must run on the execution host, where the source, launcher,
-models, and dataset paths exist. The runner submits the canonical training
-scripts through `ray-job.sh`. Every run archives its request, source identity,
-job result, per-rank events, and the exact harness files used for execution.
-Do not hash models, download assets, profile, or copy large evidence while
-collecting formal performance measurements.
+The parser reads per-rank events, counts the global batch once and uses the
+slowest rank's complete step time. It reports cold and steady windows, repeated
+run variation and missing evidence; local encoding time is only diagnostic.
+Add `--low-reuse-online` and `--low-reuse-cached` directories for separate
+low-reuse comparisons. Set the cold window from the data size and experiment
+plan rather than choosing it after seeing results.
 
-## Offline verification
-
-```bash
-python scripts/benchmarks/conditioning_cache/summarize_plan.py \
-  --plan /path/to/fixed-plan.json --runs-root /path/to/completed-runs \
-  --repo /path/to/frozen-checkout --output /path/to/new-summary.json
-
-python scripts/benchmarks/conditioning_cache/compare_snapshots.py \
-  --reference /path/to/reference-snapshots \
-  --actual /path/to/actual-snapshots --world-size 8 --rtol 0 \
-  --output /path/to/new-comparison.json
-```
-
-The snapshot comparison uses elementwise tensor differences aggregated across
-shards, not a comparison of tensor norms. Every parameter tensor must be finite;
-a zero reference norm requires an exactly zero result. Updates are the actual
-FP32 `theta_after - theta_before`, not the relative error of final full weights.
-Use `--rtol 0` for the deterministic exact path. The tool accepts at most 1%
-relative tolerance; a non-deterministic experiment still needs an independently
-established repeated reference and justified absolute-error policy.
-
-The plan summary establishes run provenance and paired training throughput. It
-does not independently certify lifecycle, random sampling semantics, resource
-growth, confidence intervals, or every acceptance item. Preserve the raw logs
-and separate resource/lifecycle/advanced-statistics reports in the evidence
-package, with the exact scripts that produced them. Historical evidence must
-use its original harness; this directory uses the neutral `conditioning-cache-`
-job prefix for new runs and does not rewrite old requests.
-
-## Tests
-
-```bash
-python scripts/benchmarks/conditioning_cache/test_harness.py -v
-CUDA_VISIBLE_DEVICES= python -m pytest -q \
-  scripts/benchmarks/conditioning_cache/test_compare_snapshots.py
-```
-
-The first suite is stdlib-only and mocks ownership/plan/numerical gates without
-Ray, network, or GPU execution. Snapshot tests use existing CPU PyTorch/pytest
-dependencies. These tests do not replace real distributed SFT verification.
-
-Model contracts and cache lifecycle are documented in
-[frozen-conditioning-cache](../../../docs/en/guide/frozen-conditioning-cache.md)
-and [Qwen T2I SFT](../../../docs/en/guide/t2i-sft.md).
+Preserve the exact source commit, model/data revisions, launch configuration and
+raw events. Full job timing additionally needs Ray's `job.json` with `status`,
+`start_time` and `end_time` in milliseconds. Trainer events alone exclude
+startup and shutdown. Keep external CPU/GPU/shared-memory/disk measurements,
+cache build and payback analysis, and cancellation/error cleanup evidence with
+the experiment reports; throughput summaries do not certify those properties.

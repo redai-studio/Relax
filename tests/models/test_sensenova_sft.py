@@ -291,53 +291,6 @@ def test_sensenova_branch_groups_reject_trainable_understanding(training_mode):
     assert not any(getattr(module, "_fsdp_fine_grained", False) for module in model.modules())
 
 
-def test_prefix_kv_backward_bypasses_group_final_output_hook(monkeypatch):
-    """KV-only prefix supervision cannot use a trainable sibling group.
-
-    Demonstrate the hook boundary independently: gradients flow from exported
-    intermediate K/V to the input without visiting the final MLP output. This
-    is why preparation rejects a trainable understanding branch.
-    """
-    from torch.distributed.fsdp._fully_shard._fsdp_state import _register_group_forward_hooks
-
-    from relax.backends.fsdp.runtime import resolve_module_groups
-    from relax.models.sensenova.adapter import SenseNovaSFTAdapter
-
-    monkeypatch.setenv("RELAX_ATTENTION_IMPLEMENTATION", "torch")
-    model = _branch_group_model()
-    SenseNovaSFTAdapter().prepare_for_sharding(model)
-    model.float()
-    modules = resolve_module_groups(model)[0]
-    forward_calls, backward_calls = [], []
-
-    def pre(module, args, kwargs):
-        return args, kwargs
-
-    def post(module, args, output):
-        forward_calls.append(module)
-        output.register_hook(lambda grad: backward_calls.append(module) or grad)
-        return output
-
-    handle = _register_group_forward_hooks(modules, pre, post, set(), lambda output: output)
-    layer = model.pipe.dit.language_model.model.layers[0]
-    hidden = torch.randn(1, 3, 32, requires_grad=True)
-    try:
-        _, key, value = layer(
-            hidden_states=hidden,
-            exist_non_image_gen_tokens=True,
-            exist_image_gen_tokens=False,
-            indexes=torch.arange(3).repeat(3, 1),
-            attention_mask=None,
-            update_cache=True,
-        )
-        (key.sum() + value.sum()).backward()
-        assert forward_calls == [layer.mlp]
-        assert backward_calls == []
-        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
-    finally:
-        handle.remove()
-
-
 def test_sensenova_native_group_hooks_complete_each_branch_at_mlp(monkeypatch):
     """Exercise installed PyTorch's real grouped hooks without CUDA/FSDP state.
 

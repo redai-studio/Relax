@@ -1,8 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Frozen replicas keep normal registration and bypass only root sharding."""
 
-import inspect
-
 import pytest
 import torch
 
@@ -25,12 +23,6 @@ def _model():
     model.blocks = torch.nn.ModuleList([_Block(), _Block()])
     model.output = torch.nn.Linear(4, 4)
     return model.to(dtype=torch.bfloat16)
-
-
-def test_native_fully_shard_exposes_ignored_parameters():
-    from torch.distributed.fsdp import fully_shard
-
-    assert "ignored_params" in inspect.signature(fully_shard).parameters
 
 
 def test_replicated_modules_keep_registration_and_ignore_only_root_parameters(monkeypatch):

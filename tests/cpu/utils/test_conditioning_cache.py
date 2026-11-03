@@ -586,26 +586,13 @@ def test_mixed_unaligned_layout_falls_back_with_exact_owned_tensors(tmp_path: Pa
             assert lease._packed_layout() is None
             moved, size = lease.copy_to("cpu")
             assert size == sum(tensor.numel() * tensor.element_size() for tensor in lease._tensors.values())
+            assert len(lease._transfer_sources) == len(lease._tensors)
             _assert_exact(moved, payload)
             assert (
                 moved["alias"][0].untyped_storage().data_ptr() != lease.data["alias"][0].untyped_storage().data_ptr()
             )
         assert not lease._transfer_sources
     _assert_exact(moved, payload)
-
-
-def test_copy_fallback_retains_sources_and_returns_real_tensor_bytes(tmp_path: Path, monkeypatch) -> None:
-    with _cache(1 << 20, tmp_path, "fallback") as cache:
-        assert cache.put("item", _payload())
-        with cache.lookup("item") as lease:
-            monkeypatch.setattr(lease, "_packed_layout", lambda: None)
-            moved, size = lease.copy_to("cpu")
-            assert size == sum(tensor.numel() * tensor.element_size() for tensor in lease._tensors.values())
-            assert len(lease._transfer_sources) == len(lease._tensors)
-            _assert_exact(moved, _payload())
-            assert moved["prefix"][0].data_ptr() != lease.data["prefix"][0].data_ptr()
-        assert not lease._transfer_sources
-    _assert_exact(moved, _payload())
 
 
 @pytest.mark.parametrize("field", ["shape", "dtype", "offsets", "size"])

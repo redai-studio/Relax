@@ -142,4 +142,4 @@ The first executed step, steps whose index is a multiple of 16, and the final st
 
 See [Image-to-Image SFT](./i2i-sft.md) for data and resume behavior, and [Performance Tuning](./performance-tuning.md) for workload measurement.
 
-The reusable plan runner, provenance checks, repeated-plan summary, and FP32 snapshot comparison are documented in [the benchmark tools](../../../scripts/benchmarks/conditioning_cache/README.md).
+See the [validation guide](../../../scripts/benchmarks/conditioning_cache/README.md) for numerical verification and repeated online/cache measurement using the training launchers and shared summary tool.

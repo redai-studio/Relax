@@ -140,4 +140,4 @@ python scripts/tools/benchmark_condition_cache.py \
 
 数据与恢复行为见[图像编辑 SFT](./i2i-sft.md)，负载测量建议见[性能调优](./performance-tuning.md)。
 
-可复用的计划执行、来源校验、重复实验汇总及 FP32 快照比较工具见[实验工具说明](../../../scripts/benchmarks/conditioning_cache/README.md)。
+使用训练启动脚本和公共汇总工具进行数值验证与重复在线/缓存对照，见[验证指南](../../../scripts/benchmarks/conditioning_cache/README.md)。
