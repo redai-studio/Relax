@@ -9,7 +9,9 @@ import hashlib
 import json
 import math
 import statistics
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 
 LENGTHS = ("short", "long")
@@ -19,7 +21,7 @@ PAIRS = 4
 EXPORTS = 64
 
 
-def percentile(values, q=99):
+def percentile(values: Sequence[float], q: float = 99) -> float:
     ordered = sorted(values)
     if not ordered or not all(math.isfinite(value) for value in ordered):
         raise ValueError("Missing or nonfinite percentile input")
@@ -29,12 +31,12 @@ def percentile(values, q=99):
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (position - lo)
 
 
-def near(actual, expected, label):
+def near(actual: float, expected: float, label: str) -> None:
     if not math.isfinite(actual) or not math.isclose(actual, expected, rel_tol=1e-8, abs_tol=1e-8):
         raise ValueError(f"{label} does not reproduce its raw observations: {actual} != {expected}")
 
 
-def describe(values):
+def describe(values: list[float]) -> dict[str, Any]:
     return dict(
         values=values,
         mean=statistics.mean(values),
@@ -45,7 +47,7 @@ def describe(values):
     )
 
 
-def inspect_arm(row, length, concurrency, pair):
+def inspect_arm(row: dict[str, Any], length: str, concurrency: int, pair: int) -> dict[str, Any]:
     if row["length"] != length or row["concurrency"] != concurrency or row["order_seed"] != pair:
         raise ValueError("Raw arm parameters differ from the fixed matrix")
     if row["formal_evaluation"] or not row["cleanup_complete"] or row["mock_processes_are_os_processes"]:
@@ -182,7 +184,7 @@ def inspect_arm(row, length, concurrency, pair):
     )
 
 
-def collect(directory):
+def collect(directory: Path) -> dict[str, Any]:
     workload_rows = {}
     references = {}
     totals = dict(main_exports=0, warmup_exports=0, main_backend_calls=0, warmup_backend_calls=0)

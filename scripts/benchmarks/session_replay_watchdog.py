@@ -12,18 +12,35 @@ import json
 import os
 import re
 import signal
-import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TypedDict
+
+from relax.utils.logging_utils import get_logger
 
 
-def save(path, value):
+logger = get_logger(__name__)
+
+
+class ProcessIdentity(TypedDict):
+    pid: int
+    pgid: int
+    sid: int
+    start_ticks: str
+    state: str
+
+
+EventCallback = Callable[[str, Any], None]
+
+
+def save(path: Path, value: Any) -> None:
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(value, indent=2))
     temp.replace(path)
 
 
-def identity(pid):
+def identity(pid: int) -> ProcessIdentity | None:
     try:
         fields = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()
         return dict(pid=int(pid), pgid=int(fields[2]), sid=int(fields[3]), start_ticks=fields[19], state=fields[0])
@@ -31,20 +48,24 @@ def identity(pid):
         return None
 
 
-def matches(old):
+def matches(old: ProcessIdentity | None) -> bool:
     if not isinstance(old, dict) or not {"pid", "pgid", "sid", "start_ticks"} <= old.keys():
         return False
     now = identity(old["pid"])
     return now is not None and all(now[key] == old[key] for key in ("pid", "pgid", "sid", "start_ticks"))
 
 
-def freeze_owned_tree(root, event, journal=None):
+def freeze_owned_tree(
+    root: ProcessIdentity,
+    event: EventCallback,
+    journal: list[ProcessIdentity] | None = None,
+) -> list[ProcessIdentity]:
     """Follow kernel child links from one verified owner, never scan global
     PIDs."""
     seen = set()
     rows = [] if journal is None else journal
 
-    def visit(row, depth):
+    def visit(row: ProcessIdentity, depth: int) -> None:
         if not matches(row) or row["pid"] in seen or row["pid"] == os.getpid():
             return
         if depth > 32 or len(seen) >= 2048:
@@ -89,7 +110,7 @@ def freeze_owned_tree(root, event, journal=None):
     return rows
 
 
-def terminate_group(members, pgid, event):
+def terminate_group(members: list[ProcessIdentity], pgid: int, event: EventCallback) -> None:
     verified = [row for row in members if row.get("pgid") == pgid and row.get("sid") == pgid and matches(row)]
     if not verified:
         return
@@ -130,7 +151,7 @@ def terminate_group(members, pgid, event):
                     pass
 
 
-def cleanup_process_harness(directory, expected_source_root, event):
+def cleanup_process_harness(directory: Path, expected_source_root: str, event: EventCallback) -> None:
     """Only this run's validated ledger and private receipt paths authorize
     signals."""
     owner = directory / "process-ownership.json"
@@ -207,7 +228,7 @@ def cleanup_process_harness(directory, expected_source_root, event):
         terminate_group([daemon_row], daemon_row["pgid"], event)
 
 
-def stop_command(command, directory, event):
+def stop_command(command: dict[str, Any], directory: Path, event: EventCallback) -> None:
     row = command.get("identity")
     tree = []
     try:
@@ -229,7 +250,7 @@ def stop_command(command, directory, event):
                 event("owned_group_cleanup_error", dict(pgid=pgid, error=f"{type(error).__name__}: {error}"))
 
 
-def stop_runner(runner, directory, event):
+def stop_runner(runner: ProcessIdentity, directory: Path, event: EventCallback) -> None:
     tree = []
     try:
         freeze_owned_tree(runner, event, tree)
@@ -249,7 +270,7 @@ def stop_runner(runner, directory, event):
                 event("owned_group_cleanup_error", dict(pgid=pgid, error=f"{type(error).__name__}: {error}"))
 
 
-def main():
+def main() -> None:
     if not Path("/kaggle").exists():
         raise RuntimeError("Kaggle-only supervisor")
     parser = argparse.ArgumentParser()
@@ -267,7 +288,7 @@ def main():
     last_progress = time.monotonic()
     last_command = None
 
-    def event(kind, detail):
+    def event(kind: str, detail: Any) -> None:
         row = dict(at=time.time(), kind=kind, detail=detail)
         try:
             with (args.directory / "watchdog-events.jsonl").open("a") as stream:
@@ -276,7 +297,7 @@ def main():
                 save(args.directory / "needs-attention.json", row)
         except BaseException as error:
             try:
-                print("SUPERVISOR_EVENT_WRITE_ERROR", kind, repr(error), file=sys.stderr, flush=True)
+                logger.error("SUPERVISOR_EVENT_WRITE_ERROR %s %r", kind, error)
             except BaseException:
                 pass
 

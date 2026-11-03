@@ -14,15 +14,19 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from session_replay_watchdog import cleanup_process_harness, identity, save, stop_command
 
+from relax.utils.logging_utils import get_logger
 
-OUT = None
-ROOT = None
-COMMANDS = []
-RUN_ID = None
-MONITOR = None
+
+logger = get_logger(__name__)
+OUT: Path | None = None
+ROOT: Path | None = None
+COMMANDS: list[dict[str, Any]] = []
+RUN_ID: str | None = None
+MONITOR: subprocess.Popen[bytes] | None = None
 GATE_CODE = """import os,sys,time
 deadline=time.monotonic()+30
 while not os.path.isfile(sys.argv[1]):
@@ -33,24 +37,31 @@ os.execvpe(sys.argv[2],sys.argv[2:],os.environ)
 """
 
 
-def state(phase, **extra):
+def state(phase: str, **extra: Any) -> None:
     row = dict(phase=phase, at=time.time(), run_id=RUN_ID, **extra)
     save(OUT / "state.json", row)
-    print("TASK14_PROGRESS " + json.dumps(row), flush=True)
+    log = logger.error if phase == "error" else logger.info
+    log("TASK14_PROGRESS %s", json.dumps(row))
 
 
-def event(kind, detail):
+def event(kind: str, detail: Any) -> None:
     try:
         with (OUT / "runner-cleanup-events.jsonl").open("a") as stream:
             stream.write(json.dumps(dict(at=time.time(), kind=kind, detail=detail)) + "\n")
     except BaseException as error:
         try:
-            print("RUNNER_EVENT_WRITE_ERROR", kind, repr(error), file=sys.stderr, flush=True)
+            logger.error("RUNNER_EVENT_WRITE_ERROR %s %r", kind, error)
         except BaseException:
             pass
 
 
-def run(argv, cwd=None, timeout=600, check=True, process_harness=None):
+def run(
+    argv: list[str],
+    cwd: Path | None = None,
+    timeout: float = 600,
+    check: bool = True,
+    process_harness: Path | None = None,
+) -> int:
     key = str(time.time_ns())
     log_path = OUT / f"command-{key}.log"
     env = dict(
@@ -63,7 +74,7 @@ def run(argv, cwd=None, timeout=600, check=True, process_harness=None):
     gate = OUT / f".command-gate-{key}"
     with log_path.open("w") as log:
         child = None
-        receipt = dict(
+        receipt: dict[str, Any] = dict(
             id=key,
             run_id=RUN_ID,
             phase="preparing",
@@ -136,12 +147,12 @@ def run(argv, cwd=None, timeout=600, check=True, process_harness=None):
     if process_harness and code:
         cleanup_process_harness(Path(process_harness), str(cwd), event)
     if code and check:
-        print(log_path.read_text()[-12000:], flush=True)
+        logger.error("Command exit %s; output tail:\n%s", code, log_path.read_text()[-12000:])
         raise RuntimeError(f"Command exit {code}: {argv}")
     return code
 
 
-def source_hashes(repo):
+def source_hashes(repo: Path) -> dict[str, str]:
     names = set(subprocess.check_output(["git", "ls-files", "-z"], cwd=repo).decode().split("\0"))
     names.update(
         subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=repo)
@@ -155,7 +166,7 @@ def source_hashes(repo):
     }
 
 
-def main():
+def main() -> None:
     global OUT, RUN_ID, MONITOR
     if sys.platform != "linux" or not Path("/kaggle/working").is_dir():
         raise RuntimeError("Run this reproduction only inside Kaggle")

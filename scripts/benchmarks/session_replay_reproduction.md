@@ -12,12 +12,16 @@ The driver checks the benchmark and candidate pipeline hashes before starting.
 From the supplied source checkout:
 
 ```bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 python -c 'from importlib.metadata import version; print("torch==" + version("torch"))' > /tmp/task14-torch-constraint.txt
 python -m pip install -c /tmp/task14-torch-constraint.txt -r scripts/benchmarks/session_replay_evidence/cpu-replay-requirements.txt
 python scripts/benchmarks/prepare_session_replay_inputs.py --root /tmp/task14-replay-inputs --fetch-corpus
 ```
 
 The requirements pin the replay packages used by the inspected study. Keep the
+source checkout on `PYTHONPATH` for the runner and watchdog's repository logger.
+JSON state and event files remain available even when the configured log level
+suppresses informational progress messages. Keep the
 provided Kaggle PyTorch build and record the newly allocated environment:
 Kaggle images and CPU allocations can change. The latest public evidence retains
 the actual run's source, provided Torch and command records. The preparer
