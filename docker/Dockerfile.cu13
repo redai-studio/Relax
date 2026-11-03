@@ -82,7 +82,7 @@ FROM base as train
 RUN python -c "import torch; assert torch.backends.cudnn.version() is not None"
 
 # FA2 is retained as a comparison backend. Build against this image's Torch/CUDA ABI.
-# Hopper-only FA3 is intentionally omitted from this 280G Blackwell-focused CUDA 13 image.
+# Hopper-only FA3 is built in relax_hopper below, outside the Blackwell stage chain.
 RUN . /etc/relax_build.env && FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=32 \
     pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
     pip install --no-cache-dir flash-linear-attention==0.4.1
@@ -422,6 +422,14 @@ RUN --mount=type=bind,from=hybridep_builder,source=/opt/ep-wheels,target=/tmp/ep
 
 # Enable the EFA NCCL plugin only for 280G Blackwell; Hopper clusters may not have EFA.
 FROM relax_ep as relax_hopper
+# Match the CUDA 12 FA3 source/API, rebuilt for this image's Torch/CUDA ABI.
+ARG FA3_COMMIT=0f82fead0b2d59f6390c62a1d74e927159bc5a7b
+RUN git clone https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention-fa3 && \
+    cd /tmp/flash-attention-fa3 && git checkout "$FA3_COMMIT" && \
+    git submodule update --init --depth=1 && \
+    CUDA_VISIBLE_DEVICES="" FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTENTION_DISABLE_SM80=TRUE \
+        MAX_JOBS=32 pip install --no-cache-dir --no-build-isolation --no-deps ./hopper && \
+    cd /root && rm -rf /tmp/flash-attention-fa3
 ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/sglang/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}
 
 FROM relax_ep as relax_blackwell
@@ -486,6 +494,17 @@ ENV FI_PROVIDER=efa \
     TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 FROM relax_${GPU_ARCH} as relax
+
+# Keye/DSA indexers require this CUDA extension; use the same source pin as CUDA 12.
+# Force a local build: upstream's wheel lookup maps CUDA 13 to CUDA 12 wheels.
+RUN . /etc/relax_build.env && \
+    CUDA_VISIBLE_DEVICES="" FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE MAX_JOBS=32 \
+    NVCC_APPEND_FLAGS="-gencode arch=compute_${RELAX_EXPECT_SM},code=sm_${RELAX_EXPECT_SM}" \
+    pip install --no-cache-dir --no-build-isolation --no-deps --force-reinstall \
+        git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca && \
+    python -c "from fast_hadamard_transform import hadamard_transform; assert callable(hadamard_transform)" && \
+    HADAMARD_SO="$(python -c 'import torch, fast_hadamard_transform_cuda as m; print(m.__file__)')" && \
+    /usr/local/cuda/bin/cuobjdump --list-elf "$HADAMARD_SO" | grep -q "sm_${RELAX_EXPECT_SM}"
 
 # Restore the unified image runtime after all dependency resolution.
 # Its DeepEP binaries require NCCL 2.30.7; Torch metadata still pins 2.29.7.

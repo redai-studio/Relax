@@ -317,7 +317,8 @@ prefix = 'relax.models.deepseek_v4'
 def bindings():
     methods = ('__init__', 'load_state_dict', 'step_with_ready_grads', '_copy_model_params_to_main_params')
     return tuple(getattr(DO, name) for name in methods) + (
-        TEBase.get_weight_workspace, TEGroupedLinear.get_weight_workspace,
+        getattr(TEBase, 'get_weight_workspace', None),
+        getattr(TEGroupedLinear, 'get_weight_workspace', None),
         csa.CompressedSparseAttention.forward, csa.rotate_activation,
         getattr(score_kernels, topk_attr), getattr(score_kernels, namespace_attr))
 before = bindings()

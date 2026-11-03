@@ -650,7 +650,7 @@ Patch signatures must be mutually exclusive. The dispatcher evaluates all regist
 
 ### Tests
 
-Follow [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/test_qwen_chat_template_patch.py) and cover at least:
+Follow [`test_qwen_chat_template_patch.py`](../../../tests/cpu/engine/sft/dataset/test_qwen_chat_template_patch.py) and cover at least:
 
 1. Unrelated-template strict no-op behavior.
 2. Correct legacy-template patching and native-template idempotence.

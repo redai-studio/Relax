@@ -90,7 +90,7 @@ git checkout -b feat/your-change
 pytest tests/
 
 # 运行特定测试文件
-pytest tests/utils/test_metrics_service.py
+pytest tests/cpu/utils/test_metrics_service.py
 
 # 带覆盖率运行
 pytest --cov=relax tests/
