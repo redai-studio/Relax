@@ -5,7 +5,7 @@ carve-up to the domain-agnostic ``start_multi_instance_managers`` helper (also
 used by GenRM's multi-instance path).
 
 This must not change MOPD's observable
-contract: equal-split validation, one TeacherManager per data_source at a
+contract: default equal-split validation, one TeacherManager per data_source at a
 non-overlapping bundle_offset, and a ``(pg, list[manager])`` return shape.
 """
 
@@ -13,6 +13,8 @@ import json
 import sys
 from argparse import Namespace
 from types import ModuleType
+
+import pytest
 
 
 def _install_fake_teacher_manager(monkeypatch, captured):
@@ -73,10 +75,8 @@ def _base_args(**overrides):
 
 
 def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monkeypatch):
-    """Two teachers with equal GPU shares (the only shape MOPD currently
-    supports, since it enforces an even split) must land at non-overlapping,
-    monotonically increasing bundle offsets starting after the rollout
-    region."""
+    """Legacy checkpoint paths still receive equal, non-overlapping GPU
+    shares."""
     import ray
 
     from relax.core.service import create_placement_group as _real_create_pg  # noqa: F401
@@ -140,3 +140,67 @@ def test_multi_teacher_rejects_uneven_gpu_split(monkeypatch):
 
     with pytest.raises(ValueError, match="evenly divisible"):
         opd_utils._start_managed_multi_teacher(args, routes_json)
+
+
+@pytest.mark.parametrize("teacher_tp,expected_replicas", [(4, (2, 1, 1)), (None, (1, 1, 1))])
+def test_multi_teacher_explicit_budgets_preserve_routes_and_offsets(
+    monkeypatch: pytest.MonkeyPatch, teacher_tp: int | None, expected_replicas: tuple[int, int, int]
+) -> None:
+    import ray
+
+    from relax.utils.opd import opd_utils
+
+    captured = {"calls": [], "ctor_calls": {}}
+    _install_fake_teacher_manager(monkeypatch, captured)
+    full_pg = ("pg", list(range(64)), list(range(64)))
+    monkeypatch.setattr("relax.core.service.create_placement_group", lambda **kwargs: full_pg)
+    budgets = {"audit": 8, "evidence": 4, "evaluation": 4}
+    routes = {source: {"checkpoint_path": f"/ckpt/{source}", "num_gpus": size} for source, size in budgets.items()}
+    expected_urls = {
+        f"/ckpt/{source}": [f"http://{source}-{index}/generate" for index in range(count)]
+        for source, count in zip(budgets, expected_replicas, strict=True)
+    }
+    monkeypatch.setattr(ray, "get", lambda ref: expected_urls[ref[0]])
+    args = _base_args(
+        opd_teacher_routes=json.dumps(routes),
+        rollout_num_gpus=48,
+        teacher_num_gpus_per_engine=teacher_tp,
+        resource={"actor": [1, 64], "rollout": [1, 48], "teacher": [1, 16]},
+    )
+    shared_pg, managers = opd_utils._start_managed_multi_teacher(args, args.opd_teacher_routes)
+    assert shared_pg == full_pg
+    assert isinstance(managers, list) and len(managers) == 3
+    for source, offset, count in zip(budgets, (0, 8, 12), expected_replicas, strict=True):
+        call = captured["ctor_calls"][f"/ckpt/{source}"]
+        assert call == {
+            "num_replicas": count,
+            "gpus_per_replica": teacher_tp or budgets[source],
+            "pg": full_pg,
+            "shared_pg": True,
+            "bundle_offset": offset,
+        }
+        assert args.opd_teacher_routes_map[source] == expected_urls[f"/ckpt/{source}"]
+    assert args.opd_teacher_routes == json.dumps(routes)
+
+
+@pytest.mark.parametrize(
+    "routes,total,tp,message",
+    [
+        ({}, 16, 4, "non-empty JSON object"),
+        ([], 16, 4, "non-empty JSON object"),
+        (
+            {"a": "/a", "b": {"checkpoint_path": "/b", "num_gpus": 8}},
+            16,
+            4,
+            "must be a checkpoint path string or an object",
+        ),
+        ({"a": {"checkpoint_path": "/a"}}, 16, 4, "must be a checkpoint path string or an object"),
+        ({"a": {"checkpoint_path": "/a", "num_gpus": 6}}, 6, 4, "must be divisible"),
+        ({"a": {"checkpoint_path": "/a", "num_gpus": 8}}, 16, 4, "must sum"),
+    ],
+)
+def test_multi_teacher_rejects_invalid_route_budgets(routes: object, total: int, tp: int, message: str) -> None:
+    from relax.utils.opd import opd_utils
+
+    with pytest.raises(ValueError, match=message):
+        opd_utils._parse_teacher_routes(json.dumps(routes), total, tp)

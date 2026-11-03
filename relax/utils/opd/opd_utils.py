@@ -248,6 +248,42 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
     return shared_pg, teacher_manager
 
 
+def _parse_teacher_routes(
+    routes_json: str, total_gpus: int, gpus_per_replica: int | None = None
+) -> dict[str, dict[str, Any]]:
+    """Normalize equal-share paths or explicit per-teacher GPU budgets."""
+    routes = json.loads(routes_json)
+    if not isinstance(routes, dict) or not routes:
+        raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
+
+    # Legacy format: {"source": "/path", ...} splits total_gpus equally.
+    if all(isinstance(v, str) for v in routes.values()):
+        if total_gpus % len(routes) != 0:
+            raise ValueError(
+                f"Total teacher GPUs ({total_gpus}) must be evenly divisible by number of teachers ({len(routes)})."
+            )
+        share = total_gpus // len(routes)
+        routes = {source: {"checkpoint_path": path, "num_gpus": share} for source, path in routes.items()}
+
+    for source, spec in routes.items():
+        if not isinstance(spec, dict) or "checkpoint_path" not in spec or "num_gpus" not in spec:
+            raise ValueError(
+                f"Invalid teacher route {source!r}: must be a checkpoint path string or an object "
+                "with 'checkpoint_path' and 'num_gpus'."
+            )
+        num_gpus = spec["num_gpus"]
+        if gpus_per_replica and num_gpus % gpus_per_replica != 0:
+            raise ValueError(
+                f"Teacher '{source}': GPUs ({num_gpus}) must be divisible by "
+                f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
+            )
+
+    if sum(spec["num_gpus"] for spec in routes.values()) != total_gpus:
+        raise ValueError(f"Teacher route GPU budgets must sum to total teacher GPUs ({total_gpus}).")
+
+    return routes
+
+
 def _start_managed_multi_teacher(
     args: Any,
     routes_json: str,
@@ -256,9 +292,9 @@ def _start_managed_multi_teacher(
 ) -> tuple[Any, list]:
     """Launch multiple managed teachers for MOPD and inject routes into args.
 
-    Each teacher (one per ``data_source``) gets an equal share of the 'teacher'
-    resource GPUs; that share is further split into replicas of TP size
-    ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
+    Each teacher (one per ``data_source``) gets an equal share by default, or
+    an explicit ``num_gpus`` budget; that budget is split into replicas of TP
+    size ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
     collected into a list and written to
     ``args.opd_teacher_routes_map[data_source]`` so the per-sample router
     (``_pick_teacher_url``) can route by data_source and then round-robin
@@ -268,27 +304,9 @@ def _start_managed_multi_teacher(
 
     import ray
 
-    routes_map: dict[str, str] = json.loads(routes_json)
-    if not routes_map:
-        raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
-
-    num_teachers = len(routes_map)
     _, total_teacher_gpus = args.resource["teacher"]
-    if total_teacher_gpus % num_teachers != 0:
-        raise ValueError(
-            f"Total teacher GPUs ({total_teacher_gpus}) must be evenly divisible by "
-            f"number of teachers ({num_teachers})."
-        )
-    gpus_per_teacher = total_teacher_gpus // num_teachers
-
-    # Per-teacher replica layout: TP size = --teacher-num-gpus-per-engine (default
-    # = all of that teacher's GPUs, i.e. a single replica).
-    gpus_per_replica = getattr(args, "teacher_num_gpus_per_engine", None) or gpus_per_teacher
-    if gpus_per_teacher % gpus_per_replica != 0:
-        raise ValueError(
-            f"Per-teacher GPUs ({gpus_per_teacher}) must be divisible by "
-            f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
-        )
+    teacher_tp = getattr(args, "teacher_num_gpus_per_engine", None)
+    instance_specs = _parse_teacher_routes(routes_json, total_teacher_gpus, teacher_tp)
 
     if not is_managed_opd_teacher_colocate(args):
         raise ValueError(
@@ -300,7 +318,7 @@ def _start_managed_multi_teacher(
     # MOPD is colocate-only: all teachers SHARE the actor/rollout placement group
     # (same as the single-teacher colocate path). During training the actor uses
     # all GPUs; during rollout student-rollout occupies bundles [0, rollout_gpus)
-    # and teacher_k occupies [rollout_gpus + k*gpus_per_teacher, +gpus_per_teacher).
+    # and teachers occupy consecutive regions sized by their individual budgets.
     # This requires rollout_gpus + total_teacher_gpus == actor_gpus. Both this
     # placement-group import and TeacherManager's (below) pull in the full SGLang/
     # transformers dependency chain, so they stay deferred until every ValueError
@@ -326,12 +344,9 @@ def _start_managed_multi_teacher(
     )
     logger.info(
         f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
-        f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus} "
-        f"({gpus_per_teacher} GPU/teacher)"
-    )
-    logger.info(
-        f"[MOPD teacher] launching {num_teachers} teachers x {gpus_per_teacher // gpus_per_replica} replica(s), "
-        f"{gpus_per_replica} GPU(s)/replica, {gpus_per_teacher} GPU(s)/teacher, total={total_teacher_gpus}"
+        f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus}, "
+        "budgets=%s",
+        {source: spec["num_gpus"] for source, spec in instance_specs.items()},
     )
 
     def _build_teacher_manager_args(base_args: Any, data_source: str, spec: dict) -> Any:
@@ -340,6 +355,7 @@ def _start_managed_multi_teacher(
         return teacher_args
 
     def _spawn_teacher_manager(_key: str, per_instance_args: Any, bundle_offset: int, spec: dict) -> Any:
+        gpus_per_replica = teacher_tp or spec["num_gpus"]
         return TeacherManager.options(
             **with_control_plane_affinity(
                 per_instance_args,
@@ -354,10 +370,6 @@ def _start_managed_multi_teacher(
             bundle_offset=bundle_offset,
         )
 
-    instance_specs = {
-        data_source: {"num_gpus": gpus_per_teacher, "checkpoint_path": ckpt}
-        for data_source, ckpt in routes_map.items()
-    }
     managers = start_multi_instance_managers(
         args=args,
         instance_specs=instance_specs,
@@ -372,10 +384,8 @@ def _start_managed_multi_teacher(
         # Append /generate to match the route format expected by _pick_teacher_url.
         replica_urls = [(u if u.endswith("/generate") else u.rstrip("/") + "/generate") for u in urls]
         url_routes[data_source] = replica_urls
-        logger.info(
-            f"[MOPD teacher] '{data_source}' → {routes_map[data_source]} "
-            f"({len(replica_urls)} replica(s), {gpus_per_replica} GPU(s) each) → {replica_urls}"
-        )
+        checkpoint_path = instance_specs[data_source]["checkpoint_path"]
+        logger.info(f"[MOPD teacher] '{data_source}' → {checkpoint_path} → {replica_urls}")
 
     # Inject the routes map so per-sample routing works via _pick_teacher_url.
     args.opd_teacher_routes_map = url_routes
@@ -571,11 +581,14 @@ def add_opd_arguments(parser: Any) -> Any:
         type=str,
         default=None,
         help=(
-            "JSON map from data_source value to HF checkpoint path for multi-teacher "
+            "JSON map from data_source to HF checkpoint path, or to an object with "
+            "checkpoint_path and num_gpus, for multi-teacher "
             "on-policy distillation (MOPD). Relax launches one managed teacher per entry "
             "and routes each sample to the teacher whose key matches "
             "sample.metadata[--opd-teacher-key]. The 'teacher' entry in --resource specifies "
-            "the TOTAL GPU budget, which is split equally among all teachers. "
+            "the TOTAL GPU budget. Path-only entries split it equally; explicit GPU "
+            "budgets must sum to that total and be divisible by --teacher-num-gpus-per-engine when set. "
+            "Use one format for all entries. "
             'Example: \'{"openai/gsm8k":"/path/Qwen3-8B",'
             '"hiyouga/geometry3k":"/path/Qwen3-VL-8B-Instruct"}\'. '
             "Mutually exclusive with --teacher-hf-checkpoint."
@@ -865,25 +878,13 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
                 "In sglang mode, teacher log-probs are obtained from external server during rollout."
             )
 
-        # --opd-teacher-routes: JSON map {data_source: HF checkpoint path} for
+        # --opd-teacher-routes: checkpoint paths or explicit per-route GPU specs for
         # Relax-managed multi-teacher MOPD. The runtime URL map
         # (args.opd_teacher_routes_map) is populated at launch by
         # _start_managed_multi_teacher; here we only validate the spec.
         args.opd_teacher_routes_map = None
         opd_teacher_routes = getattr(args, "opd_teacher_routes", None)
         if opd_teacher_routes is not None:
-            try:
-                routes_map = json.loads(opd_teacher_routes)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"--opd-teacher-routes must be valid JSON: {e}") from e
-            if not isinstance(routes_map, dict) or not routes_map:
-                raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
-            log.info(
-                "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s",
-                len(routes_map),
-                getattr(args, "opd_teacher_key", None) or "data_source",
-                list(routes_map.keys()),
-            )
             if getattr(args, "teacher_hf_checkpoint", None) is not None:
                 raise ValueError(
                     "--opd-teacher-routes is mutually exclusive with --teacher-hf-checkpoint. "
@@ -894,6 +895,17 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
                     "--opd-teacher-routes requires a 'teacher' entry in --resource "
                     "specifying the total GPU budget to split among teachers."
                 )
+            routes_map = _parse_teacher_routes(
+                opd_teacher_routes,
+                args.resource["teacher"][1],
+                getattr(args, "teacher_num_gpus_per_engine", None),
+            )
+            log.info(
+                "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s",
+                len(routes_map),
+                getattr(args, "opd_teacher_key", None) or "data_source",
+                list(routes_map.keys()),
+            )
 
         has_managed_teacher = (
             getattr(args, "teacher_hf_checkpoint", None) is not None
