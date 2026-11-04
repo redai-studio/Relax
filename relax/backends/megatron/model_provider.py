@@ -8,6 +8,7 @@ import logging
 import os
 import pickle
 import re
+import tempfile
 from collections.abc import Sequence
 from contextlib import nullcontext
 from pathlib import Path
@@ -596,7 +597,7 @@ def get_model_provider_func(
             save_path = getattr(args, "save", None)
             if not save_path and (sync_config := getattr(args, "disk_weight_sync_config", None)):
                 save_path = str(Path(sync_config).resolve().parent / "provider")
-            save_path = save_path or "/tmp/relax"
+            save_path = save_path or str(Path(tempfile.gettempdir()) / "relax")
             _dump_provider_config(provider, save_path)
 
         original_provide = provider.provide

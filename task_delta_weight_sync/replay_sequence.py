@@ -8,6 +8,7 @@ import shutil
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import Callable
 
 from relax.distributed.weight_sync.config import WeightSyncConfig
 from relax.distributed.weight_sync.consumer import Consumer
@@ -24,54 +25,70 @@ def main() -> int:
     parser.add_argument("--versions", type=int, nargs="+", required=True)
     parser.add_argument("--full-only", action="store_true")
     args = parser.parse_args()
+    return replay(args.config, args.output, args.versions, args.full_only, args.endpoint)
+
+
+def replay(
+    config_path: Path,
+    output: Path,
+    versions: list[int],
+    full_only: bool = False,
+    tcp_endpoint: str | None = None,
+    installed: Callable[[dict], None] | None = None,
+) -> int:
     from urllib.parse import urlparse
 
-    config = WeightSyncConfig.load(args.config)
-    args.output.mkdir(parents=True, exist_ok=True)
-    if args.endpoint:
-        endpoint = urlparse(args.endpoint)
+    config = WeightSyncConfig.load(config_path)
+    output.mkdir(parents=True, exist_ok=True)
+    if tcp_endpoint:
+        endpoint = urlparse(tcp_endpoint)
         if endpoint.scheme != "tcp" or not endpoint.hostname or endpoint.port is None:
             raise ValueError("Expected tcp://HOST:PORT")
         transport = TCPTransport(endpoint.hostname, endpoint.port, timeout_s=config.sync_timeout_s)
     else:
         transport = SharedFSStore(config.store_root, config.disk_budget_bytes, canonical_root=config.canonical_root)
-    cache = SharedFSStore(args.output / "cache", config.disk_budget_bytes)
+    cache = SharedFSStore(output / "cache", config.disk_budget_bytes)
     consumer = Consumer(
         transport,
         cache,
-        args.output / "checkpoints",
+        output / "checkpoints",
         disk_budget_bytes=config.disk_budget_bytes,
         timeout_s=config.sync_timeout_s,
     )
     rows = []
-    for version in args.versions:
+    for version in versions:
         started = time.monotonic()
         # This reference is a normal independently exported HF checkpoint.
-        export = args.config.parent / "exports" / f"update-{version:06d}"
-        reference = args.output / "full" / f"{version:06d}"
+        export = config_path.parent / "exports" / f"update-{version:06d}"
+        reference = output / "full" / f"{version:06d}"
         if not reference.exists():
             reference.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(export, reference)
         before = dict(getattr(transport, "metrics", {}))
-        prepared = consumer.prepare(config.stream, version, full=args.full_only)
+        prepared = consumer.prepare(config.stream, version, full=full_only)
         check = compare(reference, Path(prepared.path))
-        check_path = args.output / f"{version:06d}-diff.json"
+        check_path = output / f"{version:06d}-diff.json"
         atomic_write(check_path, json.dumps(check, indent=2).encode())
         consumer.release(prepared)
         row = asdict(prepared) | {
-            "transport": "TCP" if args.endpoint else "SharedFS",
+            "transport": "TCP" if tcp_endpoint else "SharedFS",
             "consumer_metrics": dict(consumer.last_metrics),
-            "full_only": args.full_only,
+            "full_only": full_only,
             "elapsed_s": time.monotonic() - started,
             "diff": str(check_path),
             "wire_delta": {k: v - before.get(k, 0) for k, v in getattr(transport, "metrics", {}).items()},
             "equal": check["equal"],
             "reference": str(reference),
         }
-        rows.append(row)
-        atomic_write(args.output / "results.json", json.dumps(rows, indent=2).encode())
         if not check["equal"]:
+            rows.append(row)
+            atomic_write(output / "results.json", json.dumps(rows, indent=2).encode())
             return 1
+        if installed:
+            installed(row)
+        row["elapsed_s"] = time.monotonic() - started
+        rows.append(row)
+        atomic_write(output / "results.json", json.dumps(rows, indent=2).encode())
     return 0
 
 
