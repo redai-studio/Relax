@@ -70,6 +70,8 @@ class SessionSpec:
     metadata: dict[str, Any] = field(default_factory=dict)
     input_payload: dict[str, Any] = field(default_factory=dict)
     sampling_params: dict[str, Any] | None = None
+    observation_stage_id: str | None = None
+    observation_started_at: str | None = None
 
 
 @dataclass

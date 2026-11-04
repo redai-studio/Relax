@@ -73,7 +73,14 @@ class StreamingReader:
     access to any line in the file.
     """
 
-    def __init__(self, path: str, *, pre_make_index: bool = False, line_offsets_cache: dict | None = None):
+    def __init__(
+        self,
+        path: str,
+        *,
+        pre_make_index: bool = False,
+        line_offsets_cache: dict | None = None,
+        with_source: bool = False,
+    ):
         """Initialize the streaming reader.
 
         Args:
@@ -83,6 +90,8 @@ class StreamingReader:
         self._pre_make_index = pre_make_index
         self._line_offsets_cache = {} if line_offsets_cache is None else line_offsets_cache
         self._cache_key = path
+        self.with_source = with_source
+        self._source_row_ids: list[int] = []
 
         if not os.path.exists(self.path):
             raise FileNotFoundError(f"Dataset path '{self.path}' does not exist.")
@@ -96,7 +105,7 @@ class StreamingReader:
         if not self.path.endswith((".jsonl", ".parquet")):
             raise ValueError(f"Unsupported file format: {self.path}. Supported formats are .jsonl and .parquet.")
 
-        if not pre_make_index and not self._is_parquet and path in self._line_offsets_cache:
+        if not self.with_source and not pre_make_index and not self._is_parquet and path in self._line_offsets_cache:
             import ray
 
             self._line_offsets = ray.get(self._line_offsets_cache[path])
@@ -123,9 +132,11 @@ class StreamingReader:
         # blocks and avoid copying each entire row just to detect blank lines.
         with open(self.path, "rb", buffering=1024 * 1024) as f:
             offset = 0
-            for line in f:
+            for row_id, line in enumerate(f):
                 if not line.isspace():  # Skip empty lines
                     self._line_offsets.append(offset)
+                    if self.with_source:
+                        self._source_row_ids.append(row_id)
                 offset += len(line)
 
         # Apply row slice if specified
@@ -133,6 +144,7 @@ class StreamingReader:
             start = self.row_slice.start or 0
             stop = self.row_slice.stop or len(self._line_offsets)
             self._line_offsets = self._line_offsets[start:stop]
+            self._source_row_ids = self._source_row_ids[start:stop]
 
         self._total_lines = len(self._line_offsets)
         logger.info(f"Index built: {self._total_lines} lines")
@@ -189,14 +201,26 @@ class StreamingReader:
             raise IndexError(f"Index {idx} out of range [0, {self._total_lines})")
 
         if self._is_parquet:
-            return self._parquet_data[idx]
+            return self._with_source(self._parquet_data[idx], idx)
 
         # Read from JSONL using line offset
         offset = self._line_offsets[idx]
         with open(self.path, "rb") as f:
             f.seek(offset)
             line = f.readline().decode("utf-8").strip()
-            return json.loads(line)
+            return self._with_source(json.loads(line), idx)
+
+    def _with_source(self, data: dict, idx: int) -> dict:
+        if not self.with_source:
+            return data
+        from relax.utils.agentic_obs.source import SourceRow
+
+        if self._is_parquet:
+            start = self.row_slice.start or 0 if self.row_slice is not None else 0
+            row_id = start + idx
+        else:
+            row_id = self._source_row_ids[idx]
+        return SourceRow(data, self.path, row_id)
 
     def iter_batch(self, indices: list[int]) -> Iterator[dict]:
         """Iterate over multiple indices efficiently.
@@ -215,7 +239,7 @@ class StreamingReader:
 
         if self._is_parquet:
             for idx in indices:
-                yield idx, self._parquet_data[idx]
+                yield idx, self._with_source(self._parquet_data[idx], idx)
             return
 
         # Sort indices for sequential reading (more efficient for HDD)
@@ -227,7 +251,7 @@ class StreamingReader:
                 offset = self._line_offsets[idx]
                 f.seek(offset)
                 line = f.readline().decode("utf-8").strip()
-                results[original_pos] = (idx, json.loads(line))
+                results[original_pos] = (idx, self._with_source(json.loads(line), idx))
 
         yield from results
 
@@ -875,6 +899,8 @@ class StreamingDataset(BaseDataset):
         custom_prompt_func=None,
         teacher_prompt_key: Optional[str] = None,
         teacher_multimodal_keys: Optional[dict] = None,
+        record_source: bool = False,
+        source_split: str = "train",
     ):
         """Initialize the streaming dataset.
 
@@ -925,11 +951,12 @@ class StreamingDataset(BaseDataset):
         )
 
         # Streaming-specific components
+        self.source_split = source_split
         paths, row_slice = resolve_path_plan(path)
         if len(paths) == 1 and row_slice is None:
-            self.reader = StreamingReader(paths[0])
+            self.reader = StreamingReader(paths[0], with_source=record_source)
         else:
-            self.reader = CompositeStreamingReader(paths, row_slice)
+            self.reader = CompositeStreamingReader(paths, row_slice, with_source=record_source)
         self.buffer = SampleBuffer(max_size=buffer_size)
         self.index_manager = IndexManager(len(self.reader), seed=seed)
 
