@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[3]
 def _load_definitions(path, names, namespace):
     # These orchestration functions only need mocked service APIs. Avoid importing
     # CUDA/Megatron dependencies just to exercise their actual control flow.
+    namespace.setdefault("Callable", Callable)
     tree = ast.parse((ROOT / path).read_text())
     tree.body = [
         node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
@@ -54,6 +55,7 @@ def _train_namespace():
         "_shutdown_done": False,
         "_training_completed": False,
         "_kernel_cache_heartbeat": None,
+        "_fault_runtime": None,
         "_SHUTDOWN_TIMEOUT_SEC": 60,
         "_NORMAL_SHUTDOWN_TIMEOUT_SEC": 1800,
     }

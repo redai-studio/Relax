@@ -104,7 +104,7 @@ def test_default_global_restart_reinitializes_after_legacy_manager_death(monkeyp
 
     controller_module.ray.shutdown.assert_called_once_with()
     controller_module.ray.init.assert_called_once_with(runtime_env=controller.runtime_env)
-    initialize.assert_called_once_with(controller.config, controller.runtime_env)
+    initialize.assert_called_once_with(controller.config, controller.runtime_env, fault_events=None)
 
 
 def test_global_restart_count_limit_remains_terminal(monkeypatch):
@@ -309,7 +309,7 @@ def test_original_in_place_restart_keeps_other_service_responses(monkeypatch):
 
     controller.restart_serve("sft")
 
-    service.restart.assert_called_once_with()
+    service.restart.assert_called_once_with(fault_observer=None)
     response.cancel.assert_not_called()
     assert controller._pending_task_refs == [response]
     assert controller._restart_mode == "local"

@@ -17,6 +17,8 @@ from relax.distributed.ray.placement_group import (
     _require_node_group_markers,
     create_placement_group,
 )
+from relax.utils.fault_events.models import RecoveryEvidence
+from relax.utils.fault_events.recovery import observe_recovery
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url, recovery_load_path
 
@@ -294,7 +296,7 @@ class Service:
         self._deploy(self.pgs)
         self._task_ref = None
 
-    def restart(self) -> None:
+    def restart(self, fault_observer: Callable[..., None] | None = None) -> None:
         """Restart this service in-place: reuse placement groups and dynamic
         state.
 
@@ -332,6 +334,7 @@ class Service:
 
         recovery_load_path(self.config)  # Ensure config has the correct checkpoint paths after restart
         self._deploy(pgs)
+        observe_recovery(fault_observer, observed=RecoveryEvidence.DEPLOYED)
         logger.info(f"[{self.role}] Service redeployed successfully")
 
         current_step = 0
@@ -345,11 +348,15 @@ class Service:
         try:
             self._http_call(self.role, "/set_step", method="POST", params={"step": current_step})
             logger.info(f"[{self.role}] Restored step to {current_step}")
+            observe_recovery(fault_observer, observed=RecoveryEvidence.STEP_RESTORED)
         except Exception as e:
+            observe_recovery(fault_observer, failed=RecoveryEvidence.STEP_RESTORED)
             logger.warning(f"[{self.role}] Failed to restore step: {e}")
 
         self._task_ref = None
         task_ref = self.run()
+        if task_ref is not None:
+            observe_recovery(fault_observer, observed=RecoveryEvidence.TASK_SUBMITTED)
         logger.info(f"[{self.role}] Service task re-launched after restart, task_ref={task_ref}")
 
     def _ensure_placement_group(self) -> Optional[Any]:
