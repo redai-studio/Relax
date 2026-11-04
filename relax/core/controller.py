@@ -181,17 +181,14 @@ def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
 
 
 class Controller:
-    # Class defaults cover controllers built with ``__new__`` in CPU tests.
+    # Fault observation is optional; class defaults also cover controllers
+    # built with ``__new__``.
     _fault_events: Any = None
     _fault_recovery: Any = None
     _fault_rebuild_ready: Any = None
 
     def __init__(
-        self,
-        config: Namespace,
-        runtime_env: dict = None,
-        fault_events: Any = None,
-        fault_recovery: Any = None,
+        self, config: Namespace, runtime_env: dict = None, fault_events: Any = None, fault_recovery: Any = None
     ) -> None:
         self._fault_events = fault_events
         self._fault_recovery = fault_recovery
@@ -204,10 +201,7 @@ class Controller:
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
         self._health_manager = HealthManager(
-            check_interval=1.0,
-            config=config,
-            fault_events=fault_events,
-            fault_recovery=fault_recovery,
+            check_interval=1.0, config=config, fault_events=fault_events, fault_recovery=fault_recovery
         )
         if not hasattr(self, "_restarting"):
             self._restarting = False  # Flag to indicate a restart is in progress
@@ -1303,7 +1297,7 @@ class Controller:
     def training_loop(self):
         # Start all services in parallel without blocking on their completion
         # Each service runs independently: rollout, actor, critic, etc.
-        async def run_all_services(*, resume_existing: bool = False):
+        async def run_all_services(*, resume_existing: bool = False, startup: GlobalStartup):
             if not resume_existing and not (self.config.debug_train_only or self.config.debug_rollout_only):
                 # Pass genRM manager(s) to actor for coordinated offload/onload
                 if GENRM_ROLE in self.serve_dict and not self.config.fully_async:
@@ -1367,15 +1361,13 @@ class Controller:
                         handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async(recovery_token=token))
                     # Start senders and receivers together, and await the real
                     # Serve responses before set_step or generation can start.
-                    startup.waiting_weights = True
-                    await asyncio.gather(*handles)
-                    startup.waiting_weights = False
+                    with startup.weight_sync():
+                        await asyncio.gather(*handles)
                 if ROLES.actor in self.serve_dict:
-                    startup.restoring_step = True
-                    step = await self.serve_dict[ROLES.actor].get_step()
-                    for service in self.serve_dict.values():
-                        await service.set_step(step)
-                    startup.step_restored()
+                    with startup.step_restore():
+                        step = await self.serve_dict[ROLES.actor].get_step()
+                        for service in self.serve_dict.values():
+                            await service.set_step(step)
 
             # All startup consumers have now initialized and the first policy
             # weights have been synchronized. Remove source weight shards
@@ -1417,7 +1409,7 @@ class Controller:
         while True:
             startup = GlobalStartup(self._fault_events, pending_recovery, pending_initialized)
             try:
-                run(run_all_services(resume_existing=resume_existing))
+                run(run_all_services(resume_existing=resume_existing, startup=startup))
                 if self._restarting:
                     raise RuntimeError("Service completion interrupted by recovery")
                 logger.info("All services running successfully")
@@ -1630,10 +1622,7 @@ class Controller:
         self._fault_recovery = None
         if self._fault_events is not None:
             self._fault_recovery = self._fault_events.plan_recovery(
-                role,
-                self._restart_mode,
-                self.config,
-                self.serve_dict,
+                role, self._restart_mode, self.config, self.serve_dict
             )
         if global_restart:
             # Perform full Controller re-initialization from zero when:

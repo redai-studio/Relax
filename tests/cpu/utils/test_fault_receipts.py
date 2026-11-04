@@ -364,7 +364,8 @@ def test_sender_never_replaces_unconfirmed_request_and_queue_stays_bounded(monke
     assert not sender._thread.is_alive()
 
 
-def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exception(monkeypatch):
+@pytest.mark.parametrize("failure", ["creation", "enqueue"])
+def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exception(monkeypatch, failure):
     import ast
 
     from relax.utils.fault_events import receipts
@@ -387,8 +388,47 @@ def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exc
     def broken_worker(*args, **kwargs):
         raise ValueError("original worker error")
 
-    monkeypatch.setattr(receipts, "ReceiptSender", broken_sender)
-    owner.actor_model.update_weights_fully_async = broken_worker
+    if failure == "creation":
+        monkeypatch.setattr(receipts, "ReceiptSender", broken_sender)
+    else:
+        owner._fault_receipt_sender = SimpleNamespace(emit=broken_sender)
     token = {"run_id": new_id(), "recovery_id": new_id(), "recovery_generation": 1}
+    ns[fn.name](owner, recovery_token=token)
+    assert len(calls) == 2
+    owner.actor_model.update_weights_fully_async = broken_worker
     with pytest.raises(ValueError, match="original worker error"):
         ns[fn.name](owner, recovery_token=token)
+
+
+@pytest.mark.parametrize("field,value", [("token", {}), ("operation", "unknown"), ("outcome", True)])
+def test_health_rpc_rejects_invalid_receipt_without_changing_business_state(runtime, field, value):
+    _, recovery, _ = start(runtime)
+    token = runtime.token(recovery)
+    status = Status(fault_generation=runtime.generation, fault_seed=token)
+    status.mark_unhealthy("actor", "business error")
+    original = status.get_service_health("actor", include_fault=True)
+    request = {"token": token, "operation": "actor_send", "outcome": "succeeded", field: value}
+    assert status.record_recovery_receipt(**request) == "invalid"
+    assert status.get_service_health("actor", include_fault=True) == original
+    assert status._fault_receipts.snapshot()["observed"] == 0
+    status.mark_healthy("actor")
+    assert status.get_service_health("actor")["healthy"]
+    assert status.record_recovery_receipt(token, "actor_send", "succeeded") == "accepted"
+
+
+def test_malformed_receipt_seed_keeps_valid_fault_source():
+    status = Status(fault_generation=0, fault_seed={})
+    status.report_error("actor", "business error")
+    assert status._fault_observation_error and status._fault_receipts is None
+    assert status.get_service_health("actor", include_fault=True)["fault"]["role"] == "actor"
+
+
+def test_sender_counts_invalid_receipt_without_submitting(monkeypatch):
+    from relax.utils.fault_events.receipts import ReceiptSender
+
+    # No worker is needed to test admission; real transport and queue bounds
+    # are exercised by test_sender_never_replaces_unconfirmed_request.
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    sender = ReceiptSender(object())
+    sender.emit({}, "actor_send", "succeeded")
+    assert sender.dropped == 1 and sender._queue.empty()

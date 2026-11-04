@@ -11,7 +11,7 @@ from .context import (
     parse_trace_contexts,
 )
 from .models import ROLES, FaultContext, new_id, service_role, valid_uint
-from .receipts import ReceiptInbox, receipt_snapshot
+from .receipts import ReceiptInbox
 
 
 class FaultSource:
@@ -199,7 +199,6 @@ def snapshot_details(
     contexts = _validated_trace_contexts(observed.get("trace_contexts"))
     if contexts:
         result["trace_contexts"] = contexts
-    slots = receipt_snapshot(receipts)
-    if slots is not None:
-        result["receipts"] = slots
+    if receipts is not None:
+        result["receipts"] = receipts.snapshot()
     return result

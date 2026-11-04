@@ -7,6 +7,7 @@ import asyncio
 import socket
 import sys
 import threading
+from argparse import Namespace
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -15,7 +16,7 @@ from relax.utils import health_system
 from relax.utils.fault_events.models import EventDraft, new_id
 from relax.utils.fault_events.query_server import FaultQueryServer
 from relax.utils.fault_events.receipts import ReceiptInbox
-from relax.utils.fault_events.recovery import global_plan
+from relax.utils.fault_events.recovery import GlobalStartup, expected_evidence, global_plan
 from relax.utils.fault_events.runtime import FaultEventRuntime
 from tests.cpu.core.test_fault_local_recovery_cpu import ROOT, Roles, make_controller, make_service, observe, records
 from tests.cpu.core.test_fault_local_recovery_cpu import cpu_algorithm_registry as _cpu_registry
@@ -23,6 +24,34 @@ from tests.cpu.utils.test_fault_health_flow import HealthStatusImpl, LocalStatus
 
 
 cpu_algorithm_registry = _cpu_registry
+
+
+def test_sparse_configuration_uses_the_same_plan_defaults():
+    roles = ("actor", "actor_fwd")
+    assert global_plan(Namespace(), roles).expected == expected_evidence("global", Namespace(), roles) == 7
+
+
+@pytest.mark.parametrize("stage,reason", [("weight_sync", None), ("step_restore", "step_restore_failed")])
+def test_cancelled_startup_stage_keeps_classification_and_resets_on_retry(runtime, stage, reason):
+    controller = startup_controller(runtime, (Roles.actor,), [])
+    recovery = prepare_handoff(controller, runtime)
+    startup = GlobalStartup(runtime, recovery, initialized=True)
+    with pytest.raises(asyncio.CancelledError):
+        with getattr(startup, stage)():
+            raise asyncio.CancelledError()
+    startup.fail(False, recovery)
+    assert recovery.outcome == ("recovery_failed" if reason else None)
+    if reason:
+        assert records(runtime)[-1]["reason_code"] == reason
+    else:
+        assert recovery.observed == 1 and not recovery.failed
+
+    # A later successful stage must not retain the cancellation category.
+    with startup.weight_sync():
+        pass
+    startup.fail(False, recovery)
+    if not reason:
+        assert records(runtime)[-1]["reason_code"] == "handoff_exception"
 
 
 @pytest.fixture

@@ -390,22 +390,20 @@ class FaultEventRuntime:
         # Health queries merge slots before any unhealthy callback can destroy
         # the receiver, including a query with no unhealthy roles.
         if receipts is not None and receipts["token"] == self._receipt_seed:
-            token = receipts["token"]
-            if token["recovery_generation"] == generation:
+            if receipts["conflict"]:
+                self.note_unknown("RECEIPT_CONFLICT")
+            recovery = self._recoveries.get(receipts["token"]["recovery_id"])
+            if recovery is not None:
+                recovery.conflict |= receipts["conflict"]
                 if receipts["conflict"]:
-                    self.note_unknown("RECEIPT_CONFLICT")
-                recovery = self._recoveries.get(token["recovery_id"])
-                if recovery is not None:
-                    recovery.conflict |= receipts["conflict"]
-                    if receipts["conflict"]:
-                        # Slots are cumulative. Once a slot conflicts it is
-                        # absent from both masks, including previously merged
-                        # evidence. Keep independent definite results usable.
-                        recovery.observed &= ~RecoveryEvidence.WEIGHT_OPERATIONS.value
-                        recovery.failed &= ~RecoveryEvidence.WEIGHT_OPERATIONS.value
-                    self._evidence(
-                        recovery, receipts["observed"], receipts["failed"], False, "operation_failed", event_ids
-                    )
+                    # Slots are cumulative. Once a slot conflicts it is
+                    # absent from both masks, including previously merged
+                    # evidence. Keep independent definite results usable.
+                    recovery.observed &= ~RecoveryEvidence.WEIGHT_OPERATIONS.value
+                    recovery.failed &= ~RecoveryEvidence.WEIGHT_OPERATIONS.value
+                self._evidence(
+                    recovery, receipts["observed"], receipts["failed"], False, "operation_failed", event_ids
+                )
         if self._source_disabled:
             return False
         active = {fault.fault_id for recovery in self._recoveries.values() for fault in recovery.members}

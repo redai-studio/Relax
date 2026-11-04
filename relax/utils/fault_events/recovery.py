@@ -2,7 +2,8 @@
 """Evidence required by local and global recovery plans."""
 
 from argparse import Namespace
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,11 +32,23 @@ def expected_evidence(mode: str, config: Namespace, roles: Collection[str]) -> R
     """Read the configured recovery plan without importing model components."""
     if mode == "local":
         return RecoveryEvidence.LOCAL
+    return _expected_evidence(_branch(config), roles)
+
+
+def _branch(config: Namespace) -> str:
+    if getattr(config, "debug_train_only", False) or getattr(config, "debug_rollout_only", False):
+        return "debug"
+    if getattr(config, "hybrid", False):
+        return "hybrid"
+    return "pure_async" if getattr(config, "fully_async", False) else "colocate"
+
+
+def _expected_evidence(branch: str, roles: Collection[str]) -> RecoveryEvidence:
     expected = RecoveryEvidence.DEPLOYED | RecoveryEvidence.TASK_SUBMITTED
-    if not (getattr(config, "debug_train_only", False) or getattr(config, "debug_rollout_only", False)):
+    if branch != "debug":
         if "actor" in roles:
             expected |= RecoveryEvidence.STEP_RESTORED
-            if getattr(config, "fully_async", False) and not getattr(config, "hybrid", False):
+            if branch == "pure_async":
                 expected |= RecoveryEvidence.ACTOR_WEIGHT_SENT
                 if "actor_fwd" in roles:
                     expected |= RecoveryEvidence.ACTOR_FWD_WEIGHT_RECEIVED
@@ -69,25 +82,14 @@ class RecoveryPlan:
 
     @property
     def expected(self) -> RecoveryEvidence:
-        return expected_evidence(
-            "global",
-            Namespace(debug_train_only=self.branch == "debug", fully_async=self.branch == "pure_async"),
-            self.roles,
-        )
+        return _expected_evidence(self.branch, self.roles)
 
 
 def global_plan(config: Namespace, roles: Collection[str]) -> RecoveryPlan:
     from relax.engine.sft.runtime import is_offline_mode
 
     graph = tuple(sorted(service_role(role) for role in roles))
-    if config.debug_train_only or config.debug_rollout_only:
-        branch = "debug"
-    elif config.hybrid:
-        branch = "hybrid"
-    elif config.fully_async:
-        branch = "pure_async"
-    else:
-        branch = "colocate"
+    branch = _branch(config)
     sync = branch in ("colocate", "hybrid") and {"actor", "rollout"} <= set(graph) and not is_offline_mode(config)
     return RecoveryPlan(graph, branch, sync)
 
@@ -100,13 +102,29 @@ class GlobalStartup:
         self.runtime = runtime
         self.recovery = recovery
         self.observed = RecoveryEvidence.DEPLOYED if initialized else RecoveryEvidence(0)
-        self.restoring_step = False
-        self.waiting_weights = False
+        self._failed_stage: str | None = None
         self.complete = False
 
-    def step_restored(self) -> None:
+    @contextmanager
+    def weight_sync(self) -> Iterator[None]:
+        self._failed_stage = None
+        try:
+            yield
+        except BaseException:
+            # Cancellation may be translated by the training event loop.
+            # Preserve its location and let Controller choose superseded first.
+            self._failed_stage = "weights"
+            raise
+
+    @contextmanager
+    def step_restore(self) -> Iterator[None]:
+        self._failed_stage = None
+        try:
+            yield
+        except BaseException:
+            self._failed_stage = "step"
+            raise
         self.observed |= RecoveryEvidence.STEP_RESTORED
-        self.restoring_step = False
 
     def token(self) -> dict | None:
         if self.runtime is not None:
@@ -125,12 +143,12 @@ class GlobalStartup:
             return
         if restarting and current is not self.recovery:
             self.runtime.finish(self.recovery, "recovery_interrupted", "superseded", observed=self.observed)
-        elif self.waiting_weights:
+        elif self._failed_stage == "weights":
             # A failed Serve response can mean worker failure or transport
             # loss. Only its completion receipt proves an operation outcome.
             self.runtime.evidence(self.recovery, observed=self.observed)
             self.runtime.note_unknown("OUTCOME_UNOBSERVED")
-        elif self.restoring_step:
+        elif self._failed_stage == "step":
             self.runtime.finish(
                 self.recovery,
                 "recovery_failed",

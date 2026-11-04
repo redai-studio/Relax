@@ -63,13 +63,19 @@ class HealthStatus:
                 self._fault_observation_error = True
         from relax.utils.fault_events.receipts import create_inbox
 
-        self._fault_receipts = create_inbox(fault_seed, self._fault_generation)
+        try:
+            self._fault_receipts = create_inbox(fault_seed, self._fault_generation)
+        except (ValueError, TypeError):
+            self._fault_receipts = None
         self._fault_observation_error |= fault_seed is not None and self._fault_receipts is None
 
     def record_recovery_receipt(self, token: dict, operation: str, outcome: str) -> str:
-        from relax.utils.fault_events.receipts import record_receipt
-
-        return record_receipt(self._fault_receipts, token, operation, outcome)
+        if self._fault_receipts is None:
+            return "invalid"
+        try:
+            return self._fault_receipts.receive(token, operation, outcome)
+        except (ValueError, TypeError):
+            return "invalid"
 
     def _observe(self, method: str, *args: Any) -> Any:
         if self._fault_source is None:

@@ -76,10 +76,7 @@ class ReceiptInbox:
         return bool(self._conflicts)
 
     def receive(self, token: dict, operation: str, outcome: str) -> str:
-        try:
-            validate_receipt(token, operation, outcome)
-        except (TypeError, ValueError):
-            return "invalid"
+        validate_receipt(token, operation, outcome)
         if self._seed is None or token != self._seed:
             return "stale"
         bit = OPERATIONS[operation].value
@@ -110,27 +107,10 @@ class ReceiptInbox:
 def create_inbox(seed: dict | None, generation: int | None) -> ReceiptInbox | None:
     if seed is None:
         return None
-    try:
-        inbox = ReceiptInbox(seed)
-        if seed["recovery_generation"] != generation:
-            raise ValueError("INVALID_TOKEN: recovery_generation must match the receipt receiver")
-        return inbox
-    except Exception:
+    inbox = ReceiptInbox(seed)
+    if seed["recovery_generation"] != generation:
         return None
-
-
-def record_receipt(inbox: ReceiptInbox | None, token: dict, operation: str, outcome: str) -> str:
-    try:
-        return inbox.receive(token, operation, outcome) if inbox is not None else "invalid"
-    except Exception:
-        return "invalid"
-
-
-def receipt_snapshot(inbox: ReceiptInbox | None) -> dict | None:
-    try:
-        return inbox.snapshot() if inbox is not None else None
-    except Exception:
-        return None
+    return inbox
 
 
 class ReceiptSender:
@@ -153,7 +133,7 @@ class ReceiptSender:
         try:
             validate_receipt(token, operation, outcome)
             self._queue.put_nowait((dict(token), operation, outcome))
-        except Exception:
+        except (ValueError, TypeError, queue.Full):
             self._drop()
 
     def _send(self) -> None:
