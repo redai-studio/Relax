@@ -16,6 +16,7 @@ from relax.utils.metrics.metric_utils import (
 from relax.utils.misc import group_by
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.types import Sample
+from relax.utils.weight_version_audit import parse_weight_version
 
 
 def compute_metrics_from_samples(
@@ -24,6 +25,7 @@ def compute_metrics_from_samples(
     *,
     rollout_id: int | None = None,
     include_rloo_diagnostics: bool = True,
+    consumption_weight_version: str | None = None,
 ) -> dict[str, float]:
     if not samples:
         return {}
@@ -57,6 +59,7 @@ def compute_metrics_from_samples(
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     log_dict |= compute_rollout_stop_reason_and_turn_metrics(samples)
+    log_dict |= _compute_weight_version_metrics(samples, consumption_weight_version)
     if rollout_id is not None and args.partial_rollout and not args.fully_async:
         staleness_gaps = [rollout_id - sample.metadata.get("start_rollout_id", rollout_id) for sample in samples]
         log_dict["staleness/avg"] = np.mean(staleness_gaps).item()
@@ -64,6 +67,84 @@ def compute_metrics_from_samples(
         log_dict["staleness/min"] = np.min(staleness_gaps).item()
         log_dict["global_batch_size"] = len({sample.index for sample in samples})
     return log_dict
+
+
+def _compute_weight_version_metrics(
+    samples: list[Sample],
+    consumption_weight_version: str | None = None,
+) -> dict[str, float]:
+    """Report how many trained tokens came from which policy version.
+
+    Only committed generation segments are audited. Tokens generated before the
+    audit path existed, outside any segment, or carrying an unparsable version
+    are reported as missing instead of being coerced to version 0 or to the
+    newest version.
+
+    ``consumption_weight_version`` is the policy version the trainer consumes
+    the batch with. Callers that cannot supply it get ``weight_version/batch_age_*``
+    (measured against the newest version in the batch) rather than a number
+    mislabelled as the training-side lag.
+    """
+    segment_count = 0
+    known_tokens = 0
+    unknown_tokens = 0
+    segments_per_sample: list[int] = []
+    span_per_sample: list[int] = []
+    observed_versions: list[int] = []
+    # (version, token count) pairs, split evenly when a span saw several versions.
+    version_tokens: list[tuple[int, float]] = []
+
+    for sample in samples:
+        segments = sample.generation_segments
+        segments_per_sample.append(len(segments))
+        sample_known = 0
+        sample_unknown = 0
+        for segment in segments:
+            segment_count += 1
+            versions = [
+                version for version in map(parse_weight_version, segment.weight_versions) if version is not None
+            ]
+            tokens = segment.token_count
+            if not versions:
+                sample_unknown += tokens
+                continue
+            sample_known += tokens
+            observed_versions.extend(versions)
+            span_per_sample.append(max(versions) - min(versions))
+            share = tokens / len(versions)
+            version_tokens.extend((version, share) for version in versions)
+        known_tokens += sample_known
+        # Response tokens outside any audit segment are unknown as well.
+        unsegmented = max(sample.effective_response_length - sample_known - sample_unknown, 0)
+        unknown_tokens += sample_unknown + unsegmented
+
+    if segment_count == 0:
+        return {}
+
+    total_tokens = known_tokens + unknown_tokens
+    metrics: dict[str, float] = {
+        "weight_version/coverage": known_tokens / total_tokens if total_tokens else 0.0,
+        "weight_version/missing_ratio": unknown_tokens / total_tokens if total_tokens else 0.0,
+        "weight_version/segments_per_sample": float(np.mean(segments_per_sample)),
+        "weight_version/span_avg": float(np.mean(span_per_sample)) if span_per_sample else 0.0,
+        "weight_version/span_max": float(np.max(span_per_sample)) if span_per_sample else 0.0,
+    }
+
+    reference = parse_weight_version(consumption_weight_version)
+    prefix = "weight_version/lag"
+    if reference is None and observed_versions:
+        reference = max(observed_versions)
+        prefix = "weight_version/batch_age"
+    if reference is None or not version_tokens:
+        return metrics
+
+    lags = [reference - version for version, _ in version_tokens]
+    weights = [tokens for _, tokens in version_tokens]
+    metrics[f"{prefix}_avg"] = float(np.mean(lags))
+    metrics[f"{prefix}_p95"] = float(np.percentile(lags, 95))
+    metrics[f"{prefix}_max"] = float(np.max(lags))
+    metrics[f"{prefix}_token_weighted_avg"] = float(np.average(lags, weights=weights))
+    return metrics
 
 
 def _compute_min_mean_max_stats(values: list[int], prefix: str) -> dict[str, float]:

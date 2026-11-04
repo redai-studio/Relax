@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
-from relax.utils.types import Sample
+from relax.utils.types import GenerationSegment, Sample
 
 
 MsgKind = Literal["obs", "resp"]
@@ -796,6 +796,7 @@ class SessionForest:
         response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
+        generation_segments: list[GenerationSegment] = []
         spec_info = dict(_EMPTY_SPEC_DELTA)
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
@@ -813,10 +814,20 @@ class SessionForest:
             if node.kind == "resp":
                 if first_response_node is None:
                     first_response_node = node
-                turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
+                turn_index = len(turns)
+                turns.append(self._agentic_trace_turn_from_node(node, turn_index))
                 response_start = len(continuation_train_tokens)
                 continuation_train_tokens.extend(node.train_token_delta)
                 response_node_spans.append([response_start, len(continuation_train_tokens)])
+                generation_segments.append(
+                    GenerationSegment(
+                        turn_index=turn_index,
+                        token_start=response_start,
+                        token_end=len(continuation_train_tokens),
+                        weight_versions=[str(version) for version in node.weight_version_delta],
+                        state_hash=node.state_hash,
+                    )
+                )
                 loss_mask.extend([1] * len(node.train_token_delta))
                 rollout_log_probs.extend(node.logprob_delta)
                 if topk_width is not None:
@@ -882,6 +893,7 @@ class SessionForest:
             custom_advantage=response_node_spans,
             loss_mask=loss_mask,
             weight_versions=weight_versions,
+            generation_segments=generation_segments,
             rollout_log_probs=rollout_log_probs,
             rollout_topk_token_ids=np.concatenate(topk_token_ids) if topk_token_ids else None,
             rollout_topk_log_probs=np.concatenate(topk_log_probs) if topk_log_probs else None,
