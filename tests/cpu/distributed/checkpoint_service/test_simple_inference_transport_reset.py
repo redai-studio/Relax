@@ -28,6 +28,31 @@ def _backend() -> DeviceDirectBackend:
     return backend
 
 
+@pytest.mark.parametrize("mode", ["success", "http_error", "wrong_role"])
+def test_unregister_is_strict(mode):
+    response = Mock()
+    if mode == "http_error":
+        response.raise_for_status.side_effect = RuntimeError("unregister rejected")
+    client = object.__new__(CheckpointEngineClient)
+    client.role_info = SimpleNamespace(role_name="actor" if mode == "wrong_role" else "actor_fwd", rank=2)
+    client.coordinator_url = "http://coordinator.test"
+    client._registered = True
+    client._http_client = SimpleNamespace(delete=AsyncMock(return_value=response))
+    if mode == "success":
+        asyncio.run(client.unregister_for_recovery())
+    else:
+        with pytest.raises(RuntimeError, match="Only the replaced|unregister rejected"):
+            asyncio.run(client.unregister_for_recovery())
+    assert client._registered is (mode != "success")
+    if mode == "wrong_role":
+        client._http_client.delete.assert_not_called()
+    else:
+        client._http_client.delete.assert_awaited_once_with(
+            "http://coordinator.test/unregister", params={"role": "actor_fwd", "rank": 2}
+        )
+        response.raise_for_status.assert_called_once()
+
+
 @pytest.mark.parametrize("role", ["rollout", "actor_fwd"])
 def test_reset_destroys_only_the_requested_transport(monkeypatch, role):
     backend = _backend()
