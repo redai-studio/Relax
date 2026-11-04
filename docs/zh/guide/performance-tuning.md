@@ -255,6 +255,24 @@ traces/my-profiling-run/
 
 ---
 
+## CPU Offload 与 NUMA
+
+在多 NUMA 节点的机器上，如果训练 GPU 都位于同一个 NUMA 节点，CPU 优化器计算和内存访问就可能集中在一侧。先用 `nvidia-smi topo -m` 查看拓扑，再结合 GPU 互联情况，选择分布在不同 NUMA 节点的 GPU。
+
+例如，GPU 0/1 靠近 NUMA 0，GPU 4/5 靠近 NUMA 1，可以在**启动 Ray 节点时**只暴露这四张卡：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,4,5 ray start --head --num-gpus=4
+```
+
+网络地址、加入集群等选项沿用现有 Ray 启动配置。只在提交任务的命令上设置 `CUDA_VISIBLE_DEVICES`，不会改变已运行 Ray 节点的 GPU 资源。详见 [Ray 加速器配置](https://docs.ray.io/en/latest/ray-core/scheduling/accelerators.html)。
+
+Relax 会在初始化训练通信组之前，根据实际 CUDA 设备的 UUID 查询附近的 CPU，并在各线程原有 CPU 范围内绑定已有线程，非连续选卡也能正确对应。框架不会因此修改线程数，也不会自动跨 NUMA 节点选卡。
+
+CPU 绑定不等于强制内存绑定，也不会迁移已经分配的内存。在 Linux 默认内存策略下，首次访问新内存页的 CPU 会影响分配位置，本地容量充足时优先本地分配。可通过 `/proc/<pid>/numa_maps` 检查实际分布。`numactl --membind` 等严格绑定可能在其他节点仍有空闲内存时耗尽本地内存，因此 Relax 不会自动启用。
+
+---
+
 ## 激活重计算
 
 重计算以计算换内存。对大多数 RL 训练场景，建议启用重计算：
