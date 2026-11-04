@@ -306,8 +306,8 @@ def test_condition_cache_environment_is_registered_and_typed(monkeypatch):
         "RELAX_CONDITION_CACHE_DEVICE": "cpu",
         "RELAX_CONDITION_CACHE_IDENTITY": "a" * 64,
     }
-    monkeypatch.delenv("RELAX_ATTENTION_IMPLEMENTATION", raising=False)
-    monkeypatch.delenv("RELAX_DETERMINISTIC_ATTENTION", raising=False)
+    # validate_env also reads os.environ; this unit test owns only its cache inputs.
+    monkeypatch.setattr("os.environ", {})
     assert set(values) <= known_env_names()
     validate_env({**values, "RELAX_STRICT_ENV": "1"})
     monkeypatch.setenv("RELAX_CONDITION_CACHE_BYTES", "4096")

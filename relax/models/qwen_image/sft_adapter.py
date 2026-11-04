@@ -31,13 +31,16 @@ def _processor_cache_identity(processor: Any) -> str:
     Legacy to_dict deep-copies every attribute before dropping components and
     chat_template. Exclude only those same fields before that copy; component
     reprs are still evaluated on the original objects on every call. Custom
-    serializers retain their own behavior via the conservative fallback.
+    serializers and newer APIs that retain image configs use the native repr.
     """
+    from inspect import signature
+
     from transformers.processing_utils import ProcessorMixin
 
     cls = type(processor)
     if (
         not isinstance(processor, ProcessorMixin)
+        or "legacy_serialization" not in signature(ProcessorMixin.to_dict).parameters
         or cls.__repr__ is not ProcessorMixin.__repr__
         or cls.__str__ is not object.__str__
         or cls.to_dict is not ProcessorMixin.to_dict
