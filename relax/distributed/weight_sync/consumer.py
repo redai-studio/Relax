@@ -129,6 +129,7 @@ class Consumer:
                 raise
             if full:
                 raise
+            self.last_metrics["fallback_reason"] = str(error)[:1024]
             artifact_id = self.transport.ensure_full(stream, version)
             manifest = self._fetch_chain(artifact_id, deadline, reference)
         self.last_metrics["fetch_and_fallback_s"] = monotonic() - fetch_started
