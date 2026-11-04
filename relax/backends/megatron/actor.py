@@ -3031,18 +3031,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def unregister_inference_transport(self) -> None:
         """Strictly unregister an idle old ActorFwd worker before replacing
         it."""
-        client = self.checkpoint_engine_client
-        if client.role != "actor_fwd":
-            raise RuntimeError("Only the replaced ActorFwd worker may unregister its inference transport")
-
-        async def unregister() -> None:
-            response = await client._http_client.delete(
-                f"{client.coordinator_url}/unregister", params={"role": client.role, "rank": client.rank}
-            )
-            response.raise_for_status()
-            client._registered = False
-
-        run(unregister())
+        run(self.checkpoint_engine_client.unregister_for_recovery())
 
     def recovery_update_weights_colocate(self) -> None:
         """Push the existing CPU Actor backup without waking or rotating

@@ -10,6 +10,7 @@ import pytest
 
 try:
     from relax.core import controller as controller_module
+    from relax.core.inference_recovery_executor import InferenceRecoveryExecutor, InferenceRecoveryResult
 
     Controller = controller_module.Controller
 except (ImportError, AssertionError) as exc:
@@ -370,7 +371,7 @@ def test_training_loop_requests_global_after_service_wait_returns(monkeypatch):
 def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
     monkeypatch, rollout_step, advance_tail, needs_global
 ):
-    from relax.engine.rollout import recovery_storage
+    from relax.utils.tq import recovery_storage
 
     controller = _controller_shell()
     _patch_restart_entry(monkeypatch, controller)
@@ -436,6 +437,9 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
     forward.run = lambda: asyncio.create_task(failed())
     forward.rebuild_for_recovery = Mock()
     controller.serve_dict = {service.role: service for service in (actor, rollout, forward)}
+    # This case isolates preparation from replacement weight transport, as before.
+    synchronize = AsyncMock(return_value=1)
+    monkeypatch.setattr(InferenceRecoveryExecutor, "_synchronize", synchronize)
     controller._activate_inference_recovery = AsyncMock(side_effect=lambda *args: asyncio.create_task(completed()))
 
     def global_restart():
@@ -450,6 +454,7 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
         discard.assert_not_awaited()
         reset.assert_not_awaited()
         forward.rebuild_for_recovery.assert_not_called()
+        synchronize.assert_not_awaited()
         controller._activate_inference_recovery.assert_not_awaited()
     else:
         controller.training_loop()
@@ -458,7 +463,8 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
         discard.assert_awaited_once_with()
         reset.assert_awaited_once_with()
         forward.rebuild_for_recovery.assert_called_once()
-        assert controller._activate_inference_recovery.await_args.args[:3] == ("actor_fwd", state, 2)
+        role, recovery_state, recovery = controller._activate_inference_recovery.await_args.args
+        assert (role, recovery_state, recovery.step) == ("actor_fwd", state, 2)
 
 
 def test_old_global_owner_does_not_publish_completion_into_next_cycle(monkeypatch):
@@ -533,9 +539,18 @@ async def test_activation_publishes_and_registers_only_current_recovery(monkeypa
     }
     monkeypatch.setattr(controller_module.ray, "get", lambda value: value)
 
-    activation = controller._activate_inference_recovery(
-        "actor_fwd", state, step=3, attempt=1, started=controller_module.time.monotonic()
+    executor = InferenceRecoveryExecutor(
+        controller.config,
+        controller.serve_dict,
+        state,
+        controller._inference_recovery_timeout,
+        lambda: controller._check_inference_recovery(state),
     )
+    generation = await executor._synchronize("actor_fwd", step=3)
+    recovery = InferenceRecoveryResult(
+        step=3, attempt=1, generation=generation, started=controller_module.time.monotonic()
+    )
+    activation = controller._activate_inference_recovery("actor_fwd", state, recovery)
     if global_takeover:
         with pytest.raises(RuntimeError, match="Global restart has taken over"):
             await activation

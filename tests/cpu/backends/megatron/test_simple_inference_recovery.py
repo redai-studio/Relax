@@ -2,10 +2,9 @@
 
 """CPU control-flow checks; these do not validate NCCL or live recovery."""
 
-import asyncio
 from contextlib import contextmanager, nullcontext
 from types import MethodType, SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -223,35 +222,6 @@ def test_colocate_cpu_export_preserves_training_state(backend, monkeypatch, mode
     worker.wake_up.assert_not_called()
     worker._train_state_offloader.reload.assert_not_called()
     backend.dist.destroy_process_group.assert_called_once_with("old_sender")
-
-
-@pytest.mark.parametrize("mode", ["success", "http_error", "wrong_role"])
-def test_unregister_is_strict(backend, monkeypatch, mode):
-    response = Mock()
-    if mode == "http_error":
-        response.raise_for_status.side_effect = RuntimeError("unregister rejected")
-    client = SimpleNamespace(
-        role="actor" if mode == "wrong_role" else "actor_fwd",
-        rank=2,
-        coordinator_url="http://coordinator.test",
-        _registered=True,
-        _http_client=SimpleNamespace(delete=AsyncMock(return_value=response)),
-    )
-    monkeypatch.setattr(backend, "run", asyncio.run)
-    worker = SimpleNamespace(checkpoint_engine_client=client)
-    if mode == "success":
-        backend.MegatronTrainRayActor.unregister_inference_transport(worker)
-    else:
-        with pytest.raises(RuntimeError, match="Only the replaced|unregister rejected"):
-            backend.MegatronTrainRayActor.unregister_inference_transport(worker)
-    assert client._registered is (mode != "success")
-    if mode == "wrong_role":
-        client._http_client.delete.assert_not_called()
-    else:
-        client._http_client.delete.assert_awaited_once_with(
-            "http://coordinator.test/unregister", params={"role": "actor_fwd", "rank": 2}
-        )
-        response.raise_for_status.assert_called_once()
 
 
 @pytest.mark.parametrize("fail_push", [False, True])
