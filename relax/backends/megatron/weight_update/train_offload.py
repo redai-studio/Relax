@@ -344,11 +344,9 @@ class _SelectiveOffloadStrategy:
         # it is supported on this path (no torch_memory_saver clash) and does help
         # offload()'s resize_(0) + empty_cache() hand whole segments back to the driver,
         # but it belongs to the user via --train-env-vars, not as a hidden side effect of
-        # --selective-offload. Scoping it here would not work anyway:
-        # _set_allocator_settings only affects newly created segments, so turning it off
-        # around a region cannot stop allocations from being served out of expandable
-        # blocks that already exist. See the OOM troubleshooting guide for the supported
-        # configuration.
+        # --selective-offload. The IPC bucket allocator separately scopes ordinary
+        # allocation to transport buffers, restoring the training configuration before
+        # conversion and communication continue.
         return nullcontext()
 
 
@@ -382,6 +380,12 @@ class MegatronTrainStateOffloader:
                     "torch_memory_saver hook is not LD_PRELOAD'ed; falling back to selective "
                     "offload. Pass --selective-offload to select it explicitly and silence this warning."
                 )
+
+        if self.enabled and not self.uses_tms and getattr(args, "optimizer", "adam") == "sgd":
+            raise ValueError(
+                "SGD does not support selective train-state offload; use a working "
+                "torch_memory_saver configuration or disable train-state offload."
+            )
 
         self._strategy: _OffloadStrategy = (
             _TmsOffloadStrategy() if self.uses_tms else _SelectiveOffloadStrategy(model, optimizer, args)

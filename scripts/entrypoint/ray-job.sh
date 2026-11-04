@@ -212,6 +212,7 @@ relax_kernel_cache_start_agents cluster
 export RUNTIME_ENV_JSON="{
 \"worker_process_setup_hook\": \"relax.utils.logging_utils.install_asyncio_noise_filter\",
 \"env_vars\": {
+   \"PATH\": \"${PATH}\",
    \"PYTHONUNBUFFERED\": \"1\",
    \"PYTHONPATH\": \"${PYTHONPATH}\",
    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",

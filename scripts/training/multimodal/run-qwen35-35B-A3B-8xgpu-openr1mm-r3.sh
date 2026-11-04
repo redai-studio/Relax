@@ -27,7 +27,6 @@ NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3.5-35B-A3B
-   --ref-load ${MODEL_DIR}/Qwen3.5-35B-A3B
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
 )
@@ -43,12 +42,12 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type openr1mm
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
+   --rollout-batch-size 64
    --n-samples-per-prompt 8
    --rollout-max-response-len 2048
    --rollout-max-prompt-len 2048
    --rollout-temperature 1
-   --global-batch-size 256
+   --global-batch-size 512
    --use-streaming-dataset
    --balance-data
    --use-fault-tolerance
@@ -60,10 +59,10 @@ ROLLOUT_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
-   --pipeline-model-parallel-size 2
+   --pipeline-model-parallel-size 1
    --calculate-per-token-loss
    --context-parallel-size 1
-   --expert-model-parallel-size 4
+   --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
    --recompute-granularity full
    --recompute-method uniform
@@ -71,14 +70,16 @@ PERF_ARGS=(
    # --qkv-format bshd
    # --micro-batch-size 1 # avoid OOM
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 6144
+   --max-tokens-per-gpu 8192
+   --moe-token-dispatcher-type flex
+   --moe-flex-dispatcher-backend deepep
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
+   --true-on-policy-mode
+   # Zero KL coefficient: skip the reference model and its forward pass.
    --kl-loss-coef 0.00
-   --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
@@ -103,7 +104,6 @@ OPTIMIZER_ARGS=(
 
    # --fp16 # Qwen3.5 does not support fp16 training for now
    --use-rollout-routing-replay
-   --use-slime-router
 )
 
 SGLANG_ARGS=(

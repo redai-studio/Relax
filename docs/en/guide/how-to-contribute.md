@@ -90,7 +90,7 @@ After changing the code, add tests for new or fixed behavior and choose the test
 pytest tests/
 
 # Run a specific test file
-pytest tests/utils/test_metrics_service.py
+pytest tests/cpu/utils/test_metrics_service.py
 
 # Run with coverage
 pytest --cov=relax tests/

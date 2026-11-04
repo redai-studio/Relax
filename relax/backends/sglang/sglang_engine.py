@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
+import functools
 import ipaddress
 import json
 import multiprocessing
@@ -778,32 +779,82 @@ class SGLangEngine(RayActor):
         )
 
     def get_expert_weight_sync_layout(self) -> dict:
-        """Return resolved layout settings for opt-in colocated expert
-        routing."""
+        """Return resolved layout settings for opt-in colocated expert routing
+        and direct BF16 loading."""
         from relax.utils.misc import get_hf_config
 
         if self.node_rank != 0 or self.worker_type != "regular":
             raise ValueError("Expert routing requires a regular node-0 rollout engine")
-        response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
-        response.raise_for_status()
-        info = response.json()
+        for _ in range(2):
+            response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
+            response.raise_for_status()
+            info = response.json()
+            # /server_info can time out fetching scheduler state while still
+            # returning HTTP 200. Retry once before rejecting an unknown auto layout.
+            if info.get("internal_states") or info.get("moe_runner_backend") != "auto":
+                break
         keys = (
+            "model_path",
+            "device",
             "tp_size",
             "ep_size",
             "pp_size",
             "moe_dp_size",
+            "dwdp_size",
             "enable_eplb",
             "ep_num_redundant_experts",
             "init_expert_location",
             "ep_join_mode",
+            "elastic_ep_backend",
             "speculative_algorithm",
             "moe_runner_backend",
+            "moe_a2a_backend",
             "json_model_override_args",
+            "dtype",
+            "quantization",
+            "enable_lora",
+            "disable_shared_experts_fusion",
+            "enforce_shared_experts_fusion",
+            "kt_weight_path",
+            "custom_weight_loader",
         )
         layout = {key: info[key] for key in keys if key in info}
-        config = get_hf_config(info["model_path"])
+        # Scheduler-side load-time overrides may differ from the HTTP process's
+        # startup config. Never infer the native layout from a stale "auto".
+        states = info.get("internal_states") or []
+        if states:
+            layouts = [{**layout, **{key: state[key] for key in keys if key in state}} for state in states]
+            if any(candidate != layouts[0] for candidate in layouts[1:]):
+                raise ValueError("Rollout schedulers disagree on the expert weight layout")
+            layout = layouts[0]
+        # ROCm also reports device="cuda". The local platform probe only describes
+        # receivers spawned here, not an externally managed HTTP engine.
+        layout["is_cuda"] = (
+            getattr(self, "process", None) is not None
+            and layout.get("device") == "cuda"
+            and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
+        )
+        config = get_hf_config(layout["model_path"])
         text_config = getattr(config, "text_config", None) or config
-        layout["num_experts"] = getattr(text_config, "num_experts", None)
+        if "dtype" in layout:
+            from sglang.srt.configs.model_config import _get_and_verify_dtype
+
+            layout["dtype"] = str(_get_and_verify_dtype(text_config, layout["dtype"])).removeprefix("torch.")
+        if (
+            states
+            and all("moe_runner_backend" in state for state in states)
+            and layout.get("moe_runner_backend") == "auto"
+            and layout["is_cuda"]
+        ):
+            # Unquantized CUDA FusedMoE uses the standard Triton layout for auto.
+            # Quantization, remapping and fused shared experts are still checked
+            # by DirectExpertLayout; this does not change the engine's settings.
+            layout["moe_runner_backend"] = "triton"
+        layout["num_experts"] = getattr(text_config, "num_experts", None) or getattr(
+            text_config, "n_routed_experts", None
+        )
+        for key in ("hidden_size", "moe_intermediate_size", "quantization_config"):
+            layout[key] = getattr(text_config, key, None)
         return layout
 
     def load_lora_adapter_from_tensors(
@@ -1667,6 +1718,25 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response
 
+    def begin_weight_update(self):
+        """Open a weight-update session; newer SGLang rejects weight loads
+        outside one.
+
+        No-op on older SGLang.
+        """
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("begin_weight_update", {})
+
+    def end_weight_update(self):
+        """Close the session opened by ``begin_weight_update``.
+
+        No-op on older SGLang.
+        """
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("end_weight_update", {})
+
     def post_process_weights(
         self,
         restore_weights_before_load: bool = False,
@@ -1849,6 +1919,33 @@ def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None)
     return speculative_algorithm is not None
 
 
+@functools.lru_cache(maxsize=None)
+def _sglang_has_weight_update_session() -> bool:
+    """Probe lazily: this module is imported by every process that parses args,
+    and importing ``io_struct`` there can pull torch_npu's torchair
+    ``all_reduce`` patch into train actors on Ascend, which rejects float64."""
+    try:
+        from sglang.srt.managers.io_struct import BeginWeightUpdateReqInput  # noqa: F401
+    except ImportError:
+        # SGLang < 0.5.21 accepts weight loads without an explicit update session.
+        # Weight-update sessions were added in 0.5.21 (sgl-project/sglang#40777).
+        return False
+    return True
+
+
+def _server_arg_field_names() -> tuple[str, ...]:
+    """Return ServerArgs field names; newer SGLang defines it as a msgspec
+    Struct instead of a dataclass."""
+    # SGLang < 0.5.20 defines ServerArgs as a dataclass; 0.5.20 switched it to
+    # a msgspec.Struct (sgl-project/sglang#38753).
+    if dataclasses.is_dataclass(ServerArgs):
+        return tuple(field.name for field in dataclasses.fields(ServerArgs))
+
+    import msgspec
+
+    return tuple(field.name for field in msgspec.structs.fields(ServerArgs))
+
+
 def _compute_genrm_server_args(
     args,
     rank,
@@ -1935,18 +2032,18 @@ def _compute_genrm_server_args(
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
     unused_keys = set(kwargs.keys())
-    for attr in dataclasses.fields(ServerArgs):
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+    for name in _server_arg_field_names():
+        if worker_type == "decode" and name == "enable_hierarchical_cache":
             continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
+        if hasattr(args, f"sglang_{name}") and name not in kwargs:
+            kwargs[name] = getattr(args, f"sglang_{name}")
+        unused_keys.discard(name)
 
     # Per-genrm overrides from --genrm-engine-config. Applied after base args
     # and sglang_* defaults so user-supplied keys take highest priority. Keys
     # not recognized by the installed SGLang ServerArgs are dropped with a
     # warning rather than causing a TypeError at ServerArgs(**kwargs).
-    server_arg_fields = {f.name for f in dataclasses.fields(ServerArgs)}
+    server_arg_fields = set(_server_arg_field_names())
     for key, value in (args.genrm_engine_config or {}).items():
         if key not in server_arg_fields:
             logger.info(
@@ -1958,6 +2055,16 @@ def _compute_genrm_server_args(
             logger.info(f"genrm_engine_config: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
         kwargs[key] = value
         unused_keys.discard(key)
+
+    # CUDA IPC cannot cross nodes. Resolve the default after GenRM's own topology
+    # and overrides; an explicit None retains SGLang's automatic selection.
+    if (
+        "mm_feature_transport" in server_arg_fields
+        and "mm_feature_transport" not in (args.genrm_engine_config or {})
+        and kwargs.get("mm_feature_transport") is None
+        and kwargs["nnodes"] == 1
+    ):
+        kwargs["mm_feature_transport"] = "cuda_ipc"
 
     # for compatibility with old args
     if len(unused_keys) > 0:
@@ -2054,15 +2161,14 @@ def _compute_server_args(
         kwargs["dtype"] = "float16"
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
-    server_arg_fields = dataclasses.fields(ServerArgs)
-    server_arg_field_names = {attr.name for attr in server_arg_fields}
+    server_arg_field_names = _server_arg_field_names()
     unused_keys = set(kwargs.keys())
-    for attr in server_arg_fields:
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+    for name in server_arg_field_names:
+        if worker_type == "decode" and name == "enable_hierarchical_cache":
             continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
+        if hasattr(args, f"sglang_{name}") and name not in kwargs:
+            kwargs[name] = getattr(args, f"sglang_{name}")
+        unused_keys.discard(name)
 
     # Per-engine-group overrides from --sglang-config YAML.
     # Applied after base args so they take highest priority.
@@ -2072,6 +2178,35 @@ def _compute_server_args(
                 logger.info(f"sglang_overrides: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
             kwargs[key] = value
             unused_keys.discard(key)
+
+    # Use CUDA IPC only for engines confined to one node; multi-node engines
+    # retain SGLang's auto policy, including CUDA VMM where supported.
+    if (
+        "mm_feature_transport" in server_arg_field_names
+        and "mm_feature_transport" not in (sglang_overrides or {})
+        and kwargs.get("mm_feature_transport") is None
+        and kwargs["nnodes"] == 1
+    ):
+        kwargs["mm_feature_transport"] = "cuda_ipc"
+
+    # Repeated policy updates benefit from keeping shared and routed experts
+    # separate. Explicit per-engine settings or enforced fusion take precedence.
+    if (
+        "disable_shared_experts_fusion" in server_arg_field_names
+        and "disable_shared_experts_fusion" not in (sglang_overrides or {})
+        and not kwargs.get("enforce_shared_experts_fusion", False)
+    ):
+        kwargs["disable_shared_experts_fusion"] = True
+
+    if "custom_weight_loader" in server_arg_field_names:
+        from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
+
+        # Register alongside user loaders. The sender negotiates this exact
+        # capability from server_info before emitting partial native tensors.
+        loaders = list(kwargs.get("custom_weight_loader") or [])
+        if EXPERT_SLICE_LOADER not in loaders:
+            loaders.append(EXPERT_SLICE_LOADER)
+        kwargs["custom_weight_loader"] = loaders
 
     if (
         "cuda_graph_backend_prefill" in server_arg_field_names

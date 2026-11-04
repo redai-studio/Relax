@@ -403,9 +403,9 @@ def _broadcast_routed_experts(
     PP step (among tp_rank==0 peers) fans to all PP stages, and finally
     the TP step fans from tp_rank==0 to the remaining TP ranks.
 
-    Using ``dist.broadcast`` on contiguous GPU tensors is orders of magnitude
-    faster than ``broadcast_object_list`` which pickles everything (~14 s for
-    377 MB vs sub-second via NCCL).
+    CPU-resident results use a bounded CUDA staging buffer, so a long batch
+    does not require a full-batch allocation on every model-parallel rank.
+    ``keep_on_gpu`` retains the direct GPU path for indexer replay.
     """
 
     def _bcast_tensor(tensor, is_sender, dtype):
@@ -418,8 +418,7 @@ def _broadcast_routed_experts(
         def _bcast_unknown_shape(t, has_data, src_global, group):
             """Broadcast a tensor whose shape is unknown to receivers.
 
-            Broadcasts ndim -> shape -> data in three NCCL calls. Returns the
-            broadcast tensor on *cuda_dev* with *dtype*.
+            Broadcast ndim and shape, then stream the payload through NCCL.
             """
             if has_data and t is not None:
                 ndim_t = torch.tensor([t.ndim], dtype=torch.long, device=cuda_dev)
@@ -435,12 +434,33 @@ def _broadcast_routed_experts(
             dist.broadcast(shape_t, src=src_global, group=group)
             shape = torch.Size(shape_t.tolist())
 
+            if keep_on_gpu:
+                if has_data and t is not None:
+                    buf = t.to(dtype=dtype, device=cuda_dev).contiguous()
+                else:
+                    buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
+                dist.broadcast(buf, src=src_global, group=group)
+                return buf
+
             if has_data and t is not None:
-                buf = t.to(dtype=dtype, device=cuda_dev).contiguous()
+                result = t.to(dtype=dtype, device="cpu").contiguous()
             else:
-                buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
-            dist.broadcast(buf, src=src_global, group=group)
-            return buf
+                result = torch.empty(shape, dtype=dtype, device="cpu")
+            flat = result.view(-1)
+            # Reuse one buffer; neither source nor receiver stages the full
+            # batch on GPU. Blocking copies keep it safe to reuse across chunks
+            # and across the following CP -> PP -> TP broadcasts.
+            chunk_elements = max(1, (64 * 1024 * 1024) // result.element_size())
+            staging = torch.empty(min(flat.numel(), chunk_elements), dtype=dtype, device=cuda_dev)
+            for start in range(0, flat.numel(), chunk_elements):
+                end = min(start + chunk_elements, flat.numel())
+                chunk = staging[: end - start]
+                if has_data:
+                    chunk.copy_(flat[start:end])
+                dist.broadcast(chunk, src=src_global, group=group)
+                if not has_data:
+                    flat[start:end].copy_(chunk)
+            return result
 
         # Short-circuit: when CP, TP and PP groups are all trivial (size 1),
         # skip the GPU round-trip entirely and return the source tensor.
@@ -489,9 +509,8 @@ def _broadcast_routed_experts(
     offsets_out = _bcast_tensor(offsets, is_src, torch.long)
 
     if keep_on_gpu:
-        # When optimize_routing_replay is enabled, keep tensors on GPU to
-        # avoid a redundant GPU→CPU→GPU round-trip.  fill_routing_replay's
-        # RoutingReplay.record() handles GPU→CPU-pinned copy automatically.
+        # Indexer replay consumes GPU tensors. MoE routing replay instead packs
+        # CPU inputs into per-layer, per-microbatch pinned buffers.
         # _bcast_tensor may short-circuit and return CPU tensors when all
         # groups are trivial (size 1); ensure GPU residency in that case.
         if not values_out.is_cuda:
@@ -500,7 +519,7 @@ def _broadcast_routed_experts(
             offsets_out = offsets_out.to(device=cuda_dev)
         return values_out, offsets_out
 
-    # Move back to CPU for downstream consumption (fill_routing_replay etc.)
+    # Chunked broadcasts already return CPU tensors.
     return values_out.cpu(), offsets_out.cpu()
 
 
@@ -1039,13 +1058,14 @@ def get_data_from_transfer_queue(
     # per-sample list happens below.
     if has_routed_experts and not per_rank_fetch:
         with timer("tgd_bcast_rexp"):
+            # Even with inference-side optimize_routing_replay enabled, keep
+            # training inputs on CPU until CP/TP slicing and PP layer selection.
             routed_experts_values, routed_experts_offsets = _broadcast_routed_experts(
                 routed_experts_values,
                 routed_experts_offsets,
                 should_fetch,
                 cuda_dev,
                 broadcast_pp,
-                keep_on_gpu=getattr(args, "optimize_routing_replay", False),
             )
 
     if has_indexer_topk and not per_rank_fetch:
@@ -1293,8 +1313,10 @@ def post_process_rollout_data(args, rollout_data):
     if "rollout_routed_experts" in rollout_data:
         from tensordict.tensorclass import NonTensorData
 
+        # Pack CP/TP slices and PP-local layers on CPU in fill_routing_replay.
+        # Upload and widen indices only when a router consumes its microbatch.
         rollout_data["rollout_routed_experts"] = [
-            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.long, device=cuda_dev)
+            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.int32, device="cpu")
             for r in rollout_data["rollout_routed_experts"]
         ]
 

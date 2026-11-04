@@ -36,6 +36,7 @@ from relax.utils.data.processing_utils import (
     load_processor,
     remap_mm_train_inputs,
 )
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.multimodal.image_utils import fetch_image, resize_qwen_vl_extreme_aspect_ratio
@@ -337,6 +338,8 @@ class ProcessorPool:
         trust_remote_code: bool = True,
         multimodal_config: MultimodalConfig | None = None,
     ) -> None:
+        if pool_size is None:
+            pool_size = Envs.RELAX_PROCESSOR_POOL_SIZE
         if pool_size is None:
             pool_size = min(16, os.cpu_count() or 8)
 

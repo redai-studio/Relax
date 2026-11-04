@@ -112,7 +112,7 @@ index ba632f3..99e8aa9 100644
      freeze_language_model: bool = False
      freeze_vision_model: bool = False
 diff --git a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
-index 4ef12d7..01c5180 100644
+index 4ef12d7..7bf9ad0 100644
 --- a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
 +++ b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
 @@ -16,7 +16,9 @@ import logging
@@ -275,6 +275,15 @@ index 4ef12d7..01c5180 100644
  
              if self.config.sequence_parallel:
                  tp_group = self.config._pg_collection.tp if self.config._pg_collection is not None else None
+@@ -532,7 +622,7 @@ class KimiK25VLModel(MegatronModule):
+             runtime_gather_output=runtime_gather_output,
+             packed_seq_params=packed_seq_params,
+         )
+-        if cp_size > 1:
++        if cp_size > 1 and loss_mask is not None:
+             return outputs, loss_mask
+         return outputs
+ 
 diff --git a/megatron/bridge/models/qwen/qwen3_moe_bridge.py b/megatron/bridge/models/qwen/qwen3_moe_bridge.py
 index a6476f4..cab29da 100644
 --- a/megatron/bridge/models/qwen/qwen3_moe_bridge.py

@@ -36,6 +36,23 @@ class RewardExecutionError(RuntimeError):
             f"Custom reward {custom_rm_path!r} failed for {sample_context}: {type(cause).__name__}: {cause}"
         )
 
+    def __reduce__(self) -> tuple:
+        # BaseException otherwise restores this keyword-only constructor with
+        # positional args, losing the original failure across Ray workers.
+        return (
+            _restore_reward_execution_error,
+            (self.custom_rm_path, self.sample_context, self.cause),
+            self.__dict__,
+        )
+
+
+def _restore_reward_execution_error(
+    custom_rm_path: str, sample_context: str, cause: Exception
+) -> RewardExecutionError:
+    error = RewardExecutionError(custom_rm_path=custom_rm_path, sample_context=sample_context, cause=cause)
+    error.__cause__ = cause
+    return error
+
 
 def _bounded_repr(value: Any) -> str:
     value_repr = repr(value)
