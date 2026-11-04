@@ -30,7 +30,7 @@ from pathlib import Path
 env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 root = Path(os.environ["SAVE_DIR"])
 overrides = {
-    "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(root / "tmp"),
+    "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": os.environ.get("TMPDIR", str(root / "tmp")),
     "XDG_CACHE_HOME": str(root / "cache"), "HF_HOME": str(root / "cache" / "hf"),
     "TRITON_CACHE_DIR": str(root / "cache" / "triton"),
     "TORCHINDUCTOR_CACHE_DIR": str(root / "cache" / "inductor"),
