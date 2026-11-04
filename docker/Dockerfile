@@ -230,6 +230,7 @@ COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
+COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
@@ -240,10 +241,11 @@ RUN cd Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
+    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 

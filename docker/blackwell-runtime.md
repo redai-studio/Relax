@@ -118,9 +118,9 @@ both pinned 0.5.2 wheels. `BLACKWELL_MEGATRON_SOURCE_DIR` is the assembled main 
 with both patches applied. `BLACKWELL_HYBRIDEP_SOURCE_DIR` is the pinned DeepEP checkout.
 
 ```bash
-PYTHONPATH=. pytest -q tests/tools/test_blackwell_runtime_build.py \
+PYTHONPATH=. pytest -q tests/cpu/tools/test_blackwell_runtime_build.py \
   tests/scripts/test_qwen_moe_runtime_preflight.py tests/scripts/test_qwen_moe_entries.py \
-  tests/backends/megatron/test_model_provider_vpp.py
+  tests/cpu/backends/megatron/test_model_provider_vpp.py
 ```
 
 Inside the image on explicitly allocated 280G Blackwell hardware:

@@ -192,6 +192,9 @@ def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module
     cu_seqlens instead of the pre-split + cp-multiplied form, and by model.py
     to route those through the forward.
     """
+    if getattr(model, "uses_unsplit_forward", False):
+        args.uses_unsplit_forward = True
+        return
     try:
         from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     except ImportError:
@@ -382,6 +385,13 @@ def get_model_provider_func(
             "recompute_num_layers",
             "recompute_modules",
             "distribute_saved_activations",
+            "fine_grained_activation_offloading",
+            "offload_modules",
+            "min_offloaded_tensor_size",
+            "activation_offload_fraction",
+            "delta_offload_bytes_across_pp_ranks",
+            "delay_offload_until_cuda_graph",
+            "fine_grained_offloading_max_inflight_offloads",
             "moe_router_load_balancing_type",
             "moe_router_dtype",
             "moe_router_fusion",
@@ -463,6 +473,9 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        if callable(getattr(provider, "configure_runtime", None)):
+            provider.configure_runtime(args)
 
         if is_kimi_k3:
             configure_runtime(provider, args)
