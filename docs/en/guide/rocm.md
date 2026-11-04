@@ -46,7 +46,7 @@ docker run -it --init \
   --group-add video --group-add render \
   --ipc host --network host \
   --security-opt seccomp=unconfined \
-  -v $(pwd)/Relax:/root/Relax \
+  -v "$(pwd):/root/Relax" \
   -v /path/to/models_and_data:/root/exp \
   relax:dev-rocm-gfx950 /bin/bash
 ```
