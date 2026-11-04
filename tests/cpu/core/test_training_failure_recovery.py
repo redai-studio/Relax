@@ -109,6 +109,7 @@ def controller_fixture():
         "relax/core/controller.py", "Controller", {"restart_serve", "training_loop", "_consume_restart_cycle"}, ns
     )
     ctrl = cls()
+    ctrl._fault_events = None
     ctrl._restart_done_event = threading.Event()
     ctrl._restart_lock = threading.RLock()
     ctrl._restart_consumed_event = threading.Event()
@@ -299,6 +300,7 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
         "maybe_pin_baseline_to_stable": Mock(),
         "logger": logging.getLogger(__name__),
         "_graceful_shutdown": shutdown,
+        "_fault_runtime": None,
     }
     with pytest.raises(SystemExit) as caught:
         exec(code, scope)
@@ -420,7 +422,7 @@ def test_recovery_dispatch_signals_only_after_work_finishes(role, global_restart
     ctrl._health_manager.increment_restart_count = Mock(return_value=1)
     ctrl._health_manager.mark_healthy = Mock()
 
-    def work():
+    def work(fault_observer=None):
         assert ctrl._restarting
         assert not ctrl._restart_done_event.is_set()
 
