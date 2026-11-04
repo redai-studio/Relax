@@ -272,6 +272,8 @@ def _parse_teacher_routes(
                 "with 'checkpoint_path' and 'num_gpus'."
             )
         num_gpus = spec["num_gpus"]
+        if not isinstance(num_gpus, int) or num_gpus <= 0:
+            raise ValueError(f"Teacher {source!r}: num_gpus must be a positive integer.")
         if gpus_per_replica and num_gpus % gpus_per_replica != 0:
             raise ValueError(
                 f"Teacher '{source}': GPUs ({num_gpus}) must be divisible by "
