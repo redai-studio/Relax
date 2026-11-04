@@ -61,12 +61,17 @@ def replay(
         # This reference is a normal independently exported HF checkpoint.
         export = config_path.parent / "exports" / f"update-{version:06d}"
         reference = output / "full" / f"{version:06d}"
+        reference_started = time.monotonic()
         if not reference.exists():
             reference.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(export, reference)
+        reference_copy_s = time.monotonic() - reference_started
         before = dict(getattr(transport, "metrics", {}))
         prepared = consumer.prepare(config.stream, version, full=full_only)
+        manifest = cache.manifest(prepared.artifact_id)
+        check_started = time.monotonic()
         check = compare(reference, Path(prepared.path))
+        hf_check_s = time.monotonic() - check_started
         check_path = output / f"{version:06d}-diff.json"
         atomic_write(check_path, json.dumps(check, indent=2).encode())
         consumer.release(prepared)
@@ -74,6 +79,9 @@ def replay(
             "transport": "TCP" if tcp_endpoint else "SharedFS",
             "consumer_metrics": dict(consumer.last_metrics),
             "full_only": full_only,
+            "artifact_kind": manifest["kind"],
+            "reference_copy_s": reference_copy_s,
+            "hf_check_s": hf_check_s,
             "elapsed_s": time.monotonic() - started,
             "diff": str(check_path),
             "wire_delta": {k: v - before.get(k, 0) for k, v in getattr(transport, "metrics", {}).items()},

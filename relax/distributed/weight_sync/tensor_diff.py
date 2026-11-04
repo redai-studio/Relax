@@ -113,6 +113,11 @@ def _coordinate(index: int, shape: list[int]) -> list[int]:
 
 
 def compare(left: Path, right: Path) -> dict[str, Any]:
+    import numpy as np
+
+    # NumPy is already required by the codec. Work only on bounded raw-byte
+    # chunks; no floating-point conversion or whole-model materialization.
+    popcount = np.array([value.bit_count() for value in range(256)], dtype=np.uint8)
     left_tensors, right_tensors = _checkpoint(left), _checkpoint(right)
 
     def inodes(tensors: dict) -> set[tuple[int, int]]:
@@ -170,25 +175,22 @@ def compare(left: Path, right: Path) -> dict[str, Any]:
                 if a == b:
                     continue
                 differs = True
-                for pos, (x, y) in enumerate(zip(a, b)):
-                    if x != y:
-                        result["mismatch_bytes"] += 1
-                        result["mismatch_bits"] += (x ^ y).bit_count()
-                        if result["first_difference"] is None:
-                            byte_offset = offset + pos
-                            element = byte_offset // width
-                            base = element * width
-                            result["first_difference"] = {
-                                "name": name,
-                                "coordinate": _coordinate(element, shape),
-                                "element_index": element,
-                                "byte_offset": byte_offset,
-                                "left_bits": lm[lo + base : lo + base + width].hex(),
-                                "right_bits": rm[ro + base : ro + base + width].hex(),
-                            }
-                for element_offset in range(0, chunk_length, width):
-                    if a[element_offset : element_offset + width] != b[element_offset : element_offset + width]:
-                        result["mismatch_elements"] += 1
+                xor = np.bitwise_xor(np.frombuffer(a, dtype=np.uint8), np.frombuffer(b, dtype=np.uint8))
+                result["mismatch_bytes"] += int(np.count_nonzero(xor))
+                result["mismatch_bits"] += int(popcount[xor].sum(dtype=np.uint64))
+                result["mismatch_elements"] += int(np.count_nonzero(np.any(xor.reshape(-1, width), axis=1)))
+                if result["first_difference"] is None:
+                    byte_offset = offset + int(np.argmax(xor != 0))
+                    element = byte_offset // width
+                    base = element * width
+                    result["first_difference"] = {
+                        "name": name,
+                        "coordinate": _coordinate(element, shape),
+                        "element_index": element,
+                        "byte_offset": byte_offset,
+                        "left_bits": lm[lo + base : lo + base + width].hex(),
+                        "right_bits": rm[ro + base : ro + base + width].hex(),
+                    }
         if differs:
             result["mismatch_tensors"] += 1
     result["equal"] = not any(
