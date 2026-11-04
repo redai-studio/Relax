@@ -243,6 +243,16 @@ class CheckpointEngineClient:
                     raise RuntimeError(f"Failed to register with coordinator: {e}")
         return self._rank
 
+    async def unregister_for_recovery(self) -> None:
+        """Confirm old forward registration is removed before replacement."""
+        if self.role != "actor_fwd":
+            raise RuntimeError("Only the replaced ActorFwd worker may unregister its inference transport")
+        response = await self._http_client.delete(
+            f"{self.coordinator_url}/unregister", params={"role": self.role, "rank": self.rank}
+        )
+        response.raise_for_status()
+        self._registered = False
+
     async def unregister(self) -> None:
         """Unregister node from coordinator."""
         if not self._registered:
