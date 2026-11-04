@@ -175,6 +175,7 @@ class _Cfg:
     apply_rope_fusion = False
     mscale = 1.0
     mscale_all_dim = 1.0
+    mrope_section = None
 
 
 @pytest.fixture(scope="module")
