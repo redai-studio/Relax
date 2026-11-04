@@ -69,6 +69,7 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
+from relax.agentic.weight_audit import attempt_weight_version
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import get_spec_token_counts
@@ -2393,14 +2394,18 @@ class AgenticSessionShard:
             raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
         if not acquired:
             raise RuntimeGroupError("SGLang permit acquire was cancelled")
+        audit = {}
         try:
-            yield
+            yield audit
         finally:
             try:
-                await finish_before_cancellation(
-                    self._sglang_request_limiter.release_request_permit.remote(permit_id),
+                snapshot = await finish_before_cancellation(
+                    self._sglang_request_limiter.release_request_permit.remote(
+                        permit_id, audit_version=audit.get("version"), audit=True
+                    ),
                     "sglang-permit-release",
                 )
+                audit["publication"] = snapshot or {}
             except Exception as error:
                 raise RuntimeGroupError(f"SGLang permit release failed: {type(error).__name__}: {error}") from error
 
@@ -2435,7 +2440,7 @@ class AgenticSessionShard:
             for attempt in range(2):
                 router_unavailable = False
                 async with self._admission_lease(session, ir):
-                    async with self._sglang_request_permit():
+                    async with self._sglang_request_permit() as attempt_audit:
                         async with session.lock:
                             if not is_current():
                                 return
@@ -2465,6 +2470,8 @@ class AgenticSessionShard:
                                 collect_score_centering=group.rollout_mode == "train",
                                 fail_fast_no_workers=router_recovery_enabled,
                             )
+                            if attempt_audit is not None:
+                                attempt_audit["version"] = attempt_weight_version(result.meta_info)
                         except httpx.HTTPStatusError as error:
                             router_unavailable = router_recovery_enabled and is_router_no_available_workers(error)
                             if not router_unavailable:
@@ -2479,6 +2486,7 @@ class AgenticSessionShard:
                                 "generation_end_at",
                             )
                 if not router_unavailable:
+                    result.meta_info["_relax_publication"] = (attempt_audit or {}).get("publication", {})
                     break
                 async with session.lock:
                     if not is_current():
@@ -2599,6 +2607,17 @@ class AgenticSessionShard:
     ) -> None:
         """Accumulate one backend attempt on the stable IR ref."""
 
+        if result.new_tokens:
+            start = len(ir.pending_token_delta)
+            version = attempt_weight_version(result.meta_info)
+            ir.pending_weight_version_spans.append(
+                {
+                    "start": start,
+                    "end": start + len(result.new_tokens),
+                    "weight_version": str(version) if version is not None else None,
+                    "publication": dict(result.meta_info.get("_relax_publication", {})),
+                }
+            )
         ir.pending_token_delta.extend(result.new_tokens)
         ir.pending_logprob_delta.extend(result.new_log_probs)
         if getattr(result, "new_topk_token_ids", None) is not None:
@@ -2691,6 +2710,8 @@ class AgenticSessionShard:
             if ir.pending_topk_logprob_delta
             else None,
             weight_version_delta=ir.pending_weight_version_delta,
+            weight_version_spans=ir.pending_weight_version_spans,
+            generation_end_publication=ir.latest_backend_meta.get("_relax_publication", {}),
             spec_delta=ir.pending_spec_delta,
             prefix_cache_delta=ir.pending_prefix_cache_delta,
             wall_elapsed_s=time.monotonic() - ir.wall_started_at,
@@ -3342,6 +3363,9 @@ class AgenticChatAPIService:
         """Lend Shards and their shared admission Coordinator to Runtime."""
 
         return tuple(self._session_shards.items()), self._admission_coordinator
+
+    async def record_publication(self, epoch: str, sequence: int, version: str) -> None:
+        await self._admission_coordinator.record_publication.remote(epoch, sequence, version)
 
 
 def deploy_agentic_chat_api_services(

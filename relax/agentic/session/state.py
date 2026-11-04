@@ -424,6 +424,8 @@ class MsgNode:
     backend_audio_data_delta: list[str] = field(default_factory=list)
     backend_video_data_delta: list[str] = field(default_factory=list)
     weight_version_delta: list[str] = field(default_factory=list)
+    weight_version_spans: list[dict[str, Any]] = field(default_factory=list)
+    generation_end_publication: dict[str, Any] = field(default_factory=dict)
     spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     tools: list[dict[str, Any]] | None = None
@@ -458,6 +460,7 @@ class InflightRequest:
     pending_topk_token_ids_delta: list[np.ndarray] = field(default_factory=list)
     pending_topk_logprob_delta: list[np.ndarray] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
+    pending_weight_version_spans: list[dict[str, Any]] = field(default_factory=list)
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
@@ -700,6 +703,8 @@ class SessionForest:
         topk_token_ids_delta: np.ndarray | None = None,
         topk_logprob_delta: np.ndarray | None = None,
         weight_version_delta: list[str] | None = None,
+        weight_version_spans: list[dict[str, Any]] | None = None,
+        generation_end_publication: dict[str, Any] | None = None,
         spec_delta: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
@@ -738,6 +743,8 @@ class SessionForest:
                 topk_token_ids_delta=topk_token_ids_delta,
                 topk_logprob_delta=topk_logprob_delta,
                 weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
+                weight_version_spans=copy.deepcopy(weight_version_spans) if weight_version_spans is not None else [],
+                generation_end_publication=copy.deepcopy(generation_end_publication or {}),
                 spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
                 prefix_cache_delta=prefix_cache_delta
                 if prefix_cache_delta is not None
@@ -796,6 +803,8 @@ class SessionForest:
         response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
+        weight_version_spans: list[dict[str, Any]] = []
+        generation_end_publication: dict[str, Any] = {}
         spec_info = dict(_EMPTY_SPEC_DELTA)
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
@@ -815,6 +824,27 @@ class SessionForest:
                     first_response_node = node
                 turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
                 response_start = len(continuation_train_tokens)
+                if node.train_token_delta:
+                    generation_end_publication = copy.deepcopy(node.generation_end_publication)
+                # Old nodes without provenance remain explicitly unknown; a
+                # version list alone cannot recover attempt token boundaries.
+                node_spans = node.weight_version_spans or (
+                    [{"start": 0, "end": len(node.train_token_delta), "weight_version": None}]
+                    if node.train_token_delta
+                    else []
+                )
+                for fragment_index, span in enumerate(node_spans):
+                    weight_version_spans.append(
+                        {
+                            **copy.deepcopy(span),
+                            "start": response_start + span["start"],
+                            "end": response_start + span["end"],
+                            "turn_idx": len(turns) - 1,
+                            "request_id": node.export_metadata_patch.get("request_id"),
+                            "resp_state_hash": node.state_hash,
+                            "fragment_index": fragment_index,
+                        }
+                    )
                 continuation_train_tokens.extend(node.train_token_delta)
                 response_node_spans.append([response_start, len(continuation_train_tokens)])
                 loss_mask.extend([1] * len(node.train_token_delta))
@@ -860,6 +890,8 @@ class SessionForest:
                 "terminal_status": status.value,
                 "turn_count": len(turns),
                 "turns": turns,
+                "weight_version_spans": weight_version_spans,
+                "generation_end_publication": generation_end_publication,
             }
         )
         merged_metadata[TRACE_KEY] = trace

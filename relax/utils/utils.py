@@ -96,6 +96,15 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if custom_convert_path is not None:
         custom_convert_func = load_function(custom_convert_path)
         train_data = custom_convert_func(args, samples)
+        if getattr(args, "use_agentic_rollout", False):
+            # A custom converter may reorder, filter or expand physical rows.
+            # Keep its contract intact; absent provenance must not stall TQ.
+            if isinstance(train_data, TensorDict):
+                train_data["weight_version_audit"] = dict_to_tensordict(
+                    {"weight_version_audit": [None] * train_data.batch_size[0]}, train_data.batch_size
+                )["weight_version_audit"]
+            else:
+                train_data["weight_version_audit"] = [None] * len(train_data["tokens"])
         if getattr(args, "advantage_estimator", None) == "score_centering":
             from relax.utils.score_centering import SCORE_CENTERING_FIELDS
 
@@ -148,6 +157,10 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
+    if getattr(args, "use_agentic_rollout", False):
+        from relax.agentic.weight_audit import AUDIT_FIELD, prepare_audit
+
+        train_data[AUDIT_FIELD] = [prepare_audit(sample) for sample in samples]
     mask_sums_by_sample_index: dict[Any, int] = {}
     for sample_index, loss_mask in zip(sample_indices, loss_masks, strict=True):
         mask_sums_by_sample_index[sample_index] = mask_sums_by_sample_index.get(sample_index, 0) + int(sum(loss_mask))
@@ -357,7 +370,7 @@ def dict_to_tensordict(
         if depth == 0:  # empty list []
             tensor = torch.empty(0)
         elif depth == 1:
-            if key in MULTIMODAL_PAYLOAD_FIELDS:
+            if key in MULTIMODAL_PAYLOAD_FIELDS or key == "weight_version_audit":
                 # Per-sample dicts (or image-ref descriptors) must stay Python
                 # objects; tensorizing them would lose the nested structure.
                 tensor = value

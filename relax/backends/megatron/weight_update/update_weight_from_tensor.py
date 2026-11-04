@@ -448,6 +448,10 @@ class UpdateWeightFromTensor:
                 post_process_quantization=True,
             )
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
+            if rank == 0:
+                from relax.agentic.weight_audit import record_publication
+
+                record_publication(self)
             self._routed_engine_call(all_engines, "continue_generation")
         elif rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
@@ -457,6 +461,9 @@ class UpdateWeightFromTensor:
                     rollout_engines=all_engines,
                 )
             ray.get([engine.end_weight_update.remote() for engine in all_engines])
+            from relax.agentic.weight_audit import record_publication
+
+            record_publication(self)
             ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
 
