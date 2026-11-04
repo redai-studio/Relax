@@ -27,11 +27,31 @@ def runtime_identity() -> dict:
     identity = {
         "pid": os.getpid(),
         "hostname": socket.gethostname(),
+        "cwd": str(Path.cwd()),
         "executable": sys.executable,
         "argv": sys.argv,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "source": json.loads(marker.read_text()) if marker.exists() else {"path": str(source_root)},
         "modules": modules,
+        "cache_environment": {
+            name: os.environ[name]
+            for name in (
+                "TMPDIR",
+                "XDG_CACHE_HOME",
+                "HF_HOME",
+                "TORCH_EXTENSIONS_DIR",
+                "TRITON_CACHE_DIR",
+                "TORCHINDUCTOR_CACHE_DIR",
+                "CUDA_CACHE_PATH",
+                "NUMBA_CACHE_DIR",
+                "TENSORBOARD_DIR",
+                "FLASHINFER_WORKSPACE_BASE",
+                "SGLANG_CACHE_DIR",
+                "SGLANG_JIT_CACHE_DIR",
+                "PYTHONDONTWRITEBYTECODE",
+            )
+            if name in os.environ
+        },
     }
     torch = sys.modules.get("torch")
     if torch is not None and torch.cuda.is_initialized():

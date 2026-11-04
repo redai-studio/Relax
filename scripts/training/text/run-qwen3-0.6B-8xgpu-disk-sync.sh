@@ -28,7 +28,7 @@ import json
 import os
 from pathlib import Path
 env = json.loads(os.environ["RUNTIME_ENV_JSON"])
-root = Path(os.environ["SAVE_DIR"])
+root = Path(os.environ["SAVE_DIR"]).resolve()
 overrides = {
     "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": os.environ.get("TMPDIR", str(root / "tmp")),
     "XDG_CACHE_HOME": str(root / "cache"), "HF_HOME": str(root / "cache" / "hf"),
@@ -42,6 +42,10 @@ overrides = {
     # because nvidia-smi reports NVLink connectivity.
     "NCCL_NVLS_ENABLE": "0",
     "WANDB_DIR": str(root / "logs"), "CLEARML_CACHE_DIR": str(root / "cache" / "clearml"),
+    "TENSORBOARD_DIR": str(root / "logs" / "tensorboard"),
+    "FLASHINFER_WORKSPACE_BASE": str(root / "cache" / "flashinfer-workspace"),
+    "SGLANG_CACHE_DIR": str(root / "cache" / "sglang"),
+    "SGLANG_JIT_CACHE_DIR": str(root / "cache" / "sglang" / "jit"),
     "OMP_NUM_THREADS": "4", "MKL_NUM_THREADS": "4", "OPENBLAS_NUM_THREADS": "4",
 }
 env.setdefault("env_vars", {}).update(overrides)
