@@ -1,0 +1,225 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+"""Real isolated CPU Ray/Serve and native thread acceptance, without GPU
+models."""
+
+import asyncio
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+import ray
+import requests
+from ray import serve
+
+from relax.utils.async_utils import shutdown_async_loop
+from relax.utils.fault_events.query_server import FaultQueryServer
+from relax.utils.fault_events.runtime import FaultEventRuntime
+from tests.cpu.core.fault_event_support import CPUReplica, config, cpu_controller_class
+
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(autouse=True)
+def cpu_registry(monkeypatch):
+    registry = ModuleType("relax.core.registry")
+    registry.resolve_algorithm = lambda config: dict.fromkeys(config.cpu_roles, CPUReplica)
+    monkeypatch.setitem(sys.modules, "relax.core.registry", registry)
+
+
+class LocalRay:
+    def __getattr__(self, name):
+        return getattr(ray, name)
+
+    def init(self, **kwargs):
+        return ray.init(
+            address="local",
+            num_cpus=4,
+            include_dashboard=False,
+            _temp_dir=tempfile.mkdtemp(prefix="r12-", dir="/tmp"),
+            log_to_driver=False,
+            runtime_env={"env_vars": {"PYTHONPATH": str(ROOT)}},
+        )
+
+
+class LocalServe:
+    def __getattr__(self, name):
+        return getattr(serve, name)
+
+    def start(self, **kwargs):
+        return serve.start(proxy_location="Disabled")
+
+
+@pytest.fixture
+def cluster():
+    local = LocalRay()
+    local.init()
+    LocalServe().start()
+    yield local
+    shutdown_async_loop()
+    serve.shutdown()
+    ray.shutdown()
+
+
+def wait_until(predicate, timeout=35):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    pytest.fail("CPU Ray integration condition timed out")
+
+
+def start_training(controller):
+    errors = []
+
+    def train():
+        try:
+            controller.training_loop()
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=train, daemon=True)
+    thread.start()
+    wait_until(lambda: bool(controller._pending_task_refs) or errors)
+    assert not errors, errors
+    return thread, errors
+
+
+def trigger_fault(controller, roles):
+    checker = controller._health_manager._checker
+    checker._stop_event.clear()
+    reports = [controller._health_manager.status.report_error.remote(role, "CPU injected fault") for role in roles]
+    ray.get(reports, timeout=5)
+    asyncio.run(checker._check_loop())  # global restart sets its original stop event
+
+
+def poll_receipts(controller, runtime, outcome):
+    checker = controller._health_manager._checker
+    checker._stop_event.clear()
+
+    async def poll():
+        task = asyncio.create_task(checker._check_loop())
+        try:
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                if any(e["event_type"] == outcome for e in runtime.query(limit=100)["events"]):
+                    return
+                await asyncio.sleep(0.01)
+            pytest.fail("completion evidence did not reach the driver")
+        finally:
+            checker._stop_event.set()
+            await asyncio.wait_for(task, 5)
+
+    asyncio.run(poll())
+
+
+def finish(controller, thread):
+    for service in controller.serve_dict.values():
+        service.handle.finish.remote().result(timeout_s=5)
+    thread.join(10)
+    assert not thread.is_alive()
+
+
+def test_two_real_ray_rebuilds_use_real_worker_completions_and_keep_http(cluster):
+    runtime = FaultEventRuntime()
+    server = FaultQueryServer(runtime)
+    controller = cpu_controller_class(cluster, LocalServe())(
+        config(cpu_roles=["actor", "actor_fwd", "reference"]), {}, runtime
+    )
+    thread, errors = start_training(controller)
+    run_id, url = runtime.run_id, server.url
+    reads, read_errors = [], []
+    stop_reader = threading.Event()
+
+    def read():
+        while not stop_reader.wait(0.02):
+            try:
+                payload = requests.get(url + "/events", timeout=1).json()
+                reads.append(payload["run_id"])
+            except Exception as exc:
+                read_errors.append(type(exc).__name__)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        controller.config.hold_weights = True
+        trigger_fault(controller, ["actor", "actor_fwd"])
+        wait_until(lambda: bool(ray.get(controller._cpu_gate.entered.remote())))
+        pending = controller._fault_recovery
+        assert pending.expected == 63 and pending.outcome is None
+        envelope = ray.get(controller._health_manager.status.get_unhealthy_services.remote(include_faults=True))
+        assert envelope["roles"] == [] and envelope["receipts"]["observed"] == 0
+        ray.get(controller._cpu_gate.release.remote())
+        wait_until(lambda: pending.handoff and bool(controller._pending_task_refs))
+        poll_receipts(controller, runtime, "recovery_succeeded")
+        wait_until(
+            lambda: (
+                len([e for e in runtime.query(limit=100)["events"] if e["event_type"] == "recovery_succeeded"]) == 2
+            )
+        )
+        first = [e for e in runtime.query(limit=100)["events"] if e["event_type"] == "recovery_succeeded"]
+        assert {e["role"] for e in first} == {"actor", "actor_fwd"}
+        assert len({e["recovery_id"] for e in first}) == 1
+        assert all(
+            e["source_generation"] == 0 and e["expected_evidence"] == e["observed_evidence"] == 63 for e in first
+        )
+
+        controller.config.hold_weights = False
+        controller.config.fail_weights = True
+        trigger_fault(controller, ["actor"])
+        poll_receipts(controller, runtime, "recovery_failed")
+        all_events = runtime.query(limit=100)["events"]
+        second = [e for e in all_events if e["event_type"] == "recovery_failed"]
+        assert len(second) == 1 and second[0]["failed_evidence"] & 56
+        assert second[0]["source_generation"] == 1 and second[0]["fault_id"] != first[0]["fault_id"]
+        assert runtime.generation == 2 and runtime.run_id == run_id and server.url == url
+        assert len({e["event_id"] for e in all_events}) == len(all_events)
+        finish(controller, thread)
+        # main awaits actual weight responses: the original worker exception
+        # now reaches training, independently of the failed completion receipt.
+        assert len(errors) == 1 and "injected CPU weight operation failure" in str(errors[0])
+        assert reads and set(reads) == {run_id} and not read_errors
+    finally:
+        stop_reader.set()
+        reader.join(3)
+        runtime.close()
+        server.close()
+        runtime._consumer.join(3)
+        server._thread.join(3)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_health_and_training_threads_complete_actual_global_restart(cluster, enabled):
+    from relax.utils.async_utils import get_async_loop
+
+    runtime = FaultEventRuntime() if enabled else None
+    controller = cpu_controller_class(cluster, LocalServe(), native=True)(
+        config(cpu_roles=["actor", "actor_fwd"]), {}, runtime
+    )
+    thread, errors = start_training(controller)
+    try:
+        checker = controller._health_manager._checker
+        assert checker._thread.ident != get_async_loop()._thread.ident
+        ray.get(controller._health_manager.status.report_error.remote("actor", "native restart"), timeout=5)
+        wait_until(
+            lambda: (
+                controller._global_restart_count == 1
+                and not controller._restarting
+                and bool(controller._pending_task_refs)
+            )
+        )
+        if runtime is not None:
+            wait_until(lambda: any(e["event_type"] == "recovery_succeeded" for e in runtime.query()["events"]))
+            assert runtime.generation == 1
+        finish(controller, thread)
+        assert not errors
+    finally:
+        controller.stop_health_check()
+        if runtime is not None:
+            runtime.close()
+            runtime._consumer.join(3)

@@ -36,7 +36,8 @@ from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
 from relax.utils.env import Envs
-from relax.utils.fault_events.recovery import expected_evidence
+from relax.utils.fault_events.models import RecoveryEvidence
+from relax.utils.fault_events.recovery import GlobalStartup
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -180,14 +181,20 @@ def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
 
 
 class Controller:
-    # Fault observation is optional; class defaults also cover controllers
-    # built with ``__new__``. ``__init__`` never resets ``_fault_recovery``
-    # because a global restart re-runs it while that recovery is in progress.
+    # Class defaults cover controllers built with ``__new__`` in CPU tests.
     _fault_events: Any = None
     _fault_recovery: Any = None
+    _fault_rebuild_ready: Any = None
 
-    def __init__(self, config: Namespace, runtime_env: dict = None, fault_events: Any = None) -> None:
+    def __init__(
+        self,
+        config: Namespace,
+        runtime_env: dict = None,
+        fault_events: Any = None,
+        fault_recovery: Any = None,
+    ) -> None:
         self._fault_events = fault_events
+        self._fault_recovery = fault_recovery
         self.config = config
         self.serve_dict = {}
         self._teacher_manager = None
@@ -196,7 +203,12 @@ class Controller:
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
-        self._health_manager = HealthManager(check_interval=1.0, config=config, fault_events=self._fault_events)
+        self._health_manager = HealthManager(
+            check_interval=1.0,
+            config=config,
+            fault_events=fault_events,
+            fault_recovery=fault_recovery,
+        )
         if not hasattr(self, "_restarting"):
             self._restarting = False  # Flag to indicate a restart is in progress
         # Keep the synchronization object stable across the self.__init__ call
@@ -1347,18 +1359,23 @@ class Controller:
                     # Pure fully_async: actor sends weights to separate actor_fwd/reference services
                     # via checkpoint engine. Hybrid mode skips this because the actor handles
                     # ref/actor_fwd internally via _switch_model.
-                    handles = [self.serve_dict[ROLES.actor].update_weights_fully_async()]
+                    token = startup.token()
+                    handles = [self.serve_dict[ROLES.actor].update_weights_fully_async(recovery_token=token)]
                     if ROLES.actor_fwd in self.serve_dict:
-                        handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async())
+                        handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async(recovery_token=token))
                     if ROLES.reference in self.serve_dict:
-                        handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async())
+                        handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async(recovery_token=token))
                     # Start senders and receivers together, and await the real
                     # Serve responses before set_step or generation can start.
+                    startup.waiting_weights = True
                     await asyncio.gather(*handles)
+                    startup.waiting_weights = False
                 if ROLES.actor in self.serve_dict:
+                    startup.restoring_step = True
                     step = await self.serve_dict[ROLES.actor].get_step()
                     for service in self.serve_dict.values():
                         await service.set_step(step)
+                    startup.step_restored()
 
             # All startup consumers have now initialized and the first policy
             # weights have been synchronized. Remove source weight shards
@@ -1377,6 +1394,7 @@ class Controller:
             with self._pending_task_refs_lock:
                 self._pending_task_refs = list(task_refs)
 
+            startup.handoff(self.config, self.serve_dict, len(task_refs))
             if task_refs:
                 logger.info(f"Started {len(task_refs)} services in parallel: {service_names}")
 
@@ -1394,7 +1412,10 @@ class Controller:
                         self._pending_task_refs.clear()
 
         resume_existing = False
+        pending_recovery = None
+        pending_initialized = False
         while True:
+            startup = GlobalStartup(self._fault_events, pending_recovery, pending_initialized)
             try:
                 run(run_all_services(resume_existing=resume_existing))
                 if self._restarting:
@@ -1402,7 +1423,9 @@ class Controller:
                 logger.info("All services running successfully")
                 return  # Normal completion, exit
             except Exception as e:
+                startup.fail(self._restarting, self._fault_recovery)
                 if self._restarting:
+                    startup.interrupt()
                     # A restart is in progress (triggered by HealthChecker callback thread).
                     # The service task failure is expected because restart kills the old replica.
                     # Block here until the global restart completes (teardown + re-init),
@@ -1413,8 +1436,17 @@ class Controller:
                     )
                     restart_done_event = self._restart_done_event
                     restart_done_event.wait()  # Block until _global_restart signals done
+                    # Copy the completed attempt before ACK permits the next
+                    # checker callback to replace these shared fields.
+                    pending_recovery = self._fault_recovery
+                    pending_initialized = (
+                        pending_recovery is not None and self._fault_rebuild_ready is pending_recovery
+                    )
                     restart_mode, restart_error = self._consume_restart_cycle()
                     resume_existing = restart_mode == "local"
+                    if resume_existing:
+                        pending_recovery = None
+                        pending_initialized = False
 
                     if restart_error is not None:
                         logger.exception(f"{restart_mode} restart failed, cannot recover: {restart_error}")
@@ -1597,8 +1629,11 @@ class Controller:
         self._restart_mode = "global" if global_restart else "local"
         self._fault_recovery = None
         if self._fault_events is not None:
-            self._fault_recovery = self._fault_events.start_recovery(
-                role, self._restart_mode, expected_evidence(self._restart_mode, self.config, self.serve_dict)
+            self._fault_recovery = self._fault_events.plan_recovery(
+                role,
+                self._restart_mode,
+                self.config,
+                self.serve_dict,
             )
         if global_restart:
             # Perform full Controller re-initialization from zero when:
@@ -1847,7 +1882,10 @@ class Controller:
         saved_global_restart_count = self._global_restart_count
 
         try:
-            self.__init__(config, runtime_env, fault_events=self._fault_events)
+            self.__init__(config, runtime_env, fault_events=self._fault_events, fault_recovery=self._fault_recovery)
+            self._fault_rebuild_ready = self._fault_recovery
+            if self._fault_events is not None:
+                self._fault_events.evidence(self._fault_recovery, observed=RecoveryEvidence.DEPLOYED)
             # Restore fields that __init__ overwrites but must survive across restarts
             self._restarting = saved_restarting
             self._global_restart_count = saved_global_restart_count
