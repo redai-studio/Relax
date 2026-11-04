@@ -23,7 +23,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--endpoint", help="tcp://HOST:PORT; omitted means SharedFS")
     parser.add_argument("--versions", type=int, nargs="+", required=True)
-    parser.add_argument("--full-only", action="store_true")
+    parser.add_argument("--full-only", action="store_true", help="Force a same-target FULL recovery request")
     args = parser.parse_args()
     return replay(args.config, args.output, args.versions, args.full_only, args.endpoint)
 
@@ -79,6 +79,7 @@ def replay(
             "transport": "TCP" if tcp_endpoint else "SharedFS",
             "consumer_metrics": dict(consumer.last_metrics),
             "full_only": full_only,
+            "source_full_only": config.full_only,
             "artifact_kind": manifest["kind"],
             "reference_copy_s": reference_copy_s,
             "hf_check_s": hf_check_s,
