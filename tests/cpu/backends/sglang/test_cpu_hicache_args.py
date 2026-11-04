@@ -32,6 +32,8 @@ def test_cpu_cache_is_independent_of_pd_topology(request, monkeypatch, worker_ty
         fp16=False,
         sglang_enable_hierarchical_cache=True,
         sglang_hicache_storage_backend=None,
+        # _enable_draft_weights_cpu_backup() reads this before cache asserts.
+        enable_mtp_training=False,
     )
     overrides = {} if override is None else {"enable_hierarchical_cache": override}
     actual, _ = module._compute_server_args(

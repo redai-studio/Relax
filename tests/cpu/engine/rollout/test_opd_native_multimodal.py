@@ -356,6 +356,11 @@ def native_generate(monkeypatch):
         use_rollout_routing_replay=False,
         sglang_router_policy="round_robin",
         sglang_speculative_algorithm=None,
+        advantage_estimator="grpo",
+        lora_rank=0,
+        lora_adapter_mode=False,
+        use_rollout_indexer_replay=False,
+        slime_router_sticky=False,
     )
     state = SimpleNamespace(
         tokenizer=SimpleNamespace(
@@ -454,6 +459,13 @@ async def test_image_opd_rejects_text_radix_routing_before_generation(monkeypatc
         sglang_router_port=1,
         use_slime_router=True,
         slime_router_middleware_paths=["RadixTreeMiddleware"],
+        use_rollout_routing_replay=False,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        advantage_estimator="grpo",
+        sglang_router_policy="round_robin",
+        slime_router_sticky=False,
     )
     sample = Sample(prompt="text")
     if image_side == "student":
