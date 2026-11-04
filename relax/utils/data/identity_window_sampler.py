@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import inspect
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -7,6 +8,7 @@ from typing import Any, Literal
 
 try:
     from transfer_queue import StreamingTokenBudgetSampler
+    from transfer_queue.sampler import BaseSampler
 except ImportError as e:
     raise ImportError(
         "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
@@ -16,9 +18,9 @@ except ImportError as e:
     ) from e
 
 from relax.utils.data.flops_balancing import (
-    checked_packing_geometry,
-    select_packing_aware_assignment,
-    validated_cost_weights,
+    apply_schedule_metadata,
+    encode_schedule,
+    validate_packing_geometry,
 )
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 
@@ -36,6 +38,7 @@ class _WindowState:
     admission_closed: bool = False
     terminal_batch_by_dp: dict[int, int] = field(default_factory=dict)
     finalized_dps: set[int] = field(default_factory=set)
+    plan_metadata: dict[int, dict[str, Any]] | None = None
 
     @property
     def admitted_count(self) -> int:
@@ -100,15 +103,14 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         dp_size: int,
         placement: Literal["sequential", "balanced", "streaming"],
         balance_unit_multiplier: int = 1,
-        cost_key: str | None = None,
+        balance_by_flops: bool = False,
     ) -> None:
         super().__init__(n_samples_per_prompt=1, balance_unit_multiplier=balance_unit_multiplier)
         self.dp_size = dp_size
         self.placement = placement
-        if cost_key is not None and placement != "balanced":
-            raise ValueError("FLOPs costs require synchronous balanced placement")
-        self.cost_key = cost_key
-        self._packing_geometries: dict[str, dict[str, Any] | None] = {}
+        if balance_by_flops and placement != "balanced":
+            raise ValueError("FLOPs scheduling requires synchronous balanced placement")
+        self.balance_by_flops = balance_by_flops
         self._partition_task_states: dict[tuple[str, str], _PartitionTaskState] = {}
         self._cache_window_by_key: dict[tuple[str, str, int, int], int] = {}
         self._window_buckets: dict[tuple[str, str, int], dict[int, list[int]]] = {}
@@ -178,13 +180,14 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
             sampled = [index for identity in identity_order[:batch_size] for index in rows_by_identity[identity]]
             return sampled, sampled.copy()
 
-        geometry = (
-            checked_packing_geometry(self._packing_geometries, task_name, kwargs.get("packing_geometry"))
-            if self.cost_key is not None
-            else None
-        )
+        geometry = validate_packing_geometry(kwargs.get("packing_geometry"))
+        if geometry is not None and not self.balance_by_flops:
+            raise ValueError("FLOPs plan requested from a length-only sampler")
         cached = self._cached_result(partition_id, task_name, dp_rank, batch_index)
         if cached is not None:
+            window_id = self._cache_window_by_key[(partition_id, task_name, dp_rank, batch_index)]
+            window = self._partition_task_states[(partition_id, task_name)].windows[window_id]
+            apply_schedule_metadata(partition, window.plan_metadata, geometry)
             self._mark_cache_served(partition_id, task_name, dp_rank, batch_index, cached[0])
             return cached
 
@@ -226,19 +229,16 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         window = self._window(task_state, batch_index, target_identity_count)
         selected_identities = identity_order[:target_identity_count]
         selected_rows = [index for identity in selected_identities for index in rows_by_identity[identity]]
-        lengths = (
-            validated_cost_weights(selected_rows, custom_meta, self.cost_key)
-            if self.cost_key is not None
-            else {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows}
-        )
-        rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
         if geometry is not None:
-            original = _BalancedRowPlacement.place(
-                selected_rows,
-                {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows},
-                self.dp_size,
+            key = (partition_id, task_name, batch_index)
+            rank_rows, updates = encode_schedule(
+                selected_rows, custom_meta, geometry, self.dp_size, len(selected_identities), key
             )
-            rank_rows = select_packing_aware_assignment(original, rank_rows, lengths, custom_meta, geometry)
+            apply_schedule_metadata(partition, updates, geometry)
+            window.plan_metadata = updates
+        else:
+            lengths = {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows}
+            rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
         self._admit_identities(task_state, window, selected_identities, rows_by_identity)
         window.admission_closed = True
 
@@ -521,19 +521,18 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
                 "resolved_lengths": self._resolved_lengths,
                 "dispatched": self._dispatched,
                 "dummy_rounds": self._dummy_rounds,
-                "balance_geometry": (self.dp_size, self.placement, self.cost_key),
-                "packing_geometries": self._packing_geometries.copy(),
+                "balance_geometry": (self.dp_size, self.placement, self.balance_by_flops),
             }
         )
         return state
 
     def load_checkpoint(self, state: dict) -> None:
-        if state.get("balance_geometry", (self.dp_size, self.placement, None)) != (
+        if state.get("balance_geometry", (self.dp_size, self.placement, False)) != (
             self.dp_size,
             self.placement,
-            self.cost_key,
+            self.balance_by_flops,
         ):
-            raise ValueError("Sampler checkpoint DP geometry or cost mode differs")
+            raise ValueError("Sampler checkpoint DP geometry or FLOPs mode differs")
         super().load_checkpoint(state)
         self._partition_task_states = state["partition_task_states"]
         self._cache_window_by_key = state["cache_window_by_key"]
@@ -543,7 +542,6 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         self._resolved_lengths = state["resolved_lengths"]
         self._dispatched = state["dispatched"]
         self._dummy_rounds = state["dummy_rounds"]
-        self._packing_geometries = state.get("packing_geometries", {}).copy()
         for key, task_state in self._partition_task_states.items():
             self._assigned_global[key] = task_state.reserved_indexes
 
@@ -558,3 +556,65 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
                 del mapping[key]
         for key in [key for key in self._cache_window_by_key if key[0] == partition_id]:
             del self._cache_window_by_key[key]
+
+
+class FlopsBalancedSampler(BaseSampler):
+    """Keep SFT batch selection and cache ownership in TransferQueue."""
+
+    def __init__(self, n_samples_per_prompt: int = 1, dp_size: int = 1) -> None:
+        from transfer_queue import SeqlenBalancedSampler
+
+        if n_samples_per_prompt != 1:
+            raise ValueError("FLOPs SFT DP assignment requires one sample per group")
+        self.base = SeqlenBalancedSampler(n_samples_per_prompt=n_samples_per_prompt, dp_size=dp_size)
+        self.plan_metadata: dict[tuple, dict] = {}
+        if "assignment_transform" not in inspect.signature(self.base.sample).parameters:
+            raise RuntimeError("FLOPs DP assignment requires the image-built TransferQueue assignment_transform patch")
+
+    def has_cached_result(self, partition_id: str, task_name: str, sampling_config: Any = None) -> bool:
+        return self.base.has_cached_result(partition_id, task_name, sampling_config)
+
+    def sample(
+        self, ready_indexes: list[int], batch_size: int, task_name: str = "", partition_id: str = "", **kwargs: Any
+    ) -> tuple[list[int], list[int]]:
+        partition = kwargs.get("partition")
+        if partition is None:
+            raise ValueError("FLOPs DP assignment requires queue metadata")
+        geometry = validate_packing_geometry(kwargs.get("packing_geometry"))
+
+        key = (partition_id, task_name, kwargs.get("batch_index", 0))
+        if geometry is None:
+            if key in self.plan_metadata:
+                raise ValueError("DP packing geometry changed across requests or checkpoint restore")
+            return self.base.sample(ready_indexes, batch_size, task_name, partition_id, **kwargs)
+
+        def transform(original: list[list[int]]) -> list[list[int]]:
+            rows = sorted(index for group in original for index in group)
+            metadata = partition.get_custom_meta(rows)
+            groups, updates = encode_schedule(rows, metadata, geometry, self.base.dp_size, len(rows), key)
+            self.plan_metadata[key] = updates
+            return groups
+
+        result = self.base.sample(
+            ready_indexes, batch_size, task_name, partition_id, assignment_transform=transform, **kwargs
+        )
+        if result[0]:
+            apply_schedule_metadata(partition, self.plan_metadata.get(key), geometry)
+        return result
+
+    def clear_cache(self, partition_id: str) -> None:
+        self.base.clear_cache(partition_id)
+        self.plan_metadata = {k: v for k, v in self.plan_metadata.items() if k[0] != partition_id}
+
+    def save_checkpoint(self) -> dict:
+        return {
+            "base": self.base.save_checkpoint(),
+            "dp_size": self.base.dp_size,
+            "plan_metadata": self.plan_metadata.copy(),
+        }
+
+    def load_checkpoint(self, state: dict) -> None:
+        if state.get("dp_size") != self.base.dp_size:
+            raise ValueError("FLOPs sampler checkpoint geometry or mode differs")
+        self.plan_metadata = state.get("plan_metadata", {}).copy()
+        self.base.load_checkpoint(state["base"])

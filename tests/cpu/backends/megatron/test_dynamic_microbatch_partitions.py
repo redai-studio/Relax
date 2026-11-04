@@ -11,23 +11,20 @@ import pytest
 @pytest.fixture
 def partitioner():
     root = Path(__file__).resolve().parents[4]
-    from relax.utils.training.microbatch_cost import sample_costs, validate_microbatch_balance
+    from relax.utils.data import packing
 
     namespace = {
+        **vars(packing),
         "logger": Mock(),
-        "sample_costs": sample_costs,
-        "validate_microbatch_balance": validate_microbatch_balance,
     }
     names = {
         "get_first_fit_partitions",
-        "get_binpack_partitions",
-        "get_flops_packing_seed",
-        "get_minimum_num_micro_batch_size",
         "_get_first_fit_partitions",
         "_partitions_fit_capacity_or_singleton_oversize",
+        "get_binpack_partitions",
+        "get_minimum_num_micro_batch_size",
         "_get_capacity_safe_balanced_partitions",
         "_get_seqlen_partitions_with_dummy_padding",
-        "_get_synchronised_sample_costs",
     }
     for path in (
         "relax/utils/data/seqlen_balancing.py",
@@ -170,184 +167,81 @@ def test_iterator_uses_selected_packing_and_dp_aligned_count(iterator_data, monk
         assert dummy == {6, 7}
 
 
-def test_flops_objective_improves_equal_token_work_and_keeps_capacity(partitioner):
-    lengths = [8] * 6
-    costs = [100, 74, 99, 75, 80, 79]
-    reference, _ = partitioner(lengths, 3, 16)
-    actual, dummy = partitioner(lengths, 3, 16, costs=costs)
-    worst = lambda groups: max(sum(costs[i] for i in group) for group in groups)
-    assert worst(actual) < worst(reference)
-    assert dummy == set()
-    assert all(sum(lengths[i] for i in group) <= 16 for group in actual)
-    assert sorted(i for group in actual for i in group) == list(range(6))
-
-
-def test_flops_capacity_fallback_and_cheapest_dummy(partitioner):
-    lengths = [3, 9, 7, 6, 2, 5, 2, 5, 9]
-    actual, _ = partitioner(lengths, 5, 10, costs=[x * x for x in lengths])
-    assert all(sum(lengths[i] for i in group) <= 10 for group in actual)
-    groups, dummy = partitioner([4, 2], 3, 8, costs=[1, 100])
-    assert dummy == {2}
-    assert groups[2] == [0]  # Less compute even though this sample has more tokens.
-
-
-def test_flops_seed_reduces_first_fit_count_and_survives_synced_count(partitioner):
-    seed = partitioner.__globals__["get_flops_packing_seed"]
-    lengths, costs = [4, 4, 6, 6], [16, 16, 36, 36]
-    old_count = partitioner.__globals__["get_minimum_num_micro_batch_size"](lengths, 10)
-    assert old_count == 3
-    assert len(seed(lengths, costs, 10)) == 2
-    for synced_count in (2, 3, 4, 6):
-        groups, dummy = partitioner(lengths, synced_count, 10, costs=costs)
-        assert len(groups) == synced_count
-        assert sorted(i for j, group in enumerate(groups) if j not in dummy for i in group) == list(range(4))
-        assert all(sum(lengths[i] for i in group) <= 10 for group in groups)
-
-
-def test_flops_seed_preserves_oversized_singletons_and_input(partitioner):
-    seed = partitioner.__globals__["get_flops_packing_seed"]
-    lengths, costs = [17, 4, 6, 3, 7], [289, 16, 36, 9, 49]
-    before = lengths.copy(), costs.copy()
-    groups = seed(lengths, costs, 10)
-    assert [0] in groups
-    assert sorted(i for group in groups for i in group) == list(range(5))
-    assert all(sum(lengths[i] for i in group) <= 10 or group == [0] for group in groups)
-    assert (lengths, costs) == before
-
-
-def test_flops_seed_randomized_capacity_coverage_and_determinism(partitioner):
-    import random
-
-    seed = partitioner.__globals__["get_flops_packing_seed"]
-    first_fit = partitioner.__globals__["get_minimum_num_micro_batch_size"]
-    generator = random.Random(2026)
-    for _ in range(100):
-        lengths = [generator.randint(1, 24) for _ in range(generator.randint(1, 32))]
-        costs = [length * generator.randint(1, 500) for length in lengths]
-        groups = seed(lengths, costs, 20)
-        assert groups == seed(lengths, costs, 20)
-        assert len(groups) <= first_fit(lengths, 20)
-        assert sorted(i for group in groups for i in group) == list(range(len(lengths)))
-        assert all(sum(lengths[i] for i in group) <= 20 or len(group) == 1 for group in groups)
-
-
-@pytest.mark.parametrize("microbatch", ["tokens", "flops"])
-@pytest.mark.parametrize("dp", ["tokens", "flops"])
-def test_iterator_slices_only_enabled_microbatch_costs_at_each_optimizer_step(
-    iterator_data, monkeypatch, microbatch, dp
-):
+@pytest.mark.parametrize("rank", [0, 1])
+def test_iterator_executes_central_packs_without_local_repacking(iterator_data, monkeypatch, rank):
     from types import SimpleNamespace
 
-    costs = [100, 74, 99, 75, 80, 79, 1, 90, 2, 91, 3, 92]
-    cost_calls, sync_groups = [], []
+    from relax.utils.data.flops_balancing import encode_schedule, restore_schedule
 
-    def estimator(args, data):
-        cost_calls.append(1)
-        return costs
-
-    monkeypatch.setattr(iterator_data, "sample_costs", estimator)
-    monkeypatch.setattr(iterator_data.dist, "all_reduce", lambda *args, **kw: sync_groups.append(kw["group"]))
+    monkeypatch.setattr(iterator_data.mpu, "get_data_parallel_world_size", lambda **_: 2)
+    monkeypatch.setattr(iterator_data.mpu, "get_data_parallel_rank", lambda **_: rank, raising=False)
+    metadata = {i: dict(total_lengths=1, flops_cost=9 if i == 5 else 1) for i in range(6)}
+    rows, updates = encode_schedule(
+        list(range(6)),
+        metadata,
+        dict(version=4, capacity=5, microbatch_group_size=1, context_parallel_size=1, pipeline_stages=2),
+        2,
+        6,
+        ("p", "sft_train", 0),
+    )
+    local = rows[rank]
+    batch = dict(total_lengths=[1] * len(local), ids=local)
+    restore_schedule(
+        SimpleNamespace(global_indexes=local, get_all_custom_meta=lambda: [updates[i] for i in local]), batch
+    )
     args = SimpleNamespace(
-        microbatch_balance=microbatch,
-        dp_balance=dp,
-        global_batch_size=6,
+        balance_by_flops=True,
         use_dynamic_batch_size=True,
-        max_tokens_per_gpu=16,
+        global_batch_size=6,
+        max_tokens_per_gpu=5,
+        pipeline_model_parallel_size=2,
     )
-    rollout = {"total_lengths": [8] * 12, "flops_cost": costs}
-    iterators, counts = iterator_data.get_data_iterator(args, [], rollout)
-    partition = iterator_data._get_seqlen_partitions_with_dummy_padding
-    first, _ = partition([8] * 6, 3, 16, costs=costs[:6] if microbatch == "flops" else None)
-    second, _ = partition([8] * 6, 3, 16, costs=costs[6:] if microbatch == "flops" else None)
-    assert counts == [3, 3]
-    assert iterators[0].micro_batch_indices == [*first, *[[i + 6 for i in group] for group in second]]
-    assert len(cost_calls) == int(microbatch == "flops")
-    assert sync_groups == (["model", "dp"] if microbatch == "flops" else []) + ["dp"]
-
-
-@pytest.mark.parametrize("moe", [False, True])
-@pytest.mark.parametrize("reduce_k", [False, True])
-def test_real_qwen35_repartition_preserves_loss_gradient_and_update(partitioner, moe, reduce_k, monkeypatch):
-    import copy
-    import importlib
-    import inspect
-    from argparse import Namespace
-
-    import torch
-    import transformers
-
-    from relax.utils.training.qwen35_cost import estimate_sample_costs
-
-    config_class = transformers.Qwen3_5MoeTextConfig if moe else transformers.Qwen3_5TextConfig
-    model_class = transformers.Qwen3_5MoeForCausalLM if moe else transformers.Qwen3_5ForCausalLM
-    # Keep this CPU test on the upstream PyTorch reference when optional
-    # kernel dispatchers are installed in the training image.
-    modeling = importlib.import_module(model_class.__module__)
     monkeypatch.setattr(
-        modeling, "torch_chunk_gated_delta_rule", inspect.unwrap(modeling.torch_chunk_gated_delta_rule)
+        iterator_data, "_get_capacity_safe_balanced_partitions", lambda *_: pytest.fail("central packs must survive")
     )
-    for name in ("chunk_gated_delta_rule", "FusedRMSNormGated", "causal_conv1d_fn"):
-        monkeypatch.setattr(modeling, name, None)
-    config = config_class(
-        hidden_size=16,
-        vocab_size=32,
-        num_hidden_layers=2,
-        layer_types=["linear_attention", "full_attention"],
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        linear_num_key_heads=1,
-        linear_key_head_dim=4,
-        linear_num_value_heads=2,
-        linear_value_head_dim=4,
-        linear_conv_kernel_dim=4,
-        **(
-            {
-                "num_experts": 4,
-                "num_experts_per_tok": 2,
-                "moe_intermediate_size": 8,
-                "shared_expert_intermediate_size": 8,
-            }
-            if moe
-            else {"intermediate_size": 32}
-        ),
+    iterators, counts = iterator_data.get_data_iterator(args, [], batch)
+    assert counts == [1]
+    assert iterators[0].get_next(["ids"])["ids"] == local
+    assert batch["rollout_mini_local_sample_counts"] == [len(local)]
+    assert batch["rollout_mini_global_sample_counts"] == [6]
+
+
+def test_iterator_rejects_missing_central_plan_instead_of_silent_local_fallback(iterator_data):
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        balance_by_flops=True, use_dynamic_batch_size=True, global_batch_size=2, max_tokens_per_gpu=5
     )
-    config._attn_implementation = "eager"
-    lengths = [4, 4, 6, 6] if reduce_k else [33, 43, 27, 21, 12, 15, 59, 47]
-    capacity = 10 if reduce_k else 80
-    costs = estimate_sample_costs(config, {"total_lengths": lengths}, Namespace())
-    baseline_k = partitioner.__globals__["get_minimum_num_micro_batch_size"](lengths, capacity) if reduce_k else 4
-    optimized_k = len(partitioner.__globals__["get_flops_packing_seed"](lengths, costs, capacity)) if reduce_k else 4
-    by_tokens, _ = partitioner(lengths, baseline_k, capacity)
-    by_flops, _ = partitioner(lengths, optimized_k, capacity, costs=costs)
-    if reduce_k:
-        assert len(by_flops) < len(by_tokens)
-    assert sorted(by_tokens) != sorted(by_flops)
-    threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    try:
-        torch.manual_seed(47)
-        reference = model_class(config).train()
-        actual = copy.deepcopy(reference)
-        initial = [parameter.detach().clone() for parameter in reference.parameters()]
-        samples = [torch.randint(0, 32, (1, length)) for length in lengths]
-        losses = []
-        for model, groups in ((reference, by_tokens), (actual, by_flops)):
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-            total = 0.0
-            for group in groups:
-                for index in group:
-                    loss = model(input_ids=samples[index], labels=samples[index], use_cache=False).loss
-                    weighted = loss * (lengths[index] - 1) / sum(n - 1 for n in lengths)
-                    weighted.backward()
-                    total += float(weighted.detach())
-            losses.append(total)
-            optimizer.step()
-        assert losses[0] == pytest.approx(losses[1], abs=1e-6)
-        for left, right, before in zip(reference.parameters(), actual.parameters(), initial, strict=True):
-            assert (left.grad is None) == (right.grad is None)
-            if left.grad is not None:
-                torch.testing.assert_close(left.grad, right.grad, atol=2e-6, rtol=2e-5)
-            torch.testing.assert_close(left.detach() - before, right.detach() - before, atol=2e-6, rtol=2e-5)
-    finally:
-        torch.set_num_threads(threads)
+    with pytest.raises(ValueError, match="Invalid FLOPs schedule"):
+        iterator_data.get_data_iterator(args, [], dict(total_lengths=[1, 1]))
+
+
+def test_forward_explicit_budget_needs_no_training_plan(iterator_data):
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        balance_by_flops=True, use_dynamic_batch_size=True, global_batch_size=2, max_tokens_per_gpu=5
+    )
+    iterators, counts = iterator_data.get_data_iterator(args, [], dict(total_lengths=[2, 2]), max_tokens_per_gpu=5)
+    assert counts == [1]
+    assert iterators[0].micro_batch_indices == [[0, 1]]
+
+
+def test_multi_mini_restore_errors_reach_synchronised_validation(iterator_data, monkeypatch):
+    from types import SimpleNamespace
+
+    batch = iterator_data.concat_rollout_batches(
+        [
+            dict(total_lengths=[1], _flops_schedule_error=["Partial schedule"]),
+            dict(total_lengths=[1], _flops_schedule_error=["Mixed schedules"]),
+        ]
+    )
+    assert batch["_flops_schedule_error"] == ["Partial schedule", "Mixed schedules"]
+    reductions = []
+    monkeypatch.setattr(iterator_data.dist, "all_reduce", lambda status, **_: reductions.append(status.tolist()))
+    args = SimpleNamespace(
+        balance_by_flops=True, use_dynamic_batch_size=True, global_batch_size=2, max_tokens_per_gpu=5
+    )
+    with pytest.raises(ValueError, match="Invalid FLOPs schedule"):
+        iterator_data.get_data_iterator(args, [], batch)
+    assert len(reductions) == 2 and reductions[0][0] == 1

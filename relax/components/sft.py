@@ -1228,9 +1228,7 @@ class SFT(Base):
                 custom_meta=(
                     preference_custom_meta[s:e]
                     if preference_custom_meta is not None
-                    else add_flops_cost_metadata(
-                        self.config, chunk, [{"total_lengths": int(length)} for length in chunk["total_lengths"]]
-                    )
+                    else [{"total_lengths": int(length)} for length in chunk["total_lengths"]]
                 ),
             )
             drained = await self._wait_for_partition_drained(partition_id, timeout_sec=chunk_drain_timeout)
