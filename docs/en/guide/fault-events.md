@@ -142,7 +142,7 @@ Local duplicate commits do not enqueue another export; network retries can still
 
 Shutdown stops export admission and waits at most 50 ms for the export worker. `otel_shutdown_dropped` counts only queued records abandoned at shutdown. A request already in flight is not counted as dropped: after the 50 ms wait its outcome remains unknown until the worker returns, when the actual result updates the transport counters. It must not be described as failed or delivered while pending; hard process exit can still lose its record. Export shutdown does not extend the local Runtime's queue-drain policy or wait for Ray.
 
-The second-batch acceptance test will use a real local OTLP HTTP receiver that decodes the binary protobuf request and checks the received `relax.fault.*` attributes. It will live at `tests/utils/test_fault_event_otel_exporter.py`; no pass count is claimed here. A receiver's health endpoint can be checked with its own documented command or `curl`; posting plain JSON to `/v1/logs` is not a valid OTLP test because this interface sends binary `http/protobuf`.
+The second-batch acceptance test in `tests/cpu/utils/test_fault_event_otel_exporter.py` uses a real local OTLP HTTP receiver that decodes the binary protobuf request and checks the received `relax.fault.*` attributes. A receiver's health endpoint can be checked with its own documented command or `curl`; posting plain JSON to `/v1/logs` is not a valid OTLP test because this interface sends binary `http/protobuf`.
 
 ## Bounds, failures and shutdown
 
@@ -160,15 +160,19 @@ Run from the repository root in an environment with its existing test and HTTP d
 
 ```bash
 PYTHONPATH=. pytest -q \
-  tests/utils/test_fault_event_store.py \
-  tests/utils/test_fault_event_runtime.py \
-  tests/utils/test_fault_query_server.py \
-  tests/utils/test_fault_publication.py \
-  tests/utils/test_fault_health_flow.py \
-  tests/utils/test_health_checker_thread.py \
-  tests/core/test_fault_local_recovery_cpu.py \
-  tests/entrypoints/test_fault_events_lifecycle.py \
-  tests/entrypoints/test_startup_failure.py
+  tests/cpu/utils/test_fault_event_store.py \
+  tests/cpu/utils/test_fault_event_runtime.py \
+  tests/cpu/utils/test_fault_query_server.py \
+  tests/cpu/utils/test_fault_publication.py \
+  tests/cpu/utils/test_fault_health_flow.py \
+  tests/cpu/utils/test_health_checker_thread.py \
+  tests/cpu/core/test_fault_local_recovery_cpu.py \
+  tests/cpu/entrypoints/test_fault_events_lifecycle.py \
+  tests/cpu/entrypoints/test_startup_failure.py \
+  tests/cpu/utils/test_fault_event_otel_exporter.py \
+  tests/cpu/utils/test_fault_event_otel_runtime.py \
+  tests/cpu/utils/test_fault_event_trace_context.py \
+  tests/cpu/core/test_fault_event_otel_ray.py
 pre-commit run --all-files
 ```
 

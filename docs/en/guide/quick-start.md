@@ -177,7 +177,7 @@ When a score drops, compare identical prompts/labels, effective sample counts, t
 Run CPU regression checks with:
 
 ```bash
-python -m pytest tests/engine/rewards/test_openr1mm.py tests/tools/test_process_openr1.py
+python -m pytest tests/cpu/engine/rewards/test_openr1mm.py tests/cpu/tools/test_process_openr1.py
 ```
 
 ---

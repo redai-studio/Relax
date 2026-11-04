@@ -142,7 +142,7 @@ export OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/protobuf
 
 关闭先停止导出接纳，最多等待导出线程 50 ms。`otel_shutdown_dropped` 只统计关闭时放弃的排队记录，不把在途请求计为已丢弃：50 ms 等待结束后，在途结果仍为未知，直到工作线程返回，再按实际结果更新传输计数。未决时不能声称失败或已交付；进程硬退出仍可能丢失它。不因此延长本地 Runtime 的队列排空策略，也不等待 Ray。
 
-第二批验收将使用真实的本地 OTLP HTTP 接收端解码二进制 protobuf 请求，并检查收到的 `relax.fault.*` 属性；计划测试文件为 `tests/utils/test_fault_event_otel_exporter.py`，这里不预填通过数。接收端健康检查可使用其文档提供的命令或 `curl`；向 `/v1/logs` 发送普通 JSON 不是有效 OTLP 测试，因为本接口发送的是二进制 `http/protobuf`。
+`tests/cpu/utils/test_fault_event_otel_exporter.py` 中的第二批验收测试使用真实的本地 OTLP HTTP 接收端解码二进制 protobuf 请求，并检查收到的 `relax.fault.*` 属性。接收端健康检查可使用其文档提供的命令或 `curl`；向 `/v1/logs` 发送普通 JSON 不是有效 OTLP 测试，因为本接口发送的是二进制 `http/protobuf`。
 
 ## 容量、异常与退出
 
@@ -160,15 +160,19 @@ driver 退出时向 Runtime 和 HTTP 发出关闭信号，不等待队列排空�
 
 ```bash
 PYTHONPATH=. pytest -q \
-  tests/utils/test_fault_event_store.py \
-  tests/utils/test_fault_event_runtime.py \
-  tests/utils/test_fault_query_server.py \
-  tests/utils/test_fault_publication.py \
-  tests/utils/test_fault_health_flow.py \
-  tests/utils/test_health_checker_thread.py \
-  tests/core/test_fault_local_recovery_cpu.py \
-  tests/entrypoints/test_fault_events_lifecycle.py \
-  tests/entrypoints/test_startup_failure.py
+  tests/cpu/utils/test_fault_event_store.py \
+  tests/cpu/utils/test_fault_event_runtime.py \
+  tests/cpu/utils/test_fault_query_server.py \
+  tests/cpu/utils/test_fault_publication.py \
+  tests/cpu/utils/test_fault_health_flow.py \
+  tests/cpu/utils/test_health_checker_thread.py \
+  tests/cpu/core/test_fault_local_recovery_cpu.py \
+  tests/cpu/entrypoints/test_fault_events_lifecycle.py \
+  tests/cpu/entrypoints/test_startup_failure.py \
+  tests/cpu/utils/test_fault_event_otel_exporter.py \
+  tests/cpu/utils/test_fault_event_otel_runtime.py \
+  tests/cpu/utils/test_fault_event_trace_context.py \
+  tests/cpu/core/test_fault_event_otel_ray.py
 pre-commit run --all-files
 ```
 

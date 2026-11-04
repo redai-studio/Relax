@@ -116,7 +116,7 @@ pytest tests/algorithms/ -v
 - 注册与分发：算法名在 `ALGORITHM_SPECS` 里；能力字段与预期一致；未注册名报错。
 - 数值：手算一个小例子做对照，别用全零或全相同的 reward——那种输入下任何公式都输出 0，测不出东西。
 - 退化场景：组内 reward 全相同、`n_samples_per_prompt` 取边界值、缺字段、非数值输入。
-- **改动已有算法时**：把旧实现冻结进测试文件当参照，逐位对拍（`view(torch.int32).equal`），不要用 `allclose`——它的默认容差足以吞掉无偏/有偏标准差的差异。`tests/algorithms/test_reward_normalizers.py` 是现成范例。
+- **改动已有算法时**：把旧实现冻结进测试文件当参照，逐位对拍（`view(torch.int32).equal`），不要用 `allclose`——它的默认容差足以吞掉无偏/有偏标准差的差异。`tests/cpu/algorithms/test_reward_normalizers.py` 是现成范例。
 
 ### 4. 加示例与文档
 
