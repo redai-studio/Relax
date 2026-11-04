@@ -71,7 +71,7 @@ def test_disk_install_prepares_per_node_and_preserves_each_member_gate(tmp_path,
             preparations[self.node] += 1
             with monkeypatch.context() as patch:
                 patch.setattr(ray.util, "get_node_ip_address", lambda: self.node)
-                return prepare(None, config_path, published, reference)
+                return prepare(config_path, published, reference)
 
         def pause_generation(self, timeout):
             self.paused = True

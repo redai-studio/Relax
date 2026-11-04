@@ -781,7 +781,7 @@ class SGLangEngine(RayActor):
     def prepare_disk_checkpoint(self, config_path: str, published: dict, reference: str) -> dict:
         from .disk_weight_sync import prepare
 
-        return prepare(self, config_path, published, reference)
+        return prepare(config_path, published, reference)
 
     def install_disk_checkpoint(self, target: dict, published: dict, timeout: float) -> dict:
         from .disk_weight_sync import install

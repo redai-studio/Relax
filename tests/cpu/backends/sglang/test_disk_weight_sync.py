@@ -47,7 +47,7 @@ def test_receiver_repairs_corrupt_delta_using_external_canonical_owner(tmp_path,
     (reference / "config.json").write_text('{"model_type":"qwen3"}')
     (reference / "reference-id.txt").write_text("update-1")
     save_file({"x": x}, reference / "model.safetensors")
-    target = prepare(None, str(config_path), asdict(published), str(reference))
+    target = prepare(str(config_path), asdict(published), str(reference))
     assert target["root"] == published.root
     assert compare(reference, Path(target["path"]))["equal"]
     assert "FULL" in store.record(config.stream, 1)["artifacts"]
@@ -61,7 +61,7 @@ def test_receiver_repairs_corrupt_delta_using_external_canonical_owner(tmp_path,
     pub = Publisher(store, config.stream, {"model_config": {"model_type": "qwen3"}}, **config.publisher_kwargs())
     later = pub.finalize_pending(pub.submit("2", [("x", x)]))
     pub.close()
-    later_target = prepare(None, str(config_path), asdict(later), str(later_reference))
+    later_target = prepare(str(config_path), asdict(later), str(later_reference))
     assert later.root == published.root
     assert later_target["path"] == target["path"]
     assert later_target["full_reference"] != target["full_reference"]

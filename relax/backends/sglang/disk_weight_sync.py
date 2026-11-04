@@ -16,7 +16,7 @@ from relax.distributed.weight_sync.store import SharedFSStore, atomic_write
 from relax.distributed.weight_sync.tensor_diff import compare
 
 
-def prepare(engine, config_path: str, published: dict, reference: str) -> dict:
+def prepare(config_path: str, published: dict, reference: str) -> dict:
     import ray
 
     started = monotonic()
