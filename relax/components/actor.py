@@ -3,6 +3,7 @@
 import threading
 import time
 from argparse import Namespace
+from contextlib import suppress
 from typing import Any, Dict, Optional
 
 import ray
@@ -230,19 +231,7 @@ class Actor(Base):
                     break
                 self.step = local_step
                 try:
-                    self._logger.info(f"Actor training step {local_step}/{self.config.num_rollout}")
-                    did_train = self._execute_training()
-                    self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
-                    if did_train:
-                        for partition_id in sft_partition_ids(self.config, local_step):
-                            run(self.data_system_client.async_clear_partition(partition_id=partition_id))
-                        self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
-                    try:
-                        self.healthy.update_heartbeat.remote("actor", local_step + 1)
-                    except Exception:
-                        pass
-                    with self._lock:
-                        self.step = local_step + 1
+                    self._run_training_step(local_step)
                 except Exception as exc:
                     self._recovery.fail(exc)
                     raise
@@ -268,6 +257,21 @@ class Actor(Base):
         # A requested stop is incomplete training, but not a health failure.
         if self.step < self.config.num_rollout:
             raise RuntimeError("Actor stopped before all training steps finished")
+
+    def _run_training_step(self, local_step: int) -> None:
+        """Train and clear consumed data before committing the next step."""
+        self._logger.info(f"Actor training step {local_step}/{self.config.num_rollout}")
+        did_train = self._execute_training()
+        self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
+        if did_train:
+            for partition_id in sft_partition_ids(self.config, local_step):
+                run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+            self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
+        # Heartbeat submission is best-effort; training and data errors must propagate.
+        with suppress(Exception):
+            self.healthy.update_heartbeat.remote("actor", local_step + 1)
+        with self._lock:
+            self.step = local_step + 1
 
     def _wait_for_rollout_data(self) -> bool:
         """Wait for rollout data to be ready in async colocate mode.
