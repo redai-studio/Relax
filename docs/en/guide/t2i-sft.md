@@ -23,7 +23,8 @@ Prepare a JSON array of target images and captions. Image paths are relative to
 
 Captions should describe the target image. The T2I data contract rejects the
 image-editing `edit_image` field. Submit to an existing Ray cluster, using model,
-data and output paths accessible to every worker:
+data and output paths accessible to every worker. Replace `<ray-head>` below
+with your Ray head host; `RAY_DASHBOARD_ADDRESS` is the Ray Jobs HTTP endpoint:
 
 ```bash
 MODEL_PATH=/shared/models/Qwen-Image \
@@ -31,7 +32,7 @@ DATA_ROOT=/shared/data/captions METADATA_PATH=/shared/data/captions/train.json \
 DATASET_SIZE=128 SAVE_DIR=/shared/runs/qwen-sft EXP_NAME=qwen-r01 SAVE_INTERVAL=32 \
 GPUS=8 GLOBAL_BATCH_SIZE=16 MICRO_BATCH_SIZE=1 STEPS=32 \
 HEIGHT=512 WIDTH=512 RAY_NO_WAIT=1 RELAX_SKIP_CLUSTER_CLEANUP=1 \
-TEXT_ENCODER_PLACEMENT=sharded \
+TEXT_ENCODER_PLACEMENT=sharded RAY_DASHBOARD_ADDRESS="http://<ray-head>:8265" \
 bash scripts/entrypoint/ray-job.sh scripts/training/diffusion/run-qwen-image-sft.sh
 ```
 

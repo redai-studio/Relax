@@ -18,7 +18,8 @@ Qwen-Image 通过 `QwenImageSFTAdapter` 接入 Relax 的同步 FSDP2 SFT 训练�
 ```
 
 描述应对应目标图片；文生图数据不接受图像编辑的 `edit_image` 字段。
-在已有 Ray 集群上提交，模型、数据和输出路径需要所有 worker 可访问：
+在已有 Ray 集群上提交，模型、数据和输出路径需要所有 worker 可访问。
+将下例中的 `<ray-head>` 替换为 Ray head 主机，`RAY_DASHBOARD_ADDRESS` 指向 Ray Jobs HTTP 端点：
 
 ```bash
 MODEL_PATH=/shared/models/Qwen-Image \
@@ -26,7 +27,7 @@ DATA_ROOT=/shared/data/captions METADATA_PATH=/shared/data/captions/train.json \
 DATASET_SIZE=128 SAVE_DIR=/shared/runs/qwen-sft EXP_NAME=qwen-r01 SAVE_INTERVAL=32 \
 GPUS=8 GLOBAL_BATCH_SIZE=16 MICRO_BATCH_SIZE=1 STEPS=32 \
 HEIGHT=512 WIDTH=512 RAY_NO_WAIT=1 RELAX_SKIP_CLUSTER_CLEANUP=1 \
-TEXT_ENCODER_PLACEMENT=sharded \
+TEXT_ENCODER_PLACEMENT=sharded RAY_DASHBOARD_ADDRESS="http://<ray-head>:8265" \
 bash scripts/entrypoint/ray-job.sh scripts/training/diffusion/run-qwen-image-sft.sh
 ```
 

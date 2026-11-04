@@ -190,8 +190,14 @@ class QwenImageSFTAdapter:
             torch.backends.cudnn.benchmark = False
         device = torch.device("cuda", torch.cuda.current_device())
         dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[args.fsdp_param_dtype]
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.model_path, subfolder="scheduler", shift=3.0)
-        pipe = QwenImagePipeline.from_pretrained(args.model_path, torch_dtype=dtype, scheduler=scheduler)
+        revision = getattr(args, "model_revision", None)
+        load_kwargs = {"revision": str(revision)} if revision else {}
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            args.model_path, subfolder="scheduler", shift=3.0, **load_kwargs
+        )
+        pipe = QwenImagePipeline.from_pretrained(
+            args.model_path, torch_dtype=dtype, scheduler=scheduler, **load_kwargs
+        )
         pipe.to(device)
         pipe.text_encoder.set_attn_implementation("sdpa")
         pipe.transformer.requires_grad_(False)

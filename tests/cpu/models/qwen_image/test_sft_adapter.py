@@ -5,7 +5,9 @@ The pipeline retains text encoding, posterior sampling and independent noise
 and timesteps. It does not replace the pretrained GPU smoke test.
 """
 
+import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -136,6 +138,39 @@ def _pack_oracle(value):
         ],
         dim=1,
     )
+
+
+@pytest.mark.parametrize("revision", ["feature-revision", None])
+def test_load_train_model_uses_same_revision_for_pipeline_and_scheduler(monkeypatch, revision):
+    pipe = TinyPipeline(torch.float32)
+    pipe.to = Mock(return_value=pipe)
+    pipe.text_encoder.set_attn_implementation = Mock()
+    scheduler_load = Mock(return_value=pipe.scheduler)
+    pipeline_load = Mock(return_value=pipe)
+    monkeypatch.setitem(
+        sys.modules,
+        "diffusers",
+        SimpleNamespace(
+            FlowMatchEulerDiscreteScheduler=SimpleNamespace(from_pretrained=scheduler_load),
+            QwenImagePipeline=SimpleNamespace(from_pretrained=pipeline_load),
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    model = QwenImageSFTAdapter().load_train_model(
+        SimpleNamespace(
+            loss_type="sft",
+            generation_task="t2i",
+            t2i_sft_config={"gradient_checkpointing": False},
+            fsdp_trainable_mode="lora",
+            fsdp_param_dtype="fp32",
+            model_path="model",
+            model_revision=revision,
+        )
+    )
+    kwargs = {} if revision is None else {"revision": revision}
+    scheduler_load.assert_called_once_with("model", subfolder="scheduler", shift=3.0, **kwargs)
+    pipeline_load.assert_called_once_with("model", torch_dtype=torch.float32, scheduler=pipe.scheduler, **kwargs)
+    assert model.pipe is pipe
 
 
 def test_pack_latents_matches_explicit_channel_patch_order():

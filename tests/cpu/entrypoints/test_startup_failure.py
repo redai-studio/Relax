@@ -387,7 +387,7 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
     assert call.kwargs["args"] == (1,)
 
 
-@pytest.mark.parametrize("mode", ["missing_config", "text_sft", "i2i", "i2i_stop_failure"])
+@pytest.mark.parametrize("mode", ["missing_config", "text_sft", "i2i", "i2i_stop_failure", "t2i", "t2i_stop_failure"])
 def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
@@ -418,16 +418,18 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
         _cleanup_s3_model_weights_after_init=Mock(),
     )
     partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
-    stop_image = AsyncMock(side_effect=RuntimeError("producer unavailable") if mode == "i2i_stop_failure" else None)
+    stop_image = AsyncMock(
+        side_effect=RuntimeError("producer unavailable") if mode.endswith("_stop_failure") else None
+    )
     if mode != "missing_config":
         partial_controller.config = SimpleNamespace(
-            loss_type="sft", generation_task="i2i" if mode.startswith("i2i") else "t2i"
+            loss_type="sft", generation_task=mode[:3] if mode.startswith(("i2i", "t2i")) else None
         )
         partial_controller.serve_dict["sft"] = SimpleNamespace(
             handle=SimpleNamespace(stop=SimpleNamespace(remote=stop_image))
         )
     ns["shutdown"](partial_controller)
-    if mode.startswith("i2i"):
+    if mode.startswith(("i2i", "t2i")):
         stop_image.assert_awaited_once()
     else:
         stop_image.assert_not_called()
