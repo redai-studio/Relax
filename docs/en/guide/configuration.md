@@ -477,6 +477,18 @@ How the SFT producer handles samples whose tokenized + media-expanded length exc
 | `--sft-oversize-strategy` | str | keep | `skip`, `keep`, `truncate_left`, `truncate_right`, `custom` | `skip` drops the sample; `keep` returns it unchanged (may OOM downstream); `truncate_left` keeps the last `capacity` tokens; `truncate_right` keeps the first `capacity` tokens; `custom` delegates to `--sft-oversize-custom-function-path`. ⚠ Truncating multimodal samples in-place may misalign `multimodal_train_inputs` — use `custom` if you also need to trim media inputs. |
 | `--sft-oversize-custom-function-path` | str | None | - | Required when `--sft-oversize-strategy custom`. Importable path to a function with signature `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) \| None`. Returning `None` is treated as `skip`. |
 
+To keep complete SFT samples above the packing budget but skip samples beyond `--seq-length`, add these options to the training command:
+
+```bash
+--seq-length 262144 \
+--use-dynamic-batch-size \
+--max-tokens-per-gpu 131072 \
+--sft-oversize-strategy custom \
+--sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
+```
+
+This policy reads `--seq-length` directly; no additional environment variable is needed. With CP=1, samples above 131072 and up to 262144 expanded tokens stay intact in their own micro-batches; longer samples are skipped. Keep `0 < max_tokens_per_gpu × context_parallel_size <= seq_length`, because samples within the packing budget bypass the oversize hook. The policy preserves tokens and loss masks; it does not reduce the memory required by a long sample.
+
 Preference training uses these same options after applying `--preference-max-length` and `--preference-max-completion-length`. The capacity counts both branches together: `keep` preserves the pair in its own micro-batch, while `skip` drops the whole pair.
 
 For `truncate_left`, `truncate_right`, and `custom`, Relax divides the pair budget between the two branches. Left truncation keeps a common prompt suffix; right truncation keeps the start of each branch. A custom function receives each oversized branch and its allocated capacity; returning `None` for either branch drops the whole pair. Processing raises an error if a branch has no supervised answer tokens, the two answers become identical, or their prompts differ.
