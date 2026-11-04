@@ -509,8 +509,20 @@ RUN . /etc/relax_build.env && \
 # Restore the unified image runtime after all dependency resolution.
 # Its DeepEP binaries require NCCL 2.30.7; Torch metadata still pins 2.29.7.
 # pip check above validates every other dependency before this explicit override.
-RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7 && \
+# SM90 can share DSA backward signatures after making the length clamp dynamic;
+# SM100 kernels retain width-dependent compile-time tuning.
+RUN --mount=type=bind,source=docker/patch/cudnn/1.30.0-dsa-sm90-signature-cache.patch,target=/tmp/cudnn-dsa.patch \
+    pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7 && \
     python -c "import importlib.metadata as m; assert m.version('nvidia-nccl-cu13') == '2.30.7'" && \
+    if [ "$RELAX_GPU_ARCH" = "hopper" ]; then \
+        CUDNN_SITE="$(python -c 'import importlib.metadata as m; \
+            assert m.version("nvidia-cudnn-frontend") == "1.30.0", "DSA SM90 patch requires cuDNN Frontend 1.30.0"; \
+            assert m.version("nvidia-cutlass-dsl") == "4.6.2", "DSA SM90 patch requires CuTe DSL 4.6.2"; \
+            print(m.distribution("nvidia-cudnn-frontend").locate_file(""))')" && \
+        patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa.patch && \
+        python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" \
+            "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm90.py"; \
+    fi && \
     python /opt/relax/validate_hybridep_install.py && \
     python /opt/relax/validate_final_runtime.py && \
     sed 's/^ray==2\.56\.1$/ray==2.56.1.*/' "$PIP_CONSTRAINT" > /etc/relax-cu130-runtime-constraints.txt

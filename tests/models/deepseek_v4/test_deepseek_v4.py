@@ -171,6 +171,90 @@ def test_expert_gradients_and_full_optimizer_resume(tmp_path: Path, compute: str
     assert report["status"] == "PASS" and report["expert_compute"] == compute
 
 
+@_GPU
+@pytest.mark.parametrize("layer", ["Linear", "LayerNormLinear", "GroupedLinear"])
+def test_weight_quantizer_cache_rebuilds_and_refreshes_layouts(layer: str) -> None:
+    _require_cuda()
+    import copy
+    import dataclasses
+
+    import torch
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Float8BlockScaling, Format
+
+    from relax.models.deepseek_v4.fp8_weights import _install_weight_quantizers, _install_workspace
+
+    torch.manual_seed(731)
+    factory = getattr(te, layer)
+    dimensions = (2, 256, 256) if layer == "GroupedLinear" else (256, 256)
+    options = dict(bias=False, params_dtype=torch.bfloat16, device="cuda", fuse_wgrad_accumulation=False)
+    actual, reference = factory(*dimensions, **options), factory(*dimensions, **options)
+    if hasattr(actual, "get_weight_workspace"):
+        pytest.skip("requires TE 2.18's instance weight-quantizer API")
+    keys = ("weight0", "weight1") if layer == "GroupedLinear" else ("weight",)
+    if layer == "GroupedLinear":
+        _install_weight_quantizers(actual, module_name=layer)
+    else:
+        _install_workspace(actual, module_name=layer)
+    with torch.no_grad():
+        for name, parameter in actual.named_parameters():
+            reference.get_parameter(name).copy_(parameter)
+    recipe = Float8BlockScaling(fp8_format=Format.E4M3)
+    fields = ("fp8_quant_fwd_inp", "fp8_quant_fwd_weight", "fp8_quant_bwd_grad")
+    for name in fields:
+        setattr(recipe, name, dataclasses.replace(getattr(recipe, name), power_2_scale=False))
+    expected_recipe = copy.deepcopy(recipe)
+    expected_recipe.fp8_quant_fwd_weight = dataclasses.replace(recipe.fp8_quant_fwd_weight, power_2_scale=True)
+    inputs = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16)
+
+    def forward(module: Any, value: Any, first: bool | None) -> Any:
+        extra = ([128, 128],) if layer == "GroupedLinear" else ()
+        return module(value, *extra, is_first_microbatch=first)
+
+    # First recreate a row-only cache for dgrad, then update a complete cache
+    # without gradients and reuse its refreshed column layout for dgrad.
+    for step, (grad, first) in enumerate(((False, True), (True, False), (False, True), (True, False))):
+        if step == 2:
+            with torch.no_grad():
+                for key in keys:
+                    weight = getattr(actual, key)
+                    weight.add_(torch.randn_like(weight) * 0.01)
+                    getattr(reference, key).copy_(weight)
+        previous = [actual._fp8_workspaces.get(key) for key in keys]
+        actual.zero_grad(set_to_none=True)
+        reference.zero_grad(set_to_none=True)
+        left_input = inputs.detach().clone().requires_grad_(grad)
+        right_input = inputs.detach().clone().requires_grad_(grad)
+        with torch.set_grad_enabled(grad):
+            with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                left = forward(actual, left_input, first)
+                if grad:
+                    left.float().square().mean().backward()
+            with te.fp8_autocast(enabled=True, fp8_recipe=expected_recipe):
+                right = forward(reference, right_input, None)
+                if grad:
+                    right.float().square().mean().backward()
+        assert torch.equal(left, right), (layer, step, "output")
+        if grad:
+            assert torch.equal(left_input.grad, right_input.grad), (layer, step, "dgrad")
+            for name, parameter in actual.named_parameters():
+                assert torch.equal(parameter.grad, reference.get_parameter(name).grad), (layer, step, name)
+        for key, old in zip(keys, previous):
+            cached = actual._fp8_workspaces[key]
+            if step == 0:
+                assert cached._columnwise_data is None
+            else:
+                assert cached._rowwise_data is not None and cached._columnwise_data is not None
+                assert (cached is old) == (step != 1)
+        assert all(
+            not quantizer.force_pow_2_scales
+            for scope in ("scaling_fwd", "scaling_bwd")
+            for quantizer in actual.quantizers.get(scope, ())
+            if quantizer is not None and hasattr(quantizer, "force_pow_2_scales")
+        )
+        assert all(not getattr(recipe, name).power_2_scale for name in fields)
+
+
 @pytest.mark.parametrize("mode", ["native", "stock_fp8"])
 def test_provider_mode_selects_compute_and_optional_quantizers(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     globals_module = pytest.importorskip("megatron.training.global_vars")
