@@ -6,6 +6,8 @@
 # See the repository root LICENSE for the full license text.
 from __future__ import annotations
 
+import inspect
+import json
 from pathlib import Path
 from typing import Any, Union
 
@@ -207,8 +209,22 @@ class SenseNovaU1ImagePipeline(BasePipeline):
         shards = sorted(Path(model_path).glob("model*.safetensors"))
         if not shards:
             raise FileNotFoundError(model_path)
+        config = json.loads((Path(model_path) / "config.json").read_text())
+        model_config = {**config.get("llm_config", {}), **config}
+        vision_config = config.get("vision_config", {})
+        for source, target in (
+            ("hidden_size", "vision_hidden_size"),
+            ("rope_theta_vision", "rope_theta_vision"),
+            ("max_position_embeddings_vision", "max_position_embeddings_vision"),
+            ("num_channels", "num_channels"),
+        ):
+            if source in vision_config:
+                model_config[target] = vision_config[source]
+        model_config = {
+            key: model_config[key] for key in inspect.signature(SenseNovaU1DiT).parameters if key in model_config
+        }
         with init_empty_weights(include_buffers=False):
-            pipe.dit = SenseNovaU1DiT()
+            pipe.dit = SenseNovaU1DiT(**model_config)
         state = {}
         for shard in shards:
             values = load_file(str(shard), device="cpu")
@@ -332,6 +348,29 @@ class SenseNovaU1ImageUnit_EditImageEmbedder(PipelineUnit):
 
 
 class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
+    # Only this adapter serializes the model-specific mutable cache class.
+    # The public cache stores a plain tensor tree and never imports SenseNova.
+    frozen_condition_schema = "sensenova-prefix-kv-indexes-v1"
+
+    @staticmethod
+    def pack_frozen_conditions(outputs: dict[str, Any]) -> dict[str, Any]:
+        cache = outputs["past_key_values"]
+        return {
+            "kv": tuple((layer.keys, layer.values) for layer in cache.layers),
+            "indexes_image": outputs["indexes_image"],
+        }
+
+    @staticmethod
+    def unpack_frozen_conditions(payload: dict[str, Any]) -> dict[str, Any]:
+        from transformers.cache_utils import DynamicCache
+
+        # A fresh container for every consumer. update_cache=False in the
+        # generation forward also prevents appending generation tokens here.
+        cache = DynamicCache()
+        for index, (keys, values) in enumerate(payload["kv"]):
+            cache.update(keys, values, index, cache_kwargs=None)
+        return {"past_key_values": cache, "indexes_image": payload["indexes_image"]}
+
     def __init__(self) -> None:
         super().__init__(
             seperate_cfg=True,

@@ -5,9 +5,12 @@
 head 无需挂载模型和原始图片。模型目录、metadata 和图片必须在所有训练 worker 上可见，
 checkpoint 输出目录必须跨 worker 共享。
 
-当前模型适配为 SenseNova U1.5 MoT Edit，支持全参或 LoRA、单张 source 条件图，
+SenseNova U1.5 MoT Edit 适配支持全参或 LoRA、单张 source 条件图，
 以及按顺序提供 source 和 glyph 两张条件图。target 图片是监督目标，不计入条件图数量。
 1024² 是像素预算，图片保持长宽比并对齐到模型 patch 大小。
+
+新增的 Qwen-Image-Edit 适配支持 LoRA 和单张条件图。两个适配器都可按需启用
+[冻结条件特征缓存](./frozen-condition-cache.md)，复用冻结编码器的结果。
 
 ## 数据
 

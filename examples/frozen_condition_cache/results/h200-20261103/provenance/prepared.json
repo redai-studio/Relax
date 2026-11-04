@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "state": "READY",
+  "models": {
+    "sensenova": {
+      "path": "<PATH_0004>",
+      "identity": "4df2c617622be0aa9a776cfaba1afbeeb26ebf12f5f5736953856fb0bbaf39f2",
+      "revision": "bfa9b436503cb8aed4f2bc60e3236710cc77468d",
+      "receipt": "<PATH_0041>"
+    },
+    "qwen_edit": {
+      "path": "<PATH_0017>",
+      "identity": "8e5978f1f40129da6348bc9aebca1a8bd879d80d07cc1e7eabcda313272fbc1a",
+      "revision": "ac7f9318f633fc4b5778c59367c8128225f1e3de",
+      "receipt": "<PATH_0042>"
+    }
+  },
+  "data": {
+    "root": "<PATH_0003>",
+    "high128": "<PATH_0043>",
+    "low1024": "<PATH_0044>",
+    "debug8": "<PATH_0045>",
+    "identity": "808ae38d70d0513a69a8f1f68545fca2a3515776d86bb2e670aadc217a6afcf7",
+    "receipt": "<PATH_0046>"
+  },
+  "input_manifest_sha256": "34665003a9b902998cd65c3bf82bae4cdf1f5138690e808d7761f6ab8a0c561d",
+  "all_assets_downloaded_and_verified": true
+}

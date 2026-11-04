@@ -1,0 +1,25 @@
+# Standalone native SFT path. No Ray/SGLang/TransformerEngine build required.
+# Torch and torchvision are installed separately from the official cu128 index.
+diffusers @ git+https://github.com/huggingface/diffusers.git@d791c5c024014784df4a8dac2601e19fb4d300fc
+transformers==4.57.1
+peft==0.20.0
+accelerate==1.11.0
+huggingface-hub==0.36.0
+tokenizers==0.22.1
+safetensors==0.6.2
+numpy==1.26.4
+pillow==11.3.0
+einops==0.8.1
+pyarrow==21.0.0
+packaging==25.0
+psutil==7.1.0
+pyyaml==6.0.3
+omegaconf==2.3.0
+hydra-core==1.3.2
+jinja2==3.1.6
+tqdm==4.67.1
+requests==2.32.5
+httpx==0.28.1
+protobuf==6.33.0
+sentencepiece==0.2.1
+pytest==8.4.2

@@ -1,0 +1,98 @@
+{
+  "world_size_per_model": 1,
+  "concurrent_model_lanes": 2,
+  "performance_execution": "User authorizes two cards. Two independent world1 performance lanes concurrently, not two-GPU distributed speedup. Same GPU/CPU affinity and original AB/BA/AB order within each workload; host memory bandwidth remains shared. Report concurrency explicitly.",
+  "numerical_provenance": "Reused same-source SHA-verified full numerical matrix from performance03/work",
+  "segments": [
+    {
+      "stage": "sensenova_repeated-pair1-a",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_repeated-pair1-b",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_repeated-pair2-b",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_repeated-pair2-a",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_repeated-pair3-a",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_repeated-pair3-b",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "qwen_edit_repeated-pair1-a",
+      "physical_gpu_index": 3,
+      "cpu_affinity": "60-79"
+    },
+    {
+      "stage": "qwen_edit_repeated-pair1-b",
+      "physical_gpu_index": 3,
+      "cpu_affinity": "60-79"
+    },
+    {
+      "stage": "qwen_edit_repeated-pair2-b",
+      "physical_gpu_index": 3,
+      "cpu_affinity": "60-79"
+    },
+    {
+      "stage": "qwen_edit_repeated-pair2-a",
+      "physical_gpu_index": 3,
+      "cpu_affinity": "60-79"
+    },
+    {
+      "stage": "qwen_edit_repeated-pair3-a",
+      "physical_gpu_index": 3,
+      "cpu_affinity": "60-79"
+    },
+    {
+      "stage": "qwen_edit_repeated-pair3-b",
+      "physical_gpu_index": 3,
+      "cpu_affinity": "60-79"
+    },
+    {
+      "stage": "sensenova_low_reuse-pair1-a",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_low_reuse-pair1-b",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_low_reuse-pair2-b",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_low_reuse-pair2-a",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_low_reuse-pair3-a",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    },
+    {
+      "stage": "sensenova_low_reuse-pair3-b",
+      "physical_gpu_index": 2,
+      "cpu_affinity": "40-59"
+    }
+  ]
+}
