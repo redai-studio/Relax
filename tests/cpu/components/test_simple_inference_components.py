@@ -6,6 +6,7 @@ dependencies."""
 import ast
 import asyncio
 import threading
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -59,7 +60,8 @@ def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(h
     actor = component_methods(
         "actor.py",
         "Actor",
-        ["_background_run"],
+        ["_background_run", "_run_training_step"],
+        suppress=suppress,
         build_async_train_data_fields=lambda config: ["advantages"],
         build_data_fields=lambda config, **kwargs: ["tokens"],
         sft_partition_ids=lambda config, step: [f"train_{step}"],
@@ -93,7 +95,11 @@ def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(h
 def test_actor_failure_pauses_before_leaving_and_is_not_swallowed_by_health_check():
     events = []
     actor = component_methods(
-        "actor.py", "Actor", ["_background_run"], build_async_train_data_fields=lambda config: ["advantages"]
+        "actor.py",
+        "Actor",
+        ["_background_run", "_run_training_step"],
+        suppress=suppress,
+        build_async_train_data_fields=lambda config: ["advantages"],
     )
     actor.config = SimpleNamespace(num_rollout=1, fully_async=True, use_health_check=True)
     actor.step = 0

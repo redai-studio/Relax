@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import threading
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -60,8 +61,14 @@ def actor_fixture(health=True, fail=True, report_fail=False):
         ray=SimpleNamespace(get=get),
         sft_partition_ids=lambda *args: [],
         run=asyncio.run,
+        suppress=suppress,
     )
-    cls = load_methods("relax/components/actor.py", "Actor", {"run", "_background_run", "_reset_consumption"}, ns)
+    cls = load_methods(
+        "relax/components/actor.py",
+        "Actor",
+        {"run", "_background_run", "_reset_consumption", "_run_training_step"},
+        ns,
+    )
     actor = cls()
     actor.config = SimpleNamespace(num_rollout=2, fully_async=True, use_health_check=health)
     actor._recovery = RecoveryGate(actor.config, "actor")
