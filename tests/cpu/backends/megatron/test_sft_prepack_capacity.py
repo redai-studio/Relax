@@ -121,11 +121,12 @@ def test_prepack_executes_central_plan_with_variable_local_rows(partitioning, ra
 
     from relax.utils.data.flops_balancing import STEP_PLANS_FIELD, encode_schedule, local_schedule, restore_schedule
 
-    geometry = dict(version=4, capacity=5, microbatch_group_size=1, context_parallel_size=1, pipeline_stages=1)
-    metadata = {i: dict(total_lengths=1, flops_cost=9.0 if i == 5 else 1.0) for i in range(6)}
+    lengths = [9, 6, 6, 3, 3, 8]
+    geometry = dict(version=4, capacity=12, microbatch_group_size=1, context_parallel_size=1, pipeline_stages=1)
+    metadata = {i: dict(total_lengths=n, flops_cost=n + n * n) for i, n in enumerate(lengths)}
     assignments, updates = encode_schedule(list(range(6)), metadata, geometry, 2, 6, ("p", "sft_train", 0))
     rows = assignments[rank]
-    batch = dict(total_lengths=[1] * len(rows), ids=rows)
+    batch = dict(total_lengths=[lengths[i] for i in rows], ids=rows)
     restore_schedule(
         SimpleNamespace(global_indexes=rows, get_all_custom_meta=lambda: [updates[i] for i in rows]), batch
     )
@@ -166,13 +167,13 @@ def test_prepack_executes_central_plan_with_variable_local_rows(partitioning, ra
     _execute([select, method], partitioning)
     owner = SimpleNamespace(
         args=SimpleNamespace(
-            balance_by_flops=True, use_dynamic_batch_size=True, loss_type="sft", max_tokens_per_gpu=5
+            balance_by_flops=True, use_dynamic_batch_size=True, loss_type="sft", max_tokens_per_gpu=12
         ),
         _sft_prepack_local_batch_size=lambda: 3,
         _sft_prefetch_stream=object(),
         _sft_device="cpu",
     )
     result = partitioning["_pack_sft_prepack_window"](owner, 0, batch, 0.0, 0.0)
-    assert captured == [rows]
-    assert len(result.packed_micro_batches) == 1
-    assert len(rows) == (1 if rank == 0 else 5)
+    assert captured == [[[1, 3], [4, 5]], [[2], [0]]][rank]
+    assert len(result.packed_micro_batches) == 2
+    assert len(rows) == (4 if rank == 0 else 2)

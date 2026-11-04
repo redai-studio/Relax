@@ -41,21 +41,23 @@ def _worker(rank, rendezvous, native):
             mpu.get_context_parallel_world_size = lambda: 1
         patches.setattr(data.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
         args = SimpleNamespace(
-            balance_by_flops=True, global_batch_size=6, use_dynamic_batch_size=True, max_tokens_per_gpu=5
+            balance_by_flops=True, global_batch_size=6, use_dynamic_batch_size=True, max_tokens_per_gpu=12
         )
         dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
-        metadata = {i: dict(total_lengths=1, flops_cost=9.0 if i == 5 else 1.0) for i in range(6)}
-        geometry = dict(version=4, capacity=5, microbatch_group_size=1, context_parallel_size=1, pipeline_stages=1)
+        lengths = [9, 6, 6, 3, 3, 8]
+        metadata = {i: dict(total_lengths=n, flops_cost=n + n * n) for i, n in enumerate(lengths)}
+        geometry = dict(version=4, capacity=12, microbatch_group_size=1, context_parallel_size=1, pipeline_stages=1)
         ranks, updates = encode_schedule(list(range(6)), metadata, geometry, 2, 6, ("p", "actor_train", 0))
         ids = ranks[dp_rank]
-        rollout = dict(total_lengths=[1] * len(ids), ids=ids)
+        rollout = dict(total_lengths=[lengths[i] for i in ids], ids=ids)
         meta = SimpleNamespace(global_indexes=ids, get_all_custom_meta=lambda: [updates[i] for i in ids])
         restore_schedule(meta, rollout)
         iterators, counts = data.get_data_iterator(args, [], rollout)
-        assert counts == [1]
-        assert iterators[0].get_next(["ids"])["ids"] == ids
+        assert counts == [2]
+        expected = [[[1, 3], [4, 5]], [[2], [0]]][dp_rank]
+        assert [iterators[0].get_next(["ids"])["ids"] for _ in range(2)] == expected
         assert rollout[data.ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] == [6]
-        assert len(ids) == (1 if dp_rank == 0 else 5)
+        assert len(ids) == (4 if dp_rank == 0 else 2)
         bad = copy.deepcopy(rollout)
         if rank == 0:
             bad[STEP_PLANS_FIELD][0]["indices"] = [[0, 0]]
