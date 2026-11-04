@@ -148,7 +148,8 @@ if [[ -n "${RELAX_SFT_DATA_NODE_IP:-}" ]]; then
   DATA_NODE_RESOURCES=$(python3 -c 'import json, os; print(json.dumps({"node:" + os.environ["RELAX_SFT_DATA_NODE_IP"]: 0.001}))')
   RAY_ARGS+=(--entrypoint-resources "$DATA_NODE_RESOURCES")
 fi
-[[ -z "${SUBMISSION_ID:-}" ]] || RAY_ARGS+=(--submission-id "$SUBMISSION_ID")
+SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
+RAY_ARGS+=(--submission-id "$SUBMISSION_ID")
 [[ -z "${RAY_NO_WAIT}" ]] || RAY_ARGS+=(--no-wait)
 [[ -z "${WORKING_DIR:-}" ]] || RAY_ARGS+=(--working-dir "$WORKING_DIR")
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
@@ -161,3 +162,4 @@ fi
 : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray Jobs HTTP URL}"
 mkdir -p "$SCRIPT_DIR/log"
 ray "${RAY_ARGS[@]}" -- python3 -m relax.entrypoints.train "${ARGS[@]}" 2>&1 | tee "$SCRIPT_DIR/log/$EXP_NAME-$now.log"
+bash "$RELAX/scripts/entrypoint/check-ray-job-status.sh" "$RAY_ADDRESS" "$SUBMISSION_ID"

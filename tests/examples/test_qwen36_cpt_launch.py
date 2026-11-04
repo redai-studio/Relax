@@ -107,16 +107,59 @@ def test_cpt_launch_rejects_invalid_configuration(name, value):
 
 
 @pytest.mark.parametrize(
-    "submit_code,no_wait",
-    [(0, ""), (7, ""), (0, "1"), (7, "1")],
+    "submit_code,no_wait,status,expected",
+    [
+        (0, "", "SUCCEEDED", 0),
+        (0, "", "STOPPED", 1),
+        (0, "", "FAILED", 1),
+        (0, "", "RUNNING", 1),
+        (0, "", "ERROR", 1),
+        (7, "", "SUCCEEDED", 7),
+        (0, "1", "ERROR", 0),
+        (7, "1", "ERROR", 7),
+    ],
 )
-def test_cpt_submission_propagates_ray_exit_status(tmp_path, submit_code, no_wait):
-    path = tmp_path / "ray"
+@pytest.mark.parametrize(
+    "script",
+    [
+        SCRIPT,
+        ROOT / "scripts/training/sft/run-qwen35-optimized-64xblackwell.sh",
+        ROOT / "scripts/training/sft/run-qwen3.5-397B-A17B-sft-64xblackwell.sh",
+        ROOT / "examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh",
+    ],
+)
+def test_submission_requires_successful_terminal_status(tmp_path, script, submit_code, no_wait, status, expected):
+    # Stub the SDK so these launcher-tail tests cannot contact a cluster.
+    package = tmp_path / "ray"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "job_submission.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "class JobStatus:\n    SUCCEEDED = 'SUCCEEDED'\n"
+        "class JobSubmissionClient:\n"
+        "    def __init__(self, address):\n        assert address == 'http://ray-test'\n"
+        "    def get_job_status(self, job_id):\n"
+        "        Path(os.environ['STATUS_RECORD']).write_text(job_id)\n"
+        "        if os.environ['JOB_STATUS'] == 'ERROR':\n            raise RuntimeError('query failed')\n"
+        "        return os.environ['JOB_STATUS']\n"
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    path = bin_dir / "ray"
     path.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$RAY_RECORD"\nexit "$SUBMIT_CODE"\n')
     path.chmod(0o755)
     environment = dict(
         os.environ,
-        PATH=f"{tmp_path}:{os.environ['PATH']}",
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        PYTHONPATH=str(tmp_path),
+        RELAX=str(ROOT),
+        RAY_ADDRESS="http://ray-test",
+        JOB_STATUS=status,
+        STATUS_RECORD=str(tmp_path / "status-record"),
+        EXP_NAME="test",
+        now="test",
+        DRY_RUN="0",
+        RELAX_SFT_DATA_NODE_IP="",
         SUBMISSION_ID="fixed-child",
         RAY_JOBS_ADDRESS="http://ray-test",
         RUNTIME_ENV_JSON="{}",
@@ -127,13 +170,20 @@ def test_cpt_submission_propagates_ray_exit_status(tmp_path, submit_code, no_wai
         RAY_RECORD=str(tmp_path / "ray-args"),
         SUBMIT_CODE=str(submit_code),
     )
-    fragment = "set -euo pipefail\nTRAIN_ARGS=(python3 -m relax.entrypoints.train)\n"
-    fragment += "RAY_ARGS=(job submit" + SCRIPT.read_text().split("RAY_ARGS=(job submit", 1)[1]
+    fragment = "set -euo pipefail\nTRAIN_ARGS=(python3 -m relax.entrypoints.train)\nARGS=()\n"
+    source = script.read_text()
+    marker = "RAY_ARGS=(job submit" if "RAY_ARGS=(job submit" in source else ': "${RAY_JOBS_ADDRESS:?'
+    fragment += marker + source.rsplit(marker, 1)[1]
     result = subprocess.run(["bash", "-c", fragment], env=environment, capture_output=True, text=True)
-    assert result.returncode == submit_code, result.stderr
+    assert result.returncode == expected, result.stderr
+    record = tmp_path / "status-record"
+    if submit_code == 0 and not no_wait:
+        assert record.read_text() == "fixed-child"
+    else:
+        assert not record.exists()
     args = (tmp_path / "ray-args").read_text().splitlines()
     assert args.count("job") == 1
-    assert "--submission-id=fixed-child" in args
+    assert "--submission-id=fixed-child" in args or args[args.index("--submission-id") + 1] == "fixed-child"
     assert "--working-dir" in args and "/source with spaces" in args
     assert ("--no-wait" in args) == bool(no_wait)
 
