@@ -21,6 +21,7 @@ PROJECT_NAME="${PROJECT_NAME:-Relax/rl/delta-weight-sync}"
 EXP_NAME="${EXP_NAME:-qwen3-0.6b-dapo-8xgpu-disk-sync}"
 now=$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "${SAVE_DIR}/logs" "${SAVE_DIR}/tmp" "${SAVE_DIR}/cache"
+SAVE_DIR="$(cd -- "${SAVE_DIR}" && pwd -P)"
 
 # Carry every cache/temp destination into remote workers, not just the submitter.
 RUNTIME_ENV_JSON=$(SAVE_DIR="${SAVE_DIR}" python - <<'PY'
@@ -132,7 +133,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} \
    --submission-id="${SUBMISSION_ID:-${EXP_NAME}-${now}}" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 -m relax.entrypoints.train \
+   -- env -C "${SAVE_DIR}" python3 -m relax.entrypoints.train \
    --resource '{"actor": [1, 4], "rollout": [1, 4]}' \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4 \
