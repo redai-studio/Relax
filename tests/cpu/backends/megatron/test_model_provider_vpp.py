@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from relax.utils.misc import resolve_is_vl_model
 from relax.utils.training import ppo_utils
 
 
@@ -104,6 +105,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     tokenizer._vocab_size_with_padding = lambda *args, **kwargs: None
     bridge.AutoBridge = _FakeAutoBridge
     misc.load_function = lambda path: None
+    misc.resolve_is_vl_model = resolve_is_vl_model
 
     modules = {
         "megatron": megatron,
@@ -197,6 +199,29 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.virtual_pipeline_model_parallel_size == 2
     assert provider.finalized
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+@pytest.mark.parametrize("path", ["bridge", "custom", "raw"])
+@pytest.mark.parametrize("processor", [False, True])
+@pytest.mark.parametrize("declared", [None, False, True])
+def test_model_routing_is_resolved_before_model_construction(monkeypatch, tmp_path, path, processor, declared):
+    if processor:
+        (tmp_path / "processor_config.json").write_text("{}")
+    provider = _FakeProvider()
+    provider.relax_is_multimodal = declared
+    module, provider = _load_model_provider(monkeypatch, provider)
+    args = _bridge_args(
+        hf_checkpoint=str(tmp_path),
+        megatron_to_hf_mode="raw" if path == "raw" else "bridge",
+        custom_model_provider_path="custom.provider" if path == "custom" else None,
+        is_vl_model=not processor,
+        uses_unsplit_forward=True,
+    )
+    module.get_model_provider_func(args)
+    expected = declared if path == "bridge" and declared is not None else processor
+    assert args.is_vl_model is expected
+    assert args.uses_unsplit_forward is True
+    assert provider.calls == []
 
 
 def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
@@ -709,6 +734,19 @@ def test_bridge_forwards_blackwell_runtime_configuration(monkeypatch, name, valu
     module, provider = _load_model_provider(monkeypatch, provider)
     module.get_model_provider_func(_bridge_args(**{name: value}))(pre_process=True, post_process=True)
     assert getattr(provider, name) == value
+
+
+@pytest.mark.parametrize("max_tokens,alignment", [(65536, 8), (4096, 16)])
+def test_bridge_provider_receives_packed_sequence_limits(monkeypatch, max_tokens, alignment):
+    provider = _FakeProvider()
+    provider.max_seqlen_per_dp_cp_rank = 2048
+    provider.pad_packed_seq_alignment = 1
+    module, provider = _load_model_provider(monkeypatch, provider=provider)
+    module.get_model_provider_func(
+        _bridge_args(max_seqlen_per_dp_cp_rank=max_tokens, pad_packed_seq_alignment=alignment)
+    )
+    assert provider.max_seqlen_per_dp_cp_rank == max_tokens
+    assert provider.pad_packed_seq_alignment == alignment
 
 
 def test_bridge_provider_preserves_native_offload_policy(monkeypatch):
