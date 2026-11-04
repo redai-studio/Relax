@@ -155,6 +155,7 @@ def parallel_ranks() -> dict[str, int]:
         "pp": mpu.get_pipeline_model_parallel_rank(),
         "cp": mpu.get_context_parallel_rank(),
         "ep": mpu.get_expert_model_parallel_rank(),
+        "ep_group": mpu.get_expert_model_parallel_src_rank(),
     }
 
 

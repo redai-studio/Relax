@@ -437,6 +437,59 @@ def test_late_arrival_under_overlapped_grad_reduce_shows_in_the_peers_backward()
     assert report.metrics["straggler/late/peer_idle_ms"] == pytest.approx(158.0)
 
 
+def test_late_arrival_under_ep_shows_as_a_forward_shorter_than_its_ep_peers():
+    # DeepSeek-V2-Lite cut to 4 layers, DP8 x EP8, rank 3 sleeping 200 ms before each step: the
+    # peers wait for it in the first MoE all-to-all of their forward and the grad-sync lines up.
+    table = [_healthy_row(fwd=384.0, bwd=318.0, optim=7.0, dp_grad_sync=5.0) for _ in range(8)]
+    table[3] = _healthy_row(fwd=187.0, bwd=318.0, optim=7.0, dp_grad_sync=5.0)
+    report = _analyze_once(table, _meta(8, ep_size=8))
+    assert _reasons(report) == [(3, "late_arrival")]
+    assert "its expert-parallel peers wait 197.0 ms/step for it inside their forward" in report.alerts[0].message
+    assert "its forward is 0.49x theirs" in report.alerts[0].message
+
+
+def test_ep_peers_that_wait_for_a_late_rank_in_their_forward_are_not_culprits():
+    # DP8 x EP4, rank 3 late: ranks 0-2 wait for it in their forward, ranks 4-7 (the other EP
+    # group) in the overlapped grad reduce of their backward, so all of 0-3 reach the grad-sync late.
+    table = [_healthy_row(fwd=384.0, bwd=318.0) for _ in range(3)]
+    table += [_healthy_row(fwd=187.0, bwd=318.0)]
+    table += [_healthy_row(fwd=187.0, bwd=518.0) for _ in range(4)]
+    report = _analyze_once(table, _meta(8, ep_size=4))
+    assert _reasons(report) == [(3, "late_arrival")]
+    assert "its expert-parallel peers wait 197.0 ms/step" in report.alerts[0].message
+
+
+def test_a_shorter_forward_under_ep_from_fewer_tokens_is_not_late_arrival():
+    # Fewer tokens shorten the part of the forward after the last all-to-all (head, loss); nobody waits.
+    table = [_healthy_row(fwd=300.0, bwd=400.0) for _ in range(8)]
+    table[2] = _healthy_row(fwd=255.0, bwd=400.0, tokens=5600.0)
+    assert _analyze_once(table, _meta(8, ep_size=8)).alerts == []
+
+
+def test_slow_device_under_ep_is_not_mistaken_for_late_ep_peers():
+    # OpenSeek-Small DP8 x EP8 with GPU 5's SMs contended: the all-to-alls even out most of the
+    # forward, the part after the last one still shows rank 5; its peers' forwards are not short.
+    table = [_healthy_row(fwd=392.0, bwd=945.0, optim=5.0, dp_grad_sync=8.0) for _ in range(8)]
+    table[5] = _healthy_row(fwd=558.0, bwd=947.0, optim=5.0, dp_grad_sync=8.0)
+    assert _reasons(_analyze_once(table, _meta(8, ep_size=8))) == [(5, "slow_device")]
+
+
+def test_rank_late_to_its_ep_peers_because_it_waits_on_pp_is_upstream_wait():
+    # PP2 x DP4 x EP4: rank 5 receives its activations 200 ms later than the rest of stage 1.
+    table = [_healthy_row() for _ in range(4)]
+    table += [_healthy_row(fwd=384.0, bwd=318.0, pp_recv=50.0) for _ in range(4)]
+    table[5] = _healthy_row(fwd=187.0, bwd=318.0, pp_recv=250.0)
+    report = _analyze_once(table, _meta(8, pp_size=2, ep_size=4))
+    assert _reasons(report) == [(5, "upstream_wait")]
+
+
+def test_ranks_without_an_ep_group_are_not_compared_on_forward():
+    no_ep = [RankMeta(rank=r, dp=r, tp=0, pp=0) for r in range(8)]
+    table = [_healthy_row(fwd=384.0, bwd=318.0) for _ in range(8)]
+    table[3] = _healthy_row(fwd=187.0, bwd=318.0)
+    assert _analyze_once(table, no_ep).alerts == []
+
+
 def _slow_tp_pair_4b():
     # Qwen3-4B TP2 x PP2 x DP2 with SM contention on GPU 1 (numbers from that run): ranks 0 / 1
     # (dp0, stage 0) are slow, so they hardly wait on PP; ranks 2 / 3 wait as usual

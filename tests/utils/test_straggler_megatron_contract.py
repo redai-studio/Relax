@@ -48,6 +48,7 @@ _FUNCTIONS = (
     ("parallel_state.py", "get_pipeline_model_parallel_rank", (), ()),
     ("parallel_state.py", "get_context_parallel_rank", (), ()),
     ("parallel_state.py", "get_expert_model_parallel_rank", (), ()),
+    ("parallel_state.py", "get_expert_model_parallel_src_rank", (), ()),
     ("parallel_state.py", "is_pipeline_last_stage", (), ()),
 )
 # Model config fields the schedule table reads, and the classes that declare them.

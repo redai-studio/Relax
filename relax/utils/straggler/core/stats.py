@@ -157,6 +157,9 @@ class RankMeta:
     pp: int
     cp: int = 0
     ep: int = 0
+    # Global rank of the first member of its expert-parallel group (the ranks of
+    # one MoE all-to-all); -1 when not known.
+    ep_group: int = -1
     host: str = ""
     device: int = -1
     # The rank that logs metrics and receives the sampled-step traces.

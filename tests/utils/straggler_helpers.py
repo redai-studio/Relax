@@ -102,15 +102,19 @@ def bracket(collector, name="forward-compute", phase="train"):
     timer.stop()
 
 
-def meta(world, pp_size=1, tp_size=1):
-    """``world`` ranks laid out as PP stages of equal size, TP fastest."""
+def meta(world, pp_size=1, tp_size=1, ep_size=1):
+    """``world`` ranks laid out as PP stages of equal size, TP fastest, EP
+    groups of ``ep_size`` consecutive DP ranks."""
     ranks_per_stage = world // pp_size
+    dp = [(r % ranks_per_stage) // tp_size for r in range(world)]
     return [
         RankMeta(
             rank=r,
-            dp=(r % ranks_per_stage) // tp_size,
+            dp=dp[r],
             tp=r % tp_size,
             pp=r // ranks_per_stage,
+            ep=dp[r] % ep_size,
+            ep_group=r - dp[r] % ep_size * tp_size,
             host=f"h{r // 8}",
             device=r % 8,
         )
