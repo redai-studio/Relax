@@ -3,6 +3,8 @@
 models."""
 
 import asyncio
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -125,7 +127,54 @@ def finish(controller, thread):
     assert not thread.is_alive()
 
 
-def test_two_real_ray_rebuilds_use_real_worker_completions_and_keep_http(cluster):
+def _run_isolated_ray_case(case: str) -> None:
+    """Own Ray only in the child, preserving any cluster used by the suite."""
+    was_initialized = ray.is_initialized()
+    parent_job_id = ray.get_runtime_context().get_job_id() if was_initialized else None
+    child_env = os.environ.copy()
+    child_env.pop("RAY_ADDRESS", None)
+    existing_pythonpath = child_env.get("PYTHONPATH")
+    child_env["PYTHONPATH"] = str(ROOT) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                f"{Path(__file__).resolve()}::{case}",
+                "-o",
+                "python_functions=check_*",
+                "-q",
+                "--disable-warnings",
+            ],
+            cwd=ROOT,
+            env=child_env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"Ray case {case} timed out\nstdout:\n{exc.stdout}\nstderr:\n{exc.stderr}", pytrace=False)
+    output = completed.stdout + completed.stderr
+    assert ray.is_initialized() == was_initialized, output
+    if was_initialized:
+        assert ray.get_runtime_context().get_job_id() == parent_job_id, output
+        marker = {"ray_parent_probe": "still-owned"}
+        assert ray.get(ray.put(marker)) == marker, output
+    assert completed.returncode == 0, output
+    assert "1 passed" in completed.stdout and " skipped" not in completed.stdout, output
+
+
+def test_two_real_ray_rebuilds_use_real_worker_completions_and_keep_http():
+    _run_isolated_ray_case("check_two_real_ray_rebuilds_use_real_worker_completions_and_keep_http")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_health_and_training_threads_complete_actual_global_restart(enabled):
+    _run_isolated_ray_case(f"check_native_health_and_training_threads_complete_actual_global_restart[{enabled}]")
+
+
+def check_two_real_ray_rebuilds_use_real_worker_completions_and_keep_http(cluster):
     runtime = FaultEventRuntime()
     server = FaultQueryServer(runtime)
     controller = cpu_controller_class(cluster, LocalServe())(
@@ -194,7 +243,7 @@ def test_two_real_ray_rebuilds_use_real_worker_completions_and_keep_http(cluster
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_native_health_and_training_threads_complete_actual_global_restart(cluster, enabled):
+def check_native_health_and_training_threads_complete_actual_global_restart(cluster, enabled):
     from relax.utils.async_utils import get_async_loop
 
     runtime = FaultEventRuntime() if enabled else None

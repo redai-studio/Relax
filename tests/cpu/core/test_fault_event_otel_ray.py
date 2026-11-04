@@ -193,6 +193,7 @@ def test_real_ray_source_context_reaches_driver_runtime_and_otlp_once():
         timeout=180,
     )
     output = completed.stdout + completed.stderr
+    assert ray.is_initialized() == was_initialized, output
     assert completed.returncode == 0, output
     assert "1 passed" in completed.stdout and " skipped" not in completed.stdout, output
     if was_initialized:
