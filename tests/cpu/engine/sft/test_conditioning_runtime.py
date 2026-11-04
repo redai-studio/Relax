@@ -150,6 +150,7 @@ def test_cpu_hit_owns_storage_after_lease_closes(runtime_factory, monkeypatch):
 def _fake_cuda_events(runtime, monkeypatch, actions):
     runtime.device = torch.device("cuda:0")
     monkeypatch.setattr(runtime, "_resources", lambda **_kwargs: {})
+    state = {"ready": False}
 
     class Event:
         def __init__(self, **_kwargs):
@@ -157,38 +158,48 @@ def _fake_cuda_events(runtime, monkeypatch, actions):
 
         def record(self, stream=None):
             actions.append("event_record")
+            if state.pop("record_error", False):
+                raise RuntimeError("event recording failed")
 
-        def synchronize(self):
-            actions.append("event_wait")
+        def query(self):
+            actions.append("event_query")
+            if state.pop("query_error", False):
+                raise RuntimeError("event query failed")
+            return state["ready"]
 
-    def forbidden_sync(*_args, **_kwargs):
-        raise AssertionError("Cache copies must not synchronize the entire device")
+        def elapsed_time(self, end):
+            return 0.0
+
+    def synchronize(*_args, **_kwargs):
+        actions.append("device_sync")
+        if state.pop("sync_error", False):
+            raise KeyboardInterrupt("cleanup interrupted")
+        state["ready"] = True
 
     monkeypatch.setattr(conditioning.torch.cuda, "Event", Event)
     monkeypatch.setattr(conditioning.torch.cuda, "current_stream", lambda device: "copy-stream")
-    monkeypatch.setattr(conditioning.torch.cuda, "synchronize", forbidden_sync)
+    monkeypatch.setattr(conditioning.torch.cuda, "synchronize", synchronize)
+    return state
 
 
-@pytest.mark.parametrize("failure", ["copy", "restore"])
-def test_cuda_copy_failure_drains_event_before_lease_close_and_unanimous_fallback(
-    runtime_factory, monkeypatch, failure
-):
+@pytest.mark.parametrize("failure", ["copy", "restore", "record"])
+def test_cuda_copy_failure_retains_lease_until_close_and_unanimous_fallback(runtime_factory, monkeypatch, failure):
     runtime, _, _ = runtime_factory()
     actions = []
-    _fake_cuda_events(runtime, monkeypatch, actions)
+    state = _fake_cuda_events(runtime, monkeypatch, actions)
+    state["record_error"] = failure == "record"
     expected = torch.tensor([1.0, -2.0], dtype=torch.bfloat16)
 
     class Lease:
+        data = {"value": expected}
+
         def copy_to(self, device):
             actions.append("copy_enqueued")
             if failure == "copy":
                 raise RuntimeError("simulated partial H2D failure")
             return {"value": expected.clone(), "invalid_field": expected.clone()}, 2 * expected.nbytes
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
+        def close(self):
             actions.append("lease_close")
 
     monkeypatch.setattr(runtime.cache, "lookup", lambda key: Lease())
@@ -209,8 +220,9 @@ def test_cuda_copy_failure_drains_event_before_lease_close_and_unanimous_fallbac
     result = runtime.resolve(_spec(), compute, _restore)
     assert torch.equal(result["condition"], expected)
     assert votes == [False]
-    assert actions.index("event_record") < actions.index("event_wait") < actions.index("lease_close")
-    assert actions.index("lease_close") < actions.index("invalidate") < actions.index("compute")
+    assert "device_sync" not in actions and "lease_close" not in actions
+    assert len(runtime._pending_copies) == 1
+    assert (runtime._pending_copies[0][0] is None) == (failure == "record")
     assert actions.index("invalidate") < actions.index("vote") < actions.index("compute")
     assert runtime._step["cache_errors"] == 1
     assert (
@@ -218,25 +230,27 @@ def test_cuda_copy_failure_drains_event_before_lease_close_and_unanimous_fallbac
         == (0 if failure == "copy" else 2) * expected.numel() * expected.element_size()
     )
     assert runtime._step["h2d_enqueue_seconds"] >= 0
-    assert runtime._step["h2d_wait_seconds"] >= 0
+    assert runtime._step["h2d_wait_seconds"] == 0
+    runtime.close(0, status="error")
+    assert actions.index("compute") < actions.index("device_sync") < actions.index("lease_close")
+    assert not runtime._pending_copies
 
 
 def test_packed_copy_counts_actual_transfer_bytes_and_keeps_one_vote(runtime_factory, monkeypatch):
     runtime, _, _ = runtime_factory()
     actions, votes = [], []
-    _fake_cuda_events(runtime, monkeypatch, actions)
+    state = _fake_cuda_events(runtime, monkeypatch, actions)
     expected = torch.arange(4, dtype=torch.bfloat16)
 
     class Lease:
-        def __enter__(self):
-            return self
+        data = {"value": expected}
 
         def copy_to(self, device):
             assert device == torch.device("cuda:0")
             actions.append("packed_copy")
             return {"value": expected.clone()}, 4096
 
-        def __exit__(self, *_args):
+        def close(self):
             actions.append("lease_close")
 
     def vote(ready, group):
@@ -249,10 +263,95 @@ def test_packed_copy_counts_actual_transfer_bytes_and_keeps_one_vote(runtime_fac
     result = runtime.resolve(_spec(), lambda: pytest.fail("Packed hit must skip online encoding"), _restore)
     assert torch.equal(result["condition"], expected)
     assert votes == [True]
-    assert actions == ["packed_copy", "event_record", "event_wait", "lease_close", "vote"]
+    assert actions == ["packed_copy", "event_record", "vote"]
     assert runtime._step["condition_h2d_bytes"] == 4096
     assert runtime._step["cache_read_bytes"] == expected.numel() * expected.element_size()
     assert runtime._step["effective_hit"] == 1
+    runtime._release_copies()
+    assert "lease_close" not in actions
+    state["ready"] = True
+    runtime._release_copies()
+    assert actions[-1] == "lease_close" and not runtime._pending_copies
+    assert "device_sync" not in actions
+
+
+@pytest.mark.parametrize("limit", ["count", "bytes", "unknown", "close"])
+def test_pending_cuda_copies_bound_admission_without_invalidating(runtime_factory, monkeypatch, limit):
+    runtime, _, _ = runtime_factory()
+    actions, votes = [], []
+    state = _fake_cuda_events(runtime, monkeypatch, actions)
+    expected = torch.ones(4)
+    if limit == "bytes":
+        runtime._pending_copy_limit = 4
+        runtime.cache.max_bytes = expected.nbytes
+    elif limit in ("unknown", "close"):
+        runtime._pending_copy_limit = 4
+
+    class Lease:
+        data = {"value": expected}
+
+        def copy_to(self, device):
+            actions.append("copy")
+            return {"value": expected.clone()}, expected.nbytes
+
+        def close(self):
+            if state.pop("lease_error", False):
+                raise OSError("lease close interrupted")
+            actions.append("lease_close")
+
+    monkeypatch.setattr(runtime.cache, "lookup", lambda key: Lease())
+    monkeypatch.setattr(runtime.cache, "put", lambda *_args: pytest.fail("Bypass must not rewrite an existing entry"))
+    monkeypatch.setattr(runtime.cache, "invalidate", lambda key: pytest.fail("Capacity is not corruption"))
+    monkeypatch.setattr(conditioning, "unanimous_ready", lambda ready, group: votes.append(ready) or ready)
+    runtime.resolve(_spec(), lambda: pytest.fail("First hit should fit"), _restore)
+    state["query_error"] = limit == "unknown"
+    state["ready"] = state["lease_error"] = limit == "close"
+    runtime.resolve(_spec(), lambda: {"value": expected.clone()}, _restore)
+    assert votes == [True, False] and actions.count("copy") == 1
+    assert actions.count("lease_close") == 1  # Only the unsubmitted second lease.
+    assert len(runtime._pending_copies) == 1
+    assert "device_sync" not in actions
+    runtime.end_step(0, local_samples=1, loss=0.0)
+    assert actions.index("device_sync") < len(actions) - 1
+    assert actions[-1] == "lease_close" and not runtime._pending_copies
+
+
+@pytest.mark.parametrize("failure", ["sync", "lease_close"])
+def test_pending_cuda_close_retries_before_closing_cache(runtime_factory, monkeypatch, failure):
+    runtime, _, _ = runtime_factory()
+    actions = []
+    state = _fake_cuda_events(runtime, monkeypatch, actions)
+    state["sync_error"] = failure == "sync"
+
+    class Lease:
+        data = {"value": torch.ones(1)}
+        fail_close = failure == "lease_close"
+
+        def copy_to(self, device):
+            return {"value": self.data["value"].clone()}, 4
+
+        def close(self):
+            if self.fail_close:
+                self.fail_close = False
+                raise KeyboardInterrupt("cleanup interrupted")
+            actions.append("lease_close")
+
+    monkeypatch.setattr(runtime.cache, "lookup", lambda key: Lease())
+    close = runtime.cache.close
+
+    def close_cache():
+        actions.append("cache_close")
+        close()
+
+    monkeypatch.setattr(runtime.cache, "close", close_cache)
+    runtime.resolve(_spec(), lambda: pytest.fail("Expected hit"), _restore)
+    with pytest.raises(KeyboardInterrupt, match="cleanup interrupted"):
+        runtime.close(0, status="cancelled")
+    assert runtime._pending_copies and not runtime._closed
+    assert "lease_close" not in actions and "cache_close" not in actions
+    runtime.close(0, status="cancelled")
+    assert actions[-2:] == ["lease_close", "cache_close"]
+    assert not runtime._pending_copies and runtime._closed
 
 
 def test_local_hit_with_missing_peer_forces_online_but_preserves_entry(runtime_factory, monkeypatch):

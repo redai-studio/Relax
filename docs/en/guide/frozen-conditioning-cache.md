@@ -43,7 +43,7 @@ All ranks in the parameter-sharding group agree before skipping an encoder. Any 
 
 ## Capacity, ownership and release
 
-Workers in one attempt share immutable safetensors payloads on each node. Every new lookup verifies the file SHA and preserves tensor dtype. The caller borrows a lease; eviction cannot remove a borrowed entry. GPU copies belong to the current forward, and the runtime waits for copy completion before returning the lease. There is no persistent GPU feature cache.
+Workers in one attempt share immutable safetensors payloads on each node. Every new lookup verifies the file SHA and preserves tensor dtype. The caller borrows a lease; eviction cannot remove a borrowed entry. GPU copies belong to the current forward. The runtime retains source leases until completion events are ready, without waiting on each hit, and drains them at step end or shutdown. Pending copies per rank are limited to its effective-batch sample count and the payload byte budget; insufficient capacity falls back online. There is no persistent GPU feature cache.
 
 The payload cap includes committed, leased and pending files. LRU evicts only unborrowed entries; oversized entries or insufficient capacity bypass caching. Writer staging has a separate bound equal to the payload budget, checked before CPU copies. Optional SenseNova prefetch has its own per-worker byte/depth bounds and drains before storage closes. Hints only schedule reads; actual forward rebuilds dependencies and checks frozen state.
 

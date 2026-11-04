@@ -4,6 +4,7 @@
 # Invoke through scripts/entrypoint/ray-job.sh on an existing Ray cluster.
 # MODEL_PATH=/models/Qwen-Image DATA_ROOT=/data/COCO2017 METADATA_PATH=/data/train.json \
 # DATASET_SIZE=128 SAVE_DIR=/runs RUN_DIR=/runs/qwen-online \
+# RAY_DASHBOARD_ADDRESS="http://<ray-head>:8265" \
 # RELAX_SKIP_CLUSTER_CLEANUP=1 bash scripts/entrypoint/ray-job.sh \
 # scripts/training/diffusion/run-qwen-image-sft.sh
 # DRY_RUN=1 prints the submission without sourcing entrypoints, creating

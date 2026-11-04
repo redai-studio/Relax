@@ -101,10 +101,13 @@ def test_speedup_and_payback_use_e2e_not_encoding_time(tmp_path):
     assert not result["repeated_measurements"]
 
 
-@pytest.mark.parametrize("change", [{"seed": 43, "prefetch": 4}, {"seed": 42, "prefetch": 0}])
-def test_refuses_speedup_for_different_training_or_prefetch(tmp_path, change):
-    online = summarize_run(write_run(tmp_path / "online"), 1)
-    cached = summarize_run(write_run(tmp_path / "cached", mode="cached", config=change), 1)
+@pytest.mark.parametrize(
+    "change", [{"seed": 43}, {"prefetch": 0}, {"checkpoint_enabled": False}, {"checkpoint_interval": 8}]
+)
+def test_refuses_speedup_for_different_training_workload(tmp_path, change):
+    config = {"seed": 42, "prefetch": 4, "checkpoint_enabled": True, "checkpoint_interval": 64}
+    online = summarize_run(write_run(tmp_path / "online", config=config), 1)
+    cached = summarize_run(write_run(tmp_path / "cached", mode="cached", config={**config, **change}), 1)
     result = compare_runs([online], [cached])
     assert not result["comparable"]
     assert "steady_throughput_improvement" not in result

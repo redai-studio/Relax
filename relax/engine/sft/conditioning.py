@@ -112,6 +112,8 @@ class ConditioningRuntime:
         self._closed = False
         self._close_event_written = False
         self._events: list[tuple[Any, Any]] = []
+        self._pending_copies: list[tuple[Any, Any, int]] = []
+        self._pending_copy_limit = max(1, global_batch_size // world_size)
         self._step: defaultdict[str, int | float] = defaultdict(int)
         self._last_end: float | None = None
         self._cycle_started = 0.0
@@ -313,6 +315,7 @@ class ConditioningRuntime:
         restore: Callable[[dict[str, torch.Tensor]], dict[str, Any]],
     ) -> dict[str, Any]:
         started = time.perf_counter()
+        self._release_copies()
         features = restored = None
         local_hit = False
         key = None
@@ -331,23 +334,10 @@ class ConditioningRuntime:
                     if lease is None:
                         lease = self.cache.lookup(key)
                 if lease is not None:
-                    with lease:
-                        copied_bytes = 0
-                        copy_event = torch.cuda.Event() if self.device.type == "cuda" else None
-                        enqueue_started = time.perf_counter()
-                        try:
-                            features, copied_bytes = lease.copy_to(self.device)
-                        finally:
-                            self._step["h2d_enqueue_seconds"] += time.perf_counter() - enqueue_started
-                            if copy_event is not None:
-                                self._step["condition_h2d_bytes"] += copied_bytes
-                                wait_started = time.perf_counter()
-                                try:
-                                    # Drain even a partially enqueued copy before releasing CPU mappings.
-                                    copy_event.record(torch.cuda.current_stream(self.device))
-                                    copy_event.synchronize()
-                                finally:
-                                    self._step["h2d_wait_seconds"] += time.perf_counter() - wait_started
+                    features = self._copy_features(lease)
+                    if features is None:
+                        key = None  # Admission bypass: retain the entry without rewriting it.
+                    else:
                         restore_started = time.perf_counter()
                         try:
                             restored = restore(features)  # validate before the unanimous decision
@@ -402,9 +392,58 @@ class ConditioningRuntime:
         self._step["condition_seconds"] += time.perf_counter() - started
         return restore(features)
 
+    def _copy_features(self, lease: Any) -> dict[str, torch.Tensor] | None:
+        if self.device.type != "cuda":
+            with lease:
+                return lease.copy_to(self.device)[0]
+        try:
+            nbytes = _tensor_bytes(lease.data)
+            if (
+                len(self._pending_copies) >= self._pending_copy_limit
+                or any(event is None for event, _, _ in self._pending_copies)
+                or sum(size for _, _, size in self._pending_copies) + nbytes > self.cache.max_bytes
+            ):
+                lease.close()
+                return None
+            stream = torch.cuda.current_stream(self.device)
+            event = torch.cuda.Event()
+        except BaseException:
+            lease.close()  # No copy has been submitted yet.
+            raise
+        index = len(self._pending_copies)
+        # Own the sources before copy_to can enqueue even a partial transfer.
+        # An unrecorded event must never authorize releasing those sources.
+        self._pending_copies.append((None, lease, nbytes))
+        started = time.perf_counter()
+        try:
+            features, copied_bytes = lease.copy_to(self.device)
+            self._step["condition_h2d_bytes"] += copied_bytes
+            return features
+        finally:
+            self._step["h2d_enqueue_seconds"] += time.perf_counter() - started
+            event.record(stream)
+            self._pending_copies[index] = (event, lease, nbytes)
+
+    def _release_copies(self, *, synchronized: bool = False) -> None:
+        while self._pending_copies:
+            event, lease, nbytes = self._pending_copies[0]
+            if synchronized:
+                lease.close()
+            else:
+                try:
+                    if event is None or not event.query():
+                        break
+                    lease.close()
+                except Exception as error:
+                    self._pending_copies[0] = (None, lease, nbytes)
+                    logger.warning("Conditioning copy cleanup deferred until step end: %s", error)
+                    break
+            self._pending_copies.pop(0)
+
     def end_step(self, step: int, *, local_samples: int, loss: float) -> None:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
+        self._release_copies(synchronized=True)
         self._step["encode_seconds"] += sum(start.elapsed_time(end) / 1000 for start, end in self._events)
         resources = self._resources()
         ended = time.monotonic()
@@ -477,6 +516,8 @@ class ConditioningRuntime:
             "cache_storage_scope": scope,
             "disk_bytes": 0,
             "prefetch_stats": self._prefetch.stats() if self._prefetch is not None else {},
+            "pending_copy_count": len(self._pending_copies),
+            "pending_copy_bytes": sum(size for _, _, size in self._pending_copies),
         }
         try:
             stat = os.statvfs("/dev/shm")
@@ -505,6 +546,9 @@ class ConditioningRuntime:
         # Do not run later cleanup in a finally that could mask this exception.
         if self._prefetch is not None:
             self._prefetch.close()
+        if self._pending_copies:
+            torch.cuda.synchronize(self.device)
+            self._release_copies(synchronized=True)
         if self.cache is not None:
             self.cache.close()
         if not self._close_event_written:

@@ -43,7 +43,7 @@ Qwen 使用 `run-qwen-image-sft-condition-cache.sh`，它在基础在线训练�
 
 ## 容量、所有权与释放
 
-同一训练 attempt 的 worker 在节点内共享不可变 safetensors payload；每次新查找验证文件 SHA，张量 dtype 不变。调用方借用 lease，使用中的条目不可淘汰。GPU 副本属于当前 forward，搬运完成后才归还 lease；不建立 GPU 常驻特征缓存。
+同一训练 attempt 的 worker 在节点内共享不可变 safetensors payload；每次新查找验证文件 SHA，张量 dtype 不变。调用方借用 lease，使用中的条目不可淘汰。GPU 副本属于当前 forward；运行时保留源 lease，查询到搬运完成后归还，无需逐次命中等待，并在训练步结束或退出时排空。每个 rank 的待完成复制数量不超过其有效 batch 样本数，源张量字节不超过 payload 预算；容量不足时回退在线。不建立 GPU 常驻特征缓存。
 
 Payload 上限覆盖已发布、借用和待发布文件，LRU 只淘汰未借用条目；条目过大或容量不足时在线计算。Writer staging 有独立上限，数值等于 payload 预算，在 CPU 复制前检查。SenseNova 可选预取另有每 worker 字节/深度限制，关闭存储前先排空预取。预取提示只安排读取，实际 forward 仍重建依赖并检查冻结状态。
 

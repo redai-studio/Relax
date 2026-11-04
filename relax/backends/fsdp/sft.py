@@ -198,6 +198,8 @@ class FSDPSFTTrainer:
                         "image_prefetch_workers": workers,
                         "conditioning_verification": os.environ.get("RELAX_CONDITION_VERIFY", "0") == "1",
                         "resume_checkpoint": os.path.realpath(self.args.load) if self.args.load else None,
+                        "checkpoint_enabled": bool(self.args.save),
+                        "checkpoint_interval": self.args.save_interval if self.args.save else None,
                     },
                     metadata_sha256=self.dataset.sha256,
                     global_batch_size=self.args.global_batch_size,
