@@ -17,6 +17,10 @@ class SmallModel(torch.nn.Module):
         self.alias = self.weight
         self.register_buffer("persistent", torch.tensor([7], dtype=torch.int64))
         self.register_buffer("scratch", torch.tensor([8], dtype=torch.int64), persistent=False)
+        shared = torch.nn.Module()
+        shared.register_buffer("rotary_cache", torch.tensor([9]), persistent=False)
+        self.layer_a = shared
+        self.layer_b = shared
 
 
 def test_disk_weight_dump_preserves_bits_and_coverage(tmp_path):
@@ -29,7 +33,11 @@ def test_disk_weight_dump_preserves_bits_and_coverage(tmp_path):
     assert coverage["parameter_aliases"] == [["alias", "weight"]]
     assert coverage["parameter_count"] == 2
     assert coverage["persistent_buffer_count"] == 1
-    assert [item["name"] for item in coverage["excluded_nonpersistent_buffers"]] == ["scratch"]
+    assert [item["name"] for item in coverage["excluded_nonpersistent_buffers"]] == [
+        "layer_a.rotary_cache",
+        "layer_b.rotary_cache",
+        "scratch",
+    ]
     assert coverage["bytes"] == 2 * model.weight.numel() * 4 + 8
     assert torch.equal(load_file(rank_dir / index["weight"])["weight"].view(torch.int32), before)
     assert torch.equal(model.weight.detach().view(torch.int32), before)

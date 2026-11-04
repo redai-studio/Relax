@@ -38,7 +38,10 @@ def dump_model(model: torch.nn.Module, directory: Path, tp_rank: int) -> dict:
     parameters = dict(model.named_parameters(remove_duplicate=False))
     persistent_buffers = dict(model.named_buffers(remove_duplicate=False))
     excluded = []
-    for module_name, module in model.named_modules():
+    # SGLang shares one rotary module across layers. Enumerate every module
+    # path, just as named_buffers(remove_duplicate=False) does, so each alias
+    # of a nonpersistent cache is excluded explicitly from the sync coverage.
+    for module_name, module in model.named_modules(remove_duplicate=False):
         for name in module._non_persistent_buffers_set:
             tensor = module._buffers.get(name)
             if tensor is not None:
