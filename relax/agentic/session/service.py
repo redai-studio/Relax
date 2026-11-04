@@ -534,7 +534,38 @@ def _text_block_content(
     return separator.join(texts) if texts else None
 
 
+def _tool_result_content(
+    content: Any,
+    *,
+    text_type: str,
+    image_type: str,
+    image_block: Callable[..., dict[str, Any]],
+    field: str,
+    param: str,
+) -> Any:
+    text = _text_block_content(
+        content, block_type=text_type, separator="", field=field, param=param, allow_empty_string=True
+    )
+    if not isinstance(content, list) or not any(
+        isinstance(block, dict) and block.get("type") == image_type for block in content
+    ):
+        return text
+    return [
+        image_block(block, field=f"{field}[{index}]")
+        if block["type"] == image_type
+        else {"type": "text", "text": block["text"]}
+        for index, block in enumerate(content)
+        if isinstance(block, dict) and block.get("type") in {text_type, image_type}
+    ]
+
+
 def _responses_input_messages(request_input: Any, instructions: Any) -> list[dict[str, Any]]:
+    def image_block(block: dict[str, Any], *, field: str) -> dict[str, Any]:
+        image_url = block.get("image_url")
+        if not isinstance(image_url, str) or not image_url:
+            raise AgenticChatRequestError(f"{field}.image_url must be a non-empty string", param="input")
+        return {"type": "image_url", "image_url": {"url": image_url}}
+
     def message_content(content: Any, *, role: str, field: str) -> Any:
         if isinstance(content, str):
             return content
@@ -553,13 +584,7 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
                     raise AgenticChatRequestError(f"{part_field} text must be non-empty", param="input")
                 canonical_parts.append({"type": "text", "text": text})
             elif part_type == "input_image" and role == "user":
-                image_url = part.get("image_url")
-                if not isinstance(image_url, str) or not image_url:
-                    raise AgenticChatRequestError(
-                        f"{part_field}.image_url must be a non-empty string",
-                        param="input",
-                    )
-                canonical_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                canonical_parts.append(image_block(part, field=part_field))
                 has_image = True
         if not canonical_parts:
             return ""
@@ -659,13 +684,13 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
                     "tool_call_id": _required_nonempty_string(
                         item.get("call_id"), field=f"{field}.call_id", param="input"
                     ),
-                    "content": _text_block_content(
+                    "content": _tool_result_content(
                         item.get("output"),
-                        block_type="input_text",
-                        separator="",
+                        text_type="input_text",
+                        image_type="input_image",
+                        image_block=image_block,
                         field=f"{field}.output",
                         param="input",
-                        allow_empty_string=True,
                     ),
                 }
             )
@@ -799,13 +824,13 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
                             field=f"{block_field}.tool_use_id",
                             param="messages",
                         ),
-                        "content": _text_block_content(
+                        "content": _tool_result_content(
                             block.get("content", ""),
-                            block_type="text",
-                            separator="",
+                            text_type="text",
+                            image_type="image",
+                            image_block=image_block,
                             field=f"{block_field}.content",
                             param="messages",
-                            allow_empty_string=True,
                         ),
                     }
                 )

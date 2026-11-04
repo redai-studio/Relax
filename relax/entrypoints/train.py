@@ -195,7 +195,8 @@ def main(args):
         # Keep the owner reachable even if initialization fails after creating
         # a teacher, router, or some of the training services.
         _ctrl = Controller.__new__(Controller)
-        _ctrl.__init__(args, runtime_env)
+        fault_options = {"fault_events": _fault_runtime} if _fault_runtime is not None else {}
+        _ctrl.__init__(args, runtime_env, **fault_options)
         _ctrl.training_loop()
         _training_completed = True
     except Exception as e:

@@ -19,6 +19,7 @@ not importable, so pickling it raises ``PicklingError``.
 
 from contextlib import contextmanager
 from functools import partial
+from typing import ClassVar
 
 from megatron.bridge.models.gemma.gemma4_provider import Gemma4DenseProvider, Gemma4ModelProvider
 from megatron.bridge.models.gemma_vl.gemma4_vl_provider import Gemma4DenseVLProvider, Gemma4VLModelProvider
@@ -71,6 +72,8 @@ class PackedSafeGemma4DenseProvider(_PackedSafeBuildMixin, Gemma4DenseProvider):
     """``Gemma4DenseProvider`` for the text-only path
     (GEMMA4_CONVERSION_MODE=text)."""
 
+    relax_is_multimodal: ClassVar[bool] = False
+
 
 class PackedSafeGemma4DenseVLProvider(_PackedSafeBuildMixin, Gemma4DenseVLProvider):
     """``Gemma4DenseVLProvider`` for the VL path.
@@ -78,6 +81,8 @@ class PackedSafeGemma4DenseVLProvider(_PackedSafeBuildMixin, Gemma4DenseVLProvid
     Untested -- Relax's gemma-4
     work is text-only SFT so far.
     """
+
+    relax_is_multimodal: ClassVar[bool] = True
 
 
 #: Where the bridge parks the ``(local, global)`` rope-theta pair. Deliberately
@@ -148,6 +153,8 @@ class _Gemma4MoEProvideMixin:
 class RelaxGemma4MoEProvider(_Gemma4MoEProvideMixin, Gemma4ModelProvider):
     """``Gemma4ModelProvider`` for the text-only MoE path."""
 
+    relax_is_multimodal: ClassVar[bool] = False
+
 
 class RelaxGemma4MoEVLProvider(_Gemma4MoEProvideMixin, Gemma4VLModelProvider):
     """``Gemma4VLModelProvider`` for the MoE VL path.
@@ -156,6 +163,8 @@ class RelaxGemma4MoEVLProvider(_Gemma4MoEProvideMixin, Gemma4VLModelProvider):
     ``provide_language_model()``, which delegates to the ``provide()`` hooked
     here.
     """
+
+    relax_is_multimodal: ClassVar[bool] = True
 
 
 # No subclass adds fields, so an instance can be re-pointed in place and keep
