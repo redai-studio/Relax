@@ -174,6 +174,10 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch,
         critic_train_only=False,
         actor_num_nodes=1,
         actor_num_gpus_per_node=1,
+        fully_async=False,
+        hybrid=False,
+        colocate_expert_weight_routing=False,
+        lora_target_modules=None,
     )
     pre = SimpleNamespace(
         debug_train_only=True,
