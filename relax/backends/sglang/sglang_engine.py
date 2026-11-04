@@ -778,6 +778,25 @@ class SGLangEngine(RayActor):
             "update_weight_version", {"new_version": weight_version, "abort_all_requests": False}
         )
 
+    def prepare_disk_checkpoint(self, config_path: str, published: dict, reference: str) -> dict:
+        from .disk_weight_sync import prepare
+
+        return prepare(self, config_path, published, reference)
+
+    def install_disk_checkpoint(self, target: dict, published: dict, timeout: float) -> dict:
+        from .disk_weight_sync import install
+
+        return install(self, target, published, timeout)
+
+    def disk_weight_generation_probe(self, timeout: float) -> dict:
+        result = self._make_request(
+            "generate", {"input_ids": [1], "sampling_params": {"max_new_tokens": 1, "temperature": 0}}, timeout=timeout
+        )
+        if not isinstance(result, dict) or not result.get("meta_info", {}).get("output_token_ids", result.get("text")):
+            if not isinstance(result, dict) or result.get("meta_info", {}).get("completion_tokens", 0) < 1:
+                raise RuntimeError(f"Disk weight generation probe failed: {result}")
+        return {"success": True}
+
     def get_expert_weight_sync_layout(self) -> dict:
         """Return resolved layout settings for opt-in colocated expert routing
         and direct BF16 loading."""
@@ -2216,6 +2235,11 @@ def _compute_server_args(
         loaders = list(kwargs.get("custom_weight_loader") or [])
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
+        if getattr(args, "disk_weight_sync_config", None):
+            from relax.backends.sglang.disk_weight_dump import DUMP_LOADER
+
+            if DUMP_LOADER not in loaders:
+                loaders.append(DUMP_LOADER)
         kwargs["custom_weight_loader"] = loaders
 
     if (

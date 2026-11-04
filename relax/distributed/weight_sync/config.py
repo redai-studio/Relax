@@ -58,5 +58,58 @@ class WeightSyncConfig:
     def publisher_kwargs(self) -> dict:
         return {
             name: getattr(self, name)
-            for name in ("chunk_bytes", "compression", "anchor_interval", "host_budget_bytes", "full_only")
+            for name in (
+                "chunk_bytes",
+                "compression",
+                "anchor_interval",
+                "host_budget_bytes",
+                "full_only",
+                "sync_timeout_s",
+            )
         }
+
+
+def validate_disk_weight_sync_args(args) -> None:
+    """Reject execution modes whose lifecycle is outside the disk MVP."""
+    path = getattr(args, "disk_weight_sync_config", None)
+    if path is None:
+        return
+    config = WeightSyncConfig.load(path)
+    if config.mode != "delta":
+        raise WeightSyncError("--disk-weight-sync-config requires mode=delta (full_only selects the FULL control)")
+    unsupported = [
+        name
+        for name in (
+            "fully_async",
+            "hybrid",
+            "colocate",
+            "offload_train",
+            "offload_rollout",
+            "use_fault_tolerance",
+            "keep_old_actor",
+            "use_lora",
+            "debug_train_only",
+            "debug_rollout_only",
+            "partial_rollout",
+            "use_agentic_rollout",
+            "rollout_external",
+            "sglang_speculative_algorithm",
+            "enable_mtp_training",
+            "mtp_num_layers",
+        )
+        if getattr(args, name, False)
+    ]
+    if unsupported:
+        raise WeightSyncError(f"Disk weight sync does not support: {', '.join(unsupported)}")
+    if getattr(args, "lora_rank", 0) > 0 or getattr(args, "save_hf_dtype", "bf16") != "bf16":
+        raise WeightSyncError("Disk weight sync requires full-parameter, nonquantized HF export")
+    if getattr(args, "num_experts", None):
+        raise WeightSyncError("Disk weight sync currently supports Dense models only")
+    if not getattr(args, "sglang_disable_cuda_graph", False):
+        raise WeightSyncError("Disk weight sync currently requires --sglang-disable-cuda-graph")
+    if any(
+        getattr(args, name, 1) != 1 for name in ("sglang_pp_size", "sglang_dp_size", "rollout_num_gpus_per_engine")
+    ):
+        raise WeightSyncError("The disk MVP currently requires single-GPU TP/PP/DP=1 inference engines")
+    if getattr(args, "train_backend", "megatron") != "megatron":
+        raise WeightSyncError("Disk weight sync requires the Megatron backend")

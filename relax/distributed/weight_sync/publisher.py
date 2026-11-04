@@ -71,6 +71,7 @@ class Publisher:
         anchor_interval: int = 20,
         host_budget_bytes: int = 16 * 1024**3,
         full_only: bool = False,
+        sync_timeout_s: float = 600,
     ) -> None:
         if not isinstance(stream, str) or not stream:
             raise WeightSyncError("A nonempty stream is required")
@@ -85,6 +86,9 @@ class Publisher:
         self.host_budget_bytes = integer(host_budget_bytes, 1)
         self.compression = compression
         self.full_only = full_only
+        if sync_timeout_s <= 0:
+            raise WeightSyncError("Publication timeout must be positive")
+        self.sync_timeout_s = sync_timeout_s
         self.confirmed: PublishedVersion | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="weight-publication")
         self._pending: tuple[PublicationHandle, Future] | None = None
@@ -141,6 +145,14 @@ class Publisher:
             self._executor.shutdown(wait=True)
 
     def _publish(self, update_id: str, snapshot: dict) -> PublishedVersion:
+        previous_deadline = self.store.deadline
+        self.store.deadline = monotonic() + self.sync_timeout_s
+        try:
+            return self._publish_snapshot(update_id, snapshot)
+        finally:
+            self.store.deadline = previous_deadline
+
+    def _publish_snapshot(self, update_id: str, snapshot: dict) -> PublishedVersion:
         import torch
 
         started = monotonic()
@@ -151,6 +163,7 @@ class Publisher:
                 catalog = self.store._artifact_for(state, self.stream, latest["version"])["catalog"]
                 captured = []
                 for name in sorted(snapshot, key=lambda value: value.encode()):
+                    self.store._check_deadline(self.store.deadline)
                     tensor = snapshot[name]
                     dtype = TORCH_DTYPES[str(tensor.dtype)]
                     view = memoryview(tensor.reshape(-1).view(torch.uint8).numpy()).cast("B")
@@ -199,6 +212,7 @@ class Publisher:
             metrics = {"logical_bytes": 0, "payload_bytes": 0, "new_object_bytes": 0, "encodings": {}}
             block_index = 0
             for name in sorted(snapshot, key=lambda value: value.encode()):
+                self.store._check_deadline(self.store.deadline)
                 tensor = snapshot[name]
                 dtype = TORCH_DTYPES[str(tensor.dtype)]
                 width = DTYPE_SIZES[dtype]
@@ -206,6 +220,7 @@ class Publisher:
                 stride = self.chunk_bytes // width * width
                 blocks = []
                 for offset in range(0, len(view), stride):
+                    self.store._check_deadline(self.store.deadline)
                     target = bytes(view[offset : offset + stride])
                     before = None if full else self.store.canonical_block(base_blocks[block_index]["digest"])
                     encoded, payload = encode_block(target, before, width, self.compression)

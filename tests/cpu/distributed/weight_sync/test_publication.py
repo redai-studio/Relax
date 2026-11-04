@@ -31,6 +31,23 @@ def load_checkpoint(prepared):
     }
 
 
+def test_publication_writer_lock_timeout_also_bounds_close(tmp_path):
+    import fcntl
+    from time import monotonic
+
+    store = SharedFSStore(tmp_path / "store")
+    pub = publisher(store, sync_timeout_s=0.1)
+    with (store.root / ".writer.lock").open("ab") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        started = monotonic()
+        handle = pub.submit("blocked", [("x", torch.ones(8))])
+        with pytest.raises(TimeoutError, match="Store transaction deadline"):
+            pub.finalize_pending(handle, timeout=2)
+        pub.close()
+        assert monotonic() - started < 2
+    assert store.head("stream") is None
+
+
 @pytest.mark.parametrize("transport_name", ["shared_fs", "tcp"])
 def test_twenty_versions_anchor_delta_restart_and_bitwise_dtype_roundtrip(tmp_path, transport_name):
     store = SharedFSStore(tmp_path / "store")

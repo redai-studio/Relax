@@ -572,6 +572,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
 
             update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+            if getattr(self.args, "disk_weight_sync_config", None):
+                from .weight_update.update_weight_from_disk import UpdateWeightFromDisk
+
+                update_weight_cls = UpdateWeightFromDisk
             # Push-side repack is decided by the HF config: an FP8 release auto-routes
             # through quantize_params_fp8, a compressed-tensors release through
             # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
@@ -2988,6 +2992,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
         self._flush_resident_sft_parameters()
+
+        if getattr(self.args, "disk_weight_sync_config", None):
+            self.weight_updater.update_weights(self.rollout_manager)
+            return
 
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
