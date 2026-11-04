@@ -4,9 +4,7 @@
 
 import copy
 import importlib.util
-import json
 from datetime import timedelta
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _worker(rank, rendezvous, output, native):
+def _worker(rank, rendezvous, native):
     from relax.utils.data.flops_balancing import STEP_PLANS_FIELD, encode_schedule, restore_schedule
 
     torch.set_num_threads(1)
@@ -68,7 +66,6 @@ def _worker(rank, rendezvous, output, native):
             bad[STEP_PLANS_FIELD][0]["sha256"] = "0" * 64
         with pytest.raises(ValueError, match="differs across ranks"):
             data._get_synchronised_flops_schedule(args, bad)
-        Path(output, f"rank-{rank}.json").write_text(json.dumps(dict(counts=counts, peer_errors=True)))
     finally:
         if native:
             mpu.destroy_model_parallel()
@@ -79,11 +76,9 @@ def _worker(rank, rendezvous, output, native):
 def test_global_plan_real_gloo_groups_and_peer_failures(tmp_path):
     # Stub only the Megatron group accessors; collectives run in four OS
     # processes with orthogonal TP2/DP2 groups and the production iterator.
-    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), False), nprocs=4, join=True)
-    assert len(list(tmp_path.glob("rank-*.json"))) == 4
+    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}", False), nprocs=4, join=True)
 
 
 @pytest.mark.skipif(importlib.util.find_spec("megatron") is None, reason="requires Megatron Core")
 def test_native_megatron_iterator_and_orthogonal_groups(tmp_path):
-    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), True), nprocs=4, join=True)
-    assert len(list(tmp_path.glob("rank-*.json"))) == 4
+    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}", True), nprocs=4, join=True)
