@@ -1,43 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Keep balanced packing capacity protection and dummy padding compatible."""
 
-import ast
-from pathlib import Path
-from unittest.mock import Mock
-
 import pytest
 
 
 @pytest.fixture
-def partitioner():
-    root = Path(__file__).resolve().parents[4]
-    from relax.utils.data import packing
-
-    namespace = {
-        **vars(packing),
-        "logger": Mock(),
-    }
-    names = {
-        "get_first_fit_partitions",
-        "_get_first_fit_partitions",
-        "_partitions_fit_capacity_or_singleton_oversize",
-        "get_binpack_partitions",
-        "get_minimum_num_micro_batch_size",
-        "_get_capacity_safe_balanced_partitions",
-        "_get_seqlen_partitions_with_dummy_padding",
-    }
-    for path in (
-        "relax/utils/data/seqlen_balancing.py",
-        "relax/utils/data/data.py",
-        "relax/utils/data/packing.py",
-        "relax/backends/megatron/data.py",
-    ):
-        nodes = ast.parse((root / path).read_text()).body
-        if not path.endswith("seqlen_balancing.py"):
-            nodes = [node for node in nodes if getattr(node, "name", None) in names]
-        module = ast.Module(body=[ast.parse("from __future__ import annotations").body[0], *nodes], type_ignores=[])
-        exec(compile(module, path, "exec"), namespace)
-    return namespace["_get_seqlen_partitions_with_dummy_padding"]
+def partitioner(iterator_data):
+    return iterator_data._get_seqlen_partitions_with_dummy_padding
 
 
 @pytest.fixture
