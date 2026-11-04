@@ -116,7 +116,7 @@ class CheckedEngine:
 class SourceServer:
     def __init__(self, config_path: str) -> None:
         config = WeightSyncConfig.load(config_path)
-        self.server = ObjectServer(
+        self.server = ObservedObjectServer(
             (ray.util.get_node_ip_address(), 0),
             SharedFSStore(config.store_root, config.disk_budget_bytes, canonical_root=config.canonical_root),
             request_timeout_s=config.sync_timeout_s,
@@ -125,16 +125,38 @@ class SourceServer:
         self.thread.start()
 
     def identity(self) -> dict:
+        with self.server.observation_lock:
+            observed = {
+                "accepted_connections": self.server.accepted_connections,
+                "peer_ips": sorted(self.server.peer_ips),
+            }
         return {
             "endpoint": "tcp://%s:%s" % self.server.server_address,
             "node_id": ray.get_runtime_context().get_node_id(),
             "node_ip": ray.util.get_node_ip_address(),
+            **observed,
         }
 
     def shutdown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(5)
+
+
+class ObservedObjectServer(ObjectServer):
+    """Record actual accepted peers without changing the object protocol."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.observation_lock = threading.Lock()
+        self.accepted_connections = 0
+        self.peer_ips = set()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: socket.socket, client_address: tuple) -> None:
+        with self.observation_lock:
+            self.accepted_connections += 1
+            self.peer_ips.add(client_address[0])
+        super().process_request(request, client_address)
 
 
 def main() -> int:
@@ -213,6 +235,8 @@ def main() -> int:
                 ray.kill(engine, no_restart=True)
         if source:
             try:
+                identity = ray.get(source.identity.remote(), timeout=10)
+                atomic_write(args.output / "source-final.json", json.dumps(identity, indent=2).encode())
                 ray.get(source.shutdown.remote(), timeout=35)
             except Exception as error:
                 cleanup_errors.append(str(error))

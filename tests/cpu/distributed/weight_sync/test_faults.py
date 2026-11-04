@@ -192,6 +192,77 @@ def test_tcp_retries_truncated_object_and_reuses_completed_connection(tmp_path):
     assert transport.metrics["payload_bytes"] == 3 + len(data)
 
 
+def test_tcp_counts_only_accepted_request_bytes_before_interrupted_send(monkeypatch):
+    data = b"verified-object-data"
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    listener.settimeout(3)
+    accepted = []
+    server_errors = []
+
+    def serve():
+        try:
+            with listener.accept()[0] as connection:
+                connection.settimeout(2)
+                accepted.append(b"".join(iter(lambda: connection.recv(4096), b"")))
+            with listener.accept()[0] as connection:
+                connection.settimeout(2)
+                _receive_frame(connection, monotonic() + 2)
+                _frame(connection, {"status": "OK", "length": len(data)}, monotonic() + 2)
+                connection.sendall(data)
+        except Exception as error:
+            server_errors.append(error)
+        finally:
+            listener.close()
+
+    connect = socket.create_connection
+    calls = 0
+
+    class InterruptedSocket:
+        def __init__(self, connection):
+            self.connection, self.sent = connection, False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.connection.close()
+
+        def settimeout(self, timeout):
+            self.connection.settimeout(timeout)
+
+        def send(self, payload):
+            if self.sent:
+                raise ConnectionError("injected interruption after three actual socket bytes")
+            self.sent = True
+            self.connection.sendall(payload[:3])
+            return 3
+
+    def interrupted_connect(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        connection = connect(*args, **kwargs)
+        return InterruptedSocket(connection) if calls == 1 else connection
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        monkeypatch.setattr(socket, "create_connection", interrupted_connect)
+        transport = TCPTransport(*listener.getsockname(), timeout_s=2)
+        assert transport.object("a" * 64) == data
+    finally:
+        listener.close()
+        thread.join(5)
+    assert not thread.is_alive() and not server_errors
+    assert accepted == [struct.pack("!I", len(canonical_json({"op": "object", "id": "a" * 64})))[:3]]
+    complete_request = 4 + len(canonical_json({"op": "object", "id": "a" * 64}))
+    complete_response = 4 + len(canonical_json({"status": "OK", "length": len(data)}))
+    assert transport.metrics["frame_bytes"] == 3 + complete_request + complete_response
+    assert transport.metrics["payload_bytes"] == len(data)
+    assert transport.metrics["retries"] == 1
+
+
 def test_tcp_slow_header_releases_worker_and_other_consumer_progresses(tmp_path):
     store, _ = make_store(tmp_path)
     server = ObjectServer(("127.0.0.1", 0), store, workers=1, request_timeout_s=0.15)

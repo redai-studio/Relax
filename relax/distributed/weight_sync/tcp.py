@@ -34,20 +34,30 @@ def _read_exact(
     return bytes(chunks)
 
 
-def _send(connection: socket.socket, payload: bytes, deadline: float) -> None:
-    for offset in range(0, len(payload), 64 * 1024):
+def _send(
+    connection: socket.socket, payload: bytes, deadline: float, on_bytes: Callable[[int], None] | None = None
+) -> None:
+    offset = 0
+    while offset < len(payload):
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise TimeoutError("TCP response deadline exceeded")
         connection.settimeout(min(remaining, 5.0))
-        connection.sendall(payload[offset : offset + 64 * 1024])
+        sent = connection.send(payload[offset : offset + 64 * 1024])
+        if not sent:
+            raise ConnectionError("TCP send made no progress")
+        offset += sent
+        if on_bytes is not None:
+            on_bytes(sent)
 
 
-def _frame(connection: socket.socket, value: dict, deadline: float) -> None:
+def _frame(
+    connection: socket.socket, value: dict, deadline: float, on_bytes: Callable[[int], None] | None = None
+) -> None:
     data = canonical_json(value)
     if len(data) > MAX_CONTROL_BYTES:
         raise WeightSyncError("Control frame exceeds limit")
-    _send(connection, struct.pack("!I", len(data)) + data, deadline)
+    _send(connection, struct.pack("!I", len(data)) + data, deadline, on_bytes)
 
 
 def _receive_frame(connection: socket.socket, deadline: float, on_bytes: Callable[[int], None] | None = None) -> dict:
@@ -190,8 +200,7 @@ class TCPTransport:
             try:
                 with socket.create_connection(self.address, timeout=min(remaining, 5)) as connection:
                     self.metrics["requests"] += 1
-                    self.metrics["frame_bytes"] += len(canonical_json(command)) + 4
-                    _frame(connection, command, deadline)
+                    _frame(connection, command, deadline, self._count_frame)
                     response = _receive_frame(connection, deadline, self._count_frame)
                     if response.get("status") == "BUSY":
                         raise ConnectionError("WAITING_SERVER: all object worker slots are occupied")

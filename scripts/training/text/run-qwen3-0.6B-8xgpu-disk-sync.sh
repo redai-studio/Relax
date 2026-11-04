@@ -94,10 +94,13 @@ GRPO_ARGS=(
    --eps-clip-high 0.28
 )
 OPTIMIZER_ARGS=(
+   # Make AdamW decay visible in BF16 within five real optimizer steps, even
+   # when a tiny DAPO batch has zero reward variance. This is a sync validation
+   # configuration, not a convergence or model-quality recipe.
    --optimizer adam
-   --lr 1e-5
+   --lr 1e-3
    --lr-decay-style constant
-   --weight-decay 0.1
+   --weight-decay 1.0
    --adam-beta1 0.9
    --adam-beta2 0.98
 )
