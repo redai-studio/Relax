@@ -41,6 +41,14 @@ class UpdateWeightFromDisk:
         self.config = WeightSyncConfig.load(self.config_path)
         self.root = self.config_path.parent
         self.weight_version = 0
+        from relax.distributed.weight_sync.provenance import runtime_identity
+
+        identity = runtime_identity()
+        identity["config"] = json.loads(self.config_path.read_text())
+        atomic_write(
+            self.root / "ranks" / f"train-{dist.get_rank(get_gloo_group())}.json",
+            json.dumps(identity, indent=2).encode(),
+        )
 
     def update_weights(self, rollout_manager) -> None:
         from relax.backends.megatron.model import save_hf_model

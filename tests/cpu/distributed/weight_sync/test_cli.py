@@ -121,6 +121,16 @@ def test_config_rejects_ambiguous_or_unbounded_settings(data):
         WeightSyncConfig.from_dict(data)
 
 
+def test_config_store_paths_are_relative_to_config_not_current_directory(tmp_path, monkeypatch):
+    path = tmp_path / "run" / "sync.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"mode": "delta", "stream": "s", "store_root": "store", "canonical_root": "canonical"}))
+    monkeypatch.chdir(tmp_path)
+    config = WeightSyncConfig.load(path)
+    assert config.store_root == str(path.parent / "store")
+    assert config.canonical_root == str(path.parent / "canonical")
+
+
 def test_incomplete_hf_checkpoint_is_rejected_before_publication(tmp_path):
     from relax.distributed.weight_sync.__main__ import checkpoint_tensors
     from relax.distributed.weight_sync.publisher import Publisher

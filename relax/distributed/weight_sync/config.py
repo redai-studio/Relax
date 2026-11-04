@@ -24,7 +24,13 @@ class WeightSyncConfig:
 
     @classmethod
     def load(cls, path: str | Path) -> "WeightSyncConfig":
-        data = parse_json(Path(path).read_bytes())
+        path = Path(path).resolve()
+        data = parse_json(path.read_bytes())
+        if isinstance(data, dict):
+            for name in ("store_root", "canonical_root"):
+                value = data.get(name)
+                if isinstance(value, str) and value and not Path(value).is_absolute():
+                    data[name] = str(path.parent / value)
         return cls.from_dict(data)
 
     @classmethod

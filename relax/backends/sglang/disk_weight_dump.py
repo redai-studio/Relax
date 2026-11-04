@@ -95,6 +95,9 @@ def dump_model(model: torch.nn.Module, directory: Path, tp_rank: int) -> dict:
     }
     _atomic_json(rank_dir / "model.safetensors.index.json", {"weight_map": weight_map})
     _atomic_json(rank_dir / "coverage.json", coverage)
+    from relax.distributed.weight_sync.provenance import runtime_identity
+
+    _atomic_json(rank_dir / "runtime.json", runtime_identity())
     logger.info("Dumped rank=%s tensors=%s bytes=%s to %s", tp_rank, len(entries), total_bytes, rank_dir)
     return coverage
 
