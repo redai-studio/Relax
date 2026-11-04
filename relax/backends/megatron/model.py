@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
-import gc
 import itertools
 import json
 import math
@@ -44,7 +43,7 @@ from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_bridge_utils import patch_megatron_model
 from relax.utils.megatron_peft_utils import is_lora_enabled
-from relax.utils.memory_utils import available_memory, clear_memory, log_step_peak_memory
+from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
@@ -1274,6 +1273,8 @@ def train_one_step(
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
+    collect_manual_gc(args)
+
     if args.custom_megatron_before_train_step_hook_path:
         from relax.utils.misc import load_function
 
@@ -1781,13 +1782,6 @@ def train(
                 if "momentum_buffer" in state:
                     state["momentum_buffer"].zero_()
 
-    if args.manual_gc:
-        # Disable the default garbage collector and perform the collection manually.
-        # This is to align the timing of garbage collection across ranks.
-        assert args.manual_gc_interval >= 0, "Manual garbage collection interval should be larger than or equal to 0"
-        gc.disable()
-        gc.collect()
-
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
@@ -2031,6 +2025,10 @@ def train(
         # branch/parameter-gather order. Per-step sync above has made weights current.
         enable_forward_pre_hook(model)
         config.param_sync_func = param_sync_func
+
+    # Include final collection in the training timer, before publishing performance metrics.
+    if getattr(args, "manual_gc", False) and rollout_id + 1 == args.num_rollout:
+        collect_manual_gc(args, final=True)
 
 
 def save(
