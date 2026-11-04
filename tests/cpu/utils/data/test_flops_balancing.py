@@ -18,20 +18,29 @@ from relax.utils.data.flops_balancing import (
 
 
 @pytest.mark.parametrize(
-    "lengths,costs,capacity,dp,group,expected",
+    "lengths,costs,capacity,dp,group,expected,paired_order",
     [
-        ([1] * 6, [1, 1, 1, 1, 1, 9], 5, 2, 1, [[[5]], [[0, 1, 2, 3, 4]]]),
-        ([2] * 6, [1, 2, 3, 4, 5, 6], 12, 2, 2, [[[1, 5], [2]], [[0, 4], [3]]]),
-        ([9, 9, 1, 1], [1, 1, 1, 9], 10, 1, 1, [[[3], [0, 1, 2]]]),
+        ([1] * 6, [1, 1, 1, 1, 1, 9], 5, 2, 1, [[[5]], [[0, 1, 2, 3, 4]]], [[0], [0]]),
+        ([2] * 6, [1, 2, 3, 4, 5, 6], 12, 2, 2, [[[1, 5], [2]], [[0, 4], [3]]], [[1, 0], [1, 0]]),
+        ([9, 9, 1, 1], [1, 1, 1, 9], 10, 1, 1, [[[3], [0, 1, 2]]], [[0, 1]]),
+        ([9, 6, 6, 3, 3, 8], [90, 42, 42, 12, 12, 72], 12, 2, 1, [[[1, 3], [4, 5]], [[0], [2]]], [[0, 1], [1, 0]]),
+        ([1] * 8, [1] * 8, 2, 2, 1, [[[0, 7], [3, 4]], [[1, 6], [2, 5]]], [[0, 1], [0, 1]]),
     ],
 )
-def test_global_schedule(lengths, costs, capacity, dp, group, expected):
+def test_global_schedule(lengths, costs, capacity, dp, group, expected, paired_order):
     # Small inline cases, as in upstream tests/test_dp_schedule.py. Ordered
     # expectations were checked with Slime 053bdfc using identical costs.
     plan = build_flops_schedule(lengths, costs, capacity, dp, group)
     assert plan == expected
     assert len({len(rank) for rank in plan}) == 1
     assert sorted(i for rank in plan for pack in rank for i in pack) == list(range(len(lengths)))
+    metadata = {i: dict(total_lengths=length, flops_cost=cost) for i, (length, cost) in enumerate(zip(lengths, costs))}
+    paired = [[rank[i] for i in order] for rank, order in zip(expected, paired_order, strict=True)]
+    for pp in (1, 2):
+        packing = {**geometry(capacity), "microbatch_group_size": group, "pipeline_stages": pp}
+        rows, updates = encode_schedule(list(metadata), metadata, packing, dp, len(lengths), ("p", "train", 0))
+        actual = [updates[rank[0]][PLAN_METADATA_FIELD]["packs"] for rank in rows]
+        assert actual == (paired if pp == 1 else expected)
 
 
 def test_impossible_alignment_is_rejected():
@@ -82,30 +91,35 @@ def test_plan_replay_checkpoint_and_step_boundaries(sft):
         return FlopsBalancedSampler(dp_size=2) if sft else IdentityWindowSampler(2, "balanced", balance_by_flops=True)
 
     partition = Partition()
+    lengths = [9, 6, 6, 3, 3, 8]
+    partition.metadata = {
+        i: dict(sample_index=i, total_lengths=length, flops_cost=length + length * length)
+        for i, length in enumerate(lengths)
+    }
     sampler = make()
-    expected = [[5], [0, 1, 2, 3, 4]]
-    assert collect(sampler, partition) == expected
+    expected = [[1, 3, 4, 5], [2, 0]]
+    assert collect(sampler, partition, capacity=12) == expected
     restored = make()
     restored.load_checkpoint(copy.deepcopy(sampler.save_checkpoint()))
     for metadata in partition.metadata.values():
         metadata.pop(PLAN_METADATA_FIELD)
         metadata["producer_field"] = 42
-    assert collect(restored, partition) == expected
+    assert collect(restored, partition, capacity=12) == expected
     assert all(row["producer_field"] == 42 for row in partition.metadata.values())
     for rows in expected:
-        batch = dict(total_lengths=[1] * len(rows))
+        batch = dict(total_lengths=[lengths[i] for i in rows])
         meta = SimpleNamespace(global_indexes=rows, get_all_custom_meta=lambda: [partition.metadata[i] for i in rows])
         restore_schedule(meta, batch)
-        assert local_schedule(batch) == ([list(range(len(rows)))], [1])
+        assert local_schedule(batch) == ([[0, 1], [2, 3]] if len(rows) == 4 else [[0], [1]], [2])
         assert batch["rollout_mini_local_sample_counts"] == [len(rows)]
         assert batch["rollout_mini_global_sample_counts"] == [6]
         doubled = {key: value + copy.deepcopy(value) for key, value in batch.items()}
-        assert local_schedule(doubled)[1] == [1, 1]
+        assert local_schedule(doubled)[1] == [2, 2]
         assert len(doubled[STEP_PLANS_FIELD]) == 2
     with pytest.raises(ValueError, match="geometry changed"):
-        collect(restored, partition, capacity=6)
+        collect(restored, partition, capacity=24)
     restored.clear_cache("p")
-    assert collect(restored, partition, capacity=6) == [[1, 3, 5], [0, 2, 4]]
+    assert collect(restored, partition, capacity=24) == [[1, 3, 4, 5], [0, 2]]
 
 
 def test_checkpoint_preserves_flops_mode():
