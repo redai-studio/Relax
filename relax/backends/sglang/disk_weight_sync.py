@@ -36,7 +36,7 @@ def prepare(engine, config_path: str, published: dict, reference: str) -> dict:
         raise RuntimeError("Prepared checkpoint has the wrong target root")
     # Independent reference: copy the ordinary Bridge export, rather than
     # deriving the correctness oracle through this package's encoder/decoder.
-    full = root / "full" / published["root"]
+    full = root / "full" / f"{published['version']:06d}-{published['root']}"
     with (root / ".full-reference.lock").open("ab") as lock:
         deadline = monotonic() + config.sync_timeout_s
         while True:

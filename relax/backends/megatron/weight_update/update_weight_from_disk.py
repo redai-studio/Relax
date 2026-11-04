@@ -137,10 +137,26 @@ class UpdateWeightFromDisk:
 
         # Preparation does not touch live GPU parameters. The receiver cache and
         # reconstruction directories are distinct from the producer store.
-        prepared = ray.get(
-            [engine.prepare_disk_checkpoint.remote(str(self.config_path), published, reference) for engine in engines],
-            timeout=remaining(),
+        identities = ray.get([engine.get_pid_and_node_id.remote() for engine in engines], timeout=remaining())
+        nodes = [identity.get("node_id") for identity in identities]
+        if any(not isinstance(node, str) or not node for node in nodes):
+            raise RuntimeError("Cannot prepare a fixed inference group without every member's node identity")
+        representatives = {}
+        for node, engine in zip(nodes, engines):
+            representatives.setdefault(node, engine)
+        node_targets = dict(
+            zip(
+                representatives,
+                ray.get(
+                    [
+                        engine.prepare_disk_checkpoint.remote(str(self.config_path), published, reference)
+                        for engine in representatives.values()
+                    ],
+                    timeout=remaining(),
+                ),
+            )
         )
+        prepared = [node_targets[node] for node in nodes]
         while not ray.get(lock.acquire.remote(), timeout=remaining()):
             sleep(min(0.05, remaining()))
         paused_at = monotonic()

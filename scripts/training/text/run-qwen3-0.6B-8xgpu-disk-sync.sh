@@ -89,7 +89,9 @@ PERF_ARGS=(
 )
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --entropy-coef 0.0
+   # The tiny bounded DAPO batch can have constant rewards; entropy keeps this
+   # validation on a real nonzero-gradient optimizer path in that case.
+   --entropy-coef 0.001
    --eps-clip 0.2
    --eps-clip-high 0.28
 )
