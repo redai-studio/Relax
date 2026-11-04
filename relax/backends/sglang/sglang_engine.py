@@ -807,6 +807,7 @@ class SGLangEngine(RayActor):
             "ep_join_mode",
             "elastic_ep_backend",
             "speculative_algorithm",
+            "speculative_draft_model_path",
             "moe_runner_backend",
             "moe_a2a_backend",
             "json_model_override_args",
@@ -835,7 +836,11 @@ class SGLangEngine(RayActor):
             and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
         )
         config = get_hf_config(layout["model_path"])
-        text_config = getattr(config, "text_config", None) or config
+        text_config = (
+            getattr(config, "text_config", None)
+            or getattr(getattr(config, "thinker_config", None), "text_config", None)
+            or config
+        )
         if "dtype" in layout:
             from sglang.srt.configs.model_config import _get_and_verify_dtype
 
@@ -852,6 +857,11 @@ class SGLangEngine(RayActor):
             layout["moe_runner_backend"] = "triton"
         layout["num_experts"] = getattr(text_config, "num_experts", None) or getattr(
             text_config, "n_routed_experts", None
+        )
+        layout["num_shared_experts"] = (
+            getattr(text_config, "n_shared_experts", None)
+            or getattr(text_config, "num_shared_experts", None)
+            or int(bool(getattr(text_config, "shared_expert_intermediate_size", 0)))
         )
         for key in ("hidden_size", "moe_intermediate_size", "quantization_config"):
             layout[key] = getattr(text_config, key, None)

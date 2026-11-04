@@ -26,7 +26,9 @@ def test_bridge_projection_capability_uses_existing_mapping(prefix, packed, tran
         source: SimpleNamespace(mapping=SimpleNamespace(hf_param=hf_param, transpose_on_export=transpose_on_export))
     }
     assert converter.supports_packed_experts([source]) is (not transpose_on_export)
+    assert converter.supports_routed_expert(source)
     converter._bridge_task_map[source].mapping.hf_param = target + ".3.w1.weight"
     assert not converter.supports_packed_experts([source])
+    assert not converter.supports_routed_expert(source)
     converter._bridge_task_map[source].mapping.hf_param = {"gate": target + ".3.gate_proj.weight"}
     assert not converter.supports_packed_experts([source])

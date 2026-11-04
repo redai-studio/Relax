@@ -78,7 +78,8 @@ def test_legacy_ipc_wait_does_not_add_collectives(module):
 
 @pytest.mark.parametrize("fail_load", [False, True, "conversion", "dispatch"])
 @pytest.mark.parametrize("mode", ["disabled", "colocate", "hybrid"])
-def test_routed_update_publishes_version_only_after_all_loads(module, fail_load, mode):
+@pytest.mark.parametrize("automatic_bf16", [False, True])
+def test_routed_update_publishes_version_only_after_all_loads(module, fail_load, mode, automatic_bf16):
     from types import SimpleNamespace
 
     events = []
@@ -87,6 +88,8 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
         "pause_generation",
         "flush_cache",
         "post_process_weights",
+        "begin_weight_update",
+        "end_weight_update",
         "update_weight_version",
         "continue_generation",
     ):
@@ -96,6 +99,7 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
     updater = object.__new__(module.UpdateWeightFromTensor)
     updater._route_experts = True
     updater.args = SimpleNamespace(inference_recovery=mode != "disabled", colocate=True, hybrid=mode == "hybrid")
+    updater._auto_expert_routing = automatic_bf16
     updater.lora_enabled = updater.lora_merge_mode = False
     updater.rollout_engines, updater.distributed_rollout_engines = [engine], []
     updater.weight_version = 0
@@ -149,18 +153,19 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
             expected = [
                 "pause_generation",
                 "flush_cache",
-                "post_process_weights",
+                "begin_weight_update" if automatic_bf16 else "post_process_weights",
                 "send",
                 "send",
-                "post_process_weights",
+                "end_weight_update" if automatic_bf16 else "post_process_weights",
                 "update_weight_version",
                 "continue_generation",
             ]
             if mode == "colocate":
                 expected.remove("continue_generation")
             assert [name for name, _ in events] == expected
-            assert events[2][1]["restore_weights_before_load"] is True
-            assert events[5][1]["post_process_quantization"] is True
+            if not automatic_bf16:
+                assert events[2][1]["restore_weights_before_load"] is True
+                assert events[5][1]["post_process_quantization"] is True
             engine.update_weight_version.remote.assert_called_once_with(weight_version="1")
 
 

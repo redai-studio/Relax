@@ -76,7 +76,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_merge_mode,
     summarize_lora_modules,
 )
-from relax.utils.memory_utils import clear_memory, print_memory
+from relax.utils.memory_utils import clear_memory, manual_gc_eval, manual_gc_training, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.opd.opd_utils import (
@@ -1349,10 +1349,12 @@ class MegatronTrainRayActor(TrainRayActor):
                                 )
                             )
                     dist.barrier(group=get_gloo_group())
-                    run_sft_eval(self, rollout_id)
+                    with manual_gc_eval(self.args):
+                        run_sft_eval(self, rollout_id)
 
                 if should_run_predict:
-                    run_sft_predict(self, rollout_id)
+                    with manual_gc_eval(self.args):
+                        run_sft_predict(self, rollout_id)
             except Exception as e:
                 logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
                 raise
@@ -1391,6 +1393,7 @@ class MegatronTrainRayActor(TrainRayActor):
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    @manual_gc_training
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
@@ -2551,6 +2554,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if clear_routing_replay_forward:
                 RoutingReplay.clear_all_forward()
 
+    @manual_gc_training
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -2794,6 +2798,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self._end_inference_sync()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
+    @manual_gc_training
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -3146,7 +3151,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if reconnect_rollout_engines:
             self.wake_up()
         elif self.args.offload_train:
-            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+            reload_process_groups(
+                timeout_minutes=self.args.distributed_timeout_minutes,
+                process_groups=getattr(self.weight_updater, "process_groups_for_update", None),
+            )
 
         if num_new_engines > 0 or reconnect_rollout_engines:
             self.weight_updater.connect_rollout_engines(

@@ -27,10 +27,11 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
 )
+from relax.utils.reloadable_process_group import retain_process_groups
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .expert_layout import DirectExpertLayout, direct_expert_chunk, expert_slice_chunk
-from .expert_routing import ExpertLayout, validate_server_layout
+from .expert_routing import ExpertLayout, validate_bf16_server_layout, validate_server_layout
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .ipc import dispatch_typed_buckets
 from .ipc_allocator import IpcBucketAllocator
@@ -86,8 +87,21 @@ class UpdateWeightFromTensor:
         self._lora_sync = LoraAdapterSync(args, model) if self.lora_adapter_mode else None
 
         self._route_experts = getattr(args, "colocate_expert_weight_routing", False)
+        self._auto_expert_routing = False
+        self._auto_route_candidate = (
+            not self._route_experts
+            and args.colocate
+            and args.megatron_to_hf_mode == "bridge"
+            and not self.lora_enabled
+            and not quantization_config
+            and not getattr(args, "rollout_external", False)
+            and isinstance(getattr(args, "num_experts", None), int)
+            and args.num_experts > 0
+        )
         self._expert_routing_placement = None
         self._expert_routing_group = None
+        self.process_groups_for_update = None
+        self._sync_groups_configured = False
         if self._route_experts and (
             not args.colocate
             or args.megatron_to_hf_mode != "bridge"
@@ -124,6 +138,10 @@ class UpdateWeightFromTensor:
         to colocated IPC engines.
         """
         self.rollout_engines = rollout_engines
+        explicit_placement = engine_gpu_counts is not None and engine_gpu_offsets is not None
+        if getattr(self, "_auto_expert_routing", False):
+            self._hf_weight_iterator.configure_expert_routing(None)
+            self._route_experts = self._auto_expert_routing = False
         if self._route_experts and (engine_gpu_counts is None or engine_gpu_offsets is None):
             raise ValueError("Expert routing requires explicit engine GPU counts and offsets")
 
@@ -187,7 +205,11 @@ class UpdateWeightFromTensor:
         if self._ipc_placement not in (None, placement):
             raise ValueError("Weight sync cannot reconnect with changed IPC GPU placement")
 
-        if self._route_experts:
+        self._configure_sync_process_groups()
+        if getattr(self, "_auto_route_candidate", False) and explicit_placement and not self.use_distribute:
+            self._configure_auto_expert_routing(colocate_gpu_counts, colocate_gpu_offsets)
+
+        if self._route_experts and not getattr(self, "_auto_expert_routing", False):
             placement = (tuple(colocate_gpu_offsets), tuple(colocate_gpu_counts))
             if self._expert_routing_placement not in (None, placement):
                 raise ValueError("Expert routing cannot reconnect with changed IPC GPU placement")
@@ -215,10 +237,10 @@ class UpdateWeightFromTensor:
                 dist.get_world_size(get_gloo_group()),
             )
             if self._expert_routing_group is None:
-                # Use the standard reloadable-group factory so colocate sleep
-                # releases NCCL resources and wake-up restores this same proxy.
-                self._expert_routing_group = dist.new_group(
-                    ranks=list(range(layout.world_size)), backend=device_utils.get_dist_backend()
+                self._expert_routing_group = (
+                    dist.group.WORLD
+                    if self.process_groups_for_update is not None
+                    else dist.new_group(ranks=list(range(layout.world_size)), backend=device_utils.get_dist_backend())
                 )
             self._hf_weight_iterator.configure_expert_routing(
                 layout, payload_group=self._expert_routing_group, metadata_group=get_gloo_group()
@@ -247,6 +269,107 @@ class UpdateWeightFromTensor:
             end = start + colocate_gpu_counts[i]
             if start <= dist.get_rank() < end:
                 self._ipc_engine = engine
+
+    def _configure_sync_process_groups(self) -> None:
+        """Retain the audited iterator's communicator closure, independently of
+        whether this receiver supports expert routing."""
+        if (
+            not getattr(self.args, "offload_train", False)
+            or not getattr(self.args, "colocate", False)
+            or not getattr(self.args, "num_experts", None)
+            or getattr(self.args, "megatron_to_hf_mode", None) != "bridge"
+            or getattr(self.args, "rollout_external", False)
+            or self.use_distribute
+            or self.lora_enabled
+        ):
+            for group in getattr(self, "process_groups_for_update", None) or ():
+                group._keep_alive_for_weight_sync = False
+            self.process_groups_for_update = None
+            self._sync_groups_configured = False
+            return
+        if getattr(self, "_sync_groups_configured", False):
+            return
+        metadata_group = get_gloo_group()
+        groups = []
+        ready = False
+        try:
+            configure = getattr(self._hf_weight_iterator, "weight_sync_process_groups", None)
+            ready = (
+                torch.cuda.is_available()
+                and torch.version.hip is None
+                and dist.get_backend(group=dist.group.WORLD) == "nccl"
+                and configure is not None
+            )
+            if ready:
+                groups = configure()
+        except (AttributeError, RuntimeError, TypeError):
+            ready = False
+        agreed = torch.tensor([int(ready)], dtype=torch.int32, device="cpu")
+        dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=metadata_group)
+        if agreed.item():
+            self.process_groups_for_update = retain_process_groups(groups, metadata_group=metadata_group)
+        self._sync_groups_configured = True
+        if dist.get_rank(group=metadata_group) == 0:
+            logger.info(
+                "Weight sync communicator plan: %s",
+                "full reload"
+                if self.process_groups_for_update is None
+                else f"retain {len(self.process_groups_for_update)} PP/EP/TP/ETP groups",
+            )
+
+    def _configure_auto_expert_routing(self, gpu_counts: Sequence[int], gpu_offsets: Sequence[int]) -> None:
+        """Negotiate BF16 routing before changing any receiver weights."""
+        group = get_gloo_group()
+        configure = getattr(self._hf_weight_iterator, "configure_expert_routing", None)
+        ready = torch.tensor(
+            [
+                int(
+                    configure is not None
+                    and torch.cuda.is_available()
+                    and torch.version.hip is None
+                    and mpu.get_expert_tensor_parallel_world_size() == 1
+                    and mpu.get_expert_model_parallel_world_size() > 1
+                    and dist.get_backend(group=dist.group.WORLD) == "nccl"
+                )
+            ],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=group)
+        if not ready.item():
+            return
+        status = [None]
+        if dist.get_rank(group=group) == 0:
+            try:
+                status[0] = (
+                    ray.get([engine.get_expert_weight_sync_layout.remote() for engine in self.rollout_engines]),
+                    None,
+                )
+            except Exception as error:
+                status[0] = ([], str(error))
+        dist.broadcast_object_list(status, src=0, group=group)
+        receivers, reason = status[0]
+        layout = None
+        try:
+            if reason is not None or not receivers or len(receivers) != len(gpu_counts):
+                raise ValueError(reason or "Missing receiver placement/layout")
+            ep_size = receivers[0]["ep_size"]
+            for config, count in zip(receivers, gpu_counts, strict=True):
+                validate_bf16_server_layout(config, count, ep_size, self.args.num_experts)
+            layout = ExpertLayout(self.args.num_experts, ep_size, tuple(gpu_offsets), dist.get_world_size(group=group))
+            configure(layout, payload_group=dist.group.WORLD, metadata_group=group, allow_replicas=True)
+        except (ValueError, TypeError, KeyError, RuntimeError) as error:
+            reason = str(error)
+            layout = None
+        agreed = torch.tensor([int(layout is not None)], dtype=torch.int32, device="cpu")
+        dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=group)
+        if agreed.item():
+            self._route_experts = self._auto_expert_routing = True
+            self._expert_routing_placement = (tuple(gpu_offsets), tuple(gpu_counts))
+        else:
+            configure(None)
+        if dist.get_rank(group=group) == 0:
+            logger.info("Weight sync BF16 expert routing: %s", layout if agreed.item() else reason or "peer rejected")
 
     def _configure_direct_experts(self, gpu_counts: Sequence[int]) -> None:
         """Negotiate one fast path using actual training and receiver
@@ -350,12 +473,15 @@ class UpdateWeightFromTensor:
         if self._route_experts:
             self._routed_engine_call(all_engines, "pause_generation")
             self._routed_engine_call(all_engines, "flush_cache")
-            self._routed_engine_call(
-                all_engines,
-                "post_process_weights",
-                restore_weights_before_load=True,
-                post_process_quantization=False,
-            )
+            if getattr(self, "_auto_expert_routing", False):
+                self._routed_engine_call(all_engines, "begin_weight_update")
+            else:
+                self._routed_engine_call(
+                    all_engines,
+                    "post_process_weights",
+                    restore_weights_before_load=True,
+                    post_process_quantization=False,
+                )
         elif rank == 0:
             ray.get([engine.pause_generation.remote() for engine in all_engines])
             ray.get([engine.flush_cache.remote() for engine in all_engines])
@@ -446,12 +572,15 @@ class UpdateWeightFromTensor:
             and not getattr(self.args, "hybrid", False)
         )
         if self._route_experts:
-            self._routed_engine_call(
-                all_engines,
-                "post_process_weights",
-                restore_weights_before_load=False,
-                post_process_quantization=True,
-            )
+            if getattr(self, "_auto_expert_routing", False):
+                self._routed_engine_call(all_engines, "end_weight_update")
+            else:
+                self._routed_engine_call(
+                    all_engines,
+                    "post_process_weights",
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                )
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
             if not defer_generation:
                 self._routed_engine_call(all_engines, "continue_generation")
