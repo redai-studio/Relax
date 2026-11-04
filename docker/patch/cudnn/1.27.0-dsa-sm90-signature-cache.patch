@@ -4,7 +4,7 @@
 # In this version max_topk is inactive in that kernel branch. Newer Frontend
 # kernels (including 1.31.0) use it there, so this patch MUST NOT be reused
 # without revalidating the kernel and cache key. Dockerfile checks package
-# versions and the wrapper/kernel/conversion/compiler sources before applying.
+# versions before applying with --fuzz=0, then checks the patched wrapper syntax.
 # No-length specialization, kernel math, inputs and launch order are unchanged.
 
 --- a/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py
