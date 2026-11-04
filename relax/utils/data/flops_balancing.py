@@ -1,11 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Slime PR #2017's pack-first, whole-microbatch DP scheduling.
+"""FLOPs-aware packing and whole-microbatch data-parallel scheduling.
 
-Algorithm pinned to THUDM/slime 053bdfcebb9733373cc4fc70d6c1e011fa3ee216. The
-capacity determines the initial bin count; upstream FLOPs KK does not enforce a
-hard token bound on each resulting bin. No local repair or search is applied
-here.
+With PP=1 and multiple DP ranks, pair microbatch positions by ascending FLOPs
+without changing pack membership or ownership. Capacity determines the initial
+bin count rather than enforcing a hard token limit on each pack.
 """
 
 import hashlib
@@ -139,6 +138,11 @@ def encode_schedule(
     weights = validated_cost_weights(rows, metadata)
     costs = [weights[i] for i in rows]
     plan = build_flops_schedule(lengths, costs, geometry["capacity"], dp_size, geometry["microbatch_group_size"])
+    if geometry["pipeline_stages"] == 1 and dp_size > 1:
+        # Co-sort packs for microbatch-level synchronization (e.g. EP).
+        # Keep PP pipeline order unchanged; equal-cost ties remain stable.
+        for rank in plan:
+            rank.sort(key=lambda pack: sum(costs[i] for i in pack))
     packs = [[[rows[i] for i in group] for group in rank] for rank in plan]
     digest = hashlib.sha256(json.dumps([identity, geometry, rows, lengths, costs, packs]).encode()).hexdigest()
     assignments, updates = [], {}
