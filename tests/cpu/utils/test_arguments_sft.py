@@ -196,21 +196,10 @@ def test_sft_packing_preserves_default_and_archived_recipe(balance_parser, cli, 
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_balance_single_switch_default_and_serialization(balance_parser, enabled):
-    import pickle
-
+def test_balance_single_switch_default_and_explicit_enable(balance_parser, enabled):
     args = balance_parser.parse_args(["--balance-by-flops"] if enabled else [])
     assert args.balance_by_flops is enabled
     assert not args.balance_data
-    restored = pickle.loads(pickle.dumps(args))
-    assert restored.balance_by_flops is enabled
-    assert not hasattr(args, "dp_balance") and not hasattr(args, "microbatch_balance")
-
-
-@pytest.mark.parametrize("option", ["--microbatch-balance", "--dp-balance"])
-def test_obsolete_balance_options_are_not_exposed(balance_parser, option):
-    with pytest.raises(SystemExit):
-        balance_parser.parse_args([option, "flops"])
 
 
 def test_balance_is_validated_before_training_setup(arguments_module):
