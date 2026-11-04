@@ -66,8 +66,10 @@ class ReceiptInbox:
         if seed is not None:
             validate_token(seed)
         self._seed = seed.copy() if seed is not None else None
-        self.observed = self.failed = RecoveryEvidence(0)
-        self._conflicts = RecoveryEvidence(0)
+        # Receipt slots are wire masks. Business evidence remains IntFlag
+        # until Runtime admission; both use the enum's single bit definition.
+        self.observed = self.failed = 0
+        self._conflicts = 0
 
     @property
     def conflict(self) -> bool:
@@ -80,7 +82,7 @@ class ReceiptInbox:
             return "invalid"
         if self._seed is None or token != self._seed:
             return "stale"
-        bit = OPERATIONS[operation]
+        bit = OPERATIONS[operation].value
         previous = self.observed if outcome == "succeeded" else self.failed
         opposite = self.failed if outcome == "succeeded" else self.observed
         if opposite & bit:
@@ -99,8 +101,8 @@ class ReceiptInbox:
             return None
         return {
             "token": dict(self._seed),
-            "observed": int(self.observed & ~self._conflicts),
-            "failed": int(self.failed & ~self._conflicts),
+            "observed": self.observed & ~self._conflicts,
+            "failed": self.failed & ~self._conflicts,
             "conflict": self.conflict,
         }
 
