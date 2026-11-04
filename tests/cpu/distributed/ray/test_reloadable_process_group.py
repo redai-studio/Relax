@@ -19,6 +19,7 @@ import ast
 import contextlib
 import os
 import sys
+from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,7 +31,7 @@ source, rendezvous, mode = sys.argv[1:]
 tree = ast.parse(Path(source).read_text())
 names = {"monkey_patch_torch_dist", "ReloadableProcessGroup"}
 nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
-namespace = dict(torch=torch, dist=dist, os=os, timedelta=timedelta,
+namespace = dict(torch=torch, dist=dist, os=os, timedelta=timedelta, Sequence=Sequence,
                  old_new_group_dict={}, _wrap_low_level_call=contextlib.nullcontext,
                  logger=SimpleNamespace(info=lambda *a, **kw: None))
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
