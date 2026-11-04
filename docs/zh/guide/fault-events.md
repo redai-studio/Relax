@@ -91,10 +91,10 @@ driver 退出时向 Runtime 和 HTTP 发出关闭信号，不等待队列排空�
 
 ```bash
 PYTHONPATH=. pytest -q \
-  tests/utils/test_fault_event_store.py \
-  tests/utils/test_fault_event_runtime.py \
-  tests/utils/test_fault_query_server.py \
-  tests/entrypoints/test_fault_events_lifecycle.py
+  tests/cpu/utils/test_fault_event_store.py \
+  tests/cpu/utils/test_fault_event_runtime.py \
+  tests/cpu/utils/test_fault_query_server.py \
+  tests/cpu/entrypoints/test_fault_events_lifecycle.py
 pre-commit run --all-files
 ```
 

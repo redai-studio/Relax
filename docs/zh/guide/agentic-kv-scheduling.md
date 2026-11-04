@@ -98,7 +98,7 @@ Close 只是 KV 释放优化。失败不会阻塞逻辑终态；受影响的 ses
 | **Coordinator** | 单写者 Ray actor、全局 FIFO、`/metrics` 轮询、lease TTL 回收 | `relax/agentic/session/admission_coordinator.py` |
 | **Shard 集成** | 在 fleet permit 前以 cancellation-safe 方式获取 lease | `relax/agentic/session/service.py` |
 
-`BudgetState` 与 Ray 解耦，容量、pressure、lease、TTL 和 usage accounting 都通过注入的 monotonic `now` 进行确定性的 CPU 测试。全局 FIFO、aging、cancellation 和 metrics polling 位于 Ray-backed `AdmissionCoordinator`；测试直接使用其底层类，无需启动 Ray（`tests/test_agentic_rollout.py`）。
+`BudgetState` 与 Ray 解耦，容量、pressure、lease、TTL 和 usage accounting 都通过注入的 monotonic `now` 进行确定性的 CPU 测试。全局 FIFO、aging、cancellation 和 metrics polling 位于 Ray-backed `AdmissionCoordinator`；测试直接使用其底层类，无需启动 Ray（`tests/cpu/test_agentic_rollout.py`）。
 
 ### Reservation 的计算
 
