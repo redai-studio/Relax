@@ -296,19 +296,11 @@ def _allgather_cp_redistribute(
             e = min(logit_global_end, chunk_end)
 
             if e <= s:
-                # This rank has no response logprobs for this sample. Match the
-                # placeholder's requires_grad to the real data (`value`): forcing
-                # requires_grad=True makes the concatenated all_reduce input require
-                # grad on ranks with an empty chunk while non-empty ranks (F.pad of
-                # a no-grad `value`) do not, so the differentiable dist.nn.all_reduce
-                # below builds a backward graph on some CP ranks but not others and
-                # the collective deadlocks.
-                full_resp = torch.zeros(
-                    (response_length, *value.shape[1:]),
-                    dtype=value.dtype,
-                    device=value.device,
-                    requires_grad=value.requires_grad,
-                )
+                # Pad the empty value itself to preserve its path to logits.
+                # Fresh zeros disconnect this CP rank from collective backward.
+                # Keep trailing top-k dimensions and detached/no-grad metrics.
+                padding = (0, 0) * (value.ndim - 1) + (0, response_length)
+                full_resp = F.pad(value, padding)
             else:
                 resp_start = s - logit_global_start
                 resp_end = e - logit_global_start
@@ -1231,18 +1223,22 @@ def policy_loss_function(
         ref_log_probs = torch.cat(ref_log_probs, dim=0)
         if is_score_centering:
             ref_log_probs = torch.where(sc_valid, ref_log_probs, 0)
-        importance_ratio = None
-        if args.use_unbiased_kl:
-            importance_ratio = torch.exp(log_probs - old_log_probs)
-        kl = compute_approx_kl(
-            log_probs,
-            ref_log_probs,
-            kl_loss_type=args.kl_loss_type,
-            importance_ratio=importance_ratio,
-        )
-        kl_loss = sum_of_sample_mean(kl)
+        # A zero coefficient makes KL diagnostic-only. Attaching its graph
+        # can still produce NaN gradients through 0 * exp(large_log_ratio).
+        with torch.set_grad_enabled(torch.is_grad_enabled() and args.kl_loss_coef != 0):
+            importance_ratio = None
+            if args.use_unbiased_kl:
+                importance_ratio = torch.exp(log_probs - old_log_probs)
+            kl = compute_approx_kl(
+                log_probs,
+                ref_log_probs,
+                kl_loss_type=args.kl_loss_type,
+                importance_ratio=importance_ratio,
+            )
+            kl_loss = sum_of_sample_mean(kl)
 
-        loss = loss + args.kl_loss_coef * kl_loss
+        if args.kl_loss_coef != 0:
+            loss = loss + args.kl_loss_coef * kl_loss
 
     opd_loss, opd_reported_loss = compute_policy_opd_loss(
         args=args,

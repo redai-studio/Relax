@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import os
 
 import torch
@@ -32,12 +34,12 @@ class RoutingReplay:
     def pop_forward(self):
         top_indices = self.top_indices_list[self.forward_index]
         self.forward_index += 1
-        return top_indices.to(device_utils.make_current_torch_device())
+        return top_indices.to(device=device_utils.make_current_torch_device(), dtype=torch.long)
 
     def pop_backward(self):
         top_indices = self.top_indices_list[self.backward_index]
         self.backward_index += 1
-        return top_indices.to(device_utils.make_current_torch_device())
+        return top_indices.to(device=device_utils.make_current_torch_device(), dtype=torch.long)
 
     def clear(self):
         self.forward_index = 0

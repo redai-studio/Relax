@@ -6,6 +6,7 @@ from argparse import Namespace
 
 from relax.engine.sft.image_preprocessing_config import configure_image_preprocessing
 from relax.engine.sft.runtime import is_offline_mode, is_sft_mode
+from relax.utils.data.wholepack_policy import enabled as wholepack_enabled
 
 
 def configure_sft_data_pipeline(args: Namespace) -> None:
@@ -17,6 +18,8 @@ def configure_sft_data_pipeline(args: Namespace) -> None:
         # NCCL describes the training workers, unlike the driver's local device.
         args.sft_async_prepack = bool(
             is_sft
+            # Wholepack owns the packing plan and requires raw prefetched batches.
+            and not wholepack_enabled(args)
             and lookahead
             and "image" not in (getattr(args, "multimodal_keys", None) or {})
             and args.distributed_backend == "nccl"

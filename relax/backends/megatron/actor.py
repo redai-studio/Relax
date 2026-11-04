@@ -453,16 +453,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
 
-        # Single source of truth for VL-model routing across data prep, forward,
-        # and CP helpers. Detected by the presence of processor/preprocessor
-        # config in the HF checkpoint dir — only multimodal models ship one.
-        # This way VL models with text-only batches (no --multimodal-keys) still
-        # take the bridge VL+CP+thd path.
-        args.is_vl_model = any(
-            os.path.exists(os.path.join(args.hf_checkpoint, name))
-            for name in ("processor_config.json", "preprocessor_config.json")
-        )
-
         from relax.utils.training.flops_counter import FlopsCounter
 
         self.flops_counter = FlopsCounter(self.hf_config)

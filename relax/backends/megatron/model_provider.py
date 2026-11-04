@@ -43,7 +43,7 @@ from relax.utils.megatron_peft_utils import (
     scope_target_modules_to_region,
     summarize_lora_modules,
 )
-from relax.utils.misc import load_function
+from relax.utils.misc import load_function, resolve_is_vl_model
 from relax.utils.training.ppo_utils import (
     ensure_sequence_classification_head_trainable,
     install_critic_value_head_in_provider,
@@ -56,6 +56,23 @@ from .conditional_branch_sync import install_conditional_branch_sync
 
 
 logger = get_logger(__name__)
+
+
+def configure_gdn_a_log_fp32(model: torch.nn.Module) -> None:
+    """Preserve GDN A_log precision before Float16Module, DDP and HF
+    loading."""
+    for module in model.modules():
+        if not any(cls.__name__ == "GatedDeltaNet" for cls in type(module).__mro__):
+            continue
+        # Import only for GDN models; other architectures need no GDN dependencies.
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+        from megatron.core.transformer.module import mark_keep_in_fp32
+
+        if isinstance(module, GatedDeltaNet):
+            # Keep Parameter identity and TP metadata. This also preserves the
+            # constructor's RNG sequence and works for meta-device construction.
+            module.A_log.data = module.A_log.data.float()
+            mark_keep_in_fp32(module.A_log)
 
 
 def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
@@ -175,6 +192,9 @@ def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module
     cu_seqlens instead of the pre-split + cp-multiplied form, and by model.py
     to route those through the forward.
     """
+    if getattr(model, "uses_unsplit_forward", False):
+        args.uses_unsplit_forward = True
+        return
     try:
         from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     except ImportError:
@@ -276,6 +296,25 @@ def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    from relax.models.qwen3_5.recipe import enabled as optimized_recipe
+
+    args._relax_qwen35_optimized = optimized_recipe(args)
+    if args._relax_qwen35_optimized:
+        assert not getattr(args, "sft_async_prepack", False), "Whole-pack recipe requires foreground packing"
+        from relax.models.qwen3_5.deepep_backend import ensure_backend
+
+        ensure_backend(args)
+
+    provider = None
+    if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
+    # Resolve once, after provider selection and before model/data setup. A VL
+    # checkpoint can produce a text-only provider despite its processor files.
+    args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
+
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -293,6 +332,7 @@ def get_model_provider_func(
             for module in model.modules():
                 if getattr(module, "config", None) is not None:
                     _validate_linear_cp_mode(args, module.config)
+            configure_gdn_a_log_fp32(model)
             configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
@@ -309,10 +349,6 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
-
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        provider = bridge.to_megatron_provider(load_weights=False)
         is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
         if is_kimi_k3:
             from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
@@ -334,6 +370,8 @@ def get_model_provider_func(
             "cp_comm_type",
             "cp_partition_mode",
             "sequence_packing_scheduler",
+            "max_seqlen_per_dp_cp_rank",
+            "pad_packed_seq_alignment",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "variable_seq_lengths",
@@ -355,8 +393,18 @@ def get_model_provider_func(
             "recompute_num_layers",
             "recompute_modules",
             "distribute_saved_activations",
+            "fine_grained_activation_offloading",
+            "offload_modules",
+            "min_offloaded_tensor_size",
+            "activation_offload_fraction",
+            "delta_offload_bytes_across_pp_ranks",
+            "delay_offload_until_cuda_graph",
+            "fine_grained_offloading_max_inflight_offloads",
             "moe_router_load_balancing_type",
             "moe_router_dtype",
+            "moe_router_fusion",
+            "overlap_dispatch_backward_with_experts_wgrad",
+            "_relax_qwen35_optimized",
             "moe_aux_loss_coeff",
             "moe_token_dispatcher_type",
             "moe_shared_expert_overlap",
@@ -433,6 +481,9 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        if callable(getattr(provider, "configure_runtime", None)):
+            provider.configure_runtime(args)
 
         if is_kimi_k3:
             configure_runtime(provider, args)
@@ -555,6 +606,7 @@ def get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = _call_model_provider(original_provide, *p_args, **p_kwargs)
+            configure_gdn_a_log_fp32(model)
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
@@ -689,6 +741,7 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        configure_gdn_a_log_fp32(model)
         configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)
         install_reward_model_head_in_provider(model, args, role, post_process)

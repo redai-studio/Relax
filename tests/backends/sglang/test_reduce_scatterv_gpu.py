@@ -2,6 +2,7 @@
 
 """Exercise variable-size DP MoE reductions with real NCCL and CUDA graphs."""
 
+from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ def _check_reduce_scatterv(rank: int, init_method: str) -> None:
         initialize_model_parallel,
         set_custom_all_reduce,
     )
+    from sglang.srt.environ import envs
     from sglang.srt.layers import dp_attention
     from sglang.srt.layers.moe.utils import should_use_dp_reduce_scatterv
     from sglang.srt.runtime_context import publish
@@ -38,19 +40,31 @@ def _check_reduce_scatterv(rank: int, init_method: str) -> None:
         moe_a2a_backend="none",
         disable_custom_all_reduce=True,
     )
-    publish(args, role="test")
+    if "ranks" in signature(publish).parameters:
+        from sglang.srt.runtime_context import SpawnRanks
+
+        publish(args, role="test", ranks=SpawnRanks(world_rank=rank, gpu_id=rank))
+    else:
+        publish(args, role="test")
     set_custom_all_reduce(False)
     init_distributed_environment(
         world_size=4, rank=rank, local_rank=rank, distributed_init_method=init_method, backend="nccl", timeout=120
     )
     try:
-        initialize_model_parallel(
-            tensor_model_parallel_size=4, expert_model_parallel_size=4, attention_data_parallel_size=4
-        )
+        if "tensor_model_parallel_size" in signature(initialize_model_parallel).parameters:
+            initialize_model_parallel(
+                tensor_model_parallel_size=4, expert_model_parallel_size=4, attention_data_parallel_size=4
+            )
+        else:
+            # SGLang 0.5.21 reads the widths from the published runtime context.
+            initialize_model_parallel()
         group = get_tp_group()
-        dp_attention.initialize_dp_attention(
-            args, SimpleNamespace(hf_config=SimpleNamespace(), hidden_size=4, dtype=torch.bfloat16)
-        )
+        model_config = SimpleNamespace(hf_config=SimpleNamespace(), hidden_size=4, dtype=torch.bfloat16)
+        if "model_config" in signature(dp_attention.initialize_dp_attention).parameters:
+            dp_attention.initialize_dp_attention(args, model_config)
+        else:
+            dp_attention.initialize_dp_attention(args)
+            dp_attention.init_dp_gathered_buffer(model_config)
         assert should_use_dp_reduce_scatterv()
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
             for sizes in ([0, 1, 3, 4], [1, 3, 0, 4], [0, 0, 0, 0], None):
@@ -99,6 +113,28 @@ def _check_reduce_scatterv(rank: int, init_method: str) -> None:
                         torch.cuda.synchronize()
                         check(result, phase)
                     del graph, result
+
+        if not hasattr(group, "_deterministic_reduce_scatterv"):
+            return  # 0.5.17 is covered by the regular NCCL and graph matrix above.
+
+        # The deterministic dispatch must use the same FP32 accumulation as the
+        # regular PyNCCL path, including when replayed from a CUDA graph.
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
+        sizes = [0, 1, 3, 4]
+        value = torch.full((8, 4), (256, 1, -256, 0.5)[rank], device=device, dtype=torch.bfloat16)
+        original = value.clone()
+        output = torch.empty((sizes[rank], 4), device=device, dtype=torch.bfloat16)
+        with graph_capture() as capture:
+            group.reduce_scatterv(value, output=output, sizes=sizes)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture.stream):
+                result = group.reduce_scatterv(value, output=output, sizes=sizes)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert result is output
+        torch.testing.assert_close(result, torch.full_like(output, 1.5), rtol=0, atol=0)
+        torch.testing.assert_close(value, original, rtol=0, atol=0)
     finally:
         cleanup_dist_env_and_memory()
 

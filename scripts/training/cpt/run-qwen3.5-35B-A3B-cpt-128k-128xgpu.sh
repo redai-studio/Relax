@@ -76,7 +76,7 @@ CMD=(
     --num-rollout "${TRAIN_STEPS}" --seed 42
     --rollout-batch-size "${GLOBAL_BATCH_SIZE}" --global-batch-size "${GLOBAL_BATCH_SIZE}"
     --n-samples-per-prompt 1 --num-steps-per-rollout 1 --micro-batch-size 1
-    --use-dynamic-batch-size --sft-packing-strategy binpack --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}" --balance-data
+    --use-dynamic-batch-size --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}" --balance-data
     --seq-length "${SEQ_LENGTH}" --qkv-format thd --data-pad-size-multiplier 1
     --sft-max-in-flight-steps 2 --per-rank-fetch
     --num-data-storage-units 4
