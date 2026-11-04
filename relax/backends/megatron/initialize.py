@@ -137,7 +137,7 @@ def init(args):
 
         _initialize_tp_communicators()
 
-    if getattr(args, "custom_megatron_init_path", None):
+    if args.custom_megatron_init_path:
         from relax.utils.misc import load_function
 
         custom_init = load_function(args.custom_megatron_init_path)

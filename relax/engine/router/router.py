@@ -61,13 +61,13 @@ class SlimeRouter:
         self.sticky_map: dict[str, list] = {}
         self.sticky_stats = {"hit": 0, "assigned": 0, "remap": 0, "evicted": 0, "no_routing_key": 0}
 
-        max_connections = getattr(args, "slime_router_max_connections", None)
+        max_connections = args.slime_router_max_connections
         if max_connections is None:
             max_connections = (
                 args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
             )
 
-        timeout = getattr(args, "slime_router_timeout", None)
+        timeout = args.slime_router_timeout
 
         self.client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=max_connections),

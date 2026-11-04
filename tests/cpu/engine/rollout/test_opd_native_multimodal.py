@@ -19,7 +19,9 @@ from relax.utils.opd.opd_multimodal import (
     validate_prompt_token_ids,
 )
 from relax.utils.opd.opd_opsd_worker import OpsdWorker
+from relax.utils.opd.opd_utils import validate_opd_args
 from relax.utils.types import Sample
+from tests.helpers.relax_args import make_args
 
 
 @pytest.fixture
@@ -56,7 +58,12 @@ def _sample() -> Sample:
 
 
 def _manager(**overrides) -> OpdManager:
-    args = dict(
+    # Declared defaults via make_args; validate_opd_args establishes runtime-only
+    # OPD fields (connector limit / urls / routes) that OpdManager consumers need.
+    # Merge overrides first so callers can replace defaults like opd_token_selection.
+    values = dict(
+        use_opd=True,
+        opd_type="sglang",
         opd_token_selection="student_sampled",
         opd_log_prob_top_k=2,
         opd_kl_coef=1.0,
@@ -65,8 +72,10 @@ def _manager(**overrides) -> OpdManager:
         sglang_router_ip="student",
         sglang_router_port=80,
     )
-    args.update(overrides)
-    return OpdManager(SimpleNamespace(**args))
+    values.update(overrides)
+    args = make_args(**values)
+    validate_opd_args(args, is_offline=False)
+    return OpdManager(args)
 
 
 def _response(expected_ids: list[int], **meta) -> dict:
@@ -356,6 +365,11 @@ def native_generate(monkeypatch):
         use_rollout_routing_replay=False,
         sglang_router_policy="round_robin",
         sglang_speculative_algorithm=None,
+        advantage_estimator="grpo",
+        lora_rank=0,
+        lora_adapter_mode=False,
+        use_rollout_indexer_replay=False,
+        slime_router_sticky=False,
     )
     state = SimpleNamespace(
         tokenizer=SimpleNamespace(
@@ -454,6 +468,13 @@ async def test_image_opd_rejects_text_radix_routing_before_generation(monkeypatc
         sglang_router_port=1,
         use_slime_router=True,
         slime_router_middleware_paths=["RadixTreeMiddleware"],
+        use_rollout_routing_replay=False,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        advantage_estimator="grpo",
+        sglang_router_policy="round_robin",
+        slime_router_sticky=False,
     )
     sample = Sample(prompt="text")
     if image_side == "student":

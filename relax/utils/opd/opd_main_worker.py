@@ -235,7 +235,7 @@ class TopkWorker:
         return cls(
             args.opd_token_selection,
             args.opd_log_prob_top_k,
-            opd_kl_coef=(0.0 if bool(getattr(args, "opd_fkl_entropy_gate", False)) else args.opd_kl_coef),
+            opd_kl_coef=(0.0 if bool(args.opd_fkl_entropy_gate) else args.opd_kl_coef),
             opd_loss_coef=args.opd_loss_coef,
         )
 
@@ -391,8 +391,8 @@ class TopkWorker:
 def restore_opd_topk_rollout_fields(rollout_data: dict, args, device) -> None:
     import torch
 
-    token_selection = getattr(args, "opd_token_selection", None)
-    opd_top_k = int(getattr(args, "opd_log_prob_top_k", 0) or 0)
+    token_selection = args.opd_token_selection
+    opd_top_k = int(args.opd_log_prob_top_k or 0)
     if opd_top_k <= 0 or token_selection not in ("student_topk", "teacher_topk", "union"):
         return
     is_union = token_selection == "union"

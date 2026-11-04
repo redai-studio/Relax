@@ -692,6 +692,10 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         use_rollout_routing_replay=False,
         sglang_router_policy="cache_aware",
         slime_router_sticky=False,
+        advantage_estimator="grpo",
+        lora_rank=0,
+        lora_adapter_mode=False,
+        use_rollout_indexer_replay=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
     adapter.tokenizer = _FakeTokenizer()

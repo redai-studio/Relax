@@ -80,8 +80,13 @@ def test_generate_keeps_training_ids_separate_and_resumes_rollout_ids(monkeypatc
         sglang_router_port=1,
         use_rollout_routing_replay=False,
         sglang_router_policy="cache_aware",
+        advantage_estimator="grpo",
         use_slime_router=False,
         sglang_speculative_algorithm=None,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        use_rollout_indexer_replay=False,
+        slime_router_sticky=False,
     )
     sample = Sample(
         prompt=original, multimodal_inputs={"images": [object()] if has_image else [], "videos": [], "audio": []}

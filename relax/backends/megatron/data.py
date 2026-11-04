@@ -83,9 +83,9 @@ def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBa
     if n_samples_per_prompt <= 0:
         raise ValueError(f"n_samples_per_prompt must be positive, got {n_samples_per_prompt}")
 
-    num_rollout_minis = getattr(args, "num_steps_per_rollout", None)
+    num_rollout_minis = args.num_steps_per_rollout
     if num_rollout_minis is None:
-        global_batch_size = getattr(args, "global_batch_size", None)
+        global_batch_size = args.global_batch_size
         if global_batch_size is None:
             raise ValueError("global_batch_size is required when num_steps_per_rollout is not set")
         total_samples = rollout_batch_size * n_samples_per_prompt
@@ -118,7 +118,7 @@ def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBa
             f"got mini_global_samples={mini_global_samples}, dp_size={dp_size}"
         )
 
-    global_batch_size = getattr(args, "global_batch_size", None)
+    global_batch_size = args.global_batch_size
     if global_batch_size is not None and int(global_batch_size) != mini_global_samples:
         raise ValueError(
             "global_batch_size must match the fixed-n_samples rollout mini size in phase 1, "
@@ -205,7 +205,7 @@ def _round_up_to_microbatch_group(num_microbatches: torch.Tensor, microbatch_gro
 
 
 def _get_micro_batch_token_capacity(args: Namespace, max_tokens: int, cp_size: int) -> int:
-    if getattr(args, "allgather_cp", False):
+    if args.allgather_cp:
         pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
         if pad_size <= 0 or max_tokens < pad_size:
             raise ValueError(
@@ -941,7 +941,7 @@ def prepack_sft_micro_batch_cpu(args: Namespace, batch: RolloutBatch) -> Prepack
         args.data_pad_size_multiplier,
         args.qkv_format,
         args.allgather_cp,
-        getattr(args, "is_vl_model", False),
+        args.is_vl_model,
         pack_device=torch.device("cpu"),
     )
     pinned = pin_tensors(packed)
@@ -1239,7 +1239,7 @@ def get_data_iterator(
 
     num_local_samples = len(rollout_data["total_lengths"])
     step_global_sample_counts = rollout_data.get(ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY)
-    if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
+    if args.partial_rollout and args.use_dynamic_global_batch_size:
         if step_global_sample_counts is not None:
             if not isinstance(step_global_sample_counts, list) or len(step_global_sample_counts) != 1:
                 raise ValueError(
@@ -1283,7 +1283,7 @@ def get_data_iterator(
     # collectives stay aligned. Explicit rollout-mini boundaries or divisible
     # fixed-size local steps must already produce the same count on every rank;
     # otherwise fail instead of generating empty batches.
-    if getattr(args, "balance_data", False):
+    if args.balance_data:
         local_num_steps_per_rollout = num_steps_per_rollout
         steps_tensor = torch.tensor(
             [num_steps_per_rollout], dtype=torch.int, device=device_utils.make_current_torch_device()
@@ -1359,16 +1359,16 @@ def get_data_iterator(
         micro_batch_token_capacity = _get_micro_batch_token_capacity(args, _max_tokens, cp_size)
         # calculate the number of mirobatches for each step
         samples = rollout_data["total_lengths"]
-        packing_strategy = getattr(args, "sft_packing_strategy", "balanced")
+        packing_strategy = args.sft_packing_strategy
         assert len(samples) == num_local_samples
         # Bridge pads each THD document before CP splitting, including text-only
         # batches of VL models. Plan with those physical lengths as well.
         needs_unsplit_input = (
-            getattr(args, "is_vl_model", False)
+            args.is_vl_model
             or getattr(args, "uses_unsplit_forward", False)
             or rollout_data.get("multimodal_train_inputs") is not None
         )
-        if getattr(args, "qkv_format", "thd") == "thd" and cp_size > 1 and needs_unsplit_input:
+        if args.qkv_format == "thd" and cp_size > 1 and needs_unsplit_input:
             alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
             samples = [(length + alignment - 1) // alignment * alignment for length in samples]
         num_microbatches = []
@@ -1501,7 +1501,7 @@ def log_rollout_data(
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             args.qkv_format,
-            getattr(args, "is_vl_model", False)
+            args.is_vl_model
             or rollout_data.get("multimodal_train_inputs") is not None
             or getattr(args, "uses_unsplit_forward", False),
         )

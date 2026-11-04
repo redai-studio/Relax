@@ -38,6 +38,6 @@ def config_contract(args) -> tuple[int, int]:
     if getattr(args, "sft_async_prepack", False) or getattr(args, "dynamic_context_parallel", False):
         raise ValueError("wholepack draft does not support async prepack or dynamicCP")
     sampler_padding(args.n_samples_per_prompt, WORLD_SIZE // tp, capacity, pad_size)
-    if getattr(args, "rollout_batch_size", GLOBAL_BATCH_SIZE) != GLOBAL_BATCH_SIZE:
+    if args.rollout_batch_size != GLOBAL_BATCH_SIZE:
         raise ValueError("wholepack requires one GBS1600 optimizer step per rollout")
     return capacity, pad_size
