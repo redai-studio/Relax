@@ -8,6 +8,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, contextmanager
+from itertools import groupby
 from time import monotonic
 from typing import Any
 
@@ -831,13 +832,9 @@ async def generate_and_rm_group(
 
     group = await asyncio.gather(*tasks)
 
-    # A group with any aborted member (e.g. a weight-sync pre-dispatch 499) is
-    # incomplete: skip group reward for it in training so it is not scored on a
-    # partial trajectory. The group is carried to the resume buffer and finished
-    # under the next weight version. Eval is unaffected — it never converts a 499.
-    group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
-    # eval should still compute group reward even if abort was triggered by a concurrent rollout
-    if (not state.aborted or evaluation) and args.group_rm and not group_has_training_abort:
+    # Group rewards require complete trajectories, including during evaluation.
+    group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
+    if (not state.aborted or evaluation) and args.group_rm and not group_aborted:
         rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
@@ -1344,7 +1341,7 @@ async def generate_rollout_async(
 EVAL_PROMPT_DATASET = {}
 
 
-async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
+async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[RolloutFnEvalOutput, list[list[Sample]]]:
 
     state = GenerateState(args)
     # Increment evaluating counter so that abort() knows to wait for eval to finish.
@@ -1365,7 +1362,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
 
 async def eval_rollout_single_dataset(
     args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
-) -> dict[str, dict[str, list[Any]]]:
+) -> dict[str, dict[str, Any]]:
     """An example to implement the eval_rollout function for an rule based rm
     rollout generation.
 
@@ -1440,7 +1437,8 @@ async def eval_rollout_single_dataset(
         pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
         for coro in asyncio.as_completed(tasks):
             group = await coro
-            if do_print:
+            pbar.update(1)
+            if do_print and group:
                 sample = group[0]
                 logger.info(
                     "eval_rollout_single_dataset example data: "
@@ -1449,7 +1447,6 @@ async def eval_rollout_single_dataset(
                 )
                 do_print = False
             data.extend(group)
-            pbar.update(1)
         pbar.close()
     else:
         tasks = []
@@ -1492,11 +1489,34 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+    # Preserve original prompt boundaries for pass@k, including missing samples.
+    group_size = dataset_cfg.n_samples_per_eval_prompt
+    valid_data = []
+    for prompt_index, samples in groupby(data, key=lambda sample: sample.index // group_size):
+        group = list(samples)
+        expected_indices = range(prompt_index * group_size, (prompt_index + 1) * group_size)
+        if (
+            0 <= prompt_index < len(dataset.samples)
+            and [sample.index for sample in group] == list(expected_indices)
+            and all(sample.reward is not None and sample.status != Sample.Status.ABORTED for sample in group)
+        ):
+            valid_data.extend(group)
+    num_valid_prompts = len(valid_data) // group_size
+    if num_valid_prompts != len(dataset.samples):
+        logger.warning(
+            "eval_rollout_single_dataset: partial evaluation, retaining %d/%d complete prompts",
+            num_valid_prompts,
+            len(dataset.samples),
+        )
+    data = valid_data
     return {
         dataset_cfg.name: {
             "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
+            "group_size": group_size,
+            "num_prompts": len(dataset.samples),
+            "num_valid_prompts": num_valid_prompts,
         }
     }
 
