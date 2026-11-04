@@ -38,10 +38,17 @@ overrides = {
     "CUDA_CACHE_PATH": str(root / "cache" / "cuda"),
     "NUMBA_CACHE_DIR": str(root / "cache" / "numba"),
     "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+    # Four-GPU Trial allocations cannot rely on NVLS multicast support merely
+    # because nvidia-smi reports NVLink connectivity.
+    "NCCL_NVLS_ENABLE": "0",
     "WANDB_DIR": str(root / "logs"), "CLEARML_CACHE_DIR": str(root / "cache" / "clearml"),
     "OMP_NUM_THREADS": "4", "MKL_NUM_THREADS": "4", "OPENBLAS_NUM_THREADS": "4",
 }
 env.setdefault("env_vars", {}).update(overrides)
+# Controller builds the detached Serve/TrainGroup environment from env.yaml.
+# Forward the task-owned cache paths and runtime controls across that boundary.
+propagate = env["env_vars"].get("RELAX_PROPAGATE_ENV_VARS", os.environ.get("RELAX_PROPAGATE_ENV_VARS", ""))
+env["env_vars"]["RELAX_PROPAGATE_ENV_VARS"] = ",".join(sorted(set(filter(None, propagate.split(","))) | set(overrides)))
 print(json.dumps(env))
 PY
 )
@@ -122,6 +129,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} \
    --actor-num-gpus-per-node 4 \
    --rollout-num-gpus 4 \
    --num-gpus-per-node 4 \
+   --train-env-vars '{"NCCL_NVLS_ENABLE":"0"}' \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    "${MODEL_ARGS[@]}" \
