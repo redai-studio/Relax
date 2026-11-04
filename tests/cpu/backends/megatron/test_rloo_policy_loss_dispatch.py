@@ -42,7 +42,6 @@ loss_module = _load_loss_module()
 
 
 def test_policy_loss_function_dispatches_rloo_objective(monkeypatch):
-
     log_probs = torch.tensor([-0.7, -0.4, -0.2, -0.1], dtype=torch.float64, requires_grad=True)
     entropy = torch.zeros_like(log_probs)
     advantages = torch.tensor([1.0, -1.0, 0.5, -0.5], dtype=torch.float64)
@@ -156,7 +155,9 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
     monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **_kwargs: (None, {}))
 
-    args = SimpleNamespace(
+    from tests.helpers.relax_args import make_args
+
+    args = make_args(
         loss_type="policy_loss",
         advantage_estimator="rloo",
         calculate_per_token_loss=True,
@@ -267,7 +268,9 @@ def test_loss_function_exports_effective_tokens_independent_of_metric_denominato
     monkeypatch, is_dummy, calculate_per_token_loss
 ):
     monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1, raising=False)
-    args = SimpleNamespace(
+    from tests.helpers.relax_args import make_args
+
+    args = make_args(
         mtp_only_training=True,
         calculate_per_token_loss=calculate_per_token_loss,
         qkv_format="thd",

@@ -86,7 +86,7 @@ def _aiohttp_json_post_kwargs(payload: dict) -> dict:
 
 
 def is_opd_enabled(args, evaluation: bool = False) -> bool:
-    return not evaluation and getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
+    return not evaluation and getattr(args, "use_opd", False) and args.opd_type == "sglang"
 
 
 def _create_teacher_client_session(args) -> aiohttp.ClientSession:
