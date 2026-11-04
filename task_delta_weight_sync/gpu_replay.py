@@ -197,6 +197,8 @@ class SourceServer:
         self.thread.start()
 
     def identity(self) -> dict:
+        from relax.distributed.weight_sync.provenance import runtime_identity
+
         with self.server.observation_lock:
             observed = {
                 "accepted_connections": self.server.accepted_connections,
@@ -205,7 +207,10 @@ class SourceServer:
         return {
             "endpoint": "tcp://%s:%s" % self.server.server_address,
             "node_id": ray.get_runtime_context().get_node_id(),
+            "actor_id": ray.get_runtime_context().get_actor_id(),
+            "creator_job_id": ray.get_runtime_context().get_job_id(),
             "node_ip": ray.util.get_node_ip_address(),
+            "runtime": runtime_identity(),
             **observed,
         }
 
