@@ -18,6 +18,7 @@ relax/                   核心框架
 ├── models/              模型层 — 模型专属实现与注册
 └── utils/               基础设施 — 工具函数、指标监控、多模态处理
 tests/                   模块测试与集成回归测试
+├── cpu/                 无 GPU 环境执行的测试，内部保留模块层级
 ├── backends/megatron/   Megatron 后端测试（权重转换等）
 ├── backends/sglang/     SGLang 后端测试
 ├── components/          RL 服务组件测试
@@ -125,6 +126,18 @@ make docs-dev                       # 启动 VitePress 文档开发服务器
 - 提交遵循 Conventional Commits（`feat:`, `fix:`, `docs:`），详见 `git-commit` skill
 - 默认仅创建本地 commit；用户授权 push 或创建 PR 时，遵循 `relax-github-workflow` skill
 - 测试命名：`test_<module>_<behavior>()`，GPU 测试用 `@pytest.mark.skipif` 优雅跳过
+
+## Test Scope & Placement
+
+新增测试前先评估必要性，不要求每个函数、类或实现改动都配套新增单测。
+
+- 先检查现有覆盖，并在变更说明中简述新增测试要防止的真实失败、覆盖缺口和 CI 成本；没有明确增量价值时不新增。
+- 优先覆盖用户可见行为、真实缺陷回归、数值与梯度正确性，以及分布式通信、状态恢复和资源清理等高风险路径。
+- 纯搬迁、重命名、文案或无行为变化的重构，优先复用现有回归与静态检查；避免重复实现逻辑、只断言 mock 调用或源码文本的测试。
+- 优先扩展已有用例，以最小场景集覆盖不同失败机制；避免重复覆盖和无必要的参数组合。新增慢测试或多进程测试时，说明为什么现有轻量测试不足，并限制进程数和超时。
+- 测试按实际运行需求归类：纯 CPU 测试放入 `tests/cpu/<module>/`，需要真实 GPU 的测试保留在对应的 `tests/<module>/`。CPU/GPU 混合文件应拆开，不在 workflow 维护文件清单或逐用例排除。
+- CPU 分类必须检查间接调用和 fixture 的设备依赖，包括 CUDA tensor 搬运、设备探测和可见设备环境变量；不能仅凭测试名称或使用 mock 判断，也不能为迁入 CPU 而新增 skip/mock 掩盖真实 GPU 依赖。
+- CPU 套件须支持隐藏 GPU 后执行 `pytest tests/cpu`；GPU 套件由 `pytest tests/ --ignore=tests/cpu` 执行。依赖不全导致的 skip 不算回归通过，应明确验证限制。
 
 ## Distributed Code Rules
 
