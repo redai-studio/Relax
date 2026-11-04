@@ -278,6 +278,14 @@ def _install_cp_probe(model: torch.nn.Module) -> None:
     )
 
 
+def _install_chunkflow(args: argparse.Namespace, model: torch.nn.Module) -> None:
+    if not getattr(args, "use_chunkflow", False):
+        return
+    from .chunkflow.integration import install
+
+    install(model, args.chunkflow_chunk_size)
+
+
 def _call_model_provider(provider: Any, *args: Any, **kwargs: Any) -> GPTModel:
     """Forward current MCore arguments while supporting older/custom
     providers."""
@@ -342,6 +350,7 @@ def get_model_provider_func(
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
+            _install_chunkflow(args, model)
             return model
 
         if is_lora_enabled(args) and getattr(args, "task_type", "causal_lm") == "seq_cls":
@@ -622,6 +631,7 @@ def get_model_provider_func(
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
+            _install_chunkflow(args, model)
             return model
 
         if is_lora_enabled(args):
@@ -751,6 +761,7 @@ def get_model_provider_func(
         _maybe_mark_unsplit_forward(args, model)
         install_conditional_branch_sync(args, model)
         _install_cp_probe(model)
+        _install_chunkflow(args, model)
         return model
 
     if is_lora_enabled(args):

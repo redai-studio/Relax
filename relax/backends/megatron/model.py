@@ -1383,7 +1383,7 @@ def train_one_step(
 
             forward_kwargs = {
                 "input_ids": batch["unsplit_tokens"] if use_unsplit else batch["tokens"],
-                "position_ids": None,
+                "position_ids": batch.get("position_ids"),
                 "attention_mask": None,
                 "labels": None,
                 "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],
@@ -1498,7 +1498,11 @@ def train_one_step(
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
-    if use_streaming:
+    if getattr(args, "use_chunkflow", False):
+        from .chunkflow.schedules import get_schedule
+
+        forward_backward_func = get_schedule(args, mpu.get_pipeline_model_parallel_world_size())
+    elif use_streaming:
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         if pp_size <= 1:
             from relax.backends.megatron.streaming_schedules import (
