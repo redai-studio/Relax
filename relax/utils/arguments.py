@@ -1597,22 +1597,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--dp-balance",
-                choices=["tokens", "flops"],
-                default="tokens",
+                "--balance-by-flops",
+                action="store_true",
+                default=False,
                 help=(
-                    "Select tokens or estimated FLOPs for existing synchronous DP assignments. "
-                    "Does not enable --balance-data or change --microbatch-balance."
-                ),
-            )
-            parser.add_argument(
-                "--microbatch-balance",
-                choices=["tokens", "flops"],
-                default="tokens",
-                help=(
-                    "Balance dynamic microbatches within each DP rank by token count or estimated model FLOPs. "
-                    "FLOPs mode requires Megatron, dynamic batching, balanced packing and a registered model "
-                    "cost estimator. Token capacity and DP/VPP microbatch-count alignment remain unchanged."
+                    "Enable FLOPs-aware microbatch construction and data-parallel placement together. "
+                    "Requires Megatron, dynamic batching, THD balanced packing and a supported Qwen3.5 text model. "
+                    "Omit this flag to retain the existing token balancing, packing and DP placement behavior."
                 ),
             )
             parser.add_argument(
@@ -4742,9 +4733,9 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
-    from relax.utils.training.microbatch_cost import configure_flops_balance
+    from relax.utils.training.microbatch_cost import validate_flops_balance
 
-    configure_flops_balance(args)
+    validate_flops_balance(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")

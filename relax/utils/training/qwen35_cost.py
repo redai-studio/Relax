@@ -5,11 +5,10 @@
 Count multiply-add as two operations. GDN uses three state contractions per
 real token; chunk/WY overhead, padding, recomputation, communication, lookup,
 normalization and elementwise operations are excluded. Head rows use all-token
-execution, including each enabled MTP depth. Costs are independent of TP/PP/EP.
+execution. Costs are independent of TP/PP/EP.
 """
 
 from argparse import Namespace
-from collections.abc import Sequence
 from numbers import Integral
 from typing import Any
 
@@ -29,26 +28,6 @@ def _layer_types(text: Any) -> list[str]:
     if len(types) != count or any(t not in ("full_attention", "linear_attention") for t in types):
         raise ValueError("Qwen3.5 layer_types must cover every layer with full_attention or linear_attention")
     return list(types)
-
-
-def _grids(inputs: dict[str, Any] | None) -> list[tuple[int, int, int]]:
-    result = []
-    inputs = inputs or {}
-    for name, pixels in (("image_grid_thw", "pixel_values"), ("video_grid_thw", "pixel_values_videos")):
-        value = inputs.get(name)
-        if value is None:
-            if inputs.get(pixels) is not None:
-                raise ValueError(f"Qwen3.5 FLOPs balancing requires {name} for {pixels}")
-            continue
-        if hasattr(value, "device") and value.device.type != "cpu":
-            raise ValueError("FLOPs balancing requires CPU grid metadata; CUDA copies are not allowed")
-        if hasattr(value, "tolist"):
-            value = value.tolist()
-        for row in value:
-            if len(row) != 3:
-                raise ValueError(f"{name} must have shape [N, 3]")
-            result.append(tuple(_positive(v, name) for v in row))
-    return result
 
 
 def _layer_forward(text: Any, length: int, layer_type: str) -> tuple[float, float]:
@@ -86,44 +65,8 @@ def _layer_forward(text: Any, length: int, layer_type: str) -> tuple[float, floa
     return float(2 * length * projections), float(attention)
 
 
-def _vision_cost(vision: Any, grids: Sequence[tuple[int, int, int]], args: Namespace) -> float:
-    if not grids:
-        return 0.0
-    if vision is None:
-        raise ValueError("Visual grid metadata requires a Qwen3.5 vision_config")
-    hidden = _positive(vision.hidden_size, "vision.hidden_size")
-    merge = _positive(vision.spatial_merge_size, "vision.spatial_merge_size")
-    if any(h % merge or w % merge for _, h, w in grids):
-        raise ValueError("Visual grid height/width must be divisible by spatial_merge_size")
-    patches = sum(t * h * w for t, h, w in grids)
-    # Vision attention is frame-local, not attention across all video frames.
-    squares = sum(t * (h * w) ** 2 for t, h, w in grids)
-    merged = patches // (merge * merge)
-    patch_weights = hidden * _positive(vision.in_channels, "vision.in_channels")
-    patch_weights *= _positive(vision.temporal_patch_size, "vision.temporal_patch_size")
-    patch_weights *= _positive(vision.patch_size, "vision.patch_size") ** 2
-    blocks = _positive(vision.depth, "vision.depth") * (
-        2
-        * patches
-        * (4 * hidden * hidden + 2 * hidden * _positive(vision.intermediate_size, "vision.intermediate_size"))
-        + 4 * squares * hidden
-    )
-    width = hidden * merge * merge
-    merger = 2 * merged * width * (width + _positive(vision.out_hidden_size, "vision.out_hidden_size"))
-    merger *= 1 + len(getattr(vision, "deepstack_visual_indexes", None) or [])
-    encoder_grad = not getattr(args, "freeze_vision_model", False)
-    projector_grad = not getattr(args, "freeze_vision_projection", False)
-    # Merger norm is trainable with the projector, so fc1 also needs dX.
-    return (
-        2 * patches * patch_weights * (1 + int(encoder_grad))
-        + blocks * (3 if encoder_grad else 1)
-        + merger * (1 + int(encoder_grad or projector_grad) + int(projector_grad))
-    )
-
-
 def estimate_sample_costs(config: Any, rollout_data: dict[str, Any], args: Namespace) -> list[float]:
-    """Estimate ideal training graph work, honoring independent freeze
-    flags."""
+    """Estimate text training work for the supported Dense/MoE models."""
     if (getattr(args, "lora_rank", 0) or 0) > 0 or any(
         getattr(args, name, None) for name in ("freeze_params_name_list", "only_train_params_name_list")
     ):
@@ -138,35 +81,17 @@ def estimate_sample_costs(config: Any, rollout_data: dict[str, Any], args: Names
         inputs = [None] * len(lengths)
     if len(inputs) != len(lengths):
         raise ValueError("multimodal_train_inputs must contain one entry per sample")
-    train_text = not getattr(args, "freeze_language_model", False)
-    mtp = (getattr(args, "mtp_num_layers", 0) or 0) if getattr(args, "enable_mtp_training", False) else 0
-    if mtp:
-        _positive(mtp, "mtp_num_layers")
-        if not train_text or types[-1] != "full_attention" or getattr(args, "pipeline_model_parallel_layout", None):
-            raise ValueError(
-                "Qwen3.5 MTP cost requires trainable language, a full-attention last layer and no custom PP layout"
-            )
+    if getattr(args, "freeze_language_model", False) or (
+        getattr(args, "enable_mtp_training", False) and (getattr(args, "mtp_num_layers", 0) or 0)
+    ):
+        raise ValueError("FLOPs scheduling currently supports trainable text without MTP")
+    if any(media is not None and (not isinstance(media, dict) or bool(media)) for media in inputs):
+        raise ValueError("FLOPs scheduling currently supports text-only samples")
     hidden = _positive(text.hidden_size, "hidden_size")
     vocab = _positive(text.vocab_size, "vocab_size")
     costs = []
-    for length, media in zip(lengths, inputs, strict=True):
+    for length in lengths:
         length = _positive(length, "sequence length")
-        grids = _grids(media)
-        media_grad = bool(grids) and not (
-            getattr(args, "freeze_vision_model", False) and getattr(args, "freeze_vision_projection", False)
-        )
-        backward = train_text or media_grad
-        linear_factor = 1 + int(backward) + int(train_text)
         linears, attention = zip(*(_layer_forward(text, length, kind) for kind in types), strict=True)
-        cost = linear_factor * (sum(linears) + 2 * length * hidden * vocab)
-        cost += (3 if backward else 1) * sum(attention)
-        if mtp:
-            mtp_linear, mtp_attention = _layer_forward(text, length, "full_attention")
-            detached_head = "lm-head" in getattr(args, "mtp_detach_paths", ("embedding", "backbone", "lm-head"))
-            cost += mtp * (
-                3 * (mtp_linear + mtp_attention + 4 * length * hidden * hidden)
-                + (4 if detached_head else 6) * length * hidden * vocab
-            )
-        cost += _vision_cost(getattr(config, "vision_config", None), grids, args)
-        costs.append(float(cost))
+        costs.append(3 * (sum(linears) + sum(attention) + 2 * length * hidden * vocab))
     return costs

@@ -24,10 +24,7 @@ def _execute(nodes, namespace):
 
 @pytest.fixture
 def partitioning():
-    from relax.utils.training.microbatch_cost import sample_costs
-
     namespace = {
-        "sample_costs": sample_costs,
         "logger": Mock(),
         "mpu": SimpleNamespace(
             get_tensor_model_parallel_world_size=lambda: 2,
@@ -35,12 +32,13 @@ def partitioning():
         ),
     }
     _execute(_tree("relax/utils/data/seqlen_balancing.py").body, namespace)
+    _execute(_tree("relax/utils/data/packing.py").body, namespace)
     names = {
         "get_first_fit_partitions",
-        "get_minimum_num_micro_batch_size",
-        "_get_micro_batch_token_capacity",
         "_get_first_fit_partitions",
         "_partitions_fit_capacity_or_singleton_oversize",
+        "get_minimum_num_micro_batch_size",
+        "_get_micro_batch_token_capacity",
         "_get_capacity_safe_balanced_partitions",
     }
     for path in ("relax/utils/data/data.py", "relax/backends/megatron/data.py"):
@@ -68,8 +66,11 @@ def _run_actor_partitions(namespace, repack):
         [
             node
             for node in nodes
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
+            if (
+                isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
+            )
+            or (isinstance(node, ast.If) and ast.unparse(node.test) == "getattr(self.args, 'balance_by_flops', False)")
         ],
         namespace,
     )
@@ -78,23 +79,18 @@ def _run_actor_partitions(namespace, repack):
 
 @pytest.mark.parametrize("repack", [False, True])
 @pytest.mark.parametrize("allgather_cp", [False, True])
-@pytest.mark.parametrize("dp", [None, "tokens", "flops"])
-def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgather_cp, dp):
+def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgather_cp):
     # The original KK-only partition produces [11, 10, 9, 9, 9] with K=5.
     lengths = [3, 9, 7, 6, 2, 5, 2, 5, 9]
     args = SimpleNamespace(max_tokens_per_gpu=10, allgather_cp=allgather_cp, data_pad_size_multiplier=2)
-    if dp is not None:
-        args.dp_balance = dp
     capacity = 8 if allgather_cp else 10
     local_k = partitioning["get_minimum_num_micro_batch_size"](lengths, capacity)
     partitioning.update(
         self=SimpleNamespace(args=args),
         samples=lengths,
-        rollout_data={"total_lengths": lengths, "flops_cost": [float(length * length) for length in lengths]},
+        rollout_data={"total_lengths": lengths},
         cp_size=1,
-        window=SimpleNamespace(
-            rollout_data={"total_lengths": lengths, "flops_cost": [float(length * length) for length in lengths]}
-        ),
+        window=SimpleNamespace(rollout_data={"total_lengths": lengths}),
         max_k=local_k + 1,
     )
     partitions = _run_actor_partitions(partitioning, repack)
@@ -116,31 +112,67 @@ def test_allgather_capacity_rejects_budget_smaller_than_padding(partitioning):
         partitioning["_get_micro_batch_token_capacity"](args, 10, 1)
 
 
-@pytest.mark.parametrize("repack", [False, True])
-def test_prepack_and_repack_use_same_flops_objective(partitioning, repack):
-    lengths = [8] * 6
-    costs = [100, 74, 99, 75, 80, 79]
-    calls = []
-    rollout = {"total_lengths": lengths}
+@pytest.mark.parametrize("rank", [0, 1])
+def test_prepack_executes_central_plan_with_variable_local_rows(partitioning, rank):
+    import time
+    from contextlib import nullcontext
 
-    def estimator(args, data):
-        assert data is rollout
-        calls.append(1)
-        return costs
+    import torch
+
+    from relax.utils.data.flops_balancing import STEP_PLANS_FIELD, encode_schedule, local_schedule, restore_schedule
+
+    geometry = dict(version=4, capacity=5, microbatch_group_size=1, context_parallel_size=1, pipeline_stages=1)
+    metadata = {i: dict(total_lengths=1, flops_cost=9.0 if i == 5 else 1.0) for i in range(6)}
+    assignments, updates = encode_schedule(list(range(6)), metadata, geometry, 2, 6, ("p", "sft_train", 0))
+    rows = assignments[rank]
+    batch = dict(total_lengths=[1] * len(rows), ids=rows)
+    restore_schedule(
+        SimpleNamespace(global_indexes=rows, get_all_custom_meta=lambda: [updates[i] for i in rows]), batch
+    )
+    actor = next(
+        n
+        for n in _tree("relax/backends/megatron/actor.py").body
+        if isinstance(n, ast.ClassDef) and n.name == "MegatronTrainRayActor"
+    )
+    method = next(n for n in actor.body if getattr(n, "name", None) == "_pack_sft_prepack_window")
+    select = next(
+        n
+        for n in _tree("relax/backends/megatron/actor.py").body
+        if getattr(n, "name", None) == "_select_rollout_samples"
+    )
+    captured = []
+
+    def pack(_args, selected):
+        assert STEP_PLANS_FIELD not in selected
+        captured.append(selected["ids"])
+        return dict(ids=selected["ids"])
 
     partitioning.update(
-        sample_costs=estimator,
-        self=SimpleNamespace(args=SimpleNamespace(max_tokens_per_gpu=16)),
-        rollout_data=rollout,
-        samples=lengths,
-        cp_size=1,
-        max_k=4,
-        window=SimpleNamespace(rollout_data=rollout),
+        torch=torch,
+        time=time,
+        STEP_PLANS_FIELD=STEP_PLANS_FIELD,
+        local_schedule=local_schedule,
+        PrefetchedSFTWindow=SimpleNamespace,
+        PrepackedBatch=dict,
+        prepack_sft_micro_batch_cpu=pack,
+        move_tensors_to_device=lambda value, *_, **__: value,
+        device_module=SimpleNamespace(
+            set_device=lambda *_: None,
+            stream_context=lambda *_: nullcontext(),
+            Event=lambda: SimpleNamespace(record=lambda *_: None),
+        ),
     )
-    k = 4 if repack else 3
-    actual = _run_actor_partitions(partitioning, repack)
-    reference = partitioning["_get_capacity_safe_balanced_partitions"](lengths, k, 16)
-    assert calls == [1]
-    assert actual != reference
-    worst = lambda groups: max(sum(costs[i] for i in group) for group in groups)
-    assert worst(actual) < worst(reference)
+    partitioning["mpu"].get_data_parallel_rank = lambda **_: rank
+    _execute([select, method], partitioning)
+    owner = SimpleNamespace(
+        args=SimpleNamespace(
+            balance_by_flops=True, use_dynamic_batch_size=True, loss_type="sft", max_tokens_per_gpu=5
+        ),
+        _sft_prepack_local_batch_size=lambda: 3,
+        _sft_prefetch_stream=object(),
+        _sft_device="cpu",
+    )
+    result = partitioning["_pack_sft_prepack_window"](owner, 0, batch, 0.0, 0.0)
+    assert captured == [rows]
+    assert len(result.packed_micro_batches) == 1
+    assert len(rows) == (1 if rank == 0 else 5)

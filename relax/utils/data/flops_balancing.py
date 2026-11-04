@@ -1,21 +1,30 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Cost-weighted DP placement without changing queue admission or replay."""
+"""Slime PR #2017's pack-first, whole-microbatch DP scheduling.
 
-import inspect
+Algorithm pinned to THUDM/slime 053bdfcebb9733373cc4fc70d6c1e011fa3ee216. The
+capacity determines the initial bin count; upstream FLOPs KK does not enforce a
+hard token bound on each resulting bin. No local repair or search is applied
+here.
+"""
+
+import hashlib
+import json
 import math
 from argparse import Namespace
 from numbers import Integral
 from typing import Any
 
-from transfer_queue.sampler import BaseSampler
-
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 
 
+PLAN_METADATA_FIELD = "_flops_schedule_v1"
+STEP_PLANS_FIELD = "_flops_step_plans"
+
+
 def get_dp_packing_geometry(args: Namespace, task_name: str) -> dict[str, Any] | None:
-    """Describe a complete CP1/VPP1 training window without GPU queries."""
-    if getattr(args, "dp_balance", "tokens") != "flops" or task_name not in (
+    """Describe one complete training step without GPU queries."""
+    if not getattr(args, "balance_by_flops", False) or task_name not in (
         "train",
         "train_critic",
         "actor_train",
@@ -23,180 +32,196 @@ def get_dp_packing_geometry(args: Namespace, task_name: str) -> dict[str, Any] |
         "sft_train",
     ):
         return None
-    if (
-        not getattr(args, "use_dynamic_batch_size", False)
-        or getattr(args, "sft_packing_strategy", "balanced") != "balanced"
-        or getattr(args, "qkv_format", "thd") != "thd"
-        or getattr(args, "context_parallel_size", 1) != 1
-        or (getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) != 1
-        or getattr(args, "num_layers_per_virtual_pipeline_stage", None) is not None
-        or getattr(args, "num_virtual_stages_per_pipeline_rank", None) not in (None, 1)
-        or getattr(args, "dynamic_context_parallel", False)
-    ):
-        return None
-    from relax.engine.sft.runtime import is_sft_mode, sft_tq_num_shards
+    from relax.utils.training.microbatch_cost import validate_flops_balance
 
-    if is_sft_mode(args) and sft_tq_num_shards(args) != 1:
-        return None
-    if not is_sft_mode(args):
-        if getattr(args, "num_steps_per_rollout", None) not in (None, 1):
-            return None
-        rollout_size = getattr(args, "rollout_batch_size", None)
-        samples = getattr(args, "n_samples_per_prompt", None)
-        global_batch_size = getattr(args, "global_batch_size", None)
-        if (
-            any(
-                not isinstance(value, Integral) or isinstance(value, bool) or value <= 0
-                for value in (rollout_size, samples, global_batch_size)
-            )
-            or rollout_size * samples != global_batch_size
-        ):
-            return None
-    capacity = getattr(args, "max_tokens_per_gpu", None)
-    if capacity is None:
-        return None
+    validate_flops_balance(args)
+    cp_size = getattr(args, "context_parallel_size", 1)
+    capacity = args.max_tokens_per_gpu * cp_size
     if getattr(args, "allgather_cp", False):
         padding = getattr(args, "tensor_model_parallel_size", 1) * args.data_pad_size_multiplier
-        if padding <= 0 or capacity < padding:
-            raise ValueError("DP packing requires padding to fit within max_tokens_per_gpu")
-        capacity = capacity // padding * padding
+        if padding <= 0 or args.max_tokens_per_gpu < padding:
+            raise ValueError("allgather CP padding must fit within max_tokens_per_gpu")
+        capacity = cp_size * (args.max_tokens_per_gpu // padding) * padding
     return {
-        "version": 1,
+        "version": 4,
         "capacity": capacity,
-        "length_alignment": 1,
-        "microbatch_balance": getattr(args, "microbatch_balance", "tokens"),
         "microbatch_group_size": 1,
+        "context_parallel_size": cp_size,
+        "pipeline_stages": getattr(args, "pipeline_model_parallel_size", 1),
     }
 
 
-def checked_packing_geometry(
-    geometries: dict[str, dict[str, Any] | None], task_name: str, geometry: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    """Require identical scheduling geometry before returning cached rows."""
+def validate_packing_geometry(geometry: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Validate a queue request; replay geometry lives in the cached plan."""
     if geometry is not None:
-        fields = {"version", "capacity", "length_alignment", "microbatch_balance", "microbatch_group_size"}
+        fields = {
+            "version",
+            "capacity",
+            "context_parallel_size",
+            "microbatch_group_size",
+            "pipeline_stages",
+        }
         if not isinstance(geometry, dict) or set(geometry) != fields:
             raise ValueError("Invalid DP packing geometry fields")
         geometry = dict(geometry)
-        for name in fields - {"microbatch_balance"}:
+        for name in fields:
             value = geometry[name]
             if not isinstance(value, Integral) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"DP packing geometry requires positive integer {name}")
-        if geometry["version"] != 1 or geometry["microbatch_balance"] not in ("tokens", "flops"):
-            raise ValueError("Unsupported DP packing geometry version or microbatch objective")
-    if task_name in geometries and geometries[task_name] != geometry:
-        raise ValueError("DP packing geometry changed across requests or checkpoint restore")
-    geometries[task_name] = geometry
+        if geometry["version"] != 4:
+            raise ValueError("Unsupported FLOPs packing geometry version or pipeline size")
     return geometry
 
 
-def select_packing_aware_assignment(
-    original: list[list[int]],
-    weighted: list[list[int]],
-    weights: dict[int, float],
-    metadata: dict[int, dict[str, Any]],
-    geometry: dict[str, Any] | None,
-) -> list[list[int]]:
-    """Compare existing placements by aligned global K, then rank cost."""
-    if geometry is None:
-        return weighted
-    from relax.utils.data.data import get_minimum_num_micro_batch_size
-    from relax.utils.data.packing import get_flops_packing_seed
-
-    alignment = geometry["length_alignment"]
-    capacity = geometry["capacity"]
-    group_size = geometry["microbatch_group_size"]
-
-    def objective(groups: list[list[int]]) -> tuple[int, float, float]:
-        counts, loads = [], []
-        for rows in groups:
-            lengths = []
-            for index in rows:
-                value = metadata[index]["total_lengths"]
-                if not isinstance(value, Integral) or isinstance(value, bool) or value <= 0:
-                    raise ValueError("DP packing requires positive integer total_lengths")
-                lengths.append((int(value) + alignment - 1) // alignment * alignment)
-            costs = [weights[index] for index in rows]
-            count = (
-                len(get_flops_packing_seed(lengths, costs, capacity))
-                if costs and geometry["microbatch_balance"] == "flops"
-                else get_minimum_num_micro_batch_size(lengths, capacity)
-            )
-            counts.append(count)
-            loads.append(sum(costs))
-        global_k = max(1, (max(counts) + group_size - 1) // group_size * group_size)
-        return global_k, max(loads), sum(load * load for load in loads)
-
-    # min retains the original token assignment on an exact tie.
-    return min((original, weighted), key=objective)
-
-
-def validated_cost_weights(
-    rows: list[int], metadata: dict[int, dict[str, Any]], cost_key: str = "flops_cost"
-) -> dict[int, float]:
+def validated_cost_weights(rows: list[int], metadata: dict[int, dict[str, Any]]) -> dict[int, float]:
     weights = {}
     for index in rows:
         try:
-            value = float(metadata[index][cost_key])
+            value = float(metadata[index]["flops_cost"])
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"Missing or invalid {cost_key} for sample {index}") from error
+            raise ValueError(f"Missing or invalid flops_cost for sample {index}") from error
         if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{cost_key} must be positive and finite for sample {index}")
+            raise ValueError(f"flops_cost must be positive and finite for sample {index}")
         weights[index] = value
     return weights
 
 
-class FlopsBalancedSampler(BaseSampler):
-    """Keep SFT batch selection and cache ownership in TransferQueue."""
-
-    def __init__(self, n_samples_per_prompt: int = 1, dp_size: int = 1) -> None:
-        from transfer_queue import SeqlenBalancedSampler
-
-        if n_samples_per_prompt != 1:
-            raise ValueError("FLOPs SFT DP assignment requires one sample per group")
-        self.base = SeqlenBalancedSampler(n_samples_per_prompt=n_samples_per_prompt, dp_size=dp_size)
-        self._packing_geometries: dict[str, dict[str, Any] | None] = {}
-        if "assignment_transform" not in inspect.signature(self.base.sample).parameters:
-            raise RuntimeError("FLOPs DP assignment requires the image-built TransferQueue assignment_transform patch")
-
-    def has_cached_result(self, partition_id: str, task_name: str, sampling_config: Any = None) -> bool:
-        return self.base.has_cached_result(partition_id, task_name, sampling_config)
-
-    def sample(
-        self, ready_indexes: list[int], batch_size: int, task_name: str = "", partition_id: str = "", **kwargs: Any
-    ) -> tuple[list[int], list[int]]:
-        partition = kwargs.get("partition")
-        if partition is None:
-            raise ValueError("FLOPs DP assignment requires queue metadata")
-        geometry = checked_packing_geometry(self._packing_geometries, task_name, kwargs.get("packing_geometry"))
-
-        def transform(original: list[list[int]]) -> list[list[int]]:
-            rows = sorted(index for group in original for index in group)
-            metadata = partition.get_custom_meta(rows)
-            weights = validated_cost_weights(rows, metadata)
-            groups = get_seqlen_balanced_partitions(
-                [weights[index] for index in rows], self.base.dp_size, equal_size=True
-            )
-            weighted = [[rows[position] for position in group] for group in groups]
-            return select_packing_aware_assignment(original, weighted, weights, metadata, geometry)
-
-        return self.base.sample(
-            ready_indexes, batch_size, task_name, partition_id, assignment_transform=transform, **kwargs
+def build_flops_schedule(
+    lengths: list[int], costs: list[float], capacity: int, dp_size: int, microbatch_group_size: int = 1
+) -> list[list[list[int]]]:
+    """Plan one complete optimizer step; indices refer to the input order."""
+    if (
+        any(
+            not isinstance(v, Integral) or isinstance(v, bool) or v <= 0
+            for v in [capacity, dp_size, microbatch_group_size, *lengths]
         )
+        or len(lengths) < dp_size
+    ):
+        raise ValueError("FLOPs scheduling needs positive lengths/geometry and at least one sample per DP")
+    if len(costs) != len(lengths) or any(not math.isfinite(c) or c <= 0 for c in costs):
+        raise ValueError("FLOPs scheduling needs one positive finite cost per sample")
+    count = max(1, (sum(lengths) + capacity - 1) // capacity)
+    bins = (
+        [[i] for i in range(len(lengths))]
+        if count >= len(lengths)
+        else get_seqlen_balanced_partitions(costs, count, equal_size=False)
+    )
+    align = dp_size * microbatch_group_size
+    target = max((len(bins) + align - 1) // align * align, align)
+    # Exact upstream expand_bins_by_splitting, including tie breaking/order.
+    while len(bins) < target:
+        candidates = [(sum(lengths[i] for i in b), j) for j, b in enumerate(bins) if len(b) > 1]
+        if not candidates:
+            raise ValueError(f"Cannot split {len(lengths)} samples into {target} aligned microbatches")
+        _, j = max(candidates)
+        halves: list[list[int]] = [[], []]
+        sums = [0, 0]
+        for i in sorted(bins[j], key=lambda i: -lengths[i]):
+            half = 0 if sums[0] <= sums[1] else 1
+            halves[half].append(i)
+            sums[half] += lengths[i]
+        bins[j] = halves[0]
+        bins.append(halves[1])
+    weights = [sum(costs[i] for i in b) for b in bins]
+    owners = get_seqlen_balanced_partitions(weights, dp_size, equal_size=True)
+    return [[bins[j] for j in group] for group in owners]
 
-    def clear_cache(self, partition_id: str) -> None:
-        self.base.clear_cache(partition_id)
 
-    def save_checkpoint(self) -> dict:
-        return {
-            "base": self.base.save_checkpoint(),
-            "dp_size": self.base.dp_size,
-            "cost_key": "flops_cost",
-            "packing_geometries": self._packing_geometries.copy(),
-        }
+def encode_schedule(
+    rows: list[int],
+    metadata: dict[int, dict[str, Any]],
+    geometry: dict[str, Any],
+    dp_size: int,
+    global_count: int,
+    identity: tuple,
+) -> tuple[list[list[int]], dict[int, dict[str, Any]]]:
+    lengths = [metadata[i]["total_lengths"] for i in rows]
+    weights = validated_cost_weights(rows, metadata)
+    costs = [weights[i] for i in rows]
+    plan = build_flops_schedule(lengths, costs, geometry["capacity"], dp_size, geometry["microbatch_group_size"])
+    packs = [[[rows[i] for i in group] for group in rank] for rank in plan]
+    digest = hashlib.sha256(json.dumps([identity, geometry, rows, lengths, costs, packs]).encode()).hexdigest()
+    assignments, updates = [], {}
+    for rank, groups in enumerate(packs):
+        ids = [i for group in groups for i in group]
+        assignments.append(ids)
+        for i in ids:
+            updates[i] = {PLAN_METADATA_FIELD: {"sha256": digest}}
+        updates[ids[0]][PLAN_METADATA_FIELD] = dict(
+            version=1,
+            sha256=digest,
+            identity=list(identity),
+            geometry=geometry,
+            dp_rank=rank,
+            dp_size=dp_size,
+            global_count=global_count,
+            rows=ids,
+            lengths=[metadata[i]["total_lengths"] for i in ids],
+            packs=groups,
+            K=len(groups),
+        )
+    return assignments, updates
 
-    def load_checkpoint(self, state: dict) -> None:
-        if state.get("dp_size") != self.base.dp_size or state.get("cost_key") != "flops_cost":
-            raise ValueError("FLOPs sampler checkpoint geometry or mode differs")
-        self.base.load_checkpoint(state["base"])
-        self._packing_geometries = state.get("packing_geometries", {}).copy()
+
+def apply_schedule_metadata(
+    partition: Any, updates: dict[int, dict[str, Any]] | None, geometry: dict[str, Any] | None
+) -> None:
+    """Check cached geometry and merge with current producer metadata."""
+    if updates is None:
+        if geometry is not None:
+            raise RuntimeError("FLOPs replay is missing its checkpoint plan")
+        return
+    header = next(row[PLAN_METADATA_FIELD] for row in updates.values() if "packs" in row[PLAN_METADATA_FIELD])
+    if header["geometry"] != geometry:
+        raise ValueError("DP packing geometry changed across requests or checkpoint restore")
+    current = partition.get_custom_meta(list(updates))
+    partition.set_custom_meta({i: {**current[i], **update} for i, update in updates.items()})
+
+
+def restore_schedule(batch_meta: Any, rollout_data: dict[str, Any]) -> None:
+    """Restore exact local pack membership after payload/metadata broadcast."""
+    entries = [m.get(PLAN_METADATA_FIELD) for m in batch_meta.get_all_custom_meta()]
+    if not any(entries):
+        return
+    headers = [m for m in entries if m and "packs" in m]
+    if not all(entries) or len(headers) != 1:
+        raise ValueError("Partial FLOPs schedule or missing/duplicate local header")
+    h = headers[0]
+    if h["version"] != 1 or any(m["sha256"] != h["sha256"] for m in entries):
+        raise ValueError("Mixed FLOPs schedules or unsupported version")
+    ids = list(batch_meta.global_indexes)
+    if ids != h["rows"] or len(ids) != len(set(ids)) or list(rollout_data["total_lengths"]) != h["lengths"]:
+        raise ValueError("FLOPs schedule row order/lengths differ from payload")
+    if "tokens" in rollout_data and [len(t) for t in rollout_data["tokens"]] != h["lengths"]:
+        raise ValueError("FLOPs schedule token payload lengths differ")
+    position = {i: j for j, i in enumerate(ids)}
+    indices = [[position[i] for i in group] for group in h["packs"]]
+    if len(indices) != h["K"] or not indices or any(not group for group in indices):
+        raise ValueError("Invalid FLOPs microbatch count")
+    if sorted(i for group in indices for i in group) != list(range(len(ids))):
+        raise ValueError("FLOPs schedule must consume every local sample exactly once")
+    rollout_data[STEP_PLANS_FIELD] = [{**h, "indices": indices}]
+    rollout_data["rollout_mini_local_sample_counts"] = [len(ids)]
+    rollout_data["rollout_mini_global_sample_counts"] = [h["global_count"]]
+
+
+def local_schedule(rollout_data: dict[str, Any]) -> tuple[list[list[int]], list[int]]:
+    """Flatten per-step plans while retaining explicit optimizer boundaries."""
+    plans = rollout_data[STEP_PLANS_FIELD]
+    indices, counts, offset = [], [], 0
+    for plan in plans:
+        local_count = len(plan["rows"])
+        if sorted(i for group in plan["indices"] for i in group) != list(range(local_count)):
+            raise ValueError("FLOPs plan local sample coverage differs")
+        if len(plan["indices"]) != plan["K"]:
+            raise ValueError("FLOPs plan microbatch count differs")
+        if list(rollout_data["total_lengths"][offset : offset + local_count]) != plan["lengths"]:
+            raise ValueError("FLOPs plan lengths differ after concatenation")
+        indices.extend([[i + offset for i in group] for group in plan["indices"]])
+        counts.append(plan["K"])
+        offset += local_count
+    if offset != len(rollout_data["total_lengths"]):
+        raise ValueError("FLOPs plans must cover the complete payload")
+    if rollout_data.get("rollout_mini_global_sample_counts") != [p["global_count"] for p in plans]:
+        raise ValueError("FLOPs plan logical step counts differ")
+    return indices, counts

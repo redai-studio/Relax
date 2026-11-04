@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Native Megatron iterator and orthogonal process-group checks on CPU/Gloo."""
+"""Real CPU/Gloo collectives for exact-plan execution and peer failures."""
 
+import copy
 import importlib.util
 import json
 from datetime import timedelta
@@ -14,69 +15,75 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-pytestmark = pytest.mark.skipif(importlib.util.find_spec("megatron") is None, reason="requires Megatron Core")
-
-
-def _worker(rank, rendezvous, output):
-    from megatron.core import parallel_state as mpu
-
-    from relax.backends.megatron import data
-    from relax.utils import misc
-    from relax.utils.training.microbatch_cost import register_sample_cost_estimator
+def _worker(rank, rendezvous, output, native):
+    from relax.utils.data.flops_balancing import STEP_PLANS_FIELD, encode_schedule, restore_schedule
 
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=45))
+    patches = pytest.MonkeyPatch()
     try:
-        mpu.initialize_model_parallel(tensor_model_parallel_size=2)
-        data.device_utils.make_current_torch_device = lambda: torch.device("cpu")
-        misc.get_hf_config = lambda _: SimpleNamespace(model_type="distributed_cost_test")
-        register_sample_cost_estimator("distributed_cost_test", lambda config, batch, args: batch["test_costs"])
+        if native:
+            from megatron.core import parallel_state as mpu
+
+            from relax.backends.megatron import data
+
+            mpu.initialize_model_parallel(tensor_model_parallel_size=2)
+        else:
+            from tests.backends.megatron.test_data_vpp import _load_data_module
+
+            data = _load_data_module(patches)
+            mpu = data.mpu
+            tp_groups = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])]
+            dp_groups = [dist.new_group(ranks) for ranks in ([0, 2], [1, 3])]
+            mpu.get_model_parallel_group = lambda: tp_groups[rank // 2]
+            mpu.get_data_parallel_group = lambda **_: dp_groups[rank % 2]
+            mpu.get_data_parallel_world_size = lambda **_: 2
+            mpu.get_data_parallel_rank = lambda **_: rank // 2
+            mpu.get_virtual_pipeline_model_parallel_world_size = lambda: None
+            mpu.get_context_parallel_world_size = lambda: 1
+        patches.setattr(data.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
         args = SimpleNamespace(
-            microbatch_balance="flops",
-            global_batch_size=8,
-            use_dynamic_batch_size=True,
-            max_tokens_per_gpu=16,
-            hf_checkpoint="unused",
-            qkv_format="thd",
+            balance_by_flops=True, global_batch_size=6, use_dynamic_batch_size=True, max_tokens_per_gpu=5
         )
         dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
-        lengths = [8, 8] if dp_rank == 0 else [16] * 6
-        costs = [100, 1] if dp_rank == 0 else [10, 20, 30, 40, 50, 60]
-        rollout = {
-            "total_lengths": lengths,
-            "ids": list(range(len(lengths))),
-            "test_costs": costs,
-            data.ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY: [len(lengths)],
-        }
+        metadata = {i: dict(total_lengths=1, flops_cost=9.0 if i == 5 else 1.0) for i in range(6)}
+        geometry = dict(version=4, capacity=5, microbatch_group_size=1, context_parallel_size=1, pipeline_stages=1)
+        ranks, updates = encode_schedule(list(range(6)), metadata, geometry, 2, 6, ("p", "actor_train", 0))
+        ids = ranks[dp_rank]
+        rollout = dict(total_lengths=[1] * len(ids), ids=ids)
+        meta = SimpleNamespace(global_indexes=ids, get_all_custom_meta=lambda: [updates[i] for i in ids])
+        restore_schedule(meta, rollout)
         iterators, counts = data.get_data_iterator(args, [], rollout)
-        iterator = iterators[0]
-        seen = []
-        for _ in range(counts[0]):
-            batch = iterator.get_next(["ids", "total_lengths"])
-            assert sum(batch["total_lengths"]) <= 16
-            if not batch.get("__is_dummy__", False):
-                seen.extend(batch["ids"])
-        assert sorted(seen) == list(range(len(lengths)))
-        assert counts == [6]
-        assert len(iterator.dummy_micro_batch_offsets) == (4 if dp_rank == 0 else 0)
-
-        # Only rank 0 fails. TP then DP propagation must make all four ranks
-        # exit the same call, rather than allowing peers to enter training.
-        bad = {"total_lengths": [8], "test_costs": [-1 if rank == 0 else 1]}
-        with pytest.raises(ValueError, match="FLOPs sample cost estimation failed"):
-            data._get_synchronised_sample_costs(args, bad)
-
-        args.dp_balance, args.loss_type = "flops", "sft"
-        cached = {"total_lengths": [8], "flops_cost": [float("nan") if rank == 0 else 1.0]}
-        with pytest.raises(ValueError, match="FLOPs sample cost estimation failed") as failure:
-            data._get_synchronised_sample_costs(args, cached)
-        assert ("positive and finite" if rank == 0 else "peer estimator failed") in str(failure.value)
-        Path(output, f"rank-{rank}.json").write_text(json.dumps({"counts": counts, "peer_error": True}))
+        assert counts == [1]
+        assert iterators[0].get_next(["ids"])["ids"] == ids
+        assert rollout[data.ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] == [6]
+        assert len(ids) == (1 if dp_rank == 0 else 5)
+        bad = copy.deepcopy(rollout)
+        if rank == 0:
+            bad[STEP_PLANS_FIELD][0]["indices"] = [[0, 0]]
+        with pytest.raises(ValueError, match="Invalid FLOPs schedule"):
+            data._get_synchronised_flops_schedule(args, bad)
+        bad = copy.deepcopy(rollout)
+        if rank == 0:
+            bad[STEP_PLANS_FIELD][0]["sha256"] = "0" * 64
+        with pytest.raises(ValueError, match="differs across ranks"):
+            data._get_synchronised_flops_schedule(args, bad)
+        Path(output, f"rank-{rank}.json").write_text(json.dumps(dict(counts=counts, peer_errors=True)))
     finally:
-        mpu.destroy_model_parallel()
+        if native:
+            mpu.destroy_model_parallel()
+        patches.undo()
         dist.destroy_process_group()
 
 
-def test_native_iterator_dp_alignment_dummy_and_model_parallel_failure(tmp_path):
-    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path)), nprocs=4, join=True)
+def test_global_plan_real_gloo_groups_and_peer_failures(tmp_path):
+    # Stub only the Megatron group accessors; collectives run in four OS
+    # processes with orthogonal TP2/DP2 groups and the production iterator.
+    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), False), nprocs=4, join=True)
+    assert len(list(tmp_path.glob("rank-*.json"))) == 4
+
+
+@pytest.mark.skipif(importlib.util.find_spec("megatron") is None, reason="requires Megatron Core")
+def test_native_megatron_iterator_and_orthogonal_groups(tmp_path):
+    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), True), nprocs=4, join=True)
     assert len(list(tmp_path.glob("rank-*.json"))) == 4

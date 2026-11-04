@@ -104,13 +104,6 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
                 raise ValueError(
                     f"Score Centering custom converter omitted required behavior probability fields: {missing}"
                 )
-        if getattr(args, "dp_balance", "tokens") == "flops":
-            from relax.utils.training.microbatch_cost import sample_costs
-
-            costs = sample_costs(args, train_data, for_dp=True)
-            train_data["flops_cost"] = (
-                torch.tensor(costs, dtype=torch.float64) if isinstance(train_data, TensorDict) else costs
-            )
         return train_data
 
     rewards = post_process_rewards(args, samples)
@@ -219,27 +212,31 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
 
     total_lengths = [len(t) for t in train_data["tokens"]]
     train_data["total_lengths"] = total_lengths
-    if getattr(args, "dp_balance", "tokens") == "flops":
-        from relax.utils.training.microbatch_cost import sample_costs
-
-        train_data["flops_cost"] = sample_costs(args, train_data, for_dp=True)
     if args.debug_train_only:
         return train_data
     rollout_batch = dict_to_tensordict(train_data, len(total_lengths))
     return rollout_batch
 
 
-def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int | float]]:
+def build_rollout_custom_meta(rollout_batch: Any, args: Any = None) -> list[dict[str, int | float]]:
     metadata = [
         {"total_lengths": int(total_length), "sample_index": int(sample_index)}
         for total_length, sample_index in zip(
             rollout_batch["total_lengths"], rollout_batch["sample_indices"], strict=True
         )
     ]
-    if "flops_cost" in rollout_batch:
-        for row, cost in zip(metadata, rollout_batch["flops_cost"], strict=True):
-            row["flops_cost"] = float(cost)
-    return metadata
+    if args is None or not getattr(args, "balance_by_flops", False):
+        return metadata
+    from tensordict.tensorclass import NonTensorData
+
+    from relax.utils.training.microbatch_cost import add_flops_cost_metadata
+
+    batch = {"total_lengths": [row["total_lengths"] for row in metadata]}
+    if "multimodal_train_inputs" in rollout_batch:
+        batch["multimodal_train_inputs"] = [
+            item.data if isinstance(item, NonTensorData) else item for item in rollout_batch["multimodal_train_inputs"]
+        ]
+    return add_flops_cost_metadata(args, batch, metadata)
 
 
 def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
@@ -325,10 +322,6 @@ def dict_to_tensordict(
     for key, value in data.items():
         if not isinstance(value, list):
             raise TypeError(f"Value for key '{key}' must be a list, got {type(value)}")
-        if key == "flops_cost":
-            # Reused scheduling costs must retain the producer's float precision.
-            result[key] = torch.tensor(value, dtype=torch.float64, device=device)
-            continue
         if key == "classification_labels":
             depth = _nesting_depth(value)
             if depth == 1:
@@ -634,7 +627,7 @@ async def transfer_batch_to_data_system(
         logger.info(f"Transferring batch rollout_batch: {rollout_batch}")
 
         # Pass sampler metadata inline so it lands atomically with ready samples.
-        custom_meta = build_rollout_custom_meta(rollout_batch)
+        custom_meta = build_rollout_custom_meta(rollout_batch, args)
         await data_system_client.async_put(
             data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
         )
