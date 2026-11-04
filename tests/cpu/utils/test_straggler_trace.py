@@ -13,7 +13,7 @@ from relax.utils.straggler.analysis.trace import FILE_PREFIX, TIMELINE_PID_BASE
 from relax.utils.straggler.core.modules import module_segment
 from relax.utils.straggler.core.stats import FIELD_INDEX, RankTrace
 from relax.utils.straggler.megatron_adapter import GRAD_SYNC_TIMERS, MODULE_NAMES
-from tests.utils.straggler_helpers import meta as _meta
+from tests.cpu.utils.straggler_helpers import meta as _meta
 
 
 # The names the profiler passes in.

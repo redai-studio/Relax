@@ -17,7 +17,7 @@ from relax.utils.straggler.analysis.detector import WindowReport
 from relax.utils.straggler.analysis.report import REPORTED_METRICS
 from relax.utils.straggler.relax_integration import StragglerProfiler, install_straggler_profiler
 from relax.utils.timer import TimelineEvent, Timer
-from tests.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
+from tests.cpu.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta
 
 
 def _args(num_rollout=100):
@@ -399,7 +399,7 @@ def _function(path, name):
 
 def test_the_primary_rank_rule_is_the_one_log_perf_data_logs_on():
     # The window scalars reach the metrics only through that rank's log_perf_data.
-    repo = Path(__file__).resolve().parents[2]
+    repo = Path(__file__).resolve().parents[3]
     log_perf_data = _function(repo / "relax/backends/megatron/data.py", "log_perf_data")
     (logged_on,) = (
         keyword.value

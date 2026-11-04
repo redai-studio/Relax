@@ -14,7 +14,7 @@ from relax.utils.straggler.megatron_adapter import (
     TIMER_PHASES,
     phase_timers,
 )
-from tests.utils.straggler_helpers import FakeEvent
+from tests.cpu.utils.straggler_helpers import FakeEvent
 
 
 class _FakeSink:
