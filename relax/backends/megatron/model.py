@@ -1654,7 +1654,7 @@ def train_one_step(
 
         loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
         values = values.tolist()
-        is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+        is_sequence_classification = args.task_type == "seq_cls"
         num_samples_or_tokens = (
             values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
         )
@@ -2054,7 +2054,7 @@ def save(
         args.head_type = REWARD_MODEL_HEAD_TYPE
     elif role == "critic":
         args.head_type = "critic_value_terminal_v1"
-    elif getattr(args, "task_type", "causal_lm") == "seq_cls":
+    elif args.task_type == "seq_cls":
         args.head_type = "sequence_classification_v1"
     else:
         args.head_type = "causal_lm_v1"
@@ -2402,7 +2402,7 @@ def initialize_model_and_optimizer(
     classification_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
     if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
@@ -2427,7 +2427,7 @@ def initialize_model_and_optimizer(
         assert loaded_reward_head_param_ids == reward_head_param_ids, (
             "reward-model head parameter identities changed during checkpoint loading"
         )
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         release_sequence_classification_lm_heads(model)
         loaded_classification_head_param_ids = validate_sequence_classification_head_registration(
             model, optimizer, args
