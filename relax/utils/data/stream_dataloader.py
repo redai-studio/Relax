@@ -846,7 +846,7 @@ def get_data_from_transfer_queue(
     """
     if not synchronize_per_rank_fetch and not per_rank_fetch:
         raise ValueError("synchronize_per_rank_fetch=False requires per_rank_fetch=True")
-    if token_budget is None and getattr(args, "dp_balance", "tokens") == "flops":
+    if token_budget is None and getattr(args, "balance_by_flops", False):
         geometry = get_dp_packing_geometry(args, task_name)
         if geometry is not None:
             sampling_config = {**sampling_config, "packing_geometry": geometry}
@@ -1140,15 +1140,15 @@ def get_data_from_transfer_queue(
 
         rollout_data = new_rollout_data
 
-    if getattr(args, "dp_balance", "tokens") == "flops":
-        sample_count = len(rollout_data["total_lengths"])
-        # Keep CPU costs in payload order. Defer malformed metadata to packing
-        # so its peer-error propagation runs, including the prepack path.
+    if getattr(args, "balance_by_flops", False):
+        from relax.utils.data.flops_balancing import restore_schedule
+
         try:
-            cached_costs = [row.get("flops_cost") for row in batch_meta.get_all_custom_meta()]
-        except Exception:  # noqa: BLE001
-            cached_costs = []
-        rollout_data["flops_cost"] = cached_costs if len(cached_costs) == sample_count else [None] * sample_count
+            restore_schedule(batch_meta, rollout_data)
+        except Exception as error:  # noqa: BLE001
+            # Background fetch stays collective-free; the training thread
+            # propagates malformed plans before any forward/backward call.
+            rollout_data["_flops_schedule_error"] = [str(error)]
 
     # Re-attach routed_experts as a list of 2D tensors (per-sample) — only on
     # the bcast path, where the NestedTensor was extracted into ``routed_experts_values``

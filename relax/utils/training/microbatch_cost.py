@@ -1,43 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU sample costs for capacity-constrained dynamic microbatch balancing."""
+"""Producer-side CPU costs for global FLOPs scheduling."""
 
 import math
 from argparse import Namespace
-from collections.abc import Callable, Sequence
-from numbers import Real
 from typing import Any
-
-
-SampleCostEstimator = Callable[[Any, dict[str, Any], Namespace], Sequence[float]]
-_ESTIMATORS: dict[str, SampleCostEstimator] = {}
-
-
-def configure_flops_balance(args: Namespace) -> None:
-    """Validate independent objectives after the final CLI/YAML overrides."""
-    validate_microbatch_balance(args)
-    validate_dp_balance(args)
-
-
-def register_sample_cost_estimator(model_type: str, estimator: SampleCostEstimator) -> None:
-    """Register a CPU-only estimator(config, rollout_data, args).
-
-    Return one positive finite cost per sample, in the original order. The
-    estimator must not mutate data, access CUDA tensors or run collectives.
-    Import registrations in each worker via RELAX_EXTRA_MODULES.
-    """
-    if not model_type or not callable(estimator):
-        raise ValueError("A nonempty model_type and callable estimator are required")
-    if model_type in _ESTIMATORS:
-        raise ValueError(f"Sample cost estimator already registered for {model_type!r}")
-    _ESTIMATORS[model_type] = estimator
-
-
-def _uses_flops(args: Namespace, attribute: str) -> bool:
-    mode = getattr(args, attribute, "tokens")
-    if mode not in ("tokens", "flops"):
-        raise ValueError(f"--{attribute.replace('_', '-')} must be tokens or flops")
-    return mode == "flops"
 
 
 def _validate_flops_configuration(args: Namespace) -> None:
@@ -45,6 +12,19 @@ def _validate_flops_configuration(args: Namespace) -> None:
         raise ValueError("FLOPs balancing requires --train-backend megatron")
     if not getattr(args, "use_dynamic_batch_size", False):
         raise ValueError("FLOPs balancing requires --use-dynamic-batch-size")
+    if getattr(args, "qkv_format", "thd") != "thd":
+        raise ValueError("FLOPs scheduling requires THD packed sequences")
+    if (
+        (getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) != 1
+        or getattr(args, "num_layers_per_virtual_pipeline_stage", None) is not None
+        or getattr(args, "num_virtual_stages_per_pipeline_rank", None) not in (None, 1)
+        or getattr(args, "dynamic_context_parallel", False)
+    ):
+        raise ValueError("FLOPs queue integration currently requires VPP1 and static context parallelism")
+    if not getattr(args, "polling_mode", True):
+        raise ValueError("FLOPs variable-row DP assignment requires TransferQueue polling mode")
+    if getattr(args, "debug_train_only", False):
+        raise ValueError("FLOPs global scheduling requires TransferQueue; --debug-train-only bypasses its planner")
     if getattr(args, "sft_packing_strategy", "balanced") != "balanced":
         raise ValueError("FLOPs balancing requires balanced packing, not binpack")
     if getattr(args, "sft_wholepack", False):
@@ -65,61 +45,37 @@ def _validate_flops_configuration(args: Namespace) -> None:
         raise ValueError("FLOPs balancing requires token-independent MoE routing; batch-coupled modes are unsupported")
 
 
-def validate_microbatch_balance(args: Namespace) -> bool:
-    """Validate only the rank-local microbatch objective."""
-    if not _uses_flops(args, "microbatch_balance"):
-        return False
-    _validate_flops_configuration(args)
-    return True
-
-
-def validate_dp_balance(args: Namespace) -> bool:
-    """Validate DP placement without changing microbatches or legacy
-    enablement."""
-    if not _uses_flops(args, "dp_balance"):
+def validate_flops_balance(args: Namespace) -> bool:
+    """Gate both scheduling layers; OFF bypasses every FLOPs restriction."""
+    enabled = getattr(args, "balance_by_flops", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("--balance-by-flops must be a boolean")
+    if not enabled:
         return False
     _validate_flops_configuration(args)
     if getattr(args, "loss_type", None) == "sft":
+        from relax.engine.sft.runtime import sft_tq_num_shards
+
+        if sft_tq_num_shards(args) != 1:
+            raise ValueError("FLOPs global-step scheduling requires one SFT TransferQueue shard")
         if getattr(args, "n_samples_per_prompt", 1) != 1:
             raise ValueError("FLOPs DP balancing for SFT requires n_samples_per_prompt=1")
         if getattr(args, "sft_image_preprocess_on_rank", False):
             raise ValueError("FLOPs DP balancing requires CPU media metadata before queue publication")
-    elif not getattr(args, "balance_data", False):
-        raise ValueError("--dp-balance flops requires --balance-data for non-SFT training")
     return True
 
 
-def sample_costs(args: Namespace, rollout_data: dict[str, Any], *, for_dp: bool = False) -> list[float] | None:
-    """Resolve the selected objective, reusing DP costs for microbatches."""
-    validate = validate_dp_balance if for_dp else validate_microbatch_balance
-    if not validate(args):
+def sample_costs(args: Namespace, rollout_data: dict[str, Any]) -> list[float] | None:
+    """Estimate each sample once, before publication to the queue."""
+    if not validate_flops_balance(args):
         return None
-    if "_sft_wholepack_v1" in rollout_data:
-        raise ValueError("FLOPs balancing cannot consume an existing wholepack plan")
-    if not for_dp and validate_dp_balance(args):
-        costs = rollout_data.get("flops_cost")
-        if not isinstance(costs, (list, tuple)) or any(
-            not isinstance(value, Real) or isinstance(value, bool) for value in costs
-        ):
-            raise ValueError("FLOPs microbatch reuse requires cached CPU numeric scalars")
-    else:
-        from relax.utils.misc import get_hf_config
+    from relax.utils.misc import get_hf_config
+    from relax.utils.training.qwen35_cost import estimate_sample_costs
 
-        config = get_hf_config(args.hf_checkpoint)
-        model_type = config.model_type
-        estimator = _ESTIMATORS.get(model_type)
-        if estimator is None and model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
-            from relax.utils.training.qwen35_cost import estimate_sample_costs
-
-            estimator = estimate_sample_costs
-        if estimator is None:
-            option = "--dp-balance" if for_dp else "--microbatch-balance"
-            raise ValueError(
-                f"No FLOPs sample cost estimator for model_type={model_type!r}; "
-                f"register_sample_cost_estimator or use {option} tokens"
-            )
-        costs = estimator(config, rollout_data, args)
-    costs = [float(value) for value in costs]
+    config = get_hf_config(args.hf_checkpoint)
+    if config.model_type not in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
+        raise ValueError(f"FLOPs scheduling does not support model_type={config.model_type!r}")
+    costs = [float(value) for value in estimate_sample_costs(config, rollout_data, args)]
     if len(costs) != len(rollout_data["total_lengths"]):
         raise ValueError("Sample cost count must match total_lengths")
     if any(not math.isfinite(value) or value <= 0 for value in costs):
@@ -131,7 +87,7 @@ def add_flops_cost_metadata(
     args: Namespace | None, batch: dict[str, Any], metadata: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Attach CPU costs before payloads enter the queue's sampling layer."""
-    costs = sample_costs(args, batch, for_dp=True) if args is not None else None
+    costs = sample_costs(args, batch) if args is not None else None
     if costs is None:
         return metadata
     return [{**row, "flops_cost": cost} for row, cost in zip(metadata, costs, strict=True)]
