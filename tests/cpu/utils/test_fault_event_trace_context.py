@@ -21,7 +21,7 @@ from relax.utils.fault_events.context import (
 )
 from relax.utils.fault_events.models import ROLES, FaultContext
 from relax.utils.fault_events.source import FaultSource
-from tests.utils.test_fault_health_flow import HealthStatusImpl, LocalStatusRPC
+from tests.cpu.utils.test_fault_health_flow import HealthStatusImpl, LocalStatusRPC
 
 
 def test_trace_context_round_trips_with_fixed_width_ids():

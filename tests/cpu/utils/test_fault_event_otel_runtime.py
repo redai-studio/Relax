@@ -13,7 +13,7 @@ from relax.utils.fault_events.context import FaultTraceContext
 from relax.utils.fault_events.models import EventDraft, RecoveryEvidence
 from relax.utils.fault_events.runtime import FaultEventRuntime, start_fault_events
 from relax.utils.fault_events.source import FaultSource
-from tests.utils.test_fault_event_otel_exporter import collector as _collector_fixture
+from tests.cpu.utils.test_fault_event_otel_exporter import collector as _collector_fixture
 
 
 collector = _collector_fixture

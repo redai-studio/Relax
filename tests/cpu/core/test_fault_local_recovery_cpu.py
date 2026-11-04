@@ -34,7 +34,7 @@ except ImportError:
             return self.value
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 class Roles(StrEnum):

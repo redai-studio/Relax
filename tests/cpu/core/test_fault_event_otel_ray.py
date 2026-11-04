@@ -22,11 +22,11 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 
 from relax.utils.fault_events.runtime import start_fault_events
-from tests.utils.test_fault_event_otel_exporter import collector as _collector_fixture
+from tests.cpu.utils.test_fault_event_otel_exporter import collector as _collector_fixture
 
 
 collector = _collector_fixture
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 @ray.remote(num_cpus=0.1)
