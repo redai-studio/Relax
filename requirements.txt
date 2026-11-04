@@ -1,6 +1,12 @@
 ray[serve]
 fastapi==0.139.1
 uvicorn>=0.36.0
+# The owned fault exporter sanitizes SDK 1.45 transport diagnostics per client.
+opentelemetry-sdk>=1.45.0,<1.46
+opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46
+# Fault export uses HTTP only. The umbrella keeps any preinstalled gRPC exporter
+# (e.g. in base images) on the same release as the SDK.
+opentelemetry-exporter-otlp>=1.45.0,<1.46
 apprise
 clearml==2.1.3
 numpy<2

@@ -1,0 +1,10 @@
+# ROCm image additions to requirements.txt, which Dockerfile.rocm installs alongside it.
+# Match the Ray, Transformers and tokenizers versions of Dockerfile.cu13 and Relax's SGLang
+# 0.5.21 patch, whose pyproject.toml pins are not applied on ROCm.
+ray[default,serve]==2.56.1
+transformers==5.16.0
+tokenizers==0.23.2
+# Imported by transformer_engine 2.18, which is installed from a wheel with no deps.
+onnxscript
+# librosa 1.0 no longer pulls audioread, which multimodal audio loading needs.
+audioread

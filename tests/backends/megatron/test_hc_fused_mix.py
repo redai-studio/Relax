@@ -119,10 +119,12 @@ def test_hc_fusion_forward_backward_and_outer_checkpoint(runtime, combine, reent
 
 
 @gpu
-def test_hc_fusion_publishes_params_and_preserves_hooks(runtime):
+@pytest.mark.parametrize("recompute", [False, True])
+def test_hc_fusion_publishes_params_and_preserves_hooks(runtime, monkeypatch, recompute):
     make, original = runtime
     from megatron.core import utils
 
+    monkeypatch.setenv("RELAX_QWEN38_HC_RECOMPUTE", "1" if recompute else "0")
     if not hasattr(utils, "ensure_params_ready"):
         pytest.skip("MCore does not expose parameter publication")
     model = make()
@@ -142,7 +144,8 @@ def test_hc_fusion_publishes_params_and_preserves_hooks(runtime):
     ddp_hook.__qualname__ = "DistributedDataParallel._make_forward_pre_hook.<locals>.hook"
     handle = model.input_mix_weight_down.register_forward_pre_hook(ddp_hook)
     assert patch._supported(model, x, utils.ensure_params_ready)
-    model._mix(x)
+    outputs = model._mix(x)
+    sum(output.float().square().mean() for output in outputs if output is not None).backward()
     assert calls == ["ready"]  # Same callback shared by all four parameters.
     handle.remove()
 
@@ -188,3 +191,98 @@ def test_hc_fusion_production_width_dynamic_tokens(runtime, combine):
         actual_grads = torch.autograd.grad(actual, [x, *model.parameters()], grad_outputs=upstream)
         for a, b in zip((*actual, *actual_grads), (*expected, *expected_grads)):
             _close(a, b)
+
+
+@gpu
+@pytest.mark.parametrize(
+    "combine,rows,outer,enabled,method,hidden_size,expected_calls",
+    [
+        (True, 8, True, True, "uniform", 2560, 2),
+        (True, 9, True, True, "uniform", 2560, 3),
+        (False, 8, True, True, "uniform", 2560, 3),
+        (True, 8, False, True, "uniform", 2560, 2),
+        (True, 9, True, False, "uniform", 2560, 2),
+        (True, 8, True, True, "block", 2560, 3),
+        (True, 8, True, True, "uniform", 128, 3),
+    ],
+)
+def test_hc_inner_recompute_matches_mcore_outer_gradients(
+    runtime, monkeypatch, combine, rows, outer, enabled, method, hidden_size, expected_calls
+):
+    from megatron.core.tensor_parallel import random as tp_random
+
+    make, _ = runtime
+    torch.manual_seed(71)
+    model = make(combine, hidden_size=hidden_size, rank=320 if hidden_size == 2560 else 32)
+    model.config.recompute_granularity = "full"
+    model.config.recompute_method = method
+    params = list(model.parameters())
+    for param in params:
+        param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+    identity = [(id(p), p.data_ptr(), id(p.main_grad)) for p in params]
+    schema = {name: (p.shape, p.dtype) for name, p in model.state_dict().items()}
+    x = torch.randn(rows, 1, 4 * hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    block_grad = torch.randn(rows, 1, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.01
+    post_grad = torch.randn(rows, 1, 4, device="cuda") * 0.01
+
+    def loss(value):
+        block, post = patch.fused_mix(model, value)
+        return (block * block_grad).sum() + (0 if post is None else (post * post_grad).sum())
+
+    monkeypatch.setenv("RELAX_QWEN38_HC_RECOMPUTE", "0")
+    reference_loss = loss(x)
+    reference_loss.backward()
+    expected = [value.grad.detach().clone() for value in [x, *params]]
+    for value in [x, *params]:
+        value.grad = None
+
+    compiled = patch.compiled_mix(hidden_size == 2560)
+    calls = []
+
+    def observed(*args):
+        calls.append(torch.is_grad_enabled())
+        return compiled(*args)
+
+    monkeypatch.setattr(patch, "compiled_mix", lambda fixed_width: observed)
+    monkeypatch.setenv("RELAX_QWEN38_HC_RECOMPUTE", "1" if enabled else "0")
+    monkeypatch.setenv("RELAX_QWEN38_HC_OUTER_BYPASS_MAX_LOCAL_ROWS", "8")
+    result = tp_random.checkpoint(loss, False, x) if outer else loss(x)
+    result.backward()
+    torch.testing.assert_close(result, reference_loss, rtol=0, atol=0)
+    for value, expected_grad in zip([x, *params], expected):
+        torch.testing.assert_close(value.grad, expected_grad, rtol=0, atol=0)
+    assert len(calls) == expected_calls
+    assert not tp_random.is_checkpointing()
+    assert identity == [(id(p), p.data_ptr(), id(p.main_grad)) for p in params]
+    assert schema == {name: (p.shape, p.dtype) for name, p in model.state_dict().items()}
+
+
+@gpu
+@pytest.mark.parametrize("combine", [False, True])
+def test_hc_inner_recompute_reduces_saved_activations(runtime, monkeypatch, record_property, combine):
+    make, _ = runtime
+    model = make(combine)
+    x = torch.randn(128, 1, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    allocated_bytes = []
+    for enabled in (False, True):
+        monkeypatch.setenv("RELAX_QWEN38_HC_RECOMPUTE", "1" if enabled else "0")
+        # Measure live allocator bytes after warming the compiled graph. An
+        # extra saved_tensors_hooks observer changes Dynamo's graph selection
+        # when checkpoint restores inputs, so it would perturb this workload.
+        for warmup in (True, False):
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            outputs = patch.fused_mix(model, x)
+            if not warmup:
+                allocated_bytes.append(torch.cuda.memory_allocated() - before)
+            sum(output.float().square().mean() for output in outputs if output is not None).backward()
+            del outputs
+            for value in [x, *model.parameters()]:
+                value.grad = None
+    record_property("allocated_bytes_without_recompute", allocated_bytes[0])
+    record_property("allocated_bytes_with_recompute", allocated_bytes[1])
+    assert allocated_bytes[1] < allocated_bytes[0] / 2, allocated_bytes
+    # Inference must not construct checkpoint state even when opted in.
+    with torch.no_grad():
+        outputs = patch.fused_mix(model, x)
+    assert all(not output.requires_grad for output in outputs if output is not None)

@@ -76,7 +76,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_merge_mode,
     summarize_lora_modules,
 )
-from relax.utils.memory_utils import clear_memory, print_memory
+from relax.utils.memory_utils import clear_memory, manual_gc_eval, manual_gc_training, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.opd.opd_utils import (
@@ -449,16 +449,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
-
-        # Single source of truth for VL-model routing across data prep, forward,
-        # and CP helpers. Detected by the presence of processor/preprocessor
-        # config in the HF checkpoint dir — only multimodal models ship one.
-        # This way VL models with text-only batches (no --multimodal-keys) still
-        # take the bridge VL+CP+thd path.
-        args.is_vl_model = any(
-            os.path.exists(os.path.join(args.hf_checkpoint, name))
-            for name in ("processor_config.json", "preprocessor_config.json")
-        )
 
         from relax.utils.training.flops_counter import FlopsCounter
 
@@ -1355,10 +1345,12 @@ class MegatronTrainRayActor(TrainRayActor):
                                 )
                             )
                     dist.barrier(group=get_gloo_group())
-                    run_sft_eval(self, rollout_id)
+                    with manual_gc_eval(self.args):
+                        run_sft_eval(self, rollout_id)
 
                 if should_run_predict:
-                    run_sft_predict(self, rollout_id)
+                    with manual_gc_eval(self.args):
+                        run_sft_predict(self, rollout_id)
             except Exception as e:
                 logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
                 raise
@@ -1397,6 +1389,7 @@ class MegatronTrainRayActor(TrainRayActor):
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    @manual_gc_training
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
@@ -2550,6 +2543,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if clear_routing_replay_forward:
                 RoutingReplay.clear_all_forward()
 
+    @manual_gc_training
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -2789,6 +2783,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @manual_gc_training
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -3037,7 +3032,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if reconnect_rollout_engines:
             self.wake_up()
         elif self.args.offload_train:
-            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+            reload_process_groups(
+                timeout_minutes=self.args.distributed_timeout_minutes,
+                process_groups=getattr(self.weight_updater, "process_groups_for_update", None),
+            )
 
         if num_new_engines > 0 or reconnect_rollout_engines:
             self.weight_updater.connect_rollout_engines(
