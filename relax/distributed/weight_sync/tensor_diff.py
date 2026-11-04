@@ -144,6 +144,7 @@ def compare(left: Path, right: Path) -> dict[str, Any]:
         lf, lo, length, dtype, shape = left_tensors[name]
         rf, ro, rlength, rdtype, rshape = right_tensors[name]
         if (dtype, shape, length) != (rdtype, rshape, rlength):
+            result["mismatch_tensors"] += 1
             result["metadata_mismatches"].append(
                 {
                     "name": name,
@@ -214,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         result = compare(args.left, args.right)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         result = {"equal": False, "error": str(exc), "left": str(args.left), "right": str(args.right)}
+        logger.error("tensor diff failed: %s", exc)
     args.result.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
     return 0 if result["equal"] else 1
 

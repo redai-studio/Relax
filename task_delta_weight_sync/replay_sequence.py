@@ -57,6 +57,7 @@ def main() -> int:
         check = compare(reference, Path(prepared.path))
         check_path = args.output / f"{version:06d}-diff.json"
         atomic_write(check_path, json.dumps(check, indent=2).encode())
+        consumer.release(prepared)
         row = asdict(prepared) | {
             "transport": "TCP" if args.endpoint else "SharedFS",
             "consumer_metrics": dict(consumer.last_metrics),
@@ -69,7 +70,6 @@ def main() -> int:
         }
         rows.append(row)
         atomic_write(args.output / "results.json", json.dumps(rows, indent=2).encode())
-        consumer.release(prepared)
         if not check["equal"]:
             return 1
     return 0
