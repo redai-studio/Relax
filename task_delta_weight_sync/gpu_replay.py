@@ -9,11 +9,13 @@ records/manifests/objects.
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import socket
 import sys
 import threading
+import uuid
 from argparse import Namespace
 from pathlib import Path
 from time import monotonic
@@ -107,6 +109,76 @@ class CheckedEngine:
     def probe(self) -> None:
         self.engine.disk_weight_generation_probe(30)
 
+    def reject_bad_load(self, target: dict, published: dict) -> dict:
+        import requests
+
+        try:
+            self.evaluate(target, published, 60)
+        except requests.HTTPError as error:
+            response = error.response
+            body = response.json() if response is not None else {}
+            if response is None or response.status_code != 400 or body.get("success") is not False:
+                raise
+            if "Failed to get weights iterator" not in body.get("message", ""):
+                raise
+            return {"status": "REJECTED_PAUSED", "http_status": response.status_code, "response": body}
+        raise AssertionError("The real loader accepted a checkpoint without weights")
+
+    def observe_paused_generation(self) -> dict:
+        import requests
+
+        self.pause()
+        url = f"http://{self.engine.server_host}:{self.engine.server_port}"
+        health = requests.get(url + "/health", timeout=5)
+        health.raise_for_status()
+        request_id = uuid.uuid4().hex
+        payload = {"rid": request_id, "input_ids": [1], "sampling_params": {"max_new_tokens": 1, "temperature": 0}}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(requests.post, url + "/generate", json=payload, timeout=15)
+            observed_at = monotonic()
+            try:
+                try:
+                    response = future.result(timeout=3)
+                except concurrent.futures.TimeoutError:
+                    pass
+                else:
+                    raise AssertionError(f"Paused generation completed: {response.status_code} {response.text[:500]}")
+            finally:
+                # The full unique rid avoids SGLang's prefix-abort affecting
+                # any other request. Keep the original HTTP request until done.
+                aborted = requests.post(
+                    url + "/abort_request", json={"rid": request_id, "abort_all": False}, timeout=5
+                )
+                aborted.raise_for_status()
+            response = future.result(timeout=8)
+        body = response.json()
+        meta = body.get("meta_info", {})
+        if (
+            meta.get("completion_tokens", 0)
+            or meta.get("output_token_ids")
+            or body.get("text")
+            or body.get("output_ids")
+        ):
+            raise AssertionError(f"Paused probe produced a token: {body}")
+        message = body.get("error", {}).get("message", "")
+        if response.status_code != 499 or request_id not in message or "was aborted" not in message:
+            raise AssertionError(f"Paused probe did not terminate as aborted: {body}")
+        info = requests.get(url + "/model_info", timeout=5)
+        info.raise_for_status()
+        result = {
+            "status": "PAUSED_NO_TOKEN_ABORTED",
+            "rid": request_id,
+            "observation_window_s": 3,
+            "observation_and_abort_s": monotonic() - observed_at,
+            "health_status": health.status_code,
+            "abort_status": aborted.status_code,
+            "generate_status": response.status_code,
+            "generate_response": body,
+            "model_info": info.json(),
+        }
+        atomic_write(self.root / "paused-probe.json", json.dumps(result, indent=2).encode())
+        return result
+
     def shutdown(self) -> None:
         # This harness has no router; shutdown's process-tree cleanup is reused.
         self.engine.shutdown()
@@ -169,6 +241,7 @@ def main() -> int:
     parser.add_argument("--gpu-count", type=int, default=4, choices=[1, 2, 4])
     parser.add_argument("--versions", type=int, nargs="+", required=True)
     parser.add_argument("--full-only", action="store_true")
+    parser.add_argument("--check-load-failure", action="store_true")
     args = parser.parse_args()
     if args.source_node_ip == args.consumer_node_ip:
         raise ValueError("TCP requires two different nodes")
@@ -197,7 +270,10 @@ def main() -> int:
         # independent ordinary FULL export. GPU loading remains outside prepare.
         from replay_sequence import replay
 
+        last_row = None
+
         def installed(row: dict) -> None:
+            nonlocal last_row
             started = monotonic()
             target = {
                 "path": row["path"],
@@ -214,6 +290,7 @@ def main() -> int:
                     item["events"].extend(["CONTINUED", "PROBED"])
                 row["gpu"] = checked
                 row["group_pause_and_probe_s"] = monotonic() - started
+                last_row = row
             except Exception:
                 for engine in engines:
                     try:
@@ -222,7 +299,46 @@ def main() -> int:
                         ray.kill(engine, no_restart=True)
                 raise
 
-        return replay(args.config, args.output / "receiver", args.versions, args.full_only, endpoint, installed)
+        result = replay(args.config, args.output / "receiver", args.versions, args.full_only, endpoint, installed)
+        if result == 0 and args.check_load_failure:
+            fault_started = monotonic()
+            stable = dict(last_row)
+            empty = args.output / "fault" / "empty"
+            empty.mkdir(parents=True)
+            ray.get([engine.pause.remote() for engine in engines], timeout=30)
+            bad_target = {"path": str(empty), "full_reference": stable["reference"], "node": args.consumer_node_ip}
+            attempt = stable | {"version": stable["version"] + 1}
+            rejected = ray.get(engines[0].reject_bad_load.remote(bad_target, attempt), timeout=90)
+            # A failed member never opens the group. Confirm each member's
+            # actual gate while its health/control interface remains responsive.
+            ray.get([engine.pause.remote() for engine in engines], timeout=30)
+            probes = ray.get([engine.observe_paused_generation.remote() for engine in engines], timeout=45)
+            for probe in probes:
+                if str(probe["model_info"].get("weight_version")) != str(stable["version"]):
+                    raise AssertionError(f"Rejected attempt changed the installed version: {probe}")
+            fault = {
+                "status": "REJECTED_CLOSED",
+                "attempted_version": attempt["version"],
+                "stable_version": stable["version"],
+                "stable_root": stable["root"],
+                "bad_path": str(empty),
+                "rejected": rejected,
+                "probes": probes,
+                "resume_calls_before_recovery": 0,
+                "negative_stage_s": monotonic() - fault_started,
+            }
+            atomic_write(args.output / "fault-recovery.json", json.dumps(fault, indent=2).encode())
+            # The runner's model_path changed on rejection. Explicitly reload
+            # and audit the good frozen target before the next group resume.
+            installed(stable)
+            fault.update(
+                status="RECOVERED",
+                restored_root=stable["root"],
+                gpu=stable["gpu"],
+                total_pause_and_recovery_s=monotonic() - fault_started,
+            )
+            atomic_write(args.output / "fault-recovery.json", json.dumps(fault, indent=2).encode())
+        return result
     finally:
         original_error = sys.exc_info()[0]
         cleanup_errors = []

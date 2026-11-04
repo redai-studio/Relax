@@ -13,7 +13,7 @@ from relax.distributed.weight_sync.consumer import Consumer, verify_checkpoint
 from relax.distributed.weight_sync.format import WeightSyncError, canonical_json
 from relax.distributed.weight_sync.publisher import Publisher
 from relax.distributed.weight_sync.store import CapacityError, SharedFSStore
-from relax.distributed.weight_sync.tcp import ObjectServer, TCPTransport, _frame, _receive_frame
+from relax.distributed.weight_sync.tcp import ObjectServer, TCPTransport, _frame, _read_exact, _receive_frame
 
 
 def make_store(tmp_path):
@@ -261,6 +261,48 @@ def test_tcp_counts_only_accepted_request_bytes_before_interrupted_send(monkeypa
     assert transport.metrics["frame_bytes"] == 3 + complete_request + complete_response
     assert transport.metrics["payload_bytes"] == len(data)
     assert transport.metrics["retries"] == 1
+
+
+@pytest.mark.parametrize("responds", [True, False])
+def test_tcp_read_poll_preserves_total_deadline(responds):
+    receiver, sender = socket.socketpair()
+    first_timeout, release = threading.Event(), threading.Event()
+
+    class PollingSocket:
+        def settimeout(self, timeout):
+            receiver.settimeout(min(timeout, 0.01))
+
+        def recv(self, size):
+            try:
+                return receiver.recv(size)
+            except socket.timeout:
+                first_timeout.set()
+                raise
+
+    def serve():
+        try:
+            if first_timeout.wait(1) and responds:
+                release.wait(0.03)
+                sender.sendall(b"target")
+            else:
+                release.wait(1)
+        finally:
+            sender.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        if responds:
+            assert _read_exact(PollingSocket(), 6, monotonic() + 1) == b"target"
+        else:
+            with pytest.raises(TimeoutError, match="deadline exceeded"):
+                _read_exact(PollingSocket(), 6, monotonic() + 0.06)
+        assert first_timeout.is_set()
+    finally:
+        release.set()
+        thread.join(2)
+        receiver.close()
+    assert not thread.is_alive()
 
 
 def test_tcp_slow_header_releases_worker_and_other_consumer_progresses(tmp_path):

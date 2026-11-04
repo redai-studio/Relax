@@ -25,7 +25,12 @@ def _read_exact(
         if remaining <= 0:
             raise TimeoutError("TCP object deadline exceeded")
         connection.settimeout(min(remaining, 5.0))
-        part = connection.recv(min(size - len(chunks), 64 * 1024))
+        try:
+            part = connection.recv(min(size - len(chunks), 64 * 1024))
+        except socket.timeout:
+            # FULL materialization may legitimately hold the response while it
+            # verifies/encodes the target. A socket poll is not its total budget.
+            continue
         if not part:
             raise ConnectionError("TCP object truncated")
         chunks.extend(part)
