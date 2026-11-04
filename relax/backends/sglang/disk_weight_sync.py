@@ -126,10 +126,15 @@ def install(engine, target: dict, published: dict, timeout: float) -> dict:
         return path
 
     delta_load_s = load(target["path"])
+    dump_started = monotonic()
     delta_dump = dump("delivered")  # Must survive before reference FULL reload.
+    delivered_dump_s = monotonic() - dump_started
     reference_started = monotonic()
     reference_load_s = load(target["full_reference"])
+    dump_started = monotonic()
     full_dump = dump("reference")
+    reference_dump_s = monotonic() - dump_started
+    diff_started = monotonic()
     delta_ranks = {path.name for path in delta_dump.glob("rank-*")}
     full_ranks = {path.name for path in full_dump.glob("rank-*")}
     expected = engine.num_gpus_per_engine or engine.args.rollout_num_gpus_per_engine
@@ -155,6 +160,9 @@ def install(engine, target: dict, published: dict, timeout: float) -> dict:
         "node": target["node"],
         "delta_load_s": delta_load_s,
         "reference_load_s": reference_load_s,
+        "delivered_dump_s": delivered_dump_s,
+        "reference_dump_s": reference_dump_s,
+        "gpu_diff_s": monotonic() - diff_started,
         "reference_validation_s": monotonic() - reference_started,
         "install_and_check_s": monotonic() - started,
         "readback": checks,

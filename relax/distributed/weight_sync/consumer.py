@@ -120,6 +120,8 @@ class Consumer:
         # Callers can explicitly release it after recovery/abandonment.
         record = self.transport.record(stream, version)
         artifact_id = self.transport.ensure_full(stream, version) if full else record["artifact_id"]
+        self.last_metrics["resolve_s"] = monotonic() - started
+        fetch_started = monotonic()
         try:
             manifest = self._fetch_chain(artifact_id, deadline, reference)
         except WeightSyncError as error:
@@ -129,8 +131,10 @@ class Consumer:
                 raise
             artifact_id = self.transport.ensure_full(stream, version)
             manifest = self._fetch_chain(artifact_id, deadline, reference)
+        self.last_metrics["fetch_and_fallback_s"] = monotonic() - fetch_started
         if (manifest["stream"], manifest["version"], manifest["root"]) != (stream, version, record["root"]):
             raise WeightSyncError("Prepared artifact does not match the requested target")
+        rebuild_started = monotonic()
         target = self.checkpoint_root / require_digest(record["root"])
         # A node-local lock prevents multiple workers from rebuilding one target.
         import fcntl
@@ -154,6 +158,7 @@ class Consumer:
             if not target.exists():
                 self._reconstruct(manifest, target, deadline)
             verify_checkpoint(target, manifest["catalog"])
+        self.last_metrics["rebuild_and_verify_s"] = monotonic() - rebuild_started
         self.last_metrics["prepare_s"] = monotonic() - started
         self._deadline(deadline)
         return PreparedCheckpoint(stream, version, record["root"], artifact_id, str(target), reference)

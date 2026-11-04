@@ -284,8 +284,10 @@ def main() -> int:
                 checked = ray.get([engine.evaluate.remote(target, row, 900) for engine in engines], timeout=1200)
                 if any(item["status"] != "VERIFIED" or item["root"] != row["root"] for item in checked):
                     raise RuntimeError("A GPU member did not verify the requested target")
+                resume_started = monotonic()
                 ray.get([engine.resume.remote() for engine in engines], timeout=30)
                 ray.get([engine.probe.remote() for engine in engines], timeout=45)
+                row["resume_and_probe_s"] = monotonic() - resume_started
                 for item in checked:
                     item["events"].extend(["CONTINUED", "PROBED"])
                 row["gpu"] = checked

@@ -171,6 +171,7 @@ class UpdateWeightFromDisk:
             )
             if any(item.get("status") != "VERIFIED" or item.get("root") != published["root"] for item in checked):
                 raise RuntimeError("Inference member did not verify the requested disk target")
+            resume_started = monotonic()
             ray.get(
                 [engine.continue_generation.remote(timeout=remaining()) for engine in engines], timeout=remaining()
             )
@@ -179,7 +180,11 @@ class UpdateWeightFromDisk:
             ray.get(
                 [engine.disk_weight_generation_probe.remote(remaining()) for engine in engines], timeout=remaining()
             )
-            return {"members": checked, "generation_pause_s": monotonic() - paused_at}
+            return {
+                "members": checked,
+                "generation_pause_s": monotonic() - paused_at,
+                "resume_and_probe_s": monotonic() - resume_started,
+            }
         except Exception:
             # Also covers partial continue/probe success. A member that cannot
             # acknowledge pause must not continue serving a possibly bad version.
