@@ -2,7 +2,7 @@
 
 Qwen-Image 通过 `QwenImageSFTAdapter` 接入 Relax 的同步 FSDP2 SFT 训练循环，
 复用图像 SFT 的数据游标、优化器更新和 checkpoint。该入口训练 DiT LoRA，
-文本编码器和 VAE 冻结并保持 eval 模式；每个样本在线执行文本编码、VAE 编码及后验采样，
+文本编码器和 VAE 冻结并保持 eval 模式；默认每个样本在线执行文本编码、VAE 编码及后验采样，
 随后采样扩散噪声和时间步，计算 flow-matching loss。
 
 默认使用 BF16 计算、FP32 梯度归约和优化器主权重。当前不支持该入口的全参训练或文本编码器 LoRA。
@@ -80,12 +80,12 @@ python examples/diffusion/export_i2i_sft.py \
 
 ## 可选冻结条件缓存
 
-使用 `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh`，沿用上面的训练设置。
-`RELAX_CONDITION_CACHE=1` 启用冻结文本特征与 VAE 后验分布参数复用，`RELAX_CONDITION_CACHE_MAX_BYTES`
-设置每节点 payload 预算（默认 1 GiB），每次使用新的 `RELAX_CONDITION_CACHE_RUN_DIR`。
-`RELAX_CONDITION_CACHE=0` 保留在线基线。后验采样仍在线执行，保留原随机数顺序与张量布局；在线与缓存路径均使用冻结 VAE 副本。随机裁剪和
-caption dropout 保持随机数流顺序，使用实际结果构键。
+在上面的普通启动命令中添加 `RELAX_CONDITION_CACHE=1`，即可复用冻结文本特征与 VAE 后验分布参数。
+`RELAX_CONDITION_CACHE_MAX_BYTES` 设置每节点 payload 预算（默认 8 GiB），
+`RELAX_CONDITION_CACHE=0` 恢复在线编码，无需单独的启动脚本或验收工具。
+后验采样仍在线执行，保留原随机数顺序与张量布局；在线与缓存路径均使用冻结 VAE 副本。
+随机裁剪和 caption dropout 保持随机数流顺序，使用实际结果构键。
 
 在线/缓存对照和 checkpoint 恢复使用相同编码器放置、checkpointing 和 FSDP reshard 设置。
-跳过编码器前全部 rank 一致同意，恢复不要求热缓存。所有权、容量、失效和数值/性能验证
+跳过编码器前全部 rank 一致同意，恢复不要求热缓存。配置、所有权、容量和失效规则
 见[冻结条件缓存](./frozen-conditioning-cache.md)。

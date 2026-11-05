@@ -230,8 +230,6 @@ class QwenImageSFTModel(torch.nn.Module):
             raise
 
     def _conditioning_features(self, data: dict[str, Any]) -> dict[str, Any]:
-        import time
-
         placement = self.config.get("text_encoder_placement", "sharded")
         if placement != getattr(self, "_text_encoder_placement", placement):
             raise ValueError("Changing text_encoder_placement requires a new model and FSDP ownership")
@@ -241,7 +239,6 @@ class QwenImageSFTModel(torch.nn.Module):
             )
         if any(parameter.requires_grad for parameter in self.vae.parameters()):
             raise ValueError("Replicated Qwen VAE is frozen-only; training its parameters requires a new model")
-        started = time.perf_counter()
         prepared = self._prepare_conditioning(data["prompt"])
         pixels = self._prepare_pixels(data)
         resolver = self.conditioning_cache
@@ -252,37 +249,19 @@ class QwenImageSFTModel(torch.nn.Module):
         length = min(prepared["input_ids"].shape[1] - start, self.config["max_sequence_length"])
         if length <= 0:
             raise ValueError("Prompt template produced no conditioning tokens")
-        if resolver is not None and hasattr(resolver, "record_prepare"):
-            resolver.record_prepare(time.perf_counter() - started)
         online_posterior = None
 
         def compute() -> dict[str, torch.Tensor]:
             nonlocal online_posterior
-            if resolver is not None:
-                resolver.record_input_transfer(
-                    sum(value.numel() * value.element_size() for value in prepared.values())
-                )
             with torch.no_grad() if spec.cacheable else nullcontext():
-                if resolver is not None and getattr(resolver, "force_online", False):
-                    # Independent, original Diffusers path for verification.
-                    embeds, mask = self.pipe.encode_prompt(
-                        prompt=data["prompt"],
-                        device=self.device,
-                        max_sequence_length=self.config["max_sequence_length"],
-                    )
-                    if mask is not None:
-                        raise ValueError("Singleton reference prompt unexpectedly contains padding")
-                else:
-                    output = self.text_encoder(
-                        **{name: value.to(self.device) for name, value in prepared.items()},
-                        output_hidden_states=True,
-                        use_cache=False,
-                        logits_to_keep=1,  # Hidden states do not need vocabulary logits for every token.
-                    )
-                    embeds = output.hidden_states[-1][:, start : start + length].to(self.compute_dtype)
+                output = self.text_encoder(
+                    **{name: value.to(self.device) for name, value in prepared.items()},
+                    output_hidden_states=True,
+                    use_cache=False,
+                    logits_to_keep=1,  # Hidden states do not need vocabulary logits for every token.
+                )
+                embeds = output.hidden_states[-1][:, start : start + length].to(self.compute_dtype)
             normalized = pixels.to(torch.float32).permute(2, 0, 1).div(127.5).sub(1).unsqueeze(0).unsqueeze(2)
-            if resolver is not None:
-                resolver.record_input_transfer(normalized.numel() * (torch.finfo(self.compute_dtype).bits // 8))
             with torch.no_grad():
                 online_posterior = self._encode_posterior(normalized)
             parameters = online_posterior.parameters

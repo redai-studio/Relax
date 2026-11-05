@@ -3,8 +3,8 @@
 `QwenImageSFTAdapter` connects Qwen-Image to Relax's synchronous FSDP2 SFT loop,
 reusing image SFT data cursors, optimizer updates and checkpoint support. The entry
 point trains DiT LoRA while keeping the text encoder and VAE frozen in eval mode.
-Every sample runs text encoding, VAE encoding and posterior sampling online, then
-samples diffusion noise and a timestep for the flow-matching objective.
+By default, every sample runs text encoding, VAE encoding and posterior sampling
+online, then samples diffusion noise and a timestep for the flow-matching objective.
 
 The default recipe uses BF16 computation with FP32 gradient reduction and optimizer
 master weights. Full-parameter training and text-encoder LoRA are not supported by
@@ -97,15 +97,14 @@ and use the exported directory for model loading.
 
 ## Optional frozen conditioning cache
 
-Use `scripts/training/diffusion/run-qwen-image-sft-condition-cache.sh` with the same
-training settings as above. Set `RELAX_CONDITION_CACHE=1` to reuse frozen text embeddings and VAE posterior parameters,
-`RELAX_CONDITION_CACHE_MAX_BYTES` for the per-node payload budget (default 1 GiB),
-and a fresh `RELAX_CONDITION_CACHE_RUN_DIR`. Set `RELAX_CONDITION_CACHE=0` for the
-online baseline. Posterior sampling remains online with the same RNG order and
-tensor layout; crops and caption dropout key their actual outputs. The frozen
-VAE is replicated in both modes.
+Add `RELAX_CONDITION_CACHE=1` to the normal launch command above to reuse frozen
+text embeddings and VAE posterior parameters. `RELAX_CONDITION_CACHE_MAX_BYTES`
+sets the per-node payload budget (default 8 GiB); `RELAX_CONDITION_CACHE=0` restores
+online encoding. No separate launcher or validation tool is required. Posterior
+sampling remains online with the same RNG order and tensor layout; crops and
+caption dropout key their actual outputs. The frozen VAE is replicated in both modes.
 
 Keep encoder placement, checkpointing and FSDP reshard settings identical across
 the comparison and on checkpoint resume. All ranks agree before skipping an
 encoder; a warm cache is not required to resume. See [Frozen conditioning cache](./frozen-conditioning-cache.md)
-for ownership, limits, invalidation and numerical/performance validation.
+for configuration, ownership, limits and invalidation.

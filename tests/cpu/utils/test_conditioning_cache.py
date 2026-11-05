@@ -666,9 +666,6 @@ def test_writers_copy_and_serialize_concurrently_while_lookup_proceeds(tmp_path:
         assert state["inflight_writes"] == state["staging_reserved_bytes"] == state["bytes_reserved"] == 0
         assert state["entries"] == 3
         assert not list(cache.directory.glob("writer-*"))
-        assert all(
-            state[key] > 0 for key in ("serialize_seconds", "file_write_seconds", "checksum_seconds", "map_seconds")
-        )
 
 
 def test_concurrent_payload_reservations_never_overcommit_disk_budget(tmp_path: Path, monkeypatch) -> None:

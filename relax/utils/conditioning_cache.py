@@ -348,20 +348,11 @@ class ConditioningCache:
                 "read_bytes",
                 "write_bytes",
                 "reused_tensor_bytes",
-                "load_seconds",
-                "save_seconds",
                 "peak_reserved_bytes",
                 "peak_temporary_host_bytes",
                 "peak_staging_reserved_bytes",
                 "checksum_bytes",
                 "reclaimed_namespaces",
-                "lock_wait_seconds",
-                "lock_hold_seconds",
-                "checksum_seconds",
-                "map_seconds",
-                "d2h_seconds",
-                "serialize_seconds",
-                "file_write_seconds",
             ),
             0,
         )
@@ -390,15 +381,11 @@ class ConditioningCache:
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
-        started = time.perf_counter()
         with self._mutex:
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX)
-            acquired = time.perf_counter()
-            self._count("lock_wait_seconds", acquired - started)
             try:
                 yield
             finally:
-                self._count("lock_hold_seconds", time.perf_counter() - acquired)
                 fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
 
     @contextmanager
@@ -649,7 +636,7 @@ class ConditioningCache:
 
     def _lookup(self, key: str, *, max_bytes: int | None = None) -> ConditioningLease | None:
         self._count("lookups", 1)
-        started, hit = time.perf_counter(), False
+        hit = False
         descriptor = reader = None
         digest, entry = "", None
         try:
@@ -673,23 +660,17 @@ class ConditioningCache:
                 fcntl.flock(descriptor.fileno(), fcntl.LOCK_SH)
                 identity = ConditioningLease._stat_identity(os.fstat(descriptor.fileno()))
             self._count("checksum_bytes", entry["size"])
-            checksum_started = time.perf_counter()
-            try:
-                checksum = fingerprint_file(path)
-            finally:
-                self._count("checksum_seconds", time.perf_counter() - checksum_started)
+            checksum = fingerprint_file(path)
             if checksum != entry["sha256"]:
                 raise ValueError("Conditioning payload checksum mismatch")
             from safetensors import safe_open
 
-            map_started = time.perf_counter()
             reader = safe_open(str(path), framework="pt", device="cpu")
             reader.__enter__()
             metadata = reader.metadata() or {}
             if metadata.get("format") != str(_FORMAT):
                 raise ValueError("Invalid conditioning payload format")
             tensors = {name: reader.get_tensor(name) for name in reader.keys()}
-            self._count("map_seconds", time.perf_counter() - map_started)
             with self._locked():
                 index = self._index(recover=False)
                 current = index["entries"].get(digest)
@@ -733,7 +714,6 @@ class ConditioningCache:
                 reader.__exit__(None, None, None)
             if descriptor is not None:
                 descriptor.close()
-            self._count("load_seconds", time.perf_counter() - started)
             if not hit:
                 self._count("misses", 1)
         return None
@@ -749,7 +729,6 @@ class ConditioningCache:
     def _put(self, key: str, tensors: dict[str, torch.Tensor]) -> bool:
         import torch
 
-        started = time.perf_counter()
         identity, writer = uuid.uuid4().hex, None
         host_bytes = 0
         temporary = self.directory / f"writer-{identity}.pending"
@@ -796,7 +775,6 @@ class ConditioningCache:
 
             # Heavy work is protected by this writer's reservation and owner
             # lock, never by the shared namespace lock.
-            copy_started = time.perf_counter()
             host_bytes = tensor_bytes
             self._host_staging(host_bytes)
             cpu_tensors, storage_ids = {}, set()
@@ -807,10 +785,7 @@ class ConditioningCache:
                     value = value.clone()
                 storage_ids.add(storage_id)
                 cpu_tensors[name] = value
-            self._count("d2h_seconds", time.perf_counter() - copy_started)
-            serialize_started = time.perf_counter()
             payload = save(cpu_tensors, metadata={"format": str(_FORMAT)})
-            self._count("serialize_seconds", time.perf_counter() - serialize_started)
             size = len(payload)
             self._host_staging(size)
             host_bytes += size
@@ -828,12 +803,8 @@ class ConditioningCache:
                 self._counters["peak_reserved_bytes"] = max(
                     self._counters["peak_reserved_bytes"], index["reserved_bytes"]
                 )
-            write_started = time.perf_counter()
             temporary.write_bytes(payload)
-            self._count("file_write_seconds", time.perf_counter() - write_started)
-            checksum_started = time.perf_counter()
             checksum = hashlib.sha256(payload).hexdigest()
-            self._count("checksum_seconds", time.perf_counter() - checksum_started)
             with self._locked():
                 index = self._index()
                 reservation = index["writers"][identity]
@@ -877,7 +848,6 @@ class ConditioningCache:
                     self._error("writer cleanup", error)
                     if writer is not None:
                         writer.close()
-            self._count("save_seconds", time.perf_counter() - started)
 
     def stats(self) -> dict[str, int | float | str | None]:
         """Read accounting without scanning payloads or changing cache state.

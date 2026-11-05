@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Model-independent conditioning reuse and opt-in SFT measurement.
+"""Model-independent frozen conditioning reuse and cache ownership.
 
 The adapter calls resolve inside its normal FSDP root forward. A unanimous
 decision on the existing Gloo group keeps sharded forward collectives aligned.
@@ -10,10 +10,8 @@ data.
 
 from __future__ import annotations
 
-import json
 import os
 import socket
-import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
@@ -36,12 +34,8 @@ def _flag(name: str) -> bool:
     return value in {"1", "true"}
 
 
-def conditioning_measurement_enabled() -> bool:
-    return bool(
-        _flag("RELAX_CONDITION_CACHE")
-        or _flag("RELAX_CONDITION_PROFILE")
-        or os.environ.get("RELAX_CONDITION_CACHE_RUN_DIR")
-    )
+def conditioning_cache_enabled() -> bool:
+    return _flag("RELAX_CONDITION_CACHE")
 
 
 def model_fingerprint(model_path: str | Path) -> str:
@@ -76,15 +70,8 @@ def _tensor_bytes(features: dict[str, torch.Tensor]) -> int:
     return sum(tensor.numel() * tensor.element_size() for tensor in features.values())
 
 
-def _rss_bytes() -> int | None:
-    try:
-        return int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, IndexError):
-        return None
-
-
 class ConditioningRuntime:
-    """Optional resolver, cache ownership and per-rank raw JSONL telemetry."""
+    """Resolve frozen conditions with bounded storage and in-flight copies."""
 
     def __init__(
         self,
@@ -94,104 +81,54 @@ class ConditioningRuntime:
         device: torch.device,
         group: Any,
         rank: int,
-        world_size: int,
         namespace: str,
-        config: dict[str, Any],
-        metadata_sha256: str,
-        global_batch_size: int,
-        start_step: int,
-        num_steps: int,
-        trainer_started: float | None = None,
+        local_batch_size: int,
     ) -> None:
-        self.enabled = _flag("RELAX_CONDITION_CACHE")
-        self.force_online = False  # numerical reference pass still populates the cache
-        self.device, self.group, self.rank = device, group, rank
-        self.world_size = world_size
-        self._conditioning_started = time.monotonic()
-        self._started = self._conditioning_started if trainer_started is None else trainer_started
+        self.enabled = conditioning_cache_enabled()
+        self.device, self.group = device, group
         self._closed = False
-        self._close_event_written = False
-        self._events: list[tuple[Any, Any]] = []
         self._pending_copies: list[tuple[Any, Any, int]] = []
-        self._pending_copy_limit = max(1, global_batch_size // world_size)
-        self._step: defaultdict[str, int | float] = defaultdict(int)
-        self._last_end: float | None = None
-        self._cycle_started = 0.0
-        self._cycle_unix = 0.0
-        self._start_step = start_step
-        self._num_steps = num_steps
-        self._global_batch_size = global_batch_size
-        self._samples: list[int] = []
-        self._seen_samples: set[int] = set()
-        self._repeated_sample = False
+        self._pending_copy_limit = max(1, local_batch_size)
+        self._step: defaultdict[str, int] = defaultdict(int)
         self._model = model
         self._conditioning_snapshot: dict[str, Any] | None = None
         self._conditioning_semantic_snapshot: str | None = None
         self._cache_guard_disabled = bool(getattr(model, "conditioning_reuse_disabled", False))
         self._cache_guard_reason = getattr(model, "conditioning_reuse_disabled_reason", None)
-        self._writer: Any = None
         self.cache: ConditioningCache | None = None
         self._prefetch: Any = None
         self.prefetch_depth = int(os.environ.get("RELAX_CONDITION_PREFETCH_DEPTH", "0"))
         prefetch_bytes = int(os.environ.get("RELAX_CONDITION_PREFETCH_MAX_BYTES", str(512 * 1024**2)))
         if self.prefetch_depth < 0 or (self.prefetch_depth and prefetch_bytes <= 0):
             raise ValueError("Conditioning prefetch requires nonnegative depth and positive byte capacity")
-        # Fingerprinting failures are broadcast rather than stranding peers.
-        fingerprint: list[Any] = [None]
-        if rank == 0:
-            try:
-                fingerprint[0] = {"sha256": model_fingerprint(model_path)}
-            except Exception as error:
-                fingerprint[0] = {"error": f"{type(error).__name__}: {error}"}
-        if dist.is_initialized():
-            dist.broadcast_object_list(fingerprint, src=0, group=group)
-        if "error" in fingerprint[0]:
-            raise ValueError(fingerprint[0]["error"])
-        self.fingerprint = fingerprint[0]["sha256"]
+        self.fingerprint = ""
         if self.enabled:
+            # Fingerprinting failures are broadcast rather than stranding peers.
+            fingerprint: list[Any] = [None]
+            if rank == 0:
+                try:
+                    fingerprint[0] = {"sha256": model_fingerprint(model_path)}
+                except Exception as error:
+                    fingerprint[0] = {"error": f"{type(error).__name__}: {error}"}
+            if dist.is_initialized():
+                dist.broadcast_object_list(fingerprint, src=0, group=group)
+            if "error" in fingerprint[0]:
+                raise ValueError(fingerprint[0]["error"])
+            self.fingerprint = fingerprint[0]["sha256"]
             maximum = int(os.environ.get("RELAX_CONDITION_CACHE_MAX_BYTES", str(8 * 1024**3)))
             if maximum <= 0:
                 raise ValueError("Enabled conditioning cache requires a positive byte limit")
             directory = os.environ.get("RELAX_CONDITION_CACHE_DIR") or "/dev/shm/relax-conditioning"
             self.cache = ConditioningCache(maximum, directory, f"{namespace}:{socket.gethostname()}")
-        directory = os.environ.get("RELAX_CONDITION_CACHE_RUN_DIR")
         try:
             if self.enabled and self.prefetch_depth:
                 from relax.engine.sft.conditioning_prefetch import ConditioningPrefetch
 
                 self._prefetch = ConditioningPrefetch(self.cache, depth=self.prefetch_depth, max_bytes=prefetch_bytes)
-            if directory:
-                run_directory = Path(directory)
-                run_directory.mkdir(parents=True, exist_ok=True)
-                self._writer = (run_directory / f"events-rank{rank}.jsonl").open("x", buffering=1)
-            self._write(
-                {
-                    "stage": "init",
-                    "run_id": namespace,
-                    "mode": "cached" if self.enabled else "online",
-                    "rank": rank,
-                    "world_size": world_size,
-                    "global_batch_size": global_batch_size,
-                    "start_step": start_step,
-                    "expected_steps": num_steps - start_step,
-                    "config": config,
-                    "metadata_sha256": metadata_sha256,
-                    "model_fingerprint": self.fingerprint,
-                    "created_unix": time.time(),
-                    "time_init_seconds": time.monotonic() - self._started,
-                    "conditioning_init_seconds": time.monotonic() - self._conditioning_started,
-                    "total_seconds_scope": "trainer lifetime; model and Ray startup excluded (see external job.json)",
-                    "cache_enabled": self.enabled,
-                    "prefetch_depth": self.prefetch_depth if self.enabled else 0,
-                    "prefetch_max_bytes": prefetch_bytes if self._prefetch is not None else 0,
-                    "prefetch_scope": "validated CPU leases; device copies remain on the training thread",
-                }
-            )
             self._model.conditioning_cache = self
         except BaseException:
-            # No prefetch can be submitted until initialization returns. Try
-            # every cleanup, retaining the original initialization exception.
-            for resource in (self._prefetch, self.cache, self._writer):
+            # Initialization has not returned, so no prefetch has been submitted.
+            for resource in (self._prefetch, self.cache):
                 if resource is not None:
                     try:
                         resource.close()
@@ -200,25 +137,10 @@ class ConditioningRuntime:
             self._closed = True
             raise
 
-    def _write(self, event: dict[str, Any]) -> None:
-        if self._writer is not None:
-            self._writer.write(json.dumps(event, allow_nan=False) + "\n")
-
     def begin_step(self) -> None:
         self._step.clear()
-        self._events.clear()
-        self._samples.clear()
-        now = time.monotonic()
-        self._cycle_started = self._last_end if self._last_end is not None else now
-        self._cycle_unix = time.time() - (now - self._cycle_started)
 
-    def sample(self, sample_id: int) -> None:
-        self._check_conditioning_state()
-        self._samples.append(sample_id)
-        self._repeated_sample = sample_id in self._seen_samples
-        self._seen_samples.add(sample_id)
-
-    def _check_conditioning_state(self) -> None:
+    def before_forward(self) -> None:
         """Fail closed on a conditioning-master change outside FSDP forward.
 
         The adapter optionally declares ``frozen``, named tensor metadata and
@@ -270,14 +192,6 @@ class ConditioningRuntime:
                 "Disabling conditioning reuse for this model instance: %s; start a new task to reenable", reason
             )
 
-    def record_input_transfer(self, nbytes: int) -> None:
-        self._step["online_input_h2d_bytes"] += nbytes
-        if self._repeated_sample:
-            self._step["repeated_h2d_bytes"] += nbytes
-
-    def record_prepare(self, seconds: float) -> None:
-        self._step["condition_prepare_seconds"] += seconds
-
     @property
     def prefetch_enabled(self) -> bool:
         return self._prefetch is not None and not self._closed
@@ -288,7 +202,7 @@ class ConditioningRuntime:
     def prefetch(self, spec: ConditioningSpec) -> bool:
         """Schedule CPU storage work for an already prepared effective
         input."""
-        if not self.prefetch_enabled or self.force_online or self._cache_guard_disabled or not spec.cacheable:
+        if not self.prefetch_enabled or self._cache_guard_disabled or not spec.cacheable:
             return False
         return self._prefetch.submit(self._conditioning_key(spec))
 
@@ -302,7 +216,7 @@ class ConditioningRuntime:
         """
         if not self.prefetch_enabled:
             return 0
-        if self.force_online or self._cache_guard_disabled:
+        if self._cache_guard_disabled:
             self._prefetch.clear()
             return 0
         keys = [self._conditioning_key(spec) for spec in specs if spec.cacheable]
@@ -314,35 +228,28 @@ class ConditioningRuntime:
         compute: Callable[[], dict[str, torch.Tensor]],
         restore: Callable[[dict[str, torch.Tensor]], dict[str, Any]],
     ) -> dict[str, Any]:
-        started = time.perf_counter()
         self._release_copies()
         features = restored = None
         local_hit = False
         key = None
-        lookup_started = time.perf_counter()
         reusable = self.enabled and spec.cacheable and not self._cache_guard_disabled
-        if self._prefetch is not None and (not reusable or self.force_online):
+        if self._prefetch is not None and not reusable:
             self._prefetch.clear()
         if reusable:
             try:
                 key = self._conditioning_key(spec)
                 lease = None
-                if not self.force_online:
-                    if self._prefetch is not None:
-                        lease = self._prefetch.take(key)
-                        self._step["prefetch_hit"] += int(lease is not None)
-                    if lease is None:
-                        lease = self.cache.lookup(key)
+                if self._prefetch is not None:
+                    lease = self._prefetch.take(key)
+                    self._step["prefetch_hit"] += int(lease is not None)
+                if lease is None:
+                    lease = self.cache.lookup(key)
                 if lease is not None:
                     features = self._copy_features(lease)
                     if features is None:
                         key = None  # Admission bypass: retain the entry without rewriting it.
                     else:
-                        restore_started = time.perf_counter()
-                        try:
-                            restored = restore(features)  # validate before the unanimous decision
-                        finally:
-                            self._step["cache_restore_seconds"] += time.perf_counter() - restore_started
+                        restored = restore(features)  # validate before the unanimous decision
                         local_hit = True
             except Exception as error:
                 features = restored = None
@@ -350,46 +257,28 @@ class ConditioningRuntime:
                 if key is not None and self.cache is not None:
                     self.cache.invalidate(key)
                 logger.warning("Conditioning read failed; using online encoding: %s", error)
-        self._step["cache_lookup_seconds"] += time.perf_counter() - lookup_started
         self._step["local_hit"] += int(local_hit)
-        coordinate_started = time.perf_counter()
-        ready = local_hit and not self.force_online
+        ready = local_hit
         if self.enabled:
             self._step["coordinate_calls"] += 1
             ready = unanimous_ready(ready, self.group)
-        self._step["coordinate_seconds"] += time.perf_counter() - coordinate_started
         if ready:
             self._step["effective_hit"] += 1
             self._step["cache_read_bytes"] += _tensor_bytes(features)
-            self._step["condition_seconds"] += time.perf_counter() - started
             return restored
         self._step["forced_recompute"] += int(local_hit)
         self._step["miss"] += int(not local_hit)
         features = restored = None
-        encode_started = time.perf_counter()
-        gpu_start = gpu_end = None
-        if self.device.type == "cuda":
-            gpu_start, gpu_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            gpu_start.record()
         features = compute()
-        if gpu_end is not None:
-            gpu_end.record()
-            self._events.append((gpu_start, gpu_end))
-        else:
-            self._step["encode_seconds"] += time.perf_counter() - encode_started
         self._step["encoding_calls"] += 1
         self._step["condition_payload_bytes"] += _tensor_bytes(features)
-        if reusable and key is not None and (not local_hit or self.force_online):
-            store_started = time.perf_counter()
+        if reusable and key is not None and not local_hit:
             try:
                 if self.cache.put(key, features):
                     self._step["cache_write_bytes"] += _tensor_bytes(features)
-                    self._step["condition_d2h_bytes"] += _tensor_bytes(features)
             except Exception as error:
                 self._step["cache_errors"] += 1
                 logger.warning("Conditioning write failed; retaining online result: %s", error)
-            self._step["cache_store_seconds"] += time.perf_counter() - store_started
-        self._step["condition_seconds"] += time.perf_counter() - started
         return restore(features)
 
     def _copy_features(self, lease: Any) -> dict[str, torch.Tensor] | None:
@@ -414,13 +303,11 @@ class ConditioningRuntime:
         # Own the sources before copy_to can enqueue even a partial transfer.
         # An unrecorded event must never authorize releasing those sources.
         self._pending_copies.append((None, lease, nbytes))
-        started = time.perf_counter()
         try:
             features, copied_bytes = lease.copy_to(self.device)
             self._step["condition_h2d_bytes"] += copied_bytes
             return features
         finally:
-            self._step["h2d_enqueue_seconds"] += time.perf_counter() - started
             event.record(stream)
             self._pending_copies[index] = (event, lease, nbytes)
 
@@ -440,107 +327,26 @@ class ConditioningRuntime:
                     break
             self._pending_copies.pop(0)
 
-    def end_step(self, step: int, *, local_samples: int, loss: float) -> None:
+    def end_step(self) -> None:
+        """Finish copies before returning their leases at the step boundary."""
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         self._release_copies(synchronized=True)
-        self._step["encode_seconds"] += sum(start.elapsed_time(end) / 1000 for start, end in self._events)
-        resources = self._resources()
-        ended = time.monotonic()
-        counters = {
-            name: self._step[name]
-            for name in (
-                "condition_prepare_seconds",
-                "condition_seconds",
-                "encode_seconds",
-                "cache_lookup_seconds",
-                "cache_store_seconds",
-                "h2d_enqueue_seconds",
-                "h2d_wait_seconds",
-                "cache_restore_seconds",
-                "coordinate_seconds",
-                "coordinate_calls",
-                "local_hit",
-                "effective_hit",
-                "miss",
-                "forced_recompute",
-                "encoding_calls",
-                "repeated_h2d_bytes",
-                "online_input_h2d_bytes",
-                "condition_h2d_bytes",
-                "condition_d2h_bytes",
-                "cache_read_bytes",
-                "cache_write_bytes",
-                "condition_payload_bytes",
-                "cache_errors",
-                "prefetch_hit",
-            )
-        }
-        self._write(
-            {
-                "stage": "step",
-                "step": step,
-                "rank": self.rank,
-                "global_samples": self._global_batch_size,
-                "verification": _flag("RELAX_CONDITION_VERIFY") and step == self._start_step,
-                "cache_guard_disabled": self._cache_guard_disabled,
-                "cache_guard_reason": self._cache_guard_reason,
-                "local_samples": local_samples,
-                "sample_ids": list(self._samples),
-                "started_unix": self._cycle_unix,
-                "finished_unix": time.time(),
-                "wall_seconds": ended - self._cycle_started,
-                "loss": loss,
-                **counters,
-                **resources,
-            }
-        )
-        self._last_end = ended
 
-    def _resources(self) -> dict[str, Any]:
-        cache: dict[str, Any] = {}
-        scope = "disabled"
-        if self.cache is not None:
-            try:
-                cache = self.cache.stats()
-                scope = cache["storage_scope"]
-            except Exception as error:
-                scope = "unavailable"
-                cache = {"storage_scope": scope, "error": f"{type(error).__name__}: {error}"}
-                logger.warning("Conditioning resource snapshot unavailable: %s", error)
-        current = scope == "index_accounting"
-        result = {
-            "cpu_rss_bytes": _rss_bytes(),
-            "cache_bytes": cache.get("resident_bytes") if current else (0 if self.cache is None else None),
-            "cache_stats": cache,
-            "cache_storage_scope": scope,
-            "disk_bytes": 0,
-            "prefetch_stats": self._prefetch.stats() if self._prefetch is not None else {},
+    def stats(self) -> dict[str, Any]:
+        """Current-step counters and ownership state; no I/O or device
+        queries."""
+        return {
+            **self._step,
+            "cache_guard_disabled": self._cache_guard_disabled,
+            "cache_guard_reason": self._cache_guard_reason,
             "pending_copy_count": len(self._pending_copies),
             "pending_copy_bytes": sum(size for _, _, size in self._pending_copies),
         }
-        try:
-            stat = os.statvfs("/dev/shm")
-            result["shm_used_bytes"] = (stat.f_blocks - stat.f_bfree) * stat.f_frsize
-        except OSError:
-            result["shm_used_bytes"] = None
-        if self.device.type == "cuda":
-            result.update(
-                {
-                    "gpu_allocated_bytes": torch.cuda.memory_allocated(self.device),
-                    "gpu_reserved_bytes": torch.cuda.memory_reserved(self.device),
-                    "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
-                    "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved(self.device),
-                }
-            )
-        if self.cache is not None and not str(self.cache.directory).startswith("/dev/shm/"):
-            result["disk_bytes"] = None  # Physical disk use is measured by the external monitor.
-        return result
 
-    def close(self, completed_step: int, *, status: str | None = None) -> None:
+    def close(self) -> None:
         if self._closed:
             return
-        started = time.monotonic()
         # Keep the runtime retryable if draining is interrupted. In particular,
         # the cache cannot close while its read-ahead worker still owns a read.
         # Do not run later cleanup in a finally that could mask this exception.
@@ -551,20 +357,5 @@ class ConditioningRuntime:
             self._release_copies(synchronized=True)
         if self.cache is not None:
             self.cache.close()
-        if not self._close_event_written:
-            self._write(
-                {
-                    "stage": "close",
-                    "rank": self.rank,
-                    "completed_steps": completed_step - self._start_step,
-                    "status": status or ("complete" if completed_step >= self._num_steps else "error"),
-                    "total_seconds": time.monotonic() - self._started,
-                    "close_seconds": time.monotonic() - started,
-                    **self._resources(),
-                }
-            )
-            self._close_event_written = True
-        if self._writer is not None:
-            self._writer.close()
         self._model.conditioning_cache = None
         self._closed = True

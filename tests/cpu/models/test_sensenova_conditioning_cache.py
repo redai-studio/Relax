@@ -50,11 +50,10 @@ class _MemoryResolver:
         self.enabled = enabled
         self.entries = {}
         self.computes = 0
-        self.force_online = False
 
     def resolve(self, spec, compute, restore):
         key = json.dumps(spec.dependencies, sort_keys=True)
-        if self.enabled and not self.force_online and spec.cacheable and key in self.entries:
+        if self.enabled and spec.cacheable and key in self.entries:
             return restore(self.entries[key])
         self.computes += 1
         features = compute()
@@ -192,7 +191,7 @@ def public_conditioning_runtime(tmp_path, monkeypatch, tiny_conditioning_model):
     monkeypatch.setenv("RELAX_CONDITION_CACHE", "1")
     monkeypatch.setenv("RELAX_CONDITION_CACHE_MAX_BYTES", str(4 * 1024**2))
     monkeypatch.setenv("RELAX_CONDITION_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.delenv("RELAX_CONDITION_CACHE_RUN_DIR", raising=False)
+
     monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "0")
     runtime = ConditioningRuntime(
         model=model,
@@ -200,24 +199,19 @@ def public_conditioning_runtime(tmp_path, monkeypatch, tiny_conditioning_model):
         device=torch.device("cpu"),
         group=None,
         rank=0,
-        world_size=1,
         namespace="sensenova-mutation-test",
-        config={},
-        metadata_sha256="fixed-tiny-image",
-        global_batch_size=1,
-        start_step=0,
-        num_steps=3,
+        local_batch_size=1,
     )
     try:
         yield model, data, runtime
     finally:
-        runtime.close(3, status="complete")
+        runtime.close()
 
 
 def _public_forward(model, data, runtime):
     torch.manual_seed(42)
     runtime.begin_step()
-    runtime.sample(0)  # The production entrypoint that actually runs the guard.
+    runtime.before_forward()
     with torch.no_grad():
         loss = model(data)
     return loss, torch.get_rng_state().clone()
@@ -308,7 +302,7 @@ def test_public_cache_rejects_changed_nonparameter_conditioning(public_condition
     current_prefix = captured[-1]
     assert runtime._cache_guard_disabled
     assert runtime._step["effective_hit"] == 0 and runtime._step["encoding_calls"] == 1
-    runtime.force_online = True
+    model.conditioning_cache = None
     expected = _public_forward(model, data, runtime)
     assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
     assert all(torch.equal(current_prefix[name], value) for name, value in captured[-1].items())
@@ -326,7 +320,7 @@ def test_generation_only_update_keeps_public_conditioning_hot(public_conditionin
     actual = _public_forward(model, data, runtime)
     assert not runtime._cache_guard_disabled
     assert runtime._step["effective_hit"] == 1 and runtime._step["encoding_calls"] == 0
-    runtime.force_online = True
+    model.conditioning_cache = None
     expected = _public_forward(model, data, runtime)
     assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
 
@@ -539,15 +533,15 @@ def test_unchanged_effective_tokenizer_inputs_preserve_actual_frozen_prefix(tiny
     assert all(torch.equal(features[0][name], features[1][name]) for name in features[0])
 
 
-def test_prepared_forward_tokenizes_once_and_force_online_uses_legacy(tiny_conditioning_model):
+def test_prepared_forward_tokenizes_once_and_online_uses_legacy(tiny_conditioning_model):
     model, data = tiny_conditioning_model
     model.conditioning_cache = _MemoryResolver()
     model(data)
     assert model.pipe.tokenizer.calls == 1
     assert model.pipe.prefix_prepared == [True]
-    model.conditioning_cache.force_online = True
+    model.conditioning_cache = None
     model(data)
-    assert model.pipe.tokenizer.calls == 3  # One key preparation, one independent legacy reference.
+    assert model.pipe.tokenizer.calls == 2  # Online forward tokenizes without preparing a cache key.
     assert model.pipe.prefix_prepared == [True, False]
 
 
@@ -619,13 +613,12 @@ def _update(model, data):
     return torch.stack(losses), gradients, updates
 
 
-@pytest.mark.parametrize("reference", ["legacy", "prepared", "forced_online"])
+@pytest.mark.parametrize("reference", ["legacy", "prepared"])
 def test_warm_reuse_preserves_rng_batch_gradients_and_fp32_updates(tiny_conditioning_model, reference):
     model, data = tiny_conditioning_model
     online, cached = copy.deepcopy(model), copy.deepcopy(model)
     if reference != "legacy":
-        online.conditioning_cache = _MemoryResolver(enabled=reference == "forced_online")
-        online.conditioning_cache.force_online = reference == "forced_online"
+        online.conditioning_cache = _MemoryResolver(enabled=False)
     cached.conditioning_cache = _MemoryResolver()
     cached(data)  # Build outside the fixed numerical comparison, without updates.
     snapshot = {name: value.clone() for name, value in next(iter(cached.conditioning_cache.entries.values())).items()}

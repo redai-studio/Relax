@@ -412,9 +412,6 @@ class SenseNovaSFTModel(torch.nn.Module):
                     inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
             else:
                 inputs = self.pipe.unit_runner(self.pipe.units[0], self.pipe, *inputs)
-                import time
-
-                prepare_started = time.perf_counter()
                 inputs[0]["prepared_prefix"] = self._prepare_conditioning(data)
                 spec = self.conditioning_spec(
                     data,
@@ -422,28 +419,11 @@ class SenseNovaSFTModel(torch.nn.Module):
                     enabled=self.conditioning_cache.enabled,
                     prepared_prefix=inputs[0]["prepared_prefix"],
                 )
-                record_prepare = getattr(self.conditioning_cache, "record_prepare", None)
-                if record_prepare is not None:
-                    record_prepare(time.perf_counter() - prepare_started)
 
                 def compute() -> dict[str, torch.Tensor]:
                     condition_inputs = (dict(inputs[0]), dict(inputs[1]), dict(inputs[2]))
-                    # Numerical verification deliberately exercises the original
-                    # tokenizer/device-index path as its independent reference.
-                    # Performance runs never set force_online.
-                    if getattr(self.conditioning_cache, "force_online", False):
-                        condition_inputs[0].pop("prepared_prefix", None)
                     for unit in self.pipe.units[1:3]:
                         condition_inputs = self.pipe.unit_runner(unit, self.pipe, *condition_inputs)
-                    record_transfer = getattr(self.conditioning_cache, "record_input_transfer", None)
-                    if record_transfer is not None:
-                        record_transfer(
-                            sum(
-                                value.numel() * value.element_size()
-                                for name in ("edit_pixel_values", "edit_grid_hw")
-                                if isinstance(value := condition_inputs[0].get(name), torch.Tensor)
-                            )
-                        )
                     return self._export_conditioning(condition_inputs[1], detach=spec.cacheable)
 
                 restored = self.conditioning_cache.resolve(

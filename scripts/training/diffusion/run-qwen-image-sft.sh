@@ -119,6 +119,10 @@ import os
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON", "{}"))
 env = runtime.setdefault("env_vars", {})
 env.setdefault("PATH", os.environ["PATH"])
+for key in ("RELAX_CONDITION_CACHE", "RELAX_CONDITION_CACHE_DIR", "RELAX_CONDITION_CACHE_MAX_BYTES",
+            "RELAX_CONDITION_PREFETCH_DEPTH", "RELAX_CONDITION_PREFETCH_MAX_BYTES"):
+    if key in os.environ:
+        env[key] = os.environ[key]
 print(json.dumps(runtime))
 PY
 )

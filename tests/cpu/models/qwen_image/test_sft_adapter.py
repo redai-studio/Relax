@@ -3,10 +3,10 @@
 
 These do not replace the pretrained GPU comparison. The small pipeline retains
 text encoding, posterior sampling, noise/timestep sampling and trainable low-
-rank updates so public cache and full-effective-batch verification run without
-mocks.
+rank updates to check cache behavior with CPU autograd.
 """
 
+import copy
 import json
 import sys
 from types import SimpleNamespace
@@ -18,7 +18,6 @@ import torch
 from PIL import Image
 
 from relax.engine.sft.conditioning import ConditioningRuntime
-from relax.engine.sft.conditioning_verification import verify_update
 from relax.models.qwen_image import sft_adapter
 from relax.models.qwen_image.sft_adapter import (
     QwenImageSFTAdapter,
@@ -158,7 +157,7 @@ def cache_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("RELAX_CONDITION_CACHE_MAX_BYTES", str(1024**2))
     monkeypatch.setenv("RELAX_CONDITION_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "0")
-    monkeypatch.delenv("RELAX_CONDITION_CACHE_RUN_DIR", raising=False)
+
     runtimes = []
 
     def create(model):
@@ -173,20 +172,15 @@ def cache_runtime(tmp_path, monkeypatch):
             device=torch.device("cpu"),
             group=None,
             rank=0,
-            world_size=1,
             namespace=f"qwen-tiny-{len(runtimes)}",
-            config={"model": "tiny-qwen-contract"},
-            metadata_sha256="tiny-data-v1",
-            global_batch_size=2,
-            start_step=0,
-            num_steps=2,
+            local_batch_size=2,
         )
         runtimes.append(runtime)
         return runtime
 
     yield create
     for runtime in reversed(runtimes):
-        runtime.close(0, status="cancelled")
+        runtime.close()
 
 
 def _pack_oracle(value):
@@ -300,19 +294,17 @@ def test_flow_loss_reduces_spatial_fp32_elements_in_reference_order():
 
 @pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])
 @pytest.mark.parametrize("size", [16, 8])
-def test_condition_cache_preserves_every_bf16_bit_and_independent_reference(cache_runtime, memory_format, size):
+def test_condition_cache_preserves_every_bf16_bit_between_cold_and_warm(cache_runtime, memory_format, size):
     model = _model(memory_format=memory_format)
     data = _sample()
     data["image"] = data["image"].resize((size, size))
     runtime = cache_runtime(model)
-    runtime.sample(0)
+    runtime.before_forward()
     initial_rng = torch.get_rng_state().clone()
-    runtime.force_online = True
     reference = model._conditioning_features(data)
     assert reference["posterior"] is model.vae.posterior, "The cold path must retain the original distribution"
-    runtime.force_online = False
     actual = model._conditioning_features(data)
-    assert model.pipe.reference_calls == model.text_encoder.calls == model.vae.calls == 1
+    assert model.text_encoder.calls == model.vae.calls == 1
     for left, right in (
         (reference["prompt_embeds"], actual["prompt_embeds"]),
         (reference["posterior"].parameters, actual["posterior"].parameters),
@@ -347,7 +339,7 @@ def test_fast_text_encode_matches_pipeline_reference_for_effective_context(promp
 def test_invalid_cached_condition_is_recomputed_without_changing_tensor_contract(cache_runtime, fault):
     model = _model()
     runtime = cache_runtime(model)
-    runtime.sample(0)
+    runtime.before_forward()
     data = _sample()
     expected = model._condition(data)
     key = runtime._conditioning_key(model.conditioning_spec(data))
@@ -468,7 +460,7 @@ def test_vae_mutation_never_reuses_stale_posterior(cache_runtime, mutation):
     model = _model(torch.float32)
     QwenImageSFTAdapter().prepare_for_sharding(model)
     runtime = cache_runtime(model)
-    runtime.sample(0)
+    runtime.before_forward()
     before = model._conditioning_features(_sample())["posterior"].mean.clone()
     if mutation == "inplace":
         with torch.no_grad():
@@ -479,7 +471,7 @@ def test_vae_mutation_never_reuses_stale_posterior(cache_runtime, mutation):
         model.vae.train()
     else:
         model.vae.requires_grad_(True)
-    runtime.sample(1)
+    runtime.before_forward()
     assert runtime._cache_guard_disabled
     if mutation == "trainable":
         with pytest.raises(ValueError, match="Replicated Qwen VAE is frozen-only"):
@@ -534,7 +526,7 @@ def test_deterministic_attention_controls_are_cache_dependencies():
 def test_frozen_encoder_mutation_disables_reuse_and_keeps_gradients(cache_runtime, mutation):
     model = _model(dtype=torch.float32)
     runtime = cache_runtime(model)
-    runtime.sample(0)
+    runtime.before_forward()
     original = model._condition(_sample())
     if mutation == "weight":
         with torch.no_grad():
@@ -543,7 +535,7 @@ def test_frozen_encoder_mutation_disables_reuse_and_keeps_gradients(cache_runtim
         model.text_encoder.embedding.weight.requires_grad_(True)
     else:
         model.text_encoder.train()
-    runtime.sample(1)
+    runtime.before_forward()
     result = model._condition(_sample())
     assert runtime._cache_guard_disabled
     assert model.text_encoder.calls == 2
@@ -562,7 +554,7 @@ def test_frozen_encoder_mutation_disables_reuse_and_keeps_gradients(cache_runtim
 def test_condition_buffer_mutation_disables_old_cache(cache_runtime, mutation, module_name):
     model = _model(dtype=torch.float32)
     runtime = cache_runtime(model)
-    runtime.sample(0)
+    runtime.before_forward()
     data = _sample()
 
     def features():
@@ -582,7 +574,7 @@ def test_condition_buffer_mutation_disables_old_cache(cache_runtime, mutation, m
     # effective-input key; the live tensor identity/version guard must catch it.
     assert "conditioning_offset" not in module.state_dict()
     assert runtime._conditioning_key(model.conditioning_spec(data)) == key
-    runtime.sample(1)
+    runtime.before_forward()
     actual = features()
     assert runtime._cache_guard_disabled
     assert f"{module_name}.buffers.conditioning_offset" in runtime._cache_guard_reason
@@ -649,11 +641,11 @@ def test_replicated_text_encoder_unfreeze_fails_before_cache_or_encoding(cache_r
     model.config["text_encoder_placement"] = "replicated"
     QwenImageSFTAdapter().prepare_for_sharding(model)
     runtime = cache_runtime(model)
-    runtime.sample(0)
+    runtime.before_forward()
     model._condition(_sample())
     calls = model.text_encoder.calls
     model.text_encoder.embedding.weight.requires_grad_(True)
-    runtime.sample(1)
+    runtime.before_forward()
     with pytest.raises(ValueError, match="Replicated Qwen conditioning is frozen-only"):
         model._condition(_sample())
     assert model.text_encoder.calls == calls
@@ -664,7 +656,7 @@ def test_replicated_text_encoder_unfreeze_fails_before_cache_or_encoding(cache_r
 def test_posterior_sampling_noise_and_timesteps_remain_online_with_same_rng(cache_runtime, monkeypatch, memory_format):
     model = _model(memory_format=memory_format)
     runtime = cache_runtime(model)
-    runtime.sample(0)
+    runtime.before_forward()
     model._condition(_sample())
     captured = []
     objective = sft_adapter.flow_matching_loss
@@ -675,8 +667,8 @@ def test_posterior_sampling_noise_and_timesteps_remain_online_with_same_rng(cach
 
     monkeypatch.setattr(sft_adapter, "flow_matching_loss", record)
     states, results = [], []
-    for force_online in (True, False):
-        runtime.force_online = force_online
+    for cached in (False, True):
+        model.conditioning_cache = runtime if cached else None
         torch.manual_seed(73)
         results.append(torch.stack([model(_sample()) for _ in range(4)]))
         states.append(torch.get_rng_state().clone())
@@ -733,40 +725,40 @@ def test_scheduler_timestep_is_divided_in_fp32_before_transformer_compute(monkey
 
 
 @pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])
-def test_public_verifier_compares_complete_two_sample_batch_and_fp32_update(cache_runtime, tmp_path, memory_format):
-    model = _model(dtype=torch.float32, memory_format=memory_format)
-    runtime = cache_runtime(model)
-    parameters = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW([parameter for _, parameter in parameters], lr=0.01)
+def test_cached_batch_preserves_loss_gradients_and_fp32_updates(cache_runtime, memory_format):
+    online = _model(dtype=torch.float32, memory_format=memory_format)
+    cached = copy.deepcopy(online)
     samples = [_sample("red boat"), _sample("blue bird", offset=17)]
+    runtime = cache_runtime(cached)
+    for sample in samples:
+        cached._conditioning_features(sample)
 
-    def forward(sample):
-        runtime.sample(samples.index(sample))
-        return model(sample)
+    def update(model):
+        parameters = {name: value for name, value in model.named_parameters() if value.requires_grad}
+        optimizer = torch.optim.AdamW(parameters.values(), lr=0.01)
+        before = {name: value.detach().clone() for name, value in parameters.items()}
+        losses = []
+        torch.manual_seed(73)
+        for sample in samples:
+            if model is cached:
+                runtime.before_forward()
+            loss = model(sample)
+            losses.append(loss.detach())
+            (loss / len(samples)).backward()
+        gradients = {name: value.grad.detach().clone() for name, value in parameters.items()}
+        optimizer.step()
+        deltas = {name: value.detach() - before[name] for name, value in parameters.items()}
+        return torch.stack(losses), gradients, deltas, torch.get_rng_state()
 
-    report = verify_update(
-        model,
-        optimizer,
-        parameters,
-        samples,
-        forward,
-        lambda value: setattr(runtime, "force_online", value),
-        device=torch.device("cpu"),
-        group=None,
-        gloo_group=None,
-        loss_scale=0.5,
-        rank=0,
-        output_dir=tmp_path / "verification",
-        relative_tolerance=0.0,
-        cache_statistics=lambda: {
-            "effective_hit": runtime._step["effective_hit"],
-            "encoding_calls": runtime._step["encoding_calls"],
-        },
-    )
-    assert report["passed"] and report["cache_branch_verified"]
-    assert report["local_samples"] == 2
-    assert all(parameter.dtype == torch.float32 for _, parameter in parameters)
-    assert len(optimizer.state) == len(parameters)
+    reference, actual = update(online), update(cached)
+    assert torch.equal(reference[0], actual[0]) and torch.equal(reference[3], actual[3])
+    for expected, observed in zip(reference[1:3], actual[1:3], strict=True):
+        assert expected.keys() == observed.keys()
+        for name, value in expected.items():
+            assert value.dtype == observed[name].dtype == torch.float32
+            assert torch.isfinite(value).all() and torch.equal(value, observed[name])
+    assert any(torch.count_nonzero(value) for value in reference[2].values())
+    assert runtime.stats()["effective_hit"] == len(samples)
 
 
 def test_random_crop_and_caption_dropout_follow_original_rng_stream(tmp_path):
@@ -811,12 +803,13 @@ def test_online_and_cached_normal_micro_loops_preserve_random_augmentation_order
     runtime = cache_runtime(model)
     adapter = QwenImageSFTAdapter()
     runs, states = [], []
-    for force_online in (True, False):
-        runtime.force_online = force_online
+    for cached in (False, True, True):  # Online, cold cache, then actual warm hits.
+        runtime.begin_step()
+        model.conditioning_cache = runtime if cached else None
         torch.manual_seed(137)
         presentations = []
         for micro in range(6):
-            runtime.sample(micro)
+            runtime.before_forward()
             data = adapter.prepare_sample(row, tmp_path, config, index=micro)
             # Preserve the actual trainer ordering: augmentation, forward's VAE
             # posterior/noise/timestep, then the next presentation's augmentation.
@@ -824,13 +817,15 @@ def test_online_and_cached_normal_micro_loops_preserve_random_augmentation_order
             presentations.append((data["prompt"], np.array(data["image"]), loss.detach().clone()))
         runs.append(presentations)
         states.append(torch.get_rng_state().clone())
-    assert torch.equal(states[0], states[1])
-    for reference, actual in zip(runs[0], runs[1]):
-        assert reference[0] == actual[0]
-        np.testing.assert_array_equal(reference[1], actual[1])
-        assert torch.equal(reference[2], actual[2])
+    assert all(torch.equal(states[0], state) for state in states[1:])
+    for run in runs[1:]:
+        for reference, actual in zip(runs[0], run, strict=True):
+            assert reference[0] == actual[0]
+            np.testing.assert_array_equal(reference[1], actual[1])
+            assert torch.equal(reference[2], actual[2])
     assert {presentation[0] for presentation in runs[0]} == {"red boat", ""}
-    assert runtime._step["encoding_calls"] == runtime._step["effective_hit"] == 6
+    assert runtime.stats()["effective_hit"] == 6
+    assert runtime.stats().get("encoding_calls", 0) == 0
 
 
 @pytest.mark.parametrize("placement", ["sharded", "replicated"])

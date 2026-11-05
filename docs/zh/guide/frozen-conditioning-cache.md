@@ -7,29 +7,23 @@
 按 [SenseNova 图像编辑 SFT](./i2i-sft.md) 或 [Qwen-Image 文生图 SFT](./t2i-sft.md) 准备模型与数据。设置 worker 可见的 `MODEL_PATH`、`DATA_ROOT`、`METADATA_PATH`、`DATASET_SIZE`、`SAVE_DIR` 和已有集群的 `RAY_DASHBOARD_ADDRESS`。`DATASET_SIZE` 必须等于元数据条数。
 
 ```bash
-RELAX_SKIP_CLUSTER_CLEANUP=1 USE_CLEARML=0 \
+RELAX_SKIP_CLUSTER_CLEANUP=1 \
 RELAX_CONDITION_CACHE=1 RELAX_CONDITION_CACHE_MAX_BYTES=4294967296 \
-RELAX_CONDITION_CACHE_DIR="${CACHE_DIR:?设置可写节点本地缓存目录}" \
-RELAX_CONDITION_CACHE_RUN_DIR="${RUN_DIR:?设置全新的共享测量目录}" \
 bash scripts/entrypoint/ray-job.sh \
-    scripts/training/diffusion/run-sensenova-condition-cache.sh
+    scripts/training/diffusion/run-sensenova-i2i-sft-8xgpu.sh
 ```
 
-Qwen 使用 `run-qwen-image-sft-condition-cache.sh`，它在基础在线训练脚本上补充缓存配置。在线基线设置 `RELAX_CONDITION_CACHE=0` 并使用新的输出目录；数据顺序、有效 batch、分辨率、优化器和训练设置保持一致。直接以 `DRY_RUN=1` 运行训练脚本可预览命令，不提交任务或创建目录。
+Qwen 使用 `scripts/training/diffusion/run-qwen-image-sft.sh`，设置相同的缓存变量即可。两者均使用普通训练入口，无需安装验收工具或设置测量目录。`RELAX_CONDITION_CACHE=0` 恢复在线编码。缓存适合冻结条件重复出现的训练；低复用负载仍承担查找和构建缓存的开销，可能变慢。
 
 ## 配置
 
-对照脚本会将下列变量传入 Ray worker，自定义启动脚本也需传递。
+两份普通训练脚本会将下列变量传入 Ray worker。自定义启动脚本需将它们加入 `RUNTIME_ENV_JSON.env_vars`。
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `RELAX_CONDITION_CACHE` | `0` | 启用复用；`0` 保留在线编码。 |
-| `RELAX_CONDITION_PROFILE` | Runtime `0`，脚本 `1` | 缓存关闭时也测量条件阶段。 |
-| `RELAX_CONDITION_CACHE_MAX_BYTES` | Runtime/SenseNova 8 GiB，Qwen 1 GiB | 每节点 payload 上限，启用缓存时须为正。 |
+| `RELAX_CONDITION_CACHE_MAX_BYTES` | 8 GiB | 每节点 payload 上限，启用缓存时须为正。 |
 | `RELAX_CONDITION_CACHE_DIR` | `/dev/shm/relax-conditioning` | 可写节点本地根目录，也支持本地磁盘。 |
-| `RELAX_CONDITION_CACHE_RUN_DIR` | 脚本 `${SAVE_DIR}/${EXP_NAME}/metrics` | 全新且 worker 可见的 `events-rank*.jsonl` 目录；设置它也会启用测量。 |
-| `RELAX_CONDITION_VERIFY` | `0` | 验证首个有效 batch，需要启用缓存并设置 run 目录。 |
-| `RELAX_CONDITION_VERIFY_RTOL` | `0.01` | loss、梯度和 FP32 更新量相对误差阈值，范围 `0` 到 `0.01`。 |
 | `RELAX_CONDITION_PREFETCH_DEPTH` | `0` | SenseNova 条件预取条目数，要求同时开启图像预取；Qwen 须为 `0`。 |
 | `RELAX_CONDITION_PREFETCH_MAX_BYTES` | 512 MiB | 每 worker 的预取预留和借用字节上限。 |
 
@@ -49,12 +43,10 @@ Payload 上限覆盖已发布、借用和待发布文件，LRU 只淘汰未借�
 
 这些预算不等于进程 RSS 总上限；输入、GPU 临时副本和 metadata 也占内存。tmpfs 使用 host RAM，磁盘缓存也可能占用 OS page cache。并发训练 attempt 各有独立预算，节点容量规划需相加。
 
-正常结束、取消和被捕获异常会关闭 lease/client，最后一个 client 删除 namespace。Worker 突然退出后由 OS 释放锁，下次缓存初始化在确认 client/payload 锁均空闲后回收遗留 namespace；没有后台清理 daemon，也不要求恢复持久缓存。缓存统计是 payload/预留的账面字节，不等于物理峰值；未知测量保留 `null`，节点共享值不得跨 rank 重复相加。释放及 CPU/GPU/共享内存/磁盘物理峰值须通过外部监控核验。
+正常结束、取消和被捕获异常会关闭 lease/client，最后一个 client 删除 namespace。Worker 突然退出后由 OS 释放锁，下次缓存初始化在确认 client/payload 锁均空闲后回收遗留 namespace；没有后台清理 daemon。恢复 checkpoint 时重新构建缓存，缓存文件不属于训练 checkpoint。
 
-## 适配与验收
+## 模型适配
 
 [`ConditioningSpec` 与 `ConditioningResolver`](../../../relax/models/generative_sft.py) 保持模型解耦。适配器声明 schema/版本、有效依赖和 `cacheable`，在正常模型 forward 中调用 `resolve(spec, compute, restore)`。`compute` 返回扁平张量字典，`restore` 验证字段/shape/dtype 并构建当前 forward 的模型对象；不能修改借用张量或在 lease 结束后保留它。可用 `conditioning_state()` 声明需检查的参数、buffer 和语义状态。未来 RL 接入还需定义其所有权和 collective 边界，本期没有 rollout 特征传递。
 
-数值验证与性能实验分开运行。验证恢复相同初始权重、优化器和 RNG，逐参数比较 loss、完整有效 batch 累积归约后的梯度，以及真实 FP32 `theta_after - theta_before`。所有比较值必须有限，零参考要求结果为零。确定性路径使用阈值 `0`；非确定性结果需补充重复在线基线及合理的近零绝对容差，同时满足 1% 相对上限。
-
-性能计时包含数据准备、条件装载、前向、反向及优化器更新；重复测量相同配置的在线/缓存运行，分别报告冷构建、稳态、完整任务、回本和低复用开销。已有 FSDP 分组、编码器放置及 checkpointing 优化须同时纳入两组。特征可能比原输入更大，减少编码不代表搬运字节一定下降。启动、汇总、版本与资源记录见[验证指南](../../../scripts/benchmarks/conditioning_cache/README.md)。
+固定版本的数值与性能验收工具、实验记录见[独立验证仓库](https://github.com/Religious-J/relax-condition-cache-validation/tree/117d4fb037d93e2123734ccacf3e411e5f5b7b1e)。

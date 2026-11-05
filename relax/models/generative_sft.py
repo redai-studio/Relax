@@ -44,10 +44,6 @@ class ConditioningResolver(Protocol):
         restore: Callable[[dict[str, torch.Tensor]], dict[str, Any]],
     ) -> dict[str, Any]: ...
 
-    def record_input_transfer(self, nbytes: int) -> None:
-        """Record condition-input H2D bytes from the online encoder path."""
-        ...
-
 
 class GenerativeSFTAdapter(Protocol):
     family: str
