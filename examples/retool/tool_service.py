@@ -69,6 +69,13 @@ def apptainer_service() -> Iterator[str]:
         )
         if probe["status"] != "ok" or probe["stdout"].strip() != "65534 65534 1073741824 0":
             raise RuntimeError(f"Apptainer sandbox resource/uid validation failed: {probe}")
+        numeric = client._request(
+            "from scipy.optimize import linprog; "
+            "r = linprog([-1, -2, -3], A_ub=[[2, 1, 1]], b_ub=[10], bounds=[(0, 5)] * 3, method='highs'); "
+            "print(r.success, r.fun)"
+        )
+        if numeric["status"] != "ok" or numeric["stdout"].strip() != "True -25.0":
+            raise RuntimeError(f"Apptainer sandbox single-thread HiGHS validation failed: {numeric}")
         with tempfile.NamedTemporaryFile(prefix="retool-host-canary-", dir="/tmp") as canary:
             os.chmod(canary.name, 0o644)
             forbidden = [

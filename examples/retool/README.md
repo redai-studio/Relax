@@ -23,6 +23,8 @@ bash examples/retool/scripts/run-qwen25-7B-grpo-8xgpu.sh
 
 内核没有实现 Landlock 时，自动复用本例现有的 Apptainer/SandboxFusion 后端，需要容器中已有 `apptainer` 和 namespace/cgroup 权限。首次运行会把固定 `server-20250609` 镜像下载到 `$SAVE_DIR/.retool-sandbox/sandboxfusion-server-20250609.sif`，以后复用；也可用 `SANDBOX_IMAGE` 指定现成镜像。后端启动失败会直接停止任务，不会降级为未隔离的 Python 执行。显式设置 `SANDBOX_FUSION_URL` 时使用该服务，不启动或清理外部服务。
 
+固定 Apptainer 镜像内的 SciPy/HiGHS 由运行时限制为单线程，避免其默认线程池在禁止创建线程的环境中崩溃；每次服务启动都会验证一次线性规划求解。生成的 Python 代码保持原样，进程信号退出仍作为基础设施故障上报。
+
 默认启用 ClearML 和 metrics service，使用训练环境已有的凭证。没有 ClearML 配置时，可在命令后追加 `--no-use-clearml`；与原任务相同地关闭远程监控可追加 `--no-use-clearml --no-use-metrics-service --no-use-tensorboard --no-use-wandb`。这些覆盖不改变训练与保存路径。
 
 ## Apptainer 沙箱与直接 RL 验证

@@ -21,6 +21,33 @@ from examples.retool.sandbox import SandboxClient
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_retool_sandbox_python_limits_highs_without_rewriting_payload(tmp_path):
+    # Exercise the real import/launcher boundary; the recording module replaces
+    # the pinned native extension, not the policy that injects its options.
+    package = tmp_path / "scipy/optimize/_highs"
+    package.mkdir(parents=True)
+    for directory in [package, package.parent, package.parent.parent]:
+        (directory / "__init__.py").touch()
+    (package / "_highs_wrapper.py").write_text("def _highs_wrapper(*args):\n    return args[-1]\n")
+    payload = tmp_path / "payload.py"
+    source = (
+        "from scipy.optimize._highs._highs_wrapper import _highs_wrapper\n"
+        "import json, sys\n"
+        "print(json.dumps(_highs_wrapper(None, {'threads': 16, 'presolve': True})))\n"
+        "assert __name__ == '__main__' and sys.argv[1] == 'argument'\n"
+    )
+    payload.write_text(source)
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "examples/retool/sandbox_python.py"), str(payload), "argument"],
+        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(result.stdout) == {"threads": 1, "presolve": True}
+    assert payload.read_text() == source
+
+
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_retool_job_owns_service_through_training_hard_exit(tmp_path, monkeypatch, exit_code):
     monkeypatch.delenv("SANDBOX_FUSION_URL", raising=False)

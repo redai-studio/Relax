@@ -16,6 +16,7 @@ exec apptainer exec --cleanenv --containall --no-home \
     --no-mount hostfs,bind-paths,cwd --scratch /run --pwd /root/sandbox \
     --bind /sys/fs/cgroup:/sys/fs/cgroup:rw \
     --bind "${SCRIPT_DIR}/../sandbox_server.py:/opt/retool_server.py:ro" \
+    --bind "${SCRIPT_DIR}/../sandbox_python.py:/opt/retool_python.py:ro" \
     --env PYTHONPATH=/root/sandbox --env OMP_NUM_THREADS=1 --env OPENBLAS_NUM_THREADS=1 \
     "${SANDBOX_IMAGE}" bash -c \
     'set -e; mount --make-private /; exec python /opt/retool_server.py "$@"' sandbox \

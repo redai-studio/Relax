@@ -9,6 +9,7 @@ contract.
 import argparse
 import asyncio
 import os
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,8 @@ def main() -> None:
         # The trusted parent creates the script; the payload only needs to read
         # it. No model/data/repository directories are mounted into this image.
         Path(cwd).chmod(0o755)
+        launcher = Path(cwd) / ".retool_python.py"
+        launcher.write_bytes(Path("/opt/retool_python.py").read_bytes())
         for path in Path(cwd).iterdir():
             path.chmod(0o644)
         at = command.index("chroot")
@@ -76,7 +79,7 @@ def main() -> None:
             *command[at + 2 :],
         ]
         # exec replaces the shell without requiring a child under RLIMIT_NPROC.
-        command[-1] = command[-1].replace(" && python ", " && exec python ", 1)
+        command[-1] = command[-1].replace(" && python ", f" && exec python {shlex.quote(str(launcher))} ", 1)
         try:
             await execute_command(["mount", "-o", "remount,bind,ro", str(script_dir)])
             return await original_command(command, timeout, stdin, cwd, extra_env, use_exec)

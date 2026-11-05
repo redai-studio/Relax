@@ -9,6 +9,11 @@ import json
 import urllib.request
 from urllib.parse import urlsplit
 
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
+
 
 def parse_result(value: dict) -> dict[str, str]:
     if value.get("status") not in {"Success", "Failed"}:
@@ -63,7 +68,12 @@ class SandboxClient:
             body = response.read(4 * 1024 * 1024 + 1)
         if len(body) > 4 * 1024 * 1024:
             raise RuntimeError("Sandbox response exceeds 4 MiB")
-        return parse_result(json.loads(body))
+        value = json.loads(body)
+        try:
+            return parse_result(value)
+        except RuntimeError:
+            logger.exception("Sandbox execution failed: code=%r response=%r", code, value)
+            raise
 
     async def execute(self, code: str) -> dict[str, str]:
         return await asyncio.to_thread(self._request, code)
