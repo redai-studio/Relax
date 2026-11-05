@@ -1,0 +1,243 @@
+# syntax=docker/dockerfile:1.7
+# AMD ROCm image: SGLang ROCm release -> training stack -> Relax runtime.
+# GPU_ARCH selects the target: gfx950 (MI350X/MI355X, default) or gfx942 (MI300X/MI325X).
+# The base is SGLang's official ROCm 10 image (docker/rocm.Dockerfile, SGL_BRANCH=v0.5.21,
+# GPU_ARCH=<arch>-rocm1000): Ubuntu 24.04, ROCm 10 SDK wheels, torch 2.11, aiter and SGLang.
+# SGLang, the router and Megatron receive the same Relax patches as Dockerfile.cu13, plus the ROCm
+# fix in docker/patch/rocm. Transformer Engine, apex and flash-attn come from the prebuilt wheels
+# of radixark/miles' ROCm image (docker/Dockerfile.rocm, variants rocm10-mi35x/mi30x).
+ARG GPU_ARCH=gfx950
+ARG BASE_IMAGE_GFX950=lmsysorg/sglang:v0.5.21-rocm10-mi35x@sha256:69616267bbeac9c70b69463a9a900e8101dcffa26f5d3fc321e769cb307c78be
+ARG BASE_IMAGE_GFX942=lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+
+# BuildKit pulls only the base stage that GPU_ARCH selects.
+FROM ${BASE_IMAGE_GFX950} as base-gfx950
+FROM ${BASE_IMAGE_GFX942} as base-gfx942
+
+# Build Relax's patched SGLang Rust cache against the base's ROCm Torch.
+FROM base-${GPU_ARCH} as tree_core_builder
+COPY docker/patch/sglang/v0.5.21.patch /tmp/tree-core.patch
+COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
+RUN cd /sgl-workspace/sglang && \
+    test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
+    git apply --check --exclude=python/pyproject.toml /tmp/tree-core.patch && \
+    git apply --exclude=python/pyproject.toml /tmp/tree-core.patch && \
+    python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core
+
+# Build the patched R3 + PD DP-aware router, as Dockerfile.cu13 does.
+FROM base-${GPU_ARCH} as router_builder
+
+ARG ROUTER_RUST_VERSION=1.97.1
+# Override these build args when CI requires an approved Rust mirror.
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+ARG ROUTER_RUSTUP_INIT_URL=https://sh.rustup.rs
+ARG ROUTER_BUILD_JOBS=16
+ENV PATH=/root/.cargo/bin:${PATH} \
+    CARGO_BUILD_JOBS=${ROUTER_BUILD_JOBS} \
+    CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git libssl-dev pkg-config protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --retry-all-errors \
+        --connect-timeout 30 --max-time 300 "$ROUTER_RUSTUP_INIT_URL" -o /tmp/rustup-init.sh && \
+    (for attempt in 1 2 3; do \
+        if sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${ROUTER_RUST_VERSION}"; then \
+            exit 0; \
+        fi; \
+        if [ "$attempt" -eq 3 ]; then exit 1; fi; \
+        sleep 5; \
+    done) && \
+    python -m pip install --no-cache-dir "maturin==1.9.6"
+COPY docker/patch/sglang-router /tmp/router-patch
+COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
+RUN bash /tmp/build_sglang_router.sh /tmp/router-patch /opt/router-wheels
+
+FROM base-${GPU_ARCH} as relax
+
+SHELL ["/bin/bash", "-ceuxo", "pipefail"]
+
+ARG GPU_ARCH
+ARG WHEELS_REPO_URL=https://github.com/XinyuJiangCMU/miles-wheels-rocm/releases/download
+ARG MOONCAKE_VERSION=0.3.12.post1
+ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
+
+ENV GPU_ARCH=${GPU_ARCH} \
+    PYTORCH_ROCM_ARCH=${GPU_ARCH} \
+    GPU_ARCH_LIST=${GPU_ARCH} \
+    AMDGPU_TARGET=${GPU_ARCH} \
+    MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
+    PYTHONPATH=/root/Megatron-LM/
+
+WORKDIR /root
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential cmake dnsutils ethtool git nvtop patch rsync wget && \
+    rm -rf /var/lib/apt/lists/*
+
+# Prebuilt ROCm wheels for GPU_ARCH, verified against the release's recorded digests.
+RUN case "${GPU_ARCH}" in \
+      gfx950) wheels_tag=rocm10-gfx950-v0.5.18; \
+              te_sha=48b9d10b69fc3c105f3527a04989886ea46f95e668841f91d59a8c1e2c2d6b61; \
+              apex_sha=c82e5e48fcff0ff6a730a55be331701484306d6b874d67a8b15ad6944a3f10f4; \
+              fa_sha=5c915f96fefd583299d1056bdbd98fe5b16ff9b499b057a708ee028f20e92933 ;; \
+      gfx942) wheels_tag=rocm10-gfx942-v0.5.20; \
+              te_sha=d75787133d7aa778a9c7aa5ddb7c2f8d191a818a071625629a870bd3e5d5cb51; \
+              apex_sha=4913e53d501fe4fb1b4290236e4d14c57e4f0fd44059827062507e8eb52a336b; \
+              fa_sha=ed99b7438431d2a954e501eaf0d8e8102d08608a3f1451da6bf5c502ee26b940 ;; \
+      *) echo "Unsupported GPU_ARCH=${GPU_ARCH}; use gfx950 or gfx942" >&2; exit 1 ;; \
+    esac && \
+    mkdir -p /tmp/wheels && cd /tmp/wheels && \
+    printf '%s  %s\n' \
+      "$te_sha" transformer_engine-2.18.0.dev0-cp312-cp312-linux_x86_64.whl \
+      "$apex_sha" apex-1.15.0a0-cp312-cp312-linux_x86_64.whl \
+      "$fa_sha" flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl \
+      > SHA256SUMS && \
+    for f in $(awk '{print $2}' SHA256SUMS); do curl -fsSL --retry 3 -o "$f" "${WHEELS_REPO_URL}/${wheels_tag}/$f"; done && \
+    sha256sum -c SHA256SUMS && \
+    (pip uninstall -y transformer-engine transformer_engine transformer_engine_torch || true) && \
+    pip install --no-cache-dir transformer_engine-*.whl flash_attn-*.whl cxxfilt==0.3.0 py-cpuinfo==9.0.0 && \
+    pip install --no-cache-dir --no-deps apex-*.whl && \
+    cd / && rm -rf /tmp/wheels
+
+# Megatron's fused wgrad path needs this apex op; read it by path because `import apex`
+# pulls in aiter, which probes for a GPU the build host lacks.
+RUN python3 -c "import glob, importlib.util as iu, os; \
+    d = iu.find_spec('apex').submodule_search_locations[0]; \
+    info = {}; exec(open(os.path.join(d, 'git_version_info_installed.py')).read(), info); \
+    assert info['installed_ops'].get('fused_weight_gradient_mlp_cuda'), 'apex wheel lacks fused_weight_gradient_mlp_cuda'; \
+    assert glob.glob(os.path.join(d, 'fused_weight_gradient_mlp_cuda.*.so'))"
+
+# The base's mooncake install lays down native modules but not its pure Python files.
+RUN pip install --no-cache-dir --no-deps --target=/tmp/mc "mooncake-transfer-engine-non-cuda==${MOONCAKE_VERSION}" && \
+    cp -n /tmp/mc/mooncake/*.py "$(python3 -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')" && \
+    rm -rf /tmp/mc
+
+# Relax's SGLang patch (shared with Dockerfile.cu13), then the ROCm fix: disable the aiter fused
+# qk-norm+mrope decode path, which breaks Qwen3-VL.
+# The base's editable install already used its ROCm pyproject.toml; Relax's Transformers and
+# tokenizers pins in that file are applied from rocm-runtime-requirements.txt instead.
+COPY docker/patch/sglang/v0.5.21.patch /tmp/sglang.patch
+COPY docker/patch/rocm/sglang-v0.5.21-rocm.patch /tmp/sglang-rocm.patch
+RUN cd /sgl-workspace/sglang && \
+    test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
+    git apply --check --exclude=python/pyproject.toml /tmp/sglang.patch && \
+    git apply --exclude=python/pyproject.toml /tmp/sglang.patch && \
+    sha256sum /tmp/sglang.patch > /etc/relax-sglang-patch.sha256 && \
+    git apply --check /tmp/sglang-rocm.patch && \
+    git apply /tmp/sglang-rocm.patch && \
+    rm /tmp/sglang.patch /tmp/sglang-rocm.patch
+
+COPY --from=tree_core_builder /opt/relax-tree-core /opt/relax-tree-core
+COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
+RUN python /tmp/build_sglang_tree_core.py install /opt/relax-tree-core && \
+    rm /tmp/build_sglang_tree_core.py
+# Load the tree core installed above instead of JIT-building one in every new container.
+ENV SGLANG_RUST_BUILD_MODE=never
+
+RUN pip install --no-cache-dir "numba==0.65.1" "flash-linear-attention==0.5.2" && \
+    pip install --no-cache-dir --no-build-isolation --force-reinstall \
+      "git+https://github.com/fzyzcjy/torch_memory_saver.git@06caa534822c5b980b61733a5d79ac731f9a5f9c" && \
+    pip install --no-cache-dir "git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0" && \
+    pip install --no-cache-dir "megatron-energon==7.4.1" "multi-storage-client==1.2.0" && \
+    pip install --no-cache-dir --no-build-isolation "nvidia-modelopt[torch]>=0.37.0" && \
+    pip install --no-cache-dir "setuptools==79.0.1" "nvidia-resiliency-ext==0.6.0"
+
+# Load torch's HIP runtime from the SDK so both sides share one copy.
+RUN torch_lib="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')" && \
+    for lib in libamdhip64.so libhsa-runtime64.so; do \
+      target="$(readlink -f "/opt/rocm/lib/${lib}")"; \
+      if [ -f "$torch_lib/$lib" ] && [ -f "$target" ]; then ln -sfn "$target" "$torch_lib/$lib"; fi; \
+    done
+
+# Replace the base image's Megatron checkout with the tree Relax patches against.
+RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && \
+    cd /root/Megatron-Bridge/ && git checkout ${MEGATRON_BRIDGE_COMMIT} && \
+    git submodule update --init --recursive && ./scripts/switch_mcore.sh dev && \
+    mkdir /root/Megatron-LM && \
+    cp -r /root/Megatron-Bridge/src/megatron /root/Megatron-LM/ && \
+    rsync -a /root/Megatron-Bridge/3rdparty/Megatron-LM/megatron/ /root/Megatron-LM/megatron/ && \
+    rm -rf /root/Megatron-Bridge
+
+# Same Megatron patch sequence and checks as Dockerfile.cu13.
+COPY docker/patch/latest/megatron.patch \
+    docker/patch/megatron/sync-save-bounded-staging.patch \
+    docker/patch/megatron/kimi-packed-sequence-api.patch \
+    docker/patch/megatron/20261016-qwen38-models.patch \
+    docker/patch/megatron/20261020-qwen35-optimized.patch \
+    docker/patch/megatron/20261020-model-operators.patch \
+    docker/patch/megatron/mtp-cp-normalization.patch \
+    docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch /root/Megatron-LM/
+RUN cd /root/Megatron-LM && \
+    sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
+    patch --batch --forward --fuzz=0 -p1 < megatron.patch && \
+    patch --batch --forward --fuzz=0 -p1 < sync-save-bounded-staging.patch && \
+    patch --batch --forward --fuzz=0 -p1 < kimi-packed-sequence-api.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
+    sha256sum 20261016-qwen38-models.patch > /etc/relax-qwen38-model-patch.sha256 && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
+    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
+    echo 'e8cbb2b2a895154622678516a6f67ef47e4b934dc7dc196115cd56a6cea235e6  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
+    patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \
+    echo 'e88edbe5c69536a4dcfdd9bf6e24d79634d1058ccdd62660bab5ae0b48ae7f76  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
+    sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
+    sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
+    python -m compileall -q megatron && \
+    rm ./*.patch
+
+RUN wget -q https://github.com/apptainer/apptainer/releases/download/v1.4.1/apptainer_1.4.1_amd64.deb && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ./apptainer_1.4.1_amd64.deb && \
+    rm apptainer_1.4.1_amd64.deb && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pin the base's ROCm builds so Relax dependencies cannot replace them; the base's
+# PIP_CONSTRAINT only covers torch, torchaudio and torchvision. requirements.txt's NumPy 1,
+# PyArrow, huggingface_hub and av pins would downgrade the base's NumPy 2 stack, so the base
+# versions are kept, as Dockerfile.cu13 rewrites the same pins for its CUDA 13 base.
+COPY requirements.txt /tmp/requirements.txt
+COPY docker/rocm-runtime-requirements.txt /opt/relax/rocm-runtime-requirements.txt
+RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq-assignment.patch \
+    python -c 'import importlib.metadata as m; keep = ("torch", "torchvision", "torchaudio", "triton", "numpy", "sglang", "sglang-router", "transformer-engine", "apex", "flash-attn", "aiter"); print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in keep))' > /tmp/rocm-constraints.txt && \
+    sed -i -e '/^numpy</d' -e '/^pyarrow==/d' -e '/^huggingface_hub==/d' -e '/^av==/d' /tmp/requirements.txt && \
+    pip install --no-cache-dir -c "$PIP_CONSTRAINT" -c /tmp/rocm-constraints.txt \
+        -r /tmp/requirements.txt -r /opt/relax/rocm-runtime-requirements.txt && \
+    rm /tmp/requirements.txt && \
+    pip install --no-cache-dir --no-deps tensordict==0.10.0 pyvers==0.1.0 && \
+    pip install --no-cache-dir --no-deps "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" && \
+    TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch && \
+    rm /tmp/rocm-constraints.txt
+
+# Install the R3 + PD DP-aware router after requirements.
+COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
+RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
+    python -c "import json, importlib.resources as r, sglang_router; from sglang_router import sglang_router_rs; \
+        b = json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()); \
+        assert sglang_router.__version__ == b['version'] == '0.3.2+slime.dpaware'; \
+        assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)" && \
+    rm -rf /tmp/router-wheels
+
+# Collapse duplicate ROCm SDK libraries that could otherwise load twice (ROCm/TheRock#7818).
+RUN SP="$(python3 -c 'import site; print(site.getsitepackages()[0])')"; \
+    if [ -d "$SP/_rocm_sdk_devel/lib" ]; then \
+      for f in "$SP"/_rocm_sdk_devel/lib/*.so*; do \
+        { [ -f "$f" ] && [ ! -L "$f" ]; } || continue; \
+        for t in _rocm_sdk_core _rocm_sdk_libraries; do \
+          c="$SP/$t/lib/$(basename "$f")"; \
+          if [ -f "$c" ] && cmp -s "$f" "$c"; then ln -srf "$c" "$f"; break; fi; \
+        done; \
+      done; \
+    fi
+
+# ROCm >= 7.2 IPC uses dma-buf, which leaks exported VRAM in colocate mode.
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1 \
+    RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+
+# Importing torch-backed packages needs a GPU (aiter probes rocminfo), so only
+# locate the Megatron tree here.
+RUN cd / && python -c "import importlib.util as u, transfer_queue, tensordict, clearml, math_verify; \
+    origin = u.find_spec('megatron.bridge').origin; \
+    assert origin.startswith('/root/Megatron-LM/'), origin"

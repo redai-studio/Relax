@@ -83,6 +83,22 @@ CU13_BLACKWELL_TRAIN_IMAGE="$REGISTRY/relax:train-YYYYMMDD-HASH8-cu13-blackwell"
 
 See the [English installation guide](../docs/en/guide/installation.md) or [中文安装指南](../docs/zh/guide/installation.md) for container setup and direct Docker build examples.
 
+## Build the ROCm Image
+
+`docker/Dockerfile.rocm` targets AMD Instinct GPUs; `GPU_ARCH` selects the variant:
+
+| `GPU_ARCH`         | GPUs           | SGLang base image                      |
+| ------------------ | -------------- | -------------------------------------- |
+| `gfx950` (default) | MI350X, MI355X | `lmsysorg/sglang:v0.5.21-rocm10-mi35x` |
+| `gfx942`           | MI300X, MI325X | `lmsysorg/sglang:v0.5.21-rocm10-mi30x` |
+
+```bash
+docker build -f docker/Dockerfile.rocm -t relax:dev-rocm-gfx950 .
+docker build -f docker/Dockerfile.rocm --build-arg GPU_ARCH=gfx942 -t relax:dev-rocm-gfx942 .
+```
+
+See the [English ROCm guide](../docs/en/guide/rocm.md) or [中文 ROCm 指南](../docs/zh/guide/rocm.md) for running containers and training.
+
 ## Pre-Release Testing
 
 Before each update, we perform comprehensive testing on the following models using Hopper GPUs:
