@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Publish an independent FULL control from the same frozen ordinary HF
-sequence.
+"""Publish an independent FULL or DELTA control from frozen ordinary HF
+targets.
 
 This measures offline HF read/capture and encoding/persistence, not a second
 training export. Consume primary FULL artifacts without forcing ensure_full.
@@ -25,6 +25,7 @@ def main() -> int:
     parser.add_argument("--output-config", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--versions", type=int, nargs="+", required=True)
+    parser.add_argument("--strategy", choices=["full", "delta"], default="full")
     args = parser.parse_args()
     config = WeightSyncConfig.load(args.config)
     root, output = args.output_root.resolve(), args.output_config.resolve()
@@ -38,7 +39,11 @@ def main() -> int:
         raise ValueError("Replay the contiguous frozen sequence starting at version zero")
     full = WeightSyncConfig.from_dict(
         asdict(config)
-        | {"store_root": str(root / "store"), "canonical_root": str(root / "canonical"), "full_only": True}
+        | {
+            "store_root": str(root / "store"),
+            "canonical_root": str(root / "canonical"),
+            "full_only": args.strategy == "full",
+        }
     )
     root.mkdir(parents=True)
     atomic_write(output, json.dumps(asdict(full), indent=2).encode())
@@ -60,8 +65,9 @@ def main() -> int:
             publisher.close()
         if (published.stream, published.version, published.root) != (full.stream, version, expected["root"]):
             raise RuntimeError("FULL control differs from the frozen training target")
-        if store.manifest(published.artifact_id)["kind"] != "FULL":
-            raise RuntimeError("The control did not publish a primary FULL artifact")
+        expected_kind = "FULL" if full.full_only or version % full.anchor_interval == 0 else "DELTA"
+        if store.manifest(published.artifact_id)["kind"] != expected_kind:
+            raise RuntimeError(f"The control did not publish a primary {expected_kind} artifact")
         result["versions"].append(
             asdict(published)
             | {"ordinary_hf": str(export), "metrics": publisher.last_metrics, "wall_s": time.monotonic() - stage}
