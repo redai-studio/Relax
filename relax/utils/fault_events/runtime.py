@@ -57,6 +57,9 @@ class Recovery:
     _local_failed: threading.Event = field(default_factory=threading.Event, init=False, repr=False, compare=False)
     _local_event_ids: tuple[str, ...] = field(default=(), init=False, repr=False, compare=False)
     _local_context: FaultTraceContext | None = field(default=None, init=False, repr=False, compare=False)
+    # (plan, observed, event_ids, context) recorded by a finished startup and
+    # applied by the next admitted transaction.
+    _startup_handoff: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -146,6 +149,7 @@ class FaultEventRuntime:
                 return None
             self._admission_context = context
             self._settle_local_completions()
+            self._settle_startup_handoffs()
             if self._source_epoch[1].is_set() and not self._source_retired:
                 self._retire_source(self._source_epoch[0], self._source_epoch[2])
             return function(*args) if function is not None else None
@@ -641,13 +645,19 @@ class FaultEventRuntime:
         if recovery is None:
             return
         try:
-            self._call(
-                self._complete_handoff,
-                recovery,
-                global_plan(config, roles),
+            plan = global_plan(config, roles)
+        except Exception:
+            plan = None  # An unreadable rebuilt graph cannot verify the frozen plan.
+        try:
+            # Record before admission: a rejected or failed admission must not
+            # lose the handoff of a startup that has already finished.
+            recovery._startup_handoff = (
+                plan,
                 int(observed),
                 tuple(new_id() for _ in range(2 * _MAX_MEMBERS)),
+                capture_trace_context(),
             )
+            self._call(None)
         except Exception:
             self.note_unknown()
 
@@ -709,6 +719,20 @@ class FaultEventRuntime:
             self._call(None)
         except Exception:
             self.note_unknown()
+
+    def _settle_startup_handoffs(self) -> None:
+        for recovery in tuple(self._recoveries.values()):
+            request = recovery._startup_handoff
+            if request is None:
+                continue
+            recovery._startup_handoff = None
+            plan, observed, event_ids, context = request
+            previous_context = self._admission_context
+            self._admission_context = context
+            try:
+                self._complete_handoff(recovery, plan, observed, event_ids)
+            finally:
+                self._admission_context = previous_context
 
     def _settle_local_completions(self) -> None:
         # Every lifecycle transaction drains these fixed fences first, before

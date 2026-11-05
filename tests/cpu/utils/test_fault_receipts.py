@@ -200,6 +200,19 @@ def test_handoff_lock_failure_commits_none_of_plan_evidence_or_handoff(runtime):
     assert recovery.outcome == "recovery_succeeded"
 
 
+def test_rejected_startup_handoff_is_applied_by_the_next_admission(runtime):
+    fault, recovery, _ = start(runtime, RecoveryPlan(("actor",), "colocate"))
+    config = SimpleNamespace(debug_train_only=False, debug_rollout_only=False, hybrid=False, fully_async=False)
+    with runtime._lock:
+        runtime.startup_handoff(recovery, config, ["actor"], 7)
+    assert not recovery.handoff and recovery.outcome is None
+    # The next admitted transaction, here a health snapshot, settles it.
+    runtime.observe_snapshot(snapshot(runtime, fault))
+    assert recovery.plan_verified and recovery.handoff
+    assert recovery.outcome == "recovery_succeeded"
+    assert recovery.recovery_id not in runtime._recoveries
+
+
 def test_retirement_lock_failure_is_settled_before_later_handoff(runtime):
     _, recovery, _ = start(runtime, RecoveryPlan(("actor",), "colocate"))
     with runtime._lock:
