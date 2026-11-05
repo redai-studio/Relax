@@ -20,6 +20,7 @@ import socket
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import timedelta
 from functools import lru_cache
 from types import SimpleNamespace
@@ -932,10 +933,14 @@ class DeviceDirectBackend(CommBackend):
         actor_fwd_only=False,
         pbar: tqdm | None = None,
     ) -> int | None:
-        """Gather parameter across TP, convert to HF format and buffer it.
+        """Gather dense parameters or stream PLE shards into update buckets.
 
         Returns updated buffer size on the source rank, otherwise None.
         """
+        if self._use_bridge and name.endswith(".per_layer_embedding.ple_embedding.ngram_embedding.weight"):
+            return self._update_ple_weight_from_distributed(
+                name, param, converted_named_tensors, origin_named_tensors, rollout_only, actor_fwd_only, pbar
+            )
         param = self._megatron.all_gather_param(self.args, name, param)
         if not self._is_pp_src_rank:
             return
@@ -974,6 +979,56 @@ class DeviceDirectBackend(CommBackend):
                     )
         buffer_size += param_size
         return buffer_size
+
+    def _update_ple_weight_from_distributed(
+        self,
+        name: str,
+        local_rows: torch.Tensor,
+        converted_named_tensors: list[tuple[str, torch.Tensor]],
+        origin_named_tensors: list[tuple[str, torch.Tensor]],
+        rollout_only: bool,
+        actor_fwd_only: bool,
+        pbar: tqdm | None,
+    ) -> int | None:
+        """Keep every TP rank in Bridge's shard collectives; only src sends."""
+
+        def flush_rollout_bucket() -> None:
+            if not converted_named_tensors or actor_fwd_only:
+                return
+            ready, pending = converted_named_tensors, []
+            if self._rollout_bucket_splitter is not None:
+                ready, pending = self._rollout_bucket_splitter(converted_named_tensors)
+            if ready:
+                self._update_bucket_weights_from_distributed(ready, pbar=pbar)
+            converted_named_tensors[:] = pending
+
+        if self._is_pp_src_rank:
+            if origin_named_tensors and not rollout_only:
+                self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
+            origin_named_tensors.clear()
+            flush_rollout_bucket()
+
+        if not rollout_only:
+            # actor_fwd/ref still consume full Megatron weights. Do not retain
+            # that separate payload while streaming the HF shards to rollout.
+            gathered = self._megatron.all_gather_param(self.args, name, local_rows)
+            if self._is_pp_src_rank:
+                self._update_bucket_weights_from_distributed_for_actor_fwd_ref([(name, gathered)])
+            del gathered
+
+        if not actor_fwd_only and not self._lora_skip_rollout_base:
+            # PLE mappings expect TP-local rows and perform an all-reduce per
+            # HF shard. Neither gather the full table nor filter non-src ranks.
+            with closing(self._bridge_converter.iter_ple_shards(name, local_rows)) as shards:
+                for converted in shards:
+                    if self._is_pp_src_rank:
+                        converted_named_tensors.append(converted)
+                        flush_rollout_bucket()
+                    del converted
+
+        if self._is_pp_src_rank:
+            return sum(tensor.numel() * tensor.element_size() for _, tensor in converted_named_tensors)
+        return None
 
     def _run_expert_pass(self, *, rollout_only: bool, actor_fwd_only: bool, pbar: tqdm | None) -> None:
         """One full pass over the grouped-expert params: gather, (optionally)
