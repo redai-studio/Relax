@@ -4,6 +4,65 @@ Relax 训练吞吐量最大化实践指南。本文提到的所有参数均可�
 
 ---
 
+## 按 FLOPs 平衡动态微批
+
+`--balance-by-flops` 根据样本训练 FLOPs 的估算值构造全局微批，并将整微批分配给数据并行（DP）rank，以均衡计算负载。开关默认 `False`，开启后同时启用微批构造和 DP 分配。
+
+### 配置方式
+
+Qwen3.5 文本训练可在训练配置中加入以下参数：
+
+```bash
+--train-backend megatron \
+--qkv-format thd \
+--use-dynamic-batch-size \
+--max-tokens-per-gpu 8192 \
+--sft-packing-strategy balanced \
+--polling-mode True \
+--balance-by-flops
+```
+
+请根据模型和可用显存设置 token 预算，示例值为 8192。自定义 YAML 使用布尔字段 `balance_by_flops: true`。SFT 专用设置见 [SFT 配置](./sft-training.md#flops-感知调度)。
+
+### 调度过程
+
+Relax 为每个完整全局 batch 执行以下流程，参考 [Slime PR #2017](https://github.com/THUDM/slime/pull/2017)：
+
+1. 计算初始全局微批数 `K = ceil(总长度 / (max_tokens_per_gpu × CP))`，最多为样本数。Allgather CP 会先将每卡预算向下取整到 `TP × data_pad_size_multiplier` 的倍数。
+2. 以样本 FLOPs 为权重，用 Karmarkar–Karp（KK）分区，允许各微批包含不同数量的样本。
+3. 拆分 token 总量最大的可拆分 bin，直到全局微批数能被 DP 整除。每次拆分按长度从大到小，将样本放入当前 token 总量较小的半边。
+4. 以整微批的总 FLOPs 为权重，用 KK 分配给 DP，保证每个 rank 的微批数相同。
+5. PP=1 且 DP>1 时，各 rank 按微批 FLOPs 升序执行，让计算量相近的微批彼此配对。
+
+TransferQueue 将微批成员、顺序和数量传给普通 iterator 与 SFT CPU prepack。各 DP rank 收到的样本数可以不同，训练端保留全局 batch 的优化器更新边界和 loss 归一化方式。Eval 和 forward-only 调用使用各自的 token 预算。
+
+::: warning Token 预算与显存
+`--max-tokens-per-gpu` 用于计算初始微批数，最终 pack 的 token 数可能超过该预算。请根据实际 pack 大小预留显存余量。
+:::
+
+Producer 在 CPU 上估算样本训练成本，写入队列元数据，作为微批构造和 DP 分配的权重。Qwen3.5 估算器覆盖 full attention、Gated DeltaNet（GDN）、Dense MLP、激活的 MoE 专家和共享专家，以及词表输出头。一次乘加计为两个 FLOPs，训练成本近似为前向的三倍。
+
+### 支持范围
+
+| 配置项 | 要求 |
+| --- | --- |
+| 模型 | HF `model_type` 为 `qwen3_5`、`qwen3_5_text`、`qwen3_5_moe` 或 `qwen3_5_moe_text`，使用标准 Dense 或所有层均为 MoE 的布局。 |
+| 训练 | 全参数、纯文本、同步 SFT 或 RL 训练。 |
+| 后端与打包 | Megatron、THD、balanced 动态打包和 TransferQueue polling 模式。MTP、wholepack 和 `--debug-train-only` 保持关闭。 |
+| 并行 | VPP=1、静态 CP；GDN CP>1 配置中保持 `allgather_cp: false`。SFT 异步 CPU prepack 使用 CUDA、PP=1、CP=1。 |
+| MoE | `--moe-aux-loss-coeff 0`，`moe_expert_capacity_factor: null`。Router 均衡模式为 `none`、`aux_loss`、`seq_aux_loss` 或 `global_aux_loss`。 |
+| SFT | 一个 TransferQueue shard，`--n-samples-per-prompt 1`。 |
+
+SFT 使用 `docker/patch/transferqueue/9784ad0-assignment-transform.patch` 中的 TransferQueue `assignment_transform` 补丁。仓库的 `docker/Dockerfile` 和 `docker/Dockerfile.cu13` 会在构建镜像时应用该补丁。
+
+### 恢复与排查
+
+队列计划随 sampler checkpoint 保存。恢复时，请保持 DP 数、FLOPs 开关、token 预算和 CP/PP 配置一致。
+
+`Cannot split ... into ... aligned microbatches` 表示物理样本行数少于 DP 对齐所需的微批数，请调整 batch 大小或 DP 数，确保有足够的样本行。
+
+评估吞吐时，使用相同的模型、数据和训练配置，对比 FLOPs 调度与长度均衡基线的有效训练 token/s 和等待时间。
+
 ## Kimi K3 TFLOPS 与 MFU
 
 `perf/actor_train_tflops` 估算每卡每秒的有效模型 FLOPs。`perf/mfu/actor_train` 再除以设备 BF16 dense 峰值（280G Blackwell 配置为 2250 TFLOPS），记录的是比例，0.4 表示 40%。时间分母是 actor 训练耗时，不是包含 rollout/save 的整轮耗时；训练内部的 optimizer 和 offload 耗时会降低该指标。
@@ -202,7 +261,7 @@ traces/my-profiling-run/
 
 ## 动态批处理
 
-动态批处理根据样本长度动态打包，使每个 micro-batch 的总 Token 数接近目标值，相比固定大小的 micro-batch 能更好地利用 GPU。它同时也是一种有效的 OOM 防护机制——使用固定的 `--micro-batch-size` 时，一批异常长的序列可能超出 GPU 显存，而动态批处理通过 `--max-tokens-per-gpu` 限制每个 micro-batch 的总 Token 数，使显存使用可预测。
+动态批处理将变长样本打包，使每个 micro-batch 的 Token 数接近目标值，以提高 GPU 利用率。默认打包路径按 token 预算检查 pack 容量。`--balance-by-flops` 使用该预算推算初始微批数，详见[按 FLOPs 平衡动态微批](#按-flops-平衡动态微批)。
 
 ```bash
 --use-dynamic-batch-size \
@@ -364,6 +423,8 @@ Partial Rollout 最适合 `max_response_len` 较大（如 8K+）且响应长度�
 ```
 
 在静态/序列长度均衡路径上，`--balance-data` 会启用 `SeqlenBalancedSampler`，并使用 `karmarkar_karp` 在数据并行 rank 间均衡 Token。
+
+`--balance-by-flops` 同时启用 FLOPs 微批构造和 DP 分配，详见[配置说明](#按-flops-平衡动态微批)。
 
 全异步结合 `--use-dynamic-batch-size` 时，动态 batch 路径会通过 `StreamingTokenBudgetSampler` 自动做 DP token 均衡。此时传入 `--balance-data` 是允许的，但不会额外增加一次均衡。
 
