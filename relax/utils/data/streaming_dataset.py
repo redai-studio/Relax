@@ -100,6 +100,7 @@ class StreamingReader:
         self._total_lines: Optional[int] = None
         self._is_parquet = self.path.endswith(".parquet")
         self._parquet_data: Optional[list] = None  # For parquet, we cache in memory
+        self._parquet_row_start = 0
 
         # Validate file format
         if not self.path.endswith((".jsonl", ".parquet")):
@@ -172,6 +173,7 @@ class StreamingReader:
 
         # Apply row slice if specified
         if self.row_slice is not None:
+            self._parquet_row_start = self.row_slice.indices(len(self._parquet_data))[0]
             start = self.row_slice.start or 0
             stop = self.row_slice.stop or len(self._parquet_data)
             self._parquet_data = self._parquet_data[start:stop]
@@ -216,8 +218,7 @@ class StreamingReader:
         from relax.utils.agentic_obs.source import SourceRow
 
         if self._is_parquet:
-            start = self.row_slice.start or 0 if self.row_slice is not None else 0
-            row_id = start + idx
+            row_id = self._parquet_row_start + idx
         else:
             row_id = self._source_row_ids[idx]
         return SourceRow(data, self.path, row_id)

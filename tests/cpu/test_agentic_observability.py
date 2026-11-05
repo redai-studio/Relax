@@ -1524,6 +1524,68 @@ def test_prompt_source_survives_slices_shuffle_and_replication(tmp_path, extensi
     assert eager_sources[0]["input_payload"] == rows[0]
 
 
+@pytest.mark.parametrize(
+    ("row_slice", "expected_rows"),
+    [("[-3:]", [2, 3, 4]), ("[-4:-1]", [1, 2, 3]), ("[-10:]", [0, 1, 2, 3, 4])],
+)
+def test_streaming_parquet_slice_preserves_prompt_source(tmp_path, row_slice, expected_rows):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from relax.utils.agentic_obs.source import snapshot_source
+    from relax.utils.data.streaming_dataset import StreamingReader
+
+    path = tmp_path / "questions.parquet"
+    rows = [{"text": str(i)} for i in range(5)]
+    pq.write_table(pa.Table.from_pylist(rows), path, row_group_size=2)
+    unsliced = StreamingReader(str(path), with_source=True)
+    reader = StreamingReader(f"{path}@{row_slice}", with_source=True)
+    expected_sources = [snapshot_source(unsliced[i], metadata_key="metadata", split="train") for i in expected_rows]
+
+    assert len(reader) == len(expected_rows)
+    assert [reader[i].source_row_id for i in range(len(reader))] == [str(i) for i in expected_rows]
+    assert [snapshot_source(reader[i], metadata_key="metadata", split="train") for i in range(len(reader))] == (
+        expected_sources
+    )
+    indices = list(reversed(range(len(reader)))) + [0]
+    batch = list(reader.iter_batch(indices))
+    assert [i for i, _ in batch] == indices
+    assert [snapshot_source(row, metadata_key="metadata", split="train") for _, row in batch] == [
+        expected_sources[i] for i in indices
+    ]
+
+    plain_reader = StreamingReader(f"{path}@{row_slice}")
+    plain_rows = [plain_reader[i] for i in range(len(plain_reader))]
+    assert plain_rows == [rows[i] for i in expected_rows]
+    assert all(type(row) is dict for row in plain_rows)
+    assert list(plain_reader.iter_batch(indices)) == [(i, plain_rows[i]) for i in indices]
+
+
+def test_streaming_parquet_per_file_slices_preserve_prompt_source(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from relax.utils.agentic_obs.source import snapshot_source
+    from relax.utils.data.data import Dataset
+    from relax.utils.data.streaming_dataset import StreamingDataset
+
+    paths = [tmp_path / f"questions_{i}.parquet" for i in range(2)]
+    for path in paths:
+        pq.write_table(pa.Table.from_pylist([{"text": "same"} for _ in range(5)]), path, row_group_size=2)
+    options = dict(tokenizer=None, processor=None, max_length=None, record_source=True)
+    unsliced = Dataset(path=[str(path) for path in paths], **options)
+    expected_sources = [unsliced[i].agentic_prompt_source for i in [2, 3, 4, 5, 6, 7, 8, 9]]
+    streaming = StreamingDataset(path=[f"{paths[0]}@[-3:]", f"{paths[1]}@[-10:]"], **options)
+
+    assert [streaming[i].agentic_prompt_source for i in range(len(streaming))] == expected_sources
+    indices = [7, 0, 3, 2, 0]
+    batch = list(streaming.reader.iter_batch(indices))
+    assert [i for i, _ in batch] == indices
+    assert [snapshot_source(row, metadata_key="metadata", split="train") for _, row in batch] == [
+        expected_sources[i] for i in indices
+    ]
+
+
 def test_streaming_prompt_source_survives_reused_line_index(tmp_path, monkeypatch):
     import ray
 
