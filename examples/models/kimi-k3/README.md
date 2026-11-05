@@ -17,23 +17,25 @@ export MODEL_DIR=/shared/models/Kimi-K3
 export DATA_DIR=/shared/data/openr1mm
 export SAVE_DIR=/shared/checkpoints
 export EXP_NAME=kimi-k3-openr1mm-full
-DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300.sh
+DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh
 bash scripts/entrypoint/ray-job.sh \
-  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300.sh
+  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh
 ```
 
-| Recipe filename                             |     GPUs | Input                                              |
-| ------------------------------------------- | -------: | -------------------------------------------------- |
-| `run-kimi-k3-hellaswag-128xb300.sh`         | 128 B300 | `train.jsonl`, `validation.jsonl`                  |
-| `run-kimi-k3-hellaswag-128xb300-rawtext.sh` | 128 B300 | Same files; raw context/target baseline comparison |
-| `run-kimi-k3-openr1mm-128xb300.sh`          | 128 B300 | `train.parquet`                                    |
-| `run-kimi-k3-llava-onevision-128xb300.sh`   | 128 B300 | `train/` JSONL shards and `READY.json`             |
-| `run-kimi-k3-pokemon-64xb300.sh`            |  64 B300 | `pokemon_gpt4o_zh.parquet`                         |
-| `run-kimi-k3-pokemon-128xb300.sh`           | 128 B300 | Same Parquet file                                  |
-| `run-kimi-k3-pokemon-192xgpu-b300.sh`       | 192 B300 | Same Parquet file                                  |
-| `run-kimi-k3-pokemon-lora-64xb300.sh`       |  64 B300 | Same Parquet file; language-backbone LoRA          |
+| Recipe filename                                  |               GPUs | Input                                              |
+| ------------------------------------------------ | -----------------: | -------------------------------------------------- |
+| `run-kimi-k3-hellaswag-128xblackwell.sh`         | 128×280G Blackwell | `train.jsonl`, `validation.jsonl`                  |
+| `run-kimi-k3-hellaswag-128xblackwell-rawtext.sh` | 128×280G Blackwell | Same files; raw context/target baseline comparison |
+| `run-kimi-k3-openr1mm-128xblackwell.sh`          | 128×280G Blackwell | `train.parquet`                                    |
+| `run-kimi-k3-llava-onevision-128xblackwell.sh`   | 128×280G Blackwell | `train/` JSONL shards and `READY.json`             |
+| `run-kimi-k3-pokemon-64xblackwell.sh`            |  64×280G Blackwell | `pokemon_gpt4o_zh.parquet`                         |
+| `run-kimi-k3-pokemon-128xblackwell.sh`           | 128×280G Blackwell | Same Parquet file                                  |
+| `run-kimi-k3-pokemon-192xgpu-blackwell.sh`       | 192×280G Blackwell | Same Parquet file                                  |
+| `run-kimi-k3-pokemon-lora-64xblackwell.sh`       |  64×280G Blackwell | Same Parquet file; language-backbone LoRA          |
 
 `SAVE_DIR` enables saving to the stable `${SAVE_DIR}/${EXP_NAME}` directory and loading from the same directory. Without it, recipes do not save checkpoints. OpenR1-MM and OneVision save **model weights only** by default; optimizer and scheduler state are not preserved. `SAVE_OPTIMIZER=1` enables full-state saving, which needs substantially more host memory and storage. A model-only checkpoint is not an exact training resume.
+
+The default SFT experiment names now use architecture and memory profiles. To continue an existing experiment after upgrading, keep `SAVE_DIR` unchanged and explicitly set `EXP_NAME` to the original experiment name. Using the new default changes the checkpoint directory and can restart training from the HF weights instead of resuming the existing checkpoint.
 
 OpenR1-MM and OneVision default to frozen vision; set `FREEZE_VISION_TOWER=0` for joint vision training and revalidate memory use. `FLA_TILELANG=0` is passed to training actors by default; an explicit environment override is supported. ClearML uses the existing runtime configuration. Ray submission waits for completion and streams logs by default; set `RAY_NO_WAIT=1` to submit in the background, where submission success does not establish training success.
 
@@ -96,10 +98,10 @@ Kimi K3 supports colocated GRPO with native MXFP4 rollout weights. Training keep
 
 The SGLang v0.5.17 patch shipped in this repository must be installed on **every rollout node**. Its reload hooks preserve captured runtime storage while refreshing MXFP4 repacks, fused decode buffers, MLA projections and AttnRes caches. The router supports worker removal and re-registration without applying stale requests or health checks to a replacement worker. PP weight conversion broadcasts cleaned configuration copies and avoids repeating TP/EP collectives after weights have already been gathered.
 
-| Recipe                                                                  | Layout                                     | Purpose                                                              |
-| ----------------------------------------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------- |
-| `scripts/training/text/run-kimi-k3-5l-8xgpu-grpo.sh`                    | Training TP2/EP4/ETP1, rollout TP8; 8 GPUs | Reduced 5-layer/128-expert checkpoint, text-only DAPO math smoke run |
-| `examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh` | Training TP4/PP4/CP2/EP32/ETP1; 128 B300   | Full-parameter multimodal OpenR1-MM GRPO, including vision           |
+| Recipe                                                                       | Layout                                             | Purpose                                                              |
+| ---------------------------------------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------- |
+| `scripts/training/text/run-kimi-k3-5l-8xgpu-grpo.sh`                         | Training TP2/EP4/ETP1, rollout TP8; 8 GPUs         | Reduced 5-layer/128-expert checkpoint, text-only DAPO math smoke run |
+| `examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh` | Training TP4/PP4/CP2/EP32/ETP1; 128×280G Blackwell | Full-parameter multimodal OpenR1-MM GRPO, including vision           |
 
 The full recipe uses PP layer counts 21/24/24/24, eight 16-GPU rollout engines with attention TP8/DP2 and MoE EP16, CPU optimizer offload (default fraction 0.9), dummy rollout initialization followed by a full weight push, and no reference model. It clears inherited allocator settings, limits compiler threads and keeps Ray Serve probes responsive during weight synchronization. Defaults are 200 training rollouts and a model-only save every 200 rollouts, retaining one checkpoint. It initializes from HF unless `LOAD_DIR` is set. Model-only checkpoints do **not** restore optimizer state.
 
@@ -110,9 +112,9 @@ export SAVE_DIR=/shared/checkpoints
 export EXP_NAME=kimi-k3-openr1mm-grpo
 export HF_CHECKPOINT="${MODEL_DIR}"
 export PROMPT_SET="${DATA_DIR}/train.parquet"
-DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh
+DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh
 bash scripts/entrypoint/ray-job.sh \
-  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh
+  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh
 ```
 
 The full recipe defaults to `${MODEL_DIR}/Kimi-K3` for model weights and `${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet` for data with `prompt`, `label` and `image` fields. The example above sets `HF_CHECKPOINT` and `PROMPT_SET` explicitly to reuse the SFT directory layout. The reduced recipe expects `dapo-math-17k.jsonl` under `DATA_DIR` and the reduced checkpoint directly under `MODEL_DIR`. Its entropy coefficient 0.01 keeps gradients nonzero when the unretrained smoke checkpoint receives zero rewards; it is not a quality baseline. Optional `SAVE_DIR` enables full-state saves and resume for this reduced recipe. Experiment names and checkpoint paths are stable; timestamps appear only in log/task names. ClearML uses existing runtime configuration.

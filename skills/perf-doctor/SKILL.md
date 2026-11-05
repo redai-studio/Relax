@@ -29,7 +29,7 @@ argument-hint: <launch-script-or-trace-path>
 2. **抽取 context** —
    - 文件名解析：`run-<model>-<size>-<NxgpuY>(-async|-image|-video)?.sh` → 总 GPU 数、节点数、模式、模态
    - flag 解析：TP/PP/CP/EP/ETP、`--colocate` vs `--fully-async`、`--rollout-max-response-len`、`--max-tokens-per-gpu`、`--resource`、`--num-iters-per-train-update`、`--max-staleness`、`--num-data-storage-units`
-   - **默认 GPU 假设：H20 96GB**，除非用户在 prompt 里给出别的（A100 80G / H100 80G 等）
+   - **默认 GPU 假设：H20 96GB**，除非用户在 prompt 里给出别的（A100 80G / H800 等）
 3. **加载规则** — 读 `references/rules.md`，逐条判断 applies / borderline / not-applicable；涉及 MoE 吞吐、EP overlap 或训练侧 CUDA graphs 时，按下方入口加载官方调优参考的对应小节
 4. **对照 baseline** — 读 `references/baselines.md`，若用户脚本与某条 baseline 同模型 + 同 GPU 数量级，把 baseline 的并行 / batch / mem 配置作为合理区间锚点；偏离 ≥ 2 档时把 baseline 数值写进对应 finding 的 `Cost` 一栏佐证
 5. **输出报告** — 严格按下方 [输出模板](#输出模板) 渲染

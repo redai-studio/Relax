@@ -112,7 +112,7 @@ index ba632f3..99e8aa9 100644
      freeze_language_model: bool = False
      freeze_vision_model: bool = False
 diff --git a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
-index 4ef12d7..01c5180 100644
+index 4ef12d7..7bf9ad0 100644
 --- a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
 +++ b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
 @@ -16,7 +16,9 @@ import logging
@@ -275,6 +275,15 @@ index 4ef12d7..01c5180 100644
  
              if self.config.sequence_parallel:
                  tp_group = self.config._pg_collection.tp if self.config._pg_collection is not None else None
+@@ -532,7 +622,7 @@ class KimiK25VLModel(MegatronModule):
+             runtime_gather_output=runtime_gather_output,
+             packed_seq_params=packed_seq_params,
+         )
+-        if cp_size > 1:
++        if cp_size > 1 and loss_mask is not None:
+             return outputs, loss_mask
+         return outputs
+ 
 diff --git a/megatron/bridge/models/qwen/qwen3_moe_bridge.py b/megatron/bridge/models/qwen/qwen3_moe_bridge.py
 index a6476f4..cab29da 100644
 --- a/megatron/bridge/models/qwen/qwen3_moe_bridge.py
@@ -784,7 +793,16 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
          params = []
          for group in self.param_groups:
              params.extend(group["params"])
-@@ -370,11 +375,11 @@
+@@ -276,6 +281,8 @@
+                     cpu_copy = True
+                 if self.param_update_in_fp32 and param.dtype != torch.float32:
+                     param = param.detach().clone().float()
++                    if cpu_copy and self.pin_cpu_params:
++                        param = param.pin_memory()
+                     param_to_fp32_param[orig_param] = param
+
+                 if cpu_copy:
+@@ -370,11 +377,11 @@
          if not self.param_update_in_fp32:
              return
          for param, v in self.state.items():
@@ -801,7 +819,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
  
      def update_fp32_param_by_new_param(self):
          """
-@@ -382,6 +387,16 @@
+@@ -382,6 +389,16 @@
          """
          for param, fp32_param in self.param_to_fp32_param.items():
              fp32_param.data.copy_(param)
@@ -1217,24 +1235,38 @@ index 4ce5ebf..d39ca64 100644
      # Precision notes:
      # - Logits are converted to fp32 for score functions.
      # - All the intermediate calculations are in fp32.
-@@ -1495,7 +1498,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
+@@ -1495,7 +1498,16 @@
          inp_shape = inp.shape
          inp = inp.view(-1, inp_shape[-1])
  
 -        if te_general_gemm is not None and router_dtype != torch.float64:
-+        # TE multiplies in the operand dtype, so BF16 operands silently defeat
-+        # --moe-router-dtype fp32. Keep FP32/FP64 routing on torch.mm.
-+        if te_general_gemm is not None and router_dtype not in (torch.float32, torch.float64):
++        from relax.utils.env import Envs
++
++        if (
++            te_general_gemm is not None
++            and router_dtype != torch.float64
++            and (
++                router_dtype != torch.float32
++                or Envs.RELAX_QWEN38_ROUTER_SORTED_REPLAY
++            )
++        ):
              # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
              # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
              # small bias vector before passing it to TE.
-@@ -1534,7 +1539,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
+@@ -1534,7 +1544,16 @@
          inp = inp.view(-1, inp_shape[-1])
          grad_output = grad_output.view(-1, grad_shape[-1])
  
 -        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
-+        if te_general_gemm is not None and ctx.router_dtype not in (
-+            torch.float32, torch.float64
++        from relax.utils.env import Envs
++
++        if (
++            te_general_gemm is not None
++            and ctx.router_dtype != torch.float64
++            and (
++                ctx.router_dtype != torch.float32
++                or Envs.RELAX_QWEN38_ROUTER_SORTED_REPLAY
++            )
 +        ):
              grad_input = te_general_gemm(
                  weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True

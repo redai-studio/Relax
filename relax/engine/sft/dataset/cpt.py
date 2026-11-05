@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Text-only continued pretraining on the SFT data contract."""
+"""Continued pretraining on the SFT data contract."""
 
 import re
 from typing import Any
@@ -171,3 +171,43 @@ def render_cpt(sample: CanonicalSample, *, tokenizer: Any, template: str = "raw"
     tokens = torch.tensor(ids, dtype=torch.long)
     # Megatron aligns this mask once, per document, and masks its last label.
     return tokens, torch.ones_like(tokens)
+
+
+def mask_cpt_media_tokens(tokens: torch.Tensor, tokenizer: Any, pad_token_ids: frozenset[int]) -> torch.Tensor:
+    """Supervise text and chat delimiters, excluding media payload/structure
+    tokens.
+
+    Called on CPU dataset tensors before and after processor expansion. The
+    regular SFT packing path subsequently aligns next-token document
+    boundaries.
+    """
+    excluded = set(pad_token_ids)
+    names = (
+        "<|image_pad|>",
+        "<|video_pad|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|audio_pad|>",
+        "<|audio|>",
+        "<|audio_bos|>",
+        "<|audio_eos|>",
+        "<|audio_start|>",
+        "<|audio_end|>",
+        "<|audio_perception|>",
+        "<|soft_audio|>",
+        "<|soft_audio_text|>",
+    )
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if convert is not None:
+        for name in names:
+            token_id = convert(name)
+            if token_id is not None and token_id != getattr(tokenizer, "unk_token_id", None):
+                excluded.add(token_id)
+    # pad may alias EOS; actual sequence padding is masked by the packer.
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is not None and pad_id != getattr(tokenizer, "eos_token_id", None):
+        excluded.add(pad_id)
+    mask = torch.ones_like(tokens)
+    for token_id in excluded:
+        mask.masked_fill_(tokens == token_id, 0)
+    return mask

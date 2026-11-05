@@ -1,20 +1,23 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 import threading
 import time
 from argparse import Namespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import ray
 import requests
 from ray import serve
 from ray.util.placement_group import remove_placement_group
 
-from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.core.node_group_affinity import require_control_plane_resource_on_node, with_control_plane_affinity
 from relax.distributed.ray.placement_group import (
     _require_node_group_markers,
     create_placement_group,
 )
+from relax.utils.fault_events.models import RecoveryEvidence
+from relax.utils.fault_events.recovery import observe_recovery
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url, recovery_load_path
 
@@ -123,6 +126,20 @@ class Service:
             self.config,
             {"runtime_env": self.runtime_env},
         )
+        data_node_ip = os.environ.get("RELAX_SFT_DATA_NODE_IP", "").strip()
+        if self.role == "sft" and data_node_ip:
+            resource = f"node:{data_node_ip}"
+            node = next(
+                (node for node in ray.nodes() if node.get("Alive") and node.get("NodeManagerAddress") == data_node_ip),
+                None,
+            )
+            if node is None or node.get("Resources", {}).get(resource, 0) < 0.001:
+                raise ValueError(f"SFT data node is not available: {data_node_ip}")
+            require_control_plane_resource_on_node(self.config, node["NodeID"])
+            ray_actor_options["resources"] = {
+                **ray_actor_options.get("resources", {}),
+                resource: 0.001,
+            }
         if self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
@@ -237,14 +254,16 @@ class Service:
 
     async def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False):
         """Trigger a fully asynchronous weight update for Actor service."""
-        return self.handle.update_weights_fully_async.remote(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        return await self.handle.update_weights_fully_async.remote(
+            rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+        )
 
     async def recv_weight_fully_async(self):
         """Trigger a fully asynchronous weight receive for Actor FWD
         service."""
-        return self.handle.recv_weight_fully_async.remote()
+        return await self.handle.recv_weight_fully_async.remote()
 
-    def restart(self) -> None:
+    def restart(self, fault_observer: Callable[..., None] | None = None) -> None:
         """Restart this service in-place: reuse placement groups and dynamic
         state.
 
@@ -282,6 +301,7 @@ class Service:
 
         recovery_load_path(self.config)  # Ensure config has the correct checkpoint paths after restart
         self._deploy(pgs)
+        observe_recovery(fault_observer, observed=RecoveryEvidence.DEPLOYED)
         logger.info(f"[{self.role}] Service redeployed successfully")
 
         current_step = 0
@@ -295,11 +315,15 @@ class Service:
         try:
             self._http_call(self.role, "/set_step", method="POST", params={"step": current_step})
             logger.info(f"[{self.role}] Restored step to {current_step}")
+            observe_recovery(fault_observer, observed=RecoveryEvidence.STEP_RESTORED)
         except Exception as e:
+            observe_recovery(fault_observer, failed=RecoveryEvidence.STEP_RESTORED)
             logger.warning(f"[{self.role}] Failed to restore step: {e}")
 
         self._task_ref = None
         task_ref = self.run()
+        if task_ref is not None:
+            observe_recovery(fault_observer, observed=RecoveryEvidence.TASK_SUBMITTED)
         logger.info(f"[{self.role}] Service task re-launched after restart, task_ref={task_ref}")
 
     def _ensure_placement_group(self) -> Optional[Any]:

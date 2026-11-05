@@ -1,0 +1,861 @@
+diff --git a/src/app_context.rs b/src/app_context.rs
+--- a/src/app_context.rs
++++ b/src/app_context.rs
+@@ -328,8 +328,11 @@
+         // backend to avoid unnecessary TLS initialization overhead.
+         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
+ 
++        // Retire PD connections before SGLang's default five-second keep-alive.
++        // Reusing a closing prefill connection can leave decode waiting for KV.
++        let pool_idle_secs = if config.mode.is_pd_mode() { 4 } else { 50 };
+         let mut client_builder = Client::builder()
+-            .pool_idle_timeout(Some(Duration::from_secs(50)))
++            .pool_idle_timeout(Some(Duration::from_secs(pool_idle_secs)))
+             .pool_max_idle_per_host(500)
+             .timeout(Duration::from_secs(timeout_secs))
+             .connect_timeout(Duration::from_secs(10))
+diff --git a/src/core/worker_builder.rs b/src/core/worker_builder.rs
+--- a/src/core/worker_builder.rs
++++ b/src/core/worker_builder.rs
+@@ -316,7 +316,13 @@
+             builder = builder.api_key(api_key);
+         }
+ 
+-        let base_worker = builder.build();
++        let mut base_worker = builder.build();
++        // Keep per-rank identity and metrics, but use the physical host for KV bootstrap.
++        base_worker.metadata.bootstrap_host = url::Url::parse(&self.base_url)
++            .or_else(|_| url::Url::parse(&format!("http://{}", self.base_url)))
++            .ok()
++            .and_then(|url| url.host_str().map(str::to_owned))
++            .unwrap_or_else(|| "localhost".to_string());
+         DPAwareWorker::with_base_worker(base_worker, self.base_url, self.dp_rank, self.dp_size)
+     }
+ }
+@@ -432,6 +438,19 @@
+     }
+ 
+     #[test]
++    fn test_dp_aware_bootstrap_host_uses_physical_url() {
++        for (url, host) in [("http://127.0.0.1:8080", "127.0.0.1"), ("http://prefill:8080", "prefill")] {
++            let worker = DPAwareWorkerBuilder::new(url, 1, 2)
++                .worker_type(WorkerType::Prefill { bootstrap_port: Some(8998) })
++                .build();
++            assert_eq!(worker.url(), format!("{url}@1"));
++            assert_eq!(worker.base_url(), url);
++            assert_eq!(worker.bootstrap_host(), host);
++            assert_eq!(worker.bootstrap_port(), Some(8998));
++        }
++    }
++
++    #[test]
+     fn test_dp_aware_worker_builder_minimal() {
+         let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 2, 8).build();
+ 
+diff --git a/src/routers/http/mod.rs b/src/routers/http/mod.rs
+--- a/src/routers/http/mod.rs
++++ b/src/routers/http/mod.rs
+@@ -1,5 +1,6 @@
+ //! HTTP router implementations
+ 
+ pub mod pd_router;
++mod pd_routing;
+ pub mod pd_types;
+ pub mod router;
+diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
+--- a/src/routers/http/pd_router.rs
++++ b/src/routers/http/pd_router.rs
+@@ -10,16 +10,16 @@
+     },
+     response::{IntoResponse, Response},
+ };
++#[cfg(test)]
+ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+ use futures_util::StreamExt;
+-use memchr::memmem;
+ use reqwest::Client;
+ use serde::Serialize;
+ use serde_json::{json, Value};
+ use tokio_stream::wrappers::UnboundedReceiverStream;
+ use tracing::{debug, error, warn};
+ 
+-use super::pd_types::api_path;
++use super::{pd_routing, pd_types::api_path};
+ use crate::{
+     config::types::RetryConfig,
+     core::{
+@@ -76,7 +76,7 @@
+         headers: Option<Vec<(String, String)>>,
+     ) -> Response {
+         let workers = self.worker_registry.get_prefill_workers();
+-        let first_worker_url = workers.first().map(|w| w.url().to_string());
++        let first_worker_url = workers.first().map(|w| w.base_url().to_string());
+ 
+         if let Some(worker_url) = first_worker_url {
+             self.proxy_to_worker(worker_url, endpoint, headers).await
+@@ -480,6 +480,7 @@
+                 None,
+                 context.return_logprob,
+                 false,
++                None,
+                 Some(decode_url),
+                 Some(response_headers),
+                 prefill,
+@@ -557,6 +558,29 @@
+         }
+     }
+ 
++    // Keep physical endpoints separate from virtual DP identities. Preserve the raw
++    // request so native extensions such as routed_experts survive the round trip.
++    fn prepare_dp_requests(
++        request: Value,
++        prefill: &dyn Worker,
++        decode: &dyn Worker,
++    ) -> (Value, Value) {
++        let mut prefill_request = request.clone();
++        let mut decode_request = request;
++        if let (Some(rank), Some(object)) = (prefill.dp_rank(), prefill_request.as_object_mut()) {
++            object.insert("routed_dp_rank".to_string(), Value::from(rank));
++        }
++        if let Some(object) = decode_request.as_object_mut() {
++            if let Some(rank) = decode.dp_rank() {
++                object.insert("routed_dp_rank".to_string(), Value::from(rank));
++            }
++            if let Some(rank) = prefill.dp_rank() {
++                object.insert("disagg_prefill_dp_rank".to_string(), Value::from(rank));
++            }
++        }
++        (prefill_request, decode_request)
++    }
++
+     // Internal method that performs the actual dual dispatch (without retry logic)
+     async fn execute_dual_dispatch_internal(
+         &self,
+@@ -578,20 +602,30 @@
+         inject_trace_context_http(&mut headers_with_trace);
+         let headers = Some(&headers_with_trace);
+ 
+-        // Build both requests
++        // Build both requests with their independently selected DP owners.
++        let routed_start = (context.route == "/generate"
++            && json_request.get("return_routed_experts").and_then(Value::as_bool) == Some(true))
++            .then(|| json_request.get("routed_experts_start_len").and_then(Value::as_u64).unwrap_or(0) as usize);
++        let (mut prefill_json, decode_json) =
++            Self::prepare_dp_requests(json_request, prefill.as_ref(), decode.as_ref());
++        // P returns a single complete metadata snapshot, including prompt routes.
++        // D alone owns the client-facing stream.
++        if context.route == "/generate" {
++            prefill_json["stream"] = Value::Bool(false);
++        }
+         let prefill_request = self.build_post_with_headers(
+             &self.client,
+-            prefill.url(),
++            prefill.base_url(),
+             context.route,
+-            &json_request,
++            &prefill_json,
+             headers,
+             false,
+         );
+         let decode_request = self.build_post_with_headers(
+             &self.client,
+-            decode.url(),
++            decode.base_url(),
+             context.route,
+-            &json_request,
++            &decode_json,
+             headers,
+             false,
+         );
+@@ -604,10 +638,45 @@
+         }
+         .emit();
+ 
++        let merge_prefill_meta = context.route == "/generate";
++        let capture_prefill_body = context.return_logprob || merge_prefill_meta;
++        let prefill_future = async {
++            self.process_prefill_response(
++                prefill_request.send().await,
++                prefill.url(),
++                capture_prefill_body,
++                &prefill_json,
++            )
++            .await
++        };
++        // Read/log P's result as soon as it arrives, but settle both requests
++        // before retrying the same rid. Dropping D early can race its asynchronous
++        // disconnect cleanup and make the next attempt a duplicate request.
+         let (prefill_result, decode_result) =
+-            tokio::join!(prefill_request.send(), decode_request.send());
++            tokio::join!(prefill_future, decode_request.send());
+ 
+         events::RequestReceivedEvent {}.emit();
++
++        let prefill_body = match prefill_result {
++            Ok((_, body)) => body,
++            Err(error_response) => {
++                // A D timeout must not hide the original P HTTP/transport error.
++                match &decode_result {
++                    Ok(res) if !res.status().is_success() => error!(
++                        decode_url = %decode.url(),
++                        status = %res.status(),
++                        "Decode also failed after a prefill failure"
++                    ),
++                    Err(e) => error!(
++                        decode_url = %decode.url(),
++                        error = %e,
++                        "Decode request also failed after a prefill failure"
++                    ),
++                    _ => {}
++                }
++                return error_response;
++            }
++        };
+ 
+         // Process decode response
+         match decode_result {
+@@ -628,23 +697,13 @@
+                         .await;
+                 }
+ 
+-                let merge_prefill_meta = context.route == "/generate";
+-                let capture_prefill_body = context.return_logprob || merge_prefill_meta;
+-                let prefill_body = match self
+-                    .process_prefill_response(prefill_result, prefill.url(), capture_prefill_body)
+-                    .await
+-                {
+-                    Ok((_, body)) => body,
+-                    Err(error_response) => return error_response,
+-                };
+-
+                 if context.is_stream {
+                     // Streaming response
+                     let prefill_meta = if capture_prefill_body {
+                         prefill_body
+                             .as_ref()
+                             .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+-                            .and_then(|json| json.get("meta_info").cloned())
++                            .and_then(|json| pd_routing::prefill_metadata(&json))
+                     } else {
+                         None
+                     };
+@@ -657,6 +716,7 @@
+                         prefill_meta,
+                         context.return_logprob,
+                         merge_prefill_meta,
++                        routed_start,
+                         None,
+                         Some(response_headers),
+                         prefill,
+@@ -669,6 +729,7 @@
+                         status,
+                         context.return_logprob,
+                         merge_prefill_meta,
++                        routed_start,
+                         prefill_body,
+                     )
+                     .await
+@@ -830,6 +891,7 @@
+         prefill_meta: Option<Value>,
+         return_logprob: bool,
+         merge_prefill_meta: bool,
++        routed_start: Option<usize>,
+         decode_url: Option<String>,
+         headers: Option<HeaderMap>,
+         prefill: Arc<dyn Worker>,
+@@ -841,39 +903,43 @@
+ 
+         tokio::spawn(async move {
+             futures_util::pin_mut!(stream);
++            let mut buffer = pd_routing::SseBuffer::default();
++            let mut completed = std::collections::HashSet::new();
++            let expected = prefill_meta.as_ref().and_then(Value::as_array).map_or(1, Vec::len);
+             while let Some(chunk_result) = stream.next().await {
+-                match chunk_result {
+-                    Ok(chunk) => {
+-                        let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+-
+-                        let result = if prefill_meta.is_some() {
+-                            Self::merge_streaming_prefill_meta(
+-                                prefill_meta.clone(),
+-                                return_logprob,
+-                                merge_prefill_meta,
+-                                &chunk,
+-                            )
+-                            .unwrap_or(chunk)
+-                        } else {
+-                            chunk
+-                        };
+-
+-                        if tx.send(Ok(result)).is_err() {
+-                            break;
+-                        }
+-
+-                        if is_done {
+-                            break;
+-                        }
+-                    }
++                let chunk = match chunk_result {
++                    Ok(chunk) => chunk,
+                     Err(e) => {
+                         if let Some(ref url) = decode_url {
+                             error!("Stream error from decode server {}: {}", url, e);
+                         }
+                         let _ = tx.send(Err(format!("Stream error: {}", e)));
+-                        break;
++                        return;
++                    }
++                };
++                buffer.push(&chunk);
++                while let Some(event) = buffer.next_event() {
++                    let event = Self::merge_streaming_prefill_meta(
++                        prefill_meta.clone(), return_logprob, merge_prefill_meta, &event,
++                    ).unwrap_or(event);
++                    match pd_routing::merge_routing_event(prefill_meta.as_ref(), event, routed_start) {
++                        Ok((event, index, done)) => {
++                            if let Some(index) = index { completed.insert(index); }
++                            if done && routed_start.is_some() && !completed.contains(&usize::MAX) && completed.len() != expected {
++                                let _ = tx.send(Err("PD routing replay stream ended without complete routes".to_string()));
++                                return;
++                            }
++                            if tx.send(Ok(event)).is_err() || done { return; }
++                        }
++                        Err(error) => { let _ = tx.send(Err(error)); return; }
+                     }
+                 }
++            }
++            let tail = buffer.remaining();
++            if routed_start.is_some() && (!tail.is_empty() || !completed.contains(&usize::MAX) && completed.len() != expected) {
++                let _ = tx.send(Err("Incomplete PD routing replay stream".to_string()));
++            } else if !tail.is_empty() {
++                let _ = tx.send(Ok(tail));
+             }
+         });
+ 
+@@ -914,6 +980,7 @@
+         status: StatusCode,
+         return_logprob: bool,
+         merge_prefill_meta: bool,
++        routed_start: Option<usize>,
+         prefill_body: Option<bytes::Bytes>,
+     ) -> Response {
+         let response_headers = header_utils::preserve_response_headers(res.headers());
+@@ -934,6 +1001,9 @@
+         }
+ 
+         let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) else {
++            if routed_start.is_some() {
++                return error::bad_gateway("invalid_routing_replay", "Invalid decode JSON for PD routing replay");
++            }
+             warn!("Failed to parse decode response for PD meta normalization");
+             let mut response = Response::new(Body::from(decode_body));
+             *response.status_mut() = status;
+@@ -951,14 +1021,18 @@
+                         None
+                     }
+                 });
+-        let prefill_meta = prefill_json.as_ref().and_then(|json| json.get("meta_info"));
+-
+-        let changed = Self::merge_prefill_meta_in_json(
+-            prefill_meta,
++        let prefill_meta = prefill_json.as_ref().and_then(pd_routing::prefill_metadata);
++
++        let mut changed = Self::merge_prefill_meta_in_json(
++            prefill_meta.as_ref(),
+             &mut decode_json,
+             return_logprob,
+             merge_prefill_meta,
+         );
++        match pd_routing::merge_routed_experts(prefill_meta.as_ref(), &mut decode_json, routed_start) {
++            Ok(merged) => changed |= merged,
++            Err(message) => return error::bad_gateway("invalid_routing_replay", message),
++        }
+         if !changed {
+             let mut response = Response::new(Body::from(decode_body));
+             *response.status_mut() = status;
+@@ -991,24 +1065,23 @@
+         prefill_result: Result<reqwest::Response, reqwest::Error>,
+         prefill_url: &str,
+         capture_body: bool,
++        request: &Value,
+     ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
+         // Check prefill result first - it's critical for disaggregated mode
+         let prefill_response = match prefill_result {
+             Ok(response) => response,
+             Err(e) => {
+                 error!(
+-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
+                     prefill_url,
+-                    e
++                    rid = ?request.get("rid"),
++                    bootstrap_room = ?request.get("bootstrap_room"),
++                    error = ?e,
++                    "Prefill HTTP request failed"
+                 );
+ 
+-                // Return error immediately - don't wait for decode to timeout
+                 return Err(error::bad_gateway(
+                     "prefill_server_error",
+-                    format!(
+-                        "Prefill server error: {}. This will cause decode timeout.",
+-                        e
+-                    ),
++                    format!("Prefill server error: {}", e),
+                 ));
+             }
+         };
+@@ -1018,6 +1091,13 @@
+ 
+         // Check if prefill succeeded
+         if !prefill_status.is_success() {
++            error!(
++                prefill_url,
++                rid = ?request.get("rid"),
++                bootstrap_room = ?request.get("bootstrap_room"),
++                status = %prefill_status,
++                "Prefill HTTP error response"
++            );
+             // Get error body from prefill
+             let error_msg = prefill_response
+                 .text()
+@@ -1111,6 +1191,18 @@
+         return_logprob: bool,
+         merge_prefill_meta: bool,
+     ) -> bool {
++        if let Value::Array(items) = decode_json {
++            let mut changed = false;
++            for (index, item) in items.iter_mut().enumerate() {
++                let prefix = match prefill_meta {
++                    Some(Value::Array(prefixes)) => prefixes.get(index),
++                    value => value,
++                };
++                changed |= Self::merge_prefill_meta_in_json(prefix, item, return_logprob, merge_prefill_meta);
++            }
++            return changed;
++        }
++        let prefill_meta = pd_routing::select_prefill(prefill_meta, decode_json);
+         let Some(decode_meta) = decode_json
+             .get_mut("meta_info")
+             .and_then(Value::as_object_mut)
+@@ -1140,27 +1232,6 @@
+             }
+         }
+ 
+-        if let Some(prefill_routed) = prefill_meta.and_then(|meta| meta.get("routed_experts")) {
+-            if let Some(decode_routed) = decode_meta.get_mut("routed_experts") {
+-                if Self::merge_base64_int32_meta_field(
+-                    prefill_routed,
+-                    decode_routed,
+-                    "routed_experts",
+-                ) {
+-                    changed = true;
+-                }
+-            } else if decode_meta
+-                .get("finish_reason")
+-                .is_some_and(|value| !value.is_null())
+-                && prefill_routed
+-                    .as_str()
+-                    .is_some_and(|value| !value.is_empty())
+-            {
+-                decode_meta.insert("routed_experts".to_string(), prefill_routed.clone());
+-                changed = true;
+-            }
+-        }
+-
+         if merge_prefill_meta {
+             if let Some(prefill_meta) = prefill_meta.and_then(Value::as_object) {
+                 for (key, value) in prefill_meta {
+@@ -1175,44 +1246,6 @@
+         changed
+     }
+ 
+-    fn merge_base64_int32_meta_field(
+-        prefill_value: &Value,
+-        decode_value: &mut Value,
+-        field_name: &str,
+-    ) -> bool {
+-        let Some(prefill_str) = prefill_value.as_str() else {
+-            return false;
+-        };
+-        if prefill_str.is_empty() {
+-            return false;
+-        }
+-
+-        let Some(decode_str) = decode_value.as_str() else {
+-            warn!(
+-                "Cannot merge PD {}: decode value is not a base64 string",
+-                field_name
+-            );
+-            return false;
+-        };
+-        if decode_str.is_empty() {
+-            *decode_value = Value::String(prefill_str.to_string());
+-            return true;
+-        }
+-
+-        let Ok(mut prefill_bytes) = BASE64_STANDARD.decode(prefill_str) else {
+-            warn!("Cannot merge PD {}: invalid prefill base64", field_name);
+-            return false;
+-        };
+-        let Ok(decode_bytes) = BASE64_STANDARD.decode(decode_str) else {
+-            warn!("Cannot merge PD {}: invalid decode base64", field_name);
+-            return false;
+-        };
+-
+-        prefill_bytes.extend_from_slice(&decode_bytes);
+-        *decode_value = Value::String(BASE64_STANDARD.encode(prefill_bytes));
+-        true
+-    }
+-
+     fn should_merge_prefill_meta_key(key: &str) -> bool {
+         key.starts_with("pd_prefill_") || key.starts_with("pd_transfer_")
+     }
+@@ -1223,31 +1256,19 @@
+         merge_prefill_meta: bool,
+         decode_chunk: &[u8],
+     ) -> Result<bytes::Bytes, ()> {
+-        // Skip non-data chunks
+         let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
+-        if !chunk_str.starts_with("data: ") || chunk_str.contains("[DONE]") {
++        let data = chunk_str.lines()
++            .filter_map(|line| line.strip_prefix("data:").map(|value| value.strip_prefix(' ').unwrap_or(value)))
++            .collect::<Vec<_>>().join("\n");
++        if data.trim() == "[DONE]" || data.is_empty() { return Err(()); }
++        let mut decode_json: Value = serde_json::from_str(&data).map_err(|_| ())?;
++        if !Self::merge_prefill_meta_in_json(prefill_meta.as_ref(), &mut decode_json, return_logprob, merge_prefill_meta) {
+             return Err(());
+         }
+-
+-        // Parse JSON from chunk
+-        let json_str = chunk_str.trim_start_matches("data: ").trim();
+-        let mut decode_json: Value = serde_json::from_str(json_str).map_err(|_| ())?;
+-
+-        if !Self::merge_prefill_meta_in_json(
+-            prefill_meta.as_ref(),
+-            &mut decode_json,
+-            return_logprob,
+-            merge_prefill_meta,
+-        ) {
+-            return Err(());
+-        }
+-
+-        // Re-serialize
+-        let merged_str = format!(
+-            "data: {}\n\n",
+-            serde_json::to_string(&decode_json).unwrap_or_default()
+-        );
+-        Ok(bytes::Bytes::from(merged_str))
++        let mut merged = chunk_str.lines().filter(|line| !line.starts_with("data:") && !line.is_empty())
++            .map(|line| format!("{line}\n")).collect::<String>();
++        merged.push_str(&format!("data: {}\n\n", serde_json::to_string(&decode_json).map_err(|_| ())?));
++        Ok(bytes::Bytes::from(merged))
+     }
+ }
+ 
+@@ -1271,11 +1292,11 @@
+             }
+         };
+ 
+-        let prefill_url = format!("{}/health_generate", prefill.url());
++        let prefill_url = format!("{}/health_generate", prefill.base_url());
+         let (prefill_result, decode_result) = tokio::join!(
+             self.client.get(&prefill_url).send(),
+             self.client
+-                .get(format!("{}/health_generate", decode.url()))
++                .get(format!("{}/health_generate", decode.base_url()))
+                 .send()
+         );
+ 
+@@ -1523,6 +1544,36 @@
+     use super::*;
+     use crate::core::{BasicWorkerBuilder, WorkerType};
+ 
++    #[test]
++    fn test_pd_dp_requests_select_independent_owners() {
++        let prefill = crate::core::DPAwareWorkerBuilder::new("http://p:8000", 1, 2)
++            .worker_type(WorkerType::Prefill { bootstrap_port: Some(8998) })
++            .build();
++        let decode = crate::core::DPAwareWorkerBuilder::new("http://d:8000", 0, 2)
++            .worker_type(WorkerType::Decode)
++            .build();
++        let request = serde_json::json!({"input_ids": [1, 2], "routed_experts": "raw-r3", "routed_dp_rank": 7});
++        let (p, d) = PDRouter::prepare_dp_requests(request, &prefill, &decode);
++        assert_eq!(p["routed_dp_rank"], 1);
++        assert_eq!(d["routed_dp_rank"], 0);
++        assert_eq!(d["disagg_prefill_dp_rank"], 1);
++        assert!(p.get("disagg_prefill_dp_rank").is_none());
++        assert_eq!(p["routed_experts"], "raw-r3");
++        assert_eq!(d["routed_experts"], "raw-r3");
++        assert_eq!(prefill.base_url(), "http://p:8000");
++        assert_eq!(prefill.bootstrap_host(), "p");
++    }
++
++    #[test]
++    fn test_pd_dp1_requests_preserve_native_fields() {
++        let prefill = BasicWorkerBuilder::new("http://p:8000").build();
++        let decode = BasicWorkerBuilder::new("http://d:8000").build();
++        let request = serde_json::json!({"input_ids": [1], "custom_native_field": {"value": 3}});
++        let (p, d) = PDRouter::prepare_dp_requests(request.clone(), &prefill, &decode);
++        assert_eq!(p, request);
++        assert_eq!(d, request);
++    }
++
+     fn create_test_pd_router() -> PDRouter {
+         let worker_registry = Arc::new(WorkerRegistry::new());
+         let policy_registry =
+@@ -1635,7 +1686,6 @@
+     #[test]
+     fn test_merge_prefill_pd_meta_whitelist_and_logprobs() {
+         let prefill_routed = b64_i32(&[1, 2, 3, 4]);
+-        let decode_routed = b64_i32(&[5, 6, 7, 8]);
+         let prefill_meta = json!({
+             "pd_prefill_bootstrap_queue_duration": 0.011,
+             "pd_prefill_bootstrap_duration": 0.012,
+@@ -1649,6 +1699,8 @@
+             "queue_time": 99.0,
+             "finish_reason": {"type": "length"},
+             "input_token_logprobs": [[-0.3, 10]],
++            "prompt_tokens": 2,
++            "completion_tokens": 1,
+             "routed_experts": prefill_routed,
+         });
+         let mut decode_json = json!({
+@@ -1659,7 +1711,9 @@
+                 "pd_decode_bootstrap_duration": 0.2,
+                 "pd_decode_forward_duration": 0.75,
+                 "input_token_logprobs": [[-0.2, 20]],
+-                "routed_experts": decode_routed,
++                "prompt_tokens": 2,
++                "completion_tokens": 3,
++                "routed_experts": b64_i32(&[99, 99, 99, 99, 5, 6, 7, 8]),
+             }
+         });
+ 
+@@ -1670,6 +1724,7 @@
+             true,
+         ));
+ 
++        pd_routing::merge_routed_experts(Some(&prefill_meta), &mut decode_json, Some(0)).unwrap();
+         let meta = &decode_json["meta_info"];
+         assert_eq!(meta["pd_prefill_bootstrap_queue_duration"], 0.011);
+         assert_eq!(meta["pd_prefill_bootstrap_duration"], 0.012);
+@@ -1708,21 +1763,24 @@
+     fn test_merge_prefill_routed_experts_when_decode_has_no_decode_rows() {
+         let prefill_routed = b64_i32(&[1, 2, 3, 4]);
+         let prefill_meta = json!({
++            "prompt_tokens": 2,
++            "completion_tokens": 1,
+             "routed_experts": prefill_routed,
+         });
+         let mut decode_json = json!({
+             "text": "ok",
+             "meta_info": {
+                 "finish_reason": {"type": "stop"},
++                "prompt_tokens": 2,
++                "completion_tokens": 1,
+             }
+         });
+ 
+-        assert!(PDRouter::merge_prefill_meta_in_json(
++        assert!(pd_routing::merge_routed_experts(
+             Some(&prefill_meta),
+             &mut decode_json,
+-            false,
+-            false,
+-        ));
++            Some(0),
++        ).unwrap());
+ 
+         let meta = &decode_json["meta_info"];
+         assert_eq!(
+@@ -1785,7 +1843,7 @@
+         assert_eq!(meta["queue_time"], 0.1);
+         assert_eq!(
+             decode_b64_i32(meta["routed_experts"].as_str().unwrap()),
+-            vec![11, 12, 21, 22]
++            vec![21, 22]
+         );
+     }
+ 
+@@ -1817,6 +1875,7 @@
+             false,
+             false,
+             None,
++            None,
+             Some(headers),
+             prefill_worker,
+             decode_worker,
+@@ -1870,6 +1929,7 @@
+                 false,
+                 None,
+                 None,
++                None,
+                 prefill_ref.clone(),
+                 decode_ref.clone(),
+             );
+diff --git a/src/routers/http/pd_routing.rs b/src/routers/http/pd_routing.rs
+new file mode 100644
+--- /dev/null
++++ b/src/routers/http/pd_routing.rs
+@@ -0,0 +1,161 @@
++//! Native /generate routing replay: P owns prompt routes, D owns generated routes.
++
++use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
++use bytes::Bytes;
++use serde_json::Value;
++
++pub(super) fn prefill_metadata(response: &Value) -> Option<Value> {
++    match response {
++        Value::Array(items) => Some(Value::Array(
++            items.iter().map(|item| item.get("meta_info").cloned().unwrap_or(Value::Null)).collect(),
++        )),
++        _ => response.get("meta_info").cloned(),
++    }
++}
++
++pub(super) fn select_prefill<'a>(prefill: Option<&'a Value>, decode: &Value) -> Option<&'a Value> {
++    match prefill? {
++        Value::Array(items) => items.get(decode.get("index").and_then(Value::as_u64).unwrap_or(0) as usize),
++        item => Some(item),
++    }
++}
++
++fn count(meta: &Value, key: &str) -> Result<usize, String> {
++    meta.get(key).and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok())
++        .ok_or_else(|| format!("PD routing replay requires a valid {key}"))
++}
++
++fn routes(meta: &Value) -> Result<Vec<u8>, String> {
++    let text = meta.get("routed_experts").and_then(Value::as_str)
++        .ok_or_else(|| "PD routing replay response is missing routed_experts".to_string())?;
++    let bytes = BASE64_STANDARD.decode(text)
++        .map_err(|_| "PD routing replay response has invalid base64".to_string())?;
++    if bytes.len() % 4 != 0 {
++        return Err("PD routing replay response is not aligned to int32".to_string());
++    }
++    Ok(bytes)
++}
++
++pub(super) fn merge_routed_experts(
++    prefill: Option<&Value>,
++    decode: &mut Value,
++    start: Option<usize>,
++) -> Result<bool, String> {
++    let Some(start) = start else { return Ok(false) };
++    if let Value::Array(items) = decode {
++        let prefixes = prefill.and_then(Value::as_array)
++            .ok_or_else(|| "PD routing replay batch is missing prefill metadata".to_string())?;
++        if prefixes.len() != items.len() {
++            return Err("PD routing replay batch sizes differ".to_string());
++        }
++        for (prefix, item) in prefixes.iter().zip(items) {
++            merge_routed_experts(Some(prefix), item, Some(start))?;
++        }
++        return Ok(true);
++    }
++    let prefix = select_prefill(prefill, decode);
++    if decode.get("error").is_some() { return Ok(false); }
++    let Some(meta) = decode.get("meta_info") else {
++        return Err("PD routing replay response is missing meta_info".to_string());
++    };
++    // Preserve native errors and empty aborted attempts for the caller's retry path.
++    if decode.get("error").is_some() || (meta["finish_reason"]["type"] == "abort" && meta.get("routed_experts").is_none()) {
++        return Ok(false);
++    }
++    if meta.get("finish_reason").is_none_or(Value::is_null) {
++        return Ok(false);
++    }
++    let prefix = prefix.ok_or_else(|| "PD routing replay is missing prefill metadata".to_string())?;
++    let prompt = count(meta, "prompt_tokens")?;
++    let completion = count(meta, "completion_tokens")?;
++    if count(prefix, "prompt_tokens")? != prompt || start > prompt {
++        return Err("PD routing replay has inconsistent token counts".to_string());
++    }
++    let prefix_rows = prompt - start;
++    if count(prefix, "completion_tokens")? != 1 || prefix["finish_reason"]["type"] == "abort" {
++        return Err("PD routing replay prefill did not complete its handoff token".to_string());
++    }
++    let total_rows = prefix_rows.checked_add(completion)
++        .ok_or_else(|| "PD routing replay token count overflow".to_string())?.saturating_sub(1);
++    let mut p = routes(prefix)?;
++    let d = match meta.get("routed_experts") {
++        // A first-token EOS/length stop completes before D executes a forward.
++        None | Some(Value::Null) if completion <= 1 => None,
++        _ => Some(routes(meta)?),
++    };
++    if prefix_rows == 0 {
++        if !p.is_empty() { return Err("PD routing replay has unexpected prefill rows".to_string()); }
++        if total_rows == 0 {
++            if d.as_ref().is_some_and(|v| !v.is_empty()) {
++                return Err("PD routing replay has unexpected decode rows".to_string());
++            }
++        } else {
++            let bytes = d.ok_or_else(|| "PD routing replay is missing decode rows".to_string())?;
++            if bytes.is_empty() || bytes.len() % total_rows != 0 || (bytes.len() / total_rows) % 4 != 0 {
++                return Err("PD routing replay has an invalid decode shape".to_string());
++            }
++            p = bytes;
++        }
++    } else {
++        if p.is_empty() || p.len() % prefix_rows != 0 || (p.len() / prefix_rows) % 4 != 0 {
++            return Err("PD routing replay has an invalid prefill shape".to_string());
++        }
++        let width = p.len() / prefix_rows;
++        if let Some(d) = d {
++            let expected = total_rows.checked_mul(width)
++                .ok_or_else(|| "PD routing replay byte count overflow".to_string())?;
++            if d.len() != expected {
++                return Err(format!("PD routing replay decode byte count {} differs from expected {expected}", d.len()));
++            }
++            // D's prompt slots have KV, but were never forwarded on that worker.
++            if completion > 1 { p.extend_from_slice(&d[p.len()..]); }
++        }
++        if completion == 0 {
++            p.truncate(total_rows * width);
++        }
++    }
++    decode["meta_info"]["routed_experts"] = Value::String(BASE64_STANDARD.encode(p));
++    Ok(true)
++}
++
++#[derive(Default)]
++pub(super) struct SseBuffer {
++    bytes: Vec<u8>,
++}
++
++impl SseBuffer {
++    pub fn push(&mut self, chunk: &[u8]) { self.bytes.extend_from_slice(chunk); }
++
++    pub fn next_event(&mut self) -> Option<Bytes> {
++        // Parse bytes, not chunk-local UTF-8: both characters and CRLF can split.
++        let end = self.bytes.windows(2).position(|v| v == b"\n\n").map(|v| v + 2);
++        let crlf = self.bytes.windows(4).position(|v| v == b"\r\n\r\n").map(|v| v + 4);
++        let end = match (end, crlf) {
++            (Some(a), Some(b)) => a.min(b), (Some(a), None) | (None, Some(a)) => a,
++            (None, None) => return None,
++        };
++        Some(Bytes::from(self.bytes.drain(..end).collect::<Vec<_>>()))
++    }
++
++    pub fn remaining(self) -> Bytes { Bytes::from(self.bytes) }
++}
++
++pub(super) fn merge_routing_event(
++    prefill: Option<&Value>, event: Bytes, start: Option<usize>,
++) -> Result<(Bytes, Option<usize>, bool), String> {
++    let text = std::str::from_utf8(&event).map_err(|_| "Invalid UTF-8 in PD SSE event".to_string())?;
++    let data = text.lines().filter_map(|line| line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s)))
++        .collect::<Vec<_>>().join("\n");
++    if data.trim() == "[DONE]" { return Ok((event, None, true)); }
++    if data.is_empty() || start.is_none() { return Ok((event, None, false)); }
++    let mut decoded: Value = serde_json::from_str(&data).map_err(|_| "Invalid JSON in PD routing SSE event".to_string())?;
++    if decoded.get("error").is_some() || (decoded["meta_info"]["finish_reason"]["type"] == "abort" && decoded["meta_info"].get("routed_experts").is_none()) {
++        return Ok((event, Some(usize::MAX), false));
++    }
++    if !merge_routed_experts(prefill, &mut decoded, start)? { return Ok((event, None, false)); }
++    let index = decoded.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
++    let mut output = text.lines().filter(|line| !line.starts_with("data:") && !line.is_empty())
++        .map(|line| format!("{line}\n")).collect::<String>();
++    output.push_str(&format!("data: {}\n\n", serde_json::to_string(&decoded).map_err(|e| e.to_string())?));
++    Ok((Bytes::from(output), Some(index), false))
++}

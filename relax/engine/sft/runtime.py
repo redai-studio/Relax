@@ -64,6 +64,11 @@ def is_sft_mode(args: Namespace) -> bool:
     return getattr(args, "loss_type", None) == "sft"
 
 
+def is_i2i_sft(args: Namespace) -> bool:
+    """Image-edit supervision uses its own data contract within SFT."""
+    return is_sft_mode(args) and getattr(args, "generation_task", None) == "i2i"
+
+
 def is_dpo_mode(args: Namespace) -> bool:
     """Return whether the normalized training objective is DPO."""
     return getattr(args, "loss_type", None) == "dpo"
@@ -162,17 +167,20 @@ def validate_preference_args(args: Namespace) -> None:
             raise ValueError("standard DPO requires --enable-weights-backuper for actor/ref snapshots")
 
 
-def should_skip_mtp_only_weight_management(
+def should_skip_sft_weight_management(
     args: Namespace,
     *,
     with_ref: bool = False,
     with_opd_teacher: bool = False,
 ) -> bool:
-    """Return whether a pure MTP-only SFT actor needs no weight snapshots or
-    rollout sync."""
+    """Skip snapshots and rollout sync when offline SFT has no consumer.
+
+    Checkpoint saves and local loss evaluation read the live model. Generation
+    prediction, reference/teacher forwards, and offload still retain their
+    existing weight-management paths.
+    """
     return bool(
-        getattr(args, "mtp_only_training", False)
-        and is_sft_mode(args)
+        is_sft_mode(args)
         and getattr(args, "sft_predict_interval", None) is None
         and not getattr(args, "offload_train", False)
         and not with_ref
@@ -193,8 +201,18 @@ def should_use_sft_chunked(args: Namespace) -> bool:
     return is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)
 
 
+def sft_partition_prefix(args: Namespace) -> str:
+    """Keep image SFT queue state isolated across Controller attempts."""
+    if is_i2i_sft(args):
+        attempt_id = getattr(args, "_i2i_sft_attempt_id", None)
+        if not attempt_id:
+            raise ValueError("Image SFT queue attempt must be initialized before starting workers")
+        return f"sft_{attempt_id}_"
+    return "sft_" if is_offline_mode(args) else "train_"
+
+
 def sft_partition_id(args: Namespace, step: int) -> str:
-    return f"sft_{step}" if is_offline_mode(args) else f"train_{step}"
+    return f"{sft_partition_prefix(args)}{step}"
 
 
 def sft_tq_num_shards(args: Namespace) -> int:
@@ -274,3 +292,42 @@ def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:
 def evaluation_step_for_rollout(args: Namespace, rollout_id: int) -> int:
     """Map a zero-based training rollout to the evaluation step namespace."""
     return rollout_id + 1 if is_offline_mode(args) else rollout_id
+
+
+def resident_sft_param_overlap_enabled(args: Namespace) -> bool:
+    """Validate the opt-in resident SFT experiment before retaining gathers.
+
+    This first implementation excludes periodic weight readers. Actor-side
+    validation additionally checks there is no rollout manager/model swapping.
+    Explicit save/sleep boundaries still synchronize any pending parameters.
+    """
+    if not Envs.RELAX_SFT_RESIDENT_PARAM_OVERLAP:
+        return False
+    required = ("use_distributed_optimizer", "overlap_grad_reduce", "overlap_param_gather")
+    incompatible = (
+        "fully_async",
+        "hybrid",
+        "use_critic",
+        "keep_old_actor",
+        "enable_mtp_training",
+        "mtp_only_training",
+        "eval_prompt_data",
+        "eval_size",
+        "sft_predict_interval",
+        "save",
+        "save_hf",
+        "rotate_ckpt",
+        "debug_train_only",
+        "debug_rollout_only",
+        "custom_megatron_before_train_step_hook_path",
+    )
+    if not is_sft_mode(args) or any(not getattr(args, name, False) for name in required):
+        raise ValueError("Resident parameter overlap requires SFT and distributed optimizer with both overlap flags")
+    conflicts = [name for name in incompatible if getattr(args, name, None)]
+    if conflicts:
+        raise ValueError(f"Resident SFT parameter overlap does not support: {', '.join(conflicts)}")
+    if getattr(args, "moe_shared_expert_overlap", False) and not getattr(
+        args, "_relax_shared_expert_gate_ready_verified", False
+    ):
+        raise ValueError("Shared resident overlap requires verified gate parameter readiness")
+    return True

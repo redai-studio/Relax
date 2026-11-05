@@ -95,14 +95,23 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     custom_convert_path = getattr(args, "custom_convert_samples_to_train_data_path", None)
     if custom_convert_path is not None:
         custom_convert_func = load_function(custom_convert_path)
-        return custom_convert_func(args, samples)
+        train_data = custom_convert_func(args, samples)
+        if getattr(args, "advantage_estimator", None) == "score_centering":
+            from relax.utils.score_centering import SCORE_CENTERING_FIELDS
+
+            missing = [field for field in (*SCORE_CENTERING_FIELDS, "rollout_log_probs") if field not in train_data]
+            if missing:
+                raise ValueError(
+                    f"Score Centering custom converter omitted required behavior probability fields: {missing}"
+                )
+        return train_data
 
     rewards = post_process_rewards(args, samples)
 
     assert len(rewards) == len(samples)
 
     if any(isinstance(reward, list) for reward in rewards):
-        if args.advantage_estimator not in ("grpo", "gspo", "sapo", "cispo", "m2po", "rloo"):
+        if args.advantage_estimator not in ("grpo", "gspo", "sapo", "cispo", "m2po", "rloo", "score_centering"):
             raise ValueError(f"dense rewards are not supported for {args.advantage_estimator!r}")
         rewards = [
             reward if isinstance(reward, list) else [reward] * sample.response_length
@@ -151,6 +160,21 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     # Add rollout log probabilities for off-policy correction
     if samples[0].rollout_log_probs is not None:
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
+
+    if getattr(args, "advantage_estimator", None) == "score_centering":
+        from relax.utils.score_centering import (
+            SCORE_CENTERING_FIELDS,
+            resolve_score_centering_vocab_size,
+            validate_score_centering_sample,
+        )
+
+        sc_vocab_size = resolve_score_centering_vocab_size(args)
+        for sample in samples:
+            validate_score_centering_sample(sample, args.rollout_top_logprobs_num, vocab_size=sc_vocab_size)
+        for field in SCORE_CENTERING_FIELDS:
+            # TQ's numeric nested-list path expects one flat variable-length row
+            # per sample. Restore [R, K] at the training ingestion boundary.
+            train_data[field] = [getattr(sample, field).reshape(-1).tolist() for sample in samples]
 
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
@@ -435,6 +459,9 @@ def post_process_env(args, env):
     if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
         env["env_vars"]["RELAX_SFT_TQ_SHARDS"] = str(Envs.RELAX_SFT_TQ_SHARDS)
 
+    # Use the same file-scanning concurrency in the driver and SFT replicas.
+    env["env_vars"].setdefault("RELAX_JSONL_INDEX_WORKERS", str(Envs.RELAX_JSONL_INDEX_WORKERS))
+
     # ray-job.sh prepares the node-local cache before launching the inner Ray
     # job. Carry its resolved session into the runtime env that Controller
     # explicitly forwards through detached Serve deployments to TrainGroup.
@@ -449,6 +476,10 @@ def post_process_env(args, env):
     # name is copied from the driver's os.environ; missing names are
     # silently skipped.
     propagate_list = Envs.RELAX_PROPAGATE_ENV_VARS
+    # Training scripts may replace the generic passthrough list. Preserve the
+    # explicitly selected numerical-failure policy across detached Ray actors.
+    if (value := os.environ.get("RELAX_SKIP_NONFINITE_GRAD")) is not None:
+        env["env_vars"].setdefault("RELAX_SKIP_NONFINITE_GRAD", value)
     for var in propagate_list.split(","):
         var = var.strip()
         if not var or var in env["env_vars"]:
@@ -456,6 +487,10 @@ def post_process_env(args, env):
         val = os.environ.get(var)
         if val is not None:
             env["env_vars"][var] = val
+
+    # Apply the default after passthrough so preprocessing pools can disable
+    # tokenizer threads without overriding an explicit runtime configuration.
+    env["env_vars"].setdefault("TOKENIZERS_PARALLELISM", "true")
 
     logger.info(f"Ray runtime env: {env['env_vars']}")
 

@@ -4,6 +4,7 @@ from argparse import Namespace
 
 from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils.data.image_refs import sft_multimodal_data_fields
+from relax.utils.env import Envs
 
 
 PREFERENCE_DATA_FIELDS = (
@@ -46,6 +47,8 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return list(PREFERENCE_DATA_FIELDS)
     if is_sft_mode(args):
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
+        if Envs.RELAX_SFT_PRE_SHIFTED_LABELS:
+            fields.append("pre_shifted_labels")
         if getattr(args, "task_type", "causal_lm") == "seq_cls":
             fields.append("classification_labels")
         fields.extend(sft_multimodal_data_fields(args))
@@ -74,6 +77,8 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return fields
 
     fields = _base_rollout_fields(args)
+    if getattr(args, "advantage_estimator", None) == "score_centering":
+        fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
     if getattr(args, "use_rollout_indexer_replay", False):
         fields.append("rollout_indexer_topk")
     if has_critic:

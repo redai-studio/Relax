@@ -90,6 +90,21 @@ class Base:
         self._logger_instance = None
         self._lock = threading.Lock()
 
+    def __del__(self) -> None:
+        # Ray Serve calls the destructor on replica shutdown (normal stop,
+        # global restart, in-place restart). Components that attached a
+        # TransferQueue client must detach so a MooncakeStore segment
+        # deregisters before client_ttl instead of leaving a stale endpoint.
+        if getattr(self, "data_system_client", None) is None:
+            return
+        try:
+            from relax.utils.tq.lifecycle import detach_tq_client
+
+            detach_tq_client()
+            self.data_system_client = None
+        except Exception:  # destructor must never raise (interpreter shutdown)
+            return
+
     @property
     def _logger(self):
         """Lazily create and cache a logger for this instance.

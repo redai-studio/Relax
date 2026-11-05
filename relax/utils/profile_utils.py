@@ -1,20 +1,41 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import gzip
 import os
+import shutil
+import tempfile
 import time
 import traceback
 from pathlib import Path
+from typing import Callable
 
 import torch
 
 from relax.utils import device as device_utils
+from relax.utils.env import Envs
 from relax.utils.http_utils import router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import print_memory
 
 
 logger = get_logger(__name__)
+
+
+def _profile_this_rank() -> bool:
+    """Limit optional profiler capture to the requested global ranks."""
+    selected = Envs.RELAX_PROFILE_RANKS
+    if not selected:
+        return True
+    try:
+        ranks = {int(value.strip()) for value in selected.split(",") if value.strip()}
+    except ValueError as exc:
+        raise ValueError("RELAX_PROFILE_RANKS must be a comma-separated list of global ranks") from exc
+    if not ranks or any(rank < 0 for rank in ranks):
+        raise ValueError("RELAX_PROFILE_RANKS must contain non-negative global ranks")
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("RELAX_PROFILE_RANKS requires an initialized distributed process group")
+    return torch.distributed.get_rank(group=torch.distributed.group.WORLD) in ranks
 
 
 def _get_rank_tag() -> str:
@@ -29,17 +50,28 @@ def _get_rank_tag() -> str:
     return f"rank{global_rank}_dp{dp}_tp{tp}_pp{pp}"
 
 
+def _should_profile_train_rank(args) -> bool:
+    ranks = getattr(args, "profile_ranks", None)
+    return _profile_this_rank() and (
+        ranks is None or torch.distributed.get_rank(group=torch.distributed.group.WORLD) in ranks
+    )
+
+
 class TrainProfiler:
     def __init__(self, args):
         self.args = args
         self._torch_profiler_overall = None
         self._memory_profiler_overall = None
 
-        if args.use_pytorch_profiler and ("train_overall" in args.profile_target):
+        if args.use_pytorch_profiler and ("train_overall" in args.profile_target) and _should_profile_train_rank(args):
             self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
             logger.info(f"PyTorch profiler for overall training is enabled, dump dir: {_get_train_trace_dir(args)}")
 
-        if args.record_memory_history and ("train_overall" in args.profile_target):
+        if (
+            args.record_memory_history
+            and ("train_overall" in args.profile_target)
+            and _should_profile_train_rank(args)
+        ):
             self._memory_profiler_overall = _BaseMemoryProfiler.create(args)
             self._memory_profiler_overall.start()
             logger.info(f"Memory profiler for overall training is enabled, dump dir: {args.memory_snapshot_dir}")
@@ -67,7 +99,7 @@ class TrainProfiler:
 
 
 def _profile_simple_loop(iterator, args, name):
-    if not (args.use_pytorch_profiler and (name in args.profile_target)):
+    if not (args.use_pytorch_profiler and (name in args.profile_target) and _should_profile_train_rank(args)):
         yield from iterator
         return
 
@@ -89,7 +121,7 @@ def _get_trace_base_dir(args):
         from datetime import datetime
 
         task_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join("traces", task_name)
+    return os.path.join(getattr(args, "profile_output_dir", None) or "traces", task_name)
 
 
 def _get_train_trace_dir(args):
@@ -98,6 +130,36 @@ def _get_train_trace_dir(args):
     Uses ``./traces/<tb_experiment_name>/train_trace`` as the default location.
     """
     return os.path.join(_get_trace_base_dir(args), "train_trace")
+
+
+def _create_train_trace_handler(trace_dir: str, worker_name: str) -> Callable[[torch.profiler.profile], None]:
+    compression = Envs.RELAX_PROFILE_GZIP_LEVEL
+    if compression is None:
+        return torch.profiler.tensorboard_trace_handler(trace_dir, worker_name=worker_name, use_gzip=True)
+    level = int(compression)
+    if not 0 <= level <= 9:
+        raise ValueError("RELAX_PROFILE_GZIP_LEVEL must be an integer from 0 through 9")
+
+    def export_trace(profiler: torch.profiler.profile) -> None:
+        directory = Path(trace_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        output = directory / f"{worker_name}.{time.time_ns()}.pt.trace.json.gz"
+        partial = output.with_suffix(output.suffix + ".partial")
+        descriptor, local_name = tempfile.mkstemp(prefix=f"relax-{worker_name}-", suffix=".json")
+        os.close(descriptor)
+        local = Path(local_name)
+        # Long Python stacks can produce tens of GB of JSON. Keep serialization
+        # on local disk and allow fast compression without dropping stack data.
+        # Retain incomplete files on errors for diagnosis; publish only on success.
+        logger.info("Exporting training trace to %s, then %s (gzip level %s)", local, output, level)
+        profiler.export_chrome_trace(str(local))
+        with local.open("rb") as source, gzip.open(partial, "wb", compresslevel=level) as destination:
+            shutil.copyfileobj(source, destination, length=2 * 1024 * 1024)
+        partial.replace(output)
+        local.unlink()
+        logger.info("Training trace export completed: %s", output)
+
+    return export_trace
 
 
 def _create_torch_profiler(args, name):
@@ -111,13 +173,11 @@ def _create_torch_profiler(args, name):
             active=args.profile_step_end - args.profile_step_start + 1,  # end is inclusive
             repeat=1,
         ),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            trace_dir,
-            worker_name=worker_name,
-            use_gzip=True,
-        ),
+        on_trace_ready=_create_train_trace_handler(trace_dir, worker_name),
         record_shapes=True,
         with_stack=args.profile_with_stack,
+        # Kineto exports operator Call stack fields only in verbose mode.
+        experimental_config=torch._C._profiler._ExperimentalConfig(verbose=args.profile_with_stack),
         profile_memory=args.profile_with_memory,
         with_flops=args.profile_with_flops,
     )

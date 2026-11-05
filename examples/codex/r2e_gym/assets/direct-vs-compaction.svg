@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" role="img" aria-labelledby="codex-paths-title codex-paths-desc" id="codex-direct-vs-compaction-root">
+  <title id="codex-paths-title">Direct and Compaction data paths</title>
+  <desc id="codex-paths-desc">Comparison of Codex connecting directly to Relax and connecting through a host-side recording proxy that records multiple append-only contexts while Codex performs compaction.</desc>
+  <defs>
+      <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
+      #codex-direct-vs-compaction-root { --paper: #ffffff;
+      --ink: #111827;
+      --text: #374151;
+      --muted: #6b7280;
+      --soft: #9ca3af;
+      --rule: #cbd2dc;
+      --panel: #f8fafc;
+      --blue: #2f6fe4;
+      --blue-tint: #eef4ff;
+      --coral: #ed7956;
+      --coral-tint: #fff4ef; }
+      #codex-direct-vs-compaction-root { font-family: "DejaVu Sans", Arial, sans-serif; }
+      #codex-direct-vs-compaction-root .title { font-size: 28px; font-weight: 700; fill: var(--ink); }
+      #codex-direct-vs-compaction-root .subtitle { font-size: 14px; fill: var(--muted); }
+      #codex-direct-vs-compaction-root .panel { fill: var(--panel); stroke: var(--rule); stroke-width: 1; }
+      #codex-direct-vs-compaction-root .panel-title { font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+      #codex-direct-vs-compaction-root .boundary { fill: var(--paper); stroke: var(--rule); stroke-width: 1; stroke-dasharray: 5 4; }
+      #codex-direct-vs-compaction-root .relax-boundary { fill: var(--paper); stroke: var(--rule); stroke-width: 1; }
+      #codex-direct-vs-compaction-root .boundary-label { font: 600 9px "DejaVu Sans Mono", monospace; letter-spacing: .10em; fill: var(--muted); }
+      #codex-direct-vs-compaction-root .node { fill: var(--paper); stroke: #9ca3af; stroke-width: 1.2; }
+      #codex-direct-vs-compaction-root .node-blue { fill: var(--blue-tint); stroke: var(--blue); stroke-width: 1.4; }
+      #codex-direct-vs-compaction-root .node-coral { fill: var(--coral-tint); stroke: var(--coral); stroke-width: 1.4; }
+      #codex-direct-vs-compaction-root .node-name { font-size: 15px; font-weight: 700; fill: var(--ink); text-anchor: middle; }
+      #codex-direct-vs-compaction-root .node-sub { font: 11px "DejaVu Sans Mono", monospace; fill: var(--muted); text-anchor: middle; }
+      #codex-direct-vs-compaction-root .tag { fill: none; stroke: var(--rule); stroke-width: .8; }
+      #codex-direct-vs-compaction-root .tag-text { font: 600 8px "DejaVu Sans Mono", monospace; fill: var(--muted); text-anchor: middle; letter-spacing: .08em; }
+      #codex-direct-vs-compaction-root .flow { fill: none; stroke: var(--blue); stroke-width: 1.8; }
+      #codex-direct-vs-compaction-root .record { fill: none; stroke: var(--coral); stroke-width: 1.8; }
+      #codex-direct-vs-compaction-root .arrow-label { font: 9px "DejaVu Sans Mono", monospace; fill: var(--muted); text-anchor: middle; letter-spacing: .05em; }
+      #codex-direct-vs-compaction-root .arrow-label-coral { font: 9px "DejaVu Sans Mono", monospace; fill: var(--coral); text-anchor: middle; letter-spacing: .05em; }
+      #codex-direct-vs-compaction-root .label-mask { fill: var(--panel); }
+      #codex-direct-vs-compaction-root .label-mask-white { fill: var(--paper); }
+      #codex-direct-vs-compaction-root .context-title { font-size: 12px; font-weight: 700; fill: var(--ink); text-anchor: middle; }
+      #codex-direct-vs-compaction-root .context-sub { font: 9px "DejaVu Sans Mono", monospace; fill: var(--muted); text-anchor: middle; }
+      #codex-direct-vs-compaction-root .message-chip { fill: var(--paper); stroke: var(--rule); stroke-width: .8; }
+      #codex-direct-vs-compaction-root .message-text { font: 8px "DejaVu Sans Mono", monospace; fill: var(--text); text-anchor: middle; }
+      #codex-direct-vs-compaction-root .shared-note { font: 9px "DejaVu Sans Mono", monospace; fill: var(--coral); text-anchor: middle; }</style>
+    <marker id="codex-direct-vs-compaction-arrow-blue" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#2f6fe4"/>
+    </marker>
+    <marker id="codex-direct-vs-compaction-arrow-blue-start" markerWidth="8" markerHeight="6" refX="1" refY="3" orient="auto">
+      <polygon points="8 0, 0 3, 8 6" fill="#2f6fe4"/>
+    </marker>
+    <marker id="codex-direct-vs-compaction-arrow-coral" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#ed7956"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="720" fill="#ffffff"/>
+  <text class="title" x="48" y="48">Direct and Compaction data paths</text>
+  <text class="subtitle" x="48" y="76">Codex performs compaction; the host-side proxy forwards traffic and records context boundaries.</text>
+
+  <rect class="panel" x="48" y="104" width="1184" height="228" rx="8"/>
+  <text class="panel-title" x="72" y="136" fill="#2f6fe4">DIRECT</text>
+
+  <rect class="boundary" x="72" y="164" width="232" height="112" rx="8"/>
+  <text class="boundary-label" x="88" y="181">APPTAINER</text>
+  <rect class="node-blue" x="96" y="192" width="184" height="64" rx="6"/>
+  <rect class="tag" x="108" y="201" width="44" height="14" rx="2"/>
+  <text class="tag-text" x="130" y="211">AGENT</text>
+  <text class="node-name" x="188" y="228">Codex</text>
+  <text class="node-sub" x="188" y="245">growing full history</text>
+
+  <rect class="relax-boundary" x="680" y="148" width="536" height="144" rx="8"/>
+  <text class="boundary-label" x="696" y="167">RELAX</text>
+  <rect class="node" x="712" y="192" width="184" height="64" rx="6"/>
+  <rect class="tag" x="724" y="201" width="34" height="14" rx="2"/>
+  <text class="tag-text" x="741" y="211">API</text>
+  <text class="node-name" x="804" y="228">Agentic API</text>
+  <text class="node-sub" x="804" y="245">/v1/responses</text>
+
+  <rect class="node" x="936" y="176" width="248" height="96" rx="6"/>
+  <text class="context-title" x="1060" y="198">ONE APPEND-ONLY CONTEXT</text>
+  <text class="context-sub" x="1060" y="213">training export</text>
+  <rect class="message-chip" x="956" y="228" width="44" height="22" rx="4"/>
+  <text class="message-text" x="978" y="242">user</text>
+  <text class="message-text" x="1008" y="242">→</text>
+  <rect class="message-chip" x="1018" y="228" width="58" height="22" rx="4"/>
+  <text class="message-text" x="1047" y="242">assistant</text>
+  <text class="message-text" x="1084" y="242">→</text>
+  <rect class="message-chip" x="1094" y="228" width="34" height="22" rx="4"/>
+  <text class="message-text" x="1111" y="242">tool</text>
+  <text class="message-text" x="1136" y="242">→</text>
+  <rect class="message-chip" x="1146" y="228" width="22" height="22" rx="4"/>
+  <text class="message-text" x="1157" y="242">…</text>
+
+  <path class="flow" d="M280 224 H712" marker-start="url(#codex-direct-vs-compaction-arrow-blue-start)" marker-end="url(#codex-direct-vs-compaction-arrow-blue)"/>
+  <rect class="label-mask" x="423" y="190" width="146" height="16" rx="2"/>
+  <text class="arrow-label" x="496" y="201">RESPONSES API</text>
+  <path class="flow" d="M896 224 H936" marker-end="url(#codex-direct-vs-compaction-arrow-blue)"/>
+
+  <rect class="panel" x="48" y="360" width="1184" height="312" rx="8"/>
+  <text class="panel-title" x="72" y="392" fill="#ed7956">COMPACTION</text>
+
+  <rect class="boundary" x="72" y="452" width="232" height="112" rx="8"/>
+  <text class="boundary-label" x="88" y="469">APPTAINER</text>
+  <rect class="node-blue" x="96" y="480" width="184" height="64" rx="6"/>
+  <rect class="tag" x="108" y="489" width="44" height="14" rx="2"/>
+  <text class="tag-text" x="130" y="499">AGENT</text>
+  <text class="node-name" x="188" y="516">Codex</text>
+  <text class="node-sub" x="188" y="533">performs auto-compaction</text>
+
+  <rect class="node-coral" x="376" y="480" width="224" height="72" rx="6"/>
+  <rect class="tag" x="388" y="489" width="48" height="14" rx="2"/>
+  <text class="tag-text" x="412" y="499">PROXY</text>
+  <text class="node-name" x="488" y="520">Recording Proxy</text>
+  <text class="node-sub" x="488" y="537">worker loopback · random port</text>
+
+  <rect class="relax-boundary" x="680" y="420" width="536" height="220" rx="8"/>
+  <text class="boundary-label" x="696" y="439">RELAX</text>
+  <rect class="node" x="712" y="480" width="184" height="64" rx="6"/>
+  <rect class="tag" x="724" y="489" width="34" height="14" rx="2"/>
+  <text class="tag-text" x="741" y="499">API</text>
+  <text class="node-name" x="804" y="516">Agentic API</text>
+  <text class="node-sub" x="804" y="533">/v1/responses</text>
+
+  <rect class="node" x="936" y="428" width="248" height="176" rx="6"/>
+  <text class="context-title" x="1060" y="450">MULTIPLE APPEND-ONLY CONTEXTS</text>
+  <text class="context-sub" x="1060" y="465">training exports</text>
+  <rect class="message-chip" x="960" y="478" width="200" height="20" rx="4"/>
+  <text class="message-text" x="1060" y="491">initial task context</text>
+  <rect class="message-chip" x="960" y="502" width="200" height="20" rx="4"/>
+  <text class="message-text" x="1060" y="515">summary-generation context 1</text>
+  <rect class="message-chip" x="960" y="526" width="200" height="20" rx="4"/>
+  <text class="message-text" x="1060" y="539">resumed task context 1</text>
+  <rect class="message-chip" x="960" y="550" width="200" height="20" rx="4"/>
+  <text class="message-text" x="1060" y="563">summary-generation context 2</text>
+  <rect class="message-chip" x="960" y="574" width="200" height="20" rx="4"/>
+  <text class="message-text" x="1060" y="587">resumed task context 2</text>
+  <text class="shared-note" x="1060" y="624">shared Session reward / advantage</text>
+
+  <path class="flow" d="M280 516 H376" marker-start="url(#codex-direct-vs-compaction-arrow-blue-start)" marker-end="url(#codex-direct-vs-compaction-arrow-blue)"/>
+  <rect class="label-mask" x="293" y="482" width="70" height="16" rx="2"/>
+  <text class="arrow-label" x="328" y="493">RESPONSES</text>
+  <path class="flow" d="M600 516 H712" marker-start="url(#codex-direct-vs-compaction-arrow-blue-start)" marker-end="url(#codex-direct-vs-compaction-arrow-blue)"/>
+  <rect class="label-mask" x="621" y="482" width="70" height="16" rx="2"/>
+  <text class="arrow-label" x="656" y="493">FORWARDS</text>
+  <path class="record" d="M488 552 V624 H960 V604" marker-end="url(#codex-direct-vs-compaction-arrow-coral)"/>
+  <rect class="label-mask-white" x="700" y="614" width="128" height="16" rx="2"/>
+  <text class="arrow-label-coral" x="764" y="625">RECORDS MESSAGES</text>
+
+</svg>

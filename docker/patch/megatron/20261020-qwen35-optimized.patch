@@ -1,0 +1,850 @@
+diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
+--- a/megatron/core/transformer/multi_token_prediction.py
++++ b/megatron/core/transformer/multi_token_prediction.py
+@@ -1702,24 +1702,7 @@
+         MTPLossAutoScaler.main_loss_backward_scale = scale
+ 
+ 
+-def process_mtp_loss(
+-    hidden_states: Tensor,
+-    labels: Optional[Tensor],
+-    loss_mask: Optional[Tensor],
+-    output_layer: Callable,
+-    output_weight: Optional[Tensor],
+-    runtime_gather_output: Optional[bool],
+-    is_training: bool,
+-    compute_language_model_loss: Callable,
+-    config: TransformerConfig,
+-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+-    packed_seq_params: Optional[PackedSeqParams] = None,
+-    scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
+-    input_ids: Optional[Tensor] = None,
+-    sequence_roll_context: Optional[MTPSequenceRollContext] = None,
+-    mtp_input_mask: Optional[Tensor] = None,
+-) -> Tensor:
++def process_mtp_loss(hidden_states: Tensor, labels: Optional[Tensor], loss_mask: Optional[Tensor], output_layer: Callable, output_weight: Optional[Tensor], runtime_gather_output: Optional[bool], is_training: bool, compute_language_model_loss: Callable, config: TransformerConfig, cp_group: Optional[torch.distributed.ProcessGroup]=None, tp_group: Optional[torch.distributed.ProcessGroup]=None, packed_seq_params: Optional[PackedSeqParams]=None, scale_logits_fn: Optional[Callable[[Tensor], Tensor]]=None, input_ids: Optional[Tensor]=None, sequence_roll_context: Optional[MTPSequenceRollContext]=None, mtp_input_mask: Optional[Tensor]=None) -> Tensor:
+     """Process Multi-Token Prediction (MTP) loss computation.
+ 
+     This is a standalone function that handles MTP loss computation. It's used on the
+@@ -1750,138 +1733,66 @@
+     Returns:
+         Tensor: Updated hidden states after MTP loss processing (first chunk only).
+     """
++    if getattr(config, '_relax_qwen35_optimized', False):
++        from relax.backends.megatron.megatron_patch.qwen3_5.mtp_loss import selected_mtp_head as _relax_selected_mtp_head
+     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
+     hidden_states = hidden_states_list[0]
+-
+-    # When labels are not provided (e.g. RL training), derive them from input_ids by
+-    # rolling left so that label[i] = input_id[i + 1], matching the SFT label format.
+     derived_labels_from_input_ids = labels is None
+     if derived_labels_from_input_ids:
+         if input_ids is None:
+             return hidden_states
+         if loss_mask is None:
+             loss_mask = torch.ones_like(input_ids)
+-        labels, loss_mask = roll_tensor(
+-            [input_ids, loss_mask],
+-            shifts=-1,
+-            dims=-1,
+-            cp_group=cp_group,
+-            packed_seq_params=packed_seq_params,
+-            roll_context=sequence_roll_context,
+-            sequence_fields=["input_ids", "loss_mask"],
+-            roll_depth=0,
+-        )
++        labels, loss_mask = roll_tensor([input_ids, loss_mask], shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params, roll_context=sequence_roll_context, sequence_fields=['input_ids', 'loss_mask'], roll_depth=0)
+     elif loss_mask is None:
+         loss_mask = torch.ones_like(labels)
+-
+     assert labels is not None
+     assert loss_mask is not None
+-
+-    if getattr(config, "mtp_detach_lm_head", True):
++    if getattr(config, 'mtp_detach_lm_head', True):
+         if output_weight is not None:
+             output_weight = output_weight.detach()
+         else:
+             output_weight = output_layer.weight.detach()
+-
+     mtp_labels = labels
+-
+-    # Store the original number of tokens before rolling for proper normalization
+-    # when calculate_per_token_loss is enabled. This ensures MTP gradients are
+-    # correctly scaled relative to the main loss gradients in finalize_model_grads.
+     original_num_tokens = loss_mask.sum() if config.calculate_per_token_loss else None
+-
+-    fuse_linear_cross_entropy = (
+-        config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
+-    )
++    fuse_linear_cross_entropy = config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == 'linear'
+     cumulative_mtp_input_mask = None
+     if mtp_input_mask is not None and (mtp_input_mask.dtype != torch.bool or mtp_input_mask.shape != loss_mask.shape):
+-        raise ValueError("MTP input mask must be boolean and match the CP-local loss mask")
++        raise ValueError('MTP input mask must be boolean and match the CP-local loss mask')
+     for mtp_layer_number in range(config.mtp_num_layers):
+-        mtp_labels, loss_mask = roll_tensor(
+-            [mtp_labels, loss_mask],
+-            shifts=-1,
+-            dims=-1,
+-            cp_group=cp_group,
+-            packed_seq_params=packed_seq_params,
+-            roll_context=sequence_roll_context,
+-            sequence_fields=[
+-                "input_ids" if derived_labels_from_input_ids else "labels",
+-                "loss_mask",
+-            ],
+-            roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
+-        )
++        mtp_labels, loss_mask = roll_tensor([mtp_labels, loss_mask], shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params, roll_context=sequence_roll_context, sequence_fields=['input_ids' if derived_labels_from_input_ids else 'labels', 'loss_mask'], roll_depth=mtp_layer_number + int(derived_labels_from_input_ids))
+         layer_loss_mask = loss_mask
+         if mtp_input_mask is not None:
+-            [mtp_input_mask] = roll_tensor(
+-                [mtp_input_mask], cp_group=cp_group, packed_seq_params=packed_seq_params,
+-                fill_values=[False], roll_context=sequence_roll_context,
+-                sequence_fields=["mtp_input_mask"], roll_depth=mtp_layer_number,
+-            )
+-            cumulative_mtp_input_mask = (mtp_input_mask if cumulative_mtp_input_mask is None
+-                                         else cumulative_mtp_input_mask & mtp_input_mask)
++            [mtp_input_mask] = roll_tensor([mtp_input_mask], cp_group=cp_group, packed_seq_params=packed_seq_params, fill_values=[False], roll_context=sequence_roll_context, sequence_fields=['mtp_input_mask'], roll_depth=mtp_layer_number)
++            cumulative_mtp_input_mask = mtp_input_mask if cumulative_mtp_input_mask is None else cumulative_mtp_input_mask & mtp_input_mask
+             layer_loss_mask = loss_mask * cumulative_mtp_input_mask
+         num_tokens = layer_loss_mask.sum()
+         if fuse_linear_cross_entropy:
+-            mtp_loss = output_layer(
+-                hidden_states_list[mtp_layer_number + 1],
+-                weight=output_weight,
+-                runtime_gather_output=runtime_gather_output,
+-                output_cross_entropy_loss=True,
+-                labels=mtp_labels,
+-            )
+-            # Fused linear cross entropy does not materialize logits, so MTP
+-            # acceptance counts cannot be computed for this layer.
++            mtp_loss = _relax_selected_mtp_head(output_layer, layer_loss_mask, hidden_states_list[mtp_layer_number + 1], weight=output_weight, runtime_gather_output=runtime_gather_output, output_cross_entropy_loss=True, labels=mtp_labels) if getattr(config, '_relax_qwen35_optimized', False) else output_layer(hidden_states_list[mtp_layer_number + 1], weight=output_weight, runtime_gather_output=runtime_gather_output, output_cross_entropy_loss=True, labels=mtp_labels)
+             mtp_logits = None
+         else:
+-            mtp_logits, _ = output_layer(
+-                hidden_states_list[mtp_layer_number + 1],
+-                weight=output_weight,
+-                runtime_gather_output=runtime_gather_output,
+-            )
++            mtp_logits, _ = output_layer(hidden_states_list[mtp_layer_number + 1], weight=output_weight, runtime_gather_output=runtime_gather_output)
+             if scale_logits_fn is not None:
+                 mtp_logits = scale_logits_fn(mtp_logits)
+             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+         mtp_loss = layer_loss_mask * mtp_loss
+         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+-
+         if is_training:
+             correct = None
+             total = None
+             if mtp_logits is not None and MTPLossLoggingHelper.should_collect_acceptance():
+-                correct, total = _compute_mtp_acceptance_counts(
+-                    mtp_logits, mtp_labels, layer_loss_mask, output_layer, runtime_gather_output, tp_group
+-                )
+-
+-            MTPLossLoggingHelper.save_loss_to_tracker(
+-                mtp_loss_scale * torch.sum(mtp_loss),
+-                num_tokens,
+-                mtp_layer_number,
+-                config.mtp_num_layers,
+-                correct=correct,
+-                total=total,
+-                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+-                calculate_per_token_loss=config.calculate_per_token_loss,
+-            )
++                correct, total = _compute_mtp_acceptance_counts(mtp_logits, mtp_labels, layer_loss_mask, output_layer, runtime_gather_output, tp_group)
++            MTPLossLoggingHelper.save_loss_to_tracker(mtp_loss_scale * torch.sum(mtp_loss), num_tokens, mtp_layer_number, config.mtp_num_layers, correct=correct, total=total, avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True), calculate_per_token_loss=config.calculate_per_token_loss)
+         if config.calculate_per_token_loss:
+-            # When calculate_per_token_loss is enabled, finalize_model_grads will
+-            # divide all gradients by total_num_tokens (from main loss).
+-            # However, MTP has fewer valid tokens due to rolling. To ensure correct
+-            # per-token gradient weighting, we normalize by the rolled token count
+-            # and re-scale by the original token count.
+-            # Avoid division by zero
+             assert original_num_tokens is not None
+             num_tokens_safe = torch.clamp(num_tokens, min=1)
+-            mtp_loss_normalized = (
+-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+-            )
++            mtp_loss_normalized = mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
+         else:
+             safe_num_tokens = num_tokens.clamp(min=1)
+-            hidden_states = MTPLossAutoScaler.apply(
+-                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+-            )
+-
++            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens)
+     return hidden_states
++
+ 
+ 
+ class MultiTokenPredictionLayer(MegatronModule):
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -2032,6 +2032,11 @@
+             return False, None, None
+ 
+         grad_norm = self.get_grad_norm()
++        _relax_threshold_norm = grad_norm
++        if getattr(self, "_relax_qwen35_optimized", False):
++            from relax.backends.megatron.megatron_patch.qwen3_5.grad_norm import finite_norm
++
++            _relax_threshold_norm = finite_norm(grad_norm)
+         should_skip_update = False
+ 
+         should_clip = any(
+@@ -2092,7 +2097,7 @@
+             if (
+                 main_params
+                 and math.isfinite(grad_norm_skip_threshold)
+-                and grad_norm > grad_norm_skip_threshold
++                and _relax_threshold_norm > grad_norm_skip_threshold
+             ):
+                 log_single_rank(
+                     logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
+diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/transformer/transformer_block.py
+--- a/megatron/core/transformer/transformer_block.py
++++ b/megatron/core/transformer/transformer_block.py
+@@ -579,21 +579,7 @@
+     def _get_layer(self, layer_number: int):
+         return self.layers[layer_number]
+ 
+-    def _checkpointed_forward(
+-        self,
+-        hidden_states: Tensor,
+-        attention_mask: Tensor,
+-        context: Tensor,
+-        context_mask: Tensor,
+-        rotary_pos_emb: Tensor,
+-        attention_bias: Tensor,
+-        packed_seq_params: PackedSeqParams,
+-        use_inner_quantization_context: bool,
+-        padding_mask: Optional[Tensor] = None,
+-        extract_layer_indices: Optional[Set[int]] = None,
+-        layer_offset: int = 0,
+-        input_ids: Optional[Tensor] = None,
+-    ):
++    def _checkpointed_forward(self, hidden_states: Tensor, attention_mask: Tensor, context: Tensor, context_mask: Tensor, rotary_pos_emb: Tensor, attention_bias: Tensor, packed_seq_params: PackedSeqParams, use_inner_quantization_context: bool, padding_mask: Optional[Tensor]=None, extract_layer_indices: Optional[Set[int]]=None, layer_offset: int=0, input_ids: Optional[Tensor]=None):
+         """Forward method with activation checkpointing.
+ 
+         Args:
+@@ -608,153 +594,69 @@
+             If extract_layer_indices is empty: hidden_states tensor
+             If extract_layer_indices is non-empty: (hidden_states, intermediate_hidden_states) tuple
+         """
++        _relax_checkpoint_mask = None
++        if getattr(self.config, '_relax_qwen35_optimized', False):
++            _relax_checkpoint_mask = tuple(getattr(packed_seq_params, '_qwen_recompute_mask'))
+         if extract_layer_indices is None:
+             extract_layer_indices = set()
+         intermediate_hidden_states: List[Tensor] = []
+-
+-        # Unpack dual RoPE before checkpointing because autograd only accepts
+-        # tensors (or None) in save_for_backward.
+         is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
+-        assert (
+-            not is_dual_rope or len(rotary_pos_emb) == 2
+-        ), "Dual RoPE input length is not equal to 2"
++        assert not is_dual_rope or len(rotary_pos_emb) == 2, 'Dual RoPE input length is not equal to 2'
+         rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+ 
+         def custom(start: int, end: int):
+-            def custom_forward(
+-                hidden_states,
+-                attention_mask,
+-                context,
+-                context_mask,
+-                rotary_pos_emb_local,
+-                rotary_pos_emb_global,
+-                padding_mask=None,
+-            ):
+-                rotary_pos_emb = (
+-                    (rotary_pos_emb_local, rotary_pos_emb_global)
+-                    if is_dual_rope
+-                    else rotary_pos_emb_global
+-                )
+-
++
++            def custom_forward(hidden_states, attention_mask, context, context_mask, rotary_pos_emb_local, rotary_pos_emb_global, padding_mask=None):
++                rotary_pos_emb = (rotary_pos_emb_local, rotary_pos_emb_global) if is_dual_rope else rotary_pos_emb_global
+                 for index in range(start, end):
+                     layer = self._get_layer(index)
+-
+-                    # Get appropriate inner quantization context
+                     if use_inner_quantization_context:
+                         if self.config.fp8:
+-                            inner_quantization_context = get_fp8_context(
+-                                self.config, layer.layer_number - 1
+-                            )
+-                        # TODO: check if fp4 is supported in this case
++                            inner_quantization_context = get_fp8_context(self.config, layer.layer_number - 1)
+                         elif self.config.fp4:
+-                            inner_quantization_context = get_fp4_context(
+-                                self.config, layer.layer_number - 1
+-                            )
++                            inner_quantization_context = get_fp4_context(self.config, layer.layer_number - 1)
+                         else:
+                             inner_quantization_context = nullcontext()
+                     else:
+                         inner_quantization_context = nullcontext()
+-
+                     with inner_quantization_context:
+-                        hidden_states, context = layer(
+-                            hidden_states=hidden_states,
+-                            attention_mask=attention_mask,
+-                            context=context,
+-                            context_mask=context_mask,
+-                            rotary_pos_emb=rotary_pos_emb,
+-                            attention_bias=attention_bias,
+-                            inference_context=None,
+-                            packed_seq_params=packed_seq_params,
+-                            padding_mask=padding_mask,
+-                            input_ids=input_ids,
+-                        )
+-                return hidden_states, context
+-
++                        hidden_states, context = layer(hidden_states=hidden_states, attention_mask=attention_mask, context=context, context_mask=context_mask, rotary_pos_emb=rotary_pos_emb, attention_bias=attention_bias, inference_context=None, packed_seq_params=packed_seq_params, padding_mask=padding_mask, input_ids=input_ids)
++                return (hidden_states, context)
+             return custom_forward
+ 
+         def checkpoint_handler(forward_func):
+             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
+-            # TODO: check if fp4 is supported in this case
+             if self.config.fp8 or self.config.fp4:
+-                return te_checkpoint(
+-                    forward_func,
+-                    self.config.distribute_saved_activations,
+-                    tensor_parallel.random.get_cuda_rng_tracker,
+-                    self.pg_collection.tp,
+-                    hidden_states,
+-                    attention_mask,
+-                    context,
+-                    context_mask,
+-                    *rotary_pos_emb,
+-                    padding_mask,
+-                )
++                return te_checkpoint(forward_func, self.config.distribute_saved_activations, tensor_parallel.random.get_cuda_rng_tracker, self.pg_collection.tp, hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+             else:
+-                return tensor_parallel.checkpoint(
+-                    forward_func,
+-                    self.config.distribute_saved_activations,
+-                    hidden_states,
+-                    attention_mask,
+-                    context,
+-                    context_mask,
+-                    *rotary_pos_emb,
+-                    padding_mask,
+-                )
+-
++                return tensor_parallel.checkpoint(forward_func, self.config.distribute_saved_activations, hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+         if self.config.recompute_method == 'uniform':
+-            # Uniformly divide the total number of Transformer layers and checkpoint
+-            # the input activation of each divided chunk.
+-            # A method to further reduce memory usage reducing checkpoints.
+             layer_idx = 0
+             while layer_idx < self.num_layers_per_pipeline_rank:
+-                chunk_end = min(
+-                    layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
+-                )
++                chunk_end = min(layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank)
+                 hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
+-
+-                # Feature extraction for uniform recompute: collect at end of each chunk
+-                # Note: Only the last layer of each chunk can have features collected
+                 for idx in range(layer_idx, chunk_end):
+-                    if (idx + layer_offset) in extract_layer_indices:
+-                        # For uniform recompute, we can only get features at chunk boundaries
+-                        # Limitation: for fine-grained extraction, use 'block'
++                    if idx + layer_offset in extract_layer_indices:
+                         if idx == chunk_end - 1:
+                             intermediate_hidden_states.append(hidden_states)
+-
+                 layer_idx += self.config.recompute_num_layers
+-
+         elif self.config.recompute_method == 'block':
+-            # Checkpoint the input activation of only a set number of individual
+-            # Transformer layers and skip the rest.
+-            # A method fully use the device memory removing redundant re-computation.
+             recompute_skip_num_layers = 0
+             for layer_idx in range(self.num_layers_per_pipeline_rank):
+-                # Skip recomputation when input grad computation is not needed.
+-                # Need to have at least one input tensor with gradient computation
+-                # for re-enterant autograd engine.
+-                # TODO: check if fp4 is supported in this case
+-                if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
++                if (self.config.fp8 or self.config.fp4) and (not hidden_states.requires_grad):
+                     recompute_skip_num_layers += 1
+-                if (
+-                    layer_idx >= recompute_skip_num_layers
+-                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+-                ):
++                if layer_idx in _relax_checkpoint_mask if _relax_checkpoint_mask is not None else layer_idx >= recompute_skip_num_layers and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers:
+                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
+                 else:
+-                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
+-                        hidden_states, attention_mask, context, context_mask, *rotary_pos_emb
+-                    )
+-
+-                # Feature extraction: collect hidden states at specified global layer indices
+-                if (layer_idx + layer_offset) in extract_layer_indices:
++                    hidden_states, context = custom(layer_idx, layer_idx + 1)(hidden_states, attention_mask, context, context_mask, *rotary_pos_emb)
++                if layer_idx + layer_offset in extract_layer_indices:
+                     intermediate_hidden_states.append(hidden_states)
+         else:
+-            raise ValueError("Invalid activation recompute method.")
+-
+-        # Return intermediate hidden states if feature extraction was requested
++            raise ValueError('Invalid activation recompute method.')
+         if len(extract_layer_indices) > 0:
+-            return hidden_states, intermediate_hidden_states
+-
++            return (hidden_states, intermediate_hidden_states)
+         return hidden_states
++
+ 
+     def set_input_tensor(self, input_tensor: Tensor):
+         """Set input tensor to be used instead of forward()'s input.
+diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
+--- a/megatron/core/transformer/attention.py
++++ b/megatron/core/transformer/attention.py
+@@ -1949,166 +1949,89 @@
+                 "TP",
+             )
+ 
+-    def get_query_key_value_tensors(
+-        self,
+-        hidden_states: Tensor,
+-        key_value_states: Tensor | None = None,
+-        output_gate: bool = False,
+-        head_wise_gate: bool = False,
+-        split_qkv: bool = True,
+-    ) -> (
+-        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
+-        | tuple[Tensor, Tensor, Tensor, Tensor]
+-        | tuple[Tensor, Tensor, Tensor]
+-        | tuple[Tensor, list[int]]
+-    ):
++    def get_query_key_value_tensors(self, hidden_states: Tensor, key_value_states: Tensor | None=None, output_gate: bool=False, head_wise_gate: bool=False, split_qkv: bool=True) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, list[int]]:
+         """
+         Derives `query`, `key` and `value` tensors from `hidden_states`.
+         If `output_gate` is True, also returns a per-head head_dim gate.
+         If `head_wise_gate` is True, also returns a per-head scalar gate.
+         If `split_qkv=False`, returns the unsplit mixed_qkv tensor.
+         """
++        if getattr(self, '_qwen_qkv_fused', False):
++            from relax.backends.megatron.megatron_patch.qwen3_5.qkv_transform import _supported as _qwen_extract_supported
++            from relax.backends.megatron.kernels.qwen3_5.qkv_extract import Extract
++            _qwen_extract = Extract.apply
+         if head_wise_gate:
+             assert split_qkv and self.config.head_wise_attn_gate
+-        # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+-        # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
+         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+-
+-        # Peel the trailing per-rank gate scalars before any reshape / AG.
+-        # Correct only because (a) ColumnParallelLinear splits axis 0
+-        # contiguously, (b) num_attention_heads % tp == 0, (c) global layout
+-        # is [QKV; Gate] (preserved across dist-ckpt by
+-        # apply_head_wise_attn_gate_sharded_factory). (a)+(b) checked at
+-        # config / init time.
++        if getattr(self, '_qwen_qkv_fused', False) and _qwen_extract_supported(self, mixed_qkv, key_value_states, output_gate, head_wise_gate, split_qkv):
++            query, key, value, gate = _qwen_extract(mixed_qkv, self._qwen_kv_pair_group)
++            if self.q_layernorm is not None:
++                query = apply_module(self.q_layernorm)(query)
++            if self.k_layernorm is not None:
++                key = apply_module(self.k_layernorm)(key)
++            if self.config.test_mode:
++                self.run_realtime_tests()
++            return (query, key, value, gate)
+         head_wise_gate_states = None
+         if head_wise_gate:
+             gate_size = self.num_attention_heads_per_partition
+-            mixed_qkv, head_wise_gate_states = torch.split(
+-                mixed_qkv, [mixed_qkv.size(-1) - gate_size, gate_size], dim=-1
+-            )
+-            # torch.split on the last dim leaves non-contiguous views: the
+-            # outer-dim stride still spans the original (QKV+gate) width, so
+-            # downstream key.view(sk, b*np, hn) in dot_product_attention would
+-            # fail with "view size is not compatible with input tensor's size
+-            # and stride." Materialize a contiguous QKV slab here.
++            mixed_qkv, head_wise_gate_states = torch.split(mixed_qkv, [mixed_qkv.size(-1) - gate_size, gate_size], dim=-1)
+             mixed_qkv = mixed_qkv.contiguous()
+-        num_query_heads_per_group = (
+-            self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+-        )
++        num_query_heads_per_group = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+         num_qkv_heads_per_group = num_query_heads_per_group + 2
+         if output_gate:
+             num_qkv_heads_per_group += num_query_heads_per_group
+-
+         assert self.config.num_query_groups is not None
+         if self.config.num_query_groups < self.world_size:
+-            # Note that weights are interleaved in the following manner:
+-            # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
+-            # When tp_size > num_kv_heads, we split "q1 q2 k1 v1" over multiple
+-            # ranks, so a rank does not have a clean partitioning of just the q_heads
+-            # it needs. Instead, we perform the following steps:
+-            # 1. Assemble the full "q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ..."
+-            #    through an AG.
+-            # 2. Pull out the right slice (e.g., "q1 q2 k1 v1" or "q3 q4 k2 v2").
+-            # 3. Split q_heads (e.g., q1, q2), k_heads (e.g., k1), v_heads (e.g., v1).
+-            # 4. Further index into query to get only the q_heads that this rank is
+-            #    responsible for (e.g., q1).
+-            # The block of code below performs steps 1 and 2.
+-            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
+-                mixed_qkv, group=self.pg_collection.tp
+-            )
+-            idx = get_pg_rank(self.pg_collection.tp) // (
+-                self.world_size // self.config.num_query_groups
+-            )
+-            size = mixed_qkv.size()[-1] // self.config.num_query_groups
+-            mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
+-
+-        # If no output gate: [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+-        # If have output gate: [sq, b, hp] --> [sq, b, ng, (2 * np/ng + 2) * hn]
+-        new_tensor_shape = mixed_qkv.size()[:-1] + (
+-            self.num_query_groups_per_partition,
+-            num_qkv_heads_per_group * self.hidden_size_per_attention_head,
+-        )
++            if hasattr(self, '_qwen_kv_pair_group'):
++                mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv, group=self._qwen_kv_pair_group)
++            else:
++                mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv, group=self.pg_collection.tp)
++                idx = get_pg_rank(self.pg_collection.tp) // (self.world_size // self.config.num_query_groups)
++                size = mixed_qkv.size()[-1] // self.config.num_query_groups
++                mixed_qkv = mixed_qkv[:, :, idx * size:(idx + 1) * size]
++        new_tensor_shape = mixed_qkv.size()[:-1] + (self.num_query_groups_per_partition, num_qkv_heads_per_group * self.hidden_size_per_attention_head)
+         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
+-
+-        # Split the tensor into query, gate, key, and value.
+         if output_gate:
+             if not split_qkv:
+-                raise ValueError("split_qkv not supported for gated attention yet.")
+-            # If have output gate: [sq, b, ng, (2 * np/ng + 2) * hn]
+-            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, np/ng * hn],
+-            # [sq, b, ng, hn], [sq, b, ng, hn]
+-            split_arg_list = [
+-                num_query_heads_per_group * self.hidden_size_per_attention_head,
+-                num_query_heads_per_group * self.hidden_size_per_attention_head,
+-                self.hidden_size_per_attention_head,
+-                self.hidden_size_per_attention_head,
+-            ]
+-
++                raise ValueError('split_qkv not supported for gated attention yet.')
++            split_arg_list = [num_query_heads_per_group * self.hidden_size_per_attention_head, num_query_heads_per_group * self.hidden_size_per_attention_head, self.hidden_size_per_attention_head, self.hidden_size_per_attention_head]
+             if SplitAlongDim is not None:
+                 query, gate, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+             else:
+                 query, gate, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
+         else:
+-            # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
+-            # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
+-            split_arg_list = [
+-                num_query_heads_per_group * self.hidden_size_per_attention_head,
+-                self.hidden_size_per_attention_head,
+-                self.hidden_size_per_attention_head,
+-            ]
+-
+-            # Return unsplit mixed_qkv and split_arg_list
++            split_arg_list = [num_query_heads_per_group * self.hidden_size_per_attention_head, self.hidden_size_per_attention_head, self.hidden_size_per_attention_head]
+             if not split_qkv:
+-                return mixed_qkv, split_arg_list
+-
++                return (mixed_qkv, split_arg_list)
+             if SplitAlongDim is not None:
+                 query, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+             else:
+                 query, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
+-
+-        # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+-
+         if self.config.num_query_groups < self.world_size:
+-            # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
+-            # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
+-            # This is step 4 in the list of steps above.
+-            idx = get_pg_rank(self.pg_collection.tp) % (
+-                self.world_size // self.config.num_query_groups
+-            )
+-            size = self.num_attention_heads_per_partition // (
+-                self.world_size // self.config.num_query_groups
+-            )
+-            query = query[:, :, idx * size : (idx + 1) * size, :]
+-
++            idx = get_pg_rank(self.pg_collection.tp) % (self.world_size // self.config.num_query_groups)
++            size = self.num_attention_heads_per_partition // (self.world_size // self.config.num_query_groups)
++            query = query[:, :, idx * size:(idx + 1) * size, :]
+         if self.q_layernorm is not None:
+             query = apply_module(self.q_layernorm)(query)
+-
+         if self.k_layernorm is not None:
+             key = apply_module(self.k_layernorm)(key)
+-
+         if self.config.test_mode:
+             self.run_realtime_tests()
+-
+         if output_gate:
+-            # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
+             if self.config.num_query_groups < self.world_size:
+-                idx = get_tensor_model_parallel_rank() % (
+-                    self.world_size // self.config.num_query_groups
+-                )
+-                size = self.num_attention_heads_per_partition // (
+-                    self.world_size // self.config.num_query_groups
+-                )
+-                gate = gate[:, :, idx * size : (idx + 1) * size, :]
++                idx = get_tensor_model_parallel_rank() % (self.world_size // self.config.num_query_groups)
++                size = self.num_attention_heads_per_partition // (self.world_size // self.config.num_query_groups)
++                gate = gate[:, :, idx * size:(idx + 1) * size, :]
+             if head_wise_gate:
+-                return query, key, value, gate, head_wise_gate_states
+-            return query, key, value, gate
+-
++                return (query, key, value, gate, head_wise_gate_states)
++            return (query, key, value, gate)
+         if head_wise_gate:
+-            return query, key, value, head_wise_gate_states
+-
+-        return query, key, value
++            return (query, key, value, head_wise_gate_states)
++        return (query, key, value)
++
+ 
+     def backward_dw(self) -> None:
+         """Execute weight update operations"""
+diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/transformer/moe/shared_experts.py
+--- a/megatron/core/transformer/moe/shared_experts.py
++++ b/megatron/core/transformer/moe/shared_experts.py
+@@ -382,7 +382,7 @@
+         with torch.cuda.stream(self.stream):
+             if self.use_shared_expert_gate:
+                 assert self.gate_score is not None
+-                output = self.cached_output * self.gate_score
++                output = (self._relax_shared_gate(self.cached_output, self.gate_score) if hasattr(self, "_relax_shared_gate") else self.cached_output * self.gate_score)
+                 self.gate_score = None
+             else:
+                 output = self.cached_output
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -2554,6 +2554,12 @@
+         config = get_model_config(model[0])
+ 
+         ddp_config = get_megatron_ddp_config(args)
++        if getattr(args, "_relax_qwen35_optimized", False) and getattr(args, "overlap_dispatch_backward_with_experts_wgrad", False):
++            assert not getattr(args, "delay_wgrad_compute", False)
++            assert not getattr(args, "overlap_moe_expert_parallel_comm", False)
++            assert not getattr(args, "use_megatron_fsdp", False)
++            assert not getattr(args, "use_torch_fsdp2", False)
++            ddp_config.delay_wgrad_compute = True
+         if not getattr(args, "use_torch_fsdp2", False):
+             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
+             ddp_config.bucket_size = resolve_ddp_bucket_size(
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -64,6 +64,8 @@
+     The initialization function has an argument for each parameter,
+     including those in ModelParallelConfig.
+     """
++
++    _relax_qwen35_optimized: bool = False
+ 
+     ####################
+     # model architecture
+diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transformer/moe/fused_a2a.py
+--- a/megatron/core/transformer/moe/fused_a2a.py
++++ b/megatron/core/transformer/moe/fused_a2a.py
+@@ -24,12 +24,19 @@
+ except ImportError:
+     HAVE_DEEP_EP = False
+ 
+-try:
+-    from deep_ep import ElasticBuffer
+-
++# Discover the isolated backend without initializing NCCL/JIT for legacy recipes.
++from importlib.util import find_spec
++
++if find_spec("_relax_deep_ep_v2") is not None:
++    ElasticBuffer = None
+     HAVE_DEEP_EP_V2 = True
+-except ImportError:
+-    HAVE_DEEP_EP_V2 = False
++else:
++    try:
++        from deep_ep import ElasticBuffer
++
++        HAVE_DEEP_EP_V2 = True
++    except ImportError:
++        HAVE_DEEP_EP_V2 = False
+ 
+ import torch
+ 
+@@ -92,7 +99,10 @@
+     group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
+ ):
+     """Get or create a DeepEP v2 elastic buffer for all-to-all communication."""
+-    global _elastic_buffer
++    global _elastic_buffer, ElasticBuffer
++
++    if ElasticBuffer is None:
++        from _relax_deep_ep_v2 import ElasticBuffer
+ 
+     num_bytes = ElasticBuffer.get_buffer_size_hint(
+         group, num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden, num_topk=num_topk
+diff --git a/megatron/core/transformer/moe/token_dispatcher.py b/megatron/core/transformer/moe/token_dispatcher.py
+--- a/megatron/core/transformer/moe/token_dispatcher.py
++++ b/megatron/core/transformer/moe/token_dispatcher.py
+@@ -1968,7 +1968,12 @@
+             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
+         elif self.config.moe_flex_dispatcher_backend == "deepepv2":
+             assert self.tp_size * self.ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"
+-            self._comm_manager = _DeepepV2Manager(
++            manager_class = _DeepepV2Manager
++            if getattr(self.config, "_relax_qwen35_optimized", False):
++                from relax.backends.megatron.megatron_patch.qwen3_5.deepep_expanded import ExpandedManager
++
++                manager_class = ExpandedManager
++            self._comm_manager = manager_class(
+                 group=self.tp_ep_group,
+                 num_local_experts=self.num_local_experts,
+                 router_topk=self.tp_size * self.config.moe_router_topk,
+diff --git a/megatron/core/fusions/linear_cross_entropy/blackwell/fwd_mainloop.py b/megatron/core/fusions/linear_cross_entropy/blackwell/fwd_mainloop.py
+--- a/megatron/core/fusions/linear_cross_entropy/blackwell/fwd_mainloop.py
++++ b/megatron/core/fusions/linear_cross_entropy/blackwell/fwd_mainloop.py
+@@ -417,7 +417,7 @@
+                 gLabels = cute.local_tile(mLabels, (self.epi_tile[0],), (pidm,))
+ 
+                 tLabelsCAcc = thr_copy_g2r.partition_S(cAcc)[(None, None, 0)]
+-                tLabelsCAcc_mask = cute.make_fragment(tLabelsCAcc.shape, cutlass.Boolean)
++                tLabelsCAcc_mask = cute.make_rmem_tensor(tLabelsCAcc.shape, cutlass.Boolean)
+                 # [(1, 1), 1]
+                 tLabelsCAcc_mask[0] = cute.elem_less(pidm * self.epi_tile[0] + tidx, problem_mnk[0])
+                 # to align shape with gMax and gAccu
+@@ -425,7 +425,7 @@
+ 
+                 # [(1, 1), 1, 1]
+                 tLabelsgLabels = thr_copy_g2r.partition_S(cute.append_ones(gLabels))
+-                tLabelsrLabels = cute.make_fragment(
++                tLabelsrLabels = cute.make_rmem_tensor(
+                     tLabelsgLabels.shape, tLabelsgLabels.element_type
+                 )
+                 cute.copy(tiled_copy_g2r, tLabelsgLabels, tLabelsrLabels, pred=tLabelsCAcc_mask)
+@@ -437,14 +437,14 @@
+                 gMax = cute.local_tile(mMax, (self.epi_tile[0], 1), (pidm, pidn))
+                 # [(CPYM, CPYN), loopM, loopN]
+                 tR2GgMax = thr_copy_r2g.partition_D(gMax)
+-                tR2GrMax = cute.make_fragment(tR2GgMax.shape, tR2GgMax.element_type)
++                tR2GrMax = cute.make_rmem_tensor(tR2GgMax.shape, tR2GgMax.element_type)
+                 tR2GrMax.fill(-1e30)
+ 
+                 # [tileM, 1]
+                 gAccu = cute.local_tile(mAccu, (self.epi_tile[0], 1), (pidm, pidn))
+                 # [(CPYM, CPYN), loopM, loopN]
+                 tR2GgAccu = thr_copy_r2g.partition_D(gAccu)
+-                tR2GrAccu = cute.make_fragment(tR2GgAccu.shape, tR2GgAccu.element_type)
++                tR2GrAccu = cute.make_rmem_tensor(tR2GgAccu.shape, tR2GgAccu.element_type)
+                 tR2GrAccu.fill(0.0)
+ 
+                 # [tileM, 1]
+@@ -453,11 +453,11 @@
+                 )
+                 # [(CPYM, CPYN), loopM, loopN]
+                 tR2GgLogprobs = thr_copy_r2g.partition_D(gLogprobs)
+-                tR2GrLogprobs = cute.make_fragment(tR2GgLogprobs.shape, tR2GgLogprobs.element_type)
++                tR2GrLogprobs = cute.make_rmem_tensor(tR2GgLogprobs.shape, tR2GgLogprobs.element_type)
+                 tR2GrLogprobs.fill(0.0)
+ 
+                 # [(tileN // num_epi_stage_per_tile, 1), 1, 1]
+-                tTMEM_load_rAcc = cute.make_fragment(tTMEM_load_cAcc_shape, self.acc_dtype)
++                tTMEM_load_rAcc = cute.make_rmem_tensor(tTMEM_load_cAcc_shape, self.acc_dtype)
+ 
+                 for n in cutlass.range(num_n_tiles):
+                     mma_pipeline.consumer_wait(mma_consumer_state)
+diff --git a/megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py b/megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py
+--- a/megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py
++++ b/megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py
+@@ -361,7 +361,7 @@
+                 )
+                 tTMEM_load_cAcc = thr_copy_t2r.partition_D(tCcAcc_epi)
+                 tTMEM_load_cAcc_shape = cute.select(tTMEM_load_cAcc.shape, mode=[0, 1, 2])
+-                tTMEM_load_rAcc = cute.make_fragment(tTMEM_load_cAcc_shape, self.acc_dtype)
++                tTMEM_load_rAcc = cute.make_rmem_tensor(tTMEM_load_cAcc_shape, self.acc_dtype)
+ 
+                 copy_atom_g2r_int64 = cute.make_copy_atom(
+                     cute.nvgpu.CopyUniversalOp(), mLabels.element_type
+@@ -387,7 +387,7 @@
+                 # slice along M direction
+                 tMCAcc = thr_copy_g2r_int64.partition_S(cAcc)[(None, None, 0)]
+                 # [(1, 1), 1]
+-                tMCAcc_mask = cute.make_fragment(tMCAcc.shape, cutlass.Boolean)
++                tMCAcc_mask = cute.make_rmem_tensor(tMCAcc.shape, cutlass.Boolean)
+                 # to align shape with gMax and gAccu
+                 tMCAcc_mask = cute.append_ones(tMCAcc_mask)
+                 tMCAcc_mask[0] = cute.elem_less(
+@@ -395,16 +395,16 @@
+                 )
+                 # [(1, 1), 1, 1]
+                 tMgLabels = thr_copy_g2r_int64.partition_S(cute.append_ones(gLabels))
+-                tMrLabels = cute.make_fragment(tMgLabels.shape, tMgLabels.element_type)
++                tMrLabels = cute.make_rmem_tensor(tMgLabels.shape, tMgLabels.element_type)
+                 cute.copy(tiled_copy_g2r_int64, tMgLabels, tMrLabels, pred=tMCAcc_mask)
+                 tMgMaximum = thr_copy_g2r_fp32.partition_S(cute.append_ones(gMaximum))
+-                tMrMaximum = cute.make_fragment(tMgMaximum.layout, tMgMaximum.element_type)
++                tMrMaximum = cute.make_rmem_tensor(tMgMaximum.layout, tMgMaximum.element_type)
+                 cute.copy(tiled_copy_g2r_fp32, tMgMaximum, tMrMaximum, pred=tMCAcc_mask)
+                 tMgAccu = thr_copy_g2r_fp32.partition_S(cute.append_ones(gAccu))
+-                tMrAccu = cute.make_fragment(tMgAccu.layout, tMgAccu.element_type)
++                tMrAccu = cute.make_rmem_tensor(tMgAccu.layout, tMgAccu.element_type)
+                 cute.copy(tiled_copy_g2r_fp32, tMgAccu, tMrAccu, pred=tMCAcc_mask)
+ 
+-                tMrDlogprobs = cute.make_fragment(tMgAccu.layout, mDlogprobs.element_type)
++                tMrDlogprobs = cute.make_rmem_tensor(tMgAccu.layout, mDlogprobs.element_type)
+                 if cutlass.const_expr(self.REDUCTION == 2):
+                     # mean reduction
+                     num_valid_tokens = cute.make_tensor(scalarNumValidTokens, layout=(1,))
+@@ -425,7 +425,7 @@
+                 # ------ Partial output ------ #
+                 # [tileM, tileN]
+                 gDlogits_partial = cute.local_tile(
+-                    mDlogits_partial, (self.epi_tile[0], self.epi_tile[1]), (pidm, pidn)
++                    mDlogits_partial, (self.epi_tile[0], self.epi_tile[1]), (cutlass.Int64(pidm), cutlass.Int64(pidn))
+                 )
+                 # blackwell supports STG.256
+                 copy_atom_r2g = cute.make_copy_atom(
+@@ -440,7 +440,7 @@
+ 
+                 # [CPY, loopM, loopN]
+                 tR2GCAcc = thr_copy_r2g.partition_S(cAcc)
+-                tR2GCAcc_pred = cute.make_fragment(tR2GCAcc.shape, cutlass.Boolean)
++                tR2GCAcc_pred = cute.make_rmem_tensor(tR2GCAcc.shape, cutlass.Boolean)
+                 for elem in cutlass.range(cute.size(tR2GCAcc_pred, mode=[0])):
+                     for row in cutlass.range(cute.size(tR2GCAcc_pred, mode=[1])):
+                         for col in cutlass.range(cute.size(tR2GCAcc_pred, mode=[2])):
+@@ -457,7 +457,7 @@
+                 tR2GgDlogits = thr_copy_r2g.partition_D(gDlogits_partial)
+ 
+                 # for type conversion
+-                dLogits_half = cute.make_fragment(tTMEM_load_rAcc.shape, tR2GgDlogits.element_type)
++                dLogits_half = cute.make_rmem_tensor(tTMEM_load_rAcc.shape, tR2GgDlogits.element_type)
+                 dLogits_half = cute.tiled_divide(
+                     dLogits_half, (cute.size(tR2GgDlogits, mode=[0]), 1)
+                 )
+diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transformer/moe/experts.py
+--- a/megatron/core/transformer/moe/experts.py
++++ b/megatron/core/transformer/moe/experts.py
+@@ -751,7 +751,8 @@
+                 tokens_per_expert, dtype=torch.int64, device=permuted_probs.device
+             )
+
+-        if self._use_grouped_tensor:
++        # Expanded BF16 dispatch keeps variable expert counts without 256-token padding.
++        if self._use_grouped_tensor or getattr(self.config, "_relax_qwen35_optimized", False):
+             if not isinstance(tokens_per_expert, torch.Tensor):
+                 tokens_per_expert = torch.tensor(
+                     tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device

@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tupl
 from uuid import uuid4
 
 import httpx
+import numpy as np
 import ray
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -64,6 +65,7 @@ from relax.agentic.session.state import (
     _messages_tools_template_state_hash,
     _multimodal_inputs_from_messages,
     check_messages,
+    merge_routed_experts,
     normalize_template_kwargs,
     normalize_tools,
 )
@@ -278,7 +280,7 @@ def _decode_routed_experts(
     token_count: int,
 ) -> Any:
     encoded = meta_info.get("routed_experts")
-    if not encoded or token_count <= 1:
+    if encoded is None:
         return None
     import numpy as np
     import pybase64
@@ -532,7 +534,38 @@ def _text_block_content(
     return separator.join(texts) if texts else None
 
 
+def _tool_result_content(
+    content: Any,
+    *,
+    text_type: str,
+    image_type: str,
+    image_block: Callable[..., dict[str, Any]],
+    field: str,
+    param: str,
+) -> Any:
+    text = _text_block_content(
+        content, block_type=text_type, separator="", field=field, param=param, allow_empty_string=True
+    )
+    if not isinstance(content, list) or not any(
+        isinstance(block, dict) and block.get("type") == image_type for block in content
+    ):
+        return text
+    return [
+        image_block(block, field=f"{field}[{index}]")
+        if block["type"] == image_type
+        else {"type": "text", "text": block["text"]}
+        for index, block in enumerate(content)
+        if isinstance(block, dict) and block.get("type") in {text_type, image_type}
+    ]
+
+
 def _responses_input_messages(request_input: Any, instructions: Any) -> list[dict[str, Any]]:
+    def image_block(block: dict[str, Any], *, field: str) -> dict[str, Any]:
+        image_url = block.get("image_url")
+        if not isinstance(image_url, str) or not image_url:
+            raise AgenticChatRequestError(f"{field}.image_url must be a non-empty string", param="input")
+        return {"type": "image_url", "image_url": {"url": image_url}}
+
     def message_content(content: Any, *, role: str, field: str) -> Any:
         if isinstance(content, str):
             return content
@@ -551,13 +584,7 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
                     raise AgenticChatRequestError(f"{part_field} text must be non-empty", param="input")
                 canonical_parts.append({"type": "text", "text": text})
             elif part_type == "input_image" and role == "user":
-                image_url = part.get("image_url")
-                if not isinstance(image_url, str) or not image_url:
-                    raise AgenticChatRequestError(
-                        f"{part_field}.image_url must be a non-empty string",
-                        param="input",
-                    )
-                canonical_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                canonical_parts.append(image_block(part, field=part_field))
                 has_image = True
         if not canonical_parts:
             return ""
@@ -657,13 +684,13 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
                     "tool_call_id": _required_nonempty_string(
                         item.get("call_id"), field=f"{field}.call_id", param="input"
                     ),
-                    "content": _text_block_content(
+                    "content": _tool_result_content(
                         item.get("output"),
-                        block_type="input_text",
-                        separator="",
+                        text_type="input_text",
+                        image_type="input_image",
+                        image_block=image_block,
                         field=f"{field}.output",
                         param="input",
-                        allow_empty_string=True,
                     ),
                 }
             )
@@ -797,13 +824,13 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
                             field=f"{block_field}.tool_use_id",
                             param="messages",
                         ),
-                        "content": _text_block_content(
+                        "content": _tool_result_content(
                             block.get("content", ""),
-                            block_type="text",
-                            separator="",
+                            text_type="text",
+                            image_type="image",
+                            image_block=image_block,
                             field=f"{block_field}.content",
                             param="messages",
-                            allow_empty_string=True,
                         ),
                     }
                 )
@@ -2250,15 +2277,14 @@ class AgenticSessionShard:
             ir = session.queued_irs.popleft()
             remaining_tokens = int(ir.sampling_params["max_new_tokens"]) - len(ir.pending_token_delta)
             if remaining_tokens == 0:
-                # Reactivate every aborted IR, then reject a zero remaining
-                # budget before another backend call or Forest commit.
+                # Commit an interrupted response that already used its budget.
+                try:
+                    payload = self._context_exhausted_response_locked(session, ir)
+                except Exception as error:
+                    self._fail_ir_locked(session, ir, error)
+                    continue
                 session.live_irs.remove(ir)
-                ir.waiter.set_result(
-                    _context_length_error_result(
-                        max_context_len=self._max_context_len(group),
-                        prompt_tokens=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
-                    )
-                )
+                ir.waiter.set_result(payload)
                 continue
             ir.rollout_id = session.rollout_id
             ir.backend_started = False
@@ -2436,6 +2462,7 @@ class AgenticSessionShard:
                                 audio_data=ir.history_backend_audio_data,
                                 video_data=ir.history_backend_video_data,
                                 return_logprob=group.rollout_mode == "train" or ir.logprobs,
+                                collect_score_centering=group.rollout_mode == "train",
                                 fail_fast_no_workers=router_recovery_enabled,
                             )
                         except httpx.HTTPStatusError as error:
@@ -2483,15 +2510,14 @@ class AgenticSessionShard:
                 if is_current():
                     ir.runner_task = None
                     ir.backend_started = False
-                    session.live_irs.remove(ir)
-                    ir.waiter.set_result(
-                        _context_length_error_result(
-                            max_context_len=self._max_context_len(group),
-                            prompt_tokens=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
-                            requested_completion_tokens=remaining_tokens,
-                        )
-                    )
-                    self._dispatch_queued_irs_locked(session)
+                    try:
+                        payload = self._context_exhausted_response_locked(session, ir, remaining_tokens)
+                    except Exception as error:
+                        self._fail_ir_locked(session, ir, error)
+                    else:
+                        session.live_irs.remove(ir)
+                        ir.waiter.set_result(payload)
+                        self._dispatch_queued_irs_locked(session)
             self._notify_state_change(group)
             return
         except RuntimeGroupError as error:
@@ -2575,13 +2601,39 @@ class AgenticSessionShard:
 
         ir.pending_token_delta.extend(result.new_tokens)
         ir.pending_logprob_delta.extend(result.new_log_probs)
+        if getattr(result, "new_topk_token_ids", None) is not None:
+            ir.pending_topk_token_ids_delta.append(result.new_topk_token_ids)
+            ir.pending_topk_logprob_delta.append(result.new_topk_log_probs)
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
         self._accumulate_request_meta(ir, meta_info=result.meta_info)
-        ir.pending_routed_experts = _decode_routed_experts(
+        routed_experts = _decode_routed_experts(
             args=self.args,
             meta_info=result.meta_info,
             token_count=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
+        )
+        if getattr(self.args, "use_rollout_routing_replay", False) and result.new_tokens and routed_experts is None:
+            raise ValueError("Backend omitted routed experts for newly accepted tokens")
+        ir.pending_routed_experts = merge_routed_experts(
+            ir.pending_routed_experts,
+            routed_experts,
+            expected_rows=max(0, len(ir.history_train_token_prefix) + len(ir.pending_token_delta) - 1),
+        )
+
+    def _context_exhausted_response_locked(
+        self,
+        session: _SessionRecord,
+        ir: InflightRequest,
+        requested_tokens: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Keep partial generation when a resumed request exhausts capacity."""
+        if ir.pending_token_delta or ir.pending_logprob_delta:
+            ir.pending_status = "truncated"
+            return self._terminal_response_locked(session=session, ir=ir, finish_type="length")
+        return _context_length_error_result(
+            max_context_len=self._max_context_len(session.group),
+            prompt_tokens=len(ir.history_train_token_prefix),
+            requested_completion_tokens=requested_tokens,
         )
 
     def _terminal_response_locked(
@@ -2594,6 +2646,21 @@ class AgenticSessionShard:
         """Commit one terminal IR to its Forest and build its OpenAI
         response."""
 
+        finish_reason = ir.latest_backend_meta.get("finish_reason") or {}
+        if (
+            finish_type == "length"
+            and finish_reason.get("length") == 0
+            and not ir.pending_token_delta
+            and not ir.pending_logprob_delta
+            and int(ir.sampling_params.get("max_new_tokens", 0)) > 0
+        ):
+            # A KV capacity rejection must not become an empty successful
+            # response or discard generation retained from earlier attempts.
+            return _context_length_error_result(
+                max_context_len=self._max_context_len(session.group),
+                prompt_tokens=len(ir.history_rollout_token_prefix),
+                requested_completion_tokens=int(ir.sampling_params["max_new_tokens"]),
+            )
         mark_agentic_event(agentic_trace_events(ir.pending_export_metadata_patch), "chat_end_at")
         ir.pending_export_metadata_patch.update(
             {
@@ -2617,6 +2684,12 @@ class AgenticSessionShard:
             messages_delta=response_messages,
             token_delta=ir.pending_token_delta,
             logprob_delta=ir.pending_logprob_delta,
+            topk_token_ids_delta=np.concatenate(ir.pending_topk_token_ids_delta)
+            if ir.pending_topk_token_ids_delta
+            else None,
+            topk_logprob_delta=np.concatenate(ir.pending_topk_logprob_delta)
+            if ir.pending_topk_logprob_delta
+            else None,
             weight_version_delta=ir.pending_weight_version_delta,
             spec_delta=ir.pending_spec_delta,
             prefix_cache_delta=ir.pending_prefix_cache_delta,

@@ -2,7 +2,8 @@
 
 ## Scope and Evidence
 
-- Limit removal proposals to code made obsolete by the reviewed change or needed to solve its concrete problem.
+- Limit dead-code cleanup to unused or redundant code introduced by the reviewed change, or existing code made unused by it (including imports, variables, and functions).
+- Do not include pre-existing dead code in the cleanup or removal plan. If noticed, mention it separately as out of scope; do not expand the current change to remove it.
 - Use the severity definitions in `SKILL.md`; scheduling a cleanup does not make it P0/P1.
 - A disabled feature, absent direct caller, or passing test suite does not establish that a public API has no consumers. Respect repository approval requirements for deleting or renaming public APIs.
 - For removed or merged tests, identify retained coverage that detects the relevant independent failures and actually executes their production boundary. Do not preserve an intentionally removed policy solely because its old tests encode it.

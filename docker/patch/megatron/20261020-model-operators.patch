@@ -1,0 +1,942 @@
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py
+@@ -186,7 +186,11 @@
+             context_layer = out.view(out.size(0), out.size(1), -1)
+             if gate is not None:
+                 context_layer = self._apply_output_gate(context_layer, gate)
+-            output, bias = self.linear_proj(context_layer)
++            if getattr(self.config, "_relax_qwen35_optimized", False):
++                from relax.models.qwen3_5.projection_hooks import run_projection
++                output, bias = run_projection(self.linear_proj, context_layer, self.linear_proj)
++            else:
++                output, bias = self.linear_proj(context_layer)
+             return output, bias
+ 
+         if in_decode_mode and self.config.enable_cuda_graph and inference_context.is_static_batching():
+@@ -290,7 +294,7 @@
+         else:
+             if inference_context is None or inference_context.is_static_batching():
+                 # Static batching attention kernel.
+-                core_attn_out = self.core_attention(
++                core_attn_out = self._run_core_attention(
+                     query,
+                     key,
+                     value,
+@@ -337,7 +341,11 @@
+         # =================
+ 
+         nvtx_range_push(suffix="linear_proj")
+-        output, bias = self.linear_proj(core_attn_out)
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.projection_hooks import run_projection
++            output, bias = run_projection(self.linear_proj, core_attn_out, self.linear_proj)
++        else:
++            output, bias = self.linear_proj(core_attn_out)
+         nvtx_range_pop(suffix="linear_proj")
+ 
+         return output, bias
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
+@@ -13,13 +13,14 @@
+ # limitations under the License.
+ 
+ 
++import sys
+ from typing import List, Optional
+ 
+ import torch
+ import torch.nn as nn
+ from megatron.core.inference.contexts import BaseInferenceContext
+ from megatron.core.models.common.embeddings.rope_utils import (
+-    _apply_rotary_pos_emb_bshd,
++    _apply_rotary_pos_emb_bshd as _native_apply_rotary_pos_emb_bshd,
+     get_pos_emb_on_this_cp_rank,
+ )
+ from megatron.core.packed_seq_params import PackedSeqParams
+@@ -30,6 +31,14 @@
+ 
+ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import Qwen3VLTransformerConfig
+ from megatron.bridge.training.utils.packed_seq_utils import get_packed_seq_q_cu_seqlens
++
++
++def _apply_rotary_pos_emb_bshd(*args, **kwargs):
++    recipe = sys.modules.get("relax.models.qwen3_5.recipe")
++    if recipe is not None and recipe.active():
++        from relax.models.qwen3_5.rotary_embedding import apply_rotary
++        return apply_rotary(_native_apply_rotary_pos_emb_bshd, *args, **kwargs)
++    return _native_apply_rotary_pos_emb_bshd(*args, **kwargs)
+ 
+ 
+ def _get_flat_packed_ranges(
+@@ -253,6 +262,14 @@
+     video_index: int,
+ ) -> tuple[torch.Tensor, int, int]:
+     """Build Qwen3-VL MRoPE positions for one logical sample."""
++    recipe = sys.modules.get("relax.models.qwen3_5.recipe")
++    if (
++        recipe is not None and recipe._TEXT_ONLY_CPT
++        and image_grid_thw is None and video_grid_thw is None
++    ):
++        # Literal vision markers in text-only CPT are ordinary text tokens.
++        positions = torch.arange(sample_input_ids.numel()).view(1, -1).expand(3, -1)
++        return positions, image_index, video_index
+     vision_start_indices = torch.argwhere(sample_input_ids == vision_start_token_id).squeeze(1)
+     vision_tokens = sample_input_ids[vision_start_indices + 1]
+     image_nums = int((vision_tokens == image_token_id).sum().item())
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
+@@ -519,7 +519,33 @@
+         visual_pos_masks: Optional[torch.Tensor] = None,
+         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+     ):
++        from relax.utils.env import Envs
++        if any(getattr(layer, "_relax_qsa_attention_retained", False) for layer in self.layers):
++            from relax.models.qwen3_8.qsa_bridge_recompute import qsa_bridge_checkpointed_forward
++
++            return qsa_bridge_checkpointed_forward(self, hidden_states, attention_mask, context, context_mask, rotary_pos_emb, attention_bias, packed_seq_params, padding_mask, use_inner_fp8_context, visual_pos_masks, deepstack_visual_embeds)
++        return self._relax_native_checkpointed_forward(hidden_states, attention_mask, context, context_mask, rotary_pos_emb, attention_bias, packed_seq_params, padding_mask, use_inner_fp8_context, visual_pos_masks, deepstack_visual_embeds)
++
++    def _relax_native_checkpointed_forward(
++        self,
++        hidden_states: Tensor,
++        attention_mask: Tensor,
++        context: Tensor,
++        context_mask: Tensor,
++        rotary_pos_emb: Tensor,
++        attention_bias: Tensor,
++        packed_seq_params: PackedSeqParams,
++        padding_mask: Optional[Tensor],
++        use_inner_fp8_context: bool,
++        # args for deepstack
++        visual_pos_masks: Optional[torch.Tensor] = None,
++        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
++    ):
+         """Forward method with activation checkpointing."""
++
++        checkpoint_mask = None
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            checkpoint_mask = tuple(getattr(packed_seq_params, "_qwen_recompute_mask"))
+ 
+         def custom(start: int, end: int):
+             # Pipeline schedules may prepare a later microbatch before this checkpoint
+@@ -637,7 +663,9 @@
+                 if self.config.fp8 and not hidden_states.requires_grad:
+                     recompute_skip_num_layers += 1
+                 if (
+-                    layer_idx >= recompute_skip_num_layers
++                    layer_idx in checkpoint_mask
++                    if checkpoint_mask is not None
++                    else layer_idx >= recompute_skip_num_layers
+                     and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                 ):
+                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
+diff --git a/megatron/core/distributed/finalize_model_grads.py b/megatron/core/distributed/finalize_model_grads.py
+--- a/megatron/core/distributed/finalize_model_grads.py
++++ b/megatron/core/distributed/finalize_model_grads.py
+@@ -429,65 +429,8 @@
+     gradients from modules with average_gradients_across_tp_domain=True
+     across tensor-model-parallel ranks.
+     """
+-    tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+-    if tp_group.size() <= 1:
+-        return
+-
+-    params_sum = []
+-    grads_sum = []
+-    params_avg = []
+-    grads_avg = []
+-
+-    for model_chunk in model:
+-        ddp_config = model_chunk.ddp_config
+-        for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
+-            if param.requires_grad:
+-                # Check if this param needs average reduction (average_gradients_across_tp_domain)
+-                if getattr(param, "average_gradients_across_tp_domain", False):
+-                    grad_attr = _get_main_grad_attr(param)
+-                    grad = getattr(param, grad_attr)
+-                    if grad is None:
+-                        continue
+-                    params_avg.append(param)
+-                    if ddp_config.use_megatron_fsdp:
+-                        grads_avg.append(grad._local_tensor.data)
+-                    else:
+-                        grad = _unshard_if_dtensor(grad)
+-                        grads_avg.append(grad.data)
+-                # Check if this param needs sum reduction (sequence parallel or qk_layernorm)
+-                elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
+-                    config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
+-                ):
+-                    grad_attr = _get_main_grad_attr(param)
+-                    grad = getattr(param, grad_attr)
+-                    if grad is None:
+-                        continue
+-                    params_sum.append(param)
+-                    if ddp_config.use_megatron_fsdp:
+-                        grads_sum.append(grad._local_tensor.data)
+-                    else:
+-                        grad = _unshard_if_dtensor(grad)
+-                        grads_sum.append(grad.data)
+-
+-    # Loop grads and perform correct all-reduce
+-    for params, grads, all_reduce_op in zip(
+-        [params_sum, params_avg],
+-        [grads_sum, grads_avg],
+-        [torch.distributed.ReduceOp.SUM, torch.distributed.ReduceOp.AVG],
+-    ):
+-        if grads:
+-            coalesced = _flatten_dense_tensors(grads)
+-            torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)
+-            for param, buf, synced in zip(
+-                params, grads, _unflatten_dense_tensors(coalesced, grads)
+-            ):
+-                buf.copy_(synced)
+-                grad_attr = _get_main_grad_attr(param)
+-                orig_grad = getattr(param, grad_attr)
+-                if ddp_config.use_megatron_fsdp:
+-                    setattr(param, grad_attr, orig_grad)
+-                else:
+-                    setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
++    from relax.models.common.chunked_grad_coalesce import _allreduce_non_tensor_model_parallel_grads as chunked_reduce
++    return chunked_reduce(model, config, tp_group)
+ 
+ 
+ """
+diff --git a/megatron/core/fusions/linear_cross_entropy/blackwell/entry.py b/megatron/core/fusions/linear_cross_entropy/blackwell/entry.py
+--- a/megatron/core/fusions/linear_cross_entropy/blackwell/entry.py
++++ b/megatron/core/fusions/linear_cross_entropy/blackwell/entry.py
+@@ -2,6 +2,7 @@
+ 
+ import logging
+ import os
++import sys
+ import typing
+ from dataclasses import dataclass, field
+ from functools import lru_cache
+@@ -36,6 +37,16 @@
+             default=int(os.environ.get("LCE_FWD_VOCAB_SPLIT_SIZE", 512 * 6))
+         )
+ 
++    def _qwen35_recipe_active():
++        recipe = sys.modules.get("relax.models.qwen3_5.recipe")
++        return recipe is not None and recipe.active()
++
++    def _backward_vocab_split():
++        if _qwen35_recipe_active():
++            from relax.models.qwen3_5.loss_config import VOCAB_PER_SPLIT
++            return VOCAB_PER_SPLIT
++        return int(os.environ.get("LCE_BWD_VOCAB_SPLIT_SIZE", 512 * 6))
++
+     @dataclass
+     class BwdConfig:
+         """
+@@ -44,7 +55,7 @@
+ 
+         _bwd_kernel: typing.Dict[str, cute.kernel] = field(default_factory=dict)
+         _vocab_per_split: int = field(
+-            default=int(os.environ.get("LCE_BWD_VOCAB_SPLIT_SIZE", 512 * 6))
++            default_factory=_backward_vocab_split
+         )
+         _backward_method: utils.BackwardMethodEnum = field(
+             default=utils.BackwardMethodEnum.kDlogitsSplitN
+@@ -157,9 +168,15 @@
+                 _logprobs.zero_()
+         assert _max.is_contiguous() and _accu.is_contiguous() and _logprobs.is_contiguous()
+ 
+-        triton_kernels.get_num_valid_tokens[(1,)](
+-            num_tokens, ignore_index, labels_view, labels_view.stride(0), num_valid_tokens
+-        )
++        if _qwen35_recipe_active():
++            triton_kernels.get_num_valid_tokens.fn[(1,)](
++                num_tokens, ignore_index, labels_view, labels_view.stride(0), num_valid_tokens,
++                BLOCK_SIZE_M=2048, num_warps=32, num_stages=3,
++            )
++        else:
++            triton_kernels.get_num_valid_tokens[(1,)](
++                num_tokens, ignore_index, labels_view, labels_view.stride(0), num_valid_tokens
++            )
+ 
+         # need to compile the kernel for the first time
+         hidden_packed = from_dlpack(
+diff --git a/megatron/core/models/hybrid/hybrid_block.py b/megatron/core/models/hybrid/hybrid_block.py
+--- a/megatron/core/models/hybrid/hybrid_block.py
++++ b/megatron/core/models/hybrid/hybrid_block.py
+@@ -1200,7 +1200,12 @@
+ 
+         with outer_fp8_context:
+             if self.config.recompute_granularity == 'full' and self.training:
+-                hidden_states = checkpointed_forward(
++                checkpoint_impl = checkpointed_forward
++                if any(getattr(layer, "_relax_qsa_attention_retained", False) for layer in self.layers):
++                    from relax.models.qwen3_8.qsa_split_recompute import qsa_split_checkpointed_forward
++
++                    checkpoint_impl = qsa_split_checkpointed_forward
++                hidden_states = checkpoint_impl(
+                     self,
+                     hidden_states=hidden_states,
+                     attention_mask=attention_mask,
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -2034,7 +2034,7 @@
+         grad_norm = self.get_grad_norm()
+         _relax_threshold_norm = grad_norm
+         if getattr(self, "_relax_qwen35_optimized", False):
+-            from relax.backends.megatron.megatron_patch.qwen3_5.grad_norm import finite_norm
++            from relax.models.qwen3_5.grad_norm import finite_norm
+ 
+             _relax_threshold_norm = finite_norm(grad_norm)
+         should_skip_update = False
+diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_delta_net/gdn.py
+--- a/megatron/core/ssm/gated_delta_net/gdn.py
++++ b/megatron/core/ssm/gated_delta_net/gdn.py
+@@ -308,7 +308,11 @@
+         """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
+         # Input projection
+         nvtx_range_push(suffix="in_proj")
+-        qkvzba, _ = self.in_proj(hidden_states)
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.projection_hooks import run_projection
++            qkvzba, _ = run_projection(self.in_proj, hidden_states, self.in_proj)
++        else:
++            qkvzba, _ = self.in_proj(hidden_states)
+         nvtx_range_pop(suffix="in_proj")
+ 
+         qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
+@@ -388,7 +392,10 @@
+             nvtx_range_pop(suffix="pre_gated_delta_rule")
+ 
+         nvtx_range_push(suffix="gated_delta_rule")
+-        core_attn_out, _ = self.gated_delta_rule(
++        rule = self.gated_delta_rule
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.gdn_backend import rule
++        core_attn_out, _ = rule(
+             **kernel_inputs,
+             initial_state=None,
+             output_final_state=False,
+@@ -430,7 +437,11 @@
+ 
+         # Output projection
+         nvtx_range_push(suffix="out_proj")
+-        out, out_bias = self.out_proj(norm_out)
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.projection_hooks import run_projection
++            out, out_bias = run_projection(self.out_proj, norm_out, self.out_proj)
++        else:
++            out, out_bias = self.out_proj(norm_out)
+         nvtx_range_pop(suffix="out_proj")
+ 
+         if self.recompute_norm_out and self.training:
+@@ -476,6 +487,10 @@
+     ):
+         """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
+ 
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.gdn_preprocessing import pre
++            return pre(self, qkvzba, batch, seq_len, cp_size_headwise,
++                       cp_group_headwise, cu_seqlens_q, chunkwise_cp_context, packed_seq_params)
+         qkvzba = qkvzba.transpose(0, 1)
+         qkv, gate, beta, alpha = torch.split(
+             qkvzba, self._get_feat_dim_split(cp_size_headwise), dim=-1
+diff --git a/megatron/core/tensor_parallel/random.py b/megatron/core/tensor_parallel/random.py
+--- a/megatron/core/tensor_parallel/random.py
++++ b/megatron/core/tensor_parallel/random.py
+@@ -674,6 +674,20 @@
+         distribute_saved_activations: bool,
+         *args: Unpack[_Ts],
+     ) -> _R:
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_QSA_RECOMPUTE_REPLAY:
++            from relax.models.qwen3_8.qsa_cp import _checkpoint_forward
++
++            return _checkpoint_forward(ctx, run_function, distribute_saved_activations, *args)
++        return CheckpointFunction._relax_native_forward(ctx, run_function, distribute_saved_activations, *args)
++
++    @staticmethod
++    def _relax_native_forward(
++        ctx: Any,
++        run_function: Callable[[Unpack[_Ts]], _R],
++        distribute_saved_activations: bool,
++        *args: Unpack[_Ts],
++    ) -> _R:
+         """Forward pass."""
+         _set_checkpointing()
+ 
+diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
+--- a/megatron/core/transformer/attention.py
++++ b/megatron/core/transformer/attention.py
+@@ -584,6 +584,11 @@
+         **extra_kwargs,
+     ):
+         """Run the configured core attention module."""
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.attention import forward
++            return forward(self.core_attention, query, key, value, attention_mask,
++                           attn_mask_type=attn_mask_type, attention_bias=attention_bias,
++                           packed_seq_params=packed_seq_params, **extra_kwargs)
+         return apply_module(self.core_attention)(
+             query,
+             key,
+@@ -1534,7 +1539,11 @@
+             )
+             out = output.transpose(0, 1).contiguous()
+             context_layer = out.view(out.size(0), out.size(1), -1)
+-            output, bias = apply_module(self.linear_proj)(context_layer)
++            if getattr(self.config, "_relax_qwen35_optimized", False):
++                from relax.models.qwen3_5.projection_hooks import run_projection
++                output, bias = run_projection(self.linear_proj, context_layer, apply_module(self.linear_proj))
++            else:
++                output, bias = apply_module(self.linear_proj)(context_layer)
+             if back_to_input_converter is not None:
+                 output = back_to_input_converter.convert(
+                     output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+@@ -1659,7 +1668,7 @@
+             if inference_context is None or inference_context.is_static_batching():
+                 # Static batching attention kernel.
+                 with core_attn_manager as query:
+-                    core_attn_out = apply_module(self.core_attention)(
++                    core_attn_out = self._run_core_attention(
+                         query,
+                         key,
+                         value,
+@@ -1728,7 +1737,11 @@
+         nvtx_range_push(suffix="linear_proj")
+         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+         with attn_proj_manager as core_attn_out:
+-            output, bias = apply_module(self.linear_proj)(core_attn_out)
++            if getattr(self.config, "_relax_qwen35_optimized", False):
++                from relax.models.qwen3_5.projection_hooks import run_projection
++                output, bias = run_projection(self.linear_proj, core_attn_out, apply_module(self.linear_proj))
++            else:
++                output, bias = apply_module(self.linear_proj)(core_attn_out)
+         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+         nvtx_range_pop(suffix="linear_proj")
+ 
+@@ -1740,8 +1753,14 @@
+         self.pg_collection.cp = _orig_cp_group
+         return output, bias
+ 
++    def _apply_output_gate(self, x, gate):
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.attention_gate import compact_gate
++            gate = compact_gate(gate)
++        return self._apply_output_gate_native(x, gate)
++
+     @jit_fuser
+-    def _apply_output_gate(self, x, gate):
++    def _apply_output_gate_native(self, x, gate):
+         x_dtype = x.dtype
+         gate = gate.contiguous()
+         gate = gate.view(*x.shape)
+@@ -1950,6 +1969,14 @@
+             )
+ 
+     def get_query_key_value_tensors(self, hidden_states: Tensor, key_value_states: Tensor | None=None, output_gate: bool=False, head_wise_gate: bool=False, split_qkv: bool=True) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, list[int]]:
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_QSA_ROUTED_QKV:
++            from relax.models.qwen3_8.qsa_routed_qkv import forward
++
++            return forward(self, hidden_states, key_value_states, output_gate, head_wise_gate, split_qkv)
++        return self._relax_native_get_query_key_value_tensors(hidden_states, key_value_states, output_gate, head_wise_gate, split_qkv)
++
++    def _relax_native_get_query_key_value_tensors(self, hidden_states: Tensor, key_value_states: Tensor | None=None, output_gate: bool=False, head_wise_gate: bool=False, split_qkv: bool=True) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, list[int]]:
+         """
+         Derives `query`, `key` and `value` tensors from `hidden_states`.
+         If `output_gate` is True, also returns a per-head head_dim gate.
+@@ -1957,12 +1984,16 @@
+         If `split_qkv=False`, returns the unsplit mixed_qkv tensor.
+         """
+         if getattr(self, '_qwen_qkv_fused', False):
+-            from relax.backends.megatron.megatron_patch.qwen3_5.qkv_transform import _supported as _qwen_extract_supported
+-            from relax.backends.megatron.kernels.qwen3_5.qkv_extract import Extract
++            from relax.models.qwen3_5.qkv_transform import _supported as _qwen_extract_supported
++            from relax.models.qwen3_5.ops.qkv_extract import Extract
+             _qwen_extract = Extract.apply
+         if head_wise_gate:
+             assert split_qkv and self.config.head_wise_attn_gate
+-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.projection_hooks import run_projection
++            mixed_qkv, _ = run_projection(self.linear_qkv, hidden_states, apply_module(self.linear_qkv))
++        else:
++            mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+         if getattr(self, '_qwen_qkv_fused', False) and _qwen_extract_supported(self, mixed_qkv, key_value_states, output_gate, head_wise_gate, split_qkv):
+             query, key, value, gate = _qwen_extract(mixed_qkv, self._qwen_kv_pair_group)
+             if self.q_layernorm is not None:
+diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/megatron/core/transformer/experimental_attention_variant/qsa.py
+--- a/megatron/core/transformer/experimental_attention_variant/qsa.py
++++ b/megatron/core/transformer/experimental_attention_variant/qsa.py
+@@ -184,6 +184,20 @@
+     device,
+     stage2_max_doc_len: Optional[int] = None,
+ ) -> Tuple[Tensor, Tensor, int]:
++    from relax.utils.env import Envs
++    if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
++        from relax.models.qwen3_8.qsa_cpu_layout import _sequence_layout
++
++        return _sequence_layout(batch_size, seq_len, packed_seq_params, device, stage2_max_doc_len)
++    return _relax_native_sequence_layout(batch_size, seq_len, packed_seq_params, device, stage2_max_doc_len)
++
++def _relax_native_sequence_layout(
++    batch_size: int,
++    seq_len: int,
++    packed_seq_params: Optional[PackedSeqParams],
++    device,
++    stage2_max_doc_len: Optional[int] = None,
++) -> Tuple[Tensor, Tensor, int]:
+     """Document ids and in-document positions for every token.
+ 
+     Returns ``(doc_ids [b, s], positions [b, s], max_doc_len)`` as int32 tensors.
+@@ -318,6 +332,16 @@
+         return torch.cat([rotated.view_as(x_rot), x_pass], dim=-1)
+ 
+     def _pool_keys(
++        self, raw_keys: Tensor, doc_ids: Tensor, positions: Tensor, max_doc_len: int
++    ) -> Tuple[Tensor, Tensor, Tensor]:
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or Envs.RELAX_QWEN38_QSA_FIXED_POOL:
++            from relax.models.qwen3_8.qsa_dispatch import pool_keys
++
++            return pool_keys(self, raw_keys, doc_ids, positions, max_doc_len)
++        return self._relax_native_pool_keys(raw_keys, doc_ids, positions, max_doc_len)
++
++    def _relax_native_pool_keys(
+         self, raw_keys: Tensor, doc_ids: Tensor, positions: Tensor, max_doc_len: int
+     ) -> Tuple[Tensor, Tensor, Tensor]:
+         """Mean-pool complete blocks of ``compress_ratio`` consecutive tokens per document.
+@@ -422,6 +446,23 @@
+ 
+     @torch.no_grad()
+     def _select_blocks(
++        self,
++        q: Tensor,
++        pooled_keys: Tensor,
++        block_valid: Tensor,
++        doc_ids: Tensor,
++        positions: Tensor,
++        uniform_doc_len: Optional[int] = None,
++        output_format: str = "bits",
++    ) -> Tuple[Tensor, bool]:
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or Envs.RELAX_QWEN38_QSA_FUSED_SELECTOR:
++            from relax.models.qwen3_8.qsa_dispatch import select_blocks
++
++            return select_blocks(self, q, pooled_keys, block_valid, doc_ids, positions, uniform_doc_len, output_format)
++        return self._relax_native_select_blocks(q, pooled_keys, block_valid, doc_ids, positions, uniform_doc_len, output_format)
++
++    def _relax_native_select_blocks(
+         self,
+         q: Tensor,
+         pooled_keys: Tensor,
+@@ -565,6 +606,21 @@
+ 
+     # ------------------------------------------------------------------ forward
+     def forward(
++        self,
++        hidden_states: Tensor,
++        rotary_pos_emb: Optional[Tensor],
++        packed_seq_params: Optional[PackedSeqParams] = None,
++        output_format: str = "bits",
++    ) -> QSASelection:
++        from relax.utils.env import Envs
++        import os
++        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or Envs.RELAX_QWEN38_QSA_RECOMPUTE_REPLAY or Envs.RELAX_QWEN38_QSA_FUSED_SELECTOR or Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND == "mixed" or os.environ.get("RELAX_QWEN38_QSA_TP_SELECTOR", "0") == "1":
++            from relax.models.qwen3_8.qsa_dispatch import indexer_forward
++
++            return indexer_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, output_format)
++        return self._relax_native_forward(hidden_states, rotary_pos_emb, packed_seq_params, output_format)
++
++    def _relax_native_forward(
+         self,
+         hidden_states: Tensor,
+         rotary_pos_emb: Optional[Tensor],
+@@ -824,7 +880,15 @@
+             **kwargs,
+         )
+         self._selection: Optional[QSASelection] = None
+-        self.sparse_backend = os.environ.get("MCORE_QSA_SPARSE_BACKEND", "flex")
++        from relax.utils.env import Envs
++
++        default_backend = "flex"
++        if Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND:
++            from relax.models.qwen3_8.qsa_community import validate_backend
++
++            validate_backend()
++            default_backend = "id_sparse"
++        self.sparse_backend = os.environ.get("MCORE_QSA_SPARSE_BACKEND", default_backend)
+ 
+     def set_selection(self, selection: Optional[QSASelection]) -> None:
+         """Register the block selection consumed by the next forward call."""
+@@ -945,6 +1009,16 @@
+     def _id_sparse_forward(
+         self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
+     ) -> Tensor:
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND:
++            from relax.models.qwen3_8.qsa_community import _community_id_sparse_forward
++
++            return _community_id_sparse_forward(self, query, key, value, selection, is_thd)
++        return self._relax_native_id_sparse_forward(query, key, value, selection, is_thd)
++
++    def _relax_native_id_sparse_forward(
++        self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
++    ) -> Tensor:
+         """Run the experimental selected-ID kernel on the current full-sequence order."""
+         from megatron.core.transformer.experimental_attention_variant.qsa_id_sparse import (
+             qsa_sparse_attention_id,
+@@ -976,6 +1050,16 @@
+         return out.permute(2, 0, 1, 3).reshape(s, b, hq * d)
+ 
+     def _flex_forward(
++        self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
++    ) -> Tensor:
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_QSA_SPARSE_BLOCKMASK or Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION:
++            from relax.models.qwen3_8.qsa_dispatch import flex_forward
++
++            return flex_forward(self, query, key, value, selection, is_thd)
++        return self._relax_native_flex_forward(query, key, value, selection, is_thd)
++
++    def _relax_native_flex_forward(
+         self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
+     ) -> Tensor:
+         if not HAVE_FLEX_ATTENTION:
+@@ -1112,6 +1196,27 @@
+         qsa_index_query: Optional[Tensor] = None,
+         qsa_compressed_key: Optional[Tensor] = None,
+     ) -> Tensor:
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_QSA_LOCAL_QUERY:
++            from relax.models.qwen3_8.qsa_cp import _core_forward
++
++            return _core_forward(self, query, key, value, attention_mask, attn_mask_type, attention_bias, packed_seq_params, qsa_selection=qsa_selection, qsa_index_query=qsa_index_query, qsa_compressed_key=qsa_compressed_key)
++        return self._relax_native_forward(query, key, value, attention_mask, attn_mask_type, attention_bias, packed_seq_params, qsa_selection=qsa_selection, qsa_index_query=qsa_index_query, qsa_compressed_key=qsa_compressed_key)
++
++    def _relax_native_forward(
++        self,
++        query: Tensor,
++        key: Tensor,
++        value: Tensor,
++        attention_mask: Optional[Tensor],
++        attn_mask_type: Optional[AttnMaskType] = None,
++        attention_bias: Optional[Tensor] = None,
++        packed_seq_params: Optional[PackedSeqParams] = None,
++        *,
++        qsa_selection: Optional[QSASelection] = None,
++        qsa_index_query: Optional[Tensor] = None,
++        qsa_compressed_key: Optional[Tensor] = None,
++    ) -> Tensor:
+         """Attention over the selected tokens.
+ 
+         ``query``/``key``/``value`` are ``[s, b, h, d]`` (sbhd) or ``[t, h, d]`` (thd); the output
+diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
+--- a/megatron/core/transformer/hyper_connection.py
++++ b/megatron/core/transformer/hyper_connection.py
+@@ -1012,6 +1012,11 @@
+                 setattr(param, 'sequence_parallel', True)
+ 
+     def _mix(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_HC_FUSED_MIX:
++            from relax.models.qwen3_8.ops.hc_fused_mix import supported, fused_mix
++            if supported(self, hidden_states):
++                return fused_mix(self, hidden_states)
+         s, b, nC = hidden_states.shape
+         n, C = self.n, self.hidden_size
+         xn = gated_residual_group_rmsnorm(hidden_states, self.hc_norm.weight, n, self.norm_eps)
+@@ -1054,6 +1059,12 @@
+     def _inject(
+         residual: Tensor, inject: Tensor, x: Tensor, bias: Optional[Tensor], n: int
+     ) -> Tensor:
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_HC_FUSED_COMBINE:
++            from relax.models.qwen3_8.ops.hc_fused_combine import supported
++            if supported(residual, inject, x, bias, n):
++                from relax.models.qwen3_8.ops.hc_combine import combine
++                return combine(residual, x, inject, n)
+         s, b, nC = residual.shape
+         out = x.float()
+         if bias is not None:
+diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transformer/moe/experts.py
+--- a/megatron/core/transformer/moe/experts.py
++++ b/megatron/core/transformer/moe/experts.py
+@@ -500,6 +500,13 @@
+         # Container for fusible ops
+         ops = te.pytorch.ops.Sequential()
+ 
++        grouped_linear = te.pytorch.ops.GroupedLinear
++        scaled_swiglu = te.pytorch.ops.ScaledSwiGLU
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.ops.grouped_linear import QwenGroupedLinear
++            from relax.models.qwen3_5.ops.scaled_swiglu import QwenScaledSwiGLU
++            grouped_linear, scaled_swiglu = QwenGroupedLinear, QwenScaledSwiGLU
++
+         # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
+         fc1_single_grouped_weight = self.linear_fc1.single_grouped_weight
+         fc1_weight_dtype = (
+@@ -524,7 +531,7 @@
+ 
+         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
+         # Using meta avoids allocating duplicate weights for the fused wrapper.
+-        op = te.pytorch.ops.GroupedLinear(
++        op = grouped_linear(
+             self.linear_fc1.num_gemms,
+             self.linear_fc1.in_features,
+             self.linear_fc1.out_features,
+@@ -576,12 +583,12 @@
+                 "activation_recompute_in_mlp"
+                 in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
+             ):
+-                op = te.pytorch.ops.ScaledSwiGLU(
++                op = scaled_swiglu(
+                     glu_interleave_size=glu_interleave,
+                     activation_recompute_in_mlp=activation_recompute_in_mlp,
+                 )
+             else:
+-                op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
++                op = scaled_swiglu(glu_interleave_size=glu_interleave)
+         elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
+             clamp = self.config.activation_func_clamp_value
+             if clamp is not None:
+@@ -632,7 +639,7 @@
+         ops.append(op)
+ 
+         # FC2
+-        op = te.pytorch.ops.GroupedLinear(
++        op = grouped_linear(
+             self.linear_fc2.num_gemms,
+             self.linear_fc2.in_features,
+             self.linear_fc2.out_features,
+@@ -825,7 +832,15 @@
+         x = x.view(shape)
+         return x
+ 
+-    def forward(
++    def forward(self, permuted_local_hidden_states, tokens_per_expert, permuted_probs):
++        state = getattr(self, "_qwen_expert_checkpoint_state", None)
++        if state is not None:
++            from relax.models.qwen3_5.expert_recompute import forward
++            return forward(self, permuted_local_hidden_states, tokens_per_expert,
++                           permuted_probs, self._forward_native, state)
++        return self._forward_native(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
++
++    def _forward_native(
+         self,
+         permuted_local_hidden_states: torch.Tensor,
+         tokens_per_expert: torch.Tensor,
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -852,7 +852,12 @@
+             )
+         else:
+             # Sorting top-k turned off during inference
+-            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
++            from relax.utils.env import Envs
++            sort_topk = torch.is_grad_enabled()
++            if Envs.RELAX_QWEN38_ROUTER_SORTED_REPLAY:
++                from relax.models.qwen3_8.ops.router_sorted_replay import use_sorted_topk
++                sort_topk = sort_topk or use_sorted_topk(logits, topk, use_pre_softmax, num_groups, group_topk, scaling_factor, score_function, expert_bias, fused, router_replay, dense_output, qb_histogram, qb_bin_bounds, topk_indices)
++            return torch.topk(scores, k=topk, dim=1, sorted=sort_topk)
+ 
+     def compute_topk(scores, topk, num_groups=None, group_topk=None):
+         # Default behavior if no replay is active
+diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/transformer/moe/shared_experts.py
+--- a/megatron/core/transformer/moe/shared_experts.py
++++ b/megatron/core/transformer/moe/shared_experts.py
+@@ -234,8 +234,14 @@
+             sharded_state_dict.update(sub_sd)
+         return sharded_state_dict
+ 
++    shared_gate_param_readiness_version = 1
++
+     def wait_current_stream(self):
+         """Wait for the current stream to complete."""
++        from relax.utils.env import Envs
++        if self.use_shared_expert_gate and Envs.RELAX_SFT_RESIDENT_PARAM_OVERLAP:
++            from megatron.core.utils import ensure_params_ready
++            ensure_params_ready([self.gate_weight])
+         self.stream.wait_stream(torch.cuda.current_stream())
+ 
+     @overlap_state_check(SharedExpertState.IDLE, SharedExpertState.PRE_FORWARD_COMM_DONE)
+@@ -382,7 +388,11 @@
+         with torch.cuda.stream(self.stream):
+             if self.use_shared_expert_gate:
+                 assert self.gate_score is not None
+-                output = (self._relax_shared_gate(self.cached_output, self.gate_score) if hasattr(self, "_relax_shared_gate") else self.cached_output * self.gate_score)
++                if getattr(self.config, "_relax_qwen35_optimized", False):
++                    from relax.models.qwen3_5.shared_expert import apply
++                    output = apply(self.cached_output, self.gate_score)
++                else:
++                    output = self.cached_output * self.gate_score
+                 self.gate_score = None
+             else:
+                 output = self.cached_output
+diff --git a/megatron/core/transformer/moe/token_dispatcher.py b/megatron/core/transformer/moe/token_dispatcher.py
+--- a/megatron/core/transformer/moe/token_dispatcher.py
++++ b/megatron/core/transformer/moe/token_dispatcher.py
+@@ -1970,7 +1970,7 @@
+             assert self.tp_size * self.ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"
+             manager_class = _DeepepV2Manager
+             if getattr(self.config, "_relax_qwen35_optimized", False):
+-                from relax.backends.megatron.megatron_patch.qwen3_5.deepep_expanded import ExpandedManager
++                from relax.models.qwen3_5.deepep_expanded import ExpandedManager
+ 
+                 manager_class = ExpandedManager
+             self._comm_manager = manager_class(
+diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
+--- a/megatron/core/transformer/multi_token_prediction.py
++++ b/megatron/core/transformer/multi_token_prediction.py
+@@ -1733,8 +1733,11 @@
+     Returns:
+         Tensor: Updated hidden states after MTP loss processing (first chunk only).
+     """
++    from relax.models.common.chunked_mtp_loss import _chunked_mtp_enabled, process_mtp_loss as chunked_mtp_loss
++    if _chunked_mtp_enabled() and not (config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"):
++        return chunked_mtp_loss(hidden_states, labels, loss_mask, output_layer, output_weight, runtime_gather_output, is_training, compute_language_model_loss, config, cp_group=cp_group, tp_group=tp_group, packed_seq_params=packed_seq_params, scale_logits_fn=scale_logits_fn, input_ids=input_ids, sequence_roll_context=sequence_roll_context, mtp_input_mask=mtp_input_mask)
+     if getattr(config, '_relax_qwen35_optimized', False):
+-        from relax.backends.megatron.megatron_patch.qwen3_5.mtp_loss import selected_mtp_head as _relax_selected_mtp_head
++        from relax.models.qwen3_5.mtp_loss import selected_mtp_head as _relax_selected_mtp_head
+     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
+     hidden_states = hidden_states_list[0]
+     derived_labels_from_input_ids = labels is None
+diff --git a/megatron/core/transformer/per_layer_embedding.py b/megatron/core/transformer/per_layer_embedding.py
+--- a/megatron/core/transformer/per_layer_embedding.py
++++ b/megatron/core/transformer/per_layer_embedding.py
+@@ -517,6 +517,14 @@
+     # ------------------------------------------------------------------ forward
+     def forward(self, hidden_states: Tensor) -> Tensor:
+         """[s_local, b, n*C] streams -> [s_local, b, n*C] PLE update (to be added by the layer)."""
++        from relax.utils.env import Envs
++        if Envs.RELAX_QWEN38_PLE_STREAMED:
++            from relax.models.qwen3_8.ops.ple_stream import _streamed_forward
++            return _streamed_forward(self, hidden_states)
++        if Envs.RELAX_QWEN38_PLE_FUSED_CONV:
++            from relax.models.qwen3_8.ops.ple_fused_conv import supported, fused_forward
++            if supported(self, hidden_states):
++                return fused_forward(self, hidden_states)
+         if self._ngram_ids is None:
+             raise RuntimeError("PerLayerEmbedding.prepare() must be called before forward().")
+         from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp, split_tensor_cp
+diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
+--- a/megatron/core/transformer/transformer_layer.py
++++ b/megatron/core/transformer/transformer_layer.py
+@@ -882,6 +882,13 @@
+ 
+     @copy_signature(_forward_attention)
+     def forward(self, *args, **kwargs):
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            from relax.models.qwen3_5.layer_recompute import layer_context
++            with layer_context(self, kwargs.get("packed_seq_params")):
++                return self._forward_with_recompute_state(*args, **kwargs)
++        return self._forward_with_recompute_state(*args, **kwargs)
++
++    def _forward_with_recompute_state(self, *args, **kwargs):
+         """
+         Perform a forward pass through the transformer layer.
+ 
+@@ -1096,6 +1103,20 @@
+         return mlp_output_with_bias, residual
+ 
+     def _forward_mlp(
++        self,
++        hidden_states: Tensor,
++        inference_context: BaseInferenceContext | None = None,
++        padding_mask: Tensor | None = None,
++        input_ids: Optional[Tensor] = None,
++        packed_seq_params: Optional[PackedSeqParams] = None,
++    ) -> Tensor | list[Tensor | None]:
++        if getattr(self, "_relax_qsa_attention_retained", False):
++            from relax.models.qwen3_8.qsa_attention_recompute import retained_mlp
++
++            return retained_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params, native_forward=TransformerLayer._relax_native_forward_mlp)
++        return TransformerLayer._relax_native_forward_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params)
++
++    def _relax_native_forward_mlp(
+         self,
+         hidden_states: Tensor,
+         inference_context: BaseInferenceContext | None = None,
+@@ -2426,6 +2447,21 @@
+         packed_seq_params: Optional[PackedSeqParams] = None,
+         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
+     ):
++        if getattr(self, "_relax_qsa_attention_retained", False):
++            from relax.models.qwen3_8.qsa_attention_recompute import retained_mlp
++
++            return retained_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params, mhc_recompute_manager, native_forward=HyperConnectionTransformerLayer._relax_native_forward_mlp)
++        return HyperConnectionTransformerLayer._relax_native_forward_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params, mhc_recompute_manager)
++
++    def _relax_native_forward_mlp(
++        self,
++        hidden_states,
++        inference_context=None,
++        padding_mask=None,
++        input_ids=None,
++        packed_seq_params: Optional[PackedSeqParams] = None,
++        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
++    ):
+         """Forward MLP with hyper connection pre/post processing."""
+         is_last_in_recompute_block = bool(
+             mhc_recompute_manager is not None
+@@ -3171,6 +3207,20 @@
+         return out
+ 
+     def _forward_mlp(
++        self,
++        hidden_states,
++        inference_context=None,
++        padding_mask=None,
++        input_ids=None,
++        packed_seq_params=None,
++    ):
++        if getattr(self, "_relax_qsa_attention_retained", False):
++            from relax.models.qwen3_8.qsa_attention_recompute import retained_mlp
++
++            return retained_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params, native_forward=MoETransformerLayer._relax_native_forward_mlp)
++        return MoETransformerLayer._relax_native_forward_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params)
++
++    def _relax_native_forward_mlp(
+         self,
+         hidden_states,
+         inference_context=None,
+diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transformer/moe/fused_a2a.py
+--- a/megatron/core/transformer/moe/fused_a2a.py
++++ b/megatron/core/transformer/moe/fused_a2a.py
+@@ -9,7 +9,7 @@
+ from megatron.core.utils import internal_api
+
+ try:
+-    from deep_ep.utils import EventHandle, EventOverlap
++    from _relax_hybrid_ep.utils import EventHandle, EventOverlap
+ except ImportError:
+     try:
+         from deep_ep import EventHandle, EventOverlap
+@@ -18,7 +18,7 @@
+         EventOverlap = None
+
+ try:
+-    from deep_ep import Buffer
++    from _relax_hybrid_ep import Buffer
+
+     HAVE_DEEP_EP = True
+ except ImportError:
+@@ -510,14 +510,14 @@
+
+
+ try:
+-    from deep_ep import HybridEPBuffer
++    from _relax_hybrid_ep import HybridEPBuffer
+
+     HAVE_HYBRIDEP = True
+     HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING = _has_parameter(
+         HybridEPBuffer.dispatch_with_permute, "dense_routing"
+     )
+     try:
+-        import hybrid_ep_cpp
++        from _relax_hybrid_ep import hybrid_ep_cpp
+
+         HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING = hasattr(
+             hybrid_ep_cpp.HybridEpConfigInstance(), "topk"

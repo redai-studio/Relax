@@ -650,7 +650,7 @@ _CHAT_TEMPLATE_PATCHERS = (
 
 ### 测试
 
-参考 [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/test_qwen_chat_template_patch.py)，至少覆盖：
+参考 [`test_qwen_chat_template_patch.py`](../../../tests/cpu/engine/sft/dataset/test_qwen_chat_template_patch.py)，至少覆盖：
 
 1. 无关模板严格 no-op。
 2. legacy 模板正确 patch，native 模板保持幂等。
@@ -666,3 +666,33 @@ _CHAT_TEMPLATE_PATCHERS = (
 - 阅读[配置参考手册](./configuration.md)，查看完整 SFT 参数表。
 - 阅读[性能调优](./performance-tuning.md)，了解更完整的吞吐优化方法。
 - 如果任务在模型加载或训练中 OOM，阅读[OOM 排查](./oom-troubleshooting.md)。
+
+
+### Gemma4 工具调用轨迹
+
+OpenAI 工具消息保留 `tool_call_id` 和 `name`；缺失的工具名称会根据调用 ID 从对应的工具调用中补齐。助手工具调用允许省略 `content` 或设置为 `null`。以 JSON 对象字符串编码的工具参数会被解析，原始数据行不变。可选的行级字段 `message_loss_mask` 为每条输入消息提供一个 `0` 或 `1`，选择参与监督的消息。
+
+Gemma4 模板补丁通过环境变量显式启用，需要将这些变量传入训练 worker：
+
+- `GEMMA4_SFT_TOOL_TURN_BOUNDARY=1` 在一批工具调用后加入受监督的回合结束标记，内嵌工具响应仅作为上下文。fallback loss mask 支持监督全部助手消息或仅最后一条助手回答，其他监督选择会明确报错。
+- `GEMMA4_SFT_THINKING=1` 在每个新模型回合开始时插入空思考结构，不启用独立的系统思考前缀。
+- `GEMMA4_SFT_MS_SWIFT_COMPAT=1` 在传给模板的消息中省略工具关联字段，用于显式对齐 ms-swift。
+
+启用模板补丁并导出 HF 模型时，传入 `--save-hf-post-hook-path scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template`，并在导出时保留相同环境变量，使 `chat_template.jinja` 为推理保留训练时的回合边界。导出模板同时保存 ms-swift 的关联字段过滤逻辑，重载后的 tokenizer 无需 Relax 预处理或环境变量即可应用。该 hook 只修改模板，视觉权重由现有导出器处理。
+
+
+### Gemma4 31B 文本 64K SFT
+
+在 worker 环境中显式设置 `RELAX_GEMMA4_FORCE_FLEX_GLOBAL=1`，可为 Gemma4 全局注意力层选择分块 FlexAttention。滑动窗口层继续使用 FlashAttention；不设置该开关时，全局层保留现有 SDPA 路径。packed 样本分别计算注意力。FlexAttention 训练要求 attention dropout 为零，目前仅支持 CP1。
+
+文本启动脚本默认 TP8/PP1/CP1、65,536 tokens，启用分块 logits 及逐块 loss 重计算、完整激活重计算和 optimizer CPU offload。两台各有 8 张 GPU 的节点可设置 `NUM_NODES=2 GPUS_PER_NODE=8`，使用 TP8/DP2。共享 embedding 权重要求保持梯度通信 overlap 关闭。该 profile 固定使用 text conversion，不包含图像输入。
+
+```bash
+RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/messages.jsonl \
+  bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-gemma4-31B-sft-64k-8xgpu.sh
+```
+
+`run-gemma4-31B-multiturn-flex64k.sh` 复用上述脚本，使用 messages 输入并非阻塞提交。两个 profile 默认 `GEMMA4_SFT_THINKING=0`，启用工具回合边界，并使用 Gemma4 post-hook 导出对应模板。`DISABLE_CHECKPOINT_SAVE=1` 关闭模型保存，`OPTIMIZER_CPU_OFFLOAD=0` 关闭 CPU offload。默认跳过超长样本（`SFT_OVERSIZE_STRATEGY=skip`）。
+
+Flex 路径需要支持 FlexAttention 和 BlockMask 的 PyTorch 环境。生产使用前，应在目标环境验证 CUDA 前向／反向一致性、真实 64K 峰值显存和训练稳定性；CPU 参考测试不能证明完整模型的 GPU 数值等价。

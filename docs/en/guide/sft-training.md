@@ -650,7 +650,7 @@ Patch signatures must be mutually exclusive. The dispatcher evaluates all regist
 
 ### Tests
 
-Follow [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/test_qwen_chat_template_patch.py) and cover at least:
+Follow [`test_qwen_chat_template_patch.py`](../../../tests/cpu/engine/sft/dataset/test_qwen_chat_template_patch.py) and cover at least:
 
 1. Unrelated-template strict no-op behavior.
 2. Correct legacy-template patching and native-template idempotence.
@@ -666,3 +666,33 @@ Follow [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/te
 - Read [Configuration Reference](./configuration.md) for the full SFT parameter table.
 - Read [Performance Tuning](./performance-tuning.md) for broader throughput tuning.
 - Read [OOM Troubleshooting](./oom-troubleshooting.md) if the job fails during model load or training.
+
+
+### Gemma4 tool-call trajectories
+
+OpenAI tool messages retain `tool_call_id` and `name`; a missing tool name is resolved from the corresponding call ID. Assistant tool calls may omit `content` or set it to `null`. Function arguments encoded as JSON objects are decoded without modifying the source row. An optional row-level `message_loss_mask` selects supervised messages with one `0` or `1` per input message.
+
+Gemma4 template patches are opt-in environment variables and must be propagated to the training workers:
+
+- `GEMMA4_SFT_TOOL_TURN_BOUNDARY=1` adds a supervised end-of-turn after a tool-call batch. Embedded tool responses remain context-only. The fallback loss mask supports all assistant messages or only the final assistant answer; other supervision selections fail explicitly.
+- `GEMMA4_SFT_THINKING=1` inserts an empty thought scaffold at each new model turn without enabling the separate system thinking prefix.
+- `GEMMA4_SFT_MS_SWIFT_COMPAT=1` omits tool correlation fields from template inputs for explicit ms-swift compatibility.
+
+When using these template patches with HF export, pass `--save-hf-post-hook-path scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template`. Keep the same environment flags enabled during export so `chat_template.jinja` preserves the training-time boundaries for serving. The exported template also retains the ms-swift correlation-field filter, so a reloaded tokenizer applies it without Relax preprocessing or environment variables. This hook only patches the template; the existing exporter handles vision weights.
+
+
+### Gemma4 31B text SFT at 64K
+
+The opt-in `RELAX_GEMMA4_FORCE_FLEX_GLOBAL=1` worker environment variable selects chunked FlexAttention for Gemma4 global layers. Sliding-window layers continue to use FlashAttention; leaving the flag unset keeps the existing SDPA global path. Packed samples are handled independently. FlexAttention training requires zero attention dropout and currently supports CP1 only.
+
+The text launcher defaults to TP8/PP1/CP1, 65,536 tokens, chunked logits with per-chunk loss recomputation, full activation recomputation, and optimizer CPU offload. Two equal 8-GPU nodes can use TP8/DP2 by setting `NUM_NODES=2 GPUS_PER_NODE=8`. Tied embeddings require gradient overlap to remain disabled. The launcher always selects text conversion; image inputs are not part of this profile.
+
+```bash
+RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/messages.jsonl \
+  bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-gemma4-31B-sft-64k-8xgpu.sh
+```
+
+`run-gemma4-31B-multiturn-flex64k.sh` reuses that launcher with messages input and nonblocking submission. Both profiles default to `GEMMA4_SFT_THINKING=0`, enable tool-turn boundaries, and export the matching template using the Gemma4 post-hook. `DISABLE_CHECKPOINT_SAVE=1` disables model saves; `OPTIMIZER_CPU_OFFLOAD=0` disables CPU offload. Oversized samples are skipped by default (`SFT_OVERSIZE_STRATEGY=skip`).
+
+The Flex path needs a PyTorch runtime with FlexAttention and BlockMask support. Validate CUDA forward/backward agreement, actual 64K peak memory, and training stability on the target runtime before production use; CPU reference checks do not establish full-model GPU numerical equivalence.

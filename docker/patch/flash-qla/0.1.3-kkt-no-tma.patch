@@ -1,0 +1,39 @@
+--- a/flash_qla/ops/gated_delta_rule/chunk/blackwell/kkt_solve.py
++++ b/flash_qla/ops/gated_delta_rule/chunk/blackwell/kkt_solve.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2026 The Qwen team, Alibaba Group.
+ # Licensed under The MIT License [see LICENSE for details]
+ 
++from functools import lru_cache
+ from typing import Optional
+ 
+ import torch
+@@ -8,12 +9,20 @@
+ import tilelang.language as T
+ 
+ from flash_qla.utils import prepare_chunk_indices
++
++
++@lru_cache(maxsize=128)
++def _relax_verify_kkt_store(kernel):
++    # Check the compiled artifact once per specialization, before launching it.
++    if "tl::tma_store" in kernel.get_kernel_source():
++        raise RuntimeError("FlashQLA KKT unexpectedly lowered to TMA store")
+ 
+ 
+ @tilelang.jit(
+     # out_idx=[-1],
+     pass_configs={
+         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
++        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+     },
+ )
+ def tilelang_kkt_solve(
+@@ -318,6 +327,7 @@
+         accum_dtype="float32",
+         is_varlen=is_varlen,
+     )
++    _relax_verify_kkt_store(tilelang_kkt_solve_kernel)
+     if is_varlen:
+         tilelang_kkt_solve_kernel(k, b, cu_seqlens, chunk_indices, a)
+     else:
