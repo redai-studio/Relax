@@ -21,7 +21,7 @@ export RELAX_CONDITION_CACHE_DEVICE=cpu
 export RELAX_CONDITION_CACHE_IDENTITY="<verified-model-manifest-sha256>"
 ```
 
-Replace the identity placeholder with the SHA256 identity of a verified manifest covering the model files. A model directory name is not a content identity. The reproduction example generates this identity after validating its pinned assets; use its `prepared.json` when running the fixed comparison.
+Replace the identity placeholder with the SHA256 identity of a verified manifest covering the model files. A model directory name is not a content identity. The external validation repository generates this identity after validating its pinned assets. See the link below for that fixed comparison.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -37,7 +37,7 @@ To return to online encoding, start the next run with:
 export RELAX_CONDITION_CACHE_BYTES=0
 ```
 
-Variables are read when the model is created. Changing them does not resize an existing cache. For the standard SenseNova training recipe and metadata format, see [Image-to-Image SFT](./i2i-sft.md). The Qwen adapter loads a local Diffusers model directory; the reproduction example pins and prepares the required files for both models.
+Variables are read when the model is created. Changing them does not resize an existing cache. For the standard SenseNova training recipe and metadata format, see [Image-to-Image SFT](./i2i-sft.md). The Qwen adapter loads a local Diffusers model directory; pass `relax.models.qwen_image.sft_adapter.QwenImageEditSFTAdapter` as `--model-adapter-path` in the I2I training path.
 
 ## Capacity and cache keys
 
@@ -55,20 +55,10 @@ Cache reads preserve tensor dtype and return private copies. SenseNova reconstru
 
 Each FSDP rank owns its cache. Ranks agree on eligibility and hits before taking a branch around a sharded encoder; a rank-local hit cannot skip a collective that another rank needs. Changing data assignment between ranks may therefore reduce reuse.
 
-The model exposes `clear_condition_cache()`, `close_condition_cache()` and `condition_cache_stats()`. `clear` drops entries while leaving the cache usable; `close` releases entries and ends its use. The FSDP trainer's cleanup method closes the model cache, including when an update fails or is interrupted. The reproduction runner calls cleanup in `finally` on completion, failure or cancellation; custom loops must do the same. Entries are not written to disk, shared memory or checkpoints, and a resumed process rebuilds them.
+The model exposes `clear_condition_cache()`, `close_condition_cache()` and `condition_cache_stats()`. `clear` drops entries while leaving the cache usable; `close` releases entries and ends its use. The FSDP trainer's cleanup method closes the model cache, including when an update fails or is interrupted. Custom training loops should call cleanup in `finally` on completion, failure or cancellation. Entries are not written to disk, shared memory or checkpoints, and a resumed process rebuilds them.
 
-## Reproduce the comparison
+## Validation and benchmark evidence
 
-From the repository root, enter the standalone example:
+The [separate validation repository](https://github.com/tryu-ai/relax-condition-cache-validation) contains the fixed model/data locks, numerical and performance comparison tools, and recorded H200/RTX 3090 evidence. It documents its own source revision and environment; these tools are not part of the Relax runtime or required to use the cache.
 
-```bash
-cd examples/frozen_condition_cache
-python -m runner.campaign prepare --assets /path/to/assets
-python -m runner.campaign validate --prepared /path/to/assets/prepared.json
-python -m runner.campaign run \
-  --prepared /path/to/assets/prepared.json \
-  --work /path/to/results --devices 0 --world 1
-python -m runner.campaign summarize --work /path/to/results
-```
-
-Replace the paths with your own asset and output directories. Preparation downloads the pinned public model/data files; validation checks their SHA256 values. The runner uses the native `FSDPSFTTrainer`, with identical online/cache model, precision, optimizer and sample order. Its default matrix runs serially on one GPU and retains all three AB/BA/AB pairs, cold-cache costs and a low-reuse workload. It measures the training loop, including preparation waits, forward/backward, reduction and Adam; it excludes Ray/TQ orchestration, model initialization and checkpoint I/O from the steady-state interval.
+Use the standard [Image-to-Image SFT](./i2i-sft.md) training path for everyday runs, with the cache variables above. The external comparison covers repeated and low-reuse workloads, including cold-cache cost; its results do not guarantee a speedup on other data or hardware.
