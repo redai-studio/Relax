@@ -36,7 +36,7 @@ from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
-from relax.utils import tracking_utils
+from relax.utils import tracking_utils, weight_version_audit
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.device import device_module
 from relax.utils.env import Envs
@@ -1283,6 +1283,12 @@ def train_one_step(
 
     main_loss_has_tokens = False
     packing_metrics = PackingMetrics()
+    audit_step = (
+        weight_version_audit.AuditStep(f"rollout-{rollout_id}/step-{step_id}")
+        if weight_version_audit.enabled() and getattr(model[0], "role", "actor") == "actor"
+        else None
+    )
+    audit_ordinals = itertools.count()
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -1333,6 +1339,7 @@ def train_one_step(
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
+                    *([weight_version_audit.PREPARED_FIELD] if audit_step is not None else []),
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1340,6 +1347,7 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
+        audit_ordinal = next(audit_ordinals)
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
@@ -1479,7 +1487,21 @@ def train_one_step(
             # Megatron invokes the loss callback only on the final physical and
             # virtual pipeline stage, so VPP chunks count each microbatch once.
             packing_metrics.add(batch, mpu.get_context_parallel_world_size())
-            return loss_callback(logits)
+            result = loss_callback(logits)
+            if audit_step is None:
+                return result
+            cp_rank = batch.get("dynamic_cp_rank", mpu.get_context_parallel_rank())
+            if mpu.get_tensor_model_parallel_rank() != 0 or cp_rank != 0:
+                return result
+            try:
+                audit_step.observe(
+                    audit_ordinal,
+                    batch.get(weight_version_audit.PREPARED_FIELD),
+                    dummy=batch.get("__is_dummy__", False),
+                )
+            except Exception:
+                logger.exception("Weight audit failed; actor loss remains unchanged")
+            return result
 
         return output_tensor, loss_callback_with_packing_metrics
 
@@ -1525,6 +1547,12 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+
+    if audit_step is not None and audit_step.observed:
+        try:
+            audit_step.commit(torch.distributed.get_rank(group=torch.distributed.group.WORLD))
+        except Exception:
+            logger.exception("Unable to write consumed weight audit; actor training continues")
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group

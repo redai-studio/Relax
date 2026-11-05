@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
+from relax.utils import weight_version_audit
 from relax.utils.types import Sample
 
 
@@ -801,6 +802,8 @@ class SessionForest:
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
         first_response_node: MsgNode | None = None
+        audit_spans: list[dict[str, Any]] = []
+        audit_finish = None
 
         for idx, node in enumerate(lineage):
             tokens.extend(node.train_token_delta)
@@ -811,6 +814,19 @@ class SessionForest:
             if node.multimodal_train_inputs_delta is not None:
                 multimodal_train_inputs_buffer.append(node.multimodal_train_inputs_delta)
             if node.kind == "resp":
+                if weight_version_audit.enabled():
+                    provenance = node.export_metadata_patch.get(weight_version_audit.AUDIT_KEY, {})
+                    absolute_start = len(tokens) - len(node.train_token_delta)
+                    audit_spans.extend(
+                        {
+                            **copy.deepcopy(span),
+                            "token_start": absolute_start + span["token_start"],
+                            "token_end": absolute_start + span["token_end"],
+                            "turn_index": len(turns),
+                        }
+                        for span in provenance.get("spans", [])
+                    )
+                    audit_finish = copy.deepcopy(provenance.get("finish_snapshot"))
                 if first_response_node is None:
                     first_response_node = node
                 turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
@@ -868,6 +884,15 @@ class SessionForest:
         # path) see a single source of truth without having to know about
         # ``agentic_trace``.
         merged_metadata["rollout_turns"] = len(turns)
+        if weight_version_audit.enabled():
+            merged_metadata[weight_version_audit.AUDIT_KEY] = {
+                "schema_version": 1,
+                "sample_uid": f"{self.session_id}/{leaf_state_hash}/{self.index}",
+                "session_id": self.session_id,
+                "leaf_state_hash": leaf_state_hash,
+                "spans": audit_spans,
+                "finish_snapshot": audit_finish,
+            }
         sample = Sample(
             group_index=self.group_index,
             index=self.index,

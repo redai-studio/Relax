@@ -215,6 +215,8 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_OPD_PER_POS_TOKEN_IDS = EnvProperty("RELAX_OPD_PER_POS_TOKEN_IDS", bool, False)
     RELAX_OPTIMIZE_ROUTING_REPLAY = EnvProperty("RELAX_OPTIMIZE_ROUTING_REPLAY", bool, False)
     RELAX_FORCE_LOGPROBS_BASE64 = EnvProperty("RELAX_FORCE_LOGPROBS_BASE64", bool, False)
+    # Shared publication frontier and bounded, per-representative actor audit reports.
+    RELAX_WEIGHT_AUDIT_DIR = EnvProperty("RELAX_WEIGHT_AUDIT_DIR", str, None)
 
     # Qwen model compatibility and optional training kernels.
     RELAX_LOGPROB_FAST_PATH = EnvProperty("RELAX_LOGPROB_FAST_PATH", bool, False)

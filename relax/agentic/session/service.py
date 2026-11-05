@@ -69,6 +69,7 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
+from relax.utils import weight_version_audit
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import get_spec_token_counts
@@ -2599,6 +2600,21 @@ class AgenticSessionShard:
     ) -> None:
         """Accumulate one backend attempt on the stable IR ref."""
 
+        if weight_version_audit.enabled() and result.new_tokens:
+            provenance = ir.pending_export_metadata_patch.setdefault(weight_version_audit.AUDIT_KEY, {"spans": []})
+            try:
+                provenance["spans"].extend(
+                    weight_version_audit.generation_spans(
+                        result.meta_info,
+                        len(result.new_tokens),
+                        offset=len(ir.pending_token_delta),
+                        request_id=ir.request_id,
+                        attempt_id=_backend_request_id(ir),
+                        piece_index=len(provenance["spans"]),
+                    )
+                )
+            except (ValueError, TypeError, KeyError, AttributeError):
+                logger.exception("Unable to audit accepted generation; uncovered tokens remain unknown")
         ir.pending_token_delta.extend(result.new_tokens)
         ir.pending_logprob_delta.extend(result.new_log_probs)
         if getattr(result, "new_topk_token_ids", None) is not None:
@@ -2677,6 +2693,12 @@ class AgenticSessionShard:
             tools=forest.subtree_tools(ir.parent_state_hash),
             parent_state_hash=ir.parent_state_hash,
         )
+        if weight_version_audit.enabled():
+            provenance = copy.deepcopy(
+                ir.pending_export_metadata_patch.get(weight_version_audit.AUDIT_KEY, {"spans": []})
+            )
+            provenance["finish_snapshot"] = weight_version_audit.read_frontier()
+            ir.pending_export_metadata_patch[weight_version_audit.AUDIT_KEY] = provenance
         response_node = forest.append_resp(
             parent_state_hash=ir.parent_state_hash,
             rollout_id=ir.rollout_id,

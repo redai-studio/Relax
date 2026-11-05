@@ -36,6 +36,7 @@ from urllib3.exceptions import NewConnectionError
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
+from relax.utils import weight_version_audit
 from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.env import Envs
@@ -641,6 +642,12 @@ class DeviceDirectBackend(CommBackend):
         model parameters (non-expert then expert), then resume generation.
         """
         self.weight_version += 1
+        if weight_version_audit.enabled():
+            self._weight_audit_load_ok = True
+            if dist.get_rank(group=get_gloo_group()) == 0 and not hasattr(self, "_weight_audit_publisher"):
+                self._weight_audit_publisher = weight_version_audit.PublicationLedger(
+                    Envs.RELAX_WEIGHT_AUDIT_DIR, self.model_name
+                )
 
         if self._use_bridge:
             # Bridge task construction and config exchange contain PP
@@ -691,7 +698,22 @@ class DeviceDirectBackend(CommBackend):
             if dist.get_rank() == 0:
                 # Pause generation on all rollout nodes
                 logger.info("Pausing generation on all rollout nodes...")
-                ray.get(self._batch_request("/pause_generation"))
+                pause_payload = {"mode": "abort"} if weight_version_audit.enabled() else None
+                ray.get(self._batch_request("/pause_generation", pause_payload))
+
+                if weight_version_audit.enabled() and self._lora_adapter_mode:
+                    # Subsequent adapter-only pushes do not pass through a base-weight
+                    # bucket. Invalidate the previous tag before changing the adapter.
+                    try:
+                        self._weight_audit_load_ok = self._set_weight_audit_version(
+                            f"relax-audit-pending:{self.weight_version}"
+                        )
+                        if not self._weight_audit_load_ok:
+                            self._invalidate_weight_audit()
+                    except Exception:
+                        logger.exception("Unable to invalidate adapter version evidence")
+                        self._weight_audit_load_ok = False
+                        self._invalidate_weight_audit()
 
                 # Flush cache on all rollout nodes
                 logger.info("Flushing cache on all rollout nodes...")
@@ -800,6 +822,11 @@ class DeviceDirectBackend(CommBackend):
                 push_failed = bool(flag.item())
             if dist.get_rank() == 0:
                 # Continue generation on all rollout nodes
+                if weight_version_audit.enabled() and push_failed:
+                    self._invalidate_weight_audit()
+            if weight_version_audit.enabled():
+                self._publish_weight_audit_version(push_failed=push_failed)
+            if dist.get_rank() == 0:
                 logger.info("Resuming generation on all rollout nodes...")
                 self._batch_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
@@ -827,6 +854,37 @@ class DeviceDirectBackend(CommBackend):
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
         device_module.empty_cache()
+
+    def _set_weight_audit_version(self, version: str) -> bool:
+        responses = ray.get(
+            self._batch_request("/update_weight_version", {"new_version": version, "abort_all_requests": False})
+        )
+        return bool(responses) and all(response.get("success") is True for response in responses)
+
+    def _publish_weight_audit_version(self, *, push_failed: bool) -> None:
+        """Confirm all PP/bucket loads, then label the policy before generation
+        resumes."""
+        group = get_gloo_group()
+        failed = torch.tensor([int(push_failed or not self._weight_audit_load_ok)], dtype=torch.int32)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+        if dist.get_rank(group=group) != 0:
+            return
+        try:
+            if bool(failed.item()):
+                self._weight_audit_publisher.invalidate()
+                logger.error("Weight publication unconfirmed; provenance remains unknown")
+                return
+            version = self._weight_audit_publisher.publish()
+            if not self._set_weight_audit_version(version):
+                logger.error("Policy published but some engines did not confirm their audit tag")
+        except Exception:
+            logger.exception("Weight audit publication failed; original weight synchronization continues")
+
+    def _invalidate_weight_audit(self) -> None:
+        try:
+            self._weight_audit_publisher.invalidate()
+        except OSError:
+            logger.exception("Unable to invalidate the failed weight audit frontier")
 
     def _should_sync_tensor(self, name: str, tensor: torch.Tensor) -> bool:
         return (
@@ -1047,7 +1105,11 @@ class DeviceDirectBackend(CommBackend):
                 handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
             for handle in handles:
                 handle.wait()
-            ray.get(futures)  # Ensure remote update completes
+            responses = ray.get(futures)  # Ensure remote update completes
+            if weight_version_audit.enabled():
+                self._weight_audit_load_ok &= bool(responses) and all(
+                    response.get("success") is True for response in responses
+                )
             completed = True
         finally:
             try:
@@ -1338,7 +1400,11 @@ class DeviceDirectBackend(CommBackend):
                     handles.clear()
                     bucket.clear()
                     offset += count
-                ray.get(futures)
+                responses = ray.get(futures)
+                if weight_version_audit.enabled():
+                    self._weight_audit_load_ok &= bool(responses) and all(
+                        response.get("success") is True for response in responses
+                    )
                 logger.info(
                     "[lora-adapter] broadcast %d tensors in %d bucket(s) over %s",
                     len(names),
