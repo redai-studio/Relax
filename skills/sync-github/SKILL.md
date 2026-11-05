@@ -88,7 +88,7 @@ gh run view <run-id> -R redai-studio/Relax --json status,conclusion,headSha,url
 门禁规则：
 
 - `headSha` 必须等于 `SOURCE_SHA`，否则该 CI 结果不能作为本次 `github/main` push 凭证。
-- `conclusion` 必须是 `success`，且至少包含 `Pre-commit Checks`、`Lint`、Python 测试矩阵全部成功。
+- `conclusion` 必须是 `success`，且所有 required CI 均成功。
 - 如果失败，先查看失败日志：
 
 ```bash

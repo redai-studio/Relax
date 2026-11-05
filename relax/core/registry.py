@@ -11,6 +11,9 @@ except ImportError:
             return self.value
 
 
+from argparse import Namespace
+from typing import Any
+
 from relax.algorithms import ALGORITHM_SPECS, algorithm_needs_critic
 from relax.components.actor import Actor
 from relax.components.actor_fwd import ActorFwd
@@ -18,6 +21,7 @@ from relax.components.advantages import Advantages
 from relax.components.critic import Critic
 from relax.components.rollout import Rollout
 from relax.components.sft import SFT
+from relax.engine.sft.runtime import is_offline_mode
 
 
 # NOTE(dev): Use StrEnum and keep visiting order with definition order
@@ -110,8 +114,8 @@ def _rl_roles(*, needs_critic: bool) -> dict:
 
 
 # NOTE(dev): `ALGOS` keys live in a different namespace from AlgorithmSpec names.
-# "sft" is selected by `loss_type`, not by `--advantage-estimator`, so it stays a
-# separate literal entry rather than being folded into the algorithm registry.
+# "sft" is the shared offline role key selected by `loss_type`, not by
+# `--advantage-estimator`, so it stays separate from the algorithm registry.
 ALGOS = {name: _rl_roles(needs_critic=spec.needs_critic) for name, spec in ALGORITHM_SPECS.items()}
 ALGOS["sft"] = {
     ROLES.sft: SFT,
@@ -124,7 +128,7 @@ def process_role(config):
         return ROLES_ROLLOUT_ONLY
     if config.debug_train_only:
         return ROLES_TRAIN_ONLY
-    if getattr(config, "loss_type", None) == "sft":
+    if is_offline_mode(config):
         return ROLES_SFT_ONLY
     if algorithm_needs_critic(config):
         if config.fully_async:
@@ -144,3 +148,17 @@ def process_role(config):
         return ROLES
     else:
         return ROLES_COLOCATE
+
+
+def resolve_algorithm(config: Namespace) -> dict[str, Any]:
+    """Resolve model-independent SFT orchestration for registration and
+    restart."""
+    from relax.engine.sft.bootstrap import resolve_sft_algo_key
+    from relax.engine.sft.runtime import is_i2i_sft
+
+    algo = ALGOS[resolve_sft_algo_key(config)].copy()
+    if is_i2i_sft(config):
+        from relax.components.image_sft import ImageSFT
+
+        algo[ROLES.sft] = ImageSFT
+    return algo

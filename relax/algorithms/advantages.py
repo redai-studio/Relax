@@ -11,7 +11,7 @@ optional advantage whitening.
 
 Any group-wise reward standardisation happens earlier, on the rollout side
 (see :mod:`relax.algorithms.rewards`). By the time an estimator runs,
-``rewards`` holds one processed scalar per sample.
+``rewards`` holds one processed scalar or token-aligned tensor per sample.
 """
 
 from typing import Any, Callable
@@ -34,9 +34,12 @@ def _as_reward_tensor(rewards: Any, kl: list[torch.Tensor]) -> torch.Tensor:
 
 
 def advantage_grpo_broadcast(args: Any, *, rewards, kl, **_unused):
-    """Broadcast the processed scalar reward over tokens."""
-    reward_tensor = _as_reward_tensor(rewards, kl)
-    returns = get_grpo_returns(reward_tensor, kl)
+    """Broadcast scalar rewards or pass through token-aligned rewards."""
+    if isinstance(rewards, list) and rewards and isinstance(rewards[0], torch.Tensor):
+        reward_values = [reward.detach().to(dtype=torch.float32, device=kl[0].device, copy=True) for reward in rewards]
+    else:
+        reward_values = _as_reward_tensor(rewards, kl)
+    returns = get_grpo_returns(reward_values, kl)
     advantages = list(returns)  # separate list so rebinding one does not move the other
     return advantages, returns
 

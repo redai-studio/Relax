@@ -44,6 +44,8 @@ class Sample:
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
+    rollout_topk_token_ids: np.ndarray | None = None  # [response_length, K], int32; -1 pads observations
+    rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
     rollout_routed_experts: np.ndarray | None = None  # [seq_len - 1, num_layers, topk]
     remove_sample: bool = False
     abort_count: int = 0  # Number of times this sample has been aborted
@@ -64,10 +66,9 @@ class Sample:
     teacher_prompt: str | list[dict[str, str]] | None = None
     teacher_multimodal_inputs: dict[str, Any] | None = None
     teacher_tokens: list[int] | None = None  # expanded teacher_prompt_tokens + response_tokens
+    teacher_rollout_tokens: list[int] | None = None  # collapsed teacher prompt + the same response tokens
     teacher_prompt_length: int | None = None  # number of teacher prompt tokens in teacher_tokens (expanded)
     teacher_image_data: dict[str, list] | None = None  # base64-encoded teacher media for SGLang payload
-    teacher_image_b64_list: list[str] | None = None  # raw base64-PNG list for OPD pre-expanded teacher path
-    teacher_image_grid_thw: Any = None  # HF processor image_grid_thw, [[t, h, w], ...]
 
     class Status(Enum):
         PENDING = "pending"

@@ -98,7 +98,7 @@ def _identity():
 def _config():
     from relax.utils.replay.schema import RecomputeConfig
 
-    return RecomputeConfig(advantage_estimator="grpo", n_samples_per_prompt=2)
+    return RecomputeConfig(advantage_estimator="grpo")
 
 
 if __name__ == "__main__":

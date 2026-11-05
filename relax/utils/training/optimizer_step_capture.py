@@ -101,6 +101,8 @@ class OptimizerStepCapture:
             leaves = getattr(self.optimizer, "chained_optimizers", [self.optimizer])
             for leaf in leaves:
                 config = leaf.config
+                if getattr(config, "chunked_optimizer_state_offload", False):
+                    raise ValueError("Capture does not support chunked optimizer-state offload")
                 sources = list(leaf.get_parameters())
                 inner = getattr(leaf, "optimizer", None)
                 hybrid = type(inner).__module__ == "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"

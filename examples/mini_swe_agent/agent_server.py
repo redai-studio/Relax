@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from glob import glob
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import pyarrow.dataset as ds
 from flask import Flask, jsonify, request
@@ -33,6 +33,10 @@ from minisweagent.environments.singularity import SingularityEnvironment, Singul
 from minisweagent.exceptions import FormatError, Submitted
 from minisweagent.models.litellm_model import LitellmModel
 from minisweagent.utils.serialize import recursive_merge
+
+
+if TYPE_CHECKING:
+    from swebench.harness.test_spec.test_spec import TestSpec
 
 
 INSTANCE_PREFIX = "mswe-"
@@ -504,6 +508,37 @@ def _r2e_reward(row: dict[str, Any], output: str) -> float:
     return 1.0
 
 
+def make_test_spec_without_deps(row: dict[str, Any]) -> "TestSpec":
+    # Adapted from SWE-bench 4.1.0 make_test_spec; skip scripts unused by scoring.
+    # https://github.com/SWE-bench/SWE-bench/blob/726c5461e2ef52d83cf1ea2107870a8bb3328d57/swebench/harness/test_spec/test_spec.py
+    from swebench.harness.constants import (
+        FAIL_TO_PASS,
+        KEY_INSTANCE_ID,
+        MAP_REPO_TO_EXT,
+        MAP_REPO_VERSION_TO_SPECS,
+        PASS_TO_PASS,
+    )
+    from swebench.harness.test_spec.test_spec import TestSpec
+
+    repo, version = row["repo"], row.get("version")
+    fail_to_pass = row.get(FAIL_TO_PASS, [])
+    pass_to_pass = row.get(PASS_TO_PASS, [])
+    return TestSpec(
+        instance_id=row[KEY_INSTANCE_ID],
+        repo=repo,
+        version=version,
+        repo_script_list=[],
+        env_script_list=[],
+        eval_script_list=[],
+        arch="x86_64",
+        FAIL_TO_PASS=json.loads(fail_to_pass) if isinstance(fail_to_pass, str) else fail_to_pass,
+        PASS_TO_PASS=json.loads(pass_to_pass) if isinstance(pass_to_pass, str) else pass_to_pass,
+        language=MAP_REPO_TO_EXT[repo],
+        docker_specs=MAP_REPO_VERSION_TO_SPECS[repo][version].get("docker_specs", {}),
+        namespace=None,
+    )
+
+
 def _swebench_reward(row: dict[str, Any], output: str) -> float:
     from swebench.harness.constants import (
         APPLY_PATCH_FAIL,
@@ -520,11 +555,10 @@ def _swebench_reward(row: dict[str, Any], output: str) -> float:
     )
     from swebench.harness.grading import get_eval_tests_report, get_resolution_status
     from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
-    from swebench.harness.test_spec.test_spec import make_test_spec
 
     if any(code in output for code in [APPLY_PATCH_FAIL, RESET_FAILED, TESTS_ERROR, TESTS_TIMEOUT]):
         return 0.0
-    test_spec = make_test_spec(row)
+    test_spec = make_test_spec_without_deps(row)
     test_cmd = MAP_REPO_VERSION_TO_SPECS[test_spec.repo][test_spec.version]["test_cmd"]
     test_cmd = test_cmd[-1] if isinstance(test_cmd, list) else test_cmd
     eval_status_map = MAP_REPO_TO_PARSER[test_spec.repo](output.split(test_cmd)[-1], test_spec)

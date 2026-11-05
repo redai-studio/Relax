@@ -22,6 +22,15 @@ def validate_flops_scheduling_args(args: Any) -> None:
         raise ValueError("FLOPs scheduling currently requires the Megatron backend")
     if not getattr(args, "use_dynamic_batch_size", False):
         raise ValueError("FLOPs scheduling requires --use-dynamic-batch-size")
+    if getattr(args, "sft_wholepack", False):
+        raise ValueError("FLOPs scheduling and --sft-wholepack are mutually exclusive")
+    if (
+        getattr(args, "flops_microbatch_packing", False)
+        and getattr(args, "sft_packing_strategy", "balanced") != "balanced"
+    ):
+        raise ValueError(
+            "FLOPs microbatch packing replaces the balanced strategy; disable --sft-packing-strategy binpack"
+        )
     if getattr(args, "qkv_format", "thd") != "thd":
         raise ValueError("FLOPs scheduling currently requires THD packing")
     if getattr(args, "dynamic_context_parallel", False):

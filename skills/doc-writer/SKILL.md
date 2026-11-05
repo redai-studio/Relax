@@ -11,11 +11,27 @@ description: Write and maintain bilingual (English + Chinese) documentation for
 
 Write bilingual VitePress documentation for the Relax project, ensuring both **format correctness** and **content correctness**.
 
-## Three Inviolable Rules
+## Inviolable Rules
 
-1. **Bilingual requirement** — EVERY documentation page MUST be created in BOTH English (`docs/guide/`) AND Chinese (`docs/zh/guide/`) simultaneously. Never create only one language version. Both versions must have identical structure and content coverage.
-2. **Format correctness** — every doc page must exist in both `docs/guide/` (English) and `docs/zh/guide/` (Chinese), be registered in `docs/.vitepress/config.mts` sidebar, and follow the established Markdown conventions.
-3. **Content correctness** — every API, class, function, config option, and CLI flag mentioned in the doc **must** be verified against the current source code. Never invent features, never describe removed/renamed APIs, never guess parameter names.
+1. **Bilingual requirement** — create or update both English (`docs/en/guide/`) and Chinese (`docs/zh/guide/`) pages together. Keep technical coverage, commands, defaults, and limitations aligned; write natural prose in each language rather than mirroring sentences mechanically.
+2. **Format correctness** — use the actual `docs/en/` and `docs/zh/` layout, register published pages in `docs/.vitepress/config.mts`, and follow the established Markdown conventions.
+3. **Content correctness** — verify every API, config option, CLI flag, default, and limitation against current source code. Never invent features, describe removed APIs, or turn a successful test or training experiment into a feature guarantee.
+4. **User-facing purpose** — help users understand, configure, and operate the feature. Never publish test or training acceptance reports as user documentation. Keep test counts, acceptance checklists, execution logs, machine traces, and verification history in internal notes or the PR's validation evidence, not in guide content or navigation.
+
+## Clear, natural writing
+
+Aim for **“80% of the way to ASD-STE100”** as a comprehension goal, not strict compliance, certification, or a fixed sentence pattern. Apply these principles to both languages:
+
+- Read two or three relevant repository guides before drafting. Follow their established terminology, level of detail, and way of introducing examples, without copying inaccuracies or report content.
+- Explain what the feature is for and what its differences mean to a user. Introduce configuration examples with context, and explain the important choices after the code.
+- Prefer concise, connected prose. Make actors and actions explicit when they would otherwise be unclear. Do not split every idea into a separate sentence or instruction; retain the context and transitions that make a paragraph readable.
+- Purpose, setup, configuration, limitations, and troubleshooting are content needs, not mandatory headings or a required sequence. Use numbered steps only when order matters, tables for settings that benefit from comparison, and prose for explanations.
+- Use consistent terms and familiar language. Avoid internal labels, abstract slogans, repetitive “verified” wording, and unnecessary definitions of terms the target reader already knows.
+- Separate recipe defaults from parser defaults and identify user-supplied paths. Verify commands against their consumers, but keep the verification process out of the guide.
+- Put constraints next to the affected configuration. Reserve warning containers for consequential risks, especially destructive commands; ordinary limitations usually need only a sentence. Explain causes and remedies without historical logs or generic disclaimers about every possible outcome.
+- Read each version as a standalone guide. Natural Chinese and natural English may use different phrasing; they must give the same operating instructions and must not turn test results into quality, performance, or reliability guarantees.
+
+For a cleanup task, read the actual affected pages (including live pages when supplied), source, navigation, and related code before editing. Preserve useful operating instructions in the guide. Remove report pages, their navigation, dangling links, and assets used only by those reports. Keep both languages synchronized and avoid unrelated site-wide changes.
 
 ______________________________________________________________________
 
@@ -47,7 +63,7 @@ Before writing a single line of documentation, **read the actual source code** f
 2. **Read public APIs** — list all classes, functions, and their actual signatures (parameter names, types, defaults).
 3. **Read config/arguments** — check `relax/utils/arguments.py` or the relevant argument parser for CLI flags.
 4. **Check imports** — verify that import paths shown in code examples are correct (e.g., `from relax.metrics import MetricsClient`).
-5. **Check existing docs** — read any related existing docs to avoid contradictions.
+5. **Check existing docs** — read relevant guides for both factual consistency and writing conventions. Choose examples close to the current task; do not treat any one page as a mandatory template.
 
 **Critical**: If the source code differs from what the user describes, trust the source code and note the discrepancy.
 
@@ -58,33 +74,34 @@ Before writing a single line of documentation, **read the actual source code** f
 
 #### Step 3a: Write English doc
 
-Create `docs/guide/<filename>.md` (or `docs/examples/<filename>.md`, `docs/api/<filename>.md` depending on category).
+Create `docs/en/guide/<filename>.md` (or `docs/en/examples/<filename>.md`, `docs/en/api/<filename>.md` depending on category).
 
-Follow the doc template in `references/doc-template.md`.
+Use the English and Chinese templates in `references/doc-template.md` as reusable starting points. Keep useful sections, remove unused ones, and adapt the order to the user task rather than filling every heading. Keep verification evidence separate from the page.
 
 Key rules:
 - Title is an H1 (`#`) matching the feature name
-- Use standard section order: Overview → Architecture (if applicable) → Features → Quick Start → Configuration → API Reference → Usage Examples → Best Practices → Troubleshooting → Next Steps
-- Not every section is required — omit sections that don't apply
+- Choose headings and length to suit the user task and neighboring guides, not a fixed Purpose / Prerequisites / Steps / Configuration sequence
+- Cover necessary setup, settings, and constraints where they fit naturally; explain why the main configuration choices matter
+- Add architecture or API detail only when users need it. Omit generic feature lists and redundant explanations.
 - Code examples must use real import paths and real function signatures from Step 2
 - Architecture diagrams use ASCII art (box drawing characters: `┌ ─ ┐ │ └ ┘ ▼ ▲ ► ◄`)
 - Use VitePress containers: `::: tip`, `::: warning`, `::: danger`
 - Cross-reference other docs with relative links: `[Architecture](./architecture.md)`
-- End with "Next Steps" linking to 2-3 related docs
+- Add a few related links when they help users continue; a "Next Steps" section is optional
 
 #### Step 3b: Write Chinese doc (MANDATORY)
 
 **Immediately after** creating the English doc, create the Chinese counterpart at `docs/zh/guide/<filename>.md` (or corresponding `zh/` path).
 
 Translation rules:
-- Translate ALL prose text to Chinese
+- Write all explanations in natural Chinese; preserve meaning rather than English sentence patterns
 - Keep code blocks, CLI commands, variable names, class names **unchanged**
 - Translate code comments inside code blocks to Chinese
 - Keep technical terms that are widely used in English as-is (e.g., "Ray Serve", "TensorBoard", "checkpoint") — no forced translation
 - Section headers must be natural Chinese (e.g., "Overview" → "概述", "Quick Start" → "快速开始", "Configuration" → "配置", "Best Practices" → "最佳实践", "Troubleshooting" → "故障排除", "Next Steps" → "下一步")
-- Chinese doc must cover the exact same sections and content as the English doc — no missing sections, no extra sections
+- Both versions must cover the same user tasks, configuration, defaults, and limitations; wording and paragraph structure need not be literal translations
 
-**Verification**: Before proceeding to Step 4, confirm that BOTH `docs/guide/<filename>.md` AND `docs/zh/guide/<filename>.md` have been created.
+**Verification**: Before proceeding to Step 4, confirm that BOTH `docs/en/guide/<filename>.md` AND `docs/zh/guide/<filename>.md` have been created.
 
 ### Step 4: Register in VitePress config
 
@@ -92,7 +109,7 @@ Edit `docs/.vitepress/config.mts`:
 
 1. Add to the English sidebar under the correct group
 2. Add to the Chinese sidebar under the corresponding Chinese group
-3. Both entries must use correct `link` paths (`/guide/<filename>` and `/zh/guide/<filename>`)
+3. Both entries must use correct `link` paths (`/en/guide/<filename>` and `/zh/guide/<filename>`)
 
 English sidebar group mapping:
 | Category | Sidebar group text |
@@ -101,8 +118,8 @@ English sidebar group mapping:
 | Core Concepts | `Core Concepts` |
 | Advanced | `Advanced` |
 | Development | `Development` |
-| Examples | (separate `/examples/` sidebar) |
-| API | (separate `/api/` sidebar) |
+| Examples | (separate `/en/examples/` sidebar) |
+| API | (separate `/en/api/` sidebar) |
 
 Chinese sidebar group mapping:
 | Category | Sidebar group text |
@@ -118,12 +135,14 @@ Chinese sidebar group mapping:
 
 After creating both docs and updating config:
 
-1. **Verify both language versions exist** — confirm BOTH `docs/guide/<filename>.md` AND `docs/zh/guide/<filename>.md` have been created. If only one exists, immediately create the missing version.
+1. **Verify both language versions exist** — confirm BOTH `docs/en/guide/<filename>.md` AND `docs/zh/guide/<filename>.md` have been created. If only one exists, immediately create the missing version.
 2. **Cross-check code examples** — re-read the source files and confirm every import path, class name, and function signature in the doc matches the code.
-3. **Check bilingual parity** — confirm both docs have the same sections in the same order, with identical content coverage.
+3. **Check bilingual parity** — confirm matching technical coverage and commands, and read both versions independently for natural flow. Do not enforce word-for-word prose or sentence structure.
 4. **Check sidebar config** — confirm both English and Chinese entries are added to `config.mts`.
 5. **Check internal links** — any `[text](./other-doc.md)` references must point to docs that actually exist.
 6. **Check repository paths** — scan the doc for every file/directory path that references the repo (e.g., `relax/utils/health_system.py`, `scripts/models/qwen3-4B.sh`). For each path, verify the file or directory actually exists. Remove or correct any stale/wrong paths.
+7. **Check user-facing content** — remove reports, acceptance evidence, unsupported guarantees, mechanical lists, and repetitive warnings. Check that examples have context and that important constraints and remedies remain easy to find.
+8. **Build and inspect** — run the docs build, check emitted links and rendered pages, and run applicable project checks. A passing build alone does not prove links are valid. Report results and unavailable hardware checks in the PR, not in the guide.
 
 ______________________________________________________________________
 
@@ -131,7 +150,7 @@ ______________________________________________________________________
 
 When writing docs, verify each of these against the source code:
 
-- [ ] **Bilingual completeness** — BOTH English (`docs/guide/`) AND Chinese (`docs/zh/guide/`) versions exist with identical structure
+- [ ] **Bilingual completeness** — BOTH English (`docs/en/guide/`) AND Chinese (`docs/zh/guide/`) versions exist with aligned technical coverage and independently natural prose
 - [ ] **Import paths** — `from relax.xxx import YYY` must match actual `__init__.py` exports
 - [ ] **Class names** — must match actual class definitions
 - [ ] **Function signatures** — parameter names, types, and defaults must match source
@@ -142,7 +161,7 @@ When writing docs, verify each of these against the source code:
 - [ ] **Feature claims** — don't say "supports X" if X is not implemented
 - [ ] **Repository paths** — every file or directory path mentioned in the doc (e.g., `relax/utils/metrics/client.py`, `configs/env.yaml`, `scripts/training/basic/run-qwen3-4B-8xgpu.sh`) must actually exist in the repo. Run `ls` or `read_file` to confirm before including any path. This includes paths in prose text, code block comments, tables, and architecture diagrams
 
-If you cannot verify something (e.g., the code is ambiguous or the feature is partially implemented), explicitly mark it in the doc with a `::: warning` block.
+If a claim cannot be verified, omit it or clarify the uncertainty in internal notes before publication. Explain verified limitations near the affected example; use a warning container only when the consequence warrants one.
 
 ______________________________________________________________________
 
@@ -152,13 +171,13 @@ ______________________________________________________________________
 docs/
 ├── .vitepress/
 │   └── config.mts              # Sidebar & nav config (MUST update for new pages)
-├── guide/                      # English guides
-├── zh/guide/                   # Chinese guides (mirror of guide/)
-├── api/                        # English API docs
+├── en/guide/                   # English guides
+├── zh/guide/                   # Chinese guides (mirror of en/guide/)
+├── en/api/                     # English API docs
 ├── zh/api/                     # Chinese API docs
-├── examples/                   # English example docs
+├── en/examples/                # English example docs
 ├── zh/examples/                # Chinese example docs
-└── index.md / zh/index.md      # Home pages
+└── index.md / en/index.md / zh/index.md  # Home pages
 ```
 
 Source code locations for verification:
@@ -202,5 +221,5 @@ configs/                        # Runtime env config (env.yaml)
 
 ## References
 
-- `references/doc-template.md` — Standard doc page template (English + Chinese)
+- `references/doc-template.md` — Reusable English/Chinese page templates, optional sections, and natural-writing examples
 - `references/content-verification-guide.md` — Detailed guide on verifying doc content against source code

@@ -6,9 +6,9 @@ from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict
 
-import ray
 import torch
 
 from relax.utils.http_utils import is_port_available
@@ -74,6 +74,8 @@ def exec_command(cmd: str, capture_output: bool = False) -> str | None:
 
 
 def get_current_node_ip():
+    import ray
+
     address = ray._private.services.get_node_ip_address()
     # strip ipv6 address
     address = address.strip("[]")
@@ -178,4 +180,21 @@ def _chunk_by_size(objects: Iterable[Any], compute_size: Callable[[Any], int], c
 def get_hf_config(hf_checkpoint: str):
     from transformers import AutoConfig
 
-    return AutoConfig.from_pretrained(hf_checkpoint)
+    return AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
+
+
+def resolve_is_vl_model(provider: object | None, checkpoint: str | None) -> bool:
+    """Prefer an explicit provider declaration over checkpoint metadata.
+
+    ``relax_is_multimodal`` describes the selected model, independent of the
+    current batch's contents. Providers without a declaration retain the
+    processor-config heuristic, including custom and raw model providers.
+    """
+    declared = getattr(provider, "relax_is_multimodal", None)
+    if declared is not None:
+        if not isinstance(declared, bool):
+            raise TypeError("provider.relax_is_multimodal must be bool or None")
+        return declared
+    if checkpoint is None:
+        return False
+    return any((Path(checkpoint) / name).exists() for name in ("processor_config.json", "preprocessor_config.json"))

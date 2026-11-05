@@ -16,10 +16,12 @@ import time
 from typing import Any, Dict, Optional, Sequence
 
 import httpx
+import torch.distributed as dist
 
 from relax.distributed.checkpoint_service.backends import CommBackend, DeviceDirectBackend
 from relax.distributed.checkpoint_service.config import BackendType, DCSConfig, RoleInfo
 from relax.distributed.checkpoint_service.metrics import MetricsCollector
+from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
 
 
@@ -279,8 +281,9 @@ class CheckpointEngineClient:
             return
         self._backend.recv_weight()
 
-    async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
-        """Update weights for rollout role from trainer."""
+    async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> list[str]:
+        """Update rollout weights; rank 0 returns the actual recipient Actor
+        IDs."""
         response = await self._http_client.get(f"{self.coordinator_url}/topology")
         response.raise_for_status()
         data = response.json()
@@ -289,6 +292,23 @@ class CheckpointEngineClient:
             self._backend.init_process_group_for_rollout(data)
         self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
         logger.info("Weights updated for rollout role.")
+        # Adapter delta-skip can't confirm a replacement got base+adapter; keep existing behavior.
+        if actor_fwd_only or self._backend._lora_adapter_mode:
+            return []
+        # A publishable generation must have received every PP stage (each PP source prunes
+        # independently; health checks may prune recipients).
+        recipients = None
+        if self._backend._is_pp_src_rank:
+            recipients = {
+                actor_id
+                for info in self._backend.rollout_topology.values()
+                if (actor_id := (info.get("metadata") or {}).get("actor_id"))
+            }
+        group = get_gloo_group()
+        all_recipients = [None] * dist.get_world_size(group=group)
+        dist.all_gather_object(all_recipients, recipients, group=group)
+        sources = [ids for ids in all_recipients if ids is not None]
+        return sorted(set.intersection(*sources)) if self.rank == 0 and sources else []
 
     async def _heartbeat_loop(self) -> None:
         """Periodically send heartbeat signals to coordinator."""

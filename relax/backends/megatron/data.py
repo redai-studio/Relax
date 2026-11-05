@@ -15,23 +15,28 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.training.global_vars import get_args
 from torch.nn.utils.rnn import pad_sequence
 
+from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.flops_schedule import (
     build_workload_microbatch_plan,
     expand_workload_microbatch_plan,
-    flops_scheduling_enabled,
     get_flops_estimator,
     validate_text_rollout,
 )
+from relax.utils.data.packing import get_binpack_partitions
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
+from relax.utils.multimodal.stats import count_images, get_multimodal_token_counts
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
+from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
 from relax.utils.training.flops_counter import FlopsCounter
+from relax.utils.training.preference_utils import pack_preference_pair_indices
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -41,6 +46,7 @@ from .cp_utils import (
     slice_log_prob_with_cp,
     slice_with_cp,
 )
+from .qsa_layout_metadata import bind_physical_layout, rebind_mapped_layout, valid_physical_layout
 
 
 logger = get_logger(__name__)
@@ -108,13 +114,9 @@ def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBa
     mini_rollout_batch_size = rollout_batch_size // num_rollout_minis
     if mini_rollout_batch_size <= 0:
         raise ValueError(f"mini_rollout_batch_size must be positive, got {mini_rollout_batch_size}")
-    if mini_rollout_batch_size % dp_size != 0:
-        raise ValueError(
-            "mini_rollout_batch_size must be divisible by data parallel size when using current "
-            "sample-count TransferQueue API, "
-            f"got mini_rollout_batch_size={mini_rollout_batch_size}, dp_size={dp_size}"
-        )
-
+    # IdentityWindowSampler requests logical Sample.index identities, then
+    # places their context rows across DPs. A prompt group may span DPs;
+    # only the global sample count (after n_samples_per_prompt) must divide DP.
     mini_global_samples = mini_rollout_batch_size * n_samples_per_prompt
     if mini_global_samples % dp_size != 0:
         raise ValueError(
@@ -208,12 +210,110 @@ def _round_up_to_microbatch_group(num_microbatches: torch.Tensor, microbatch_gro
     )
 
 
+def _get_micro_batch_token_capacity(args: Namespace, max_tokens: int, cp_size: int) -> int:
+    if getattr(args, "allgather_cp", False):
+        pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+        if pad_size <= 0 or max_tokens < pad_size:
+            raise ValueError(
+                "allgather CP padding must fit within max_tokens_per_gpu: "
+                f"max_tokens_per_gpu={max_tokens}, local_pad_size={pad_size}"
+            )
+        return cp_size * (max_tokens // pad_size) * pad_size
+    return max_tokens * cp_size
+
+
+def _get_first_fit_partitions(total_lengths: Sequence[int], capacity: int) -> list[list[int]]:
+    partitions: list[list[int]] = []
+    partition_token_counts: list[int] = []
+    for sample_idx, length in enumerate(total_lengths):
+        length = int(length)
+        for partition_idx, token_count in enumerate(partition_token_counts):
+            if token_count + length <= capacity:
+                partitions[partition_idx].append(sample_idx)
+                partition_token_counts[partition_idx] += length
+                break
+        else:
+            partitions.append([sample_idx])
+            partition_token_counts.append(length)
+    return partitions
+
+
+def _partitions_fit_capacity_or_singleton_oversize(
+    partitions: Sequence[Sequence[int]],
+    partition_token_counts: Sequence[int],
+    total_lengths: Sequence[int],
+    capacity: int,
+) -> bool:
+    return all(
+        token_count <= capacity or (len(partition) == 1 and int(total_lengths[partition[0]]) > capacity)
+        for partition, token_count in zip(partitions, partition_token_counts)
+    )
+
+
+def _get_capacity_safe_balanced_partitions(
+    total_lengths: Sequence[int], num_partitions: int, capacity: int
+) -> list[list[int]]:
+    partitions = get_seqlen_balanced_partitions(total_lengths, num_partitions, equal_size=False)
+    partition_token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
+    if _partitions_fit_capacity_or_singleton_oversize(partitions, partition_token_counts, total_lengths, capacity):
+        return partitions
+
+    balanced_max_tokens = max(partition_token_counts)
+    partitions = _get_first_fit_partitions(total_lengths, capacity)
+    partition_token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
+    if len(partitions) > num_partitions or not _partitions_fit_capacity_or_singleton_oversize(
+        partitions, partition_token_counts, total_lengths, capacity
+    ):
+        raise RuntimeError(
+            "first-fit dynamic microbatch partitions cannot satisfy the synchronised schedule: "
+            f"first_fit_partitions={len(partitions)}, num_partitions={num_partitions}, capacity={capacity}"
+        )
+
+    while len(partitions) < num_partitions:
+        splittable = [idx for idx, partition in enumerate(partitions) if len(partition) > 1]
+        if not splittable:
+            raise RuntimeError(
+                "dynamic microbatch partitions cannot be split into the synchronised number of non-empty batches: "
+                f"current={len(partitions)}, requested={num_partitions}"
+            )
+        partition_idx = max(splittable, key=lambda idx: (partition_token_counts[idx], -idx))
+        partition = partitions[partition_idx]
+        sample_idx = max(partition, key=lambda idx: (int(total_lengths[idx]), -idx))
+        partition.remove(sample_idx)
+        sample_length = int(total_lengths[sample_idx])
+        partition_token_counts[partition_idx] -= sample_length
+        partitions.append([sample_idx])
+        partition_token_counts.append(sample_length)
+
+    flat_indices = [idx for partition in partitions for idx in partition]
+    if sorted(flat_indices) != list(range(len(total_lengths))) or not _partitions_fit_capacity_or_singleton_oversize(
+        partitions, partition_token_counts, total_lengths, capacity
+    ):
+        raise RuntimeError("capacity-safe dynamic microbatch partitioning produced an invalid partition")
+
+    logger.warning(
+        "Balanced dynamic microbatches violated token capacity; using first-fit partitions with any oversized "
+        "samples isolated: "
+        f"balanced_max_tokens={balanced_max_tokens}, capacity={capacity}, num_partitions={num_partitions}"
+    )
+    return partitions
+
+
 def _get_seqlen_partitions_with_dummy_padding(
     seqlens: list[int],
     num_partitions: int,
+    capacity: int,
+    packing_strategy: str = "balanced",
 ) -> tuple[list[list[int]], set[int]]:
-    real_partition_count = min(len(seqlens), num_partitions)
-    partitions = get_seqlen_balanced_partitions(seqlens, real_partition_count, equal_size=False)
+    if packing_strategy == "binpack":
+        partitions = get_binpack_partitions(seqlens, capacity)
+    else:
+        real_partition_count = min(len(seqlens), num_partitions)
+        partitions = _get_capacity_safe_balanced_partitions(seqlens, real_partition_count, capacity)
+    real_partition_count = len(partitions)
+    assert real_partition_count <= num_partitions, (
+        f"{real_partition_count} partitions > num_partitions={num_partitions}"
+    )
     dummy_offsets: set[int] = set()
     if real_partition_count < num_partitions:
         shortest_partition = min(partitions, key=lambda partition: sum(seqlens[index] for index in partition))
@@ -284,6 +384,39 @@ def pad_and_flatten(
     return torch.cat(padded_list, dim=0), num_items
 
 
+def _build_allgather_thd_metadata(
+    sequence_lengths: Sequence[int], physical_total_length: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | None]:
+    """Build separate real and physical THD metadata for allgather CP."""
+    if not sequence_lengths:
+        raise ValueError("allgather THD metadata requires at least one sequence")
+
+    real_cu_list = [0]
+    for sequence_length in sequence_lengths:
+        real_cu_list.append(real_cu_list[-1] + int(sequence_length))
+
+    real_total_length = real_cu_list[-1]
+    if physical_total_length < real_total_length:
+        raise ValueError(
+            f"physical_total_length={physical_total_length} is smaller than real_total_length={real_total_length}"
+        )
+
+    real_cu_seqlens = torch.tensor(real_cu_list, dtype=torch.int32, device=device)
+    padded_cu_list = real_cu_list
+    if physical_total_length == real_total_length:
+        padded_cu_seqlens = real_cu_seqlens
+        padding_mask = None
+    else:
+        padded_cu_list = real_cu_list.copy()
+        padded_cu_list[-1] = physical_total_length
+        padded_cu_seqlens = torch.tensor(padded_cu_list, dtype=torch.int32, device=device)
+        padding_mask = torch.zeros(physical_total_length, dtype=torch.bool, device=device)
+        padding_mask[real_total_length:] = True
+
+    max_seqlen = max(end - start for start, end in zip(padded_cu_list[:-1], padded_cu_list[1:], strict=True))
+    return real_cu_seqlens, padded_cu_seqlens, max_seqlen, padding_mask
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -315,7 +448,9 @@ def get_batch(
 
     assert "tokens" in keys
     if isinstance(data_iterator, DataIterator):
-        batch = data_iterator.get_next(keys)
+        batch = data_iterator.get_next(
+            [*keys, "selective_loss_masks_cpu"] if Envs.RELAX_SFT_SELECTIVE_LOGITS else keys
+        )
 
         if getattr(get_args(), "partial_rollout", False) and getattr(
             get_args(), "use_dynamic_global_batch_size", False
@@ -335,7 +470,11 @@ def get_batch(
         return batch
 
     if pack_device is not None:
-        for key, dtype in (("tokens", torch.long), ("loss_masks", torch.int)):
+        for key, dtype in (
+            ("tokens", torch.long),
+            ("loss_masks", torch.int),
+            ("pre_shifted_labels", torch.long),
+        ):
             values = batch.get(key)
             if values is not None:
                 batch[key] = [torch.as_tensor(value, dtype=dtype, device=pack_device) for value in values]
@@ -364,11 +503,26 @@ def get_batch(
 
     tokens = batch["tokens"]
     batch_device = pack_device or tokens[0].device
+    qsa_stage2_enabled = (getattr(get_args(), "qsa_indexer_loss_coeff", 0.0) or 0.0) > 0
+    if qsa_stage2_enabled and allgather_cp and cp_size > 1:
+        raise NotImplementedError("QSA Stage-2 CP requires per-document zigzag packing, not allgather CP")
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
+    pre_shifted_labels = batch.get("pre_shifted_labels")
+    if pre_shifted_labels is not None:
+        args = get_args()
+        if args.loss_type != "sft":
+            raise ValueError("pre-shifted labels are only supported for SFT")
+        if cp_size != 1:
+            raise ValueError("pre-shifted SFT labels currently require context_parallel_size=1")
+        if getattr(args, "enable_mtp_training", False):
+            raise ValueError("pre-shifted SFT labels are incompatible with MTP")
+        if any(label.shape != token.shape for label, token in zip(pre_shifted_labels, tokens, strict=True)):
+            raise ValueError("pre-shifted labels and tokens must have identical per-sample shapes")
+        batch["unconcat_pre_shifted_labels"] = pre_shifted_labels
 
     if qkv_format == "bshd":
         max_seqlen = batch["max_seq_lens"][0]
@@ -430,10 +584,31 @@ def get_batch(
                 cu_seqlens_q_padded=cu_seqlens_padded,
                 cu_seqlens_kv_padded=cu_seqlens_padded,
             )
+            # Preserve producer-owned physical boundaries for QSA without device synchronization.
+            select_offsets = [0]
+            for length in seqlens_padded:
+                select_offsets.append(select_offsets[-1] + length)
+            vlm_packed_seq_params.cu_seqlens_q_cpu = select_offsets
+            vlm_packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
+            if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
+                bind_physical_layout(vlm_packed_seq_params, tuple(select_offsets))
+            if qsa_stage2_enabled:
+                # Keep the attention/CP boundaries physical. Stage-2 QSA uses
+                # these original lengths to exclude trailing pad queries.
+                vlm_packed_seq_params.qsa_stage2_valid_lengths = torch.tensor(
+                    seqlens, dtype=torch.int32, device=device
+                )
+                physical_starts = [0]
+                for length in seqlens_padded:
+                    physical_starts.append(physical_starts[-1] + length)
+                vlm_packed_seq_params.qsa_stage2_layout_cpu = (tuple(physical_starts), tuple(seqlens))
             if use_dynamic_context_parallel:
                 vlm_packed_seq_params.local_cp_size = cp_size
                 vlm_packed_seq_params.cp_group = cp_group
             batch["vlm_packed_seq_params"] = vlm_packed_seq_params
+            # Bridge returns per-document zigzag CP outputs even when attention
+            # uses allgather CP. Loss slicing must follow the output layout.
+            batch["cp_output_is_zigzag"] = True
             # Per-sample tp*cp*2-aligned lengths consumed by loss helpers so
             # their per-sample chunking matches bridge's preprocess_packed_seqs.
             batch["padded_total_lengths"] = seqlens_padded
@@ -441,10 +616,7 @@ def get_batch(
         if allgather_cp:
             # DSA mode: concatenate all sequences first, then slice once with CP.
             # We also pad the *global* concatenated stream to make per-rank chunks equal.
-            cu_seqlens_list: list[int] = [0]
-            for t in tokens:
-                cu_seqlens_list.append(cu_seqlens_list[-1] + t.size(0))
-
+            sequence_lengths = [t.size(0) for t in tokens]
             tokens = torch.cat(tokens, dim=0)
 
             # Pad global stream so (1) divisible by cp_size (equal chunks),
@@ -453,10 +625,17 @@ def get_batch(
             pad = (global_pad_size - tokens.size(0) % global_pad_size) % global_pad_size
             if pad != 0:
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
-                cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
-            cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=batch_device)
-            cu_seqlens_cpu = cu_seqlens_list
+            cu_seqlens, cu_seqlens_padded, max_seqlen, global_padding_mask = _build_allgather_thd_metadata(
+                sequence_lengths,
+                tokens.size(0),
+                batch_device,
+            )
+            if global_padding_mask is not None:
+                batch["padding_mask"] = global_padding_mask.chunk(cp_size, dim=0)[cp_rank].unsqueeze(0)
+            cu_seqlens_cpu = [0]
+            for sequence_length in sequence_lengths:
+                cu_seqlens_cpu.append(cu_seqlens_cpu[-1] + sequence_length)
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [
@@ -480,20 +659,66 @@ def get_batch(
             cu_seqlens_cpu = [offset * cp_size for offset in cu_seqlens]
             cu_seqlens = torch.tensor(cu_seqlens_cpu, dtype=torch.int, device=batch_device)
 
-        max_seqlen = max(end - start for start, end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:]))
+        if not allgather_cp:
+            max_seqlen = max(end - start for start, end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:]))
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded if allgather_cp else None,
+            cu_seqlens_kv_padded=cu_seqlens_padded if allgather_cp else None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
         )
+        # The NPU Megatron pin does not accept this constructor keyword.
+        packed_seq_params.pad_between_seqs = pad != 0 if allgather_cp else None
+        if qsa_stage2_enabled:
+            valid_lengths = [int(sample.size(0)) for sample in batch["unconcat_tokens"]]
+            physical_cu = cu_seqlens_padded if allgather_cp else cu_seqlens
+            extra_segments = physical_cu.numel() - 1 - len(valid_lengths)
+            if extra_segments not in (0, 1) or (extra_segments == 1 and pad == 0):
+                raise ValueError("QSA Stage-2 requires one physical segment per sample plus optional tail padding.")
+            valid_lengths.extend([0] * extra_segments)
+            packed_seq_params.qsa_stage2_valid_lengths = torch.tensor(
+                valid_lengths, dtype=torch.int32, device=batch_device
+            )
+            physical_starts = list(cu_seqlens_cpu)
+            if allgather_cp:
+                # The all-gather layout extends the last document's physical end
+                # instead of adding a padding-only segment.
+                physical_starts[-1] += pad
+            packed_seq_params.qsa_stage2_layout_cpu = (tuple(physical_starts), tuple(valid_lengths))
         # Python boundaries let attention implementations iterate packed
         # subsequences without synchronizing individual accelerator scalars.
         packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_cpu
+        # Zigzag CP pads each sample separately; valid tokens need not form a prefix.
+        valid_lengths = [sample.numel() for sample in batch["unconcat_tokens"]]
+        packed_seq_params.valid_seqlens_q_cpu = valid_lengths + [0] * (len(cu_seqlens_cpu) - 1 - len(valid_lengths))
+        # Auxiliary attention losses must exclude the optional padding-only tail.
+        packed_seq_params.num_valid_tokens = sum(valid_lengths)
+        select_offsets = list(cu_seqlens_cpu)
+        if allgather_cp:
+            select_offsets[-1] += pad
+        packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
+        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
+            bind_physical_layout(packed_seq_params, tuple(select_offsets))
         if use_dynamic_context_parallel:
             packed_seq_params.local_cp_size = cp_size
             packed_seq_params.cp_group = cp_group
+
+        # DSv4 hybrid attention rejects the default 'zigzag' layout and reads the
+        # *_padded cu_seqlens to rebuild per-rank position ids and the sliding-window
+        # boundary exchange (csa_cp_utils). The allgather-CP branch above already
+        # produces exactly mcore's contiguous layout -- one global stream, rank r
+        # taking rows [r*L/cp, (r+1)*L/cp) -- and pads the stream to a multiple of
+        # cp_size. The real and physical endpoints remain distinct so DSA and
+        # MoE can identify the tail padding instead of treating it as data.
+        if cp_size > 1 and getattr(get_args(), "cp_partition_mode", "zigzag") == "contiguous":
+            assert allgather_cp, (
+                "--cp-partition-mode contiguous requires --allgather-cp; the default "
+                "per-sample zigzag split does not produce a contiguous global stream."
+            )
+            packed_seq_params.cp_partition_mode = "contiguous"
 
         tokens = tokens.unsqueeze(0)
     else:
@@ -510,7 +735,11 @@ def get_batch(
     for loss_mask, total_length, response_length in zip(
         batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True
     ):
-        if response_length == total_length:
+        if pre_shifted_labels is not None:
+            if response_length != total_length:
+                raise ValueError("pre-shifted SFT labels require response_length == total_length")
+            per_sample_loss_masks.append(loss_mask)
+        elif response_length == total_length:
             loss_mask = align_loss_mask_for_sft(loss_mask)
             per_sample_loss_masks.append(loss_mask)
         else:
@@ -525,6 +754,10 @@ def get_batch(
                 loss_mask, 0, qkv_format, max_seqlen, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank
             )
         loss_masks.append(loss_mask)
+    if pre_shifted_labels is not None:
+        for loss_mask, labels in zip(full_per_sample_loss_masks, pre_shifted_labels, strict=True):
+            if not torch.equal(loss_mask.bool(), labels.ne(-100)):
+                raise ValueError("pre-shifted SFT loss mask must equal labels != -100")
     batch["loss_masks"] = per_sample_loss_masks
 
     if qkv_format == "bshd":
@@ -560,6 +793,9 @@ def get_batch(
             pad_to = int(pad_to)
             t_padded = F.pad(sample_tokens, (0, pad_to - sample_tokens.size(0)), value=pad_token_id)
             m_padded = F.pad(sample_mask, (0, pad_to - sample_mask.size(0)), value=0)
+            if len(orig_tokens) == 1:
+                # Bridge slices this next-token mask only for packed singleton input.
+                batch["unsplit_full_mtp_loss_mask"] = m_padded.unsqueeze(0)
             # This VL/THD path bypasses MCore's default label construction, so
             # labels must be pre-shifted by one here (label[t] = x[t+1]); MCore's
             # per-depth roll advances label and mask together afterwards.
@@ -585,14 +821,18 @@ def get_batch(
         multimodal_data = {}  # key -> concatenated tensor
         multimodal_num_items = {}  # key -> list of item counts per sequence
         tensor_dict_list = {}
+        input_key_map = getattr(get_args(), "multimodal_input_key_map", {})
 
         for mm_input_dict in multimodal_train_inputs:
             if mm_input_dict is None:
                 continue
             for key, mm_tensor in mm_input_dict.items():
+                mapped_key = input_key_map.get(key, key)
+                if mapped_key != key and mapped_key in mm_input_dict:
+                    raise ValueError(f"Multimodal inputs contain both {key!r} and its mapped key {mapped_key!r}.")
                 if isinstance(mm_tensor, list):
                     mm_tensor = torch.tensor(mm_tensor)
-                tensor_dict_list.setdefault(key, []).append(mm_tensor)
+                tensor_dict_list.setdefault(mapped_key, []).append(mm_tensor)
 
         for key, tensor_list in tensor_dict_list.items():
             if key in PAD_RULES:
@@ -624,6 +864,8 @@ def get_batch(
             "log_probs",
             "ref_log_probs",
             "rollout_log_probs",
+            "rollout_topk_token_ids",
+            "rollout_topk_log_probs",
             "advantages",
             "teacher_log_probs",
             "opd_reverse_kl",
@@ -648,9 +890,51 @@ def get_batch(
                     )
                 ]
 
+    if (
+        Envs.RELAX_SFT_SELECTIVE_LOGITS
+        and cp_size == 1
+        and qkv_format == "thd"
+        and not has_mm_inputs
+        and "unsplit_tokens" not in batch
+        and "vlm_packed_seq_params" not in batch
+        and getattr(get_args(), "loss_type", None) == "sft"
+        and getattr(get_args(), "sft_chunked_logits", False)
+    ):
+        from .selective_logits import prepare_selective_logits, prepare_selective_logits_from_cpu_masks
+
+        if batch_device.type == "cpu":
+            prepare_selective_logits(batch, get_args())
+        elif batch.get("selective_loss_masks_cpu") is not None:
+            prepare_selective_logits_from_cpu_masks(batch, get_args())
+
+    if (
+        batch.get("selective_logit_rows") is not None
+        and batch.get("replay_micro_batch_index") == 0
+        and mpu.is_pipeline_last_stage()
+        and mpu.get_tensor_model_parallel_rank() == 0
+    ):
+        logger.info(
+            "Selective logits first microbatch: main selected/full=%s, MTP selected=%s",
+            [(rows.numel(), full) for full, rows in batch["selective_logit_rows"]],
+            [rows.numel() for rows in getattr(packed_seq_params, "relax_sft_selective_mtp_rows", ())],
+        )
+    batch.pop("selective_loss_masks_cpu", None)
+    for packed_key in ("packed_seq_params", "vlm_packed_seq_params"):
+        if batch.get(packed_key) is not None:
+            batch[packed_key].is_dummy = batch.get("__is_dummy__", False)
+            if not is_sft_mode(get_args()) and not is_preference_mode(get_args()) and "response_lengths" in batch:
+                # Visual placeholders belong to the prompt, not generated token IDs.
+                batch[packed_key].prompt_lengths = [
+                    total - response
+                    for total, response in zip(batch["total_lengths"], batch["response_lengths"], strict=True)
+                ]
     batch = move_tensors_to_device(batch, batch["tokens"].device)
     if pack_device is not None:
         batch = PrepackedBatch(batch)
+    if getattr(get_args(), "_relax_qwen35_optimized", False):
+        from relax.models.qwen3_5.recompute import attach_mask
+
+        attach_mask(get_args(), data_iterator, batch)
     return batch
 
 
@@ -676,11 +960,13 @@ def gather_log_data(
     rollout_id: int,
     log_dict: dict[str, float],
     metric_weights: dict[str, int] | None = None,
+    metric_reductions: dict[str, str] | None = None,
 ) -> dict[str, float] | None:
     """Gather per-rank metrics, reduce on the DP source rank, and log.
 
     Expects `log_dict` to contain plain scalars. `metric_weights` provides
     local observation counts for metrics whose DP shards have different sizes.
+    `metric_reductions` selects min/max instead of the default weighted mean.
     The DP source rank prints and optionally logs to WandB/TensorBoard with a
     step derived from `rollout_id` and batch sizes. Returns the reduced dict on
     the DP source rank; returns None on others.
@@ -700,6 +986,11 @@ def gather_log_data(
 
         reduced_log_dict = {}
         for key in log_dict:
+            reduction = (metric_reductions or {}).get(key)
+            if reduction in ("min", "max"):
+                reduce_fn = min if reduction == "min" else max
+                reduced_log_dict[f"{metric_name}/{key}"] = reduce_fn(metrics[key] for metrics, _ in gathered_metrics)
+                continue
             weights = [weights_by_key.get(key, 1) for _, weights_by_key in gathered_metrics]
             reduced_log_dict[f"{metric_name}/{key}"] = sum(
                 metrics[key] * weight for (metrics, _), weight in zip(gathered_metrics, weights, strict=True)
@@ -806,6 +1097,119 @@ class DataIterator:
         return self
 
 
+def expand_preference_rollout_data(rollout_data: RolloutBatch) -> RolloutBatch:
+    """Expand pair rows into adjacent chosen/rejected model sequences."""
+    if "preference_pair_costs" in rollout_data:
+        return rollout_data
+    missing = [key for key in PREFERENCE_DATA_FIELDS if key not in rollout_data]
+    if missing:
+        raise ValueError(f"preference rollout data is missing fields: {missing}")
+    pair_count = len(rollout_data["pair_ids"])
+    if pair_count <= 0:
+        raise ValueError("preference rollout batch must contain at least one pair")
+    for key in PREFERENCE_DATA_FIELDS:
+        if len(rollout_data[key]) != pair_count:
+            raise ValueError(
+                f"preference field {key!r} is not pair-row aligned: expected {pair_count}, got {len(rollout_data[key])}"
+            )
+
+    flat: RolloutBatch = {
+        "tokens": [],
+        "loss_masks": [],
+        "total_lengths": [],
+        "response_lengths": [],
+        "preference_branch_pair_ids": [],
+        "preference_is_chosen": [],
+    }
+    pair_costs: list[int] = []
+    pair_ids: list[int] = []
+    for index in range(pair_count):
+        chosen_length = int(rollout_data["chosen_total_lengths"][index])
+        rejected_length = int(rollout_data["rejected_total_lengths"][index])
+        if chosen_length <= 0 or rejected_length <= 0:
+            raise ValueError(f"preference pair row {index} has non-positive branch length")
+        pair_id = int(rollout_data["pair_ids"][index])
+        pair_ids.append(pair_id)
+        pair_costs.append(chosen_length + rejected_length)
+        for prefix, is_chosen in (("chosen", True), ("rejected", False)):
+            tokens = rollout_data[f"{prefix}_tokens"][index]
+            loss_mask = rollout_data[f"{prefix}_loss_masks"][index]
+            total_length = int(rollout_data[f"{prefix}_total_lengths"][index])
+            if len(tokens) != total_length or len(loss_mask) != total_length:
+                raise ValueError(
+                    f"preference pair row {index} {prefix} tensor length does not match declared total_length"
+                )
+            flat["tokens"].append(tokens)
+            flat["loss_masks"].append(loss_mask)
+            flat["total_lengths"].append(total_length)
+            flat["response_lengths"].append(total_length)
+            flat["preference_branch_pair_ids"].append(pair_id)
+            flat["preference_is_chosen"].append(is_chosen)
+    flat["preference_pair_costs"] = pair_costs
+    flat["preference_pair_ids"] = pair_ids
+    if "dynamic_global_batch_size" in rollout_data:
+        flat["dynamic_global_batch_size"] = rollout_data["dynamic_global_batch_size"]
+    return flat
+
+
+def _split_preference_bins_to_count(bins: list[list[int]], target_count: int) -> list[list[int]]:
+    bins = [list(group) for group in bins]
+    while len(bins) < target_count:
+        candidates = [(len(group), -index, index) for index, group in enumerate(bins) if len(group) > 1]
+        _, _, index = max(candidates)
+        group = bins[index]
+        bins[index] = group[:-1]
+        bins.insert(index + 1, [group[-1]])
+    return bins
+
+
+def _get_preference_data_iterator(
+    args: Namespace,
+    rollout_data: RolloutBatch,
+    max_tokens_per_gpu: int | None,
+) -> tuple[list[DataIterator], list[int]]:
+    pair_costs = [int(cost) for cost in rollout_data["preference_pair_costs"]]
+    pair_ids = rollout_data["preference_pair_ids"]
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    dynamic_count = rollout_data.get("dynamic_global_batch_size")
+    if isinstance(dynamic_count, (list, tuple)):
+        normalized = {int(value) for value in dynamic_count}
+        if len(normalized) != 1:
+            raise ValueError(f"dynamic_global_batch_size values must be identical, got {dynamic_count}")
+        dynamic_count = normalized.pop()
+    expected_global_pairs = int(args.global_batch_size) if dynamic_count is None else int(dynamic_count)
+    capacity = int(max_tokens_per_gpu or args.max_tokens_per_gpu)
+    pair_bins = pack_preference_pair_indices(pair_costs, pair_ids, capacity=capacity)
+    control_values = [None] * dp_size
+    dist.all_gather_object(
+        control_values,
+        (len(pair_costs), expected_global_pairs, len(pair_bins)),
+        group=mpu.get_data_parallel_group_gloo(with_context_parallel=False),
+    )
+    local_pair_counts = {int(values[0]) for values in control_values}
+    if len(local_pair_counts) != 1:
+        raise ValueError(f"preference objectives require equal local pair rows on every DP rank: {local_pair_counts}")
+    declared_global_pairs = {int(values[1]) for values in control_values}
+    if len(declared_global_pairs) != 1:
+        raise ValueError(f"dynamic_global_batch_size must be identical on every DP rank: {declared_global_pairs}")
+    step_global_pair_count = local_pair_counts.pop() * dp_size
+    declared_global_pair_count = declared_global_pairs.pop()
+    if declared_global_pair_count != step_global_pair_count:
+        raise ValueError(
+            "dynamic_global_batch_size must equal the step-global preference pair count: "
+            f"declared={declared_global_pair_count}, actual={step_global_pair_count}, "
+            f"local={len(pair_costs)}, dp_size={dp_size}"
+        )
+    rollout_data["dynamic_global_batch_size"] = step_global_pair_count
+    rollout_data[ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] = [step_global_pair_count]
+    pair_bins = _split_preference_bins_to_count(pair_bins, max(int(values[2]) for values in control_values))
+    branch_bins = [
+        [branch for pair_index in group for branch in (2 * pair_index, 2 * pair_index + 1)] for group in pair_bins
+    ]
+    iterator = DataIterator(rollout_data, micro_batch_indices=branch_bins, max_tokens_per_gpu=capacity)
+    return [iterator], [len(branch_bins)]
+
+
 def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
@@ -816,15 +1220,17 @@ def get_data_iterator(
 
     - If `use_dynamic_batch_size` is False, splits into fixed-size contiguous
       micro-batches of `micro_batch_size`.
-    - If True, computes the number of micro-batches per local step based on
-      `max_tokens_per_gpu` (or the override passed via the parameter) and per-sample lengths, all-reduces to a DP-wide
-      maximum, optionally enforces divisibility for Virtual Pipeline Parallelism (VPP), and builds a balanced
-      index schedule to equalize token counts across micro-batches.
+    - If True, computes the micro-batch count using the token budget, aligns
+      it across DP/VPP, and balances with KK. Falls back to first-fit if KK
+      exceeds the capacity.
 
     Returns `(data_iterators, num_microbatches)` where:
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    if is_preference_mode(args):
+        return _get_preference_data_iterator(args, rollout_data, max_tokens_per_gpu)
+
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     dp_group = mpu.get_data_parallel_group()
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
@@ -930,6 +1336,20 @@ def get_data_iterator(
             )
         return data_iterator
 
+    wholepack_plan = rollout_data.pop("_sft_wholepack_v1", None)
+    if wholepack_plan is not None:
+        from relax.utils.data.wholepack import enabled
+
+        if not enabled(args):
+            raise ValueError("Whole-pack metadata requires the optimized training recipe")
+        return _generate_data_iterator(
+            rollout_data,
+            None,
+            wholepack_plan["indices"],
+            max_tokens_per_gpu=args.max_tokens_per_gpu,
+            dummy_micro_batch_offsets=set(wholepack_plan["dummy"]),
+        ), [int(wholepack_plan["K"])]
+
     if not args.use_dynamic_batch_size:
         invalid_counts = [count for count in step_local_sample_counts if count % args.micro_batch_size != 0]
         if invalid_counts:
@@ -942,13 +1362,25 @@ def get_data_iterator(
     else:
         _max_tokens = max_tokens_per_gpu if max_tokens_per_gpu is not None else args.max_tokens_per_gpu
         assert _max_tokens is not None
+        micro_batch_token_capacity = _get_micro_batch_token_capacity(args, _max_tokens, cp_size)
         # calculate the number of mirobatches for each step
         samples = rollout_data["total_lengths"]
+        packing_strategy = getattr(args, "sft_packing_strategy", "balanced")
         assert len(samples) == num_local_samples
+        # Bridge pads each THD document before CP splitting, including text-only
+        # batches of VL models. Plan with those physical lengths as well.
+        needs_unsplit_input = (
+            getattr(args, "is_vl_model", False)
+            or getattr(args, "uses_unsplit_forward", False)
+            or rollout_data.get("multimodal_train_inputs") is not None
+        )
+        if getattr(args, "qkv_format", "thd") == "thd" and cp_size > 1 and needs_unsplit_input:
+            alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
+            samples = [(length + alignment - 1) // alignment * alignment for length in samples]
         num_microbatches = []
         step_offsets = np.cumsum([0, *step_local_sample_counts]).tolist()
         use_flops_packing = getattr(args, "flops_microbatch_packing", False)
-        coordinate_flops = flops_scheduling_enabled(args)
+        coordinate_flops = use_flops_packing or getattr(args, "flops_dp_balancing", False)
         flops_plans = []
         planning_error = None
         estimator = None
@@ -970,13 +1402,15 @@ def get_data_iterator(
                 for start, end in zip(step_offsets, step_offsets[1:]):
                     if use_flops_packing:
                         plan = build_workload_microbatch_plan(
-                            samples[start:end], estimator, _max_tokens, **plan_kwargs
+                            rollout_data["total_lengths"][start:end], estimator, _max_tokens, **plan_kwargs
                         )
                         flops_plans.append(plan)
                         num_microbatches.append(len(plan.partitions))
                     else:
                         num_microbatches.append(
-                            get_minimum_num_micro_batch_size(samples[start:end], _max_tokens * cp_size)
+                            len(get_binpack_partitions(samples[start:end], micro_batch_token_capacity))
+                            if packing_strategy == "binpack"
+                            else get_minimum_num_micro_batch_size(samples[start:end], micro_batch_token_capacity)
                         )
             except Exception as exc:
                 # Agree on failure before any peer enters the training collectives.
@@ -986,7 +1420,14 @@ def get_data_iterator(
             for i in range(num_steps_per_rollout):
                 start = step_offsets[i]
                 end = step_offsets[i + 1]
-                num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], _max_tokens * cp_size))
+                if packing_strategy == "binpack":
+                    num_microbatches.append(
+                        len(get_binpack_partitions(samples[start:end], micro_batch_token_capacity))
+                    )
+                else:
+                    num_microbatches.append(
+                        get_minimum_num_micro_batch_size(samples[start:end], micro_batch_token_capacity)
+                    )
 
         required_num_microbatches = torch.tensor(
             [int(planning_error is not None), *num_microbatches] if coordinate_flops else num_microbatches,
@@ -1012,9 +1453,10 @@ def get_data_iterator(
         if not coordinate_flops:
             num_microbatches = num_microbatches.tolist()
 
-        # balance the each micro batch
-        samples = rollout_data["total_lengths"]
-        # balance the number of mirobatches across steps
+        # Prefer Karmarkar-Karp balancing when it respects capacity. If it
+        # overflows, first-fit reconstructs the schedule used to derive the
+        # local K, keeping indivisible oversized samples isolated, then
+        # deterministically splits it to the DP/VPP K.
         micro_batch_indices = []
         dummy_micro_batch_offsets: set[int] = set()
         for i, num_mbs in enumerate(num_microbatches):
@@ -1027,12 +1469,14 @@ def get_data_iterator(
                     plan = expand_workload_microbatch_plan(plan, num_mbs)
                 partitions, local_dummy_offsets = plan.partitions, plan.dummy_offsets
             else:
-                partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(step_samples, num_mbs)
+                partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(
+                    step_samples,
+                    num_mbs,
+                    micro_batch_token_capacity,
+                    packing_strategy=packing_strategy,
+                )
             base_offset = len(micro_batch_indices)
-            for j in range(num_mbs):
-                for k in range(len(partitions[j])):
-                    partitions[j][k] = start + partitions[j][k]
-            micro_batch_indices.extend(partitions)
+            micro_batch_indices.extend([[idx + start for idx in partition] for partition in partitions])
             dummy_micro_batch_offsets.update(base_offset + offset for offset in local_dummy_offsets)
 
         if getattr(args, "dynamic_context_parallel", False):
@@ -1055,7 +1499,16 @@ def get_data_iterator(
             micro_batch_indices = ordered
             dummy_micro_batch_offsets = ordered_dummy_offsets
 
-        assert len(set(sum(micro_batch_indices, []))) == num_local_samples
+        flat_micro_batch_indices = [
+            idx
+            for offset, partition in enumerate(micro_batch_indices)
+            if offset not in dummy_micro_batch_offsets
+            for idx in partition
+        ]
+        if len(flat_micro_batch_indices) != num_local_samples or sorted(flat_micro_batch_indices) != list(
+            range(num_local_samples)
+        ):
+            raise RuntimeError("dynamic microbatch partitions must contain every local sample exactly once")
         logger.info(
             f"After dynamic batching, num_microbatches: {num_microbatches}, micro_batch_indices: {micro_batch_indices}, "
             f"dummy_microbatches={len(dummy_micro_batch_offsets)}"
@@ -1095,6 +1548,8 @@ def log_rollout_data(
         cp_size = 1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size()
         log_dict = {}
         metric_weights = {}
+        metric_reductions = {}
+        is_sft = is_sft_mode(args)
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
@@ -1116,6 +1571,8 @@ def log_rollout_data(
         )
 
         for key, val in rollout_data.items():
+            if is_sft and key in ("response_lengths", "total_lengths", "learn_lengths", "non_learn_lengths"):
+                continue
             if key in [
                 "tokens",
                 "multimodal_train_inputs",
@@ -1123,14 +1580,21 @@ def log_rollout_data(
                 "sample_indices",
                 "sample_index_mask_sums",
                 "rollout_routed_experts",
+                "rollout_topk_token_ids",
+                "rollout_topk_log_probs",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
                 "packed_seq_params",
                 "vlm_packed_seq_params",
                 "__loss_scale__",
+                "_sft_wholepack_v1",
                 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,
+                "preference_pair_costs",
+                "preference_pair_ids",
+                "preference_branch_pair_ids",
+                "preference_is_chosen",
             ]:
                 continue
             if args.use_opd and key in OPD_ROLLOUT_LOG_SKIP_FIELDS:
@@ -1187,7 +1651,28 @@ def log_rollout_data(
                 continue
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
-        if total_lengths:
+        if is_sft and total_lengths:
+            # Raw per-sample multimodal inputs stay on CPU; count before packing
+            # and include text-only rows as zeros, matching rollout metrics.
+            mm_inputs = rollout_data.get("multimodal_train_inputs")
+            if mm_inputs is None:
+                mm_inputs = [None] * len(total_lengths)
+            counts = {
+                "total_lengths": total_lengths,
+                "learn_lengths": rollout_data["learn_lengths"],
+                "non_learn_lengths": rollout_data["non_learn_lengths"],
+                "image_count": [count_images(None, mm) for mm in mm_inputs],
+                "multimodal_token_count": [get_multimodal_token_counts(mm)["total"] for mm in mm_inputs],
+            }
+            for name, values in counts.items():
+                log_dict[f"{name}/min"] = min(values)
+                log_dict[f"{name}/mean"] = sum(values) / len(values)
+                log_dict[f"{name}/max"] = max(values)
+                metric_weights[f"{name}/mean"] = len(values)
+                metric_reductions[f"{name}/min"] = "min"
+                metric_reductions[f"{name}/max"] = "max"
+
+        if total_lengths and not is_sft:
             dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
             stats = torch.tensor(
                 [max(total_lengths), -min(total_lengths)],
@@ -1198,7 +1683,7 @@ def log_rollout_data(
             log_dict["total_lengths/max"] = int(stats[0].item())
             log_dict["total_lengths/min"] = -int(stats[1].item())
 
-        reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict, metric_weights)
+        reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict, metric_weights, metric_reductions)
         if args.ci_test and reduced_log_dict is not None:
             if (
                 rollout_id == 0
@@ -1344,9 +1829,11 @@ def sync_actor_critic_data(
 
 
 def _map_packed_seq_params(data: PackedSeqParams, map_value: Callable[[Any], Any]) -> PackedSeqParams:
+    record = valid_physical_layout(data)
     mapped = copy(data)
     for name, value in vars(data).items():
         setattr(mapped, name, map_value(value))
+    rebind_mapped_layout(mapped, record)
     return mapped
 
 
@@ -1357,7 +1844,12 @@ def move_tensors_to_device(data: Any, device: torch.device, *, non_blocking: boo
     Non-tensor values are left unchanged.
     """
     if isinstance(data, dict):
-        return {k: move_tensors_to_device(v, device, non_blocking=non_blocking) for k, v in data.items()}
+        # MoonViT consumes grid_thws as Python geometry. Preserve host metadata
+        # instead of copying it to CUDA only to synchronize it back in forward.
+        return {
+            k: v if k == "grid_thws" else move_tensors_to_device(v, device, non_blocking=non_blocking)
+            for k, v in data.items()
+        }
     if isinstance(data, list):
         return [move_tensors_to_device(v, device, non_blocking=non_blocking) for v in data]
     if isinstance(data, tuple):
@@ -1403,5 +1895,5 @@ def record_tensors_on_stream(data: Any, stream: Any) -> None:
     elif isinstance(data, PackedSeqParams):
         for value in vars(data).values():
             record_tensors_on_stream(value, stream)
-    elif isinstance(data, torch.Tensor):
+    elif isinstance(data, torch.Tensor) and data.device.type != "cpu":
         data.record_stream(stream)

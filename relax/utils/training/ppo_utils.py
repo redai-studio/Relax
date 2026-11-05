@@ -5,6 +5,7 @@
 
 import contextlib
 import math
+import os
 from argparse import Namespace
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from relax.algorithms import algorithm_needs_critic
+from relax.engine.sft.runtime import is_rm_mode
 from relax.utils.logging_utils import get_logger
 
 
@@ -466,9 +468,21 @@ def compute_m2po_loss(
 # ───────────────────────────────────────────────────────────────────────────
 
 
+# Experimental deferred softmax normalization changes floating-point operation order.
+# Keep it opt-in until GPU numerical/performance validation is available.
+# Single-rank collective elision is unconditional because SUM/MAX are identities.
+_LOGPROB_FAST_PATH = os.environ.get("RELAX_LOGPROB_FAST_PATH", "0") == "1"
+_LOGPROB_FAST_PATH_LOGGED = False
+
+
 def _maybe_all_reduce(tensor: torch.Tensor, op: dist.ReduceOp, process_group) -> None:
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(tensor, op=op, group=process_group)
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    # A 1-rank group makes MAX/SUM the identity; skipping is exact, not an
+    # approximation, so it does not need an experiment switch.
+    if _get_vocab_parallel_rank_size(process_group)[1] == 1:
+        return
+    dist.all_reduce(tensor, op=op, group=process_group)
 
 
 def _get_vocab_parallel_rank_size(process_group) -> tuple[int, int]:
@@ -491,6 +505,10 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         with_entropy_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with_entropy_grad = with_entropy and with_entropy_grad
+        global _LOGPROB_FAST_PATH_LOGGED
+        if _LOGPROB_FAST_PATH and not _LOGPROB_FAST_PATH_LOGGED:
+            _LOGPROB_FAST_PATH_LOGGED = True
+            logger.info("Relax logprob fast path enabled (RELAX_LOGPROB_FAST_PATH=1): deferred softmax normalization.")
         vocab_parallel_logits = vocab_parallel_logits.float()
         seq_len, vocab_parallel_size = vocab_parallel_logits.shape
         rank, _world_size = _get_vocab_parallel_rank_size(process_group)
@@ -501,6 +519,10 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         masked_target_1d = (target - vocab_start_index).clone()
         masked_target_1d[target_mask] = 0
         arange_1d = torch.arange(seq_len, device=vocab_parallel_logits.device)
+
+        # Deferring the normalize is only valid when nothing in forward reads the
+        # softmax; entropy does, so it stays on the original path.
+        defer_normalize = _LOGPROB_FAST_PATH and not with_entropy
 
         def vocab_parallel_softmax(
             logits: torch.Tensor,
@@ -520,6 +542,14 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             exp_logits = normalized_logits.exp_()
             sum_exp_logits = exp_logits.sum(dim=-1, keepdim=True)
             _maybe_all_reduce(sum_exp_logits, dist.ReduceOp.SUM, process_group)
+            # ``div_`` is a full [seq_len, vocab] read-modify-write whose result the
+            # forward never reads -- it exists purely to be saved for backward, which
+            # then scales the same buffer by another per-row factor. Return the
+            # UNNORMALIZED exp and let backward fold 1/sum into that scale: the pass
+            # is removed, not moved. ``log_prob`` below uses sum_exp_logits directly
+            # and is unaffected.
+            if defer_normalize:
+                return predicted_logits, sum_exp_logits, exp_logits, logits_max
             softmax = exp_logits.div_(sum_exp_logits)
             return predicted_logits, sum_exp_logits, softmax, logits_max
 
@@ -580,6 +610,10 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             sum_softmax_times_logits if with_entropy_grad else vocab_parallel_logits.new_empty((0,))
         )
         saved_logits = vocab_parallel_logits if with_entropy_grad else vocab_parallel_logits.new_empty((0,))
+        # Under defer_normalize ``log_prob_softmax`` holds the unnormalized exp, so
+        # backward needs the row sums to finish the division it inherited.
+        ctx.defer_normalize = defer_normalize
+        saved_sum_exp_logits = log_prob_sum_exp_logits if defer_normalize else vocab_parallel_logits.new_empty((0,))
         ctx.save_for_backward(
             log_prob_softmax,
             target_mask,
@@ -587,6 +621,7 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             saved_entropy_softmax,
             saved_sum_softmax_times_logits,
             saved_logits,
+            saved_sum_exp_logits,
         )
         return log_prob, entropy
 
@@ -601,6 +636,7 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             entropy_softmax,
             sum_softmax_times_logits,
             vocab_parallel_logits,
+            sum_exp_logits,
         ) = ctx.saved_tensors
 
         if grad_log_prob is None:
@@ -618,12 +654,26 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             grad_entropy_input.mul_(grad_entropy.reshape(-1, 1))
 
         vocab_parallel_size = log_prob_softmax.size(-1)
-        grad_input = log_prob_softmax.neg_()
-        grad_2d = grad_input.view(-1, vocab_parallel_size)
-        arange_1d = torch.arange(grad_2d.size(0), device=grad_2d.device)
-        target_update = (~target_mask).to(dtype=grad_2d.dtype)
-        grad_2d[arange_1d, masked_target_1d] += target_update
-        grad_input.mul_(grad_log_prob.reshape(-1, 1))
+        if ctx.defer_normalize:
+            # log_prob_softmax is exp(logits - max), still unnormalized. The default
+            # path below walks the [seq_len, vocab] buffer twice (neg_, then mul_);
+            # 1/sum, the negation and grad_log_prob are all per-row scalars, so fold
+            # them into one factor and touch the big tensor exactly once.
+            row_scale = grad_log_prob.reshape(-1, 1).div(sum_exp_logits).neg_()
+            grad_input = log_prob_softmax.mul_(row_scale)
+            grad_2d = grad_input.view(-1, vocab_parallel_size)
+            arange_1d = torch.arange(grad_2d.size(0), device=grad_2d.device)
+            # The +1 at the target position must carry the grad_log_prob factor that
+            # the fused row scale already applied to the rest of the row.
+            target_update = (~target_mask).to(dtype=grad_2d.dtype) * grad_log_prob.reshape(-1)
+            grad_2d[arange_1d, masked_target_1d] += target_update
+        else:
+            grad_input = log_prob_softmax.neg_()
+            grad_2d = grad_input.view(-1, vocab_parallel_size)
+            arange_1d = torch.arange(grad_2d.size(0), device=grad_2d.device)
+            target_update = (~target_mask).to(dtype=grad_2d.dtype)
+            grad_2d[arange_1d, masked_target_1d] += target_update
+            grad_input.mul_(grad_log_prob.reshape(-1, 1))
 
         if grad_entropy_input is not None:
             grad_input.add_(grad_entropy_input)
@@ -1238,9 +1288,11 @@ def calculate_log_probs_and_entropy(
                 log_prob_keep_mask=log_prob_keep_mask,
             )
     else:
-        log_prob = logits.new_zeros((0,))
+        # Empty CP response shards still participate in differentiable
+        # redistribution; keep the zero-size result connected to logits.
+        log_prob = logits.sum(dim=-1)
         if with_entropy:
-            entropy = logits.new_zeros((0,))
+            entropy = log_prob if with_entropy_grad else log_prob.detach()
 
     return log_prob, entropy
 
@@ -1696,3 +1748,58 @@ def maybe_verify_critic_value_head_movement(model, optimizer, update_successful:
                 count,
             )
             setattr(model[0], _CRITIC_VH_VERIFIED_ATTR, True)
+
+
+def install_reward_model_head_in_provider(
+    model: torch.nn.Module,
+    args,
+    role: str,
+    post_process: bool,
+    *,
+    stash_lm_head: bool = False,
+) -> None:
+    """Install the offline reward-model scalar head before DDP/optimizer
+    construction."""
+    if role != "actor" or not post_process or not is_rm_mode(args):
+        return
+
+    owner = _find_output_layer_owner(model)
+    if owner is None:
+        return
+
+    output_layer = owner.output_layer
+    if isinstance(output_layer, LinearForLastLayer) and output_layer.out_features == 1:
+        return
+
+    if stash_lm_head:
+        object.__setattr__(owner, _RELAX_HF_OUTPUT_LAYER_ATTR, output_layer)
+    owner.output_layer = LinearForLastLayer(
+        input_size=owner.config.hidden_size,
+        output_size=1,
+        config=owner.config,
+        bias=False,
+    )
+
+
+def validate_reward_model_head_registration(model, optimizer) -> tuple[int, ...]:
+    """Validate RM scalar-head shape, bias contract, registration, and DDP
+    ownership."""
+    del optimizer
+    parameter_ids = []
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is None:
+            continue
+        head = owner.output_layer
+        assert isinstance(head, LinearForLastLayer), (
+            f"reward-model output layer must be LinearForLastLayer, got {type(head).__name__}"
+        )
+        assert tuple(head.weight.shape) == (1, owner.config.hidden_size), (
+            f"reward-model head weight must have shape (1, {owner.config.hidden_size}), got {tuple(head.weight.shape)}"
+        )
+        assert head.bias is None, "reward-model scalar head must use bias=False"
+        registered_parameter_ids = {id(parameter) for parameter in model_chunk.parameters()}
+        assert id(head.weight) in registered_parameter_ids, "reward-model output_layer.weight is not registered"
+        assert _ddp_owns_param(model_chunk, head.weight), "DDP does not own reward-model output_layer.weight"
+        parameter_ids.append(id(head.weight))
+    return tuple(parameter_ids)

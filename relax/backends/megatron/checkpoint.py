@@ -6,7 +6,7 @@ import json
 import os
 import re
 from argparse import Namespace
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,6 +17,7 @@ from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint_megatron
 from megatron.training.global_vars import get_args
 
+from relax.engine.sft.runtime import is_rm_mode
 from relax.utils import megatron_bridge_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
@@ -26,6 +27,9 @@ from relax.utils.training.ppo_utils import (
     use_critic_lm_head_for_hf_load,
     use_sequence_classification_lm_head_for_hf_load,
 )
+
+from .checkpoint_metadata import _checkpoint_has_optimizer_state, _collective_checkpoint_probe
+from .compat import patch_hybrid_optimizer_native_fp32_checkpoint_load, preserve_hdo_dp_reshardable_steps_on_load
 
 
 try:
@@ -108,7 +112,114 @@ except ImportError:
 
 logger = get_logger(__name__)
 
-__all__ = ["save_checkpoint"]
+REWARD_MODEL_HEAD_TYPE = "reward_model_terminal_v1"
+
+__all__ = ["REWARD_MODEL_HEAD_TYPE", "load_checkpoint", "save_checkpoint"]
+
+
+def _checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | None = None) -> Path:
+    path = Path(load_path)
+    if re.fullmatch(r"iter_\d{7}", path.name):
+        return path
+    tracker = path / "latest_checkpointed_iteration.txt"
+    try:
+        metadata = tracker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if metadata == "release":
+        return path / "release"
+    try:
+        iteration = int(metadata)
+    except ValueError as exc:
+        raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if ckpt_step is not None:
+        iteration = int(ckpt_step)
+    if iteration < 0:
+        raise RuntimeError(f"Megatron checkpoint iteration must be non-negative, got {iteration}")
+    return path / f"iter_{iteration:07d}"
+
+
+def _metadata_value(metadata, name: str):
+    return metadata.get(name) if isinstance(metadata, dict) else getattr(metadata, name, None)
+
+
+def _validate_reward_model_tensor_metadata(tensor_metadata: dict, hidden_size: int) -> None:
+    head_keys = [
+        str(key)
+        for key in tensor_metadata
+        if not str(key).startswith("optimizer.") and ("output_layer." in str(key) or "reward_model_head." in str(key))
+    ]
+    weight_keys = [key for key in head_keys if key.endswith("output_layer.weight")]
+    if len(weight_keys) != 1:
+        raise RuntimeError(
+            f"RM resume requires exactly one output_layer.weight checkpoint tensor, found {weight_keys}"
+        )
+    unexpected = [key for key in head_keys if key != weight_keys[0]]
+    if unexpected:
+        raise RuntimeError(f"RM checkpoint contains unexpected scalar-head tensors: {unexpected}")
+    entry = tensor_metadata[weight_keys[0]]
+    shape = tuple(getattr(entry, "global_shape", getattr(entry, "shape", ())))
+    expected = (1, int(hidden_size))
+    if shape != expected:
+        raise RuntimeError(f"RM output_layer.weight shape mismatch: checkpoint={shape}, expected={expected}")
+
+
+def _load_checkpoint_metadata(args, ddp_model, checkpoint_dir: Path) -> dict:
+    from megatron.core import dist_checkpointing
+
+    role = getattr(ddp_model[0], "role", "actor")
+    current_is_rm = role == "actor" and is_rm_mode(args)
+    if current_is_rm and checkpoint_dir.name == "release":
+        raise RuntimeError(
+            "RM resume rejects release checkpoints because optimizer, scheduler, and RNG state are absent"
+        )
+    if not dist_checkpointing.check_is_distributed_checkpoint(str(checkpoint_dir)):
+        if current_is_rm:
+            raise RuntimeError(
+                "RM resume requires a distributed checkpoint with contract metadata; legacy Megatron "
+                "checkpoints are not supported"
+            )
+        return {}
+    common = dist_checkpointing.load_common_state_dict(checkpoint_dir)
+    saved_args = common.get("args")
+    if saved_args is None:
+        if current_is_rm:
+            raise RuntimeError(f"checkpoint {checkpoint_dir} is missing saved args metadata")
+        return common
+    saved_loss_type = _metadata_value(saved_args, "loss_type")
+    if saved_loss_type == "sft" and _metadata_value(saved_args, "sft_objective") == "reward_model":
+        saved_loss_type = "rm"
+    saved_head_type = _metadata_value(saved_args, "head_type")
+    saved_role = _metadata_value(saved_args, "checkpoint_role")
+    saved_is_rm = saved_loss_type == "rm" or saved_head_type == REWARD_MODEL_HEAD_TYPE
+
+    if current_is_rm:
+        if (saved_loss_type, saved_head_type, saved_role) != (
+            "rm",
+            REWARD_MODEL_HEAD_TYPE,
+            "actor",
+        ):
+            raise RuntimeError(
+                "RM resume requires checkpoint metadata "
+                "loss_type=rm, head_type=reward_model_terminal_v1, checkpoint_role=actor; "
+                f"got loss_type={saved_loss_type!r}, head_type={saved_head_type!r}, role={saved_role!r}"
+            )
+        incompatible_flags = [
+            name
+            for name in ("no_load_optim", "no_load_rng", "finetune", "reset_optimizer_states")
+            if bool(getattr(args, name, False))
+        ]
+        if incompatible_flags:
+            raise RuntimeError(
+                f"RM resume must restore optimizer, scheduler, and RNG state; incompatible flags: {incompatible_flags}"
+            )
+        tensor_metadata = dist_checkpointing.load_tensors_metadata(str(checkpoint_dir))
+        _validate_reward_model_tensor_metadata(tensor_metadata, int(args.hidden_size))
+    elif saved_is_rm:
+        target = "PPO critic" if role == "critic" else "non-RM actor/SFT"
+        raise RuntimeError(f"{target} load rejects reward-model checkpoints")
+    return common
+
 
 _LORA_CHECKPOINT_METADATA_ATTR = "relax_lora_checkpoint_metadata"
 _LORA_CHECKPOINT_FORMAT_VERSION = 1
@@ -395,7 +506,12 @@ def _sync_hybrid_optimizer_checkpoint_steps(optimizer) -> None:
                 for sub_optimizer in current.sub_optimizers:
                     for group in sub_optimizer.param_groups:
                         group["step"] = step
-        pending.extend(getattr(current, "chained_optimizers", ()))
+        chained = getattr(current, "chained_optimizers", None)
+        if chained is not None:
+            # ChainedOptimizer.optimizer only permits a single child. Walk the
+            # children directly for chains containing dense and expert optimizers.
+            pending.extend(chained)
+            continue
         nested = getattr(current, "optimizer", None)
         if nested is not None:
             pending.append(nested)
@@ -434,28 +550,32 @@ def _validate_lora_model_state_load(model):
             chunk.load_state_dict = original
 
 
-def _resolve_checkpoint_iteration_dir(load_path: str | Path) -> Path | None:
+def _resolve_checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | None = None) -> Path | None:
+    """Resolve the concrete iteration directory megatron will load from.
+
+    Accepts an iteration directory directly for internal metadata reads. For a
+    checkpoint root, a positive ``--ckpt-step`` overrides a numeric tracker,
+    while a ``release`` tracker always selects the release directory, matching
+    Megatron's load behavior. Zero does not override the tracker.
+    """
     path = Path(load_path)
     if re.fullmatch(r"iter_\d{7}", path.name):
         return path
+    iteration = None
     tracker = path / "latest_checkpointed_iteration.txt"
-    if not tracker.is_file():
+    if tracker.is_file():
+        value = tracker.read_text().strip()
+        if value.isdigit():
+            iteration = int(value)
+        elif value == "release":
+            return path / "release"
+        else:
+            raise ValueError(f"Invalid checkpoint iteration in {tracker}: {value!r}")
+    if ckpt_step:
+        iteration = ckpt_step
+    if iteration is None:
         return None
-    value = tracker.read_text().strip()
-    if not value.isdigit():
-        return None
-    return path / f"iter_{int(value):07d}"
-
-
-def _read_lora_checkpoint_metadata(load_path: str | Path) -> dict | None:
-    checkpoint_dir = _resolve_checkpoint_iteration_dir(load_path)
-    if checkpoint_dir is None or not checkpoint_dir.is_dir():
-        return None
-    from megatron.core import dist_checkpointing
-
-    common_state = dist_checkpointing.load_common_state_dict(str(checkpoint_dir))
-    checkpoint_args = common_state.get("args")
-    return getattr(checkpoint_args, _LORA_CHECKPOINT_METADATA_ATTR, None)
+    return path / f"iter_{iteration:07d}"
 
 
 def _validate_lora_checkpoint_metadata(args, model, metadata: dict) -> None:
@@ -508,25 +628,93 @@ def _alias_renamed_transfer_queue_enum() -> None:
         enum_utils.TransferQueueRole = enum_utils.Role
 
 
+def _checkpoint_load_state(load_path: str, args: Namespace, load_optimizer: bool) -> dict:
+    """Probe only host metadata before deciding which collective loader to
+    use."""
+    exists = Path(load_path).exists() and _is_dir_nonempty(load_path)
+    megatron = exists and (is_megatron_checkpoint(load_path) or bool(getattr(args, "ckpt_step", None)))
+    iteration_dir = (
+        _resolve_checkpoint_iteration_dir(load_path, ckpt_step=getattr(args, "ckpt_step", None)) if megatron else None
+    )
+    valid_iteration = iteration_dir is not None and iteration_dir.is_dir()
+    return {
+        "load_path": str(load_path),
+        "load_optimizer": load_optimizer,
+        "exists": exists,
+        "megatron": megatron,
+        "iteration_dir": str(iteration_dir) if iteration_dir is not None else None,
+        "valid_iteration": valid_iteration,
+        "has_optimizer": (
+            _checkpoint_has_optimizer_state(iteration_dir, args) if valid_iteration and load_optimizer else True
+        ),
+        "hf": exists and not megatron and _is_hf_checkpoint(load_path),
+    }
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
     load_path = args.load
 
-    exist = Path(load_path).exists() and _is_dir_nonempty(load_path)
+    load_optimizer = (
+        optimizer is not None and not getattr(args, "no_load_optim", False) and not getattr(args, "finetune", False)
+    )
+    state = _collective_checkpoint_probe(lambda: _checkpoint_load_state(load_path, args, load_optimizer))
+    exist = state["exists"]
 
-    if exist and _is_megatron_checkpoint(load_path):
+    if state["megatron"]:
+        current_is_rm = is_rm_mode(args) and getattr(ddp_model[0], "role", "actor") == "actor"
+        iter_dir = state["iteration_dir"]
+        if not state["valid_iteration"]:
+            if current_is_rm:
+                raise RuntimeError(f"RM resume requires an existing checkpoint iteration: {iter_dir}")
+            logger.warning(
+                f"Cannot resume from {load_path}: iteration directory {iter_dir} does not exist "
+                "(deleted or interrupted save). Falling back to the HF checkpoint, "
+                "training restarts from scratch."
+            )
+            return _load_checkpoint_hf(ddp_model=ddp_model, optimizer=optimizer, args=args, load_path=None)
+
+        if load_optimizer and not state["has_optimizer"]:
+            if current_is_rm:
+                raise RuntimeError(f"RM resume requires optimizer state in checkpoint {iter_dir}")
+            logger.warning(
+                f"Checkpoint {iter_dir} contains no optimizer state (saved with --no-save-optim). "
+                "Loading model weights only; the optimizer and LR scheduler start from scratch."
+            )
+            args.no_load_optim = True
+
         _alias_renamed_transfer_queue_enum()
-        lora_metadata = _read_lora_checkpoint_metadata(load_path)
+        if (
+            optimizer is not None
+            and getattr(args, "optimizer_cpu_offload", False)
+            and patch_hybrid_optimizer_native_fp32_checkpoint_load()
+        ):
+            logger.info("Applied compatibility fix for native-FP32 CPU-offloaded optimizer checkpoint load")
+        lora_metadata = _collective_checkpoint_probe(
+            lambda: _metadata_value(
+                _load_checkpoint_metadata(args, ddp_model, Path(iter_dir)).get("args"),
+                _LORA_CHECKPOINT_METADATA_ATTR,
+            )
+        )
         try:
             if lora_metadata is None:
-                return _load_checkpoint_megatron(
-                    ddp_model=ddp_model,
-                    optimizer=optimizer,
-                    opt_param_scheduler=opt_param_scheduler,
-                    checkpointing_context=checkpointing_context,
-                    skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+                step_context = (
+                    preserve_hdo_dp_reshardable_steps_on_load()
+                    if optimizer is not None
+                    and getattr(args, "optimizer_cpu_offload", False)
+                    and not getattr(args, "no_load_optim", False)
+                    and not skip_load_to_model_and_opt
+                    else nullcontext()
                 )
+                with step_context:
+                    return _load_checkpoint_megatron(
+                        ddp_model=ddp_model,
+                        optimizer=optimizer,
+                        opt_param_scheduler=opt_param_scheduler,
+                        checkpointing_context=checkpointing_context,
+                        skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+                    )
 
             _validate_lora_checkpoint_metadata(args, ddp_model, lora_metadata)
             if not skip_load_to_model_and_opt:
@@ -558,7 +746,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         if not exist:
             load_path = None
             logger.warning(f"{args.load=} does not exist or is an empty directory. use args.hf_checkpoint")
-        elif not _is_hf_checkpoint(load_path):
+        elif not state["hf"]:
             logger.warning(
                 f"{args.load=} exists but is not a valid HF checkpoint (no config.json). "
                 "Falling back to args.hf_checkpoint"
@@ -600,10 +788,22 @@ def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:
     )
 
 
-def _is_megatron_checkpoint(path: str | Path) -> bool:
-    return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
-        re.fullmatch(r"iter_\d{7}", Path(path).name)
-    )
+def is_megatron_checkpoint(path: str | Path) -> bool:
+    path = Path(path)
+    if (path / "latest_checkpointed_iteration.txt").is_file():
+        return True
+    if not re.fullmatch(r"iter_\d{7}", path.name):
+        return False
+
+    # HF exports use the same iteration names. Native format evidence takes
+    # precedence over HF config files, including for incomplete checkpoints:
+    # let the native loader report corruption instead of falling back to HF.
+    if (path / "metadata.json").is_file() or (path / ".metadata").is_file():
+        return True
+    if any(candidate.is_file() for candidate in path.glob("mp_rank_*/model_optim_rng.pt")):
+        return True
+    # Preserve the legacy route/error behavior for unknown iteration contents.
+    return not _is_hf_checkpoint(path)
 
 
 def _is_hf_checkpoint(path: str | Path) -> bool:

@@ -69,6 +69,7 @@ def _load_megatron_dependencies() -> SimpleNamespace:
         )
         from relax.backends.megatron.weight_update.lora_adapter_sync import LoraAdapterSync
         from relax.distributed.checkpoint_service.utils import load_weight
+        from relax.models.deepseek_v4.weight_sync import get_dcs_bucket_splitter
     except ModuleNotFoundError as exc:
         missing = exc.name or ""
         if missing == "megatron" or missing.startswith("megatron."):
@@ -84,6 +85,7 @@ def _load_megatron_dependencies() -> SimpleNamespace:
         named_params_and_buffers=named_params_and_buffers,
         adapter_base_prefix=_adapter_base_prefix,
         base_param_prefix=_base_param_prefix,
+        get_dcs_bucket_splitter=get_dcs_bucket_splitter,
         LoraAdapterSync=LoraAdapterSync,
         load_weight=load_weight,
     )
@@ -198,6 +200,9 @@ class DeviceDirectBackend(CommBackend):
 
         # Bridge-based HF weight converter (lazy-initialized on first use)
         self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
+        self._rollout_bucket_splitter = self._megatron.get_dcs_bucket_splitter(
+            model_name, use_bridge=self._use_bridge, has_model=bool(model)
+        )
         if self._use_bridge:
             from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter
 
@@ -222,9 +227,9 @@ class DeviceDirectBackend(CommBackend):
         """Build a stable signature of the rollout topology.
 
         Two topologies with the same signature describe the same set of engines
-        (same rank, endpoint and per-engine GPU count, the latter affecting the
-        NCCL group world size), so the existing engines + weight-update group
-        can be reused without a teardown/rebuild.
+        (same actor generation, rank, endpoint and per-engine GPU count, the
+        latter affecting the NCCL group world size), so the existing engines +
+        weight-update group can be reused without a teardown/rebuild.
         """
         sig = set()
         for rank, info in rollout_topology.items():
@@ -235,6 +240,7 @@ class DeviceDirectBackend(CommBackend):
                     info.get("ip") if isinstance(info, dict) else None,
                     info.get("port") if isinstance(info, dict) else None,
                     meta.get("num_gpus_per_engine"),
+                    meta.get("actor_id"),
                 )
             )
         return frozenset(sig)
@@ -636,6 +642,12 @@ class DeviceDirectBackend(CommBackend):
         """
         self.weight_version += 1
 
+        if self._use_bridge:
+            # Bridge task construction and config exchange contain PP
+            # collectives, so every rank must enter them before filtering.
+            self._bridge_converter.init_tasks()
+            self._bridge_converter.broadcast_and_apply_configs()
+
         # LoRA: in merge mode, pre-gather every adapter to a full tensor so each base weight can
         # be folded before conversion (reuses the existing NCCL broadcast). In adapter mode, the
         # base is broadcast to rollout only on the first sync; afterwards only the adapter is
@@ -694,7 +706,11 @@ class DeviceDirectBackend(CommBackend):
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
 
-        for name, param in self._megatron.named_params_and_buffers(self.args, self.model):
+        for name, param in self._megatron.named_params_and_buffers(
+            self.args, self.model, include_persistent_buffers=self._use_bridge
+        ):
+            if not self._should_sync_tensor(name, param):
+                continue
             if ".experts." in name:
                 continue
             buffer_size = self._update_weight_from_distributed(
@@ -712,6 +728,8 @@ class DeviceDirectBackend(CommBackend):
             if not rollout_only:
                 self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
             if converted_named_tensors and not actor_fwd_only:
+                if self._rollout_bucket_splitter is not None:
+                    self._rollout_bucket_splitter(converted_named_tensors, require_complete=True)
                 self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
                 converted_named_tensors.clear()
             origin_named_tensors.clear()
@@ -810,10 +828,15 @@ class DeviceDirectBackend(CommBackend):
         # to allocate contiguous Adam state buffers.
         device_module.empty_cache()
 
+    def _should_sync_tensor(self, name: str, tensor: torch.Tensor) -> bool:
+        return (
+            not self._use_bridge or isinstance(tensor, torch.nn.Parameter) or self._bridge_converter.can_convert(name)
+        )
+
     def _update_weight_from_distributed(
         self,
         name: str,
-        param: torch.nn.Parameter,
+        param: torch.Tensor,
         converted_named_tensors: list[tuple[str, torch.Tensor]],
         origin_named_tensors: list[tuple[str, torch.Tensor]],
         buffer_size: int,
@@ -832,13 +855,18 @@ class DeviceDirectBackend(CommBackend):
         param_size = param.numel() * param.element_size()
         if buffer_size + param_size > self.args.update_weight_buffer_size:
             if converted_named_tensors or origin_named_tensors:
+                ready = converted_named_tensors
+                pending = []
+                if self._rollout_bucket_splitter is not None and not actor_fwd_only:
+                    ready, pending = self._rollout_bucket_splitter(converted_named_tensors)
                 if not rollout_only:
                     self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
-                if converted_named_tensors and not actor_fwd_only:
-                    self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
-                    converted_named_tensors.clear()
+                if ready and not actor_fwd_only:
+                    self._update_bucket_weights_from_distributed(ready, pbar=pbar)
+                if not actor_fwd_only:
+                    converted_named_tensors[:] = pending
                 origin_named_tensors.clear()
-                buffer_size = 0
+                buffer_size = sum(tensor.numel() * tensor.element_size() for _, tensor in pending)
         origin_named_tensors += [(name, param)]
         if not actor_fwd_only and not self._lora_skip_rollout_base:
             if self._lora_enabled and is_lora_adapter_param(name):
@@ -870,7 +898,11 @@ class DeviceDirectBackend(CommBackend):
         """
         buffer_size = 0
         named_tensors: list[tuple[str, torch.Tensor]] = []
-        for name, param in self._megatron.named_params_and_buffers(self.args, self.model):
+        for name, param in self._megatron.named_params_and_buffers(
+            self.args, self.model, include_persistent_buffers=self._use_bridge
+        ):
+            if not self._should_sync_tensor(name, param):
+                continue
             if ".experts." not in name:
                 continue
             buffer_size = self._update_expert_weight_from_distributed(
@@ -884,7 +916,7 @@ class DeviceDirectBackend(CommBackend):
     def _update_expert_weight_from_distributed(
         self,
         name: str,
-        param: torch.nn.Parameter,
+        param: torch.Tensor,
         named_tensors: list[tuple[str, torch.Tensor]],
         buffer_size: int,
         rollout_only: bool = False,
@@ -995,27 +1027,37 @@ class DeviceDirectBackend(CommBackend):
 
         while not ray.get(self.lock.acquire.remote()):
             time.sleep(0.1)
-        # Prepare payload for weight update
-        weight_payload = {
-            "names": [name for name, _ in converted_named_tensors],
-            "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
-            "shapes": [param.shape for _, param in converted_named_tensors],
-            "group_name": self._group_name,
-            "weight_version": str(self.weight_version),
-            "flush_cache": False,
-        }
-        # Send weight update to all rollout nodes via Ray actors
-        futures = self._batch_request("/update_weights_from_distributed", weight_payload)
+        completed = False
+        try:
+            # Prepare payload for weight update
+            weight_payload = {
+                "names": [name for name, _ in converted_named_tensors],
+                "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
+                "shapes": [param.shape for _, param in converted_named_tensors],
+                "group_name": self._group_name,
+                "weight_version": str(self.weight_version),
+                "flush_cache": False,
+            }
+            # Send weight update to all rollout nodes via Ray actors
+            futures = self._batch_request("/update_weights_from_distributed", weight_payload)
 
-        # Broadcast weights via PyTorch distributed
-        handles = []
-        for _, param in converted_named_tensors:
-            handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
-        for handle in handles:
-            handle.wait()
-        ray.get(futures)  # Ensure remote update completes
-
-        ray.get(self.lock.release.remote())
+            # Broadcast weights via PyTorch distributed
+            handles = []
+            for _, param in converted_named_tensors:
+                handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
+            for handle in handles:
+                handle.wait()
+            ray.get(futures)  # Ensure remote update completes
+            completed = True
+        finally:
+            try:
+                ray.get(self.lock.release.remote())
+            except Exception:
+                if completed:
+                    raise
+                # Preserve the original sync error if cluster teardown also
+                # makes releasing the lock fail.
+                logger.exception("Failed to release the DCS weight-update lock after a sync error")
         if pbar is not None:
             pbar.update(1)
 

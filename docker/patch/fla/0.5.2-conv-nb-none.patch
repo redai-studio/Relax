@@ -1,0 +1,70 @@
+--- a/fla/modules/conv/triton/kernels.py
++++ b/fla/modules/conv/triton/kernels.py
+@@ -30,7 +30,7 @@
+         for BD in [16, 32, 64, 128]
+         for num_warps in NUM_WARPS_AUTOTUNE
+     ],
+-    key=['D', 'W', 'NB'],
++    key=['D', 'W'],
+     **autotune_cache_kwargs,
+ )
+ @triton.jit
+@@ -53,7 +53,6 @@
+     BT: tl.constexpr,
+     BW: tl.constexpr,
+     BD: tl.constexpr,
+-    NB: tl.constexpr,
+     ACTIVATION: tl.constexpr,
+     HAS_WEIGHT: tl.constexpr,
+     HAS_BIAS: tl.constexpr,
+@@ -151,7 +150,7 @@
+         for BD in [16, 32, 64, 128]
+         for num_warps in [4, 8, 16, 32]
+     ],
+-    key=['D', 'W', 'NB'],
++    key=['D', 'W'],
+     **autotune_cache_kwargs,
+ )
+ @triton.jit
+@@ -183,7 +182,6 @@
+     BT: tl.constexpr,
+     BW: tl.constexpr,
+     BD: tl.constexpr,
+-    NB: tl.constexpr,
+     ACTIVATION: tl.constexpr,
+     HAS_WEIGHT: tl.constexpr,
+     HAS_BIAS: tl.constexpr,
+--- a/fla/modules/conv/triton/ops.py
++++ b/fla/modules/conv/triton/ops.py
+@@ -59,7 +59,6 @@
+     if cu_seqlens is not None and chunk_indices is None:
+         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+-    NB = triton.cdiv(B*T, 1024)
+
+     y = torch.empty_like(x, memory_format=torch.contiguous_format)
+
+@@ -79,7 +78,6 @@
+         W=W,
+         BT=BT,
+         BW=BW,
+-        NB=NB,
+         stride_x_n=stride_x_n,
+         stride_x_t=stride_x_t,
+         stride_x_d=stride_x_d,
+@@ -170,7 +168,6 @@
+     if cu_seqlens is not None and chunk_indices is None:
+         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+-    NB = triton.cdiv(B*T, 1024)
+
+     y = None
+     if activation is not None:
+@@ -212,7 +209,6 @@
+         W=W,
+         BT=BT,
+         BW=BW,
+-        NB=NB,
+         stride_x_n=stride_x_n,
+         stride_x_t=stride_x_t,
+         stride_x_d=stride_x_d,

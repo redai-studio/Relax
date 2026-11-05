@@ -16,6 +16,9 @@ reporting rules.
 - Static TP/PP/CP; microbatch counts follow existing DP/VPP agreement.
 - No dynamic CP, streaming fully-async sampler, MTP, expert token dropping,
   router expert-bias updates or nonzero MoE auxiliary/z losses.
+- Wholepack is a separate scheduling policy and cannot be combined with either
+  FLOPs flag. FLOPs microbatch packing replaces `balanced`; DP-only placement
+  may also use the existing `binpack` microbatch strategy.
 
 `SequenceFlopsEstimator.from_config(hf_config).estimate_per_sample(lengths)`
 returns raw integer work `a*L + b*L**2`, without time or hardware queries. It
@@ -53,22 +56,21 @@ work for lengths in KK and balances microbatch work across DP. Its illustrative
 
 These adaptations have CPU regression coverage; native parallel validation is pending.
 
-## Local checks
+## CPU regression checks
 
 ```bash
-python -m examples.flops_balancing.compare_capacity_partitions
-python -m examples.flops_balancing.cpu_schedule_validation --output /tmp/cpu.json
-python -m torch.distributed.run --standalone --nproc-per-node=2 \
-  -m examples.flops_balancing.cpu_schedule_validation --output /tmp/gloo.json
-python -m examples.flops_balancing.cpu_schedule_validation \
-  --device cuda --output /tmp/cuda-reference.json
+CUDA_VISIBLE_DEVICES='' python -m pytest \
+  tests/cpu/utils/data/test_workload_balancing.py \
+  tests/cpu/utils/data/test_flops_schedule.py \
+  tests/cpu/utils/data/test_flops_sampler.py \
+  tests/cpu/backends/megatron/test_flops_iterator.py \
+  tests/cpu/utils/test_flops_counter.py \
+  tests/cpu/utils/test_optimizer_step_capture.py \
+  tests/cpu/examples/test_flops_validation_tools.py
 ```
 
-The tiny Dense/top-2 MoE harness checks sample/token normalization, A/B/C/D,
-full gradients, actual FP32 AdamW deltas and dummy slots. It uses real autograd,
-TransferQueue and Gloo/CUDA where requested. It is not Qwen3.5/TP/PP/CP/EP proof.
-
-`native_optimizer_smoke.py` also checks real pinned Megatron optimizers on one
-GPU, including BF16 DistributedOptimizer with actual FP32 CPU masters. DP=1
-checks the capture API, not multi-rank reduction. The opt-in numerical exporter
-intentionally synchronizes/writes large files and must be disabled for timing.
+These cover packing and sample boundaries, real TransferQueue replay, production
+iterator logic with CPU metadata, actual FP32 AdamW deltas and report rejection
+paths. They do not prove Qwen3.5/TP/PP/CP/EP correctness. The opt-in numerical
+exporter intentionally synchronizes/writes large files and must be disabled for
+timing. Chunked optimizer-state offload and FSDP capture are unsupported.

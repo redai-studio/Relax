@@ -1,22 +1,27 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import asyncio
 import threading
 import time
 from argparse import Namespace
 from typing import Any, Dict, Optional
 
 import ray
-import transfer_queue as tq
 from fastapi import FastAPI
 from ray import serve
 
+from relax.components.background_loop import BackgroundLoopRunner
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
-from relax.engine.sft.runtime import is_sft_mode, sft_partition_ids, sft_task_name
+from relax.engine.sft.runtime import (
+    is_dpo_mode,
+    is_offline_mode,
+    sft_partition_ids,
+    sft_task_name,
+)
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 app = FastAPI()
@@ -65,22 +70,22 @@ class Actor(Base):
 
         # Threading primitives so the training loop doesn't block the Serve/FastAPI thread
         self._stop_event = threading.Event()
-        self._run_thread = None
-        self._done_event: Optional[asyncio.Event] = None
-        self._thread_error: Optional[Exception] = None
+        self._loop_runner = BackgroundLoopRunner()
 
         self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role=self.role,
+        )
 
-        self.steps = ray.get(
-            self.actor_model.async_init(
-                config,
-                role=self.role,
-                with_ref=config.kl_coef != 0 or config.use_kl_loss,
-                with_opd_teacher=self.config.opd_teacher_load,
-            )
+        self.steps = self.actor_model.init_and_wait(
+            config,
+            role=self.role,
+            with_ref=(
+                config.kl_coef != 0 or config.use_kl_loss or (is_dpo_mode(config) and not config.dpo_reference_free)
+            ),
+            with_opd_teacher=self.config.opd_teacher_load,
         )
 
         assert len(set(self.steps)) == 1
@@ -111,14 +116,14 @@ class Actor(Base):
 
         # Call update_weights when weight_updater exists (sync colocate or hybrid mode).
         # In pure fully_async mode weight_updater is not created and weights are synced via DCS.
-        # SFT: skip the init-time weight sync. SFT only sync weights to SGLang
+        # Offline training skips the init-time weight sync. SFT syncs weights to SGLang
         # right before periodic predict (gated in `train_actor`); between
         # predicts SGLang stays fully offloaded. Sync-at-init would leave
         # SGLang with `weights` resumed but no follow-up offload, causing
         # the first predict-step `onload_weights` to crash on a non-idempotent
         # `set.remove`. NCCL group setup is lazy — `connect_rollout_engines`
         # fires on the first real `update_weights` instead.
-        if (not self.config.fully_async or self.config.hybrid) and not is_sft_mode(self.config):
+        if (not self.config.fully_async or self.config.hybrid) and not is_offline_mode(self.config):
             self.actor_model.update_weights()
 
     def set_barriers(
@@ -152,44 +157,14 @@ class Actor(Base):
         self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
 
     async def run(self) -> None:
-        """Start the training loop in a background thread and async-wait until
-        it completes.
+        await self._loop_runner.run(self._background_run, before_start=self._reset_consumption)
 
-        Uses an asyncio.Event so that this coroutine yields control back to the
-        Ray Serve event loop while waiting. This keeps the Serve replica
-        responsive to concurrent HTTP requests while the long-running training
-        loop executes in a background thread.
-        """
-        if self._run_thread is not None and self._run_thread.is_alive():
-            if self._done_event is not None:
-                await self._done_event.wait()
-            return
+    def _reset_consumption(self) -> None:
         for partition_id in sft_partition_ids(self.config, self.step):
             self.data_system_client.reset_consumption(
                 partition_id=partition_id,
                 task_name=sft_task_name(self.config, component="actor"),
             )
-        # Create an asyncio.Event bound to the current event loop so the
-        # background thread can signal completion without blocking the loop.
-        loop = asyncio.get_running_loop()
-        self._done_event = asyncio.Event()
-
-        def _thread_target():
-            try:
-                self._background_run()
-            except Exception as exc:
-                self._thread_error = exc
-            finally:
-                # Thread-safe way to set the asyncio event from a non-async context
-                loop.call_soon_threadsafe(self._done_event.set)
-
-        self._thread_error = None
-        self._run_thread = threading.Thread(target=_thread_target, daemon=True)
-        self._run_thread.start()
-        # Async-wait: yields control so other requests can be served
-        await self._done_event.wait()
-        if self._thread_error is not None:
-            raise self._thread_error
 
     def _background_run(self) -> None:
         """The actual training loop running in a background thread.
@@ -201,7 +176,6 @@ class Actor(Base):
         try:
             while True:
                 if self._stop_event.is_set():
-                    self._logger.info("Actor background loop stopping by request")
                     break
 
                 with self._lock:
@@ -237,9 +211,22 @@ class Actor(Base):
         except Exception as e:
             error_msg = f"Actor training failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
-            self.healthy.report_error.remote("actor", error_msg)
-            if not getattr(self.config, "use_health_check", False):
-                raise
+            try:
+                # Acknowledge the report before waiting for the supervisor. A failed
+                # report must not hide the original training exception.
+                ray.get(self.healthy.report_error.remote("actor", error_msg), timeout=30)
+            except Exception:
+                self._logger.exception("Failed to report actor training failure")
+                raise e
+            if getattr(self.config, "use_health_check", False):
+                # Keep run() pending until recovery stops/deletes this replica.
+                # Returning here races the health checker and reports false success.
+                self._stop_event.wait()
+            raise
+
+        # A requested stop is incomplete training, but not a health failure.
+        if self.step < self.config.num_rollout:
+            raise RuntimeError("Actor stopped before all training steps finished")
 
     def _wait_for_rollout_data(self) -> bool:
         """Wait for rollout data to be ready in async colocate mode.
@@ -248,17 +235,18 @@ class Actor(Base):
             True if data is ready and training can proceed,
             False if should continue waiting (caller should skip this iteration)
         """
-        partition_ids = sft_partition_ids(self.config, self.step)
         partition_list = run(self.data_system_client.async_get_partition_list())
-        if partition_list is None or any(partition_id not in partition_list for partition_id in partition_ids):
+        if not partition_list or not all(
+            partition_id in partition_list for partition_id in sft_partition_ids(self.config, self.step)
+        ):
             time.sleep(1)
             return False
 
         # Colocate: block until rollout(SGLang) has offloaded so wake_up/onload
         # of actor weights doesn't collide with SGLang's static KV pool.
-        # SFT skips the barrier — its rollout is a passive HTTP server driven
-        # by /predict, no async GPU contention.
-        if is_sft_mode(self.config):
+        # Offline training skips the barrier. Only SFT can have a passive
+        # rollout server driven by /predict, with no async GPU contention.
+        if is_offline_mode(self.config):
             return True
         if self.config.offload_rollout and self._rollout_barrier is not None:
             self._rollout_barrier.wait_offloaded_sync()
@@ -396,8 +384,7 @@ class Actor(Base):
         stops.
         """
         self._stop_event.set()
-        if self._run_thread is not None:
-            self._run_thread.join(timeout=5)
+        await self._loop_runner.join(timeout=5)
 
     # --- HTTP endpoints for restart / recovery (bypass Ray Serve handle) ---
 

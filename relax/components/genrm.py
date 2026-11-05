@@ -28,15 +28,38 @@ from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
+from relax.utils.logging_utils import get_logger
 
 
 app = FastAPI()
+logger = get_logger(__name__)
 
 # Max concurrent in-flight requests per GenRM Serve replica. Ray Serve's default
 # of 5 throttles judge dispatch and leaves the SGLang engines idle. The replica
-# is a pure-async CPU proxy (tokenize + forward), so a high cap lets one replica
-# saturate the engines. Override via env for tuning.
+# forwards asynchronously, but HTTP connection-pool assignment runs synchronously
+# on its event loop. Keep admission bounded instead of queueing inside that pool.
 GENRM_SERVE_MAX_ONGOING_REQUESTS = Envs.GENRM_SERVE_MAX_ONGOING_REQUESTS
+_GENRM_HTTP_MAX_CONNECTIONS = 2048
+
+
+def _validate_genrm_concurrency(max_ongoing_requests: int) -> None:
+    """Reject pool oversubscription before allocating GenRM engines."""
+    if not 0 < max_ongoing_requests <= _GENRM_HTTP_MAX_CONNECTIONS:
+        raise ValueError(
+            f"GENRM_SERVE_MAX_ONGOING_REQUESTS={max_ongoing_requests} must be positive and must not exceed "
+            f"the GenRM HTTP pool capacity ({_GENRM_HTTP_MAX_CONNECTIONS}). "
+            "Oversubscription can stall the event loop in HTTP connection-pool assignment and leave GPUs idle. "
+            "Set GENRM_SERVE_MAX_ONGOING_REQUESTS=256 to queue excess requests in Ray Serve."
+        )
+    if max_ongoing_requests > 256:
+        logger.warning(
+            "GENRM_SERVE_MAX_ONGOING_REQUESTS=%s exceeds the recommended default of 256. "
+            "Fitting within the HTTP pool capacity (%s) does not guarantee good throughput: "
+            "pool scans run on the event loop. Monitor GenRM latency and CPU utilization when tuning this limit.",
+            max_ongoing_requests,
+            _GENRM_HTTP_MAX_CONNECTIONS,
+        )
+
 
 # NOTE: GENRM_SERVE_MAX_ONGOING_REQUESTS above must stay module-level — it feeds
 # the @serve.deployment decorator, which runs at import. The retry count has no
@@ -144,6 +167,12 @@ class GenRM(Base):
             runtime_env: Optional Ray runtime environment dict.
         """
         super().__init__()
+        _validate_genrm_concurrency(GENRM_SERVE_MAX_ONGOING_REQUESTS)
+        self._logger.info(
+            "GenRM concurrency limits: max_ongoing_requests=%s, http_max_connections=%s",
+            GENRM_SERVE_MAX_ONGOING_REQUESTS,
+            _GENRM_HTTP_MAX_CONNECTIONS,
+        )
         self.config = config
         self.healthy = healthy
         self.role = role
@@ -161,7 +190,11 @@ class GenRM(Base):
         # idle-then-reused connections aren't reaped mid-burst (avoids ReadError/500).
         self._http_client = httpx.AsyncClient(
             timeout=1800,
-            limits=httpx.Limits(max_connections=2048, max_keepalive_connections=2048, keepalive_expiry=600),
+            limits=httpx.Limits(
+                max_connections=_GENRM_HTTP_MAX_CONNECTIONS,
+                max_keepalive_connections=_GENRM_HTTP_MAX_CONNECTIONS,
+                keepalive_expiry=600,
+            ),
         )
 
         # Load one tokenizer per instance -- distinct instances may be distinct

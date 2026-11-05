@@ -3,7 +3,7 @@
 """Offline replay runner.
 
 Executes the pipeline stages in DAG order. Only stages that (a) resolve to
-recompute under the frozen V1 matrix for the bundle's topology and (b) are
+recompute under the frozen V2 matrix for the bundle's topology and (b) are
 declared recompute in the manifest are executed. An unsupported topology (non-
 GRPO or CP!=1) raises ValueError. Per-stage unsupported / recorded-only /
 inspect-only results are skipped unless the caller explicitly requested that
@@ -65,7 +65,7 @@ def replay_bundle(
         raise ValueError(
             "unsupported replay topology "
             f"advantage_estimator={config.advantage_estimator!r} cp={context_parallel} "
-            "(V1 supports GRPO with CP=1)"
+            "(V2 supports GRPO with CP=1)"
         )
     ctx: dict[str, object] = {}
 

@@ -1,0 +1,61 @@
+model = "relax-training-model"
+model_provider = "relax"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+web_search = "disabled"
+check_for_update_on_startup = false
+instructions = '''
+You are an autonomous coding agent completing one task in an existing repository. Continue until the task is solved. There is no interactive user; make reasonable assumptions and keep working.
+
+Inspect the repository before editing, find the root cause, make the smallest focused change, and avoid unrelated work. Do not commit.
+
+Use only the listed tools and call them directly. Use exec_command for all shell and file operations; its required parameter is `cmd`. Omit `justification` and `sandbox_permissions`. Use write_stdin only with a session_id returned by exec_command.
+
+For focused file edits, run Codex's apply_patch command through exec_command's `cmd` using this shell form:
+apply_patch <<'PATCH'
+*** Begin Patch
+...
+*** End Patch
+PATCH
+
+Use update_plan for non-trivial tasks with dependent steps, ambiguity, or a long execution horizon. Keep steps concrete and verifiable, update their status as work progresses, and revise the plan when evidence changes. Skip plans for simple tasks.
+
+Run the narrowest relevant tests first, inspect the final diff, and finish with a concise result.
+'''
+include_permissions_instructions = false
+include_apps_instructions = false
+include_collaboration_mode_instructions = false
+
+[shell_environment_policy]
+inherit = "none"
+set = { PATH = "/root/.venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", OMP_NUM_THREADS = "2", MKL_NUM_THREADS = "2", OPENBLAS_NUM_THREADS = "2" }
+
+[model_providers.relax]
+name = "Relax"
+env_key = "RELAX_SESSION_ID"
+wire_api = "responses"
+supports_websockets = false
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 3600000
+
+[tools.experimental_request_user_input]
+enabled = false
+
+[tools.update_plan]
+enabled = true
+
+[skills]
+include_instructions = false
+
+[skills.bundled]
+enabled = false
+
+[features]
+unified_exec = true
+goals = false
+multi_agent = false
+apps = false
+plugins = false
+image_generation = false
+view_image = false

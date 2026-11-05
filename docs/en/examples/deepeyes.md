@@ -18,11 +18,11 @@ DeepEyes uses the [ChenShawn/DeepEyes-Datasets-47k](https://huggingface.co/datas
 ### Download the Dataset
 
 ```bash
-# 使用 huggingface-cli
+# Using the Hugging Face CLI
 hf download --repo-type dataset ChenShawn/DeepEyes-Datasets-47k \
   --local-dir /root/deepeyes-v1
 
-# 或使用 Python
+# Or use Python
 from datasets import load_dataset
 ds = load_dataset("ChenShawn/DeepEyes-Datasets-47k")
 ds.save_to_disk("/root/deepeyes-v1")

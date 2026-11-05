@@ -51,7 +51,7 @@ TRAIN_ARGS=(
     --num-rollout "${NUM_ROLLOUT:-30}" --rollout-batch-size "${GLOBAL_BATCH_SIZE}"
     --global-batch-size "${GLOBAL_BATCH_SIZE}" --n-samples-per-prompt 1
     --micro-batch-size 1 --use-dynamic-batch-size --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-8192}"
-    --balance-data --qkv-format thd --sft-oversize-strategy keep
+    --balance-data --qkv-format thd --sft-oversize-strategy keep --sft-packing-strategy balanced
     --seed 1605 --rollout-seed 1605 --max-staleness 0
     --tensor-model-parallel-size "${TP_SIZE}" --pipeline-model-parallel-size "${PP_SIZE}"
     --context-parallel-size "${CP_SIZE}" --expert-model-parallel-size "${EP_SIZE}"

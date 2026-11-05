@@ -1,7 +1,7 @@
 Thanks for contributing to Relax, @{{author}}! 感谢你为 Relax 做出贡献！
 
 <details>
-<summary>Contribution guide / 贡献指南</summary>
+<summary>📚 Contribution guide / 贡献指南</summary>
 
 Describe the problem, your changes, and how you validated them. Keep each PR focused and run `pre-commit run --all-files` before submitting.
 
@@ -12,7 +12,7 @@ Describe the problem, your changes, and how you validated them. Keep each PR foc
 </details>
 
 <details>
-<summary>CI commands / CI 指令</summary>
+<summary>🛠️ CI commands / CI 指令</summary>
 
 | Command / 指令       | Usage / 用途                                         |
 | -------------------- | ---------------------------------------------------- |
@@ -29,5 +29,7 @@ Put one command on the first line of a new PR comment. Rerun/cancel require PR a
 [CI usage and targets]({{docs}}/en/guide/how-to-contribute#ci) · [CI 用法与 target]({{docs}}/zh/guide/how-to-contribute#ci)
 
 </details>
+
+{{mergeStatus}}
 
 <!-- Agents: Use the relax-github-ci skill to inspect and operate CI: {{source}}/skills/relax-github-ci/SKILL.md -->

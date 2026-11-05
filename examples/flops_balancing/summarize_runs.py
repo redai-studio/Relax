@@ -78,11 +78,13 @@ def summarize(directories: list[Path], *, warmup: int, steps: int, minimum_runs:
             for key in (
                 "invariant_command",
                 "versions",
+                "launch_environment",
                 "source_sha256",
                 "workload_sha256",
                 "model_revision",
                 "data_revision",
                 "native_source_sha256",
+                "transfer_queue_source_sha256",
                 "devices",
             )
         }

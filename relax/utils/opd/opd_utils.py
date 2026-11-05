@@ -13,11 +13,11 @@ import torch.distributed as dist
 
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.utils.logging_utils import get_logger
-from relax.utils.opd import opd_opsd_worker
+from relax.utils.metrics.rollout_metrics import compute_mopd_metrics  # noqa: F401 - keep the existing import path
 
 
 if TYPE_CHECKING:
-    from relax.utils.types import RolloutBatch, Sample
+    from relax.utils.types import RolloutBatch
 
 
 logger = get_logger(__name__)
@@ -248,6 +248,44 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
     return shared_pg, teacher_manager
 
 
+def _parse_teacher_routes(
+    routes_json: str, total_gpus: int, gpus_per_replica: int | None = None
+) -> dict[str, dict[str, Any]]:
+    """Normalize equal-share paths or explicit per-teacher GPU budgets."""
+    routes = json.loads(routes_json)
+    if not isinstance(routes, dict) or not routes:
+        raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
+
+    # Legacy format: {"source": "/path", ...} splits total_gpus equally.
+    if all(isinstance(v, str) for v in routes.values()):
+        if total_gpus % len(routes) != 0:
+            raise ValueError(
+                f"Total teacher GPUs ({total_gpus}) must be evenly divisible by number of teachers ({len(routes)})."
+            )
+        share = total_gpus // len(routes)
+        routes = {source: {"checkpoint_path": path, "num_gpus": share} for source, path in routes.items()}
+
+    for source, spec in routes.items():
+        if not isinstance(spec, dict) or "checkpoint_path" not in spec or "num_gpus" not in spec:
+            raise ValueError(
+                f"Invalid teacher route {source!r}: must be a checkpoint path string or an object "
+                "with 'checkpoint_path' and 'num_gpus'."
+            )
+        num_gpus = spec["num_gpus"]
+        if not isinstance(num_gpus, int) or num_gpus <= 0:
+            raise ValueError(f"Teacher {source!r}: num_gpus must be a positive integer.")
+        if gpus_per_replica and num_gpus % gpus_per_replica != 0:
+            raise ValueError(
+                f"Teacher '{source}': GPUs ({num_gpus}) must be divisible by "
+                f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
+            )
+
+    if sum(spec["num_gpus"] for spec in routes.values()) != total_gpus:
+        raise ValueError(f"Teacher route GPU budgets must sum to total teacher GPUs ({total_gpus}).")
+
+    return routes
+
+
 def _start_managed_multi_teacher(
     args: Any,
     routes_json: str,
@@ -256,9 +294,9 @@ def _start_managed_multi_teacher(
 ) -> tuple[Any, list]:
     """Launch multiple managed teachers for MOPD and inject routes into args.
 
-    Each teacher (one per ``data_source``) gets an equal share of the 'teacher'
-    resource GPUs; that share is further split into replicas of TP size
-    ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
+    Each teacher (one per ``data_source``) gets an equal share by default, or
+    an explicit ``num_gpus`` budget; that budget is split into replicas of TP
+    size ``--teacher-num-gpus-per-engine``. Every teacher's replica URLs are
     collected into a list and written to
     ``args.opd_teacher_routes_map[data_source]`` so the per-sample router
     (``_pick_teacher_url``) can route by data_source and then round-robin
@@ -268,27 +306,9 @@ def _start_managed_multi_teacher(
 
     import ray
 
-    routes_map: dict[str, str] = json.loads(routes_json)
-    if not routes_map:
-        raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
-
-    num_teachers = len(routes_map)
     _, total_teacher_gpus = args.resource["teacher"]
-    if total_teacher_gpus % num_teachers != 0:
-        raise ValueError(
-            f"Total teacher GPUs ({total_teacher_gpus}) must be evenly divisible by "
-            f"number of teachers ({num_teachers})."
-        )
-    gpus_per_teacher = total_teacher_gpus // num_teachers
-
-    # Per-teacher replica layout: TP size = --teacher-num-gpus-per-engine (default
-    # = all of that teacher's GPUs, i.e. a single replica).
-    gpus_per_replica = getattr(args, "teacher_num_gpus_per_engine", None) or gpus_per_teacher
-    if gpus_per_teacher % gpus_per_replica != 0:
-        raise ValueError(
-            f"Per-teacher GPUs ({gpus_per_teacher}) must be divisible by "
-            f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
-        )
+    teacher_tp = getattr(args, "teacher_num_gpus_per_engine", None)
+    instance_specs = _parse_teacher_routes(routes_json, total_teacher_gpus, teacher_tp)
 
     if not is_managed_opd_teacher_colocate(args):
         raise ValueError(
@@ -300,7 +320,7 @@ def _start_managed_multi_teacher(
     # MOPD is colocate-only: all teachers SHARE the actor/rollout placement group
     # (same as the single-teacher colocate path). During training the actor uses
     # all GPUs; during rollout student-rollout occupies bundles [0, rollout_gpus)
-    # and teacher_k occupies [rollout_gpus + k*gpus_per_teacher, +gpus_per_teacher).
+    # and teachers occupy consecutive regions sized by their individual budgets.
     # This requires rollout_gpus + total_teacher_gpus == actor_gpus. Both this
     # placement-group import and TeacherManager's (below) pull in the full SGLang/
     # transformers dependency chain, so they stay deferred until every ValueError
@@ -326,12 +346,9 @@ def _start_managed_multi_teacher(
     )
     logger.info(
         f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
-        f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus} "
-        f"({gpus_per_teacher} GPU/teacher)"
-    )
-    logger.info(
-        f"[MOPD teacher] launching {num_teachers} teachers x {gpus_per_teacher // gpus_per_replica} replica(s), "
-        f"{gpus_per_replica} GPU(s)/replica, {gpus_per_teacher} GPU(s)/teacher, total={total_teacher_gpus}"
+        f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus}, "
+        "budgets=%s",
+        {source: spec["num_gpus"] for source, spec in instance_specs.items()},
     )
 
     def _build_teacher_manager_args(base_args: Any, data_source: str, spec: dict) -> Any:
@@ -340,6 +357,7 @@ def _start_managed_multi_teacher(
         return teacher_args
 
     def _spawn_teacher_manager(_key: str, per_instance_args: Any, bundle_offset: int, spec: dict) -> Any:
+        gpus_per_replica = teacher_tp or spec["num_gpus"]
         return TeacherManager.options(
             **with_control_plane_affinity(
                 per_instance_args,
@@ -354,10 +372,6 @@ def _start_managed_multi_teacher(
             bundle_offset=bundle_offset,
         )
 
-    instance_specs = {
-        data_source: {"num_gpus": gpus_per_teacher, "checkpoint_path": ckpt}
-        for data_source, ckpt in routes_map.items()
-    }
     managers = start_multi_instance_managers(
         args=args,
         instance_specs=instance_specs,
@@ -372,10 +386,8 @@ def _start_managed_multi_teacher(
         # Append /generate to match the route format expected by _pick_teacher_url.
         replica_urls = [(u if u.endswith("/generate") else u.rstrip("/") + "/generate") for u in urls]
         url_routes[data_source] = replica_urls
-        logger.info(
-            f"[MOPD teacher] '{data_source}' → {routes_map[data_source]} "
-            f"({len(replica_urls)} replica(s), {gpus_per_replica} GPU(s) each) → {replica_urls}"
-        )
+        checkpoint_path = instance_specs[data_source]["checkpoint_path"]
+        logger.info(f"[MOPD teacher] '{data_source}' → {checkpoint_path} → {replica_urls}")
 
     # Inject the routes map so per-sample routing works via _pick_teacher_url.
     args.opd_teacher_routes_map = url_routes
@@ -571,11 +583,14 @@ def add_opd_arguments(parser: Any) -> Any:
         type=str,
         default=None,
         help=(
-            "JSON map from data_source value to HF checkpoint path for multi-teacher "
+            "JSON map from data_source to HF checkpoint path, or to an object with "
+            "checkpoint_path and num_gpus, for multi-teacher "
             "on-policy distillation (MOPD). Relax launches one managed teacher per entry "
             "and routes each sample to the teacher whose key matches "
             "sample.metadata[--opd-teacher-key]. The 'teacher' entry in --resource specifies "
-            "the TOTAL GPU budget, which is split equally among all teachers. "
+            "the TOTAL GPU budget. Path-only entries split it equally; explicit GPU "
+            "budgets must sum to that total and be divisible by --teacher-num-gpus-per-engine when set. "
+            "Use one format for all entries. "
             'Example: \'{"openai/gsm8k":"/path/Qwen3-8B",'
             '"hiyouga/geometry3k":"/path/Qwen3-VL-8B-Instruct"}\'. '
             "Mutually exclusive with --teacher-hf-checkpoint."
@@ -622,6 +637,28 @@ def add_opd_arguments(parser: Any) -> Any:
         ),
     )
     parser.add_argument(
+        "--opd-fkl-entropy-gate",
+        action="store_true",
+        default=False,
+        help=(
+            "EOPD (arXiv 2603.07079): combine sampled-token reverse-KL advantages "
+            "(--opd-kl-coef) with an entropy-gated forward-KL loss on the teacher "
+            "top-k distribution (--opd-loss-coef). The forward-KL applies only at "
+            "positions where the teacher top-k (renormalized) entropy >= "
+            "--opd-fkl-entropy-threshold. Requires --opd-token-selection "
+            "teacher_topk/union and --opd-log-prob-top-k > 0."
+        ),
+    )
+    parser.add_argument(
+        "--opd-fkl-entropy-threshold",
+        type=float,
+        default=0.8,
+        help=(
+            "Entropy threshold tau (nats) for --opd-fkl-entropy-gate, computed on "
+            "the teacher top-k distribution renormalized within top-k."
+        ),
+    )
+    parser.add_argument(
         "--opd-log-prob-min-clamp",
         type=float,
         default=None,
@@ -639,6 +676,34 @@ def add_opd_arguments(parser: Any) -> Any:
         default="student_sampled",
         choices=list(OPD_TOKEN_SELECTIONS),
         help=("Which token set the OPD KL signal is computed on."),
+    )
+    parser.add_argument(
+        "--opd-student-eos-token-id",
+        type=int,
+        default=None,
+        help=(
+            "Optional student EOS token id to replace inside the response before teacher scoring. "
+            "Must be set together with --opd-teacher-eos-token-id."
+        ),
+    )
+    parser.add_argument(
+        "--opd-teacher-eos-token-id",
+        type=int,
+        default=None,
+        help=(
+            "Teacher-side EOS token id used when scoring a student response whose EOS id differs. "
+            "Must be set together with --opd-student-eos-token-id."
+        ),
+    )
+    parser.add_argument(
+        "--opd-teacher-response-prefix-token-ids",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional token ids inserted between the prompt and response for teacher scoring only. "
+            "This supports teacher-specific response prefixes such as Qwen3's empty non-thinking block."
+        ),
     )
     parser.add_argument(
         "--opd-teacher-prompt-key",
@@ -691,8 +756,8 @@ def add_opd_arguments(parser: Any) -> Any:
     return parser
 
 
-def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> None:
-    if is_sft:
+def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -> None:
+    if is_offline:
         return
 
     if not getattr(args, "use_opd", False):
@@ -711,6 +776,15 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
         raise ValueError("--opd-teacher-timeout-s must be > 0.")
     if args.opd_log_prob_top_k < 0:
         raise ValueError("--opd-log-prob-top-k must be >= 0.")
+    student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
+    teacher_eos_token_id = getattr(args, "opd_teacher_eos_token_id", None)
+    if (student_eos_token_id is None) != (teacher_eos_token_id is None):
+        raise ValueError("--opd-student-eos-token-id and --opd-teacher-eos-token-id must be set together.")
+    if student_eos_token_id is not None and (student_eos_token_id < 0 or teacher_eos_token_id < 0):
+        raise ValueError("OPD EOS token ids must be >= 0.")
+    teacher_response_prefix_token_ids = getattr(args, "opd_teacher_response_prefix_token_ids", None) or ()
+    if any(token_id < 0 for token_id in teacher_response_prefix_token_ids):
+        raise ValueError("OPD teacher response prefix token ids must be >= 0.")
     token_selection = args.opd_token_selection
     if token_selection != "student_sampled":
         if args.opd_log_prob_top_k <= 0:
@@ -727,11 +801,26 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
     opd_kl_coef = float(getattr(args, "opd_kl_coef", 0.0) or 0.0)
     opd_loss_coef = float(getattr(args, "opd_loss_coef", 0.0) or 0.0)
 
+    is_eopd = bool(getattr(args, "opd_fkl_entropy_gate", False))
     is_adv_mode = opd_kl_coef != 0.0 and opd_loss_coef == 0.0
     is_loss_mode = opd_kl_coef == 0.0 and opd_loss_coef != 0.0
-    if not is_adv_mode and not is_loss_mode:
+    if is_eopd:
+        if opd_kl_coef == 0.0 or opd_loss_coef == 0.0:
+            raise ValueError(
+                "--opd-fkl-entropy-gate (EOPD) requires both --opd-kl-coef != 0 "
+                "(sampled-token reverse-KL advantage) and --opd-loss-coef != 0 "
+                "(entropy-gated forward-KL loss). "
+                f"Got opd_kl_coef={opd_kl_coef}, opd_loss_coef={opd_loss_coef}."
+            )
+        if getattr(args, "opd_token_selection", None) not in ("teacher_topk", "union"):
+            raise ValueError(
+                "--opd-fkl-entropy-gate requires --opd-token-selection "
+                f"teacher_topk or union, got {getattr(args, 'opd_token_selection', None)}."
+            )
+    elif not is_adv_mode and not is_loss_mode:
         raise ValueError(
-            "Exactly one of --opd-kl-coef / --opd-loss-coef must be non-zero. "
+            "Exactly one of --opd-kl-coef / --opd-loss-coef must be non-zero "
+            "(unless --opd-fkl-entropy-gate is set). "
             f"Got opd_kl_coef={opd_kl_coef}, opd_loss_coef={opd_loss_coef}. "
             "Use --opd-kl-coef=X --opd-loss-coef=0.0 for advantage mode, or "
             "--opd-kl-coef=0.0 --opd-loss-coef=X for loss mode."
@@ -791,25 +880,13 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
                 "In sglang mode, teacher log-probs are obtained from external server during rollout."
             )
 
-        # --opd-teacher-routes: JSON map {data_source: HF checkpoint path} for
+        # --opd-teacher-routes: checkpoint paths or explicit per-route GPU specs for
         # Relax-managed multi-teacher MOPD. The runtime URL map
         # (args.opd_teacher_routes_map) is populated at launch by
         # _start_managed_multi_teacher; here we only validate the spec.
         args.opd_teacher_routes_map = None
         opd_teacher_routes = getattr(args, "opd_teacher_routes", None)
         if opd_teacher_routes is not None:
-            try:
-                routes_map = json.loads(opd_teacher_routes)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"--opd-teacher-routes must be valid JSON: {e}") from e
-            if not isinstance(routes_map, dict) or not routes_map:
-                raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
-            log.info(
-                "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s",
-                len(routes_map),
-                getattr(args, "opd_teacher_key", None) or "data_source",
-                list(routes_map.keys()),
-            )
             if getattr(args, "teacher_hf_checkpoint", None) is not None:
                 raise ValueError(
                     "--opd-teacher-routes is mutually exclusive with --teacher-hf-checkpoint. "
@@ -820,6 +897,17 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
                     "--opd-teacher-routes requires a 'teacher' entry in --resource "
                     "specifying the total GPU budget to split among teachers."
                 )
+            routes_map = _parse_teacher_routes(
+                opd_teacher_routes,
+                args.resource["teacher"][1],
+                getattr(args, "teacher_num_gpus_per_engine", None),
+            )
+            log.info(
+                "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s",
+                len(routes_map),
+                getattr(args, "opd_teacher_key", None) or "data_source",
+                list(routes_map.keys()),
+            )
 
         has_managed_teacher = (
             getattr(args, "teacher_hf_checkpoint", None) is not None
@@ -839,82 +927,6 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
             )
 
 
-# ============================================================================
-# Multimodal image encoding helpers (raw base64 PNG for opd_preexpanded_raw)
-# ============================================================================
-
-
-def _to_jsonable(x):
-    """Convert a tensor / ndarray to nested Python lists for JSON transport."""
-    if x is None:
-        return None
-    tolist = getattr(x, "tolist", None)
-    return tolist() if callable(tolist) else x
-
-
-async def _encode_images_b64(raw_images: list, cache_key: str, mm_dict: dict | None) -> list[str]:
-    """Parallel-encode raw images to base64, with group-level dedup cache.
-
-    ``cache_key`` is the attribute name on the shared ``mm_dict`` to cache the
-    result (so 8 samples in a group encode each image at most once per step).
-    """
-    import asyncio
-
-    from relax.utils.data.processing_utils import async_encode_image_for_rollout_engine
-
-    if mm_dict is None:
-        return list(await asyncio.gather(*(async_encode_image_for_rollout_engine(img) for img in raw_images)))
-    cached = mm_dict.get(cache_key)
-    if cached is None:
-        cached = list(await asyncio.gather(*(async_encode_image_for_rollout_engine(img) for img in raw_images)))
-        mm_dict[cache_key] = cached
-    return cached
-
-
-async def build_teacher_preexpanded_image_data(sample: "Sample") -> list | None:
-    """Build image_data for the teacher forward request (OPSD path).
-
-    Ships raw base64 images + teacher image_grid_thw via
-    format=opd_preexpanded_raw. Returns None when there are no images (text-
-    only path).
-    """
-    image_b64_list = getattr(sample, "teacher_image_b64_list", None)
-    image_grid_thw = getattr(sample, "teacher_image_grid_thw", None)
-    if not image_b64_list or image_grid_thw is None:
-        return None
-    return [
-        {
-            "format": opd_opsd_worker.PREEXPANDED_RAW_FORMAT,
-            "images_b64": list(image_b64_list),
-            "image_grid_thw": _to_jsonable(image_grid_thw),
-        }
-    ]
-
-
-async def build_student_preexpanded_image_data(sample: "Sample") -> list | None:
-    """Build image_data for the student extra forward request (student-at-
-    teacher-topk).
-
-    The student SGLang has the same opd_preexpanded_raw patch. Ships raw base64
-    images (from sample.multimodal_inputs, cached) + student image_grid_thw.
-    Returns None for text-only samples.
-    """
-    student_mm_train_inputs = getattr(sample, "multimodal_train_inputs", None) or {}
-    image_grid_thw = student_mm_train_inputs.get("image_grid_thw")
-    student_mm_in = sample.multimodal_inputs or {}
-    raw_images = student_mm_in.get("images") or []
-    if image_grid_thw is None or not raw_images:
-        return None
-    cached = await _encode_images_b64(raw_images, "_student_image_b64_cache", student_mm_in)
-    return [
-        {
-            "format": opd_opsd_worker.PREEXPANDED_RAW_FORMAT,
-            "images_b64": cached,
-            "image_grid_thw": _to_jsonable(image_grid_thw),
-        }
-    ]
-
-
 def _get_opd_transfer_schema(args: Namespace) -> list[str]:
     from relax.engine.rollout.on_policy_distillation import OpdManager
 
@@ -924,13 +936,17 @@ def _get_opd_transfer_schema(args: Namespace) -> list[str]:
 def consume_opd_train_data(data_fields: list[str], args: Namespace) -> None:
     if not (getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"):
         return
-    data_fields.extend(_get_opd_transfer_schema(args))
+    for _f in _get_opd_transfer_schema(args):
+        if _f not in data_fields:
+            data_fields.append(_f)
 
 
 def consume_opd_advantage_data(data_fields: list[str], args: Namespace) -> None:
     if not getattr(args, "use_opd", False):
         return
-    data_fields.extend(_get_opd_transfer_schema(args))
+    for _f in _get_opd_transfer_schema(args):
+        if _f not in data_fields:
+            data_fields.append(_f)
 
 
 def build_opd_teacher_sample_fields(
@@ -1295,6 +1311,10 @@ def apply_opd_to_advantages(
     token_selection = args.opd_token_selection
     is_topk = token_selection in ("student_topk", "teacher_topk", "union")
 
+    if bool(getattr(args, "opd_fkl_entropy_gate", False)):
+        # EOPD: advantages always use the sampled-token reverse-KL signal; the
+        # top-k tensors feed the entropy-gated forward-KL loss path instead.
+        is_topk = False
     if is_topk:
         student_topk_lp_list = rollout_data.get("opd_topk_student_log_probs")
         teacher_topk_lp_list = rollout_data.get("opd_topk_teacher_log_probs")
@@ -1377,6 +1397,7 @@ def compute_policy_opd_loss(
     *,
     args: Namespace,
     batch: RolloutBatch,
+    metric_reducer: Callable[[torch.Tensor], torch.Tensor],
     log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
     log_probs_and_entropy: dict[str, list[torch.Tensor]],
@@ -1404,6 +1425,11 @@ def compute_policy_opd_loss(
         k_lengths_list = batch.get("opd_topk_ksz") if token_selection == "union" else None
         device = log_probs.device
         per_token_kl_chunks: list[torch.Tensor] = []
+        _eopd = bool(getattr(args, "opd_fkl_entropy_gate", False))
+        _eopd_tau = float(getattr(args, "opd_fkl_entropy_threshold", 0.8))
+        _eopd_gate_sum = 0.0
+        _eopd_tok_cnt = 0.0
+        _eopd_ent_sum = 0.0
         for i, s_lp_2d in enumerate(student_topk_lp_list):
             t_lp_2d = teacher_topk_lp_list[i].to(device=device).detach()
             s_lp_2d = s_lp_2d.to(device=device)
@@ -1414,17 +1440,29 @@ def compute_policy_opd_loss(
                     kl = kl.to(device=device)
                     max_kp = t_lp_2d.size(-1)
                     mask = torch.arange(max_kp, device=device).unsqueeze(0) < kl.unsqueeze(1)
-            per_token_kl_chunks.append(
-                compute_opd_kl_topk(
-                    s_lp_2d,
-                    t_lp_2d,
-                    kl_type=opd_kl_type,
-                    jsd_alpha=opd_jsd_alpha,
-                    norm_mode=opd_norm_mode,
-                    log_prob_min_clamp=opd_log_prob_min_clamp,
-                    mask=mask,
-                )
+            _chunk = compute_opd_kl_topk(
+                s_lp_2d,
+                t_lp_2d,
+                kl_type=("forward_kl" if _eopd else opd_kl_type),
+                jsd_alpha=opd_jsd_alpha,
+                norm_mode=opd_norm_mode,
+                log_prob_min_clamp=opd_log_prob_min_clamp,
+                mask=mask,
             )
+            if _eopd:
+                # EOPD gate: teacher top-k entropy (renormalized within top-k)
+                _t = t_lp_2d.detach().float()
+                if mask is not None:
+                    _t = _t.masked_fill(~mask, float("-inf"))
+                _t = _t - torch.logsumexp(_t, dim=-1, keepdim=True)
+                _p = torch.exp(_t)
+                _ent = -torch.where(torch.isfinite(_t), _p * _t, torch.zeros_like(_t)).sum(dim=-1)
+                _gate = (_ent >= _eopd_tau).to(dtype=_chunk.dtype)
+                _chunk = _chunk * _gate
+                _eopd_gate_sum += float(_gate.sum().item())
+                _eopd_tok_cnt += float(_gate.numel())
+                _eopd_ent_sum += float(_ent.sum().item())
+            per_token_kl_chunks.append(_chunk)
         opd_per_token_kl = torch.cat(per_token_kl_chunks, dim=0).to(dtype=log_probs.dtype)
     else:
         if "teacher_log_probs" not in batch or batch["teacher_log_probs"] is None:
@@ -1442,13 +1480,16 @@ def compute_policy_opd_loss(
         ).to(dtype=log_probs.dtype)
 
     reported_loss: dict[str, torch.Tensor] = {}
+    if is_topk and bool(getattr(args, "opd_fkl_entropy_gate", False)) and _eopd_tok_cnt > 0:
+        reported_loss["opd_fkl_gate_frac"] = torch.tensor(_eopd_gate_sum / _eopd_tok_cnt)
+        reported_loss["opd_fkl_teacher_topk_entropy"] = torch.tensor(_eopd_ent_sum / _eopd_tok_cnt)
     per_token_clip = getattr(args, "opd_per_token_clip", None)
     if per_token_clip is not None:
         tau = float(per_token_clip)
         before_clip = opd_per_token_kl
         opd_per_token_kl = torch.clamp(opd_per_token_kl, max=tau)
         with torch.no_grad():
-            reported_loss["opd_per_token_clip_frac"] = (before_clip > tau).float().mean().clone().detach()
+            reported_loss["opd_per_token_clip_frac"] = metric_reducer((before_clip > tau).float()).detach()
 
     is_clip = getattr(args, "opd_is_clip", None)
     if is_clip is not None:
@@ -1457,82 +1498,7 @@ def compute_policy_opd_loss(
         ratio_clipped = torch.clamp(ratio, max=clip)
         opd_per_token_kl = opd_per_token_kl * ratio_clipped.to(dtype=opd_per_token_kl.dtype)
         with torch.no_grad():
-            reported_loss["opd_is_clip_frac"] = (ratio > clip).float().mean().clone().detach()
+            reported_loss["opd_is_clip_frac"] = metric_reducer((ratio > clip).float()).detach()
 
     opd_loss = reduce_opd_loss(batch, opd_per_token_kl)
     return opd_loss_coef * opd_loss, reported_loss
-
-
-# ---------------------------------------------------------------------------
-# MOPD per-source metrics
-# ---------------------------------------------------------------------------
-
-
-def compute_mopd_metrics(args: Namespace, all_samples: list) -> dict:
-    """Per-data-source accuracy and OPD distillation metrics for MOPD.
-
-    Groups samples by ``metadata[opd_teacher_key]`` and reports for each source:
-      - accuracy     : fraction of samples with reward == 1
-      - mean_reward  : average reward value
-      - teacher_logp : sequence-mean teacher log-prob
-      - student_logp : sequence-mean student log-prob
-      - logp_gap     : student_logp - teacher_logp (→ 0 as student converges)
-      - rkl_approx   : E_student[log p_s - log p_t] per token, averaged across samples
-
-    Returns ``{}`` when OPD is disabled (``opd_teacher_key`` absent).
-    """
-    from relax.utils.misc import group_by
-
-    opd_teacher_key = getattr(args, "opd_teacher_key", None)
-    if not opd_teacher_key:
-        return {}
-
-    by_source = group_by(all_samples, lambda s: (s.metadata or {}).get(opd_teacher_key, "unknown"))
-    log_dict: dict = {}
-
-    for source, samples in by_source.items():
-        n = len(samples)
-        if n == 0:
-            continue
-
-        label = source.replace("/", "_").replace("-", "_")
-        prefix = f"by_source/{label}/"
-
-        raw_rewards = [s.get_reward_value(args) for s in samples]
-        log_dict[prefix + "accuracy"] = sum(1 for r in raw_rewards if r == 1) / n
-        log_dict[prefix + "mean_reward"] = sum(raw_rewards) / n
-
-        teacher_lp_seq: list[float] = []
-        student_lp_seq: list[float] = []
-        gap_seq: list[float] = []
-        rkl_seq: list[float] = []
-
-        for s in samples:
-            t_lp = s.teacher_log_probs
-            s_lp = s.rollout_log_probs
-            t_mean = sum(t_lp) / len(t_lp) if t_lp and len(t_lp) > 0 else None
-            s_mean = sum(s_lp) / len(s_lp) if s_lp and len(s_lp) > 0 else None
-            if t_mean is not None:
-                teacher_lp_seq.append(t_mean)
-            if s_mean is not None:
-                student_lp_seq.append(s_mean)
-            # Pair gap/rkl per-sample: only when THIS sample has both teacher and
-            # student log probs, so the values stay aligned to one sample (the
-            # marginal teacher_lp_seq/student_lp_seq lists can differ in membership).
-            if t_mean is not None and s_mean is not None:
-                gap_seq.append(s_mean - t_mean)
-            if t_lp and s_lp:
-                n_tok = min(len(t_lp), len(s_lp))
-                if n_tok > 0:
-                    rkl_seq.append(sum(s_lp[i] - t_lp[i] for i in range(n_tok)) / n_tok)
-
-        if teacher_lp_seq:
-            log_dict[prefix + "teacher_logp"] = sum(teacher_lp_seq) / len(teacher_lp_seq)
-        if student_lp_seq:
-            log_dict[prefix + "student_logp"] = sum(student_lp_seq) / len(student_lp_seq)
-        if gap_seq:
-            log_dict[prefix + "logp_gap"] = sum(gap_seq) / len(gap_seq)
-        if rkl_seq:
-            log_dict[prefix + "rkl_approx"] = sum(rkl_seq) / len(rkl_seq)
-
-    return log_dict

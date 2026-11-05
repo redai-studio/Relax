@@ -63,10 +63,13 @@ class FlopsBalancedSampler(SeqlenBalancedSampler):
     def save_checkpoint(self) -> dict[str, Any]:
         state = super().save_checkpoint()
         state["flops_coefficients"] = [self.estimator.linear_flops, self.estimator.quadratic_flops]
+        state["flops_geometry"] = [self.dp_size, self.n_samples_per_prompt]
         return state
 
     def load_checkpoint(self, state: dict[str, Any]) -> None:
         expected = [self.estimator.linear_flops, self.estimator.quadratic_flops]
         if state.get("flops_coefficients") != expected:
             raise ValueError("Cannot restore FLOPs sampler assignments with different or missing model coefficients")
+        if state.get("flops_geometry") != [self.dp_size, self.n_samples_per_prompt]:
+            raise ValueError("Cannot restore FLOPs sampler assignments with different or missing DP/prompt geometry")
         super().load_checkpoint(state)

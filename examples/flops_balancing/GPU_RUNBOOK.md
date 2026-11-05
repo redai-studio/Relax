@@ -4,14 +4,18 @@
 
 ## 1. 四组实验与候选布局
 
-| 模式 | 微批构造                       | DP 分配     | 用途               |
-| ---- | ------------------------------ | ----------- | ------------------ |
-| A    | 原有 First-Fit 估数量、KK 分组 | 原有长度 KK | 保留已有优化的基线 |
-| B    | 带容量约束的 FLOPs 打包        | 原有长度 KK | 单看微批收益       |
-| C    | 原有微批路径                   | FLOPs KK    | 单看 DP 收益       |
-| D    | FLOPs 打包                     | FLOPs KK    | 组合效果           |
+| 模式 | 微批构造                        | DP 分配     | 用途               |
+| ---- | ------------------------------- | ----------- | ------------------ |
+| A    | 原有动态估数、KK 分组及容量回退 | 原有长度 KK | 保留已有优化的基线 |
+| B    | 带容量约束的 FLOPs 打包         | 原有长度 KK | 单看微批收益       |
+| C    | 原有微批路径                    | FLOPs KK    | 单看 DP 收益       |
+| D    | FLOPs 打包                      | FLOPs KK    | 组合效果           |
 
 两开关独立，默认关闭。候选脚本用普通同步 SFT、THD、BF16、TP2/PP2/CP1；八卡对应普通 DP2。MoE 另设 EP2/ETP1，不能再把 EP 乘进普通 DP 卡数。MTP、dropout、辅助/z loss 关闭，不改 loss mask 或有效 batch。
+
+最新主分支还提供 `sft_packing_strategy=binpack` 和独立的 `sft_wholepack` 策略。
+此候选实验固定 `balanced`，保留其最新容量保护。DP-only 可叠加 binpack；FLOPs 微批构造与 binpack、任一 FLOPs 开关与 wholepack 均不允许同开。
+若实际基线已使用 binpack，需另保留该基线的性能对照，不能仅与更弱配置比较后宣称收益。
 
 八卡上 FP32 Adam 状态很大，所以四组都开启 `--optimizer-cpu-offload --optimizer-offload-fraction 1.0 --use-precision-aware-optimizer`，读取优化器实际 FP32 CPU 主权重。CPU RAM、内存带宽与 PCIe 可能成为瓶颈，offload 也可能压低优化收益。改精度、offload、batch、重计算、布局或预算时，所有对照必须一起改并重新冻结。
 
@@ -22,9 +26,13 @@
 | [Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B)                                   | `fc05daec18b0a78c049392ed2e771dde82bdf654` |
 | [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)                           | `59d61f3ce65a6d9863b86d2e96597125219dc754` |
 | [OpenMathReasoning-mini](https://huggingface.co/datasets/unsloth/OpenMathReasoning-mini) | `5ea611a9fde449e7df8e72aefe698996a9882390` |
-| 项目 Docker 固定 Bridge                                                                  | `af17edf52c514c58c79cd291b04a9b42bc5c57f3` |
-| Bridge 切换 dev 后的 Core                                                                | `0e6ac576fba8995fca541ceb6af5f35eb0e4f16e` |
-| 项目固定 TransferQueue                                                                   | `58054a33834aadbcf76aacd6b1e32e25c030f2c9` |
+| 项目 Docker 固定 Bridge                                                                  | `6862ee170a2569607e8ebc5dde91f119779093ca` |
+| Bridge 切换 dev 后的 Core                                                                | `4a4de865795f123eda422ebf0a4c13d2418cf3cb` |
+| 项目固定 TransferQueue                                                                   | `9784ad0d8a5f0db93ff8326379ab2a6d06e640a0` |
+
+TransferQueue 还需应用项目 Docker 中 `docker/patch/transferqueue/9784ad0-assignment-transform.patch`；
+仅安装相同版本号不代表源码和补丁一致。记录镜像 digest 与实际安装源码摘要。
+此前旧 Core 上的单卡优化器检查不代替这一版本组合的原生验证。
 
 `download_assets` 下载固定数据、配置和 tokenizer，不下载模型权重。基础 Parquet 有 19252 行。规则：种子 1605 打乱物理行号，依序保留前 2048 条满足长度区间的原始行；不截断、不重复、不按长度排序。使用生产 `SFTStreamingDataset` 生成长度和 mask。
 
@@ -62,10 +70,14 @@ hf download Qwen/Qwen3.5-27B \
 hf download Qwen/Qwen3.5-35B-A3B \
   --revision 59d61f3ce65a6d9863b86d2e96597125219dc754 \
   --local-dir "$ASSETS/Qwen3.5-35B-A3B"
-python -m examples.flops_balancing.preflight --require-gpus 8 --output /tmp/task16-preflight.json
+python -m examples.flops_balancing.preflight --require-gpus 8 \
+  --require-host-memory-gib 900 --require-disk-free-gib 1200 \
+  --output "$ASSETS/task16-preflight.json"
 ```
 
 优先用项目固定 Docker/依赖及补丁。CPU venv 或单独加入 PYTHONPATH 的 Core 源码不是完整训练镜像。A800 候选用标准 MoE alltoall，没有启用参考 Hopper 路径的 DeepEP。preflight 只读设备、拓扑与版本，不装驱动。
+
+上机检查同时读取容器内存限制，不能只看物理服务器的 RAM；输出文件放在实际资产/数值导出磁盘上，确保空间检查针对正确的挂载点。运行记录保存白名单环境变量和实际 TransferQueue/Megatron 源码摘要，性能汇总会拒绝这些条件变化的对照。
 
 ## 4. 离线预览与原生数值对照
 

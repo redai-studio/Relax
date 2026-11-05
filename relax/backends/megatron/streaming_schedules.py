@@ -79,6 +79,12 @@ def streaming_forward_backward_no_pipelining(
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
+    if getattr(config, "fine_grained_activation_offloading", False):
+        # Native offload reuses a fixed microbatch chunk order after warmup.
+        raise ValueError(
+            "Streaming schedules do not support fine-grained activation offloading with variable microbatch counts. "
+            "Disable --fine-grained-activation-offloading or --use-dynamic-batch-size."
+        )
 
     pg_collection = kwargs.get("pg_collection", None)
     force_all_reduce = kwargs.get("force_all_reduce", False)
@@ -95,6 +101,7 @@ def streaming_forward_backward_no_pipelining(
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
+        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
 
     cp_size = pg_collection.cp.size()
 
@@ -211,6 +218,12 @@ def streaming_forward_backward_pipelining_without_interleaving(
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
+    if getattr(config, "fine_grained_activation_offloading", False):
+        # Native offload reuses a fixed microbatch chunk order after warmup.
+        raise ValueError(
+            "Streaming schedules do not support fine-grained activation offloading with variable microbatch counts. "
+            "Disable --fine-grained-activation-offloading or --use-dynamic-batch-size."
+        )
 
     if config.overlap_p2p_comm:
         raise ValueError("Streaming pipeline schedule does not support overlap_p2p_comm")
@@ -237,6 +250,7 @@ def streaming_forward_backward_pipelining_without_interleaving(
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
+        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
     else:
         assert hasattr(pg_collection, "cp"), "pg_collection must have cp"
         cp_group = pg_collection.cp

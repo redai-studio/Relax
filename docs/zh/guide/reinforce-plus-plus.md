@@ -1,218 +1,143 @@
-# REINFORCE++ 与 REINFORCE++-baseline
+# REINFORCE++ 训练
 
-Relax 提供两个独立的 estimator 名称，因为 baseline 变体并不只是使用了不同的 recipe：
+REINFORCE++ 是一种不需要 Critic 的策略梯度算法。Relax 根据奖励计算优势值（advantage），再使用 PPO 风格的裁剪目标更新策略。已有 GRPO 训练配置时，可以沿用 Actor 和 Rollout 的部署方式，替换算法参数。
 
-- `reinforce_plus_plus`
-- `reinforce_plus_plus_baseline`
+## 概述
 
-本文冻结两个变体的 return、advantage、归一化、mask、KL 和 reduction 语义。实现遵循
-[REINFORCE++ arXiv v9](https://arxiv.org/abs/2501.03262) 的主要公式，以及 OpenRLHF
-commit [`bc71bb1`](https://github.com/OpenRLHF/OpenRLHF/tree/bc71bb19464aca306b33080b2d2bb45d154e2f49)
-中的可执行归一化约定。
+Relax 提供两个变体，主要区别是如何计算优势值，以及如何约束策略偏离参考模型：
 
-## 版本与命名说明
+- **REINFORCE++**（`reinforce_plus_plus`）：将最终奖励与逐 token 的 k1 KL 惩罚合并，再累积得到各 token 的回报值（return）。这样，参考策略惩罚会参与优势值计算。
+- **REINFORCE++-baseline**（`reinforce_plus_plus_baseline`）：为同一提示词生成多个回答，用每个回答的奖励减去组内平均奖励，得到原始优势值。参考策略惩罚通过独立的 k2 KL 损失加入，不影响优势值。
 
-论文从 v1 到 v9 发生了变化，甚至 v9 的主要方法与附录 B.2 对 token 放置方式的描述也并不完全一致。下表明确列出版本和实现边界。
+baseline 的组均值包含当前回答；它既不像 RLOO 那样排除当前回答，也不像默认的 GRPO 奖励处理那样除以组内标准差。不同算法的对比见[算法参考](../examples/algorithms.md)。
 
-| 来源 | Return / baseline | 归一化与 KL | 本实现中的状态 |
-|---|---|---|---|
-| 论文 v1 | token k1 KL-to-go advantage 加 PPO clipping | 描述 reward 归一化/裁剪和 batch z-score advantage 归一化，但没有单独命名的 group-baseline-plus-k2 变体 | 仅作为历史 REINFORCE++；不是 baseline 定义 |
-| 论文 v9 主要公式 | token KL-to-go return；inclusive group-mean baseline 变体 | 对 advantage token 做全局归一化 | 规范性的论文定义 |
-| 论文 v9 附录 B.2 | 最后一个 token 之前 advantage 为零 | sample-level reward 归一化 | 已记录的冲突；未采用 |
-| OpenRLHF `bc71bb1` | inclusive group mean 和全局有效 token population 归一化 | 固定的 baseline 训练脚本同时启用 token KL shaping 和独立 k2 loss | 仅作为归一化参考；有意不复制其组合 KL baseline |
-| 本功能之前的 Relax | 部分 helper 名称和 return 代码 | 没有注册两个变体、冻结校验、专用 population moments、recipe 或完整数值契约 | 兼容性基线 |
+两种变体都会在整个训练批次的有效回答 token 上归一化优势值，包括跨数据并行 rank 的统计。提示词、padding 和被 mask 的 token 不参与统计，较长回答因 token 更多而占更大权重。损失则先在每个回答内求均值，再跨回答求均值。
 
-Relax 采用 v9 主要公式的解释。本文所说的“与 OpenRLHF 对齐”仅指其可执行的 inclusive baseline 和 masked population normalization 约定。根据 Task 29 Proposal 冻结的定义，Relax baseline 明确不把 KL 放入 advantage，只应用独立 k2 loss，因此它并不是固定 OpenRLHF 训练脚本的完全复现。
+## 快速开始
 
-## 符号与 mask 契约
+[单 GPU 示例](../../../examples/algorithms/run-qwen3-0.6B-1xgpu-reinforce-plus-plus.sh)使用 Qwen3-0.6B 和 `math` 奖励函数。先完成[安装](./installation.md)，准备带 CUDA GPU 的训练环境，以及以下输入：
 
-对于 response $i$ 和 response 位置 $t$：
+- Hugging Face 格式的 Qwen3-0.6B checkpoint 和 tokenizer；示例也用它作为参考模型。
+- 包含 `question`、`answer` 列的训练 Parquet 文件。`answer` 只保存最终答案，例如 `42`，不要直接使用 GSM8K 的完整解题过程。
+- 可写的输出目录。脚本从其 `actor` 子目录加载和保存 checkpoint，因此新任务应使用新目录；在容器内运行时，将输出挂载到持久存储。
 
-- $R_i$ 是标量终止奖励；
-- $m_{i,t}\in\{0,1\}$ 是 response loss mask；
-- $T_i$ 是最后一个有效 response 位置；
-- $L_i=\sum_t m_{i,t}$ 是有效 response 长度。
+::: warning 使用独占训练环境
+`ray-job.sh` 会清理旧的 Relax/SGLang worker 和训练作业，关闭 Ray Serve 应用，并移除已有 placement group。不要在有其他任务的共享主机或 Ray 集群上运行。也不要直接启动示例脚本：它默认走本地启动流程，会停止 Ray 并清理 Python 进程。
+:::
 
-Prompt token、padding 和 `mask=0` 的 response token 均不参与 reward shaping、return、归一化或 loss。生产环境中的 return 和 advantage 张量在 mask 外显式为零。选择操作使用布尔条件而非乘法，因此即使 mask 外存储位置包含 `NaN` 或 `Inf`，也不会污染有效 token 的结果。
+下面假设训练容器只暴露一张 GPU，且尚未启动 Ray。从仓库根目录运行，将路径替换为本地路径，并确保 Ray worker 能访问这些文件：
 
-## REINFORCE++
+```bash
+export MODEL_PATH=/path/to/Qwen3-0.6B
+export PROMPT_DATA=/path/to/gsm8k/main/train_clean.parquet
+export OUTPUT_DIR=/path/to/runs/reinforce-plus-plus
 
-定义带符号的 k1 estimator：
+ray start --head --num-gpus=1 --dashboard-host=127.0.0.1 --dashboard-port=8265
 
-$$
-d_{i,t}=\log\pi_{old}(a_{i,t})-\log\pi_{ref}(a_{i,t}).
-$$
-
-shaped token reward 为：
-
-$$
-r_{i,t}=m_{i,t}\left[-\beta d_{i,t}+\mathbf{1}(t=T_i)R_i\right].
-$$
-
-终止奖励只加到最后一个有效 response token。Return 从后向前累计：
-
-$$
-G_{i,t}=m_{i,t}\sum_{u=t}^{T_i}\gamma^{u-t}r_{i,u}.
-$$
-
-正式 recipe 固定 `gamma=1`。原始 advantage 为 $G$，随后执行下文的全局 masked normalization。该变体使用 token KL reward shaping，不再增加第二个 KL loss。
-
-```text
---advantage-estimator reinforce_plus_plus
---normalize-advantages
---gamma 1.0
---kl-coef 0.01
---kl-loss-type k1
+ADVANTAGE_ESTIMATOR=reinforce_plus_plus \
+bash scripts/entrypoint/ray-job.sh \
+  examples/algorithms/run-qwen3-0.6B-1xgpu-reinforce-plus-plus.sh
 ```
 
-## REINFORCE++-baseline
+已有专用 Ray 环境时，跳过 `ray start`；Jobs API 不在 `http://127.0.0.1:8265` 时，设置 `RAY_ADDRESS`。`--num-gpus=1` 只声明 Ray 的资源容量，不控制 GPU 可见性。
 
-对于包含 $K$ 个采样 response 的 prompt group $g$：
+要运行 baseline，换用另一个输出目录，并修改 `ADVANTAGE_ESTIMATOR`：
 
-$$
-b_g=\frac{1}{K}\sum_{j\in g}R_j,\qquad C_i=R_i-b_g.
-$$
-
-group mean 包含当前 response，因此不是 leave-one-out baseline。Relax 不使用 group 标准差除以 $C_i$。
-
-原始 token advantage 为：
-
-$$
-A^{raw}_{i,t}=m_{i,t}C_i.
-$$
-
-Token KL 不从该 advantage 中减去。Reference regularization 使用独立 k2 loss：
-
-$$
-D^{k2}_{i,t}=\frac{1}{2}
-\left(\log\pi_\theta(a_{i,t})-\log\pi_{ref}(a_{i,t})\right)^2.
-$$
-
-```text
---advantage-estimator reinforce_plus_plus_baseline
---normalize-advantages
---n-samples-per-prompt 8
---kl-coef 0
---use-kl-loss
---kl-loss-type k2
---kl-loss-coef 0.01
+```bash
+OUTPUT_DIR=/path/to/runs/reinforce-plus-plus-baseline \
+ADVANTAGE_ESTIMATOR=reinforce_plus_plus_baseline \
+bash scripts/entrypoint/ray-job.sh \
+  examples/algorithms/run-qwen3-0.6B-1xgpu-reinforce-plus-plus.sh
 ```
 
-baseline 变体要求每个 prompt 的采样数大于 1。group mean 包含样本自身，因此 `n_samples_per_prompt=1` 会使每个原始 advantage 都退化为零，配置会被拒绝。该 estimator 同样拒绝自定义 reward 后处理和 agentic 自定义 advantage hook，因为它们会绕过已经冻结的 inclusive group-mean 语义。
+示例使用同步 colocate 模式，Actor 与 Rollout 分时共用一张 GPU，上下文并行度为 1。
 
-## 全局 masked normalization
+## 配置
 
-统计总体包含闭合同步 global batch 中、跨全部 data-parallel rank 的所有有效 response token：
+### 调整示例脚本
 
-$$
-S=\{(r,i,t)\mid m_{r,i,t}=1\},\qquad N=|S|.
-$$
+通过环境变量调整示例，例如在启动命令前设置 `NUM_ROLLOUT=100 LR=5e-7`。下表列出常用设置，默认值来自示例脚本，而不是 Relax 参数解析器。
 
-Relax 使用总体方差（`ddof=0`）：
+| 环境变量 | 示例默认值 | 说明 |
+|---|---|---|
+| `NUM_ROLLOUT` | `50` | rollout 迭代次数 |
+| `ROLLOUT_BATCH_SIZE` | `4` | 每次 rollout 的提示词数 |
+| `N_SAMPLES_PER_PROMPT` | `8` | 每个提示词的回答数；baseline 必须大于 1 |
+| `GLOBAL_BATCH_SIZE` | `32` | 每个训练批次的回答数 |
+| `ROLLOUT_MAX_RESPONSE_LEN` | `1024` | 训练和评测的回答 token 上限 |
+| `LR` | `1e-6` | 学习率 |
+| `KL_COEF` | `0.01` | REINFORCE++ 的奖励 KL 系数；baseline 不使用此变量 |
+| `KL_LOSS_COEF` | `0.01` | baseline 的独立 KL 损失系数；REINFORCE++ 不使用此变量 |
+| `MAX_TOKENS_PER_GPU` / `LOG_PROBS_MAX_TOKENS_PER_GPU` | `4096` / `4096` | 每张 GPU 的动态训练 / log probability 前向 token 预算 |
+| `SGLANG_MEM_FRACTION_STATIC` | `0.45` | SGLang 的静态显存比例 |
 
-$$
-\mu=\frac{1}{N}\sum_{S}A,
-\qquad
-\sigma^2=\frac{1}{N}\sum_{S}(A-\mu)^2.
-$$
+示例默认每次采样 `4 × 8 = 32` 个回答，用一个训练批次完成更新。调整批量时，保持 `GLOBAL_BATCH_SIZE = ROLLOUT_BATCH_SIZE × N_SAMPLES_PER_PROMPT` 即可沿用这一设置。
 
-归一化输出为：
+设置 `EVAL_DATA` 后才启用评测，数据格式与训练数据相同。评测默认每 10 次 rollout 进行一次，每个提示词生成 4 个回答，不在训练前评测；可通过 `EVAL_INTERVAL` 和 `N_SAMPLES_PER_EVAL_PROMPT` 调整。checkpoint 默认每 50 次 rollout 保存一次，可通过 `SAVE_INTERVAL` 调整。
 
-$$
-\hat A=m(A-\mu)\left[\max(\sigma^2,10^{-8})\right]^{-1/2}.
-$$
+### 在自己的脚本中启用
 
-epsilon 的语义是**方差下限**，与固定的 OpenRLHF 实现一致。它不同于 `sqrt(var) + epsilon`，也不同于 Relax 旧有的 `sqrt(unbiased_var + epsilon)` helper。两个 REINFORCE++ 变体使用专用 helper，既有算法保持原有归一化行为。
+保留模型、数据和资源配置，将算法参数替换为下面两组之一。当前仅支持 Megatron 同步 colocate 训练，需要 `--colocate --context-parallel-size 1` 和 `--ref-load <参考模型路径>`，不支持 `--fully-async`、`--hybrid` 或 `--calculate-per-token-loss`。
 
-预期边界行为：
+**REINFORCE++：**
 
-- 零方差和单个有效 token 产生有限的零 advantage；
-- 全零 baseline reward group 产生有限的零；
-- reward 全零但 KL 非零时，REINFORCE++ 可产生有限的 KL-shaped return；
-- 本地 response 全部被 mask 时贡献零张量，但仍参与 data-parallel collective；
-- 全局 mask 为空时，在所有参与 rank 上触发设备端异步断言。
+```bash
+ALGORITHM_ARGS=(
+  --advantage-estimator reinforce_plus_plus
+  --normalize-advantages
+  --gamma 1.0
+  --kl-coef 0.01
+  --kl-loss-type k1
+  --kl-loss-coef 0
+)
+```
 
-由于 baseline 标量会广播到每个有效 token，更长的 response 在 token-level global moments 中权重更大。这是有意的设计。
+这里使用 k1 KL 惩罚，即 `-kl_coef × (log_prob_old - log_prob_ref)`。最终奖励加到最后一个有效回答 token，再从后向前累积；`gamma=1.0` 表示不对后续奖励做折扣。`--kl-coef` 必须为正，且不能同时启用 `--use-kl-loss`。
 
-## PPO 与 KL reduction
+**REINFORCE++-baseline：**
 
-两个变体都使用普通的 token PPO clipped surrogate。其正式标量目标是 response mean：
+```bash
+ALGORITHM_ARGS=(
+  --advantage-estimator reinforce_plus_plus_baseline
+  --normalize-advantages
+  --n-samples-per-prompt 8
+  --kl-coef 0
+  --use-kl-loss
+  --kl-loss-type k2
+  --kl-loss-coef 0.01
+)
+```
 
-$$
-L_{PG}=\frac{1}{B}\sum_i\frac{1}{L_i}
-\sum_t m_{i,t}\max\left(
--\rho_{i,t}\hat A_{i,t},
--\operatorname{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)\hat A_{i,t}
-\right).
-$$
+这组参数将组内奖励差复制到回答 token，并用独立的 k2 惩罚 `0.5 × (log_prob_current - log_prob_ref)²` 约束策略。`--kl-loss-coef` 必须为正。每个提示词须保留完整的回答组；缺少回答或组标识不一致时，会报奖励组不完整。
 
-baseline k2 loss 使用相同的 response-mean reduction。初始实现拒绝对这两个变体使用 `--calculate-per-token-loss`，因为该参数会把目标改为全局 token mean。
+baseline 依赖内置的组均值处理，因此不能使用 `--disable-rewards-normalization`、`--custom-reward-post-process-path` 或 `--agentic-custom-advantage-path`，也不支持 `--use-unbiased-kl`。
 
-## 公式级对比
+Relax 默认选择 GRPO，关闭优势值归一化，两个 KL 系数均为零。只修改 `--advantage-estimator` 不会自动补齐上述设置，迁移已有脚本时应一起替换算法参数。完整选项见[配置说明](./configuration.md)。
 
-定义：
+## 监控与常见问题
 
-$$
-\rho_{i,t}=\exp(\log\pi_\theta(a_{i,t})-\log\pi_{old}(a_{i,t})),
-$$
+示例默认将 TensorBoard event 写入 `OUTPUT_DIR/actor/tensorboard_log`，提交日志保存在 `OUTPUT_DIR/logs`。如需更改 event 目录，在 `ray start` 前执行 `export TENSORBOARD_DIR=/path/to/tensorboard`。`ray-job.sh` 不转发该变量，因此 Ray 已启动后，只在提交终端设置它不会将覆盖值传入作业。
 
-并用 `clip-PPO` 表示上文的 token objective。Relax 的既有 group-relative 算法首先计算：
+评估训练效果时，结合评测奖励、`rollout/response_len/mean` 和 `rollout/truncated_ratio`，而不是只看损失。回答经常达到长度上限时，可在显存允许的情况下增大 `ROLLOUT_MAX_RESPONSE_LEN`。
 
-$$
-A_i^{grp}=R_i-\bar R_g,
-$$
+### 奖励或优势值一直为零
 
-并在启用 `--grpo-std-normalization` 时除以 `torch.std({R_j:j in g}) + 1e-6`。该 `torch.std` 使用 Bessel 样本校正（`ddof=1`），不同于新增的全局总体方差。
+先检查标签和生成回答。`math` 奖励函数从回答中的 `\boxed{...}` 提取最终答案，无法提取时返回零；标签应是最终答案，而非完整解题过程。
 
-| 算法 | 原始 advantage 与统计轴 | Ratio / policy objective | Reference regularization |
-|---|---|---|---|
-| REINFORCE++ | token KL-to-go $G_{i,t}$；使用 `ddof=0` 在全部有效 token 和 DP rank 上归一化 | token $\rho_{i,t}$ 和 clip-PPO；response mean | k1 位于 token reward 内 |
-| REINFORCE++-baseline | $R_i-\bar R_g$ 广播到有效 token，不除以 group std；随后使用相同的全局 token/DP 归一化 | token $\rho_{i,t}$ 和 clip-PPO；response mean | 独立 k2 loss，response mean |
-| GRPO | $A_i^{grp}$，可选同 prompt sample-std 缩放；在 response 内广播 | token $\rho_{i,t}$ 和 clip-PPO | Relax 既有可配置 KL |
-| GSPO | 与 GRPO 相同的 group advantage | sequence ratio $\rho_i=\exp[L_i^{-1}\sum_t m_{i,t}(\log\pi_\theta-\log\pi_{old})]$ 扩展到其 token，再使用 clip-PPO | Relax 既有可配置 KL |
-| SAPO | 与 GRPO 相同的 group advantage | token ratio 和 $f_\tau(\rho)=4\,\sigma[\tau(\rho-1)]/\tau$；loss 为 $-f_\tau(\rho)A$，正负 advantage 使用不同 $\tau$ | Relax 既有可配置 KL |
+baseline 中，同组奖励都相同时，减去组均值后原始优势值为零，奖励无法区分该提示词下的回答。归一化后的值还受整批 token 统计影响。可先查看 `rollout/reinforce_pp_advantage_raw_std` 和 `rollout/reinforce_pp_zero_variance`，而不是修改归一化参数；原始优势值全部相同时，归一化结果为零，整个批次没有有效 token 时则会报错。
 
-对于这五条路径，mask 选择参与计算的 response token，Relax 既有 reducer 先对每个 response 求均值，再对 response 求均值。新增变体拒绝另一种 global-token reduction，避免分母被静默改变。
+### 一直等待调度或显存不足
 
-本功能不改变 GRPO、GSPO 或 SAPO 的默认行为。
+用 `ray status` 检查是否有可用 GPU，以及足够运行服务和奖励 worker 的 CPU 资源。示例默认使用 4 个奖励 worker、最多 16 个并发请求，可用 `REWARD_NUM_WORKERS` 和 `REWARD_MAX_CONCURRENCY` 调整。
 
-## 支持的模式
+训练或 log probability 前向阶段 OOM 时，降低对应的 token 预算；推理侧显存不足时，调整 `SGLANG_MEM_FRACTION_STATIC`。具体排查方法见 [OOM 排查](./oom-troubleshooting.md)。
 
-首个实现支持：
+### 如何查看 KL 惩罚
 
-- synchronous colocate training；
-- data-parallel normalization；
-- `context_parallel_size=1`；
-- response-mean loss reduction。
+`train/ppo_kl` 比较旧策略与当前策略，不代表策略与参考模型的差异。baseline 的参考模型惩罚记录在 `train/kl_loss`，乘以 `--kl-loss-coef` 后加入总损失。REINFORCE++ 的惩罚已包含在回报值中，没有独立的 `train/kl_loss`；`rollout/returns` 与 `rollout/raw_reward` 可辅助排查，但二者差值不是参考策略 KL 的直接估计。
 
-它拒绝 fully-async、hybrid、context parallelism 大于 1，以及 per-token global loss reduction。fully-async 当前没有可用于计算这些 moments 的闭合 global batch；CP 大于 1 则需要单独验证 unique-token ownership 契约。
+## 相关文档
 
-## 监控指标
-
-Rollout 指标包括：
-
-- 原始 global advantage mean 和 standard deviation；
-- normalized advantage mean 和 standard deviation；
-- valid-token count；
-- zero-variance indicator；
-- 常规 reward、return 和 advantage 汇总。
-
-三个 KL 相关观测量具有明确不同的含义：
-
-- `train/ppo_kl` 是用于构造 PPO importance ratio 的 response-reduced old-policy/current-policy log-prob 差值。它度量 policy-update drift，不是 reference-policy KL，也不能说明 k1 或 k2 regularization 是否生效。
-- 对 REINFORCE++，reference-policy k1 shaping 已折入 `rollout/returns`。比较同一步的 `rollout/returns` 与 `rollout/raw_reward` 汇总可以观察其实际影响；该变体没有独立 `train/kl_loss`。
-- 对 REINFORCE++-baseline，`train/kl_loss` 是单独 reduction 的 k2 reference-policy penalty。它不进入 advantage，而是通过 `--kl-loss-coef` 加到总 loss。
-
-训练指标仍会报告 policy loss 和 clip fraction。
-
-## 测试
-
-数值测试使用独立 float64 参考实现，不调用生产环境的 return、advantage、归一化或 loss 函数。覆盖变长 response、padding、内部 mask hole、mask 外的有限与非有限 sentinel、全零 reward、零方差、单个有效 token、本地全 mask rank、PPO clipping，以及 response-reduced policy/k2 loss。Megatron backend 集成测试还会调用生产环境的 `compute_advantages_and_returns` dispatcher。在宿主环境缺少 Megatron 时，测试只注入该函数所需的最小 `mpu` 接口，因此仍执行真实的 Relax dispatch 和 normalization 代码，而不是 mock 这些代码。
-
-分布式归一化使用两个真实 Gloo 进程和真实 `all_reduce` 测试，包括一个 rank 没有有效 token 的情况。输出与独立拼接得到的全局总体进行比较。
-
-参数化 Qwen3-0.6B recipe 参见：
-`examples/algorithms/run-qwen3-0.6B-1xgpu-reinforce-plus-plus.sh`。
-
-相同预算的 Qwen3-0.6B 稳定性实验、数值证据、曲线及与 GRPO 的对比记录在
-[训练与数值验证报告](./reinforce-plus-plus-training-report.md)中。
+- [数据集设计](./dataset-design.md)：准备提示词和标签。
+- [自定义训练](./customize-training.md)：调整训练脚本。
+- [Metrics 服务](./metrics-service-detailed.md)：配置指标输出。

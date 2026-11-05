@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import ray
-import transfer_queue as tq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -20,6 +19,7 @@ from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 app = FastAPI()
@@ -336,8 +336,10 @@ class Rollout(Base):
         self.config = config
         self.healthy = healthy
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role="rollout",
+        )
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
             config, pg, data_source=data_source, runtime_env=runtime_env
         )
@@ -401,11 +403,11 @@ class Rollout(Base):
         await self.rollout_manager.eval.remote(rollout_id=rollout_id)
 
     async def _async_run(self) -> None:
-        from relax.engine.sft.runtime import is_sft_mode
+        from relax.engine.sft.runtime import is_offline_mode
 
-        # SFT-with-rollout: Rollout is a passive SGLang server that responds to
-        # HTTP /predict and /evaluate driven by the Actor. No RL rollout loop.
-        if is_sft_mode(self.config):
+        # Offline training has no RL rollout loop. SFT can use a passive SGLang
+        # server for HTTP /predict and /evaluate driven by the Actor.
+        if is_offline_mode(self.config):
             return
         try:
             if self.config.eval_interval is not None and self.step == 0 and not self.config.skip_eval_before_train:

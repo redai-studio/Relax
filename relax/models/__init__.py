@@ -6,6 +6,13 @@ _OMNI_NAMES = ("Qwen3OmniMoEBridge", "Qwen3OmniMoeModel", "Qwen3OmniModelProvide
 _OMNI_IMPORT_ERROR: Exception | None = None
 
 try:
+    from relax.models import keye_vl2  # noqa: F401,E402
+except ImportError as _e:
+    from relax.utils.logging_utils import get_logger
+
+    get_logger(__name__).warning("Failed to import relax.models.keye_vl2: %s", _e)
+
+try:
     from megatron.bridge.models.qwen_omni import (  # type: ignore[attr-defined]  # noqa: F401
         Qwen3OmniModelProvider,
         Qwen3OmniMoEBridge,
@@ -50,6 +57,15 @@ except Exception as _e:
     import logging as _logging
 
     _logging.getLogger(__name__).warning("Failed to import relax.models.gemma4: %s", _e)
+
+
+# Register the complete K3 VL model in place of upstream's language-only bridge.
+try:
+    from relax.models import kimi_k3  # noqa: F401
+except Exception as _e:
+    from relax.utils.logging_utils import get_logger
+
+    get_logger(__name__).warning("Failed to import relax.models.kimi_k3: %s", _e)
 
 
 # Only advertise what actually got bound: exporting an unbound name here makes

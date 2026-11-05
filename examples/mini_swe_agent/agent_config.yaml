@@ -79,7 +79,7 @@ r2e:
       set -e
       chmod +x /run_tests.sh
       ln -s /opt/miniconda3/envs/testbed /root/.venv
-      python -m pip install --no-index --find-links /r2e_wheels chardet==5.2.0
+      python -m pip install --no-index --find-links /r2e_wheels chardet==5.0.0
   reward_commands:
     train: bash /root/run_tests.sh
     eval: bash /run_tests.sh

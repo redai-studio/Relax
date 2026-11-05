@@ -5,6 +5,7 @@
 import argparse
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import subprocess
@@ -62,6 +63,15 @@ def main() -> None:
     for path in native_files:
         native_digest.update(str(path.relative_to(native_root)).encode())
         native_digest.update(bytes.fromhex(sha256_file(path)))
+    tq_spec = importlib.util.find_spec("transfer_queue")
+    tq_root = Path(tq_spec.origin).parent if tq_spec and tq_spec.origin else None
+    tq_files = sorted(tq_root.rglob("*.py")) if tq_root else []
+    tq_digest = hashlib.sha256()
+    for path in tq_files:
+        tq_digest.update(str(path.relative_to(tq_root)).encode())
+        tq_digest.update(bytes.fromhex(sha256_file(path)))
+    if not args.dry_run and (not native_files or not tq_files):
+        raise ValueError("Actual training requires identifiable Megatron and TransferQueue sources")
     result = dict(
         mode=args.mode,
         capture=args.capture,
@@ -69,12 +79,28 @@ def main() -> None:
         command=command,
         invariant_command=invariant_command,
         versions=versions,
+        launch_environment={
+            name: os.environ.get(name)
+            for name in (
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NCCL_ALGO",
+                "NCCL_PROTO",
+                "CUDA_DEVICE_MAX_CONNECTIONS",
+                "CUDA_MODULE_LOADING",
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "CUBLAS_WORKSPACE_CONFIG",
+                "RELAX_SFT_RESIDENT_PARAM_OVERLAP",
+            )
+        },
         source_sha256=source.hexdigest(),
         workload_sha256=sha256_file(args.workload / "manifest.json"),
         model_revision=manifest["model_revision"],
         data_revision=manifest["source_revision"],
         git_head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         native_source_sha256=native_digest.hexdigest() if native_files else None,
+        transfer_queue_source_sha256=tq_digest.hexdigest() if tq_files else None,
         devices=[
             {
                 "name": torch.cuda.get_device_name(index),
