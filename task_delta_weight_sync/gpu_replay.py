@@ -129,8 +129,10 @@ class CheckedEngine:
 
         self.pause()
         url = f"http://{self.engine.server_host}:{self.engine.server_port}"
-        health = requests.get(url + "/health", timeout=5)
-        health.raise_for_status()
+        # /health generates a token in this SGLang runtime and waits while paused.
+        control_endpoint = "/model_info"
+        control = requests.get(url + control_endpoint, timeout=5)
+        control.raise_for_status()
         request_id = uuid.uuid4().hex
         payload = {"rid": request_id, "input_ids": [1], "sampling_params": {"max_new_tokens": 1, "temperature": 0}}
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -170,7 +172,8 @@ class CheckedEngine:
             "rid": request_id,
             "observation_window_s": 3,
             "observation_and_abort_s": monotonic() - observed_at,
-            "health_status": health.status_code,
+            "control_endpoint": control_endpoint,
+            "control_status": control.status_code,
             "abort_status": aborted.status_code,
             "generate_status": response.status_code,
             "generate_response": body,
