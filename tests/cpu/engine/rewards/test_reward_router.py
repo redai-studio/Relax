@@ -51,7 +51,7 @@ pytestmark = pytest.mark.skipif(not _HAS_FULL_PIPELINE, reason="Full pipeline re
 def _make_args(**overrides) -> SimpleNamespace:
     """Use the default reward routing policy unless a test overrides it."""
     defaults = {
-        **vars(args_for_flags("--rm-type-infer", "--rm-type-fallback")),
+        **vars(args_for_flags("--rm-type-infer", "--rm-type-fallback", "--enable-affinity", "--autoscaler-config")),
         "rm_type": "openr1mm",
         "custom_rm_path": None,
         "reward_max_concurrency": 64,

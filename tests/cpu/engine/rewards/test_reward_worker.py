@@ -80,7 +80,7 @@ pytestmark = pytest.mark.skipif(not _HAS_MATH_VERIFY, reason="math_verify is not
 def _make_args(**overrides) -> SimpleNamespace:
     """Create a mock args namespace that mimics the training args structure."""
     defaults = {
-        **vars(args_for_flags("--rm-type-infer", "--rm-type-fallback")),
+        **vars(args_for_flags("--rm-type-infer", "--rm-type-fallback", "--enable-affinity", "--autoscaler-config")),
         "rm_type": "openr1mm",
         "custom_rm_path": None,
         "reward_max_concurrency": 64,
