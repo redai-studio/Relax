@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from argparse import Namespace
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
@@ -66,16 +67,14 @@ def group_sidecar_path(artifact_root: str, task: str, rollout_id: int, group_ind
     )
 
 
-# Keep the current rollout plus this many previous ones. 2 leaves rollout N-1
-# on disk while rollout N generates, so an actor still replaying the previous
-# step's sidecars (fully-async mode) never has a file pulled out from under it.
-_DEFAULT_ARTIFACT_RETENTION_ROLLOUTS = 2
+# Keep the current and previous rollout in memory while an actor consumes them.
+_MIN_IN_MEMORY_ARTIFACT_RETENTION_ROLLOUTS = 2
 _TRAJECTORY_REF_CACHE: Dict[Tuple[int, int], Any] = {}
 _CANDIDATE_IMAGE_CACHE: Dict[str, Any] = {}
 _CANDIDATE_IMAGE_ROLLOUT_IDS: Dict[str, int] = {}
 
 
-def prune_stale_artifacts(args, rollout_id: int) -> None:
+def prune_stale_artifacts(args: Namespace, rollout_id: int) -> None:
     """Release stale in-memory trajectories and delete old artifact
     directories.
 
@@ -88,11 +87,11 @@ def prune_stale_artifacts(args, rollout_id: int) -> None:
     ``--artifact-retention-rollouts <= 0`` disables pruning. Best-effort: a
     failed unlink must never abort a rollout.
     """
-    keep = int(getattr(args, "artifact_retention_rollouts", _DEFAULT_ARTIFACT_RETENTION_ROLLOUTS))
-    root = getattr(args, "artifact_root", None)
+    keep = int(args.artifact_retention_rollouts)
+    root = args.artifact_root
     if keep <= 0:
         return
-    memory_cutoff = int(rollout_id) - max(keep, _DEFAULT_ARTIFACT_RETENTION_ROLLOUTS)
+    memory_cutoff = int(rollout_id) - max(keep, _MIN_IN_MEMORY_ARTIFACT_RETENTION_ROLLOUTS)
     for key in [key for key in _TRAJECTORY_REF_CACHE if key[0] <= memory_cutoff]:
         del _TRAJECTORY_REF_CACHE[key]
     for uri in [
@@ -107,7 +106,7 @@ def prune_stale_artifacts(args, rollout_id: int) -> None:
         return
     import shutil
 
-    task = str(getattr(args, "generation_task", "") or "")
+    task = str(args.generation_task or "")
     for base in (os.path.join(root, task), os.path.join(root, "eval", task)):
         try:
             names = os.listdir(base)
@@ -343,7 +342,7 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
 
     adapter = _load_adapter(args)
     engines = _get_engines(args, data_system_client)
-    sampling = getattr(args, "sampling_config", None) or {}
+    sampling = args.sampling_config or {}
 
     # Pin the trained/stochastic SDE steps ONCE per rollout and hand every request
     # the same explicit list. With --sampling-config sde_resample_per_rollout this
@@ -358,7 +357,7 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
 
     groups = _get_samples(data_source, args.rollout_batch_size)
     out_groups: List[List[Sample]] = []
-    base_seed = int(getattr(args, "generation_seed", 1234))
+    base_seed = int(args.generation_seed)
     request_sampling_base = {**sampling, "_rollout_id": int(rollout_id), "_base_seed": base_seed}
     driver_xt = bool(sampling.get("driver_xt", True))
     # Constant for the whole rollout (see _sampling_fingerprint) — hoisted out of
@@ -423,7 +422,7 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
             for slot, (sample, resp) in enumerate(zip(group, responses)):
                 # Keep the decoded image in process for local rewards. Only an
                 # external scorer needs a durable URI it can open.
-                if getattr(args, "reward_runtime", "cpu") == "remote":
+                if args.reward_runtime == "remote":
                     # External scorers receive JSON and cannot resolve this
                     # process's memory:// image cache.
                     img_uri, img_h, img_w, img_sha256 = save_candidate_image(
@@ -532,8 +531,8 @@ def evaluate_rollout(args, rollout_id: int):
 
     adapter = _load_adapter(args)
     engines = _get_engines(args, None)
-    sampling = dict(getattr(args, "sampling_config", None) or {})
-    base_seed = int(getattr(args, "generation_seed", 1234))
+    sampling = dict(args.sampling_config or {})
+    base_seed = int(args.generation_seed)
     request_sampling_base = {**sampling, "_rollout_id": int(rollout_id), "_base_seed": base_seed}
     driver_xt = bool(sampling.get("driver_xt", True))
     artifact_root = os.path.join(args.artifact_root, "eval")
@@ -544,7 +543,7 @@ def evaluate_rollout(args, rollout_id: int):
         if not prompts:
             logger.warning(f"native evaluate_rollout: dataset {cfg.name!r} at {cfg.path!r} yielded no prompts.")
             continue
-        n = int(getattr(cfg, "n_samples_per_eval_prompt", None) or getattr(args, "n_samples_per_eval_prompt", 1) or 1)
+        n = int(getattr(cfg, "n_samples_per_eval_prompt", None) or args.n_samples_per_eval_prompt or 1)
 
         scored: List[Sample] = []
         # n single-candidate requests per prompt, with every candidate of a wave
@@ -609,7 +608,7 @@ def evaluate_rollout(args, rollout_id: int):
         component_rewards = score_samples(args, scored)
         if not component_rewards:
             continue
-        weights = getattr(args, "reward_component_weights", None) or {}
+        weights = args.reward_component_weights or {}
         primary = max(weights, key=weights.get) if weights else next(iter(component_rewards))
         entry: Dict[str, Any] = {"rewards": [float(v) for v in component_rewards[primary]]}
         # Surface every component so a multi-component reward is fully visible.
@@ -711,7 +710,7 @@ def _read_eval_prompts(args, cfg) -> List[Sample]:
     if not path or not os.path.exists(path):
         logger.warning(f"native evaluate_rollout: eval dataset path {path!r} does not exist.")
         return []
-    prompt_key = getattr(cfg, "input_key", None) or getattr(args, "input_key", None) or "prompt"
+    prompt_key = getattr(cfg, "input_key", None) or args.input_key or "prompt"
     samples: List[Sample] = []
     with open(path, encoding="utf-8") as handle:
         for line in handle:
@@ -1011,7 +1010,7 @@ def hydrate_micro_batches(args, adapter, rollout_id, rollout_data_ref, *, dp_ran
             skip = bool(int(rows["skip_optimizer_step"][positions].max()))
         # old_logp is recomputed by the actor (replay anchor); pass a batch view.
         local_size = len(local_idx)
-        for chunk in _candidate_chunks(local_size, int(getattr(args, "micro_batch_size", 0) or 0)):
+        for chunk in _candidate_chunks(local_size, int(args.micro_batch_size or 0)):
             chunk_batch = _shard_group_batch(batch, local_size, chunk) if len(chunk) < local_size else batch
             micro_batches.append(
                 {

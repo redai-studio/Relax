@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 """Full-pipeline tests for format-aware reward routing.
@@ -17,6 +18,8 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+
+from tests.cpu.relax_parser import args_for_flags
 
 
 _HAS_FULL_PIPELINE = False
@@ -46,12 +49,9 @@ pytestmark = pytest.mark.skipif(not _HAS_FULL_PIPELINE, reason="Full pipeline re
 
 
 def _make_args(**overrides) -> SimpleNamespace:
-    """Mock args namespace with the same six keys existing tests use.
-
-    New router flags are intentionally absent from the defaults so these tests
-    double as a guard that the executor reads them with getattr.
-    """
+    """Use the default reward routing policy unless a test overrides it."""
     defaults = {
+        **vars(args_for_flags("--rm-type-infer", "--rm-type-fallback", "--enable-affinity", "--autoscaler-config")),
         "rm_type": "openr1mm",
         "custom_rm_path": None,
         "reward_max_concurrency": 64,

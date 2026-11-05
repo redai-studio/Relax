@@ -7,7 +7,6 @@ import ast
 import dataclasses
 import math
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -22,22 +21,25 @@ from relax.utils.training.ppo_utils import (  # noqa: E402
     compute_rloo_loss,
     compute_sapo_loss,
 )
+from tests.cpu.relax_parser import parser_for_flags  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _args(estimator, **overrides):
-    base = dict(
-        advantage_estimator=estimator,
-        eps_clip=0.15,
-        eps_clip_high=0.3,
-        m2po_kl2_budget=0.02,
-        m2po_miniclip_low=0.25,
-        m2po_miniclip_high=0.4,
+    parser = parser_for_flags(
+        "--advantage-estimator",
+        "--eps-clip",
+        "--eps-clip-high",
+        "--m2po-kl2-budget",
+        "--m2po-miniclip-low",
+        "--m2po-miniclip-high",
     )
-    base.update(overrides)
-    return SimpleNamespace(**base)
+    cli = ["--advantage-estimator", estimator]
+    for key, value in overrides.items():
+        cli.extend([f"--{key.replace('_', '-')}", str(value)])
+    return parser.parse_args(cli)
 
 
 def _tensors():
@@ -48,7 +50,7 @@ def _tensors():
 @pytest.mark.parametrize("estimator", ["grpo", "gspo", "ppo", "reinforce_plus_plus", "reinforce_plus_plus_baseline"])
 def test_ppo_clip_adapters_pass_mains_arguments(estimator):
     log_probs, ppo_kl, advantages = _tensors()
-    args = _args(estimator)
+    args = _args(estimator, eps_clip=0.15, eps_clip_high=0.3)
     loss, clipfrac, metrics = compute_policy_loss_for(args, log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
     expected = compute_policy_loss(ppo_kl, advantages, 0.15, 0.3)
     assert torch.equal(loss, expected[0])
@@ -56,24 +58,50 @@ def test_ppo_clip_adapters_pass_mains_arguments(estimator):
     assert metrics == {}
 
 
-@pytest.mark.parametrize("taus", [None, (1.3, 1.7)], ids=["defaults", "explicit"])
-def test_sapo_adapter_preserves_defaults_and_explicit_parameters(taus):
+@pytest.mark.parametrize(
+    ("cli", "yaml", "taus"),
+    [
+        pytest.param([], None, (1.0, 1.05), id="defaults"),
+        pytest.param(["--sapo-tau-pos", "1.3", "--sapo-tau-neg", "1.7"], None, (1.3, 1.7), id="explicit"),
+        pytest.param(
+            ["--sapo-tau-pos", "1.3"],
+            "sapo_tau_pos: 1.9\nsapo_tau_neg: 1.8\n",
+            (1.9, 1.8),
+            id="yaml-overrides-cli-and-default",
+        ),
+    ],
+)
+def test_sapo_adapter_preserves_defaults_and_explicit_parameters(
+    algorithm_args_parser, arguments_module, tmp_path, cli, yaml, taus
+):
     log_probs, ppo_kl, advantages = _tensors()
-    overrides = {} if taus is None else dict(sapo_tau_pos=taus[0], sapo_tau_neg=taus[1])
-    loss, clipfrac, metrics = compute_policy_loss_for(
-        _args("sapo", **overrides), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages
-    )
-    tau_pos, tau_neg = (1.0, 1.05) if taus is None else taus
-    expected = compute_sapo_loss(ppo_kl=ppo_kl, advantages=advantages, tau_pos=tau_pos, tau_neg=tau_neg)
+    args = algorithm_args_parser.parse_args(["--advantage-estimator", "sapo", "--n-samples-per-prompt", "4", *cli])
+    if yaml is not None:
+        config = tmp_path / "sapo.yaml"
+        config.write_text(yaml, encoding="utf-8")
+        args.custom_config_path = str(config)
+        arguments_module.validate_algorithm_args(args)
+        arguments_module.apply_custom_config_overrides(args)
+    loss, clipfrac, metrics = compute_policy_loss_for(args, log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
+    expected = compute_sapo_loss(ppo_kl=ppo_kl, advantages=advantages, tau_pos=taus[0], tau_neg=taus[1])
     assert torch.equal(loss, expected[0])
     assert torch.equal(clipfrac, expected[1])
     assert metrics == {}
 
 
+@pytest.mark.parametrize("field", ["sapo_tau_pos", "sapo_tau_neg"])
+def test_sapo_adapter_rejects_missing_declared_temperature(algorithm_args_parser, field):
+    args = algorithm_args_parser.parse_args(["--advantage-estimator", "sapo"])
+    delattr(args, field)
+    log_probs, ppo_kl, advantages = _tensors()
+    with pytest.raises(AttributeError, match=field):
+        compute_policy_loss_for(args, log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
+
+
 def test_cispo_adapter_passes_mains_arguments():
     log_probs, ppo_kl, advantages = _tensors()
     loss, clipfrac, metrics = compute_policy_loss_for(
-        _args("cispo", eps_clip_high=9.0), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages
+        _args("cispo", eps_clip=0.15, eps_clip_high=9.0), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages
     )
     expected = compute_cispo_loss(
         log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages, eps_clip=0.15, eps_clip_high=9.0
@@ -158,7 +186,7 @@ def test_m2po_dispatch_preserves_legacy_loss_metrics_and_gradients(dtype, ppo_kl
     expected_ppo_kl = actual_ppo_kl.detach().clone().requires_grad_()
     advantages = torch.tensor(advantages, dtype=dtype)
     actual = compute_policy_loss_for(
-        _args("m2po", m2po_kl2_budget=budget),
+        _args("m2po", m2po_kl2_budget=budget, m2po_miniclip_low=0.25, m2po_miniclip_high=0.4),
         log_probs=-actual_ppo_kl,
         ppo_kl=actual_ppo_kl,
         advantages=advantages,

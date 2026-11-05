@@ -21,8 +21,21 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 ROOT = Path(__file__).resolve().parents[4]
+
+
+def _mtp_args(enabled: bool = True) -> Namespace:
+    parser = parser_for_flags(
+        "--enable-mtp-training",
+        "--loss-type",
+        "--qsa-indexer-loss-coeff",
+        constants=("qsa_coeff_option",),
+        converters=("_nonnegative_finite_float",),
+    )
+    return parser.parse_args(["--enable-mtp-training"] if enabled else [])
 
 
 def load_functions(path, names, namespace):
@@ -39,6 +52,7 @@ def load_functions(path, names, namespace):
 def production_namespace(cp_size, rank, tp_size=2):
     from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
     from relax.utils.env import Envs
+    from relax.utils.megatron_argument_compat import dynamic_context_parallel_enabled
 
     namespace = {
         "Envs": Envs,
@@ -50,7 +64,8 @@ def production_namespace(cp_size, rank, tp_size=2):
         "PackedSeqParams": SimpleNamespace,
         "DataIterator": type("DataIterator", (), {}),
         "PrepackedBatch": type("PrepackedBatch", (dict,), {}),
-        "get_args": lambda: Namespace(enable_mtp_training=True),
+        "get_args": _mtp_args,
+        "dynamic_context_parallel_enabled": dynamic_context_parallel_enabled,
         "is_preference_mode": is_preference_mode,
         "is_sft_mode": is_sft_mode,
         "mpu": SimpleNamespace(
@@ -115,7 +130,7 @@ def test_legacy_packing_mask_tokens_ce_and_gradients(cp_size, lengths):
             namespace = production_namespace(cp_size, rank)
             batch = make_batch(namespace, lengths)
             kwargs = legacy_kwargs(batch)
-            namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=True), batch, kwargs)
+            namespace["_attach_mtp_forward_kwargs"](_mtp_args(), batch, kwargs)
             labels = kwargs["mtp_kwargs"]["mtp_labels"]
             mask = kwargs["loss_mask"]
             if cp_size > 1:
@@ -155,7 +170,8 @@ def test_legacy_packing_mask_tokens_ce_and_gradients(cp_size, lengths):
             )
             actual = chunked * mask
             actual_grad = torch.autograd.grad(actual.sum(), (hidden, head.weight))
-            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            # Chunked and unchunked CPU kernels can round the FP64 CE differently.
+            torch.testing.assert_close(actual, reference, rtol=0, atol=4 * torch.finfo(torch.float64).eps)
             for got, expected in zip(actual_grad, expected_grad, strict=True):
                 torch.testing.assert_close(got, expected, rtol=1e-11, atol=1e-9)
     finally:
@@ -175,7 +191,7 @@ def test_single_sequence_mask_matches_bridge_input_mode(rank, position_kind, att
         kwargs["position_ids"] = torch.arange(4432).unsqueeze(0)
     elif position_kind == "mrope":
         kwargs["position_ids"] = torch.arange(4432).reshape(1, 1, -1).expand(3, 1, -1)
-    namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=True), batch, kwargs)
+    namespace["_attach_mtp_forward_kwargs"](_mtp_args(), batch, kwargs)
     legacy = attention_mask_present and position_kind != "mrope"
     expected = batch["unsplit_mtp_loss_mask"] if legacy else batch["unsplit_full_mtp_loss_mask"]
     assert kwargs["loss_mask"] is expected
@@ -187,9 +203,9 @@ def test_disabled_mtp_preserves_forward_and_existing_mask():
     kwargs = legacy_kwargs(batch)
     existing = object()
     kwargs["loss_mask"] = existing
-    namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=False), batch, kwargs)
+    namespace["_attach_mtp_forward_kwargs"](_mtp_args(False), batch, kwargs)
     assert "mtp_kwargs" not in kwargs
-    namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=True), batch, kwargs)
+    namespace["_attach_mtp_forward_kwargs"](_mtp_args(), batch, kwargs)
     assert kwargs["loss_mask"] is existing
 
 
@@ -277,7 +293,7 @@ def test_zero_supervision_singleton_keeps_local_mask_and_zero_gradient(rank):
         iter([(raw, None)]), tuple(raw), pad_multiplier=1024, is_vl_model=True, pack_device=torch.device("cpu")
     )
     kwargs = legacy_kwargs(batch)
-    namespace["_attach_mtp_forward_kwargs"](Namespace(enable_mtp_training=True), batch, kwargs)
+    namespace["_attach_mtp_forward_kwargs"](_mtp_args(), batch, kwargs)
     labels, mask = kwargs["mtp_kwargs"]["mtp_labels"], kwargs["loss_mask"]
     assert labels.shape == mask.shape == (1, 1108)
     head = CPUHead()

@@ -4,13 +4,16 @@ degeneracy."""
 
 from __future__ import annotations
 
+from argparse import ArgumentParser, Namespace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from relax.backends.fsdp.arguments import add_generative_arguments
 from relax.engine.rewards.generative import combine_group_advantages
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import parser_for_flags
 
 
 class SpreadScorer:
@@ -196,16 +199,21 @@ def test_compute_reward_metrics_degenerate_zero_group_std():
 # ---------------------------------------------------------------------------
 
 
-def _post_process_args(**kw):
-    base = dict(
-        reward_runtime="cpu",
-        reward_scorer_path="tests.cpu.engine.rewards.test_generative.SpreadScorer",
-        reward_model_path=None,
-        reward_endpoint=None,
-        reward_component_weights={"pickscore": 1.0},
-        reward_required_components=["pickscore"],
-        grpo_std_normalization=True,
-        generative_advantage_std_mode=None,
+def _post_process_args(*flags: str, **overrides: object) -> Namespace:
+    shared = parser_for_flags("--disable-grpo-std-normalization")
+    parser = add_generative_arguments(ArgumentParser(parents=[shared], add_help=False))
+    args = parser.parse_args(
+        [
+            "--reward-scorer-path",
+            "tests.cpu.engine.rewards.test_generative.SpreadScorer",
+            "--reward-component-weights",
+            '{"pickscore": 1.0}',
+            "--reward-required-components",
+            '["pickscore"]',
+            *flags,
+        ]
+    )
+    vars(args).update(
         # tracking sink: absent backends are tolerated by _log_reward_metrics
         use_metrics_service=False,
         use_wandb=False,
@@ -213,8 +221,8 @@ def _post_process_args(**kw):
         use_clearml=False,
         notify_urls=None,
     )
-    base.update(kw)
-    return SimpleNamespace(**base)
+    vars(args).update(overrides)
+    return args
 
 
 def test_post_process_keeps_the_raw_reward_on_the_sample():
@@ -271,11 +279,22 @@ def test_post_process_uses_explicit_batch_advantage_mode():
     for slot, s in enumerate(samples):
         s.train_metadata = {"group_index": slot // 2, "manifest": {"outputs": []}}
 
-    args = _post_process_args(generative_advantage_std_mode="batch")
+    args = _post_process_args("--generative-advantage-std-mode", "batch")
     advantages = post_process(args, samples)
 
     expected = float(0.5 / torch.tensor([0.0, 1.0, 2.0, 3.0]).std())
     assert advantages == pytest.approx([-expected, expected, -expected, expected], abs=1e-5)
+
+
+def test_post_process_uses_legacy_std_flag_when_generative_mode_is_unset() -> None:
+    from relax.engine.rewards.generative import post_process
+
+    samples = [Sample(prompt="p", group_index=0, index=i) for i in range(4)]
+    args = _post_process_args("--disable-grpo-std-normalization")
+
+    advantages = post_process(args, samples)
+
+    assert advantages == pytest.approx([-1.5, -0.5, 0.5, 1.5])
 
 
 def test_post_process_flags_a_degenerate_round_even_without_train_metadata():

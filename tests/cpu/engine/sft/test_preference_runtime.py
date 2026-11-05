@@ -9,43 +9,50 @@ import pytest
 
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.engine.sft.runtime import is_preference_mode, validate_preference_args
+from tests.cpu.relax_parser import parser_for_flags
 
 
 def _args(**overrides) -> Namespace:
     values = {
         "loss_type": "dpo",
-        "custom_dataset_class_path": None,
-        "multimodal_keys": None,
-        "n_samples_per_prompt": 1,
         "tensor_model_parallel_size": 1,
         "pipeline_model_parallel_size": 1,
         "context_parallel_size": 1,
         "dynamic_context_parallel": False,
-        "qkv_format": "thd",
-        "fully_async": False,
-        "hybrid": False,
         "use_gloo_process_groups": True,
-        "sft_chunked_logits": False,
-        "enable_mtp_training": False,
         "calculate_per_token_loss": False,
-        "lora_rank": 0,
         "hidden_dropout": 0.0,
         "attention_dropout": 0.0,
-        "sft_predict_interval": None,
-        "save_hf": None,
         "eval_interval": None,
-        "dpo_beta": 0.1,
-        "rollout_temperature": 1.0,
-        "dpo_reference_free": False,
         "ref_load": None,
-        "ref_update_interval": None,
-        "enable_weights_backuper": True,
-        "preference_max_length": 1024,
-        "preference_max_completion_length": 512,
         "seq_length": 2048,
     }
-    values.update(overrides)
-    return Namespace(**values)
+    args = parser_for_flags(
+        "--eval-size",
+        "--sft-predict-interval",
+        "--task-type",
+        "--rollout-temperature",
+        "--dpo-beta",
+        "--dpo-reference-free",
+        "--preference-max-length",
+        "--preference-max-completion-length",
+        "--ref-update-interval",
+        "--disable-weights-backuper",
+        "--save-hf",
+        "--sft-async-prepack",
+        "--mtp-only-training",
+        "--custom-dataset-class",
+        "--multimodal-keys",
+        "--n-samples-per-prompt",
+        "--qkv-format",
+        "--fully-async",
+        "--hybrid",
+        "--sft-chunked-logits",
+        "--enable-mtp-training",
+        "--lora-rank",
+    ).parse_args([])
+    vars(args).update(values, **overrides)
+    return args
 
 
 def test_preference_mode_uses_loss_type():
@@ -70,11 +77,18 @@ def test_preference_mode_uses_loss_type():
         ({"lora_rank": 8}, "LoRA"),
         ({"hidden_dropout": 0.1}, "dropout"),
         ({"ref_update_interval": 10}, "frozen reference"),
+        ({"ref_update_interval": 0}, "frozen reference"),
+        ({"enable_weights_backuper": False}, "requires --enable-weights-backuper"),
         ({"dpo_beta": float("nan")}, "finite and positive"),
+        ({"dpo_beta": 0.0}, "finite and positive"),
+        ({"preference_max_length": None}, "length limits must be positive"),
+        ({"preference_max_completion_length": 0}, "length limits must be positive"),
         ({"rollout_temperature": 0.8}, "rollout-temperature 1.0"),
+        ({"rollout_temperature": 0.0}, "rollout-temperature 1.0"),
         ({"rollout_temperature": float("nan")}, "rollout-temperature 1.0"),
         ({"rollout_temperature": float("inf")}, "rollout-temperature 1.0"),
         ({"preference_max_completion_length": 2048}, "must not exceed"),
+        ({"multimodal_keys": {}}, "pure text only"),
     ],
 )
 def test_preference_validation_rejects_unsupported_configs(overrides: dict, match: str):

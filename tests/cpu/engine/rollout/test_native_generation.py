@@ -5,13 +5,135 @@ trip."""
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
+import sys
+from argparse import ArgumentParser, Namespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 
 from relax.engine.rollout import native_generation as ng
+from relax.models.generative import ArtifactTrack
+from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import parser_for_flags
+
+
+def _artifact_args(*flags: str) -> Namespace:
+    from relax.backends.fsdp.arguments import add_generative_arguments
+
+    data = parser_for_flags("--input-key")
+    parser = add_generative_arguments(ArgumentParser(parents=[data], add_help=False))
+    return parser.parse_args(["--generation-task", "t2i", *flags])
+
+
+@pytest.fixture
+def native_requests(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    requests: list[dict[str, Any]] = []
+
+    def build_request(sample: Sample, sampling: dict[str, Any], seed: int) -> dict[str, Any]:
+        request = {"prompt": sample.prompt, "sampling": sampling, "seed": seed}
+        requests.append(request)
+        return request
+
+    def dispatch(_engines: list[object], groups: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+        return [
+            [{"generated_output": torch.zeros(3, 8, 12), "weight_manifest_sha256": "a" * 64} for _ in group]
+            for group in groups
+        ]
+
+    def artifact_tracks(response: dict[str, Any]) -> list[ArtifactTrack]:
+        output = response["output"]
+        return [ArtifactTrack("image", output["uri"], output["mime"], output["sha256"])]
+
+    adapter = SimpleNamespace(
+        build_rollout_request=build_request,
+        validate_rollout_response=lambda _response: None,
+        artifact_tracks=artifact_tracks,
+    )
+    monkeypatch.setattr(ng, "_load_adapter", lambda _args: adapter)
+    monkeypatch.setattr(ng, "_get_engines", lambda _args, _client: [object()])
+    monkeypatch.setattr(ng, "_dispatch_groups", dispatch)
+    return requests
+
+
+@pytest.mark.parametrize("remote", [False, True], ids=["default-local", "explicit-remote"])
+def test_native_rollout_uses_declared_sampling_and_reward_runtime(
+    remote: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_requests: list[dict[str, Any]]
+) -> None:
+    flags = ["--artifact-root", str(tmp_path)]
+    if remote:
+        flags += ["--sampling-config", '{"driver_xt": false}', "--generation-seed", "0", "--reward-runtime", "remote"]
+    args = _artifact_args(*flags)
+    rollout_args = parser_for_flags("--rollout-batch-size").parse_args(["--rollout-batch-size", "1"])
+    args.rollout_batch_size = rollout_args.rollout_batch_size
+    group = [Sample(prompt="p", group_index=2, index=index) for index in range(2)]
+    data_source = SimpleNamespace(get_samples=lambda _count: [group])
+    monkeypatch.setattr(ng, "adapter_pack_group", lambda _adapter, _responses: ({}, {}, {}))
+    monkeypatch.setattr(ng, "_put_group_batch", lambda *_args: b"trajectory")
+    monkeypatch.setattr(ng, "_log_rollout_perf", lambda *_args: None)
+    monkeypatch.setattr(ng, "_CANDIDATE_IMAGE_CACHE", {})
+    monkeypatch.setattr(ng, "_CANDIDATE_IMAGE_ROLLOUT_IDS", {})
+
+    result = ng.generate_rollout(args, rollout_id=3, data_source=data_source)
+
+    assert [request["seed"] for request in native_requests] == ([4, 5] if remote else [1234, 1234])
+    assert [request["sampling"]["_base_seed"] for request in native_requests] == [0 if remote else 1234] * 2
+    for sample in result.samples[0]:
+        uri = sample.train_metadata["manifest"]["outputs"][0]["uri"]
+        if remote:
+            assert Path(uri).is_file()
+        else:
+            assert uri.startswith("memory://")
+            assert ng.get_cached_candidate_image(uri).shape == (8, 12, 3)
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["declared-defaults", "zero-seed-weighted-reward"])
+def test_native_eval_uses_declared_request_options_and_primary_reward(
+    configured: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_requests: list[dict[str, Any]]
+) -> None:
+    path = tmp_path / "heldout.jsonl"
+    path.write_text('{"prompt":"p"}\n', encoding="utf-8")
+    flags = ["--artifact-root", str(tmp_path)]
+    eval_cli = []
+    if configured:
+        flags += [
+            "--sampling-config",
+            '{"driver_xt": false}',
+            "--generation-seed",
+            "0",
+            "--reward-component-weights",
+            '{"quality": 2}',
+        ]
+        eval_cli += ["--n-samples-per-eval-prompt", "2"]
+    args = _artifact_args(*flags)
+    eval_args = parser_for_flags("--n-samples-per-eval-prompt").parse_args(eval_cli)
+    args.n_samples_per_eval_prompt = eval_args.n_samples_per_eval_prompt
+    args.eval_datasets = [
+        EvalDatasetConfig(name="heldout", path=str(path), input_key="prompt", n_samples_per_eval_prompt=0)
+    ]
+
+    def score_samples(_args: Namespace, samples: list[Sample]) -> dict[str, list[float]]:
+        return {"base": [0.25] * len(samples), "quality": [0.5] * len(samples)}
+
+    # This test supplies scores at the evaluation boundary. The rest of the
+    # reward registry is outside the request and aggregation contract.
+    reward_module = ModuleType("relax.engine.rewards.generative")
+    reward_module.score_samples = score_samples
+    monkeypatch.setitem(sys.modules, reward_module.__name__, reward_module)
+    monkeypatch.setattr(ng, "_log_eval_perf", lambda *_args: None)
+
+    result = ng.generate_rollout(args, rollout_id=3, data_source=None, evaluation=True)
+
+    assert [request["seed"] for request in native_requests] == ([0, 1] if configured else [1234])
+    assert all(not request["rollout_return_dit_trajectory"] for request in native_requests)
+    assert all(not request["rollout_return_denoising_env"] for request in native_requests)
+    if configured:
+        assert result.data == {"heldout": {"rewards": [0.5, 0.5], "reward_base": [0.25, 0.25]}}
+    else:
+        assert result.data == {"heldout": {"rewards": [0.25], "reward_quality": [0.5]}}
 
 
 def test_group_sidecar_write_and_hydrate_round_trip(tmp_path):
@@ -99,9 +221,7 @@ def test_prune_stale_artifacts_releases_cached_candidate_images():
     old_uri, *_ = ng.cache_candidate_image(torch.rand(3, 8, 12), "t2i", 1, 0, 0)
     recent_uri, *_ = ng.cache_candidate_image(torch.rand(3, 8, 12), "t2i", 4, 0, 0)
 
-    ng.prune_stale_artifacts(
-        SimpleNamespace(artifact_root=None, generation_task="t2i", artifact_retention_rollouts=2), rollout_id=5
-    )
+    ng.prune_stale_artifacts(_artifact_args("--artifact-retention-rollouts", "1"), rollout_id=5)
 
     assert ng.get_cached_candidate_image(old_uri) is None
     assert ng.get_cached_candidate_image(recent_uri, remove=True) is not None
@@ -131,6 +251,7 @@ def _sample(group_index, slot, policy_version, reward):
 
 def test_convert_samples_to_train_data_numeric_row_only():
     args = SimpleNamespace(
+        **vars(parser_for_flags("--agentic-custom-advantage-path").parse_args([])),
         debug_train_only=True,
         custom_reward_post_process_path=None,
         reward_key=None,
@@ -168,6 +289,7 @@ def test_convert_samples_to_train_data_numeric_row_only():
 
 def test_convert_samples_to_train_data_uses_normalized_advantages():
     args = SimpleNamespace(
+        **vars(parser_for_flags("--agentic-custom-advantage-path").parse_args([])),
         debug_train_only=True,
         custom_reward_post_process_path=None,
         reward_key=None,
@@ -327,7 +449,10 @@ def _write_two_groups(tmp_path, group_size=4, shared_conditions=False):
         "advantages": torch.tensor([g * 100 + s for g in (0, 1) for s in range(group_size)]).float(),
         "skip_optimizer_step": torch.zeros(2 * group_size, dtype=torch.long),
     }
-    args = SimpleNamespace(artifact_root=str(tmp_path), generation_task="t2i")
+    args = parser_for_flags("--micro-batch-size").parse_args(
+        ["--micro-batch-size", str(group_size)],
+        namespace=Namespace(artifact_root=str(tmp_path), generation_task="t2i"),
+    )
     return args, rows
 
 
@@ -627,7 +752,7 @@ def test_prune_stale_artifacts_keeps_the_retention_window(tmp_path):
     shared volume and the run dies on an unrelated write error.
     """
     root = str(tmp_path)
-    args = SimpleNamespace(artifact_root=root, generation_task="t2i", artifact_retention_rollouts=2)
+    args = _artifact_args("--artifact-root", root)
     dirs = {r: _touch_rollout_dir(root, "t2i", r) for r in range(6)}
     eval_dir = _touch_rollout_dir(os.path.join(root, "eval"), "t2i", 1)
 
@@ -642,13 +767,11 @@ def test_prune_stale_artifacts_can_be_disabled_and_tolerates_a_missing_root(tmp_
     root = str(tmp_path)
     dirs = {r: _touch_rollout_dir(root, "t2i", r) for r in range(3)}
     ng.prune_stale_artifacts(
-        SimpleNamespace(artifact_root=root, generation_task="t2i", artifact_retention_rollouts=0), rollout_id=99
+        _artifact_args("--artifact-root", root, "--artifact-retention-rollouts", "0"), rollout_id=99
     )
     assert all(os.path.exists(p) for p in dirs.values())
     # A root that was never written to must not raise on the first rollout.
     ng.prune_stale_artifacts(
-        SimpleNamespace(
-            artifact_root=os.path.join(root, "nope"), generation_task="t2i", artifact_retention_rollouts=1
-        ),
+        _artifact_args("--artifact-root", os.path.join(root, "nope"), "--artifact-retention-rollouts", "1"),
         rollout_id=7,
     )

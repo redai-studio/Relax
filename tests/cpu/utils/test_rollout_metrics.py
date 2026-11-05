@@ -7,7 +7,6 @@ import copy
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -17,21 +16,28 @@ from relax.utils.metrics.rollout_metrics import (
     compute_perf_metrics_from_samples,
 )
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import args_for_flags, parser_for_flags
 
 
 def _args(**overrides):
-    values = dict(
-        advantage_estimator="grpo",
-        reward_key=None,
-        log_reward_category=None,
-        log_passrate=False,
-        n_samples_per_prompt=2,
-        partial_rollout=False,
-        fully_async=False,
-        rollout_num_gpus=2,
+    opd = parser_for_flags("--opd-teacher-key", source_file="relax/utils/opd/opd_utils.py").parse_args([])
+    values = {
+        **vars(opd),
+        "reward_key": None,
+        "log_reward_category": None,
+        "n_samples_per_prompt": 2,
+        "rollout_num_gpus": 2,
+        **overrides,
+    }
+    return args_for_flags(
+        "--advantage-estimator",
+        "--custom-reward-post-process-path",
+        "--agentic-custom-advantage-path",
+        "--log-passrate",
+        "--partial-rollout",
+        "--fully-async",
+        **values,
     )
-    values.update(overrides)
-    return SimpleNamespace(**values)
 
 
 def test_rollout_metrics_and_scale_types_import_without_deployment_dependencies():

@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+from argparse import ArgumentParser, Namespace
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -11,7 +12,7 @@ import pytest
 def arguments_module(monkeypatch):
     router_pkg = ModuleType("sglang_router")
     launch_router = ModuleType("sglang_router.launch_router")
-    launch_router.RouterArgs = object
+    launch_router.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     monkeypatch.setitem(sys.modules, "sglang_router", router_pkg)
     monkeypatch.setitem(sys.modules, "sglang_router.launch_router", launch_router)
 
@@ -37,32 +38,21 @@ def arguments_module(monkeypatch):
     sys.modules.pop("relax.utils.arguments", None)
 
 
-def _args(estimator: str, **overrides) -> SimpleNamespace:
-    defaults = dict(
-        advantage_estimator=estimator,
-        normalize_advantages=True,
-        fully_async=False,
-        hybrid=False,
-        colocate=True,
-        context_parallel_size=1,
-        calculate_per_token_loss=False,
-        kl_coef=0.01 if estimator == "reinforce_plus_plus" else 0.0,
-        kl_loss_coef=0.0 if estimator == "reinforce_plus_plus" else 0.01,
-        kl_loss_type="k1" if estimator == "reinforce_plus_plus" else "k2",
-        use_kl_loss=estimator == "reinforce_plus_plus_baseline",
-        n_samples_per_prompt=8,
-        rewards_normalization=True,
-        use_unbiased_kl=False,
-        custom_reward_post_process_path=None,
-        agentic_custom_advantage_path=None,
-    )
-    defaults.update(overrides)
-    return SimpleNamespace(**defaults)
+def _args(arguments_module: ModuleType, estimator: str, **overrides: object) -> Namespace:
+    parser = arguments_module.get_slime_extra_args_provider()(ArgumentParser())
+    flags = ["--advantage-estimator", estimator, "--normalize-advantages", "--colocate", "--n-samples-per-prompt", "8"]
+    if estimator == "reinforce_plus_plus":
+        flags += ["--kl-coef", "0.01", "--kl-loss-type", "k1"]
+    elif estimator == "reinforce_plus_plus_baseline":
+        flags += ["--use-kl-loss", "--kl-loss-coef", "0.01", "--kl-loss-type", "k2"]
+    args = parser.parse_args(flags)
+    vars(args).update({"context_parallel_size": 1, "calculate_per_token_loss": False, **overrides})
+    return args
 
 
 @pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])
 def test_valid_reinforce_plus_plus_contracts(arguments_module, estimator):
-    arguments_module._validate_reinforce_plus_plus_args(_args(estimator), is_offline=False)
+    arguments_module._validate_reinforce_plus_plus_args(_args(arguments_module, estimator), is_offline=False)
 
 
 @pytest.mark.parametrize(
@@ -79,7 +69,9 @@ def test_valid_reinforce_plus_plus_contracts(arguments_module, estimator):
 @pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])
 def test_common_contract_rejections(arguments_module, estimator, overrides, message):
     with pytest.raises(ValueError, match=message):
-        arguments_module._validate_reinforce_plus_plus_args(_args(estimator, **overrides), is_offline=False)
+        arguments_module._validate_reinforce_plus_plus_args(
+            _args(arguments_module, estimator, **overrides), is_offline=False
+        )
 
 
 @pytest.mark.parametrize(
@@ -93,7 +85,7 @@ def test_common_contract_rejections(arguments_module, estimator, overrides, mess
 def test_reinforce_plus_plus_kl_contract(arguments_module, overrides, message):
     with pytest.raises(ValueError, match=message):
         arguments_module._validate_reinforce_plus_plus_args(
-            _args("reinforce_plus_plus", **overrides), is_offline=False
+            _args(arguments_module, "reinforce_plus_plus", **overrides), is_offline=False
         )
 
 
@@ -113,11 +105,11 @@ def test_reinforce_plus_plus_kl_contract(arguments_module, overrides, message):
 def test_reinforce_plus_plus_baseline_contract(arguments_module, overrides, message):
     with pytest.raises(ValueError, match=message):
         arguments_module._validate_reinforce_plus_plus_args(
-            _args("reinforce_plus_plus_baseline", **overrides), is_offline=False
+            _args(arguments_module, "reinforce_plus_plus_baseline", **overrides), is_offline=False
         )
 
 
 def test_other_estimators_are_unchanged(arguments_module):
     arguments_module._validate_reinforce_plus_plus_args(
-        _args("grpo", normalize_advantages=False, colocate=False), is_offline=False
+        _args(arguments_module, "grpo", normalize_advantages=False, colocate=False), is_offline=False
     )

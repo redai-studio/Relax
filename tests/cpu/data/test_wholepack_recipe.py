@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.data import wholepack as wp
+from tests.cpu.relax_parser import parser_for_flags
 
 
 def test_wholepack_binpack_capacity_and_stable_assignment():
@@ -47,14 +48,12 @@ def test_wholepack_peer_timeout_is_collective():
 
 
 def test_wholepack_scope_requires_explicit_recipe():
-    assert not wp.enabled(SimpleNamespace())
-    assert not wp.enabled(
-        SimpleNamespace(custom_megatron_before_train_step_hook_path="relax.models.qwen3_5.recipe.before_step")
-    )
-    assert wp.enabled(SimpleNamespace(sft_wholepack=True))
-    assert wp.enabled(
-        SimpleNamespace(sft_wholepack=True, custom_megatron_before_train_step_hook_path="custom.wrapper")
-    )
+    hook = "--custom-megatron-before-train-step-hook-path"
+    parser = parser_for_flags("--sft-wholepack", hook)
+    assert not wp.enabled(parser.parse_args([]))
+    assert not wp.enabled(parser.parse_args([hook, "relax.models.qwen3_5.recipe.before_step"]))
+    assert wp.enabled(parser.parse_args(["--sft-wholepack"]))
+    assert wp.enabled(parser.parse_args(["--sft-wholepack", hook, "custom.wrapper"]))
 
 
 @pytest.mark.parametrize("oversize", [False, True])

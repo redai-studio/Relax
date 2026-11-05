@@ -130,28 +130,28 @@ class MetricsService:
         self._adapters = {}
         self._tracking_finish_task: Optional[asyncio.Task] = None
 
-        if getattr(config, "use_tensorboard", False):
+        if config.use_tensorboard:
             try:
                 self._adapters["tensorboard"] = _TensorboardAdapter(config)
                 logger.info("TensorBoard adapter initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize TensorBoard adapter: {e}")
 
-        if getattr(config, "use_clearml", False):
+        if config.use_clearml:
             try:
                 self._adapters["clearml"] = _ClearMLAdapter(config)
                 logger.info("ClearML adapter initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize ClearML adapter: {e}")
 
-        if getattr(config, "notify_urls", None):
+        if config.notify_urls:
             try:
                 self._adapters["apprise"] = _AppriseAdapter(config)
                 logger.info("Apprise adapter initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Apprise adapter: {e}")
 
-        self._use_wandb = getattr(config, "use_wandb", False)
+        self._use_wandb = config.use_wandb
         if self._use_wandb:
             try:
                 self._init_wandb(config)
@@ -161,7 +161,7 @@ class MetricsService:
                 self._use_wandb = False
 
         # Initialize TimelineTrace adapter
-        timeline_dump_dir = getattr(config, "timeline_dump_dir", None)
+        timeline_dump_dir = config.timeline_dump_dir
         if timeline_dump_dir:
             self._timeline_adapter = TimelineTraceAdapter(timeline_dump_dir)
             logger.info(f"TimelineTrace adapter enabled, dumping to: {timeline_dump_dir}")
@@ -184,22 +184,22 @@ class MetricsService:
 
         offline = _is_offline_mode(config)
 
-        if (not offline) and getattr(config, "wandb_key", None) is not None:
-            wandb.login(key=config.wandb_key, host=getattr(config, "wandb_host", None))
+        if (not offline) and config.wandb_key is not None:
+            wandb.login(key=config.wandb_key, host=config.wandb_host)
 
-        project = getattr(config, "wandb_project", None) or getattr(config, "tb_project_name", None)
-        run_name = getattr(config, "tb_experiment_name", None) or "metrics-service"
+        project = config.wandb_project or config.tb_project_name
+        run_name = config.tb_experiment_name or "metrics-service"
 
         init_kwargs = {
             "project": project,
             "name": run_name,
-            "entity": getattr(config, "wandb_team", None),
+            "entity": config.wandb_team,
         }
 
         if offline:
             init_kwargs["settings"] = wandb.Settings(mode="offline")
 
-        wandb_dir = getattr(config, "wandb_dir", None)
+        wandb_dir = config.wandb_dir
         if wandb_dir:
             os.makedirs(wandb_dir, exist_ok=True)
             init_kwargs["dir"] = wandb_dir

@@ -2,15 +2,17 @@
 """Image data ordering must survive restart without consuming training RNG."""
 
 import json
-from argparse import Namespace
+from argparse import ArgumentParser
 
 import pytest
 import torch
 from torch.utils.data import DistributedSampler
 
-from relax.backends.fsdp.arguments import validate_i2i_sft_config
+from relax.backends.fsdp.arguments import add_generative_arguments, validate_i2i_sft_config
 from relax.engine.sft.bootstrap import resolve_sft_num_rollout
 from relax.engine.sft.image import ImageBatchSampler, ImageEditDataset
+from relax.utils.opd.opd_utils import add_opd_arguments
+from tests.cpu.relax_parser import args_for_flags, parser_for_flags
 
 
 @pytest.mark.parametrize("size", [3, 16, 19, 64])
@@ -30,7 +32,7 @@ def test_sample_order_matches_eight_rank_reference(size):
     assert restored.batch(planner.steps_per_epoch + 1) == planner.batch(planner.steps_per_epoch + 1)
 
 
-def _args(**overrides):
+def _args(argv=(), **overrides):
     values = dict(
         loss_type="sft",
         generation_task="i2i",
@@ -40,12 +42,40 @@ def _args(**overrides):
         i2i_sft_config={"data_root": "/worker", "dataset_size": 19},
         global_batch_size=8,
         rollout_batch_size=8,
-        fsdp_trainable_mode="full",
         num_rollout=None,
         num_epoch=2,
         seed=42,
+        micro_batch_size=1,
+        debug_train_only=False,
+        debug_rollout_only=False,
     )
-    return Namespace(**{**values, **overrides})
+    defaults = args_for_flags(
+        "--task-type",
+        "--fully-async",
+        "--hybrid",
+        "--offload-train",
+        "--use-dynamic-batch-size",
+        "--balance-data",
+        "--sft-async-prepack",
+        "--sft-chunked-logits",
+        "--sft-predict-interval",
+        "--eval-prompt-data",
+        "--eval-size",
+        "--custom-dataset-class-path",
+        "--use-routing-replay",
+        "--use-rollout-routing-replay",
+        "--enable-mtp-training",
+        "--lora-rank",
+        "--lora-merge-mode",
+        "--lora-adapter-mode",
+        "--num-critic-only-steps",
+        "--sft-train-data-prefetch",
+        "--n-samples-per-prompt",
+    )
+    parser = add_opd_arguments(add_generative_arguments(ArgumentParser()))
+    args = parser.parse_args(argv, namespace=defaults)
+    vars(args).update({**values, **overrides})
+    return args
 
 
 def test_head_validation_and_sizing_need_no_worker_mount():
@@ -55,6 +85,12 @@ def test_head_validation_and_sizing_need_no_worker_mount():
     assert args.num_rollout == 6
     assert args.num_rollout_per_epoch == 3
     assert args.i2i_sft_config["max_pixels"] == 1024**2
+
+
+def test_image_sft_rejects_sequence_classification():
+    parsed = parser_for_flags("--task-type").parse_args(["--task-type", "seq_cls"])
+    with pytest.raises(ValueError, match="Image SFT does not support text classification"):
+        validate_i2i_sft_config(_args(task_type=parsed.task_type))
 
 
 @pytest.mark.parametrize("tiers", [[True], [False], [1024, True], [1.5], ["1024"], [0], [-1], [], True])
@@ -120,7 +156,6 @@ def test_rank_rotation_validates_and_preserves_disabled_checkpoint_contract():
         ("fully_async", True),
         ("sft_async_prepack", True),
         ("tensor_model_parallel_size", 2),
-        ("fsdp_activation_checkpointing", True),
         ("lora_rank", 32),
         ("global_batch_size", 7),
         ("eval_size", 8),
@@ -129,6 +164,52 @@ def test_rank_rotation_validates_and_preserves_disabled_checkpoint_contract():
 def test_reject_unsupported_training_contract(option, value):
     with pytest.raises(ValueError):
         validate_i2i_sft_config(_args(**{option: value}))
+
+
+def test_image_sft_rejects_enabled_activation_checkpointing():
+    with pytest.raises(ValueError, match="Image SFT does not support --fsdp-activation-checkpointing"):
+        validate_i2i_sft_config(_args(["--fsdp-activation-checkpointing"]))
+
+
+@pytest.mark.parametrize("argv", [[], ["--fsdp-master-dtype", "fp32"]])
+def test_image_sft_derives_fp32_master_dtype(argv):
+    args = _args(argv)
+    validate_i2i_sft_config(args)
+    assert args.fsdp_master_dtype == "fp32"
+
+
+def test_image_sft_rejects_explicit_bf16_master_dtype():
+    with pytest.raises(ValueError, match="Image SFT requires FP32 optimizer masters"):
+        validate_i2i_sft_config(_args(["--fsdp-master-dtype", "bf16"]))
+
+
+@pytest.mark.parametrize("style", ["linear", "cosine"])
+def test_image_sft_rejects_nonconstant_fsdp_schedule(style):
+    with pytest.raises(ValueError, match="constant"):
+        validate_i2i_sft_config(_args(["--fsdp-lr-scheduler", style]))
+
+
+@pytest.mark.parametrize("argv", [["--fsdp-param-dtype", "fp32"], ["--fsdp-reduce-dtype", "bf16"]])
+def test_image_sft_rejects_unsupported_compute_precision(argv):
+    with pytest.raises(ValueError, match="Image SFT requires BF16 compute and FP32 reduction"):
+        validate_i2i_sft_config(_args(argv))
+
+
+def test_image_sft_rejects_enabled_cpu_offload():
+    with pytest.raises(ValueError, match="Image SFT does not support --fsdp-cpu-offload"):
+        validate_i2i_sft_config(_args(["--fsdp-cpu-offload"]))
+
+
+def test_image_sft_rejects_enabled_debug_fingerprint():
+    with pytest.raises(ValueError, match="Image SFT does not support --fsdp-debug-fingerprint"):
+        validate_i2i_sft_config(_args(["--fsdp-debug-fingerprint"]))
+
+
+def test_image_sft_lora_mode_requires_positive_rank():
+    args = _args(["--fsdp-trainable-mode", "lora"], lora_rank=0)
+    with pytest.raises(ValueError, match="LoRA mode requires positive --lora-rank"):
+        validate_i2i_sft_config(args)
+    validate_i2i_sft_config(_args(["--fsdp-trainable-mode", "lora"], lora_rank=8))
 
 
 def test_metadata_preserves_condition_order_and_checks_size(tmp_path):

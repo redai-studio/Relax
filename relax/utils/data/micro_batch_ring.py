@@ -35,7 +35,7 @@ def _raise_pin_memory_failure(context: str, exc: BaseException) -> None:
 
 def is_sft_async_prepack_enabled(args: Any) -> bool:
     """Return the SFT prepack decision derived from the final configuration."""
-    return bool(getattr(args, "sft_async_prepack", False))
+    return bool(args.sft_async_prepack)
 
 
 @dataclass(frozen=True)

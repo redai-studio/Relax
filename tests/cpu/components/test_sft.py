@@ -12,6 +12,7 @@ import torch
 from relax.engine.sft.dataset.streaming import ProcessedSample, apply_oversize_strategy
 from relax.engine.sft.runtime import resolve_sft_split_indices
 from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
+from tests.cpu.relax_parser import MULTIMODAL_FLAGS, parser_for_flags
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +34,28 @@ def _make_processed(idx: int = 0, n_tokens: int = 8) -> ProcessedSample:
 
 def _make_args(global_batch_size=4, max_tokens_per_gpu=128, num_rollout=1):
     return SimpleNamespace(
+        **vars(
+            parser_for_flags(
+                "--task-type",
+                "--generation-task",
+                *MULTIMODAL_FLAGS,
+                "--sft-oversize-strategy",
+                "--sft-oversize-custom-function-path",
+                "--sft-tq-timeout-minutes",
+                "--sft-invalid-multimodal-strategy",
+                "--eval-input-key",
+                "--eval-label-key",
+                "--eval-tool-key",
+                "--conversation-key-map",
+                "--apply-chat-template-kwargs",
+                "--sft-training-mode",
+                "--sft-cpt-template",
+                "--num-labels",
+                "--problem-type",
+                "--sft-loss-last-turn-only",
+                "--sft-ignore-empty-think",
+            ).parse_args([])
+        ),
         global_batch_size=global_batch_size,
         max_tokens_per_gpu=max_tokens_per_gpu,
         context_parallel_size=1,
@@ -346,7 +369,8 @@ def test_sft_remote_batch_producer_falls_back_for_target_only_modes(monkeypatch,
     assert sft._should_use_remote_batch_producer() is False
 
 
-def test_sft_remote_batch_producer_allows_eval_size(monkeypatch):
+@pytest.mark.parametrize("task_override", [{}, {"task_type": None}])
+def test_sft_remote_batch_producer_allows_eval_size(monkeypatch, task_override):
     from relax.components.sft import SFT
 
     monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
@@ -355,6 +379,7 @@ def test_sft_remote_batch_producer_allows_eval_size(monkeypatch):
     args = _make_args(global_batch_size=4)
     args.sft_async_prepack = True
     args.eval_size = 0.25
+    vars(args).update(task_override)
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = args
@@ -812,7 +837,11 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real, im
         eval_size=n_real,
         eval_interval=1,
         global_batch_size=4,
-        task_type="seq_cls",
+        **vars(
+            parser_for_flags(
+                "--task-type", "--eval-prompt-data", "--generation-task", "--sft-async-prepack"
+            ).parse_args(["--task-type", "seq_cls"])
+        ),
         multimodal_keys={"image": "images"} if image_preprocess_on_rank else None,
         sft_image_preprocess_on_rank=image_preprocess_on_rank,
         sft_eval_chunk_drain_timeout_sec=1,
@@ -864,6 +893,7 @@ async def test_preference_eval_preserves_pairs_and_partial_batches(loss_type, n_
     ]
     sft = SFT.func_or_class.__new__(SFT.func_or_class)
     sft.config = SimpleNamespace(
+        **vars(parser_for_flags("--task-type", "--eval-prompt-data").parse_args([])),
         loss_type=loss_type,
         eval_size=n_pairs,
         eval_interval=1,

@@ -24,6 +24,7 @@ from relax.backends.megatron.reference_integrity import (
 from relax.engine.sft.runtime import is_dpo_mode
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.training import tensor_backper
+from tests.cpu.relax_parser import parser_for_flags
 
 
 def test_megatron_resume_detection_ignores_fresh_output_directory(tmp_path):
@@ -303,6 +304,7 @@ def test_save_model_persists_reference_identity(tmp_path, reference_actor_method
     actor_type, namespace = reference_actor_methods
     instance = actor_type()
     instance.args = Namespace(
+        **vars(parser_for_flags("--save-lora-only").parse_args([])),
         loss_type="dpo",
         dpo_reference_free=False,
         debug_rollout_only=False,

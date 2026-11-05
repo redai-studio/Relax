@@ -18,6 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.cpu.relax_parser import args_for_flags
+
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("safetensors")
@@ -63,7 +65,9 @@ def _install_fakes(monkeypatch, recorded):
 
 
 def _args(tmp_path):
-    return SimpleNamespace(
+    return args_for_flags(
+        "--ref-load",
+        "--save-hf-post-hook-path",
         save_hf=str(tmp_path / "hf_out/iter_{rollout_id}"),
         save_hf_dtype="bf16",
         hf_checkpoint="/tmp/fake-hf",

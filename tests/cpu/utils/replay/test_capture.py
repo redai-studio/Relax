@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import threading
+from argparse import ArgumentParser, Namespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -45,7 +47,12 @@ from relax.utils.replay.schema import (
     StageCapability,
     StageId,
 )
+from tests.cpu.utils.test_arguments_opd_teacher_colocate import _opd_args
+from tests.cpu.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
 from tests.utils.replay.helpers import make_capture_record, make_rollout_capture_record
+
+
+arguments_module = _arguments_module_fixture
 
 
 @pytest.fixture(autouse=True)
@@ -211,14 +218,50 @@ def test_capture_step_lifecycle(tmp_path):
     assert replay(tmp_path / "b-step").passed
 
 
-def test_group_indices_from_rollout_uses_tq_or_synthesizes():
-    class _Args:
-        n_samples_per_prompt = 2
+def _parse_capture_args(arguments_module: ModuleType, flags: list[str]) -> Namespace:
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    return parser.parse_args(flags)
 
-    from_tq = capture_hooks._group_indices_from_rollout({"group_index": [3, 3, 9, 9]}, _Args())
+
+@pytest.mark.parametrize(
+    ("flags", "clip", "clip_high", "entropy", "kl_type"),
+    [
+        ([], 0.2, 0.2, 0.0, "k1"),
+        (["--eps-clip", "0.15", "--kl-loss-type", "k2"], 0.15, 0.15, 0.0, "k2"),
+        (["--eps-clip-high", "0", "--entropy-coef", "0.01"], 0.2, 0.0, 0.01, "k1"),
+    ],
+)
+def test_capture_config_records_validated_cli_values(
+    arguments_module: ModuleType, flags: list[str], clip: float, clip_high: float, entropy: float, kl_type: str
+) -> None:
+    parsed = _parse_capture_args(arguments_module, flags)
+    args = _opd_args()
+    args.advantage_estimator = parsed.advantage_estimator
+    args.kl_loss_type = parsed.kl_loss_type
+    args.kl_coef = parsed.kl_coef
+    args.eps_clip = parsed.eps_clip
+    args.eps_clip_high = parsed.eps_clip_high
+    args.entropy_coef = parsed.entropy_coef
+    arguments_module.slime_validate_args(args)
+
+    assert capture_hooks.build_config_from_args(args) == RecomputeConfig(
+        advantage_estimator="grpo",
+        kl_loss_type=kl_type,
+        kl_coef=0.0,
+        eps_clip=clip,
+        eps_clip_high=clip_high,
+        entropy_coef=entropy,
+    )
+
+
+def test_group_indices_from_rollout_uses_tq_or_synthesizes(arguments_module: ModuleType) -> None:
+    args = _parse_capture_args(arguments_module, ["--n-samples-per-prompt", "2"])
+    from_tq = capture_hooks._group_indices_from_rollout({"group_index": [3, 3, 9, 9]}, args)
     assert list(from_tq) == [3, 3, 9, 9]
 
-    synthesized = capture_hooks._group_indices_from_rollout({"response_lengths": [1, 1, 1, 1]}, _Args())
+    synthesized = capture_hooks._group_indices_from_rollout({"response_lengths": [1, 1, 1, 1]}, args)
     assert synthesized == [0, 0, 1, 1]
 
 

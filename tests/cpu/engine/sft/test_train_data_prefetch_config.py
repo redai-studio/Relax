@@ -11,13 +11,25 @@ from types import SimpleNamespace
 import pytest
 
 from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
+from tests.cpu.relax_parser import parser_for_flags
 
 
 _SOURCE = Path(__file__).resolve().parents[4] / "relax/utils/arguments.py"
 
 
 def make_args(**overrides):
+    parser = parser_for_flags(
+        "--use-routing-replay",
+        "--use-rollout-routing-replay",
+        "--use-rollout-indexer-replay",
+        "--multimodal-keys",
+        "--sft-wholepack",
+        "--generation-task",
+        "--rollout-batch-size",
+        "--n-samples-per-prompt",
+    )
     values = dict(
+        **vars(parser.parse_args([])),
         loss_type="sft",
         train_backend="megatron",
         max_staleness=1,
@@ -29,7 +41,6 @@ def make_args(**overrides):
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
         virtual_pipeline_model_parallel_size=None,
-        multimodal_keys=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -55,6 +66,8 @@ def make_args(**overrides):
         ({"use_rollout_routing_replay": True}, False, True, False),
         ({"use_rollout_indexer_replay": True}, False, True, False),
         ({"train_backend": "fsdp"}, False, False, False),
+        ({"multimodal_keys": {}}, True, False, False),
+        ({"multimodal_keys": {"audio": "recordings"}}, True, False, False),
     ],
 )
 def test_pipeline_uses_capabilities_and_preserves_budget(overrides, prepack, prefetch, image):
@@ -89,17 +102,22 @@ def test_rl_preserves_explicit_per_rank_fetch(per_rank):
 
 
 def test_pipeline_accepts_partial_non_sft_arguments():
-    args = SimpleNamespace(train_backend="megatron", per_rank_fetch=True)
+    args = parser_for_flags("--loss-type").parse_args(
+        [], namespace=SimpleNamespace(train_backend="megatron", per_rank_fetch=True)
+    )
+    loss_type = args.loss_type
     configure_sft_data_pipeline(args)
     assert args.per_rank_fetch is True
     assert args.sft_train_data_prefetch is False
     assert args.sft_image_preprocess_on_rank is False
-    assert not hasattr(args, "loss_type")
+    assert args.loss_type == loss_type
     assert not hasattr(args, "sft_async_prepack")
 
 
 def test_pipeline_i2i_fsdp_does_not_require_megatron_arguments():
-    args = SimpleNamespace(loss_type="sft", generation_task="i2i", train_backend="fsdp", max_staleness=1)
+    args = parser_for_flags("--sft-wholepack").parse_args(
+        [], namespace=SimpleNamespace(loss_type="sft", generation_task="i2i", train_backend="fsdp", max_staleness=1)
+    )
     configure_sft_data_pipeline(args)
     assert not args.per_rank_fetch
     assert not args.sft_async_prepack
@@ -128,7 +146,8 @@ def test_pipeline_selection_runs_after_custom_and_backend_validation():
     )
     args = make_args(debug_rollout_only=False)
 
-    def custom(args):
+    def custom(args, *, _parsed_eval_args):
+        assert _parsed_eval_args is True
         args.sft_async_prepack = True
         args.sft_train_data_prefetch = True
 
@@ -202,6 +221,7 @@ def test_wholepack_recipe_keeps_raw_prefetch_and_valid_geometry(tp, capacity):
         sft_wholepack=True,
         tensor_model_parallel_size=tp,
         global_batch_size=1600,
+        rollout_batch_size=1600,
         n_samples_per_prompt=1,
         expert_model_parallel_size=8,
         expert_tensor_parallel_size=1,

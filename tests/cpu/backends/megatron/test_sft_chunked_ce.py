@@ -10,11 +10,13 @@ and sequence-parallel gather behavior.
 from __future__ import annotations
 
 from argparse import Namespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from relax.engine.sft.runtime import should_use_sft_chunked
+from tests.cpu.relax_parser import parser_for_flags
 
 
 try:
@@ -446,17 +448,26 @@ def test_loss_function_forwards_recompute_checkpoint_mode(monkeypatch, configure
     monkeypatch.setattr(_loss_mod, "get_cp_local_num_tokens", lambda *args, **kwargs: torch.tensor(1))
     monkeypatch.setattr(_loss_mod, "get_sum_of_sample_mean", lambda *args, **kwargs: object())
 
+    flags = ["--recompute-loss-function"]
+    if configured_value is not None:
+        flag = "--recompute-loss-function-use-reentrant"
+        flags.append(flag if configured_value else "--no-recompute-loss-function-use-reentrant")
+    parser = parser_for_flags(
+        "--task-type",
+        "--advantage-estimator",
+        "--mtp-only-training",
+        "--recompute-loss-function",
+        "--recompute-loss-function-use-reentrant",
+    )
     args = Namespace(
+        **vars(parser.parse_args(flags)),
         loss_type="sft",
-        recompute_loss_function=True,
         sft_chunked_logits=False,
         qkv_format="thd",
         calculate_per_token_loss=True,
         allgather_cp=False,
         global_batch_size=1,
     )
-    if configured_value is not None:
-        args.recompute_loss_function_use_reentrant = configured_value
     batch = {
         "total_lengths": [1],
         "response_lengths": [1],
@@ -492,6 +503,44 @@ def test_should_use_sft_chunked(loss_type, chunked_flag, expected):
         sft_chunked_logits=chunked_flag,
     )
     assert should_use_sft_chunked(args) is expected
+
+
+@pytest.mark.parametrize(
+    ("flags", "has_head", "chunked"),
+    [([], True, False), (["--sft-chunked-logits"], True, True), (["--sft-chunked-logits"], False, False)],
+)
+def test_loss_dispatch_uses_declared_chunked_flag(
+    monkeypatch: pytest.MonkeyPatch, flags: list[str], has_head: bool, chunked: bool
+) -> None:
+    args = parser_for_flags(
+        "--task-type", "--sft-chunked-logits", "--mtp-only-training", "--advantage-estimator"
+    ).parse_args(
+        flags,
+        namespace=Namespace(
+            loss_type="sft",
+            recompute_loss_function=False,
+            qkv_format="thd",
+            calculate_per_token_loss=True,
+            allgather_cp=False,
+            global_batch_size=1,
+        ),
+    )
+    head = Mock() if has_head else None
+    legacy_loss = Mock(return_value=(torch.tensor(1.0), {}))
+    chunked_loss = Mock(return_value=(torch.tensor(2.0), {}))
+    monkeypatch.setattr(_loss_mod, "get_cp_local_num_tokens", lambda *args, **kwargs: torch.tensor(1))
+    monkeypatch.setattr(_loss_mod, "get_sum_of_sample_mean", lambda *args, **kwargs: object())
+    monkeypatch.setattr(_loss_mod, "sft_loss_function", legacy_loss)
+    monkeypatch.setattr(_loss_mod, "sft_loss_function_chunked", chunked_loss)
+    batch = {"total_lengths": [1], "response_lengths": [1], "loss_masks": [torch.ones(1)]}
+
+    loss, _, _ = _loss_mod.loss_function(args, batch, num_microbatches=1, logits=torch.ones(1), lm_head_forward=head)
+
+    assert loss.item() == (2.0 if chunked else 1.0)
+    assert legacy_loss.call_count == int(not chunked)
+    assert chunked_loss.call_count == int(chunked)
+    if chunked:
+        assert chunked_loss.call_args.kwargs["lm_head_forward"] is head
 
 
 @pytest.mark.parametrize("use_reentrant", [False, True])

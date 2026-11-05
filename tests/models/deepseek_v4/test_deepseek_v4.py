@@ -328,9 +328,13 @@ for precision in (None, 'e4m3'):
     provider = SimpleNamespace(fp8=None, fp8_recipe='delayed', provide=lambda **kw: None)
     provider.finalize = lambda: setattr(provider, 'finalized', True)
     bridge = SimpleNamespace(to_megatron_provider=lambda **kw: provider)
-    args = SimpleNamespace(custom_model_provider_path=None, megatron_to_hf_mode='bridge',
+    args = SimpleNamespace(
+        custom_model_provider_path=None, megatron_to_hf_mode='bridge',
         hf_checkpoint='unused', fp16=False, bf16=True, fp8=precision,
-        fp8_recipe='blockwise' if precision else 'delayed')
+        fp8_recipe='blockwise' if precision else 'delayed', sft_wholepack=False,
+        vision_dp_when_tp=False, decoder_first_pipeline_num_layers=None,
+        decoder_last_pipeline_num_layers=None, save=None, lora_rank=0,
+    )
     with patch.object(AutoBridge, 'from_hf_pretrained', return_value=bridge), \
          patch.object(model_provider, '_dump_provider_config'):
         selected = model_provider.get_model_provider_func(args)

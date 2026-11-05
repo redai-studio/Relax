@@ -193,9 +193,7 @@ class AgenticResidentPipeline:
             metrics = dict(output.metrics or {})
             metrics.update(_aggregate_agentic_timing(samples))
             metrics.update(self.reward_domain.collect_metrics())
-            if getattr(self.args, "agentic_program_admission", False) or getattr(
-                self.args, "agentic_session_lifecycle", False
-            ):
+            if self.args.agentic_program_admission or self.args.agentic_session_lifecycle:
                 metrics.update(await self.runtime_domain.collect_agentic_kv_metrics())
             for key, value in _collect_agentic_metadata_metrics(samples).items():
                 metrics.setdefault(key, value)
@@ -855,7 +853,7 @@ def _build_eval_samples(
 
     resources = load_agentic_compiler_resources(args)
     try:
-        custom_prompt_path = getattr(args, "custom_prompt_path", None)
+        custom_prompt_path = args.custom_prompt_path
         custom_prompt_func = load_function(custom_prompt_path) if custom_prompt_path else None
         dataset = Dataset(
             path=dataset_cfg.path,

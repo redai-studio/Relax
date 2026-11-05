@@ -9,6 +9,7 @@ import pytest
 from relax.engine.sft.data_state import restore_data_state, save_data_state
 from relax.engine.sft.dataset.streaming import SFTStreamingDataset
 from relax.utils.data.streaming_dataset import IndexManager
+from tests.cpu.relax_parser import args_for_flags
 
 
 def dataset():
@@ -24,7 +25,32 @@ def dataset():
 
 
 def config(tmp_path):
-    return SimpleNamespace(load=str(tmp_path), save=str(tmp_path), seed=42, global_batch_size=4, prompt_data="dataset")
+    return args_for_flags(
+        "--eval-size",
+        "--input-key",
+        "--multimodal-keys",
+        "--conversation-key-map",
+        "--metadata-key",
+        "--tool-key",
+        "--system-prompt",
+        "--apply-chat-template",
+        "--apply-chat-template-kwargs",
+        "--max-tokens-per-gpu",
+        "--image-min-token-num",
+        "--image-max-token-num",
+        "--sft-oversize-strategy",
+        "--sft-invalid-multimodal-strategy",
+        "--sft-training-mode",
+        "--sft-cpt-template",
+        "--sft-loss-last-turn-only",
+        "--sft-ignore-empty-think",
+        load=str(tmp_path),
+        save=str(tmp_path),
+        seed=42,
+        global_batch_size=4,
+        prompt_data="dataset",
+        hf_checkpoint=None,
+    )
 
 
 def ids(batch):

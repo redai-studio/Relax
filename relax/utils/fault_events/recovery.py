@@ -30,10 +30,10 @@ def expected_evidence(mode: str, config: Namespace, roles: Collection[str]) -> i
     if mode == "local":
         return int(RecoveryEvidence.LOCAL)
     expected = RecoveryEvidence.DEPLOYED | RecoveryEvidence.TASK_SUBMITTED
-    if not (getattr(config, "debug_train_only", False) or getattr(config, "debug_rollout_only", False)):
+    if not (config.debug_train_only or config.debug_rollout_only):
         if "actor" in roles:
             expected |= RecoveryEvidence.STEP_RESTORED
-            if getattr(config, "fully_async", False) and not getattr(config, "hybrid", False):
+            if config.fully_async and not config.hybrid:
                 expected |= RecoveryEvidence.ACTOR_WEIGHT_SENT
                 if "actor_fwd" in roles:
                     expected |= RecoveryEvidence.ACTOR_FWD_WEIGHT_RECEIVED

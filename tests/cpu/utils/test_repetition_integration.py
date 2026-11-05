@@ -8,20 +8,22 @@ import random
 import string
 import subprocess
 import sys
+from argparse import ArgumentParser
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from relax.entrypoints.diagnose_repetition import diagnose_dump, main
 from relax.utils.metrics import rollout_metrics as rollout_metrics_module
 from relax.utils.metrics.metric_utils import compression_ratio, has_repetition
+from relax.utils.opd.opd_utils import add_opd_arguments
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
     save_eval_summary_jsonl,
     save_rollout_result_jsonl,
 )
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import parser_for_flags
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -48,7 +50,8 @@ def _samples() -> list[Sample]:
 def test_repetition_real_rollout_metrics_dump_writers_and_cli(tmp_path, evaluation) -> None:
     samples = _samples()
     before = [sample.to_dict() for sample in samples]
-    args = SimpleNamespace(
+    parser = add_opd_arguments(ArgumentParser())
+    parser.set_defaults(
         log_reward_category=None,
         reward_key=None,
         log_passrate=False,
@@ -56,6 +59,7 @@ def test_repetition_real_rollout_metrics_dump_writers_and_cli(tmp_path, evaluati
         save_debug_rollout_data=str(tmp_path / "{rollout_id}.pt"),
         rollout_result_dir=str(tmp_path / "results"),
     )
+    args = parser.parse_args([])
     metric = rollout_metrics_module.compute_metrics_from_samples(args, samples)
     assert metric["repetition_frac"] == 0.5
     assert all(compression_ratio(sample.response[-10_000:])[0] < 10 for sample in samples)
@@ -94,8 +98,18 @@ def test_repetition_real_rollout_metrics_dump_writers_and_cli(tmp_path, evaluati
     assert [sample.to_dict() for sample in samples] == before
 
 
+def test_default_result_directory_leaves_result_dump_disabled(monkeypatch) -> None:
+    args = parser_for_flags("--rollout-result-dir").parse_args([])
+    monkeypatch.setattr(
+        "relax.utils.training.train_dump_utils._write_summary_jsonl", lambda *_: pytest.fail("Unexpected result dump")
+    )
+    save_rollout_result_jsonl(args, 42, [])
+    save_eval_summary_jsonl(args, 42, {})
+
+
 def test_repetition_fixed_fixture_report_matches_stdout(tmp_path, capsys) -> None:
-    save_rollout_result_jsonl(SimpleNamespace(rollout_result_dir=str(tmp_path)), 42, _samples())
+    args = parser_for_flags("--rollout-result-dir").parse_args(["--rollout-result-dir", str(tmp_path)])
+    save_rollout_result_jsonl(args, 42, _samples())
     main([str(tmp_path / "train/42.jsonl")])
     report = json.loads(capsys.readouterr().out)
     assert report["summary"]["repetition_frac"] == 0.5

@@ -4,8 +4,11 @@ import argparse
 import importlib
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+
+from tests.cpu.relax_parser import parser_for_flags
 
 
 @pytest.fixture()
@@ -74,14 +77,58 @@ def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected
 
 
 def _opd_args() -> SimpleNamespace:
+    from relax.utils.opd.opd_utils import add_opd_arguments
+
+    parser = parser_for_flags(
+        "--task-type",
+        "--generation-task",
+        "--calculate-per-token-loss",
+        "--sft-async-prepack",
+        "--mtp-only-training",
+        "--mtp-detach-paths",
+        "--save-hf",
+        "--save-hf-dtype",
+        "--save-hf-fp8-quant-mode",
+        "--save-hf-fp8-block-size",
+        "--save-hf-post-hook-path",
+        "--save-lora-only",
+        "--sft-training-mode",
+        "--sft-cpt-template",
+        "--sft-chunked-logits",
+        "--lora-rank",
+        "--lora-adapter-mode",
+        "--lora-merge-mode",
+        "--lora-target-modules",
+        "--lora-scope",
+        "--genrm-instances",
+        "--genrm-model-path",
+        "--sft-max-in-flight-steps",
+        "--sft-tq-timeout-minutes",
+        "--use-rollout-indexer-replay",
+        "--ref-ckpt-step",
+        "--custom-dataset-class-path",
+        "--sft-predict-interval",
+        "--data-pad-size-multiplier",
+        "--rollout-max-context-len",
+        "--rm-type-fallback",
+        "--num-labels",
+        "--selective-offload",
+        "--train-env-vars",
+        "--sft-train-data-prefetch",
+        "--rollout-result-dir",
+        constants=("_MTP_DETACH_PATHS",),
+    )
+    opd_args = add_opd_arguments(argparse.ArgumentParser()).parse_args(
+        ["--use-opd", "--opd-type", "sglang", "--opd-teacher-timeout-s", "600", "--teacher-hf-checkpoint", "/teacher"]
+    )
     return SimpleNamespace(
+        **vars(parser.parse_args([])),
+        **vars(opd_args),
         loss_type="grpo",
         eval_config=None,
         eval_prompt_data=None,
         disable_thinking=False,
         max_staleness=0,
-        sft_max_in_flight_steps=None,
-        sft_tq_timeout_minutes=None,
         use_agentic_rollout=False,
         partial_rollout=False,
         use_rollout_routing_replay=False,
@@ -90,38 +137,16 @@ def _opd_args() -> SimpleNamespace:
         kl_loss_coef=0.0,
         use_kl_loss=False,
         ref_load="/student",
-        opd_teacher_timeout_s=600,
-        opd_log_prob_top_k=0,
-        opd_token_selection="student_sampled",
-        opd_kl_type="reverse_kl",
-        use_opd=True,
-        opd_kl_coef=1.0,
-        opd_loss_coef=0.0,
-        opd_teacher_prompt_key=None,
-        opd_teacher_image_key=None,
-        opd_teacher_video_key=None,
-        opd_teacher_audio_key=None,
         multimodal_keys=None,
-        opd_per_token_clip=None,
-        opd_is_clip=None,
-        opd_mask_on_success=False,
-        opd_only_reward=False,
-        opd_log_prob_dump_dir=None,
-        opd_type="sglang",
-        opd_teacher_load=None,
-        teacher_hf_checkpoint="/teacher",
         resource={"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]},
-        opd_teacher_url=None,
         rm_url="http://teacher/generate",
         megatron_to_hf_mode="bridge",
         load=None,
         hf_checkpoint="/student",
         eval_interval=None,
         eval_size=None,
-        custom_dataset_class_path=None,
         save_interval=None,
         save=None,
-        sft_predict_interval=None,
         advantage_estimator="grpo",
         normalize_advantages=False,
         rollout_batch_size=4,
@@ -149,7 +174,6 @@ def _opd_args() -> SimpleNamespace:
         debug_rollout_only=False,
         debug_train_only=False,
         balance_data=False,
-        genrm_model_path=None,
         rollout_num_gpus=4,
         actor_num_gpus_per_node=8,
         actor_num_nodes=1,
@@ -167,7 +191,6 @@ def _opd_args() -> SimpleNamespace:
         use_routing_replay=False,
         custom_config_path=None,
         eval_max_context_len=None,
-        rollout_max_context_len=None,
         rollout_max_prompt_len=None,
         qkv_format="sbhd",
         train_backend="megatron",
@@ -192,6 +215,72 @@ def test_opd_sampled_token_loss_is_accepted(arguments_module):
     # student_sampled + loss mode is supported via the 1D reverse-KL path
     # (see compute_policy_opd_loss); validation must not reject it.
     arguments_module.slime_validate_args(args)
+
+
+@pytest.mark.parametrize("is_offline", [False, True], ids=["disabled", "offline"])
+def test_opd_validator_does_not_require_fields_on_inactive_paths(is_offline: bool) -> None:
+    from relax.utils.opd.opd_utils import validate_opd_args
+
+    args = parser_for_flags("--use-opd", source_file="relax/utils/opd/opd_utils.py").parse_args(
+        ["--use-opd"] if is_offline else []
+    )
+    before = vars(args).copy()
+
+    validate_opd_args(args, is_offline=is_offline)
+
+    assert vars(args) == before
+
+
+@pytest.mark.parametrize(("kl_coef", "loss_coef"), [(None, 1.0), (1.0, None)], ids=["loss", "advantage"])
+def test_opd_validator_preserves_null_coefficients_and_zero_eos(
+    kl_coef: float | None, loss_coef: float | None
+) -> None:
+    from relax.utils.opd.opd_utils import validate_opd_args
+
+    args = _opd_args()
+    args.opd_kl_coef = kl_coef
+    args.opd_loss_coef = loss_coef
+    args.opd_student_eos_token_id = 0
+    args.opd_teacher_eos_token_id = 0
+    args.opd_teacher_response_prefix_token_ids = []
+
+    validate_opd_args(args, is_offline=False)
+
+    assert (args.opd_kl_coef, args.opd_loss_coef) == (kl_coef, loss_coef)
+    assert (args.opd_student_eos_token_id, args.opd_teacher_eos_token_id) == (0, 0)
+    assert args.opd_teacher_response_prefix_token_ids == []
+    assert args.opd_teacher_key == "data_source"
+
+
+@pytest.mark.parametrize(
+    ("field", "flag"), [("opd_per_token_clip", "--opd-per-token-clip"), ("opd_is_clip", "--opd-is-clip")]
+)
+def test_opd_validator_rejects_zero_clip_as_an_explicit_value(field: str, flag: str) -> None:
+    from relax.utils.opd.opd_utils import validate_opd_args
+
+    args = _opd_args()
+    setattr(args, field, 0.0)
+
+    with pytest.raises(ValueError, match=f"{flag} must be > 0"):
+        validate_opd_args(args, is_offline=False)
+
+
+def test_opd_routes_keep_empty_key_and_report_the_effective_default() -> None:
+    from relax.utils.opd.opd_utils import validate_opd_args
+
+    args = _opd_args()
+    args.opd_teacher_key = ""
+    args.opd_teacher_routes = '{"source":"/teacher"}'
+    args.teacher_hf_checkpoint = None
+    log = Mock()
+
+    validate_opd_args(args, is_offline=False, log=log)
+
+    assert args.opd_teacher_key == ""
+    assert args.opd_teacher_routes_map is None
+    log.info.assert_called_once_with(
+        "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s", 1, "data_source", ["source"]
+    )
 
 
 def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments_module):

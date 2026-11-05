@@ -2,6 +2,8 @@ import re
 
 import torch
 
+from relax.utils.megatron_argument_compat import resolve_kv_channels
+
 
 def _convert_mtp_layer(args, name, param, layer_idx):
     """Convert MTP layer parameters from Megatron to HuggingFace format.
@@ -64,10 +66,7 @@ def convert_qwen3_next_to_hf(args, name, param):
     if name == "module.module.decoder.final_layernorm.weight":
         return [("model.norm.weight", param)]
 
-    try:
-        head_dim = args.kv_channels if args.kv_channels is not None else args.hidden_size // args.num_attention_heads
-    except AttributeError:
-        head_dim = args.hidden_size // args.num_attention_heads
+    head_dim = resolve_kv_channels(args)
     value_num_per_group = args.num_attention_heads // args.num_query_groups
 
     decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"

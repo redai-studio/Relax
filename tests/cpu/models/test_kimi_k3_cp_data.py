@@ -53,7 +53,7 @@ def test_kimi_k3_processor_batch_model_keeps_only_k3_grid_on_cpu(monkeypatch, vi
     )
     grid = inputs["image_grid_thw"]
     mask = inputs.pop(KIMI_K3_SFT_LOSS_MASK)
-    args = SimpleNamespace(dynamic_context_parallel=False)
+    args = SimpleNamespace(dynamic_context_parallel=False, qsa_indexer_loss_coeff=0.0, loss_type="policy_loss")
     spec = importlib.util.spec_from_file_location(
         "_k3_grid_configuration", Path(__file__).parents[3] / "relax/models/kimi_k3/configuration.py"
     )
@@ -180,7 +180,13 @@ def test_kimi_k3_cp_layout_consumes_real_prepacked_batch_and_loss_coordinates(mo
         ("get_tensor_model_parallel_world_size", 2),
     ):
         monkeypatch.setattr(mpu, name, lambda value=value: value)
-    monkeypatch.setattr(data, "get_args", lambda: SimpleNamespace(dynamic_context_parallel=False))
+    args = SimpleNamespace(
+        dynamic_context_parallel=False,
+        qsa_indexer_loss_coeff=0.0,
+        enable_mtp_training=False,
+        loss_type="policy_loss",
+    )
+    monkeypatch.setattr(data, "get_args", lambda: args)
     lengths = [9, 5]
     tokens = [torch.arange(1, length + 1) for length in lengths]
     batch = data.get_batch(

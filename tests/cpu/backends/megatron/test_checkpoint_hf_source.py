@@ -10,6 +10,7 @@ import torch
 from relax.backends.megatron import compat
 from relax.utils.model_source import ModelSource
 from tests.cpu.backends.megatron.test_checkpoint_preflight import _load_checkpoint_module
+from tests.cpu.relax_parser import args_for_flags
 
 
 checkpoint = _load_checkpoint_module()
@@ -42,7 +43,7 @@ def test_load_checkpoint_preserves_valid_megatron_resume(monkeypatch, tmp_path):
     resume_path.mkdir()
     (resume_path / "latest_checkpointed_iteration.txt").write_text("1")
     (resume_path / "iter_0000001").mkdir()
-    args = SimpleNamespace(load=str(resume_path))
+    args = args_for_flags("--loss-type", load=str(resume_path))
     expected = (1, 2)
 
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
@@ -126,7 +127,9 @@ def test_full_checkpoint_preserves_hdo_step_only_when_applicable(monkeypatch, tm
     resume_path.mkdir()
     (resume_path / "latest_checkpointed_iteration.txt").write_text("7")
     (resume_path / "iter_0000007").mkdir()
-    args = SimpleNamespace(load=str(resume_path), optimizer_cpu_offload=True, no_load_optim=case == "no_optim")
+    args = args_for_flags(
+        "--loss-type", load=str(resume_path), optimizer_cpu_offload=True, no_load_optim=case == "no_optim"
+    )
     monkeypatch.setattr(DistributedOptimizer, "load_state_dict", original_load)
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)

@@ -114,7 +114,8 @@ def run_sft_eval(actor, rollout_id: int) -> None:
     from relax.backends.megatron.model import forward_only
     from relax.utils.data.image_refs import sft_multimodal_data_fields
 
-    is_classification = getattr(actor.args, "task_type", "causal_lm") == "seq_cls"
+    args = actor.args
+    is_classification = args.task_type == "seq_cls"
     if is_classification:
         from relax.engine.sft.eval.classification import (
             compute_classification_eval_step,
@@ -123,7 +124,6 @@ def run_sft_eval(actor, rollout_id: int) -> None:
     else:
         from relax.engine.sft.eval.ppl import compute_ppl_metrics, compute_sft_eval_step
 
-    args = actor.args
     task_name = "sft_eval"
     # Eval consume chunk size mirrors the train micro-batching so that
     # `get_data_iterator` can build pipeline microbatches the same way.

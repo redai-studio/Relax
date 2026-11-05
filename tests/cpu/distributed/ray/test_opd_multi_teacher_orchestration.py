@@ -16,6 +16,8 @@ from types import ModuleType
 
 import pytest
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 def _install_fake_teacher_manager(monkeypatch, captured):
     teacher_manager_module = ModuleType("relax.distributed.ray.teacher_manager")
@@ -58,6 +60,8 @@ def _install_fake_teacher_manager(monkeypatch, captured):
 
 def _base_args(**overrides):
     defaults = dict(
+        **vars(parser_for_flags("--autoscaler-config").parse_args([])),
+        **vars(parser_for_flags("--teacher-hf-checkpoint", source_file="relax/utils/opd/opd_utils.py").parse_args([])),
         use_opd=True,
         opd_type="sglang",
         colocate=True,

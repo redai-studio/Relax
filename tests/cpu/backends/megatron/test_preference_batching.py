@@ -8,6 +8,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 try:
     from relax.backends.megatron import data as data_module
@@ -84,6 +86,7 @@ def test_dp2_pair_rows_remain_atomic_with_global_pair_denominator(monkeypatch, p
 
     monkeypatch.setattr(data_module.dist, "all_gather_object", all_gather_object)
     args = Namespace(
+        **vars(parser_for_flags("--task-type", "--advantage-estimator", "--mtp-only-training").parse_args([])),
         global_batch_size=4,
         max_tokens_per_gpu=capacity,
         loss_type="dpo",

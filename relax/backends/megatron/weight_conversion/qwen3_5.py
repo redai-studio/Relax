@@ -4,6 +4,7 @@ import re
 
 import torch
 
+from relax.utils.megatron_argument_compat import resolve_kv_channels
 from relax.utils.misc import get_hf_config
 
 
@@ -242,10 +243,7 @@ def convert_qwen3_5_to_hf(args, name, param):
     if name.startswith("module.module.vision_model."):
         return convert_qwen3_5_vision_to_hf(args, name, param)
 
-    try:
-        head_dim = args.kv_channels if args.kv_channels is not None else args.hidden_size // args.num_attention_heads
-    except AttributeError:
-        head_dim = args.hidden_size // args.num_attention_heads
+    head_dim = resolve_kv_channels(args)
     value_num_per_group = args.num_attention_heads // args.num_query_groups
 
     decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"

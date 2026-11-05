@@ -4,13 +4,14 @@ import asyncio
 import copy
 import pickle
 import sys
+from argparse import ArgumentParser
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pybase64
 import pytest
 
-from relax.engine.rollout.on_policy_distillation import OpdManager
+from relax.engine.rollout.on_policy_distillation import OpdManager, _create_teacher_client_session
 from relax.utils.opd.opd_main_worker import LogprobResponse
 from relax.utils.opd.opd_multimodal import (
     encode_image_inputs,
@@ -19,7 +20,9 @@ from relax.utils.opd.opd_multimodal import (
     validate_prompt_token_ids,
 )
 from relax.utils.opd.opd_opsd_worker import OpsdWorker
+from relax.utils.opd.opd_utils import add_opd_arguments
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import args_for_flags
 
 
 @pytest.fixture
@@ -55,18 +58,27 @@ def _sample() -> Sample:
     )
 
 
-def _manager(**overrides) -> OpdManager:
-    args = dict(
-        opd_token_selection="student_sampled",
-        opd_log_prob_top_k=2,
-        opd_kl_coef=1.0,
-        opd_loss_coef=0.0,
-        opd_teacher_url="http://teacher/generate",
-        sglang_router_ip="student",
-        sglang_router_port=80,
+def _manager(*cli: str, **overrides) -> OpdManager:
+    args = add_opd_arguments(ArgumentParser()).parse_args(
+        ["--opd-log-prob-top-k", "2", "--opd-teacher-url", "http://teacher/generate", *cli]
     )
-    args.update(overrides)
-    return OpdManager(SimpleNamespace(**args))
+    args.sglang_router_ip = "student"
+    args.sglang_router_port = 80
+    vars(args).update(overrides)
+    return OpdManager(args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "limit"), [({}, 256), ({"opd_teacher_connector_limit": 0}, 0)], ids=["default", "unlimited"]
+)
+async def test_teacher_client_uses_initialized_connector_limit(overrides: dict[str, int], limit: int) -> None:
+    args = add_opd_arguments(ArgumentParser()).parse_args(["--opd-teacher-timeout-s", "7"])
+    vars(args).update(overrides)
+
+    async with _create_teacher_client_session(args) as session:
+        assert session.connector.limit == limit
+        assert session.timeout.total == 7.0
 
 
 def _response(expected_ids: list[int], **meta) -> dict:
@@ -105,6 +117,37 @@ class _Session:
 
     def raise_for_status(self):
         raise RuntimeError("HTTP failure")
+
+
+@pytest.mark.parametrize("gate", [False, True])
+def test_entropy_gate_controls_opd_transfer_fields(gate: bool) -> None:
+    cli = ["--opd-token-selection", "teacher_topk", "--opd-loss-coef", "1"]
+    if gate:
+        cli.append("--opd-fkl-entropy-gate")
+
+    fields = _manager(*cli).schema_opd_transfer_data()
+
+    assert "opd_topk_teacher_log_probs" in fields
+    assert ("opd_topk_student_log_probs" in fields) is not gate
+    assert ("teacher_log_probs" in fields) is gate
+    assert ("rollout_log_probs" in fields) is gate
+
+
+@pytest.mark.asyncio
+async def test_text_teacher_preserves_zero_eos_and_empty_prefix_options() -> None:
+    manager = _manager(
+        "--opd-student-eos-token-id", "0", "--opd-teacher-eos-token-id", "9", "--opd-teacher-response-prefix-token-ids"
+    )
+    sample = Sample(prompt="text prompt", tokens=[1, 2, 0, 4], rollout_tokens=[1, 2, 0, 4], response_length=2)
+    session = _Session(_response([1, 2, 9, 4]))
+
+    assert await manager._teacher_prefill(sample, session)
+
+    payload = session.requests[0][1]
+    assert payload["input_ids"] == [1, 2, 9, 4]
+    assert payload["logprob_start_len"] == 1
+    assert sample.tokens == [1, 2, 0, 4]
+    assert sample.teacher_log_probs == pytest.approx([-0.2, -0.3])
 
 
 @pytest.mark.asyncio
@@ -348,7 +391,12 @@ def test_image_contract_rejects_expanded_payload_missing_prompt_ids_and_unsuppor
 @pytest.fixture
 def native_generate(monkeypatch):
     sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
-    args = SimpleNamespace(
+    args = args_for_flags(
+        "--advantage-estimator",
+        "--lora-rank",
+        "--lora-adapter-mode",
+        "--slime-router-sticky",
+        "--use-rollout-indexer-replay",
         ci_test=False,
         sglang_router_ip="unused",
         sglang_router_port=1,

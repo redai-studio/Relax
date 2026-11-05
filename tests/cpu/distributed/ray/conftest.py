@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+
 """Shared fixtures and helpers for autoscale tests."""
 
 import os
@@ -9,6 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from tests.cpu.relax_parser import args_for_flags, parser_for_flags
 
 
 # Make this directory importable so test files can do ``from conftest import X``
@@ -136,6 +139,18 @@ def make_mock_engine(
 def make_mock_args(**overrides):
     """Create a ``SimpleNamespace`` that mimics the training args structure."""
     defaults = dict(
+        **vars(
+            args_for_flags(
+                "--rollout-engine-init-timeout",
+                "--scale-weight-sync-precheck",
+                "--use-slime-router",
+            )
+        ),
+        **vars(
+            parser_for_flags("--rollout-engine-class-path", source_file="relax/backends/fsdp/arguments.py").parse_args(
+                []
+            )
+        ),
         rollout_num_gpus=8,
         rollout_num_gpus_per_engine=2,
         num_gpus_per_node=8,

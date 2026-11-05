@@ -242,7 +242,9 @@ class TestSaveHfModelFp8Branch:
             save_hf_fp8_quant_mode="tensor",
             save_hf_fp8_block_size=None,
             hf_checkpoint="/tmp/fake-hf",
+            ref_load=None,
             mtp_num_layers=None,
+            save_hf_post_hook_path=None,
         )
 
         model_mod.save_hf_model(args, rollout_id=7, model=[])

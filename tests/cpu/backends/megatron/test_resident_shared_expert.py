@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from relax.engine.sft.runtime import resident_sft_param_overlap_enabled
+from tests.cpu.relax_parser import args_for_flags
 
 
 _PATH = Path(__file__).resolve().parents[4] / "relax/backends/megatron/resident_shared_expert.py"
@@ -90,6 +91,7 @@ def test_frozen_gate_needs_no_callback():
     "field,value",
     [
         ("cuda_graph_impl", "local"),
+        ("enable_cuda_graph", True),
         ("moe_token_dispatcher_type", "alltoall"),
         ("moe_flex_dispatcher_backend", "other"),
         ("moe_shared_expert_overlap", False),
@@ -161,8 +163,23 @@ def test_unvalidated_configuration_rejected_before_optional_import(monkeypatch, 
 
 def test_runtime_requires_successful_verification(monkeypatch):
     monkeypatch.setenv("RELAX_SFT_RESIDENT_PARAM_OVERLAP", "1")
-    args = Namespace(
+    args = args_for_flags(
+        "--fully-async",
+        "--hybrid",
+        "--keep-old-actor",
+        "--enable-mtp-training",
+        "--mtp-only-training",
+        "--eval-prompt-data",
+        "--eval-size",
+        "--sft-predict-interval",
+        "--save",
+        "--save-hf",
+        "--rotate-ckpt",
+        "--debug-train-only",
+        "--debug-rollout-only",
+        "--custom-megatron-before-train-step-hook-path",
         loss_type="sft",
+        use_critic=False,
         use_distributed_optimizer=True,
         overlap_grad_reduce=True,
         overlap_param_gather=True,

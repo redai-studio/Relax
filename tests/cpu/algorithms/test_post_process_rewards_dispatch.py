@@ -6,10 +6,12 @@ dispatcher."""
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
+
+from tests.cpu.relax_parser import args_for_flags
 
 
 pytest.importorskip("torch")
@@ -45,7 +47,7 @@ def _args(estimator="grpo", **overrides):
         reward_key=None,
     )
     base.update(overrides)
-    return SimpleNamespace(**base)
+    return args_for_flags("--agentic-custom-advantage-path", **base)
 
 
 class _Sample:

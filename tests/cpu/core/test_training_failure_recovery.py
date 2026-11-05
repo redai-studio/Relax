@@ -293,7 +293,7 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
         "os": SimpleNamespace(path=os.path, environ={}),
         "cur_file_dir": str(ROOT),
         "yaml": SimpleNamespace(safe_load=lambda file: {}),
-        "args": SimpleNamespace(),
+        "args": SimpleNamespace(fault_events_enabled=False),
         "post_process_env": lambda args, env: env,
         "ray": SimpleNamespace(is_initialized=lambda: True),
         "init_tracking": Mock(),
@@ -456,7 +456,15 @@ def test_real_controller_initialization_wires_health_callback_and_preserves_rest
     monkeypatch.setattr(module, "create_dcs_deployment", Mock(return_value=(None, None)))
     monkeypatch.setattr(module.Controller, "_initialize_data_system", Mock())
     monkeypatch.setattr(module.Controller, "register_all_serve", Mock())
-    config = SimpleNamespace(use_health_check=True, use_agentic_rollout=False)
+    from tests.cpu.relax_parser import parser_for_flags
+
+    config = parser_for_flags(
+        "--use-health-check",
+        "--use-agentic-rollout",
+        "--max-global-restart",
+        "--use-metrics-service",
+        "--autoscaler-config",
+    ).parse_args(["--use-health-check", "--no-use-metrics-service"])
     controller = module.Controller(config)
     health.start.assert_called_once_with(
         on_unhealthy=controller._on_service_unhealthy, on_fatal=controller._on_service_fatal

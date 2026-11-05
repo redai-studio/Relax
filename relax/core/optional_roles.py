@@ -38,7 +38,7 @@ def register_sft_rollout(config: Namespace, algo: dict) -> list:
     """
     if not is_sft_mode(config):
         return []
-    if getattr(config, "sft_predict_interval", None) is None:
+    if config.sft_predict_interval is None:
         return []
 
     from relax.components.rollout import Rollout

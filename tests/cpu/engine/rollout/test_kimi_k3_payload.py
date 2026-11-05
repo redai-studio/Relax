@@ -7,6 +7,7 @@ import pytest
 
 from relax.utils.data import kimi_k3
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import args_for_flags
 
 
 class Tokenizer:
@@ -73,12 +74,16 @@ def test_generate_keeps_training_ids_separate_and_resumes_rollout_ids(monkeypatc
     monkeypatch.setattr(rollout, "_run_image_processor", processor)
     monkeypatch.setattr(rollout, "_encode_multimodal_inputs", encode)
     monkeypatch.setattr(rollout, "post", post)
-    args = SimpleNamespace(
+    args = args_for_flags(
+        "--advantage-estimator",
         ci_test=False,
         fully_async=False,
         sglang_router_ip="localhost",
         sglang_router_port=1,
         use_rollout_routing_replay=False,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        slime_router_sticky=False,
         sglang_router_policy="cache_aware",
         use_slime_router=False,
         sglang_speculative_algorithm=None,

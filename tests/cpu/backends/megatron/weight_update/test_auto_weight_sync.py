@@ -6,6 +6,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 pytest.importorskip("megatron.core", reason="Weight sync tests require Megatron Core", exc_type=ImportError)
 pytest.importorskip("megatron.bridge", reason="Weight sync tests require Megatron Bridge", exc_type=ImportError)
@@ -99,7 +101,9 @@ def test_bridge_sync_collective_closure_includes_tp_and_etp(monkeypatch):
 @pytest.mark.parametrize("quantization", [None, {"quant_method": "fp8"}, {"format": "mxfp4-pack-quantized"}])
 def test_communicator_plan_is_independent_of_quantization_and_releases_on_remote_reconnect(monkeypatch, quantization):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater.args = SimpleNamespace(offload_train=True, colocate=True, num_experts=8, megatron_to_hf_mode="bridge")
+    updater.args = parser_for_flags("--rollout-external").parse_args(
+        [], namespace=SimpleNamespace(offload_train=True, colocate=True, num_experts=8, megatron_to_hf_mode="bridge")
+    )
     updater.use_distribute = updater.lora_enabled = updater._sync_groups_configured = False
     updater.quantization_config = quantization
     updater.process_groups_for_update = None
@@ -217,7 +221,9 @@ def test_negotiation_preserves_full_engine_placement_for_expert_parallelism(monk
 @pytest.mark.parametrize("rank", [0, 3])
 def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, rank):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=2)
+    updater.args = parser_for_flags("--rollout-num-gpus-per-engine", "--offload-train").parse_args(
+        ["--rollout-num-gpus-per-engine", "2", "--no-offload-train"]
+    )
     updater._route_experts = False
     updater._ipc_placement = updater._ipc_gather_group = updater._ipc_gather_src = updater._ipc_engine = None
     updater._configure_direct_experts = Mock()
@@ -381,7 +387,8 @@ def test_auto_async_plan_reads_gdn_config_only_for_sharded_parameters(monkeypatc
         )
     )
     monkeypatch.setattr(bridge, "get_hf_config", config)
-    iterator = HfWeightIteratorBridge(SimpleNamespace(hf_checkpoint="test"), [], "any-model", None)
+    args = parser_for_flags("--lora-rank").parse_args([], namespace=SimpleNamespace(hf_checkpoint="test"))
+    iterator = HfWeightIteratorBridge(args, [], "any-model", None)
     assert iterator._async_weight_gather
     if kind == "sharded":
         config.assert_called_once_with("test")
@@ -406,5 +413,8 @@ def test_expert_eligibility_uses_full_buffer_instead_of_per_owner_quota(monkeypa
     monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_world_size", lambda: 16)
     monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_group", lambda: "ep")
     monkeypatch.setattr(bridge.dist, "get_process_group_ranks", lambda group: list(range(16)))
-    iterator = HfWeightIteratorBridge(SimpleNamespace(update_weight_buffer_size=512 * 1024**2), [], "any-model", None)
+    args = parser_for_flags("--lora-rank").parse_args(
+        [], namespace=SimpleNamespace(update_weight_buffer_size=512 * 1024**2)
+    )
+    iterator = HfWeightIteratorBridge(args, [], "any-model", None)
     assert (iterator._bf16_expert_buckets is not None) is enabled

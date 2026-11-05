@@ -1,12 +1,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import ast
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from relax.engine.sft.image_preprocessing_config import configure_image_preprocessing
+from tests.cpu.relax_parser import parser_for_flags
 
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -26,18 +28,23 @@ _ROOT = Path(__file__).resolve().parents[4]
     ],
 )
 def test_image_preprocessing_is_derived_without_changing_other_options(overrides, is_sft, expected):
-    values = dict(
-        sft_train_data_prefetch=True,
-        per_rank_fetch=True,
-        multimodal_keys={"image": "images"},
-        sft_async_prepack=False,
-        max_staleness=1,
-    )
-    values.update(overrides)
-    args = SimpleNamespace(**values)
+    parser = parser_for_flags("--multimodal-keys", "--max-staleness")
+    args = parser.parse_args(["--multimodal-keys", '{"image": "images"}', "--max-staleness", "1"])
+    # configure_sft_data_pipeline derives these fields before image preprocessing.
+    args.sft_train_data_prefetch = True
+    args.per_rank_fetch = True
+    args.sft_async_prepack = False
+    vars(args).update(overrides)
+    values = vars(args).copy()
     configure_image_preprocessing(args, is_sft)
     assert args.sft_image_preprocess_on_rank is expected
     assert vars(args) == {**values, "sft_image_preprocess_on_rank": expected}
+
+
+def test_non_sft_image_preprocessing_does_not_require_sft_fields() -> None:
+    args = Namespace()
+    configure_image_preprocessing(args, is_sft=False)
+    assert args.sft_image_preprocess_on_rank is False
 
 
 @pytest.mark.parametrize(

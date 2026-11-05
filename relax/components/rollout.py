@@ -432,7 +432,7 @@ class Rollout(Base):
                     final_partition_id = f"train_{self.config.num_rollout - 1}"
                     if (
                         local_step == self.config.num_rollout
-                        and getattr(self.config, "fully_async", False)
+                        and self.config.fully_async
                         and not await self._async_check_partition_production_complete(final_partition_id)
                     ):
                         self._logger.warning(
@@ -452,7 +452,7 @@ class Rollout(Base):
                     error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
                     self._logger.exception(error_msg)
                     self.healthy.report_error.remote("rollout", error_msg)
-                    if not getattr(self.config, "use_health_check", False):
+                    if not self.config.use_health_check:
                         raise
                     break
                 self._logger.info(f"Finish rollout {local_step}/{self.config.num_rollout}")
@@ -521,7 +521,7 @@ class Rollout(Base):
             error_msg = f"Rollout failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
             self.healthy.report_error.remote("rollout", error_msg)
-            if not getattr(self.config, "use_health_check", False):
+            if not self.config.use_health_check:
                 raise
 
     async def _maybe_save_data(self, local_step) -> None:
@@ -634,7 +634,7 @@ class Rollout(Base):
         # No-preset-global-batch path: a tensor-wide .all() flips True as soon as
         # activated rows are produced (even mid-fill across steps), admitting an
         # under-filled partition. Gate on the explicit producer completion signal.
-        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+        if self.config.fully_async and self.config.use_dynamic_batch_size:
             return await self.data_system_client.async_check_production_completed(
                 f"train_{step - 1}"
             ) or await self.data_system_client.async_check_production_completed(f"train_{step}")
@@ -643,7 +643,7 @@ class Rollout(Base):
         ) or await self.data_system_client.async_check_production_status(["tokens"], f"train_{step}")
 
     async def _async_check_partition_production_complete(self, partition_id: str) -> bool:
-        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+        if self.config.fully_async and self.config.use_dynamic_batch_size:
             return await self.data_system_client.async_check_production_completed(partition_id)
         return await self.data_system_client.async_check_production_status(["tokens"], partition_id)
 
@@ -679,7 +679,7 @@ class Rollout(Base):
     @app.post("/scale_out", response_model=ScaleOutResponse)
     async def scale_out(self, request: ScaleOutAPIRequest):
         # Scale-out is incompatible with SlimeRouter (which uses fixed engine pool)
-        if getattr(self.config, "use_slime_router", False):
+        if self.config.use_slime_router:
             raise HTTPException(
                 status_code=400,
                 detail="Scale-out is not available when --use-slime-router is enabled. "
@@ -828,7 +828,7 @@ class Rollout(Base):
     @app.post("/scale_in", response_model=ScaleInResponse)
     async def scale_in(self, request: ScaleInAPIRequest):
         # Scale-in is incompatible with SlimeRouter (which uses fixed engine pool)
-        if getattr(self.config, "use_slime_router", False):
+        if self.config.use_slime_router:
             raise HTTPException(
                 status_code=400,
                 detail="Scale-in is not available when --use-slime-router is enabled. "

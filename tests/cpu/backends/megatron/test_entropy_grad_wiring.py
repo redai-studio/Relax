@@ -2,10 +2,13 @@
 
 """Regression tests for fused log-probability and entropy wiring."""
 
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 
 import pytest
 import torch
+
+from relax.utils.opd.opd_utils import add_opd_arguments
+from tests.cpu.relax_parser import args_for_flags, parser_for_flags
 
 
 try:
@@ -29,10 +32,11 @@ def test_get_log_probs_and_entropy_wires_entropy_grad(
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(loss_module.mpu, "get_tensor_model_parallel_group", lambda: None)
 
-    args = Namespace(
-        allgather_cp=False,
+    args = args_for_flags(
+        "--advantage-estimator",
+        "--allgather-cp",
+        "--log-probs-chunk-size",
         entropy_coef=entropy_coef,
-        log_probs_chunk_size=-1,
         loss_type="grpo",
         opd_log_prob_top_k=0,
         qkv_format="thd",
@@ -76,6 +80,7 @@ def test_sft_chunked_lm_head_matches_log_softmax_gradients(monkeypatch: pytest.M
     loss_weights = torch.tensor([0.25, -0.5, 1.5, 0.75], dtype=torch.float32)
     temperature = 0.7
     args = Namespace(
+        **vars(parser_for_flags("--advantage-estimator", "--recompute-loss-function").parse_args([])),
         allgather_cp=False,
         entropy_coef=0.0,
         loss_type="sft",
@@ -164,3 +169,46 @@ def test_allgather_cp_empty_response_keeps_graph_and_topk_shape(monkeypatch, tra
         result.sum().backward()
         assert origin.grad is not None
         assert origin.grad.shape == origin.shape
+
+
+@pytest.mark.parametrize(
+    ("with_topk", "override", "expected_width"),
+    [
+        pytest.param(False, None, None, id="disabled-without-config"),
+        pytest.param(True, None, 2, id="configured-width"),
+        pytest.param(True, 0, 1, id="explicit-zero-keeps-existing-clamp"),
+    ],
+)
+def test_get_log_probs_reads_opd_width_only_when_needed(
+    monkeypatch: pytest.MonkeyPatch, with_topk: bool, override: int | None, expected_width: int | None
+) -> None:
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(loss_module.mpu, "get_tensor_model_parallel_group", lambda: None)
+    parser = add_opd_arguments(ArgumentParser())
+    args = parser.parse_args(
+        ["--opd-log-prob-top-k", "2"],
+        namespace=args_for_flags(
+            "--advantage-estimator",
+            "--allgather-cp",
+            "--log-probs-chunk-size",
+            loss_type="grpo",
+            qkv_format="thd",
+            rollout_temperature=1.0,
+        ),
+    )
+    if not with_topk or override is not None:
+        del args.opd_log_prob_top_k
+
+    _, result = loss_module.get_log_probs_and_entropy(
+        torch.arange(12, dtype=torch.float32).reshape(1, 3, 4),
+        args=args,
+        unconcat_tokens=[torch.tensor([2, 3, 1])],
+        total_lengths=[3],
+        response_lengths=[2],
+        with_topk=with_topk,
+        topk_k=override,
+    )
+    if expected_width is None:
+        assert "topk_token_ids" not in result
+    else:
+        assert result["topk_token_ids"][0].shape == (2, expected_width)

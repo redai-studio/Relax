@@ -2,21 +2,31 @@
 
 """Check process-group selection with real CPU groups and Dynamo."""
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 @pytest.mark.parametrize("mode", ["resident", "offload", "unspecified"])
 def test_reloadable_process_group_resident_compile_and_offload_compatibility(mode, tmp_path):
+    flags = {
+        "resident": ["--no-offload-train"],
+        "offload": ["--offload-train", "--enable-cuda-memory-check"],
+    }
+    parser = parser_for_flags("--offload-train", "--enable-cuda-memory-check")
+    args = vars(parser.parse_args(flags[mode])) if mode in flags else None
     # Isolate the global torch.distributed patches, and extract the real code
     # without importing optional CUDA memory-management dependencies.
     source = Path(__file__).resolve().parents[4] / "relax/utils/reloadable_process_group.py"
     program = r"""
 import ast
 import contextlib
+import json
 import os
 import sys
 from collections.abc import Sequence
@@ -27,7 +37,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
-source, rendezvous, mode = sys.argv[1:]
+source, rendezvous, mode, args_json = sys.argv[1:]
 tree = ast.parse(Path(source).read_text())
 names = {"monkey_patch_torch_dist", "ReloadableProcessGroup"}
 nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
@@ -41,8 +51,10 @@ try:
     # Exercise the multi-rank NCCL selection branch using a real CPU group;
     # group creation itself is substituted because this is a CPU regression.
     dist.new_group = lambda *args, **kwargs: native
-    args = SimpleNamespace(offload_train=mode == "offload") if mode != "unspecified" else None
+    values = json.loads(args_json)
+    args = SimpleNamespace(**values) if values is not None else None
     namespace["monkey_patch_torch_dist"](args)
+    assert namespace["_wrap_low_level_call_enabled"] is (mode == "offload")
     group = dist.new_group(ranks=[0, 1], backend="nccl")
     if mode == "resident":
         assert group is native
@@ -68,7 +80,7 @@ finally:
     dist.destroy_process_group()
 """
     result = subprocess.run(
-        [sys.executable, "-c", program, str(source), str(tmp_path / "rendezvous"), mode],
+        [sys.executable, "-c", program, str(source), str(tmp_path / "rendezvous"), mode, json.dumps(args)],
         capture_output=True,
         text=True,
         timeout=60,

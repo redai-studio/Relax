@@ -8,6 +8,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.cpu.relax_parser import args_for_flags, parser_for_flags
+
 
 pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
 
@@ -287,6 +289,7 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
         hf_checkpoint="/test/model",
         seed=42,
         offload_rollout=True,
+        **vars(args_for_flags("--lora-rank", "--enable-mtp-training", "--use-rollout-indexer-replay")),
         sglang_pp_size=1,
         sglang_dp_size=1,
         sglang_ep_size=1,
@@ -316,6 +319,7 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
         hf_checkpoint="/test/model",
         seed=42,
         offload_rollout=True,
+        **vars(args_for_flags("--lora-rank", "--enable-mtp-training", "--use-rollout-indexer-replay")),
         sglang_pp_size=1,
         sglang_dp_size=1,
         sglang_ep_size=1,
@@ -354,6 +358,7 @@ def test_policy_pd_routing_replay_accepts_configured_topology(monkeypatch, sglan
         hf_checkpoint="/test/model",
         seed=42,
         offload_rollout=True,
+        **vars(args_for_flags("--lora-rank", "--enable-mtp-training", "--use-rollout-indexer-replay")),
         sglang_pp_size=1,
         sglang_dp_size=1,
         sglang_ep_size=1,
@@ -455,6 +460,7 @@ def _compute_engine_server_args(
         genrm_engine_config=overrides,
         seed=42,
         offload_rollout=True,
+        **vars(args_for_flags("--lora-rank", "--enable-mtp-training", "--use-rollout-indexer-replay")),
         sglang_pp_size=1,
         sglang_dp_size=1,
         sglang_ep_size=1,
@@ -514,3 +520,41 @@ def _check_native_transport_validation(monkeypatch, actual, expected):
     else:
         validate_transport(cfg)
         assert cfg.mm_feature_transport == (expected or native_default)
+
+
+@pytest.mark.parametrize(
+    ("enabled", "cli", "expected_width"),
+    [
+        pytest.param(False, [], None, id="disabled-without-width"),
+        pytest.param(True, [], 0, id="declared-default"),
+        pytest.param(True, ["--opd-log-prob-top-k", "3"], 3, id="explicit-width"),
+    ],
+)
+def test_normal_startup_reads_opd_width_only_for_per_position_logging(
+    monkeypatch, sglang_engine_module, enabled, cli, expected_width
+):
+    module = sglang_engine_module
+    parser = parser_for_flags("--opd-log-prob-top-k", source_file="relax/utils/opd/opd_utils.py")
+    engine = object.__new__(module.SGLangEngine)
+    engine.args = parser.parse_args(
+        cli, namespace=args_for_flags("--optimize-routing-replay", "--warm-hf-checkpoint-page-cache")
+    )
+    engine.server_host, engine.server_port = "localhost", 8000
+    engine.worker_type = "regular"
+    engine._skip_router_registration = True
+    if not enabled:
+        del engine.args.opd_log_prob_top_k
+    monkeypatch.setattr(module, "Envs", SimpleNamespace(RELAX_OPD_PER_POS_TOKEN_IDS=enabled))
+    monkeypatch.setenv("RELAX_FORCE_LOGPROBS_BASE64", "0")
+    monkeypatch.delenv("RELAX_FORCE_LOGPROBS_BASE64")
+    monkeypatch.setattr(module, "ServerArgs", SimpleNamespace)
+    logger = Mock()
+    monkeypatch.setattr(module, "logger", logger)
+    launch = Mock()
+    monkeypatch.setattr(module, "launch_server_process", launch)
+
+    engine._init_normal({"host": "localhost", "dp_size": 1}, apply_policy_load_plan=False)
+
+    launch.assert_called_once()
+    widths = [call.args[1] for call in logger.info.call_args_list if "opd_log_prob_top_k=%s" in call.args[0]]
+    assert widths == ([] if expected_width is None else [expected_width])

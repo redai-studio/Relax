@@ -18,6 +18,7 @@ from relax.engine.rollout.base_types import (
     call_rollout_fn,
 )
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import args_for_flags
 
 
 def _mark_even_index(args, groups):
@@ -84,10 +85,9 @@ class TestCallRolloutFnFilter:
 
         assert not any(g[0].remove_sample for g in out.samples)
 
-    def test_filter_skipped_when_attr_missing(self):
-        """``getattr(..., None)`` must swallow the missing attribute."""
+    def test_filter_skipped_with_cli_defaults(self):
         groups = _build_groups(2)
-        args = Namespace()  # no rollout_sample_filter_path at all
+        args = args_for_flags("--rollout-sample-filter-path")
 
         def rollout_fn(a, evaluation):
             return RolloutFnTrainOutput(samples=groups)

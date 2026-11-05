@@ -20,6 +20,7 @@ from relax.backends.megatron.model_provider import (
     validate_mtp_only_trainable_params,
 )
 from relax.engine.sft.runtime import should_bypass_main_output_layer, should_skip_sft_weight_management
+from tests.cpu.relax_parser import parser_for_flags
 
 
 class _MtpOnlyModel(torch.nn.Module):
@@ -72,7 +73,8 @@ def test_configure_mtp_detach_paths_updates_all_module_configs(detach_paths, exp
 def test_configure_mtp_detach_paths_defaults_to_all_detached():
     model = _ConfiguredModule(Namespace())
 
-    configure_mtp_detach_paths(Namespace(), model)
+    parser = parser_for_flags("--mtp-detach-paths", constants=("_MTP_DETACH_PATHS",))
+    configure_mtp_detach_paths(parser.parse_args([]), model)
 
     assert model.config.mtp_detach_embedding is True
     assert model.config.mtp_detach_backbone is True
@@ -179,6 +181,7 @@ def test_mtp_only_zero_anchor_triggers_attached_mtp_loss_backward():
 
 def _actor_args(**overrides) -> Namespace:
     defaults = {
+        **vars(parser_for_flags("--use-rollout-indexer-replay").parse_args([])),
         "mtp_only_training": True,
         "loss_type": "sft",
         "sft_predict_interval": None,

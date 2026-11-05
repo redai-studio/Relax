@@ -4,6 +4,8 @@ import re
 
 import torch
 
+from relax.utils.megatron_argument_compat import resolve_kv_channels
+
 
 def convert_qwen3omni_to_hf(args, name, param):
     if ".audio_model." in name:
@@ -22,10 +24,7 @@ def convert_qwen3omni_to_hf(args, name, param):
     if name == "module.module.thinker.language_model.decoder.final_layernorm.weight":
         return [("thinker.model.norm.weight", param)]
 
-    try:
-        head_dim = args.kv_channels if args.kv_channels is not None else args.hidden_size // args.num_attention_heads
-    except AttributeError:
-        head_dim = args.hidden_size // args.num_attention_heads
+    head_dim = resolve_kv_channels(args)
     value_num_per_group = args.num_attention_heads // args.num_query_groups
 
     decoder_layers_pattern = r"module\.module\.thinker\.language_model\.decoder\.layers\.(\d+)\.(.+)"

@@ -7,12 +7,12 @@ import pytest
 from relax.engine.sft.runtime import sft_tq_num_shards
 from relax.utils.env import Envs, known_env_names
 from relax.utils.utils import post_process_env
+from tests.cpu.relax_parser import parser_for_flags
 
 
 def _make_args() -> SimpleNamespace:
     return SimpleNamespace(
-        fully_async=False,
-        use_dynamic_batch_size=False,
+        **vars(parser_for_flags("--fully-async", "--use-dynamic-batch-size").parse_args([])),
         rollout_batch_size=1,
         n_samples_per_prompt=1,
         partial_rollout=False,

@@ -4,7 +4,6 @@
 Megatron."""
 
 import ast
-from argparse import Namespace
 from contextlib import nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -20,6 +19,7 @@ from relax.engine.sft.runtime import (
     should_skip_sft_weight_management,
 )
 from relax.utils.env import Envs
+from tests.cpu.relax_parser import args_for_flags
 
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -39,7 +39,22 @@ def _functions(path, names, namespace, *, class_method=False):
 
 
 def _args():
-    return Namespace(
+    return args_for_flags(
+        "--fully-async",
+        "--hybrid",
+        "--keep-old-actor",
+        "--mtp-only-training",
+        "--eval-prompt-data",
+        "--eval-size",
+        "--sft-predict-interval",
+        "--save",
+        "--save-hf",
+        "--rotate-ckpt",
+        "--debug-train-only",
+        "--debug-rollout-only",
+        "--custom-megatron-before-train-step-hook-path",
+        "--offload-train",
+        "--use-rollout-indexer-replay",
         loss_type="sft",
         use_distributed_optimizer=True,
         overlap_grad_reduce=True,
@@ -49,6 +64,7 @@ def _args():
         reset_optimizer_states=False,
         manual_gc=False,
         enable_mtp_training=False,
+        use_critic=False,
         global_batch_size=1536,
         num_rollout=3,
         _relax_resident_sft_actor_verified=True,

@@ -8,9 +8,12 @@ from argparse import Namespace
 import pytest
 import torch
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 def _mk_actor_args(loss_type: str):
     return Namespace(
+        **vars(parser_for_flags("--generation-task").parse_args([])),
         loss_type=loss_type,
         compute_advantages_and_returns=(loss_type not in {"sft", "dpo", "rm"}),
         debug_train_only=False,
@@ -21,9 +24,13 @@ def _mk_actor_args(loss_type: str):
         global_batch_size=2,
         use_rollout_routing_replay=False,
         multimodal_keys=None,
+        sft_image_preprocess_on_rank=False,
         use_opd=False,
         opd_type=None,
         opd_log_prob_top_k=0,
+        **vars(
+            parser_for_flags("--advantage-estimator", "--use-rollout-indexer-replay", "--task-type").parse_args([])
+        ),
     )
 
 
@@ -39,6 +46,7 @@ def test_sft_data_fields_excludes_rl_only_keys():
     assert "loss_masks" in fields
     assert "total_lengths" in fields
     assert "response_lengths" in fields
+    assert "classification_labels" not in fields
 
     for forbidden in ("rollout_log_probs", "rewards", "raw_reward", "teacher_log_probs"):
         assert forbidden not in fields, f"SFT data_fields leaked RL key: {forbidden}"
@@ -76,7 +84,9 @@ def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypat
         "chosen_total_lengths": [3],
         "rejected_total_lengths": [2],
     }
-    args = Namespace(qkv_format="thd", is_vl_model=False, uses_unsplit_forward=False, use_opd=False)
+    args = Namespace(
+        loss_type="policy_loss", qkv_format="thd", is_vl_model=False, uses_unsplit_forward=False, use_opd=False
+    )
     monkeypatch.setattr(stream_dataloader.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
 
     stream_dataloader.post_process_rollout_data(args, rollout_data)
@@ -93,7 +103,8 @@ def test_sequence_classification_sft_requests_classification_labels():
     from relax.utils.training.data_fields import build_data_fields
 
     args = _mk_actor_args(loss_type="sft")
-    args.task_type = "seq_cls"
+    parsed = parser_for_flags("--task-type").parse_args(["--task-type", "seq_cls"])
+    args.task_type = parsed.task_type
 
     fields = build_data_fields(args)
 

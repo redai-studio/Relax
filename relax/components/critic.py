@@ -50,7 +50,7 @@ class Critic(Base):
         )
 
         self.critic_model.init_and_wait(config, role=self.role, with_ref=False)
-        self.step = getattr(self.config, "start_rollout_id", None) or 0
+        self.step = self.config.start_rollout_id or 0
         # Wired by controller in colocate PPO to gate wake_up on SGLang offload.
         self._rollout_barrier: Optional[RolloutOffloadBarrier] = None
 
@@ -82,7 +82,7 @@ class Critic(Base):
                 self.healthy.report_error.remote("critic", error_msg)
             except Exception:
                 pass
-            if not getattr(self.config, "use_health_check", False):
+            if not self.config.use_health_check:
                 raise
 
     def _wait_for_rollout_data(self) -> None:
@@ -99,7 +99,7 @@ class Critic(Base):
             if partition_list is not None and partition_id in partition_list:
                 break
             time.sleep(1)
-        if getattr(self.config, "offload_rollout", False) and self._rollout_barrier is not None:
+        if self.config.offload_rollout and self._rollout_barrier is not None:
             self._rollout_barrier.wait_offloaded_sync()
 
     def train(self) -> None:
@@ -121,7 +121,7 @@ class Critic(Base):
 
             # In critic-only warmup, actor+advantages never consume the partition,
             # so critic must clear it itself; steady-state clearing stays with actor.
-            if has_critic and self.step < getattr(self.config, "num_critic_only_steps", 0):
+            if has_critic and self.step < self.config.num_critic_only_steps:
                 run(self.data_system_client.async_clear_partition(partition_id=f"train_{self.step}"))
 
             try:

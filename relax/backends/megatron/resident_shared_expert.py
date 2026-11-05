@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from relax.utils.env import Envs
+from relax.utils.megatron_argument_compat import legacy_cuda_graphs_enabled
 
 
 def _verify_runtime_config(config: Any) -> None:
@@ -20,7 +21,7 @@ def _verify_runtime_config(config: Any) -> None:
         or getattr(config, "moe_flex_dispatcher_backend", None) != "deepep"
         or not getattr(config, "moe_shared_expert_overlap", False)
         or getattr(config, "cuda_graph_impl", "none") != "none"
-        or getattr(config, "enable_cuda_graph", False)
+        or legacy_cuda_graphs_enabled(config)
     ):
         raise ValueError("Actual shared-expert configuration must use flex/DeepEP overlap without CUDA Graphs")
 
@@ -71,7 +72,7 @@ def verify_resident_shared_readiness(args: Namespace, model_chunks: Sequence[Any
         or getattr(args, "moe_flex_dispatcher_backend", None) != "deepep"
         or os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") != "32"
         or getattr(args, "cuda_graph_impl", "none") != "none"
-        or getattr(args, "enable_cuda_graph", False)
+        or legacy_cuda_graphs_enabled(args)
     ):
         raise ValueError("Shared resident overlap is gated to flex/DeepEP, CUDA connections32 and no CUDA Graphs")
     from megatron.core.distributed import DistributedDataParallel

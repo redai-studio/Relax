@@ -17,6 +17,7 @@ import pytest
 import relax.utils
 from relax.utils.fault_events import runtime as runtime_module
 from relax.utils.fault_events.models import EventDraft
+from tests.cpu.relax_parser import parser_for_flags
 from tests.cpu.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
 
 
@@ -198,7 +199,10 @@ def test_train_default_off_does_not_start_runtime(train_loader, monkeypatch):
     factory = Mock(side_effect=AssertionError("default-off observer must not start"))
     monkeypatch.setattr(runtime_module, "start_fault_events", factory)
     with pytest.raises(SystemExit) as exc:
-        module.main(SimpleNamespace())
+        args = parser_for_flags(
+            "--fault-events-enabled", "--use-health-check", "--fault-events-port", converters=("_fault_events_port",)
+        ).parse_args([])
+        module.main(args)
     assert exc.value.code == 0
     factory.assert_not_called()
     assert module._fault_runtime is None

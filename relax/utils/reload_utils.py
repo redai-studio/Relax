@@ -284,7 +284,7 @@ def get_function_path(args: Any, func_def: ReloadableFunction) -> Optional[str]:
     Returns:
         Function path or None
     """
-    return getattr(args, func_def.config_attr, None)
+    return getattr(args, func_def.config_attr)
 
 
 def get_all_reloadable_paths(args: Any) -> Dict[str, Optional[str]]:

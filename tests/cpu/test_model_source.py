@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from relax.utils import model_source as m
+from tests.cpu.relax_parser import parser_for_flags
 
 
 @pytest.fixture(autouse=True)
@@ -166,7 +167,10 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch,
 
     logical_uri = "somesource://models/policy"
     source = m.ModelSource("s3://bucket/models/policy/", provider_name="test")
-    parsed = SimpleNamespace(
+    parser = parser_for_flags(
+        "--lora-target-modules", "--colocate-expert-weight-routing", "--fully-async", "--loss-type"
+    )
+    namespace = SimpleNamespace(
         hf_checkpoint=logical_uri,
         ref_load=logical_uri,
         train_backend="megatron",
@@ -175,11 +179,14 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch,
         actor_num_nodes=1,
         actor_num_gpus_per_node=1,
     )
+    parsed = parser.parse_args([], namespace=namespace)
     pre = SimpleNamespace(
         debug_train_only=True,
         debug_rollout_only=True,
         load_debug_rollout_data=None,
         skip_hf_validate=False,
+        loss_type=None,
+        generation_task=None,
     )
     provider_argv = None
     validated = False
@@ -189,8 +196,9 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch,
         provider_argv = argv
         return source
 
-    def validate(parsed_args):
+    def validate(parsed_args, *, _parsed_eval_args):
         nonlocal validated
+        assert _parsed_eval_args is True
         assert parsed_args.model_source == source
         assert parsed_args._model_source_original_hf_checkpoint == logical_uri
         assert parsed_args.hf_checkpoint == source.uri

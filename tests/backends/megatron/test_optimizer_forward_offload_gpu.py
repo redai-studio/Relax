@@ -13,6 +13,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Optimizer DMA and TE Adam require CUDA")
 @pytest.mark.parametrize("chunk_size_bytes", [0, 1024 * 1024], ids=["full_window", "multiple_chunks"])
@@ -56,6 +58,14 @@ def test_forward_offload_preserves_adam_updates_and_releases_master_memory(
         optimizer_owned_master_dtypes={parameter: torch.float32 for parameter in parameters},
     )
     args = Namespace(
+        **vars(
+            parser_for_flags(
+                "--task-type",
+                "--use-rollout-indexer-replay",
+                "--use-dynamic-batch-size",
+                "--fully-async",
+            ).parse_args([])
+        ),
         empty_unused_memory_level=0,
         custom_megatron_before_train_step_hook_path=None,
         ci_test=False,

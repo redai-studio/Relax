@@ -19,6 +19,7 @@ from transformers import AutoConfig
 
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_argument_compat import dynamic_context_parallel_enabled, supports_dynamic_context_parallel
 from relax.utils.model_source import ModelSource
 
 
@@ -102,11 +103,9 @@ def _resolve_optimizer_precision_args(args):
 
 
 def _validate_dynamic_context_parallel(args):
-    import inspect
-
     from megatron.core import mpu
 
-    assert "dynamic_context_parallel" in inspect.signature(mpu.initialize_model_parallel).parameters, (
+    assert supports_dynamic_context_parallel(mpu.initialize_model_parallel), (
         "dynamic_context_parallel is not supported in your megatron version, "
         "please update your megatron version to the corresponding version"
     )
@@ -150,10 +149,8 @@ def _validate_linear_cp_mode(args: Namespace, config: Optional[object] = None) -
     if getattr(model_config, "experimental_attention_variant", None) not in {"gated_delta_net", "gdn"}:
         return
 
-    cp_may_exceed_one = (
-        getattr(args, "dynamic_context_parallel", False) or getattr(model_config, "context_parallel_size", 1) > 1
-    )
-    if cp_may_exceed_one and getattr(args, "allgather_cp", False):
+    cp_may_exceed_one = dynamic_context_parallel_enabled(args) or getattr(model_config, "context_parallel_size", 1) > 1
+    if cp_may_exceed_one and args.allgather_cp:
         raise ValueError(
             "GDN CP requires zig-zag THD packing in every linear_cp_mode; --allgather-cp uses "
             "contiguous per-rank packing and is incompatible with GDN CP>1. --allgather-cp is a "
@@ -172,7 +169,7 @@ def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron
     validations."""
 
-    if getattr(args, "dynamic_context_parallel", False):
+    if dynamic_context_parallel_enabled(args):
         _validate_dynamic_context_parallel(args)
 
     if not device_utils.is_available():
@@ -210,7 +207,7 @@ def validate_args(args):
 
     # Megatron-Bridge requires --calculate-per-token-loss when context parallelism is enabled.
     # See https://github.com/NVIDIA-NeMo/Megatron-Bridge
-    if args.context_parallel_size > 1 or getattr(args, "dynamic_context_parallel", False):
+    if args.context_parallel_size > 1 or dynamic_context_parallel_enabled(args):
         assert args.calculate_per_token_loss, (
             "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )
@@ -347,7 +344,7 @@ def _derive_cluster_args_from_resource(args):
     if args.resource is None:
         return
 
-    num_gpus_per_node = getattr(args, "num_gpus_per_node", 8)
+    num_gpus_per_node = args.num_gpus_per_node
 
     # --- actor ---
     if "actor" in args.resource:
@@ -388,7 +385,7 @@ def _derive_cluster_args_from_resource(args):
     # --- genrm ---
     if "genrm" in args.resource:
         _, genrm_total_gpus = args.resource["genrm"]
-        if getattr(args, "genrm_num_gpus", 1) == 1 and genrm_total_gpus != 1:
+        if args.genrm_num_gpus == 1 and genrm_total_gpus != 1:
             args.genrm_num_gpus = genrm_total_gpus
             logger.info(f"Derived genrm_num_gpus={args.genrm_num_gpus} from --resource")
 

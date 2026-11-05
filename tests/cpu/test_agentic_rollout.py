@@ -54,6 +54,7 @@ from relax.agentic.session.service import (
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import parser_for_flags
 
 
 # ``relax.agentic.rollout`` only needs this logging helper at import time. Keep
@@ -74,6 +75,7 @@ finally:
 
 def _runtime_args(**overrides):
     base = {
+        **vars(parser_for_flags("--advantage-estimator").parse_args([])),
         "agent_command": "python -c 'pass'",
         "agent_cwd": None,
         "agent_env": [],
@@ -687,6 +689,7 @@ async def test_transfer_preserves_original_sample_refs_and_training_fields() -> 
 def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
     adapter = object.__new__(SGLangBackendAdapter)
     adapter._args = SimpleNamespace(
+        **vars(parser_for_flags("--advantage-estimator").parse_args([])),
         sglang_router_ip="10.0.0.1",
         sglang_router_port=8000,
         use_rollout_routing_replay=False,
@@ -991,7 +994,7 @@ async def test_runtime_router_publication_waits_for_every_owner(fails) -> None:
         for i in range(3)
     ]
     runtime = RuntimeDomain(
-        Namespace(rollout_engine_init_timeout=1.0),
+        parser_for_flags("--rollout-engine-init-timeout").parse_args(["--rollout-engine-init-timeout", "1.0"]),
         "train",
         [SimpleNamespace(handle=handle) for handle in handles[:2]],
         concurrency=1,
@@ -1200,12 +1203,11 @@ def _router_503() -> httpx.HTTPStatusError:
 
 def _router_recovery_shard():
     shard = _shard_new()
-    shard.args = SimpleNamespace(
-        fully_async=True,
-        partial_rollout=False,
-        partial_rollout_max_aborted_count=None,
-        use_slime_router=False,
-        router_cb_timeout_duration_secs=0,
+    parser = parser_for_flags(
+        "--fully-async", "--partial-rollout", "--partial-rollout-max-aborted-count", "--use-rollout-routing-replay"
+    )
+    shard.args = parser.parse_args(
+        ["--fully-async"], namespace=Namespace(use_slime_router=False, router_cb_timeout_duration_secs=0)
     )
     shard._train_generation_open = True
     shard._state_revision = 0

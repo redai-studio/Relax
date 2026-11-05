@@ -261,7 +261,7 @@ class AutoscalerConfig:
         Returns:
             AutoscalerConfig instance if config path is provided, None otherwise.
         """
-        config_path = getattr(args, "autoscaler_config", None)
+        config_path = args.autoscaler_config
         if config_path is None:
             return None
 

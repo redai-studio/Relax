@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 # `relax.core.registry` eagerly imports `relax.components.advantages`, which
 # imports `megatron.core` at module level. Skip the whole module when megatron
@@ -18,6 +20,7 @@ def _cfg(**kwargs):
     defaults = dict(
         debug_rollout_only=False,
         debug_train_only=False,
+        **vars(parser_for_flags("--true-on-policy-mode", "--generation-task").parse_args([])),
         fully_async=False,
         hybrid=False,
         loss_type="policy_loss",

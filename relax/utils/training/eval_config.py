@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from argparse import Namespace
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -204,7 +205,10 @@ def build_named_prompt_data_configs(
 
 
 def _apply_dataset_field_overrides(
-    args: Any, dataset_cfg: dict[str, Any], defaults: dict[str, Any], spec_names: dict[str, Any]
+    dataset_cfg: dict[str, Any],
+    defaults: dict[str, Any],
+    spec_names: dict[str, Any],
+    resolve_args: Callable[[str, tuple[str, ...]], Any],
 ) -> None:
     for field_name, spec in spec_names.items():
         dataset_value = _pick_from_mapping(dataset_cfg, spec["dataset_keys"])
@@ -213,7 +217,23 @@ def _apply_dataset_field_overrides(
         if resolved_value is not _MISSING:
             dataset_cfg[field_name] = resolved_value
             continue
-        dataset_cfg[field_name] = pick_from_args(args, spec["arg_attrs"])
+        dataset_cfg[field_name] = resolve_args(field_name, spec["arg_attrs"])
+
+
+def _build_eval_dataset_configs(
+    raw_config: Iterable[dict[str, Any]],
+    defaults: dict[str, Any],
+    resolve_args: Callable[[str, tuple[str, ...]], Any],
+) -> list[EvalDatasetConfig]:
+    defaults = defaults or {}
+    datasets: list[EvalDatasetConfig] = []
+    for cfg in raw_config:
+        cfg_dict = dict(cfg or {})
+        combined_specs = {**DATASET_RUNTIME_SPECS, **DATASET_SAMPLE_SPECS}
+        _apply_dataset_field_overrides(cfg_dict, defaults, combined_specs, resolve_args)
+        dataset = EvalDatasetConfig(**cfg_dict)
+        datasets.append(dataset)
+    return datasets
 
 
 def build_eval_dataset_configs(
@@ -221,12 +241,28 @@ def build_eval_dataset_configs(
     raw_config: Iterable[dict[str, Any]],
     defaults: dict[str, Any],
 ) -> list[EvalDatasetConfig]:
-    defaults = defaults or {}
-    datasets: list[EvalDatasetConfig] = []
-    for cfg in raw_config:
-        cfg_dict = dict(cfg or {})
-        combined_specs = {**DATASET_RUNTIME_SPECS, **DATASET_SAMPLE_SPECS}
-        _apply_dataset_field_overrides(args, cfg_dict, defaults, combined_specs)
-        dataset = EvalDatasetConfig(**cfg_dict)
-        datasets.append(dataset)
-    return datasets
+    return _build_eval_dataset_configs(raw_config, defaults, lambda _field, attrs: pick_from_args(args, attrs))
+
+
+def _build_eval_dataset_configs_from_parsed_args(
+    args: Namespace,
+    raw_config: Iterable[dict[str, Any]],
+    defaults: dict[str, Any],
+) -> list[EvalDatasetConfig]:
+    # Dataset and defaults mappings can supply a value without reading either argument.
+    readers = {
+        "n_samples_per_eval_prompt": (
+            lambda: args.n_samples_per_prompt if (value := args.n_samples_per_eval_prompt) is None else value
+        ),
+        "temperature": lambda: args.rollout_temperature if (value := args.eval_temperature) is None else value,
+        "top_p": lambda: args.rollout_top_p if (value := args.eval_top_p) is None else value,
+        "top_k": lambda: args.rollout_top_k if (value := args.eval_top_k) is None else value,
+        "max_response_len": (
+            lambda: args.rollout_max_response_len if (value := args.eval_max_response_len) is None else value
+        ),
+        "input_key": lambda: args.input_key if (value := args.eval_input_key) is None else value,
+        "label_key": lambda: args.label_key if (value := args.eval_label_key) is None else value,
+        "tool_key": lambda: args.tool_key if (value := args.eval_tool_key) is None else value,
+        "metadata_key": lambda: args.metadata_key,
+    }
+    return _build_eval_dataset_configs(raw_config, defaults, lambda field, _attrs: readers[field]())

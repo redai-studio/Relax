@@ -28,6 +28,8 @@ from relax.utils.types import Sample
 def _args(**overrides):
     values = dict(
         advantage_estimator="score_centering",
+        custom_convert_samples_to_train_data_path=None,
+        use_rollout_indexer_replay=False,
         rollout_temperature=0.7,
         rollout_top_logprobs_num=2,
         sglang_speculative_algorithm=None,
@@ -328,6 +330,8 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         sglang_router_ip="localhost",
         sglang_router_port=1,
         use_rollout_routing_replay=False,
+        lora_rank=0,
+        slime_router_sticky=False,
         use_slime_router=False,
         sglang_router_policy="round_robin",
         partial_rollout=True,

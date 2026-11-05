@@ -16,14 +16,14 @@ def init_tracking(args, primary: bool = True, **kwargs):
         init_wandb_secondary(args, **kwargs)
 
     # Initialize metrics service adapter if using new service-based logging
-    if getattr(args, "use_metrics_service", False):
+    if args.use_metrics_service:
         init_metrics_service_adapter(args)
 
 
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
     # Check if using new metrics service
-    if getattr(args, "use_metrics_service", False):
+    if args.use_metrics_service:
         adapter = get_metrics_service_adapter()
         if adapter:
             return adapter.log(metrics, step_key)
@@ -41,7 +41,7 @@ def log(args, metrics, step_key: str):
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
         _ClearMLAdapter(args).log(data=metrics_except_step, step=metrics[step_key])
 
-    if getattr(args, "notify_urls", None):
+    if args.notify_urls:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
         _AppriseAdapter(args).log(data=metrics_except_step, step=metrics[step_key])
 
@@ -54,7 +54,7 @@ def flush_metrics(args, step: int, *, wait: bool = True):
     Wait for delivery by default. Intermediate training steps may pass
     wait=False to overlap reporting; the final step must wait before shutdown.
     """
-    if getattr(args, "use_metrics_service", False):
+    if args.use_metrics_service:
         adapter = get_metrics_service_adapter()
         if adapter:
             return adapter.flush(step, wait=wait)
@@ -72,7 +72,7 @@ def log_direct(args, step: int, metrics: dict):
         step: Step number
         metrics: Dictionary of metrics to log
     """
-    if getattr(args, "use_metrics_service", False):
+    if args.use_metrics_service:
         adapter = get_metrics_service_adapter()
         if adapter:
             return adapter.direct_log(step, metrics)

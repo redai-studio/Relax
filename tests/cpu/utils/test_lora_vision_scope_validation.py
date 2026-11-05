@@ -9,12 +9,13 @@ configurations that are actually safe (merge mode, explicit language scope), or
 it would block legitimate runs.
 """
 
-import argparse
 import importlib
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from tests.cpu.relax_parser import parser_for_flags
 
 
 @pytest.fixture()
@@ -63,15 +64,11 @@ def _stub_hf_config(monkeypatch, config):
 
 
 def _args(**overrides):
-    base = dict(
-        lora_rank=32,
-        lora_scope="all",
-        lora_adapter_mode=True,
-        lora_merge_mode=False,
-        hf_checkpoint="/models/base",
-    )
-    base.update(overrides)
-    return argparse.Namespace(**base)
+    parser = parser_for_flags("--lora-rank", "--lora-scope", "--lora-adapter-mode", "--lora-merge-mode")
+    args = parser.parse_args(["--lora-rank", "32", "--lora-adapter-mode"])
+    args.hf_checkpoint = "/models/base"
+    vars(args).update(overrides)
+    return args
 
 
 _VL_CONFIG = SimpleNamespace(vision_config=SimpleNamespace(depth=27))

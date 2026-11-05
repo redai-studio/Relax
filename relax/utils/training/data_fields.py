@@ -30,18 +30,31 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "sample_index_mask_sums",
         "group_index",
     ]
-    if getattr(args, "use_rollout_routing_replay", False):
+    if args.use_rollout_routing_replay:
         fields.append("rollout_routed_experts")
-    if getattr(args, "multimodal_keys", None) is not None:
+    if args.multimodal_keys is not None:
         fields.append("multimodal_train_inputs")
     return fields
 
 
-def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
+def _consume_opd_fields(fields: list[str], args: Namespace, *, require_declared_opd: bool) -> None:
+    if require_declared_opd:
+        from relax.utils.opd.opd_utils import consume_parsed_opd_train_data
+
+        consume_parsed_opd_train_data(fields, args)
+    elif getattr(args, "use_opd", False):
+        from relax.utils.opd.opd_utils import consume_opd_train_data
+
+        consume_opd_train_data(fields, args)
+
+
+def build_data_fields(args: Namespace, *, consumer: str = "actor", require_declared_opd: bool = False) -> list[str]:
     """Decide which fields to pull from TransferQueue for training.
 
     ``consumer`` is only meaningful for PPO (``critic``, ``advantages``,
     ``actor``); other algorithms ignore it and receive the base rollout fields.
+    The initialized training actor sets ``require_declared_opd`` to read the
+    declared OPD fields. Standalone callers may supply sparse arguments.
     """
     if is_preference_mode(args):
         return list(PREFERENCE_DATA_FIELDS)
@@ -49,7 +62,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
         if Envs.RELAX_SFT_PRE_SHIFTED_LABELS:
             fields.append("pre_shifted_labels")
-        if getattr(args, "task_type", "causal_lm") == "seq_cls":
+        if args.task_type == "seq_cls":
             fields.append("classification_labels")
         fields.extend(sft_multimodal_data_fields(args))
         return fields
@@ -66,40 +79,34 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         # requested when kl_coef != 0 (i.e. an actor_fwd role is present).
         fields = _base_rollout_fields(args)
         fields.append("values")
-        if getattr(args, "kl_coef", 0.0) != 0:
-            if not getattr(args, "use_rollout_logprobs", False) and not getattr(args, "true_on_policy_mode", False):
+        if args.kl_coef != 0:
+            if not args.use_rollout_logprobs and not args.true_on_policy_mode:
                 fields.append("log_probs")
             fields.append("ref_log_probs")
-        if getattr(args, "use_opd", False):
-            from relax.utils.opd.opd_utils import consume_opd_train_data
-
-            consume_opd_train_data(fields, args)
+        _consume_opd_fields(fields, args, require_declared_opd=require_declared_opd)
         return fields
 
     fields = _base_rollout_fields(args)
-    if getattr(args, "advantage_estimator", None) == "score_centering":
+    if args.advantage_estimator == "score_centering":
         fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
-    if getattr(args, "use_rollout_indexer_replay", False):
+    if args.use_rollout_indexer_replay:
         fields.append("rollout_indexer_topk")
     if has_critic:
         # PPO colocate: actor consumes critic's ``values`` and computes GAE
         # inline. Fully_async: standalone Advantages service produces
         # ``advantages``/``returns``, actor just pulls the finished tensors.
-        if getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):
+        if args.fully_async and not args.hybrid:
             fields.extend(["advantages", "returns"])
         else:
             fields.append("values")
-            if getattr(args, "kl_coef", 0.0) != 0:
+            if args.kl_coef != 0:
                 fields.append("ref_log_probs")
         # log_probs is produced inline by actor's forward pass in train_actor
         # (see relax/backends/megatron/actor.py). PPO does not deploy an
         # actor_fwd role in any mode, so nothing writes log_probs to the
         # TransferQueue; requesting it here would hang async_get_meta.
-        if getattr(args, "kl_coef", 0.0) != 0 or getattr(args, "use_kl_loss", False):
+        if args.kl_coef != 0 or args.use_kl_loss:
             if "ref_log_probs" not in fields:
                 fields.append("ref_log_probs")
-    if getattr(args, "use_opd", False):
-        from relax.utils.opd.opd_utils import consume_opd_train_data
-
-        consume_opd_train_data(fields, args)
+    _consume_opd_fields(fields, args, require_declared_opd=require_declared_opd)
     return fields

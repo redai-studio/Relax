@@ -2,10 +2,13 @@
 
 """Zero-token no-signal step handling for the shared Megatron trainer."""
 
+from argparse import ArgumentParser
 from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+
+from tests.cpu.relax_parser import parser_for_flags
 
 
 torch = pytest.importorskip("torch")
@@ -185,14 +188,22 @@ def test_is_global_zero_token_step_single_host_sync(monkeypatch, pp_size):
 
 def _make_args() -> SimpleNamespace:
     return SimpleNamespace(
+        **vars(
+            parser_for_flags(
+                "--task-type",
+                "--use-rollout-indexer-replay",
+                "--use-dynamic-batch-size",
+                "--fully-async",
+                "--mtp-only-training",
+                "--sft-chunked-logits",
+            ).parse_args([])
+        ),
         custom_megatron_before_train_step_hook_path=None,
         ci_test=False,
         enable_mtp_training=False,
         check_for_nan_in_loss_and_grad=True,
         global_batch_size=32,
         dynamic_context_parallel=False,
-        use_dynamic_batch_size=False,
-        fully_async=False,
         seq_length=512,
         micro_batch_size=1,
         decoder_seq_length=512,
@@ -217,7 +228,6 @@ def test_train_one_step_preserves_logical_batch_and_capture(
 ):
     args = _make_args()
     args.calculate_per_token_loss = calculate_per_token_loss
-    args.task_type = "causal_lm"
     args.loss_type = "rm" if reward_model else "policy_loss"
     calls = {"optimizer": 0, "scheduler": [], "capture_begin": 0, "capture_end": 0, "critic_update_successful": []}
     token_count = 0.0 if zero_tokens else 4.0
@@ -321,7 +331,16 @@ def test_train_one_step_preserves_logical_batch_and_capture(
 
 
 def _make_opd_policy_args(clip: str, per_token: bool, use_tis: bool = False) -> SimpleNamespace:
+    from relax.utils.opd.opd_utils import add_opd_arguments
+
+    opd_cli = ["--opd-loss-coef", "1", "--opd-kl-coef", "0"]
+    if clip == "per_token":
+        opd_cli += ["--opd-per-token-clip", "0.5"]
+    elif clip == "is":
+        opd_cli += ["--opd-is-clip", "1"]
     return SimpleNamespace(
+        **vars(parser_for_flags("--task-type", "--mtp-only-training").parse_args([])),
+        **vars(add_opd_arguments(ArgumentParser()).parse_args(opd_cli)),
         loss_type="policy_loss",
         advantage_estimator="grpo",
         calculate_per_token_loss=per_token,
@@ -340,13 +359,6 @@ def _make_opd_policy_args(clip: str, per_token: bool, use_tis: bool = False) -> 
         use_kl_loss=False,
         eps_clip=0.2,
         eps_clip_high=0.28,
-        opd_loss_coef=1.0,
-        opd_kl_type="reverse_kl",
-        opd_jsd_alpha=0.5,
-        opd_token_selection="student_sampled",
-        opd_log_prob_top_k=0,
-        opd_per_token_clip=0.5 if clip == "per_token" else None,
-        opd_is_clip=1.0 if clip == "is" else None,
     )
 
 

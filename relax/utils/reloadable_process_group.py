@@ -22,7 +22,7 @@ _wrap_low_level_call_enabled = False
 
 def monkey_patch_torch_dist(args=None):
     global _wrap_low_level_call_enabled
-    _wrap_low_level_call_enabled = getattr(args, "enable_cuda_memory_check", False) if args is not None else False
+    _wrap_low_level_call_enabled = args.enable_cuda_memory_check if args is not None else False
 
     pid = os.getpid()
     if pid in old_new_group_dict:
@@ -34,7 +34,7 @@ def monkey_patch_torch_dist(args=None):
     old_new_group = dist.new_group
     old_new_group_dict[pid] = old_new_group
     dist.old_new_group = old_new_group
-    use_reloadable_groups = getattr(args, "offload_train", True)
+    use_reloadable_groups = args.offload_train if args is not None else True
 
     def new_group(*args, **kwargs):
         group = old_new_group(*args, **kwargs)

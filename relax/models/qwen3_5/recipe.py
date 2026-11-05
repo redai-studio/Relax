@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from relax.utils.data import wholepack_policy
+from relax.utils.megatron_argument_compat import dynamic_context_parallel_enabled
 
 
 ENTRY = "relax.models.qwen3_5.recipe.before_step"
@@ -73,11 +74,11 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
     from relax.utils.env import Envs
 
     _check_args(args)
-    _TEXT_ONLY_CPT = getattr(args, "sft_training_mode", None) == "cpt"
+    _TEXT_ONLY_CPT = args.sft_training_mode == "cpt"
     assert args.max_tokens_per_gpu == 262144
     assert mpu.get_data_parallel_world_size(with_context_parallel=False) == 16
     assert tex.get_cublasLt_version() == 130300
-    assert args.qkv_format == "thd" and not getattr(args, "dynamic_context_parallel", False)
+    assert args.qkv_format == "thd" and not dynamic_context_parallel_enabled(args)
     assert not getattr(args, "overlap_moe_expert_parallel_comm", False)
     assert args.mtp_num_layers == 1 and args.cross_entropy_fusion_impl == "linear"
     assert Envs.RELAX_SFT_SELECTIVE_LOGITS

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.cpu.relax_parser import parser_for_flags
 from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
     arguments_module as _arguments_module_fixture,
 )
@@ -57,28 +58,31 @@ def test_removed_mtp_detach_flags_fail_fast_even_when_unknown_args_are_ignored(a
         arguments_module._reject_removed_mtp_detach_flags([flag])
 
 
-def _args(arguments_module, **overrides) -> SimpleNamespace:
+def _args(**overrides) -> SimpleNamespace:
+    parser = parser_for_flags(
+        "--mtp-only-training",
+        "--only-train-params-name-list",
+        "--freeze-params-name-list",
+        "--lora-rank",
+        "--sft-chunked-logits",
+        "--fully-async",
+        "--hybrid",
+        "--enable-mtp-training",
+        "--mtp-detach-paths",
+        constants=("_MTP_DETACH_PATHS",),
+    )
     defaults = {
-        "mtp_only_training": True,
+        **vars(parser.parse_args(["--mtp-only-training"])),
         "loss_type": "sft",
-        "only_train_params_name_list": None,
-        "freeze_params_name_list": None,
-        "lora_rank": 0,
-        "sft_chunked_logits": False,
-        "overlap_moe_expert_parallel_comm": False,
-        "fully_async": False,
-        "hybrid": False,
         "mtp_num_layers": None,
         "mtp_loss_scaling_factor": 0.2,
-        "enable_mtp_training": False,
-        "mtp_detach_paths": arguments_module._MTP_DETACH_PATHS,
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
 
 
 def test_normalize_mtp_only_training_enables_mtp_and_freezes_non_mtp_params(arguments_module):
-    args = _args(arguments_module)
+    args = _args()
 
     arguments_module._normalize_mtp_only_training_args(args)
 
@@ -106,11 +110,11 @@ def test_normalize_mtp_only_training_enables_mtp_and_freezes_non_mtp_params(argu
 )
 def test_normalize_mtp_only_training_rejects_unsafe_combinations(arguments_module, override, expected_flag):
     with pytest.raises(ValueError, match=expected_flag):
-        arguments_module._normalize_mtp_only_training_args(_args(arguments_module, **override))
+        arguments_module._normalize_mtp_only_training_args(_args(**override))
 
 
 def test_normalize_mtp_only_training_is_noop_when_disabled(arguments_module):
-    args = _args(arguments_module, mtp_only_training=False)
+    args = _args(mtp_only_training=False)
 
     arguments_module._normalize_mtp_only_training_args(args)
 

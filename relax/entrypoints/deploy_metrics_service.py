@@ -26,9 +26,16 @@ def create_demo_args() -> argparse.Namespace:
         "use_clearml": False,  # Set to True if you have ClearML configured
         "tb_project_name": "demo-project",
         "tb_experiment_name": "demo-experiment",
+        "save": None,
         "wandb_project": "demo-project",
         "wandb_team": "demo-team",
         "wandb_group": "demo-group",
+        "wandb_mode": None,
+        "wandb_key": None,
+        "wandb_host": None,
+        "wandb_dir": None,
+        "notify_urls": None,
+        "timeline_dump_dir": None,
         "use_metrics_service": True,  # Enable metrics service
     }
     return create_namespace(args_dict)

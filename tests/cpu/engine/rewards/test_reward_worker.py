@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 """Tests for the openr1mm reward function through rm_hub's full execution path.
@@ -17,6 +18,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from tests.cpu.relax_parser import args_for_flags
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +80,7 @@ pytestmark = pytest.mark.skipif(not _HAS_MATH_VERIFY, reason="math_verify is not
 def _make_args(**overrides) -> SimpleNamespace:
     """Create a mock args namespace that mimics the training args structure."""
     defaults = {
+        **vars(args_for_flags("--rm-type-infer", "--rm-type-fallback", "--enable-affinity", "--autoscaler-config")),
         "rm_type": "openr1mm",
         "custom_rm_path": None,
         "reward_max_concurrency": 64,
