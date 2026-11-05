@@ -659,6 +659,8 @@ def validate_i2i_sft_config(args: Namespace) -> None:
             "image_prefetch_workers",
             "dp_tier_micro_balance",
             "dp_tier_rank_rotation",
+            "baseline_stats_dir",
+            "baseline_warmup_steps",
         }
     )
     _fail(errors, bool(unknown), f"Unknown i2i_sft_config keys: {sorted(unknown)}")
@@ -666,6 +668,18 @@ def validate_i2i_sft_config(args: Namespace) -> None:
     depth, workers = config.get("image_prefetch_depth", 0), config.get("image_prefetch_workers", 2)
     _fail(errors, type(depth) is not int or depth < 0, "image_prefetch_depth must be a nonnegative integer")
     _fail(errors, type(workers) is not int or workers <= 0, "image_prefetch_workers must be a positive integer")
+    stats_dir = config.get("baseline_stats_dir")
+    _fail(
+        errors,
+        stats_dir is not None and (not isinstance(stats_dir, str) or not stats_dir.strip()),
+        "baseline_stats_dir must be a non-empty path when set",
+    )
+    warmup_steps = config.get("baseline_warmup_steps", 5)
+    _fail(
+        errors,
+        type(warmup_steps) is not int or warmup_steps < 0,
+        "baseline_warmup_steps must be a nonnegative integer",
+    )
     _fail(
         errors, type(config.get("dp_tier_micro_balance", False)) is not bool, "dp_tier_micro_balance must be boolean"
     )
