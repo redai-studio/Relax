@@ -6,12 +6,12 @@ from argparse import Namespace
 from collections.abc import Iterator, Mapping, Sequence
 
 import torch
-import torch.distributed as dist
 from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.backends.megatron.weight_update.train_offload import torch_memory_saver_preloaded
+from relax.distributed.weight_sync import traffic
 from relax.utils.device import is_npu_available
 from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
@@ -51,60 +51,93 @@ def _restore_tp_weight(name, partitions, partition_dim, split_sizes=None):
     return torch.cat(partitions, dim=partition_dim)
 
 
-def _gather_tp_weights(named_params, *, split_sizes, async_op):
-    tasks, handles = [], []
-    for name, param in named_params:
-        name = name.replace(".to_wrap.", ".")
-        if "expert_bias" in name:
-            tasks.append((name, param, None, None))
-            continue
-        if not hasattr(param, "tensor_model_parallel"):
-            multimodal = any(part in name for part in (".audio_model.", ".vision_model.", ".video_model."))
-            assert multimodal or not isinstance(param, torch.nn.Parameter), f"{name} lacks TP metadata"
-            tasks.append((name, param, None, None))
-            continue
-        if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
-            tasks.append((name, param.data, None, None))
-            continue
-        if ".experts." in name:
-            size, group = mpu.get_expert_tensor_parallel_world_size(), mpu.get_expert_tensor_parallel_group()
-        else:
-            size, group = mpu.get_tensor_model_parallel_world_size(), mpu.get_tensor_model_parallel_group()
-        if "linear_fc1" not in name:
-            assert getattr(param, "partition_stride", 1) == 1, f"Unsupported partition stride for {name}"
-        partitions = [torch.empty_like(param.data) for _ in range(size)]
-        handle = dist.all_gather(partitions, param.data, group=group, async_op=async_op)
-        if handle is not None:
-            handles.append(handle)
-        tasks.append((name, None, partitions, param.partition_dim))
-    # All async collectives launch before any wait. Results remain in input order.
+def _gather_tp_weights(named_params, *, split_sizes, async_op, agreement=None):
+    tasks, handles, error = [], [], None
+    try:
+        for name, param in named_params:
+            name = name.replace(".to_wrap.", ".")
+            if "expert_bias" in name:
+                tasks.append((name, param, None, None, None))
+                continue
+            if not hasattr(param, "tensor_model_parallel"):
+                multimodal = any(part in name for part in (".audio_model.", ".vision_model.", ".video_model."))
+                assert multimodal or not isinstance(param, torch.nn.Parameter), f"{name} lacks TP metadata"
+                tasks.append((name, param, None, None, None))
+                continue
+            if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
+                tasks.append((name, param.data, None, None, None))
+                continue
+            expert = ".experts." in name
+            size = (
+                mpu.get_expert_tensor_parallel_world_size() if expert else mpu.get_tensor_model_parallel_world_size()
+            )
+            if "linear_fc1" not in name:
+                assert getattr(param, "partition_stride", 1) == 1, f"Unsupported partition stride for {name}"
+            if size == 1:
+                # This rank already owns the complete tensor, including GLU/GDN
+                # component order. Avoid receive buffers and NCCL staging.
+                tasks.append((name, param.data, None, None, None))
+                continue
+            group = mpu.get_expert_tensor_parallel_group() if expert else mpu.get_tensor_model_parallel_group()
+            partitions = [torch.empty_like(param.data) for _ in range(size)]
+            tasks.append((name, param.data, partitions, param.partition_dim, group))
+    except Exception as caught:
+        if agreement is None:
+            raise
+        error = f"{type(caught).__name__}: {caught}"
+    if agreement is not None:
+        agreement(error)
+    # Every participant finishes allocation before entering a device collective.
+    for _, source, partitions, _, group in tasks:
+        if partitions is not None:
+            handle = traffic.all_gather(partitions, source, group=group, async_op=async_op)
+            if handle is not None:
+                handles.append(handle)
     for handle in handles:
         handle.wait()
-    return [
-        direct if partitions is None else _restore_tp_weight(name, partitions, dim, split_sizes.get(name))
-        for name, direct, partitions, dim in tasks
-    ]
+    result, error = None, None
+    try:
+        result = [
+            source if partitions is None else _restore_tp_weight(name, partitions, dim, split_sizes.get(name))
+            for name, source, partitions, dim, _ in tasks
+        ]
+    except Exception as caught:
+        if agreement is None:
+            raise
+        error = f"{type(caught).__name__}: {caught}"
+    if agreement is not None:
+        agreement(error)
+    return result
 
 
-def all_gather_param(args, name: str, param: torch.Tensor) -> torch.Tensor:
+def all_gather_param(args, name: str, param: torch.Tensor, *, agreement=None) -> torch.Tensor:
     """Gather one parameter using the same layout rules as batched export."""
-    name = name.replace(".to_wrap.", ".")
-    split_sizes = {}
-    if (
-        getattr(param, "tensor_model_parallel", False)
-        and getattr(param, "parallel_mode", None) != "duplicated"
-        and any(key in name for key in ("self_attention.conv1d.weight", "self_attention.in_proj.weight"))
-    ):
-        split_sizes[name] = gdn_component_sizes(
-            get_hf_config(args.hf_checkpoint), mpu.get_tensor_model_parallel_world_size(), name
-        )
-    return _gather_tp_weights([(name, param)], split_sizes=split_sizes, async_op=False)[0]
+    error = None
+    try:
+        name = name.replace(".to_wrap.", ".")
+        split_sizes = {}
+        if (
+            getattr(param, "tensor_model_parallel", False)
+            and getattr(param, "parallel_mode", None) != "duplicated"
+            and any(key in name for key in ("self_attention.conv1d.weight", "self_attention.in_proj.weight"))
+        ):
+            split_sizes[name] = gdn_component_sizes(
+                get_hf_config(args.hf_checkpoint), mpu.get_tensor_model_parallel_world_size(), name
+            )
+    except Exception as caught:
+        if agreement is None:
+            raise
+        error = f"{type(caught).__name__}: {caught}"
+    if agreement is not None:
+        agreement(error)
+    return _gather_tp_weights([(name, param)], split_sizes=split_sizes, async_op=False, agreement=agreement)[0]
 
 
 def all_gather_params_async(
     param_infos_and_params: list[tuple[ParamInfo, torch.Tensor]],
     *,
     gdn_split_sizes: Mapping[str, tuple[int, ...]] | None = None,
+    agreement=None,
 ) -> list[torch.Tensor]:
     """Launch every parameter gather before waiting, then restore shared TP
     layouts."""
@@ -112,6 +145,7 @@ def all_gather_params_async(
         [(info.name, param) for info, param in param_infos_and_params],
         split_sizes=gdn_split_sizes or {},
         async_op=True,
+        agreement=agreement,
     )
 
 
@@ -212,9 +246,8 @@ def _named_params_and_buffers_global(
         else:
             layer_offset = get_transformer_layer_offset(model_module.config)
         for name, param in model_module.named_parameters():
-            # for model without ddp wrap
-            if not name.startswith("module.module."):
-                name = "module." + name
+            # Normalize wrapped and bare modules before applying PP offsets.
+            name = "module.module." + strip_param_name_prefix(name)
 
             decoder_layers_pattern = r"module\.module\.(?:(.*)\.)?decoder\.layers\.(\d+)\.(.+)"
             match = re.match(decoder_layers_pattern, name)
@@ -272,9 +305,7 @@ def _named_params_and_buffers_global(
 
         # Treat selected model-state buffers needed by rollout as normal parameters.
         for name, buffer in _named_buffers_for_weight_update(model_module, include_persistent_buffers):
-            # for model without ddp wrap
-            if not name.startswith("module.module."):
-                name = "module." + name
+            name = "module.module." + strip_param_name_prefix(name)
 
             decoder_layers_pattern = r"module\.module\.(?:(.*)\.)?decoder\.layers\.(\d+)\.(.+)"
 
