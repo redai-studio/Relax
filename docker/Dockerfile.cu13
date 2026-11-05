@@ -485,6 +485,21 @@ ENV FI_PROVIDER=efa \
 
 FROM relax_${GPU_ARCH} as relax
 
+# MCore's cuDNN DSA backend uses FlashMLA sparse forward on both architectures.
+# Rebuild the same pinned source as CUDA 12 against this image's Torch/CUDA ABI.
+ARG FLASH_MLA_COMMIT=b7643bd54521f563b839b98289b5cd048c062ba2
+RUN case "$RELAX_GPU_ARCH" in \
+        hopper) export FLASH_MLA_DISABLE_SM100=1 ;; \
+        blackwell) export FLASH_MLA_DISABLE_SM90=1 ;; \
+    esac && \
+    git clone https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA && \
+    cd /tmp/FlashMLA && git checkout "$FLASH_MLA_COMMIT" && \
+    git submodule update --init --recursive && \
+    CUDA_VISIBLE_DEVICES="" MAX_JOBS=16 NVCC_THREADS=4 \
+        CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}" \
+        pip install --no-cache-dir --no-build-isolation --no-deps . && \
+    cd /root && rm -rf /tmp/FlashMLA
+
 # Keye/DSA indexers require this CUDA extension; use the same source pin as CUDA 12.
 # Force a local build: upstream's wheel lookup maps CUDA 13 to CUDA 12 wheels.
 RUN . /etc/relax_build.env && \
@@ -499,8 +514,20 @@ RUN . /etc/relax_build.env && \
 # Restore the unified image runtime after all dependency resolution.
 # Its DeepEP binaries require NCCL 2.30.7; Torch metadata still pins 2.29.7.
 # pip check above validates every other dependency before this explicit override.
-RUN pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7 && \
+# SM90 can share DSA backward signatures after making the length clamp dynamic;
+# SM100 kernels retain width-dependent compile-time tuning.
+RUN --mount=type=bind,source=docker/patch/cudnn/1.30.0-dsa-sm90-signature-cache.patch,target=/tmp/cudnn-dsa.patch \
+    pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7 && \
     python -c "import importlib.metadata as m; assert m.version('nvidia-nccl-cu13') == '2.30.7'" && \
+    if [ "$RELAX_GPU_ARCH" = "hopper" ]; then \
+        CUDNN_SITE="$(python -c 'import importlib.metadata as m; \
+            assert m.version("nvidia-cudnn-frontend") == "1.30.0", "DSA SM90 patch requires cuDNN Frontend 1.30.0"; \
+            assert m.version("nvidia-cutlass-dsl") == "4.6.2", "DSA SM90 patch requires CuTe DSL 4.6.2"; \
+            print(m.distribution("nvidia-cudnn-frontend").locate_file(""))')" && \
+        patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa.patch && \
+        python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" \
+            "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm90.py"; \
+    fi && \
     python /opt/relax/validate_hybridep_install.py && \
     python /opt/relax/validate_final_runtime.py && \
     sed 's/^ray==2\.56\.1$/ray==2.56.1.*/' "$PIP_CONSTRAINT" > /etc/relax-cu130-runtime-constraints.txt
