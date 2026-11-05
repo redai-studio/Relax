@@ -9,14 +9,34 @@ import pytest
 import torch
 
 from relax.backends.megatron.chunkflow import rope as cf_rope
+from relax.backends.megatron.chunkflow.adapters import DenseAttentionCall, megatron_native_attention
+from relax.backends.megatron.chunkflow.integration import ChunkedCoreAttention
 from relax.backends.megatron.chunkflow.metadata import int32_metadata
-from tests.cpu.backends.megatron.test_chunkflow_attention_ops import fa3_backend as fa3_backend
+from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
+from relax.backends.megatron.chunkflow.scheduler import build_chunks
+from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 from tests.cpu.backends.megatron.test_chunkflow_gdn import _alignment
 from tests.cpu.backends.megatron.test_chunkflow_gdn import kernels as kernels
-from tests.cpu.backends.megatron.test_chunkflow_integration import _attn
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="FA3 numeric validation requires a CUDA GPU")
+def _native_te(heads, kv_heads, dim):
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=heads * dim,
+        num_attention_heads=heads,
+        num_query_groups=kv_heads,
+        kv_channels=dim,
+        attention_dropout=0,
+        params_dtype=torch.bfloat16,
+    )
+    return TEDotProductAttention(config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="native MCore/TE validation requires a CUDA GPU")
 @pytest.mark.parametrize(
     "bounds_q,bounds_k,heads,kv_heads,dim",
     [
@@ -25,23 +45,10 @@ from tests.cpu.backends.megatron.test_chunkflow_integration import _attn
         ([0, 8192], [0, 8192], 8, 1, 256),
     ],
 )
-def test_unit_fa3_matches_cuda_reference(monkeypatch, fa3_backend, bounds_q, bounds_k, heads, kv_heads, dim):
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("requires the Hopper FA3 build used by this experiment")
-    try:
-        from flash_attn import flash_attn_varlen_func
-    except ImportError:
-        pytest.skip("FA2 reference kernel is not installed")
-
-    from relax.backends.megatron.chunkflow import flash_backends as fb
-
-    monkeypatch.setenv("RELAX_CHUNKFLOW_FLASH_BACKEND", "fa3")
-    try:
-        fb.flash3_varlen_ops()
-    except RuntimeError as exc:
-        if isinstance(exc.__cause__, ImportError):
-            pytest.skip("optional FA3 interface is not installed")
-        raise
+def test_native_te_matches_cuda_reference(rope_module, bounds_q, bounds_k, heads, kv_heads, dim):
+    flash_attn = pytest.importorskip("flash_attn")
+    flash_attn_varlen_func = flash_attn.flash_attn_varlen_func
+    core = _native_te(heads, kv_heads, dim)
     max_q = max(b - a for a, b in zip(bounds_q[:-1], bounds_q[1:]))
     max_k = max(b - a for a, b in zip(bounds_k[:-1], bounds_k[1:]))
     cu_q = torch.tensor(bounds_q, device="cuda", dtype=torch.int32)
@@ -54,9 +61,18 @@ def test_unit_fa3_matches_cuda_reference(monkeypatch, fa3_backend, bounds_q, bou
     qr, kr, vr = (tensor.detach().clone().requires_grad_(True) for tensor in (q, k, v))
     parts = [k[a:b] for a, b in zip(bounds_k[:-1], bounds_k[1:])]
     values = [v[a:b] for a, b in zip(bounds_k[:-1], bounds_k[1:])]
-    from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
-
-    result, _ = UnitCacheAttention.apply(q, True, dim**-0.5, cu_q, cu_k, *parts, *values, (max_q, max_k))
+    call = DenseAttentionCall(
+        q,
+        tuple(parts),
+        tuple(values),
+        cu_q,
+        cu_k,
+        tuple(b - a for a, b in zip(bounds_q[:-1], bounds_q[1:])),
+        tuple(b - a for a, b in zip(bounds_k[:-1], bounds_k[1:])),
+        (max_q, max_k),
+        dim**-0.5,
+    )
+    result = megatron_native_attention(core.forward, call).reshape_as(q)
     expected = flash_attn_varlen_func(qr, kr, vr, cu_q, cu_k, max_q, max_k, causal=True)
     dout = torch.randn_like(result)
     result.backward(dout)
@@ -76,8 +92,65 @@ def test_gdn_fla_state_outputs_and_gradients_match_full_sequence(kernels, mode):
     _alignment(kernels, mode, chunk_size=64, device="cuda", heads=2, dim=32)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires native MCore/TE CUDA forward and backward")
+@pytest.mark.parametrize("keep_last_k", [1, 1000])
+def test_native_te_history_gradients_and_recomputation(rope_module, keep_last_k):
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.enums import AttnMaskType
+
+    torch.manual_seed(27)
+    total, chunk_size, heads, kv_heads, dim = 317, 128, 4, 2, 64
+    core = _native_te(heads, kv_heads, dim)
+    leaves = [
+        torch.randn(total, h, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for h in (heads, kv_heads, kv_heads)
+    ]
+    reference = [t.detach().clone().requires_grad_() for t in leaves]
+    full_cu = int32_metadata([0, total], torch.device("cuda"))
+    packed = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=full_cu, cu_seqlens_kv=full_cu, max_seqlen_q=total, max_seqlen_kv=total
+    )
+    expected = core(
+        *reference, attention_mask=None, attn_mask_type=AttnMaskType.causal, packed_seq_params=packed
+    ).reshape(total, -1)
+    dout = torch.randn_like(expected)
+    expected.backward(dout)
+    runtime = ChunkflowRuntime(chunk_size)
+    adapter = ChunkedCoreAttention(
+        config=core.config,
+        layer_number=1,
+        chunk_size=chunk_size,
+        runtime=runtime,
+        executor=lambda call: megatron_native_attention(core.forward, call),
+    )
+    chunks = build_chunks([total], chunk_size)
+    units = build_micro_batches(chunks)
+    actual, pending = {}, {}
+    for kind, uid in gen_unit_ops(units, chunks, keep_last_k):
+        unit = units[uid]
+        start = unit.chunks[0].segments[0].prefix
+        sl = slice(start, start + unit.num_tokens)
+        if kind == "B":
+            pending.pop(uid).backward(dout[sl])
+            for group in completed_groups(unit):
+                runtime.release_group(group)
+            continue
+        cu = int32_metadata([0, unit.num_tokens], torch.device("cuda"))
+        packed = SimpleNamespace(
+            cu_seqlens_q_cpu=[0, unit.num_tokens], cu_seqlens_q=cu, **{UNIT_ATTR: unit, RECOMPUTE_ATTR: kind == "Fr"}
+        )
+        with torch.set_grad_enabled(kind != "Fp"):
+            output = adapter(*(t[sl] for t in leaves), packed_seq_params=packed)
+        if kind != "Fp":
+            pending[uid], actual[uid] = output, output.detach()
+    runtime.assert_empty("native TE history")
+    torch.testing.assert_close(torch.cat([actual[u.unit_id] for u in units]), expected, atol=0.02, rtol=0.02)
+    for got, want in zip(leaves, reference):
+        torch.testing.assert_close(got.grad, want.grad, atol=0.03, rtol=0.03)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_chunkflow_matches_flash_varlen_on_training_shapes():
+def test_chunkflow_matches_flash_varlen_on_training_shapes(rope_module):
     try:
         from flash_attn import flash_attn_varlen_func
     except ImportError:
@@ -93,7 +166,16 @@ def test_chunkflow_matches_flash_varlen_on_training_shapes():
     k = torch.randn(total, kv_h, d, generator=g, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     v = torch.randn(total, kv_h, d, generator=g, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     dout = torch.randn(total, h * d, generator=g, device="cuda", dtype=torch.bfloat16)
-    packed = SimpleNamespace(cu_seqlens_q=torch.tensor(bounds, device="cuda", dtype=torch.int32))
+    packed = SimpleNamespace(
+        cu_seqlens_q=torch.tensor(bounds, device="cuda", dtype=torch.int32), cu_seqlens_q_cpu=bounds
+    )
+    native = _native_te(h, kv_h, d)
+    adapter = ChunkedCoreAttention(
+        config=native.config,
+        layer_number=1,
+        chunk_size=1024,
+        executor=lambda call: megatron_native_attention(native.forward, call),
+    )
 
     def run(fn):
         leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v)]
@@ -101,7 +183,7 @@ def test_chunkflow_matches_flash_varlen_on_training_shapes():
         return [leaf.grad for leaf in leaves]
 
     def chunked(ql, kl, vl):
-        return _attn(chunk_size=1024)(ql, kl, vl, packed_seq_params=packed)
+        return adapter(ql, kl, vl, packed_seq_params=packed)
 
     def reference(ql, kl, vl):
         cu = torch.tensor(bounds, device="cuda", dtype=torch.int32)

@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from relax.backends.megatron.chunkflow.adapters import dense_attention_adapter, register_attention_adapter
 from relax.backends.megatron.chunkflow.integration import (
     ChunkedCoreAttention,
     install,
@@ -18,6 +19,7 @@ from relax.backends.megatron.chunkflow.integration import (
 from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime
 from relax.backends.megatron.chunkflow.scheduler import build_chunks
 from relax.backends.megatron.chunkflow.units import build_micro_batches
+from tests.cpu.backends.megatron.test_chunkflow_attention_ops import SDPAttention, native_sdpa
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +46,10 @@ class _FakeAttn(torch.nn.Module):
         super().__init__()
         self.layer_number = 1
         self.config = SimpleNamespace(context_parallel_size=1)
-        self.core_attention = torch.nn.Identity()
+        self.core_attention = SDPAttention()
+
+
+register_attention_adapter(_FakeAttn, SDPAttention, dense_attention_adapter(name="test-sdpa", execute=native_sdpa))
 
 
 def _sdpa_reference(q, k, v):
@@ -67,7 +72,10 @@ def _qkv(t, h, d, seed=0, kv_heads=None):
 
 def _attn(chunk_size, cp_size=1):
     return ChunkedCoreAttention(
-        config=SimpleNamespace(context_parallel_size=cp_size), layer_number=1, chunk_size=chunk_size
+        config=SimpleNamespace(context_parallel_size=cp_size),
+        layer_number=1,
+        chunk_size=chunk_size,
+        executor=lambda call: native_sdpa(SDPAttention().forward, call),
     )
 
 
@@ -104,18 +112,31 @@ def test_chunkflow_sbhd_is_rejected():
         _attn(chunk_size=2)(torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4))
 
 
-def test_chunkflow_install_swaps_and_uninstall_restores():
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"attention_mask": torch.ones(4, 4)}, {"attention_bias": torch.ones(4, 4)}, {"attn_mask_type": "no_mask"}],
+)
+def test_dense_adapter_rejects_unhandled_attention_semantics(kwargs):
+    with pytest.raises(NotImplementedError):
+        _attn(chunk_size=2)(*_qkv(4, 2, 4), **kwargs)
+
+
+def test_chunkflow_install_preserves_module_and_uninstall_restores_forward():
     model = torch.nn.Sequential(_FakeAttn(), _FakeAttn())
     original = model[0].core_attention
+    original_forward = original.forward
     model[0].config.apply_rope_fusion = True
 
     assert install(model, chunk_size=4) == 2
-    assert isinstance(model[0].core_attention, ChunkedCoreAttention)
+    assert model[0].core_attention is original
+    assert original.forward != original_forward
     assert model[0].config.apply_rope_fusion is False
     assert install(model, chunk_size=4) == 0
 
     assert uninstall(model) == 2
     assert model[0].core_attention is original
+    assert original.forward == original_forward
+    assert model[0].config.apply_rope_fusion is True
 
 
 def _unit_attn(chunk_size, layer=1):
@@ -125,6 +146,7 @@ def _unit_attn(chunk_size, layer=1):
         layer_number=layer,
         chunk_size=chunk_size,
         runtime=ChunkflowRuntime(chunk_size),
+        executor=lambda call: native_sdpa(SDPAttention().forward, call),
     )
 
 
@@ -187,27 +209,22 @@ def test_reversed_backward_preserves_fused_weight_gradients(original_cache_disab
     assert model.disable_parameter_transpose_cache is original_cache_disabled
 
 
-def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding(monkeypatch):
-    from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
+def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding():
     from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
 
-    recorded = []
-    metadata = []
-    original = UnitCacheAttention.apply
+    recorded, metadata = [], []
 
-    def capture(*args):
-        recorded.append((args[0].shape[0], args[-1]))
-        metadata.append(args[3:5])
-        fragments = args[5:-1]
-        assert len(fragments) == (2 if args[0].shape[0] == 8 else 4)
-        assert all(t.grad_fn is None or "CatBackward" not in t.grad_fn.name() for t in fragments)
-        return original(*args)
+    def capture(call):
+        recorded.append((call.query.shape[0], call.max_seqlens))
+        metadata.append((call.cu_q, call.cu_kv))
+        assert len(call.keys) == (1 if call.query.shape[0] == 8 else 2)
+        return native_sdpa(SDPAttention().forward, call)
 
-    monkeypatch.setattr(UnitCacheAttention, "apply", capture)
     attn, next_layer = _unit_attn(8), _unit_attn(8, layer=2)
+    attn.executor = next_layer.executor = capture
     units = build_micro_batches(build_chunks([13], chunk_size=8), "staggered")
     for unit in units:
-        length = sum(seg.length for chunk in unit.chunks for seg in chunk.segments)
+        length = unit.num_tokens
         cu_q = torch.tensor([0, length], dtype=torch.int32)
         packed = SimpleNamespace(cu_seqlens_q_cpu=[0, length], cu_seqlens_q=cu_q, **{UNIT_ATTR: unit})
         q, k, v = (t.requires_grad_() for t in _qkv(length + 3, 4, 8, kv_heads=2))

@@ -5,22 +5,23 @@ from __future__ import annotations
 
 import itertools
 import os
+from collections.abc import Callable
 
 import torch
 from torch import nn
 
-from relax.backends.megatron.chunkflow.attention_ops import chunk_attention_forward
-from relax.backends.megatron.chunkflow.flash_backends import flash3_varlen_ops, flash_backend_name
+from relax.backends.megatron.chunkflow.adapters import DenseAttentionCall, resolve_attention_adapter
 from relax.backends.megatron.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
-from relax.backends.megatron.chunkflow.state_store import ChunkState, StateStore
+from relax.backends.megatron.chunkflow.state_store import ChunkState
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
 
-_ORIG_ATTR = "_chunkflow_original_core_attention"
+_ADAPTER_ATTR = "_chunkflow_attention_adapter"
 _TRANSPOSE_CACHE_ATTR = "_chunkflow_original_transpose_cache"
+_ROPE_FUSION_ATTR = "_chunkflow_original_rope_fusion"
 
 
 def split_sizes(total: int, chunk_size: int) -> list[int]:
@@ -34,7 +35,19 @@ def split_sizes(total: int, chunk_size: int) -> list[int]:
 
 
 class ChunkedCoreAttention(nn.Module):
-    def __init__(self, config, layer_number: int, chunk_size: int, softmax_scale=None, runtime=None, **kwargs):
+    """Connect chunk history to a native executor; no attention math lives
+    here."""
+
+    def __init__(
+        self,
+        config,
+        layer_number: int,
+        chunk_size: int,
+        softmax_scale=None,
+        runtime=None,
+        executor: Callable[[DenseAttentionCall], torch.Tensor] | None = None,
+        **kwargs,
+    ):
         super().__init__()
         del kwargs
         self.config = config
@@ -42,10 +55,11 @@ class ChunkedCoreAttention(nn.Module):
         self.chunk_size = chunk_size
         self.softmax_scale = softmax_scale
         self.runtime = runtime
+        if executor is None:
+            raise ValueError("ChunkFlow requires an explicit native attention executor")
+        self.executor = executor
 
     def _forward_unit(self, query, key, value, packed_seq_params) -> torch.Tensor:
-        from relax.backends.megatron.chunkflow.attention_ops import UnitCacheAttention
-
         unit = getattr(packed_seq_params, UNIT_ATTR, None)
         recompute = getattr(packed_seq_params, RECOMPUTE_ATTR, False)
         cu = packed_seq_params.cu_seqlens_q_cpu
@@ -92,24 +106,53 @@ class ChunkedCoreAttention(nn.Module):
             packed_seq_params._chunkflow_attention_metadata = metadata
         cu_q, cu_kv, max_seqlens = metadata
         scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1] ** -0.5
-        out, _lse = UnitCacheAttention.apply(query, True, scale, cu_q, cu_kv, *ks, *vs, max_seqlens)
-        return out
+        return self.executor(
+            DenseAttentionCall(
+                query,
+                tuple(ks),
+                tuple(vs),
+                cu_q,
+                cu_kv,
+                tuple(end - start for start, end in zip(cu[:-1], cu[1:])),
+                tuple(kv_lengths),
+                max_seqlens,
+                scale,
+            )
+        )
 
     def _attend_one_sequence(self, q, k, v) -> torch.Tensor:
-        store = StateStore()
         outs = []
         offset = 0
-        for chunk_id, size in enumerate(split_sizes(q.shape[0], self.chunk_size)):
+        for size in split_sizes(q.shape[0], self.chunk_size):
             sl = slice(offset, offset + size)
-            out, _lse = chunk_attention_forward(
-                chunk_id, q[sl], k[sl], v[sl], store, causal=True, softmax_scale=self.softmax_scale
+            # A full call retains its ordinary autograd graph; unit mode
+            # above handles detached state and descending backward.
+            end = offset + size
+            out = self.executor(
+                DenseAttentionCall(
+                    q[sl],
+                    (k[:end],),
+                    (v[:end],),
+                    int32_metadata([0, size], q.device),
+                    int32_metadata([0, end], q.device),
+                    (size,),
+                    (end,),
+                    (size, end),
+                    self.softmax_scale if self.softmax_scale is not None else q.shape[-1] ** -0.5,
+                )
             )
             outs.append(out)
             offset += size
         return torch.cat(outs, dim=0)
 
     def forward(self, query, key, value, attention_mask=None, attn_mask_type=None, packed_seq_params=None, **kwargs):
-        del attention_mask, attn_mask_type, kwargs
+        if attention_mask is not None or any(value is not None for value in kwargs.values()):
+            raise NotImplementedError(
+                "ChunkFlow dense KV adapter does not accept external masks, biases or extra inputs"
+            )
+        mask_type = getattr(attn_mask_type, "name", attn_mask_type)
+        if mask_type not in (None, "causal", "padding_causal", "causal_bottom_right", "padding_causal_bottom_right"):
+            raise NotImplementedError(f"ChunkFlow dense KV adapter requires causal attention, got {mask_type}")
         cp_size = getattr(self.config, "context_parallel_size", 1) or 1
         if cp_size > 1:
             raise NotImplementedError(
@@ -136,7 +179,7 @@ class ChunkedCoreAttention(nn.Module):
         else:
             bounds = getattr(packed_seq_params, "cu_seqlens_q_cpu", None)
             if bounds is None:
-                bounds = cu.detach().cpu().tolist()
+                raise ValueError("ChunkFlow requires CPU packed boundaries from the data loader")
             outs = []
             for start, end in zip(bounds[:-1], bounds[1:]):
                 if end > start:
@@ -184,19 +227,58 @@ def _attention_modules(model):
 
 
 def install(model, chunk_size: int) -> int:
-    from relax.backends.megatron.chunkflow.runtime import attach_runtime
-
-    backend = flash_backend_name()
-    if backend == "fa3":
-        flash3_varlen_ops()
-    logger.info(f"chunkflow: flash attention backend={backend}")
-    runtime = attach_runtime(model, chunk_size)
     from relax.backends.megatron.chunkflow import gdn
     from relax.backends.megatron.chunkflow import rope as chunkflow_rope
+    from relax.backends.megatron.chunkflow.runtime import RUNTIME_ATTR, attach_runtime
 
-    gdn_layers = gdn.install(model, runtime)
-    if gdn_layers:
-        logger.info("chunkflow: stateful GDN installed on %d layer(s)", gdn_layers)
+    if chunk_size <= 0:
+        raise ValueError("ChunkFlow chunk_size must be positive")
+    if os.environ.get("RELAX_CHUNKFLOW_FLASH_BACKEND"):
+        raise ValueError(
+            "Remove RELAX_CHUNKFLOW_FLASH_BACKEND: ChunkFlow now delegates kernel selection to native Megatron/TE"
+        )
+    existing_runtime = getattr(model, RUNTIME_ATTR, None)
+    if existing_runtime is not None and existing_runtime.chunk_size != chunk_size:
+        raise ValueError("ChunkFlow is already configured with a different chunk size")
+
+    # Validate the complete model before replacing even its first layer.
+    for module in model.modules():
+        if getattr(module, "per_layer_embedding", None) is not None or getattr(
+            getattr(module, "config", None), "ple_layer_ids", None
+        ):
+            raise NotImplementedError("ChunkFlow PLE requires n-gram history and causal-convolution state support")
+    plan = []
+    for attention in _attention_modules(model):
+        if hasattr(attention, _ADAPTER_ATTR):
+            continue
+        adapter = resolve_attention_adapter(attention)
+        adapter.validate(attention)
+        plan.append((attention, adapter))
+    runtime = attach_runtime(model, chunk_size)
+    installed = []
+    new_gdn = [
+        module
+        for module in model.modules()
+        if any(cls.__name__ == "GatedDeltaNet" for cls in type(module).__mro__) and not hasattr(module, gdn._ORIGINAL)
+    ]
+    try:
+        gdn_layers = gdn.install(model, runtime)
+        if gdn_layers:
+            logger.info("chunkflow: stateful GDN installed on %d layer(s)", gdn_layers)
+        for attention, adapter in plan:
+            undo = adapter.install(attention, chunk_size, runtime)
+            setattr(attention, _ADAPTER_ATTR, undo)
+            installed.append(attention)
+            logger.info("chunkflow: layer %s uses adapter %s", attention.layer_number, adapter.name)
+    except Exception:
+        for attention in reversed(installed):
+            getattr(attention, _ADAPTER_ATTR)()
+            delattr(attention, _ADAPTER_ATTR)
+        for module in new_gdn:
+            gdn.uninstall(module)
+        if existing_runtime is None:
+            delattr(model, RUNTIME_ATTR)
+        raise
     chunkflow_rope.install()
 
     # TE's first-forward flag can overwrite gradients after a later chunk's backward.
@@ -207,26 +289,15 @@ def install(model, chunk_size: int) -> int:
             module.disable_parameter_transpose_cache = True
 
     # Chunk-local offsets require unfused RoPE.
-    n = 0
-    for attn in _attention_modules(model):
-        if hasattr(attn, _ORIG_ATTR):
-            continue
-        original = attn.core_attention
-        setattr(attn, _ORIG_ATTR, original)
-        attn.core_attention = ChunkedCoreAttention(
-            config=getattr(original, "config", None) or attn.config,
-            layer_number=attn.layer_number,
-            chunk_size=chunk_size,
-            softmax_scale=getattr(original, "softmax_scale", None),
-            runtime=runtime,
-        )
-        n += 1
+    n = len(installed)
     if n:
         seen_configs: set[int] = set()
         for module in model.modules():
             cfg = getattr(module, "config", None)
             if cfg is not None and hasattr(cfg, "apply_rope_fusion") and id(cfg) not in seen_configs:
                 seen_configs.add(id(cfg))
+                if not hasattr(cfg, _ROPE_FUSION_ATTR):
+                    setattr(cfg, _ROPE_FUSION_ATTR, cfg.apply_rope_fusion)
                 cfg.apply_rope_fusion = False
         logger.info("chunkflow: apply_rope_fusion disabled (the offset path needs the unfused RoPE branch)")
     logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
@@ -236,18 +307,29 @@ def install(model, chunk_size: int) -> int:
 
 def uninstall(model) -> int:
     from relax.backends.megatron.chunkflow import gdn
+    from relax.backends.megatron.chunkflow.runtime import RUNTIME_ATTR
+
+    runtime = getattr(model, RUNTIME_ATTR, None)
+    if runtime is not None:
+        runtime.assert_empty("uninstall")
 
     gdn.uninstall(model)
     for module in model.modules():
         if hasattr(module, _TRANSPOSE_CACHE_ATTR):
             module.disable_parameter_transpose_cache = getattr(module, _TRANSPOSE_CACHE_ATTR)
             delattr(module, _TRANSPOSE_CACHE_ATTR)
+        config = getattr(module, "config", None)
+        if config is not None and hasattr(config, _ROPE_FUSION_ATTR):
+            config.apply_rope_fusion = getattr(config, _ROPE_FUSION_ATTR)
+            delattr(config, _ROPE_FUSION_ATTR)
     n = 0
-    for attn in _attention_modules(model):
-        original = getattr(attn, _ORIG_ATTR, None)
-        if original is None:
+    for attn in list(model.modules()):
+        undo = getattr(attn, _ADAPTER_ATTR, None)
+        if undo is None:
             continue
-        attn.core_attention = original
-        delattr(attn, _ORIG_ATTR)
+        undo()
+        delattr(attn, _ADAPTER_ATTR)
         n += 1
+    if runtime is not None:
+        delattr(model, RUNTIME_ATTR)
     return n
