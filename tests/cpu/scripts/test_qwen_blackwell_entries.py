@@ -240,6 +240,9 @@ def test_397b_forwarding_does_not_override_fixed_topology(flag):
 
 
 def test_397b_submission_id_reaches_ray_without_real_submission(tmp_path):
+    helper = tmp_path / "scripts/entrypoint/check-ray-job-status.sh"
+    helper.parent.mkdir(parents=True)
+    helper.write_text('#!/usr/bin/env bash\ntest "$2" = "resume-test"\n')
     entry = tmp_path / "scripts/training/sft" / SFT64.name
     entry.parent.mkdir(parents=True)
     entry.write_text(SFT64.read_text())

@@ -149,12 +149,14 @@ RUN . /etc/relax_build.env && \
 FROM ep_builder_base as deepep_v2_builder
 ARG DEEP_EP_V2_COMMIT
 COPY docker/patch/deepep/2.1.0-relax-namespace.patch /tmp/deepep-v2.patch
-RUN . /etc/relax_build.env && \
+RUN --mount=type=bind,source=docker/patch/deepep/2.1.0-nccl-runtime-filter.patch,target=/tmp/deepep-nccl-filter.patch \
+    . /etc/relax_build.env && \
     git clone https://github.com/deepseek-ai/DeepEP.git /tmp/DeepEP-v2 && \
     cd /tmp/DeepEP-v2 && git checkout --detach "$DEEP_EP_V2_COMMIT" && \
     test "$(git rev-parse HEAD)" = "$DEEP_EP_V2_COMMIT" && \
     git submodule update --init --recursive && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/deepep-v2.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/deepep-nccl-filter.patch && \
     mv deep_ep _relax_deep_ep_v2 && \
     NCCL_ROOT="$(python -c 'import importlib.metadata as m; print(m.distribution("nvidia-nccl-cu13").locate_file("nvidia/nccl"))')" && \
     CUDA_VISIBLE_DEVICES="" MAX_JOBS=16 EP_NCCL_ROOT_DIR="$NCCL_ROOT" \

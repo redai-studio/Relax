@@ -3,7 +3,7 @@
 # Ray submit can exit 0 for STOPPED; synchronous launchers require SUCCEEDED.
 set -euo pipefail
 [[ -z "${RAY_NO_WAIT:-}" ]] || exit 0
-python3 - "$@" <<'PYSTATUS'
+timeout 60s python3 - "$@" <<'PYSTATUS'
 import sys
 
 from ray.job_submission import JobStatus, JobSubmissionClient
