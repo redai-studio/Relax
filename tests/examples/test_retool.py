@@ -18,6 +18,8 @@ from examples.retool.rollout import PREFIX, VERSION, run_episode
 from examples.retool.sandbox import SandboxClient, parse_result
 from examples.retool.sft_dataset import AuthorMaskedSFTDataset, read_author_sample
 from examples.retool.vocab import mask_shard
+from relax.utils.metrics.metric_utils import compute_rollout_stop_reason_and_turn_metrics
+from relax.utils.training.train_dump_utils import _sample_to_summary_record
 from relax.utils.types import Sample
 
 
@@ -91,6 +93,18 @@ def test_retool_feedback_mask_and_exact_ids():
     assert client.calls == ["print(1 + 1)"] and client.closed
     assert sample.metadata["tool_feedback_counts"] == {"ok": 1}
     assert sample.status == Sample.Status.COMPLETED
+
+
+@pytest.mark.parametrize("tool_calls", [0, 1, 3])
+def test_retool_turn_count_reaches_export_and_metrics(tool_calls):
+    code = "<code>\n```python\nprint(2)\n```\n</code>"
+    sample, payloads = episode([(code, "stop")] * tool_calls + [("Answer: 2", "stop")], Client())
+    expected_turns = tool_calls + 1
+    assert len(payloads) == expected_turns
+    assert sample.metadata["retool_assistant_turns"] == expected_turns
+    assert _sample_to_summary_record(sample, rollout_id=0, idx=0)["agent_turns"] == expected_turns
+    metrics = compute_rollout_stop_reason_and_turn_metrics([sample])
+    assert metrics["num_turn/mean"] == metrics["num_turn/max"] == expected_turns
 
 
 @pytest.mark.parametrize("status", ["code_error", "timeout"])

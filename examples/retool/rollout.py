@@ -137,7 +137,9 @@ async def run_episode(
             sample.rollout_log_probs.extend(probs)
             sample.response_length += len(ids)
             text = tokenizer.decode(ids, skip_special_tokens=False)
-            meta.update(retool_assistant_turns=turn + 1, num_turns=turn + 1 + meta["tool_calls"])
+            meta.update(
+                retool_assistant_turns=turn + 1, rollout_turns=turn + 1, num_turns=turn + 1 + meta["tool_calls"]
+            )
             if finish == "abort":
                 sample.status = statuses.ABORTED
                 break
