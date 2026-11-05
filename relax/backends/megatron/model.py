@@ -600,6 +600,11 @@ def setup_model_and_optimizer(
     config.timers = None
     _validate_vit_lr_trainable_params(args, model)
 
+    if args.use_distributed_optimizer:
+        from .checkpoint_compat import patch_dp_reshardable_checkpoint
+
+        patch_dp_reshardable_checkpoint()
+
     if args.optimizer_cpu_offload:
         from .compat import patch_hdo_group_steps
 
