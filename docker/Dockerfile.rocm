@@ -181,7 +181,7 @@ RUN cd /root/Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
     echo 'e8cbb2b2a895154622678516a6f67ef47e4b934dc7dc196115cd56a6cea235e6  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
     patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \
-    echo 'e88edbe5c69536a4dcfdd9bf6e24d79634d1058ccdd62660bab5ae0b48ae7f76  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
+    echo 'a3d73fc9ecbedf8d0948ddee730a9009f7427160603f6737650d033f0289cb5a  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
     python -m compileall -q megatron && \
