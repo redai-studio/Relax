@@ -5,6 +5,7 @@ import asyncio
 import copy
 import json
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -14,14 +15,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from examples.retool.data_source import ReToolDataSource
-from examples.retool.rollout import PREFIX, VERSION
-from examples.retool.rollout import run_episode as native_episode
 from examples.retool_agentic import data_source as source_module
 from examples.retool_agentic.agent import ModelClient, run_episode
 from examples.retool_agentic.data_source import ReToolAgenticDataSource
-from examples.retool_agentic.protocol import CHAT_TEMPLATE, observation_text, render_prompt
+from examples.retool_agentic.protocol import CHAT_TEMPLATE, PREFIX, VERSION, observation_text, render_prompt
 from examples.retool_agentic.reward import reward_func
+from examples.retool_agentic.tests.native_reference import run_episode as native_episode
 from relax.agentic.pipeline.runtime import SGLangMessageCompiler, _build_session_specs
 from relax.agentic.runner.ipc import SessionOutput
 from relax.agentic.session.service import AgenticSessionShard, _normalized_chat_request
@@ -332,11 +331,11 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path,
         load=None,
     )
     Path(args.save).mkdir()
-    source, native = ReToolAgenticDataSource(args), ReToolDataSource(args)
+    source = ReToolAgenticDataSource(args)
+    rng = random.Random(args.rollout_seed)
     groups = source.get_samples(1) + source.get_samples(2) + source.get_samples(8)
-    baseline = native.get_samples(4)
-    assert [[s.label for s in g] for g in groups] == [[s.label for s in g] for g in baseline]
-    assert [[s.index for s in g] for g in groups] == [[s.index for s in g] for g in baseline]
+    assert [g[0].metadata["scheduled_question"] for g in groups] == [rng.randrange(17) for _ in range(4)]
+    assert [s.index for g in groups for s in g] == list(range(8))
     assert groups[0][0].prompt[0]["role"] == "user"
     assert len(groups[0][0].sampling_params["logit_bias"]) == 3
     source.save(0)
@@ -344,12 +343,29 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path,
     restored = ReToolAgenticDataSource(args)
     restored.load(0)
     next_groups = restored.get_samples(3) + restored.get_samples(1)
-    expected = native.get_samples(4)
-    assert [[s.label for s in g] for g in next_groups] == [[s.label for s in g] for g in expected]
-    assert [[s.index for s in g] for g in next_groups] == [[s.index for s in g] for g in expected]
-    restored.get_samples(1)
+    assert [g[0].metadata["scheduled_question"] for g in next_groups] == [rng.randrange(17) for _ in range(4)]
+    assert [s.index for g in next_groups for s in g] == list(range(8, 16))
+    # Replacement groups consume independent draws, not a new policy version.
+    replacement = restored.get_samples(1)[0]
+    restored.save(1)
+    assert replacement[0].group_index == 8
+    assert "policy_outer" not in replacement[0].metadata
+    after_drop = ReToolAgenticDataSource(args)
+    after_drop.load(1)
+    assert after_drop.group_cursor == 9
+    continued, replayed = restored.get_samples(1), after_drop.get_samples(1)
+    assert continued[0][0].metadata == replayed[0][0].metadata
+    assert continued[0][0].index == replayed[0][0].index == 18
     with pytest.raises(RuntimeError, match="complete Agentic prompt batch"):
-        restored.save(1)
+        restored.save(2)
+    # Original checkpoints predate next_group_index and remain loadable.
+    state_path = Path(args.save) / "dataset/retool_0.json"
+    state = json.loads(state_path.read_text())
+    state.pop("next_group_index")
+    state_path.write_text(json.dumps(state))
+    compatible = ReToolAgenticDataSource(args)
+    compatible.load(0)
+    assert compatible.group_cursor == 4
 
 
 def test_model_client_preserves_relax_route_prefix():
@@ -385,7 +401,11 @@ def test_reward_checks_resumed_policy_version():
         weight_versions=["1", "1"],
         status=Sample.Status.COMPLETED,
         metadata=dict(
-            policy_outer=25, retool_stop_reason="final_answer", retool_final_answer=FINAL, tool_feedback_counts={}
+            policy_outer=54,
+            start_rollout_id=25,
+            retool_stop_reason="final_answer",
+            retool_final_answer=FINAL,
+            tool_feedback_counts={},
         ),
     )
     args = SimpleNamespace(start_rollout_id=25)
@@ -445,6 +465,8 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, 
     assert "--no-wait" not in command
     assert "--use-agentic-rollout" in command
     assert "--custom-generate-function-path" not in command
+    assert command[command.index("-m") + 1] == "examples.retool_agentic.train"
+    assert "examples.retool_agentic.vocab.before_train_step" in command
     assert command[command.index("--agentic-concurrency") + 1] == "16"
     assert command[command.index("--agent-env") + 1] == f"RETOOL_TOKENIZER_PATH={model}/tokenizer.json"
     expected = str(save / "qwen25-7b-retool-agentic-grpo-8xgpu")

@@ -36,7 +36,7 @@ value["env_vars"].update({name: os.environ[name] for name in names if name in os
 print(json.dumps(value))
 ENV
 )
-START_ROLLOUT_ID=$(python3 -m examples.retool.checkpoint "${SAVE_DIR}/${EXP_NAME}")
+START_ROLLOUT_ID=$(python3 -m examples.retool_agentic.checkpoint "${SAVE_DIR}/${EXP_NAME}")
 printf -v AGENT_COMMAND '%q -m examples.retool_agentic.agent' "$(command -v python3)"
 CKPT_ARGS=(
     --disable-s3-model-download --hf-checkpoint "${MODEL_DIR}" --megatron-to-hf-mode bridge
@@ -53,8 +53,8 @@ ROLLOUT_ARGS=(
     --agent-cwd "${RELAX_ROOT}" --agent-env "RETOOL_TOKENIZER_PATH=${MODEL_DIR}/tokenizer.json"
     --agentic-concurrency 16 --agent-timeout 1800
     --custom-rm-path examples.retool_agentic.reward.reward_func --reward-key score --eval-reward-key acc
-    --custom-megatron-before-log-prob-hook-path examples.retool.vocab.before_log_prob
-    --custom-megatron-before-train-step-hook-path examples.retool.vocab.before_train_step
+    --custom-megatron-before-log-prob-hook-path examples.retool_agentic.vocab.before_log_prob
+    --custom-megatron-before-train-step-hook-path examples.retool_agentic.vocab.before_train_step
     --num-rollout 200 --rollout-batch-size 64 --n-samples-per-prompt 16 --global-batch-size 1024
     --num-steps-per-rollout 1 --num-iters-per-train-update 1
     --rollout-max-prompt-len 2048 --rollout-max-response-len 8192 --rollout-max-context-len 10240
@@ -87,7 +87,7 @@ TRACKING_ARGS=(
 mkdir -p "${SCRIPT_DIR}/log"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS:-http://127.0.0.1:8265}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- python3 -m examples.retool.train "${MODEL_ARGS[@]}" \
+    -- python3 -m examples.retool_agentic.train "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \
     "${GRPO_ARGS[@]}" \

@@ -1,74 +1,139 @@
 # ReTool：Relax Agentic 训练示例
 
-本目录将 ReTool 的多轮 Python 工具循环接入 resident `relax/agentic`。启用 `--use-agentic-rollout` 后，每条轨迹由一个 managed agent 进程执行，通过 Session HTTP API 请求模型；Agentic 管理上下文、真实生成 token/logprob、工具反馈 mask、权重版本和训练导出。
+使用 Qwen2.5-7B 进行多轮 Python 工具调用与 GRPO 训练。模型生成 `<code> ... </code>` 后执行一次隔离的 Python 程序，将真实结果放入 `<interpreter>`，再继续推理。`relax/agentic` 管理每条轨迹的进程、上下文、生成 token/logprob 和训练导出；工具反馈只作为上下文，不参与 loss。
 
-实现独立放在本目录，复用 `examples/retool/` 的数据准备、sandbox 生命周期、代码校验、答案判分、词表训练 hook 和 checkpoint 校验器。现有原生 rollout 示例继续使用原脚本。
+本目录包含 agent、数据准备、判分、词表 hook、sandbox、checkpoint 校验、训练脚本和测试。除 Relax 框架及其标准训练依赖外，不依赖其他 example，可单独加入兼容的 Relax 仓库。目录内不包含模型权重、训练数据或 sandbox 镜像。
 
-## 启动与恢复
+## 环境与模型
 
-在安装好 Relax 训练依赖、Megatron 和 sandbox 运行环境的独占单机 8 卡容器中运行。`MODEL_DIR` 指向具体 HF 模型（例如前序 SFT 的 `hf_49`，包含 `tokenizer.json`），`DATA_DIR` 包含原示例已准备的 `train.jsonl`，`SAVE_DIR` 是持久化 checkpoint 根目录。
+需要已安装 Relax 及其 Megatron、SGLang 训练依赖的 Linux 单机 8 卡环境。模型目录应包含完整 HF 权重、config 和 `tokenizer.json`。本例针对 Qwen2.5-7B 的词表和模板；可以使用公开的 Qwen2.5-7B-Instruct，或使用该模型前序 SFT 导出的 HF checkpoint。本例提供 RL 训练，不包含 SFT 训练流程；更换初始权重会影响结果。
+
+本地工具执行需要以下任一后端：
+
+- Landlock：Linux x86_64、支持 Landlock 的内核、root 驱动、`libseccomp.so.2`，以及可用的 NumPy/SciPy。
+- Apptainer：root 驱动、已有 `apptainer`，并允许建立 mount/PID/network namespace 和 cgroup。使用下文固定的 SandboxFusion 镜像。
+- 外部服务：设置 `SANDBOX_FUSION_URL`，服务应实现相同的隔离和执行协议，并对运行 agent 的 worker 可达。
+
+工具服务启动时检查运行条件与隔离，失败会阻止训练启动。外部服务由运行者负责部署和隔离。
+
+## 准备数据
+
+`MODEL_DIR` 指向具体 HF 模型目录，`DATA_DIR` 存放原始和转换后的数据，`SAVE_DIR` 是持久化 checkpoint 根目录。先设置三个目录：
 
 ```bash
-export MODEL_DIR=/path/to/sft/hf_49
+export MODEL_DIR=/path/to/Qwen2.5-7B-Instruct
 export DATA_DIR=/path/to/retool-data
 export SAVE_DIR=/path/to/checkpoints
+```
+
+如果还没有初始模型和原始数据，可以下载以下固定版本：
+
+```bash
+hf download Qwen/Qwen2.5-7B-Instruct \
+  --revision a09a35458c702b33eeacc393d103063234e8bc28 \
+  --local-dir "$MODEL_DIR"
+hf download BytedTsinghua-SIA/DAPO-Math-17k --repo-type dataset \
+  --revision 65877096c24ffa7abc4e4fa5edb95cf3413a5674 \
+  --local-dir "$DATA_DIR/dapo_raw"
+```
+
+将 `--input` 指向下载的完整训练 parquet：
+
+```bash
+python -m examples.retool_agentic.prepare_data \
+  --input "$DATA_DIR/dapo_raw/data/dapo-math-17k.parquet" \
+  --model "$MODEL_DIR" --out "$DATA_DIR/train.jsonl"
+```
+
+转换器验证固定源数据的重复记录，隔离同题答案冲突的 14 个 native ID，得到 17903 个问题；不截断、静默过滤超长 prompt，也不执行数据中的代码。输出旁的 manifest 记录转换统计和摘要。已有同协议的 `train.jsonl` 可以直接使用，无需重新转换；已有输出不会被覆盖。
+
+## 启动
+
+独占的单机训练容器中，从 Relax 仓库根目录运行：
+
+```bash
 bash examples/retool_agentic/scripts/run-qwen25-7B-grpo-8xgpu.sh
 ```
 
-脚本自动 source `scripts/entrypoint/local.sh`，随后阻塞提交 Ray Job。该入口会清理本机进程，适用于新任务的独占容器。已有共享 Ray 集群使用框架入口：
+脚本自动 source `scripts/entrypoint/local.sh`，建立本机 Ray，再阻塞提交任务并跟随日志。该入口会清理本机旧进程，适用于新的独占任务环境。
+
+已有 Ray 集群时使用框架入口，复用该集群：
 
 ```bash
-RAY_ADDRESS=http://head-host:8265 \
+RAY_ADDRESS=http://ray-head:8265 \
   bash scripts/entrypoint/ray-job.sh \
   examples/retool_agentic/scripts/run-qwen25-7B-grpo-8xgpu.sh
 ```
 
-默认保存位置为 `$SAVE_DIR/qwen25-7b-retool-agentic-grpo-8xgpu`，与原示例的默认实验目录区分。每 25 步保存模型、optimizer、scheduler 和抽样 RNG 状态，HF 导出位于同目录下的 `hf_{rollout_id}`。保持 `SAVE_DIR`、`EXP_NAME`、数据内容、seed、batch/K 不变，再执行相同脚本即可从完整 checkpoint 恢复。只复制 `hf_*` 目录属于从权重开始新实验。
+默认 ClearML project 为 `Relax/retool-agentic`，稳定实验名为 `qwen25-7b-retool-agentic-grpo-8xgpu`；分别可用 `PROJECT_NAME` 和 `EXP_NAME` 覆盖。ClearML 使用运行环境已有凭证，每次启动创建带时间戳的新 task。无需 ClearML 时在命令后追加 `--no-use-clearml`。显式设置非空 `RAY_NO_WAIT` 才非阻塞，此时脚本日志只包含提交输出，需用 `ray job logs` 查看训练。
 
-`PROJECT_NAME` 默认 `Relax/retool-agentic`，`EXP_NAME` 默认 `qwen25-7b-retool-agentic-grpo-8xgpu`；允许通过环境覆盖。ClearML 每次启动创建带时间戳的 task，模型恢复目录保持稳定。默认阻塞跟随日志；只有显式设置非空 `RAY_NO_WAIT` 才非阻塞。
+### Sandbox
 
-工具服务由现有 `examples.retool.train` 在 Ray Job 生命周期内管理。自动选择 Landlock 或 Apptainer 后端，镜像缓存仍为 `$SAVE_DIR/.retool-sandbox/`；可选 `SANDBOX_IMAGE` 或 `SANDBOX_FUSION_URL` 的配置与[原示例](../retool/README.md)相同。服务 URL 会传入 Session 所在 worker，tokenizer 路径通过 `--agent-env` 传入 agent 进程。
+`train.py` 为整个 Ray Job 管理工具服务，训练退出后关闭服务。自动优先使用 Landlock；内核未实现 Landlock 时使用 Apptainer。首次使用 Apptainer 会将固定镜像缓存到 `$SAVE_DIR/.retool-sandbox/`，也可预先准备：
 
-若机器出现 NVSwitch multicast 建链失败并伴随 NCCL CUDA 999，可设置 `NCCL_NVLS_ENABLE=0` 关闭 NVLS 后重启。脚本会将显式设置传入 Ray worker，覆盖入口按 NVLink 拓扑自动生成的值；未设置时沿用入口默认值。
+```bash
+apptainer pull /path/to/sandboxfusion.sif \
+  docker://vemlp-cn-beijing.cr.volces.com/preset-images/code-sandbox:server-20250609
+export SANDBOX_IMAGE=/path/to/sandboxfusion.sif
+bash examples/retool_agentic/scripts/run-qwen25-7B-grpo-8xgpu.sh
+```
 
-## 默认训练配置
+Apptainer 启动器只绑定可信 bootstrap 和 cgroup 控制目录，不挂载模型、数据、仓库或 GPU。模型代码以 uid/gid 65534 执行，每次调用是独立的无状态 Python 程序，限 30 秒、1 GiB；禁止网络、任意文件访问、子进程和线程。镜像内的 SciPy/HiGHS 限为单线程。
 
-| 参数               | 值                                                            |
-| ------------------ | ------------------------------------------------------------- |
-| 算法与训练步数     | GRPO，200 rollout，每 rollout 一次训练更新                    |
-| Batch              | 64 个有放回抽样的问题 × 16 条轨迹 = 1024                      |
-| Resident 并发      | 16 个 group，最多 256 个 agent 进程                           |
-| 模型请求容量       | 8 个 SGLang engine × 32 请求；Session 使用 consistent hashing |
-| 工具服务容量       | 复用原服务的 32 路执行并发，单次 30 秒 / 1 GiB                |
-| Token 预算         | prompt 2048；回复与工具反馈合计 8192；上下文 10240            |
-| Assistant 轮数上限 | 16，终止轮不会继续执行代码                                    |
-| Sampling           | temperature=1，top-p=1，top-k=-1                              |
-| 优化               | lr=1e-6；clip=0.2；KL/entropy=0；Actor TP=2                   |
+设置 `SANDBOX_FUSION_URL=http://sandbox-host:8080/run_code` 时复用外部服务，不启动或关闭它。需要手动运行本例的 Apptainer 服务时：
 
-每个问题的 16 条轨迹独立执行，不共享工具 Python 状态。数据源接受 Agentic 的分批 group 请求，抽题顺序与原生示例相同；只在完整 batch 边界保存 RNG。
+```bash
+SANDBOX_IMAGE=/path/to/sandboxfusion.sif \
+  bash examples/retool_agentic/scripts/run-sandbox-apptainer.sh
+```
 
-本版覆盖同步训练：未接入 Eval，禁止 prelaunch、partial rollout、fully async、动态过滤与额外 oversampling，以保留完整 batch 的抽样与恢复约束。不要传入 `EVAL_CONFIG` 或 Eval 参数。分布式 GPU 训练和 256 个 resident 进程的实际吞吐仍需在新任务环境验收，本地 CPU 检查不能证明 GPU 吞吐或训练已启动。
+服务默认监听 `127.0.0.1:8080`，可用 `SANDBOX_HOST`、`SANDBOX_PORT` 覆盖。多节点或跨容器运行时，需要自行确保服务可达和访问范围。
 
-## 上下文、mask 与奖励
+## 保存与恢复
 
-模型继续生成原作者的 `<code> ... </code>` 文本，无需函数调用或 reasoning parser。每次 Chat Completions 请求使用完整历史、固定模板、`stream=false`；URL 保留 `RELAX_BASE_URL` 的路由前缀，并使用 `Bearer RELAX_SESSION_ID`。
+模型、optimizer、scheduler 和数据 RNG 保存在 `$SAVE_DIR/$EXP_NAME`，默认每 25 次更新保存，最多保留 8 份 native checkpoint。HF 导出位于同目录的 `hf_{rollout_id}`；rollout ID 从 0 开始，第一次保存为 `iter_0000024` / `hf_24`。
 
-专用模板使初始 prompt 与 Qwen2.5 模板一致。工具结果以非空的完整 `\n<interpreter>\n...\n</interpreter>\n` 内容追加为 tool message；模板将其原样拼回 assistant 流，不额外插入 ChatML 轮次边界。即使 stdout 为空，wrapper 仍完整保留。后续请求复用原 assistant 返回消息，SessionForest 只形成一条线性路径并隐式导出一份训练样本。
+保持 `SAVE_DIR`、`EXP_NAME`、初始模型配置/tokenizer、数据内容、seed、batch 和每题轨迹数不变，再执行同一脚本，即从最新完整 checkpoint 恢复。迁移训练环境时携带完整实验目录，包括 tracker、native 模型/optimizer 状态和 `dataset/retool_*.json`。单独复制 `hf_*` 只能从权重开始新实验，不能恢复完整训练状态。改变 `SAVE_DIR` 或 `EXP_NAME` 可以新开实验。
 
-Assistant token 的 loss mask 为 1，实际反馈 token 为 0；logprob 来自 Agentic 的原生后端记录。SGLang sampling params 中的 `logit_bias` 屏蔽 padded token `[151665, 152064)`，训练端复用原词表 hook。原采样 seed 的按样本、按轮偏移保持一致。原生 API 的 `</code>` stop 只代表一个回复结束；若 agent 因总预算或轮数终止，reward adapter 将导出样本标为 truncated。
+Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batch。抽样编号和训练轮次分别计数，checkpoint 同时记录 RNG 与下一抽样编号；权重版本校验使用 Session 的实际生成轮次。兼容补样前格式的同协议 RNG checkpoint。动态过滤、额外 oversampling、prelaunch、partial rollout、fully async 和 Eval 尚未接入本例，请勿开启这些选项。
 
-奖励继续采用原 verifier 的答案分数，减每次工具失败 0.1，无下限；基础设施故障不转换成工具惩罚。代码只执行一次，无 HTTP 重试或历史代码重放。Agent 进程失败遵循 Agentic 的整组丢弃机制；本例的完整 batch/权重版本校验不支持跨 batch 自动补样恢复。
+## 默认配置与行为
 
-模型 HTTP 请求不设置 wall timeout，以允许 Runtime 暂停请求；`--agent-timeout 1800` 是独立的进程 active-time 上限。Sandbox 请求继续使用原客户端的 70 秒 wall timeout。
+| 配置               | 默认值                                                      |
+| ------------------ | ----------------------------------------------------------- |
+| 算法               | GRPO，200 rollout，每轮一次训练更新                         |
+| 训练 batch         | 64 组 × 每组 16 条轨迹 = 1024                               |
+| Resident 并发      | 16 组，最多 256 个 agent 进程                               |
+| 推理               | 8 个 SGLang engine，每 engine 32 个请求，consistent hashing |
+| Token 预算         | prompt 2048；回复与反馈合计 8192；context 10240             |
+| Assistant 轮数上限 | 16，终止轮不执行多余代码                                    |
+| Sampling           | temperature=1，top-p=1，top-k=-1                            |
+| 训练               | Actor TP=2，lr=1e-6，clip=0.2，KL/entropy=0                 |
+| 工具执行           | 32 路并发，每次 30 秒 / 1 GiB                               |
 
-## 本地验证
+每次模型请求发送完整历史，使用固定模板和 `stream=false`。工具结果原样追加为非空的 `\n<interpreter>\n...\n</interpreter>\n`，继续同一 assistant token 流，不额外插入 ChatML 边界；无需 reasoning/tool-call parser。Session 形成线性上下文并导出一份训练样本。生成 token 的 mask 为 1，实际反馈 token 的 mask 为 0，logprob 来自原生推理后端。词表 hook 和 sampling bias 屏蔽 padded token。
+
+奖励为答案判分的 ±1，减去每次工具失败的 0.1，无下限；保留 DAPO verifier 的 `Answer:` 优先、boxed 回退规则。这是 GRPO 配方，不是原论文 PPO 配方的等价复现。
+
+代码错误、超时、非法调用和隔离程序的信号退出作为工具反馈；HTTP、服务或响应协议异常直接报错，不伪装成模型负奖励。每段新代码只执行一次，不做 HTTP 重试或历史重放。模型请求不设 wall timeout，以允许 Runtime 暂停；`--agent-timeout 1800` 限制 agent 的 active time，sandbox 请求另有 70 秒 wall timeout。
+
+机器若出现 NVSwitch multicast 建链故障且 NCCL 返回 CUDA 999，可在重新启动前设置 `NCCL_NVLS_ENABLE=0`。脚本会将显式值传入 Ray worker；这属于通信故障绕过配置。
+
+## 代码与测试
+
+- `agent.py`、`protocol.py`：模型请求、工具循环、提示词与上下文模板。
+- `data_source.py`、`prepare_data.py`：抽样、恢复和 DAPO 转换。
+- `reward.py`、`math_dapo.py`、`vocab.py`：奖励、答案判分和词表训练 hook。
+- `train.py`、`checkpoint.py`：工具服务生命周期与完整恢复检查。
+- `sandbox*.py`、`landlock*.py`、`tool_service.py`：隔离执行后端及客户端。
+- `scripts/`：训练与独立 sandbox 入口。
 
 ```bash
 python -m pytest examples/retool_agentic/tests -q
 
-# 可选：使用实际训练模型的 tokenizer 重跑同一组检查。
+# 使用实际模型的 tokenizer 检查模板和 token 对齐。
 RETOOL_TEST_MODEL_DIR="$MODEL_DIR" \
   python -m pytest examples/retool_agentic/tests -q
 ```
 
-测试通过真实 `SGLangMessageCompiler`、上下文匹配和 `SessionForest` 导出，与原 rollout 逐 token 比较输入、mask、logprob、终止状态和轮数；包含多轮、空输出、代码错误、非法调用与预算终止。同时验证真实子进程的 HTTP/JSON 交互、路由前缀、抽样恢复和启动脚本。模型响应与 sandbox 执行在 CPU 测试中由固定结果替代，不占用 GPU。
+测试通过真实 compiler、上下文匹配和 SessionForest 导出，与目录内冻结的原生参考循环比较 token、mask、logprob 和终止行为；同时覆盖子进程 HTTP、数据补样恢复、sandbox 生命周期和启动命令。CPU 测试用固定模型响应和执行结果替代 GPU 推理；真实吞吐和 GPU 兼容性需在目标训练环境验证。
