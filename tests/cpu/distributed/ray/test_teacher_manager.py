@@ -55,6 +55,7 @@ def _make_teacher_manager(monkeypatch, *, num_replicas=1, gpus_per_replica=16, s
     args = SimpleNamespace(
         num_gpus_per_node=8,
         rollout_num_gpus=80,
+        enable_affinity=True,
         teacher_hf_checkpoint="/tmp/teacher",
         teacher_sglang_dp_size=8,
     )

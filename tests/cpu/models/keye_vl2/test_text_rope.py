@@ -138,7 +138,13 @@ def test_text_runtime_uses_real_packed_batch(
     config = _provider(provider_type, 2)
     # Actor's HF processor detection sets this even for a pure-text run.
     args = SimpleNamespace(
-        multimodal_keys=None, cp_partition_mode="zigzag", is_vl_model=True, uses_unsplit_forward=True
+        multimodal_keys=None,
+        cp_partition_mode="zigzag",
+        is_vl_model=True,
+        uses_unsplit_forward=True,
+        qsa_indexer_loss_coeff=0.0,
+        enable_mtp_training=False,
+        loss_type="policy_loss",
     )
     config.configure_runtime(args)
     monkeypatch.setattr(data, "get_args", lambda: args)

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.rotate_ckpt import rotate_ckpt
+from tests.cpu.relax_parser import args_for_flags
 
 
 @pytest.fixture
@@ -52,7 +53,9 @@ def test_checkpoint_sync_rotation_follows_successful_save(save_method, rank, fai
         }
     )
     actor = SimpleNamespace(
-        args=SimpleNamespace(debug_rollout_only=False, offload_train=False, async_save=False, save_hf=None),
+        args=args_for_flags(
+            "--save-lora-only", debug_rollout_only=False, offload_train=False, async_save=False, save_hf=None
+        ),
         model=None,
         optimizer=None,
         opt_param_scheduler=None,
@@ -113,7 +116,8 @@ def test_checkpoint_async_preserves_recovery_point(save_method, monkeypatch, tmp
         rotate_ckpt=rotate_ckpt,
     )
     actor = SimpleNamespace(
-        args=SimpleNamespace(
+        args=args_for_flags(
+            "--save-lora-only",
             debug_rollout_only=False,
             offload_train=False,
             async_save=True,
@@ -182,7 +186,8 @@ def test_checkpoint_async_entry_skips_rotation_without_an_older_commit(
         rotate_ckpt=rotate_ckpt,
     )
     actor = SimpleNamespace(
-        args=SimpleNamespace(
+        args=args_for_flags(
+            "--save-lora-only",
             debug_rollout_only=False,
             offload_train=False,
             async_save=True,
@@ -231,8 +236,13 @@ def test_checkpoint_async_dpo_rotation_requires_sidecar(save_method, monkeypatch
         reference_identity_path=lambda *args: None,
     )
     actor = SimpleNamespace(
-        args=SimpleNamespace(
-            debug_rollout_only=False, offload_train=False, async_save=True, save_hf=None, save="unused"
+        args=args_for_flags(
+            "--save-lora-only",
+            debug_rollout_only=False,
+            offload_train=False,
+            async_save=True,
+            save_hf=None,
+            save="unused",
         ),
         model=None,
         optimizer=None,

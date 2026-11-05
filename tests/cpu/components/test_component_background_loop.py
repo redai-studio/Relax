@@ -3,12 +3,12 @@
 import asyncio
 import importlib
 import threading
-from argparse import Namespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
 from relax.components.background_loop import BackgroundLoopRunner
+from tests.cpu.relax_parser import args_for_flags
 
 
 @pytest.fixture(params=[("actor", "Actor"), ("actor_fwd", "ActorFwd"), ("critic", "Critic")])
@@ -26,7 +26,14 @@ def component(request, monkeypatch):
     obj._logger_instance = Mock()
     obj.role = module_name
     obj.step = 0
-    obj.config = Namespace(num_rollout=1, fully_async=True, loss_type="policy_loss", use_health_check=False)
+    obj.config = args_for_flags(
+        "--generation-task",
+        "--sft-async-prepack",
+        "--use-health-check",
+        num_rollout=1,
+        fully_async=True,
+        loss_type="policy_loss",
+    )
     obj.healthy = Mock()
     obj.data_system_client = Mock()
     yield obj
@@ -157,7 +164,9 @@ async def test_component_constructor_initializes_shared_runner(component, monkey
     train_group.init_and_wait.return_value = [0]
     monkeypatch.setitem(namespace, "allocate_train_group", Mock(return_value=train_group))
     monkeypatch.setitem(namespace, "attach_tq_client", Mock(return_value=Mock()))
-    config = Namespace(
+    config = args_for_flags(
+        "--advantage-estimator",
+        "--use-health-check",
         tq_config={},
         kl_coef=0,
         use_kl_loss=False,

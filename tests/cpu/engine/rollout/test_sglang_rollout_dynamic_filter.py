@@ -67,6 +67,7 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
             rollout_global_dataset=True,
             dynamic_sampling_filter_path="test_filter" if filter_fn else None,
             fully_async=fully_async,
+            max_staleness=1,
             num_rollout=2,
             rollout_batch_size=rollout_batch_size,
             over_sampling_batch_size=max(rollout_batch_size, len(batches[0])),

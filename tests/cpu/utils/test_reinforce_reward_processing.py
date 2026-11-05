@@ -2,9 +2,11 @@
 
 import importlib
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
+
+from tests.cpu.relax_parser import args_for_flags
 
 
 @pytest.fixture()
@@ -38,7 +40,7 @@ def _args(**overrides):
         grpo_std_normalization=True,
     )
     defaults.update(overrides)
-    return SimpleNamespace(**defaults)
+    return args_for_flags("--custom-convert-samples-to-train-data-path", "--use-rollout-indexer-replay", **defaults)
 
 
 def test_baseline_subtracts_inclusive_group_mean_without_group_std(post_process_rewards):

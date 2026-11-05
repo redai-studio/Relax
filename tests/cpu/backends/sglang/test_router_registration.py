@@ -10,6 +10,7 @@ import pytest
 from requests import ConnectTimeout, ReadTimeout
 
 from relax.utils.http_utils import router_worker_base_url
+from tests.cpu.relax_parser import args_for_flags
 
 
 @pytest.fixture()
@@ -496,6 +497,7 @@ def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_eng
     from unittest.mock import Mock
 
     engine = _pd_engine(sglang_engine_module)
+    vars(engine.args).update(vars(args_for_flags("--optimize-routing-replay", "--warm-hf-checkpoint-page-cache")))
     engine._skip_router_registration = False
     engine.register_to_router = Mock(return_value=registered)
     process = SimpleNamespace(pid=123, is_alive=lambda: False)

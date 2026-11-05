@@ -25,6 +25,7 @@ from relax.utils.tq.config import (
     validate_mooncake_runtime_contract,
     validate_segment_capacity,
 )
+from tests.cpu.relax_parser import args_for_flags
 
 
 _MASTER = "master.example:50051"
@@ -42,7 +43,9 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "seq_length": 8192,
     }
     values.update(overrides)
-    return argparse.Namespace(**values)
+    return args_for_flags(
+        "--partial-rollout", "--use-dynamic-global-batch-size", "--over-sampling-batch-size", **values
+    )
 
 
 @pytest.mark.parametrize(

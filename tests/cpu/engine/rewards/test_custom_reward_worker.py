@@ -1,5 +1,4 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +8,8 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Iterator, TypeVar
 
 import pytest
+
+from tests.cpu.relax_parser import args_for_flags
 
 
 try:
@@ -55,6 +56,7 @@ T = TypeVar("T")
 
 def _make_args(**overrides: Any) -> SimpleNamespace:
     defaults = {
+        **vars(args_for_flags("--enable-affinity", "--autoscaler-config")),
         "rm_type": "openr1mm",
         "custom_rm_path": None,
         "group_rm": False,

@@ -75,7 +75,8 @@ def test_packing_preserves_rl_prompt_boundary_for_visual_embedding(monkeypatch, 
 
     data = _load_data_module(monkeypatch)
     monkeypatch.setattr(data, "PackedSeqParams", SimpleNamespace)
-    monkeypatch.setattr(data, "get_args", lambda: SimpleNamespace(loss_type=loss_type))
+    args = SimpleNamespace(loss_type=loss_type, qsa_indexer_loss_coeff=0.0, enable_mtp_training=False)
+    monkeypatch.setattr(data, "get_args", lambda: args)
     monkeypatch.setattr(data.mpu, "get_context_parallel_world_size", lambda: cp_size, raising=False)
     monkeypatch.setattr(data.mpu, "get_context_parallel_rank", lambda: 0, raising=False)
     monkeypatch.setattr(data.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)

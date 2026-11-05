@@ -9,6 +9,7 @@ from types import ModuleType
 import pytest
 
 from relax.engine.sft.bootstrap import resolve_sft_num_rollout
+from tests.cpu.relax_parser import args_for_flags
 
 
 @pytest.fixture
@@ -59,9 +60,13 @@ def _reported_metrics(args: Namespace, step: int, steps_per_rollout: int = 1) ->
     raise AssertionError("Training metric-emission block not found")
 
 
+def _sft_args(**overrides) -> Namespace:
+    return args_for_flags("--generation-task", "--custom-dataset-class", "--eval-size", loss_type="sft", **overrides)
+
+
 @pytest.mark.parametrize("step", [0, 17, 240, 241, 722])
 def test_sft_epoch_progress_reports_nondivisible_dataset(sized_dataset, step):
-    args = Namespace(loss_type="sft", prompt_data=30890, rollout_batch_size=128, num_epoch=3, num_rollout=1000)
+    args = _sft_args(prompt_data=30890, rollout_batch_size=128, num_epoch=3, num_rollout=1000)
     resolve_sft_num_rollout(args)
 
     assert args.num_rollout == 723
@@ -71,9 +76,7 @@ def test_sft_epoch_progress_reports_nondivisible_dataset(sized_dataset, step):
 
 @pytest.mark.parametrize("eval_size,train_size,interval", [(None, 1024, 8), (128, 896, 7), (42, 982, None)])
 def test_sft_epoch_progress_uses_training_split(sized_dataset, eval_size, train_size, interval):
-    args = Namespace(
-        loss_type="sft", prompt_data=1024, rollout_batch_size=128, num_epoch=3, num_rollout=1000, eval_size=eval_size
-    )
+    args = _sft_args(prompt_data=1024, rollout_batch_size=128, num_epoch=3, num_rollout=1000, eval_size=eval_size)
     resolve_sft_num_rollout(args)
 
     assert args.num_rollout_per_epoch == interval
@@ -81,8 +84,7 @@ def test_sft_epoch_progress_uses_training_split(sized_dataset, eval_size, train_
 
 
 def test_sft_epoch_progress_custom_dataset_clears_unknown_denominator():
-    args = Namespace(
-        loss_type="sft",
+    args = _sft_args(
         custom_dataset_class_path="custom.Dataset",
         num_rollout=10,
         num_epoch=None,

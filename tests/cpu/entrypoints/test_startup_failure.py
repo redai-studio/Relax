@@ -19,6 +19,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import yaml
 
+from tests.cpu.relax_parser import args_for_flags
+
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -90,7 +92,7 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
     ns["serve"].shutdown.side_effect = lambda: events.append("serve")
     ns["ray"].shutdown.side_effect = lambda: events.append("ray")
     with pytest.raises(SystemExit) as exc:
-        ns["main"](SimpleNamespace())
+        ns["main"](args_for_flags("--fault-events-enabled"))
     expected = 1 if fail_at else 0
     assert exc.value.code == expected
     assert ns["_training_completed"] is (fail_at is None)
@@ -112,9 +114,10 @@ def test_train_cleans_up_if_tracking_fails_before_controller(monkeypatch):
     ns["serve"].shutdown.side_effect = lambda: events.append("serve")
     ns["ray"].shutdown.side_effect = lambda: events.append("ray")
     with pytest.raises(SystemExit) as exc:
-        ns["main"](SimpleNamespace())
+        ns["main"](args_for_flags("--fault-events-enabled"))
 
     assert exc.value.code == 1
+    ns["init_tracking"].assert_called_once()
     assert events == ["serve", "ray", ("exit", 1)]
 
 

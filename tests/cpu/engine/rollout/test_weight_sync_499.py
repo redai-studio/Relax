@@ -251,6 +251,7 @@ def _rollout_args(**overrides):
         "over_sampling_batch_size": 1,
         "n_samples_per_prompt": 1,
         "dynamic_sampling_filter_path": None,
+        "max_staleness": 1,
         "global_batch_size": 1,
         "num_iters_per_train_update": 1,
         "partial_rollout": False,

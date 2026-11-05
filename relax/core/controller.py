@@ -1459,7 +1459,8 @@ class Controller:
 
         from relax.engine.sft.runtime import is_i2i_sft
 
-        if is_i2i_sft(getattr(self, "config", None)) and ROLES.sft in self.serve_dict:
+        config = getattr(self, "config", None)
+        if config is not None and is_i2i_sft(config) and ROLES.sft in self.serve_dict:
 
             async def stop_image_producer() -> None:
                 await asyncio.wait_for(self.serve_dict[ROLES.sft].handle.stop.remote(), timeout=10)

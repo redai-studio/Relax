@@ -9,6 +9,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.utils.megatron_argument_compat import dynamic_context_parallel_enabled
+
 
 @pytest.mark.parametrize("force_sparse", [False, True])
 def test_bridge_forwards_qsa_force_sparse(force_sparse):
@@ -24,6 +26,7 @@ def test_bridge_forwards_qsa_force_sparse(force_sparse):
                 statements["override_loop"] = node
     namespace = {
         "args": SimpleNamespace(qsa_force_sparse=force_sparse),
+        "dynamic_context_parallel_enabled": dynamic_context_parallel_enabled,
         "provider": SimpleNamespace(qsa_force_sparse=not force_sparse),
         "logger": Mock(),
         "is_kimi_k3": False,

@@ -88,7 +88,8 @@ def _text_cp_worker(rank: int, init_method: str) -> None:
         "loss_masks": [torch.ones(length, device="cuda", dtype=torch.int) for length in lengths],
     }
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(data, "get_args", lambda: SimpleNamespace())
+        args = SimpleNamespace(qsa_indexer_loss_coeff=0.0, uses_unsplit_forward=False, loss_type="policy_loss")
+        patch.setattr(data, "get_args", lambda: args)
         patch.setattr(data.mpu, "get_context_parallel_world_size", lambda: 2)
         patch.setattr(data.mpu, "get_context_parallel_rank", lambda: rank)
         patch.setattr(data.mpu, "get_tensor_model_parallel_world_size", lambda: 1)

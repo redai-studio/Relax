@@ -10,6 +10,7 @@ import pytest
 
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.engine.sft.predict import loop as predict_loop
+from tests.cpu.relax_parser import args_for_flags
 
 
 def _sample(messages: list[tuple[str, str, bool]]) -> CanonicalSample:
@@ -96,7 +97,10 @@ def test_render_eval_prompts_uses_seeded_random_eval_rows(monkeypatch):
 
     monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
     monkeypatch.setattr("relax.engine.sft.dataset.streaming.SFTStreamingDataset", _FakeDataset)
-    config = SimpleNamespace(
+    config = args_for_flags(
+        "--conversation-key-map",
+        "--sft-invalid-multimodal-strategy",
+        "--apply-chat-template-kwargs",
         hf_checkpoint="/fake/model",
         context_parallel_size=1,
         max_tokens_per_gpu=128,

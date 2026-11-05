@@ -170,6 +170,7 @@ def test_train_one_step_collects_after_clearing_gradients(args: Namespace, colle
     module = ast.parse("from __future__ import annotations")
     module.body.append(function)
     args.custom_megatron_before_train_step_hook_path = None
+    args.use_rollout_indexer_replay = False
     namespace = {
         "get_args": lambda: args,
         "capture_hooks": Mock(),
