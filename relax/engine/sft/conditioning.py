@@ -199,13 +199,6 @@ class ConditioningRuntime:
     def _conditioning_key(self, spec: ConditioningSpec) -> str:
         return build_key({"weights": self.fingerprint, "schema": spec.name, "dependencies": spec.dependencies})
 
-    def prefetch(self, spec: ConditioningSpec) -> bool:
-        """Schedule CPU storage work for an already prepared effective
-        input."""
-        if not self.prefetch_enabled or self._cache_guard_disabled or not spec.cacheable:
-            return False
-        return self._prefetch.submit(self._conditioning_key(spec))
-
     def prefetch_many(self, specs: list[ConditioningSpec]) -> int:
         """Replace the bounded future window, without model work or
         collectives.

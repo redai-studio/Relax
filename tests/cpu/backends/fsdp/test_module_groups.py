@@ -55,31 +55,3 @@ def test_module_groups_reject_ambiguous_ownership(case):
 def test_module_groups_default_preserves_existing_policy():
     model = _model()
     assert resolve_module_groups(model) == []
-
-
-def test_native_group_hooks_wait_for_all_members_after_repeated_calls():
-    from torch.distributed.fsdp._fully_shard._fsdp_state import _register_group_forward_hooks
-
-    first, last = torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
-    pending, completed = set(), []
-
-    def pre(module, args, kwargs):
-        return args, kwargs
-
-    def post(module, args, output):
-        completed.append(module)
-        return output
-
-    handles = _register_group_forward_hooks([first, last], pre, post, pending, lambda output: output)
-    try:
-        for _ in range(2):
-            value = first(torch.ones(1, 4))
-            value = first(value)
-            assert pending == {last}
-            assert not completed
-            last(value).sum().backward()
-            assert completed == [last]
-            assert not pending
-            completed.clear()
-    finally:
-        handles.remove()

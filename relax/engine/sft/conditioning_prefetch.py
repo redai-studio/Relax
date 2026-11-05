@@ -11,7 +11,6 @@ LRU eviction, not a second allocation of the shared mmap payload.
 from __future__ import annotations
 
 import threading
-import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -86,8 +85,6 @@ class ConditioningPrefetch:
                 "stale",
                 "loaded_bytes",
                 "peak_bytes",
-                "lookup_seconds",
-                "wait_seconds",
             ),
             0,
         )
@@ -123,7 +120,6 @@ class ConditioningPrefetch:
                 self._stats["bypasses"] += 1
                 return
             self._inflight_limit = available
-        started = time.perf_counter()
         lease = None
         try:
             lease = self.cache.lookup(ticket.key, max_bytes=available)
@@ -150,7 +146,6 @@ class ConditioningPrefetch:
                 lease.close()
             with self._lock:
                 self._inflight_limit = 0
-                self._stats["lookup_seconds"] += time.perf_counter() - started
 
     def _finish(self, ticket: _Ticket) -> None:
         with self._lock:
@@ -174,7 +169,6 @@ class ConditioningPrefetch:
             ticket = self._pending.pop(key, None)
         if ticket is None:
             return None
-        started = time.perf_counter()
         try:
             try:
                 ticket.future.result()
@@ -182,9 +176,6 @@ class ConditioningPrefetch:
                 with self._lock:
                     self._discard(ticket)
                 return None
-            finally:
-                with self._lock:
-                    self._stats["wait_seconds"] += time.perf_counter() - started
             with self._lock:
                 if ticket.discarded or ticket.lease is None or self._closed:
                     self.release(ticket)

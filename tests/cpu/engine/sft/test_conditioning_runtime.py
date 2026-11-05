@@ -645,7 +645,7 @@ def test_invalidated_encoder_never_consumes_prefetched_features(runtime_factory,
     monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "1")
     runtime, _ = runtime_factory()
     runtime.resolve(_spec(), lambda: {"value": torch.ones(4)}, _restore)
-    assert runtime.prefetch(_spec())
+    assert runtime.prefetch_many([_spec()]) == 1
     runtime._prefetch._pool.submit(lambda: None).result(timeout=5)
     runtime.begin_step()
     runtime._cache_guard_disabled = True
@@ -660,7 +660,7 @@ def test_prefetch_rekeys_actual_effective_input_before_using_a_future(runtime_fa
     monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "1")
     runtime, _ = runtime_factory()
     runtime.resolve(_spec(), lambda: {"value": torch.ones(2)}, _restore)
-    assert runtime.prefetch(_spec())
+    assert runtime.prefetch_many([_spec()]) == 1
     changed = ConditioningSpec("dummy.condition.v1", {"input": "changed-after-prefetch", "dtype": "bf16"}, True)
     runtime.begin_step()
     actual = runtime.resolve(changed, lambda: {"value": torch.full((2,), 3.0)}, _restore)
@@ -676,7 +676,7 @@ def test_file_corrupted_after_prefetch_is_checked_again_before_use(runtime_facto
     runtime, _ = runtime_factory()
     expected = torch.arange(8, dtype=torch.bfloat16)
     runtime.resolve(_spec(), lambda: {"value": expected}, _restore)
-    assert runtime.prefetch(_spec())
+    assert runtime.prefetch_many([_spec()]) == 1
     runtime._prefetch._pool.submit(lambda: None).result(timeout=5)
     path = next(runtime.cache.directory.glob("*.safetensors"))
     with path.open("r+b") as file:
@@ -696,7 +696,7 @@ def test_prefetched_schema_failure_releases_budget_and_rebuilds_online(runtime_f
     runtime, _ = runtime_factory()
     key = runtime._conditioning_key(_spec())
     assert runtime.cache.put(key, {"wrong_field": torch.ones(2)})
-    assert runtime.prefetch(_spec())
+    assert runtime.prefetch_many([_spec()]) == 1
     expected = torch.arange(2, dtype=torch.bfloat16)
     actual = runtime.resolve(_spec(), lambda: {"value": expected.clone()}, _restore)
     assert torch.equal(actual["condition"], expected)
@@ -714,7 +714,7 @@ def test_prefetch_disabled_with_online_runtime_and_close_drains_reader(runtime_f
     assert online.prefetch_many([_spec()]) == 0
     runtime, _ = runtime_factory()
     runtime.resolve(_spec(), lambda: {"value": torch.ones(2)}, _restore)
-    assert runtime.prefetch(_spec())
+    assert runtime.prefetch_many([_spec()]) == 1
     runtime.close()
     stats = runtime._prefetch.stats()
     assert stats["closed"] and stats["bytes"] == stats["outstanding"] == 0
@@ -726,7 +726,7 @@ def test_interrupted_runtime_close_is_retryable(runtime_factory, monkeypatch, er
     monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "1")
     runtime, model = runtime_factory()
     runtime.resolve(_spec(), lambda: {"value": torch.ones(2)}, _restore)
-    assert runtime.prefetch(_spec())
+    assert runtime.prefetch_many([_spec()]) == 1
     resource = runtime._prefetch if phase == "prefetch" else runtime.cache
     original_close, calls = resource.close, []
 

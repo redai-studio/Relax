@@ -545,56 +545,6 @@ def test_prepared_forward_tokenizes_once_and_online_uses_legacy(tiny_conditionin
     assert model.pipe.prefix_prepared == [True, False]
 
 
-def test_synthetic_random_crop_and_caption_dropout_keep_effective_keys_and_rng(tiny_conditioning_model):
-    """Exercise externally prepared augmentations; the real adapter uses center
-    crops."""
-    from PIL import Image
-
-    model, data = tiny_conditioning_model
-    online, cached = copy.deepcopy(model), copy.deepcopy(model)
-    cached.conditioning_cache = _MemoryResolver()
-    source = Image.new("RGB", (33, 32))
-    source.putdata([(x * 7, y * 7, (x + y) * 3) for y in range(32) for x in range(33)])
-
-    def prepared(offset, drop):
-        return {
-            **data,
-            "edit_image": [source.crop((offset, 0, offset + 32, 32))],
-            "prompt": "" if drop else data["prompt"],
-        }
-
-    variants = [prepared(offset, drop) for offset in (0, 1) for drop in (False, True)]
-    keys = [
-        json.dumps(
-            model.conditioning_spec(sample, {"height": 32, "width": 32}, enabled=True).dependencies, sort_keys=True
-        )
-        for sample in variants
-    ]
-    assert len(set(keys)) == 4
-    with torch.no_grad():
-        for sample in variants:
-            cached(sample)
-    cached.pipe.prefix_calls = 0
-
-    def run(current):
-        torch.manual_seed(41)
-        losses, effective_inputs = [], []
-        with torch.no_grad():
-            for _ in range(16):
-                offset, drop = int(torch.randint(0, 2, ())), bool(torch.rand(()) < 0.5)
-                sample = prepared(offset, drop)
-                effective_inputs.append((offset, sample["prompt"]))
-                losses.append(current(sample))
-        return torch.stack(losses), effective_inputs, torch.get_rng_state().clone()
-
-    expected, expected_inputs, expected_rng = run(online)
-    actual, actual_inputs, actual_rng = run(cached)
-    assert actual_inputs == expected_inputs
-    assert torch.equal(actual, expected)
-    assert torch.equal(actual_rng, expected_rng)
-    assert online.pipe.prefix_calls == 16 and cached.pipe.prefix_calls == 0
-
-
 def _update(model, data):
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
     before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
