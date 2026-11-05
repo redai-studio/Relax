@@ -70,46 +70,23 @@ def _qkv(t, h, d, seed=0, kv_heads=None):
     return q, k, v
 
 
-def _attn(chunk_size, cp_size=1):
+def _attn(cp_size=1):
     return ChunkedCoreAttention(
         config=SimpleNamespace(context_parallel_size=cp_size),
         layer_number=1,
-        chunk_size=chunk_size,
         executor=lambda call: native_sdpa(SDPAttention().forward, call),
     )
-
-
-@pytest.mark.parametrize("chunk_size,heads,kv_heads", [(size, 2, 2) for size in (1, 3, 16)] + [(3, 4, 2)])
-def test_chunkflow_output_and_gradients_match_sdpa(chunk_size, heads, kv_heads):
-    q, k, v = _qkv(t=8, h=heads, d=4, kv_heads=kv_heads)
-    reference = [t.clone().requires_grad_(True) for t in (q, k, v)]
-    chunked = [t.clone().requires_grad_(True) for t in (q, k, v)]
-    expected = _sdpa_reference(*reference)
-    actual = _attn(chunk_size)(*chunked)
-    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
-    expected.sum().backward()
-    actual.sum().backward()
-    for got, want in zip(chunked, reference):
-        torch.testing.assert_close(got.grad, want.grad, rtol=1e-9, atol=1e-9)
-
-
-def test_chunkflow_packed_sequences_are_attended_independently():
-    q, k, v = _qkv(t=10, h=2, d=4)
-    packed = SimpleNamespace(cu_seqlens_q=torch.tensor([0, 6, 10]), cu_seqlens_q_cpu=[0, 6, 10])
-    got = _attn(chunk_size=4)(q, k, v, packed_seq_params=packed)
-    want = torch.cat([_sdpa_reference(q[:6], k[:6], v[:6]), _sdpa_reference(q[6:], k[6:], v[6:])], dim=0)
-    torch.testing.assert_close(got, want, rtol=1e-10, atol=1e-10)
 
 
 def test_chunkflow_context_parallel_is_rejected():
     q, k, v = _qkv(t=4, h=2, d=4)
     with pytest.raises(NotImplementedError, match="context parallelism"):
-        _attn(chunk_size=2, cp_size=2)(q, k, v)
+        _attn(cp_size=2)(q, k, v)
 
 
 def test_chunkflow_sbhd_is_rejected():
     with pytest.raises(NotImplementedError, match="THD"):
-        _attn(chunk_size=2)(torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4))
+        _attn()(torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4))
 
 
 @pytest.mark.parametrize(
@@ -118,7 +95,7 @@ def test_chunkflow_sbhd_is_rejected():
 )
 def test_dense_adapter_rejects_unhandled_attention_semantics(kwargs):
     with pytest.raises(NotImplementedError):
-        _attn(chunk_size=2)(*_qkv(4, 2, 4), **kwargs)
+        _attn()(*_qkv(4, 2, 4), **kwargs)
 
 
 def test_chunkflow_install_preserves_module_and_uninstall_restores_forward():
@@ -144,7 +121,6 @@ def _unit_attn(chunk_size, layer=1):
     return ChunkedCoreAttention(
         config=SimpleNamespace(context_parallel_size=1),
         layer_number=layer,
-        chunk_size=chunk_size,
         runtime=ChunkflowRuntime(chunk_size),
         executor=lambda call: native_sdpa(SDPAttention().forward, call),
     )
@@ -284,12 +260,13 @@ def test_unit_schedule_outputs_gradients_and_release_match_sdpa(keep_last_k, fp3
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
-def test_kv_cache_fp32_accumulates_across_backward_without_changing_values(monkeypatch, dtype):
-    from relax.backends.megatron.chunkflow.integration import _cache_leaf, _fold_leaf_grad_into
+def test_kv_cache_fp32_accumulates_across_backward_without_changing_values(dtype):
+    from relax.backends.megatron.chunkflow.state_store import ChunkState
 
-    monkeypatch.setenv("RELAX_CHUNKFLOW_KV_GRAD_FP32", "1")
     live = torch.zeros(2, 1, 4, dtype=dtype, requires_grad=True)
-    leaf = _cache_leaf(live)
+    state = ChunkState({})
+    state.link_tensor("k", live, accumulate_fp32=True)
+    leaf = state.tensors["k"]
     assert leaf.dtype == dtype and torch.equal(leaf, live)
     for coefficient in (256, 1, 1):
         (leaf * coefficient).sum().backward()
@@ -297,15 +274,14 @@ def test_kv_cache_fp32_accumulates_across_backward_without_changing_values(monke
     expected_dtype = torch.float64 if dtype == torch.float64 else torch.float32
     assert leaf._chunkflow_grad_sum.dtype == expected_dtype
     torch.testing.assert_close(leaf._chunkflow_grad_sum, torch.full_like(leaf._chunkflow_grad_sum, 258))
-    _fold_leaf_grad_into(live, leaf)
     (live * 0).sum().backward()
     torch.testing.assert_close(live.grad, torch.full_like(live, 258), rtol=0, atol=0)
-    monkeypatch.setenv("RELAX_CHUNKFLOW_KV_GRAD_FP32", "0")
     old_live = torch.zeros_like(live, requires_grad=True)
-    old_leaf = _cache_leaf(old_live)
+    old_state = ChunkState({})
+    old_state.link_tensor("k", old_live)
+    old_leaf = old_state.tensors["k"]
     for coefficient in (256, 1, 1):
         (old_leaf * coefficient).sum().backward()
-    _fold_leaf_grad_into(old_live, old_leaf)
     (old_live * 0).sum().backward()
     torch.testing.assert_close(
         old_live.grad, torch.full_like(old_live, 256 if dtype == torch.bfloat16 else 258), rtol=0, atol=0

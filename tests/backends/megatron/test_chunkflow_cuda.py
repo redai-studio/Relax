@@ -119,7 +119,6 @@ def test_native_te_history_gradients_and_recomputation(rope_module, keep_last_k)
     adapter = ChunkedCoreAttention(
         config=core.config,
         layer_number=1,
-        chunk_size=chunk_size,
         runtime=runtime,
         executor=lambda call: megatron_native_attention(core.forward, call),
     )
@@ -147,54 +146,6 @@ def test_native_te_history_gradients_and_recomputation(rope_module, keep_last_k)
     torch.testing.assert_close(torch.cat([actual[u.unit_id] for u in units]), expected, atol=0.02, rtol=0.02)
     for got, want in zip(leaves, reference):
         torch.testing.assert_close(got.grad, want.grad, atol=0.03, rtol=0.03)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_chunkflow_matches_flash_varlen_on_training_shapes(rope_module):
-    try:
-        from flash_attn import flash_attn_varlen_func
-    except ImportError:
-        pytest.skip("flash_attn not installed")
-
-    h, kv_h, d = 16, 4, 128
-    lengths = [3000, 1096]
-    total = sum(lengths)
-    bounds = [0, lengths[0], total]
-
-    g = torch.Generator(device="cuda").manual_seed(0)
-    q = torch.randn(total, h, d, generator=g, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(total, kv_h, d, generator=g, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    v = torch.randn(total, kv_h, d, generator=g, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    dout = torch.randn(total, h * d, generator=g, device="cuda", dtype=torch.bfloat16)
-    packed = SimpleNamespace(
-        cu_seqlens_q=torch.tensor(bounds, device="cuda", dtype=torch.int32), cu_seqlens_q_cpu=bounds
-    )
-    native = _native_te(h, kv_h, d)
-    adapter = ChunkedCoreAttention(
-        config=native.config,
-        layer_number=1,
-        chunk_size=1024,
-        executor=lambda call: megatron_native_attention(native.forward, call),
-    )
-
-    def run(fn):
-        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v)]
-        fn(*leaves).backward(dout)
-        return [leaf.grad for leaf in leaves]
-
-    def chunked(ql, kl, vl):
-        return adapter(ql, kl, vl, packed_seq_params=packed)
-
-    def reference(ql, kl, vl):
-        cu = torch.tensor(bounds, device="cuda", dtype=torch.int32)
-        out = flash_attn_varlen_func(ql, kl, vl, cu, cu, max(lengths), max(lengths), causal=True)
-        return out.reshape(total, -1)
-
-    rels = {
-        name: ((got.float() - want.float()).abs().max() / want.float().abs().max()).item()
-        for name, got, want in zip(("dq", "dk", "dv"), run(chunked), run(reference))
-    }
-    assert max(rels.values()) < 2e-2, f"chunked differs from flash_attn_varlen_func: {rels}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")

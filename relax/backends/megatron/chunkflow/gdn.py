@@ -17,7 +17,7 @@ from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR,
 from relax.backends.megatron.chunkflow.state_store import ChunkState
 
 
-_ORIGINAL = "_chunkflow_original_gdn"
+_CONVOLUTIONS: dict[Any, tuple[Callable, int]] = {}
 
 
 @dataclass
@@ -25,23 +25,11 @@ class _Context:
     module: Any
     packed: Any
     previous: dict[str, torch.Tensor] | None = None
-    current: dict[str, torch.Tensor] | None = None
+    current: ChunkState | None = None
     seen: set[str] = field(default_factory=set)
 
 
 _ACTIVE: ContextVar[_Context | None] = ContextVar("chunkflow_gdn", default=None)
-
-
-class _StateGradient(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, output: torch.Tensor, final_state: torch.Tensor, leaf: torch.Tensor) -> torch.Tensor:
-        ctx.leaf = leaf
-        return output
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, None]:
-        # The final state is a separate kernel output, so inject its gradient explicitly.
-        return grad_output, ctx.leaf.grad, None
 
 
 def _wrap_kernel(kernel: Callable, name: str) -> Callable:
@@ -84,9 +72,7 @@ def _wrap_kernel(kernel: Callable, name: str) -> Callable:
         if torch.is_grad_enabled() and output.requires_grad and not final_state.requires_grad:
             raise RuntimeError(f"GDN {name} kernel must support final-state gradients")
         context.seen.add(name)
-        if name not in context.current:
-            context.current[name] = final_state.detach().requires_grad_(True)
-        output = _StateGradient.apply(output, final_state, context.current[name])
+        output = context.current.link_output(name, final_state, output)
         if padded_length > length:
             output = F.pad(output, (0, 0) * (output.ndim - 2) + (0, padded_length - length))
         return output, final_state
@@ -138,12 +124,15 @@ def _wrap_forward(module: Any, original: Callable, runtime: ChunkflowRuntime, *,
             chunk = unit.chunks[0]
             if len(chunk.segments) != 1:
                 raise NotImplementedError("ChunkFlow GDN requires one dependent segment per chunk")
-            store = runtime.store(module.layer_number, chunk.group)
-            if chunk.group_idx == len(store) and not getattr(packed, RECOMPUTE_ATTR, False):
-                store.put(chunk.group_idx, ChunkState({}))
-            states = store.lookup(chunk.group_idx)
+            states = runtime.history(
+                module.layer_number,
+                chunk.group,
+                chunk.group_idx,
+                recompute=getattr(packed, RECOMPUTE_ATTR, False),
+                allow_replay=True,  # Native selective checkpoint re-enters _forward_compute.
+            )
             context.previous = states[-2].tensors if chunk.group_idx else {}
-            context.current = states[-1].tensors
+            context.current = states[-1]
         token = _ACTIVE.set(context)
         try:
             result = original(*bound.args, **bound.kwargs)
@@ -169,53 +158,71 @@ def _wrap_resolve(module: Any, original: Callable) -> Callable:
     return resolve
 
 
-def install(model: Any, runtime: ChunkflowRuntime) -> int:
-    modules = [m for m in model.modules() if any(c.__name__ == "GatedDeltaNet" for c in type(m).__mro__)]
-    if not modules:
-        return 0
-    from megatron.core.ssm import gated_delta_net
+def _conv_owner(module: Any) -> Any:
+    preprocess = getattr(module, "pre_gated_delta_rule", None)
+    if preprocess is None:
+        from megatron.core.ssm import gated_delta_net
 
-    for module in modules:
-        if (
-            getattr(module.config, "context_parallel_size", 1) != 1
-            or getattr(module.config, "deterministic_mode", False)
-            or getattr(module, "gdn_pre_gated_delta_rule_fusion", False)
-        ):
-            raise NotImplementedError("ChunkFlow GDN requires CP=1 and unfused, nondeterministic GDN preprocessing")
-        if getattr(module.config, "recompute_granularity", None) == "full":
-            raise NotImplementedError(
-                "ChunkFlow hybrid GDN models require selective GDN, not full-layer recomputation"
-            )
-        if not all(hasattr(module, name) for name in ("_forward_compute", "_resolve_cu_seqlens", "gated_delta_rule")):
-            raise NotImplementedError("ChunkFlow GDN requires Megatron's _forward_compute interface")
-    count = 0
-    for module in modules:
-        if hasattr(module, _ORIGINAL):
-            continue
-        preprocess = getattr(module, "pre_gated_delta_rule", None)
-        owner = inspect.getmodule(inspect.unwrap(preprocess)) if preprocess is not None else gated_delta_net
-        if owner is None or not hasattr(owner, "causal_conv1d"):
-            raise NotImplementedError("ChunkFlow GDN requires an unfused causal_conv1d preprocessing path")
-        if not hasattr(owner.causal_conv1d, "_chunkflow_original"):
-            original_conv = owner.causal_conv1d
-            owner.causal_conv1d = _wrap_kernel(original_conv, "conv")
-            owner.causal_conv1d._chunkflow_original = original_conv
-        original = (module.forward, module._forward_compute, module._resolve_cu_seqlens, module.gated_delta_rule)
-        setattr(module, _ORIGINAL, original)
-        module.forward = _wrap_forward(module, original[0], runtime, prepare=True)
-        module._forward_compute = _wrap_forward(module, original[1], runtime, prepare=False)
-        module._resolve_cu_seqlens = _wrap_resolve(module, original[2])
-        module.gated_delta_rule = _wrap_kernel(original[3], "recurrent")
-        count += 1
-    return count
+        owner = gated_delta_net
+    else:
+        owner = inspect.getmodule(inspect.unwrap(preprocess))
+    if owner is None or not callable(getattr(owner, "causal_conv1d", None)):
+        raise NotImplementedError("ChunkFlow GDN requires an unfused causal_conv1d preprocessing path")
+    return owner
 
 
-def uninstall(model: Any) -> int:
-    count = 0
-    for module in model.modules():
-        original = getattr(module, _ORIGINAL, None)
-        if original is not None:
-            module.forward, module._forward_compute, module._resolve_cu_seqlens, module.gated_delta_rule = original
-            delattr(module, _ORIGINAL)
-            count += 1
-    return count
+def validate(module: Any) -> None:
+    if (
+        getattr(module.config, "context_parallel_size", 1) != 1
+        or getattr(module.config, "deterministic_mode", False)
+        or getattr(module, "gdn_pre_gated_delta_rule_fusion", False)
+    ):
+        raise NotImplementedError("ChunkFlow GDN requires CP=1 and unfused, nondeterministic GDN preprocessing")
+    if getattr(module.config, "recompute_granularity", None) == "full":
+        raise NotImplementedError("ChunkFlow hybrid GDN models require selective GDN, not full-layer recomputation")
+    if not all(
+        callable(getattr(module, name, None))
+        for name in ("_forward_compute", "_resolve_cu_seqlens", "gated_delta_rule")
+    ):
+        raise NotImplementedError("ChunkFlow GDN requires Megatron's _forward_compute interface")
+    for kernel in (_conv_owner(module).causal_conv1d, module.gated_delta_rule):
+        if not {"initial_state", "output_final_state"} <= inspect.signature(kernel).parameters.keys():
+            raise NotImplementedError("ChunkFlow GDN requires native initial/final-state kernel interfaces")
+
+
+def install(module: Any, chunk_size: int, runtime: ChunkflowRuntime) -> Callable[[], None]:
+    """Install one layer through the common adapter transaction; preserve
+    native math."""
+    owner = _conv_owner(module)
+    methods = {
+        "forward": _wrap_forward(module, module.forward, runtime, prepare=True),
+        "_forward_compute": _wrap_forward(module, module._forward_compute, runtime, prepare=False),
+        "_resolve_cu_seqlens": _wrap_resolve(module, module._resolve_cu_seqlens),
+        "gated_delta_rule": _wrap_kernel(module.gated_delta_rule, "recurrent"),
+    }
+    previous = {name: module.__dict__[name] for name in methods if name in module.__dict__}
+    original_conv, users = _CONVOLUTIONS.get(owner, (owner.causal_conv1d, 0))
+    wrapped_conv = owner.causal_conv1d if users else _wrap_kernel(original_conv, "conv")
+
+    def undo() -> None:
+        for name in methods:
+            if name in previous:
+                setattr(module, name, previous[name])
+            else:
+                module.__dict__.pop(name, None)
+        original, users = _CONVOLUTIONS[owner]
+        if users == 1:
+            owner.causal_conv1d = original
+            del _CONVOLUTIONS[owner]
+        else:
+            _CONVOLUTIONS[owner] = (original, users - 1)
+
+    owner.causal_conv1d = wrapped_conv
+    _CONVOLUTIONS[owner] = (original_conv, users + 1)
+    try:
+        for name, method in methods.items():
+            setattr(module, name, method)
+    except Exception:
+        undo()
+        raise
+    return undo

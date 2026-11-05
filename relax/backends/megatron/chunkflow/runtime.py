@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from relax.backends.megatron.chunkflow.state_store import StateStore
+from relax.backends.megatron.chunkflow.state_store import ChunkState, StateStore, StateStoreError
 
 
 RUNTIME_ATTR = "chunkflow_runtime"
@@ -29,6 +29,29 @@ class ChunkflowRuntime:
         for key in keys:
             del self._stores[key]
         return len(keys)
+
+    def history(
+        self,
+        layer_number: int,
+        group_id: int,
+        chunk_id: int,
+        *,
+        recompute: bool = False,
+        allow_replay: bool = False,
+    ) -> list[ChunkState]:
+        """Return earlier states and this chunk's stable cache, in order.
+
+        Only adapters handling native selective checkpointing may allow replay
+        without ChunkFlow's explicit recompute marker. Replays never replace
+        leaves.
+        """
+        store = self.store(layer_number, group_id)
+        if not recompute:
+            if chunk_id == len(store):
+                store.put(chunk_id, ChunkState({}))
+            elif not allow_replay:
+                raise StateStoreError(f"ChunkFlow expected new chunk {len(store)}, got {chunk_id}")
+        return store.lookup(chunk_id)
 
     def live_groups(self) -> list[int]:
         return sorted({group_id for _, group_id in self._stores})

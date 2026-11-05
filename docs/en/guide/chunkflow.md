@@ -24,6 +24,8 @@ ChunkFlow calls the model's original Megatron/Transformer Engine attention imple
 
 The connection layer supplies historical K/V and bottom-right causal masking, so current queries can attend to the correct prefix. It creates fresh physical packed-sequence boundaries for attention and keeps RoPE position offsets separate. Module identities, parameters, and checkpoint keys remain unchanged. Native autograd may retain concatenated historical K/V for each chunk, so measure memory again when migrating from the former custom attention backward.
 
+The scheduler performs chunking; attention does not split the input a second time. Calls without a `chunkflow_unit` marker go directly to the original `forward`, preserving its arguments and behavior.
+
 ## Configuration
 
 The available arguments are:
@@ -45,7 +47,7 @@ PP greater than 1 uses an experimental non-interleaved pipeline executor and als
 - Use zero dropout and disable RoPE fusion. The explicit MRoPE position path currently supports text-only batches.
 - Use `--chunkflow-keep-last-k` for attention recomputation. Megatron full-layer recomputation and selective `core_attn` recomputation are rejected because they replay cache writes without the ChunkFlow replay marker.
 - Sliding windows, non-vanilla softmax, QK clipping/logit statistics, external attention masks/biases, and the Qwen3.5 optimized recipe need separate adapters. QSA and models with PLE are rejected: preserving their original modules alone does not supply sparse-indexer, n-gram, or convolution history.
-- GDN requires kernels that propagate gradients through initial and final states and Megatron's `_forward_compute` interface. Disable preprocessing fusion; deterministic mode and full-layer recomputation are unsupported.
+- The full-layer GDN adapter matches Megatron's exact `GatedDeltaNet` class; subclasses require explicit registration. It requires kernels that propagate gradients through initial and final states and Megatron's `_forward_compute` interface. Disable preprocessing fusion; deterministic mode and full-layer recomputation are unsupported.
 - MoE auxiliary losses, capacity limits, and token-dropping configurations need separate validation. Do not assume they remain equivalent after chunking.
 - PP=1 does not currently update upstream PackingMetrics. Use actual step time for performance comparisons.
 
@@ -53,8 +55,12 @@ Keep the data, random seed, parallel configuration, precision, and recomputation
 
 ## Adding an Attention Adapter
 
-Register an `AttentionAdapter` with `register_attention_adapter(attention_type, core_type, adapter)` from `relax.backends.megatron.chunkflow.adapters` before ChunkFlow installation in each training worker, for example in a custom model provider. Registration matches both classes exactly and rejects duplicate entries. Validation runs before attention installation; installers return an undo callback and must undo their own mutations if they fail.
+Register an `AttentionAdapter` with `register_attention_adapter(attention_type, core_type, adapter)` from `relax.backends.megatron.chunkflow.adapters` before ChunkFlow installation in each training worker, for example in a custom model provider. Dense K/V adapters match both classes exactly. Use `core_type=None` for a full-layer adapter: it matches the outer class exactly and takes precedence, supporting modules such as GDN or attention with an indexer. A full-layer adapter must validate its internal implementation. Duplicate registrations are errors.
+
+All adapters share one installation flow: validate every layer, then install. Each installer returns an undo callback. A failure in a later layer restores already installed layers in reverse order; installers must also undo their own mutations if they fail. GDN's shared convolution wrapper restores the original function when its last user is uninstalled.
 
 For an operator whose history is ordinary K/V, `dense_attention_adapter(name=..., execute=..., validate=...)` reuses ChunkFlow's state and gradient connections. Its executor receives the saved native `forward` and a `DenseAttentionCall`: THD queries, K/V fragments, physical Q/KV boundaries, CPU lengths, and maximum lengths. The executor calls the native operator with bottom-right causal alignment and returns the output with native autograd intact. It must not reuse RoPE offset metadata as physical padding. Full-layer adapters can manage other history types; registering a sparse operator as dense does not implement its indexer state.
 
-GDN continues to call Megatron's convolution and recurrence kernels through the existing state adapter. ChunkFlow supplies initial/final states and connects state gradients; it does not implement the GDN calculation. Validate each new adapter against unchunked outputs, input and parameter gradients, packed-sequence boundaries, and ChunkFlow recomputation before using it for training.
+State management also shares one interface: `runtime.history(layer_number, group_id, chunk_id, recompute=...)` returns the `ChunkState` objects up to and including the current chunk, reusing cached leaves during recomputation. Dense attention reads all earlier K/V; GDN reads the preceding convolution and recurrence states. `ChunkState.link_tensor` reconnects historical gradients to state already used in the current output; `link_output` connects a separate final state returned by a native kernel. Only adapters that explicitly handle native selective checkpointing should enable `allow_replay=True`.
+
+GDN still calls Megatron's convolution and recurrence kernels; the shared layer manages state and gradient connections. If a native module already exposes a differentiable chunk interface, a full-layer adapter can call it without changing the scheduler. QSA has no such adapter yet and remains rejected: a shared entry point does not supply its indexer history automatically. Validate each new adapter against unchunked outputs, input and parameter gradients, packed-sequence boundaries, and ChunkFlow recomputation before using it for training.

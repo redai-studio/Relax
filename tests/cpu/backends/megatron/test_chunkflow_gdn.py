@@ -11,9 +11,13 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from relax.backends.megatron.chunkflow import gdn
+from relax.backends.megatron.chunkflow.adapters import AttentionAdapter, register_attention_adapter
+from relax.backends.megatron.chunkflow.integration import install, uninstall
 from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
 from relax.backends.megatron.chunkflow.scheduler import build_chunks
+from relax.backends.megatron.chunkflow.state_store import ChunkState
 from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
+from tests.cpu.backends.megatron.test_chunkflow_integration import restore_rope_patch as restore_rope_patch
 
 
 def _bounds(x, cu_seqlens):
@@ -148,6 +152,9 @@ class GatedDeltaNet(torch.nn.Module):
         return self.out_proj(out.flatten(2) * F.silu(gate)).transpose(0, 1)
 
 
+register_attention_adapter(GatedDeltaNet, None, AttentionAdapter("test-gdn", gdn.validate, gdn.install))
+
+
 @pytest.fixture
 def kernels(monkeypatch):
     ssm = ModuleType("megatron.core.ssm")
@@ -202,9 +209,9 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, paddin
             dout[offset + length - 1] = 1
             offset += length
     expected.backward(dout)
-    runtime = ChunkflowRuntime(chunk_size)
-    assert gdn.install(model, runtime) == 1
-    assert gdn.install(model, runtime) == 0
+    assert install(model, chunk_size) == 1
+    assert install(model, chunk_size) == 0
+    runtime = model.chunkflow_runtime
     chunks = build_chunks(lengths, chunk_size)
     units = build_micro_batches(chunks, "staggered")
     ops = gen_unit_ops(units, chunks, 1 if mode == "fr" else 1 << 30)
@@ -258,7 +265,7 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, paddin
     with torch.no_grad():
         check(model(x, packed_seq_params=full_packed), expected)
     runtime.assert_empty("GDN baseline pass-through")
-    assert gdn.uninstall(model) == 1
+    assert uninstall(model) == 1
     assert model.state_dict().keys() == reference.state_dict().keys()
     return torch.stack([actual[i] for i in range(sum(lengths))]), x.grad, [p.grad for p in model.parameters()]
 
@@ -269,8 +276,7 @@ def test_gdn_execution_optimization_matches_original_chunkflow(kernels, monkeypa
     results = []
     for enabled in ("0", "1"):
         monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", enabled)
-        # Global conv wrapping captures the setting at installation, as in a fresh worker.
-        kernels.causal_conv1d = _conv
+        # Each complete install/uninstall restores the shared native kernel.
         results.append(_alignment(kernels, mode, padding=padding))
     torch.testing.assert_close(results[1], results[0], rtol=0, atol=0)
 
@@ -286,7 +292,7 @@ def test_gdn_execution_optimization_preserves_input_identity_without_padding(mon
 
     x = torch.randn(1, 4 + padding, 3, requires_grad=True)
     packed = SimpleNamespace(**{UNIT_ATTR: SimpleNamespace(num_tokens=4)})
-    context = gdn._Context(SimpleNamespace(), packed, previous={}, current={})
+    context = gdn._Context(SimpleNamespace(), packed, previous={}, current=ChunkState({}))
     token = gdn._ACTIVE.set(context)
     try:
         out, _ = gdn._wrap_kernel(kernel, "conv")(x)
@@ -313,7 +319,48 @@ def test_gdn_uses_convolution_from_preprocessing_module(kernels, monkeypatch):
     _alignment(kernels, "selective")
 
     assert kernels.causal_conv1d is _conv
-    assert owner.causal_conv1d._chunkflow_original is _conv
+    assert owner.causal_conv1d is _conv
+
+
+def test_gdn_shared_convolution_restored_after_last_model_uninstall(kernels):
+    first, second = GatedDeltaNet(kernels).double(), GatedDeltaNet(kernels).double()
+    x = torch.randn(5, 1, 8, dtype=torch.float64)
+    with torch.no_grad():
+        expected = second(x, packed_seq_params=_packed([5]))
+    native = kernels.causal_conv1d
+    assert install(first, 4) == 1
+    wrapped = kernels.causal_conv1d
+    assert wrapped is not native
+    assert install(second, 4) == 1
+    assert kernels.causal_conv1d is wrapped
+    assert uninstall(first) == 1
+    assert kernels.causal_conv1d is wrapped
+    units = build_micro_batches(build_chunks([5], 4))
+    with torch.no_grad():
+        outputs = []
+        for unit in units:
+            start = unit.chunks[0].segments[0].prefix
+            outputs.append(
+                second(x[start : start + unit.num_tokens], packed_seq_params=_packed([unit.num_tokens], unit))
+            )
+    torch.testing.assert_close(torch.cat(outputs), expected, atol=1e-10, rtol=1e-9)
+    second.chunkflow_runtime.release_group(units[0].chunks[0].group)
+    assert uninstall(second) == 1
+    assert kernels.causal_conv1d is native
+    assert "forward" not in first.__dict__ and "forward" not in second.__dict__
+
+
+def test_unregistered_gdn_subclass_is_rejected_before_patching(kernels):
+    class DifferentRecurrence(GatedDeltaNet):
+        pass
+
+    model = DifferentRecurrence(kernels)
+    native = kernels.causal_conv1d
+    with pytest.raises(NotImplementedError, match="DifferentRecurrence"):
+        install(model, 4)
+    assert kernels.causal_conv1d is native
+    assert "forward" not in model.__dict__
+    assert not hasattr(model, "chunkflow_runtime")
 
 
 def test_gdn_rejects_multiple_dependent_chunks_before_state_access():
@@ -347,7 +394,7 @@ def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels, monkeypatch, e
     monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", enabled)
     kernels.rule = rule
     model = GatedDeltaNet(kernels)
-    gdn.install(model, ChunkflowRuntime(4))
+    install(model, 4)
     unit = build_micro_batches(build_chunks([2, 1], 4), "staggered")[0]
     packed = _packed([2, 1], unit)
     total = 3 + padding
@@ -372,6 +419,8 @@ def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels, monkeypatch, e
         gdn._ACTIVE.reset(token)
     with pytest.raises(ValueError, match="physical unit length changed"):
         model(torch.randn(7, 1, 8), packed_seq_params=packed)
+    assert uninstall(model) == 1
+    assert kernels.causal_conv1d is _conv
 
 
 @pytest.mark.parametrize(
@@ -384,4 +433,4 @@ def test_gdn_install_rejects_unsupported_configuration(kernels, setting, value):
     else:
         setattr(model.config, setting, value)
     with pytest.raises(NotImplementedError):
-        gdn.install(model, ChunkflowRuntime(4))
+        install(model, 4)

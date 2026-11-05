@@ -5,15 +5,18 @@ support."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import inspect
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
+from functools import wraps
 from typing import Any
 
 import torch
 from torch import nn
 
-from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime
+from relax.backends.megatron.chunkflow import gdn
+from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
 
 
 @dataclass(frozen=True)
@@ -59,28 +62,33 @@ class AttentionAdapter:
     install: Callable[[nn.Module, int, ChunkflowRuntime], Callable[[], None]]
 
 
-_ADAPTERS: dict[tuple[str, str], AttentionAdapter] = {}
+_ADAPTERS: dict[tuple[str, str | None], AttentionAdapter] = {}
 
 
 def _type_name(value: type | str) -> str:
     return value if isinstance(value, str) else f"{value.__module__}.{value.__qualname__}"
 
 
-def register_attention_adapter(attention_type: type | str, core_type: type | str, adapter: AttentionAdapter) -> None:
+def register_attention_adapter(
+    attention_type: type | str, core_type: type | str | None, adapter: AttentionAdapter
+) -> None:
     """Register before model installation, in each training worker.
 
-    Both classes must match exactly. Subclasses may change masks, indexers, or
-    gradients and require their own registration. Duplicate entries are errors.
+    Use core_type=None for a full-layer adapter, including stateful native
+    modules without core_attention. Classes match exactly; subclasses need
+    their own registration. Duplicate entries are errors.
     """
-    key = (_type_name(attention_type), _type_name(core_type))
+    key = (_type_name(attention_type), None if core_type is None else _type_name(core_type))
     if key in _ADAPTERS:
         raise ValueError(f"ChunkFlow attention adapter already registered for {key}")
     _ADAPTERS[key] = adapter
 
 
 def resolve_attention_adapter(attention: nn.Module) -> AttentionAdapter:
-    key = (_type_name(type(attention)), _type_name(type(attention.core_attention)))
-    adapter = _ADAPTERS.get(key)
+    layer_type = _type_name(type(attention))
+    core = getattr(attention, "core_attention", None)
+    key = (layer_type, _type_name(type(core)) if core is not None else None)
+    adapter = _ADAPTERS.get((layer_type, None)) or _ADAPTERS.get(key)
     if adapter is None:
         raise NotImplementedError(
             f"ChunkFlow has no attention adapter for {key[0]} with {key[1]}. "
@@ -88,6 +96,21 @@ def resolve_attention_adapter(attention: nn.Module) -> AttentionAdapter:
             "Sparse/indexer attention (including QSA) cannot use the dense KV adapter without additional state support."
         )
     return adapter
+
+
+def attention_modules(model: nn.Module) -> Iterator[nn.Module]:
+    """Find registered layers and reject unregistered attention/SSM slots."""
+    registered = {layer_type for layer_type, _ in _ADAPTERS}
+    for name, module in model.named_modules():
+        if _type_name(type(module)) in registered or (
+            hasattr(module, "layer_number")
+            and (
+                getattr(module, "core_attention", None) is not None
+                or hasattr(module, "gated_delta_rule")
+                or name.rsplit(".", 1)[-1] == "self_attention"
+            )
+        ):
+            yield module
 
 
 def _name(value: Any) -> Any:
@@ -156,19 +179,32 @@ def dense_attention_adapter(
 
         core = attention.core_attention
         original = core.forward
+        signature = inspect.signature(original)
         had_forward = "forward" in core.__dict__
         previous_forward = core.__dict__.get("forward")
         executor = lambda call: execute(original, call)
         wrapper = ChunkedCoreAttention(
             config=getattr(core, "config", None) or attention.config,
             layer_number=attention.layer_number,
-            chunk_size=chunk_size,
             softmax_scale=getattr(core, "softmax_scale", None),
             runtime=runtime,
             executor=executor,
         )
+
         # Keep module identity, parameters, hooks and checkpoint paths intact.
-        core.forward = wrapper.forward
+        @wraps(original)
+        def forward(*args, **kwargs):
+            packed = kwargs.get("packed_seq_params")
+            if len(args) > 3:
+                bound = signature.bind(*args, **kwargs)
+                packed = bound.arguments.get("packed_seq_params")
+                if getattr(packed, UNIT_ATTR, None) is not None:
+                    return wrapper(**bound.arguments)
+            if getattr(packed, UNIT_ATTR, None) is None:
+                return original(*args, **kwargs)
+            return wrapper(*args, **kwargs)
+
+        core.forward = forward
 
         def undo() -> None:
             if had_forward:
@@ -234,4 +270,11 @@ register_attention_adapter(
     dense_attention_adapter(
         name="megatron-native-te", execute=megatron_native_attention, validate=_validate_megatron_attention
     ),
+)
+
+
+register_attention_adapter(
+    "megatron.core.ssm.gated_delta_net.GatedDeltaNet",
+    None,
+    AttentionAdapter("megatron-native-gdn", gdn.validate, gdn.install),
 )

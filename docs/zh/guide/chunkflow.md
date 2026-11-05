@@ -24,6 +24,8 @@ ChunkFlow 调用模型原有的 Megatron/Transformer Engine Attention，由原�
 
 连接层负责补上历史 K/V，并使用右下对齐的因果 mask，让当前 query 正确访问前文。Attention 使用新建的实际 packed 序列边界，RoPE 的位置偏移单独保留。模块对象、参数及 checkpoint 键保持不变。原生 autograd 可能为每个 chunk 保存拼接后的历史 K/V，因此从旧的自定义 Attention 反向路径迁移后，需要重新测量显存。
 
+切块由调度器完成，Attention 内部不再二次切块。没有 `chunkflow_unit` 标记的调用直接执行原生 `forward`，保留其输入参数和行为。
+
 ## 配置
 
 相关参数如下：
@@ -45,7 +47,7 @@ PP 大于 1 使用实验性的非交错流水线执行器，还须设置 `RELAX_
 - 使用 dropout=0 并关闭 RoPE fusion。显式 MRoPE 位置路径目前仅支持纯文本 batch。
 - Attention 重计算使用 `--chunkflow-keep-last-k`。Megatron full-layer recompute 和 selective `core_attn` 重计算会在没有 ChunkFlow 重放标记的情况下重复写入缓存，因此会被拒绝。
 - 滑动窗口、非 vanilla softmax、QK clipping/logit 统计、外部 Attention mask/bias 和 Qwen3.5 optimized recipe 需要单独适配。QSA 和带 PLE 的模型会被拒绝：保留原模块并不能自动补齐稀疏选择、n-gram 或卷积所需的历史信息。
-- GDN 需要支持初始/末状态梯度的算子及 Megatron `_forward_compute` 接口；须关闭预处理融合，不支持 deterministic 模式或 full-layer recompute。
+- GDN 整层适配器精确匹配 Megatron `GatedDeltaNet`；子类需要显式注册。它需要支持初始/末状态梯度的算子及 Megatron `_forward_compute` 接口；须关闭预处理融合，不支持 deterministic 模式或 full-layer recompute。
 - MoE 辅助损失、容量限制和丢弃 token 的配置需单独验证，不能假设切块前后等价。
 - PP=1 暂不更新上游 PackingMetrics，性能对比应使用实际 step 耗时。
 
@@ -53,8 +55,12 @@ PP 大于 1 使用实验性的非交错流水线执行器，还须设置 `RELAX_
 
 ## 接入新的 Attention
 
-在每个训练 worker 安装 ChunkFlow 前，通过 `relax.backends.megatron.chunkflow.adapters` 中的 `register_attention_adapter(attention_type, core_type, adapter)` 注册 `AttentionAdapter`，例如在自定义 model provider 中注册。外层和核心类都必须精确匹配，重复注册会报错。Attention 安装前先执行兼容性检查；安装器返回卸载回调，如果自身安装失败，需要撤销已经做出的修改。
+在每个训练 worker 安装 ChunkFlow 前，通过 `relax.backends.megatron.chunkflow.adapters` 中的 `register_attention_adapter(attention_type, core_type, adapter)` 注册 `AttentionAdapter`，例如在自定义 model provider 中注册。普通 K/V 适配器精确匹配外层和核心类；`core_type=None` 表示整层适配，精确匹配外层类并优先使用，适用于 GDN 或带 indexer 的 Attention。整层适配器负责检查内部实现；重复注册会报错。
+
+所有适配器共用一次安装流程：先检查全部层，再安装；安装器返回卸载回调。如果后续层安装失败，已安装的层会倒序恢复；适配器自身失败时也必须撤销自己的修改。GDN 的共享卷积包装在最后一个使用它的层卸载后恢复原函数。
 
 如果算子的历史信息就是普通 K/V，可以用 `dense_attention_adapter(name=..., execute=..., validate=...)` 复用 ChunkFlow 的状态和梯度连接。执行函数接收保存的原生 `forward` 和 `DenseAttentionCall`，后者包含 THD query、K/V 片段、实际 Q/KV 边界、CPU 长度和最大长度。执行函数负责以右下对齐的因果关系调用原生算子，并保留原生 autograd，不能把 RoPE 偏移当作实际 padding。其他历史状态可以通过整层适配器管理；将稀疏算子注册成 Dense，并不等于实现了其 indexer 状态传递。
 
-GDN 继续通过现有状态适配层调用 Megatron 使用的卷积和递推 kernel。ChunkFlow 传递初始/末状态并连接状态梯度，不实现 GDN 计算。新增适配器用于训练前，应比较不切块和切块执行的输出、输入及参数梯度，并验证 packed 序列边界和 ChunkFlow 重计算。
+状态管理也共用一套接口：`runtime.history(layer_number, group_id, chunk_id, recompute=...)` 返回从第一块到当前块的 `ChunkState`，重计算复用已缓存的叶子。Dense 读取整个历史 K/V，GDN 读取上一块的卷积与递推状态。`ChunkState.link_tensor` 为参与当前输出计算的状态接回历史梯度；`link_output` 为原生算子额外返回的末状态连接梯度。只有明确处理原生 selective checkpoint 的适配器才应启用 `allow_replay=True`。
+
+GDN 仍调用 Megatron 使用的卷积和递推 kernel；公共层只管理状态与梯度连接。原生模块如果已有可求导的分块接口，可以注册一个整层适配器来调用它，无需修改调度器。QSA 尚未提供这样的适配器，仍然被拒绝；统一入口不会自动补齐 indexer 的历史信息。新增适配器用于训练前，应比较不切块和切块执行的输出、输入及参数梯度，并验证 packed 序列边界和 ChunkFlow 重计算。

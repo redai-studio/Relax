@@ -25,6 +25,8 @@ from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
 from relax.backends.megatron.chunkflow.scheduler import build_chunks
 from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 from tests.cpu.backends.megatron.test_chunkflow_attention_ops import SDPAttention, native_sdpa
+from tests.cpu.backends.megatron.test_chunkflow_gdn import GatedDeltaNet
+from tests.cpu.backends.megatron.test_chunkflow_gdn import kernels as kernels
 from tests.cpu.backends.megatron.test_chunkflow_integration import restore_rope_patch as restore_rope_patch
 
 
@@ -178,7 +180,7 @@ def test_uninstalled_model_accepts_a_new_chunk_size():
     assert uninstall(layer) == 1
 
 
-def test_failed_adapter_install_restores_previously_installed_layers():
+def test_failed_adapter_install_restores_previously_installed_layers(kernels):
     class FailingLayer(NativeLayer):
         pass
 
@@ -186,13 +188,97 @@ def test_failed_adapter_install_restores_previously_installed_layers():
         raise RuntimeError("native setup failed")
 
     register_attention_adapter(FailingLayer, SDPAttention, AttentionAdapter("failure", lambda layer: None, fail))
-    model = torch.nn.ModuleList([NativeLayer(), FailingLayer()])
+    recurrent = GatedDeltaNet(kernels)
+    model = torch.nn.ModuleList([NativeLayer(), recurrent, FailingLayer()])
     original = model[0].core_attention.forward
+    original_conv = kernels.causal_conv1d
+    original_rule = recurrent.gated_delta_rule
     with pytest.raises(RuntimeError, match="native setup failed"):
         install(model, 4)
     assert model[0].core_attention.forward == original
     assert not hasattr(model, "chunkflow_runtime")
     assert not hasattr(model[0], "_chunkflow_attention_adapter")
+    assert not hasattr(recurrent, "_chunkflow_attention_adapter")
+    assert "forward" not in recurrent.__dict__
+    assert recurrent.gated_delta_rule is original_rule
+    assert kernels.causal_conv1d is original_conv
+
+
+def test_non_chunk_call_preserves_native_arguments_output_and_gradients():
+    torch.manual_seed(42)
+    layer = NativeLayer()
+    reference = copy.deepcopy(layer)
+    inputs = [torch.randn(7, 1, 4, dtype=torch.float64, requires_grad=True) for _ in range(3)]
+    expected_inputs = [t.detach().clone().requires_grad_() for t in inputs]
+    # These are native-only arguments, unsupported by the chunk KV wrapper.
+    kwargs = dict(q_lengths=(4, 3), kv_lengths=(4, 3), scale=0.27)
+    expected = reference.core_attention(*expected_inputs, **kwargs)
+    assert install(layer, 4) == 1
+    actual = layer.core_attention(*inputs, **kwargs)
+    torch.testing.assert_close(actual, expected)
+    dout = torch.randn_like(actual)
+    actual.backward(dout)
+    expected.backward(dout)
+    for got, want in zip(inputs, expected_inputs):
+        torch.testing.assert_close(got.grad, want.grad)
+    torch.testing.assert_close(layer.core_attention.gain.grad, reference.core_attention.gain.grad)
+    layer.chunkflow_runtime.assert_empty("native pass-through")
+    assert uninstall(layer) == 1
+
+
+def test_dense_adapter_accepts_native_positional_mask_and_bias():
+    class Core(SDPAttention):
+        # Megatron places attention_bias before packed_seq_params.
+        def forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=None,
+            packed_seq_params=None,
+            **kwargs,
+        ):
+            return super().forward(query, key, value, **kwargs)
+
+    def execute(original, call):
+        key, value = call.joined_kv()
+        return original(
+            call.query,
+            key,
+            value,
+            None,
+            "causal",
+            q_lengths=call.q_lengths,
+            kv_lengths=call.kv_lengths,
+            scale=call.softmax_scale,
+        )
+
+    register_attention_adapter(NativeLayer, Core, dense_attention_adapter(name="positional", execute=execute))
+    layer = NativeLayer()
+    layer.core_attention = Core()
+    assert install(layer, 4) == 1
+    unit = build_micro_batches(build_chunks([3], 4))[0]
+    packed = SimpleNamespace(cu_seqlens_q_cpu=[0, 3], **{UNIT_ATTR: unit})
+    q, k, v = [torch.randn(3, 1, 4, dtype=torch.float64, requires_grad=True) for _ in range(3)]
+    expected = (
+        F.scaled_dot_product_attention(
+            q.transpose(0, 1),
+            k.transpose(0, 1),
+            v.transpose(0, 1),
+            is_causal=True,
+        )
+        .transpose(0, 1)
+        .reshape(3, 4)
+    )
+    for args, kwargs in (
+        ((None, "causal", None), {"packed_seq_params": packed}),
+        ((None, "causal", None, packed), {}),
+    ):
+        actual = layer.core_attention(q, k, v, *args, **kwargs)
+        torch.testing.assert_close(actual, expected)
+    assert uninstall(layer) == 1
 
 
 def test_native_bridge_uses_physical_boundaries_and_bottom_right_mask(monkeypatch):
