@@ -194,6 +194,7 @@ python -m pytest tests/cpu/engine/rewards/test_openr1mm.py tests/cpu/tools/test_
 # 下载数据集
 hf download --repo-type dataset harryhsing/AVQA-R1-6K \
   --local-dir /root/AVQA
+tar -zxvf /root/AVQA/AVQA_R1.tar.gz -C /root/AVQA
 
 # 转换为 Relax 格式
 # --md-dir 指向 image 和 audio 文件目录所在路径，
