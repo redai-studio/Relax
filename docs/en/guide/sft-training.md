@@ -449,7 +449,21 @@ Pokemon 1 GPU script:
 
 `"sft": [1, 0]` means the SFT producer is CPU-only. The Actor owns training GPUs. Rollout GPUs are needed when periodic predict is enabled.
 
+### FLOPs-aware Scheduling
+
+For Qwen3.5 text SFT, add `--balance-by-flops`, use `--n-samples-per-prompt 1`, and keep one TransferQueue shard (the default):
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "1"
+```
+
+See the [performance guide](./performance-tuning.md#flops-balanced-dynamic-microbatches) for packing parameters, parallelism settings and memory budgeting.
+
 ### Sharded SFT Producers
+
+FLOPs scheduling uses `RELAX_SFT_TQ_SHARDS=1`.
 
 `RELAX_SFT_TQ_SHARDS` is an experimental throughput knob for SFT async prepacking. It splits each global SFT batch across multiple TransferQueue partitions. Configure it in the Ray runtime environment:
 
@@ -561,7 +575,7 @@ If GPUs wait on SFT data:
 | `--sft-prefetch-chunk-size` | Increase | Dispatches larger prefetch chunks, with higher memory pressure. |
 | per-rank fetch | Automatic for Megatron SFT | Lets TP/PP ranks pull from TransferQueue directly. Pair with enough `--num-data-storage-units`. |
 | `--max-staleness` | Increase for I/O-heavy SFT | Lets the producer run ahead. The Pokemon 8 GPU script uses `--max-staleness 4`. |
-| `RELAX_SFT_TQ_SHARDS` | Start from 2 | Parallelizes eligible async-prepack producers. Increase only when data preparation is the bottleneck and batch divisibility constraints are met. |
+| `RELAX_SFT_TQ_SHARDS` | Start from 2; use 1 for FLOPs scheduling | Parallelizes eligible async-prepack producers. Increase only when data preparation is the bottleneck and batch divisibility constraints are met. |
 
 For text-only math, prefetch usually matters less than sequence length and model parallelism. For Pokemon, image loading and processor work are common bottlenecks.
 

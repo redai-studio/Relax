@@ -449,7 +449,21 @@ Pokemon 1 GPU 脚本：
 
 `"sft": [1, 0]` 表示 SFT producer 是 CPU-only。Actor 使用训练 GPU。开启周期性 predict 时，Rollout 也需要 GPU 资源。
 
+### FLOPs 感知调度
+
+Qwen3.5 文本 SFT 可添加 `--balance-by-flops`，使用 `--n-samples-per-prompt 1`，并保持一个 TransferQueue shard（默认值）：
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "1"
+```
+
+打包参数、并行设置与显存预算见[性能指南](./performance-tuning.md#按-flops-平衡动态微批)。
+
 ### SFT 分片 Producer
+
+FLOPs 调度使用 `RELAX_SFT_TQ_SHARDS=1`。
 
 `RELAX_SFT_TQ_SHARDS` 是 SFT async prepack 的实验性吞吐调优开关，用于把每个全局 SFT batch 拆到多个 TransferQueue 分区。推荐在 Ray 运行时环境中配置：
 
@@ -561,7 +575,7 @@ bash scripts/entrypoint/spmd-multinode.sh \
 | `--sft-prefetch-chunk-size` | 调大 | 一次派发更多预取样本，但会增加内存压力。 |
 | per-rank fetch | Megatron SFT 自动开启 | 让 TP/PP rank 直接从 TransferQueue 拉数据，需配足 `--num-data-storage-units`。 |
 | `--max-staleness` | I/O 重时调大 | 允许 producer 提前生产。Pokemon 8 GPU 脚本使用 `--max-staleness 4`。 |
-| `RELAX_SFT_TQ_SHARDS` | 从 2 开始 | 并行化满足条件的 async-prepack producer。仅当数据准备是瓶颈且 batch 满足整除约束时再增加。 |
+| `RELAX_SFT_TQ_SHARDS` | 从 2 开始；FLOPs 调度使用 1 | 并行化满足条件的 async-prepack producer。仅当数据准备是瓶颈且 batch 满足整除约束时再增加。 |
 
 纯文本 math 任务通常更受序列长度和模型并行影响；Pokemon 任务更容易被图片读取和 processor 工作拖慢。
 

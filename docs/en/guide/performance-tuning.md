@@ -4,6 +4,65 @@ A practical guide to maximizing training throughput in Relax. All parameters men
 
 ---
 
+## FLOPs-balanced dynamic microbatches
+
+`--balance-by-flops` uses estimated training FLOPs to construct global microbatches and assign whole microbatches to data-parallel (DP) ranks, balancing their computational load. The flag defaults to `False` and enables both scheduling stages together.
+
+### Configuration
+
+For Qwen3.5 text training, add these arguments to your training configuration:
+
+```bash
+--train-backend megatron \
+--qkv-format thd \
+--use-dynamic-batch-size \
+--max-tokens-per-gpu 8192 \
+--sft-packing-strategy balanced \
+--polling-mode True \
+--balance-by-flops
+```
+
+Choose the token budget for your model and available memory; this example uses 8192. Custom YAML uses the boolean field `balance_by_flops: true`. See [SFT setup](./sft-training.md#flops-aware-scheduling) for SFT-specific settings.
+
+### Scheduling behavior
+
+For each complete global batch, Relax follows the approach in [Slime PR #2017](https://github.com/THUDM/slime/pull/2017):
+
+1. Computes the initial global microbatch count `K = ceil(sum(lengths) / (max_tokens_per_gpu * CP))`, capped at the sample count. Allgather CP first rounds the per-GPU budget down to a multiple of `TP * data_pad_size_multiplier`.
+2. Partitions samples by estimated FLOPs with Karmarkar–Karp (KK), allowing different sample counts per microbatch.
+3. Splits the largest splittable token bin until the global microbatch count is divisible by DP. Each split places samples in descending length order into the half with fewer tokens.
+4. Assigns whole microbatches by summed FLOPs with KK, giving every DP rank the same microbatch count.
+5. With PP=1 and DP>1, executes each rank's microbatches in ascending FLOPs order to pair similar workloads across ranks.
+
+TransferQueue passes microbatch membership, order and counts to the normal iterator and SFT CPU prepack. DP ranks can receive different sample counts while preserving global-batch optimizer-step boundaries and loss normalization. Evaluation and forward-only calls use separate token budgets.
+
+::: warning Token budget and memory
+`--max-tokens-per-gpu` determines the initial microbatch count. Final packs can exceed this token budget, so leave memory headroom for their actual size.
+:::
+
+The producer estimates sample training costs on the CPU and stores them in queue metadata as packing and DP assignment weights. The Qwen3.5 estimator covers full attention, Gated DeltaNet (GDN), Dense MLPs, active and shared MoE experts, and the vocabulary head. It counts a multiply-add as two FLOPs and approximates training as three times forward work.
+
+### Supported combinations
+
+| Setting | Requirement |
+| --- | --- |
+| Model | HF `model_type`: `qwen3_5`, `qwen3_5_text`, `qwen3_5_moe` or `qwen3_5_moe_text`, with the standard Dense or all-MoE layer layout. |
+| Training | Full-parameter, text-only, synchronous SFT or RL training. |
+| Backend and packing | Megatron, THD, balanced dynamic packing and TransferQueue polling mode. Keep MTP, wholepack and `--debug-train-only` disabled. |
+| Parallelism | VPP=1 and static CP; GDN CP>1 requires `allgather_cp: false`. SFT async CPU prepack uses CUDA, PP=1 and CP=1. |
+| MoE | `--moe-aux-loss-coeff 0` and `moe_expert_capacity_factor: null`. Router balancing mode: `none`, `aux_loss`, `seq_aux_loss` or `global_aux_loss`. |
+| SFT | One TransferQueue shard and `--n-samples-per-prompt 1`. |
+
+SFT uses the TransferQueue `assignment_transform` patch at `docker/patch/transferqueue/9784ad0-assignment-transform.patch`. The repository's `docker/Dockerfile` and `docker/Dockerfile.cu13` apply this patch during the image build.
+
+### Resume and troubleshooting
+
+Queue plans are saved with sampler checkpoints. Keep DP size, FLOPs mode, token budget and CP/PP settings consistent when restoring them.
+
+`Cannot split ... into ... aligned microbatches` means the physical sample row count is too small for the DP-aligned microbatch count. Adjust the batch size or DP size to provide enough rows.
+
+To evaluate throughput, use the same model, data and training configuration to compare effective training tokens/s and waiting time against the length-balanced baseline.
+
 ## Kimi K3 TFLOPS and MFU
 
 `perf/actor_train_tflops` estimates useful model FLOPs per GPU per second. `perf/mfu/actor_train` divides this rate by the device's BF16 dense peak (2250 TFLOPS for the 280G Blackwell configuration) and reports a fraction, so 0.4 means 40%. It uses the actor training time, not the total rollout/save wall time. Optimizer and offload time inside training reduce the rate.
@@ -202,7 +261,7 @@ traces/my-profiling-run/
 
 ## Dynamic Batching
 
-Dynamic batching packs variable-length samples so each micro-batch approaches a target token count, improving GPU utilization compared to fixed-size micro-batches. It also serves as an effective OOM prevention mechanism — with a fixed `--micro-batch-size`, a batch of unusually long sequences can exceed GPU memory, while dynamic batching caps the total tokens per micro-batch to `--max-tokens-per-gpu`, keeping memory usage predictable.
+Dynamic batching packs variable-length samples toward a target token count to improve GPU utilization. The default packing path checks pack capacity against the token budget. `--balance-by-flops` uses this budget to determine the initial microbatch count; see [FLOPs-balanced dynamic microbatches](#flops-balanced-dynamic-microbatches).
 
 ```bash
 --use-dynamic-batch-size \
@@ -364,6 +423,8 @@ Distribute token counts evenly across data parallel ranks to reduce idle time:
 ```
 
 On the static/seqlen-balanced path, `--balance-data` enables `SeqlenBalancedSampler` and uses `karmarkar_karp` to balance tokens across data parallel ranks.
+
+`--balance-by-flops` enables both FLOPs-aware microbatch construction and DP assignment. See [configuration](#flops-balanced-dynamic-microbatches).
 
 In fully async with `--use-dynamic-batch-size`, the dynamic batch path automatically performs DP token balancing through `StreamingTokenBudgetSampler`. Passing `--balance-data` is accepted there, but it does not add another balancing pass.
 
