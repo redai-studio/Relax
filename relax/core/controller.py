@@ -321,11 +321,22 @@ class Controller:
             )
             logger.info("Using IdentityWindowSampler (fully_async + dynamic batch)")
         elif algo_key == "sft":
-            sampler = SeqlenBalancedSampler(
-                n_samples_per_prompt=self.config.n_samples_per_prompt,
-                dp_size=dp_size,
-            )
-            logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
+            if getattr(self.config, "flops_dp_balancing", False):
+                from relax.utils.data.flops_sampler import FlopsBalancedSampler
+                from relax.utils.data.flops_schedule import get_flops_estimator
+
+                sampler = FlopsBalancedSampler(
+                    estimator=get_flops_estimator(self.config),
+                    n_samples_per_prompt=self.config.n_samples_per_prompt,
+                    dp_size=dp_size,
+                )
+                logger.info("Using FlopsBalancedSampler with dp_size=%d", dp_size)
+            else:
+                sampler = SeqlenBalancedSampler(
+                    n_samples_per_prompt=self.config.n_samples_per_prompt,
+                    dp_size=dp_size,
+                )
+                logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
         elif getattr(self.config, "balance_data", False):
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")
             logger.info(f"Using IdentityWindowSampler with balanced row placement, dp_size={dp_size}")

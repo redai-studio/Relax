@@ -35,6 +35,7 @@ from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import should_bypass_main_output_layer
+from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.env import Envs
@@ -1221,7 +1222,23 @@ def train_one_step(
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
     # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
     valid_step = True
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    step_capture = None
+    capture_root = os.environ.get("RELAX_FLOPS_CAPTURE_DIR")
+    if capture_root and rollout_id == 0 and step_id == 0:
+        from relax.utils.training.optimizer_step_capture import OptimizerStepCapture
+
+        capture_group = torch.distributed.group.WORLD
+        capture_rank = torch.distributed.get_rank(capture_group)
+        step_capture = OptimizerStepCapture(
+            optimizer,
+            Path(capture_root) / f"rank-{capture_rank:05d}",
+            group=capture_group,
+            device=device_utils.make_current_torch_device(),
+        )
+        with step_capture:
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
         # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
@@ -1300,14 +1317,20 @@ def train_one_step(
             )
             for key in keys:
                 loss_reduced[key] = 0.0
+            if step_capture is not None:
+                step_capture.finish(loss_reduced, bool(update_successful))
             capture_hooks.end_step_for()
             return loss_reduced, grad_norm
         for key, value in zip(keys, values[1:], strict=False):
             # Per-token and sequence-classification metrics use the all-reduced
             # effective count. RL sample-mean metrics use the step's logical GBS.
             loss_reduced[key] = value / num_samples_or_tokens
+        if step_capture is not None:
+            step_capture.finish(loss_reduced, bool(update_successful))
         capture_hooks.end_step_for()
         return loss_reduced, grad_norm
+    if step_capture is not None:
+        step_capture.finish({}, bool(update_successful))
     capture_hooks.end_step_for()
     return {}, grad_norm
 

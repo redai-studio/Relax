@@ -3,6 +3,10 @@
 # FLOPS estimation adapted from verl (volcengine/verl) under Apache License 2.0.
 
 import inspect
+from collections.abc import Sequence
+from dataclasses import dataclass
+from numbers import Integral
+from typing import Any
 
 from relax.utils.logging_utils import get_logger
 
@@ -381,9 +385,8 @@ def _compute_qwen3_5_gdn_recurrence_flops(config, tokens_sum, num_linear_attn_la
     )
 
 
-def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
-    """Qwen3.5 hybrid attention (full attention + GatedDeltaNet linear
-    attention)."""
+def _compute_qwen3_5_text_flops_coefficients(config: Any) -> tuple[int, int]:
+    """Return a, b for estimated text training work a*sum(L) + b*sum(L**2)."""
     text_config = config.text_config if hasattr(config, "text_config") else config
     hidden_size = text_config.hidden_size
     vocab_size = text_config.vocab_size
@@ -403,20 +406,25 @@ def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kar
         mlp_N = hidden_size * text_config.intermediate_size * 3 * num_hidden_layers
 
     emd_and_lm_head_N = vocab_size * hidden_size * 2
-    dense_N_flops = 6 * (mlp_N + attn_linear_N + emd_and_lm_head_N) * tokens_sum
+    linear_flops = 6 * (mlp_N + attn_linear_N + emd_and_lm_head_N)
 
-    seqlen_square_sum = sum(s * s for s in batch_seqlens)
-    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
+    quadratic_flops = 6 * head_dim * num_attention_heads * num_full_attn_layers
 
-    gdn_recurrence_flops = _compute_qwen3_5_gdn_recurrence_flops(text_config, tokens_sum, num_linear_attn_layers)
+    linear_flops += _compute_qwen3_5_gdn_recurrence_flops(text_config, 1, num_linear_attn_layers)
+    return linear_flops, quadratic_flops
 
+
+def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    """Estimate Qwen3.5 text and optional vision training TFLOP/s."""
+    linear_flops, quadratic_flops = _compute_qwen3_5_text_flops_coefficients(config)
+    text_flops = linear_flops * tokens_sum + quadratic_flops * sum(s * s for s in batch_seqlens)
     images_seqlens = kargs.get("images_seqlens", None)
     if images_seqlens is not None and hasattr(config, "vision_config"):
         vit_flops = _estimate_qwen3_vit_flop(images_seqlens, config.vision_config)
     else:
         vit_flops = 0
 
-    flops_all_token = dense_N_flops + attn_qkv_flops + gdn_recurrence_flops + vit_flops
+    flops_all_token = text_flops + vit_flops
     return flops_all_token / delta_time / 1e12
 
 
@@ -528,6 +536,99 @@ _ESTIMATE_FUNC = {
     "qwen3_vl": _estimate_qwen3_vl_flops,
     "qwen3_vl_moe": _estimate_qwen3_vl_moe_flops,
 }
+
+
+def _require_config_int(config: Any, field: str, *, minimum: int = 1) -> int:
+    value = getattr(config, field, None)
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{field} must be an integer >= {minimum}, got {value!r}")
+    return value
+
+
+@dataclass(frozen=True)
+class SequenceFlopsEstimator:
+    """Estimate text-only Qwen3.5 forward/backward work in raw FLOPs.
+
+    Construct once with ``from_config`` and reuse for CPU sequence lengths.
+    Coefficients follow the existing FlopsCounter convention. They exclude
+    vision encoders, padding, recomputation, optimizer updates and
+    communication. A VL config is accepted for its text branch; image work is
+    not inferred.
+    """
+
+    linear_flops: int
+    quadratic_flops: int
+
+    def __post_init__(self) -> None:
+        if type(self.linear_flops) is not int or self.linear_flops <= 0:
+            raise ValueError("linear_flops must be a positive integer")
+        if type(self.quadratic_flops) is not int or self.quadratic_flops < 0:
+            raise ValueError("quadratic_flops must be a non-negative integer")
+
+    @classmethod
+    def from_config(cls, config: Any) -> "SequenceFlopsEstimator":
+        model_type = getattr(config, "model_type", None)
+        supported = {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
+        if model_type not in supported:
+            raise ValueError(f"Unsupported model_type for text FLOPs scheduling: {model_type!r}")
+        text_config = getattr(config, "text_config", config)
+        for field in (
+            "hidden_size",
+            "vocab_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+        ):
+            _require_config_int(text_config, field)
+        head_dim = getattr(text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
+        if type(head_dim) is not int or head_dim <= 0:
+            raise ValueError("head_dim must be a positive integer")
+        is_moe = model_type in {"qwen3_5_moe", "qwen3_5_moe_text"}
+        if is_moe != hasattr(text_config, "num_experts"):
+            raise ValueError("model_type and text_config disagree about MoE experts")
+        if is_moe:
+            experts = _require_config_int(text_config, "num_experts")
+            topk = _require_config_int(text_config, "num_experts_per_tok")
+            if topk > experts:
+                raise ValueError("num_experts_per_tok must not exceed num_experts")
+            _require_config_int(text_config, "moe_intermediate_size")
+            _require_config_int(text_config, "shared_expert_intermediate_size", minimum=0)
+        else:
+            _require_config_int(text_config, "intermediate_size")
+        layer_types = getattr(text_config, "layer_types", None)
+        if layer_types is None:
+            interval = getattr(text_config, "full_attention_interval", 4)
+            if type(interval) is not int or interval <= 0:
+                raise ValueError("full_attention_interval must be a positive integer")
+        elif (
+            not isinstance(layer_types, (list, tuple))
+            or len(layer_types) != text_config.num_hidden_layers
+            or any(kind not in {"full_attention", "linear_attention"} for kind in layer_types)
+        ):
+            raise ValueError("layer_types must describe every layer as full_attention or linear_attention")
+        return cls(*_compute_qwen3_5_text_flops_coefficients(text_config))
+
+    def estimate_per_sample(self, sequence_lengths: Sequence[int]) -> list[int]:
+        """Return one positive integer FLOPs weight per positive CPU length."""
+        workloads: list[int] = []
+        for length in sequence_lengths:
+            if isinstance(length, bool) or not isinstance(length, Integral):
+                raise TypeError(f"Sequence length must be an integer, got {type(length).__name__}")
+            if length <= 0:
+                raise ValueError(f"Sequence length must be positive, got {length}")
+            length = int(length)
+            workloads.append(self.linear_flops * length + self.quadratic_flops * length * length)
+        return workloads
+
+    def estimate(self, sequence_lengths: Sequence[int]) -> int:
+        """Return additive text work for isolated samples; an empty batch is
+        0."""
+        return sum(self.estimate_per_sample(sequence_lengths))
 
 
 class FlopsCounter:

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import argparse
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,23 @@ from tests.utils.test_arguments_opd_teacher_colocate import (
 
 
 arguments_module = _arguments_module_fixture
+
+
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        ([], (False, False)),
+        (["--flops-microbatch-packing"], (True, False)),
+        (["--flops-dp-balancing"], (False, True)),
+        (["--flops-microbatch-packing", "--flops-dp-balancing"], (True, True)),
+    ],
+)
+def test_flops_scheduling_flags_are_independent_and_opt_in(arguments_module, flags, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    args = parser.parse_args(flags)
+    assert (args.flops_microbatch_packing, args.flops_dp_balancing) == expected
 
 
 def test_sft_async_prepack_rejects_single_in_flight_step(arguments_module):
