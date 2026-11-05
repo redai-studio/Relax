@@ -4,6 +4,8 @@ models."""
 
 import asyncio
 import os
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -34,15 +36,22 @@ def cpu_registry(monkeypatch):
 
 
 class LocalRay:
+    """Reconnect to one head node, as a production driver does after a global
+    restart.
+
+    Starting a fresh local cluster from the health checker thread stalls Serve
+    router creation on Linux, which production never does.
+    """
+
+    def __init__(self, address: str) -> None:
+        self.address = address
+
     def __getattr__(self, name):
         return getattr(ray, name)
 
     def init(self, **kwargs):
         return ray.init(
-            address="local",
-            num_cpus=4,
-            include_dashboard=False,
-            _temp_dir=tempfile.mkdtemp(prefix="r12-", dir="/tmp"),
+            address=self.address,
             log_to_driver=False,
             runtime_env={"env_vars": {"PYTHONPATH": str(ROOT)}},
         )
@@ -56,15 +65,57 @@ class LocalServe:
         return serve.start(proxy_location="Disabled")
 
 
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _listening(port: int) -> bool:
+    with socket.socket() as probe:
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
 @pytest.fixture
 def cluster():
-    local = LocalRay()
-    local.init()
-    LocalServe().start()
-    yield local
-    shutdown_async_loop()
-    serve.shutdown()
-    ray.shutdown()
+    port = _free_port()
+    head = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "ray.scripts.scripts",
+            "start",
+            "--head",
+            "--block",
+            f"--port={port}",
+            "--node-ip-address=127.0.0.1",
+            "--num-cpus=4",
+            "--include-dashboard=false",
+            "--disable-usage-stats",
+            f"--temp-dir={tempfile.mkdtemp(prefix='r12-', dir='/tmp')}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    local = LocalRay(f"127.0.0.1:{port}")
+    try:
+        wait_until(lambda: head.poll() is None and _listening(port), timeout=60)
+        local.init()
+        LocalServe().start()
+        yield local
+    finally:
+        shutdown_async_loop()
+        if ray.is_initialized():
+            serve.shutdown()
+            ray.shutdown()
+        # The head runs in its own session, so stopping it never touches other clusters.
+        os.killpg(head.pid, signal.SIGTERM)
+        try:
+            head.wait(60)
+        except subprocess.TimeoutExpired:
+            os.killpg(head.pid, signal.SIGKILL)
+            head.wait(10)
 
 
 def wait_until(predicate, timeout=35):
@@ -156,13 +207,14 @@ def _run_isolated_ray_case(case: str) -> None:
     except subprocess.TimeoutExpired as exc:
         pytest.fail(f"Ray case {case} timed out\nstdout:\n{exc.stdout}\nstderr:\n{exc.stderr}", pytrace=False)
     output = completed.stdout + completed.stderr
-    assert ray.is_initialized() == was_initialized, output
+    assert ray.is_initialized() == was_initialized
     if was_initialized:
-        assert ray.get_runtime_context().get_job_id() == parent_job_id, output
+        assert ray.get_runtime_context().get_job_id() == parent_job_id
         marker = {"ray_parent_probe": "still-owned"}
-        assert ray.get(ray.put(marker)) == marker, output
-    assert completed.returncode == 0, output
-    assert "1 passed" in completed.stdout and " skipped" not in completed.stdout, output
+        assert ray.get(ray.put(marker)) == marker
+    if completed.returncode != 0 or "1 passed" not in completed.stdout or " skipped" in completed.stdout:
+        # pytest.fail keeps the child's report intact; assertion messages are truncated.
+        pytest.fail(f"Ray case {case} failed in its subprocess:\n{output}", pytrace=False)
 
 
 def test_two_real_ray_rebuilds_use_real_worker_completions_and_keep_http():
