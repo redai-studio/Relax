@@ -6777,3 +6777,55 @@ new file mode 100644
 +
 +    def reset(self):
 +        self.valid.zero_()
+diff --git a/python/sglang/srt/models/qwen3_omni_moe.py b/python/sglang/srt/models/qwen3_omni_moe.py
+--- a/python/sglang/srt/models/qwen3_omni_moe.py
++++ b/python/sglang/srt/models/qwen3_omni_moe.py
+@@ -506,36 +506,18 @@
+
+     def get_audio_feature(self, items: List[MultimodalDataItem]):
+         device = next(self.audio_tower.parameters()).device
+-        feature_attention_mask = (
+-            torch.cat([item.feature_attention_mask for item in items], dim=0)
+-            .type(torch.long)
+-            .to(device)
+-        )
+-        input_features = (
+-            torch.cat([item.feature for item in items])
+-            .type(self.audio_tower.dtype)
+-            .to(next(self.audio_tower.parameters()).device)
+-        )
+-        if feature_attention_mask is not None:
+-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+-            input_features = input_features.permute(0, 2, 1)[
+-                feature_attention_mask.bool()
+-            ].permute(1, 0)
+-        else:
+-            audio_feature_lengths = None
+-
+-        feature_lens = (
+-            audio_feature_lengths
+-            if audio_feature_lengths is not None
+-            else feature_attention_mask.sum(-1)
+-        )
+-        audio_outputs = self.audio_tower(
+-            input_features,
+-            feature_lens=feature_lens,
+-        )
+-        audio_features = audio_outputs.last_hidden_state
+-
+-        return audio_features
++        input_features, feature_lens = [], []
++        # Requests are padded independently; compact each item before batching.
++        for item in items:
++            mask = item.feature_attention_mask.to(device=device, dtype=torch.bool)
++            features = item.feature.to(device=device, dtype=self.audio_tower.dtype)
++            feature_lens.append(mask.sum(dim=1))
++            input_features.append(features.permute(0, 2, 1)[mask].transpose(0, 1))
++
++        return self.audio_tower(
++            torch.cat(input_features, dim=1),
++            feature_lens=torch.cat(feature_lens, dim=0),
++        ).last_hidden_state
+
+
+ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
