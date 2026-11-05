@@ -3,7 +3,8 @@
 
 Both arms use the real TCP consumer and ordinary SGLang disk loader. File
 checks follow both timed arms; initial/final GPU dumps are compared separately.
-This measures a replay segment, not the audited product or training E2E.
+With --frozen-config, publication is included from HF ready through generation
+ready. Training export and audit I/O remain outside this timer.
 """
 
 import argparse
@@ -78,6 +79,7 @@ def main() -> int:
     parser.add_argument("--source-node-ip", required=True)
     parser.add_argument("--consumer-node-ip", required=True)
     parser.add_argument("--updates", type=int, default=10)
+    parser.add_argument("--frozen-config", type=Path, help="Publish each frozen target inside the main timer")
     args = parser.parse_args()
     if args.source_node_ip == args.consumer_node_ip or not 10 <= args.updates <= 20:
         raise ValueError("Use two different nodes and 10–20 updates")
@@ -90,8 +92,23 @@ def main() -> int:
     configs = {name: WeightSyncConfig.load(path) for name, path in config_paths.items()}
     if not configs["FULL"].full_only or configs["DELTA"].full_only:
         raise ValueError("Use independent primary FULL and DELTA publishers")
+    if args.frozen_config:
+        paths = [Path(value).resolve() for c in configs.values() for value in (c.store_root, c.canonical_root)]
+        if any(path.exists() for path in paths):
+            raise ValueError("Timed publication requires empty, independent source stores")
+        if any(a.is_relative_to(b) or b.is_relative_to(a) for a in paths[:2] for b in paths[2:]):
+            raise ValueError("FULL and DELTA source stores must be independent")
+        frozen = WeightSyncConfig.load(args.frozen_config)
+        originals = [Path(value).resolve() for value in (frozen.store_root, frozen.canonical_root)]
+        if any(a.is_relative_to(b) or b.is_relative_to(a) for a in paths for b in originals):
+            raise ValueError("Timed source stores must be outside the original frozen source")
     sources, engines, consumers, transports = {}, [], {}, {}
-    result = {"status": "STARTING", "runtime": runtime_identity(), "rows": []}
+    result = {
+        "status": "STARTING",
+        "runtime": runtime_identity(),
+        "timed_publication": args.frozen_config is not None,
+        "rows": [],
+    }
     cleanup = {"errors": []}
 
     def save() -> None:
@@ -101,7 +118,7 @@ def main() -> int:
     try:
         for arm, path in config_paths.items():
             sources[arm] = SourceServer.options(
-                scheduling_strategy=NodeAffinitySchedulingStrategy(nodes[args.source_node_ip], soft=False)
+                num_cpus=1, scheduling_strategy=NodeAffinitySchedulingStrategy(nodes[args.source_node_ip], soft=False)
             ).remote(str(path))
             identity = ray.get(sources[arm].identity.remote(), timeout=60)
             atomic_write(args.output / f"source-{arm}.json", json.dumps(identity, indent=2).encode())
@@ -133,7 +150,16 @@ def main() -> int:
                 consumer, transport, config = consumers[arm], transports[arm], configs[arm]
                 before = dict(transport.metrics)
                 started = monotonic()
+                publication = None
+                if args.frozen_config:
+                    publication = ray.get(
+                        sources[arm].publish_frozen.remote(str(args.frozen_config), version),
+                        timeout=config.sync_timeout_s + 60,
+                    )
+                published_at = monotonic()
                 prepared = consumer.prepare(config.stream, version)
+                if publication and publication["root"] != prepared.root:
+                    raise RuntimeError("Consumer loaded a different published target")
                 kind = consumer.cache.manifest(prepared.artifact_id)["kind"]
                 expected_kind = "FULL" if arm == "FULL" or version % config.anchor_interval == 0 else "DELTA"
                 fallback = consumer.last_metrics.get("fallback_reason")
@@ -159,7 +185,10 @@ def main() -> int:
                     "artifact_kind": kind,
                     "source_full_only": config.full_only,
                     "request_full": False,
-                    "prepare_s": prepared_at - started,
+                    "publication": publication,
+                    "publication_rpc_s": published_at - started,
+                    "receiver_segment_s": finished - published_at,
+                    "prepare_s": prepared_at - published_at,
                     "pause_calls_s": paused_at - prepared_at,
                     "group_load_s": loaded_at - paused_at,
                     "resume_probe_s": finished - loaded_at,
@@ -177,7 +206,8 @@ def main() -> int:
                 raise RuntimeError("Arms used different frozen targets")
             for row in rows:
                 audit_at = monotonic()
-                reference = config_paths[row["arm"]].parent / "exports" / f"update-{version:06d}"
+                reference_base = args.frozen_config.parent if args.frozen_config else config_paths[row["arm"]].parent
+                reference = reference_base / "exports" / f"update-{version:06d}"
                 check = compare(reference, Path(row["path"]))
                 diff = args.output / f"hf-v{version}-{row['arm']}.json"
                 atomic_write(diff, json.dumps(check, indent=2).encode())

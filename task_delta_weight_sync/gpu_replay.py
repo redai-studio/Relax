@@ -187,10 +187,62 @@ class CheckedEngine:
         self.engine.shutdown()
 
 
+def publish_frozen_target(
+    store: SharedFSStore, config: WeightSyncConfig, original_config_path: str, version: int
+) -> dict:
+    """Publish one immutable HF target on this source node before fetching
+    it."""
+    from dataclasses import asdict
+
+    from relax.distributed.weight_sync.__main__ import checkpoint_tensors
+    from relax.distributed.weight_sync.provenance import runtime_identity
+    from relax.distributed.weight_sync.publisher import Publisher
+
+    started = monotonic()
+    original = WeightSyncConfig.load(original_config_path)
+    if (
+        store.root != Path(config.store_root).resolve()
+        or store.canonical_root != Path(config.canonical_root).resolve()
+    ):
+        raise ValueError("Publisher store differs from the source configuration")
+    roots = [Path(c.store_root).resolve() for c in (original, config)]
+    canonical = [Path(c.canonical_root).resolve() for c in (original, config)]
+    if any(
+        a.is_relative_to(b) or b.is_relative_to(a)
+        for a in roots[:1] + canonical[:1]
+        for b in roots[1:] + canonical[1:]
+    ):
+        raise ValueError("Publish into an independent store outside the frozen source")
+    source = SharedFSStore(original.store_root, canonical_root=original.canonical_root)
+    expected = source.record(original.stream, version)
+    schema = source.manifest(expected["artifact_id"])["catalog"]["schema_context"]
+    export = Path(original_config_path).resolve().parent / "exports" / f"update-{version:06d}"
+    publisher = Publisher(store, config.stream, schema, **config.publisher_kwargs())
+    try:
+        published = publisher.finalize_pending(
+            publisher.submit(expected["update_id"], checkpoint_tensors(export)), config.sync_timeout_s
+        )
+    finally:
+        publisher.close()
+    if (published.stream, published.version, published.root) != (original.stream, version, expected["root"]):
+        raise RuntimeError("Frozen publication changed the training target")
+    kind = store.manifest(published.artifact_id)["kind"]
+    expected_kind = "FULL" if config.full_only or version % config.anchor_interval == 0 else "DELTA"
+    if kind != expected_kind:
+        raise RuntimeError(f"Unexpected frozen publication kind: {kind}")
+    return asdict(published) | {
+        "kind": kind,
+        "metrics": dict(publisher.last_metrics),
+        "source_wall_s": monotonic() - started,
+        "runtime": runtime_identity(),
+    }
+
+
 @ray.remote(num_cpus=0.25)
 class SourceServer:
     def __init__(self, config_path: str) -> None:
         config = WeightSyncConfig.load(config_path)
+        self.config = config
         self.server = ObservedObjectServer(
             (ray.util.get_node_ip_address(), 0),
             SharedFSStore(config.store_root, config.disk_budget_bytes, canonical_root=config.canonical_root),
@@ -198,6 +250,9 @@ class SourceServer:
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+
+    def publish_frozen(self, original_config_path: str, version: int) -> dict:
+        return publish_frozen_target(self.server.store, self.config, original_config_path, version)
 
     def identity(self) -> dict:
         from relax.distributed.weight_sync.provenance import runtime_identity
