@@ -495,6 +495,21 @@ ENV FI_PROVIDER=efa \
 
 FROM relax_${GPU_ARCH} as relax
 
+# MCore's cuDNN DSA backend uses FlashMLA sparse forward on both architectures.
+# Rebuild the same pinned source as CUDA 12 against this image's Torch/CUDA ABI.
+ARG FLASH_MLA_COMMIT=b7643bd54521f563b839b98289b5cd048c062ba2
+RUN case "$RELAX_GPU_ARCH" in \
+        hopper) export FLASH_MLA_DISABLE_SM100=1 ;; \
+        blackwell) export FLASH_MLA_DISABLE_SM90=1 ;; \
+    esac && \
+    git clone https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA && \
+    cd /tmp/FlashMLA && git checkout "$FLASH_MLA_COMMIT" && \
+    git submodule update --init --recursive && \
+    CUDA_VISIBLE_DEVICES="" MAX_JOBS=16 NVCC_THREADS=4 \
+        CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}" \
+        pip install --no-cache-dir --no-build-isolation --no-deps . && \
+    cd /root && rm -rf /tmp/FlashMLA
+
 # Keye/DSA indexers require this CUDA extension; use the same source pin as CUDA 12.
 # Force a local build: upstream's wheel lookup maps CUDA 13 to CUDA 12 wheels.
 RUN . /etc/relax_build.env && \

@@ -1210,7 +1210,7 @@ index 59a5fef..62d9a0c 100644
                      )
                  q_indexer_cp = rotate_activation(q_indexer_cp)
 -                weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
-+                with get_fp8_disabled_context():
++                with get_fp8_disabled_context(indexer.config):
 +                    weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
                  weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
                  nvtx_range_pop("dsv4_cp_indexer_q_weights")
