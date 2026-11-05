@@ -45,12 +45,14 @@ def _environment(tmp_path):
             "FLA_TILELANG",
             "NUM_ROLLOUT",
             "SAVE_INTERVAL",
+            "SAVE_OPTIMIZER",
         }
     }
     env.update(
         MODEL_DIR=str(tmp_path / "model with spaces"),
         DATA_DIR=str(data),
         RELAX_ENTRYPOINT_MODE="test",
+        RAY_DASHBOARD_ADDRESS="http://ray-dashboard.test:8265",
         RUNTIME_ENV_JSON='{"env_vars":{}}',
         CAPTURE=str(capture),
         PATH=f"{tmp_path}:{env['PATH']}",
@@ -66,6 +68,12 @@ def test_kimi_k3_recipe_resolves_shared_paths_and_worker_settings(tmp_path, scri
     if saving:
         env["SAVE_DIR"] = str(tmp_path / "checkpoint with spaces")
     subprocess.run(["bash", "-n", str(script)], check=True)
+    if "kimi-k3.1-pro" in script.name and not saving:
+        result = subprocess.run(["bash", str(script)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+        assert result.returncode != 0
+        assert "Set SAVE_DIR" in result.stderr
+        assert not capture.exists()
+        return
     subprocess.run(["bash", str(script)], cwd=ROOT, env=env, check=True, capture_output=True, timeout=30)
     argv = json.loads(capture.read_text())
     assert argv[:2] == ["job", "submit"]
@@ -85,6 +93,10 @@ def test_kimi_k3_recipe_resolves_shared_paths_and_worker_settings(tmp_path, scri
         expected = str(Path(env["SAVE_DIR"]) / env["EXP_NAME"])
         assert argv[argv.index("--save") + 1] == expected
         assert argv[argv.index("--load") + 1] == expected
+        if "kimi-k3.1-pro" in script.name:
+            assert "--no-save-optim" not in argv
+            assert argv[argv.index("--save-interval") + 1] == "10"
+            assert argv[argv.index("--max-actor-ckpt-to-keep") + 1] == "1"
     else:
         assert "--save" not in argv
     if "rawtext" in script.name:
@@ -98,6 +110,8 @@ def test_kimi_k3_recipe_resolves_shared_paths_and_worker_settings(tmp_path, scri
 def test_kimi_k3_recipe_dry_run_never_calls_ray(tmp_path, script):
     env, capture = _environment(tmp_path)
     env["DRY_RUN"] = "1"
+    if "kimi-k3.1-pro" in script.name:
+        env["SAVE_DIR"] = str(tmp_path / "checkpoint with spaces")
     result = subprocess.run(
         ["bash", str(script)], cwd=ROOT, env=env, check=True, capture_output=True, text=True, timeout=30
     )
@@ -108,10 +122,11 @@ def test_kimi_k3_recipe_dry_run_never_calls_ray(tmp_path, script):
 
 
 @pytest.mark.parametrize("no_wait", ["", "1"])
-def test_kimi_k3_recipe_preserves_explicit_wait_and_optimizer_save(tmp_path, no_wait):
+@pytest.mark.parametrize("model", ["kimi-k3", "kimi-k3.1-pro"])
+def test_kimi_k3_recipe_preserves_explicit_wait_and_optimizer_save(tmp_path, no_wait, model):
     env, capture = _environment(tmp_path)
     env.update(RAY_NO_WAIT=no_wait, SAVE_OPTIMIZER="1", SAVE_DIR=str(tmp_path / "save"), FLA_TILELANG="1")
-    script = ROOT / "examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh"
+    script = ROOT / f"examples/models/kimi-k3/scripts/run-{model}-openr1mm-128xblackwell.sh"
     subprocess.run(["bash", str(script)], cwd=ROOT, env=env, check=True, capture_output=True, timeout=30)
     argv = json.loads(capture.read_text())
     assert ("--no-wait" in argv) is bool(no_wait)

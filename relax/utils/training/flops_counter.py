@@ -564,7 +564,12 @@ class FlopsCounter:
     """
 
     def __init__(self, config):
-        if hasattr(config, "model_type") and config.model_type not in _ESTIMATE_FUNC:
+        if getattr(config, "model_type", None) == "kimi_k31":
+            logger.warning(
+                "K3.1 FLOPs/MFU omitted: the K3 estimator does not account for sparse DSA and its frozen indexer. "
+                "Token throughput and timing remain available."
+            )
+        elif hasattr(config, "model_type") and config.model_type not in _ESTIMATE_FUNC:
             logger.warning(
                 "Unsupported model_type '%s' for FLOPS estimation — falling back to dense transformer formula. "
                 "Supported: %s.",
@@ -583,6 +588,8 @@ class FlopsCounter:
         """
         tokens_sum = sum(batch_seqlens)
         model_type = getattr(self.config, "model_type", None)
+        if model_type == "kimi_k31":
+            return float("nan"), get_device_peak_flops(unit="T")
         func = _ESTIMATE_FUNC.get(model_type, _estimate_fallback_flops)
         forward_only = kwargs.pop("forward_only", False)
         if func is estimate_kimi_k3_flops:
