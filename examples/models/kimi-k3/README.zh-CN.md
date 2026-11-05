@@ -8,6 +8,92 @@ Relax 支持 Kimi K3 的全参和 LoRA SFT，包括图片输入、packing、固�
 
 请使用按照 `docker/Dockerfile` 或 `docker/Dockerfile.cu13` 中固定的 Megatron/Bridge、FLA 和 NVRx 依赖构建的训练镜像。所有训练节点都必须能读取模型和数据目录。这些脚本是参考配置；长跑前需要在目标集群验证内存占用和数值行为。
 
+## 开源数据集复现结果
+
+以下 Kimi K3 实验使用 HellaSwag、multimodal-open-r1-8k-verified（OpenR1-MM）、Pokémon captions 和 LLaVA-OneVision v1.5 Instruct。全参 SFT/GRPO 使用 128×280G Blackwell，LoRA 使用 64×280G Blackwell。结果对应当时的实验配置，当前脚本默认值可能已有变化。曲线横轴为 raw step，平滑系数为 0.25，背景保留未平滑曲线。
+
+| 数据集                        | 实验                       | 观察结果                                                                          |
+| ----------------------------- | -------------------------- | --------------------------------------------------------------------------------- |
+| HellaSwag                     | 原始 context/target SFT    | 100 步内训练 loss 收敛至约 1.4，验证 loss 降至约 1.93。                           |
+| OpenR1-MM                     | 全参多模态 SFT             | 转换后的 MXFP4 checkpoint 在 256 条留出评估样本上的 pass@k 提升，评分口径见下表。 |
+| Pokémon captions（中文）      | 语言主干 LoRA              | 训练记录至 step 198，loss 持续下降。                                              |
+| LLaVA-OneVision v1.5 Instruct | 冻结视觉模型的长上下文 SFT | 记录至 step 680；packing 后序列约 110k token，单步约 60 秒，偶有尖峰。            |
+| OpenR1-MM                     | 多模态 GRPO                | rollout reward 上升，训推 logprob 差异维持较小量级并逐步下降。                    |
+
+### HellaSwag SFT
+
+原始文本脚本以 context 为输入、target ending 为监督目标。这里展示语言模型 loss，不代表 HellaSwag 多选题准确率。128×280G Blackwell 上记录的训练单步耗时约 40 秒。
+
+|                      训练 loss                      |                        验证 loss                         |
+| :-------------------------------------------------: | :------------------------------------------------------: |
+| ![HellaSwag 训练 loss](./assets/hellaswag-loss.png) | ![HellaSwag 验证 loss](./assets/hellaswag-eval-loss.png) |
+
+脚本：[`run-kimi-k3-hellaswag-128xblackwell-rawtext.sh`](./scripts/run-kimi-k3-hellaswag-128xblackwell-rawtext.sh)。
+
+### OpenR1-MM SFT 与评估
+
+从 multimodal-open-r1-8k-verified 中划分 7424 条训练样本和 256 条留出评估样本，对比原始 Kimi K3 与 **SFT iter86 转换为原生 MXFP4 HF 权重后的模型**。
+
+| 评分口径                           | 模型         |     pass@1 |     pass@4 |     pass@8 |    pass@16 |
+| ---------------------------------- | ------------ | ---------: | ---------: | ---------: | ---------: |
+| 原始 OpenR1-MM reward：格式 + 答案 | 原始 Kimi K3 |      7.50% |     11.92% |     14.98% |     20.00% |
+| 原始 OpenR1-MM reward：格式 + 答案 | SFT iter86   | **66.25%** | **77.64%** | **84.00%** | **90.00%** |
+| 最终答案评分器 v2                  | 原始 Kimi K3 |     43.44% |     49.31% |     52.29% |     55.00% |
+| 最终答案评分器 v2                  | SFT iter86   | **56.25%** | **64.84%** | **70.10%** | **75.00%** |
+
+两种口径使用独立的评分实现，得分并非包含关系，只应在同一评分口径内比较。这是 SFT 数据集的留出评估，并非独立 benchmark 套件。实验汇总未记录完整解码参数，因此这些数值还不能作为配置齐全的评估协议。当前 [`eval_openr1mm.py`](../../../scripts/tools/eval_openr1mm.py) 提供最终答案评估工具，其默认值不代表历史实验参数。
+
+|                       SFT 训练 loss 示例                       |
+| :------------------------------------------------------------: |
+| ![OpenR1-MM SFT 首段训练 loss](./assets/openr1mm-sft-loss.png) |
+
+上图为其中一段训练记录，不是到 iter86 的完整训练轨迹。128×280G Blackwell 上的上下文容量实验结果如下：
+
+| 全局 batch size | 上下文 | 视觉模型 | 结果             |
+| --------------: | -----: | -------- | ---------------- |
+|             256 |    64k | 联合训练 | 该次实验稳定训练 |
+|             256 |    96k | 联合训练 | step 16 OOM      |
+|             256 |    96k | 冻结     | 该次实验稳定训练 |
+|             512 |   128k | 冻结     | 该次实验稳定训练 |
+
+脚本：[`run-kimi-k3-openr1mm-128xblackwell.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell.sh)。
+
+### Pokémon LoRA
+
+64×280G Blackwell LoRA 实验使用 Pokémon GPT-4o captions 的中文数据文件 `pokemon_gpt4o_zh.parquet`。该结果展示图像描述数据上的 LoRA 训练收敛情况，没有对应的留出集准确率。
+
+|                         训练 loss                         |                           梯度范数                            |
+| :-------------------------------------------------------: | :-----------------------------------------------------------: |
+| ![Pokémon LoRA 训练 loss](./assets/pokemon-lora-loss.png) | ![Pokémon LoRA 梯度范数](./assets/pokemon-lora-grad-norm.png) |
+
+脚本：[`run-kimi-k3-pokemon-lora-64xblackwell.sh`](./scripts/run-kimi-k3-pokemon-lora-64xblackwell.sh)。
+
+### LLaVA-OneVision 长上下文 SFT
+
+128×280G Blackwell 实验冻结视觉模型，全局 batch size 为 512，使用 CP8。训练记录覆盖 step 0–680，在 128k 上下文预算下，packing 后序列通常约 110k token。loss 总体下降，多数单步耗时约 60 秒，初始化和个别尖峰耗时更长。该次实验出现过一次较大的梯度范数尖峰，后续定位为 FLA KDA 问题，记录中报告升级 FLA 0.5.2 后修复。该实验没有报告下游准确率。
+
+|                      训练 loss                      |                     单步耗时（秒）                      |                           packing 后 token 数                            |
+| :-------------------------------------------------: | :-----------------------------------------------------: | :----------------------------------------------------------------------: |
+| ![OneVision 训练 loss](./assets/onevision-loss.png) | ![OneVision 单步耗时](./assets/onevision-step-time.png) | ![OneVision packing 后序列 token 数](./assets/onevision-pack-tokens.png) |
+
+脚本：[`run-kimi-k3-llava-onevision-128xblackwell.sh`](./scripts/run-kimi-k3-llava-onevision-128xblackwell.sh)。
+
+### OpenR1-MM GRPO
+
+全参多模态 GRPO 使用 128×280G Blackwell。下图所示实验覆盖 step 0–60，rollout reward 从约 0.16 升至 0.44，训推 mismatch KL 维持在 0.002–0.003 左右，logprob 平均绝对差异约为 0.03。这些是训练诊断指标，不是留出集 pass@k。
+
+|                           Rollout reward                            |                           训推 mismatch KL                            |                              Logprob 绝对差异                               |
+| :-----------------------------------------------------------------: | :-------------------------------------------------------------------: | :-------------------------------------------------------------------------: |
+| ![OpenR1-MM GRPO rollout reward](./assets/openr1mm-grpo-reward.png) | ![OpenR1-MM GRPO mismatch KL](./assets/openr1mm-grpo-mismatch-kl.png) | ![OpenR1-MM GRPO logprob 绝对差异](./assets/openr1mm-grpo-logprob-diff.png) |
+
+优化记录中的代表性迭代耗时从约 **1100 秒降至 770 秒**，降低约 30%；权重同步从约 **270 秒降至 80 秒**，降低约 70%。这些是不同运行中的近似观测值，不是受控的吞吐对比。下方耗时对比包含一条仅记录至 step 8 的优化后短跑；启动开销和序列长度变化都会影响曲线。蓝色为 9 月 29 日的优化后实验，黄色为 9 月 28 日的对照实验。
+
+|                             优化前迭代耗时（秒）                              |                          后续实验迭代耗时（秒）                          |
+| :---------------------------------------------------------------------------: | :----------------------------------------------------------------------: |
+| ![OpenR1-MM GRPO 优化前迭代耗时](./assets/openr1mm-grpo-step-time-before.png) | ![OpenR1-MM GRPO 后续迭代耗时对比](./assets/openr1mm-grpo-step-time.png) |
+
+脚本：[`run-kimi-k3-openr1mm-128xblackwell-grpo.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh)。
+
 ## 训练
 
 在已有 Ray 集群上，从仓库根目录执行命令。`MODEL_DIR` 直接指向原始 HF 模型目录，`DATA_DIR` 指向准备好的数据目录。仍支持原有的 `HF_CHECKPOINT`、`HELLASWAG_DATA_DIR`、`OPENR1MM_DATA_DIR`、`POKEMON_DATA_DIR` 和 `LLAVA_DATA_DIR` 覆盖变量。
