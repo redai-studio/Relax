@@ -8,6 +8,18 @@ Relax provides full-parameter and LoRA SFT for Kimi K3, with image inputs, packi
 
 Use a training image built with the pinned Megatron/Bridge, FLA and NVRx dependencies in `docker/Dockerfile` or `docker/Dockerfile.cu13`. Model and dataset directories must be readable from every training node. These recipes are reference configurations; validate memory use and numerical behavior on the target cluster before a long run.
 
+## Kimi K3.1 Pro
+
+Use the official `moonshotai/Kimi-K3.1-Pro` checkpoint with `--trust-remote-code` and `--megatron-to-hf-mode bridge`. Relax selects its local K3.1 bridge from `KimiK31ForConditionalGeneration` / `kimi_k31`. The model configuration is `scripts/models/kimi-k3.1-pro.sh`; it reuses K3's backbone dimensions. Existing K3 SFT recipes can also read a K3.1 checkpoint by setting `MODEL_DIR` to that directory and using a new `EXP_NAME` and checkpoint directory.
+
+K3.1 keeps the 93-layer backbone, KDA, latent MoE, AttnRes and image processor. Its 24 MLA layers add a NoPE DSA indexer with 32 heads of dimension 128 and top-2048 key selection. The bridge maps the five new indexer tensors per MLA layer. Indexer weights remain frozen during SFT/RL: hard top-k selection has no language-loss gradient, and this integration does not add an indexer distillation objective. K3.1 uses local trainable MoonViT and projector modules because its HF repository omits the modeling files loaded by K3. FLOPs/MFU are omitted for K3.1 until the estimator accounts for sparse attention and the frozen indexer; throughput and timing are still reported.
+
+The training path uses Core's TileLang sparse attention, padding head tiles when needed for K3's 96 attention heads. If LoRA wraps `kv_b_proj`, the expanded attention path preserves adapter gradients and dropout but uses more memory at long context lengths. The other K3 parallelism limits below still apply.
+
+The pinned Megatron-Bridge already supplies the reusable K3 backbone. Neither Bridge `v0.7.0` nor main at `20874c8db` includes K3.1; upgrading Bridge alone does not enable it. This integration keeps the existing dependency pins. See the [official model config](https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/main/config.json) and [Bridge comparison](https://github.com/NVIDIA-NeMo/Megatron-Bridge/compare/6862ee170a2569607e8ebc5dde91f119779093ca...20874c8dbf87af6eafa8c93c0f44586ddc47fe5a).
+
+For RL rollout or serving, the repository's SGLang `v0.5.21` base is insufficient. Use a runtime containing [SGLang #48415](https://github.com/sgl-project/sglang/pull/48415) (`61a3c7f2`, K3.1 support) with Relax's weight-reload patches ported and validated. This change does not upgrade or validate that inference runtime. The K3-specific offline export/streaming LoRA tools below have not been extended to K3.1. GPU numerics, distributed checkpointing and online rollout reload still require validation in the target training image and cluster.
+
 ## Training
 
 Run commands from the repository root on an existing Ray cluster. `MODEL_DIR` points directly to the original HF model directory; `DATA_DIR` points to the prepared dataset directory. Existing `HF_CHECKPOINT`, `HELLASWAG_DATA_DIR`, `OPENR1MM_DATA_DIR`, `POKEMON_DATA_DIR` and `LLAVA_DATA_DIR` overrides remain supported.
