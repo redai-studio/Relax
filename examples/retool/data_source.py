@@ -4,6 +4,7 @@
 import copy
 import hashlib
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,8 @@ class ReToolDataSource(DataSource):
             sha256=self.digest,
             batch=self.args.rollout_batch_size,
             K=self.args.n_samples_per_prompt,
+            rng_state_version=1,
+            rng_state=self.rng.getstate(),
         )
 
     def save(self, rollout_id: int) -> None:
@@ -85,15 +88,25 @@ class ReToolDataSource(DataSource):
             raise RuntimeError("Data cursor and checkpoint iteration differ")
         path = Path(self.args.save) / "dataset" / f"retool_{rollout_id}.json"
         path.parent.mkdir(exist_ok=True)
-        path.write_text(json.dumps(self._state(self.cursor)) + "\n")
+        temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        with temporary.open("x") as stream:
+            json.dump(self._state(self.cursor), stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
 
     def load(self, rollout_id: int | None = None) -> None:
         if self.args.load is None or rollout_id is None or rollout_id < 0:
             return
         state = json.loads((Path(self.args.load) / "dataset" / f"retool_{rollout_id}.json").read_text())
-        if state != self._state(rollout_id + 1):
+        expected = self._state(rollout_id + 1)
+        if any(state.get(key) != expected[key] for key in ("cursor", "seed", "sha256", "batch", "K")):
             raise ValueError("Resume data, seed or trajectory grouping changed")
+        if state.get("rng_state_version") != 1 or not state.get("rng_state"):
+            raise ValueError("Resume requires a native sampling RNG snapshot")
+
+        def tuples(value: Any) -> Any:
+            return tuple(tuples(item) for item in value) if isinstance(value, list) else value
+
+        self.rng.setstate(tuples(state["rng_state"]))
         self.cursor = rollout_id + 1
-        self.rng = random.Random(self.args.rollout_seed)
-        for _ in range(self.cursor * self.args.rollout_batch_size):
-            self.rng.randrange(len(self.cases))

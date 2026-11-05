@@ -16,7 +16,7 @@ from examples.retool.prepare_sft import observation_spans
 from examples.retool.reward import score
 from examples.retool.rollout import PREFIX, VERSION, run_episode
 from examples.retool.sandbox import SandboxClient, parse_result
-from examples.retool.sft_dataset import read_author_sample
+from examples.retool.sft_dataset import AuthorMaskedSFTDataset, read_author_sample
 from examples.retool.vocab import mask_shard
 from relax.utils.types import Sample
 
@@ -227,7 +227,7 @@ def test_retool_sampler_preserves_replacement_groups_and_resume(tmp_path, monkey
 
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: Tokenizer())
     data = tmp_path / "train.jsonl"
-    data.write_text(json.dumps(make_case("1+1?", "2")) + "\n")
+    data.write_text("".join(json.dumps(make_case(f"{i}+1?", "2")) + "\n" for i in range(7)))
     args = SimpleNamespace(
         prompt_data=str(data),
         hf_checkpoint="unused",
@@ -240,7 +240,7 @@ def test_retool_sampler_preserves_replacement_groups_and_resume(tmp_path, monkey
         load=str(tmp_path),
     )
     source = ReToolDataSource(args)
-    assert source.lengths() == len(source) == 1
+    assert source.lengths() == len(source) == 7
     batch = source.get_samples(3)
     assert len(batch) == 3 and all(len(group) == 2 for group in batch)
     assert [g[0].group_index for g in batch] == [0, 1, 2]
@@ -248,9 +248,18 @@ def test_retool_sampler_preserves_replacement_groups_and_resume(tmp_path, monkey
     source.save(0)
     expected = source.get_samples(3)
     restored = ReToolDataSource(args)
-    restored.load(0)
+    # Loading must restore the saved RNG, without drawing historical samples.
+    with monkeypatch.context() as context:
+        context.setattr(random.Random, "randrange", lambda *a, **k: pytest.fail("Historical RNG replay"))
+        restored.load(0)
     actual = restored.get_samples(3)
     assert [s.to_dict() for g in actual for s in g] == [s.to_dict() for g in expected for s in g]
+    state_path = tmp_path / "dataset/retool_0.json"
+    state = json.loads(state_path.read_text())
+    del state["rng_state"]
+    state_path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="native sampling RNG"):
+        ReToolDataSource(args).load(0)
     data.write_text(json.dumps(make_case("different data", "2")) + "\n")
     with pytest.raises(ValueError, match="Resume data"):
         ReToolDataSource(args).load(0)
@@ -310,6 +319,13 @@ def test_retool_sft_reader_keeps_feedback_context(tmp_path):
     )
     sample = read_author_sample(row, 16, 0)
     assert sample.tokens.tolist() == ids and sample.loss_mask.tolist() == mask
+    dataset = object.__new__(AuthorMaskedSFTDataset)
+    dataset.path = str(tmp_path / "rows.jsonl")
+    dataset.capacity = 16
+    for prefix in ("", "/old-machine/dataset/"):
+        dataset.reader = [dict(row, tokens_path=prefix + "tokens", mask_path=prefix + "mask")]
+        relocated = dataset._process_one(0)
+        assert relocated.tokens.tolist() == ids and relocated.loss_mask.tolist() == mask
 
 
 def test_retool_resume_refuses_nonempty_or_missing_checkpoint(tmp_path):
@@ -319,6 +335,19 @@ def test_retool_resume_refuses_nonempty_or_missing_checkpoint(tmp_path):
         validate_checkpoint(tmp_path)
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("24")
     with pytest.raises(ValueError, match="Incomplete"):
+        validate_checkpoint(tmp_path)
+
+
+def test_retool_resume_accepts_only_initialization_without_rollouts(tmp_path):
+    (tmp_path / "transformer_config.json").write_text("{}")
+    (tmp_path / "tensorboard_log").mkdir()
+    assert validate_checkpoint(tmp_path) is None
+    with pytest.raises(ValueError, match="Nonempty"):
+        validate_checkpoint(tmp_path, sft=True)
+    results = tmp_path / "rollout_result/train"
+    results.mkdir(parents=True)
+    (results / "0.jsonl").write_text("{}\n")
+    with pytest.raises(ValueError, match="Uncheckpointed"):
         validate_checkpoint(tmp_path)
 
 

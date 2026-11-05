@@ -1,10 +1,29 @@
 # ReTool：原生 SGLang + GRPO
 
-本例使用 Relax 原生 Megatron、SGLang、checkpoint 和周期评测。模型在生成 `</code>` 后暂停，将新代码交给独立的 SandboxFusion 服务，把实际返回放入 `<interpreter>` 后继续生成。模型 token 参与 loss，反馈 token 仅作为上下文。
+本例使用 Relax 原生 Megatron、SGLang、checkpoint 和周期评测。模型在生成 `</code>` 后暂停，将新代码交给隔离的 Python 工具服务，把实际返回放入 `<interpreter>` 后继续生成。模型 token 参与 loss，反馈 token 仅作为上下文。
 
 默认算法与 `liyuanfan/retool@691aa8062` 的作者数据主线对齐：Qwen2.5-7B-Instruct、作者 SFT 两轮/50 步、GRPO 200 步；每步 64 次有放回抽题，每次生成 16 条轨迹。温度/top-p 为 1，top-k 为 -1，clip 两侧均为 0.2，lr 为 1e-6，KL/entropy 为 0。答案判分保留该分支固定 DAPO verifier 的 `Answer:` 优先、boxed 回退规则。总奖励为答案 ±1 减去每次工具失败的 0.1，没有下限、调用奖励或成功奖励。这是该分支的 GRPO 变体；原论文使用 PPO 和纯答案奖励。
 
-一次调用是无状态 Python 程序，限 30 秒/1 GiB；代码错误和超时作为反馈返回模型，非法调用也计失败。HTTP、服务故障等基础设施异常直接报错，不重试执行或转换成模型负奖励。执行服务必须独立部署并提供符合上述约束的隔离；这个 HTTP 客户端本身不提供代码隔离。
+一次调用是无状态 Python 程序，限 30 秒/1 GiB；代码错误和超时作为反馈返回模型，非法调用也计失败。HTTP、服务故障等基础设施异常直接报错，不重试执行或转换成模型负奖励。单机脚本会在 Ray Job 内管理工具服务；也可通过 `SANDBOX_FUSION_URL` 指向独立部署的服务。HTTP 客户端本身不提供代码隔离。
+
+## 单机启动
+
+在已安装 Relax 训练依赖的 8 卡环境中，从当前仓库启动。只需指定以下三个目录：`MODEL_DIR` 是具体的 HF 模型目录，可以使用前序 SFT 导出的 `hf_49`；`DATA_DIR` 包含下节准备的 `train.jsonl`；`SAVE_DIR` 是持久化保存根目录。
+
+```bash
+export MODEL_DIR=/path/to/hf-model
+export DATA_DIR=/path/to/retool-data
+export SAVE_DIR=/path/to/checkpoints
+bash examples/retool/scripts/run-qwen25-7B-grpo-8xgpu.sh
+```
+
+没有外部 entrypoint 时，训练脚本自动 source `scripts/entrypoint/local.sh`，启动本机 Ray，再提交训练。该入口面向独占的单机训练容器，会清理本机旧进程；已有共享 Ray 集群应使用下文的 `ray-job.sh` 入口。
+
+工具服务在 Ray Job 内启动，随训练进程退出而关闭；`RAY_NO_WAIT=1` 只改变提交等待方式，不会提前关闭工具服务。Linux x86_64、root 驱动和 `libseccomp.so.2` 是本地 Landlock 服务的前提；模型代码降权到 uid/gid 65534，以独立进程执行。每次启动先运行当前机器的计算、文件访问、网络及进程创建检查，不复用旧机器的验收文件。
+
+内核没有实现 Landlock 时，自动复用本例现有的 Apptainer/SandboxFusion 后端，需要容器中已有 `apptainer` 和 namespace/cgroup 权限。首次运行会把固定 `server-20250609` 镜像下载到 `$SAVE_DIR/.retool-sandbox/sandboxfusion-server-20250609.sif`，以后复用；也可用 `SANDBOX_IMAGE` 指定现成镜像。后端启动失败会直接停止任务，不会降级为未隔离的 Python 执行。显式设置 `SANDBOX_FUSION_URL` 时使用该服务，不启动或清理外部服务。
+
+默认启用 ClearML 和 metrics service，使用训练环境已有的凭证。没有 ClearML 配置时，可在命令后追加 `--no-use-clearml`；与原任务相同地关闭远程监控可追加 `--no-use-clearml --no-use-metrics-service --no-use-tensorboard --no-use-wandb`。这些覆盖不改变训练与保存路径。
 
 ## Apptainer 沙箱与直接 RL 验证
 
@@ -54,9 +73,11 @@ python -m examples.retool.prepare_data train \
   --input /path/to/downloaded-dapo-train.parquet --model "$MODEL_DIR" --out "$DATA_DIR/train.jsonl"
 ```
 
-将最后一条命令的 input 指向下载的完整训练 parquet。转换验证 1791700 行/17917 个 native ID 的重复内容，隔离同题矛盾 gold 的 14 个 ID，得到 17903 题，保留问题和标签。原始 SFT 的工具反馈内嵌在 assistant 文本中，因此保留原文和 token 顺序，仅屏蔽反馈 span；不执行历史代码，不把它改写为其他 chat 协议。
+将最后一条命令的 input 指向下载的完整训练 parquet，例如 `$DATA_DIR/dapo_raw/data/dapo-math-17k.parquet`。转换验证 1791700 行/17917 个 native ID 的重复内容，隔离同题矛盾 gold 的 14 个 ID，得到 17903 题，保留问题和标签。原始 SFT 的工具反馈内嵌在 assistant 文本中，因此保留原文和 token 顺序，仅屏蔽反馈 span；不执行历史代码，不把它改写为其他 chat 协议。
 
 ## SFT 与 GRPO
+
+单机 SFT 同样只需三个目录，运行 `bash examples/retool/scripts/run-qwen25-7B-sft-8xgpu.sh`，不启动工具服务。准备后的 `sft/rows.jsonl`、`tokens.u32`、`mask.u8` 应一起放在 `$DATA_DIR/sft`；读取时以当前数据目录定位二进制文件，支持搬迁旧的绝对路径 manifest。
 
 向已运行的 Ray 集群提交，`RAY_ADDRESS` 使用 Ray Jobs 的 HTTP 地址。脚本不负责建立或清理共享集群。默认 8 卡、训练 TP2、SGLang 每引擎 1 卡；SFT batch80、16K；GRPO prompt2048、response8192（包含反馈）、context10240，最多 16 个 assistant turn。
 
@@ -72,7 +93,7 @@ bash scripts/entrypoint/ray-job.sh examples/retool/scripts/run-qwen25-7B-grpo-8x
 
 SandboxFusion URL 必须能从 rollout workers 访问。SGLang 使用内置禁词 processor，Megatron 用已有 logprob/train hooks 屏蔽相同词表尾部，保持该分支 token\<151665 的策略分布。两端采用不同计算内核，logprob 不保证逐位一致。
 
-实验默认名由脚本给出，可用 `EXP_NAME`、`PROJECT_NAME` 覆盖。训练恢复使用稳定的 `$SAVE_DIR/$EXP_NAME`，保存 model/optimizer/scheduler/RNG 和数据游标；SFT 保留最近 2 个、GRPO 最近 8 个 checkpoint，每 25 步保存。重新运行同一脚本即恢复，总步数仍是原目标。不要给完整恢复追加 `--no-load-optim`、`--no-load-rng` 或 `--finetune`。启动前会拒绝缺少原生状态或数据游标的恢复目录；加载时再次核对采样 seed、分组和数据摘要。新实验须显式更换名称或保存根目录。
+实验默认名由脚本给出，可用 `EXP_NAME`、`PROJECT_NAME` 覆盖。训练恢复使用稳定的 `$SAVE_DIR/$EXP_NAME`，保存 model/optimizer/scheduler/RNG 和数据游标；SFT 保留最近 2 个、GRPO 最近 8 个 checkpoint，每 25 步保存。重新运行同一脚本即恢复，总步数仍是原目标。不要给完整恢复追加 `--no-load-optim`、`--no-load-rng` 或 `--finetune`。启动前会拒绝缺少原生状态或数据游标的恢复目录；加载时再次核对采样 seed、分组和数据摘要，并直接恢复保存的采样 RNG，不回放历史抽样。旧检查点没有 RNG 快照时拒绝自动恢复。仅初始化配置与空目录可以从 HF 启动；已有 rollout 结果却没有提交的原生检查点时，不会静默重置实验。新实验须显式更换名称或保存根目录。
 
 ClearML 和 metrics service 默认启用，使用现有凭证；W&B 未启用。Ray 提交默认等待结束，可显式设置 `RAY_NO_WAIT=1` 改为非阻塞提交。脚本末尾接受 CLI 覆盖，参数仍须满足模型架构、分组及资源约束。
 

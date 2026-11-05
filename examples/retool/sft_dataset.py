@@ -4,6 +4,7 @@ data."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -53,7 +54,12 @@ class AuthorMaskedSFTDataset(SFTStreamingDataset):
         )
 
     def _process_one(self, idx: int) -> ProcessedSample:
-        return read_author_sample(self.reader[idx], self.capacity, idx)
+        row = dict(self.reader[idx])
+        # Both legacy absolute manifests and new relative manifests travel
+        # with their immutable token/mask files when DATA_DIR is moved.
+        for field in ("tokens_path", "mask_path"):
+            row[field] = str(Path(self.path).parent / Path(row[field]).name)
+        return read_author_sample(row, self.capacity, idx)
 
     async def get_batch_async(self, n: int) -> tuple[list[ProcessedSample], bool]:
         # The generic async renderer parses raw chat rows. These rows are
