@@ -300,7 +300,7 @@ def build_env(sample: Sample | None = None, args: Any | None = None, **_: Any) -
     max_turns = args.max_turns
     if max_turns is None:
         raise ValueError("max_turns must be set via --custom-config-path in the custom config file.")
-    normalize_bbox = getattr(args, "normalize_bbox", True)
+    normalize_bbox = args.normalize_bbox
     image = _extract_initial_image(sample)
     if image is None:
         logger.warning("No image found in sample.multimodal_inputs or metadata.")

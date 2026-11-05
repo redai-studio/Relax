@@ -1,10 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from types import SimpleNamespace
+from argparse import ArgumentParser
 
 import pytest
 
 from relax.utils.metrics.metric_utils import compute_rollout_stop_reason_and_turn_metrics
+from relax.utils.opd.opd_utils import add_opd_arguments
 from relax.utils.types import Sample
 
 
@@ -136,7 +137,11 @@ def test_compute_metrics_from_samples_reports_agentic_metrics():
         ),
     ]
 
-    args = SimpleNamespace(log_reward_category=None, reward_key=None, log_passrate=False, advantage_estimator="ppo")
+    args = add_opd_arguments(ArgumentParser()).parse_args([])
+    args.log_reward_category = None
+    args.reward_key = None
+    args.log_passrate = False
+    args.advantage_estimator = "ppo"
     metrics = rollout_module.compute_metrics_from_samples(args, samples)
 
     assert metrics["stop_reason/env_done/count"] == 1

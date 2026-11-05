@@ -33,6 +33,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_merge_mode,
     write_hf_peft_adapter,
 )
+from tests.cpu.relax_parser import parser_for_flags
 
 
 def test_exclude_frozen_lora_target_modules_keeps_vision_merger() -> None:
@@ -206,12 +207,12 @@ class TestLoraPredicates:
 
     def test_is_lora_enabled_false_when_rank_zero_or_missing(self):
         assert is_lora_enabled(Namespace(lora_rank=0)) is False
-        assert is_lora_enabled(Namespace()) is False
+        assert is_lora_enabled(parser_for_flags("--lora-rank").parse_args([])) is False
 
     def test_is_lora_merge_mode(self):
         assert is_lora_merge_mode(Namespace(lora_merge_mode=True)) is True
         assert is_lora_merge_mode(Namespace(lora_merge_mode=False)) is False
-        assert is_lora_merge_mode(Namespace()) is False
+        assert is_lora_merge_mode(parser_for_flags("--lora-merge-mode").parse_args([])) is False
 
 
 class TestCountAdapterParameters:

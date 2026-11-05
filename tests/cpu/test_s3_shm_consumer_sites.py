@@ -16,6 +16,7 @@ import pytest
 from relax.agentic.pipeline import runtime
 from relax.engine.sft.predict import loop as predict_loop
 from relax.utils import s3_model_loader
+from tests.cpu.relax_parser import MULTIMODAL_FLAGS, parser_for_flags
 
 
 def _model_source(uri: str, *, enabled: bool = True):
@@ -171,6 +172,17 @@ def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch, sft_module):
     monkeypatch.setattr(sft_module, "_load_custom_dataset_class", MagicMock(return_value=fake_cls))
 
     config = SimpleNamespace(
+        **vars(
+            parser_for_flags(
+                *MULTIMODAL_FLAGS,
+                "--task-type",
+                "--loss-type",
+                "--generation-task",
+                "--sft-async-prepack",
+                "--sft-invalid-multimodal-strategy",
+                "--sft-oversize-custom-function-path",
+            ).parse_args(["--loss-type", "sft"])
+        ),
         hf_checkpoint="s3://bkt/sftmodel/",
         model_source=_model_source("s3://bkt/sftmodel/"),
         context_parallel_size=1,
@@ -181,6 +193,7 @@ def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch, sft_module):
         seed=0,
         sft_oversize_strategy="keep",
         custom_dataset_class_path="pkg.Custom",
+        sft_image_preprocess_on_rank=False,
         eval_prompt_data=None,
         eval_size=None,
         global_batch_size=1,
@@ -221,6 +234,17 @@ def test_sft_init_data_pipeline_noop_when_S3_disabled(monkeypatch, sft_module):
     monkeypatch.setattr(sft_module, "_load_custom_dataset_class", MagicMock(return_value=fake_cls))
 
     config = SimpleNamespace(
+        **vars(
+            parser_for_flags(
+                *MULTIMODAL_FLAGS,
+                "--task-type",
+                "--loss-type",
+                "--generation-task",
+                "--sft-async-prepack",
+                "--sft-invalid-multimodal-strategy",
+                "--sft-oversize-custom-function-path",
+            ).parse_args(["--loss-type", "sft"])
+        ),
         hf_checkpoint="s3://bkt/sftmodel/",
         model_source=None,
         context_parallel_size=1,
@@ -231,6 +255,7 @@ def test_sft_init_data_pipeline_noop_when_S3_disabled(monkeypatch, sft_module):
         seed=0,
         sft_oversize_strategy="keep",
         custom_dataset_class_path="pkg.Custom",
+        sft_image_preprocess_on_rank=False,
         eval_prompt_data=None,
         eval_size=None,
         global_batch_size=1,
@@ -261,6 +286,7 @@ class _EmptyEvalDataset:
 def _predict_config(*, enabled: bool):
     uri = "s3://bkt/predictmodel/"
     return SimpleNamespace(
+        **vars(parser_for_flags("--sft-invalid-multimodal-strategy").parse_args([])),
         hf_checkpoint=uri,
         model_source=_model_source(uri, enabled=enabled),
         context_parallel_size=1,

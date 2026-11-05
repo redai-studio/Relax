@@ -7,11 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
+from tests.cpu.relax_parser import parser_for_flags
 
 
 @pytest.fixture
 def actor():
     args = SimpleNamespace(
+        **vars(parser_for_flags("--num-steps-per-rollout").parse_args([])),
         colocate=True,
         true_on_policy_mode=True,
         fully_async=False,
@@ -172,6 +174,8 @@ def test_zero_kl_uses_sampling_shape_without_sampling_values(monkeypatch):
         qkv_format="thd",
         use_opd=False,
         normalize_advantages=False,
+        is_vl_model=False,
+        uses_unsplit_forward=False,
     )
     for value in (-0.1, -100):
         data = {

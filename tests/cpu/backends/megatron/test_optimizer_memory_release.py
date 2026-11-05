@@ -6,6 +6,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 pytest.importorskip("megatron.core", exc_type=ImportError)
 
@@ -40,6 +42,14 @@ def test_train_one_step_releases_cache_before_optimizer_collectives(monkeypatch,
 
     events = []
     args = Namespace(
+        **vars(
+            parser_for_flags(
+                "--task-type",
+                "--use-rollout-indexer-replay",
+                "--use-dynamic-batch-size",
+                "--fully-async",
+            ).parse_args([])
+        ),
         empty_unused_memory_level=level,
         custom_megatron_before_train_step_hook_path=None,
         ci_test=False,
@@ -99,6 +109,14 @@ def test_train_one_step_offloads_between_updates_before_forward(monkeypatch, mod
     from relax.backends.megatron import model as module
 
     args = Namespace(
+        **vars(
+            parser_for_flags(
+                "--task-type",
+                "--use-rollout-indexer-replay",
+                "--use-dynamic-batch-size",
+                "--fully-async",
+            ).parse_args([])
+        ),
         empty_unused_memory_level=0,
         custom_megatron_before_train_step_hook_path=None,
         ci_test=False,

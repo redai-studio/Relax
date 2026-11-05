@@ -3,51 +3,18 @@
 """Argument parsing and validation must read the registry, not string lists."""
 
 import argparse
-import importlib.util
-import pathlib
-import sys
 from dataclasses import replace
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
-
-ARGS_PATH = pathlib.Path(__file__).resolve().parents[3] / "relax" / "utils" / "arguments.py"
-
-
-@pytest.fixture()
-def arguments_module(monkeypatch):
-    """Load real argument parsing while isolating optional training imports."""
-    router_pkg = ModuleType("sglang_router")
-    launch_router = ModuleType("sglang_router.launch_router")
-    launch_router.RouterArgs = object
-    monkeypatch.setitem(sys.modules, "sglang_router", router_pkg)
-    monkeypatch.setitem(sys.modules, "sglang_router.launch_router", launch_router)
-
-    sglang_arguments = ModuleType("relax.backends.sglang.arguments")
-    sglang_arguments.sglang_parse_args = lambda: None
-    sglang_arguments.validate_args = lambda args: args
-    monkeypatch.setitem(sys.modules, "relax.backends.sglang.arguments", sglang_arguments)
-
-    device = ModuleType("relax.utils.device")
-    device.get_dist_backend = lambda: "gloo"
-    monkeypatch.setitem(sys.modules, "relax.utils.device", device)
-
-    eval_config = ModuleType("relax.utils.training.eval_config")
-    eval_config.EvalDatasetConfig = dict
-    eval_config.build_eval_dataset_configs = lambda args, datasets_config, defaults: []
-    eval_config.build_named_prompt_data_configs = lambda values: []
-    eval_config.ensure_dataset_list = lambda values: values or []
-    monkeypatch.setitem(sys.modules, "relax.utils.training.eval_config", eval_config)
-
-    spec = importlib.util.spec_from_file_location("_algorithm_test_arguments", ARGS_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from tests.cpu.relax_parser import parser_for_flags
 
 
 def _args(estimator="grpo", **overrides):
+    parser = parser_for_flags("--num-steps-per-rollout")
     base = dict(
+        **vars(parser.parse_args([])),
         advantage_estimator=estimator,
         normalize_advantages=False,
         rewards_normalization=True,
@@ -206,6 +173,39 @@ def test_yaml_without_algorithm_changes_is_accepted(arguments_module, tmp_path):
     arguments_module.apply_custom_config_overrides(args)
     assert args.lr == 0.5
     assert args.advantage_estimator == "grpo"
+
+
+def test_offline_yaml_preserves_explicit_falsy_values(arguments_module, algorithm_args_parser, tmp_path):
+    config = _write_yaml(
+        tmp_path, "eps_clip_high: null\nenable_affinity: false\nmax_staleness: 0\neval_prompt_data: []\n"
+    )
+    args = algorithm_args_parser.parse_args(
+        [
+            "--loss-type",
+            "sft",
+            "--eps-clip-high",
+            "0.3",
+            "--max-staleness",
+            "8",
+            "--eval-prompt-data",
+            "eval",
+            "examples/eval.jsonl",
+            "--custom-config-path",
+            config,
+        ]
+    )
+    args.use_critic = False  # Offline role selection runs before YAML overrides.
+    assert args.eps_clip_high == 0.3
+    assert args.enable_affinity is True
+    assert args.max_staleness == 8
+    assert args.eval_prompt_data == ["eval", "examples/eval.jsonl"]
+
+    arguments_module.apply_custom_config_overrides(args)
+
+    assert args.eps_clip_high is None
+    assert args.enable_affinity is False
+    assert type(args.max_staleness) is int and args.max_staleness == 0
+    assert args.eval_prompt_data == []
 
 
 @pytest.mark.parametrize(

@@ -3,13 +3,14 @@
 """Packing metrics follow the logical final stage under VPP."""
 
 from argparse import Namespace
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from relax.utils.training.indexer_replay import IndexerReplay
+from tests.cpu.relax_parser import parser_for_flags
 
 
 class _FakeModel:
@@ -43,6 +44,7 @@ class _FakeScheduler:
         (True, True, False, torch.bfloat16),
         (True, True, True, torch.bfloat16),
         (True, False, False, torch.float32),
+        (False, True, None, torch.float32),
     ],
 )
 def test_train_one_step_counts_each_logical_microbatch_once(
@@ -50,11 +52,25 @@ def test_train_one_step_counts_each_logical_microbatch_once(
 ):
     model_module = pytest.importorskip("relax.backends.megatron.model")
 
+    flags = []
+    if replay:
+        flags.append("--use-rollout-indexer-replay")
+    if chunked:
+        flags.append("--sft-chunked-logits")
+    parser = parser_for_flags(
+        "--task-type",
+        "--recompute-loss-function",
+        "--use-rollout-indexer-replay",
+        "--mtp-only-training",
+        "--sft-chunked-logits",
+        "--use-dynamic-batch-size",
+        "--fully-async",
+    )
     args = Namespace(
+        **vars(parser.parse_args(flags)),
         allgather_cp=False,
         bf16=bf16,
         fp16=False,
-        sft_chunked_logits=chunked,
         calculate_per_token_loss=False,
         check_for_nan_in_loss_and_grad=True,
         ci_test=False,
@@ -64,15 +80,14 @@ def test_train_one_step_counts_each_logical_microbatch_once(
         dynamic_context_parallel=False,
         enable_mtp_training=False,
         is_vl_model=False,
-        mtp_only_training=False,
         micro_batch_size=1,
         qkv_format="thd",
         seq_length=8,
-        task_type="causal_lm",
         use_opd=False,
-        use_rollout_indexer_replay=replay,
         uses_unsplit_forward=False,
     )
+    if replay is None:
+        args.use_rollout_indexer_replay = None
     batch = {
         "full_loss_masks": None,
         "packed_seq_params": None,
@@ -87,9 +102,17 @@ def test_train_one_step_counts_each_logical_microbatch_once(
     monkeypatch.setattr(model_module, "should_bypass_main_output_layer", lambda _args: chunked)
     monkeypatch.setattr(model_module, "_bypass_output_layer", lambda *a, **k: nullcontext(None))
     monkeypatch.setattr(model_module, "get_model_config", lambda _: SimpleNamespace(cross_entropy_loss_fusion=False))
-    monkeypatch.setattr(IndexerReplay, "forward_stage", lambda: nullcontext())
-    monkeypatch.setattr(model_module.capture_hooks, "begin_step_for", lambda *_args: None)
-    monkeypatch.setattr(model_module.capture_hooks, "end_step_for", lambda: None)
+    replay_events = []
+
+    @contextmanager
+    def forward_stage():
+        replay_events.append("enter")
+        yield
+        replay_events.append("exit")
+
+    monkeypatch.setattr(IndexerReplay, "forward_stage", forward_stage)
+    monkeypatch.setattr(model_module.capture_hooks, "begin_step_for", lambda *_args: replay_events.append("begin"))
+    monkeypatch.setattr(model_module.capture_hooks, "end_step_for", lambda: replay_events.append("end"))
     monkeypatch.setattr(model_module, "maybe_verify_critic_value_head_movement", lambda *_args: None)
     monkeypatch.setattr(model_module.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(model_module.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
@@ -142,3 +165,5 @@ def test_train_one_step_counts_each_logical_microbatch_once(
     assert metrics["num_microbatches_mean"] == num_microbatches
     assert metrics["pack_tokens_mean"] == 8
     assert metrics["pack_tokens_max"] == 8
+    expected_replay = ["enter", "exit"] * (num_microbatches * num_model_chunks) if replay else []
+    assert replay_events == ["begin", *expected_replay, "end"]

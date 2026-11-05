@@ -10,6 +10,7 @@ from megatron.core.num_microbatches_calculator import init_num_microbatches_calc
 from megatron.training.global_vars import _build_tokenizer, set_args
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_argument_compat import dynamic_context_parallel_enabled
 
 
 logger = get_logger(__name__)
@@ -39,7 +40,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     extra_args = dict()
-    if getattr(args, "dynamic_context_parallel", False):
+    if dynamic_context_parallel_enabled(args):
         extra_args["dynamic_context_parallel"] = True
     mpu.initialize_model_parallel(
         args.tensor_model_parallel_size,
@@ -75,6 +76,9 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 
 def init(args):
+    # Model providers refine these capabilities after distributed initialization.
+    vars(args).setdefault("is_vl_model", False)
+    vars(args).setdefault("uses_unsplit_forward", False)
     set_args(args)
 
     if getattr(args, "disable_jit_fuser", False):
@@ -137,7 +141,7 @@ def init(args):
 
         _initialize_tp_communicators()
 
-    if getattr(args, "custom_megatron_init_path", None):
+    if args.custom_megatron_init_path:
         from relax.utils.misc import load_function
 
         custom_init = load_function(args.custom_megatron_init_path)

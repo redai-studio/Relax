@@ -12,12 +12,13 @@ import base64
 import dataclasses
 import sys
 import types
+from argparse import ArgumentParser, Namespace
 from contextlib import contextmanager
-from types import SimpleNamespace
 
 import pytest
 import torch
 
+from relax.backends.fsdp.arguments import add_generative_arguments
 from relax.backends.sglang import diffusion_engine as de
 from relax.backends.sglang.diffusion_engine import (
     SGLangNativeGenerationEngine,
@@ -25,6 +26,7 @@ from relax.backends.sglang.diffusion_engine import (
     _local_maybe_deserialize,
     _verify_diffusion_patch_contract,
 )
+from tests.cpu.relax_parser import parser_for_flags
 
 
 def _enc(t: torch.Tensor) -> dict:
@@ -427,8 +429,13 @@ def test_cuda_visible_devices_rejects_a_block_off_the_end_of_the_node():
         SGLangNativeGenerationEngine._cuda_visible_devices(2, 4, 4)
 
 
+def _diffusion_args(*cli: str) -> Namespace:
+    shared = parser_for_flags("--lora-adapter-mode", "--lora-target-modules", "--num-gpus-per-node")
+    return add_generative_arguments(ArgumentParser(parents=[shared], add_help=False)).parse_args(cli)
+
+
 def test_launch_server_requires_a_node_width(monkeypatch):
-    args = SimpleNamespace(model_path="/models/Qwen-Image", model_revision=None, num_gpus_per_node=0)
+    args = _diffusion_args("--model-path", "/models/Qwen-Image", "--num-gpus-per-node", "0")
     eng = SGLangNativeGenerationEngine(args=args, rank=0, base_gpu_id=0, num_gpus_per_engine=1)
     monkeypatch.setattr(eng, "_get_current_node_ip_and_free_port", lambda start_port: ("127.0.0.1", 21000))
     with pytest.raises(RuntimeError, match="num_gpus_per_node"):
@@ -436,11 +443,7 @@ def test_launch_server_requires_a_node_width(monkeypatch):
 
 
 def test_compute_server_args_maps_model_ports_and_overrides():
-    args = SimpleNamespace(
-        model_path="/models/Qwen-Image/",
-        model_revision=None,
-        rollout_num_gpus_per_engine=1,
-    )
+    args = _diffusion_args("--model-path", "/models/Qwen-Image/")
     eng = SGLangNativeGenerationEngine(
         args=args, rank=0, base_gpu_id=2, sglang_overrides={"enable_torch_compile": True}
     )
@@ -462,14 +465,33 @@ def test_compute_server_args_maps_model_ports_and_overrides():
 
 
 def test_compute_server_args_rejects_an_invalid_scheduler_rendezvous_address():
-    args = SimpleNamespace(model_path="/models/Qwen-Image", model_revision=None, rollout_num_gpus_per_engine=1)
+    args = _diffusion_args("--model-path", "/models/Qwen-Image")
     eng = SGLangNativeGenerationEngine(args=args, rank=0)
     with pytest.raises(ValueError, match="invalid diffusion engine dist_init_addr"):
         eng._compute_server_args("127.0.0.1", 30010, num_gpus=1, engine_args={"dist_init_addr": "invalid"})
 
 
+def test_compute_server_args_uses_configured_revision_and_lora_targets() -> None:
+    args = _diffusion_args(
+        "--model-path",
+        "/models/Qwen-Image",
+        "--model-revision",
+        "fixture-revision",
+        "--lora-adapter-mode",
+        "--lora-target-modules",
+        "to_v",
+        "to_q",
+    )
+    engine = SGLangNativeGenerationEngine(args=args, rank=0)
+
+    server_args = engine._compute_server_args("127.0.0.1", 30010, num_gpus=1, engine_args={})
+
+    assert server_args["revision"] == "fixture-revision"
+    assert server_args["lora_target_modules"] == ["to_q", "to_v"]
+
+
 def test_compute_server_args_multi_gpu_forces_ulysses_not_cfg_parallel():
-    args = SimpleNamespace(model_path="/models/Qwen-Image", model_revision=None, rollout_num_gpus_per_engine=2)
+    args = _diffusion_args("--model-path", "/models/Qwen-Image")
     eng = SGLangNativeGenerationEngine(args=args, rank=0, base_gpu_id=4, num_gpus_per_engine=2)
     sa = eng._compute_server_args("127.0.0.1", 30010, num_gpus=2, engine_args={})
     assert sa["num_gpus"] == 2
@@ -477,7 +499,7 @@ def test_compute_server_args_multi_gpu_forces_ulysses_not_cfg_parallel():
 
 
 def test_compute_server_args_override_can_replace_ulysses_degree():
-    args = SimpleNamespace(model_path="/models/Qwen-Image", model_revision=None, rollout_num_gpus_per_engine=4)
+    args = _diffusion_args("--model-path", "/models/Qwen-Image")
     eng = SGLangNativeGenerationEngine(
         args=args, rank=0, base_gpu_id=0, sglang_overrides={"ulysses_degree": 1, "sp_degree": 4}
     )
@@ -486,7 +508,7 @@ def test_compute_server_args_override_can_replace_ulysses_degree():
 
 
 def test_compute_server_args_none_override_does_not_clobber_model_path():
-    args = SimpleNamespace(model_path="/models/Qwen-Image", hf_checkpoint=None, model_revision=None)
+    args = _diffusion_args("--model-path", "/models/Qwen-Image")
     eng = SGLangNativeGenerationEngine(args=args, rank=0, base_gpu_id=0, sglang_overrides={"model_path": None})
     sa = eng._compute_server_args("127.0.0.1", 30010, num_gpus=1, engine_args={})
     assert sa["model_path"] == "/models/Qwen-Image"
@@ -494,10 +516,12 @@ def test_compute_server_args_none_override_does_not_clobber_model_path():
 
 
 def test_resolve_model_path_precedence_and_error():
-    args = SimpleNamespace(model_path=None, sglang_hf_checkpoint=None, hf_checkpoint="/models/hf")
+    args = _diffusion_args()
+    args.hf_checkpoint = "/models/hf"
     assert SGLangNativeGenerationEngine(args=args, rank=0)._resolve_model_path() == "/models/hf"
 
-    missing = SimpleNamespace(model_path=None, sglang_hf_checkpoint=None, hf_checkpoint=None)
+    missing = _diffusion_args()
+    missing.hf_checkpoint = None
     eng = SGLangNativeGenerationEngine(args=missing, rank=0)
     with pytest.raises(RuntimeError, match="no model path"):
         eng._resolve_model_path()

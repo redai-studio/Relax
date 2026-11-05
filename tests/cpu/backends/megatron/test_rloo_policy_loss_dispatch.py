@@ -8,6 +8,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 torch = pytest.importorskip("torch")
 
@@ -157,6 +159,7 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
     monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **_kwargs: (None, {}))
 
     args = SimpleNamespace(
+        **vars(parser_for_flags("--task-type", "--mtp-only-training").parse_args([])),
         loss_type="policy_loss",
         advantage_estimator="rloo",
         calculate_per_token_loss=True,
@@ -268,6 +271,7 @@ def test_loss_function_exports_effective_tokens_independent_of_metric_denominato
 ):
     monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1, raising=False)
     args = SimpleNamespace(
+        **vars(parser_for_flags("--task-type", "--advantage-estimator").parse_args([])),
         mtp_only_training=True,
         calculate_per_token_loss=calculate_per_token_loss,
         qkv_format="thd",

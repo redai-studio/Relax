@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.cpu.relax_parser import args_for_flags
+
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("megatron.training.checkpointing")
@@ -40,7 +42,12 @@ def _runtime_args():
         expert_model_parallel_size=1,
         expert_tensor_parallel_size=1,
         virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        decoder_first_pipeline_num_layers=None,
+        decoder_last_pipeline_num_layers=None,
+        num_layers_per_virtual_pipeline_stage=None,
         world_size=4,
+        data_parallel_size=1,
     )
 
 
@@ -192,6 +199,7 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(
         (resume_path / "latest_checkpointed_iteration.txt").write_text(tracker)
     (checkpoint_dir / "common.pt").touch()
     args = SimpleNamespace(
+        **vars(args_for_flags("--reset-optimizer-states")),
         load=str(checkpoint_dir if direct_path else resume_path),
         hf_checkpoint="/models/base",
         dist_ckpt_strictness="assume_ok_unexpected",

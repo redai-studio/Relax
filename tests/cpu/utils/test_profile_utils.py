@@ -1,24 +1,29 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import gzip
 import json
-from argparse import Namespace
-from unittest.mock import Mock
+import sys
+from argparse import ArgumentParser, Namespace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from relax.utils import profile_utils
+from tests.cpu.relax_parser import parser_for_flags
 
 
 @pytest.mark.parametrize("rank,selected", [(0, True), (48, True), (1, False)])
 def test_train_profiler_honors_rank_selection(monkeypatch, rank, selected):
-    args = Namespace(
+    parser = parser_for_flags("--tb-experiment-name", "--profile-output-dir", "--memory-snapshot-dir")
+    args = parser.parse_args(["--tb-experiment-name", "rank-selection"])
+    vars(args).update(
         profile_ranks=[0, 48],
         use_pytorch_profiler=True,
         record_memory_history=True,
         profile_target=["train_overall", "train_actor", "train_log_probs"],
-        tb_experiment_name="rank-selection",
-        memory_snapshot_dir=None,
         memory_snapshot_num_steps=1,
     )
     monkeypatch.setattr(profile_utils.torch.distributed, "get_rank", lambda group: rank)
@@ -45,6 +50,104 @@ def test_train_profiler_without_rank_filter_preserves_legacy_behavior(monkeypatc
     monkeypatch.setattr(profile_utils.torch.distributed, "get_rank", get_rank)
     assert profile_utils._should_profile_train_rank(Namespace())
     get_rank.assert_not_called()
+
+
+@pytest.mark.parametrize("directory", [None, "", "configured"])
+def test_profiler_trace_path_uses_configured_directory(directory: str | None) -> None:
+    parser = parser_for_flags("--tb-experiment-name", "--profile-output-dir")
+    flags = ["--tb-experiment-name", "experiment"]
+    if directory is not None:
+        flags += ["--profile-output-dir", directory]
+    args = parser.parse_args(flags)
+    assert Path(profile_utils._get_train_trace_dir(args)) == Path(directory or "traces") / "experiment/train_trace"
+
+
+@pytest.fixture
+def sglang_profile_parser() -> ArgumentParser:
+    return parser_for_flags(
+        "--sglang-profile",
+        "--sglang-profile-output-dir",
+        "--sglang-profile-num-steps",
+        "--sglang-profile-activities",
+        "--sglang-profile-by-stage",
+        "--sglang-profile-with-stack",
+        "--sglang-profile-record-shapes",
+        "--sglang-profile-steps",
+        "--sglang-profile-step-start",
+        "--sglang-profile-step-end",
+        source_file="relax/backends/sglang/arguments.py",
+    )
+
+
+def test_sglang_profile_preserves_missing_switch_and_empty_step_filter(sglang_profile_parser: ArgumentParser) -> None:
+    assert not profile_utils._should_profile_sglang(Namespace(), 0)
+    args = sglang_profile_parser.parse_args(
+        ["--sglang-profile", "--sglang-profile-step-start", "0", "--sglang-profile-step-end", "0"]
+    )
+    assert profile_utils._should_profile_sglang(args, 0)
+    assert not profile_utils._should_profile_sglang(args, 1)
+    args.sglang_profile_steps = []
+    assert not profile_utils._should_profile_sglang(args, 0)
+
+
+@pytest.mark.parametrize(
+    ("version", "flags", "endpoint"),
+    [
+        ("0.2.1", None, "list_workers"),
+        ("0.2.2", [], "workers"),
+        ("0.2.2", ["--use-slime-router"], "list_workers"),
+    ],
+)
+def test_sglang_profile_worker_discovery_respects_router_api(
+    monkeypatch: pytest.MonkeyPatch, version: str, flags: list[str] | None, endpoint: str
+) -> None:
+    args = Namespace(sglang_router_ip="router", sglang_router_port=9000)
+    if flags is not None:
+        parser_for_flags("--use-slime-router").parse_args(flags, namespace=args)
+    monkeypatch.setitem(sys.modules, "sglang_router", SimpleNamespace(__version__=version))
+    get = AsyncMock(return_value={"urls": ["http://worker:8000"], "workers": [{"url": "http://worker:8000"}]})
+    monkeypatch.setattr("relax.utils.http_utils.get", get)
+
+    assert asyncio.run(profile_utils._get_sglang_worker_urls(args)) == ["http://worker:8000"]
+    get.assert_awaited_once_with(f"http://router:9000/{endpoint}")
+
+
+@pytest.mark.parametrize(("num_steps", "expected_steps"), [(None, 3), (-1, None), (0, 0)])
+def test_sglang_profile_passes_declared_options_to_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sglang_profile_parser: ArgumentParser,
+    num_steps: int | None,
+    expected_steps: int | None,
+) -> None:
+    flags = ["--sglang-profile", "--sglang-profile-output-dir", str(tmp_path)]
+    if num_steps is not None:
+        flags += ["--sglang-profile-num-steps", str(num_steps), "--sglang-profile-with-stack"]
+    args = sglang_profile_parser.parse_args(flags)
+    post = AsyncMock()
+    worker = "http://worker"
+    monkeypatch.setattr(profile_utils, "_get_sglang_worker_urls", AsyncMock(return_value=[worker]))
+    monkeypatch.setattr("relax.utils.http_utils.post", post)
+
+    asyncio.run(profile_utils.start_sglang_profile(args, 0))
+    post.assert_awaited_once_with(
+        f"{worker}/start_profile",
+        {
+            "output_dir": str(tmp_path / "rollout_0"),
+            "num_steps": expected_steps,
+            "activities": ["CPU", "GPU"],
+            "profile_by_stage": False,
+            "with_stack": num_steps is not None,
+            "record_shapes": False,
+            "profile_prefix": "engine0",
+        },
+    )
+    post.reset_mock()
+    asyncio.run(profile_utils.stop_sglang_profile(args, 0))
+    if num_steps is None:
+        post.assert_not_awaited()
+    else:
+        post.assert_awaited_once_with(f"{worker}/stop_profile", {})
 
 
 def _python_stack_probe_leaf(tensor):

@@ -256,7 +256,7 @@ def _resolve_chunk_size() -> int:
         args = get_args()
     except Exception:
         args = None
-    cs = int(getattr(args, "sft_logits_chunk_size", 1024) or 1024) if args is not None else 1024
+    cs = int(args.sft_logits_chunk_size or 1024) if args is not None else 1024
     return cs if cs > 0 else 1024
 
 
@@ -274,7 +274,7 @@ def _chunked_mtp_enabled() -> bool:
         return False
     if args is None:
         return False
-    return bool(getattr(args, "enable_mtp_training", False)) and bool(getattr(args, "sft_chunked_logits", False))
+    return bool(args.enable_mtp_training) and bool(args.sft_chunked_logits)
 
 
 def _main_update_token_normalization_enabled() -> bool:
@@ -291,10 +291,10 @@ def _main_update_token_normalization_enabled() -> bool:
     if mode != "main_update_tokens":
         raise ValueError(f"Unsupported mtp_loss_normalization: {mode!r}")
     if (
-        getattr(args, "loss_type", None) != "sft"
-        or not getattr(args, "enable_mtp_training", False)
-        or not getattr(args, "sft_chunked_logits", False)
-        or not getattr(args, "calculate_per_token_loss", False)
+        args.loss_type != "sft"
+        or not args.enable_mtp_training
+        or not args.sft_chunked_logits
+        or not args.calculate_per_token_loss
         or getattr(args, "mtp_num_layers", None) != 1
     ):
         raise ValueError("main_update_tokens MTP normalization requires chunked one-layer per-token SFT")

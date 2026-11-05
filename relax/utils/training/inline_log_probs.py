@@ -30,22 +30,6 @@ def can_reuse_colocate_log_probs(
         "update_weights_interval": 1,
         "partial_rollout": False,
         "use_dynamic_global_batch_size": False,
-        "context_parallel_size": 1,
-        "pipeline_model_parallel_size": 1,
-        "dynamic_context_parallel": False,
-        "hidden_dropout": 0.0,
-        "attention_dropout": 0.0,
-        "bf16": True,
-        "fp16": False,
-        "fp8": None,
-        "fp4": None,
-        "fp8_param_gather": False,
-        "moe_input_jitter_eps": None,
-        "moe_router_enable_expert_bias": False,
-        "moe_router_force_load_balancing": False,
-        "moe_router_force_biased": None,
-        "moe_expert_capacity_factor": None,
-        "moe_aux_loss_coeff": 0.0,
         "kl_coef": 0.0,
         "use_kl_loss": False,
         "use_opd": False,
@@ -68,14 +52,35 @@ def can_reuse_colocate_log_probs(
         "custom_megatron_before_log_prob_hook_path": None,
         "custom_megatron_before_train_step_hook_path": None,
     }
-    invalid = [name for name, expected in required.items() if getattr(args, name, None) != expected]
-    if invalid:
+    if any(getattr(args, name) != expected for name, expected in required.items()):
         return False
+    # Older Megatron versions omit some native settings.
+    native_required = {
+        "context_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "dynamic_context_parallel": False,
+        "hidden_dropout": 0.0,
+        "attention_dropout": 0.0,
+        "bf16": True,
+        "fp16": False,
+        "fp8": None,
+        "fp4": None,
+        "fp8_param_gather": False,
+        "moe_input_jitter_eps": None,
+        "moe_router_enable_expert_bias": False,
+        "moe_router_force_load_balancing": False,
+        "moe_router_force_biased": None,
+        "moe_expert_capacity_factor": None,
+        "moe_aux_loss_coeff": 0.0,
+    }
+    if any(getattr(args, name, None) != expected for name, expected in native_required.items()):
+        return False
+    invalid = []
     if args.rollout_batch_size * args.n_samples_per_prompt != args.global_batch_size:
         invalid.append("rollout size must equal global_batch_size")
     if len(num_microbatches) != 1:
         invalid.append("exactly one optimizer step per rollout is required")
-    if getattr(args, "num_steps_per_rollout", None) not in (None, 1):
+    if args.num_steps_per_rollout not in (None, 1):
         invalid.append("num_steps_per_rollout")
     if args.moe_router_load_balancing_type not in ("none", ["none"]):
         invalid.append("moe_router_load_balancing_type")

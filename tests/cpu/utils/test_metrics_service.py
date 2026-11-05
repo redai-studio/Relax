@@ -12,7 +12,7 @@ import requests
 from relax.utils.metrics.client import MetricsClient
 from relax.utils.metrics.metrics_service_adapter import MetricsServiceAdapter
 from relax.utils.metrics.service import MetricsBuffer
-from relax.utils.misc import create_namespace
+from tests.cpu.relax_parser import parser_for_flags
 
 
 class TestMetricsBuffer(unittest.TestCase):
@@ -130,10 +130,9 @@ class TestMetricsServiceAdapter(unittest.TestCase):
     """Test MetricsServiceAdapter for backward compatibility."""
 
     def setUp(self):
-        args_dict = {
-            "use_metrics_service": True,
-        }
-        self.args = create_namespace(args_dict)
+        self.args = parser_for_flags("--use-metrics-service", "--timeline-dump-dir").parse_args(
+            ["--use-metrics-service"]
+        )
 
         # Mock the client to avoid actual HTTP calls
         self.mock_client = Mock(spec=MetricsClient)
@@ -205,13 +204,10 @@ class TestTrackingUtilsIntegration(unittest.TestCase):
     """Test integration with tracking_utils."""
 
     def setUp(self):
-        args_dict = {
-            "use_metrics_service": True,
-            "use_wandb": False,
-            "use_tensorboard": False,
-            "use_clearml": False,
-        }
-        self.args = create_namespace(args_dict)
+        self.args = parser_for_flags("--use-metrics-service", "--notify-urls", "--timeline-dump-dir").parse_args([])
+        self.args.use_wandb = False
+        self.args.use_tensorboard = False
+        self.args.use_clearml = False
 
     @patch("relax.utils.tracking_utils.get_metrics_service_adapter")
     def test_log_with_metrics_service(self, mock_get_adapter):
@@ -272,6 +268,17 @@ class TestTrackingUtilsIntegration(unittest.TestCase):
 
         self.assertEqual(result, {"status": "success"})
         mock_adapter.direct_log.assert_called_once_with(100, metrics)
+
+    @patch("relax.utils.tracking_utils.get_metrics_service_adapter")
+    def test_explicitly_disabled_service_uses_direct_logging(self, mock_get_adapter) -> None:
+        from relax.utils import tracking_utils
+
+        args = parser_for_flags("--use-metrics-service", "--notify-urls").parse_args(
+            ["--no-use-metrics-service"], namespace=self.args
+        )
+        self.assertTrue(tracking_utils.log_direct(args, 1, {"loss": 0.42}))
+        self.assertTrue(tracking_utils.flush_metrics(args, 1))
+        mock_get_adapter.assert_not_called()
 
 
 @pytest.mark.parametrize("operation", ["metric", "batch", "report", "health"])

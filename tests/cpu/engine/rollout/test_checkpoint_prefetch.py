@@ -11,6 +11,7 @@ import pytest
 
 from relax.engine.rollout.data_source import RolloutDataSource
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import parser_for_flags
 
 
 try:
@@ -36,6 +37,7 @@ def test_resume_reads_next_unconsumed_group(monkeypatch, tmp_path, interval, rot
         n_samples_per_prompt=4,
         rollout_shuffle=True,
     )
+    parser_for_flags("--use-streaming-dataset", "--lora-rank").parse_args([], namespace=args)
 
     def source():
         args.rollout_global_dataset = False

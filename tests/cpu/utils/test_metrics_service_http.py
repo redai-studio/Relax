@@ -60,7 +60,6 @@ def test_metrics_service_http_scrapes_sglang_without_redirects():
 def _run_serve_smoke() -> None:
     import socket
     import threading
-    from argparse import Namespace
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     import httpx
@@ -70,6 +69,7 @@ def _run_serve_smoke() -> None:
     from ray import serve
 
     from relax.utils.metrics.service import MetricsService
+    from tests.cpu.relax_parser import parser_for_flags
 
     class Upstream(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -118,8 +118,11 @@ def _run_serve_smoke() -> None:
     try:
         ray.init(address="local", num_cpus=2, num_gpus=0, include_dashboard=False)
         serve.start(http_options={"host": "127.0.0.1", "port": port})
+        config = parser_for_flags(
+            "--use-tensorboard", "--use-clearml", "--notify-urls", "--use-wandb", "--timeline-dump-dir"
+        ).parse_args([])
         serve.run(
-            MetricsService.options(ray_actor_options={"num_cpus": 0.1}).bind(None, None, Namespace()),
+            MetricsService.options(ray_actor_options={"num_cpus": 0.1}).bind(None, None, config),
             name="metrics",
             route_prefix="/metrics",
         )

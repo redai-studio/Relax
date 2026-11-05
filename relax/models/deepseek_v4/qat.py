@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Callable
 
+from relax.utils.megatron_argument_compat import legacy_single_grouped_weight_enabled, legacy_te_op_fuser_enabled
+
 
 if TYPE_CHECKING:
     import torch
@@ -161,7 +163,7 @@ def install_routed_expert_qat(module: torch.nn.Module, *, module_name: str, comp
     if os.environ.get("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0") != "0":
         raise RuntimeError("MXFP4 QAT cannot be combined with the existing integer INT4 fake-QAT hooks")
     config = module.config
-    if getattr(config, "use_transformer_engine_op_fuser", False):
+    if legacy_te_op_fuser_enabled(config):
         raise ValueError(f"{module_name}: TE op fuser bypasses MXFP4 module precision hooks")
     if not getattr(config, "fp8", None) or getattr(config, "fp8_recipe", None) != "blockwise":
         raise ValueError(f"{module_name}: MXFP4 workspace QAT requires configured blockwise FP8 training")
@@ -171,7 +173,7 @@ def install_routed_expert_qat(module: torch.nn.Module, *, module_name: str, comp
         )
     if getattr(module, "primary_weights_in_fp8", False) or getattr(config, "fp8_param", False):
         raise ValueError(f"{module_name}: QAT requires high-precision model Parameters, not primary FP8 weights")
-    if getattr(config, "moe_single_grouped_weight", False):
+    if legacy_single_grouped_weight_enabled(config):
         raise ValueError(f"{module_name}: single_grouped_weight storage has not been validated for this QAT hook")
     if module._fp8_workspaces:
         raise RuntimeError(

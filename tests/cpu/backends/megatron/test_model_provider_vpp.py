@@ -8,6 +8,7 @@ import torch
 
 from relax.utils.misc import resolve_is_vl_model
 from relax.utils.training import ppo_utils
+from tests.cpu.relax_parser import parser_for_flags
 
 
 class _FakeProvider:
@@ -142,8 +143,35 @@ def _load_model_provider(monkeypatch, provider=None):
     return module, provider
 
 
+def _wrapper_args():
+    return parser_for_flags(
+        "--task-type",
+        "--lora-rank",
+        "--lora-scope",
+        "--lora-adapter-mode",
+        "--lora-merge-mode",
+        "--only-train-params-name-list",
+        "--freeze-params-name-list",
+    ).parse_args([])
+
+
 def _bridge_args(**overrides):
     values = {
+        **vars(
+            parser_for_flags(
+                "--task-type",
+                "--loss-type",
+                "--lora-rank",
+                "--lora-scope",
+                "--lora-adapter-mode",
+                "--lora-merge-mode",
+                "--allgather-cp",
+                "--sft-wholepack",
+                "--custom-model-provider-path",
+                "--mtp-detach-paths",
+                constants=("_MTP_DETACH_PATHS",),
+            ).parse_args([])
+        ),
         "megatron_to_hf_mode": "bridge",
         "hf_checkpoint": "fake-hf",
         "attention_backend": "flash",
@@ -199,6 +227,19 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.virtual_pipeline_model_parallel_size == 2
     assert provider.finalized
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+@pytest.mark.parametrize(("first", "last"), [(None, None), (0, 2), (2, 0)])
+def test_bridge_provider_preserves_explicit_pipeline_edge_counts(monkeypatch, first, last):
+    module, provider = _load_model_provider(monkeypatch)
+    provider.num_layers_in_first_pipeline_stage = 4
+    provider.num_layers_in_last_pipeline_stage = 4
+    args = _bridge_args(decoder_first_pipeline_num_layers=first, decoder_last_pipeline_num_layers=last)
+
+    module.get_model_provider_func(args, role="actor")(pre_process=True, post_process=True)
+
+    assert provider.num_layers_in_first_pipeline_stage == (4 if first is None else first)
+    assert provider.num_layers_in_last_pipeline_stage == (4 if last is None else last)
 
 
 @pytest.mark.parametrize("path", ["bridge", "custom", "raw"])
@@ -368,6 +409,13 @@ def test_bridge_actor_provider_registers_sequence_classification_head(monkeypatc
     assert model.output_layer.bias is None
     assert ppo_utils._RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR not in model._modules
     assert all("relax_seq_cls_hf_output_layer" not in name for name, _ in model.named_parameters())
+    model.output_layer.requires_grad_(False)
+    args = parser_for_flags("--task-type").parse_args(["--task-type", "seq_cls"])
+    args.num_labels = 3
+    ppo_utils.ensure_sequence_classification_head_trainable(model, args, "actor", post_process=False)
+    assert not model.output_layer.weight.requires_grad
+    ppo_utils.ensure_sequence_classification_head_trainable(model, args, "actor", post_process=True)
+    assert model.output_layer.weight.requires_grad
 
 
 def test_hf_load_context_restores_same_sequence_classification_head(monkeypatch):
@@ -527,7 +575,7 @@ def test_wrapper_derives_vp_stage_from_parallel_state(monkeypatch):
 
     wrapped_provider = module.wrap_model_provider_with_freeze(
         original_provider,
-        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None),
+        _wrapper_args(),
     )
     wrapped_provider(pre_process=True, post_process=False)
 
@@ -545,7 +593,7 @@ def test_freeze_wrapper_forwards_post_process_to_classification_head(monkeypatch
 
     wrapped_provider = module.wrap_model_provider_with_freeze(
         lambda **kwargs: SimpleNamespace(named_parameters=lambda: []),
-        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None),
+        _wrapper_args(),
     )
     wrapped_provider(post_process=False)
 
@@ -558,7 +606,7 @@ def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):
     bridge_provider = module.get_model_provider_func(_bridge_args(), role="actor")
     wrapped_provider = module.wrap_model_provider_with_freeze(
         bridge_provider,
-        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None),
+        _wrapper_args(),
     )
     wrapped_provider(pre_process=True, post_process=False)
 
@@ -620,7 +668,7 @@ def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrappe
 
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
     monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
-    args = SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None)
+    args = _wrapper_args()
     provider = {"modern": modern_provider, "kwargs": kwargs_provider, "legacy": legacy_provider}[signature]
     if "lora" in wrapper:
         provider = module.wrap_model_provider_with_lora(provider, args)
@@ -655,6 +703,24 @@ def test_custom_provider_forwards_supported_mcore_arguments(monkeypatch, accepts
     assert provider(post_process=False, vp_stage=3, config=config, pg_collection=pg_collection) is model
     expected = (True, False, 3, config, pg_collection) if accepts_mcore_arguments else (True, False)
     assert calls == [expected]
+
+
+@pytest.mark.parametrize(("argv", "expect_lora"), [([], False), (["--task-type", "seq_cls"], True)])
+def test_custom_provider_dispatches_lora_by_task_type(monkeypatch, argv, expect_lora):
+    module, _ = _load_model_provider(monkeypatch)
+    monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
+    wrappers = []
+
+    def wrap_with_lora(provider, args):
+        wrappers.append(provider)
+        return provider
+
+    monkeypatch.setattr(module, "wrap_model_provider_with_lora", wrap_with_lora)
+    parsed = parser_for_flags("--task-type").parse_args(argv)
+    args = _bridge_args(custom_model_provider_path="custom.provider", **vars(parsed))
+    provider = module.get_model_provider_func(args)
+
+    assert wrappers == ([provider] if expect_lora else [])
 
 
 def test_bridge_provider_receives_mcore_process_groups_through_wrappers(monkeypatch):

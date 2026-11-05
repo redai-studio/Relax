@@ -6,6 +6,7 @@ from __future__ import annotations
 import faulthandler
 import multiprocessing as mp
 import time
+from argparse import ArgumentParser
 from collections.abc import Callable
 from datetime import timedelta
 from multiprocessing.queues import Queue
@@ -22,7 +23,9 @@ from relax.backends.fsdp.actor import (
     _collect_weight_sync_errors,
     _raise_weight_sync_errors,
 )
+from relax.backends.fsdp.arguments import add_fsdp_arguments
 from relax.models.generative import FullWeightManifest
+from tests.cpu.relax_parser import parser_for_flags
 
 
 class _Ref:
@@ -120,6 +123,8 @@ def test_secondary_engine_commit_rpc_failure_rejects_publication(monkeypatch):
     events = []
     engines = [_Engine(events, 0), _Engine(events, 1, commit_error=RuntimeError("RPC failed"))]
     shell = _shell()
+    parser = parser_for_flags("--offload-train", "--offload-rollout", "--use-fault-tolerance", "--debug-train-only")
+    shell.args = parser.parse_args(["--no-offload-train", "--no-offload-rollout"], namespace=shell.args)
     shell.device = torch.device("cpu")
     shell._rank = 1
     shell.policy_version = 2
@@ -135,6 +140,25 @@ def test_secondary_engine_commit_rpc_failure_rejects_publication(monkeypatch):
         shell.update_weights(offload_after_sync=False)
     assert shell.policy_version == 2
     assert shell._weight_sync_failures == 1
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("--offload-train", ["sleep", "actor_offload", "engine_full_onload"]),
+        ("--no-offload-train", ["actor_offload", "engine_full_onload"]),
+    ],
+    ids=["offload", "resident"],
+)
+def test_finish_weight_sync_honors_train_offload_before_phase_completion(flag: str, expected: list[str]) -> None:
+    shell = _shell()
+    shell.args = parser_for_flags("--offload-train").parse_args([flag])
+    events = []
+    shell.sleep = lambda: events.append("sleep")
+
+    shell._finish_weight_sync_memory_state(offload_engine=False, phase_lap=events.append)
+
+    assert events == expected
 
 
 class _AdapterEngine:
@@ -316,7 +340,8 @@ def _local_phase_failure_worker(rank: int, rendezvous: str, phase: str, queue) -
                     return object()
 
             shell.adapter = _Adapter()
-            FSDPTrainRayActor._load_train_model_waved(shell, SimpleNamespace(fsdp_load_wave_size=1))
+            args = add_fsdp_arguments(ArgumentParser()).parse_args(["--fsdp-load-wave-size", "1"])
+            FSDPTrainRayActor._load_train_model_waved(shell, args)
         else:
             shell.args = SimpleNamespace()
             shell.adapter = object()
@@ -331,6 +356,21 @@ def _local_phase_failure_worker(rank: int, rendezvous: str, phase: str, queue) -
         queue.put((rank, f"{type(exc).__name__}: {exc}"))
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("argv", [[], ["--fsdp-load-wave-size", "0"], None])
+def test_disabled_model_load_wave_uses_direct_load(monkeypatch, argv):
+    args = add_fsdp_arguments(ArgumentParser()).parse_args(argv or [])
+    if argv is None:
+        args.fsdp_load_wave_size = None
+    model = object()
+    shell = SimpleNamespace(adapter=SimpleNamespace(load_train_model=lambda _: model))
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda _: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda _: 0)
+    monkeypatch.setattr("relax.utils.distributed_utils.get_gloo_group", lambda: None)
+
+    assert FSDPTrainRayActor._load_train_model_waved(shell, args) is model
 
 
 @pytest.mark.parametrize("phase, message", [("model_load", "model load failure"), ("tq_read", "TQ read failure")])

@@ -345,11 +345,10 @@ def algorithm_needs_critic(config) -> bool:
     placement logic read a config that may not have been through it yet. This
     reads the spec directly so the answer does not depend on call order.
 
-    Unknown or missing estimators answer False rather than raising: SFT and the
-    debug-only role paths reach these call sites with no estimator at all, and
-    an unknown name is rejected by argument parsing long before this matters.
+    A configured value of None answers False. An unknown name is rejected by
+    argument parsing before role construction.
     """
-    spec = ALGORITHM_SPECS.get(getattr(config, "advantage_estimator", None))
+    spec = ALGORITHM_SPECS.get(config.advantage_estimator)
     return spec is not None and spec.needs_critic
 
 

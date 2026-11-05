@@ -23,6 +23,7 @@ from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import FaultContext, RecoveryEvidence, new_id
 from relax.utils.fault_events.recovery import expected_evidence, observe_recovery
 from relax.utils.fault_events.runtime import FaultEventRuntime
+from tests.cpu.relax_parser import args_for_flags
 
 
 try:
@@ -287,7 +288,7 @@ def test_default_off_never_evaluates_recovery_plan():
     ],
 )
 def test_recovery_plan_preserves_role_and_configuration_rules(mode, roles, options, expected):
-    config = SimpleNamespace(**options)
+    config = args_for_flags("--debug-train-only", "--debug-rollout-only", "--fully-async", "--hybrid", **options)
     plan = expected_evidence(mode, config, dict.fromkeys(roles))
     assert type(plan) is int and plan == expected
 

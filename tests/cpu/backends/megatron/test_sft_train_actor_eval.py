@@ -8,6 +8,7 @@ from argparse import Namespace
 import pytest
 
 from relax.engine.sft.runtime import evaluation_step_for_rollout, should_run_sft_eval, should_run_sft_predict
+from tests.cpu.relax_parser import parser_for_flags
 
 
 def _mk_actor_args():
@@ -67,13 +68,20 @@ def test_should_run_sft_eval_disabled_for_non_sft():
 def test_should_run_sft_predict_uses_completed_step_boundaries(loss_type):
     args = _mk_actor_args()
     args.loss_type = loss_type
-    args.sft_predict_interval = 10
+    parser_for_flags("--sft-predict-interval").parse_args(["--sft-predict-interval", "10"], namespace=args)
 
     assert should_run_sft_predict(args, completed_steps=0) is False
     assert should_run_sft_predict(args, completed_steps=9) is False
     assert should_run_sft_predict(args, completed_steps=10) is (loss_type == "sft")
     assert should_run_sft_predict(args, completed_steps=19) is False
     assert should_run_sft_predict(args, completed_steps=20) is (loss_type == "sft")
+
+
+@pytest.mark.parametrize("options", [[], ["--sft-predict-interval", "0"]])
+def test_should_run_sft_predict_stays_disabled(options: list[str]) -> None:
+    args = parser_for_flags("--sft-predict-interval").parse_args(options)
+    args.loss_type = "sft"
+    assert not should_run_sft_predict(args, completed_steps=10)
 
 
 def test_evaluation_step_mapping_is_completed_for_sft_and_zero_based_for_rl():
@@ -105,6 +113,7 @@ def test_sft_lookahead_uses_completed_step_eval_boundaries():
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
     for loss_type in ("sft", "dpo", "rm"):
         args = Namespace(
+            **vars(parser_for_flags("--eval-prompt-data").parse_args([])),
             loss_type=loss_type,
             num_rollout=10,
             eval_interval=2,

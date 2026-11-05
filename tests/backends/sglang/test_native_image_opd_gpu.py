@@ -12,6 +12,7 @@ cases.
 import base64
 import io
 import os
+from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -22,6 +23,7 @@ import requests
 
 from relax.utils.opd.opd_main_worker import LogprobResponse, build_prefill_payload_base
 from relax.utils.opd.opd_multimodal import validate_image_input_ids, validate_prompt_token_ids
+from relax.utils.opd.opd_utils import add_opd_arguments
 
 
 pytestmark = pytest.mark.skipif(
@@ -149,19 +151,24 @@ async def test_native_image_opd_manager_completes_real_rollout_and_teacher_prefi
     from relax.utils.types import Sample
 
     endpoint = urlparse(os.environ["OPD_GPU_ENDPOINT"])
-    args = SimpleNamespace(
-        opd_token_selection=selection,
-        opd_log_prob_top_k=4,
-        opd_kl_coef=1.0,
-        opd_loss_coef=0.0,
-        opd_teacher_url=os.environ["OPD_GPU_ENDPOINT"].rstrip("/") + "/generate",
-        opd_teacher_timeout_s=300,
-        opd_teacher_prompt_key="teacher_prompt" if override_teacher else None,
-        opd_teacher_response_prefix_token_ids=[] if override_teacher else processor.tokenizer.encode("Answer:"),
-        sglang_router_ip=endpoint.hostname,
-        sglang_router_port=endpoint.port or 80,
-        use_audio_in_video=False,
-    )
+    cli = [
+        "--opd-token-selection",
+        selection,
+        "--opd-log-prob-top-k",
+        "4",
+        "--opd-teacher-url",
+        os.environ["OPD_GPU_ENDPOINT"].rstrip("/") + "/generate",
+        "--opd-teacher-timeout-s",
+        "300",
+    ]
+    if override_teacher:
+        cli += ["--opd-teacher-prompt-key", "teacher_prompt", "--opd-teacher-response-prefix-token-ids"]
+    else:
+        cli += ["--opd-teacher-response-prefix-token-ids", *map(str, processor.tokenizer.encode("Answer:"))]
+    args = add_opd_arguments(ArgumentParser()).parse_args(cli)
+    args.sglang_router_ip = endpoint.hostname
+    args.sglang_router_port = endpoint.port or 80
+    args.use_audio_in_video = False
     state = SimpleNamespace(
         processor=processor, tokenizer=processor.tokenizer, processor_pool=None, encode_executor=None
     )

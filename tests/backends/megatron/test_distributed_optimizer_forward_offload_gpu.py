@@ -17,6 +17,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="DistributedOptimizer and TE Adam require CUDA")
 @pytest.mark.parametrize("overlap", [False, True], ids=["synchronous_gather", "overlapped_gather"])
@@ -119,6 +121,14 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
         # newly connected optimizer-to-forward master offload lifecycle call.
         monkeypatch.setattr(optimizers[0], "offload_optimizer_state_for_forward", Mock())
         args = Namespace(
+            **vars(
+                parser_for_flags(
+                    "--task-type",
+                    "--use-rollout-indexer-replay",
+                    "--use-dynamic-batch-size",
+                    "--fully-async",
+                ).parse_args([])
+            ),
             empty_unused_memory_level=0,
             custom_megatron_before_train_step_hook_path=None,
             ci_test=False,

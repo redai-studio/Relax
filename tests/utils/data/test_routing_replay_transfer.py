@@ -18,6 +18,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from relax.utils.megatron_argument_compat import dynamic_context_parallel_enabled
+
 
 _ROOT = Path(__file__).resolve().parents[3]
 _CHUNK_BYTES = 64 * 1024 * 1024
@@ -249,6 +251,7 @@ def test_routing_replay_postprocess_keeps_full_batch_on_cpu(monkeypatch, use_gpu
         "post_process_rollout_data",
         Envs=SimpleNamespace(RELAX_SFT_SELECTIVE_LOGITS=False),
         device_utils=SimpleNamespace(make_current_torch_device=lambda: device),
+        dynamic_context_parallel_enabled=dynamic_context_parallel_enabled,
         _add_sft_token_lengths=lambda *args: None,
         iter_opd_cp_float_fields=lambda: (),
     )

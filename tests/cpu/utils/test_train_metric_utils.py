@@ -4,7 +4,24 @@ import math
 from argparse import Namespace
 from unittest.mock import Mock
 
-from relax.utils.training import train_metric_utils
+from tests.cpu.relax_parser import parser_for_flags
+
+
+def parsed_perf_args(argv: tuple[str, ...] = (), **overrides) -> Namespace:
+    parser = parser_for_flags(
+        "--freeze-vision-model",
+        "--freeze-vision-projection",
+        "--freeze-language-model",
+        "--lora-rank",
+        "--freeze-params-name-list",
+        "--only-train-params-name-list",
+        "--enable-mtp-training",
+        "--mtp-detach-paths",
+        "--mtp-only-training",
+        constants=("_MTP_DETACH_PATHS",),
+    )
+    values = vars(parser.parse_args(argv)) | overrides
+    return Namespace(wandb_always_use_train_step=False, **values)
 
 
 class FakeTimer:
@@ -25,7 +42,9 @@ class FakeTimer:
         pass
 
 
-def _collect_perf_metrics(monkeypatch, peak_tflops):
+def _collect_perf_metrics(monkeypatch, peak_tflops, argv=()):
+    from relax.utils.training import train_metric_utils
+
     timer = FakeTimer()
     flops_counter = Mock()
     flops_counter.estimate.return_value = (300.0, peak_tflops)
@@ -38,7 +57,7 @@ def _collect_perf_metrics(monkeypatch, peak_tflops):
         lambda _args, metrics, step_key: logged_metrics.update(metrics),
     )
 
-    args = Namespace(wandb_always_use_train_step=False)
+    args = parsed_perf_args(argv)
     train_metric_utils.log_perf_data_raw(
         rollout_id=3,
         args=args,
@@ -47,6 +66,10 @@ def _collect_perf_metrics(monkeypatch, peak_tflops):
         world_size=2,
     )
 
+    actual = flops_counter.estimate.call_args_list[0].kwargs
+    for name, expected in vars(args).items():
+        if name != "wandb_always_use_train_step":
+            assert actual[name] == expected
     return logged_metrics
 
 
@@ -64,6 +87,16 @@ def test_log_perf_data_raw_reports_mfu_for_known_peak(monkeypatch):
 
     assert logged_metrics["perf/device_peak_tflops"] == 100.0
     assert logged_metrics["perf/mfu/actor_train"] == 0.75
+
+
+def test_log_perf_data_raw_preserves_explicit_freeze_options(monkeypatch):
+    _collect_perf_metrics(
+        monkeypatch, 100.0, ("--freeze-vision-model", "--lora-rank", "0", "--freeze-params-name-list")
+    )
+
+
+def test_log_perf_data_raw_preserves_explicit_mtp_options(monkeypatch):
+    _collect_perf_metrics(monkeypatch, 100.0, ("--enable-mtp-training", "--mtp-only-training"))
 
 
 def test_log_perf_data_raw_reports_baseline_per_card_throughput(monkeypatch):

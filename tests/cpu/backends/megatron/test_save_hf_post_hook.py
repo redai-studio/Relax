@@ -11,9 +11,12 @@ keyword-only for forward compatibility.
 from __future__ import annotations
 
 import sys
+from argparse import Namespace
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from tests.cpu.relax_parser import parser_for_flags
 
 
 torch = pytest.importorskip("torch")
@@ -22,6 +25,12 @@ try:
     from relax.backends.megatron import model as model_mod  # noqa: E402
 except (ImportError, AssertionError) as _exc:
     pytest.skip(f"relax.backends.megatron.model unavailable: {_exc}", allow_module_level=True)
+
+
+def _hook_args(path: str | None, *flags: str) -> Namespace:
+    parser = parser_for_flags("--save-hf-post-hook-path", "--save-hf-dtype")
+    argv = ["--save-hf-post-hook-path", path] if path else []
+    return parser.parse_args([*argv, *flags])
 
 
 def _install_fake_hook_module(monkeypatch, calls, *, raise_exc=None):
@@ -50,14 +59,15 @@ def _install_fake_hook_module(monkeypatch, calls, *, raise_exc=None):
 
 class TestInvokeSaveHfPostHook:
     def test_noop_when_hook_path_is_none(self):
-        args = SimpleNamespace(save_hf_post_hook_path=None, save_hf_dtype="bf16")
+        args = _hook_args(None)
+        del args.save_hf_dtype
         # Should simply return without raising.
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 3, is_lora=False)
 
     def test_invokes_hook_with_expected_kwargs(self, monkeypatch):
         calls = []
         path = _install_fake_hook_module(monkeypatch, calls)
-        args = SimpleNamespace(save_hf_post_hook_path=path, save_hf_dtype="fp8")
+        args = _hook_args(path, "--save-hf-dtype=fp8")
 
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf/iter_5", 5, is_lora=True)
 
@@ -69,19 +79,27 @@ class TestInvokeSaveHfPostHook:
         assert call["is_lora"] is True
         assert call["args"] is args
 
-    def test_dtype_defaults_to_bf16_when_absent(self, monkeypatch):
+    def test_dtype_defaults_to_declared_bf16(self, monkeypatch):
         calls = []
         path = _install_fake_hook_module(monkeypatch, calls)
-        args = SimpleNamespace(save_hf_post_hook_path=path)  # no save_hf_dtype attr
+        args = _hook_args(path)
 
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 1, is_lora=False)
 
         assert calls[0]["dtype"] == "bf16"
 
+    def test_missing_dtype_is_visible_before_hook_execution(self, monkeypatch):
+        calls = []
+        args = SimpleNamespace(save_hf_post_hook_path=_install_fake_hook_module(monkeypatch, calls))
+
+        with pytest.raises(AttributeError, match="save_hf_dtype"):
+            model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 1, is_lora=False)
+        assert calls == []
+
     def test_hook_exception_is_swallowed(self, monkeypatch, caplog):
         calls = []
         path = _install_fake_hook_module(monkeypatch, calls, raise_exc=RuntimeError("boom"))
-        args = SimpleNamespace(save_hf_post_hook_path=path, save_hf_dtype="bf16")
+        args = _hook_args(path)
 
         # Must not raise; caller (save_hf_model) relies on this.
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 2, is_lora=False)
@@ -90,7 +108,7 @@ class TestInvokeSaveHfPostHook:
     def test_hook_receives_string_path_not_pathlike(self, monkeypatch, tmp_path):
         calls = []
         path = _install_fake_hook_module(monkeypatch, calls)
-        args = SimpleNamespace(save_hf_post_hook_path=path, save_hf_dtype="bf16")
+        args = _hook_args(path)
 
         model_mod._invoke_save_hf_post_hook(args, tmp_path / "iter_1", 1, is_lora=False)
 
@@ -118,7 +136,7 @@ class TestFlushOnFinalSave:
         module.flush = _flush
         monkeypatch.setitem(sys.modules, module_name, module)
 
-        args = SimpleNamespace(save_hf_post_hook_path=f"{module_name}.hook")
+        args = _hook_args(f"{module_name}.hook")
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 5, is_lora=False, force_sync=True)
 
         assert calls == [5]
@@ -142,7 +160,7 @@ class TestFlushOnFinalSave:
         module.flush = _flush
         monkeypatch.setitem(sys.modules, module_name, module)
 
-        args = SimpleNamespace(save_hf_post_hook_path=f"{module_name}.hook")
+        args = _hook_args(f"{module_name}.hook")
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 3, is_lora=False, force_sync=False)
 
         assert flush_calls == []
@@ -150,7 +168,7 @@ class TestFlushOnFinalSave:
     def test_force_sync_without_flush_attr_is_noop(self, monkeypatch):
         calls = []
         path = _install_fake_hook_module(monkeypatch, calls)  # no flush attr
-        args = SimpleNamespace(save_hf_post_hook_path=path)
+        args = _hook_args(path)
         # Must not raise; flush is optional.
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 7, is_lora=False, force_sync=True)
         assert len(calls) == 1
@@ -170,7 +188,7 @@ class TestFlushOnFinalSave:
         module.flush = _flush
         monkeypatch.setitem(sys.modules, module_name, module)
 
-        args = SimpleNamespace(save_hf_post_hook_path=f"{module_name}.hook")
+        args = _hook_args(f"{module_name}.hook")
         # Must not propagate the flush error.
         model_mod._invoke_save_hf_post_hook(args, "/tmp/hf", 9, is_lora=False, force_sync=True)
         assert calls == [9]

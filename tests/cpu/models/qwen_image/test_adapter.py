@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import sys
 import types
+from argparse import ArgumentParser
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from relax.backends.fsdp.arguments import add_fsdp_arguments
 from relax.models.generative import GenerativeModelAdapter
 from relax.models.qwen_image.adapter import QwenImageAdapter, latent_grid, qwen_image_sigmas
 
@@ -52,7 +54,8 @@ def test_adapter_supports_only_t2i():
 
 
 @pytest.mark.parametrize("revision", ["feature-revision", None])
-def test_load_train_model_uses_configured_revision(monkeypatch, revision):
+@pytest.mark.parametrize(("argv", "dtype"), [([], torch.bfloat16), (["--fsdp-param-dtype", "fp32"], torch.float32)])
+def test_load_train_model_uses_configured_revision_and_dtype(monkeypatch, revision, argv, dtype):
     captured = {}
 
     class _Loader:
@@ -64,10 +67,12 @@ def test_load_train_model_uses_configured_revision(monkeypatch, revision):
     fake_diffusers = types.ModuleType("diffusers")
     fake_diffusers.QwenImageTransformer2DModel = _Loader
     monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers)
-    QwenImageAdapter().load_train_model(
-        SimpleNamespace(model_path="model", model_revision=revision, fsdp_param_dtype="bf16")
-    )
+    args = add_fsdp_arguments(ArgumentParser()).parse_args(argv)
+    args.model_path = "model"
+    args.model_revision = revision
+    QwenImageAdapter().load_train_model(args)
     assert captured["path"] == "model"
+    assert captured["torch_dtype"] == dtype
     if revision is None:
         assert "revision" not in captured
     else:

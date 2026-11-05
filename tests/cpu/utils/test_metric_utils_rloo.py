@@ -8,19 +8,17 @@ import pytest
 
 from relax.utils.metrics.metric_utils import compute_rollout_explicit_reward_metrics
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import args_for_flags
 
 
 def _args(**overrides):
-    values = {
-        "advantage_estimator": "rloo",
-        "n_samples_per_prompt": 3,
-        "reward_key": None,
-        "log_passrate": False,
-        "custom_reward_post_process_path": None,
-        "agentic_custom_advantage_path": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+    return args_for_flags(
+        "--reward-key",
+        "--log-passrate",
+        "--custom-reward-post-process-path",
+        "--agentic-custom-advantage-path",
+        **{"advantage_estimator": "rloo", "n_samples_per_prompt": 3, **overrides},
+    )
 
 
 def _sample(group_index, reward, response_length, loss_mask=None):
@@ -100,6 +98,24 @@ def test_non_rloo_estimator_omits_rloo_diagnostics():
     )
 
     assert not any(key.startswith("rloo/") for key in metrics)
+
+
+def test_unrewarded_metrics_keep_sparse_config():
+    args = SimpleNamespace(log_passrate=False)
+    sample = _sample(0, None, 1)
+
+    assert compute_rollout_explicit_reward_metrics(args, [sample], include_rloo_diagnostics=False) == {}
+
+
+def test_zero_primary_reward_stays_separate_from_auxiliary_metrics():
+    args = _args(reward_key="score")
+    sample = _sample(0, {"score": 0, "aux": 3}, 1)
+
+    metrics = compute_rollout_explicit_reward_metrics(args, [sample], include_rloo_diagnostics=False)
+
+    assert metrics["raw_reward"] == 0
+    assert not any(key.startswith("score/") for key in metrics)
+    assert metrics["aux/mean"] == 3
 
 
 def test_eval_logger_disables_training_rloo_diagnostics(monkeypatch):

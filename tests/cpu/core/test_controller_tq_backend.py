@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests.cpu.core.test_controller_s3_model_cleanup import controller
+from tests.cpu.relax_parser import args_for_flags, parser_for_flags
 from tests.cpu.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
 
 
@@ -21,9 +22,21 @@ _MASTER = "master.invalid:50051"
 
 
 def _config(**overrides: Any) -> SimpleNamespace:
+    config = parser_for_flags(
+        "--tq-rdma-mode",
+        "--tq-rdma-device",
+        "--fully-async",
+        "--use-dynamic-batch-size",
+        "--hybrid",
+        "--balance-data",
+        "--sft-async-prepack",
+        "--loss-type",
+        "--partial-rollout",
+        "--enable-affinity",
+        "--autoscaler-config",
+    ).parse_args(["--tq-rdma-mode", "auto"])
     values = {
-        "tq_rdma_mode": "auto",
-        "tq_rdma_device": "",
+        **vars(config),
         "num_data_storage_units": 1,
         "n_samples_per_prompt": 1,
         "rollout_batch_size": 8,
@@ -418,7 +431,9 @@ def test_constructor_and_repeated_cleanup_preserve_owner_boundary(monkeypatch: p
     monkeypatch.setattr(controller.Controller, "_initialize_data_system", fail_init)
     monkeypatch.setattr(controller.Controller, "_close_data_system", close)
     with pytest.raises(RuntimeError, match="initialization failed"):
-        controller.Controller(SimpleNamespace(use_health_check=False, max_global_restart=3))
+        controller.Controller(
+            args_for_flags("--enable-affinity", "--autoscaler-config", use_health_check=False, max_global_restart=3)
+        )
     assert events == ["owner"]
 
     monkeypatch.setattr(controller.Controller, "_close_data_system", close_data_system)

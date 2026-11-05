@@ -9,6 +9,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 try:
     from relax.backends.megatron import cp_utils
@@ -62,13 +64,17 @@ def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(monkeypatch, cp_s
         for values, labels, mask in zip(hidden.split(lengths), tokens, masks, strict=True)
     )
     expected_grads = torch.autograd.grad(ref, (hidden, weight), retain_graph=True)
+    flags = ["--recompute-loss-function"] if recompute else []
+    parser = parser_for_flags(
+        "--recompute-loss-function", "--recompute-loss-function-use-reentrant", "--advantage-estimator"
+    )
     args = Namespace(
+        **vars(parser.parse_args(flags)),
         qkv_format="thd",
         loss_type="sft",
         allgather_cp=True,
         rollout_temperature=1.0,
         sft_chunked_logits=chunked,
-        recompute_loss_function=recompute,
         sft_logits_chunk_size=3,
         log_probs_chunk_size=3,
     )
@@ -113,7 +119,13 @@ def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(monkeypatch, cp_s
 def test_contiguous_allgather_layout_is_preserved_without_bridge_metadata(monkeypatch):
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 2)
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_rank", lambda: 1)
-    args = Namespace(qkv_format="thd", loss_type="sft", allgather_cp=True, rollout_temperature=1.0)
+    args = Namespace(
+        **vars(parser_for_flags("--sft-chunked-logits").parse_args([])),
+        qkv_format="thd",
+        loss_type="sft",
+        allgather_cp=True,
+        rollout_temperature=1.0,
+    )
     chunks = list(
         loss_module.get_responses(
             torch.arange(8, 16, dtype=torch.float32).reshape(1, 8, 1),

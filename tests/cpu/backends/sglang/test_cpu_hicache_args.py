@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.cpu.backends.sglang.test_router_registration import sglang_engine_module as sglang_engine_module
+from tests.cpu.relax_parser import parser_for_flags
 
 
 @pytest.mark.parametrize("worker_type", ["regular", "prefill", "decode"])
@@ -25,6 +26,9 @@ def test_cpu_cache_is_independent_of_pd_topology(request, monkeypatch, worker_ty
         hf_checkpoint="model",
         seed=42,
         offload_rollout=True,
+        **vars(
+            parser_for_flags("--lora-rank", "--enable-mtp-training", "--use-rollout-indexer-replay").parse_args([])
+        ),
         sglang_pp_size=1,
         sglang_dp_size=1,
         sglang_ep_size=1,

@@ -13,12 +13,17 @@ import transfer_queue
 from relax.distributed.ray import placement_group as placement_group_module
 from relax.utils import health_system
 from tests.cpu.core.controller_test_utils import load_controller_with_stubbed_dependencies
+from tests.cpu.relax_parser import parser_for_flags
 
 
 def _elastic_args(tmp_path, **kwargs):
     config_path = tmp_path / "autoscaler.yaml"
     config_path.write_text("enabled: true\n")
-    values = {"autoscaler_config": str(config_path), "enable_affinity": True}
+    values = {
+        **vars(parser_for_flags("--tq-rdma-mode", "--hybrid", "--sft-async-prepack", "--loss-type").parse_args([])),
+        "autoscaler_config": str(config_path),
+        "enable_affinity": True,
+    }
     values.update(kwargs)
     return Namespace(**values)
 

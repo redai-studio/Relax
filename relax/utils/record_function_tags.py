@@ -352,15 +352,13 @@ def install_record_function_tags(args: Any, model_chunks: Any) -> list[dict[str,
     if os.environ.get("RELAX_QWEN38_RECORD_FUNCTION_TAGS", "0") != "1" or not args.use_pytorch_profiler:
         return []
     from relax.utils.logging_utils import get_logger
+    from relax.utils.megatron_argument_compat import get_recompute_layout
     from relax.utils.profile_utils import _should_profile_train_rank
 
     if not _should_profile_train_rank(args):
         return []
-    if (
-        getattr(args, "recompute_granularity", None) != "full"
-        or not isinstance(getattr(args, "recompute_num_layers", None), int)
-        or getattr(args, "recompute_num_layers", 0) < 1
-    ):
+    recompute_granularity, recompute_num_layers = get_recompute_layout(args)
+    if recompute_granularity != "full" or not isinstance(recompute_num_layers, int) or recompute_num_layers < 1:
         raise RuntimeError("RCD profiling requires full recomputation with a positive recompute_num_layers")
     from megatron.core import parallel_state
     from megatron.core.pipeline_parallel import schedules

@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import pickle
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -11,8 +12,61 @@ from relax.engine.sft.runtime import (
     sft_partition_id,
     sft_partition_ids,
     sft_partition_prefix,
+    should_bypass_main_output_layer,
     should_skip_sft_weight_management,
+    should_use_sft_chunked,
 )
+from tests.cpu.relax_parser import parser_for_flags
+from tests.cpu.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
+
+
+arguments_module = _arguments_module_fixture
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        (["--loss-type", "sft"], False),
+        (["--loss-type", "sft", "--sft-chunked-logits"], True),
+        (["--loss-type", "sft", "--sft-chunked-logits", "--no-sft-chunked-logits"], False),
+        (["--loss-type", "dpo", "--sft-chunked-logits"], False),
+    ],
+)
+def test_sft_chunked_uses_declared_cli_flag(arguments_module: ModuleType, flags: list[str], expected: bool) -> None:
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    assert should_use_sft_chunked(parser.parse_args(flags)) is expected
+
+
+def test_sft_chunked_short_circuits_non_sft_namespace() -> None:
+    assert should_use_sft_chunked(Namespace(loss_type="policy_loss")) is False
+
+
+def test_sft_chunked_preserves_explicit_null() -> None:
+    assert should_use_sft_chunked(Namespace(loss_type="sft", sft_chunked_logits=None)) is None
+
+
+@pytest.mark.parametrize(
+    ("flags", "null_mtp", "expected"),
+    [
+        ([], False, False),
+        (["--mtp-only-training"], False, True),
+        (["--sft-chunked-logits"], False, True),
+        ([], True, False),
+        (["--sft-chunked-logits"], True, True),
+    ],
+)
+def test_bypass_main_output_uses_initialized_training_switches(
+    flags: list[str], null_mtp: bool, expected: bool
+) -> None:
+    parser = parser_for_flags("--mtp-only-training", "--sft-chunked-logits")
+    args = parser.parse_args(flags, namespace=Namespace(loss_type="sft"))
+    if null_mtp:
+        args.mtp_only_training = None
+
+    assert should_bypass_main_output_layer(args) is expected
 
 
 def test_resolve_sft_split_indices_is_deterministic_and_disjoint():
@@ -46,7 +100,8 @@ def test_resolve_sft_split_indices_matches_ms_swift_rng_order():
     ("task_type", "mtp_only_training"),
     [("causal_lm", False), ("seq_cls", False), ("seq_contrast", False), ("causal_lm", True)],
 )
-def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mtp_only_training):
+@pytest.mark.parametrize("offload_argv", [[], ["--no-offload-train"]])
+def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mtp_only_training, offload_argv):
     args = Namespace(
         loss_type="sft",
         task_type=task_type,
@@ -56,6 +111,9 @@ def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mt
         save_hf="export",
         eval_interval=5,
         eval_prompt_data=["validation"],
+        **vars(
+            parser_for_flags("--sft-predict-interval", "--offload-train", "--keep-old-actor").parse_args(offload_argv)
+        ),
     )
 
     assert should_skip_sft_weight_management(args)
@@ -76,13 +134,15 @@ def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mt
 )
 @pytest.mark.parametrize("mtp_only_training", [False, True])
 def test_sft_keeps_weight_management_for_consumers_and_other_losses(overrides, consumers, mtp_only_training):
-    args = Namespace(**{"loss_type": "sft", "mtp_only_training": mtp_only_training, **overrides})
+    args = parser_for_flags("--sft-predict-interval", "--offload-train", "--keep-old-actor").parse_args([])
+    vars(args).update({"loss_type": "sft", "mtp_only_training": mtp_only_training, **overrides})
 
     assert not should_skip_sft_weight_management(args, **consumers)
 
 
 def test_image_sft_attempt_is_shared_with_workers_and_changes_on_restore():
     args = Namespace(
+        **vars(parser_for_flags("--sft-async-prepack").parse_args([])),
         loss_type="sft",
         generation_task="i2i",
         i2i_sft_config={"dataset_size": 19},
@@ -110,4 +170,7 @@ def test_image_sft_partition_requires_shared_attempt():
 
 @pytest.mark.parametrize("loss_type,prefix", [("sft", "sft_"), ("dpo", "sft_"), ("rm", "sft_"), ("policy", "train_")])
 def test_partition_naming_preserves_non_image_modes(loss_type, prefix):
-    assert sft_partition_id(Namespace(loss_type=loss_type), 10) == f"{prefix}10"
+    args = parser_for_flags("--generation-task", "--sft-async-prepack").parse_args(
+        [], namespace=Namespace(loss_type=loss_type)
+    )
+    assert sft_partition_id(args, 10) == f"{prefix}10"

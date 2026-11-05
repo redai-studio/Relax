@@ -8,6 +8,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 torch = pytest.importorskip("torch")
 
@@ -55,6 +57,7 @@ def _stub_policy_forward(monkeypatch, log_probs):
 
 def _args(*, calculate_per_token_loss):
     return SimpleNamespace(
+        **vars(parser_for_flags("--task-type", "--mtp-only-training").parse_args([])),
         loss_type="policy_loss",
         advantage_estimator="m2po",
         calculate_per_token_loss=calculate_per_token_loss,

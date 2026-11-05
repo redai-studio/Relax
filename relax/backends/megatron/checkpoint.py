@@ -205,10 +205,10 @@ def _load_checkpoint_metadata(args, ddp_model, checkpoint_dir: Path) -> dict:
                 f"got loss_type={saved_loss_type!r}, head_type={saved_head_type!r}, role={saved_role!r}"
             )
         incompatible_flags = [
-            name
-            for name in ("no_load_optim", "no_load_rng", "finetune", "reset_optimizer_states")
-            if bool(getattr(args, name, False))
+            name for name in ("no_load_optim", "no_load_rng", "finetune") if bool(getattr(args, name, False))
         ]
+        if args.reset_optimizer_states:
+            incompatible_flags.append("reset_optimizer_states")
         if incompatible_flags:
             raise RuntimeError(
                 f"RM resume must restore optimizer, scheduler, and RNG state; incompatible flags: {incompatible_flags}"
@@ -317,19 +317,19 @@ def _lora_checkpoint_metadata(args, trainable_names: tuple[str, ...]) -> dict:
         "lora_target_modules": tuple(args.lora_target_modules or ()),
         "lora_scope": args.lora_scope,
         "lora_merge_mode": args.lora_merge_mode,
-        "lora_adapter_mode": getattr(args, "lora_adapter_mode", False),
+        "lora_adapter_mode": args.lora_adapter_mode,
         "tensor_model_parallel_size": args.tensor_model_parallel_size,
         "pipeline_model_parallel_size": args.pipeline_model_parallel_size,
         "context_parallel_size": args.context_parallel_size,
         "expert_model_parallel_size": args.expert_model_parallel_size,
-        "expert_tensor_parallel_size": getattr(args, "expert_tensor_parallel_size", 1),
-        "virtual_pipeline_model_parallel_size": getattr(args, "virtual_pipeline_model_parallel_size", None),
-        "pipeline_model_parallel_layout": str(getattr(args, "pipeline_model_parallel_layout", None)),
-        "decoder_first_pipeline_num_layers": getattr(args, "decoder_first_pipeline_num_layers", None),
-        "decoder_last_pipeline_num_layers": getattr(args, "decoder_last_pipeline_num_layers", None),
-        "num_layers_per_virtual_pipeline_stage": getattr(args, "num_layers_per_virtual_pipeline_stage", None),
+        "expert_tensor_parallel_size": args.expert_tensor_parallel_size,
+        "virtual_pipeline_model_parallel_size": args.virtual_pipeline_model_parallel_size,
+        "pipeline_model_parallel_layout": str(args.pipeline_model_parallel_layout),
+        "decoder_first_pipeline_num_layers": args.decoder_first_pipeline_num_layers,
+        "decoder_last_pipeline_num_layers": args.decoder_last_pipeline_num_layers,
+        "num_layers_per_virtual_pipeline_stage": args.num_layers_per_virtual_pipeline_stage,
         "world_size": args.world_size,
-        "data_parallel_size": getattr(args, "data_parallel_size", None),
+        "data_parallel_size": args.data_parallel_size,
         "trainable_parameter_names": trainable_names,
     }
 
@@ -861,7 +861,7 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
         f"Load checkpoint from HuggingFace model into Megatron (requested_path={load_path}, source_path={source_path})"
     )
 
-    if getattr(args, "warm_hf_checkpoint_page_cache", False):
+    if args.warm_hf_checkpoint_page_cache:
         warm_hf_checkpoint_page_cache(source_path)
 
     with use_critic_lm_head_for_hf_load(ddp_model):
@@ -976,7 +976,7 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
                 "lora_target_modules": list(args.lora_target_modules),
                 "lora_dropout": args.lora_dropout,
                 "lora_merge_mode": args.lora_merge_mode,
-                "lora_adapter_mode": getattr(args, "lora_adapter_mode", False),
+                "lora_adapter_mode": args.lora_adapter_mode,
             }
             with open(adapter_dir / "relax_lora_meta.json", "w") as f:
                 json.dump(metadata, f)

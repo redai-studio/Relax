@@ -13,6 +13,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 class _TPReduce(torch.autograd.Function):
     """Megatron's forward SUM / backward identity mapping for CPU tests."""
@@ -74,6 +76,7 @@ def _backend(monkeypatch, *, rank=0, cp_size=1, tp_size=1):
 
 def _args(**overrides):
     values = dict(
+        **vars(parser_for_flags("--task-type", "--mtp-only-training").parse_args([])),
         advantage_estimator="score_centering",
         loss_type="policy_loss",
         score_centering_vocab_size=5,

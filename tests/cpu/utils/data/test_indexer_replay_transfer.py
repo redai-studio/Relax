@@ -8,6 +8,7 @@ import torch
 
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.types import Sample
+from tests.cpu.relax_parser import parser_for_flags
 
 
 @pytest.fixture
@@ -52,7 +53,7 @@ def test_indexer_replay_field_is_actor_only():
         multimodal_keys=None,
         use_kl_loss=False,
         use_opd=False,
-        use_rollout_indexer_replay=True,
+        **vars(parser_for_flags("--use-rollout-indexer-replay").parse_args(["--use-rollout-indexer-replay"])),
         use_rollout_routing_replay=False,
     )
 
@@ -77,7 +78,7 @@ def test_indexer_replay_dynamic_sample_field_round_trips_when_enabled():
     assert np.array_equal(getattr(restored, "rollout_indexer_topk"), replay)
 
 
-def test_indexer_replay_field_is_absent_when_flag_is_false_or_missing():
+def test_indexer_replay_field_is_absent_when_flag_is_disabled():
     base_args = dict(
         advantage_estimator="grpo",
         loss_type="policy_loss",
@@ -86,11 +87,15 @@ def test_indexer_replay_field_is_absent_when_flag_is_false_or_missing():
         use_rollout_routing_replay=False,
     )
 
-    without_flag = build_data_fields(Namespace(**base_args), consumer="actor")
+    parser = parser_for_flags("--use-rollout-indexer-replay")
+    default_args = parser.parse_args([], namespace=Namespace(**base_args))
+    default_fields = build_data_fields(default_args, consumer="actor")
     with_false_flag = build_data_fields(
         Namespace(**base_args, use_rollout_indexer_replay=False),
         consumer="actor",
     )
 
-    assert without_flag == with_false_flag
-    assert "rollout_indexer_topk" not in without_flag
+    assert default_fields == with_false_flag
+    assert "rollout_indexer_topk" not in default_fields
+    with pytest.raises(AttributeError, match="use_rollout_indexer_replay"):
+        build_data_fields(Namespace(**base_args), consumer="actor")

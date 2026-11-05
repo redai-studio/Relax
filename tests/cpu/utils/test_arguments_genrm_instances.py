@@ -11,9 +11,11 @@ because it has no dependency on the rest of the argument surface.
 
 import importlib
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
+
+from tests.cpu.relax_parser import parser_for_flags
 
 
 @pytest.fixture()
@@ -52,16 +54,18 @@ def _resolve_genrm_instances(_arguments_module):
 
 
 def _args(**overrides):
-    defaults = dict(
-        genrm_instances=None,
-        genrm_model_path=None,
-        genrm_num_gpus=1,
-        genrm_num_gpus_per_engine=1,
-        genrm_engine_config=None,
-        genrm_sampling_config=None,
+    parser = parser_for_flags(
+        "--genrm-instances",
+        "--genrm-model-path",
+        "--genrm-num-gpus",
+        "--genrm-num-gpus-per-engine",
+        "--genrm-engine-config",
+        "--genrm-sampling-config",
+        "--resource",
     )
-    defaults.update(overrides)
-    return SimpleNamespace(**defaults)
+    args = parser.parse_args([])
+    vars(args).update(overrides)
+    return args
 
 
 def test_genrm_disabled_resolves_to_empty(_resolve_genrm_instances):

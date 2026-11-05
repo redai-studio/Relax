@@ -18,6 +18,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.cpu.relax_parser import args_for_flags
+
 
 def _load_functions(filename, names):
     path = Path(__file__).resolve().parents[4] / "relax/backends/megatron" / filename
@@ -63,6 +65,50 @@ def _files(path, names):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{}")
     return path
+
+
+@pytest.mark.parametrize(
+    ("vpp", "layout", "virtual_layers"), [(None, None, None), (2, "Et|t|t|tL", None), (2, None, 2)]
+)
+def test_lora_metadata_preserves_native_topology(
+    vpp: int | None, layout: str | None, virtual_layers: int | None
+) -> None:
+    module = _load_functions("checkpoint.py", ["_lora_checkpoint_metadata"])
+    module._LORA_CHECKPOINT_FORMAT_VERSION = 1
+    module._hf_checkpoint_identity = lambda path: {"path": path}
+    args = Namespace(
+        **vars(args_for_flags("--lora-adapter-mode")),
+        hf_checkpoint="model",
+        lora_rank=8,
+        lora_alpha=16,
+        lora_dropout=0.0,
+        lora_target_modules=[],
+        lora_scope=None,
+        lora_merge_mode=False,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        expert_tensor_parallel_size=2,
+        virtual_pipeline_model_parallel_size=vpp,
+        pipeline_model_parallel_layout=layout,
+        num_layers_per_virtual_pipeline_stage=virtual_layers,
+        decoder_first_pipeline_num_layers=None,
+        decoder_last_pipeline_num_layers=None,
+        world_size=8,
+        data_parallel_size=2,
+    )
+
+    metadata = module._lora_checkpoint_metadata(args, ("adapter.weight",))
+
+    assert metadata["expert_tensor_parallel_size"] == 2
+    assert metadata["virtual_pipeline_model_parallel_size"] == vpp
+    assert metadata["pipeline_model_parallel_layout"] == str(layout)
+    assert metadata["num_layers_per_virtual_pipeline_stage"] == virtual_layers
+    assert metadata["data_parallel_size"] == 2
+    del args.data_parallel_size
+    with pytest.raises(AttributeError, match="data_parallel_size"):
+        module._lora_checkpoint_metadata(args, ("adapter.weight",))
 
 
 def _route(checkpoint, monkeypatch, path, expected_path):

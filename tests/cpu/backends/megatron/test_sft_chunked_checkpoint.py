@@ -8,6 +8,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.cpu.relax_parser import parser_for_flags
+
 
 try:
     from relax.backends.megatron import loss as loss_module
@@ -35,12 +37,16 @@ def _setup(monkeypatch, labels, chunk_size, temperature):
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(loss_module, "validate_opd_topk_gather", lambda *_: None)
     monkeypatch.setattr(loss_module, "get_responses", lambda hidden, **_: iter([(hidden.squeeze(0), labels)]))
+    parser = parser_for_flags(
+        "--advantage-estimator", "--recompute-loss-function", "--recompute-loss-function-use-reentrant"
+    )
+    recompute_args = parser.parse_args(["--recompute-loss-function"])
     return Namespace(
+        **vars(recompute_args),
         sft_logits_chunk_size=chunk_size,
         rollout_temperature=temperature,
         entropy_coef=0,
         allgather_cp=False,
-        recompute_loss_function=True,
     )
 
 

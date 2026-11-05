@@ -2,14 +2,16 @@
 
 """components/actor.py module-level helpers for SFT-aware partition naming."""
 
-from argparse import Namespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from tests.cpu.relax_parser import args_for_flags
+
 
 def _mk_actor_config(loss_type: str):
-    return Namespace(
+    return args_for_flags(
+        "--generation-task",
         loss_type=loss_type,
         dpo_reference_free=False,
         kl_coef=0.0,

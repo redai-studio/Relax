@@ -10,22 +10,30 @@ otherwise rejected fail-fast.
 
 from __future__ import annotations
 
-from argparse import Namespace
-from types import SimpleNamespace
+import hashlib
+import json
+from argparse import ArgumentParser, Namespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import requests
 import torch
 
 from relax.backends.fsdp.actor import FSDPTrainRayActor
-from relax.backends.fsdp.arguments import validate_generative_config
+from relax.backends.fsdp.arguments import add_fsdp_arguments, add_generative_arguments, validate_generative_config
+from tests.cpu.relax_parser import parser_for_flags
+from tests.cpu.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
+
+
+arguments_module = _arguments_module_fixture
 
 
 class _SaveSpy:
     """Minimal stand-in exposing just what ``_maybe_save`` touches."""
 
-    def __init__(self, **args):
-        self.args = SimpleNamespace(**args)
+    def __init__(self, args: Namespace) -> None:
+        self.args = args
         self.saved: list = []
         self._checkpoint_failures = 0
 
@@ -33,50 +41,80 @@ class _SaveSpy:
         self.saved.append((rollout_id, force_sync))
 
 
-def _spy(**over):
-    base = dict(save="/tmp/ckpt", save_interval=20, num_rollout=100, rotate_ckpt=False)
-    base.update(over)
-    return _SaveSpy(**base)
+@pytest.fixture
+def checkpoint_parser(arguments_module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> ArgumentParser:
+    router = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    monkeypatch.setattr(arguments_module, "RouterArgs", router)
+    return arguments_module.get_slime_extra_args_provider()(ArgumentParser())
 
 
-def test_maybe_save_fires_on_interval():
-    spy = _spy()
+def _spy(checkpoint_parser: ArgumentParser) -> _SaveSpy:
+    args = checkpoint_parser.parse_args(["--save", "/tmp/ckpt", "--save-interval", "20", "--num-rollout", "100"])
+    return _SaveSpy(args)
+
+
+def test_maybe_save_fires_on_interval(checkpoint_parser):
+    spy = _spy(checkpoint_parser)
     FSDPTrainRayActor._maybe_save(spy, 19)  # (19 + 1) % 20 == 0
     assert spy.saved == [(19, False)]
 
 
-def test_maybe_save_skips_between_intervals():
-    spy = _spy()
+def test_maybe_save_skips_between_intervals(checkpoint_parser):
+    spy = _spy(checkpoint_parser)
     FSDPTrainRayActor._maybe_save(spy, 5)
     assert spy.saved == []
 
 
-def test_maybe_save_forces_sync_on_final_step():
-    spy = _spy(save_interval=20, num_rollout=100)
+def test_maybe_save_forces_sync_on_final_step(checkpoint_parser):
+    spy = _spy(checkpoint_parser)
     FSDPTrainRayActor._maybe_save(spy, 99)  # final step, not an interval multiple
     assert spy.saved == [(99, True)]
 
 
-def test_maybe_save_final_step_does_not_require_save_interval():
-    spy = _spy(save_interval=None)
+def test_maybe_save_final_step_does_not_require_save_interval(checkpoint_parser):
+    spy = _SaveSpy(checkpoint_parser.parse_args(["--save", "/tmp/ckpt", "--num-rollout", "100"]))
     FSDPTrainRayActor._maybe_save(spy, 99)
     assert spy.saved == [(99, True)]
 
 
-def test_maybe_save_noop_without_save_dir():
-    spy = _spy(save=None)
+def test_maybe_save_final_step_keeps_zero_interval_short_circuit(checkpoint_parser: ArgumentParser) -> None:
+    args = checkpoint_parser.parse_args(["--save", "/tmp/ckpt", "--num-rollout", "100", "--save-interval", "0"])
+    spy = _SaveSpy(args)
+    FSDPTrainRayActor._maybe_save(spy, 99)
+    assert spy.saved == [(99, True)]
+
+
+def test_maybe_save_noop_without_save_dir(checkpoint_parser):
+    spy = _SaveSpy(checkpoint_parser.parse_args([]))
     FSDPTrainRayActor._maybe_save(spy, 19)
     assert spy.saved == []
 
 
-def test_maybe_save_rotate_ckpt_saves_every_step():
-    spy = _spy(rotate_ckpt=True, save_interval=None)
+def test_maybe_save_rejects_missing_declared_save_field() -> None:
+    spy = _SaveSpy(Namespace())
+    with pytest.raises(AttributeError, match="save"):
+        FSDPTrainRayActor._maybe_save(spy, 19)
+    assert spy.saved == []
+
+
+@pytest.mark.parametrize("num_rollout", [None, 0], ids=["omitted", "zero"])
+def test_maybe_save_periodic_without_final_count(checkpoint_parser: ArgumentParser, num_rollout: int | None) -> None:
+    cli = ["--save", "/tmp/ckpt", "--save-interval", "20"]
+    if num_rollout is not None:
+        cli += ["--num-rollout", str(num_rollout)]
+    spy = _SaveSpy(checkpoint_parser.parse_args(cli))
+    FSDPTrainRayActor._maybe_save(spy, 19)
+    assert spy.saved == [(19, False)]
+
+
+def test_maybe_save_rotate_ckpt_saves_every_step(checkpoint_parser):
+    spy = _SaveSpy(checkpoint_parser.parse_args(["--save", "/tmp/ckpt", "--num-rollout", "100", "--rotate-ckpt"]))
     FSDPTrainRayActor._maybe_save(spy, 3)
     assert spy.saved == [(3, False)]
 
 
-def test_periodic_checkpoint_failure_is_best_effort():
-    spy = _spy()
+def test_periodic_checkpoint_failure_is_best_effort(checkpoint_parser):
+    spy = _spy(checkpoint_parser)
 
     def _fail(*_args, **_kwargs):
         raise OSError("disk full")
@@ -86,8 +124,8 @@ def test_periodic_checkpoint_failure_is_best_effort():
     assert spy._checkpoint_failures == 1
 
 
-def test_final_checkpoint_failure_is_propagated():
-    spy = _spy()
+def test_final_checkpoint_failure_is_propagated(checkpoint_parser):
+    spy = _spy(checkpoint_parser)
     error = OSError("disk full")
 
     def _fail(*_args, **_kwargs):
@@ -146,7 +184,7 @@ def test_empty_training_batch_does_not_advance_or_sync():
     from relax.utils.timer import Timer
 
     shell = object.__new__(FSDPTrainRayActor)
-    shell.args = SimpleNamespace()
+    shell.args = parser_for_flags("--loss-type").parse_args([])
     shell.policy_version = 7
     shell._load_train_batches = lambda *_args: []
     shell._assert_microbatch_count_aligned = lambda *_args: None
@@ -158,6 +196,80 @@ def test_empty_training_batch_does_not_advance_or_sync():
     finally:
         if "train_wait" in Timer().start_time:
             Timer().end("train_wait")
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["declared-defaults", "two-updates-zero-clip"])
+def test_fsdp_training_uses_declared_update_count_and_clip(configured: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    from relax.backends.fsdp import actor as actor_module
+    from relax.utils.timer import Timer
+
+    train_parser = parser_for_flags("--clip-grad", "--eps-clip", "--loss-type", "--offload-train")
+    parser = add_generative_arguments(ArgumentParser(parents=[train_parser], add_help=False))
+    cli = ["--generation-task", "t2i", "--sampling-config", '{"eta": 0.7}', "--no-offload-train"]
+    if configured:
+        cli += ["--num-updates-per-batch", "2", "--eps-clip", "0"]
+    shell = object.__new__(FSDPTrainRayActor)
+    shell.args = parser.parse_args(cli)
+    shell._rank = 1
+    shell._lr_steps = 0
+    shell.model = torch.nn.Linear(1, 1)
+    shell.adapter = object()
+    events = []
+    shell.optimizer = SimpleNamespace(zero_grad=lambda **_kwargs: None, step=lambda: events.append(("step",)))
+    micro_batches = [{"advantages": torch.ones(1), "step_indices": [index]} for index in range(2)]
+    shell._load_train_batches = lambda *_args: micro_batches
+    shell._assert_microbatch_count_aligned = lambda *_args: None
+    shell._prepare_micro_batch = lambda mb: (mb, mb["advantages"])
+    shell._record_update_metrics = lambda *_args: None
+    shell._apply_lr = lambda: None
+    shell._log_update = lambda *_args: None
+    shell._sync_save_and_release = lambda *_args: None
+    shell._run_step_evaluation = lambda *_args: None
+    shell._log_train_metrics = lambda *_args: None
+
+    def freeze_anchor(_batch: dict, micro_batch: dict, *_args: object) -> torch.Tensor:
+        index = micro_batch["step_indices"][0]
+        events.append(("freeze", index))
+        return torch.tensor(index)
+
+    def update(
+        _model: torch.nn.Module,
+        _adapter: object,
+        _batch: dict,
+        *,
+        step_indices: list[int],
+        clip_eps: float,
+        old_logp: torch.Tensor | None,
+        **_kwargs: object,
+    ) -> dict[str, torch.Tensor]:
+        anchor = old_logp.item() if old_logp is not None else None
+        events.append(("update", step_indices[0], clip_eps, anchor))
+        return {"new_logp": torch.zeros(1)}
+
+    shell._freeze_anchor = freeze_anchor
+    monkeypatch.setattr(actor_module, "flow_grpo_update", update)
+
+    try:
+        shell.train(rollout_id=3)
+    finally:
+        for name in ("train", "actor_train", "train_wait"):
+            if name in Timer().start_time:
+                Timer().end(name)
+            Timer().reset(name)
+
+    if configured:
+        assert events == [
+            ("freeze", 0),
+            ("freeze", 1),
+            ("update", 0, 0.0, 0),
+            ("step",),
+            ("update", 1, 0.0, 1),
+            ("step",),
+        ]
+        assert shell._lr_steps == 2
+    else:
+        assert events == [("update", 0, 0.2, None), ("update", 1, 0.2, None), ("step",)]
+        assert shell._lr_steps == 1
 
 
 @pytest.mark.parametrize(
@@ -225,18 +337,18 @@ class _Resp:
         return self._payload
 
 
-def _eval_shell(**over):
-    args = dict(
+def _eval_shell(**over: object) -> FSDPTrainRayActor:
+    args = parser_for_flags("--num-rollout").parse_args(["--num-rollout", "100"])
+    vars(args).update(
         eval_interval=10,
-        num_rollout=100,
         final_eval_poll_interval=0.0,
         final_eval_wait_timeout=1.0,
     )
-    args.update(over)
+    vars(args).update(over)
     shell = object.__new__(FSDPTrainRayActor)
     shell._rank = 0
     shell.rollout_manager = object()
-    shell.args = SimpleNamespace(**args)
+    shell.args = args
     return shell
 
 
@@ -279,33 +391,55 @@ def test_run_step_evaluation_does_not_wait_before_final_step(monkeypatch):
     assert calls == ["http://rollout/evaluate"]
 
 
-def _valid_args(**over):
-    base = dict(
+def _valid_args(**over: object) -> Namespace:
+    # The generative provider also registers the FSDP training group.
+    parser = add_generative_arguments(ArgumentParser())
+    initialized = parser_for_flags(
+        "--actor-num-gpus-per-node",
+        "--actor-num-nodes",
+        "--advantage-estimator",
+        "--autoscaler-config",
+        "--fully-async",
+        "--hybrid",
+        "--kl-coef",
+        "--lora-adapter-mode",
+        "--lora-dropout",
+        "--lora-rank",
+        "--loss-type",
+        "--max-tokens-per-gpu",
+        "--save-debug-train-data",
+        "--save-hf",
+        "--use-dynamic-batch-size",
+        "--use-kl-loss",
+    ).parse_args([])
+    args = parser.parse_args(
+        [
+            "--generation-task",
+            "t2i",
+            "--model-adapter-path",
+            "relax.models.qwen_image.adapter.QwenImageAdapter",
+            "--model-path",
+            "/models/Qwen-Image",
+            # Both rollout and actor replay require eta. Exclude step 0,
+            # where the sde diffusion coefficient is singular.
+            "--sampling-config",
+            '{"num_inference_steps": 12, "eta": 0.7, "sde_indices": [1, 3, 5]}',
+        ],
+        namespace=initialized,
+    )
+    vars(args).update(
         train_backend="fsdp",
-        generation_task="t2i",
-        model_adapter_path="relax.models.qwen_image.adapter.QwenImageAdapter",
-        model_path="/models/Qwen-Image",
-        fsdp_trainable_mode="full",
-        weight_sync_wire_dtype="bf16",
         rollout_num_gpus_per_engine=1,
         multimodal_keys={},
-        reward_required_components=None,
-        reward_component_weights=None,
-        reward_runtime="cpu",
-        generative_advantage_std_mode=None,
-        # `eta` is required (both the rollout request and the actor replay read
-        # it, and they must not disagree); step 0 is excluded because sigma==1
-        # makes the sde-type diffusion coefficient singular.
-        sampling_config={"num_inference_steps": 12, "eta": 0.7, "sde_indices": [1, 3, 5]},
         # Synchronous colocate is the only supported generative deployment mode.
         colocate=True,
-        fully_async=False,
-        hybrid=False,
-        kl_coef=0.0,
-        use_kl_loss=False,
+        async_save=False,
+        load_debug_rollout_data=None,
+        use_critic=False,
     )
-    base.update(over)
-    return Namespace(**base)
+    # Some validator cases intentionally bypass argparse choices.
+    vars(args).update(over)
+    return args
 
 
 def test_validate_requires_eta_in_sampling_config():
@@ -406,6 +540,26 @@ def test_validate_accepts_single_gpu_engine():
     validate_generative_config(_valid_args())  # must not raise
 
 
+def test_validate_aggregates_invalid_generative_options() -> None:
+    args = _valid_args(
+        generation_task=None,
+        model_adapter_path=None,
+        model_path=None,
+        weight_sync_wire_dtype="fp32",
+        reward_required_components=["quality"],
+        reward_component_weights={"base": 1.0},
+    )
+    with pytest.raises(ValueError) as exc_info:
+        validate_generative_config(args)
+
+    message = str(exc_info.value)
+    assert "generation_task must be one of" in message
+    assert "model_adapter_path is required" in message
+    assert "model_path is required" in message
+    assert "weight_sync_wire_dtype must be bf16" in message
+    assert "missing required components: ['quality']" in message
+
+
 def test_validate_accepts_tp_dividing_actor_world():
     # Rollout TP>1 is supported when the engine GPUs tile the actor world.
     validate_generative_config(
@@ -415,7 +569,7 @@ def test_validate_accepts_tp_dividing_actor_world():
 
 def test_validate_accepts_tp_when_actor_world_unknown():
     # Without actor world info the divisibility check is deferred to the first sync.
-    validate_generative_config(_valid_args(rollout_num_gpus_per_engine=4))
+    validate_generative_config(_valid_args(rollout_num_gpus_per_engine=4, actor_num_gpus_per_node=None))
 
 
 def test_validate_rejects_tp_not_dividing_actor_world():
@@ -430,9 +584,10 @@ def test_validate_rejects_tp_below_one():
         validate_generative_config(_valid_args(rollout_num_gpus_per_engine=0))
 
 
-def test_validate_skips_non_fsdp_backend():
+def test_validate_skips_non_fsdp_backend() -> None:
     # Megatron path must be untouched by the generative fail-fast checks.
-    validate_generative_config(_valid_args(train_backend="megatron", rollout_num_gpus_per_engine=8))
+    validate_generative_config(Namespace())
+    validate_generative_config(Namespace(train_backend="megatron", rollout_num_gpus_per_engine=8))
 
 
 def test_validate_rejects_fsdp_critic_and_ppo_but_not_megatron():
@@ -490,15 +645,28 @@ def test_validate_warns_but_accepts_inert_flags(caplog):
 def test_lr_at_step_constant_by_default():
     from relax.backends.fsdp.actor import lr_at_step
 
-    args = Namespace(lr_warmup_iters=0, fsdp_lr_scheduler="constant", lr_decay_iters=None, min_lr=0.0)
+    args = add_fsdp_arguments(ArgumentParser()).parse_args([])
     assert lr_at_step(args, 0, 1e-5) == 1e-5
     assert lr_at_step(args, 500, 1e-5) == 1e-5
+
+
+def test_lr_at_step_keeps_base_lr_for_explicit_none():
+    from relax.backends.fsdp.actor import lr_at_step
+
+    args = add_fsdp_arguments(ArgumentParser()).parse_args([])
+    args.fsdp_lr_scheduler = None
+    args.lr_decay_iters = 10
+    args.min_lr = 1e-6
+    assert lr_at_step(args, 5, 1e-5) == 1e-5
 
 
 def test_lr_at_step_warmup_then_cosine_decays_to_min():
     from relax.backends.fsdp.actor import lr_at_step
 
-    args = Namespace(lr_warmup_iters=10, fsdp_lr_scheduler="cosine", lr_decay_iters=110, min_lr=1e-6)
+    args = add_fsdp_arguments(ArgumentParser()).parse_args(["--fsdp-lr-scheduler", "cosine"])
+    args.lr_warmup_iters = 10
+    args.lr_decay_iters = 110
+    args.min_lr = 1e-6
     assert lr_at_step(args, 0, 1e-4) == pytest.approx(1e-5)  # first warmup step
     assert lr_at_step(args, 9, 1e-4) == pytest.approx(1e-4)  # warmup complete
     assert lr_at_step(args, 110, 1e-4) == pytest.approx(1e-6)  # decayed to the floor
@@ -512,18 +680,91 @@ def test_lr_at_step_warmup_then_cosine_decays_to_min():
 
 
 def _lora_args(**over):
+    parsed = add_fsdp_arguments(ArgumentParser()).parse_args(["--fsdp-trainable-mode", "lora"])
     base = dict(
-        fsdp_trainable_mode="lora",
+        fsdp_trainable_mode=parsed.fsdp_trainable_mode,
         lora_rank=64,
         lora_alpha=128,
-        lora_dropout=0.0,
+        lora_dropout=parser_for_flags("--lora-dropout").parse_args([]).lora_dropout,
         lora_merge_mode=True,
         lora_adapter_mode=False,
         fsdp_master_dtype="fp32",
-        fsdp_cpu_offload=False,
+        fsdp_cpu_offload=parsed.fsdp_cpu_offload,
     )
     base.update(over)
     return _valid_args(**base)
+
+
+def _actor_config_args(*options: str) -> Namespace:
+    lora_parser = parser_for_flags("--lora-rank", "--lora-alpha", "--lora-target-modules", "--lora-dropout")
+    parser = add_generative_arguments(ArgumentParser(parents=[lora_parser], add_help=False))
+    return parser.parse_args(
+        [
+            "--generation-task",
+            "t2i",
+            "--model-path",
+            "base-model",
+            "--fsdp-trainable-mode",
+            "lora",
+            "--lora-rank",
+            "4",
+            "--lora-alpha",
+            "8",
+            *options,
+        ]
+    )
+
+
+@pytest.mark.parametrize("configured", ["adapter-default", "explicit-cli", "empty-yaml"])
+def test_lora_actor_checkpoint_contract_uses_initialized_configuration(configured: str, tmp_path: Path) -> None:
+    cli = []
+    expected_revision = None
+    expected_targets = ["adapter-target"]
+    adapter = SimpleNamespace(family="test", supported_tasks=("t2i",), lora_target_modules=expected_targets)
+    if configured == "explicit-cli":
+        cli = ["--lora-target-modules", "cli-target", "--model-revision", "release", "--lora-dropout", "0"]
+        expected_revision = "release"
+        expected_targets = ["cli-target"]
+    args = _actor_config_args(*cli)
+    if configured == "empty-yaml":
+        args.lora_target_modules = []
+        args.lora_dropout = None
+
+    actor = object.__new__(FSDPTrainRayActor)
+    actor.args = args
+    actor.adapter = adapter
+    actor._trainable_mode = args.fsdp_trainable_mode
+    actor._lora_target_modules = actor._resolve_lora_target_modules(args)
+    actor._base_model_sha256 = actor._hash_base_model(args)
+
+    contract = actor._adapter_contract()
+
+    assert contract["base_model_sha256"] == hashlib.sha256(f"base-model:{expected_revision}".encode()).hexdigest()
+    assert contract["lora"]["target_modules"] == expected_targets
+    assert contract["lora"]["dropout"] == 0.0
+    assert contract["lora"]["scaling"] == 2.0
+    (tmp_path / "adapter_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+    actor._assert_resumable(str(tmp_path))
+
+
+def test_lora_actor_requires_targets_if_adapter_does_not_provide_defaults() -> None:
+    actor = object.__new__(FSDPTrainRayActor)
+    actor.adapter = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="needs target modules"):
+        actor._resolve_lora_target_modules(_actor_config_args())
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["declared-empty", "explicit-sde"])
+def test_fsdp_actor_fingerprint_uses_declared_sampling_config(configured: bool) -> None:
+    sampling = {"eta": 0.7, "sde_indices": [1, 3]} if configured else {}
+    cli = ["--sampling-config", json.dumps(sampling)] if configured else []
+    actor = object.__new__(FSDPTrainRayActor)
+    actor.args = _actor_config_args(*cli)
+
+    payload = json.dumps({"sampling": sampling, "task": "t2i"}, sort_keys=True)
+
+    assert actor.sampling_fingerprint() == hashlib.sha256(payload.encode()).hexdigest()
 
 
 def test_validate_accepts_lora_merge_mode():
@@ -557,7 +798,8 @@ def test_validate_rejects_lora_dropout():
 
 def test_validate_rejects_lora_with_cpu_offload():
     with pytest.raises(ValueError, match="fsdp-cpu-offload is not supported"):
-        validate_generative_config(_lora_args(fsdp_cpu_offload=True))
+        parsed = add_fsdp_arguments(ArgumentParser()).parse_args(["--fsdp-cpu-offload"])
+        validate_generative_config(_lora_args(fsdp_cpu_offload=parsed.fsdp_cpu_offload))
 
 
 def test_validate_rejects_adapter_transport_without_adapter_mode():

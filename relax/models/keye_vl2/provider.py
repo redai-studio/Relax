@@ -11,6 +11,8 @@ from megatron.core.transformer.moe.moe_utils import router_gating_linear
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.spec_utils import ModuleSpec
 
+from relax.utils.megatron_argument_compat import dynamic_context_parallel_enabled
+
 from .attention import KeyeCoreAttention, KeyeSelfAttention
 from .linear import KeyeRowParallelLinear
 
@@ -80,7 +82,7 @@ class KeyeModelProvider(GPTModelProvider):
     freeze_vision_projection: bool = False
 
     def configure_runtime(self, args: Any) -> None:
-        if getattr(args, "dynamic_context_parallel", False):
+        if dynamic_context_parallel_enabled(args):
             raise ValueError("Keye currently supports static context parallelism only")
         if self.context_parallel_size > 1 and args.cp_partition_mode != "zigzag":
             raise ValueError("Keye context parallelism requires zigzag partitioning")

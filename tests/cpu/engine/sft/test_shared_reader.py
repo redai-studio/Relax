@@ -18,6 +18,7 @@ import yaml
 from relax.engine.sft.bootstrap import resolve_sft_num_rollout
 from relax.engine.sft.dataset.streaming import SFTStreamingDataset, _build_reader
 from relax.utils.data.streaming_dataset import StreamingReader
+from tests.cpu.relax_parser import parser_for_flags
 
 
 @pytest.mark.parametrize("workers,expected", [(None, 16), ("3", 3), ("0", None), ("-1", None)])
@@ -46,7 +47,13 @@ def test_index_workers_default_override_and_validation(tmp_path, monkeypatch, wo
 
 def _args(path):
     return Namespace(
-        loss_type="sft", prompt_data=path, rollout_batch_size=2, num_epoch=1, num_rollout=None, eval_size=None
+        **vars(parser_for_flags("--generation-task", "--custom-dataset-class-path").parse_args([])),
+        loss_type="sft",
+        prompt_data=path,
+        rollout_batch_size=2,
+        num_epoch=1,
+        num_rollout=None,
+        eval_size=None,
     )
 
 
@@ -190,6 +197,19 @@ def test_sft_factory_reuses_offsets_without_scanning(tmp_path, monkeypatch, publ
     args.metadata_key = "metadata"
     args.tool_key = None
     args.system_prompt = None
+    parser = parser_for_flags(
+        "--custom-dataset-class-path",
+        "--conversation-key-map",
+        "--apply-chat-template-kwargs",
+        "--sft-training-mode",
+        "--sft-cpt-template",
+        "--num-labels",
+        "--problem-type",
+        "--sft-loss-last-turn-only",
+        "--sft-ignore-empty-think",
+    )
+    parser.parse_args([], namespace=args)
+    args.seed = 42
     monkeypatch.setattr(StreamingReader, "_build_index", Mock(side_effect=AssertionError("SFT scanned again")))
     dataset = _create_sft_train_dataset(
         args,

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from relax.engine.sft.eval.preference import finalize_pair_metrics, pair_metric_sums
+from tests.cpu.relax_parser import parser_for_flags
 
 
 try:
@@ -19,6 +20,7 @@ except Exception as exc:
 
 def _args(*, reference_free: bool = False, beta: float = 0.2) -> Namespace:
     return Namespace(
+        **vars(parser_for_flags("--task-type", "--advantage-estimator", "--mtp-only-training").parse_args([])),
         loss_type="dpo",
         dpo_reference_free=reference_free,
         dpo_beta=beta,

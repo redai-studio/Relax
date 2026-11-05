@@ -19,6 +19,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from relax.utils.megatron_argument_compat import dynamic_context_parallel_enabled
+from tests.cpu.relax_parser import parser_for_flags
+
 
 pytest.importorskip("megatron.core.context_parallel_layout", reason="requires the patched Megatron-LM")
 
@@ -44,6 +47,7 @@ def _load_relax_functions(filename, names):
 
 
 megatron_arguments = _load_relax_functions("arguments.py", ["_validate_linear_cp_mode"])
+megatron_arguments.dynamic_context_parallel_enabled = dynamic_context_parallel_enabled
 gdn_model = _load_relax_functions(
     "model.py", ["_patch_gdn_for_dynamic_cp", "_resolve_gdn_cp", "_assert_gdn_full_recompute"]
 )
@@ -81,7 +85,7 @@ def _args(**overrides):
     base = dict(
         linear_cp_mode="chunkwise",
         experimental_attention_variant="gated_delta_net",
-        allgather_cp=False,
+        **vars(parser_for_flags("--allgather-cp").parse_args([])),
         deterministic_mode=False,
         dynamic_context_parallel=False,
         context_parallel_size=1,

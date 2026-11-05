@@ -12,11 +12,13 @@ import json
 import os
 import sys
 import tempfile
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
+
+from tests.cpu.relax_parser import MULTIMODAL_FLAGS, parser_for_flags
 
 
 @pytest.fixture
@@ -79,6 +81,22 @@ class TestDataSourceIntegration:
     """Integration tests for data_source.py with StreamingDataset."""
 
     @pytest.fixture
+    def streaming_parser(self) -> ArgumentParser:
+        opd_parser = parser_for_flags(
+            "--opd-teacher-image-key", "--opd-teacher-prompt-key", source_file="relax/utils/opd/opd_utils.py"
+        )
+        data_parser = parser_for_flags(
+            *MULTIMODAL_FLAGS,
+            "--custom-prompt-path",
+            "--use-streaming-dataset",
+            "--streaming-buffer-size",
+            "--prefetch-chunk-size",
+            "--prefetch-max-cached",
+            "--prefetch-num-workers",
+        )
+        return ArgumentParser(parents=[data_parser, opd_parser], add_help=False)
+
+    @pytest.fixture
     def jsonl_file(self):
         """Create a temporary JSONL file for testing."""
         data = [{"text": f"Sample {i}", "label": f"label_{i}"} for i in range(10)]
@@ -91,27 +109,54 @@ class TestDataSourceIntegration:
         yield filepath, data
         os.unlink(filepath)
 
-    def test_factory_function_streaming(self, jsonl_file, data_source_module):
+    @pytest.mark.parametrize(
+        ("overrides", "buffer_size", "prefetch", "with_images"),
+        [
+            (["--streaming-buffer-size=100"], 100, None, False),
+            ([], 10000, (32, 256, 1), True),
+            (
+                [
+                    "--streaming-buffer-size=100",
+                    "--prefetch-chunk-size=4",
+                    "--prefetch-max-cached=7",
+                    "--prefetch-num-workers=2",
+                ],
+                100,
+                (4, 7, 2),
+                True,
+            ),
+            (["--prefetch-max-cached=0"], 10000, None, True),
+        ],
+        ids=["legacy-text", "default", "explicit", "prefetch-disabled"],
+    )
+    def test_factory_function_streaming(
+        self,
+        jsonl_file,
+        data_source_module,
+        streaming_parser: ArgumentParser,
+        overrides: list[str],
+        buffer_size: int,
+        prefetch: tuple[int, int, int] | None,
+        with_images: bool,
+    ) -> None:
         """Test _create_dataset factory with streaming enabled."""
         from relax.utils.data.streaming_dataset import StreamingDataset
 
         filepath, data = jsonl_file
 
-        args = MagicMock()
-        args.use_streaming_dataset = True
-        args.streaming_buffer_size = 100
+        args = streaming_parser.parse_args(["--use-streaming-dataset", *overrides])
         args.prompt_data = filepath
         args.rollout_max_prompt_len = None
         args.input_key = "text"
-        args.multimodal_keys = None
+        args.multimodal_keys = {"image": "image"} if with_images else None
         args.label_key = "label"
         args.metadata_key = "metadata"
         args.system_prompt = None
         args.tool_key = None
         args.apply_chat_template = False
         args.apply_chat_template_kwargs = None
+        args.use_audio_in_video = False
         args.rollout_seed = 42
-        args.custom_prompt_path = None
 
         tokenizer = MagicMock()
 
@@ -119,15 +164,21 @@ class TestDataSourceIntegration:
 
         assert isinstance(dataset, StreamingDataset)
         assert len(dataset) == len(data)
+        assert dataset.buffer.max_size == buffer_size
+        if prefetch is None:
+            assert dataset._prefetch_buffer is None
+        else:
+            buffer = dataset._prefetch_buffer
+            assert buffer is not None
+            assert (buffer._chunk_size, buffer._max_cached, buffer._num_workers) == prefetch
 
-    def test_factory_function_traditional(self, jsonl_file, data_source_module):
+    def test_factory_function_traditional(self, jsonl_file, data_source_module, streaming_parser: ArgumentParser):
         """Test _create_dataset factory with streaming disabled."""
         from relax.utils.data.data import Dataset
 
         filepath, data = jsonl_file
 
-        args = MagicMock()
-        args.use_streaming_dataset = False
+        args = streaming_parser.parse_args([])
         args.prompt_data = filepath
         args.rollout_max_prompt_len = None
         args.input_key = "text"
@@ -139,7 +190,7 @@ class TestDataSourceIntegration:
         args.apply_chat_template = False
         args.apply_chat_template_kwargs = None
         args.rollout_seed = 42
-        args.custom_prompt_path = None
+        args.use_audio_in_video = False
 
         tokenizer = MagicMock()
 
@@ -147,7 +198,7 @@ class TestDataSourceIntegration:
 
         assert isinstance(dataset, Dataset)
 
-    def test_factory_function_streaming_multi_file_slice(self, data_source_module):
+    def test_factory_function_streaming_multi_file_slice(self, data_source_module, streaming_parser: ArgumentParser):
         """Test _create_dataset factory with streaming dataset over multiple
         files and outer slice."""
         from relax.utils.data.streaming_dataset import StreamingDataset
@@ -162,9 +213,7 @@ class TestDataSourceIntegration:
                         f.write(json.dumps(item) + "\n")
                     files.append(f.name)
 
-            args = MagicMock()
-            args.use_streaming_dataset = True
-            args.streaming_buffer_size = 100
+            args = streaming_parser.parse_args(["--use-streaming-dataset", "--streaming-buffer-size=100"])
             args.prompt_data = f"[{files[0]},{files[1]}]@[2:6]"
             args.rollout_max_prompt_len = None
             args.input_key = "text"
@@ -176,7 +225,7 @@ class TestDataSourceIntegration:
             args.apply_chat_template = False
             args.apply_chat_template_kwargs = None
             args.rollout_seed = 42
-            args.custom_prompt_path = None
+            args.use_audio_in_video = False
 
             tokenizer = MagicMock()
             dataset = data_source_module._create_dataset(args, tokenizer, processor=None)
@@ -216,6 +265,7 @@ class TestDataSourceIntegration:
         # Exercise the real buffer/data-source path with a local dataset and no model loading.
         monkeypatch.setattr(data_source, "_create_dataset", lambda *args: dataset)
         args = Namespace(
+            **vars(parser_for_flags(*MULTIMODAL_FLAGS).parse_args([])),
             use_streaming_dataset=True,
             rollout_global_dataset=True,
             hf_checkpoint=None,

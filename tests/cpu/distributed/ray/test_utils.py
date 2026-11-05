@@ -9,9 +9,12 @@
 - EngineGroup / RolloutServer properties
 """
 
+import asyncio
+
 import pytest
 
 from relax.utils.model_source import ModelSource
+from tests.cpu.relax_parser import parser_for_flags
 
 
 try:
@@ -36,6 +39,57 @@ from conftest import (
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
+
+
+@pytest.mark.parametrize(
+    ("flags", "worker_path", "sampling"),
+    [
+        ([], "workers", {"temperature": 0.0, "max_new_tokens": 512, "top_p": 1.0}),
+        (
+            [
+                "--use-slime-router",
+                "--eval-temperature",
+                "0.7",
+                "--eval-max-response-len",
+                "73",
+                "--eval-top-p",
+                "0.9",
+            ],
+            "list_workers",
+            {"temperature": 0.7, "max_new_tokens": 73, "top_p": 0.9},
+        ),
+    ],
+    ids=["declared-defaults", "explicit-slime-sampling"],
+)
+def test_generate_predict_uses_declared_router_and_sampling(
+    monkeypatch: pytest.MonkeyPatch, flags: list[str], worker_path: str, sampling: dict[str, float | int]
+) -> None:
+    import sglang_router
+
+    from relax.distributed.ray import rollout
+
+    parser = parser_for_flags("--use-slime-router", "--eval-temperature", "--eval-max-response-len", "--eval-top-p")
+    args = parser.parse_args(flags)
+    args.sglang_router_ip, args.sglang_router_port = "router", 8010
+    manager = create_test_manager(args=args)
+    manager.health_monitoring_resume = lambda: None
+    monkeypatch.setattr(sglang_router, "__version__", "0.3.2")
+
+    async def get_workers(url: str) -> dict:
+        assert url == f"http://router:8010/{worker_path}"
+        if worker_path == "list_workers":
+            return {"urls": ["http://worker:8020"]}
+        return {"workers": [{"url": "http://worker:8020"}]}
+
+    async def generate(url: str, payload: dict) -> dict[str, str]:
+        assert url == "http://worker:8020/generate"
+        assert payload == {"text": "sample prompt", "sampling_params": sampling}
+        return {"text": "sample response"}
+
+    monkeypatch.setattr(rollout, "get", get_workers)
+    monkeypatch.setattr(rollout, "post", generate)
+
+    assert asyncio.run(manager.generate_predict(["sample prompt"])) == ["sample response"]
 
 
 def _capture_engine_runtime_env(monkeypatch, args, sglang_overrides):
@@ -269,6 +323,7 @@ class TestEngineGroupProperties:
     def test_start_engines_injects_runai_env_before_actor_import(self, monkeypatch):
         monkeypatch.delenv("RUNAI_STREAMER_S3_ENDPOINT", raising=False)
         args = make_mock_args(
+            rollout_engine_class_path=None,
             model_source=ModelSource("s3://bucket/policy/", "http://provider.example"),
             hf_checkpoint="s3://bucket/policy/",
             sglang_load_format="runai_streamer",
@@ -282,6 +337,7 @@ class TestEngineGroupProperties:
 
     def test_start_engines_does_not_inject_policy_env_for_other_model(self, monkeypatch):
         args = make_mock_args(
+            rollout_engine_class_path=None,
             model_source=ModelSource("s3://bucket/policy/", "http://provider.example"),
             hf_checkpoint="s3://bucket/policy/",
             sglang_load_format="auto",

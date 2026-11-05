@@ -2,16 +2,33 @@
 """Keep balanced packing capacity protection and dummy padding compatible."""
 
 import ast
+from argparse import ArgumentParser
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
+from relax.utils.megatron_argument_compat import dynamic_context_parallel_enabled
+from tests.cpu.relax_parser import args_for_flags
+from tests.cpu.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
+
+
+arguments_module = _arguments_module_fixture
+
+
+@pytest.fixture
+def packing_strategy_parser(arguments_module: ModuleType) -> ArgumentParser:
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    return parser
 
 
 @pytest.fixture
 def partitioner():
     root = Path(__file__).resolve().parents[4]
-    namespace = {"logger": Mock()}
+    namespace = {"logger": Mock(), "dynamic_context_parallel_enabled": dynamic_context_parallel_enabled}
     names = {
         "get_first_fit_partitions",
         "get_binpack_partitions",
@@ -67,9 +84,9 @@ def test_explicit_balanced_matches_default(partitioner):
 @pytest.mark.parametrize("strategy", ["balanced", "binpack"])
 @pytest.mark.parametrize("unsplit", ["is_vl_model", "uses_unsplit_forward", "multimodal_train_inputs", None])
 @pytest.mark.parametrize("cp_size", [1, 4])
-def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner, strategy, unsplit, cp_size):
-    from types import SimpleNamespace
-
+def test_iterator_plans_physical_cp_lengths_without_changing_samples(
+    partitioner, packing_strategy_parser, strategy, unsplit, cp_size
+):
     import numpy as np
     import torch
 
@@ -102,13 +119,20 @@ def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner
     module = ast.Module(body=[ast.parse("from __future__ import annotations").body[0], *nodes], type_ignores=[])
     exec(compile(module, "data.py", "exec"), namespace)
     # With CP4, raw lengths fit one 48-token pack, but physical lengths are 32+32.
-    args = SimpleNamespace(
+    packing_strategy = packing_strategy_parser.parse_args(["--sft-packing-strategy", strategy]).sft_packing_strategy
+    args = args_for_flags(
+        "--allgather-cp",
+        "--balance-data",
+        "--partial-rollout",
+        "--use-dynamic-global-batch-size",
         global_batch_size=2,
         use_dynamic_batch_size=True,
         max_tokens_per_gpu=12 if cp_size > 1 else 48,
-        sft_packing_strategy=strategy,
+        sft_packing_strategy=packing_strategy,
         qkv_format="thd",
         dynamic_context_parallel=True,
+        is_vl_model=False,
+        uses_unsplit_forward=False,
     )
     lengths = [17, 17]
     data = {"total_lengths": lengths}
@@ -126,10 +150,13 @@ def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner
     assert lengths == [17, 17]
 
 
-@pytest.mark.parametrize("strategy", ["balanced", "binpack"])
-def test_iterator_uses_selected_packing_and_dp_aligned_count(partitioner, strategy):
-    from types import SimpleNamespace
-
+@pytest.mark.parametrize(
+    ("argv", "explicit_null", "strategy"),
+    [([], False, "balanced"), (["--sft-packing-strategy", "binpack"], False, "binpack"), ([], True, "balanced")],
+)
+def test_iterator_uses_selected_packing_and_dp_aligned_count(
+    partitioner, packing_strategy_parser, argv, explicit_null, strategy
+):
     import numpy as np
     import torch
 
@@ -174,11 +201,15 @@ def test_iterator_uses_selected_packing_and_dp_aligned_count(partitioner, strate
         namespace,
     )
     lengths = [4, 3, 5, 5, 11, 14, 12, 14, 14, 15, 6, 2]
-    args = SimpleNamespace(
+    args = args_for_flags(
+        "--allgather-cp",
+        "--balance-data",
+        "--partial-rollout",
+        "--use-dynamic-global-batch-size",
         global_batch_size=12,
         use_dynamic_batch_size=True,
         max_tokens_per_gpu=20,
-        sft_packing_strategy=strategy,
+        sft_packing_strategy=None if explicit_null else packing_strategy_parser.parse_args(argv).sft_packing_strategy,
         qkv_format="thd",
         sft_whole_pack=False,
         pad_multiplier=1,

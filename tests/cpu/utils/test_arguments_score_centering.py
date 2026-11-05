@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.cpu.relax_parser import parser_for_flags
 from tests.cpu.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
 from tests.cpu.utils.test_arguments_rloo import _rloo_args
 
@@ -13,7 +14,14 @@ arguments_module = _arguments_module_fixture
 
 
 def _sc_args(**overrides) -> SimpleNamespace:
+    parser = parser_for_flags(
+        "--custom-tis-function-path",
+        "--use-opsm",
+        "--use-unbiased-kl",
+        "--custom-pg-loss-reducer-function-path",
+    )
     values = dict(
+        **vars(parser.parse_args([])),
         advantage_estimator="score_centering",
         loss_type="policy_loss",
         use_opd=False,

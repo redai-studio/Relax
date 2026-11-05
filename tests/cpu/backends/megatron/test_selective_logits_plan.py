@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from relax.backends.megatron.selective_logits import prepare_selective_logits
+from tests.cpu.backends.megatron.test_data_vpp import data_batch_args
 
 
 def test_main_selection_preserves_weights_and_empty_rows():
@@ -62,7 +63,7 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
     from relax.utils.data import stream_dataloader
 
     monkeypatch.setenv("RELAX_SFT_SELECTIVE_LOGITS", "1")
-    args = Namespace(
+    args = data_batch_args(
         loss_type="sft",
         qkv_format="thd",
         sft_chunked_logits=True,
