@@ -29,6 +29,8 @@ RAY_ADDRESS=http://head-host:8265 \
 
 工具服务由现有 `examples.retool.train` 在 Ray Job 生命周期内管理。自动选择 Landlock 或 Apptainer 后端，镜像缓存仍为 `$SAVE_DIR/.retool-sandbox/`；可选 `SANDBOX_IMAGE` 或 `SANDBOX_FUSION_URL` 的配置与[原示例](../retool/README.md)相同。服务 URL 会传入 Session 所在 worker，tokenizer 路径通过 `--agent-env` 传入 agent 进程。
 
+若机器出现 NVSwitch multicast 建链失败并伴随 NCCL CUDA 999，可设置 `NCCL_NVLS_ENABLE=0` 关闭 NVLS 后重启。脚本会将显式设置传入 Ray worker，覆盖入口按 NVLink 拓扑自动生成的值；未设置时沿用入口默认值。
+
 ## 默认训练配置
 
 | 参数               | 值                                                            |

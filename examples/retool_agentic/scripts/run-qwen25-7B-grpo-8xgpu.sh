@@ -30,7 +30,7 @@ RUNTIME_ENV_JSON=$(python3 - <<'ENV'
 import json
 import os
 value = json.loads(os.environ["RUNTIME_ENV_JSON"])
-names = ["DATA_DIR", "SAVE_DIR", "SANDBOX_FUSION_URL", "SANDBOX_IMAGE", "RELAX_PROPAGATE_ENV_VARS"]
+names = ["DATA_DIR", "SAVE_DIR", "SANDBOX_FUSION_URL", "SANDBOX_IMAGE", "RELAX_PROPAGATE_ENV_VARS", "NCCL_NVLS_ENABLE"]
 value.setdefault("env_vars", {})["PYTHONPATH"] = os.environ["PYTHONPATH"]
 value["env_vars"].update({name: os.environ[name] for name in names if name in os.environ})
 print(json.dumps(value))

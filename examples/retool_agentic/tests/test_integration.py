@@ -395,7 +395,8 @@ def test_reward_checks_resumed_policy_version():
         asyncio.run(reward_func(args, sample))
 
 
-def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path):
+@pytest.mark.parametrize("nvls", [None, "0"])
+def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, nvls):
     tools = tmp_path / "bin"
     tools.mkdir()
     record = tmp_path / "ray.jsonl"
@@ -417,7 +418,7 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path):
     (model / "tokenizer.json").write_text("{}")
     (data / "train.jsonl").write_text("{}\n")
     env = {key: value for key, value in os.environ.items() if not key.startswith(("RAY_", "RELAX_", "SANDBOX_"))}
-    for name in ("EVAL_CONFIG", "EXP_NAME"):
+    for name in ("EVAL_CONFIG", "EXP_NAME", "NCCL_NVLS_ENABLE"):
         env.pop(name, None)
     env.update(
         PATH=f"{tools}:{os.environ['PATH']}",
@@ -426,12 +427,20 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path):
         SAVE_DIR=str(save),
         TEST_RAY_RECORD=str(record),
     )
+    if nvls is not None:
+        # Existing-cluster entrypoints auto-detect NVLink. An explicit override
+        # must still win in the actual submitted worker environment.
+        env.update(
+            RELAX_ENTRYPOINT_MODE="ray-job",
+            RUNTIME_ENV_JSON='{"env_vars":{"NCCL_NVLS_ENABLE":"1"}}',
+            NCCL_NVLS_ENABLE=nvls,
+        )
     script = ROOT / "examples/retool_agentic/scripts/run-qwen25-7B-grpo-8xgpu.sh"
     # All process/cluster executables above are stubs: never clean up real Ray.
     result = subprocess.run(["bash", str(script)], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     commands = [json.loads(line) for line in record.read_text().splitlines()]
-    assert any(command[0] == "start" for command in commands)
+    assert any(command[0] == "start" for command in commands) == (nvls is None)
     command = next(command for command in commands if command[:2] == ["job", "submit"])
     assert "--no-wait" not in command
     assert "--use-agentic-rollout" in command
@@ -443,3 +452,5 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path):
     runtime = json.loads(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--runtime-env-json=")))
     assert runtime["env_vars"]["DATA_DIR"] == str(data)
     assert runtime["env_vars"]["SAVE_DIR"] == str(save)
+    if nvls is not None:
+        assert runtime["env_vars"]["NCCL_NVLS_ENABLE"] == nvls
