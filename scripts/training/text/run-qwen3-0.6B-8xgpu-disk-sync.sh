@@ -72,12 +72,12 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type dapo
    --reward-key score
-   --num-rollout "${NUM_ROLLOUT:-5}"
-   --rollout-batch-size 4
-   --n-samples-per-prompt 2
-   --rollout-max-response-len 256
-   --rollout-temperature 0.8
-   --global-batch-size 8
+   --num-rollout "${NUM_ROLLOUT:-10}"
+   --rollout-batch-size 16
+   --n-samples-per-prompt 8
+   --rollout-max-response-len 8192
+   --rollout-temperature 1.0
+   --global-batch-size 128
    --skip-eval-before-train
    --seed 42
 )
@@ -88,26 +88,22 @@ PERF_ARGS=(
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
-   --log-probs-max-tokens-per-gpu 4096
+   --max-tokens-per-gpu 16384
+   --log-probs-max-tokens-per-gpu 16384
    --calculate-per-token-loss
 )
 GRPO_ARGS=(
    --advantage-estimator grpo
-   # The tiny bounded DAPO batch can have constant rewards; entropy keeps this
-   # validation on a real nonzero-gradient optimizer path in that case.
-   --entropy-coef 0.001
+   --entropy-coef 0.0
    --eps-clip 0.2
    --eps-clip-high 0.28
 )
 OPTIMIZER_ARGS=(
-   # Make AdamW decay visible in BF16 within five real optimizer steps, even
-   # when a tiny DAPO batch has zero reward variance. This is a sync validation
-   # configuration, not a convergence or model-quality recipe.
+   # Match the standard Dense GRPO optimizer recipe.
    --optimizer adam
-   --lr 1e-3
+   --lr 1e-6
    --lr-decay-style constant
-   --weight-decay 1.0
+   --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
 )
