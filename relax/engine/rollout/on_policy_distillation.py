@@ -319,8 +319,8 @@ class OpdManager:
             await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
 
         async with _create_teacher_client_session(self.args) as session:
-            fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, fetch_results)
+            successes = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
+            self._raise_if_all_failed(sample_list, successes)
 
             if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
                 await asyncio.gather(
