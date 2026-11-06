@@ -73,6 +73,7 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
 
     monkeypatch.setattr(module.os, "getppid", getppid)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_SGLANG_CONTROL_POLL_INTERVAL", 1.0, raising=False)
     server_args = SimpleNamespace()
     module._launch_server_with_patches(server_args, 123)
 
@@ -332,7 +333,15 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
         base_gpu_id=0,
         sglang_overrides={"custom_weight_loader": existing},
     )
-    expected = list(dict.fromkeys([*(existing or []), "relax.backends.sglang.weight_loader.load_expert_slices"]))
+    expected = list(
+        dict.fromkeys(
+            [
+                *(existing or []),
+                "relax.backends.sglang.weight_loader.load_expert_slices",
+                "relax.backends.sglang.weight_loader.fence_native_weights",
+            ]
+        )
+    )
     assert result["custom_weight_loader"] == expected
     assert result["custom_weight_loader"] is not existing
 

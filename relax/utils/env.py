@@ -185,6 +185,12 @@ class _EnvsMeta(type):
 
 
 class Envs(metaclass=_EnvsMeta):
+    # ------------- Colocated training lifecycle -------------
+    RELAX_COLOCATE_FUSED_WEIGHT_SYNC = EnvProperty("RELAX_COLOCATE_FUSED_WEIGHT_SYNC", bool, True)
+    RELAX_COLOCATE_KEEP_PROCESS_GROUPS = EnvProperty("RELAX_COLOCATE_KEEP_PROCESS_GROUPS", bool, False)
+    RELAX_COLOCATE_LIGHT_CLEANUP = EnvProperty("RELAX_COLOCATE_LIGHT_CLEANUP", bool, False)
+    RELAX_SGLANG_CONTROL_POLL_INTERVAL = EnvProperty("RELAX_SGLANG_CONTROL_POLL_INTERVAL", float, 1.0)
+
     # ------------- GenRM -------------
     GENRM_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("GENRM_SERVE_MAX_ONGOING_REQUESTS", int, 256)
     GENRM_ENGINE_RETRY_ATTEMPTS = EnvProperty("GENRM_ENGINE_RETRY_ATTEMPTS", int, 3)

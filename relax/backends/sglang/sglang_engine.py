@@ -344,6 +344,13 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
+    if Envs.RELAX_SGLANG_CONTROL_POLL_INTERVAL != 1.0:
+        if getattr(server_args, "tokenizer_worker_num", None) != 1:
+            raise NotImplementedError("Short control polling currently requires one SGLang tokenizer worker")
+        from .control_polling_patch import apply
+
+        apply(Envs.RELAX_SGLANG_CONTROL_POLL_INTERVAL)
+
     # A wedged actor cannot run shutdown(). Keep its server tied to its lifetime,
     # including when the actor exits before the child installs this guard.
     kill_itself_when_parent_died()
@@ -2213,13 +2220,15 @@ def _compute_server_args(
         kwargs["disable_shared_experts_fusion"] = True
 
     if "custom_weight_loader" in server_arg_field_names:
-        from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
+        from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER, NATIVE_SYNC_FENCE_LOADER
 
         # Register alongside user loaders. The sender negotiates this exact
         # capability from server_info before emitting partial native tensors.
         loaders = list(kwargs.get("custom_weight_loader") or [])
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
+        if NATIVE_SYNC_FENCE_LOADER not in loaders:
+            loaders.append(NATIVE_SYNC_FENCE_LOADER)
         kwargs["custom_weight_loader"] = loaders
 
     if (

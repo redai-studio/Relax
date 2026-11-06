@@ -56,7 +56,29 @@ class _TensorBackuperNormal(TensorBackuper):
         return list(self._backups)
 
     def get(self, tag: str):
+        if tag == "actor" and getattr(self, "_actor_dirty", False):
+            raise RuntimeError("Actor snapshot is awaiting completion of a forward weight transfer")
         return self._backups[tag]
+
+    def mark_actor_dirty(self) -> None:
+        if set(self._backups) != {"actor"}:
+            raise RuntimeError("Fused forward sync requires a single actor snapshot")
+        self._actor_dirty = True
+
+    def adopt_actor_backing(self, tensors: dict[str, torch.Tensor]) -> None:
+        """Borrow completed selective-offload backing for the sole actor
+        tag."""
+        if set(self._backups) != {"actor"} or set(tensors) != set(self._backups["actor"]):
+            raise RuntimeError("Shared offload backing requires complete, single-version actor coverage")
+        if any(t.device.type != "cpu" for t in tensors.values()):
+            raise ValueError("Actor backing must be on CPU")
+        if any(
+            tensor.shape != self._backups["actor"][name].shape or tensor.dtype != self._backups["actor"][name].dtype
+            for name, tensor in tensors.items()
+        ):
+            raise ValueError("Actor backing shape/dtype changed")
+        self._backups["actor"] = tensors
+        self._actor_dirty = False
 
     @torch.no_grad()
     def backup(self, tag: str) -> None:
@@ -66,6 +88,8 @@ class _TensorBackuperNormal(TensorBackuper):
                 backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_module.synchronize()
+        if tag == "actor":
+            self._actor_dirty = False
 
     @torch.no_grad()
     def copy(self, *, src_tag: str, dst_tag: str):
@@ -74,7 +98,7 @@ class _TensorBackuperNormal(TensorBackuper):
 
     @torch.no_grad()
     def restore(self, tag: str) -> None:
-        backup_dict = self._backups[tag]
+        backup_dict = self.get(tag)
         for name, param in self._source_getter():
             assert name in backup_dict
             param.copy_(backup_dict[name], non_blocking=_NON_BLOCKING)

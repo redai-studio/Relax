@@ -119,6 +119,9 @@ WANDB_ARGS=(
 )
 
 MISC_ARGS=(
+   # Bound resident Actor communication buffers during colocate rollout.
+   # Keep SGLang's communicator settings unchanged.
+   --train-env-vars '{"NCCL_BUFFSIZE":"1048576","NCCL_MAX_CTAS":"8","NCCL_NVLS_ENABLE":"0"}'
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
    --hidden-dropout 0.0
