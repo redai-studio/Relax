@@ -1729,6 +1729,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Prelaunch agent processes for the next rollout step.",
             )
             parser.add_argument(
+                "--agentic-native-replay-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Opt-in shared directory for exact native Agentic generation request/response streams. "
+                    "Uses bounded asynchronous recording with prefix deltas; incomplete streams are marked explicitly."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-session-capacity-per-node",
+                type=int,
+                default=None,
+                help="Physical train Session limit per host; requires exact agent resource-release receipts.",
+            )
+            parser.add_argument(
+                "--agentic-incremental-session-start",
+                action="store_true",
+                help="Start partial Groups as individual physical Session credits become available.",
+            )
+            parser.add_argument(
+                "--agentic-fixed-step-eager",
+                action="store_true",
+                help="Generate each ready Session before its Group first-IR barrier; drain fully at every train step.",
+            )
+            parser.add_argument(
                 "--agentic-session-lifecycle",
                 action="store_true",
                 default=False,
@@ -3521,6 +3546,24 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-concurrency must be > 0.")
     if args.agentic_eval_concurrency is not None and args.agentic_eval_concurrency <= 0:
         raise ValueError("--agentic-eval-concurrency must be > 0.")
+    capacity = getattr(args, "agentic_session_capacity_per_node", None)
+    incremental = getattr(args, "agentic_incremental_session_start", False)
+    eager = getattr(args, "agentic_fixed_step_eager", False)
+    if capacity is not None and capacity < args.n_samples_per_prompt:
+        raise ValueError("--agentic-session-capacity-per-node must fit one complete Group.")
+    if incremental and capacity is None:
+        raise ValueError("Incremental Session startup requires --agentic-session-capacity-per-node.")
+    if eager and (
+        not incremental
+        or any(
+            getattr(args, name, False)
+            for name in ("fully_async", "partial_rollout", "agentic_prelaunch", "use_dynamic_global_batch_size")
+        )
+        or getattr(args, "over_sampling_batch_size", None) not in (None, args.rollout_batch_size)
+    ):
+        raise ValueError(
+            "Fixed-step eager requires incremental capacity, no oversampling, and synchronous full steps."
+        )
     if args.agentic_program_admission:
         if args.agentic_admission_expected_decode_cap is None:
             args.agentic_admission_expected_decode_cap = args.rollout_max_response_len

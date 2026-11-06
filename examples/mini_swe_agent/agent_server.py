@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -267,8 +268,8 @@ def _stop_apptainer_instance(executable: str, global_args: list[str], instance_n
     if pid is None:
         return ""
     try:
-        parent_pid = _ppid(pid)
-        os.kill(parent_pid if parent_pid > 1 else pid, signal.SIGKILL)
+        # A subreaper may be this instance's parent. Never kill an unowned parent.
+        os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     except OSError as exc:
@@ -412,6 +413,9 @@ class SessionRecord:
     n_calls: int = 0
     future: Future | None = None
     finished_at: float | None = None
+    release_nonce: str = ""
+    resources_released: bool = False
+    cleanup_error: str = ""
 
     def finish(self, info: dict[str, Any], error: str) -> None:
         if self.cancel_event.is_set():
@@ -713,6 +717,38 @@ class MyLitellmModel(LitellmModel):
             raise FormatError(message, *exc.messages) from exc
 
 
+@contextmanager
+def _reward_slot() -> Iterator[None]:
+    """Keep one reward budget across independent Session workers."""
+    directory = os.environ.get("AGENT_SERVER_REWARD_LOCK_DIR")
+    if directory and _REWARD_CONCURRENCY > 0:
+        held = None
+        try:
+            while held is None:
+                for index in range(_REWARD_CONCURRENCY):
+                    file = open(Path(directory) / str(index), "a+b")
+                    try:
+                        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        held = file
+                        break
+                    except BlockingIOError:
+                        file.close()
+                if held is None:
+                    time.sleep(0.05)
+            yield
+        finally:
+            if held is not None:
+                held.close()
+    else:
+        if _reward_semaphore is not None:
+            _reward_semaphore.acquire()
+        try:
+            yield
+        finally:
+            if _reward_semaphore is not None:
+                _reward_semaphore.release()
+
+
 class MyAgent(DefaultAgent):
     def __init__(
         self,
@@ -758,9 +794,7 @@ class MyAgent(DefaultAgent):
         # until every group scores 0 and the signal collapses. Gate scoring on
         # a real submission so reward only reflects "fixed it and submitted".
         if info.get("exit_status") == "Submitted":
-            if _reward_semaphore is not None:
-                _reward_semaphore.acquire()
-            try:
+            with _reward_slot():
                 reward_result = self.env.execute(
                     {"command": self.reward_command}, timeout=SETUP_AND_REWARD_TIMEOUT_SECONDS
                 )
@@ -769,9 +803,6 @@ class MyAgent(DefaultAgent):
                 output = reward_result.get("output", "")
                 reward_func = _r2e_reward if self.rollout_mode == "train" else _swebench_reward
                 reward = reward_func(self.row, output)
-            finally:
-                if _reward_semaphore is not None:
-                    _reward_semaphore.release()
         else:
             reward = 0.0
         return {**info, "reward": reward, "n_calls": self.n_calls}
@@ -821,6 +852,12 @@ class AgentServer:
             get_config_from_spec(Path(__file__).resolve().parent / "agent_config.yaml"),
         )
         self.r2e_config = self.base_config.pop("r2e")
+        max_turns = int(os.environ.get("AGENT_SERVER_MAX_TURNS", self.base_config["agent"]["step_limit"]))
+        if max_turns <= 0:
+            raise ValueError("AGENT_SERVER_MAX_TURNS must be positive")
+        self.base_config["agent"]["step_limit"] = max_turns
+        self._supervised = os.environ.get("AGENT_SERVER_SUPERVISED_SESSIONS", "0") == "1"
+        self._stopping = False
         environment_config = self.base_config["environment"]
         self.apptainer_args = (
             str(environment_config.get("executable", "apptainer")),
@@ -829,6 +866,7 @@ class AgentServer:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self._tmp_root.mkdir(parents=True, exist_ok=True)
         self.tmp_base.mkdir(parents=True, exist_ok=True)
+        (self.tmp_base / "reward_slots").mkdir(exist_ok=True)
         # Startup cleanup runs under a node-shared flock so co-tenant servers
         # cannot race the same reclaim. Reclaim ONLY dead/legacy owners -- never a
         # live server's instances or in-flight scratch (the previous unscoped
@@ -865,17 +903,25 @@ class AgentServer:
             for mode, config in self.r2e_config["datasets"].items()
         }
         self.records: dict[str, SessionRecord] = {}
+        self._session_keys: dict[tuple[str, str], str] = {}
         self.executors = {
             "train": ThreadPoolExecutor(max_workers=train_concurrency),
             "eval": ThreadPoolExecutor(max_workers=eval_concurrency),
         }
         self.lock = threading.Lock()
+        self._event_lock = threading.Lock()
         self._record_ttl = float(os.environ.get("AGENT_SERVER_RECORD_TTL_SECONDS", SESSION_RECORD_TTL_SECONDS))
         threading.Thread(target=self._record_sweep_loop, name="record-sweeper", daemon=True).start()
 
     def create_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         mode = str(payload["mode"])
         with self.lock:
+            if self._stopping:
+                raise RuntimeError("Agent server is stopping")
+            key = (str(payload["session_id"]), str(payload.get("release_nonce", "")))
+            if key in self._session_keys:
+                sid = self._session_keys[key]
+                return {"session_id": sid, "status": self.records[sid].status}
             group_id = str(payload["group_id"])
             sample_idx = self.modes[mode].lease_sample(group_id)
             server_session_id = f"{payload['session_id']}-{uuid.uuid4().hex[:8]}"
@@ -886,9 +932,12 @@ class AgentServer:
                 mode=mode,
                 base_url=str(payload["base_url"]),
                 api_key=str(payload["api_key"]),
+                release_nonce=key[1],
             )
             self.records[server_session_id] = record
-            record.future = self.executors[mode].submit(self._run_session, server_session_id, sample_idx)
+            self._session_keys[key] = server_session_id
+            runner = self._run_supervised_session if self._supervised else self._run_session
+            record.future = self.executors[mode].submit(runner, server_session_id, sample_idx)
         return {"session_id": server_session_id, "status": "queued"}
 
     def get_session(self, server_session_id: str) -> dict[str, Any]:
@@ -915,11 +964,14 @@ class AgentServer:
                 sid
                 for sid, record in self.records.items()
                 if record.status in TERMINAL_STATUSES
+                and record.future is not None
+                and record.future.done()
                 and record.finished_at is not None
                 and record.finished_at < cutoff
             ]
             for sid in stale:
-                self.records.pop(sid, None)
+                record = self.records.pop(sid)
+                self._session_keys.pop((record.session_id, record.release_nonce), None)
         return len(stale)
 
     def _record_sweep_loop(self) -> None:
@@ -939,7 +991,9 @@ class AgentServer:
             future = record.future
             env = record.env
         if future is not None:
-            future.cancel()
+            if future.cancel():
+                with self.lock:
+                    record.resources_released = True  # No worker was ever launched.
         if env is not None:
             try:
                 env.cleanup()
@@ -949,6 +1003,7 @@ class AgentServer:
     def shutdown(self) -> None:
         errors = []
         with self.lock:
+            self._stopping = True
             records = list(self.records.values())
             for record in records:
                 record.cancel_event.set()
@@ -960,7 +1015,7 @@ class AgentServer:
                     errors.append(str(exc))
                     logging.warning("failed to cleanup session during shutdown: %s", exc)
         for executor in self.executors.values():
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=self._supervised, cancel_futures=True)
         try:
             _stop_mswe_instances(
                 *self.apptainer_args,
@@ -974,6 +1029,117 @@ class AgentServer:
         _drain_orphans()
         if errors:
             raise RuntimeError("Agent server shutdown cleanup failed:\n" + "\n".join(errors))
+
+    def _run_supervised_session(self, server_session_id: str, sample_idx: int) -> None:
+        try:
+            self._supervise_session(server_session_id, sample_idx)
+        except Exception as exc:
+            with self.lock:
+                record = self.records[server_session_id]
+                record.finish({}, f"{type(exc).__name__}: {exc}")
+
+    def _supervise_session(self, server_session_id: str, sample_idx: int) -> None:
+        with self.lock:
+            record = self.records[server_session_id]
+            if record.cancel_event.is_set():
+                record.cancel()
+                record.resources_released = True
+                return
+            record.status = "running"
+        control = self.tmp_base / f"{server_session_id}-control"
+        control.mkdir(mode=0o700)
+        spec = {
+            "record": {
+                key: getattr(record, key)
+                for key in ("session_id", "group_id", "sample_idx", "mode", "base_url", "api_key")
+            },
+            "server_session_id": server_session_id,
+            "row": self.modes[record.mode].get(sample_idx),
+            "base_config": self.base_config,
+            "r2e_config": self.r2e_config,
+            "sifs": {key: str(value) for key, value in self.sifs.items()},
+            "sif_dir": str(self.sif_dir),
+            "wheel_dir": str(self.wheel_dir),
+            "tmp_base": str(self.tmp_base),
+            "work_dir": str(self.work_dir),
+            "apptainer_args": self.apptainer_args,
+            "instance_name": _new_instance_name(),
+            "server_pid": os.getpid(),
+            "release_nonce": record.release_nonce,
+        }
+        spec_path, report_path = control / "spec.json", control / "release.json"
+        spec_path.write_text(json.dumps(spec))
+        env = dict(os.environ, AGENT_SERVER_REWARD_LOCK_DIR=str(self.tmp_base / "reward_slots"))
+        error = ""
+        info: dict[str, Any] = {}
+        proc = None
+        try:
+            with (control / "worker.log").open("w") as log:
+                with _owned_lock:
+                    proc = subprocess.Popen(
+                        [
+                            sys.executable,
+                            str(Path(__file__).with_name("session_process.py")),
+                            str(spec_path),
+                            str(report_path),
+                        ],
+                        env=env,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    _owned_child_pids.add(proc.pid)
+                signalled = False
+                while proc.poll() is None:
+                    if record.cancel_event.is_set() and not signalled:
+                        proc.terminate()
+                        signalled = True
+                    time.sleep(0.05)
+                proc.wait()
+            if proc.returncode != 0 or not report_path.exists():
+                raise RuntimeError(f"Session supervisor failed ({proc.returncode}); see {control / 'worker.log'}")
+            report = json.loads(report_path.read_text())
+            if report["nonce"] != record.release_nonce or report["client_session_id"] != record.session_id:
+                raise RuntimeError("Supervisor release identity mismatch")
+            record.resources_released = report["resources_released"] is True
+            record.cleanup_error = report["cleanup_error"]
+            info, error = report["info"], report["error"]
+            if not record.resources_released:
+                error = (error + "\nSession resources remain unconfirmed: " + record.cleanup_error).strip()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if proc is not None and proc.poll() is not None:
+                _unregister_child(proc.pid)
+        with self.lock:
+            record.finish(info, error)
+        self._write_session_event(server_session_id, record, spec["row"])
+        if record.status == "completed" and record.resources_released:
+            shutil.rmtree(control)
+
+    def _write_session_event(self, server_session_id: str, record: SessionRecord, row: dict) -> None:
+        with self.lock:
+            event = {
+                "time": time.time(),
+                "session_id": server_session_id,
+                "client_session_id": record.session_id,
+                "group_id": record.group_id,
+                "mode": record.mode,
+                "sample_idx": record.sample_idx,
+                "docker_image": row.get("docker_image"),
+                "status": record.status,
+                "exit_code": record.exit_code,
+                "error": record.error,
+                "resources_released": record.resources_released,
+            }
+            filename = "session_releases.jsonl" if record.status == "completed" else "agent_server_events.jsonl"
+        self._append_event(filename, event)
+
+    def _append_event(self, filename: str, event: dict[str, Any]) -> None:
+        # Shared-filesystem writes may stall. Serialize them separately so GET,
+        # create and cancel remain responsive. The worker Future still gates ACK.
+        with self._event_lock, (self.work_dir / filename).open("a") as file:
+            file.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     def _run_session(self, server_session_id: str, sample_idx: int) -> None:
         with self.lock:
@@ -990,7 +1156,7 @@ class AgentServer:
         # `env.cleanup()` never runs -> the instance leaks, accumulates, and
         # eventually exhausts host resources so every new `instance start` fails
         # with exit 255, collapsing whole rollout groups to zero reward).
-        instance_name = _new_instance_name()
+        instance_name = getattr(self, "_worker_instance_name", None) or _new_instance_name()
         info: dict[str, Any] = {}
         error = ""
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -1077,9 +1243,11 @@ class AgentServer:
             else:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
+        event = None
         with self.lock:
             record = self.records[server_session_id]
             record.env = None
+            record.cleanup_error = cleanup_error
             record.finish(info, error)
             if record.status in {"failed", "cancelled"}:
                 event = {
@@ -1094,18 +1262,34 @@ class AgentServer:
                     "exit_code": record.exit_code,
                     "error": record.error,
                 }
-                with (self.work_dir / "agent_server_events.jsonl").open("a") as file:
-                    file.write(json.dumps(event, ensure_ascii=False) + "\n")
+        if event is not None:
+            self._append_event("agent_server_events.jsonl", event)
 
     def _public_record(self, server_session_id: str, record: SessionRecord) -> dict[str, Any]:
+        status = record.status
+        if status in TERMINAL_STATUSES and record.future is not None and not record.future.done():
+            # Legacy clients also need to wait for finalization: event I/O can
+            # still fail before the worker returns, changing completed to failed.
+            status = "running"
         data: dict[str, Any] = {
             "session_id": server_session_id,
             "client_session_id": record.session_id,
-            "status": record.status,
+            "status": status,
             "exit_code": record.exit_code,
             "error": record.error,
+            "resource_release_failed": record.future is not None
+            and record.future.done()
+            and not record.resources_released,
+            "resource_release": {
+                "schema": 1,
+                "session_id": record.session_id,
+                "nonce": record.release_nonce,
+                "status": "released"
+                if record.resources_released and record.future is not None and record.future.done()
+                else "unknown",
+            },
         }
-        if record.status != "completed":
+        if status != "completed":
             return data
         data.update(
             {
@@ -1188,5 +1372,45 @@ def main() -> None:
     app.run(host=args.host, port=args.port, threaded=True)
 
 
+def session_worker(spec_path: str, result_path: str) -> None:
+    from types import SimpleNamespace
+
+    def cancel(_signum, _frame):
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, cancel)
+    signal.signal(signal.SIGINT, cancel)
+    spec = json.loads(Path(spec_path).read_text())
+    server = AgentServer.__new__(AgentServer)
+    server.lock = threading.Lock()
+    server._event_lock = threading.Lock()
+    record = SessionRecord(**spec["record"])
+    server.records = {spec["server_session_id"]: record}
+    server.modes = {record.mode: SimpleNamespace(get=lambda _index: spec["row"])}
+    for key in ("base_config", "r2e_config", "apptainer_args"):
+        setattr(server, key, spec[key])
+    for key in ("tmp_base", "work_dir", "sif_dir", "wheel_dir"):
+        setattr(server, key, Path(spec[key]))
+    server.sifs = {key: Path(value) for key, value in spec["sifs"].items()}
+    server._worker_instance_name = spec["instance_name"]
+    server._run_session(spec["server_session_id"], record.sample_idx)
+    Path(result_path).write_text(
+        json.dumps(
+            {
+                "info": {
+                    "exit_status": record.agent_exit_status,
+                    "submission": record.submission,
+                    "reward": record.reward,
+                    "n_calls": record.n_calls,
+                },
+                "error": record.error,
+            }
+        )
+    )
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == "--session-worker":
+        session_worker(sys.argv[2], sys.argv[3])
+    else:
+        main()

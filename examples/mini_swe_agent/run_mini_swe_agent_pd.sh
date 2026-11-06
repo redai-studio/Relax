@@ -47,6 +47,7 @@ PORT
    (
       export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2
       export MSWEA_CONFIGURED=true MSWEA_SILENT_STARTUP=true MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT=1
+      export LITELLM_LOCAL_MODEL_COST_MAP="${AGENT_SERVER_LOCAL_MODEL_COST_MAP:-False}"
       exec "${MINI_SWE_AGENT_VENV}/bin/python" "${SCRIPT_DIR}/agent_server.py" \
          --host "${AGENT_SERVER_HOST}" --port "${AGENT_SERVER_PORT}"
    ) >"${AGENT_SERVER_WORK_DIR}/server.log" 2>&1 &
@@ -80,7 +81,13 @@ if [[ -z "${RELAX_ENTRYPOINT_MODE:-}" || -z "${RUNTIME_ENV_JSON:-}" ]]; then
    exit 1
 fi
 : "${MODEL_DIR:?Set MODEL_DIR to the parent of Qwen3.5-35B-A3B}"
-: "${SAVE_DIR:?Set SAVE_DIR for checkpoints}"
+ENABLE_CHECKPOINT_SAVE="${ENABLE_CHECKPOINT_SAVE:-1}"
+[[ "${ENABLE_CHECKPOINT_SAVE}" == 0 || "${ENABLE_CHECKPOINT_SAVE}" == 1 ]] || {
+   echo "ENABLE_CHECKPOINT_SAVE must be 0 or 1" >&2; exit 1;
+}
+if [[ "${ENABLE_CHECKPOINT_SAVE}" == 1 ]]; then
+   : "${SAVE_DIR:?Set SAVE_DIR for checkpoints}"
+fi
 : "${R2E_DATA_PATH:?Set R2E_DATA_PATH to the prepared parquet data directory}"
 : "${R2E_SIF_DIR:?Set R2E_SIF_DIR to the prepared SIF directory}"
 : "${EXP_ROOT:?Set EXP_ROOT to a new directory for this run}"
@@ -97,10 +104,17 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 N_SAMPLES_PER_PROMPT=8
 [[ "${ROLLOUT_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || { echo "ROLLOUT_BATCH_SIZE must be positive" >&2; exit 1; }
 GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
+AGENTIC_CONCURRENCY="${AGENTIC_CONCURRENCY:-${ROLLOUT_BATCH_SIZE}}"
+[[ "${AGENTIC_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || { echo "AGENTIC_CONCURRENCY must be positive" >&2; exit 1; }
+if [[ -n "${AGENTIC_SESSION_CAPACITY_PER_NODE:-}" ]]; then
+   REQUIRED_AGENT_SLOTS="${AGENTIC_SESSION_CAPACITY_PER_NODE}"
+else
+   REQUIRED_AGENT_SLOTS=$((AGENTIC_CONCURRENCY * N_SAMPLES_PER_PROMPT))
+fi
 export AGENT_SERVER_TRAIN_CONCURRENCY="${AGENT_SERVER_TRAIN_CONCURRENCY:-${GLOBAL_BATCH_SIZE}}"
 [[ "${AGENT_SERVER_TRAIN_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] && \
-   ((AGENT_SERVER_TRAIN_CONCURRENCY >= GLOBAL_BATCH_SIZE)) || {
-   echo "Agent server needs at least ${GLOBAL_BATCH_SIZE} train slots for all resident sessions." >&2
+   ((AGENT_SERVER_TRAIN_CONCURRENCY >= REQUIRED_AGENT_SLOTS)) || {
+   echo "Agent server needs at least ${REQUIRED_AGENT_SLOTS} train slots for the admitted sessions." >&2
    exit 1
 }
 export AGENT_SERVER_EVAL_CONCURRENCY="${AGENT_SERVER_EVAL_CONCURRENCY:-64}"
@@ -116,7 +130,10 @@ export AGENT_SERVER_SHUFFLE="${AGENT_SERVER_SHUFFLE:-1}"
 export AGENT_SERVER_SEED="${AGENT_SERVER_SEED:-42}"
 export AGENT_SERVER_REWARD_CONCURRENCY="${AGENT_SERVER_REWARD_CONCURRENCY:-24}"
 export MINI_SWE_AGENT_VENV R2E_DATA_PATH R2E_SIF_DIR
-mkdir -p "${SAVE_DIR}" "${EXP_ROOT}/dump" "${AGENT_SERVER_WORK_DIR}"
+mkdir -p "${EXP_ROOT}/dump" "${AGENT_SERVER_WORK_DIR}"
+if [[ "${ENABLE_CHECKPOINT_SAVE}" == 1 ]]; then
+   mkdir -p "${SAVE_DIR}"
+fi
 DUMMY_DATA="${EXP_ROOT}/relax_dummy.jsonl"
 seq 50 | sed 's/.*/{"input":[{"role":"user","content":""}]}/' > "${DUMMY_DATA}"
 
@@ -141,14 +158,26 @@ CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}/Qwen3.5-35B-A3B"
    --ref-load "${MODEL_DIR}/Qwen3.5-35B-A3B"
    --megatron-to-hf-mode bridge
-   --save "${SAVE_DIR}/Qwen3.5-35B-A3B-R2E-Gym-MiniSWEAgent-PD-Checkpoint"
-   --save-interval 20
-   --max-actor-ckpt-to-keep 1
 )
+if [[ "${ENABLE_CHECKPOINT_SAVE}" == 1 ]]; then
+   CKPT_ARGS+=(
+      --save "${SAVE_DIR}/Qwen3.5-35B-A3B-R2E-Gym-MiniSWEAgent-PD-Checkpoint"
+      --save-interval 20
+      --max-actor-ckpt-to-keep 1
+   )
+else
+   # Keep rollout evidence without saving model, optimizer or data-source state.
+   CKPT_ARGS+=(--rollout-result-dir "${EXP_ROOT}/rollout_result")
+fi
+
+DEBUG_DUMP_ARGS=()
+if [[ "${ENABLE_DEBUG_DUMP:-1}" == "1" ]]; then
+   DEBUG_DUMP_ARGS+=(--dump-details "${EXP_ROOT}/dump")
+fi
 
 ROLLOUT_ARGS=(
    --prompt-data "${DUMMY_DATA}"
-   --dump-details "${EXP_ROOT}/dump"
+   "${DEBUG_DUMP_ARGS[@]}"
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt ${N_SAMPLES_PER_PROMPT}
@@ -249,11 +278,12 @@ RAY_RESOURCE_ARGS=(
 # agentic rollout: agent exec + parsers ──────────────────────────────────────────────────────────────
 AGENTIC_ARGS=(
    --use-agentic-rollout
-   --agentic-concurrency "${ROLLOUT_BATCH_SIZE}"
+   --agentic-concurrency "${AGENTIC_CONCURRENCY}"
    --agent-command "bash ${SCRIPT_DIR}/agent_client.sh"
    --agent-cwd "${SCRIPT_DIR}"
    --agent-timeout 7200
-   --agent-env "AGENT_SERVER_URL=${AGENT_SERVER_URL}" "AGENT_CLIENT_TRACE_DIR=${AGENT_SERVER_WORK_DIR}/client_events"
+   --agent-env "AGENT_SERVER_URL=${AGENT_SERVER_URL}" "AGENT_CLIENT_TRACE_DIR=${AGENT_SERVER_WORK_DIR}/client_events" \
+      "AGENT_CLIENT_RESOURCE_PROTOCOL=${AGENT_CLIENT_RESOURCE_PROTOCOL:-0}"
    --agentic-tool-call-parser qwen3_coder
    --agentic-reasoning-parser qwen3
 )
