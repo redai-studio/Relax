@@ -7,12 +7,17 @@ the model or raw images mounted. The model directory, metadata, and images must 
 accessible to every training worker; the checkpoint output directory must be
 shared across workers.
 
-The current model adapter supports SenseNova U1.5 MoT Edit with full-parameter or
+The default model adapter supports SenseNova U1.5 MoT Edit with full-parameter or
 LoRA training. Inputs can contain one source conditioning image, or two
 conditioning images ordered as source then glyph. The target image provides
 supervision and does not count toward the conditioning-image limit. The default
 1024² pixel budget is not a fixed square resolution: images retain their aspect
 ratio and are aligned to the model's patch size.
+
+Qwen-Image-Edit also supports DiT LoRA with one reference image through
+`relax.models.qwen_image.edit_sft.QwenImageEditSFTAdapter`. Both adapters support
+opt-in bounded frozen-condition reuse. See [frozen conditions](./frozen-conditions.md)
+for configuration, Qwen launch/export and runtime metrics.
 
 ## Data
 
@@ -86,7 +91,7 @@ python examples/diffusion/export_i2i_sft.py \
   --output /shared/exports/adapter.safetensors
 ```
 
-LoRA exports use parameter names relative to the DiT and BF16 weights. Export
+SenseNova LoRA exports use parameter names relative to the DiT and BF16 weights. Export
 currently requires alpha to equal rank. For full-parameter checkpoints, set
 `--output` to a new directory; export writes BF16 model shards and copies the
 original model's tokenizer configuration. Exports do not include optimizer state.
