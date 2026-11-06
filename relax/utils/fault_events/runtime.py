@@ -149,9 +149,10 @@ class FaultEventRuntime:
                 return None
             self._admission_context = context
             self._settle_local_completions()
-            self._settle_startup_handoffs()
             if self._source_epoch[1].is_set() and not self._source_retired:
                 self._retire_source(self._source_epoch[0], self._source_epoch[2])
+            # After pending retirement, so a deferred handoff never outlives its receiver.
+            self._settle_startup_handoffs()
             return function(*args) if function is not None else None
         except Exception:
             self.note_unknown()
@@ -689,6 +690,12 @@ class FaultEventRuntime:
         event_ids: tuple[str, ...],
     ) -> None:
         if self._recoveries.get(recovery.recovery_id) is not recovery or recovery.outcome is not None:
+            return
+        if recovery.receiver_generation != self.generation or self._source_retired or self._source_disabled:
+            # The rebuilt receiver was never bound or is already retired: no
+            # receipt can complete this attempt, so release it without a result.
+            self.note_unknown("OUTCOME_UNOBSERVED")
+            self._recoveries.pop(recovery.recovery_id)
             return
         if recovery.mode != "global" or recovery.plan is None or recovery.plan != actual_plan:
             recovery.conflict = True

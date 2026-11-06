@@ -213,6 +213,32 @@ def test_rejected_startup_handoff_is_applied_by_the_next_admission(runtime):
     assert recovery.recovery_id not in runtime._recoveries
 
 
+def test_deferred_startup_handoff_after_receiver_retirement_is_not_success(runtime):
+    _, recovery, _ = start(runtime, RecoveryPlan(("actor",), "colocate"))
+    config = SimpleNamespace(debug_train_only=False, debug_rollout_only=False, hybrid=False, fully_async=False)
+    with runtime._lock:
+        runtime.startup_handoff(recovery, config, ["actor"], 7)
+        runtime.retire_source(recovery.receiver_generation)
+    # Any later admitted transaction settles both pending fences.
+    runtime.evidence(recovery)
+    assert recovery.outcome == "recovery_interrupted" and not recovery.handoff
+    assert "recovery_succeeded" not in {event["event_type"] for event in drain(runtime)}
+
+
+def test_deferred_startup_handoff_without_bound_receiver_releases_recovery(runtime):
+    fault = FaultContext("actor", new_id(), runtime.generation, new_id(), "reported_error")
+    runtime.observe_snapshot(snapshot(runtime, fault))
+    plan = RecoveryPlan(("actor",), "colocate")
+    recovery = runtime.start_recovery("actor", "global", plan.expected, plan=plan)
+    config = SimpleNamespace(debug_train_only=False, debug_rollout_only=False, hybrid=False, fully_async=False)
+    # The rebuilt receiver was never bound, so this generation cannot complete.
+    runtime.startup_handoff(recovery, config, ["actor"], 7)
+    assert not recovery.handoff and recovery.outcome is None
+    assert recovery.recovery_id not in runtime._recoveries
+    assert "OUTCOME_UNOBSERVED" in runtime.diagnostics()["unknown_reasons"]
+    assert "recovery_succeeded" not in {event["event_type"] for event in drain(runtime)}
+
+
 def test_retirement_lock_failure_is_settled_before_later_handoff(runtime):
     _, recovery, _ = start(runtime, RecoveryPlan(("actor",), "colocate"))
     with runtime._lock:
