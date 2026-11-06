@@ -1,0 +1,36 @@
+# Wait for HiCache Mamba H2D load completion before copying a COW state.
+# Base commit: 29481685462732237d80d86076d6563e1f658102
+# Apply from the SGLang 0.5.17 repository with patch -p1.
+--- current/python/sglang/srt/mem_cache/memory_pool.py
++++ previous/python/sglang/srt/mem_cache/memory_pool.py
+@@ -1366,6 +1366,19 @@
+     def mamba2_layer_cache(self, layer_id: int):
+         return self.mamba_pool.mamba2_layer_cache(self.mamba2_layer_index(layer_id))
+ 
++    def copy_mamba_state(
++        self, src_index: torch.Tensor, dst_index: torch.Tensor
++    ) -> None:
++        if src_index.numel() == 0:
++            return
++        if (
++            self.layer_transfer_counter is not None
++            and self.layer_transfer_counter.consumer_index >= 0
++        ):
++            last_mamba_layer = max(self.mamba_map)
++            self.layer_transfer_counter.wait_until(last_mamba_layer - self.start_layer)
++        self.mamba_pool.copy_from(src_index, dst_index)
++
+     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
+         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
+ 
+--- current/python/sglang/srt/model_executor/model_runner.py
++++ previous/python/sglang/srt/model_executor/model_runner.py
+@@ -1647,7 +1647,7 @@
+                 )
+             else:
+                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
+-                pool.mamba_pool.copy_from(
++                pool.copy_mamba_state(
+                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
+                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
+                 )

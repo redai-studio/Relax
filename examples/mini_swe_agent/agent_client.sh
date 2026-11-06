@@ -4,6 +4,10 @@
 
 set -euo pipefail
 
+if [[ "${AGENT_CLIENT_RESOURCE_PROTOCOL:-0}" == 1 ]]; then
+   exec python3 "$(dirname -- "${BASH_SOURCE[0]}")/agent_client.py"
+fi
+
 RESULT_JSON="$(mktemp)"
 REQUEST_JSON="$(mktemp)"
 SERVER_SESSION_ID=""

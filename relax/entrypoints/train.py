@@ -23,7 +23,9 @@ from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
 from relax.utils.agentic_obs.run_hooks import RunRecorder  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
+from relax.utils.async_utils import shutdown_async_loop  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
+from relax.utils.ray_shutdown import quiesce_serve_routers, shutdown_serve_router_loops  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
 
@@ -74,7 +76,8 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     timeout_sec = _SHUTDOWN_TIMEOUT_SEC if effective_exit_code else _NORMAL_SHUTDOWN_TIMEOUT_SEC
     if _kernel_cache_heartbeat is not None:
         timeout_sec += int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600"))
-    watchdog = threading.Timer(timeout_sec, os._exit, args=(effective_exit_code,))
+    # A timed-out cleanup must not turn a completed training loop into a passing job.
+    watchdog = threading.Timer(timeout_sec, os._exit, args=(effective_exit_code or 1,))
     watchdog.daemon = True
     watchdog.start()
     try:
@@ -108,6 +111,7 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
             try:
                 _ctrl.shutdown()
             except Exception as e:
+                exit_code = exit_code or 1
                 logger.warning(f"Controller shutdown error during {sig_name}: {e}")
 
         if ray.is_initialized():
@@ -127,6 +131,11 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                     # completion closes tracking tasks as successful.
                     logger.warning(f"Tracking finalization failed: {error}")
             try:
+                router_loops = quiesce_serve_routers()
+                logger.info(
+                    f"Stopped {sum(len(owner.polls) for owner in router_loops)} Serve poll client(s) "
+                    f"across {len(router_loops)} router thread(s)"
+                )
                 serve.shutdown()
                 if _kernel_cache_heartbeat is not None:
                     results = _kernel_cache_heartbeat.finalize(
@@ -134,9 +143,13 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                         timeout_sec=int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600")),
                     )
                     logger.info(f"Kernel cache agents finalized: {results}")
+                shutdown_serve_router_loops(router_loops)
+                shutdown_async_loop()
+                logger.info("Background event loop threads stopped")
                 ray.shutdown()
                 logger.info("Ray shutdown successfully")
             except Exception as e:
+                exit_code = exit_code or 1
                 logger.warning(f"Ray shutdown error during {sig_name}: {e}")
 
         if exit_code is not None:

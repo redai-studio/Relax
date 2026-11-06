@@ -55,6 +55,9 @@ def _train_namespace():
         "RunRecorder": RunRecorder,
         "post_process_env": lambda args, env: env,
         "init_tracking": Mock(),
+        "quiesce_serve_routers": Mock(return_value=[]),
+        "shutdown_serve_router_loops": Mock(),
+        "shutdown_async_loop": Mock(),
         "maybe_pin_baseline_to_stable": Mock(),
         "_ctrl": None,
         "_shutdown_done": False,
@@ -224,6 +227,9 @@ def test_train_base_exception_records_outcome_without_replacing_error(tmp_path, 
         def training_loop(self):
             raise error
 
+        def shutdown(self):
+            pass
+
     ns["Controller"] = FakeController
     args = SimpleNamespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test")
     with pytest.raises(type(error)) as caught:
@@ -245,7 +251,7 @@ def test_train_base_exception_records_outcome_without_replacing_error(tmp_path, 
     expected_code = (
         error.code if isinstance(error, SystemExit) else (130 if isinstance(error, KeyboardInterrupt) else 1)
     )
-    assert ns["threading"].Timer.call_args.kwargs["args"] == (expected_code,)
+    assert ns["threading"].Timer.call_args.kwargs["args"] == (expected_code or 1,)
     start, end = [json.loads(line) for line in path.read_text().splitlines()]
     assert start["status"] == "start"
     assert end["status"] == status and end["operation"] == "training"
@@ -297,7 +303,7 @@ else:
 ns["_graceful_shutdown"](exit_code={exit_code})
 """
     result = subprocess.run([sys.executable, "-c", script], timeout=10, capture_output=True, text=True)
-    assert result.returncode == exit_code, result.stderr
+    assert result.returncode == (exit_code or 1), result.stderr
     path = tmp_path / "run_test/stages/run.jsonl"
     start, end = [json.loads(line) for line in path.read_text().splitlines()]
     assert end["is_terminal"] and end["status"] == ("completed" if exit_code == 0 else "failed")
@@ -537,7 +543,7 @@ def test_train_normal_shutdown_arms_long_watchdog_and_cancels_it():
     call = fake_threading.Timer.call_args
     assert call.args[0] == ns["_NORMAL_SHUTDOWN_TIMEOUT_SEC"]
     assert call.args[1] is ns["os"]._exit
-    assert call.kwargs["args"] == (0,)
+    assert call.kwargs["args"] == (1,)
     timer.start.assert_called_once()
     timer.cancel.assert_called_once()
     ns["_hard_exit"].assert_called_once_with(0)
@@ -552,6 +558,53 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
     call = fake_threading.Timer.call_args
     assert call.args[0] == ns["_SHUTDOWN_TIMEOUT_SEC"]
     assert call.kwargs["args"] == (1,)
+
+
+@pytest.mark.parametrize(
+    "failed_phase", ["quiesce_serve_routers", "shutdown_serve_router_loops", "shutdown_async_loop"]
+)
+@pytest.mark.parametrize("exit_code", [0, 143])
+def test_train_does_not_destroy_ray_or_report_success_when_threads_cannot_stop(failed_phase, exit_code):
+    ns = _train_namespace()
+    ns["threading"] = Mock()
+    ns["_hard_exit"] = Mock()
+    ns[failed_phase].side_effect = TimeoutError("owned thread did not stop")
+    ns["_graceful_shutdown"](exit_code=exit_code)
+    ns["ray"].shutdown.assert_not_called()
+    ns["_hard_exit"].assert_called_once_with(exit_code or 1)
+
+
+def test_train_stops_polls_before_serve_and_joins_threads_before_ray():
+    ns = _train_namespace()
+    events = []
+    ns["threading"] = Mock()
+    ns["quiesce_serve_routers"].side_effect = lambda: events.append("polls_stopped") or []
+    ns["serve"].shutdown.side_effect = lambda: events.append("serve_shutdown")
+    ns["shutdown_serve_router_loops"].side_effect = lambda _owners: events.append("serve_threads_joined")
+    ns["shutdown_async_loop"].side_effect = lambda: events.append("async_thread_joined")
+    ns["ray"].shutdown.side_effect = lambda: events.append("ray_shutdown")
+    ns["_hard_exit"] = lambda code: events.append(code)
+    ns["_graceful_shutdown"](exit_code=0)
+    assert events == [
+        "polls_stopped",
+        "serve_shutdown",
+        "serve_threads_joined",
+        "async_thread_joined",
+        "ray_shutdown",
+        0,
+    ]
+
+
+def test_controller_shutdown_error_still_cleans_ray_and_returns_failure():
+    ns = _train_namespace()
+    ns["threading"] = Mock()
+    ns["_hard_exit"] = Mock()
+    ns["_ctrl"] = Mock()
+    ns["_ctrl"].shutdown.side_effect = RuntimeError("controller cleanup failed")
+    ns["_graceful_shutdown"](exit_code=0)
+    ns["serve"].shutdown.assert_called_once()
+    ns["ray"].shutdown.assert_called_once()
+    ns["_hard_exit"].assert_called_once_with(1)
 
 
 @pytest.mark.parametrize("mode", ["missing_config", "text_sft", "i2i", "i2i_stop_failure"])
