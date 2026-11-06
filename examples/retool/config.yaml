@@ -1,3 +1,0 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-max_turns: 16
-enable_partial_rollout: false
