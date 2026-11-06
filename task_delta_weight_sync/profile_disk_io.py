@@ -14,6 +14,7 @@ import json
 import os
 import pstats
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from time import monotonic, process_time
@@ -138,10 +139,12 @@ def seed(original: WeightSyncConfig, destination: Path, through: int, *, canonic
             raw.update(block["digest"] for block in validate_manifest(manifest))
             for folder, filename in [("catalogs", manifest["root"]), ("manifests", record["artifact_id"])]:
                 os.link(source.canonical_root / folder / filename, target.canonical_root / folder / filename)
-    for object_id in objects:
-        os.link(source.root / "objects" / object_id, target.root / "objects" / object_id)
-    for block_id in raw:
-        os.link(source.canonical_root / "blocks" / block_id, target.canonical_root / "blocks" / block_id)
+    # Only input preparation is concurrent; measured publication/prepare stays unchanged.
+    links = [(source.root / "objects" / key, target.root / "objects" / key) for key in objects]
+    links.extend((source.canonical_root / "blocks" / key, target.canonical_root / "blocks" / key) for key in raw)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for _ in pool.map(lambda paths: os.link(*paths), links):
+            pass
     atomic_write(target.root / "index.json", canonical_json(state))
     return target
 
@@ -181,7 +184,7 @@ class ProfileSource:
 
     def start_server(self, version: int) -> dict:
         self.stop_server()
-        if version == 1:
+        if version == 1 and (self.output / "publisher/store/index.json").exists():
             store = SharedFSStore(self.output / "publisher/store", canonical_root=self.output / "publisher/canonical")
         else:
             store = seed(self.original, self.output / f"source-v{version}", version, canonical=False)
@@ -209,6 +212,11 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-node-ip", required=True)
     parser.add_argument("--consumer-node-ip", required=True)
+    parser.add_argument("--skip-publish", action="store_true", help="Serve independent copies of frozen artifacts")
+    parser.add_argument(
+        "--warm-receiver-cache", action="store_true", help="Read only existing prefix objects before timing"
+    )
+    parser.add_argument("--versions", type=int, nargs="+", choices=range(1, 11), default=[1, 10])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     config = WeightSyncConfig.load(args.config)
@@ -228,12 +236,26 @@ def main() -> int:
 
     save()
     try:
-        result["source"] = ray.get(source.publish_one.remote(), timeout=config.sync_timeout_s + 60)
-        for version in [1, 10]:
+        if not args.skip_publish:
+            result["source"] = ray.get(source.publish_one.remote(), timeout=config.sync_timeout_s + 60)
+        for version in args.versions:
             result["status"] = f"PROFILING_RECEIVER_{version}"
             save()
             cache = seed(config, args.output / f"receiver-v{version}/cache", version - 1, canonical=False)
-            endpoint = ray.get(source.start_server.remote(version), timeout=180)
+            endpoint = ray.get(source.start_server.remote(version), timeout=config.sync_timeout_s)
+            warm = None
+            if args.warm_receiver_cache:
+                result["status"] = f"WARMING_RECEIVER_{version}"
+                save()
+                started, count, size = monotonic(), 0, 0
+                for path in (cache.root / "objects").iterdir():
+                    with path.open("rb") as stream:
+                        while chunk := stream.read(1024 * 1024):
+                            size += len(chunk)
+                    count += 1
+                warm = {"objects": count, "bytes": size, "wall_s_outside_profile": monotonic() - started}
+                result["status"] = f"PROFILING_RECEIVER_{version}"
+                save()
             transport = TCPTransport(endpoint["host"], endpoint["port"], timeout_s=config.sync_timeout_s)
             consumer = Consumer(
                 transport,
@@ -256,6 +278,7 @@ def main() -> int:
             result["receivers"].append(
                 {
                     "version": version,
+                    "cache_preread": warm,
                     "profile": stats,
                     "consumer": consumer.last_metrics,
                     "wire": transport.metrics,
