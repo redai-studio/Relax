@@ -81,7 +81,7 @@ SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 1 --sglang-server-concurrency 32
     --sglang-mem-fraction-static 0.7 --sglang-router-policy consistent_hashing --num-data-storage-units 1
     # Expected 499 cancellations at weight swaps must not trip the router's worker circuit breakers.
-    --router-disable-circuit-breaker
+    --sglang-router-disable-circuit-breaker
     --skip-eval-before-train
 )
 OPTIMIZER_ARGS=(

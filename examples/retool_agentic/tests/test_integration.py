@@ -599,7 +599,7 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, 
         assert command[command.index("--start-rollout-id") + 1] == "0"
         if score_centering:
             assert runtime["env_vars"]["SGLANG_RETURN_ORIGINAL_LOGPROB"] == "0"
-            assert "--router-disable-circuit-breaker" in command
+            assert "--sglang-router-disable-circuit-breaker" in command
             assert command[command.index("--advantage-estimator") + 1] == "score_centering"
             assert command[command.index("--score-centering-is") + 1] == "tis"
             assert "--use-tis" not in command and "--calculate-per-token-loss" in command

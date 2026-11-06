@@ -97,7 +97,7 @@ bash examples/retool_agentic/scripts/run-qwen25-7B-sc-8xgpu-hybrid-6a2r.sh
 
 异步修正使用专用的 `--score-centering-is tis --score-centering-tis-clip 2`，不能同时设置普通 `--use-tis`。训练记录 `sc_rollout_head_mass`、`sc_train_head_mass`、`sc_correction`、`sc_importance_weight` 等指标。checkpoint 位置、保存频率和异步恢复限制与上节一致。
 
-本脚本显式设置 `--router-disable-circuit-breaker`。部分 router 版本会将权重切换时预期的 499 请求取消计入 worker 失败，导致两路 engine 同时被熔断、返回 `503 no_available_workers`，随后请求等待 62 秒重试。关闭熔断是此兼容问题的配置绕过，健康检查、HTTP 错误处理和 Agentic 恢复逻辑仍保留；这不代表 router 二进制的失败分类已修复。
+本脚本显式设置 `--sglang-router-disable-circuit-breaker`。部分 router 版本会将权重切换时预期的 499 请求取消计入 worker 失败，导致两路 engine 同时被熔断、返回 `503 no_available_workers`，随后请求等待 62 秒重试。关闭熔断是此兼容问题的配置绕过，健康检查、HTTP 错误处理和 Agentic 恢复逻辑仍保留；这不代表 router 二进制的失败分类已修复。
 
 ### Sandbox
 
