@@ -55,7 +55,7 @@ def _args() -> Namespace:
 
 
 def _sample(data_source: str, group_index: int | None) -> Sample:
-    return Sample(group_index=group_index, metadata={"data_source": data_source})
+    return Sample(group_index=group_index, metadata={"teacher_id": data_source})
 
 
 def _interleaved_picks() -> dict[tuple[str, int], list[str]]:
@@ -118,8 +118,8 @@ def test_on_policy_distillation_routing_survives_group_map_eviction():
 
 def test_on_policy_distillation_routing_missing_routing_key_raises():
     args = _args()
-    with pytest.raises(ValueError, match="missing key 'data_source'"):
-        opd._pick_teacher_url(args, Sample(group_index=0, metadata={}))
+    with pytest.raises(KeyError, match="teacher_id"):
+        opd._pick_teacher_url(args, Sample(group_index=0, metadata={"data_source": TEXT_SOURCE}))
 
 
 def test_on_policy_distillation_routing_unknown_data_source_raises():

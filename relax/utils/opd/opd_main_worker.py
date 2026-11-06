@@ -128,9 +128,13 @@ class LogprobResponse:
         response_length: int | None,
         top_k: int,
         expected_query_ids: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Decode every response position; never pad rows or silently take a
-        tail."""
+        *,
+        legacy_text: bool = False,
+    ) -> tuple[np.ndarray | None, np.ndarray]:
+        """Decode complete response rows.
+
+        Legacy text can include prompt rows or omit IDs for token queries.
+        """
         null_prefix = 0 if prefix.startswith("output_") else 1
         shape = self.meta.get(f"{prefix}_shape")
         if shape is not None:
@@ -151,33 +155,52 @@ class LogprobResponse:
         elif f"{prefix}_val_b64" in self.meta:
             values = self._b64_decode(self.meta[f"{prefix}_val_b64"], "float32")
             ids = self._b64_decode(self.meta.get(f"{prefix}_idx_b64"), "int32")
-            for suffix in ("k", "len"):
-                lengths = self.meta.get(f"{prefix}_{suffix}")
-                if lengths is not None and lengths != [0] * null_prefix + [top_k] * response_length:
+            expected_lengths = ([0] * null_prefix if not legacy_text else []) + [top_k] * response_length
+            row_lengths = [self.meta.get(f"{prefix}_{suffix}") for suffix in ("k", "len")]
+            for lengths in row_lengths:
+                if lengths is None:
+                    continue
+                if legacy_text:
+                    if sum(lengths) != values.size:
+                        raise ValueError(f"Invalid per-position lengths for {prefix}.")
+                    lengths = lengths[-response_length:]
+                if lengths != expected_lengths:
                     raise ValueError(f"Invalid per-position lengths for {prefix}.")
+            if legacy_text:
+                count = response_length * top_k
+                if f"{prefix}_idx_b64" in self.meta and ids.size != values.size:
+                    raise ValueError(f"Misaligned value and ID counts for {prefix}.")
+                if all(lengths is None for lengths in row_lengths) and values.size % top_k:
+                    raise ValueError(f"Incomplete {prefix} response row.")
+                values = values[-count:]
+                if expected_query_ids is not None and f"{prefix}_idx_b64" not in self.meta:
+                    ids = None
+                else:
+                    ids = ids[-count:]
         else:
             rows = self.meta.get(prefix)
-            if rows is None or len(rows) != response_length + null_prefix:
-                raise ValueError(f"Missing or misaligned {prefix} response rows.")
-            if null_prefix and rows[0] not in (None, []):
-                raise ValueError(f"Missing {prefix} null prefix.")
-            rows = rows[null_prefix:]
-            if any(row is None or len(row) != top_k for row in rows):
+            if legacy_text:
+                rows = (rows or [])[-response_length:]
+            else:
+                if rows is None or len(rows) != response_length + null_prefix:
+                    raise ValueError(f"Missing or misaligned {prefix} response rows.")
+                if null_prefix and rows[0] not in (None, []):
+                    raise ValueError(f"Missing {prefix} null prefix.")
+                rows = rows[null_prefix:]
+            if len(rows) != response_length or any(row is None or len(row) != top_k for row in rows):
                 raise ValueError(f"Missing or incomplete {prefix} response row.")
             values = np.asarray([item[0] for row in rows for item in row], dtype=np.float32)
             ids = np.asarray([item[1] for row in rows for item in row], dtype=np.int32)
         expected_size = response_length * top_k
-        if values.ndim != 1 or ids.ndim != 1 or values.size != expected_size or ids.size != expected_size:
-            raise ValueError(
-                f"Native image OPD requires {response_length} x {top_k} values AND IDs for {prefix}; "
-                "cross-topk queries require a verified per-position SGLang implementation."
-            )
+        if values.ndim != 1 or values.size != expected_size or not np.isfinite(values).all():
+            raise ValueError(f"Expected {response_length} x {top_k} finite values for {prefix}.")
         values = values.reshape(response_length, top_k)
-        ids = ids.reshape(response_length, top_k)
-        if not np.isfinite(values).all() or np.any(ids < 0):
-            raise ValueError(f"Invalid token IDs or non-finite logprobs in {prefix}.")
-        if expected_query_ids is not None and not np.array_equal(ids, expected_query_ids):
-            raise ValueError(f"Per-position query token IDs differ from the returned {prefix} IDs.")
+        if ids is not None:
+            if ids.ndim != 1 or ids.size != expected_size or np.any(ids < 0):
+                raise ValueError(f"Expected {response_length} x {top_k} valid token IDs for {prefix}.")
+            ids = ids.reshape(response_length, top_k)
+            if expected_query_ids is not None and not np.array_equal(ids, expected_query_ids):
+                raise ValueError(f"Per-position query token IDs differ from the returned {prefix} IDs.")
         return ids, values
 
 

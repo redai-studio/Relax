@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 import aiohttp
 import numpy as np
@@ -99,7 +99,7 @@ def _create_teacher_client_session(args) -> aiohttp.ClientSession:
 # --- Teacher URL selection: MOPD routing (by data_source) x replica round-robin ---
 # Two layers:
 #   1. Routing (MOPD): when ``args.opd_teacher_routes_map`` is set, pick the
-#      teacher for this sample by ``sample.metadata[args.opd_teacher_key]``.
+#      teacher bound before generation in ``sample.metadata["teacher_id"]``.
 #      Each route value is a LIST of that teacher's replica URLs.
 #   2. Replica round-robin: spread requests across a teacher's replicas with a
 #      per-teacher in-process counter (single-threaded asyncio makes ``+= 1`` safe).
@@ -157,26 +157,16 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
     return replicas[idx % len(replicas)]
 
 
-def _pick_teacher_url(args, sample=None) -> str:
+def _pick_teacher_url(args, sample: Sample) -> str:
     routes_map = getattr(args, "opd_teacher_routes_map", None)
-    if routes_map and sample is not None:
-        key_field = getattr(args, "opd_teacher_key", None) or "data_source"
-        metadata = getattr(sample, "metadata", None) or {}
-        routing_value = metadata.get(key_field)
-        if routing_value is None:
-            raise ValueError(
-                f"MOPD routing: sample missing key '{key_field}' in metadata. "
-                f"Available metadata keys: {list(metadata.keys())}. "
-                f"Ensure the dataset has a '{key_field}' column and it is surfaced "
-                "via --metadata-key or the data pipeline."
-            )
-        replicas = routes_map.get(routing_value)
+    if routes_map:
+        teacher_id = (sample.metadata or {}).get("teacher_id")
+        if teacher_id is None:
+            raise KeyError("MOPD scoring requires a teacher_id bound before generation.")
+        replicas = routes_map.get(teacher_id)
         if not replicas:
-            raise KeyError(
-                f"MOPD routing: no teacher route for '{key_field}={routing_value}'. "
-                f"Available routes: {list(routes_map.keys())}."
-            )
-        return _pick_replica(replicas, sample, routing_value)
+            raise KeyError(f"MOPD routing: no teacher route for teacher_id={teacher_id!r}.")
+        return _pick_replica(replicas, sample, teacher_id)
     # Single-teacher path: round-robin over replicas if configured.
     urls = getattr(args, "opd_teacher_urls", None)
     if urls and len(urls) > 1:
@@ -184,9 +174,50 @@ def _pick_teacher_url(args, sample=None) -> str:
     return args.opd_teacher_url
 
 
+class TeacherResponseStats:
+    """Per-window response counts.
+
+    Unsubmitted responses can span rollout windows.
+    """
+
+    def __init__(self, teacher_ids: Iterable[str]) -> None:
+        self._teacher_ids = tuple(teacher_ids)
+        self._responses: dict[int | str, tuple[str, bool]] = {}
+
+    def admit(self, key: int | str | None, teacher_id: str) -> None:
+        if key is None:
+            raise ValueError("A tracked response requires a sample index or session_id.")
+        previous = self._responses.get(key)
+        if previous is not None and previous[0] != teacher_id:
+            raise ValueError(f"Response {key!r} changed Teacher from {previous[0]!r} to {teacher_id!r}")
+        self._responses[key] = (teacher_id, True)
+
+    def finish(self, key: int | str | None) -> None:
+        entry = self._responses.get(key)
+        if entry is not None and entry[1]:
+            self._responses[key] = (entry[0], False)
+
+    def new_window(self) -> None:
+        self._responses = {key: entry for key, entry in self._responses.items() if entry[1]}
+
+    def metrics(self) -> dict[str, int]:
+        counts = {
+            f"mopd/by_teacher/{teacher_id}/{metric}": 0
+            for teacher_id in self._teacher_ids
+            for metric in ("responses", "awaiting_submission")
+        }
+        for teacher_id, awaiting_submission in self._responses.values():
+            counts[f"mopd/by_teacher/{teacher_id}/responses"] += 1
+            counts[f"mopd/by_teacher/{teacher_id}/awaiting_submission"] += int(awaiting_submission)
+        return counts
+
+
 class OpdManager:
     def __init__(self, args):
         self.args = args
+        self._shared_teacher = None
+        routes = getattr(args, "opd_teacher_routes_map", None)
+        self.response_stats = TeacherResponseStats(routes) if routes else None
         self.student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
         self.teacher_eos_token_id = getattr(args, "opd_teacher_eos_token_id", None)
         self.teacher_response_prefix_token_ids = tuple(
@@ -208,6 +239,22 @@ class OpdManager:
 
         opsd_worker = opd_opsd_worker.OpsdWorker.from_args(args)
         self.opsd_worker = opsd_worker if opsd_worker.is_opsd else None
+
+    def bind_teacher(self, sample: Sample) -> None:
+        field = getattr(self.args, "opd_teacher_key", None) or "data_source"
+        metadata = sample.metadata or {}
+        teacher_id = metadata.get(field)
+        if teacher_id is None:
+            raise ValueError(
+                f"MOPD routing: sample missing key '{field}' in metadata. Available keys: {list(metadata)}."
+            )
+        if not self.args.opd_teacher_routes_map.get(teacher_id):
+            raise KeyError(f"MOPD routing: no teacher route for {field}={teacher_id!r}.")
+        if "teacher_id" in metadata and metadata["teacher_id"] != teacher_id:
+            raise ValueError(
+                f"MOPD routing: teacher_id={metadata['teacher_id']!r} conflicts with {field}={teacher_id!r}"
+            )
+        metadata["teacher_id"] = teacher_id
 
     @property
     def is_topk(self) -> bool:
@@ -312,6 +359,8 @@ class OpdManager:
         self,
         samples: Sample | Sequence[Sample],
         encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
+        *,
+        response_indices: Sequence[int | str | None] | None = None,
     ) -> None:
         sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
 
@@ -319,7 +368,19 @@ class OpdManager:
             await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
 
         async with _create_teacher_client_session(self.args) as session:
-            fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
+            keys = response_indices if response_indices is not None else [s.response_key for s in sample_list]
+            requests = [self._teacher_prefill(s, session, key) for s, key in zip(sample_list, keys, strict=True)]
+            if not getattr(self.args, "opd_teacher_routes_map", None):
+                fetch_results = await asyncio.gather(*requests)
+            else:
+                # End a response only after all its Teacher requests have settled.
+                results = await asyncio.gather(*requests, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                fetch_results = results
+            if getattr(self.args, "opd_shared_teacher", False) and not all(fetch_results):
+                raise RuntimeError("Shared Teacher failed to produce complete logprobs for this batch")
             self._raise_if_all_failed(sample_list, fetch_results)
 
             if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
@@ -361,6 +422,35 @@ class OpdManager:
             response.validate_native_prefill(expected_input_ids, int(sample.response_length))
         return response
 
+    async def _score_shared_teacher(
+        self, teacher: str, payload: dict, sample: Sample, expected_input_ids: list[int] | None
+    ) -> opd_main_worker.LogprobResponse:
+        import ray
+
+        if self._shared_teacher is None:
+            locator = getattr(self.args, "opd_shared_teacher_actor", None)
+            if not locator:
+                raise RuntimeError("Shared Teacher scoring requires the managed scheduler")
+            self._shared_teacher = ray.get_actor(**locator)
+        score_ref = self._shared_teacher.score.remote(teacher, payload)
+        try:
+            data = await score_ref
+        except asyncio.CancelledError:
+            # Cancel this caller's queued score; the manager drains already dispatched HTTP work.
+            try:
+                ray.cancel(score_ref, recursive=False)
+            except Exception:
+                logger.warning("Could not cancel shared Teacher score for sample %s", sample.index, exc_info=True)
+            raise
+        if not isinstance(data, dict) or data.get("_relax_teacher_route") != teacher:
+            raise RuntimeError(
+                f"Shared Teacher returned a different route for sample {sample.index}; expected {teacher!r}"
+            )
+        response = opd_main_worker.LogprobResponse(data)
+        if expected_input_ids is not None:
+            response.validate_native_prefill(expected_input_ids, int(sample.response_length))
+        return response
+
     def _validate_image_request(
         self, input_ids: list[int], expanded_ids: list[int], response_length: int, images: list
     ) -> None:
@@ -379,9 +469,11 @@ class OpdManager:
 
     def _validate_query_ids(self, ids: np.ndarray | None, response_length: int) -> None:
         if ids is None or ids.shape != (response_length, self.topk_worker.top_k) or np.any(ids < 0):
-            raise ValueError("Native image OPD requires complete R x K query IDs before cross-topk prefill.")
+            raise ValueError("OPD requires complete R x K query IDs before cross-topk prefill.")
 
-    async def _teacher_prefill(self, sample: Sample, session: aiohttp.ClientSession) -> bool:
+    async def _teacher_prefill(
+        self, sample: Sample, session: aiohttp.ClientSession, response_index: int | str | None = None
+    ) -> bool:
         response_length = int(sample.response_length or 0)
         if response_length <= 0:
             return True
@@ -425,8 +517,9 @@ class OpdManager:
         logprob_start_len = max(prompt_length - 1, 0)
 
         mm_fields = await encode_image_inputs(teacher_mm)
+        shared = getattr(self.args, "opd_shared_teacher", False)
         if self.topk_worker is not None:
-            if native and self.topk_worker.spec.teacher_at_student:
+            if (native or shared) and self.topk_worker.spec.teacher_at_student:
                 self._validate_query_ids(sample.student_topk_token_ids, response_length)
             payload = self.topk_worker.build_teacher_payload(
                 input_ids=teacher_input_ids,
@@ -442,10 +535,16 @@ class OpdManager:
         if native:
             payload["return_prompt_token_ids"] = True
 
-        teacher_url = _pick_teacher_url(self.args, sample)
-        resp_obj = await self._post_logprob(
-            session, teacher_url, payload, sample, "teacher prefill", expanded_ids if native else None
-        )
+        expected_ids = expanded_ids if native else None
+        if shared:
+            teacher = sample.metadata["teacher_id"]
+            fetch = self._score_shared_teacher(teacher, payload, sample, expected_ids)
+        else:
+            teacher_url = _pick_teacher_url(self.args, sample)
+            fetch = self._post_logprob(session, teacher_url, payload, sample, "teacher prefill", expected_ids)
+        if self.response_stats is not None:
+            self.response_stats.finish(response_index)
+        resp_obj = await fetch
         if resp_obj is None:
             return False
 
@@ -466,14 +565,17 @@ class OpdManager:
             )
             return False
 
+        if shared and not np.isfinite(token_logprobs[1:]).all():
+            raise ValueError(f"Shared Teacher returned non-finite logprobs for sample {sample.index}")
+
         fields = {}
-        if self.sampled_worker is not None:
-            fields["teacher_log_probs"] = [float(v) for v in token_logprobs[1 : 1 + response_length]]
         if self.topk_worker is not None:
             if self.topk_worker.spec.teacher_self_topk:
                 pair = (
-                    resp_obj.strict_topk("input_top_logprobs", response_length, self.topk_worker.top_k)
-                    if native
+                    resp_obj.strict_topk(
+                        "input_top_logprobs", response_length, self.topk_worker.top_k, legacy_text=not native
+                    )
+                    if native or shared
                     else self.topk_worker.parse_prefill_self_topk(resp_obj, response_length)
                 )
                 fields["teacher_topk_token_ids"] = pair[0] if pair else None
@@ -485,10 +587,13 @@ class OpdManager:
                         response_length,
                         self.topk_worker.top_k,
                         sample.student_topk_token_ids,
+                        legacy_text=not native,
                     )[1]
-                    if native
+                    if native or shared
                     else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
                 )
+        if self.sampled_worker is not None:
+            fields["teacher_log_probs"] = [float(v) for v in token_logprobs[1 : 1 + response_length]]
         for name, value in fields.items():
             setattr(sample, name, value)
 

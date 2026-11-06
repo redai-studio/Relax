@@ -709,7 +709,7 @@ async def _dispatch_generate(
 
 async def generate_and_rm(
     args: Namespace,
-    sample: Sample | list[Sample],
+    sample: Sample,
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
@@ -728,39 +728,37 @@ async def generate_and_rm(
 
     # Resolve the generate function and run it under the right permit scope
     # (session-level lock by default; per-request permits for opt-in functions).
-    sample = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
+    manager = state.opd_manager if not evaluation else None
+    teacher_id = sample.metadata["teacher_id"] if manager and getattr(args, "opd_teacher_routes_map", None) else None
+    response_key = sample.response_key
+    generated = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
+    results = generated if isinstance(generated, list) else [generated]
+    if teacher_id is not None:
+        # Custom generation can return replacement samples or multiple exports for one response.
+        for result in results:
+            if result is not sample:
+                result.metadata = {**sample.metadata, **(result.metadata or {})}
+            result.metadata["teacher_id"] = teacher_id
 
-    # for the rm that need the whole group, we will not do the rm here
+    if any(result.status == Sample.Status.ABORTED for result in results):
+        if args.group_rm and manager and manager.response_stats is not None:
+            manager.response_stats.finish(response_key)
+        return generated
     if args.group_rm:
-        return sample
+        return generated
 
-    # multi samples
-    if isinstance(sample, list):
-        samples = sample
-        if any(sample.status == Sample.Status.ABORTED for sample in samples):
-            return samples
-
-        # for multi agent system, the reward of some sample is calculated during generation.
-        samples_need_reward = [sample for sample in samples if sample.reward is None]
+    if isinstance(generated, list):
+        samples_need_reward = [result for result in results if result.reward is None]
         rewards = await batched_async_rm(args, samples_need_reward)
-        for sample, reward in zip(samples_need_reward, rewards, strict=False):
-            sample.reward = reward
+        for result, reward in zip(samples_need_reward, rewards, strict=False):
+            result.reward = reward
+    elif generated.reward is None:
+        generated.reward = await async_rm(args, generated)
 
-        if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
-
-        return samples
-    else:
-        if sample.status == Sample.Status.ABORTED:
-            return sample
-        # for multi-turn environment, a reward could be assigned to the agent.
-        if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
-
-        if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
-
-    return sample
+    if manager:
+        response_indices = [response_key] * len(results) if teacher_id is not None else None
+        await manager.prefill(generated, _encode_multimodal_inputs, response_indices=response_indices)
+    return generated
 
 
 def _collect_timing_from_samples(samples: list[Sample]) -> dict[str, list[float]]:
@@ -819,33 +817,55 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
+    manager = state.opd_manager if not evaluation else None
+    stats = manager.response_stats if manager else None
+    if manager and getattr(args, "opd_teacher_routes_map", None):
+        for sample in group:
+            manager.bind_teacher(sample)
+
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
-        )
+        task = asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+        tasks.append(task)
+        if stats is not None and (
+            args.group_rm or sample.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED)
+        ):
+            key = sample.response_key
+            stats.admit(key, sample.metadata["teacher_id"])
+            if not args.group_rm:
+                task.add_done_callback(lambda _, key=key: stats.finish(key))
 
-    group = await asyncio.gather(*tasks)
+    group_keys = [sample.response_key for sample in group] if stats is not None and args.group_rm else None
+    try:
+        group = await asyncio.gather(*tasks)
 
-    # A group with any aborted member (e.g. a weight-sync pre-dispatch 499) is
-    # incomplete: skip group reward for it in training so it is not scored on a
-    # partial trajectory. The group is carried to the resume buffer and finished
-    # under the next weight version. Eval is unaffected — it never converts a 499.
-    group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
-    # eval should still compute group reward even if abort was triggered by a concurrent rollout
-    if (not state.aborted or evaluation) and args.group_rm and not group_has_training_abort:
-        rewards = await batched_async_rm(args, group)
-        for sample, reward in zip(group, rewards, strict=False):
-            sample.reward = reward
+        # A group with any aborted member (e.g. a weight-sync pre-dispatch 499) is
+        # incomplete: skip group reward for it in training so it is not scored on a
+        # partial trajectory. The group is carried to the resume buffer and finished
+        # under the next weight version. Eval is unaffected — it never converts a 499.
+        group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
+        # eval should still compute group reward even if abort was triggered by a concurrent rollout
+        if (not state.aborted or evaluation) and args.group_rm and not group_has_training_abort:
+            rewards = await batched_async_rm(args, group)
+            for sample, reward in zip(group, rewards, strict=False):
+                sample.reward = reward
 
-        if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(group, _encode_multimodal_inputs)
+            if manager:
+                await manager.prefill(group, _encode_multimodal_inputs, response_indices=group_keys)
 
-    return group
+        return group
+    finally:
+        if group_keys is not None:
+            # A failing gather can return while siblings are still generating.
+            for task, key in zip(tasks, group_keys, strict=True):
+                if task.done():
+                    stats.finish(key)
+                else:
+                    task.add_done_callback(lambda _, key=key: stats.finish(key))
 
 
 async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], list[list[Sample]]]:
@@ -948,6 +968,10 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+
+    stats = state.opd_manager.response_stats if getattr(state, "opd_manager", None) else None
+    if stats is not None:
+        stats.new_window()
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1320,6 +1344,8 @@ async def generate_rollout_async(
 
     global CURRENT_ROLLOUT_BATCH
     filter_metrics = metric_gatherer.collect()
+    if stats is not None:
+        filter_metrics.update(stats.metrics())
     if CURRENT_ROLLOUT_BATCH:
         save_debug_rollout_data(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer

@@ -25,6 +25,7 @@ class PrepareDomain:
         self.scope_id = scope_id
         self.data_source = data_source
         self.runtime_domain = runtime_domain
+        self.prepare_group = runtime_domain.prepare_group
         self._prelaunch_next_step = False
         self._next_group_sequence = 0
         self._prepare_fetch_task: Optional[asyncio.Task[None]] = None
@@ -130,7 +131,7 @@ class PrepareDomain:
     def _start_prepare(self, group_input: GroupInput) -> None:
         launch_decision = asyncio.get_running_loop().create_future()
         prepare_task = asyncio.create_task(
-            self.runtime_domain.prepare_group(group_input, launch_decision),
+            self.prepare_group(group_input, launch_decision),
             name=f"agentic-prepare:{group_input.group_id}",
         )
         self._warming_prepare_tasks[prepare_task] = (group_input, launch_decision)
