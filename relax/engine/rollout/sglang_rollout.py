@@ -468,6 +468,10 @@ async def generate(
                 del sample._pre_encoded_mm_elapsed
         else:
             encoded_mm, _t_mm_encode = await _encode_multimodal_inputs(sample.multimodal_inputs)
+        if native_image_opd:
+            # Teacher prefill (and student cross-topk) can reuse the completed
+            # Student encoding, including the group-level shared result.
+            sample.multimodal_inputs["_opd_image_b64_cache"] = encoded_mm["image_data"]
         payload.update(encoded_mm)
 
     # Use existing tokens for multi-turn or tokenize the new prompt

@@ -429,6 +429,17 @@ def process_raw_sample(
     else:
         multimodal_inputs = None
 
+    # Identical image sources can share loaded media and its completed OPD encoding.
+    # Keep a teacher media dict so its prompt/processor path still runs as before.
+    reuse_teacher_mm = (
+        multimodal_inputs is not None
+        and bool(multimodal_inputs.get("images"))
+        and not (multimodal_inputs.get("videos") or multimodal_inputs.get("audio"))
+        and teacher_multimodal_keys is not None
+        and teacher_multimodal_keys == multimodal_keys
+        and teacher_prompt_key in (None, prompt_key)
+        and custom_prompt_func is None
+    )
     teacher_prompt_str, teacher_multimodal_inputs = build_opd_teacher_sample_fields(
         data,
         tokenizer,
@@ -438,7 +449,7 @@ def process_raw_sample(
         as_conversation=as_conversation,
         multimodal_keys=multimodal_keys,
         teacher_prompt_key=teacher_prompt_key,
-        teacher_multimodal_keys=teacher_multimodal_keys,
+        teacher_multimodal_keys=None if reuse_teacher_mm else teacher_multimodal_keys,
         custom_prompt_func=custom_prompt_func,
         apply_chat_template=apply_chat_template,
         apply_chat_template_kwargs=apply_chat_template_kwargs,
@@ -447,6 +458,8 @@ def process_raw_sample(
         multimodal_config=multimodal_config,
         build_messages_fn=build_messages,
     )
+    if reuse_teacher_mm:
+        teacher_multimodal_inputs = multimodal_inputs
 
     return Sample(
         prompt=output_prompt,

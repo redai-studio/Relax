@@ -4,6 +4,7 @@ import asyncio
 import copy
 import pickle
 import sys
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -393,7 +394,7 @@ def native_generate(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_native_generate_sends_collapsed_ids_and_preserves_expanded_sample(native_generate):
-    rollout, args, sample, _, _, requests = native_generate
+    rollout, args, sample, state, _, requests = native_generate
     assert await rollout.generate(args, sample, {"max_new_tokens": 2}) is sample
     assert requests[0]["input_ids"] == [1, 99, 2]
     assert requests[0]["return_prompt_token_ids"] is True
@@ -403,6 +404,172 @@ async def test_native_generate_sends_collapsed_ids_and_preserves_expanded_sample
     assert sample.rollout_log_probs == pytest.approx([-0.2, -0.3])
     assert sample.response_length == 2
     assert sample.status == Sample.Status.COMPLETED
+    session = _Session(_response(sample.tokens))
+    assert await state.opd_manager._teacher_prefill(sample, session)
+    assert session.requests[0][1]["image_data"] == requests[0]["image_data"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared_media", [False, True])
+async def test_native_group_encodes_images_once_for_student_and_teacher(native_generate, monkeypatch, shared_media):
+    from relax.engine.rollout import on_policy_distillation
+    from relax.utils.data import processing_utils
+
+    rollout, args, sample, state, _, requests = native_generate
+    args.partial_rollout = args.group_rm = False
+    args.custom_generate_function_path = None
+    state.aborted = False
+    state.semaphore = asyncio.Semaphore(2)
+    state.dp_rank_context = nullcontext
+    del sample._pre_encoded_mm
+    sample.multimodal_inputs = {"images": ["first-image"], "videos": [], "audio": []}
+    sample.reward = 0.0
+    other_media = sample.multimodal_inputs if shared_media else {"images": ["second-image"], "videos": [], "audio": []}
+    other = Sample(prompt=sample.prompt, multimodal_inputs=other_media, reward=0.0, status=Sample.Status.ABORTED)
+    session = _Session(_response([1, 99, 99, 99, 2, 10, 11]))
+    calls = []
+
+    async def encode(image):
+        calls.append(image)
+        await asyncio.sleep(0)
+        return f"encoded-{image}"
+
+    monkeypatch.setattr(rollout, "async_encode_image_for_rollout_engine", encode)
+    monkeypatch.setattr(processing_utils, "async_encode_image_for_rollout_engine", encode)
+    monkeypatch.setattr(on_policy_distillation, "_create_teacher_client_session", lambda args: session)
+    group = await rollout.generate_and_rm_group(args, [sample, other], {"max_new_tokens": 2})
+
+    assert calls == (["first-image"] if shared_media else ["first-image", "second-image"])
+    assert len(requests) == len(session.requests) == 2
+    assert [payload["image_data"] for payload in requests] == [
+        payload["image_data"] for _, payload in session.requests
+    ]
+    for member in group:
+        assert member.status == Sample.Status.COMPLETED
+        assert member.teacher_log_probs == pytest.approx([-0.2, -0.3])
+        assert not hasattr(member, "_pre_encoded_mm")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evaluation", [False, True])
+async def test_generate_does_not_cache_images_outside_training_opd(native_generate, evaluation):
+    rollout, args, sample, state, _, requests = native_generate
+    if not evaluation:
+        state.opd_manager = None
+    await rollout.generate(args, sample, {"max_new_tokens": 2}, evaluation=evaluation)
+    assert requests[0]["image_data"] == ["student-image"]
+    assert "_opd_image_b64_cache" not in sample.multimodal_inputs
+
+
+@pytest.mark.asyncio
+async def test_native_generate_does_not_replace_distinct_teacher_media(native_generate, monkeypatch):
+    from relax.utils.data import processing_utils
+
+    rollout, args, sample, state, _, requests = native_generate
+    sample.teacher_multimodal_inputs = {"images": ["teacher-image"]}
+    calls = []
+
+    async def encode(image):
+        calls.append(image)
+        return f"encoded-{image}"
+
+    monkeypatch.setattr(processing_utils, "async_encode_image_for_rollout_engine", encode)
+    await rollout.generate(args, sample, {"max_new_tokens": 2})
+    session = _Session(_response(sample.tokens))
+    assert await state.opd_manager._teacher_prefill(sample, session)
+    assert requests[0]["image_data"] == ["student-image"]
+    assert session.requests[0][1]["image_data"] == ["encoded-teacher-image"]
+    assert calls == ["teacher-image"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("teacher_prompt_key", [None, "text"])
+async def test_same_field_images_share_encoding_from_dataset_to_teacher(
+    native_generate, monkeypatch, teacher_prompt_key
+):
+    from PIL import Image
+
+    from relax.engine.rollout import on_policy_distillation
+    from relax.utils.data import processing_utils
+    from relax.utils.data.data_utils import process_raw_sample
+
+    rollout, args, _, state, _, requests = native_generate
+    state.processor.image_processor = SimpleNamespace(patch_size=16)
+    state.tokenizer.apply_chat_template = lambda *args, **kwargs: "image prompt"
+    state.opd_manager = _manager(opd_teacher_image_key="images", opd_teacher_prompt_key=teacher_prompt_key)
+    loaded = []
+    process_vision_info = processing_utils.process_vision_info
+
+    def load_media(*args, **kwargs):
+        media = process_vision_info(*args, **kwargs)
+        loaded.append(media)
+        return media
+
+    monkeypatch.setattr(processing_utils, "process_vision_info", load_media)
+    sample = process_raw_sample(
+        {"text": "<image>", "images": [Image.new("RGB", (64, 64), "red")]},
+        state.tokenizer,
+        state.processor,
+        multimodal_keys={"image": "images"},
+        teacher_multimodal_keys={"image": "images"},
+        teacher_prompt_key=teacher_prompt_key,
+        apply_chat_template=True,
+    )
+    assert len(loaded) == 1
+    assert sample.multimodal_inputs is sample.teacher_multimodal_inputs is loaded[0]
+    calls = []
+
+    async def encode(image):
+        calls.append(image)
+        return processing_utils.encode_image_for_rollout_engine(image)
+
+    session = _Session(_response([1, 99, 99, 99, 2, 10, 11]))
+    monkeypatch.setattr(rollout, "async_encode_image_for_rollout_engine", encode)
+    monkeypatch.setattr(processing_utils, "async_encode_image_for_rollout_engine", encode)
+    monkeypatch.setattr(on_policy_distillation, "_create_teacher_client_session", lambda args: session)
+    await rollout.generate(args, sample, {"max_new_tokens": 2})
+    await state.opd_manager.prefill(sample)
+
+    assert len(calls) == 1
+    assert session.requests[0][1]["image_data"] == requests[0]["image_data"]
+    assert sample.teacher_tokens == sample.tokens  # Keep the existing teacher processor path.
+    for restored in (sample, copy.deepcopy(sample), pickle.loads(pickle.dumps(sample))):
+        assert restored.teacher_multimodal_inputs is restored.multimodal_inputs
+        assert await encode_image_inputs(restored.teacher_multimodal_inputs) == {
+            "image_data": requests[0]["image_data"]
+        }
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("different", ["key", "prompt", "custom", "no_images", "video", "audio"])
+def test_dataset_preserves_separate_teacher_media_outside_same_field_images(monkeypatch, different):
+    from relax.utils.data import processing_utils
+    from relax.utils.data.data_utils import process_raw_sample
+
+    processed = []
+
+    def process(*args, **kwargs):
+        media = {
+            "images": [] if different == "no_images" else [object()],
+            "videos": [object()] if different == "video" else None,
+            "audio": [object()] if different == "audio" else None,
+        }
+        processed.append(media)
+        return media
+
+    monkeypatch.setattr(processing_utils, "process_vision_info", process)
+    sample = process_raw_sample(
+        {"text": "<image>", "teacher_text": "<image>", "images": ["student"], "other_images": ["teacher"]},
+        SimpleNamespace(),
+        SimpleNamespace(),
+        multimodal_keys={"image": "images"},
+        teacher_multimodal_keys={"image": "other_images" if different == "key" else "images"},
+        teacher_prompt_key="teacher_text" if different == "prompt" else None,
+        custom_prompt_func=(lambda prompt, data: prompt) if different == "custom" else None,
+    )
+    assert len(processed) == 2
+    assert sample.multimodal_inputs is processed[0]
+    assert sample.teacher_multimodal_inputs is processed[1]
 
 
 @pytest.mark.asyncio
