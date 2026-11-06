@@ -1,6 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 
+import asyncio
+from pathlib import Path
+from time import monotonic
+
+import aiohttp
 import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
@@ -214,3 +219,233 @@ class TeacherManager(MultiEngineManager):
             )
             addr_and_ports.update({rank: per_engine_addr_and_ports[rank] for rank, _ in engines})
         return addr_and_ports
+
+
+@ray.remote
+class SharedTeacherManager:
+    """Own admission and checkpoint changes for one physical Teacher engine."""
+
+    def __init__(self, args, manager, url: str, routes: dict[str, str]) -> None:
+        self.manager = manager
+        self.url = url
+        self.base_url = url.removesuffix("/generate")
+        self.routes = routes
+        self.current_teacher = next(iter(routes))
+        self._timeout = float(args.opd_teacher_timeout_s)
+        self._limit = int(getattr(args, "opd_teacher_connector_limit", 256))
+        if self._limit <= 0:
+            raise ValueError("Shared Teacher request capacity must be positive")
+
+        self._session: aiohttp.ClientSession | None = None
+        self._control = asyncio.Lock()
+        self._state = "starting"
+        self._worker: asyncio.Task | None = None
+        # A running batch finishes before any switch; these bounds apply between batches.
+        self._batch_tokens = 131072
+        self._max_wait_s = 2.0
+        self._queues: dict[str, dict[asyncio.Future, tuple[float, dict]]] = {}
+        self._pending = 0
+        self._capacity = asyncio.Event()
+
+    async def initialize(self) -> None:
+        async with self._control:
+            if self._state != "starting":
+                raise RuntimeError(f"Shared Teacher cannot initialize while {self._state}")
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=self._limit), timeout=aiohttp.ClientTimeout(total=self._timeout)
+            )
+            try:
+                await self._verify_checkpoint(self.current_teacher)
+                self._state = "ready"
+            except BaseException:
+                self._state = "failed"
+                await self._session.close()
+                raise
+
+    async def score(self, teacher: str, payload: dict) -> dict:
+        if self._state != "ready":
+            raise RuntimeError(f"Shared Teacher is {self._state}")
+        if teacher not in self.routes:
+            raise KeyError(f"Unknown shared Teacher: {teacher}")
+
+        input_ids = payload.get("input_ids")
+        if not isinstance(input_ids, (tuple, list)) or not input_ids or isinstance(input_ids[0], (tuple, list)):
+            raise ValueError("Shared Teacher expects one nonempty input_ids sequence per request")
+        # Wait before putting the payload into a Teacher queue. Closing admission
+        # replaces this event so an old RPC cannot slip through a later onload.
+        capacity = self._capacity
+        while self._pending >= self._limit:
+            capacity.clear()
+            await capacity.wait()
+            if capacity is not self._capacity:
+                raise RuntimeError("Shared Teacher stopped accepting requests while waiting for capacity")
+
+        reply = asyncio.get_running_loop().create_future()
+        self._queues.setdefault(teacher, {})[reply] = monotonic(), payload
+        self._pending += 1
+        if self._worker is None:
+            self._worker = asyncio.create_task(self._run_batches())
+        try:
+            return await reply
+        except asyncio.CancelledError:
+            # A queued request can be removed; a dispatched request must still drain.
+            queue = self._queues.get(teacher)
+            if queue is not None and reply in queue:
+                del queue[reply]
+                self._pending -= 1
+                self._capacity.set()
+                if not queue:
+                    del self._queues[teacher]
+            raise
+
+    async def _verify_checkpoint(self, teacher: str, *, check_version: bool = False) -> None:
+        async with self._session.get(self.base_url + "/model_info") as response:
+            response.raise_for_status()
+            info = await response.json()
+        path = info.get("model_path")
+        if not path or Path(path).resolve() != Path(self.routes[teacher]).resolve():
+            raise RuntimeError(
+                f"Shared Teacher {teacher!r} expected checkpoint {self.routes[teacher]!r}, got {path!r}"
+            )
+        if check_version and info.get("weight_version") != teacher:
+            raise RuntimeError(f"Shared Teacher {teacher!r} got weight_version={info.get('weight_version')!r}")
+
+    async def _load(self, teacher: str) -> None:
+        started = monotonic()
+        payload = {"model_path": self.routes[teacher], "weight_version": teacher, "flush_cache": True}
+        async with self._session.post(self.base_url + "/update_weights_from_disk", json=payload) as response:
+            response.raise_for_status()
+            result = await response.json()
+        if result.get("success") is not True:
+            raise RuntimeError(f"Shared Teacher checkpoint update failed for {teacher!r}: {result.get('message')}")
+        await self._verify_checkpoint(teacher, check_version=True)
+        logger.info("Shared Teacher reload %s -> %s took %.2fs", self.current_teacher, teacher, monotonic() - started)
+        self.current_teacher = teacher
+
+    async def _generate(self, payload: dict) -> dict:
+        from relax.engine.rollout.on_policy_distillation import _aiohttp_json_post_kwargs
+
+        async with self._session.post(self.url, **_aiohttp_json_post_kwargs(payload)) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    def _take_batch(self) -> tuple[str, dict[asyncio.Future, dict]]:
+        # Prefer the loaded Teacher until the oldest waiting request needs its turn.
+        oldest = min(self._queues, key=lambda key: next(iter(self._queues[key].values()))[0])
+        age = monotonic() - next(iter(self._queues[oldest].values()))[0]
+        teacher = self.current_teacher if self.current_teacher in self._queues and age < self._max_wait_s else oldest
+        queue = self._queues[teacher]
+        batch = {}
+        tokens = 0
+        while queue:
+            reply = next(iter(queue))
+            _, payload = queue[reply]
+            length = len(payload["input_ids"])
+            if batch and tokens + length > self._batch_tokens:
+                break
+            batch[reply] = payload
+            tokens += length
+            del queue[reply]
+        if not queue:
+            del self._queues[teacher]
+        return teacher, batch
+
+    async def _run_batches(self) -> None:
+        batch = {}
+        try:
+            while self._queues:
+                teacher, batch = self._take_batch()
+                if self.routes[teacher] != self.routes[self.current_teacher]:
+                    await self._load(teacher)
+                else:
+                    self.current_teacher = teacher
+                results = await asyncio.gather(*map(self._generate, batch.values()), return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                for reply, result in zip(batch, results, strict=True):
+                    if not reply.cancelled():
+                        result["_relax_teacher_route"] = teacher
+                        reply.set_result(result)
+                self._pending -= len(batch)
+                self._capacity.set()
+                batch = {}
+        except BaseException as exc:
+            # After a transport or reload failure, GPU completion/identity is unknown.
+            self._stop_admission("failed")
+            for queue in (batch, *self._queues.values()):
+                for reply in queue:
+                    if not reply.done():
+                        reply.set_exception(exc)
+            self._queues.clear()
+            self._pending = 0
+            logger.exception("Shared Teacher failed; rebuild the physical engine before reusing it")
+        finally:
+            self._worker = None
+
+    def _stop_admission(self, state: str) -> None:
+        self._state = state
+        self._capacity.set()
+        self._capacity = asyncio.Event()
+
+    def get_status(self) -> dict:
+        return {
+            "state": self._state,
+            "teacher_id": None if self._state == "failed" else self.current_teacher,
+            "pending": self._pending,
+        }
+
+    async def offload(self) -> None:
+        async with self._control:
+            if self._state == "offloaded":
+                return
+            if self._state != "ready":
+                raise RuntimeError(f"Shared Teacher cannot offload while {self._state}")
+            self._stop_admission("draining")
+            try:
+                if self._worker is not None:
+                    await asyncio.shield(self._worker)
+                if self._state == "failed":
+                    raise RuntimeError("Shared Teacher failed while draining")
+                await self.manager.offload.remote()
+                self._state = "offloaded"
+            except BaseException:
+                self._state = "failed"
+                raise
+
+    async def onload(self) -> None:
+        async with self._control:
+            if self._state == "ready":
+                return
+            if self._state != "offloaded":
+                raise RuntimeError(f"Shared Teacher cannot onload while {self._state}")
+            try:
+                await self.manager.onload.remote()
+                # The physical manager may have rebuilt the engine from its initial checkpoint.
+                await self._load(self.current_teacher)
+                self._state = "ready"
+            except BaseException:
+                self._state = "failed"
+                raise
+
+    async def shutdown(self) -> None:
+        async with self._control:
+            if self._state == "closed":
+                return
+            self._stop_admission("closing")
+            worker = self._worker
+            try:
+                if worker is not None:
+                    await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # Even a cancelled shutdown RPC must drain accepted GPU work.
+                await asyncio.shield(worker)
+                raise
+            finally:
+                try:
+                    if self._session is not None:
+                        await self._session.close()
+                    await self.manager.shutdown.remote()
+                finally:
+                    ray.kill(self.manager)
+                    self._state = "closed"

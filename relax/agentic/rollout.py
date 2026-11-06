@@ -16,6 +16,7 @@ import time
 from argparse import Namespace
 from collections import deque
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Deque, List, Optional, Tuple, cast
 
 from tqdm import tqdm
@@ -76,6 +77,7 @@ async def _run_group(
     reward_domain: RewardDomain,
     stream: RuntimeGroupStream,
     opd_manager: opd.OpdManager | None = None,
+    teacher_ids: dict[int | str | None, str] | None = None,
 ) -> Optional[GroupExport]:
     """Run one Group through Runtime and the configured Reward barrier."""
 
@@ -109,7 +111,12 @@ async def _run_group(
             return scored_group
         from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
-        await opd_manager.prefill(scored_group.samples, _encode_multimodal_inputs)
+        samples = scored_group.samples
+        if teacher_ids:
+            # Session exports and reward/filter hooks can replace the bound routing metadata.
+            for sample in samples:
+                sample.metadata["teacher_id"] = teacher_ids[sample.response_key]
+        await opd_manager.prefill(samples, _encode_multimodal_inputs)
         return scored_group
     except BaseException:
         reward_domain.discard_group_progress(stream)
@@ -137,6 +144,10 @@ class AgenticResidentPipeline:
         self.transfer_domain = transfer_domain
         self._data_system_client = data_system_client
         self._opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
+        self._response_stats = self._opd_manager.response_stats if self._opd_manager is not None else None
+        self._prepared_teachers: dict[str, dict[int | str | None, str]] = {}
+        if self._opd_manager is not None and getattr(args, "opd_teacher_routes_map", None):
+            self.prepare_domain.prepare_group = self._prepare_teacher_group
 
         self._changed = asyncio.Event()
         self.prepare_domain.set_progress_callback(self._changed.set)
@@ -154,7 +165,7 @@ class AgenticResidentPipeline:
         warming, ready = self.prepare_domain.counts
         runtime_reward = len(self._active_group_tasks)
         finalized = len(self._finalized_groups)
-        return {
+        snapshot: dict[str, object] = {
             "active_rollout_id": context.rollout_id if context is not None else None,
             "warming_prepare_group_count": warming,
             "ready_prepare_group_count": ready,
@@ -164,6 +175,9 @@ class AgenticResidentPipeline:
             "resident_group_count": self.runtime_domain.resident_group_count,
             "interrupted_runtime_group_count": len(self.runtime_domain.interrupted_group_ids),
         }
+        if self._response_stats is not None:
+            snapshot["teacher_responses"] = self._response_stats.metrics()
+        return snapshot
 
     async def run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
         """Generate one rollout step while resident Group refs may cross
@@ -181,6 +195,8 @@ class AgenticResidentPipeline:
             final_backfill=final_backfill,
         )
         self._active_step = context
+        if self._response_stats is not None:
+            self._response_stats.new_window()
         try:
             self.prepare_domain.open_step(
                 prelaunch_next_step=self.args.agentic_prelaunch and rollout_id + 1 < self.args.num_rollout
@@ -193,6 +209,8 @@ class AgenticResidentPipeline:
             metrics = dict(output.metrics or {})
             metrics.update(_aggregate_agentic_timing(samples))
             metrics.update(self.reward_domain.collect_metrics())
+            if self._response_stats is not None:
+                metrics.update(self._response_stats.metrics())
             if getattr(self.args, "agentic_program_admission", False) or getattr(
                 self.args, "agentic_session_lifecycle", False
             ):
@@ -469,6 +487,19 @@ class AgenticResidentPipeline:
         await self._await_tq_puts(context)
         self.transfer_domain.release_finished_partitions()
 
+    async def _prepare_teacher_group(
+        self, group_input: GroupInput, launch_decision: asyncio.Future[bool]
+    ) -> RuntimeGroupStream | None:
+        for sample in group_input.samples:
+            self._opd_manager.bind_teacher(sample)
+        stream = await self.runtime_domain.prepare_group(group_input, launch_decision)
+        if stream is not None:
+            # Runtime has assigned session IDs to inputs without a dataset index.
+            self._prepared_teachers[stream.group_id] = {
+                sample.response_key: sample.metadata["teacher_id"] for sample in group_input.samples
+            }
+        return stream
+
     async def _lease_prepared_groups(self, context: _StepContext) -> None:
         """Open generation for the ready FIFO prefix visible at this check.
 
@@ -478,13 +509,29 @@ class AgenticResidentPipeline:
         """
 
         for stream in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
-            await self.runtime_domain.lease_group(stream, context.rollout_id)
+            teacher_ids = self._prepared_teachers.pop(stream.group_id, {})
+            if self._response_stats is not None:
+                for key, teacher_id in teacher_ids.items():
+                    self._response_stats.admit(key, teacher_id)
+            try:
+                await self.runtime_domain.lease_group(stream, context.rollout_id)
+            except BaseException:
+                self._finish_group(teacher_ids)
+                raise
             group_task = asyncio.create_task(
-                _run_group(self.runtime_domain, self.reward_domain, stream, self._opd_manager),
+                _run_group(self.runtime_domain, self.reward_domain, stream, self._opd_manager, teacher_ids),
                 name=f"agentic-group:{stream.group_id}",
             )
-            group_task.add_done_callback(lambda _task: self._changed.set())
+            group_task.add_done_callback(partial(self._finish_group, teacher_ids))
             self._active_group_tasks.append(group_task)
+
+    def _finish_group(
+        self, teacher_ids: dict[int | str | None, str], _task: asyncio.Task[Optional[GroupExport]] | None = None
+    ) -> None:
+        if self._response_stats is not None:
+            for key in teacher_ids:
+                self._response_stats.finish(key)
+        self._changed.set()
 
     def _runtime_group_gap(self, context: _StepContext) -> int:
         oversample_groups = 0
@@ -524,6 +571,7 @@ class AgenticResidentPipeline:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+        self._prepared_teachers.clear()
         if first_error is not None:
             raise first_error
 

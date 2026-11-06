@@ -23,6 +23,8 @@ from relax.agentic.pipeline import (
     RuntimeGroupError,
     SampleExport,
     SessionExport,
+    SessionExportTransport,
+    TrainingFieldArtifact,
 )
 from relax.agentic.pipeline import runtime as runtime_mod
 from relax.agentic.pipeline.prepare import PrepareDomain
@@ -66,7 +68,7 @@ if _existing_rollout_module is None:
     _rollout_module_stub._log_rollout_data = MagicMock()
     sys.modules[_rollout_module_name] = _rollout_module_stub
 try:
-    from relax.agentic.rollout import AgenticResidentPipeline, _StepContext  # noqa: E402
+    from relax.agentic.rollout import AgenticResidentPipeline, _run_group, _StepContext  # noqa: E402
 finally:
     if _existing_rollout_module is None:
         sys.modules.pop(_rollout_module_name, None)
@@ -126,6 +128,116 @@ async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) ->
 
     assert calls == [sample]
     assert sample.reward == 1.0
+
+
+@pytest.mark.parametrize("cancel", [True, False], ids=["cancel", "export"])
+async def test_resident_teacher_binds_before_prepare_and_tracks_original_response(monkeypatch, cancel) -> None:
+    args = _runtime_args(
+        rollout_global_dataset=True,
+        use_opd=True,
+        opd_type="sglang",
+        opd_token_selection="student_sampled",
+        opd_teacher_key="domain",
+        opd_teacher_routes_map={"A": ["http://a"], "B": ["http://b"]},
+        opd_teacher_timeout_s=10,
+    )
+    metadata = {"data_source": "math_dataset", "domain": "A", "_source_mixture_batch_id": 7}
+    sample = Sample(prompt="one", metadata=metadata.copy())
+    shard = runtime_mod._SessionShardBinding("shard", MagicMock())
+    runtime = RuntimeDomain(args, "train", [shard], 1)
+    monkeypatch.setattr(runtime, "_start_shard_observers", lambda: None)
+
+    async def start_group(mode, group_id, specs):
+        assert specs[0].metadata == {**metadata, "teacher_id": "A"}
+        shard.group_streams[group_id].first_request_barrier.set_result(True)
+
+    shard.handle.start_group.remote = start_group
+    shard.handle.lease_group.remote = AsyncMock()
+    prepare = PrepareDomain("train", None, runtime)
+    reward = MagicMock(group_rm=True, custom_advantage_func=None)
+    reward.score_group = AsyncMock()
+    reward.finalize_group.side_effect = lambda group: group
+    pipeline = AgenticResidentPipeline(args, prepare, runtime, reward, SimpleNamespace(total_debt=1), None)
+    prepare._start_prepare(GroupInput("g", [sample]))
+    await asyncio.gather(*prepare._warming_prepare_tasks)
+    assert pipeline.snapshot()["teacher_responses"]["mopd/by_teacher/A/responses"] == 0
+
+    await pipeline._lease_prepared_groups(_StepContext(rollout_id=0, final_backfill=False))
+    assert pipeline.snapshot()["teacher_responses"]["mopd/by_teacher/A/awaiting_submission"] == 1
+    pipeline._response_stats.new_window()
+    if cancel:
+        # The group task can be cancelled before its coroutine first runs.
+        await pipeline._cancel_active_group_tasks()
+    else:
+        # A session can export multiple rows and override metadata on each one.
+        exports = tuple(
+            SampleExport(
+                label,
+                Sample(
+                    session_id=sample.session_id,
+                    tokens=[10, 20],
+                    response_length=1,
+                    metadata={**metadata, "teacher_id": "B"},
+                ),
+            )
+            for label in ("first", "second")
+        )
+        group = GroupExport("g", (SessionExport(exports),))
+        monkeypatch.setattr(runtime, "collect_group", AsyncMock(return_value=group))
+
+        async def post(session, url, payload, result, tag, expected_ids):
+            from relax.utils.opd.opd_main_worker import LogprobResponse
+
+            assert url == "http://a"
+            assert pipeline.snapshot()["teacher_responses"]["mopd/by_teacher/A/awaiting_submission"] == 0
+            return LogprobResponse({"meta_info": {"input_token_logprobs": [[None, 10], [-0.5, 20]]}})
+
+        monkeypatch.setattr(pipeline._opd_manager, "_post_logprob", post)
+        assert await asyncio.gather(*pipeline._active_group_tasks) == [group]
+        assert [result.teacher_log_probs for result in group.samples] == [[-0.5], [-0.5]]
+    assert pipeline.snapshot()["teacher_responses"] == {
+        "mopd/by_teacher/A/responses": 1,
+        "mopd/by_teacher/A/awaiting_submission": 0,
+        "mopd/by_teacher/B/responses": 0,
+        "mopd/by_teacher/B/awaiting_submission": 0,
+    }
+
+
+@pytest.mark.parametrize("index", [0, None])
+async def test_agentic_exports_restore_bound_teacher_after_reward_and_filter(monkeypatch, index):
+    loop = asyncio.get_running_loop()
+    result = runtime_mod._SessionResultRef("session", loop.create_future())
+    key = index if index is not None else result.session_id
+    stream = runtime_mod.RuntimeGroupStream("g", MagicMock(), loop.create_future(), (result,))
+
+    leaf = Sample(index=index, session_id=result.session_id, metadata={"teacher_id": "B"})
+    payload = TrainingFieldArtifact.from_sample(leaf).sample_payload
+    transport = SessionExportTransport(
+        tuple({"name": name, "sample_payload": payload} for name in ("first", "second"))
+    )
+    runtime_mod._resolve_session_export(stream, result, transport)
+    group = GroupExport("g", (await result.completion,))
+    runtime = SimpleNamespace(collect_group=AsyncMock(return_value=group), drop_group=AsyncMock())
+
+    async def reward(args, sample):
+        sample.metadata["teacher_id"] = "C"
+        return 1.0
+
+    def keep(samples):
+        for sample in samples:
+            sample.metadata["teacher_id"] = "B"
+        return True
+
+    async def prefill(samples, encode_multimodal_inputs):
+        assert [sample.metadata["teacher_id"] for sample in samples] == ["A", "A"]
+
+    monkeypatch.setattr("relax.agentic.pipeline.reward.async_rm", reward)
+    rewards = RewardDomain(_runtime_args(), "train", keep)
+    teacher = SimpleNamespace(prefill=AsyncMock(side_effect=prefill))
+    assert await _run_group(runtime, rewards, stream, teacher, {key: "A"}) is group
+    teacher.prefill.assert_awaited_once()
+    assert [sample.reward for sample in group.samples] == [1.0, 1.0]
+    assert [sample.metadata["teacher_id"] for sample in group.samples] == ["A", "A"]
 
 
 async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> None:
