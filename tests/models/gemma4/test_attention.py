@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tests.cpu.models.gemma4.test_attention import _MODULE, _attention, _packed_sdpa
+from tests.cpu.models.gemma4.test_attention import _MODULE, _attention, _hf_vision_mask, _packed_sdpa
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlexAttention")
@@ -86,3 +86,58 @@ def test_flex_packed_chunk_boundaries_preserve_outputs_and_gradients(monkeypatch
         changed_value[129:] += 10
         changed = attention._thd_flex_per_subseq(query.detach(), changed_key, changed_value, boundaries)
     torch.testing.assert_close(output[:129], changed[:129])
+
+
+@pytest.mark.parametrize("window_left", [31, 1023])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vision_flex_outputs_and_gradients_match_hf_masks(window_left, dtype):
+    from torch.nn.attention.flex_attention import flex_attention
+
+    torch.manual_seed(17)
+    groups = torch.full((389,), -1, dtype=torch.long, device="cuda")
+    groups[30:65] = 0
+    groups[100:310] = 1
+    offset, length = 128, 137
+    query = (torch.randn(1, 2, length, 256, device="cuda", dtype=dtype) * 0.1).requires_grad_()
+    key = (torch.randn(1, 1, groups.numel(), 256, device="cuda", dtype=dtype) * 0.1).requires_grad_()
+    value = torch.randn_like(key, requires_grad=True)
+    block_mask = _MODULE._vision_block_mask(groups, length, offset, window_left)
+    options = {
+        key: value
+        for key, value in _MODULE._FLEX_KERNEL_OPTIONS.items()
+        if key not in {"BLOCKS_ARE_CONTIGUOUS", "ROWS_GUARANTEED_SAFE"}
+    }
+    output = _MODULE._get_compiled_flex_attention()(
+        query,
+        key,
+        value,
+        block_mask=block_mask,
+        scale=1.0,
+        enable_gqa=True,
+        kernel_options=options,
+    )
+    allowed = _hf_vision_mask(groups, window_left)["sliding_attention"][offset : offset + length]
+    reference_inputs = [tensor.detach().double().requires_grad_() for tensor in (query, key, value)]
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        *reference_inputs,
+        attn_mask=allowed,
+        scale=1.0,
+        enable_gqa=True,
+    )
+    atol, rtol = (3e-3, 2e-2) if dtype == torch.bfloat16 else (3e-5, 3e-4)
+    torch.testing.assert_close(output.double(), reference, atol=atol, rtol=rtol)
+    upstream = torch.randn_like(output)
+    actual_grads = torch.autograd.grad(output, (query, key, value), upstream)
+    reference_grads = torch.autograd.grad(reference, reference_inputs, upstream.double())
+    if dtype == torch.bfloat16:
+        eager_inputs = [tensor.detach().clone().requires_grad_() for tensor in (query, key, value)]
+        eager = flex_attention(*eager_inputs, block_mask=block_mask, scale=1.0, enable_gqa=True)
+        eager_grads = torch.autograd.grad(eager, eager_inputs, upstream)
+        for actual, expected, eager_grad in zip(actual_grads, reference_grads, eager_grads, strict=True):
+            assert torch.isfinite(actual).all() and torch.isfinite(eager_grad).all() and torch.isfinite(expected).all()
+            error = (actual.double() - expected).abs().mean()
+            eager_error = (eager_grad.double() - expected).abs().mean()
+            assert error <= 2.1 * eager_error + 1e-7
+    else:
+        for actual, expected in zip(actual_grads, reference_grads, strict=True):
+            torch.testing.assert_close(actual.double(), expected, atol=atol, rtol=rtol)

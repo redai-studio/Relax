@@ -118,3 +118,29 @@ def mxfp4_qdq(weight: "torch.Tensor") -> "torch.Tensor":
     if groups:
         _cuda_kernel()[((groups + 7) // 8,)](weight, output, groups, GROUPS_PER_PROGRAM=8, num_warps=4)
     return output
+
+
+def mxfp4_qdq_into(weight: "torch.Tensor", output: "torch.Tensor") -> None:
+    """CUDA-only FP32 master QDQ into an independent existing BF16 carrier.
+
+    Uses the same kernel and rounding rules as mxfp4_qdq followed by copy_. The
+    caller owns no_grad, the stream dependency and the output lifetime.
+    """
+    import torch
+
+    _validate_weight(weight)
+    if (
+        not weight.is_cuda
+        or weight.dtype != torch.float32
+        or output.device != weight.device
+        or output.dtype != torch.bfloat16
+        or output.shape != weight.shape
+        or not output.is_contiguous()
+        or output.data_ptr() == weight.data_ptr()
+    ):
+        raise ValueError("MXFP4 direct output requires a CUDA FP32 matrix and a separate contiguous BF16 carrier")
+    groups = weight.numel() // 32
+    if groups:
+        _cuda_kernel()[((groups + 7) // 8,)](weight, output, groups, GROUPS_PER_PROGRAM=8, num_warps=4)
+    # Match the version-counter update of the former parameter.copy_.
+    torch.autograd.graph.increment_version(output)
