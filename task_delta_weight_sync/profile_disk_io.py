@@ -247,12 +247,19 @@ def main() -> int:
             if args.warm_receiver_cache:
                 result["status"] = f"WARMING_RECEIVER_{version}"
                 save()
-                started, count, size = monotonic(), 0, 0
-                for path in (cache.root / "objects").iterdir():
+
+                def read_prefix_object(path: Path) -> int:
+                    size = 0
                     with path.open("rb") as stream:
                         while chunk := stream.read(1024 * 1024):
                             size += len(chunk)
-                    count += 1
+                    return size
+
+                started, count, size = monotonic(), 0, 0
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    for amount in pool.map(read_prefix_object, (cache.root / "objects").iterdir()):
+                        size += amount
+                        count += 1
                 warm = {"objects": count, "bytes": size, "wall_s_outside_profile": monotonic() - started}
                 result["status"] = f"PROFILING_RECEIVER_{version}"
                 save()
