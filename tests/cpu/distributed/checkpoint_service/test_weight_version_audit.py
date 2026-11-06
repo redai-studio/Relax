@@ -136,6 +136,16 @@ def test_failed_publication_marks_old_tags_unknown_before_resume(backend, monkey
     assert any(endpoint == "/continue_generation" for endpoint, _ in events)
     value.update_weights_for_rollout()
     assert audit.read_frontier()["published_seq"] == 3
+    late = audit.generation_spans(
+        {"weight_version": old_tag, "_weight_audit_scalar_bound": True},
+        1,
+        offset=0,
+        request_id="late",
+        attempt_id="late:0",
+        piece_index=0,
+    )
+    assert late[0]["published_seq"] is None
+    assert late[0]["unknown_reason"] == "publication_scope_mismatch"
 
 
 def test_http_200_failed_bucket_is_not_a_successful_publication(backend, monkeypatch):
@@ -226,3 +236,68 @@ def test_real_gloo_collective_confirms_all_sources(tmp_path, monkeypatch, failed
     assert (frontier is not None) == (failed_rank in (-1, -2))
     if frontier is not None:
         assert frontier["published_seq"] == 1
+
+
+def test_late_adapter_response_stays_unknown_after_recovery(backend):
+    import asyncio
+
+    from relax.agentic.pipeline.runtime import BackendGenerateResult
+    from tests.cpu.test_agentic_weight_version_audit import _ir, _session
+
+    value, _ = backend
+    value._lora_adapter_mode = True
+    old_tag = value._weight_audit_publisher.publish()
+    engine_tag = old_tag
+    pending_fails = True
+    actual_policy = 1
+    original_request = value._batch_request
+
+    def request(endpoint, payload=None):
+        nonlocal engine_tag
+        if endpoint == "/update_weight_version":
+            if pending_fails and payload["new_version"].startswith("relax-audit-pending:"):
+                return [{"success": False}]
+            engine_tag = payload["new_version"]
+            return [{"success": True}]
+        return original_request(endpoint, payload)
+
+    def push(**_kwargs):
+        nonlocal actual_policy
+        actual_policy += 1
+
+    value._batch_request = request
+    value._push_lora_adapter_distributed = push
+    value.update_weights_for_rollout()
+    assert actual_policy == 2 and engine_tag == old_tag
+    assert audit.read_frontier() is None
+    delayed = BackendGenerateResult(
+        new_tokens=[97],
+        new_log_probs=[-0.5],
+        finish_type="stop",
+        meta_info={
+            "prompt_tokens": 4,
+            "finish_reason": {"type": "stop"},
+            "weight_version": engine_tag,
+            "_weight_audit_scalar_bound": True,
+        },
+        elapsed=0.1,
+    )
+    pending_fails = False
+    value.update_weights_for_rollout()
+    assert actual_policy == 3
+
+    async def export():
+        shard, session, forest, observation = _session()
+        ir = _ir(session, observation.state_hash, "late-response")
+        shard._apply_generate_result(ir, delayed)
+        ir.pending_status = "completed"
+        shard._terminal_response_locked(session=session, ir=ir, finish_type="stop")
+        return forest.build_sample(
+            leaf_state_hash=session.resp_state_hash_by_request_id[ir.request_id],
+            tokenizer=shard._generation_backend.tokenizer,
+        )
+
+    sample = asyncio.run(export())
+    span = sample.metadata[audit.AUDIT_KEY]["spans"][0]
+    assert span["published_seq"] is None
+    assert span["unknown_reason"] == "publication_scope_mismatch"

@@ -24,6 +24,7 @@ AUDIT_FIELD = "weight_audit_payload"
 PREPARED_FIELD = "weight_audit_rows"
 _VERSION_PREFIX = "relax-audit-v1:"
 _MAX_REPORT_BYTES = 8 * 1024 * 1024
+_pending_summaries: dict[Path, dict[str, Any]] = {}
 
 
 def enabled() -> bool:
@@ -98,6 +99,8 @@ class PublicationLedger:
 
     def invalidate(self) -> None:
         """Do not trust retained adapter labels after an unconfirmed update."""
+        # Retained tags must stay invalid even if their responses arrive after recovery.
+        self.lineage_id = uuid.uuid4().hex
         _atomic_json(self.directory / "frontier.json", {"schema_version": 1, "evidence_valid": False})
 
 
@@ -313,7 +316,7 @@ def audit_row(row: dict[str, Any], frontier: dict[str, Any] | None) -> dict[str,
         details.append({**span, "age": age, "unknown_reason": reason})
     lo, hi = (min(versions), max(versions)) if versions else (None, None)
     finish = row.get("finish_snapshot")
-    advance, finish_gap = _finish_progress(finish, frontier, hi)
+    advance, finish_gap = _finish_progress(finish, frontier, hi) if total else (None, None)
     return {
         "sample_uid": row.get("sample_uid"),
         "physical_row_index": row.get("physical_row_index"),
@@ -405,36 +408,83 @@ class AuditStep:
         self.frontier = read_frontier()
         self.observed: dict[int, list[dict[str, Any]]] = {}
         self.summary: dict[str, Any] | None = None
+        self.masked_rows: dict[int, tuple[list[dict[str, Any]], Any]] = {}
 
-    def observe(self, ordinal: int, rows: list[dict[str, Any]] | None, *, dummy: bool = False) -> None:
+    def observe(
+        self, ordinal: int, rows: list[dict[str, Any]] | None, *, dummy: bool = False, counts: Any = None
+    ) -> None:
         if not dummy and rows is not None and ordinal not in self.observed:
-            self.observed[ordinal] = [{**audit_row(row, self.frontier), "microbatch_index": ordinal} for row in rows]
+            if counts is None:
+                self.observed[ordinal] = [
+                    {**audit_row(row, self.frontier), "microbatch_index": ordinal} for row in rows
+                ]
+            else:
+                # Device counts are read only after the forward/backward schedule succeeds.
+                self.masked_rows[ordinal] = (rows, counts)
+                self.observed[ordinal] = []
 
     def commit(self, rank: int) -> dict[str, Any]:
-        """Write bounded details and a cumulative, mergeable representative
-        summary."""
-        if self.summary is not None:
-            return self.summary
-        reports = [report for batch in self.observed.values() for report in batch]
-        summary = {"consumption_id": self.consumption_id, "rank": rank, **aggregate(reports)}
-        directory = Path(Envs.RELAX_WEIGHT_AUDIT_DIR)
-        lineage = self.frontier["lineage_id"] if self.frontier else "unknown"
-        path = directory / lineage / f"consumed-rank-{rank}.jsonl"
-        dropped = self._append_details(path, reports, rank)
-        summary["detail_records_dropped"] = dropped
-        summary_path = path.with_suffix(".summary.json")
-        previous = json.loads(summary_path.read_text()) if summary_path.exists() else None
-        cumulative = aggregate([previous, summary]) if previous else aggregate([summary])
-        cumulative.update(
-            rank=rank,
-            last_consumption_id=self.consumption_id,
-            consumptions=(previous["consumptions"] if previous else 0) + 1,
-            detail_records_dropped=(previous["detail_records_dropped"] if previous else 0) + dropped,
-        )
-        _atomic_json(summary_path, cumulative)
-        self.observed.clear()
-        self.summary = summary
-        return summary
+        """Write bounded details; retain failed cumulative writes for the next
+        step."""
+        error = None
+        if self.summary is None:
+            for ordinal, (rows, counts) in self.masked_rows.items():
+                values = iter(counts.tolist())
+                for row in rows:
+                    total = next(values)
+                    spans = [{**span, "eligible_tokens": next(values)} for span in row["spans"]]
+                    adjusted = {
+                        **row,
+                        "eligible_tokens": total,
+                        "spans": spans,
+                        "uncovered_tokens": total - sum(span["eligible_tokens"] for span in spans),
+                    }
+                    self.observed[ordinal].append({**audit_row(adjusted, self.frontier), "microbatch_index": ordinal})
+            reports = [report for batch in self.observed.values() for report in batch]
+            summary = {"consumption_id": self.consumption_id, "rank": rank, **aggregate(reports)}
+            directory = Path(Envs.RELAX_WEIGHT_AUDIT_DIR)
+            lineage = self.frontier["lineage_id"] if self.frontier else "unknown"
+            path = directory / lineage / f"consumed-rank-{rank}.jsonl"
+            summary_path = path.with_suffix(".summary.json")
+            previous = _pending_summaries.get(summary_path)
+            if previous is None and summary_path.exists():
+                previous = json.loads(summary_path.read_text())
+            cumulative = aggregate([previous, summary]) if previous else aggregate([summary])
+            cumulative.update(
+                rank=rank,
+                last_consumption_id=self.consumption_id,
+                consumptions=(previous["consumptions"] if previous else 0) + 1,
+                detail_records_dropped=previous["detail_records_dropped"] if previous else 0,
+            )
+            # Stage once before I/O so retries and later steps cannot lose or duplicate counts.
+            _pending_summaries[summary_path] = cumulative
+            self.summary = summary
+            self.observed.clear()
+            self.masked_rows.clear()
+            try:
+                dropped = self._append_details(path, reports, rank)
+            except OSError as exc:
+                cumulative["audit_errors"] += 1
+                cumulative["aggregate_complete"] = False
+                dropped = len(reports)
+                error = exc
+            summary["detail_records_dropped"] = dropped
+            cumulative["detail_records_dropped"] += dropped
+        # Also retry old lineages, which may never receive another consumption.
+        for summary_path, cumulative in list(_pending_summaries.items()):
+            try:
+                _atomic_json(summary_path, cumulative)
+            except OSError as exc:
+                cumulative["audit_errors"] += 1
+                cumulative["aggregate_complete"] = False
+                error = exc
+            else:
+                del _pending_summaries[summary_path]
+        if error is not None:
+            self.summary["audit_errors"] += 1
+            self.summary["aggregate_complete"] = False
+            raise error
+        return self.summary
 
     def _append_details(self, path: Path, reports: list[dict[str, Any]], rank: int) -> int:
         """Append details within the byte limit and return the number

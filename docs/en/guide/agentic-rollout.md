@@ -708,7 +708,8 @@ env_vars:
 
 The DCS publisher assigns a sequence after all policy weight buckets have confirmed successful loading.
 Failed updates and actor-forward-only synchronization do not advance it. Successful publications receive a fresh
-lineage after a publisher restart. DCS uses abort-and-drain before updates, so managed SGLang responses can provide
+lineage after a publisher restart or invalidated publication evidence. Recovery never revalidates delayed old tags;
+cross-lineage provenance remains unknown. DCS uses abort-and-drain before updates, so managed SGLang responses can provide
 a request-bound scalar version; explicit `weight_versions` token intervals take precedence when available.
 Unconfirmed labels, unavailable snapshots, and unmapped output intervals remain unknown.
 If tag confirmation or snapshot publication fails, the shared snapshot is invalidated or removed. If both operations
@@ -717,13 +718,19 @@ audit metadata still contribute their valid loss tokens to the denominator, with
 
 Reports use actual actor loss tokens, excluding prompt, tool observations, cancelled output, zero-mask positions,
 and alignment dummy microbatches. They preserve Session, turn, request, attempt, and fragment identifiers.
-Sampling, rewards, GRPO groups, loss masks, and gradient weighting remain unchanged.
+Sampling, rewards, GRPO groups, loss masks, and gradient weighting remain unchanged. When TIS/RS changes the mask,
+the audit counts final mask positions on each CP shard; if OPD still uses the original mask, it counts the union.
+Counts are read after forward/backward completes. Rows with no eligible tokens also leave the post-generation
+publication-advance distribution unchanged.
 
 Each representative rank writes `<lineage>/consumed-rank-<rank>.jsonl` and a cumulative `.summary.json`.
 Details are limited to 8 MiB per rank and lineage; `detail_records_dropped` reports omitted details while summaries
 continue counting all observed exposures. Combine summaries with `relax.utils.weight_version_audit.aggregate`;
 it merges numerators and denominators rather than averaging rank means. Keep ranks from separate lineages separate.
-An `aggregate_complete=false` result indicates an audit error and should not be treated as a complete accounting.
+After a write failure, the current process retains cumulative counts and retries them on subsequent consumption
+commits, including summaries from older lineages. The recovered summary retains `aggregate_complete=false` to flag
+the I/O error. Pending in-memory counts cannot survive process exit. An `aggregate_complete=false` result should not
+be treated as a complete accounting.
 
 `observed_generation_span` is the difference between known source sequences within one training row.
 `token_weighted_age` uses the frontier captured before the training substep and only comparable, known source tokens;

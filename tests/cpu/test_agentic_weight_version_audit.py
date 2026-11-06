@@ -304,3 +304,23 @@ def test_unavailable_audit_transport_preserves_original_valid_mask_counts():
     assert report["missing_token_rate"] == 1
     assert report["audit_errors"] == 1
     assert audit.aggregate([report])["aggregate_complete"] is False
+
+
+def test_removed_sample_does_not_affect_consumption_wait(publisher):
+    async def run():
+        removed = await _two_turn_sample(publisher)
+        retained = await _two_turn_sample(publisher)
+        removed.remove_sample = True
+        publisher[0].publish()
+        data = convert_samples_to_train_data(_converter_args(), [removed, retained])
+        data["total_lengths"] = [len(tokens) for tokens in data["tokens"]]
+        audit.prepare_batch(data)
+        step = audit.AuditStep("filtered-sample")
+        step.observe(0, data[audit.PREPARED_FIELD])
+        summary = step.commit(0)
+        assert summary["consumed_rows"] == 1
+        assert summary["post_generation_advance_count"] == 1
+        assert summary["post_generation_advance_mean"] == 1
+        assert summary["post_generation_advance_max"] == 1
+
+    asyncio.run(run())

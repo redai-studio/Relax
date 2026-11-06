@@ -16,6 +16,7 @@ from relax.algorithms.advantages import compute_advantages_and_returns as comput
 from relax.algorithms.policy import compute_policy_loss_for
 from relax.algorithms.spec import ALGORITHM_SPECS
 from relax.engine.sft.runtime import is_sft_mode
+from relax.utils import weight_version_audit
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.env import Envs
 from relax.utils.misc import load_function
@@ -1240,6 +1241,13 @@ def policy_loss_function(
         if args.kl_loss_coef != 0:
             loss = loss + args.kl_loss_coef * kl_loss
 
+    if (
+        weight_version_audit.PREPARED_FIELD in batch
+        and not is_score_centering
+        and (args.get_mismatch_metrics or args.use_tis)
+    ):
+        batch["weight_audit_loss_masks"] = modified_response_masks
+
     opd_loss, opd_reported_loss = compute_policy_opd_loss(
         args=args,
         batch=batch,
@@ -1250,6 +1258,12 @@ def policy_loss_function(
     )
     if opd_loss is not None:
         loss = loss + opd_loss
+        if "weight_audit_loss_masks" in batch:
+            # OPD retains the original reducer even when RS rejects policy-loss tokens.
+            batch["weight_audit_loss_masks"] = [
+                (original != 0) | (modified != 0)
+                for original, modified in zip(batch["loss_masks"], batch["weight_audit_loss_masks"], strict=True)
+            ]
 
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()

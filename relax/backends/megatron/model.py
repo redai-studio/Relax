@@ -69,6 +69,7 @@ from .checkpoint import (
     save_checkpoint,
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
+from .cp_utils import get_logits_and_tokens_offset_with_cp
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
@@ -79,6 +80,56 @@ from .model_provider import (
 
 
 logger = get_logger(__name__)
+
+
+def _weight_audit_counts(args: Namespace, batch: dict[str, Any]) -> torch.Tensor | None:
+    """Count final loss masks on their CP owners without synchronizing to
+    CPU."""
+    masks = batch.get("weight_audit_loss_masks")
+    if masks is None:
+        return None
+    cp_size = batch.get("dynamic_cp_size", mpu.get_context_parallel_world_size())
+    cp_rank = batch.get("dynamic_cp_rank", mpu.get_context_parallel_rank())
+    counts = []
+    for i, (row, mask, total, response) in enumerate(
+        zip(
+            batch[weight_version_audit.PREPARED_FIELD],
+            masks,
+            batch["total_lengths"],
+            batch["response_lengths"],
+            strict=True,
+        )
+    ):
+        prompt = total - response
+        start = max(prompt, 1)
+        owners = [(start, total)]
+        if cp_size > 1:
+            _, _, _, owners = get_logits_and_tokens_offset_with_cp(
+                total,
+                response,
+                args.qkv_format,
+                batch["max_seq_lens"][i] if batch.get("max_seq_lens") is not None else None,
+                batch["padded_total_lengths"][i] if batch.get("padded_total_lengths") is not None else None,
+                dynamic_cp_size=cp_size,
+                dynamic_cp_rank=cp_rank,
+            )
+        valid = mask.detach() != 0
+        for lo, hi in [(start, total), *((span["token_start"], span["token_end"]) for span in row["spans"])]:
+            count = torch.zeros((), dtype=torch.int64, device=mask.device)
+            for owner_lo, owner_hi in owners:
+                left, right = max(lo, owner_lo), min(hi, owner_hi)
+                if left < right:
+                    count = count + valid[left - start : right - start].sum(dtype=torch.int64)
+            counts.append(count)
+    result = torch.stack(counts)
+    if cp_size > 1:
+        group = (
+            mpu.get_dynamic_data_context_parallel_groups(group_size=cp_size)
+            if "dynamic_cp_size" in batch
+            else mpu.get_context_parallel_group()
+        )
+        torch.distributed.all_reduce(result, op=torch.distributed.ReduceOp.SUM, group=group)
+    return result
 
 
 def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None:
@@ -1491,13 +1542,17 @@ def train_one_step(
             if audit_step is None:
                 return result
             cp_rank = batch.get("dynamic_cp_rank", mpu.get_context_parallel_rank())
-            if mpu.get_tensor_model_parallel_rank() != 0 or cp_rank != 0:
+            if mpu.get_tensor_model_parallel_rank() != 0:
                 return result
             try:
+                counts = _weight_audit_counts(args, batch)
+                if cp_rank != 0:
+                    return result
                 audit_step.observe(
                     audit_ordinal,
                     batch.get(weight_version_audit.PREPARED_FIELD),
                     dummy=batch.get("__is_dummy__", False),
+                    counts=counts,
                 )
             except Exception:
                 logger.exception("Weight audit failed; actor loss remains unchanged")

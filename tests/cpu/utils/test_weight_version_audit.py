@@ -308,3 +308,72 @@ def test_invalid_frontier_is_unknown_not_a_training_error(tmp_path, monkeypatch,
     (tmp_path / "frontier.json").write_text(json.dumps(value))
     assert audit.read_frontier() is None
     assert audit.AuditStep("consume").frontier is None
+
+
+@pytest.mark.parametrize("failure", ["summary", "details"])
+def test_report_write_failure_recovers_counts_on_next_step(publication, tmp_path, monkeypatch, failure):
+    row = prepared(publication)
+    first = audit.AuditStep("first")
+    first.observe(0, [row])
+
+    def fail(*_args, **_kwargs):
+        raise OSError("transient write failure")
+
+    with monkeypatch.context() as patch:
+        if failure == "summary":
+            patch.setattr(audit, "_atomic_json", fail)
+        else:
+            patch.setattr(audit.AuditStep, "_append_details", fail)
+        with pytest.raises(OSError):
+            first.commit(0)
+    if failure == "details":
+        summary = json.loads(next(tmp_path.glob("*/consumed-rank-0.summary.json")).read_text())
+        assert summary["eligible_tokens"] == 5
+        assert summary["aggregate_complete"] is False
+    second = audit.AuditStep("second")
+    second.observe(0, [row])
+    second.commit(0)
+    retried = first.commit(0)  # Retrying must not double-count or overwrite recovery.
+    assert retried["aggregate_complete"] is False
+    summary = json.loads(next(tmp_path.glob("*/consumed-rank-0.summary.json")).read_text())
+    assert summary["eligible_tokens"] == 10
+    assert summary["consumptions"] == 2
+    assert summary["aggregate_complete"] is False
+    assert summary["audit_errors"] == 1
+
+
+@pytest.mark.parametrize("old_path_still_fails", [False, True])
+def test_failed_summary_is_retried_after_lineage_changes(publication, tmp_path, monkeypatch, old_path_still_fails):
+    first = audit.AuditStep("old")
+    first.observe(0, [prepared(publication)])
+    with monkeypatch.context() as patch:
+
+        def fail(*_args):
+            raise OSError("transient write failure")
+
+        patch.setattr(audit, "_atomic_json", fail)
+        with pytest.raises(OSError):
+            first.commit(0)
+    publication[0].invalidate()
+    publication[0].publish()
+    second = audit.AuditStep("new")
+    second.observe(0, [audit.prepare_row({}, 2, 1, [1])])
+    if old_path_still_fails:
+        original_write = audit._atomic_json
+        with monkeypatch.context() as patch:
+
+            def fail_old(path, data):
+                if path.parent.name == first.frontier["lineage_id"]:
+                    raise PermissionError("old lineage is still unwritable")
+                original_write(path, data)
+
+            patch.setattr(audit, "_atomic_json", fail_old)
+            with pytest.raises(PermissionError):
+                second.commit(0)
+        new_summary = tmp_path / second.frontier["lineage_id"] / "consumed-rank-0.summary.json"
+        assert json.loads(new_summary.read_text())["eligible_tokens"] == 1
+    second.commit(0)
+    summaries = [json.loads(path.read_text()) for path in tmp_path.glob("*/consumed-rank-0.summary.json")]
+    assert len(summaries) == 2
+    assert sum(summary["eligible_tokens"] for summary in summaries) == 6
+    assert sorted(summary["aggregate_complete"] for summary in summaries) == [False, True]

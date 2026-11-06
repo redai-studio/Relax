@@ -82,6 +82,7 @@ def _run(
     dynamic_cp_rank=None,
     role="actor",
     fail_schedule=False,
+    final_mask=None,
 ):
     monkeypatch.setenv("RELAX_WEIGHT_AUDIT_DIR", str(directory))
     publisher = audit.PublicationLedger(str(directory), "policy")
@@ -138,6 +139,9 @@ def _run(
     monkeypatch.setattr(torch.distributed, "get_rank", lambda *_args, **_kwargs: 7)
 
     def loss(_args, _batch, _count, logits, **_kwargs):
+        if final_mask is not None:
+            _batch["weight_audit_loss_masks"] = [torch.tensor(final_mask)]
+            _batch.update(total_lengths=[6], response_lengths=[2])
         return logits.sum() * 0, 1, {"keys": ["loss"], "values": torch.tensor([0.0, 1.0])}
 
     def schedule(**kwargs):
@@ -204,6 +208,7 @@ def _run(
             get_data_parallel_group=lambda **_kwargs: object(),
         ),
     }
+    namespace["_weight_audit_counts"] = _load_definition(path, "_weight_audit_counts", namespace)
     train_one_step = _load_definition(path, "train_one_step", namespace)
     train_one_step(
         args,
@@ -218,3 +223,128 @@ def _run(
     )
     summaries = list(directory.glob("*/consumed*.summary.json"))
     return json.loads(summaries[0].read_text()) if summaries else None
+
+
+def test_train_step_consumes_final_mask_counts(tmp_path, monkeypatch):
+    assert _run(tmp_path, monkeypatch, final_mask=[1, 0])["eligible_tokens"] == 3
+
+
+def _counts_helper(loss_module, cp):
+    path = Path(__file__).resolve().parents[4] / "relax/backends/megatron/model.py"
+    return _load_definition(
+        path,
+        "_weight_audit_counts",
+        {
+            "torch": torch,
+            "mpu": loss_module.mpu,
+            "weight_version_audit": audit,
+            "get_logits_and_tokens_offset_with_cp": cp.get_logits_and_tokens_offset_with_cp,
+        },
+    )
+
+
+@pytest.mark.parametrize("reject_all,opd", [(False, False), (True, False), (False, True)])
+def test_real_policy_rs_mask_matches_audited_exposure(tmp_path, monkeypatch, reject_all, opd):
+    from tests.cpu.backends.megatron.test_score_centering_loss import _args, _backend
+
+    monkeypatch.setenv("RELAX_WEIGHT_AUDIT_DIR", str(tmp_path))
+    loss_module, cp = _backend(monkeypatch)
+    args = _args(
+        advantage_estimator="grpo",
+        use_tis=True,
+        custom_tis_function_path="fixture.reject",
+        calculate_per_token_loss=False,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        entropy_coef=0.0,
+        opd_token_selection="student_sampled",
+        opd_loss_coef=0.5 if opd else 0,
+        opd_kl_type="reverse_kl",
+        opd_jsd_alpha=0.5,
+    )
+
+    def reject(**kwargs):
+        masks = [torch.tensor([0 if reject_all else 1, 0])]
+        return kwargs["pg_loss"], masks, {}
+
+    monkeypatch.setattr(loss_module, "load_function", lambda _path: reject)
+    publisher = audit.PublicationLedger(str(tmp_path), "policy")
+    spans = []
+    for i in range(2):
+        version = publisher.publish()
+        spans += audit.generation_spans(
+            {"weight_versions": [{"start": 0, "end": 1, "version": version}]},
+            1,
+            offset=2 + i,
+            request_id="r",
+            attempt_id="a",
+            piece_index=i,
+        )
+    row = audit.prepare_row({"spans": spans}, 4, 2, [1, 1])
+    publisher.publish()
+    logits = torch.zeros((1, 4, 4), requires_grad=True)
+    batch = {
+        "unconcat_tokens": [torch.tensor([0, 0, 1, 2])],
+        "advantages": [torch.ones(2)],
+        "log_probs": [torch.full((2,), -math.log(4))],
+        "rollout_log_probs": [torch.full((2,), -math.log(4))],
+        "total_lengths": [4],
+        "response_lengths": [2],
+        "loss_masks": [torch.ones(2)],
+        audit.PREPARED_FIELD: [row],
+    }
+    if opd:
+        batch["teacher_log_probs"] = [torch.full((2,), -2.0)]
+    reducer = cp.get_sum_of_sample_mean([4], [2], batch["loss_masks"])
+    loss, _ = loss_module.policy_loss_function(args, batch, logits, reducer)
+    loss.backward()
+    assert batch["loss_masks"][0].tolist() == [1, 1]
+    assert (logits.grad[0, 2].abs().sum() > 0).item() == opd
+    step = audit.AuditStep("rs")
+    counts = _counts_helper(loss_module, cp)(args, batch)
+    step.observe(0, [row], counts=counts)
+    summary = step.commit(0)
+    assert summary["eligible_tokens"] == (2 if opd else 0 if reject_all else 1)
+    assert summary["token_weighted_age"] == (1.5 if opd else None if reject_all else 2)
+
+
+def _cp_audit_worker(rank, rendezvous):
+    from datetime import timedelta
+
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
+    )
+    try:
+        mpu = SimpleNamespace(
+            get_context_parallel_world_size=lambda: 2,
+            get_context_parallel_rank=lambda: rank,
+            get_context_parallel_group=lambda: torch.distributed.group.WORLD,
+            get_dynamic_data_context_parallel_groups=lambda group_size: torch.distributed.group.WORLD,
+        )
+        path = Path(__file__).resolve().parents[4] / "relax/backends/megatron/cp_utils.py"
+        offsets = _load_definition(path, "get_logits_and_tokens_offset_with_cp", {"mpu": mpu})
+        helper = _counts_helper(
+            SimpleNamespace(mpu=mpu), SimpleNamespace(get_logits_and_tokens_offset_with_cp=offsets)
+        )
+        for dynamic in (False, True):
+            for prompt in (0, 2):
+                # A span crossing CP owners; masked final tokens on different ranks.
+                row = {"spans": [{"token_start": 2, "token_end": 7}]}
+                mask = torch.tensor([1, 0, 1, 1, 0, 1, 0][max(prompt, 1) - 1 :])
+                batch = {
+                    audit.PREPARED_FIELD: [row],
+                    "weight_audit_loss_masks": [mask],
+                    "total_lengths": [8],
+                    "response_lengths": [8 - prompt],
+                }
+                if dynamic:
+                    batch.update(dynamic_cp_size=2, dynamic_cp_rank=rank)
+                counts = helper(Namespace(qkv_format="thd"), batch)
+                assert counts.tolist() == ([4, 3] if prompt == 0 else [3, 3])
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_final_mask_counts_across_real_cp_group(tmp_path):
+    torch.multiprocessing.spawn(_cp_audit_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)
