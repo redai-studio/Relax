@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import base64
+import errno
 import math
-import os
 import time
 import urllib.parse
 from io import BytesIO
@@ -13,13 +13,19 @@ import requests
 from PIL import Image, ImageFile
 
 from relax.utils.env import Envs
+from relax.utils.logging_utils import get_logger
 
 from .config import MultimodalConfig, get_image_max_token_num, get_image_min_token_num, get_image_resize_scale_factor
 
 
+logger = get_logger(__name__)
+
 SPATIAL_MERGE_SIZE = 2
 QWEN_VL_MAX_ASPECT_RATIO = 200
 QWEN_VL_SAFE_ASPECT_RATIO = 199
+_LOCAL_IMAGE_READ_ATTEMPTS = 3
+_LOCAL_IMAGE_READ_BACKOFF_S = 0.2
+_LOCAL_IMAGE_RETRY_ERRNOS = {errno.EAGAIN, errno.EIO, errno.ESTALE, errno.ETIMEDOUT}
 
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -159,6 +165,8 @@ def to_rgb(pil_image: Image.Image) -> Image.Image:
 def load_image_from_path(image: str, **kwargs: Any) -> Image.Image:
     """Load an image from a local path or HTTP(S) URL.
 
+    Retry transient local filesystem errors while opening or decoding an image.
+
     Parameters
     - image: Local filesystem path, `file://` URI, or HTTP(S) URL.
     - **kwargs: Ignored, present for forward compatibility.
@@ -199,10 +207,24 @@ def load_image_from_path(image: str, **kwargs: Any) -> Image.Image:
     else:
         if image.startswith("file://"):
             image = image[7:]
-        assert os.path.exists(image), f"Image path {image} does not exist."
-        with open(image, "rb") as f:
-            image_obj = Image.open(f)
-            image_obj.load()
+        # Open directly so a failing filesystem stat cannot hide its errno.
+        for attempt in range(_LOCAL_IMAGE_READ_ATTEMPTS):
+            image_obj = None
+            try:
+                with open(image, "rb") as f:
+                    image_obj = Image.open(f)
+                    image_obj.load()
+                break
+            except OSError as exc:
+                if image_obj is not None:
+                    image_obj.close()
+                if isinstance(exc, FileNotFoundError):
+                    raise AssertionError(f"Image path {image} does not exist.") from exc
+                if exc.errno not in _LOCAL_IMAGE_RETRY_ERRNOS or attempt + 1 == _LOCAL_IMAGE_READ_ATTEMPTS:
+                    raise
+                delay = _LOCAL_IMAGE_READ_BACKOFF_S * (attempt + 1)
+                logger.warning("Retrying local image read in %.1fs after %s: %s", delay, exc, image)
+                time.sleep(delay)
 
     return image_obj
 
