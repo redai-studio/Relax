@@ -92,6 +92,11 @@ class Sample:
 
     non_generation_time: float = 0.0  # time spent in non-generation steps
 
+    @property
+    def response_key(self) -> int | str | None:
+        """The dataset index, falling back to the session ID."""
+        return self.index if self.index is not None else self.session_id
+
     @dataclass
     class SpecInfo:
         spec_accept_token_num: int = 0
