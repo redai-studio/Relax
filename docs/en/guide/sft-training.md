@@ -685,7 +685,7 @@ When using these template patches with HF export, pass `--save-hf-post-hook-path
 
 The opt-in `RELAX_GEMMA4_FORCE_FLEX_GLOBAL=1` worker environment variable selects chunked FlexAttention for Gemma4 global layers. Sliding-window layers continue to use FlashAttention; leaving the flag unset keeps the existing SDPA global path. Packed samples are handled independently. FlexAttention training requires zero attention dropout and currently supports CP1 only.
 
-The text launcher defaults to TP8/PP1/CP1, 65,536 tokens, chunked logits with per-chunk loss recomputation, full activation recomputation, and optimizer CPU offload. Two equal 8-GPU nodes can use TP8/DP2 by setting `NUM_NODES=2 GPUS_PER_NODE=8`. Tied embeddings require gradient overlap to remain disabled. The launcher always selects text conversion; image inputs are not part of this profile.
+The text launcher defaults to TP8/PP1/CP1, 65,536 tokens, chunked logits with per-chunk loss recomputation, full activation recomputation, and optimizer CPU offload. Two equal 8-GPU nodes can use TP8/DP2 by setting `NUM_NODES=2 GPUS_PER_NODE=8`. Tied embeddings require gradient overlap to remain disabled. The default profile selects text conversion; use the separate image profile below for image inputs.
 
 ```bash
 RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/messages.jsonl \
@@ -696,3 +696,17 @@ RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/messages.jsonl \
 `run-gemma4-31B-multiturn-flex64k.sh` reuses that launcher with messages input and nonblocking submission. Both profiles default to `GEMMA4_SFT_THINKING=0`, enable tool-turn boundaries, and export the matching template using the Gemma4 post-hook. `DISABLE_CHECKPOINT_SAVE=1` disables model saves; `OPTIMIZER_CPU_OFFLOAD=0` disables CPU offload. Oversized samples are skipped by default (`SFT_OVERSIZE_STRATEGY=skip`).
 
 The Flex path needs a PyTorch runtime with FlexAttention and BlockMask support. Validate CUDA forward/backward agreement, actual 64K peak memory, and training stability on the target runtime before production use; CPU reference checks do not establish full-model GPU numerical equivalence.
+
+### Gemma4 31B packed image SFT
+
+The dense 31B image profile selects `GEMMA4_SFT_CONVERSION_MODE=vl` and reuses the text profile's TP8/PP1/CP1 settings, chunked loss and template-only export hook. Vision and projection weights use the existing checkpoint/export path. Supply a checkpoint containing the vision tower and projector weights, and JSONL rows with complete `messages` plus an `images` column; each image needs a matching `<image>` placeholder. Inline `image_url` message parts are also supported.
+
+```bash
+RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/image-messages.jsonl \
+  bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-gemma4-31B-multimodal-flex64k.sh
+```
+
+Visual features are inserted before a single sequence-parallel scatter. Processor-added image delimiters and expanded image tokens remain outside the loss. Attention follows [Transformers 5.16 Gemma4 masks](https://github.com/huggingface/transformers/blob/v5.16.0/src/transformers/models/gemma4/modeling_gemma4.py): global layers remain causal; sliding layers use `(causal OR same image) AND sliding window` when `use_bidirectional_attention="vision"`. Packed samples never share attention.
+
+This adapter supports images with CP1 and PP1; audio, video and MoE VL integration are outside this profile. Use the default oversize policy `skip` to retain matching image features and tokens. Full-model CUDA numerical parity, TP8 image training, 64K memory/stability and trained vision-weight export must be validated on the target runtime; CPU adapter tests establish interface and gradient flow only.
