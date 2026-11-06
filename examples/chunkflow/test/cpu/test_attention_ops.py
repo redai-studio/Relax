@@ -7,8 +7,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from relax.backends.megatron.chunkflow.adapters import DenseAttentionCall
-from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime, require_runtime
+from examples.chunkflow.adapters import DenseAttentionCall
+from examples.chunkflow.runtime import ChunkflowRuntime, require_runtime
 
 
 class SDPAttention(torch.nn.Module):

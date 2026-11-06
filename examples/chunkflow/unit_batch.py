@@ -7,10 +7,10 @@ from collections.abc import Sequence
 
 import torch
 
-from relax.backends.megatron.chunkflow import rope as cf_rope
-from relax.backends.megatron.chunkflow.metadata import int32_metadata
-from relax.backends.megatron.chunkflow.scheduler import Segment
-from relax.backends.megatron.chunkflow.units import Unit
+from examples.chunkflow import rope as cf_rope
+from examples.chunkflow.metadata import int32_metadata
+from examples.chunkflow.scheduler import Segment
+from examples.chunkflow.units import Unit
 
 
 def _segment_rows(parent_cu: Sequence[int], segment: Segment) -> tuple[int, int]:

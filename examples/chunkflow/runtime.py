@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from relax.backends.megatron.chunkflow.state_store import ChunkState, StateStore, StateStoreError
+from examples.chunkflow.state_store import ChunkState, StateStore, StateStoreError
 
 
 RUNTIME_ATTR = "chunkflow_runtime"

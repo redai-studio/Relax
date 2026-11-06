@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from relax.backends.megatron.chunkflow.scheduler import Chunk, group_of
+from examples.chunkflow.scheduler import Chunk, group_of
 
 
 POLICIES = ("staggered", "lockstep")

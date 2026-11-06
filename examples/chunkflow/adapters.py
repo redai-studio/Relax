@@ -15,8 +15,8 @@ from typing import Any
 import torch
 from torch import nn
 
-from relax.backends.megatron.chunkflow import gdn
-from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
+from examples.chunkflow import gdn
+from examples.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
 
 
 @dataclass(frozen=True)
@@ -175,7 +175,7 @@ def dense_attention_adapter(
     """
 
     def install(attention: nn.Module, chunk_size: int, runtime: ChunkflowRuntime) -> Callable[[], None]:
-        from relax.backends.megatron.chunkflow.integration import ChunkedCoreAttention
+        from examples.chunkflow.integration import ChunkedCoreAttention
 
         core = attention.core_attention
         original = core.forward

@@ -12,22 +12,22 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from relax.backends.megatron.chunkflow import adapters
-from relax.backends.megatron.chunkflow.adapters import (
+from examples.chunkflow import adapters
+from examples.chunkflow.adapters import (
     AttentionAdapter,
     DenseAttentionCall,
     dense_attention_adapter,
     megatron_native_attention,
     register_attention_adapter,
 )
-from relax.backends.megatron.chunkflow.integration import install, uninstall
-from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
-from relax.backends.megatron.chunkflow.scheduler import build_chunks
-from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
-from tests.cpu.backends.megatron.test_chunkflow_attention_ops import SDPAttention, native_sdpa
-from tests.cpu.backends.megatron.test_chunkflow_gdn import GatedDeltaNet
-from tests.cpu.backends.megatron.test_chunkflow_gdn import kernels as kernels
-from tests.cpu.backends.megatron.test_chunkflow_integration import restore_rope_patch as restore_rope_patch
+from examples.chunkflow.integration import install, uninstall
+from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
+from examples.chunkflow.scheduler import build_chunks
+from examples.chunkflow.test.cpu.test_attention_ops import SDPAttention, native_sdpa
+from examples.chunkflow.test.cpu.test_gdn import GatedDeltaNet
+from examples.chunkflow.test.cpu.test_gdn import kernels as kernels
+from examples.chunkflow.test.cpu.test_integration import restore_rope_patch as restore_rope_patch
+from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 
 
 class NativeLayer(torch.nn.Module):

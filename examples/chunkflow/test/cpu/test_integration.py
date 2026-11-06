@@ -10,21 +10,21 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from relax.backends.megatron.chunkflow.adapters import dense_attention_adapter, register_attention_adapter
-from relax.backends.megatron.chunkflow.integration import (
+from examples.chunkflow.adapters import dense_attention_adapter, register_attention_adapter
+from examples.chunkflow.integration import (
     ChunkedCoreAttention,
     install,
     uninstall,
 )
-from relax.backends.megatron.chunkflow.runtime import ChunkflowRuntime
-from relax.backends.megatron.chunkflow.scheduler import build_chunks
-from relax.backends.megatron.chunkflow.units import build_micro_batches
-from tests.cpu.backends.megatron.test_chunkflow_attention_ops import SDPAttention, native_sdpa
+from examples.chunkflow.runtime import ChunkflowRuntime
+from examples.chunkflow.scheduler import build_chunks
+from examples.chunkflow.test.cpu.test_attention_ops import SDPAttention, native_sdpa
+from examples.chunkflow.units import build_micro_batches
 
 
 @pytest.fixture(autouse=True)
 def restore_rope_patch():
-    from relax.backends.megatron.chunkflow import rope
+    from examples.chunkflow import rope
 
     original = rope._ORIGINAL_GET_ROTARY_SEQ_LEN
     if original is not None:
@@ -78,13 +78,13 @@ def _attn(cp_size=1):
     )
 
 
-def test_chunkflow_context_parallel_is_rejected():
+def test_context_parallel_is_rejected():
     q, k, v = _qkv(t=4, h=2, d=4)
     with pytest.raises(NotImplementedError, match="context parallelism"):
         _attn(cp_size=2)(q, k, v)
 
 
-def test_chunkflow_sbhd_is_rejected():
+def test_sbhd_is_rejected():
     with pytest.raises(NotImplementedError, match="THD"):
         _attn()(torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4), torch.zeros(2, 1, 2, 4))
 
@@ -98,7 +98,7 @@ def test_dense_adapter_rejects_unhandled_attention_semantics(kwargs):
         _attn()(*_qkv(4, 2, 4), **kwargs)
 
 
-def test_chunkflow_install_preserves_module_and_uninstall_restores_forward():
+def test_install_preserves_module_and_uninstall_restores_forward():
     model = torch.nn.Sequential(_FakeAttn(), _FakeAttn())
     original = model[0].core_attention
     original_forward = original.forward
@@ -126,7 +126,7 @@ def _unit_attn(chunk_size, layer=1):
     )
 
 
-def test_chunkflow_keeps_native_moe_parameters_and_methods():
+def test_keeps_native_moe_parameters_and_methods():
     moe = torch.nn.Module()
     moe.router = torch.nn.Linear(4, 2)
     moe.experts = torch.nn.ModuleList([torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)])
@@ -186,7 +186,7 @@ def test_reversed_backward_preserves_fused_weight_gradients(original_cache_disab
 
 
 def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding():
-    from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR
+    from examples.chunkflow.runtime import UNIT_ATTR
 
     recorded, metadata = [], []
 
@@ -217,8 +217,8 @@ def test_unit_mode_passes_cpu_lengths_with_prefix_and_padding():
 @pytest.mark.parametrize("fp32", [False, True])
 def test_unit_schedule_outputs_gradients_and_release_match_sdpa(keep_last_k, fp32, monkeypatch):
     monkeypatch.setenv("RELAX_CHUNKFLOW_KV_GRAD_FP32", str(int(fp32)))
-    from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
-    from relax.backends.megatron.chunkflow.units import completed_groups, gen_unit_ops
+    from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
+    from examples.chunkflow.units import completed_groups, gen_unit_ops
 
     torch.manual_seed(0)
     total, chunk_size = 64, 16
@@ -261,7 +261,7 @@ def test_unit_schedule_outputs_gradients_and_release_match_sdpa(keep_last_k, fp3
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
 def test_kv_cache_fp32_accumulates_across_backward_without_changing_values(dtype):
-    from relax.backends.megatron.chunkflow.state_store import ChunkState
+    from examples.chunkflow.state_store import ChunkState
 
     live = torch.zeros(2, 1, 4, dtype=dtype, requires_grad=True)
     state = ChunkState({})

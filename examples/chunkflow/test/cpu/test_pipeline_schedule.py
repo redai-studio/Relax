@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.backends.megatron.chunkflow.scheduler import build_chunks
-from relax.backends.megatron.chunkflow.units import build_micro_batches, make_model_plan
+from examples.chunkflow.scheduler import build_chunks
+from examples.chunkflow.units import build_micro_batches, make_model_plan
 
 
 def _channel(stage, action):
@@ -165,8 +165,8 @@ def test_plan_preserves_real_samples_and_excludes_alignment_padding(padding):
     pytest.importorskip("megatron.core")
     import torch
 
-    from relax.backends.megatron.chunkflow.schedules import _plan
-    from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
+    from examples.chunkflow.schedules import _plan
+    from examples.chunkflow.unit_batch import slice_parent_batch
 
     cu = [0, 1100, 1612]
     if padding:
@@ -206,9 +206,9 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     import torch
     from megatron.training import global_vars
 
-    from relax.backends.megatron.chunkflow import pipeline_schedules as executor
-    from relax.backends.megatron.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
-    from relax.backends.megatron.chunkflow.schedules import _plan
+    from examples.chunkflow import pipeline_schedules as executor
+    from examples.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
+    from examples.chunkflow.schedules import _plan
     from relax.backends.megatron.data import PrepackedBatch
 
     if parent_window is None:

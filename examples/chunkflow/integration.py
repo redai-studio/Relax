@@ -10,9 +10,9 @@ from collections.abc import Callable
 import torch
 from torch import nn
 
-from relax.backends.megatron.chunkflow.adapters import DenseAttentionCall, attention_modules, resolve_attention_adapter
-from relax.backends.megatron.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
-from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
+from examples.chunkflow.adapters import DenseAttentionCall, attention_modules, resolve_attention_adapter
+from examples.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
+from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
 from relax.utils.logging_utils import get_logger
 
 
@@ -132,8 +132,8 @@ class ChunkedCoreAttention(nn.Module):
 
 
 def install(model, chunk_size: int) -> int:
-    from relax.backends.megatron.chunkflow import rope as chunkflow_rope
-    from relax.backends.megatron.chunkflow.runtime import RUNTIME_ATTR, attach_runtime
+    from examples.chunkflow import rope as chunkflow_rope
+    from examples.chunkflow.runtime import RUNTIME_ATTR, attach_runtime
 
     if chunk_size <= 0:
         raise ValueError("ChunkFlow chunk_size must be positive")
@@ -200,7 +200,7 @@ def install(model, chunk_size: int) -> int:
 
 
 def uninstall(model) -> int:
-    from relax.backends.megatron.chunkflow.runtime import RUNTIME_ATTR
+    from examples.chunkflow.runtime import RUNTIME_ATTR
 
     runtime = getattr(model, RUNTIME_ATTR, None)
     if runtime is not None:

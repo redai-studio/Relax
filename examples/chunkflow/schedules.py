@@ -12,10 +12,10 @@ from typing import Iterator, List, Optional, Union
 import torch
 from megatron.core import parallel_state
 
-from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
-from relax.backends.megatron.chunkflow.scheduler import build_chunks
-from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
-from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
+from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
+from examples.chunkflow.scheduler import build_chunks
+from examples.chunkflow.unit_batch import slice_parent_batch
+from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 
 
 _BATCH_KEYS = (

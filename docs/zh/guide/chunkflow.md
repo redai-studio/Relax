@@ -1,12 +1,49 @@
 # ChunkFlow
 
-ChunkFlow 在 Megatron 训练中把长序列拆成 chunk，按依赖安排前后向，并保留跨 chunk 的 K/V 状态及其梯度。它可以调整流水线中的工作粒度和激活保留方式，默认关闭，通过 `--use-chunkflow` 启用。
+ChunkFlow 是 `examples/chunkflow/` 下的独立示例，在 Megatron 训练中把长序列拆成 chunk，按依赖安排前后向，并保留跨 chunk 的状态及其梯度。实现、参数和测试都由 example 管理；Relax 核心通过示例附带的接入补丁启用它。
 
 MoE 模型继续使用 Megatron 原生路由、dispatch/combine 和专家计算。切块也会增加调用开销，实际速度和显存收益需要在相同配置下与不切块训练比较。
 
-## 启用方式
+## 固定版本与安装
 
-在现有 Megatron 训练脚本中加入以下参数片段，模型、数据和资源配置沿用原脚本。SFT 数据准备和启动流程见 [SFT 训练](./sft-training.md)。
+`examples/chunkflow/relax.version` 固定 Relax 源码基线为 `d548769b77f12e445e464f99d4332290a3e5bd3d`，即引入 ChunkFlow 前的版本。使用该版本对应的 Megatron/Bridge、Transformer Engine 和 FLA 训练环境，不额外安装另一套 Attention 后端。
+
+在该版本的 Relax checkout 中放入完整的 `examples/chunkflow/`，从仓库根目录执行：
+
+```bash
+python examples/chunkflow/setup.py
+python examples/chunkflow/setup.py --check
+```
+
+安装器先对照固定 commit 检查 Relax 源码，再应用 `examples/chunkflow/relax.patch`。补丁只连接参数解析、模型安装、训练调度，以及分块位置传递。重复安装不会重复打补丁；遇到不兼容或部分修改时会拒绝覆盖。包含本示例的后续 checkout 也可以使用，但 Relax 核心必须仍与固定基线及这份补丁一致。
+
+移除接入补丁可执行 `python examples/chunkflow/setup.py --reverse`。安装器只管理源码，不安装依赖或启动集群。
+
+## Dense 与 MoE 示例
+
+两个示例都使用 8 张 GPU 进行纯文本 SFT，默认 TP=2、PP=1、CP=1。Qwen3-4B 使用 EP=1，Qwen3.6-35B-A3B 使用 EP=8、ETP=1，并包含 GDN 状态适配。
+
+先提供 `MODEL_DIR`、`DATA_DIR`、`SAVE_DIR`：模型分别位于 `${MODEL_DIR}/Qwen3-4B` 或 `${MODEL_DIR}/Qwen3.6-35B-A3B`；数据为 `${DATA_DIR}/train.jsonl`，每行包含 `messages` 对话列表。数据格式参见 [SFT 训练](./sft-training.md)。`SAVE_DIR` 必须是训练节点可访问的持久化目录。
+
+```bash
+# 预览参数，不连接 Ray，也不要求 GPU。
+DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
+DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+
+# 配好现有集群的 RAY_ADDRESS 和 RAY_JOBS_ADDRESS 后，选择一个模型提交。
+bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
+bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+```
+
+`RAY_JOBS_ADDRESS` 是现有集群的 Jobs HTTP 地址。脚本默认阻塞等待；`RAY_NO_WAIT=1` 可改为非阻塞。默认上传仓库工作目录，以便 driver 和 worker 能导入 example；使用自定义 `WORKING_DIR` 时也须包含打好补丁的 Relax 和完整 example。
+
+脚本默认 `SEQ_LENGTH=8192`、`CHUNK_SIZE=2048`、`KEEP_LAST_K=1`、`NUM_STEPS=100`、`SAVE_INTERVAL=10`，均可用同名环境变量覆盖。保存与恢复路径固定为 `${SAVE_DIR}/${EXP_NAME}`，保留最近两个训练 checkpoint；恢复时保持两者不变。时间戳只用于 ClearML task 和 `examples/chunkflow/scripts/log/` 下的日志。`PROJECT_NAME` 默认 `Relax/sft/chunkflow`，`EXP_NAME` 按模型区分且可覆盖。
+
+MoE 示例使用原生 all-to-all 分发，关闭路由辅助损失，并通过 `examples/chunkflow/configs/gdn.yaml` 关闭 GDN 预处理融合。它采用 CPU optimizer offload，需要足够的主机内存。两个示例均不启用 full-layer recompute、VPP、MTP 或多模态输入。
+
+## 接入其他训练脚本
+
+应用补丁后，可以在其他 Megatron 训练脚本中加入以下参数，并保留原脚本的模型、数据和资源配置：
 
 ```text
 --use-chunkflow
@@ -28,7 +65,7 @@ ChunkFlow 调用模型原有的 Megatron/Transformer Engine Attention，由原�
 
 ## 配置
 
-相关参数如下：
+参数定义位于 `examples/chunkflow/arguments.py`。下表是解析器默认值；两个启动示例的 chunk 大小和激活保留数使用上文所述值。
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -55,7 +92,7 @@ PP 大于 1 使用实验性的非交错流水线执行器，还须设置 `RELAX_
 
 ## 接入新的 Attention
 
-在每个训练 worker 安装 ChunkFlow 前，通过 `relax.backends.megatron.chunkflow.adapters` 中的 `register_attention_adapter(attention_type, core_type, adapter)` 注册 `AttentionAdapter`，例如在自定义 model provider 中注册。普通 K/V 适配器精确匹配外层和核心类；`core_type=None` 表示整层适配，精确匹配外层类并优先使用，适用于 GDN 或带 indexer 的 Attention。整层适配器负责检查内部实现；重复注册会报错。
+在每个训练 worker 安装 ChunkFlow 前，通过 `examples.chunkflow.adapters` 中的 `register_attention_adapter(attention_type, core_type, adapter)` 注册 `AttentionAdapter`，例如在自定义 model provider 中注册。普通 K/V 适配器精确匹配外层和核心类；`core_type=None` 表示整层适配，精确匹配外层类并优先使用，适用于 GDN 或带 indexer 的 Attention。整层适配器负责检查内部实现；重复注册会报错。
 
 所有适配器共用一次安装流程：先检查全部层，再安装；安装器返回卸载回调。如果后续层安装失败，已安装的层会倒序恢复；适配器自身失败时也必须撤销自己的修改。GDN 的共享卷积包装在最后一个使用它的层卸载后恢复原函数。
 
@@ -64,3 +101,14 @@ PP 大于 1 使用实验性的非交错流水线执行器，还须设置 `RELAX_
 状态管理也共用一套接口：`runtime.history(layer_number, group_id, chunk_id, recompute=...)` 返回从第一块到当前块的 `ChunkState`，重计算复用已缓存的叶子。Dense 读取整个历史 K/V，GDN 读取上一块的卷积与递推状态。`ChunkState.link_tensor` 为参与当前输出计算的状态接回历史梯度；`link_output` 为原生算子额外返回的末状态连接梯度。只有明确处理原生 selective checkpoint 的适配器才应启用 `allow_replay=True`。
 
 GDN 仍调用 Megatron 使用的卷积和递推 kernel；公共层只管理状态与梯度连接。原生模块如果已有可求导的分块接口，可以注册一个整层适配器来调用它，无需修改调度器。QSA 尚未提供这样的适配器，仍然被拒绝；统一入口不会自动补齐 indexer 的历史信息。新增适配器用于训练前，应比较不切块和切块执行的输出、输入及参数梯度，并验证 packed 序列边界和 ChunkFlow 重计算。
+
+## 运行测试
+
+测试与实现一起放在 `examples/chunkflow/test/`，按设备分为 `cpu/` 和 `gpu/`，文件名不再带 `chunkflow` 前缀。
+
+```bash
+CUDA_VISIBLE_DEVICES="" python -m pytest examples/chunkflow/test/cpu -q
+python -m pytest examples/chunkflow/test/gpu -q
+```
+
+部分 CPU 用例仍需要 Megatron Python 依赖。GPU 用例需要真实 CUDA、Megatron/TE 或 FLA 环境；缺依赖而跳过不代表数值或分布式训练已经通过验证。

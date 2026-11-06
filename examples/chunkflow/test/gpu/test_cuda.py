@@ -8,15 +8,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from relax.backends.megatron.chunkflow import rope as cf_rope
-from relax.backends.megatron.chunkflow.adapters import DenseAttentionCall, megatron_native_attention
-from relax.backends.megatron.chunkflow.integration import ChunkedCoreAttention
-from relax.backends.megatron.chunkflow.metadata import int32_metadata
-from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
-from relax.backends.megatron.chunkflow.scheduler import build_chunks
-from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
-from tests.cpu.backends.megatron.test_chunkflow_gdn import _alignment
-from tests.cpu.backends.megatron.test_chunkflow_gdn import kernels as kernels
+from examples.chunkflow import rope as cf_rope
+from examples.chunkflow.adapters import DenseAttentionCall, megatron_native_attention
+from examples.chunkflow.integration import ChunkedCoreAttention
+from examples.chunkflow.metadata import int32_metadata
+from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
+from examples.chunkflow.scheduler import build_chunks
+from examples.chunkflow.test.cpu.test_gdn import _alignment
+from examples.chunkflow.test.cpu.test_gdn import kernels as kernels
+from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 
 
 def _native_te(heads, kv_heads, dim):

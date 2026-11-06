@@ -224,44 +224,6 @@ def test_model_routing_is_resolved_before_model_construction(monkeypatch, tmp_pa
     assert provider.calls == []
 
 
-@pytest.mark.parametrize("provider_kind", ["bridge", "custom", "raw"])
-@pytest.mark.parametrize("enabled", [False, True])
-def test_chunkflow_installs_only_when_enabled_across_providers(monkeypatch, provider_kind, enabled):
-    module, provider = _load_model_provider(monkeypatch)
-    calls = []
-    integration = types.ModuleType("relax.backends.megatron.chunkflow.integration")
-    integration.install = lambda model, size: calls.append((model, size))
-    monkeypatch.setitem(sys.modules, integration.__name__, integration if enabled else None)
-    # A stale environment variable must not activate a disabled CLI configuration.
-    monkeypatch.setenv("RELAX_CHUNKFLOW_CHUNK_SIZE", "4096")
-    args = _bridge_args(use_chunkflow=enabled, chunkflow_chunk_size=8192)
-    if provider_kind == "custom":
-        args.custom_model_provider_path = "test.provider"
-        monkeypatch.setattr(module, "load_function", lambda _: provider.provide)
-    elif provider_kind == "raw":
-        vars(args).update(
-            megatron_to_hf_mode="raw",
-            transformer_impl="transformer_engine",
-            spec="test.spec",
-            fp8_param_gather=False,
-            padded_vocab_size=32,
-            max_position_embeddings=32,
-            fp16_lm_cross_entropy=False,
-            untie_embeddings_and_output_weights=False,
-            position_embedding_type="rope",
-            rotary_percent=1.0,
-            rotary_base=10000,
-            use_rope_scaling=False,
-            mtp_num_layers=None,
-        )
-        monkeypatch.setattr(module, "GPTModel", lambda **kwargs: provider.model)
-
-    built = module.get_model_provider_func(args)(pre_process=True, post_process=False)
-
-    assert built is provider.model
-    assert calls == ([(built, 8192)] if enabled else [])
-
-
 def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
     module, provider = _load_model_provider(monkeypatch)
 

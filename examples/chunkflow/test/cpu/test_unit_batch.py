@@ -13,10 +13,10 @@ import torch
 try:
     from megatron.core.packed_seq_params import PackedSeqParams
 
-    from relax.backends.megatron.chunkflow import rope as cf_rope
-    from relax.backends.megatron.chunkflow.scheduler import build_chunks
-    from relax.backends.megatron.chunkflow.unit_batch import _rope_offsets, _rows_for_unit, slice_parent_batch
-    from relax.backends.megatron.chunkflow.units import build_micro_batches
+    from examples.chunkflow import rope as cf_rope
+    from examples.chunkflow.scheduler import build_chunks
+    from examples.chunkflow.unit_batch import _rope_offsets, _rows_for_unit, slice_parent_batch
+    from examples.chunkflow.units import build_micro_batches
     from relax.backends.megatron.cp_utils import get_cp_local_num_tokens
 except ImportError as exc:
     pytest.skip(f"ChunkFlow batch dependencies unavailable: {exc}", allow_module_level=True)
@@ -135,7 +135,7 @@ def test_lockstep_dependent_units_fail_closed_until_per_segment_rope_exists():
 
 def test_bridge_chunk_positions_and_padding_match_full_sequence():
     bridge_rope = pytest.importorskip("megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope")
-    from relax.backends.megatron.chunkflow.schedules import _forward_kwargs
+    from examples.chunkflow.schedules import _forward_kwargs
 
     parent = _parent([301, 301, 11, 13])
     units, _ = _units(parent["total_lengths"], 128)

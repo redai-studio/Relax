@@ -12,9 +12,9 @@ from typing import Any, Callable
 import torch
 from torch.nn import functional as F
 
-from relax.backends.megatron.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
-from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
-from relax.backends.megatron.chunkflow.state_store import ChunkState
+from examples.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
+from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
+from examples.chunkflow.state_store import ChunkState
 
 
 _CONVOLUTIONS: dict[Any, tuple[Callable, int]] = {}

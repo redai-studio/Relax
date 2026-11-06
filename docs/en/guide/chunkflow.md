@@ -1,12 +1,49 @@
 # ChunkFlow
 
-ChunkFlow splits long sequences into chunks during Megatron training, schedules forward and backward passes according to their dependencies, and preserves K/V state and gradients across chunks. It changes the size of work units in the pipeline and how activations are retained. It is disabled by default; enable it with `--use-chunkflow`.
+ChunkFlow is a standalone example under `examples/chunkflow/`. It splits long sequences into chunks during Megatron training, schedules their forward and backward passes, and preserves cross-chunk state and gradients. The example owns its implementation, arguments, and tests; an included integration patch connects it to Relax.
 
 MoE models continue to use Megatron's native routing, dispatch/combine, and expert computation. Chunking also adds call overhead, so compare speed and memory usage with unchunked training under the same configuration.
 
-## Enabling ChunkFlow
+## Pinned version and installation
 
-Add the following argument fragment to an existing Megatron training script, keeping its model, data, and resource configuration. See [SFT Training](./sft-training.md) for SFT data preparation and launch instructions.
+`examples/chunkflow/relax.version` pins the Relax source baseline to `d548769b77f12e445e464f99d4332290a3e5bd3d`, the revision before ChunkFlow was introduced. Use that revision's Megatron/Bridge, Transformer Engine, and FLA training environment rather than installing a separate attention backend.
+
+Copy the complete `examples/chunkflow/` directory into a Relax checkout at that revision, then run from the repository root:
+
+```bash
+python examples/chunkflow/setup.py
+python examples/chunkflow/setup.py --check
+```
+
+The installer checks Relax sources against the pinned commit before applying `examples/chunkflow/relax.patch`. The patch connects argument parsing, model installation, training schedule selection, and chunk positions. Repeated installation is idempotent; incompatible or partial edits are rejected without overwriting them. A descendant checkout containing this example also works when its Relax core still matches the pinned baseline and this patch.
+
+Use `python examples/chunkflow/setup.py --reverse` to remove the integration patch. The installer manages source files only; it does not install dependencies or start a cluster.
+
+## Dense and MoE examples
+
+Both examples run text-only SFT on eight GPUs with TP=2, PP=1, and CP=1. Qwen3-4B uses EP=1; Qwen3.6-35B-A3B uses EP=8 and ETP=1, including GDN state adaptation.
+
+Set `MODEL_DIR`, `DATA_DIR`, and `SAVE_DIR` first. Model directories are `${MODEL_DIR}/Qwen3-4B` and `${MODEL_DIR}/Qwen3.6-35B-A3B`. Data is `${DATA_DIR}/train.jsonl`, with a `messages` conversation list in each row; see [SFT Training](./sft-training.md). `SAVE_DIR` must be persistent and accessible to the training nodes.
+
+```bash
+# Preview arguments without connecting to Ray or requiring GPUs.
+DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
+DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+
+# Set RAY_ADDRESS and RAY_JOBS_ADDRESS for an existing cluster, then choose one model.
+bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
+bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+```
+
+`RAY_JOBS_ADDRESS` is the cluster's Jobs HTTP URL. Submission blocks by default; set `RAY_NO_WAIT=1` for nonblocking submission. Scripts upload the repository working directory by default so both driver and workers can import the example. A custom `WORKING_DIR` must also contain patched Relax and the complete example.
+
+Script defaults are `SEQ_LENGTH=8192`, `CHUNK_SIZE=2048`, `KEEP_LAST_K=1`, `NUM_STEPS=100`, and `SAVE_INTERVAL=10`; override them with the corresponding environment variables. Save and resume use the stable `${SAVE_DIR}/${EXP_NAME}` directory and retain two training checkpoints. Keep both values unchanged to resume. Timestamps appear only in ClearML task names and logs under `examples/chunkflow/scripts/log/`. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`; each model has a distinct, overridable `EXP_NAME`.
+
+The MoE example uses native all-to-all dispatch, disables router auxiliary loss, and disables GDN preprocessing fusion through `examples/chunkflow/configs/gdn.yaml`. CPU optimizer offload requires sufficient host memory. Neither example enables full-layer recomputation, VPP, MTP, or multimodal input.
+
+## Using other training scripts
+
+After applying the integration patch, add the following arguments to another Megatron training script while retaining its model, data, and resource configuration:
 
 ```text
 --use-chunkflow
@@ -28,7 +65,7 @@ The scheduler performs chunking; attention does not split the input a second tim
 
 ## Configuration
 
-The available arguments are:
+Arguments live in `examples/chunkflow/arguments.py`. The table lists parser defaults; the two scripts use the chunk size and activation retention defaults described above.
 
 | Argument | Default | Description |
 | --- | --- | --- |
@@ -55,7 +92,7 @@ Keep the data, random seed, parallel configuration, precision, and recomputation
 
 ## Adding an Attention Adapter
 
-Register an `AttentionAdapter` with `register_attention_adapter(attention_type, core_type, adapter)` from `relax.backends.megatron.chunkflow.adapters` before ChunkFlow installation in each training worker, for example in a custom model provider. Dense K/V adapters match both classes exactly. Use `core_type=None` for a full-layer adapter: it matches the outer class exactly and takes precedence, supporting modules such as GDN or attention with an indexer. A full-layer adapter must validate its internal implementation. Duplicate registrations are errors.
+Register an `AttentionAdapter` with `register_attention_adapter(attention_type, core_type, adapter)` from `examples.chunkflow.adapters` before ChunkFlow installation in each training worker, for example in a custom model provider. Dense K/V adapters match both classes exactly. Use `core_type=None` for a full-layer adapter: it matches the outer class exactly and takes precedence, supporting modules such as GDN or attention with an indexer. A full-layer adapter must validate its internal implementation. Duplicate registrations are errors.
 
 All adapters share one installation flow: validate every layer, then install. Each installer returns an undo callback. A failure in a later layer restores already installed layers in reverse order; installers must also undo their own mutations if they fail. GDN's shared convolution wrapper restores the original function when its last user is uninstalled.
 
@@ -64,3 +101,14 @@ For an operator whose history is ordinary K/V, `dense_attention_adapter(name=...
 State management also shares one interface: `runtime.history(layer_number, group_id, chunk_id, recompute=...)` returns the `ChunkState` objects up to and including the current chunk, reusing cached leaves during recomputation. Dense attention reads all earlier K/V; GDN reads the preceding convolution and recurrence states. `ChunkState.link_tensor` reconnects historical gradients to state already used in the current output; `link_output` connects a separate final state returned by a native kernel. Only adapters that explicitly handle native selective checkpointing should enable `allow_replay=True`.
 
 GDN still calls Megatron's convolution and recurrence kernels; the shared layer manages state and gradient connections. If a native module already exposes a differentiable chunk interface, a full-layer adapter can call it without changing the scheduler. QSA has no such adapter yet and remains rejected: a shared entry point does not supply its indexer history automatically. Validate each new adapter against unchunked outputs, input and parameter gradients, packed-sequence boundaries, and ChunkFlow recomputation before using it for training.
+
+## Running tests
+
+Tests live alongside the implementation in `examples/chunkflow/test/`, separated into `cpu/` and `gpu/`. Test filenames no longer have a `chunkflow` prefix.
+
+```bash
+CUDA_VISIBLE_DEVICES="" python -m pytest examples/chunkflow/test/cpu -q
+python -m pytest examples/chunkflow/test/gpu -q
+```
+
+Some CPU tests still require Megatron Python dependencies. GPU tests require real CUDA and Megatron/TE or FLA. Dependency skips do not establish numerical or distributed-training correctness.

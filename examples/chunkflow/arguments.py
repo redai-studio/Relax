@@ -1,0 +1,91 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+from __future__ import annotations
+
+from argparse import ArgumentParser, Namespace
+
+
+def add_arguments(parser: ArgumentParser) -> ArgumentParser:
+    """Add the example's chunked-training options."""
+    parser.add_argument(
+        "--use-chunkflow",
+        action="store_true",
+        default=False,
+        help=(
+            "Execute sequence chunks through the model with cross-chunk states and gradients. "
+            "Requires --chunkflow-chunk-size and --context-parallel-size 1."
+        ),
+    )
+    parser.add_argument(
+        "--chunkflow-chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "Tokens per chunk for --use-chunkflow. Must be > 0 when chunkflow is enabled; a value "
+            "at or above the sequence length degenerates to a single chunk (no chunking)."
+        ),
+    )
+    parser.add_argument(
+        "--chunkflow-pack-policy",
+        type=str,
+        default="staggered",
+        choices=["staggered", "lockstep"],
+        help=(
+            "'staggered' executes one chunk per unit. 'lockstep' groups equal-depth chunks; "
+            "multiple dependent segments are currently rejected by the position/GDN adapters."
+        ),
+    )
+    parser.add_argument(
+        "--chunkflow-keep-last-k",
+        type=int,
+        default=0,
+        help=(
+            "How many of a dependency group's last chunks keep their activation; the earlier ones are "
+            "recomputed before their backward. 0 (default) keeps every chunk."
+        ),
+    )
+    parser.add_argument(
+        "--chunkflow-pipeline",
+        type=int,
+        default=0,
+        help=(
+            "Enable the pipelined chunkflow schedule. 0 (default) runs the PP=1 executor; a value equal "
+            "to --pipeline-model-parallel-size runs the pipeline executor, driving chunks through the "
+            "stages. Requires RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1 for PP > 1."
+        ),
+    )
+    return parser
+
+
+def validate_args(args: Namespace) -> None:
+    """Reject chunkflow configurations that cannot work, at parse time.
+
+    Both checks would otherwise surface much later: a missing chunk size as a
+    silently unchunked run, and CP>1 as a ``NotImplementedError`` from deep
+    inside the first attention call.
+    """
+    if not getattr(args, "use_chunkflow", False):
+        return
+
+    chunk_size = getattr(args, "chunkflow_chunk_size", 0)
+    if chunk_size <= 0:
+        raise ValueError(
+            f"--use-chunkflow requires --chunkflow-chunk-size > 0 (got {chunk_size}); "
+            "without it chunkflow would silently run unchunked."
+        )
+    if getattr(args, "context_parallel_size", 1) > 1:
+        raise ValueError(
+            "--use-chunkflow is incompatible with --context-parallel-size > 1: context parallelism "
+            "splits the very sequence chunkflow caches in its per-layer StateStore. "
+            "Remove one of the two."
+        )
+    if getattr(args, "chunkflow_keep_last_k", 0) < 0:
+        raise ValueError(
+            f"--chunkflow-keep-last-k must be >= 0 (0 keeps every chunk), got {args.chunkflow_keep_last_k}"
+        )
+    pipeline = getattr(args, "chunkflow_pipeline", 0)
+    if pipeline and pipeline != getattr(args, "pipeline_model_parallel_size", 1):
+        raise ValueError(
+            f"--chunkflow-pipeline ({pipeline}) must equal --pipeline-model-parallel-size "
+            f"({args.pipeline_model_parallel_size}) so the chunk plan and the pipeline agree."
+        )

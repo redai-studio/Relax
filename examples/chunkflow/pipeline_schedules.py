@@ -23,9 +23,9 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 from megatron.core.utils import get_model_config
 
-from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
-from relax.backends.megatron.chunkflow.unit_batch import slice_parent_batch
-from relax.backends.megatron.chunkflow.units import Unit, completed_groups, make_model_plan, merge_model_plans
+from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
+from examples.chunkflow.unit_batch import slice_parent_batch
+from examples.chunkflow.units import Unit, completed_groups, make_model_plan, merge_model_plans
 from relax.utils.logging_utils import get_logger
 
 
@@ -101,7 +101,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
 
     from megatron.training.global_vars import get_args
 
-    from relax.backends.megatron.chunkflow.schedules import _BATCH_KEYS, _num_microbatches, _plan
+    from examples.chunkflow.schedules import _BATCH_KEYS, _num_microbatches, _plan
     from relax.backends.megatron.data import get_batch
 
     args = get_args()

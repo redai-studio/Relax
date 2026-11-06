@@ -10,14 +10,14 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from relax.backends.megatron.chunkflow import gdn
-from relax.backends.megatron.chunkflow.adapters import AttentionAdapter, register_attention_adapter
-from relax.backends.megatron.chunkflow.integration import install, uninstall
-from relax.backends.megatron.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
-from relax.backends.megatron.chunkflow.scheduler import build_chunks
-from relax.backends.megatron.chunkflow.state_store import ChunkState
-from relax.backends.megatron.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
-from tests.cpu.backends.megatron.test_chunkflow_integration import restore_rope_patch as restore_rope_patch
+from examples.chunkflow import gdn
+from examples.chunkflow.adapters import AttentionAdapter, register_attention_adapter
+from examples.chunkflow.integration import install, uninstall
+from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
+from examples.chunkflow.scheduler import build_chunks
+from examples.chunkflow.state_store import ChunkState
+from examples.chunkflow.test.cpu.test_integration import restore_rope_patch as restore_rope_patch
+from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 
 
 def _bounds(x, cu_seqlens):
@@ -272,7 +272,7 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, paddin
 
 @pytest.mark.parametrize("mode", ["keep", "fr", "selective", "selective_last", "outer"])
 @pytest.mark.parametrize("padding", [0, 3])
-def test_gdn_execution_optimization_matches_original_chunkflow(kernels, monkeypatch, mode, padding):
+def test_gdn_execution_optimization_matches_original_(kernels, monkeypatch, mode, padding):
     results = []
     for enabled in ("0", "1"):
         monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", enabled)

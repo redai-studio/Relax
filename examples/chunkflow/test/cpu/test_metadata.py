@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from relax.backends.megatron.chunkflow.metadata import int32_metadata
+from examples.chunkflow.metadata import int32_metadata
 
 
 @pytest.mark.parametrize("enabled", ["0", "1"])
