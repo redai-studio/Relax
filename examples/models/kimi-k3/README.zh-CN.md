@@ -100,7 +100,7 @@ Relax 支持 Kimi K3 的全参和 LoRA SFT，包括图片输入、packing、固�
 
 K3.1 保留 93 层主干、KDA、latent MoE、AttnRes 和图像处理流程，在 24 个 MLA 层中增加 NoPE DSA 索引器：32 个头、每头 128 维，每个 query 选择 top-2048 keys。Bridge 为每个 MLA 层映射五个新增索引器张量。SFT/RL 中索引器保持冻结，因为硬 top-k 选择没有语言模型损失梯度；本次接入没有新增索引器蒸馏目标。K3.1 的 HF 仓库省略了 K3 动态加载所需的 modeling 文件，因此使用本地可训练的 MoonViT 和 projector。现有 FLOPs 估算尚未计入稀疏注意力及冻结索引器，K3.1 暂不报告 FLOPs/MFU，仍报告吞吐和耗时。
 
-训练路径使用 Core 的 TileLang 稀疏注意力，必要时对 K3 的 96 个注意力头进行计算块补齐。如果 LoRA 包装了 `kv_b_proj`，则使用展开注意力路径以保留 adapter 梯度和 dropout，但长上下文的内存开销更大。下文 K3 的其他并行限制仍然适用。
+训练路径使用 Core 的 TileLang 稀疏注意力，必要时对 K3 的 96 个注意力头进行计算块补齐。如果 LoRA 包装了 `kv_b_proj`，则使用展开注意力路径以保留 adapter 梯度和 dropout，但长上下文的内存开销更大。KDA 的固定 CP 依赖两个训练 Dockerfile 都会应用的 Relax Megatron patch：它移除了上游 Bridge 的 CP 拒绝检查，并加入 headwise/chunkwise CP 实现。请使用包含该 patch 的训练镜像；未打 patch 的固定版本 Bridge 不支持 KDA CP。K3.1 DSA 的 CP key gather 和 packed zigzag 重排由 Core 负责。完整脚本保留 CP8，但 K3.1 端到端 CP 数值和多节点训练仍需验证。下文 K3 的其他并行限制仍然适用。
 
 当前固定的 Megatron-Bridge 已提供可复用的 K3 主干。Bridge `v0.7.0` 和 main 的 `20874c8db` 均未实现 K3.1，单独升级 Bridge 无法获得支持，因此本次保留依赖版本。可参考[官方模型配置](https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/main/config.json)和 [Bridge 版本差异](https://github.com/NVIDIA-NeMo/Megatron-Bridge/compare/6862ee170a2569607e8ebc5dde91f119779093ca...20874c8dbf87af6eafa8c93c0f44586ddc47fe5a)。
 
