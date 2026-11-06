@@ -26,7 +26,7 @@ id = "platform-env-qs"
 description = "Detects platform injected environment variables with QS_ prefix"
 regex = '''\bQS_[A-Z][A-Z0-9_]*\b'''
 tags = ["internal", "env"]
-  [[rules.allowlists]]
+  [rules.allowlist]
   regexTarget = "match"
   regexes = [
     # QS_USER alone is just an env var name reference, not a leaked value
@@ -37,15 +37,6 @@ tags = ["internal", "env"]
   paths = [
     '''scripts/tools/model_upload_hook\.py$''',
     '''tests/cpu/tools/test_model_upload_hook\.py$''',
-  ]
-
-  [[rules.allowlists]]
-  description = "OBS launcher references the trial env var name, not its value"
-  condition = "AND"
-  regexTarget = "match"
-  regexes = ['''^QS_TRIAL_ID$''']
-  paths = [
-    '''(^|/)scripts/training/multimodal/run-deepeyes-8gpu-async-obs\.sh$''',
   ]
 
 # Custom rule: MAAS token (MAAS prefix)
