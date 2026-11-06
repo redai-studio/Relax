@@ -383,6 +383,7 @@ async def generate(
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
+    opd_enabled = opd.is_opd_enabled(args, evaluation=evaluation)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED, (
@@ -398,12 +399,11 @@ async def generate(
     _has_media = sample.multimodal_inputs is not None and any(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
-    native_image_opd = bool(state.opd_manager and not evaluation and _has_media)
+    native_image_opd = opd_enabled and _has_media
     if native_image_opd:
         image_inputs(sample.multimodal_inputs)
     if (
-        state.opd_manager
-        and not evaluation
+        opd_enabled
         and args.use_slime_router
         and "RadixTreeMiddleware" in args.slime_router_middleware_paths
         and (_has_media or image_inputs(sample.teacher_multimodal_inputs))
@@ -445,7 +445,7 @@ async def generate(
     if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
         payload["return_indexer_topk"] = True
 
-    if state.opd_manager and not evaluation:
+    if opd_enabled:
         state.opd_manager.before_rollout(payload)
     sc_sampling_mode = configure_score_centering_request(args, payload) if not evaluation else None
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
@@ -540,7 +540,7 @@ async def generate(
             new_response_tokens = output["output_ids"]
             new_response_log_probs = []
 
-        if state.opd_manager and not evaluation:
+        if opd_enabled:
             new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
                 output["meta_info"], new_response_tokens, new_response_log_probs
             )
@@ -617,7 +617,7 @@ async def generate(
         if sc_result is not None:
             append_score_centering_candidates(sample, sc_result[2], sc_result[3])
 
-        if state.opd_manager and not evaluation:
+        if opd_enabled:
             state.opd_manager.after_rollout(sample, output)
 
     if "routed_experts" in output["meta_info"]:
@@ -660,22 +660,12 @@ async def _dispatch_generate(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
-    """Resolve the generate function and run it under the correct permit scope.
+    """Run the selected generator with an inference permit.
 
-    Touches only ``state.aborted`` / ``state.dp_rank_context`` / ``state.semaphore``
-    so it can be unit-tested with a lightweight stub state (no GenerateState).
-
-    - Default (built-in ``generate`` or a custom function without the opt-in flag):
-      hold the session-level lock for the whole call, exactly as before.
-    - Opt-in (custom function with ``manages_inference_permit = True``): do NOT
-      hold the session lock; the function acquires a per-request permit per turn
-      via ``state.post_generate``/``state.inference_permit``.
-
-    ``GenerationAborted`` must never escape this function: ``generate_and_rm_group``
-    runs the per-sample tasks through ``asyncio.gather`` *without*
-    ``return_exceptions=True``, and no existing abort path raises -- so a leaked
-    exception would crash the whole rollout step. It is contained here and mapped
-    to an ABORTED sample (mirroring the legacy in-lock abort check).
+    By default, hold a permit until generation returns. Custom generators with
+    manages_inference_permit=True manage permits for individual requests.
+    Return an ABORTED sample on GenerationAborted so callers can handle an
+    unfinished response without failing the group call.
     """
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
@@ -686,12 +676,11 @@ async def _dispatch_generate(
             sample.status = Sample.Status.ABORTED
             return sample
         with state.dp_rank_context() as _:
-            if custom_generate_func is not None:
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                return await custom_generate_func(args, sample, sampling_params)
-            return await generate(args, sample, sampling_params, evaluation=evaluation)
+            if custom_generate_func is None:
+                return await generate(args, sample, sampling_params, evaluation=evaluation)
+            if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+            return await custom_generate_func(args, sample, sampling_params)
 
     try:
         if manages_permit:
@@ -728,8 +717,11 @@ async def generate_and_rm(
 
     # Resolve the generate function and run it under the right permit scope
     # (session-level lock by default; per-request permits for opt-in functions).
-    manager = state.opd_manager if not evaluation else None
-    teacher_id = sample.metadata["teacher_id"] if manager and getattr(args, "opd_teacher_routes_map", None) else None
+    opd_enabled = opd.is_opd_enabled(args, evaluation=evaluation)
+    manager = state.opd_manager
+    teacher_id = None
+    if opd_enabled and getattr(args, "opd_teacher_routes_map", None):
+        teacher_id = sample.metadata["teacher_id"]
     response_key = sample.response_key
     generated = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
     results = generated if isinstance(generated, list) else [generated]
@@ -741,23 +733,27 @@ async def generate_and_rm(
             result.metadata["teacher_id"] = teacher_id
 
     if any(result.status == Sample.Status.ABORTED for result in results):
-        if args.group_rm and manager and manager.response_stats is not None:
+        if args.group_rm and opd_enabled and manager.response_stats is not None:
             manager.response_stats.finish(response_key)
         return generated
+
+    # Group rewards and Teacher scoring run in generate_and_rm_group.
     if args.group_rm:
         return generated
 
+    # Custom generation may already have assigned rewards to some outputs.
     if isinstance(generated, list):
-        samples_need_reward = [result for result in results if result.reward is None]
+        samples_need_reward = [sample for sample in generated if sample.reward is None]
         rewards = await batched_async_rm(args, samples_need_reward)
-        for result, reward in zip(samples_need_reward, rewards, strict=False):
-            result.reward = reward
+        for sample, reward in zip(samples_need_reward, rewards, strict=False):
+            sample.reward = reward
     elif generated.reward is None:
         generated.reward = await async_rm(args, generated)
 
-    if manager:
+    if opd_enabled:
         response_indices = [response_key] * len(results) if teacher_id is not None else None
         await manager.prefill(generated, _encode_multimodal_inputs, response_indices=response_indices)
+
     return generated
 
 
@@ -817,9 +813,10 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
-    manager = state.opd_manager if not evaluation else None
-    stats = manager.response_stats if manager else None
-    if manager and getattr(args, "opd_teacher_routes_map", None):
+    opd_enabled = opd.is_opd_enabled(args, evaluation=evaluation)
+    manager = state.opd_manager
+    stats = manager.response_stats if opd_enabled else None
+    if opd_enabled and getattr(args, "opd_teacher_routes_map", None):
         for sample in group:
             manager.bind_teacher(sample)
 
@@ -843,19 +840,21 @@ async def generate_and_rm_group(
     try:
         group = await asyncio.gather(*tasks)
 
-        # A group with any aborted member (e.g. a weight-sync pre-dispatch 499) is
-        # incomplete: skip group reward for it in training so it is not scored on a
-        # partial trajectory. The group is carried to the resume buffer and finished
-        # under the next weight version. Eval is unaffected — it never converts a 499.
+        # Skip group scoring if any training response was aborted.
         group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
-        # eval should still compute group reward even if abort was triggered by a concurrent rollout
-        if (not state.aborted or evaluation) and args.group_rm and not group_has_training_abort:
-            rewards = await batched_async_rm(args, group)
-            for sample, reward in zip(group, rewards, strict=False):
-                sample.reward = reward
+        if not args.group_rm:
+            return group
+        if state.aborted and not evaluation:
+            return group
+        if group_has_training_abort:
+            return group
 
-            if manager:
-                await manager.prefill(group, _encode_multimodal_inputs, response_indices=group_keys)
+        rewards = await batched_async_rm(args, group)
+        for sample, reward in zip(group, rewards, strict=False):
+            sample.reward = reward
+
+        if opd_enabled:
+            await manager.prefill(group, _encode_multimodal_inputs, response_indices=group_keys)
 
         return group
     finally:

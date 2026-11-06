@@ -292,6 +292,8 @@ def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dic
                 if legacy_bshd
                 else batch.get("unsplit_full_mtp_loss_mask", batch["unsplit_mtp_loss_mask"])
             )
+        if batch.get("__is_dummy__", False):
+            forward_kwargs["loss_mask"] = torch.zeros_like(forward_kwargs["loss_mask"])
         return
 
     # MCore rolls raw text labels once before the depth-specific roll. Its
@@ -299,6 +301,10 @@ def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dic
     forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
     if forward_kwargs.get("loss_mask") is None:
         forward_kwargs["loss_mask"] = batch["full_loss_masks"]
+
+    if batch.get("__is_dummy__", False):
+        # MTPLossAutoScaler injects its gradient independently of the main loss.
+        forward_kwargs["loss_mask"] = torch.zeros_like(forward_kwargs["loss_mask"])
 
 
 def _unwrap_single_sequence_cp_output(

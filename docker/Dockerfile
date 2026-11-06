@@ -283,6 +283,8 @@ RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2
 COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
 COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
 COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
+# Apply after all pip installs; this cache specialization requires Frontend 1.27.0 / CuTe DSL 4.6.0.
+COPY docker/patch/cudnn/1.27.0-dsa-sm90-signature-cache.patch /tmp/cudnn-dsa-sm90-signature-cache.patch
 # Resolve late so existing compiled layers remain cached. NIXL packages both
 # backends, but dispatches to cu12 based on Torch; this does not change CUDA.
 RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt && \
@@ -292,4 +294,11 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
     python /opt/relax/validate_hybridep_install.py && \
+    CUDNN_SITE="$(python -c 'import importlib.metadata as m; \
+        assert m.version("nvidia-cudnn-frontend") == "1.27.0", "DSA SM90 patch requires cuDNN Frontend 1.27.0"; \
+        assert m.version("nvidia-cutlass-dsl") == "4.6.0", "DSA SM90 patch requires CuTe DSL 4.6.0"; \
+        print(m.distribution("nvidia-cudnn-frontend").locate_file(""))')" && \
+    patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa-sm90-signature-cache.patch && \
+    python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" && \
+    rm /tmp/cudnn-dsa-sm90-signature-cache.patch && \
     python /opt/relax/validate_final_runtime.py --profile cu12

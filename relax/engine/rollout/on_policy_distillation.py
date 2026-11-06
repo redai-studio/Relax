@@ -370,15 +370,15 @@ class OpdManager:
             keys = response_indices if response_indices is not None else [s.response_key for s in sample_list]
             requests = [self._teacher_prefill(s, session, key) for s, key in zip(sample_list, keys, strict=True)]
             if not getattr(self.args, "opd_teacher_routes_map", None):
-                fetch_results = await asyncio.gather(*requests)
+                successes = await asyncio.gather(*requests)
             else:
                 # End a response only after all its Teacher requests have settled.
                 results = await asyncio.gather(*requests, return_exceptions=True)
                 for result in results:
                     if isinstance(result, BaseException):
                         raise result
-                fetch_results = results
-            self._raise_if_all_failed(sample_list, fetch_results)
+                successes = results
+            self._raise_if_all_failed(sample_list, successes)
 
             if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
                 await asyncio.gather(

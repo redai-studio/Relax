@@ -15,6 +15,8 @@ from relax.utils.types import Sample
 
 def _args(**overrides) -> Namespace:
     args = {
+        "use_opd": True,
+        "opd_type": "sglang",
         "group_rm": False,
         "partial_rollout": False,
         "custom_generate_function_path": None,
