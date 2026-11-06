@@ -526,8 +526,8 @@ def test_hybrid_draws_cross_batch_boundary_and_refuse_incomplete_resume(tokenize
 
 
 @pytest.mark.parametrize("nvls", [None, "0"])
-@pytest.mark.parametrize("hybrid", [False, True])
-def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, nvls, hybrid):
+@pytest.mark.parametrize("hybrid,score_centering", [(False, False), (True, False), (True, True)])
+def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, nvls, hybrid, score_centering):
     tools = tmp_path / "bin"
     tools.mkdir()
     record = tmp_path / "ray.jsonl"
@@ -568,6 +568,8 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, 
         )
     suffix = "-hybrid-async" if hybrid else ""
     script = ROOT / f"examples/retool_agentic/scripts/run-qwen25-7B-grpo-8xgpu{suffix}.sh"
+    if score_centering:
+        script = ROOT / "examples/retool_agentic/scripts/run-qwen25-7B-sc-8xgpu-hybrid-6a2r.sh"
     # All process/cluster executables above are stubs: never clean up real Ray.
     result = subprocess.run(["bash", str(script)], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -582,6 +584,8 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, 
     assert command[command.index("--agentic-concurrency") + 1] == "16"
     assert command[command.index("--agent-env") + 1] == f"RETOOL_TOKENIZER_PATH={model}/tokenizer.json"
     expected = str(save / f"qwen25-7b-retool-agentic-grpo-8xgpu{suffix}")
+    if score_centering:
+        expected = str(save / "qwen25-7b-retool-agentic-sc-8xgpu-hybrid-6a2r")
     assert command[command.index("--load") + 1] == command[command.index("--save") + 1] == expected
     runtime = json.loads(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--runtime-env-json=")))
     assert runtime["env_vars"]["DATA_DIR"] == str(data)
@@ -590,8 +594,17 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, 
         assert runtime["env_vars"]["NCCL_NVLS_ENABLE"] == nvls
     if hybrid:
         assert "--hybrid" in command and "--fully-async" not in command and "--partial-rollout" not in command
-        assert json.loads(command[command.index("--resource") + 1]) == {"actor": [1, 4], "rollout": [1, 4]}
+        actor, rollout = (6, 2) if score_centering else (4, 4)
+        assert json.loads(command[command.index("--resource") + 1]) == {"actor": [1, actor], "rollout": [1, rollout]}
         assert command[command.index("--start-rollout-id") + 1] == "0"
+        if score_centering:
+            assert runtime["env_vars"]["SGLANG_RETURN_ORIGINAL_LOGPROB"] == "0"
+            assert command[command.index("--advantage-estimator") + 1] == "score_centering"
+            assert command[command.index("--score-centering-is") + 1] == "tis"
+            assert "--use-tis" not in command and "--calculate-per-token-loss" in command
+            batch = int(command[command.index("--global-batch-size") + 1])
+            groups = int(command[command.index("--rollout-batch-size") + 1])
+            assert batch == groups * 16 == 1008 and batch % (actor // 2) == 0
         (Path(expected)).mkdir(parents=True)
         (Path(expected) / "latest_checkpointed_iteration.txt").write_text("1")
         retry = subprocess.run(

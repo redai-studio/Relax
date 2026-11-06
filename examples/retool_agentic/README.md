@@ -1,6 +1,6 @@
 # ReTool：Relax Agentic 训练示例
 
-使用 Qwen2.5-7B 进行多轮 Python 工具调用与 GRPO 训练。模型生成 `<code> ... </code>` 后执行一次隔离的 Python 程序，将真实结果放入 `<interpreter>`，再继续推理。`relax/agentic` 管理每条轨迹的进程、上下文、生成 token/logprob 和训练导出；工具反馈只作为上下文，不参与 loss。
+使用 Qwen2.5-7B 进行多轮 Python 工具调用与 GRPO 或 Score Centering 训练。模型生成 `<code> ... </code>` 后执行一次隔离的 Python 程序，将真实结果放入 `<interpreter>`，再继续推理。`relax/agentic` 管理每条轨迹的进程、上下文、生成 token/logprob 和训练导出；工具反馈只作为上下文，不参与 loss。
 
 本目录包含 agent、数据准备、判分、词表 hook、sandbox、checkpoint 校验、训练脚本和测试。除 Relax 框架及其标准训练依赖外，不依赖其他 example，可单独加入兼容的 Relax 仓库。目录内不包含模型权重、训练数据或 sandbox 镜像。
 
@@ -85,6 +85,18 @@ bash examples/retool_agentic/scripts/run-qwen25-7B-grpo-8xgpu-hybrid-async.sh
 
 **该异步变体只支持从头启动。** 它仍每 25 次更新保存 native checkpoint 和 HF 导出，但没有持久化 resident agent、待交付组及其工具状态，所以这些 checkpoint 不具备本配方完整恢复所需的全部状态。脚本拒绝非空实验目录，避免静默跳过在途数据。再次从头运行需显式更换 `EXP_NAME` 或 `SAVE_DIR`；如需仅从已训练权重开启新实验，可将完整 HF 导出作为新的 `MODEL_DIR`。
 
+### Score Centering 异步：6 卡训练 + 2 卡推理
+
+```bash
+bash examples/retool_agentic/scripts/run-qwen25-7B-sc-8xgpu-hybrid-6a2r.sh
+```
+
+使用相同的 `MODEL_DIR`、`DATA_DIR`、`SAVE_DIR`；已有集群通过 `scripts/entrypoint/ray-job.sh` 提交。默认实验名为 `qwen25-7b-retool-agentic-sc-8xgpu-hybrid-6a2r`，从初始 HF 权重和 RL 第 0 步开始，拒绝非空实验目录。6 卡 Actor 使用 TP=2、DP=3；2 卡推理运行 2 个单卡 engine。batch 为 **63 组 × 16 条 = 1008**，每个 DP rank 336 条；oversampling 为 79 组，staleness 仍为 2，目标 200 次更新。工具预算和 resident 并发沿用上述异步配置。
+
+该变体使用框架的 `score_centering` loss：组内奖励减均值、不除标准差，按全局有效回复 token 归一化。每次生成同时采集采样 token 和 top-128 候选的行为概率，Agentic 将多轮候选对齐到训练轨迹，工具反馈位置不参与 loss。SGLang 必须支持同次请求返回这些概率；使用 temperature=1、top-p=1、top-k=-1，并将 `SGLANG_RETURN_ORIGINAL_LOGPROB=0` 传给 worker。
+
+异步修正使用专用的 `--score-centering-is tis --score-centering-tis-clip 2`，不能同时设置普通 `--use-tis`。训练记录 `sc_rollout_head_mass`、`sc_train_head_mass`、`sc_correction`、`sc_importance_weight` 等指标。checkpoint 位置、保存频率和异步恢复限制与上节一致。
+
 ### Sandbox
 
 `train.py` 为整个 Ray Job 管理工具服务，训练退出后关闭服务。自动优先使用 Landlock；内核未实现 Landlock 时使用 Apptainer。首次使用 Apptainer 会将固定镜像缓存到 `$SAVE_DIR/.retool-sandbox/`，也可预先准备：
@@ -131,7 +143,7 @@ Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batc
 
 每次模型请求发送完整历史，使用固定模板和 `stream=false`。工具结果原样追加为非空的 `\n<interpreter>\n...\n</interpreter>\n`，继续同一 assistant token 流，不额外插入 ChatML 边界；无需 reasoning/tool-call parser。Session 形成线性上下文并导出一份训练样本。生成 token 的 mask 为 1，实际反馈 token 的 mask 为 0，logprob 来自原生推理后端。词表 hook 和 sampling bias 屏蔽 padded token。
 
-奖励为答案判分的 ±1，减去每次工具失败的 0.1，无下限；保留 DAPO verifier 的 `Answer:` 优先、boxed 回退规则。这是 GRPO 配方，不是原论文 PPO 配方的等价复现。
+奖励为答案判分的 ±1，减去每次工具失败的 0.1，无下限；保留 DAPO verifier 的 `Answer:` 优先、boxed 回退规则。默认配方使用 GRPO，另提供上述 Score Centering 变体；均不是原论文 PPO 配方的等价复现。
 
 代码错误、超时、非法调用和隔离程序的信号退出作为工具反馈；HTTP、服务或响应协议异常直接报错，不伪装成模型负奖励。每段新代码只执行一次，不做 HTTP 重试或历史重放。模型请求不设 wall timeout，以允许 Runtime 暂停；`--agent-timeout 1800` 限制 agent 的 active time，sandbox 请求另有 70 秒 wall timeout。
 
