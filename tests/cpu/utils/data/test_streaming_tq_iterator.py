@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -626,3 +627,40 @@ def test_missing_audit_field_preserves_consumed_token_denominator(monkeypatch, t
         assert report["missing_token_rate"] == 1
         assert report["age_coverage"] == 0
         assert report["token_weighted_age"] is None
+
+
+@pytest.mark.parametrize("loss_type", ["dpo", "rm"])
+def test_audit_leaves_preference_pairs_unchanged(monkeypatch, tmp_path, loss_type):
+    stream_module = _load_stream_module(monkeypatch)
+    monkeypatch.setenv("RELAX_WEIGHT_AUDIT_DIR", str(tmp_path))
+    monkeypatch.setattr(stream_module, "_maybe_log_tgd_pickle_diag", lambda *_args: None)
+    payload = {
+        "pair_ids": torch.tensor([17]),
+        "chosen_tokens": torch.tensor([[1, 2, 3]]),
+        "rejected_tokens": torch.tensor([[1, 4]]),
+        "chosen_loss_masks": torch.tensor([[0, 1, 1]]),
+        "rejected_loss_masks": torch.tensor([[0, 1]]),
+        "chosen_total_lengths": torch.tensor([3]),
+        "rejected_total_lengths": torch.tensor([2]),
+    }
+    original = {key: value.clone() for key, value in payload.items()}
+    result, _ = stream_module.get_data_from_transfer_queue(
+        args=Namespace(loss_type=loss_type),
+        tq_client=None,
+        data_fields=list(payload),
+        batch_size=1,
+        partition_id="sft_0",
+        task_name="actor_train",
+        sampling_config={},
+        batch_index=0,
+        broadcast_pp=False,
+        per_rank_fetch=True,
+        synchronize_per_rank_fetch=False,
+        post_process=False,
+        prefetched_rollout_data=[payload, SimpleNamespace(size=1)],
+    )
+    assert result.keys() == original.keys()
+    for key, value in original.items():
+        assert len(result[key]) == len(value)
+        for actual, expected in zip(result[key], value, strict=True):
+            assert torch.equal(torch.as_tensor(actual), expected)

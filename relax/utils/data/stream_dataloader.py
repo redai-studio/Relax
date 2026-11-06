@@ -16,7 +16,7 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
-from relax.engine.sft.runtime import is_sft_mode
+from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
@@ -1153,7 +1153,7 @@ def get_data_from_transfer_queue(
 
     from relax.utils import weight_version_audit
 
-    if weight_version_audit.enabled():
+    if weight_version_audit.enabled() and not is_preference_mode(args):
         try:
             if weight_version_audit.AUDIT_FIELD in rollout_data:
                 weight_version_audit.prepare_batch(rollout_data)

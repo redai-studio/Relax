@@ -718,17 +718,23 @@ audit metadata still contribute their valid loss tokens to the denominator, with
 
 Reports use actual actor loss tokens, excluding prompt, tool observations, cancelled output, zero-mask positions,
 and alignment dummy microbatches. They preserve Session, turn, request, attempt, and fragment identifiers.
-Sampling, rewards, GRPO groups, loss masks, and gradient weighting remain unchanged. When TIS/RS changes the mask,
-the audit counts final mask positions on each CP shard; if OPD still uses the original mask, it counts the union.
-Counts are read after forward/backward completes. Rows with no eligible tokens also leave the post-generation
-publication-advance distribution unchanged.
+Sampling, rewards, GRPO groups, loss masks, and gradient weighting remain unchanged. On each CP shard, the audit
+counts policy-loss tokens after TIS/RS and OPSM filtering, plus targets used by nonzero entropy, KL, OPD, and text MTP
+losses. Text MTP coverage follows each sample's prediction target positions; a zero coefficient adds no coverage.
+Counts are read after forward/backward completes. Rows with no eligible tokens leave the post-generation
+publication-advance distribution unchanged. DPO/RM preference pairs bypass this audit.
+
+Multimodal MTP may apply an additional mask inside the model. When that mask is needed to determine the complete
+consumption set after filtering, the audit counts only confirmed coverage and records
+`audit_error=mtp_target_coverage_unavailable` with `aggregate_complete=false`. Training continues.
 
 Each representative rank writes `<lineage>/consumed-rank-<rank>.jsonl` and a cumulative `.summary.json`.
 Details are limited to 8 MiB per rank and lineage; `detail_records_dropped` reports omitted details while summaries
 continue counting all observed exposures. Combine summaries with `relax.utils.weight_version_audit.aggregate`;
 it merges numerators and denominators rather than averaging rank means. Keep ranks from separate lineages separate.
-After a write failure, the current process retains cumulative counts and retries them on subsequent consumption
-commits, including summaries from older lineages. The recovered summary retains `aggregate_complete=false` to flag
+Before reading an existing summary or writing reports, the current process retains the consumption increment.
+Failed reads and writes are retried on subsequent consumption commits, merging the retained increments with the
+existing counts, including summaries from older lineages. The recovered summary retains `aggregate_complete=false` to flag
 the I/O error. Pending in-memory counts cannot survive process exit. An `aggregate_complete=false` result should not
 be treated as a complete accounting.
 

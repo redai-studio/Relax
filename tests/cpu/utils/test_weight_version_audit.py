@@ -377,3 +377,46 @@ def test_failed_summary_is_retried_after_lineage_changes(publication, tmp_path, 
     assert len(summaries) == 2
     assert sum(summary["eligible_tokens"] for summary in summaries) == 6
     assert sorted(summary["aggregate_complete"] for summary in summaries) == [False, True]
+
+
+@pytest.mark.parametrize("write_also_fails", [False, True])
+def test_summary_read_failure_preserves_pending_consumption(publication, tmp_path, monkeypatch, write_also_fails):
+    row = prepared(publication)
+    initial = audit.AuditStep("initial")
+    initial.observe(0, [row])
+    initial.commit(0)
+    path = next(tmp_path.glob("*/consumed-rank-0.summary.json"))
+    original_read = type(path).read_text
+    failed = audit.AuditStep("failed-read")
+    failed.observe(0, [row])
+
+    def fail_read(self, *args, **kwargs):
+        if self == path:
+            raise OSError("transient read failure")
+        return original_read(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(path), "read_text", fail_read)
+        with pytest.raises(OSError, match="read failure"):
+            failed.commit(0)
+    assert json.loads(path.read_text())["eligible_tokens"] == 5
+    next_step = audit.AuditStep("next")
+    next_step.observe(0, [row])
+    if write_also_fails:
+        with monkeypatch.context() as patch:
+
+            def fail_write(*_args):
+                raise OSError("transient write failure")
+
+            patch.setattr(audit, "_atomic_json", fail_write)
+            with pytest.raises(OSError, match="write failure"):
+                next_step.commit(0)
+    next_step.commit(0)
+    failed.commit(0)
+    result = json.loads(path.read_text())
+    assert result["eligible_tokens"] == 15
+    assert result["consumptions"] == 3
+    assert result["aggregate_complete"] is False
+    assert result["audit_errors"] == 1 + int(write_also_fails)
+    details = [json.loads(line) for line in path.with_name("consumed-rank-0.jsonl").read_text().splitlines()]
+    assert len(details) == 3

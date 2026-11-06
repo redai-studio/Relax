@@ -90,6 +90,24 @@ def _weight_audit_counts(args: Namespace, batch: dict[str, Any]) -> torch.Tensor
         return None
     cp_size = batch.get("dynamic_cp_size", mpu.get_context_parallel_world_size())
     cp_rank = batch.get("dynamic_cp_rank", mpu.get_context_parallel_rank())
+    opsm_mask = batch.get("weight_audit_opsm_mask")
+    opsm_offset = 0
+    mtp_active = (
+        getattr(args, "enable_mtp_training", False)
+        and getattr(args, "mtp_num_layers", 0) > 0
+        and getattr(args, "mtp_loss_scaling_factor", 0) != 0
+    )
+    if (
+        mtp_active
+        and not batch.get("weight_audit_opd")
+        and (getattr(args, "is_vl_model", False) or batch.get("multimodal_train_inputs") is not None)
+    ):
+        # The bridge can apply an internal MTP input mask not exposed in this batch.
+        batch[weight_version_audit.PREPARED_FIELD] = [
+            {**row, "audit_error": "mtp_target_coverage_unavailable"}
+            for row in batch[weight_version_audit.PREPARED_FIELD]
+        ]
+        mtp_active = False
     counts = []
     for i, (row, mask, total, response) in enumerate(
         zip(
@@ -113,13 +131,28 @@ def _weight_audit_counts(args: Namespace, batch: dict[str, Any]) -> torch.Tensor
                 dynamic_cp_size=cp_size,
                 dynamic_cp_rank=cp_rank,
             )
-        valid = mask.detach() != 0
+        owned_masks = []
+        for owner_lo, owner_hi in owners:
+            if owner_lo >= owner_hi:
+                continue
+            local = mask.detach()[owner_lo - start : owner_hi - start] != 0
+            length = owner_hi - owner_lo
+            if opsm_mask is not None:
+                local = local & (opsm_mask[opsm_offset : opsm_offset + length] != 0)
+            opsm_offset += length
+            if batch.get("weight_audit_opd") or mtp_active:
+                original = batch["loss_masks"][i].detach()[owner_lo - start : owner_hi - start] != 0
+                if not batch.get("weight_audit_opd"):
+                    # First MTP head predicts target j>=2; deeper heads cover subsets.
+                    original = original & (torch.arange(owner_lo, owner_hi, device=mask.device) >= 2)
+                local = local | original
+            owned_masks.append((owner_lo, owner_hi, local))
         for lo, hi in [(start, total), *((span["token_start"], span["token_end"]) for span in row["spans"])]:
             count = torch.zeros((), dtype=torch.int64, device=mask.device)
-            for owner_lo, owner_hi in owners:
+            for owner_lo, owner_hi, valid in owned_masks:
                 left, right = max(lo, owner_lo), min(hi, owner_hi)
                 if left < right:
-                    count = count + valid[left - start : right - start].sum(dtype=torch.int64)
+                    count = count + valid[left - owner_lo : right - owner_lo].sum(dtype=torch.int64)
             counts.append(count)
     result = torch.stack(counts)
     if cp_size > 1:

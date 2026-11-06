@@ -1241,13 +1241,6 @@ def policy_loss_function(
         if args.kl_loss_coef != 0:
             loss = loss + args.kl_loss_coef * kl_loss
 
-    if (
-        weight_version_audit.PREPARED_FIELD in batch
-        and not is_score_centering
-        and (args.get_mismatch_metrics or args.use_tis)
-    ):
-        batch["weight_audit_loss_masks"] = modified_response_masks
-
     opd_loss, opd_reported_loss = compute_policy_opd_loss(
         args=args,
         batch=batch,
@@ -1258,12 +1251,22 @@ def policy_loss_function(
     )
     if opd_loss is not None:
         loss = loss + opd_loss
-        if "weight_audit_loss_masks" in batch:
-            # OPD retains the original reducer even when RS rejects policy-loss tokens.
-            batch["weight_audit_loss_masks"] = [
-                (original != 0) | (modified != 0)
-                for original, modified in zip(batch["loss_masks"], batch["weight_audit_loss_masks"], strict=True)
-            ]
+
+    if weight_version_audit.PREPARED_FIELD in batch and (
+        args.use_opsm or (not is_score_centering and (args.get_mismatch_metrics or args.use_tis))
+    ):
+        batch["weight_audit_loss_masks"] = (
+            modified_response_masks
+            if not is_score_centering and (args.get_mismatch_metrics or args.use_tis)
+            else batch["loss_masks"]
+        )
+        # OPSM gates only PG; entropy/KL retain the reducer mask, OPD the original mask.
+        batch["weight_audit_opsm_mask"] = (
+            opsm_mask.detach()
+            if args.use_opsm and args.entropy_coef == 0 and not (args.use_kl_loss and args.kl_loss_coef != 0)
+            else None
+        )
+        batch["weight_audit_opd"] = opd_loss is not None
 
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()

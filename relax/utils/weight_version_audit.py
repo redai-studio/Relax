@@ -25,6 +25,7 @@ PREPARED_FIELD = "weight_audit_rows"
 _VERSION_PREFIX = "relax-audit-v1:"
 _MAX_REPORT_BYTES = 8 * 1024 * 1024
 _pending_summaries: dict[Path, dict[str, Any]] = {}
+_unread_summaries: set[Path] = set()
 
 
 def enabled() -> bool:
@@ -447,8 +448,8 @@ class AuditStep:
             path = directory / lineage / f"consumed-rank-{rank}.jsonl"
             summary_path = path.with_suffix(".summary.json")
             previous = _pending_summaries.get(summary_path)
-            if previous is None and summary_path.exists():
-                previous = json.loads(summary_path.read_text())
+            if previous is None:
+                _unread_summaries.add(summary_path)
             cumulative = aggregate([previous, summary]) if previous else aggregate([summary])
             cumulative.update(
                 rank=rank,
@@ -473,8 +474,25 @@ class AuditStep:
         # Also retry old lineages, which may never receive another consumption.
         for summary_path, cumulative in list(_pending_summaries.items()):
             try:
+                if summary_path in _unread_summaries:
+                    try:
+                        previous = json.loads(summary_path.read_text())
+                    except FileNotFoundError:
+                        previous = None
+                    if previous is not None:
+                        merged = aggregate([previous, cumulative])
+                        merged.update(
+                            rank=cumulative["rank"],
+                            last_consumption_id=cumulative["last_consumption_id"],
+                            consumptions=previous["consumptions"] + cumulative["consumptions"],
+                            detail_records_dropped=previous["detail_records_dropped"]
+                            + cumulative["detail_records_dropped"],
+                        )
+                        cumulative.clear()
+                        cumulative.update(merged)
+                    _unread_summaries.remove(summary_path)
                 _atomic_json(summary_path, cumulative)
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 cumulative["audit_errors"] += 1
                 cumulative["aggregate_complete"] = False
                 error = exc
