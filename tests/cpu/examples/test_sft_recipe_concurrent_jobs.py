@@ -26,10 +26,17 @@ def recipe(request: pytest.FixtureRequest) -> str:
 
 @pytest.fixture
 def recipe_env(tmp_path: Path, recipe: str) -> dict[str, str]:
-    for relative in (recipe, ENTRYPOINT, "scripts/models/qwen38-flash-next.sh", "scripts/entrypoint/kernel-cache.sh"):
+    for relative in (
+        recipe,
+        ENTRYPOINT,
+        "scripts/models/qwen38-flash-next.sh",
+        "scripts/entrypoint/kernel-cache.sh",
+        "scripts/entrypoint/ray-status.sh",
+        "scripts/entrypoint/ray-bin/ray",
+    ):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(ROOT / relative, target)
+        shutil.copy(ROOT / relative, target)
 
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -62,6 +69,7 @@ elif args[:2] != ["job", "submit"]:
     env.update(
         PATH=str(bindir) + os.pathsep + env["PATH"],
         MOCK_RAY_TRACE=str(tmp_path / "ray-trace.jsonl"),
+        RAY_NO_WAIT="1",
         MODEL_DIR=str(tmp_path / "model"),
         DATA_DIR=str(tmp_path / "data"),
         SAVE_DIR=str(tmp_path / "output"),
@@ -95,7 +103,7 @@ def test_sft_recipe_submits_without_querying_other_jobs(
     submissions = [call for call in job_calls if call[:2] == ["job", "submit"]]
     assert result.returncode == 0, result.stderr
     assert len(submissions) == 1
-    assert "--no-wait" not in submissions[0]
+    assert "--no-wait" in submissions[0]
     assert sum(call[:2] == ["list", "nodes"] for call in calls) == 1
 
 
