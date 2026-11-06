@@ -124,17 +124,19 @@ class ReToolAgenticDataSource(DataSource):
         return state
 
     def save(self, rollout_id: int) -> None:
-        if rollout_id < 0 or self.group_cursor < (rollout_id + 1) * self.args.rollout_batch_size:
+        # Fully async has a terminal backfill step without a new train batch.
+        completed_steps = min(rollout_id + 1, self.args.num_rollout) if self.hybrid else rollout_id + 1
+        if rollout_id < 0 or self.group_cursor < completed_steps * self.args.rollout_batch_size:
             raise RuntimeError("Checkpoint requires a complete Agentic prompt batch")
         path = Path(self.args.save) / "dataset" / f"retool_{rollout_id}.json"
         path.parent.mkdir(exist_ok=True)
         temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
         with temporary.open("x") as stream:
-            json.dump(dict(self._state(rollout_id + 1), next_group_index=self.group_cursor), stream)
+            json.dump(dict(self._state(completed_steps), next_group_index=self.group_cursor), stream)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        self.cursor = rollout_id + 1
+        self.cursor = completed_steps
 
     def load(self, rollout_id: int | None = None) -> None:
         if self.args.load is None or rollout_id is None or rollout_id < 0:

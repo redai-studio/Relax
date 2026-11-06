@@ -500,6 +500,7 @@ def test_hybrid_draws_cross_batch_boundary_and_refuse_incomplete_resume(tokenize
         fully_async=True,
         agentic_prelaunch=True,
         start_rollout_id=0,
+        num_rollout=1,
         over_sampling_batch_size=6,
         retool_max_consecutive_timeouts=3,
         retool_tool_wall_time_budget_seconds=90,
@@ -512,6 +513,10 @@ def test_hybrid_draws_cross_batch_boundary_and_refuse_incomplete_resume(tokenize
     source.save(0)
     state = json.loads((Path(args.save) / "dataset/retool_0.json").read_text())
     assert state["next_group_index"] == 6 and state["execution_mode"] == "hybrid"
+    # The terminal backfill drains existing debt; it consumes no new batch.
+    source.save(args.num_rollout)
+    final_state = json.loads((Path(args.save) / "dataset/retool_1.json").read_text())
+    assert final_state["cursor"] == 1 and final_state["next_group_index"] == 6
     args.load = args.save
     with pytest.raises(ValueError, match="cannot resume resident"):
         source.load(0)
