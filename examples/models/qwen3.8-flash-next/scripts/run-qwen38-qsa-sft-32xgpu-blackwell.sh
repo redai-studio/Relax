@@ -298,4 +298,3 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOBS_ADDRESS}" \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- python3 -m relax.entrypoints.train "${TRAIN_ARGS[@]}" \
     2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-${now}.log"
-bash "$RELAX/scripts/entrypoint/check-ray-job-status.sh" "$RAY_JOBS_ADDRESS" "$SUBMISSION_ID"

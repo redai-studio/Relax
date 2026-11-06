@@ -317,4 +317,3 @@ if [[ -n "$RAY_NO_WAIT" ]]; then RAY_ARGS+=(--no-wait); fi
 if [[ -n "${WORKING_DIR:-}" ]]; then RAY_ARGS+=(--working-dir "$WORKING_DIR"); fi
 mkdir -p "$SCRIPT_DIR/log"
 ray "${RAY_ARGS[@]}" -- "${TRAIN_ARGS[@]}" 2>&1 | tee "$SCRIPT_DIR/log/$TASK_NAME.log"
-bash "$RELAX/scripts/entrypoint/check-ray-job-status.sh" "$RAY_JOBS_ADDRESS" "$SUBMISSION_ID"

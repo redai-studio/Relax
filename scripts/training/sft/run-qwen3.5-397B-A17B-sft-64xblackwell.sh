@@ -162,4 +162,3 @@ fi
 : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray Jobs HTTP URL}"
 mkdir -p "$SCRIPT_DIR/log"
 ray "${RAY_ARGS[@]}" -- python3 -m relax.entrypoints.train "${ARGS[@]}" 2>&1 | tee "$SCRIPT_DIR/log/$EXP_NAME-$now.log"
-bash "$RELAX/scripts/entrypoint/check-ray-job-status.sh" "$RAY_ADDRESS" "$SUBMISSION_ID"
