@@ -2132,7 +2132,8 @@ def test_all_six_streams_join_from_prompt_to_committed_update(tmp_path, rollout_
     assert rows["sessions"][0]["session_id"] == rows["trajectories"][0]["session_id"] == "s"
     trajectory = rows["trajectories"][0]
     export_id = trajectory["sample_export_id"]
-    assert export_id == str((15 << 56) | 1)
+    assert export_id == str(sample.sample_export_id)
+    assert int(export_id) >> 56 == 15 and int(export_id) & 1
     assert trajectory["schema_version"] == "3.0.0" and trajectory["run_id"] == "run_test"
     assert trajectory["sample_index"] == 5 and "index" not in trajectory
     assert trajectory["group_index"] == 2 and trajectory["label"] == "gold"

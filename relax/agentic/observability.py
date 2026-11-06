@@ -25,10 +25,11 @@ import math
 import time
 import uuid
 from argparse import Namespace
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from relax.utils.agentic_obs import (
     AgenticObsConfig,
@@ -39,8 +40,8 @@ from relax.utils.agentic_obs import (
     resolve_agentic_obs_config,
     strip_media,
 )
-from relax.utils.agentic_obs.config import write_manifest
-from relax.utils.agentic_obs.records import ExportStageRecord, utc_now
+from relax.utils.agentic_obs.config import agentic_obs_enabled, write_manifest
+from relax.utils.agentic_obs.records import SHARD_ORDINAL_SHIFT, ExportStageRecord, utc_now
 from relax.utils.agentic_obs.writers import CLOSE_TIMEOUT, best_effort, close_background
 from relax.utils.logging_utils import get_logger
 
@@ -51,6 +52,20 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+# The low 56 bits hold a fleet generation and a sequence within one shard.
+_EXPORTS_PER_GENERATION = 1 << 40
+_SHARD_GENERATIONS = iter(range((1 << SHARD_ORDINAL_SHIFT) // _EXPORTS_PER_GENERATION))
+
+
+def shard_generation_args(args: Namespace) -> Namespace:
+    """Allocate a fleet range in the driver, which survives Controller
+    recovery."""
+    if not agentic_obs_enabled(args):
+        return args
+    observed = copy(args)
+    observed.agentic_obs_shard_generation = next(_SHARD_GENERATIONS)
+    return observed
 
 
 @dataclass
@@ -166,12 +181,16 @@ class ShardTrajectoryRecorder:
     def __init__(self, args: Namespace, *, shard_ordinal: Optional[int] = None) -> None:
         self._config: Optional[AgenticObsConfig] = resolve_agentic_obs_config(args)
         self._shard_ordinal = resolve_shard_ordinal() if shard_ordinal is None else shard_ordinal
-        # Counts every export this shard produced, whether or not observability
-        # is on, so ids stay comparable across runs that toggle the flag.
-        self._counter = itertools.count()
+        # Every export receives an ID even when dumping is disabled.
+        self._counter: Iterator[int] = itertools.count()
         self._writer: Optional[AsyncJsonlAppender] = None
         self._stage_writer: Optional[AsyncJsonlAppender] = None
         if self._config is not None:
+            generation = getattr(args, "agentic_obs_shard_generation", None)
+            if generation is None:
+                generation = next(_SHARD_GENERATIONS)
+            start = generation * _EXPORTS_PER_GENERATION
+            self._counter = iter(range(start, start + _EXPORTS_PER_GENERATION))
             write_manifest(args, self._config)
             self._stage_writer = AsyncJsonlAppender(self._config.stages_dir / f"shard_{self._shard_ordinal:02d}.jsonl")
             self._writer = AsyncJsonlAppender(

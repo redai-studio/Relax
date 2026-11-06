@@ -29,7 +29,7 @@ from starlette.requests import ClientDisconnect
 
 from relax.agentic import AGENTIC_CHAT_API_ROUTE_PREFIX, AGENTIC_CHAT_API_SERVICE_NAME
 from relax.agentic.inventory import session_sampling_config
-from relax.agentic.observability import SessionObservation, ShardTrajectoryRecorder
+from relax.agentic.observability import SessionObservation, ShardTrajectoryRecorder, shard_generation_args
 from relax.agentic.pipeline import (
     RuntimeGroupError,
     SessionExportTransport,
@@ -3390,6 +3390,7 @@ def create_agentic_session_shards(
     """
 
     shard_entries: list[tuple[str, Any]] = []
+    shard_config = shard_generation_args(config)
     try:
         for placement in range(_DEFAULT_SESSION_SHARD_COUNT):
             actor_name = agentic_session_shard_name(placement)
@@ -3401,7 +3402,7 @@ def create_agentic_session_shards(
                 scheduling_strategy="SPREAD",
                 runtime_env={"env_vars": dict(_AGENTIC_SHARD_ALLOCATOR_ENV)},
             ).remote(
-                config,
+                shard_config,
                 admission_coordinator,
             )
             shard_entries.append((actor_name, shard))

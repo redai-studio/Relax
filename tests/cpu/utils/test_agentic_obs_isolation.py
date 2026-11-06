@@ -20,7 +20,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from relax.agentic.observability import SessionObservation, ShardTrajectoryRecorder
+from relax.agentic.observability import SessionObservation, ShardTrajectoryRecorder, shard_generation_args
 from relax.agentic.stage_recorder import StageRecorder
 from relax.utils.agentic_obs import AsyncJsonlAppender, merge_train_updates, writers
 from relax.utils.agentic_obs import train_hooks as hooks
@@ -184,6 +184,27 @@ def args(tmp_path):
         agentic_obs_train_generation_id="generation",
         reward_key=None,
     )
+
+
+@pytest.mark.parametrize("fleet_rebuild", [False, True])
+def test_recreated_shard_recorder_keeps_export_ids_unique_within_run(args, monkeypatch, fleet_rebuild):
+    initial_args = replacement_args = args
+    if fleet_rebuild:
+        initial_args = shard_generation_args(args)
+        replacement_args = shard_generation_args(args)
+        # The actor workers must use the generation assigned by the driver.
+        monkeypatch.setattr("relax.agentic.observability._SHARD_GENERATIONS", iter(()))
+
+    first = ShardTrajectoryRecorder(initial_args, shard_ordinal=0)
+    before = {first.next_sample_export_id() for _ in range(3)}
+    asyncio.run(first.aclose())
+
+    replacement = ShardTrajectoryRecorder(replacement_args, shard_ordinal=0)
+    after = {replacement.next_sample_export_id() for _ in range(3)}
+    asyncio.run(replacement.aclose())
+
+    assert len(before | after) == 6
+    assert all(0 <= export_id < 2**63 for export_id in before | after)
 
 
 @pytest.fixture

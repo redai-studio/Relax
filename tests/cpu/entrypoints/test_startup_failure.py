@@ -230,7 +230,6 @@ def test_train_base_exception_records_outcome_without_replacing_error(tmp_path, 
         ns["main"](args)
     assert caught.value is error
     path = tmp_path / "run_test/stages/run.jsonl"
-    assert len(path.read_text().splitlines()) == 1
     timer = Mock()
     ns["threading"] = SimpleNamespace(Timer=Mock(return_value=timer))
     recorder = ns["_run_recorder"]
@@ -247,7 +246,8 @@ def test_train_base_exception_records_outcome_without_replacing_error(tmp_path, 
         error.code if isinstance(error, SystemExit) else (130 if isinstance(error, KeyboardInterrupt) else 1)
     )
     assert ns["threading"].Timer.call_args.kwargs["args"] == (expected_code,)
-    end = json.loads(path.read_text().splitlines()[1])
+    start, end = [json.loads(line) for line in path.read_text().splitlines()]
+    assert start["status"] == "start"
     assert end["status"] == status and end["operation"] == "training"
 
 

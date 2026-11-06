@@ -4,12 +4,14 @@
 
 import errno
 import json
+import threading
 from argparse import Namespace
 from types import SimpleNamespace
 
 import pytest
 
 from relax.utils.agentic_obs.run_hooks import RunRecorder, annotate_failure_stage
+from relax.utils.agentic_obs.writers import JsonlAppender
 
 
 def _args(tmp_path, **kwargs):
@@ -30,6 +32,39 @@ def test_run_recorder_is_disabled_without_dump_directory(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_run_start_returns_while_jsonl_open_is_blocked(tmp_path, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    ensure_open = JsonlAppender._ensure_open
+
+    def blocked_open(appender):
+        entered.set()
+        assert release.wait(5)
+        return ensure_open(appender)
+
+    monkeypatch.setattr(JsonlAppender, "_ensure_open", blocked_open)
+    recorder = RunRecorder(_args(tmp_path))
+
+    def start():
+        recorder.start()
+        returned.set()
+
+    caller = threading.Thread(target=start, daemon=True)
+    caller.start()
+    try:
+        assert entered.wait(2)
+        assert returned.wait(1)
+        recorder.record_outcome("completed")
+        assert not (tmp_path / "run_test/stages/run.jsonl").exists()
+    finally:
+        release.set()
+        caller.join(2)
+        recorder.flush()
+
+    assert [row["status"] for row in _records(tmp_path)] == ["start", "completed"]
+
+
 @pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
 def test_run_recorder_pairs_execution_boundaries_and_flushes_once(tmp_path, status):
     recorder = RunRecorder(_args(tmp_path))
@@ -37,7 +72,6 @@ def test_run_recorder_pairs_execution_boundaries_and_flushes_once(tmp_path, stat
     recorder.set_phase("training")
     error = RuntimeError("backend failed") if status == "failed" else None
     recorder.record_outcome(status, error=error)
-    assert len(_records(tmp_path)) == 1  # The captured result is flushed before teardown.
     recorder.flush()
     recorder.flush()
     recorder.start()

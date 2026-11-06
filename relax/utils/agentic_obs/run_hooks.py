@@ -11,7 +11,7 @@ from typing import Any, Callable, Literal
 
 from relax.utils.agentic_obs.config import agentic_obs_enabled, resolve_agentic_obs_config, write_manifest
 from relax.utils.agentic_obs.records import ExportStageRecord
-from relax.utils.agentic_obs.writers import JsonlAppender
+from relax.utils.agentic_obs.writers import BoundedWorker, JsonlAppender
 from relax.utils.logging_utils import get_logger
 
 
@@ -71,9 +71,9 @@ def _failure_details(error: BaseException, operation: str) -> tuple[str, str]:
 class RunRecorder:
     """Write one start and the first known outcome for a training driver.
 
-    Capture the outcome before cleanup; flush it after the shutdown watchdog is
-    armed and before remote teardown. Synchronous writes avoid relying on an
-    atexit drain that ``os._exit`` would skip.
+    Queue the start without waiting for storage. After the shutdown watchdog is
+    armed, drain the start writer before writing the captured outcome
+    synchronously, since ``os._exit`` skips the atexit drain.
     """
 
     def __init__(self, args: Namespace) -> None:
@@ -84,6 +84,7 @@ class RunRecorder:
         self._started = False
         self._flushed = False
         self._outcome: ExportStageRecord | None = None
+        self._start_writer = BoundedWorker(capacity=1) if self._config is not None else None
         self._start = (
             ExportStageRecord(
                 None, "execution", "start", "", run_id=self._config.run_id, scope="run", operation="startup"
@@ -93,14 +94,17 @@ class RunRecorder:
         )
 
     def start(self) -> None:
-        if self._config is None:
+        if self._start_writer is None:
             return
         with self._lock:
             if self._started:
                 return
             self._started = True
+            queued = self._start_writer.submit(self._append, self._start)
+            self._start_writer.request_close()
+        if not queued:
+            logger.warning("agentic_obs: run start event was not queued")
         write_manifest(self._args, self._config)
-        self._append(self._start)
 
     def set_phase(self, operation: str) -> None:
         if self._config is None:
@@ -149,15 +153,19 @@ class RunRecorder:
                 self._outcome = outcome
 
     def flush(self) -> None:
-        if self._config is None:
+        if self._start_writer is None:
             return
         with self._lock:
-            if self._outcome is None or self._flushed:
-                return
-            self._flushed = True
             outcome = self._outcome
+            if self._flushed or (outcome is None and not self._started):
+                return
+            self._flushed = outcome is not None
         self.start()
-        self._append(outcome)
+        if not self._start_writer.close():
+            logger.warning("agentic_obs: run start writer did not drain before shutdown")
+            return
+        if outcome is not None:
+            self._append(outcome)
 
     def _append(self, record: ExportStageRecord) -> None:
         writer = None
