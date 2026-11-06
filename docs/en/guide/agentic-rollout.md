@@ -711,6 +711,9 @@ Failed updates and actor-forward-only synchronization do not advance it. Success
 lineage after a publisher restart. DCS uses abort-and-drain before updates, so managed SGLang responses can provide
 a request-bound scalar version; explicit `weight_versions` token intervals take precedence when available.
 Unconfirmed labels, unavailable snapshots, and unmapped output intervals remain unknown.
+If tag confirmation or snapshot publication fails, the shared snapshot is invalidated or removed. If both operations
+fail, all training ranks raise and generation stays paused to prevent reuse of stale version evidence. Batches missing
+audit metadata still contribute their valid loss tokens to the denominator, with unknown provenance.
 
 Reports use actual actor loss tokens, excluding prompt, tool observations, cancelled output, zero-mask positions,
 and alignment dummy microbatches. They preserve Session, turn, request, attempt, and fragment identifiers.

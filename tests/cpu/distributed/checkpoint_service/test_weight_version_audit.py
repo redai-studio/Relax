@@ -4,6 +4,7 @@
 doubles."""
 
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -86,24 +87,55 @@ def test_load_failure_preserves_original_exception_without_publication(backend):
 def test_failure_on_other_pp_source_prevents_confirmation(backend, monkeypatch):
     value, events = backend
     value._weight_audit_load_ok = True
-    monkeypatch.setattr(dcs.dist, "all_reduce", lambda flag, **_kwargs: flag.fill_(1))
+    verdicts = iter([1, 0])
+    monkeypatch.setattr(dcs.dist, "all_reduce", lambda flag, **_kwargs: flag.fill_(next(verdicts)))
     value._publish_weight_audit_version(push_failed=False)
     assert value._weight_audit_publisher.published_seq == 0
     assert audit.read_frontier() is None
     assert events == []
 
 
-def test_terminal_tag_failure_does_not_reuse_a_successful_policy_sequence(backend):
-    value, _ = backend
-    value._weight_audit_load_ok = True
-    value._batch_request = lambda *_args: [{"success": False}]
-    value._publish_weight_audit_version(push_failed=False)
-    assert audit.read_frontier()["published_seq"] == 1
-    tags = []
-    value._batch_request = lambda _, payload: tags.append(payload["new_version"]) or [{"success": True}]
-    value._publish_weight_audit_version(push_failed=False)
-    assert tags[0].endswith(":2")
-    assert audit.read_frontier()["published_seq"] == 2
+@pytest.mark.parametrize("failure", ["tag_response", "tag_exception", "frontier_write", "invalidation_write"])
+def test_failed_publication_marks_old_tags_unknown_before_resume(backend, monkeypatch, failure):
+    value, events = backend
+    old_tag = value._weight_audit_publisher.publish()
+    original_request = value._batch_request
+    original_write = audit._atomic_json
+
+    def request(endpoint, payload=None):
+        if endpoint == "/update_weight_version":
+            if failure == "tag_exception":
+                raise OSError("tag RPC failed")
+            return [{"success": True}, {"success": False}]
+        if endpoint == "/continue_generation":
+            assert audit.read_frontier() is None
+        return original_request(endpoint, payload)
+
+    def write(path, data):
+        if failure == "frontier_write" and "published_seq" in data:
+            raise OSError("frontier write failed")
+        if failure == "invalidation_write" and data.get("evidence_valid") is False:
+            raise OSError("invalidation write failed")
+        return original_write(path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(value, "_batch_request", request)
+        patch.setattr(audit, "_atomic_json", write)
+        value.update_weights_for_rollout()
+        assert audit.read_frontier() is None
+        spans = audit.generation_spans(
+            {"weight_versions": [{"start": 0, "end": 1, "version": old_tag}]},
+            1,
+            offset=0,
+            request_id="request",
+            attempt_id="attempt",
+            piece_index=0,
+        )
+        assert spans[0]["published_seq"] is None
+        assert spans[0]["unknown_reason"] == "publication_frontier_unavailable"
+    assert any(endpoint == "/continue_generation" for endpoint, _ in events)
+    value.update_weights_for_rollout()
+    assert audit.read_frontier()["published_seq"] == 3
 
 
 def test_http_200_failed_bucket_is_not_a_successful_publication(backend, monkeypatch):
@@ -165,19 +197,32 @@ def _gloo_publication_worker(rank, rendezvous, directory, failed_rank):
         value._batch_request = lambda *_args: [{"success": True}]
         if rank == 0:
             value._weight_audit_publisher = audit.PublicationLedger(directory, "policy")
-        value._publish_weight_audit_version(push_failed=False)
-        dcs.dist.barrier()
+        if failed_rank == -2:
+            if rank == 0:
+                value._weight_audit_publisher.publish()
+
+            def fail_io(*_args, **_kwargs):
+                raise PermissionError("frontier cannot be written or removed")
+
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(audit, "_atomic_json", fail_io)
+                patch.setattr(Path, "unlink", fail_io)
+                with pytest.raises(RuntimeError, match="generation remains paused"):
+                    value._publish_weight_audit_version(push_failed=False)
+        else:
+            value._publish_weight_audit_version(push_failed=False)
+        dcs.dist.barrier(group=dcs.dist.group.WORLD)
     finally:
         dcs.dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("failed_rank", [-1, 1])
+@pytest.mark.parametrize("failed_rank", [-1, 1, -2])
 def test_real_gloo_collective_confirms_all_sources(tmp_path, monkeypatch, failed_rank):
     monkeypatch.setenv("RELAX_WEIGHT_AUDIT_DIR", str(tmp_path))
     torch.multiprocessing.spawn(
         _gloo_publication_worker, args=(str(tmp_path / "rendezvous"), str(tmp_path), failed_rank), nprocs=2, join=True
     )
     frontier = audit.read_frontier()
-    assert (frontier is not None) == (failed_rank == -1)
+    assert (frontier is not None) == (failed_rank in (-1, -2))
     if frontier is not None:
         assert frontier["published_seq"] == 1

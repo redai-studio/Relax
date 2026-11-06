@@ -1153,9 +1153,12 @@ def get_data_from_transfer_queue(
 
     from relax.utils import weight_version_audit
 
-    if weight_version_audit.enabled() and weight_version_audit.AUDIT_FIELD in rollout_data:
+    if weight_version_audit.enabled():
         try:
-            weight_version_audit.prepare_batch(rollout_data)
+            if weight_version_audit.AUDIT_FIELD in rollout_data:
+                weight_version_audit.prepare_batch(rollout_data)
+            else:
+                rollout_data[weight_version_audit.PREPARED_FIELD] = weight_version_audit.unavailable_rows(rollout_data)
         except Exception:
             logger.exception("Weight audit preparation failed; original training fields are unchanged")
             rollout_data.pop(weight_version_audit.AUDIT_FIELD, None)

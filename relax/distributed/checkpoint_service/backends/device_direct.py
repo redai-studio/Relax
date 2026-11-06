@@ -867,24 +867,39 @@ class DeviceDirectBackend(CommBackend):
         group = get_gloo_group()
         failed = torch.tensor([int(push_failed or not self._weight_audit_load_ok)], dtype=torch.int32)
         dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
-        if dist.get_rank(group=group) != 0:
-            return
-        try:
-            if bool(failed.item()):
-                self._weight_audit_publisher.invalidate()
-                logger.error("Weight publication unconfirmed; provenance remains unknown")
-                return
-            version = self._weight_audit_publisher.publish()
-            if not self._set_weight_audit_version(version):
-                logger.error("Policy published but some engines did not confirm their audit tag")
-        except Exception:
-            logger.exception("Weight audit publication failed; original weight synchronization continues")
+        unsafe = torch.zeros(1, dtype=torch.int32)
+        if dist.get_rank(group=group) == 0:
+            try:
+                if bool(failed.item()):
+                    self._weight_audit_publisher.invalidate()
+                    logger.error("Weight publication unconfirmed; provenance remains unknown")
+                else:
+                    version = self._weight_audit_publisher.publish()
+                    if not self._set_weight_audit_version(version):
+                        self._weight_audit_publisher.invalidate()
+                        logger.error("Audit tag unconfirmed; provenance remains unknown")
+            except Exception:
+                logger.exception("Weight audit publication failed; invalidating provenance")
+                if not self._invalidate_weight_audit():
+                    unsafe.fill_(1)
+        # All ranks must fail together before any engine resumes generation.
+        dist.all_reduce(unsafe, op=dist.ReduceOp.MAX, group=group)
+        if bool(unsafe.item()):
+            raise RuntimeError("Unable to invalidate weight audit evidence; generation remains paused")
 
-    def _invalidate_weight_audit(self) -> None:
+    def _invalidate_weight_audit(self) -> bool:
         try:
             self._weight_audit_publisher.invalidate()
         except OSError:
-            logger.exception("Unable to invalidate the failed weight audit frontier")
+            logger.exception("Unable to write invalid weight audit frontier; removing the old snapshot")
+            try:
+                (self._weight_audit_publisher.directory / "frontier.json").unlink(missing_ok=True)
+            except NotADirectoryError:
+                pass  # An invalid directory cannot contain a readable frontier.
+            except OSError:
+                logger.exception("Unable to remove the failed weight audit frontier")
+                return False
+        return True
 
     def _should_sync_tensor(self, name: str, tensor: torch.Tensor) -> bool:
         return (

@@ -688,6 +688,8 @@ env_vars:
 DCS 在所有策略权重 bucket 确认加载成功后分配发布序号。更新失败或仅同步 actor_fwd 时不推进序号；发布者重启后
 使用新的 lineage。更新前会终止并排空在途生成，因此受控 SGLang 响应可使用请求绑定的标量版本；后端提供
 `weight_versions` token 区间时优先采用区间证据。未确认的标签、不可用的快照和无法映射的输出区间均保留为 unknown。
+标签确认或发布快照写入失败时，共享快照会被标为失效或删除；若两者均失败，所有训练 rank 一起报错并保持生成暂停，
+避免继续使用旧版本记录。消费批次缺少审计字段时，其有效 loss token 仍计入总数，来源记为 unknown。
 
 报告以实际 actor loss 中的 token 为统计对象，排除 prompt、工具观察、未提交的取消输出、零 mask 位置和对齐用的
 dummy microbatch，并保留 Session、轮次、request、attempt 和片段标识。原有采样、reward、GRPO 分组、loss mask

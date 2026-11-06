@@ -578,3 +578,51 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
     torch.testing.assert_close(rollout_data["rollout_topk_token_ids"][0], token_ids[expected_rows])
     torch.testing.assert_close(rollout_data["rollout_topk_log_probs"][0], log_probs[expected_rows])
     assert rollout_data["rollout_log_probs"][0].tolist() == expected_rows
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_missing_audit_field_preserves_consumed_token_denominator(monkeypatch, tmp_path, enabled):
+    from relax.utils import weight_version_audit as audit
+
+    stream_module = _load_stream_module(monkeypatch)
+    monkeypatch.setenv("RELAX_WEIGHT_AUDIT_DIR", str(tmp_path) if enabled else "")
+    monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(stream_module, "_maybe_log_tgd_pickle_diag", lambda *_args, **_kwargs: None)
+
+    def post_process(_args, data):
+        assert (audit.PREPARED_FIELD in data) is enabled
+
+    monkeypatch.setattr(stream_module, "post_process_rollout_data", post_process)
+    tokens = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+    masks = torch.tensor([[1, 0, 1], [0, 1, 0]])
+    payload = {
+        "tokens": tokens,
+        "loss_masks": masks,
+        "total_lengths": torch.tensor([4, 4]),
+        "response_lengths": torch.tensor([3, 3]),
+    }
+    data, _ = stream_module.get_data_from_transfer_queue(
+        args=Namespace(),
+        tq_client=None,
+        data_fields=list(payload),
+        batch_size=2,
+        partition_id="train_0",
+        task_name="actor_train",
+        sampling_config={},
+        batch_index=0,
+        broadcast_pp=False,
+        per_rank_fetch=True,
+        synchronize_per_rank_fetch=False,
+        prefetched_rollout_data=[payload, types.SimpleNamespace(size=2)],
+    )
+    assert torch.equal(torch.stack(data["tokens"]), tokens)
+    assert torch.equal(torch.stack(data["loss_masks"]), masks)
+    if enabled:
+        step = audit.AuditStep("missing-field")
+        step.observe(0, data[audit.PREPARED_FIELD])
+        report = step.commit(rank=0)
+        assert report["eligible_tokens"] == 3
+        assert report["known_version_tokens"] == 0
+        assert report["missing_token_rate"] == 1
+        assert report["age_coverage"] == 0
+        assert report["token_weighted_age"] is None
