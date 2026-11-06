@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Hashable
+
 from examples.chunkflow.state_store import ChunkState, StateStore, StateStoreError
 
 
@@ -14,9 +16,9 @@ RECOMPUTE_ATTR = "chunkflow_recompute"
 class ChunkflowRuntime:
     def __init__(self, chunk_size: int) -> None:
         self.chunk_size = chunk_size
-        self._stores: dict[tuple[int, int], StateStore] = {}
+        self._stores: dict[tuple[Hashable, int], StateStore] = {}
 
-    def store(self, layer_number: int, group_id: int) -> StateStore:
+    def store(self, layer_number: Hashable, group_id: int) -> StateStore:
         key = (layer_number, group_id)
         store = self._stores.get(key)
         if store is None:
@@ -32,7 +34,7 @@ class ChunkflowRuntime:
 
     def history(
         self,
-        layer_number: int,
+        layer_number: Hashable,
         group_id: int,
         chunk_id: int,
         *,

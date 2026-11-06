@@ -41,6 +41,24 @@ bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen36-35B-A3B
 
 MoE 示例使用原生 all-to-all 分发，关闭路由辅助损失，并通过 `examples/chunkflow/configs/gdn.yaml` 关闭 GDN 预处理融合。它采用 CPU optimizer offload，需要足够的主机内存。两个示例均不启用 full-layer recompute、VPP、MTP 或多模态输入。
 
+## Qwen3.8-Flash-Next（QSA + GDN + PLE）
+
+实验性的 32 卡脚本使用 `${MODEL_DIR}/Qwen3.8-Flash-Next` 和相同格式的 `train.jsonl`，配置为 TP2/PP1/CP1、EP8/ETP1，并启用 sequence parallel。脚本保留 checkpoint 的 PLE 和 hyper-connection 结构，冻结 PLE 参数及硬选块的 indexer；PLE 大表使用原生 CPU offload，优化器也卸载到 CPU，主机内存需要同时容纳两者。32 卡是启动配置，不代表任意 32 卡机器都能装下模型。
+
+```bash
+DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+# 设置目录和现有集群地址后提交。
+bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+```
+
+`configs/qwen38.yaml` 关闭 GDN 预处理融合和 QSA Stage-2 indexer 辅助损失。脚本使用原生 `flex` attention，关闭 Qwen3.8 的融合/社区 selector 覆盖、local-query/replay 补丁及 streamed PLE。`_common.sh` 将这些模型环境变量传给 Ray worker。运行不切块对照时也应保留相同设置。
+
+`adapters/qsa.py` 把每层完整的 hidden-state 前缀交给原生 `QwenSparseSelfAttention`，投影、池化、TopK、mask 和 attention 都由原生实现计算，适配器只取当前 chunk 的输出。选块前会恢复原 parent pack 的行数、文档数和候选宽度，再调用原生 TopK；如果只保留当前可见候选，并列分数可能选出不同的块。`adapters/ple.py` 将完整前缀的 token ID 和 hidden states 交给原生 PLE，继续使用它的 n-gram 哈希、门控和因果卷积。`adapters/prefix.py` 共用实际边界、padding、RoPE 和 SP 布局处理；PLE 与 QSA 使用不同的缓存命名空间，同一层的历史不会相互覆盖。
+
+每次重放的参数梯度由原生 autograd 计算。历史 hidden states 的梯度累计到 `ChunkState`，在较早 chunk 执行 backward 时接回上游；`Fr` 复用这些缓存叶子。前缀重放会重复计算，也可能保留较多激活，而 selector 仍使用完整 parent 布局。这是兼容性实现，长上下文训练前需要实际测量开销。
+
+该适配器要求固定版本的原生 QSA 类、bitset 后端（`flex`，或小规模对照用的 `dense_masked`）、PP1/CP1、packed 纯文本、零 dropout，以及由 ChunkFlow 管理重计算。不支持 `id_sparse`、Stage-2 辅助损失、推理缓存、外部 mask/bias 和上述方法覆盖优化。CPU 数值测试使用仓库补丁中的原生 selector/attention 与 PLE 方法，并用小型对象替代构造依赖；它们不能代替 CUDA kernel、多卡通信或完整 Flash-Next 训练验证。
+
 ## 接入其他训练脚本
 
 应用补丁后，可以在其他 Megatron 训练脚本中加入以下参数，并保留原脚本的模型、数据和资源配置：
@@ -65,7 +83,7 @@ ChunkFlow 调用模型原有的 Megatron/Transformer Engine Attention，由原�
 
 ## 配置
 
-参数定义位于 `examples/chunkflow/arguments.py`。下表是解析器默认值；两个启动示例的 chunk 大小和激活保留数使用上文所述值。
+参数定义位于 `examples/chunkflow/arguments.py`。下表是解析器默认值；启动示例的 chunk 大小和激活保留数使用上文所述值。
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -83,7 +101,7 @@ PP 大于 1 使用实验性的非交错流水线执行器，还须设置 `RELAX_
 - 当前路径要求 CP=1、packed THD、因果注意力、per-token loss 和单个 model chunk，不支持 VPP。
 - 使用 dropout=0 并关闭 RoPE fusion。显式 MRoPE 位置路径目前仅支持纯文本 batch。
 - Attention 重计算使用 `--chunkflow-keep-last-k`。Megatron full-layer recompute 和 selective `core_attn` 重计算会在没有 ChunkFlow 重放标记的情况下重复写入缓存，因此会被拒绝。
-- 滑动窗口、非 vanilla softmax、QK clipping/logit 统计、外部 Attention mask/bias 和 Qwen3.5 optimized recipe 需要单独适配。QSA 和带 PLE 的模型会被拒绝：保留原模块并不能自动补齐稀疏选择、n-gram 或卷积所需的历史信息。
+- 滑动窗口、非 vanilla softmax、QK clipping/logit 统计、外部 Attention mask/bias 和 Qwen3.5 optimized recipe 需要单独适配。QSA 和 PLE 使用上文受限的原生前缀适配器，即使启用了实验流水线也必须保持 PP1。
 - GDN 整层适配器精确匹配 Megatron `GatedDeltaNet`；子类需要显式注册。它需要支持初始/末状态梯度的算子及 Megatron `_forward_compute` 接口；须关闭预处理融合，不支持 deterministic 模式或 full-layer recompute。
 - MoE 辅助损失、容量限制和丢弃 token 的配置需单独验证，不能假设切块前后等价。
 - PP=1 暂不更新上游 PackingMetrics，性能对比应使用实际 step 耗时。
@@ -100,7 +118,7 @@ PP 大于 1 使用实验性的非交错流水线执行器，还须设置 `RELAX_
 
 状态管理也共用一套接口：`runtime.history(layer_number, group_id, chunk_id, recompute=...)` 返回从第一块到当前块的 `ChunkState`，重计算复用已缓存的叶子。Dense 读取整个历史 K/V，GDN 读取上一块的卷积与递推状态。`ChunkState.link_tensor` 为参与当前输出计算的状态接回历史梯度；`link_output` 为原生算子额外返回的末状态连接梯度。只有明确处理原生 selective checkpoint 的适配器才应启用 `allow_replay=True`。
 
-GDN 仍调用 Megatron 使用的卷积和递推 kernel；公共层只管理状态与梯度连接。原生模块如果已有可求导的分块接口，可以注册一个整层适配器来调用它，无需修改调度器。QSA 尚未提供这样的适配器，仍然被拒绝；统一入口不会自动补齐 indexer 的历史信息。新增适配器用于训练前，应比较不切块和切块执行的输出、输入及参数梯度，并验证 packed 序列边界和 ChunkFlow 重计算。
+GDN 仍调用 Megatron 使用的卷积和递推 kernel；公共层只管理状态与梯度连接。原生模块如果已有可求导的分块接口，可以注册一个整层适配器来调用它，无需修改调度器。QSA/PLE 通过前缀重放补齐历史，以重复执行原生计算的代价减少适配层的算法实现。新增适配器用于训练前，应比较不切块和切块执行的输出、输入及参数梯度，并验证 packed 序列边界和 ChunkFlow 重计算。
 
 ## 运行测试
 

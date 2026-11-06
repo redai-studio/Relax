@@ -15,7 +15,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from examples.chunkflow import gdn
+from examples.chunkflow.adapters import gdn, qsa
 from examples.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
 
 
@@ -93,7 +93,7 @@ def resolve_attention_adapter(attention: nn.Module) -> AttentionAdapter:
         raise NotImplementedError(
             f"ChunkFlow has no attention adapter for {key[0]} with {key[1]}. "
             "Register an exact-type AttentionAdapter that preserves history, positions, gradients and recomputation. "
-            "Sparse/indexer attention (including QSA) cannot use the dense KV adapter without additional state support."
+            "Sparse/indexer attention cannot use the dense KV adapter without additional state support."
         )
     return adapter
 
@@ -277,4 +277,10 @@ register_attention_adapter(
     "megatron.core.ssm.gated_delta_net.GatedDeltaNet",
     None,
     AttentionAdapter("megatron-native-gdn", gdn.validate, gdn.install),
+)
+
+register_attention_adapter(
+    "megatron.core.transformer.experimental_attention_variant.qsa.QwenSparseSelfAttention",
+    None,
+    AttentionAdapter("megatron-native-qsa-prefix", qsa.validate, qsa.install),
 )

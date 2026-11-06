@@ -55,20 +55,39 @@ bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen36-35B-A3B
 
 保存和恢复使用 `${SAVE_DIR}/${EXP_NAME}`，保留最近两个 checkpoint。恢复时保持两者不变；新实验显式更换 `EXP_NAME`。`PROJECT_NAME` 默认为 `Relax/sft/chunkflow`。时间戳只进入 ClearML task 名和 `scripts/log/` 日志，不进入 checkpoint 路径。
 
+## Qwen3.8-Flash-Next（QSA + GDN + PLE）
+
+实验性的 32 卡脚本使用 `${MODEL_DIR}/Qwen3.8-Flash-Next` 和相同格式的 `train.jsonl`，配置为 TP2/PP1/CP1、EP8/ETP1，并启用 sequence parallel。脚本保留 checkpoint 的 PLE 和 hyper-connection 结构，冻结 PLE 参数及硬选块的 indexer；PLE 大表使用原生 CPU offload，优化器也卸载到 CPU，主机内存需要同时容纳两者。32 卡是启动配置，不代表任意 32 卡机器都能装下模型。
+
+```bash
+DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+# 设置目录和现有集群地址后提交。
+bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+```
+
+`configs/qwen38.yaml` 关闭 GDN 预处理融合和 QSA Stage-2 indexer 辅助损失。脚本使用原生 `flex` attention，关闭 Qwen3.8 的融合/社区 selector 覆盖、local-query/replay 补丁及 streamed PLE。`_common.sh` 将这些模型环境变量传给 Ray worker。运行不切块对照时也应保留相同设置。
+
+`adapters/qsa.py` 把每层完整的 hidden-state 前缀交给原生 `QwenSparseSelfAttention`，投影、池化、TopK、mask 和 attention 都由原生实现计算，适配器只取当前 chunk 的输出。选块前会恢复原 parent pack 的行数、文档数和候选宽度，再调用原生 TopK；如果只保留当前可见候选，并列分数可能选出不同的块。`adapters/ple.py` 将完整前缀的 token ID 和 hidden states 交给原生 PLE，继续使用它的 n-gram 哈希、门控和因果卷积。`adapters/prefix.py` 共用实际边界、padding、RoPE 和 SP 布局处理；PLE 与 QSA 使用不同的缓存命名空间，同一层的历史不会相互覆盖。
+
+每次重放的参数梯度由原生 autograd 计算。历史 hidden states 的梯度累计到 `ChunkState`，在较早 chunk 执行 backward 时接回上游；`Fr` 复用这些缓存叶子。前缀重放会重复计算，也可能保留较多激活，而 selector 仍使用完整 parent 布局。这是兼容性实现，长上下文训练前需要实际测量开销。
+
+该适配器要求固定版本的原生 QSA 类、bitset 后端（`flex`，或小规模对照用的 `dense_masked`）、PP1/CP1、packed 纯文本、零 dropout，以及由 ChunkFlow 管理重计算。不支持 `id_sparse`、Stage-2 辅助损失、推理缓存、外部 mask/bias 和上述方法覆盖优化。CPU 数值测试使用仓库补丁中的原生 selector/attention 与 PLE 方法，并用小型对象替代构造依赖；它们不能代替 CUDA kernel、多卡通信或完整 Flash-Next 训练验证。
+
 ## 代码与测试
 
-| 文件                                      | 职责                         |
-| ----------------------------------------- | ---------------------------- |
-| `scheduler.py`、`units.py`                | 切块与执行计划               |
-| `unit_batch.py`、`rope.py`、`metadata.py` | 输入、原始位置和 packed 边界 |
-| `integration.py`、`adapters.py`、`gdn.py` | 模型安装与原生计算适配       |
-| `runtime.py`、`state_store.py`            | 跨块状态、梯度与清理         |
-| `schedules.py`、`pipeline_schedules.py`   | 前后向执行                   |
-| `arguments.py`、`setup.py`、`relax.patch` | 配置与固定版本接入           |
+| 文件                                                        | 职责                         |
+| ----------------------------------------------------------- | ---------------------------- |
+| `scheduler.py`、`units.py`                                  | 切块与执行计划               |
+| `unit_batch.py`、`rope.py`、`metadata.py`                   | 输入、原始位置和 packed 边界 |
+| `integration.py`、`adapters/__init__.py`、`adapters/gdn.py` | 模型安装与原生计算适配       |
+| `adapters/qsa.py`、`adapters/ple.py`、`adapters/prefix.py`  | 原生 QSA/PLE 前缀重放        |
+| `runtime.py`、`state_store.py`                              | 跨块状态、梯度与清理         |
+| `schedules.py`、`pipeline_schedules.py`                     | 前后向执行                   |
+| `arguments.py`、`setup.py`、`relax.patch`                   | 配置与固定版本接入           |
 
 ```bash
 CUDA_VISIBLE_DEVICES="" python -m pytest examples/chunkflow/test/cpu -q
 python -m pytest examples/chunkflow/test/gpu -q
 ```
 
-部分 CPU 用例需要 Megatron Python 依赖，GPU 用例需要 CUDA 和原生计算后端。跳过用例不代表数值验证通过。PP>1 是需要显式启用的实验路径。示例脚本不包含 QSA、PLE、CP>1、VPP、多模态输入或 full-layer recompute；适配器具体限制见完整指南。
+部分 CPU 用例需要 Megatron Python 依赖，GPU 用例需要 CUDA 和原生计算后端。跳过用例不代表数值验证通过。PP>1 是需要显式启用的实验路径。示例脚本不包含 CP>1、VPP、多模态输入或 full-layer recompute；适配器具体限制见完整指南。

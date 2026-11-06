@@ -83,6 +83,17 @@ def slice_parent_batch(
     if use_mrope and parent.get("multimodal_train_inputs"):
         raise NotImplementedError("ChunkFlow explicit MRoPE positions currently support text-only batches")
     packed = _build_packed_seq_params(unit_tokens, lengths, [0] * len(offsets) if use_mrope else offsets)
+    physical_cu = getattr(parent["packed_seq_params"], "qsa_select_offsets_cpu", None)
+    if physical_cu is not None:
+        packed.chunkflow_parent_physical_cu = tuple(physical_cu)
+        packed.chunkflow_parent_max_seqlen = max(b - a for a, b in zip(physical_cu[:-1], physical_cu[1:]))
+    # Native PLE hashes the original tokens, including n-grams crossing a chunk
+    # boundary. Views keep this metadata cheap and replayable during backward.
+    if unit.is_dependent:
+        start, end = rows[0]
+        packed.chunkflow_prefix_tokens = flat_tokens[start - offsets[0] : end].unsqueeze(0)
+    else:
+        packed.chunkflow_prefix_tokens = unit_tokens[: sum(lengths)].unsqueeze(0)
 
     from relax.backends.megatron.data import PrepackedBatch
 

@@ -41,6 +41,24 @@ Script defaults are `SEQ_LENGTH=8192`, `CHUNK_SIZE=2048`, `KEEP_LAST_K=1`, `NUM_
 
 The MoE example uses native all-to-all dispatch, disables router auxiliary loss, and disables GDN preprocessing fusion through `examples/chunkflow/configs/gdn.yaml`. CPU optimizer offload requires sufficient host memory. Neither example enables full-layer recomputation, VPP, MTP, or multimodal input.
 
+## Qwen3.8-Flash-Next (QSA + GDN + PLE)
+
+The experimental 32-GPU recipe uses `${MODEL_DIR}/Qwen3.8-Flash-Next`, the same `train.jsonl` format, TP2/PP1/CP1, EP8/ETP1, and sequence parallelism. It keeps the checkpoint's PLE and hyper-connection architecture. PLE parameters and the hard-selection indexer are frozen; PLE tables use native CPU offload, and the optimizer also offloads to CPU. Plan host memory for both. The GPU count is a launch configuration, not a guarantee that the model fits any 32-GPU machine.
+
+```bash
+DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+# Submit after setting the directories and existing cluster addresses.
+bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+```
+
+`configs/qwen38.yaml` disables GDN preprocessing fusion and QSA Stage-2 indexer loss. The script selects native `flex` attention and disables the Qwen3.8 fused/community selector overrides, local-query/replay patches, and streamed PLE. `_common.sh` forwards these model environment settings to Ray workers. Use the same settings when running an unchunked reference.
+
+`adapters/qsa.py` replays each layer's complete hidden-state prefix through native `QwenSparseSelfAttention`. Native projection, pooling, TopK, masking, and attention remain responsible for computation; the adapter returns only the current chunk's outputs. Selection temporarily restores the original parent pack's row count, document count, and candidate width before calling native TopK. Preserving only visible candidates can change tie selection. `adapters/ple.py` similarly supplies the original prefix token IDs and hidden states to native PLE hashing, gating, and causal convolution. `adapters/prefix.py` shares physical-boundary, padding, RoPE, and SP layout handling. Their history caches use separate namespaces so PLE and QSA at the same layer do not overwrite one another.
+
+Native autograd computes each replay's parameter gradients. Historical hidden-state gradients accumulate in `ChunkState` and reconnect when earlier chunks run backward; `Fr` reuses those cached leaves. Prefix replay repeats computation and can retain substantial activations, while the selector still uses the full parent layout. Treat this as a compatibility implementation and measure its cost before adopting it for long-context training.
+
+This adapter requires the pinned native QSA classes, a bitset backend (`flex`, or `dense_masked` for small references), PP1/CP1, packed text input, zero dropout, and ChunkFlow-owned recomputation. It rejects `id_sparse`, Stage-2 auxiliary loss, inference caches, external masks/biases, and the optimized method overrides above. The CPU numerical tests load the shipped native selector/attention and PLE methods with small construction stubs; they do not validate CUDA kernels, distributed collectives, or a full Flash-Next training run.
+
 ## Using other training scripts
 
 After applying the integration patch, add the following arguments to another Megatron training script while retaining its model, data, and resource configuration:
@@ -65,7 +83,7 @@ The scheduler performs chunking; attention does not split the input a second tim
 
 ## Configuration
 
-Arguments live in `examples/chunkflow/arguments.py`. The table lists parser defaults; the two scripts use the chunk size and activation retention defaults described above.
+Arguments live in `examples/chunkflow/arguments.py`. The table lists parser defaults; the scripts use the chunk size and activation retention defaults described above.
 
 | Argument | Default | Description |
 | --- | --- | --- |
@@ -83,7 +101,7 @@ PP greater than 1 uses an experimental non-interleaved pipeline executor and als
 - The current path requires CP=1, packed THD, causal attention, per-token loss, and a single model chunk. VPP is unsupported.
 - Use zero dropout and disable RoPE fusion. The explicit MRoPE position path currently supports text-only batches.
 - Use `--chunkflow-keep-last-k` for attention recomputation. Megatron full-layer recomputation and selective `core_attn` recomputation are rejected because they replay cache writes without the ChunkFlow replay marker.
-- Sliding windows, non-vanilla softmax, QK clipping/logit statistics, external attention masks/biases, and the Qwen3.5 optimized recipe need separate adapters. QSA and models with PLE are rejected: preserving their original modules alone does not supply sparse-indexer, n-gram, or convolution history.
+- Sliding windows, non-vanilla softmax, QK clipping/logit statistics, external attention masks/biases, and the Qwen3.5 optimized recipe need separate adapters. QSA and PLE use the restricted native-prefix adapters described above; they require PP1 even when the experimental pipeline is enabled.
 - The full-layer GDN adapter matches Megatron's exact `GatedDeltaNet` class; subclasses require explicit registration. It requires kernels that propagate gradients through initial and final states and Megatron's `_forward_compute` interface. Disable preprocessing fusion; deterministic mode and full-layer recomputation are unsupported.
 - MoE auxiliary losses, capacity limits, and token-dropping configurations need separate validation. Do not assume they remain equivalent after chunking.
 - PP=1 does not currently update upstream PackingMetrics. Use actual step time for performance comparisons.
@@ -100,7 +118,7 @@ For an operator whose history is ordinary K/V, `dense_attention_adapter(name=...
 
 State management also shares one interface: `runtime.history(layer_number, group_id, chunk_id, recompute=...)` returns the `ChunkState` objects up to and including the current chunk, reusing cached leaves during recomputation. Dense attention reads all earlier K/V; GDN reads the preceding convolution and recurrence states. `ChunkState.link_tensor` reconnects historical gradients to state already used in the current output; `link_output` connects a separate final state returned by a native kernel. Only adapters that explicitly handle native selective checkpointing should enable `allow_replay=True`.
 
-GDN still calls Megatron's convolution and recurrence kernels; the shared layer manages state and gradient connections. If a native module already exposes a differentiable chunk interface, a full-layer adapter can call it without changing the scheduler. QSA has no such adapter yet and remains rejected: a shared entry point does not supply its indexer history automatically. Validate each new adapter against unchunked outputs, input and parameter gradients, packed-sequence boundaries, and ChunkFlow recomputation before using it for training.
+GDN still calls Megatron's convolution and recurrence kernels; the shared layer manages state and gradient connections. If a native module already exposes a differentiable chunk interface, a full-layer adapter can call it without changing the scheduler. The QSA/PLE adapters supply their missing history through prefix replay; this trades repeated native computation for a smaller adaptation surface. Validate each new adapter against unchunked outputs, input and parameter gradients, packed-sequence boundaries, and ChunkFlow recomputation before using it for training.
 
 ## Running tests
 

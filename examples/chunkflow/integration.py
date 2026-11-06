@@ -10,7 +10,13 @@ from collections.abc import Callable
 import torch
 from torch import nn
 
-from examples.chunkflow.adapters import DenseAttentionCall, attention_modules, resolve_attention_adapter
+from examples.chunkflow.adapters import (
+    AttentionAdapter,
+    DenseAttentionCall,
+    attention_modules,
+    ple,
+    resolve_attention_adapter,
+)
 from examples.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
 from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
 from relax.utils.logging_utils import get_logger
@@ -146,11 +152,15 @@ def install(model, chunk_size: int) -> int:
         raise ValueError("ChunkFlow is already configured with a different chunk size")
 
     # Validate the complete model before replacing even its first layer.
-    for module in model.modules():
-        if getattr(module, "per_layer_embedding", None) is not None or getattr(
-            getattr(module, "config", None), "ple_layer_ids", None
-        ):
-            raise NotImplementedError("ChunkFlow PLE requires n-gram history and causal-convolution state support")
+    ple_layers = {
+        id(layer): layer
+        for module in model.modules()
+        if (layer := getattr(module, "per_layer_embedding", None)) is not None
+    }
+    if not ple_layers and any(
+        getattr(getattr(module, "config", None), "ple_layer_ids", None) for module in model.modules()
+    ):
+        raise NotImplementedError("ChunkFlow PLE configuration requires native per_layer_embedding modules")
     plan = []
     for attention in attention_modules(model):
         if hasattr(attention, _ADAPTER_ATTR):
@@ -158,9 +168,16 @@ def install(model, chunk_size: int) -> int:
         adapter = resolve_attention_adapter(attention)
         adapter.validate(attention)
         plan.append((attention, adapter))
+    for layer in ple_layers.values():
+        if not hasattr(layer, _ADAPTER_ATTR):
+            ple.validate(layer)
+            plan.append((layer, AttentionAdapter("megatron-native-ple-prefix", ple.validate, ple.install)))
     runtime = attach_runtime(model, chunk_size)
     installed = []
+    new_context = bool(ple_layers) and not hasattr(model, ple.CONTEXT_ATTR)
     try:
+        if new_context:
+            setattr(model, ple.CONTEXT_ATTR, ple.install_context(model))
         for attention, adapter in plan:
             undo = adapter.install(attention, chunk_size, runtime)
             setattr(attention, _ADAPTER_ATTR, undo)
@@ -170,6 +187,9 @@ def install(model, chunk_size: int) -> int:
         for attention in reversed(installed):
             getattr(attention, _ADAPTER_ATTR)()
             delattr(attention, _ADAPTER_ATTR)
+        if new_context and hasattr(model, ple.CONTEXT_ATTR):
+            getattr(model, ple.CONTEXT_ATTR)()
+            delattr(model, ple.CONTEXT_ATTR)
         if existing_runtime is None:
             delattr(model, RUNTIME_ATTR)
         raise
@@ -194,7 +214,7 @@ def install(model, chunk_size: int) -> int:
                     setattr(cfg, _ROPE_FUSION_ATTR, cfg.apply_rope_fusion)
                 cfg.apply_rope_fusion = False
         logger.info("chunkflow: apply_rope_fusion disabled (the offset path needs the unfused RoPE branch)")
-    logger.info(f"chunkflow: chunked attention installed on {n} layer(s), chunk_size={chunk_size}")
+    logger.info("chunkflow: installed %s native module adapters, chunk_size=%s", n, chunk_size)
     logger.info("chunkflow: execution optimization enabled=%s", execution_optimizations_enabled())
     return n
 
@@ -224,4 +244,7 @@ def uninstall(model) -> int:
         n += 1
     if runtime is not None:
         delattr(model, RUNTIME_ATTR)
+    if hasattr(model, ple.CONTEXT_ATTR):
+        getattr(model, ple.CONTEXT_ATTR)()
+        delattr(model, ple.CONTEXT_ATTR)
     return n

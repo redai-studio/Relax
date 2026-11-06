@@ -10,8 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from examples.chunkflow import gdn
-from examples.chunkflow.adapters import AttentionAdapter, register_attention_adapter
+from examples.chunkflow.adapters import AttentionAdapter, gdn, register_attention_adapter
 from examples.chunkflow.integration import install, uninstall
 from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
 from examples.chunkflow.scheduler import build_chunks

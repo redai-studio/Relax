@@ -45,6 +45,7 @@ def _parent(lengths: list[int], device="cpu") -> dict:
         qkv_format="thd",
     )
     packed.cu_seqlens_q_cpu = cu
+    packed.qsa_select_offsets_cpu = tuple(cu)
 
     return {
         "tokens": tokens,
@@ -115,6 +116,11 @@ def test_attention_lengths_and_rope_offsets_are_sequence_local():
         packed = batch["packed_seq_params"]
         real = batch["response_lengths"][0]
         prefix = unit.chunks[0].segments[0].prefix
+        segment = unit.chunks[0].segments[0]
+        assert packed.chunkflow_parent_physical_cu == (0, 40, 80)
+        assert packed.chunkflow_parent_max_seqlen == 40
+        start = 40 * segment.seq_id
+        torch.testing.assert_close(packed.chunkflow_prefix_tokens, parent["tokens"][:, start : start + prefix + real])
         assert _rope_offsets(unit) == [prefix]
         assert packed.cu_seqlens_q_cpu == [0, real]
         if prefix:

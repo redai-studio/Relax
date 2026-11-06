@@ -28,7 +28,7 @@ import sys
 
 runtime = json.loads(os.environ["RUNTIME_ENV_JSON"])
 environment = runtime.setdefault("env_vars", {})
-environment.update({key: value for key, value in os.environ.items() if key.startswith("RELAX_CHUNKFLOW_")})
+environment.update({key: value for key, value in os.environ.items() if key.startswith(("RELAX_CHUNKFLOW_", "RELAX_QWEN38_", "MCORE_QSA_", "QWEN38_PLE_"))})
 sys.stdout.write(json.dumps(runtime))
 PY
     )
