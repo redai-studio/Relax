@@ -39,10 +39,24 @@ async def reward_func(args: Any, sample: Sample, **kwargs: Any) -> dict:
         sample.metadata[TRACE_KEY]["terminal_status"] = sample.status.value
     # Session export records the actual rollout that generated this context.
     # Draw indices can advance further when a failed group is replaced.
-    expected = sample.metadata["start_rollout_id"] + 1
-    if not sample.weight_versions or any(
-        not str(version).isdigit() or int(version) + (args.start_rollout_id or 0) != expected
-        for version in sample.weight_versions
-    ):
-        raise RuntimeError(f"Rollout policy version mismatch: expected {expected}, got {sample.weight_versions}")
+    if getattr(args, "hybrid", False):
+        if not sample.weight_versions or any(
+            not str(version).isdigit() or int(version) < 1 for version in sample.weight_versions
+        ):
+            raise RuntimeError(f"Invalid hybrid policy versions: {sample.weight_versions}")
+        versions = list(map(int, sample.weight_versions))
+        if versions != sorted(versions):
+            raise RuntimeError(f"Hybrid policy versions went backwards: {versions}")
+        sample.metadata.update(
+            retool_policy_version_min=versions[0],
+            retool_policy_version_max=versions[-1],
+            retool_policy_version_span=versions[-1] - versions[0],
+        )
+    else:
+        expected = sample.metadata["start_rollout_id"] + 1
+        if not sample.weight_versions or any(
+            not str(version).isdigit() or int(version) + (args.start_rollout_id or 0) != expected
+            for version in sample.weight_versions
+        ):
+            raise RuntimeError(f"Rollout policy version mismatch: expected {expected}, got {sample.weight_versions}")
     return score(sample.metadata["retool_final_answer"], str(sample.label), sample.metadata["tool_feedback_counts"])

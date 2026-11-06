@@ -67,6 +67,24 @@ RAY_ADDRESS=http://ray-head:8265 \
 
 默认 ClearML project 为 `Relax/retool-agentic`，稳定实验名为 `qwen25-7b-retool-agentic-grpo-8xgpu`；分别可用 `PROJECT_NAME` 和 `EXP_NAME` 覆盖。ClearML 使用运行环境已有凭证，每次启动创建带时间戳的新 task。无需 ClearML 时在命令后追加 `--no-use-clearml`。显式设置非空 `RAY_NO_WAIT` 才非阻塞，此时脚本日志只包含提交输出，需用 `ray job logs` 查看训练。
 
+### Hybrid 异步：4 卡训练 + 4 卡推理
+
+使用相同的三个目录变量，选择新的实验名或空的保存目录后运行：
+
+```bash
+bash examples/retool_agentic/scripts/run-qwen25-7B-grpo-8xgpu-hybrid-async.sh
+```
+
+该脚本也支持通过 `scripts/entrypoint/ray-job.sh` 提交到已有集群。它使用 `--hybrid`：4 卡 Actor（TP=2）内部计算 forward 和 advantage，另外 4 卡运行 4 个单卡 SGLang engine。训练从 `MODEL_DIR` 的 HF 权重和 RL 第 0 步开始，默认实验名为 `qwen25-7b-retool-agentic-grpo-8xgpu-hybrid-async`，与同步实验分开。
+
+每次更新仍使用 64 个完整问题组，每组 16 条轨迹。`--over-sampling-batch-size 80` 提供额外 16 组的调度需求，配合 16 个 resident group 和 prelaunch，让已经完成的组先交付，未完成的 agent 继续留在 Runtime。历史代码和工具结果不会因跨更新而重新执行。最终退出前框架回填最后分区所欠的组；跨步保留不表示每条额外预取的轨迹最终都会用于训练。
+
+`--max-staleness 2` 控制 rollout 分区相对训练消费的领先程度，不是每条轨迹的模型版本跨度上限。同一轨迹可能跨版本，脚本启用 TIS（默认上限 2.0），并记录 `retool_policy_version_min/max/span`；这与同步训练的采样和损失不同，需要单独比较收敛。
+
+`config-hybrid.yaml` 增加两项工具长尾限制：连续 3 次 Python timeout 后终止轨迹；累计工具请求墙钟达到 90 秒后不再执行下一次调用。墙钟包含服务排队和 HTTP 等待，不包含模型生成；正在执行的调用仍按单次 30 秒限制完成，因此累计时间可能超过 90 秒。终止时保留真实反馈与轨迹，标为 truncated，沿用原有答案分和工具失败扣分，不将服务故障转换成模型惩罚。`retool_tool_wall_seconds`、`retool_max_timeout_streak` 和 `retool_stop_reason` 记录这些行为。将 YAML 中对应值设为 0 可分别关闭限制；同步脚本默认不开启。
+
+**该异步变体只支持从头启动。** 它仍每 25 次更新保存 native checkpoint 和 HF 导出，但没有持久化 resident agent、待交付组及其工具状态，所以这些 checkpoint 不具备本配方完整恢复所需的全部状态。脚本拒绝非空实验目录，避免静默跳过在途数据。再次从头运行需显式更换 `EXP_NAME` 或 `SAVE_DIR`；如需仅从已训练权重开启新实验，可将完整 HF 导出作为新的 `MODEL_DIR`。
+
 ### Sandbox
 
 `train.py` 为整个 Ray Job 管理工具服务，训练退出后关闭服务。自动优先使用 Landlock；内核未实现 Landlock 时使用 Apptainer。首次使用 Apptainer 会将固定镜像缓存到 `$SAVE_DIR/.retool-sandbox/`，也可预先准备：
@@ -95,7 +113,7 @@ SANDBOX_IMAGE=/path/to/sandboxfusion.sif \
 
 保持 `SAVE_DIR`、`EXP_NAME`、初始模型配置/tokenizer、数据内容、seed、batch 和每题轨迹数不变，再执行同一脚本，即从最新完整 checkpoint 恢复。迁移训练环境时携带完整实验目录，包括 tracker、native 模型/optimizer 状态和 `dataset/retool_*.json`。单独复制 `hf_*` 只能从权重开始新实验，不能恢复完整训练状态。改变 `SAVE_DIR` 或 `EXP_NAME` 可以新开实验。
 
-Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batch。抽样编号和训练轮次分别计数，checkpoint 同时记录 RNG 与下一抽样编号；权重版本校验使用 Session 的实际生成轮次。兼容补样前格式的同协议 RNG checkpoint。动态过滤、额外 oversampling、prelaunch、partial rollout、fully async 和 Eval 尚未接入本例，请勿开启这些选项。
+Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batch。同步配方的抽样编号和训练轮次分别计数，checkpoint 同时记录 RNG 与下一抽样编号；权重版本校验使用 Session 的实际生成轮次。兼容补样前格式的同协议 RNG checkpoint。同步脚本不支持额外 oversampling、prelaunch 或异步选项；异步脚本的保存边界见上节。两个变体均不支持动态过滤、单独的 partial rollout、纯 fully async 或 Eval。
 
 ## 默认配置与行为
 

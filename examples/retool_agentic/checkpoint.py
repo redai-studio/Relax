@@ -59,8 +59,14 @@ def validate_checkpoint(root: Path) -> int | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
+    parser.add_argument("--fresh", action="store_true", help="Require an empty experiment directory; never resume")
     args = parser.parse_args()
-    step = validate_checkpoint(args.root)
+    if args.fresh:
+        if args.root.exists() and any(args.root.iterdir()):
+            parser.error("Fresh training requires an empty experiment directory; change SAVE_DIR or EXP_NAME")
+        step = None
+    else:
+        step = validate_checkpoint(args.root)
     sys.stdout.write(str(step + 1 if step is not None else 0) + "\n")
 
 
