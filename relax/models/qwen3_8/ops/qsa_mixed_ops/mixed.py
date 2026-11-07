@@ -18,7 +18,7 @@ def long_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor, scale: float
 ) -> torch.Tensor:
 
-    assert q.shape[1:] == (12, 256) and k.shape[1:] == (1, 256)
+    assert q.shape[-1] == k.shape[-1] == 256 and k.shape[1] > 0 and q.shape[1] % k.shape[1] == 0
     assert k.shape == v.shape
     return attention_bf16(q, k, v, indices, scale, block_k=64, gradient_group=None)
 
