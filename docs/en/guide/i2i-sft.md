@@ -7,12 +7,16 @@ the model or raw images mounted. The model directory, metadata, and images must 
 accessible to every training worker; the checkpoint output directory must be
 shared across workers.
 
-The current model adapter supports SenseNova U1.5 MoT Edit with full-parameter or
+The SenseNova model adapter supports U1.5 MoT Edit with full-parameter or
 LoRA training. Inputs can contain one source conditioning image, or two
 conditioning images ordered as source then glyph. The target image provides
 supervision and does not count toward the conditioning-image limit. The default
 1024² pixel budget is not a fixed square resolution: images retain their aspect
 ratio and are aligned to the model's patch size.
+
+An additional Qwen-Image-Edit adapter supports LoRA with one conditioning image.
+Both adapters can reuse frozen condition features through the opt-in
+[Frozen Condition Cache](./frozen-condition-cache.md).
 
 ## Data
 

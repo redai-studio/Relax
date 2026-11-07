@@ -296,6 +296,13 @@ class Envs(metaclass=_EnvsMeta):
     # Initialization/resume also records a fresh comparison baseline; requires STATS_DIR.
     RELAX_DSV4_FP4_STATS_INTERVAL = EnvProperty("RELAX_DSV4_FP4_STATS_INTERVAL", int, 10)
 
+    # ------------- Frozen multimodal SFT conditions -------------
+    # Disabled by default; byte accounting and lifetime are per training worker.
+    RELAX_CONDITION_CACHE_BYTES = EnvProperty("RELAX_CONDITION_CACHE_BYTES", int, 0)
+    RELAX_CONDITION_CACHE_DEVICE = EnvProperty("RELAX_CONDITION_CACHE_DEVICE", str, "cpu")
+    # Content SHA of a launcher-verified weights/tokenizer/config manifest.
+    RELAX_CONDITION_CACHE_IDENTITY = EnvProperty("RELAX_CONDITION_CACHE_IDENTITY", str, "")
+
     # ------------- Compiled kernel cache -------------
     RELAX_KERNEL_CACHE_DIR = EnvProperty("RELAX_KERNEL_CACHE_DIR", str, None)
     RELAX_KERNEL_CACHE_LOCAL_DIR = EnvProperty("RELAX_KERNEL_CACHE_LOCAL_DIR", str, None)

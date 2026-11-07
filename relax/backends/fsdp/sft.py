@@ -78,7 +78,12 @@ def clip_sharded_gradients(parameters: list[torch.nn.Parameter], max_norm: float
 
 class FSDPSFTTrainer:
     def __init__(self, actor: Any) -> None:
-        from relax.backends.fsdp.actor import _collect_rank_objects, _collect_weight_sync_errors
+        from relax.backends.fsdp.sft_collectives import (
+            collect_rank_objects as _collect_rank_objects,
+        )
+        from relax.backends.fsdp.sft_collectives import (
+            collect_weight_sync_errors as _collect_weight_sync_errors,
+        )
 
         self.actor, self.args = actor, actor.args
         self.group = actor._device_group()
@@ -205,9 +210,12 @@ class FSDPSFTTrainer:
     def close(self) -> None:
         if self.prefetch:
             self.prefetch.close()
+        close_cache = getattr(self.actor.model, "close_condition_cache", None)
+        if close_cache is not None:
+            close_cache()
 
     def _train_step(self, step: int) -> None:
-        from relax.backends.fsdp.actor import _collect_weight_sync_errors
+        from relax.backends.fsdp.sft_collectives import collect_weight_sync_errors as _collect_weight_sync_errors
 
         if step != self.step:
             raise ValueError(f"Expected SFT step {self.step}, received {step}")

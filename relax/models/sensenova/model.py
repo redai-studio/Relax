@@ -892,7 +892,17 @@ class SenseNovaU1DiT(nn.Module):
         }
         if add_noise_scale_embedding:
             fm_modules["noise_scale_embedder"] = SenseNovaU1TimestepEmbedder(hidden_size)
-        fm_modules["fm_head"] = SenseNovaU1ConvDecoder(hidden_size)
+        if use_pixel_head:
+            fm_modules["fm_head"] = SenseNovaU1ConvDecoder(hidden_size)
+        else:
+            if fm_head_layers != 2:
+                raise ValueError("Only the official two-layer MLP output head is supported")
+            output_dim = num_channels * (patch_size * self.merge_size) ** 2
+            fm_modules["fm_head"] = nn.Sequential(
+                nn.Linear(hidden_size, 4096, bias=True),
+                nn.GELU(),
+                nn.Linear(4096, output_dim, bias=True),
+            )
         self.fm_modules = nn.ModuleDict(fm_modules)
 
     def get_input_embeddings(self) -> Any:
@@ -1047,6 +1057,9 @@ class SenseNovaU1DiT(nn.Module):
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
+
+        if not self.use_pixel_head:
+            return self.fm_modules["fm_head"](hidden_states[:, -num_tokens:])
 
         merged_patch = self.patch_size * self.merge_size
         token_h = image_size[1] // merged_patch
