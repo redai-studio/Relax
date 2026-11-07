@@ -68,6 +68,20 @@ def test_use_critic_follows_algorithm_spec():
     assert make_args(advantage_estimator="grpo").use_critic is False
 
 
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_offline_objectives_force_no_critic_even_for_ppo(loss_type):
+    # Mirrors slime_validate_args: offline training never spawns a critic,
+    # regardless of the algorithm spec (see relax/utils/arguments.py,
+    # ``args.use_critic = False`` under ``is_offline``).
+    args = make_args(loss_type=loss_type, advantage_estimator="ppo")
+    assert args.use_critic is False
+
+
+def test_explicit_use_critic_override_still_wins():
+    assert make_args(loss_type="sft", use_critic=True).use_critic is True
+    assert make_args(advantage_estimator="ppo", use_critic=False).use_critic is False
+
+
 def test_safe_derivations_match_production_assignments():
     raw = make_raw_args()
     apply_safe_derivations(raw)

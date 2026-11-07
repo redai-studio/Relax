@@ -20,8 +20,9 @@ This module collects the parser defaults from the **real** parser registration
 
 Post-parse validation deliberately does not run.  The small set of derived
 fields that are deterministic without a model, a dataset or a GPU are applied
-by :func:`apply_safe_derivations`, using the same assignments production makes.
-Fields produced by worker/controller initialization (``is_vl_model``,
+by :func:`apply_safe_derivations`, using the same assignments production
+makes (including forcing ``use_critic`` off for offline objectives). Fields
+produced by worker/controller initialization (``is_vl_model``,
 ``num_rollout_per_epoch``, ...) stay absent and must be supplied explicitly by
 the tests that exercise them.
 """
@@ -101,8 +102,12 @@ def apply_safe_derivations(args: argparse.Namespace) -> argparse.Namespace:
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
     from relax.algorithms import get_algorithm
+    from relax.engine.sft.runtime import is_offline_mode
 
-    args.use_critic = get_algorithm(args.advantage_estimator).needs_critic
+    # Mirror production ordering: validate_algorithm_args first assigns the
+    # algorithm spec's needs_critic, then slime_validate_args forces no critic
+    # for offline objectives (SFT/DPO/RM spawn no critic role).
+    args.use_critic = get_algorithm(args.advantage_estimator).needs_critic and not is_offline_mode(args)
     return args
 
 
