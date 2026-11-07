@@ -6,6 +6,7 @@
 # See the repository root LICENSE for the full license text.
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Union
 
@@ -315,19 +316,26 @@ class SenseNovaU1ImageUnit_EditImageEmbedder(PipelineUnit):
         if isinstance(edit_image, Image.Image):
             edit_image = [edit_image]
 
+        tracker = getattr(pipe, "tracker", None)
         max_pixels = min(2048 * 2048, (4096 * 4096) // len(edit_image))
         pixel_values, grid_hw = [], []
-        for image in edit_image:
-            cur_pixel_values, cur_grid_hw = load_image_native(
-                image,
-                pipe.dit.patch_size,
-                pipe.dit.downsample_ratio,
-                min_pixels=512 * 512,
-                max_pixels=max_pixels,
-                upscale=False,
-            )
-            pixel_values.append(cur_pixel_values.to(device=pipe.device, dtype=pipe.torch_dtype))
-            grid_hw.append(cur_grid_hw.to(pipe.device))
+        with tracker.host_stage("ref_image_preprocess_ms") if tracker is not None else nullcontext():
+            for image_index, image in enumerate(edit_image):
+                cur_pixel_values, cur_grid_hw = load_image_native(
+                    image,
+                    pipe.dit.patch_size,
+                    pipe.dit.downsample_ratio,
+                    min_pixels=512 * 512,
+                    max_pixels=max_pixels,
+                    upscale=False,
+                )
+                cur_pixel_values = cur_pixel_values.to(device=pipe.device, dtype=pipe.torch_dtype)
+                cur_grid_hw = cur_grid_hw.to(pipe.device)
+                if tracker is not None:
+                    tracker.record_transfer("ref_pixel_values", cur_pixel_values, image_index=image_index)
+                    tracker.record_transfer("ref_grid_hw", cur_grid_hw, image_index=image_index)
+                pixel_values.append(cur_pixel_values)
+                grid_hw.append(cur_grid_hw)
         return {"edit_pixel_values": torch.cat(pixel_values), "edit_grid_hw": torch.cat(grid_hw)}
 
 
@@ -368,7 +376,10 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
 
     @staticmethod
     def build_prefix_inputs(pipe: Any, query: Any, pixel_values: Any, grid_hw: Any) -> Any:
+        tracker = getattr(pipe, "tracker", None)
         input_ids = pipe.tokenizer(query, return_tensors="pt")["input_ids"].to(pipe.device)
+        if tracker is not None:
+            tracker.record_transfer("prefix_input_ids", input_ids)
         indexes = build_thw_indexes(
             input_ids[0],
             pipe.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN),
@@ -382,7 +393,14 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
 
         inputs_embeds = pipe.dit.embed_tokens(input_ids)
         batch_size, num_tokens, channels = inputs_embeds.shape
-        vision_embeds = pipe.dit.extract_und_feature(pixel_values, grid_hw)
+        with tracker.gpu_stage("ref_vision_encode_ms") if tracker is not None else nullcontext():
+            vision_embeds = pipe.dit.extract_und_feature(pixel_values, grid_hw)
+        if tracker is not None:
+            tracker.record_encode(
+                "ref_vision_encode",
+                int(grid_hw.shape[0]),
+                output_bytes=vision_embeds.numel() * vision_embeds.element_size(),
+            )
         selected = input_ids.reshape(-1) == pipe.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         inputs_embeds = inputs_embeds.reshape(-1, channels)
         inputs_embeds[selected] = vision_embeds.reshape(-1, channels).to(inputs_embeds.device)
@@ -410,6 +428,9 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
         use_gradient_checkpointing_offload: Any,
     ) -> Any:
         pipe.load_models_to_device(self.onload_model_names)
+        tracker = getattr(pipe, "tracker", None)
+        if tracker is not None:
+            tracker.set_prefix_context(prompt=prompt, is_positive=bool(is_positive), think_mode=bool(think_mode))
         num_images = 0 if edit_grid_hw is None else edit_grid_hw.shape[0]
         reasoning = bool(think_mode) and is_positive and not pipe.scheduler.training
 
@@ -452,18 +473,26 @@ class SenseNovaU1ImageUnit_PromptEmbedder(PipelineUnit):
             # it, so it is left undecoded; to read it, decode it here:
             # pipe.tokenizer.decode(token_ids, skip_special_tokens=False)
         else:
-            past_key_values, _ = pipe.dit.encode_prefix(
-                input_ids=None if inputs_embeds is not None else input_ids,
-                inputs_embeds=inputs_embeds,
-                indexes=indexes,
-                attention_mask=attention_mask,
-                use_gradient_checkpointing=bool(use_gradient_checkpointing),
-                use_gradient_checkpointing_offload=bool(use_gradient_checkpointing_offload),
-            )
+            with tracker.gpu_stage("prefix_encode_ms") if tracker is not None else nullcontext():
+                past_key_values, _ = pipe.dit.encode_prefix(
+                    input_ids=None if inputs_embeds is not None else input_ids,
+                    inputs_embeds=inputs_embeds,
+                    indexes=indexes,
+                    attention_mask=attention_mask,
+                    use_gradient_checkpointing=bool(use_gradient_checkpointing),
+                    use_gradient_checkpointing_offload=bool(use_gradient_checkpointing_offload),
+                )
             text_len = indexes[0].max()
 
         token_h, token_w = height // PATCH_SIZE, width // PATCH_SIZE
         indexes_image = self.build_image_indexes(token_h, token_w, text_len + 1, pipe.device)
+        if tracker is not None and not reasoning:
+            tracker.record_encode(
+                "prefix_encode",
+                1,
+                output_bytes=tracker.compute_kv_bytes(past_key_values),
+                indexes_image_bytes=indexes_image.numel() * indexes_image.element_size(),
+            )
         return {"past_key_values": past_key_values, "indexes_image": indexes_image}
 
 
@@ -492,7 +521,11 @@ class SenseNovaU1ImageUnit_InputImageEmbedder(PipelineUnit):
     def process(self, pipe: SenseNovaU1ImagePipeline, input_image: Any, noise: Any) -> Any:
         if input_image is None:
             return {"latents": noise, "input_latents": None}
-        input_latents = pipe.preprocess_image(input_image).to(device=pipe.device, dtype=pipe.torch_dtype)
+        tracker = getattr(pipe, "tracker", None)
+        with tracker.host_stage("target_image_preprocess_ms") if tracker is not None else nullcontext():
+            input_latents = pipe.preprocess_image(input_image).to(device=pipe.device, dtype=pipe.torch_dtype)
+            if tracker is not None:
+                tracker.record_transfer("target_input_latents", input_latents)
         return {"latents": noise, "input_latents": input_latents}
 
 
@@ -507,6 +540,7 @@ def model_fn_sensenova_u1_image(
     use_gradient_checkpointing_offload: bool = False,
     **kwargs: Any,
 ) -> Any:
+    tracker = getattr(dit, "tracker", None)
     sigma = (timestep / 1000.0).flatten()[0]
     t = 1.0 - sigma
 
@@ -519,16 +553,27 @@ def model_fn_sensenova_u1_image(
     num_tokens = z.shape[1]
 
     image_input = patchify(latents, dit.patch_size, channel_first=True)
-    image_embeds = dit.extract_gen_feature(image_input.flatten(0, 1), grid_hw).view(latents.shape[0], num_tokens, -1)
+    with tracker.gpu_stage("gen_vision_encode_ms") if tracker is not None else nullcontext():
+        image_embeds = dit.extract_gen_feature(image_input.flatten(0, 1), grid_hw).view(
+            latents.shape[0], num_tokens, -1
+        )
+    if tracker is not None:
+        tracker.record_encode(
+            "gen_vision_encode",
+            int(latents.shape[0]),
+            output_bytes=image_embeds.numel() * image_embeds.element_size(),
+            eligible=False,
+        )
     image_embeds = image_embeds + dit.embed_timestep(t, noise_scale, num_tokens, batch_size=latents.shape[0])
 
-    x_pred = dit(
-        image_embeds=image_embeds,
-        indexes_image=indexes_image,
-        past_key_values=past_key_values,
-        image_size=(latents.shape[3], latents.shape[2]),
-        use_gradient_checkpointing=use_gradient_checkpointing,
-        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-    )
+    with tracker.gpu_stage("dit_forward_ms") if tracker is not None else nullcontext():
+        x_pred = dit(
+            image_embeds=image_embeds,
+            indexes_image=indexes_image,
+            past_key_values=past_key_values,
+            image_size=(latents.shape[3], latents.shape[2]),
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        )
     x_pred = unpatchify(x_pred, PATCH_SIZE, latents.shape[2], latents.shape[3])
     return (latents - x_pred) / sigma

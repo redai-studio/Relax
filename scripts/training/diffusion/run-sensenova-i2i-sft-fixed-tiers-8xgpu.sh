@@ -42,7 +42,10 @@ if [[ "$IMAGE_DP_TIER_RANK_ROTATION" == 1 && "$IMAGE_DP_TIER_MICRO_BALANCE" != 1
     echo "IMAGE_DP_TIER_RANK_ROTATION requires IMAGE_DP_TIER_MICRO_BALANCE=1" >&2
     exit 1
 fi
+BASELINE_STATS_DIR="${BASELINE_STATS_DIR:-}"
+BASELINE_WARMUP_STEPS="${BASELINE_WARMUP_STEPS:-5}"
 export IMAGE_PREFETCH_DEPTH IMAGE_PREFETCH_WORKERS IMAGE_DP_TIER_MICRO_BALANCE IMAGE_DP_TIER_RANK_ROTATION
+export BASELINE_STATS_DIR BASELINE_WARMUP_STEPS
 if [[ "$MODE" == full ]]; then
     LORA_RANK=0
     LR="${LR:-1e-6}"
@@ -74,6 +77,9 @@ if os.environ["IMAGE_DP_TIER_MICRO_BALANCE"] == "1":
     config["dp_tier_micro_balance"] = True
 if os.environ["IMAGE_DP_TIER_RANK_ROTATION"] == "1":
     config["dp_tier_rank_rotation"] = True
+if os.environ.get("BASELINE_STATS_DIR", "").strip():
+    config["baseline_stats_dir"] = os.environ["BASELINE_STATS_DIR"].strip()
+    config["baseline_warmup_steps"] = int(os.environ.get("BASELINE_WARMUP_STEPS", "5"))
 print(json.dumps(config))
 PY
 )
