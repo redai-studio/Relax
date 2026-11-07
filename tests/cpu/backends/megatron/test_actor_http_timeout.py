@@ -83,9 +83,6 @@ def test_run_step_evaluation_probes_carry_timeout(monkeypatch):
     assert any(u.endswith("/end_update_weight") for u in by_url)
     for url, kwargs in calls:
         if url.endswith("/evaluate"):
-            # Regression guard: /evaluate runs rollout-side inference and can
-            # legitimately take long -> it must NOT carry a fixed timeout, which
-            # would falsely abort a long eval (its failure is already non-fatal).
             assert "timeout" not in kwargs, url
         else:
             assert kwargs.get("timeout") == shell.args.rollout_http_timeout, url

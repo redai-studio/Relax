@@ -569,6 +569,8 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 
 ## 容错配置
 
+Rollout 和 ActorFwd 的局部恢复、模式默认行为、环境变量及冲突配置，见[推理服务局部自愈](./inference-recovery.md)。它与 `--use-fault-tolerance` 是不同功能。
+
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--use-fault-tolerance` | flag | False | 是否启用 Rollout 期间的容错功能 |

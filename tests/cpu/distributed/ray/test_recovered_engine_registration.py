@@ -213,7 +213,7 @@ def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_initial_scaleout_success_clears_pending_without_changing_recovery_flag():
+async def test_initial_scaleout_success_clears_pending_router_registration():
     manager, group, engine, record = make_recovery()
     from relax.distributed.ray import rollout
 

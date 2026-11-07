@@ -2,6 +2,7 @@
 
 """Tests for the independent NCCL scale-out precheck."""
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -372,8 +373,10 @@ async def test_precheck_ports_use_independent_bounded_window():
         return AwaitableValue(("10.0.0.1", start_port))
 
     seed._get_current_node_ip_and_free_port.remote.side_effect = alloc
-    first = await manager._allocate_scale_weight_sync_precheck_ports(seed, tp_size=8)
-    second = await manager._allocate_scale_weight_sync_precheck_ports(seed, tp_size=8)
+    first, second = await asyncio.gather(
+        manager._allocate_scale_weight_sync_precheck_ports(seed, tp_size=8),
+        manager._allocate_scale_weight_sync_precheck_ports(seed, tp_size=8),
+    )
 
     assert set(first).isdisjoint(second)
     assert all(

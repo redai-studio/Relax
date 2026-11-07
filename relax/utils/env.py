@@ -327,6 +327,12 @@ class Envs(metaclass=_EnvsMeta):
     # Unset means "keep whatever the caller passed in", hence a None default.
     RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT = EnvProperty("RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT", int, None)
 
+    # ------------- Inference recovery -------------
+    # Unset follows the training mode; False explicitly disables recovery.
+    RELAX_ENABLE_INFERENCE_RECOVERY = EnvProperty("RELAX_ENABLE_INFERENCE_RECOVERY", bool, None)
+    RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS = EnvProperty("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", int, 3)
+    RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT = EnvProperty("RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT", float, 180.0)
+
     # ------------- Scale-out / weight-sync -------------
     # Per-replica failure reasons are canonicalized and bounded before they reach
     # ScaleOutRequest.error_message (exposed via /status and the monitor TUI).
