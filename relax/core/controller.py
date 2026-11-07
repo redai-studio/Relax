@@ -34,7 +34,7 @@ from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrie
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
-from relax.utils.data.identity_window_sampler import IdentityWindowSampler
+from relax.utils.data.identity_window_sampler import FlopsBalancedSampler, IdentityWindowSampler
 from relax.utils.env import Envs
 from relax.utils.fault_events.recovery import expected_evidence
 from relax.utils.health_system import HealthManager
@@ -385,13 +385,20 @@ class Controller:
                     pad_size=pad_size,
                 )
             else:
-                sampler = SeqlenBalancedSampler(
+                sampler_class = SeqlenBalancedSampler
+                if getattr(self.config, "balance_by_flops", False):
+                    sampler_class = FlopsBalancedSampler
+                sampler = sampler_class(
                     n_samples_per_prompt=self.config.n_samples_per_prompt,
                     dp_size=dp_size,
                 )
             logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
-        elif getattr(self.config, "balance_data", False):
-            sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")
+        elif getattr(self.config, "balance_data", False) or getattr(self.config, "balance_by_flops", False):
+            sampler = IdentityWindowSampler(
+                dp_size=dp_size,
+                placement="balanced",
+                balance_by_flops=getattr(self.config, "balance_by_flops", False),
+            )
             logger.info(f"Using IdentityWindowSampler with balanced row placement, dp_size={dp_size}")
         else:
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")

@@ -19,6 +19,7 @@ from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
+from relax.utils.data.flops_balancing import STEP_PLANS_FIELD, local_schedule
 from relax.utils.data.packing import get_binpack_partitions
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.env import Envs
@@ -30,6 +31,7 @@ from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
 from relax.utils.training.flops_counter import FlopsCounter
+from relax.utils.training.microbatch_cost import validate_flops_balance
 from relax.utils.training.preference_utils import pack_preference_pair_indices
 from relax.utils.types import RolloutBatch
 
@@ -1204,6 +1206,54 @@ def _get_preference_data_iterator(
     return [iterator], [len(branch_bins)]
 
 
+def _get_synchronised_flops_schedule(args: Namespace, rollout_data: RolloutBatch) -> tuple[list[list[int]], list[int]]:
+    """Validate the queue's global plan on every training rank before
+    execution."""
+    error = None
+    indices, counts = [], []
+    signature = []
+    plans = rollout_data.get(STEP_PLANS_FIELD, [])
+    try:
+        validate_flops_balance(args)
+        if rollout_data.get("_flops_schedule_error"):
+            raise ValueError(rollout_data["_flops_schedule_error"])
+        indices, counts = local_schedule(rollout_data)
+        for plan in plans:
+            geometry = plan["geometry"]
+            if (
+                geometry["capacity"]
+                != _get_micro_batch_token_capacity(
+                    args, args.max_tokens_per_gpu, mpu.get_context_parallel_world_size()
+                )
+                or plan["dp_size"] != mpu.get_data_parallel_world_size(with_context_parallel=False)
+                or plan["dp_rank"] != mpu.get_data_parallel_rank(with_context_parallel=False)
+                or geometry["pipeline_stages"] != getattr(args, "pipeline_model_parallel_size", 1)
+                or geometry["context_parallel_size"] != mpu.get_context_parallel_world_size()
+                or geometry["version"] != 4
+            ):
+                raise ValueError("FLOPs queue plan and runtime geometry differ")
+            if plan["global_count"] <= 0 or len(plan["sha256"]) != 64:
+                raise ValueError("Invalid FLOPs logical count or plan digest")
+            for value in (plan["K"], plan["global_count"], int(plan["sha256"][:15], 16)):
+                signature.extend([value, -value])
+    except Exception as caught:
+        error = caught
+    device = device_utils.make_current_torch_device()
+    groups = (mpu.get_model_parallel_group(), mpu.get_data_parallel_group(with_context_parallel=True))
+    status = torch.tensor([int(error is not None), len(counts), -len(counts)], dtype=torch.int64, device=device)
+    for group in groups:
+        dist.all_reduce(status, op=dist.ReduceOp.MAX, group=group)
+    if status[0].item() or status[1].item() != -status[2].item():
+        raise ValueError(f"Invalid FLOPs schedule on a training rank: {error or 'peer plan/step mismatch'}") from error
+    bounds = torch.tensor(signature, dtype=torch.int64, device=device)
+    for group in groups:
+        dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=group)
+    values = bounds.tolist()
+    if any(values[i] != -values[i + 1] for i in range(0, len(values), 2)):
+        raise ValueError("FLOPs microbatch count, logical batch or plan identity differs across ranks")
+    return indices, counts
+
+
 def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
@@ -1217,6 +1267,8 @@ def get_data_iterator(
     - If True, computes the micro-batch count using the token budget, aligns
       it across DP/VPP, and balances with KK. Falls back to first-fit if KK
       exceeds the capacity.
+
+    FLOPs mode executes the queue's global plan without local repartitioning.
 
     Returns `(data_iterators, num_microbatches)` where:
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
@@ -1236,6 +1288,13 @@ def get_data_iterator(
         config = get_model_config(model[0])
         microbatch_group_size_per_vp_stage = config.microbatch_group_size_per_vp_stage
     cp_size = mpu.get_context_parallel_world_size()
+
+    if getattr(args, "balance_by_flops", False) and max_tokens_per_gpu is None:
+        indices, counts = _get_synchronised_flops_schedule(args, rollout_data)
+        return [
+            DataIterator(rollout_data, micro_batch_indices=indices, max_tokens_per_gpu=args.max_tokens_per_gpu)
+            for _ in range(vpp_size)
+        ], counts
 
     num_local_samples = len(rollout_data["total_lengths"])
     step_global_sample_counts = rollout_data.get(ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY)
@@ -1524,6 +1583,8 @@ def log_rollout_data(
                 "vlm_packed_seq_params",
                 "__loss_scale__",
                 "_sft_wholepack_v1",
+                STEP_PLANS_FIELD,
+                "_flops_schedule_error",
                 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,

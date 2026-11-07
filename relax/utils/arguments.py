@@ -1597,6 +1597,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--balance-by-flops",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable FLOPs-aware microbatch construction and data-parallel placement together. "
+                    "Requires Megatron, dynamic batching, THD balanced packing and a supported Qwen3.5 text model. "
+                    "Omit this flag to retain the existing token balancing, packing and DP placement behavior."
+                ),
+            )
+            parser.add_argument(
                 "--max-tokens-per-gpu",
                 type=int,
                 default=None,
@@ -4723,6 +4733,9 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    from relax.utils.training.microbatch_cost import validate_flops_balance
+
+    validate_flops_balance(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")

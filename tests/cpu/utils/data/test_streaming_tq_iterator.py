@@ -367,7 +367,19 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     assert iterator._sample_count == 2  # dummies don't count as samples
 
 
-def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(monkeypatch):
+@pytest.mark.parametrize("flops", [False, True])
+def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(monkeypatch, flops):
+    from relax.utils.data.flops_balancing import STEP_PLANS_FIELD, encode_schedule
+
+    geometry = dict(version=4, capacity=4096, microbatch_group_size=1, context_parallel_size=1, pipeline_stages=1)
+    _, updates = encode_schedule(
+        [8, 2],
+        {8: dict(total_lengths=1309, flops_cost=2), 2: dict(total_lengths=842, flops_cost=1)},
+        geometry,
+        1,
+        2,
+        ("p", "train", 0),
+    )
     stream_module = _load_stream_module(monkeypatch)
     monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
@@ -378,6 +390,11 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
 
     class _Meta:
         size = 2
+        global_indexes = [8, 2]
+
+        def get_all_custom_meta(self):
+            assert flops, "Disabled scheduling must not read plan metadata"
+            return [updates[i] for i in self.global_indexes]
 
     class _TQClient:
         def get_meta(self, **kwargs):
@@ -409,7 +426,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
             }
 
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
-        args=Namespace(),
+        args=Namespace(balance_by_flops=flops),
         tq_client=_TQClient(),
         data_fields=["response_lengths", "total_lengths", "rewards"],
         batch_size=2,
@@ -424,6 +441,9 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     assert rollout_data["response_lengths"] == [512, 135]
     assert rollout_data["total_lengths"] == [1309, 842]
     assert rollout_data["rewards"] == [1.5, 2.5]
+    assert "flops_cost" not in rollout_data
+    if flops:
+        assert rollout_data[STEP_PLANS_FIELD][0]["indices"] == [[0, 1]]
 
 
 def test_tensor_to_python_values_dense_tensor(monkeypatch):

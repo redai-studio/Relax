@@ -156,7 +156,9 @@ def run_sft_eval(actor, rollout_id: int) -> None:
                 if rollout_data is None:
                     continue
                 batch_index += 1
-                data_iterator, num_microbatches = get_data_iterator(args, actor.model, rollout_data)
+                data_iterator, num_microbatches = get_data_iterator(
+                    args, actor.model, rollout_data, max_tokens_per_gpu=args.max_tokens_per_gpu
+                )
                 eval_step = compute_classification_eval_step if is_classification else compute_sft_eval_step
                 per_mb = forward_only(
                     eval_step,

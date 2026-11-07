@@ -40,7 +40,7 @@ async def _transfer_batch_to_data_system(
         batch_samples.sort(key=lambda group: group[0].index)
         samples = [sample for group in batch_samples for sample in group]
         rollout_batch = convert_samples_to_train_data(args, samples)
-        custom_meta = build_rollout_custom_meta(rollout_batch)
+        custom_meta = build_rollout_custom_meta(rollout_batch, args)
         await data_system_client.async_put(
             data=rollout_batch,
             partition_id=f"train_{rollout_id}",

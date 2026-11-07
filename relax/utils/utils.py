@@ -218,13 +218,25 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     return rollout_batch
 
 
-def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int]]:
-    return [
+def build_rollout_custom_meta(rollout_batch: Any, args: Any = None) -> list[dict[str, int | float]]:
+    metadata = [
         {"total_lengths": int(total_length), "sample_index": int(sample_index)}
         for total_length, sample_index in zip(
             rollout_batch["total_lengths"], rollout_batch["sample_indices"], strict=True
         )
     ]
+    if args is None or not getattr(args, "balance_by_flops", False):
+        return metadata
+    from tensordict.tensorclass import NonTensorData
+
+    from relax.utils.training.microbatch_cost import add_flops_cost_metadata
+
+    batch = {"total_lengths": [row["total_lengths"] for row in metadata]}
+    if "multimodal_train_inputs" in rollout_batch:
+        batch["multimodal_train_inputs"] = [
+            item.data if isinstance(item, NonTensorData) else item for item in rollout_batch["multimodal_train_inputs"]
+        ]
+    return add_flops_cost_metadata(args, batch, metadata)
 
 
 def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
@@ -615,7 +627,7 @@ async def transfer_batch_to_data_system(
         logger.info(f"Transferring batch rollout_batch: {rollout_batch}")
 
         # Pass sampler metadata inline so it lands atomically with ready samples.
-        custom_meta = build_rollout_custom_meta(rollout_batch)
+        custom_meta = build_rollout_custom_meta(rollout_batch, args)
         await data_system_client.async_put(
             data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
         )
