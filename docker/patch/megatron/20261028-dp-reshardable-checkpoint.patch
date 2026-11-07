@@ -16,24 +16,38 @@
 +                            if isinstance(value, torch.Tensor) and key != 'step'
 +                        )) for tensors in bucket
 +                    }
-+        peer_schemas = [None] * data_parallel_world_size
-+        torch.distributed.all_gather_object(
-+            peer_schemas, local_schemas, group=self.data_parallel_group
-+        )
-+        assert all(peer.keys() == local_schemas.keys() for peer in peer_schemas), (
-+            'Optimizer-state bucket keys differ across DP ranks'
-+        )
++        peer_schemas = [local_schemas]
++        if data_parallel_world_size > 1:
++            peer_schemas = [None] * data_parallel_world_size
++            torch.distributed.all_gather_object(
++                peer_schemas, local_schemas, group=self.data_parallel_group
++            )
++        if any(peer.keys() != local_schemas.keys() for peer in peer_schemas):
++            raise ValueError('Optimizer-state bucket keys differ across DP ranks')
 +        padding_schemas = {}
 +        for bucket_key in local_schemas:
 +            schemas = set().union(*(peer[bucket_key] for peer in peer_schemas))
-+            assert len(schemas) == 1 and next(iter(schemas)), (
-+                f'Invalid optimizer-state dtype schemas for bucket {bucket_key}: {schemas}'
-+            )
++            if len(schemas) != 1 or not next(iter(schemas)):
++                raise ValueError(f'Invalid optimizer-state dtype schemas for bucket {bucket_key}: {schemas}')
 +            padding_schemas[bucket_key] = dict(next(iter(schemas)))
          # per_bucket_numel metadata is saved separately for each TPxPP domain.
          for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
              key = (
-@@ -1984,10 +2010,34 @@
+@@ -1973,8 +1999,11 @@
+                         self.buffers[gbuf_idx].buckets[bucket_idx].numel_unpadded
+                     )
+                     gbuf_world_numel = self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
+-                    assert gbuf_world_numel_unpadded <= gbuf_world_numel
+-                    assert gbuf_world_numel % data_parallel_world_size == 0
++                    if (
++                        gbuf_world_numel_unpadded > gbuf_world_numel
++                        or gbuf_world_numel % data_parallel_world_size
++                    ):
++                        raise ValueError('Invalid DP optimizer bucket sizes')
+                     gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
+ 
+                     sharded_bucket_key = (
+@@ -1984,10 +2013,34 @@
  
                      # The global ckpt tensors must be fully covered.
                      # We add extra empty padding if necessary
@@ -69,7 +83,7 @@
                      for i in range(-1, len(bucket_state)):
                          if i == len(bucket_state) - 1:
                              # Potential padding at the end
-@@ -1999,16 +2049,13 @@
+@@ -1999,24 +2052,21 @@
                              cur_param_end = 0
                          else:
                              cur_param_end = bucket_state[i]['gbuf_local_end']
@@ -88,8 +102,9 @@
 +                                    padding_end - cur_param_end, dtype=v.dtype, device=v.device
                                  )
                                  for k, v in bucket_state[i].items()
-                                 if isinstance(v, torch.Tensor)
-@@ -2016,7 +2063,7 @@
+-                                if isinstance(v, torch.Tensor)
++                                if isinstance(v, torch.Tensor) and k != 'step'
+                             }
                              all_pad_tensors[i + 1] = {
                                  **pad_tensors,
                                  'gbuf_local_start': cur_param_end,
@@ -98,3 +113,19 @@
                                  'padding': True,
                              }
  
+@@ -2045,11 +2095,10 @@
+                                 continue
+                             if key == 'step':
+                                 continue
+-                            assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
+-                                tensors[key].shape,
+-                                gbuf_local_start,
+-                                gbuf_local_end,
+-                            )
++                            if tensors[key].shape != (gbuf_local_end - gbuf_local_start,):
++                                raise ValueError(
++                                    f'Optimizer-state shape does not match bucket range: {tensors[key].shape}'
++                                )
+ 
+                             tensors[key] = ShardedTensor(
+                                 f'{sharded_bucket_key}.{key}',
