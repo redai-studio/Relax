@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import logging
+import math
+import os
 import pickle
+import socket
+import tempfile
 import time
 from argparse import Namespace
 from concurrent.futures import CancelledError
@@ -20,11 +23,12 @@ from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
+from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import Timer, timer
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Throttle counter for the opt-in pickle-size diagnostic.  See
 # ``_maybe_log_tgd_pickle_diag`` below for usage.
@@ -626,12 +630,128 @@ def _encode_multimodal_inputs(mm_list):
     return spec, tensors
 
 
+def _shared_pixel_buffer(nbytes: int, group: dist.ProcessGroup) -> tuple[torch.Tensor, bool]:
+    """Map one CPU buffer per host in this TP×CP group, then unlink its name.
+
+    Tensor views keep the mapping alive until their last reference is released.
+    Only the elected writer may modify it; consumers treat pixels as read-only.
+    """
+    rank = dist.get_rank(group=group)
+    peers = [None] * dist.get_world_size(group=group)
+    hostname = socket.gethostname()
+    dist.all_gather_object(peers, hostname, group=group)
+    writer = peers.index(hostname)
+    local_readers = peers.count(hostname)
+    path = None
+    try:
+        error = None
+        if rank == writer:
+            try:
+                # Reserve node-local tmpfs space before mapping so exhaustion
+                # raises here instead of causing SIGBUS during a later copy.
+                fd, path = tempfile.mkstemp(prefix="relax-pixels-", dir="/dev/shm")
+                with os.fdopen(fd, "wb") as handle:
+                    os.posix_fallocate(handle.fileno(), 0, nbytes)
+            except (OSError, RuntimeError) as exc:
+                error = f"{hostname}: cannot allocate {nbytes} shared pixel bytes: {exc}"
+        dist.all_gather_object(peers, (path, error), group=group)
+        errors = [err for _, err in peers if err]
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+        arena = None
+        try:
+            shared_path = peers[writer][0]
+            # from_file(shared=True) can create a missing file. Reject a
+            # different/missing tmpfs mount instead of silently reading zeros.
+            if os.stat(shared_path).st_size != nbytes:
+                raise RuntimeError(f"Unexpected shared pixel file size: {shared_path}")
+            arena = torch.from_file(shared_path, shared=True, size=nbytes, dtype=torch.uint8)
+        except (OSError, RuntimeError) as exc:
+            error = f"{hostname}: cannot map shared pixels: {exc}"
+        # Every reader must open the mapping before the writer unlinks it.
+        dist.all_gather_object(peers, error, group=group)
+        errors = [err for err in peers if err]
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        if rank == writer:
+            logger.info(
+                "[shared_pixels] node=%s readers=%d shared_gib=%.3f avoided_private_gib=%.3f",
+                hostname,
+                local_readers,
+                nbytes / 2**30,
+                nbytes * (local_readers - 1) / 2**30,
+            )
+        return arena, rank == writer
+    finally:
+        if path is not None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                # Do not fail only the writer after peers acknowledged success.
+                logger.warning("[shared_pixels] could not unlink %s; manual cleanup needed: %s", path, exc)
+
+
 def _broadcast_multimodal_inputs(spec, send_tensors, is_src, cuda_dev, broadcast_pp):
-    """Reconstruct ``multimodal_train_inputs`` on every rank by streaming the
-    raw tensors via NCCL (zero pickle) instead of through
-    ``broadcast_object_list``."""
+    """Broadcast multimodal tensors, sharing PP0 CPU pixels on each host."""
     if spec is None:
         return None
+
+    # PP0 ranks share CPU pixel storage within their existing TP×CP group.
+    # Keep the current PP broadcasts: skipping pixels on later stages is a
+    # separate routing optimization. Compute the size on all PP stages so
+    # allocation/copy errors can be propagated before the next collective.
+    share_pixels = mpu.get_tensor_model_parallel_world_size() * mpu.get_context_parallel_world_size() > 1
+    nbytes = 0
+    if share_pixels:
+        for entry in spec:
+            for key, enc in (entry or {}).items():
+                if key not in ("pixel_values", "pixel_values_videos"):
+                    continue
+                parts = [enc] if enc["t"] == "tensor" else enc.get("items", [])
+                for part in parts:
+                    nbytes = (nbytes + 63) // 64 * 64
+                    nbytes += math.prod(part["shape"]) * part["dtype"].itemsize
+    arena, is_writer, pixel_group = None, False, None
+    error = [None]
+    if nbytes:
+        if mpu.get_pipeline_model_parallel_rank() == 0:
+            pixel_group = mpu.get_tensor_and_context_parallel_group()
+            try:
+                arena, is_writer = _shared_pixel_buffer(nbytes, pixel_group)
+            except (OSError, RuntimeError) as exc:
+                error[0] = str(exc)
+        if broadcast_pp and mpu.get_pipeline_model_parallel_world_size() > 1:
+            pp_group = mpu.get_pipeline_model_parallel_group()
+            dist.broadcast_object_list(error, src=dist.get_global_rank(pp_group, 0), group=pp_group)
+        if error[0]:
+            raise RuntimeError(error[0])
+
+    offset = 0
+    copy_error = None
+
+    def receive(src_t: torch.Tensor | None, desc: dict, pixel_only: bool) -> torch.Tensor | None:
+        nonlocal offset, copy_error
+        buf = _bcast_known_tensor(src_t, is_src, desc["dtype"], desc["shape"], cuda_dev, broadcast_pp)
+        if pixel_only and arena is not None:
+            if copy_error is not None:
+                return None
+            offset = (offset + 63) // 64 * 64
+            size = math.prod(desc["shape"]) * buf.element_size()
+            try:
+                view = arena[offset : offset + size].view(desc["dtype"]).reshape(desc["shape"])
+                offset += size
+                if is_writer:
+                    view.copy_(buf, non_blocking=False)
+                return view
+            except RuntimeError as exc:
+                # Finish the tensor collectives even if a reader cannot build
+                # its view. Report failure to all stages before returning data.
+                copy_error = str(exc)
+                return None
+        return buf.cpu()
 
     out: List[Any] = []
     idx = 0
@@ -641,24 +761,33 @@ def _broadcast_multimodal_inputs(spec, send_tensors, is_src, cuda_dev, broadcast
             continue
         sample: Dict[str, Any] = {}
         for key, enc in entry.items():
+            pixel_only = key in ("pixel_values", "pixel_values_videos")
             if enc["t"] == "tensor":
                 src_t = send_tensors[idx] if is_src else None
                 idx += 1
-                sample[key] = _bcast_known_tensor(
-                    src_t, is_src, enc["dtype"], enc["shape"], cuda_dev, broadcast_pp
-                ).cpu()
+                sample[key] = receive(src_t, enc, pixel_only)
             elif enc["t"] == "list":
                 items: List[Any] = []
                 for sub in enc["items"]:
                     src_t = send_tensors[idx] if is_src else None
                     idx += 1
-                    items.append(
-                        _bcast_known_tensor(src_t, is_src, sub["dtype"], sub["shape"], cuda_dev, broadcast_pp).cpu()
-                    )
+                    items.append(receive(src_t, sub, pixel_only))
                 sample[key] = items
             else:  # raw
                 sample[key] = enc["value"]
         out.append(sample)
+    if nbytes:
+        if pixel_group is not None:
+            errors = [None] * dist.get_world_size(group=pixel_group)
+            # Synchronous CPU writes must finish before any reader returns.
+            dist.all_gather_object(errors, copy_error, group=pixel_group)
+            error[0] = next((err for err in errors if err), None)
+        if broadcast_pp and mpu.get_pipeline_model_parallel_world_size() > 1:
+            dist.broadcast_object_list(error, src=dist.get_global_rank(pp_group, 0), group=pp_group)
+        if error[0]:
+            raise RuntimeError(f"Shared pixel copy failed: {error[0]}")
+        if is_writer:
+            logger.info("[shared_pixels] ready node=%s shared_gib=%.3f", socket.gethostname(), nbytes / 2**30)
     return out
 
 
