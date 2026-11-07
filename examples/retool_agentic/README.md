@@ -99,6 +99,18 @@ bash examples/retool_agentic/scripts/run-qwen25-7B-sc-8xgpu-hybrid-6a2r.sh
 
 本脚本显式设置 `--sglang-router-disable-circuit-breaker`。部分 router 版本会将权重切换时预期的 499 请求取消计入 worker 失败，导致两路 engine 同时被熔断、返回 `503 no_available_workers`，随后请求等待 62 秒重试。关闭熔断是此兼容问题的配置绕过，健康检查、HTTP 错误处理和 Agentic 恢复逻辑仍保留；这不代表 router 二进制的失败分类已修复。
 
+### Score Centering 共卡对照：8 卡分时复用
+
+```bash
+bash examples/retool_agentic/scripts/run-qwen25-7B-sc-8xgpu-colocate.sh
+```
+
+保持与 6+2 异步实验相同的初始 `MODEL_DIR`、`DATA_DIR`、batch=1008（63×16）、seed、SC top-128/TIS、学习率和 token 预算，使用空的新 `SAVE_DIR` 或新的实验名，从 RL 第 0 步跑 200 次更新。默认实验名为 `qwen25-7b-retool-agentic-sc-8xgpu-colocate`。比较时两种模式均从同一个初始 HF 模型启动；不要使用异步实验训练后的 HF 导出作为本实验初始权重。
+
+Actor TP=2、DP=4，与 8 个单卡 SGLang engine 分时复用同一组 8 张 GPU。每个 DP rank 252 条样本，名义 micro-batch-size=4，动态 token packing 仍使用每卡 16384 tokens；推理静态显存比例为 0.5，开启 selective offload。staleness=0，不开启 prelaunch、额外 oversampling 或跨步保留 agent。`config-colocate.yaml` 保持与异步实验相同的 16 轮上限、连续 3 次工具 timeout 和 90 秒累计工具预算。
+
+该对照保留 SC 专用 TIS clip=2、全局有效 token 归一化和 router 熔断绕过，启动前强制检查实验目录为空。保存频率、保留数和 ClearML 配置与异步变体一致；默认每 25 次更新保存一次。
+
 ### Sandbox
 
 `train.py` 为整个 Ray Job 管理工具服务，训练退出后关闭服务。自动优先使用 Landlock；内核未实现 Landlock 时使用 Apptainer。首次使用 Apptainer 会将固定镜像缓存到 `$SAVE_DIR/.retool-sandbox/`，也可预先准备：
