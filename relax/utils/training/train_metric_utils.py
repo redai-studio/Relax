@@ -47,54 +47,63 @@ def log_perf_data_raw(
 
     per_gpu_tflops: float | None = None
     if ("perf/actor_train_time" in log_dict) and (flops_counter is not None):
-        seq_lens = timer_instance.seq_lens
-        images_seqlens = getattr(timer_instance, "images_seqlens", None) or None
-        audio_seqlens = getattr(timer_instance, "audio_seqlens", None) or None
-        estimate_kwargs = dict(
-            batch_seqlens=seq_lens,
-            delta_time=1.0,
-            images_seqlens=images_seqlens,
-            audio_seqlens=audio_seqlens,
-            image_grid_thw=getattr(timer_instance, "image_grid_thw", None),
-            freeze_vision_model=getattr(args, "freeze_vision_model", False),
-            freeze_vision_projection=getattr(args, "freeze_vision_projection", False),
-            freeze_language_model=getattr(args, "freeze_language_model", False),
-            lora_rank=getattr(args, "lora_rank", 0),
-            freeze_params_name_list=getattr(args, "freeze_params_name_list", None),
-            only_train_params_name_list=getattr(args, "only_train_params_name_list", None),
-        )
-        for name in ("enable_mtp_training", "mtp_num_layers", "mtp_detach_paths", "mtp_only_training"):
-            if hasattr(args, name):
-                estimate_kwargs[name] = getattr(args, name)
-        estimated_tflops, peak_tflops = flops_counter.estimate(**estimate_kwargs)
-        # estimated_tflops is total fwd+bwd TFLOPS at delta_time=1 => raw TFLOPS count
-        # Normalize to per-GPU
-        per_gpu_tflops = estimated_tflops / world_size
+        # MFU is best-effort: unsupported model configs must skip tflops/mfu, not abort training.
+        try:
+            seq_lens = timer_instance.seq_lens
+            images_seqlens = getattr(timer_instance, "images_seqlens", None) or None
+            audio_seqlens = getattr(timer_instance, "audio_seqlens", None) or None
+            estimate_kwargs = dict(
+                batch_seqlens=seq_lens,
+                delta_time=1.0,
+                images_seqlens=images_seqlens,
+                audio_seqlens=audio_seqlens,
+                image_grid_thw=getattr(timer_instance, "image_grid_thw", None),
+                freeze_vision_model=getattr(args, "freeze_vision_model", False),
+                freeze_vision_projection=getattr(args, "freeze_vision_projection", False),
+                freeze_language_model=getattr(args, "freeze_language_model", False),
+                lora_rank=getattr(args, "lora_rank", 0),
+                freeze_params_name_list=getattr(args, "freeze_params_name_list", None),
+                only_train_params_name_list=getattr(args, "only_train_params_name_list", None),
+            )
+            for name in ("enable_mtp_training", "mtp_num_layers", "mtp_detach_paths", "mtp_only_training"):
+                if hasattr(args, name):
+                    estimate_kwargs[name] = getattr(args, name)
+            estimated_tflops, peak_tflops = flops_counter.estimate(**estimate_kwargs)
+        except Exception as e:  # noqa: BLE001 - perf metrics are advisory
+            logger.warning(
+                f"perf {rollout_id}: FLOPS/MFU estimation failed ({type(e).__name__}: {e}); skipping tflops/mfu"
+            )
+            estimated_tflops, peak_tflops = None, float("inf")
 
-        infer_timers = ("log_probs", "ref_log_probs")
-        if any(log_dict.get(f"perf/{name}_time", 0) > 0 for name in infer_timers):
-            # Frozen encoders still run during inference: train / 3 is wrong.
-            forward_tflops, _ = flops_counter.estimate(**estimate_kwargs, forward_only=True)
-            if math.isfinite(forward_tflops):
-                for name in infer_timers:
-                    elapsed = log_dict.get(f"perf/{name}_time", 0)
-                    if elapsed > 0:
-                        log_dict[f"perf/{name}_tflops"] = forward_tflops / world_size / elapsed
+        if estimated_tflops is not None:
+            # estimated_tflops is total fwd+bwd TFLOPS at delta_time=1 => raw TFLOPS count
+            # Normalize to per-GPU
+            per_gpu_tflops = estimated_tflops / world_size
 
-        if log_dict["perf/actor_train_time"] > 0:
-            if math.isfinite(per_gpu_tflops):
+            infer_timers = ("log_probs", "ref_log_probs")
+            if any(log_dict.get(f"perf/{name}_time", 0) > 0 for name in infer_timers):
+                # Frozen encoders still run during inference: train / 3 is wrong.
+                forward_tflops, _ = flops_counter.estimate(**estimate_kwargs, forward_only=True)
+                if math.isfinite(forward_tflops):
+                    for name in infer_timers:
+                        elapsed = log_dict.get(f"perf/{name}_time", 0)
+                        if elapsed > 0:
+                            log_dict[f"perf/{name}_tflops"] = forward_tflops / world_size / elapsed
+
+            if log_dict["perf/actor_train_time"] > 0:
+                # Training includes fwd+bwd, use full 6N flops
                 log_dict["perf/actor_train_tflops"] = per_gpu_tflops / log_dict["perf/actor_train_time"]
-            log_dict["perf/actor_train_tok_per_s"] = sum(seq_lens) / log_dict["perf/actor_train_time"]
+                log_dict["perf/actor_train_tok_per_s"] = sum(seq_lens) / log_dict["perf/actor_train_time"]
 
-        # MFU = achieved_per_gpu_tflops / device_peak_tflops
-        if math.isfinite(peak_tflops) and peak_tflops > 0:
-            log_dict["perf/device_peak_tflops"] = peak_tflops
-            if "perf/actor_train_tflops" in log_dict:
-                log_dict["perf/mfu/actor_train"] = log_dict["perf/actor_train_tflops"] / peak_tflops
-            if "perf/log_probs_tflops" in log_dict:
-                log_dict["perf/mfu/actor_infer"] = log_dict["perf/log_probs_tflops"] / peak_tflops
-            if "perf/ref_log_probs_tflops" in log_dict:
-                log_dict["perf/mfu/ref_infer"] = log_dict["perf/ref_log_probs_tflops"] / peak_tflops
+            # MFU = achieved_per_gpu_tflops / device_peak_tflops
+            if math.isfinite(peak_tflops) and peak_tflops > 0:
+                log_dict["perf/device_peak_tflops"] = peak_tflops
+                if "perf/actor_train_tflops" in log_dict:
+                    log_dict["perf/mfu/actor_train"] = log_dict["perf/actor_train_tflops"] / peak_tflops
+                if "perf/log_probs_tflops" in log_dict:
+                    log_dict["perf/mfu/actor_infer"] = log_dict["perf/log_probs_tflops"] / peak_tflops
+                if "perf/ref_log_probs_tflops" in log_dict:
+                    log_dict["perf/mfu/ref_infer"] = log_dict["perf/ref_log_probs_tflops"] / peak_tflops
 
     if "perf/train_wait_time" in log_dict and "perf/train_time" in log_dict:
         total_time = log_dict["perf/train_wait_time"] + log_dict["perf/train_time"]

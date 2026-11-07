@@ -77,6 +77,10 @@ class TrainRayActor(RayActor):
         args.rank = dist.get_rank()
         args.world_size = dist.get_world_size()
 
+        if getattr(args, "train_backend", None) == "fsdp_turbo":
+            # PLE n-gram sharing requires LOCAL_WORLD_SIZE for node-local /dev/shm collectives.
+            os.environ.setdefault("LOCAL_WORLD_SIZE", str(args.num_gpus_per_node))
+
         numa_local_rank = Envs.RANK % args.num_gpus_per_node
         device_utils.set_numa_affinity(numa_local_rank)
 

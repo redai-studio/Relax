@@ -17,13 +17,18 @@ def _resolve_train_actor_class(args):
     """Return the train actor class for the configured ``--train-backend``.
 
     Defaults to Megatron so existing token-RL runs are unaffected; ``fsdp``
-    selects the FSDP2 actor used by native generative RL (design doc 8.3).
+    selects the FSDP2 actor used by native generative RL (design doc 8.3);
+    ``fsdp_turbo`` selects the FSDPTurbo actor for colocate synchronous GRPO.
     """
     backend = getattr(args, "train_backend", "megatron")
     if backend == "fsdp":
         from relax.backends.fsdp.actor import FSDPTrainRayActor
 
         return FSDPTrainRayActor
+    if backend == "fsdp_turbo":
+        from relax.backends.fsdp_turbo.actor import FSDPTurboTrainRayActor
+
+        return FSDPTurboTrainRayActor
     from relax.backends.megatron.actor import MegatronTrainRayActor
 
     return MegatronTrainRayActor
