@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Tuple
 
 import numpy as np
+import torch
 
 from relax.utils.types import Sample
 
@@ -110,8 +111,58 @@ class TrainingFieldArtifact:
         return Sample.from_dict(_expand_sample_payload(self.sample_payload))
 
 
+def _plain_training_graph(value: Any, *, safe_ids: set[int]) -> bool:
+    """Exclude user copy hooks before changing the order of numeric copies."""
+    pending = [value]
+    seen = set(safe_ids)
+    scalar_types = (type(None), bool, int, float, complex, str, bytes)
+    while pending:
+        item = pending.pop()
+        if type(item) in scalar_types:
+            continue
+        identity = id(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        item_type = type(item)
+        if item_type is dict:
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif item_type in (list, tuple, set, frozenset):
+            pending.extend(item)
+        elif item_type is np.ndarray and not item.dtype.hasobject:
+            continue
+        elif item_type is torch.Tensor and not item.__dict__ and not item.requires_grad and item.grad is None:
+            # Storage is also a Python object whose copy hook may be replaced.
+            if item.device.type != "cpu" or item.layout is not torch.strided or item.is_quantized:
+                return False
+            storage = item.untyped_storage()
+            if type(storage) is not torch.UntypedStorage or storage.__dict__:
+                return False
+        else:
+            return False
+    return True
+
+
 def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    compacted = copy.deepcopy(payload)
+    # Converting a plain numeric list already allocates independent storage.
+    array_lists: dict[str, list[Any]] = {}
+    scalar_types = (int, float, bool)
+    if type(payload) is dict:
+        for field_name, _dtype in _TRAINING_ARTIFACT_ARRAY_FIELDS:
+            value = payload.get(field_name)
+            if type(value) is list and value and all(type(item) in scalar_types for item in value):
+                array_lists[field_name] = value
+    if array_lists and _plain_training_graph(payload, safe_ids={id(value) for value in array_lists.values()}):
+        # Unknown copy hooks can inspect the root memo or mutate a source list.
+        # Only plain data may skip the original ordered deepcopy traversal.
+        compacted: dict[str, Any] = {}
+        remainder = {key: value for key, value in payload.items() if key not in array_lists}
+        copied = copy.deepcopy(remainder, {id(payload): compacted})
+        compacted.update((key, array_lists[key] if key in array_lists else copied[key]) for key in payload)
+    else:
+        array_lists.clear()
+        compacted = copy.deepcopy(payload)
 
     tokens = compacted.get("tokens")
     rollout_tokens = compacted.get("rollout_tokens")
@@ -123,7 +174,10 @@ def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
         value = compacted.get(field_name)
         if not isinstance(value, list) or not value:
             continue
-        compacted[field_name] = np.asarray(value, dtype=dtype)
+        if field_name in array_lists:
+            compacted[field_name] = np.fromiter(value, dtype=dtype, count=len(value))
+        else:
+            compacted[field_name] = np.asarray(value, dtype=dtype)
     return compacted
 
 
