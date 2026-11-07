@@ -29,7 +29,11 @@ from relax.utils.training.ppo_utils import (
 )
 
 from .checkpoint_metadata import _checkpoint_has_optimizer_state, _collective_checkpoint_probe
-from .compat import patch_hybrid_optimizer_native_fp32_checkpoint_load, preserve_hdo_dp_reshardable_steps_on_load
+from .compat import (
+    patch_fully_reshardable_checkpoint_padding,
+    patch_hybrid_optimizer_native_fp32_checkpoint_load,
+    preserve_hdo_dp_reshardable_steps_on_load,
+)
 
 
 try:
@@ -655,6 +659,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
     load_path = args.load
+    if optimizer is not None and getattr(args, "dist_ckpt_optim_fully_reshardable", False):
+        patch_fully_reshardable_checkpoint_padding()
 
     load_optimizer = (
         optimizer is not None and not getattr(args, "no_load_optim", False) and not getattr(args, "finetune", False)

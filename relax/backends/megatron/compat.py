@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import hashlib
 import inspect
 import math
 from collections.abc import Iterator
@@ -8,10 +9,65 @@ from functools import wraps
 from threading import RLock
 from typing import Any
 
+from relax.utils.logging_utils import get_logger
 
+
+logger = get_logger(__name__)
 _BUGGY_NATIVE_FP32_LOOKUPS = ("self.param_to_fp32_param[param]", "self.param_to_fp32_param.get(param)")
 _NATIVE_FP32_LOAD_PATCHED = "_relax_native_fp32_load_patched"
 _HDO_STEP_LOAD_LOCK = RLock()
+_LEGACY_FULLY_RESHARDABLE = "6df6392a0ebb4c79b632fccd59d2703ac0021f0a73ef9e87eb32d0b3bdfb23b0"
+_FULLY_RESHARDABLE_LOCK = RLock()
+
+
+def patch_fully_reshardable_checkpoint_padding() -> bool:
+    """Use coalesced bucket offsets in the affected Megatron serializer."""
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    with _FULLY_RESHARDABLE_LOCK:
+        original = getattr(DistributedOptimizer, "sharded_param_state_fully_reshardable", None)
+        if original is None or hasattr(original, "__wrapped__"):
+            return False
+        try:
+            fingerprint = hashlib.sha256(inspect.getsource(original).encode()).hexdigest()
+        except (OSError, TypeError):
+            return False
+        if fingerprint != _LEGACY_FULLY_RESHARDABLE:
+            return False
+
+        @wraps(original)
+        def serialize(self: Any, *args: Any, **kwargs: Any) -> Any:
+            # Core's DP gather omits the end padding of each bucket. Its
+            # serializer still indexes the result in padded buffer coordinates.
+            with _FULLY_RESHARDABLE_LOCK:
+                original_maps = []
+                try:
+                    for buffer in self.buffers:
+                        offsets = []
+                        unpadded_start = 0
+                        for bucket in buffer.buckets:
+                            offsets.append(bucket.offset - unpadded_start)
+                            unpadded_start += bucket.numel_unpadded
+                        if not any(offsets):
+                            continue
+                        indices = buffer.param_index_map
+                        compact = {}
+                        for param, (start, end, bucket_id) in indices.items():
+                            bucket = buffer.buckets[bucket_id]
+                            if not bucket.offset <= start <= end <= bucket.offset + bucket.numel_unpadded:
+                                raise ValueError("Optimizer parameter exceeds its unpadded checkpoint bucket")
+                            shift = offsets[bucket_id]
+                            compact[param] = (start - shift, end - shift, bucket_id)
+                        original_maps.append((buffer, indices))
+                        buffer.param_index_map = compact
+                    return original(self, *args, **kwargs)
+                finally:
+                    for buffer, indices in original_maps:
+                        buffer.param_index_map = indices
+
+        DistributedOptimizer.sharded_param_state_fully_reshardable = serialize
+        logger.info("Applied compatibility fix for fully reshardable optimizer checkpoint padding")
+        return True
 
 
 def _patch_hdo_group_steps(optimizer_cls: type) -> bool:
