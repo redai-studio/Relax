@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -24,6 +24,27 @@ def get_spec_token_counts(meta_info: dict[str, Any]) -> tuple[int, int]:
 
 
 @dataclass
+class GenerationSegment:
+    """A committed generation span and the weight version(s) that produced it.
+
+    ``token_start`` / ``token_end`` are offsets into the sample response
+    (``response`` / ``continuation_train_tokens``) and ``token_end`` is
+    exclusive. A segment holds more than one version when the generation was
+    aborted and resumed against a newer policy.
+    """
+
+    turn_index: int
+    token_start: int
+    token_end: int
+    weight_versions: list[str] = field(default_factory=list)
+    state_hash: str | None = None
+
+    @property
+    def token_count(self) -> int:
+        return max(self.token_end - self.token_start, 0)
+
+
+@dataclass
 class Sample:
     """The sample generated."""
 
@@ -43,6 +64,10 @@ class Sample:
     custom_advantage: float | list[float] | list[list[float]] | None = None
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
+    # Per-committed-generation token spans with their weight versions. Empty for
+    # samples produced before the audit path existed; consumers must treat an
+    # empty list as "unknown", never as "version 0".
+    generation_segments: list[GenerationSegment] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_topk_token_ids: np.ndarray | None = None  # [response_length, K], int32; -1 pads observations
     rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
@@ -167,6 +192,7 @@ class Sample:
         value["status"] = self.status.value
         value["spec_info"] = self.spec_info.to_dict()
         value["prefix_cache_info"] = self.prefix_cache_info.to_dict()
+        value["generation_segments"] = [asdict(segment) for segment in self.generation_segments]
         return value
 
     @staticmethod
@@ -175,6 +201,10 @@ class Sample:
         data["status"] = Sample.Status(data["status"])
         data["spec_info"] = Sample.SpecInfo.from_dict(data.get("spec_info", {}))
         data["prefix_cache_info"] = Sample.PrefixCacheInfo.from_dict(data.get("prefix_cache_info", {}))
+        data["generation_segments"] = [
+            segment if isinstance(segment, GenerationSegment) else GenerationSegment(**segment)
+            for segment in data.get("generation_segments") or []
+        ]
 
         field_names = set(Sample.__dataclass_fields__.keys())
         init_data = {k: v for k, v in data.items() if k in field_names}
@@ -193,11 +223,13 @@ class Sample:
     def effective_response_length(self):
         return sum(self.loss_mask) if self.loss_mask is not None else self.response_length
 
-    def update_from_meta_info(self, args, meta_info: dict):
+    def update_from_meta_info(self, args, meta_info: dict, response_delta: int | None = None):
         """Update the sample with new information from meta_info returned by
         the rollout engine.
 
-        And extract
+        ``response_delta`` is the number of response tokens appended by this
+        call. When given, it closes the committed generation span so the
+        segment can be attributed to the weight version that produced it.
         """
         if args.sglang_speculative_algorithm:
             # cannot directly use spec info from sglang because of partial rollout.
@@ -207,7 +239,18 @@ class Sample:
         self.prefix_cache_info.add(meta_info=meta_info)
 
         if "weight_version" in meta_info:
-            self.weight_versions.append(meta_info["weight_version"])
+            weight_version = str(meta_info["weight_version"])
+            self.weight_versions.append(weight_version)
+            if response_delta:
+                token_end = self.response_length
+                self.generation_segments.append(
+                    GenerationSegment(
+                        turn_index=len(self.generation_segments),
+                        token_start=max(token_end - response_delta, 0),
+                        token_end=token_end,
+                        weight_versions=[weight_version],
+                    )
+                )
 
         match meta_info["finish_reason"]["type"]:
             case "length":
