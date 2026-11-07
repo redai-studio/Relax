@@ -3,6 +3,22 @@
 """CPU-only bin packing shared by local and wholepack scheduling."""
 
 
+def get_first_fit_partitions(total_lengths: list[int], max_tokens_per_gpu: int) -> list[list[int]]:
+    """Pack indices in input order; oversized samples get their own bin."""
+    batches: list[int] = []
+    partitions: list[list[int]] = []
+    for index, length in enumerate(total_lengths):
+        for i in range(len(batches)):
+            if batches[i] + length <= max_tokens_per_gpu:
+                batches[i] += length
+                partitions[i].append(index)
+                break
+        else:
+            batches.append(length)
+            partitions.append([index])
+    return partitions
+
+
 def get_binpack_partitions(total_lengths: list[int], max_tokens_per_gpu: int) -> list[list[int]]:
     """Worst-fit-decreasing bin packing, matching ms-swift's
     ``packing_strategy="binpack"``.

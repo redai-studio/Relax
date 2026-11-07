@@ -2,7 +2,11 @@
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+
+if TYPE_CHECKING:
+    from relax.utils.data.flops_balancing import FlopsWorkload
 
 
 try:
@@ -55,12 +59,21 @@ class _PartitionTaskState:
 
 class _BalancedRowPlacement:
     @staticmethod
-    def place(rows: list[int], lengths: dict[int, int], dp_size: int) -> list[list[int]]:
+    def place(
+        rows: list[int], lengths: dict[int, int], dp_size: int, workload: "FlopsWorkload | None" = None
+    ) -> list[list[int]]:
+        weights = [lengths[index] for index in rows]
+        if workload is not None:
+            weights = workload(weights)
         positions = get_seqlen_balanced_partitions(
-            [lengths[index] for index in rows],
+            weights,
             dp_size,
             equal_size=len(rows) % dp_size == 0,
         )
+        if workload is not None:
+            from relax.utils.data.flops_balancing import log_flops_balance
+
+            log_flops_balance(weights, positions)
         return [[rows[position] for position in partition] for partition in positions]
 
 
@@ -95,10 +108,14 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         dp_size: int,
         placement: Literal["sequential", "balanced", "streaming"],
         balance_unit_multiplier: int = 1,
+        workload: "FlopsWorkload | None" = None,
     ) -> None:
         super().__init__(n_samples_per_prompt=1, balance_unit_multiplier=balance_unit_multiplier)
         self.dp_size = dp_size
         self.placement = placement
+        if workload is not None and placement != "balanced":
+            raise ValueError("FLOPs placement requires non-streaming balanced identity windows")
+        self.workload = workload
         self._partition_task_states: dict[tuple[str, str], _PartitionTaskState] = {}
         self._cache_window_by_key: dict[tuple[str, str, int, int], int] = {}
         self._window_buckets: dict[tuple[str, str, int], dict[int, list[int]]] = {}
@@ -215,7 +232,8 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
 
         selected_rows = [index for identity in selected_identities for index in rows_by_identity[identity]]
         lengths = {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows}
-        rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
+        workload = None if "eval" in task_name or "eval" in partition_id else self.workload
+        rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size, workload)
 
         for rank, rows in enumerate(rank_rows):
             self._cache_result(partition_id, task_name, rank, batch_index, (rows, rows.copy()))

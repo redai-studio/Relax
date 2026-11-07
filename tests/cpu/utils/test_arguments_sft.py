@@ -16,6 +16,32 @@ from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
 arguments_module = _arguments_module_fixture
 
 
+def test_flops_option_default_and_yaml_validation(arguments_module, tmp_path):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    assert parser.parse_args([]).balance_by_flops is False
+    assert parser.parse_args(["--balance-by-flops"]).balance_by_flops is True
+
+    config = tmp_path / "flops.yaml"
+    config.write_text("balance_by_flops: true\n")
+    args = _opd_args()
+    args.custom_config_path = str(config)
+    args.sft_packing_strategy = "balanced"
+    args.use_dynamic_batch_size = True
+    args.max_tokens_per_gpu = 4096
+    arguments_module.slime_validate_args(args)
+    assert args.balance_by_flops and args.balance_data
+
+    config.write_text("balance_by_flops: true\nsft_packing_strategy: binpack\n")
+    args = _opd_args()
+    args.custom_config_path = str(config)
+    args.use_dynamic_batch_size = True
+    args.max_tokens_per_gpu = 4096
+    with pytest.raises(ValueError, match="--balance-by-flops.*binpack"):
+        arguments_module.slime_validate_args(args)
+
+
 def test_sft_legacy_prepack_allows_single_in_flight_step(arguments_module):
     args = SimpleNamespace(sft_max_in_flight_steps=1, sft_async_prepack=True, max_staleness=0)
 

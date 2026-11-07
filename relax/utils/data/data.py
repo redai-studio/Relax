@@ -7,6 +7,7 @@ from relax.utils.data.data_utils import (
     filter_long_prompts,
     read_file,
 )
+from relax.utils.data.packing import get_first_fit_partitions
 from relax.utils.types import Sample
 
 
@@ -111,23 +112,6 @@ class Dataset(BaseDataset):
     def __len__(self) -> int:
         """Return total number of samples."""
         return len(self.samples)
-
-
-def get_first_fit_partitions(total_lengths: list[int], max_tokens_per_gpu: int) -> list[list[int]]:
-    """Pack indices in input order; oversized samples get their own bin."""
-    batches: list[int] = []
-    partitions: list[list[int]] = []
-    for index, length in enumerate(total_lengths):
-        for i in range(len(batches)):
-            if batches[i] + length <= max_tokens_per_gpu:
-                batches[i] += length
-                partitions[i].append(index)
-                break
-        else:
-            batches.append(length)
-            partitions.append([index])
-
-    return partitions
 
 
 def get_minimum_num_micro_batch_size(total_lengths: list[int], max_tokens_per_gpu: int) -> int:
