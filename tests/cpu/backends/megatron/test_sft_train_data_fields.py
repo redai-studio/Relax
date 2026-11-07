@@ -12,6 +12,10 @@ import torch
 def _mk_actor_args(loss_type: str):
     return Namespace(
         loss_type=loss_type,
+        task_type="causal_lm",
+        advantage_estimator="grpo",
+        fully_async=False,
+        hybrid=False,
         compute_advantages_and_returns=(loss_type not in {"sft", "dpo", "rm"}),
         debug_train_only=False,
         offload_train=False,
@@ -76,7 +80,13 @@ def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypat
         "chosen_total_lengths": [3],
         "rejected_total_lengths": [2],
     }
-    args = Namespace(qkv_format="thd", is_vl_model=False, uses_unsplit_forward=False, use_opd=False)
+    args = Namespace(
+        loss_type="dpo",
+        qkv_format="thd",
+        is_vl_model=False,
+        uses_unsplit_forward=False,
+        use_opd=False,
+    )
     monkeypatch.setattr(stream_dataloader.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
 
     stream_dataloader.post_process_rollout_data(args, rollout_data)

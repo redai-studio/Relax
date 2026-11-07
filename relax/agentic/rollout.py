@@ -855,7 +855,7 @@ def _build_eval_samples(
 
     resources = load_agentic_compiler_resources(args)
     try:
-        custom_prompt_path = getattr(args, "custom_prompt_path", None)
+        custom_prompt_path = args.custom_prompt_path
         custom_prompt_func = load_function(custom_prompt_path) if custom_prompt_path else None
         dataset = Dataset(
             path=dataset_cfg.path,

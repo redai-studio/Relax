@@ -14,6 +14,38 @@ _NATIVE_FP32_LOAD_PATCHED = "_relax_native_fp32_load_patched"
 _HDO_STEP_LOAD_LOCK = RLock()
 
 
+def megatron_norm_epsilon_arg_name(args: Any) -> str:
+    """Return the Megatron arg name for RMSNorm epsilon.
+
+    Newer Megatron builds expose ``norm_epsilon``; older builds use
+    ``layernorm_epsilon``.
+    """
+    return "norm_epsilon" if hasattr(args, "norm_epsilon") else "layernorm_epsilon"
+
+
+def ensure_megatron_rope_type(args: Any) -> None:
+    """Fill ``rope_type`` when the Megatron build exposes the field as
+    ``None``."""
+    if hasattr(args, "rope_type") and args.rope_type is None:
+        args.rope_type = "yarn" if args.multi_latent_attention else "rope"
+
+
+def megatron_dynamic_context_parallel(args: Any) -> bool:
+    """Return whether dynamic CP is enabled.
+
+    Older Megatron builds omit ``dynamic_context_parallel``; missing means
+    False. Call sites must use this helper instead of repeating ``getattr``
+    defaults.
+    """
+    return bool(getattr(args, "dynamic_context_parallel", False))
+
+
+def megatron_context_parallel_size(args: Any, default: int = 1) -> int:
+    """Return Megatron CP size, defaulting when the schema omits the field."""
+    value = getattr(args, "context_parallel_size", default)
+    return int(default if value is None else value)
+
+
 def _patch_hdo_group_steps(optimizer_cls: type) -> bool:
     """Keep group-owned Adam counters when HDO synchronizes tensor state."""
     import torch
