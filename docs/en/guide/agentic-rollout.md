@@ -694,6 +694,73 @@ Fully async retention does not require every carried session to follow this exac
 Program-aware admission can delay backend attempts based on predicted KV use. Session lifecycle can release Session
 radix-cache entries when a session ends. See [Agentic KV Scheduling](./agentic-kv-scheduling.md).
 
+## Weight Version Audit
+
+For Megatron fully-async training with DCS, enable a read-only audit by setting
+`RELAX_WEIGHT_AUDIT_DIR` to a fresh directory shared by the publisher, Session shards, and training ranks.
+Use a separate directory for each training job. Leave it unset to keep the existing training path.
+Pass the value in the Ray runtime environment, for example in the environment YAML used by your launch:
+
+```yaml
+env_vars:
+  RELAX_WEIGHT_AUDIT_DIR: /shared/experiments/my-run/weight-audit
+```
+
+The DCS publisher assigns a sequence after all policy weight buckets have confirmed successful loading.
+Failed updates and actor-forward-only synchronization do not advance it. Successful publications receive a fresh
+lineage after a publisher restart or invalidated publication evidence. Recovery never revalidates delayed old tags;
+cross-lineage provenance remains unknown. DCS uses abort-and-drain before updates, so managed SGLang responses can provide
+a request-bound scalar version; explicit `weight_versions` token intervals take precedence when available.
+Unconfirmed labels, unavailable snapshots, and unmapped output intervals remain unknown.
+If tag confirmation or snapshot publication fails, the shared snapshot is invalidated or removed. If both operations
+fail, all training ranks raise and generation stays paused to prevent reuse of stale version evidence. Batches missing
+audit metadata still contribute their valid loss tokens to the denominator, with unknown provenance.
+Custom sample converters can change token coordinates, so their rows are fetched without audit payloads.
+Their final loss-mask counts are retained with unknown provenance and an incomplete summary.
+
+Reports use actual actor loss tokens, excluding prompt, tool observations, cancelled output, zero-mask positions,
+and alignment dummy microbatches. They preserve Session, turn, request, attempt, and fragment identifiers.
+Sampling, rewards, GRPO groups, loss masks, and gradient weighting remain unchanged. On each CP shard, the audit
+counts policy-loss tokens after TIS/RS, ICEPOP, and OPSM filtering, plus targets used by nonzero entropy, KL, OPD,
+and text MTP losses. OPD targets rejected by the teacher-entropy gate count only when another loss still covers them.
+Text MTP coverage follows each sample's prediction target positions; a zero coefficient adds no coverage.
+Counts are read after forward/backward completes. If auditing a loss callback fails, only confirmed counts are retained;
+`audit_error=loss_observation_failed` marks the step and cumulative summary with `aggregate_complete=false`.
+Rows with no eligible tokens leave the post-generation publication-advance distribution unchanged. DPO/RM preference pairs bypass this audit.
+
+Multimodal MTP may apply an additional mask inside the model. Only when MTP candidate targets remain uncovered by
+other losses and require that internal mask to confirm their consumption does the audit count only confirmed coverage and record
+`audit_error=mtp_target_coverage_unavailable` with `aggregate_complete=false`. Training continues.
+
+Each representative rank writes `<lineage>/consumed-rank-<rank>.jsonl` and a cumulative `.summary.json`.
+Details are limited to 8 MiB per rank and lineage; `detail_records_dropped` reports omitted details while summaries
+continue counting all observed exposures. Combine summaries with `relax.utils.weight_version_audit.aggregate`;
+it merges numerators and denominators rather than averaging rank means. Keep ranks from separate lineages separate.
+Before reading an existing summary or writing reports, the current process retains the consumption increment.
+Failed reads and writes are retried on subsequent consumption commits, merging the retained increments with the
+existing counts, including summaries from older lineages. The recovered summary retains `aggregate_complete=false` to flag
+the I/O error. Pending in-memory counts cannot survive process exit. An `aggregate_complete=false` result should not
+be treated as a complete accounting.
+
+`observed_generation_span` is the difference between known source sequences within one training row.
+`token_weighted_age` uses the frontier captured before the training substep and only comparable, known source tokens;
+inspect `version_coverage`, `age_coverage`, and `missing_token_rate` with it. All ages are publication counts, not seconds.
+`post_generation_published_advance` counts publications after the last successful Session response commit. This
+explicit completion boundary includes subsequent tool work, scoring, group waiting, and training queues; it does
+not measure only queue residence or the server's last-token timestamp. `finish_frontier_gap` separately exposes
+source lag already present at that boundary.
+
+To reproduce two updates during a tool wait using a CPU backend fixture, run from the repository root:
+
+```bash
+python -m examples.weight_version_audit.demo --scenario complete --output /tmp/weight-audit.json
+python -m examples.weight_version_audit.demo --scenario missing --output /tmp/weight-audit-missing.json
+python -m examples.weight_version_audit.demo --scenario lagging --output /tmp/weight-audit-lagging.json
+```
+
+The example runs real Session commit/export, numeric training serialization, and a CPU loss. It uses event barriers
+for the tool wait and controlled publication notifications, without starting a Ray cluster or GPU training.
+
 ## Operations and Troubleshooting
 
 ### Metrics and Dumps

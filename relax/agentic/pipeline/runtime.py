@@ -663,6 +663,14 @@ class SGLangBackendAdapter:
             raise ValueError(
                 "Score Centering requires the original sampled token IDs; token sanitization changed them."
             )
+        from relax.utils import weight_version_audit
+
+        if weight_version_audit.enabled() and self._args.fully_async:
+            # The audit publisher explicitly aborts and drains requests before
+            # every DCS weight update. This also supports SGLang < weight_versions.
+            meta_info["_weight_audit_scalar_bound"] = True
+        if weight_version_audit.enabled() and len(sanitized_tokens) != len(tokens):
+            meta_info["weight_audit_token_mapping_valid"] = False
         return BackendGenerateResult(
             new_tokens=sanitized_tokens,
             new_log_probs=sampled_logprobs,

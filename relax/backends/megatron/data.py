@@ -1511,6 +1511,8 @@ def log_rollout_data(
                 continue
             if key in [
                 "tokens",
+                "weight_audit_payload",
+                "weight_audit_rows",
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",

@@ -148,6 +148,14 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
+    from relax.utils import weight_version_audit
+
+    if weight_version_audit.enabled():
+        audit_payloads = []
+        for row, sample in enumerate(samples):
+            provenance = (sample.metadata or {}).get(weight_version_audit.AUDIT_KEY) or {}
+            audit_payloads.append(weight_version_audit.encode_payload({**provenance, "physical_row_index": row}))
+        train_data[weight_version_audit.AUDIT_FIELD] = audit_payloads
     mask_sums_by_sample_index: dict[Any, int] = {}
     for sample_index, loss_mask in zip(sample_indices, loss_masks, strict=True):
         mask_sums_by_sample_index[sample_index] = mask_sums_by_sample_index.get(sample_index, 0) + int(sum(loss_mask))
@@ -461,6 +469,10 @@ def post_process_env(args, env):
 
     # Use the same file-scanning concurrency in the driver and SFT replicas.
     env["env_vars"].setdefault("RELAX_JSONL_INDEX_WORKERS", str(Envs.RELAX_JSONL_INDEX_WORKERS))
+
+    # A producer/consumer field contract: every actor must use the same audit opt-in.
+    if Envs.RELAX_WEIGHT_AUDIT_DIR:
+        env["env_vars"].setdefault("RELAX_WEIGHT_AUDIT_DIR", Envs.RELAX_WEIGHT_AUDIT_DIR)
 
     # ray-job.sh prepares the node-local cache before launching the inner Ray
     # job. Carry its resolved session into the runtime env that Controller
