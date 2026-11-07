@@ -1346,6 +1346,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="The data source class for rollout data.",
             )
             parser.add_argument(
+                "--rollout-source-mixture",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a YAML source-mixture config (JSON syntax is also accepted), "
+                    "defining each source's dataset path and weight. Currently supports synchronous colocate MOPD "
+                    "with streaming data, n-samples-per-prompt=1, and rollout-batch-size=global-batch-size. "
+                    "Use this config instead of --prompt-data."
+                ),
+            )
+            parser.add_argument(
                 "--prompt-data",
                 type=str,
                 default=None,
@@ -4723,6 +4734,10 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    if getattr(args, "rollout_source_mixture", None):
+        from relax.engine.rollout.source_mixture import validate_source_mixture_args
+
+        validate_source_mixture_args(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
