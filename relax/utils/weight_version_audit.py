@@ -445,6 +445,7 @@ class AuditStep:
         error = None
         if self.summary is None:
             for ordinal, (rows, counts) in self.masked_rows.items():
+                # Each row packs total, span counts, then unconfirmed MTP targets.
                 values = iter(counts.tolist())
                 for row in rows:
                     total = next(values)
@@ -455,6 +456,8 @@ class AuditStep:
                         "spans": spans,
                         "uncovered_tokens": total - sum(span["eligible_tokens"] for span in spans),
                     }
+                    if next(values):
+                        adjusted["audit_error"] = "mtp_target_coverage_unavailable"
                     self.observed[ordinal].append({**audit_row(adjusted, self.frontier), "microbatch_index": ordinal})
             reports = [report for batch in self.observed.values() for report in batch]
             summary = {"consumption_id": self.consumption_id, "rank": rank, **aggregate(reports)}

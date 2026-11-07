@@ -696,12 +696,13 @@ DCS 在所有策略权重 bucket 确认加载成功后分配发布序号。更�
 报告以实际 actor loss 中的 token 为统计对象，排除 prompt、工具观察、未提交的取消输出、零 mask 位置和对齐用的
 dummy microbatch，并保留 Session、轮次、request、attempt 和片段标识。原有采样、reward、GRPO 分组、loss mask
 及梯度权重保持原有语义。审计按各 CP 分片统计 TIS/RS、ICEPOP、OPSM 过滤后仍参与策略损失的 token，并纳入非零系数的
-entropy、KL、OPD 和文本 MTP 辅助损失所覆盖的 token。文本 MTP 按各样本的预测目标位置计数，系数为零时不增加覆盖。
+entropy、KL、OPD 和文本 MTP 辅助损失所覆盖的 token。OPD 中被教师熵门控屏蔽的目标，只有仍被其他损失覆盖时才计入。
+文本 MTP 按各样本的预测目标位置计数，系数为零时不增加覆盖。
 计数在 forward/backward 完成后读取。loss 回调中的审计失败时仅保留已确认的计数，记录 `audit_error=loss_observation_failed`，
 并将该步及累计摘要标为 `aggregate_complete=false`。零有效 token 的样本不计入完成后发布推进的分布；DPO/RM 的成对数据跳过该审计。
 
-多模态 MTP 可能在模型内部使用额外监督 mask。过滤后的损失仍需依赖该 mask 才能确定完整消费集合时，当前审计只统计
-可确认的部分，并记录 `audit_error=mtp_target_coverage_unavailable`、`aggregate_complete=false`；训练继续执行。
+多模态 MTP 可能在模型内部使用额外监督 mask。只有存在尚未被其他损失覆盖、且依赖该内部 mask 才能确认的 MTP 候选目标时，
+审计才记录 `audit_error=mtp_target_coverage_unavailable`、`aggregate_complete=false`，并只统计已确认的部分；训练继续执行。
 
 各代表 rank 写入 `<lineage>/consumed-rank-<rank>.jsonl` 和累计 `.summary.json`。每个 rank、每个 lineage 的详细
 报告上限为 8 MiB；`detail_records_dropped` 表示省略的详细记录数，累计摘要仍统计全部已观察到的训练消费。

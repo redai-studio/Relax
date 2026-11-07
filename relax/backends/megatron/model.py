@@ -83,38 +83,21 @@ logger = get_logger(__name__)
 
 
 def _weight_audit_counts(args: Namespace, batch: dict[str, Any]) -> torch.Tensor | None:
-    """Count final loss masks on their CP owners without synchronizing to
-    CPU."""
+    """Pack each row's total, span counts and unconfirmed MTP count, then
+    reduce CP owners."""
     masks = batch.get("weight_audit_loss_masks")
     if masks is None:
         return None
     cp_size = batch.get("dynamic_cp_size", mpu.get_context_parallel_world_size())
     cp_rank = batch.get("dynamic_cp_rank", mpu.get_context_parallel_rank())
-    policy_mask = batch.get("weight_audit_policy_mask")
-    policy_offset = 0
-    mtp_active = (
-        getattr(args, "enable_mtp_training", False)
-        and getattr(args, "mtp_num_layers", 0) > 0
-        and getattr(args, "mtp_loss_scaling_factor", 0) != 0
-    )
-    if (
-        mtp_active
-        and not batch.get("weight_audit_opd")
-        and (getattr(args, "is_vl_model", False) or batch.get("multimodal_train_inputs") is not None)
-    ):
-        # The bridge can apply an internal MTP input mask not exposed in this batch.
-        batch[weight_version_audit.PREPARED_FIELD] = [
-            {**row, "audit_error": "mtp_target_coverage_unavailable"}
-            for row in batch[weight_version_audit.PREPARED_FIELD]
-        ]
-        mtp_active = False
     counts = []
-    for i, (row, mask, total, response) in enumerate(
+    for i, (row, mask, total, response, unconfirmed) in enumerate(
         zip(
             batch[weight_version_audit.PREPARED_FIELD],
             masks,
             batch["total_lengths"],
             batch["response_lengths"],
+            batch["weight_audit_unconfirmed"],
             strict=True,
         )
     ):
@@ -132,28 +115,21 @@ def _weight_audit_counts(args: Namespace, batch: dict[str, Any]) -> torch.Tensor
                 dynamic_cp_rank=cp_rank,
             )
         owned_masks = []
+        offset = 0
         for owner_lo, owner_hi in owners:
-            if owner_lo >= owner_hi:
-                continue
-            local = mask.detach()[owner_lo - start : owner_hi - start] != 0
-            length = owner_hi - owner_lo
-            if policy_mask is not None:
-                local = local & (policy_mask[policy_offset : policy_offset + length] != 0)
-            policy_offset += length
-            if batch.get("weight_audit_opd") or mtp_active:
-                original = batch["loss_masks"][i].detach()[owner_lo - start : owner_hi - start] != 0
-                if not batch.get("weight_audit_opd"):
-                    # First MTP head predicts target j>=2; deeper heads cover subsets.
-                    original = original & (torch.arange(owner_lo, owner_hi, device=mask.device) >= 2)
-                local = local | original
-            owned_masks.append((owner_lo, owner_hi, local))
-        for lo, hi in [(start, total), *((span["token_start"], span["token_end"]) for span in row["spans"])]:
+            if owner_lo < owner_hi:
+                length = owner_hi - owner_lo
+                owned_masks.append((owner_lo, owner_hi, mask[offset : offset + length]))
+                offset += length
+        counts.append(mask.sum(dtype=torch.int64))
+        for span in row["spans"]:
             count = torch.zeros((), dtype=torch.int64, device=mask.device)
             for owner_lo, owner_hi, valid in owned_masks:
-                left, right = max(lo, owner_lo), min(hi, owner_hi)
+                left, right = max(span["token_start"], owner_lo), min(span["token_end"], owner_hi)
                 if left < right:
                     count = count + valid[left - owner_lo : right - owner_lo].sum(dtype=torch.int64)
             counts.append(count)
+        counts.append(unconfirmed)
     result = torch.stack(counts)
     if cp_size > 1:
         group = (

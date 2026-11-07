@@ -722,13 +722,14 @@ Reports use actual actor loss tokens, excluding prompt, tool observations, cance
 and alignment dummy microbatches. They preserve Session, turn, request, attempt, and fragment identifiers.
 Sampling, rewards, GRPO groups, loss masks, and gradient weighting remain unchanged. On each CP shard, the audit
 counts policy-loss tokens after TIS/RS, ICEPOP, and OPSM filtering, plus targets used by nonzero entropy, KL, OPD,
-and text MTP losses. Text MTP coverage follows each sample's prediction target positions; a zero coefficient adds no coverage.
+and text MTP losses. OPD targets rejected by the teacher-entropy gate count only when another loss still covers them.
+Text MTP coverage follows each sample's prediction target positions; a zero coefficient adds no coverage.
 Counts are read after forward/backward completes. If auditing a loss callback fails, only confirmed counts are retained;
 `audit_error=loss_observation_failed` marks the step and cumulative summary with `aggregate_complete=false`.
 Rows with no eligible tokens leave the post-generation publication-advance distribution unchanged. DPO/RM preference pairs bypass this audit.
 
-Multimodal MTP may apply an additional mask inside the model. When that mask is needed to determine the complete
-consumption set after filtering, the audit counts only confirmed coverage and records
+Multimodal MTP may apply an additional mask inside the model. Only when MTP candidate targets remain uncovered by
+other losses and require that internal mask to confirm their consumption does the audit count only confirmed coverage and record
 `audit_error=mtp_target_coverage_unavailable` with `aggregate_complete=false`. Training continues.
 
 Each representative rank writes `<lineage>/consumed-rank-<rank>.jsonl` and a cumulative `.summary.json`.

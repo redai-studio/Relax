@@ -14,6 +14,7 @@ import torch.distributed as dist
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.rollout_metrics import compute_mopd_metrics  # noqa: F401 - keep the existing import path
+from relax.utils.weight_version_audit import PREPARED_FIELD
 
 
 if TYPE_CHECKING:
@@ -1402,6 +1403,10 @@ def compute_policy_opd_loss(
     old_log_probs: torch.Tensor,
     log_probs_and_entropy: dict[str, list[torch.Tensor]],
 ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+    collect_audit = PREPARED_FIELD in batch
+    if collect_audit:
+        batch.pop("weight_audit_opd_mask", None)
+    audit_gates = []
     opd_loss_coef = float(getattr(args, "opd_loss_coef", 0.0))
     if opd_loss_coef == 0.0:
         return None, {}
@@ -1459,6 +1464,8 @@ def compute_policy_opd_loss(
                 _ent = -torch.where(torch.isfinite(_t), _p * _t, torch.zeros_like(_t)).sum(dim=-1)
                 _gate = (_ent >= _eopd_tau).to(dtype=_chunk.dtype)
                 _chunk = _chunk * _gate
+                if collect_audit:
+                    audit_gates.append(_gate.detach() != 0)
                 _eopd_gate_sum += float(_gate.sum().item())
                 _eopd_tok_cnt += float(_gate.numel())
                 _eopd_ent_sum += float(_ent.sum().item())
@@ -1500,5 +1507,9 @@ def compute_policy_opd_loss(
         with torch.no_grad():
             reported_loss["opd_is_clip_frac"] = metric_reducer((ratio > clip).float()).detach()
 
+    if collect_audit:
+        batch["weight_audit_opd_mask"] = (
+            torch.cat(audit_gates) if audit_gates else torch.ones_like(log_probs, dtype=torch.bool)
+        )
     opd_loss = reduce_opd_loss(batch, opd_per_token_kl)
     return opd_loss_coef * opd_loss, reported_loss
