@@ -37,6 +37,36 @@ index c624fd0a..cef668af 100644
      return parser
  
  
+diff --git a/mindspeed/core/context_parallel/dot_product_attention.py b/mindspeed/core/context_parallel/dot_product_attention.py
+index f51c9593..444c570d 100644
+--- a/mindspeed/core/context_parallel/dot_product_attention.py
++++ b/mindspeed/core/context_parallel/dot_product_attention.py
+@@ -157,7 +157,6 @@ class CPDotProductAttentionImpl:
+         is_ulysses_algo = (getattr(self.config, 'context_parallel_algo', None) == 'ulysses_cp_algo')
+ 
+         assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
+-
+         if packed_seq_params is not None and not is_ulysses_algo:
+             #TND
+             T, n_head, D = query.shape[0], query.shape[1], query.shape[2]
+@@ -277,7 +276,7 @@ class CPDotProductAttentionImpl:
+ 
+         else:
+             # For EoD ulysses
+-            if packed_seq_params is not None:
++            if packed_seq_params is not None and is_ulysses_algo:
+                 query, key, value = [rearrange(x, 's b (h d) -> (b s) h d', d=head_dim) for x in [query, key, value]]
+                 shape_order = 'TND'
+ 
+@@ -313,7 +312,7 @@ class CPDotProductAttentionImpl:
+                     actual_seq_kvlen=actual_seq_kvlen
+                 )[0]
+ 
+-            if packed_seq_params is not None:
++            if packed_seq_params is not None and is_ulysses_algo:
+                 output = rearrange(output, '(b s) h d -> s b (h d)', b=bsz)
+                 shape_order = 'TND'
+         return output
 diff --git a/mindspeed/core/megatron_basic/arguments_basic.py b/mindspeed/core/megatron_basic/arguments_basic.py
 old mode 100644
 new mode 100755
