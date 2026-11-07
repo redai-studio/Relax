@@ -32,7 +32,7 @@ def _resolve_online_weight_scale_fmt(
             raise ValueError(f"{_BF16_SENDER_PRESERVE_UE8M0_GRID_ENV} must be 0 or 1, got {preserve_ue8m0_grid!r}")
         return configured_scale_fmt if preserve_ue8m0_grid == "1" else None
 
-    fp8_recipe = getattr(args, "fp8_recipe", None)
+    fp8_recipe = args.fp8_recipe
     fp8_recipe = getattr(fp8_recipe, "value", fp8_recipe)
     use_fp32_scales = os.environ.get("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "0") == "1"
     if fp8_recipe != "blockwise" or not use_fp32_scales:

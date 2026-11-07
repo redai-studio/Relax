@@ -51,6 +51,7 @@ def _args():
         enable_mtp_training=False,
         global_batch_size=1536,
         num_rollout=3,
+        keep_old_actor=False,
         _relax_resident_sft_actor_verified=True,
     )
 

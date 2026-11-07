@@ -240,6 +240,7 @@ def test_generic_guard_configuration_does_not_restrict_topology(monkeypatch, tp,
         bf16=True,
         fp16=False,
         check_for_nan_in_loss_and_grad=True,
+        only_load_weight=False,
         tensor_model_parallel_size=tp,
         pipeline_model_parallel_size=pp,
         context_parallel_size=cp,
@@ -252,7 +253,7 @@ def test_generic_guard_configuration_does_not_restrict_topology(monkeypatch, tp,
 @pytest.mark.parametrize("option", ["fp8", "use_megatron_fsdp", "chunked_optimizer_state_offload"])
 def test_unvalidated_storage_modes_fail_explicitly(monkeypatch, option):
     monkeypatch.setenv("RELAX_SKIP_NONFINITE_GRAD", "1")
-    args = SimpleNamespace(bf16=True, fp16=False, check_for_nan_in_loss_and_grad=True)
+    args = SimpleNamespace(bf16=True, fp16=False, check_for_nan_in_loss_and_grad=True, only_load_weight=False)
     setattr(args, option, True)
     with pytest.raises(ValueError, match=option):
         configure_nonfinite_guard(args)

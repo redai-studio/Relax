@@ -32,6 +32,7 @@ def _args(**overrides):
         rollout_top_logprobs_num=2,
         sglang_speculative_algorithm=None,
         score_centering_vocab_size=8,
+        slime_router_sticky=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)

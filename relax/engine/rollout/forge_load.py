@@ -40,7 +40,7 @@ def _resolve_path(args: Namespace, rollout_id: int, evaluation: bool) -> str | N
     keep only ``0.pt`` but want ``--num-rollout > 1``); eval has no such
     fallback.
     """
-    tpl = getattr(args, "load_forge_rollout_data", None)
+    tpl = args.load_forge_rollout_data
     if not tpl:
         raise RuntimeError(
             "--load-forge-rollout-data not set. Pass the dump path, e.g. "
@@ -95,7 +95,7 @@ def generate_rollout(
     if path is None:
         raise RuntimeError(
             f"forge_load: no dump found for rollout_id={rollout_id} "
-            f"(--load-forge-rollout-data={getattr(args, 'load_forge_rollout_data', None)!r})"
+            f"(--load-forge-rollout-data={args.load_forge_rollout_data!r})"
         )
 
     samples = _load_samples(path)
@@ -117,7 +117,7 @@ def generate_rollout(
             len(samples),
             rollout_id,
             data_system_client,
-            is_last=bool(getattr(args, "fully_async", False)),
+            is_last=bool(args.fully_async),
         )
     )
     return RolloutFnTrainOutput(samples=groups)

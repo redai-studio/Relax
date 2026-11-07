@@ -17,6 +17,11 @@ except ModuleNotFoundError:
 
 from transformers import AutoConfig
 
+from relax.backends.megatron.compat import (
+    ensure_megatron_rope_type,
+    megatron_dynamic_context_parallel,
+    megatron_norm_epsilon_arg_name,
+)
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import ModelSource
@@ -47,7 +52,7 @@ def _format_optimizer_fallback(name: str, value: object) -> str:
 
 
 def _validate_fp16_optimizer_args(args) -> None:
-    if getattr(args, "loss_scale", None) is None:
+    if args.loss_scale is None:
         for name in _DYNAMIC_LOSS_SCALE_FIELDS:
             value = getattr(args, name)
             option = _optimizer_option(name)
@@ -79,7 +84,7 @@ def _resolve_optimizer_precision_args(args):
     native_defaults = None if args.fp16 else OptimizerConfig()
     missing = []
     for name, fp16_fallback in _FP16_OPTIMIZER_FALLBACKS.items():
-        if args.fp16 and getattr(args, "loss_scale", None) is not None and name in _DYNAMIC_LOSS_SCALE_FIELDS:
+        if args.fp16 and args.loss_scale is not None and name in _DYNAMIC_LOSS_SCALE_FIELDS:
             continue
         if getattr(args, name, None) is None:
             fallback = fp16_fallback if args.fp16 else getattr(native_defaults, name)
@@ -151,9 +156,9 @@ def _validate_linear_cp_mode(args: Namespace, config: Optional[object] = None) -
         return
 
     cp_may_exceed_one = (
-        getattr(args, "dynamic_context_parallel", False) or getattr(model_config, "context_parallel_size", 1) > 1
+        megatron_dynamic_context_parallel(args) or getattr(model_config, "context_parallel_size", 1) > 1
     )
-    if cp_may_exceed_one and getattr(args, "allgather_cp", False):
+    if cp_may_exceed_one and args.allgather_cp:
         raise ValueError(
             "GDN CP requires zig-zag THD packing in every linear_cp_mode; --allgather-cp uses "
             "contiguous per-rank packing and is incompatible with GDN CP>1. --allgather-cp is a "
@@ -172,7 +177,7 @@ def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron
     validations."""
 
-    if getattr(args, "dynamic_context_parallel", False):
+    if megatron_dynamic_context_parallel(args):
         _validate_dynamic_context_parallel(args)
 
     if not device_utils.is_available():
@@ -195,7 +200,7 @@ def validate_args(args):
 
     # always use varlen
     args.variable_seq_lengths = True
-    if getattr(args, "moe_token_dispatcher_type", None) == "allgather":
+    if args.moe_token_dispatcher_type == "allgather":
         logger.info(
             "--moe-token-dispatcher-type allgather does not support variable sequence length, "
             "please use alltoall dispatcher instead."
@@ -210,7 +215,7 @@ def validate_args(args):
 
     # Megatron-Bridge requires --calculate-per-token-loss when context parallelism is enabled.
     # See https://github.com/NVIDIA-NeMo/Megatron-Bridge
-    if args.context_parallel_size > 1 or getattr(args, "dynamic_context_parallel", False):
+    if args.context_parallel_size > 1 or megatron_dynamic_context_parallel(args):
         assert args.calculate_per_token_loss, (
             "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )
@@ -220,7 +225,7 @@ def validate_args(args):
 
 
 def _has_dense_moe_layers(args):
-    moe_layer_freq = getattr(args, "moe_layer_freq", None)
+    moe_layer_freq = args.moe_layer_freq
     if moe_layer_freq is None:
         return True
 
@@ -259,7 +264,7 @@ def _hf_validate_args(args, hf_config):
     # RoPE kernel cannot handle this and produces numerically different results from the
     # unfused HF/SGLang implementation, causing training-inference log-prob mismatch.
     is_multimodal = hasattr(hf_config, "text_config") or hasattr(hf_config, "thinker_config")
-    if is_multimodal and getattr(args, "apply_rope_fusion", False):
+    if is_multimodal and args.apply_rope_fusion:
         errors.append(
             "Multimodal models use multi-axis RoPE (list of tensors) which is incompatible "
             "with fused RoPE kernels — this causes training-inference log-prob mismatch. "
@@ -276,6 +281,10 @@ def _hf_validate_args(args, hf_config):
 
     validate_dense_ffn = not _is_moe_config(hf_config) or _has_dense_moe_layers(args)
 
+    # Preserve historical operator precedence: older Megatron builds that only
+    # expose layernorm_epsilon validate epsilon alone here (FFN defaults are
+    # filled later). Newer builds with norm_epsilon validate the full set.
+    epsilon_check = [("rms_norm_eps", megatron_norm_epsilon_arg_name(args), equal)]
     for hf_config_name, megatron_config_name, compare_fn in (
         [
             ("hidden_size", "hidden_size", equal),
@@ -287,9 +296,9 @@ def _hf_validate_args(args, hf_config):
             ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
             ("rope_theta", "rotary_base", equal),
         ]
-        + [("rms_norm_eps", "norm_epsilon", equal)]
+        + epsilon_check
         if hasattr(args, "norm_epsilon")
-        else [("rms_norm_eps", "layernorm_epsilon", equal)]
+        else epsilon_check
     ):
         if hf_config_name == "intermediate_size" and not validate_dense_ffn:
             continue
@@ -307,7 +316,7 @@ def _hf_validate_args(args, hf_config):
 
 def _set_default_megatron_args(args):
     # Megatron DistributedOptimizer supports Adam, but not SGD.
-    args.use_distributed_optimizer = getattr(args, "optimizer", "adam") != "sgd"
+    args.use_distributed_optimizer = args.optimizer != "sgd"
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
     _resolve_optimizer_precision_args(args)
@@ -318,8 +327,7 @@ def _set_default_megatron_args(args):
     # TODO: revisit this when megatron(dev) have solved the optimizer-cpu-offload ckpt saving bug
     args.dist_ckpt_save_pre_mcore_014 = True
     # compatible for megatron
-    if hasattr(args, "rope_type") and args.rope_type is None:
-        args.rope_type = "yarn" if args.multi_latent_attention else "rope"
+    ensure_megatron_rope_type(args)
 
     if args.vocab_size and not args.padded_vocab_size:
         args.padded_vocab_size = vocab_size_with_padding(args.vocab_size, args)
@@ -347,7 +355,7 @@ def _derive_cluster_args_from_resource(args):
     if args.resource is None:
         return
 
-    num_gpus_per_node = getattr(args, "num_gpus_per_node", 8)
+    num_gpus_per_node = args.num_gpus_per_node
 
     # --- actor ---
     if "actor" in args.resource:
@@ -388,7 +396,7 @@ def _derive_cluster_args_from_resource(args):
     # --- genrm ---
     if "genrm" in args.resource:
         _, genrm_total_gpus = args.resource["genrm"]
-        if getattr(args, "genrm_num_gpus", 1) == 1 and genrm_total_gpus != 1:
+        if args.genrm_num_gpus == 1 and genrm_total_gpus != 1:
             args.genrm_num_gpus = genrm_total_gpus
             logger.info(f"Derived genrm_num_gpus={args.genrm_num_gpus} from --resource")
 

@@ -469,7 +469,7 @@ class EngineGroup:
             )
             env_vars.update(
                 build_runai_streamer_env_for_load(
-                    getattr(self.args, "model_source", None),
+                    self.args.model_source,
                     effective_model_path,
                     effective_load_format,
                 )
@@ -727,7 +727,7 @@ class RolloutServer:
         # is retried. Do not return None slots to the synchronous weight updater.
         for group, dead_indices in zip(groups, dead_per_group, strict=True):
             if not (
-                getattr(group.args, "fully_async", False)
+                group.args.fully_async
                 and group.is_scaled_out
                 and group.pg is not None
                 and group.skip_router_registration
@@ -1256,9 +1256,9 @@ class RolloutManager(ReloadableMixin):
         # Reuse the shared --eval-* sampling args (no SFT-predict-specific
         # flags). Defaults preserve the original SFT predict behaviour
         # (greedy, max_new_tokens=512) when --eval-* is not provided.
-        eval_temperature = getattr(self.args, "eval_temperature", None)
-        eval_max_response_len = getattr(self.args, "eval_max_response_len", None)
-        eval_top_p = getattr(self.args, "eval_top_p", None)
+        eval_temperature = self.args.eval_temperature
+        eval_max_response_len = self.args.eval_max_response_len
+        eval_top_p = self.args.eval_top_p
         sampling_params = {
             "temperature": 0.0 if eval_temperature is None else eval_temperature,
             "max_new_tokens": 512 if eval_max_response_len is None else eval_max_response_len,
@@ -3106,7 +3106,7 @@ class RolloutManager(ReloadableMixin):
                     return False
 
             pp_size = max(getattr(self.args, "sglang_pp_size", 1), 1)
-            rollout_gpus_per_engine = max(getattr(self.args, "rollout_num_gpus_per_engine", 1), 1)
+            rollout_gpus_per_engine = max(self.args.rollout_num_gpus_per_engine, 1)
             tp_size = max(rollout_gpus_per_engine // pp_size, 1)
 
             if run_precheck:
@@ -3164,7 +3164,7 @@ class RolloutManager(ReloadableMixin):
                 )
 
                 # Parallel sync with concurrency limit
-                max_concurrent = getattr(self.args, "scale_out_max_concurrent_weight_syncs", 4)
+                max_concurrent = self.args.scale_out_max_concurrent_weight_syncs
                 semaphore = asyncio.Semaphore(max_concurrent)
                 remaining = max(30.0, timeout - (time.time() - start_time))
 
@@ -3790,7 +3790,7 @@ class RolloutManager(ReloadableMixin):
             model_name=model_name,
             num_replicas=num_replicas,
             engine_urls=engine_urls or [],
-            timeout_secs=timeout_secs or getattr(self.args, "scale_in_drain_timeout", 30.0) + 60.0,
+            timeout_secs=timeout_secs or self.args.scale_in_drain_timeout + 60.0,
             force=force,
             dry_run=dry_run,
         )
@@ -3892,8 +3892,8 @@ class RolloutManager(ReloadableMixin):
                     return
                 await asyncio.sleep(min(1.0, request.timeout_secs - elapsed))
 
-            drain_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0)
-            shutdown_timeout = getattr(self.args, "scale_in_shutdown_timeout", 20.0)
+            drain_timeout = self.args.scale_in_drain_timeout
+            shutdown_timeout = self.args.scale_in_shutdown_timeout
 
             request.update_status(ScaleInStatus.DRAINING)
             removed, failed = await self._remove_live_engines(
@@ -4431,7 +4431,7 @@ class RolloutManager(ReloadableMixin):
         engine_ids = [f"group_{group.rank_offset}_engine_{idx}" for _, _, group, idx in claimed]
         logger.info("[Eviction] Gracefully removing engines %s", engine_ids)
         try:
-            wait_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0) + 60.0
+            wait_timeout = self.args.scale_in_drain_timeout + 60.0
             deadline = time.monotonic() + wait_timeout
             while self._is_weight_updating:
                 remaining = deadline - time.monotonic()
@@ -4453,8 +4453,8 @@ class RolloutManager(ReloadableMixin):
                         self._remove_live_engines(
                             srv,
                             infos,
-                            drain_timeout=getattr(self.args, "scale_in_drain_timeout", 30.0),
-                            shutdown_timeout=getattr(self.args, "scale_in_shutdown_timeout", 20.0),
+                            drain_timeout=self.args.scale_in_drain_timeout,
+                            shutdown_timeout=self.args.scale_in_shutdown_timeout,
                             force=False,
                         )
                         for _, (srv, infos) in batch_items
@@ -4626,8 +4626,8 @@ def _start_router(
         and not force_new
         and has_pd_disaggregation
         and not args.use_slime_router
-        and not getattr(args, "debug_train_only", False)
-        and getattr(args, "router_decode_policy", None) == "power_of_two"
+        and not args.debug_train_only
+        and args.router_decode_policy == "power_of_two"
     ):
         # The owner chooses and binds the endpoint after engines are ready.
         # SessionShards receive it only after the registry has been verified.
@@ -4932,7 +4932,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     routers_before = tuple(_LAUNCHED_ROUTER_PROCESSES)
     try:
         servers = _start_rollout_servers_impl(args, pg, groups)
-        if getattr(args, "use_agentic_rollout", False):
+        if args.use_agentic_rollout:
             from relax.agentic.rollout import bind_agentic_router
 
             bind_agentic_router(args.sglang_router_ip, args.sglang_router_port)
@@ -4975,7 +4975,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
             has_pd
             and managed
             and not args.use_slime_router
-            and getattr(args, "router_decode_policy", None) == "power_of_two"
+            and args.router_decode_policy == "power_of_two"
             and not args.debug_train_only
         )
         if defer_router:
@@ -5070,7 +5070,7 @@ def _resolve_sglang_config(args) -> SglangConfig:
         assert actual == expected, f"sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
         return config
 
-    if getattr(args, "prefill_num_servers", None) is not None:
+    if args.prefill_num_servers is not None:
         return SglangConfig.from_prefill_num_servers(args)
 
     # Default: single regular group.

@@ -18,12 +18,12 @@ _PROBABILITY_TOLERANCE = 1e-5
 
 
 def score_centering_enabled(args: Any) -> bool:
-    return getattr(args, "advantage_estimator", None) == "score_centering"
+    return args.advantage_estimator == "score_centering"
 
 
 def resolve_score_centering_vocab_size(args: Any) -> int:
     """Cache the model's real output vocabulary, excluding Megatron padding."""
-    vocab_size = getattr(args, "score_centering_vocab_size", None)
+    vocab_size = args.score_centering_vocab_size
     if vocab_size is None:
         from relax.utils.misc import get_hf_config
 

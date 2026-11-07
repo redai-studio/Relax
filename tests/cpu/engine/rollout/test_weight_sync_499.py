@@ -198,6 +198,8 @@ def _group_args(*, group_rm: bool) -> SimpleNamespace:
         partial_rollout=False,
         mask_offpolicy_in_partial_rollout=False,
         sglang_enable_deterministic_inference=False,
+        use_opd=False,
+        opd_type=None,
     )
 
 

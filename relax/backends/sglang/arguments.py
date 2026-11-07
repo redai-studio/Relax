@@ -337,7 +337,7 @@ def validate_args(args):
         args.sglang_router_ip = _wrap_ipv6(args.sglang_router_ip)
 
     # Mutual-exclusion checks for PD disaggregation / sglang-config.
-    assert not (getattr(args, "prefill_num_servers", None) is not None and args.rollout_external), (
+    assert not (args.prefill_num_servers is not None and args.rollout_external), (
         "prefill_num_servers cannot be set when rollout_external is set."
     )
 
@@ -345,9 +345,9 @@ def validate_args(args):
         "sglang_config cannot be set when rollout_external is set."
     )
 
-    assert not (
-        getattr(args, "sglang_config", None) is not None and getattr(args, "prefill_num_servers", None) is not None
-    ), "sglang_config and prefill_num_servers are mutually exclusive. Use engine_groups in the YAML config instead."
+    assert not (getattr(args, "sglang_config", None) is not None and args.prefill_num_servers is not None), (
+        "sglang_config and prefill_num_servers are mutually exclusive. Use engine_groups in the YAML config instead."
+    )
 
 
 def sglang_parse_args():
