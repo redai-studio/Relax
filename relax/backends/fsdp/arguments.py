@@ -763,7 +763,7 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         _fail(errors, getattr(args, field, 1) != 1, f"Image FSDP SFT requires {field}=1.")
     _fail(
         errors,
-        getattr(args, "task_type", "causal_lm") != "causal_lm",
+        args.task_type != "causal_lm",
         "Image SFT does not support text classification",
     )
     _fail(errors, getattr(args, "micro_batch_size", 1) != 1, "Image SFT currently requires --micro-batch-size 1")
