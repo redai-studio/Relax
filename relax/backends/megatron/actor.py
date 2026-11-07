@@ -1548,9 +1548,8 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"got {len(rollout_mini_batches)}."
                     )
                 rollout_data = concat_rollout_batches(rollout_mini_batches)
-                if getattr(self.args, "use_rollout_indexer_replay", False):
-                    for mini_batch in rollout_mini_batches:
-                        mini_batch.pop("rollout_indexer_topk", None)
+                # The merged batch owns the tensors; do not retain the original containers through training.
+                rollout_mini_batches.clear()
                 rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
                 rollout_data[ROLLOUT_MINI_BATCH_METAS_KEY] = rollout_mini_batch_metas
                 if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
@@ -2220,6 +2219,23 @@ class MegatronTrainRayActor(TrainRayActor):
         if use_indexer_replay:
             IndexerReplay.finish_step(expect_backward=self.args.recompute_granularity == "full")
 
+        # Keep only the small performance inputs before releasing the consumed batch.
+        total_lengths = rollout_data["total_lengths"]
+        # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
+        # assistant-only tokens; for RL it's the response-only mask sum. Avoids
+        # the SFT `response_length == total_length` convention (see data.py:296).
+        response_token_counts = [
+            int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
+        ]
+        mm_inputs = rollout_data.get("multimodal_train_inputs")
+        image_grids = _extract_image_grids(mm_inputs) if mm_inputs is not None else None
+        audio_seqlens = _extract_audio_seqlens(mm_inputs) if mm_inputs is not None else None
+        if self._per_step_rollout and self.args.offload_train:
+            # All DataIterators share this dict. Drop its payload before backup/sleep/weight sync.
+            with timer("release_rollout_data"):
+                rollout_data.clear()
+                del mm_inputs
+
         # update the cpu actor weight to the latest model
         self._backup_actor_weights_after_train()
 
@@ -2235,19 +2251,12 @@ class MegatronTrainRayActor(TrainRayActor):
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
 
-        total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
             all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
-        # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
-        # assistant-only tokens; for RL it's the response-only mask sum. Avoids
-        # the SFT `response_length == total_length` convention (see data.py:296).
-        response_token_counts = [
-            int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
-        ]
         all_response_token_counts = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
             all_response_token_counts,
@@ -2259,16 +2268,13 @@ class MegatronTrainRayActor(TrainRayActor):
         Timer().images_seqlens = []
         Timer().image_grid_thw = []
         Timer().audio_seqlens = []
-        mm_inputs = rollout_data.get("multimodal_train_inputs")
-        if mm_inputs is not None:
-            image_grids = _extract_image_grids(mm_inputs)
+        if image_grids is not None:
             all_image_grids = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
                 all_image_grids, image_grids, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().image_grid_thw = sum(all_image_grids, [])
             Timer().images_seqlens = [h * w for t, h, w in Timer().image_grid_thw for _ in range(t)]
-            audio_seqlens = _extract_audio_seqlens(mm_inputs)
             all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
