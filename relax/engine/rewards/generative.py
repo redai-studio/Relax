@@ -99,7 +99,7 @@ class BaseGenerativeScorer:
 
     def __init__(self, args, *, allow_cuda: bool = True) -> None:
         self.args = args
-        runtime = getattr(args, "reward_runtime", "cpu") if args is not None else "cpu"
+        runtime = args.reward_runtime if args is not None else "cpu"
         self._allow_cuda = allow_cuda and runtime != "cpu"
         self._model = None
 
@@ -264,8 +264,8 @@ def post_process(args, samples) -> List[float]:
     _validate_reward_lengths(component_rewards, len(flat))
 
     group_indices = _group_index_lists(flat)
-    component_weights = getattr(args, "reward_component_weights", None) or {}
-    configured_required = getattr(args, "reward_required_components", None)
+    component_weights = args.reward_component_weights or {}
+    configured_required = args.reward_required_components
     required = list(component_weights.keys()) if configured_required is None else list(configured_required)
     std_mode = _advantage_std_mode(args)
 
@@ -278,7 +278,7 @@ def post_process(args, samples) -> List[float]:
         # Backward-compatible fallback when the explicit generative mode is not
         # present on older args objects: the shared flag is on by default and
         # `--disable-grpo-std-normalization` turns the std divisor OFF.
-        std_normalization=bool(getattr(args, "grpo_std_normalization", True)),
+        std_normalization=bool(args.grpo_std_normalization),
     )
 
     # Raw reward = the primary (highest-weight) component, for logging.
@@ -374,10 +374,10 @@ def _log_reward_metrics(args, flat: List[Sample], metrics: Dict[str, float]) -> 
 
 
 def _advantage_std_mode(args) -> str:
-    mode = getattr(args, "generative_advantage_std_mode", None)
+    mode = args.generative_advantage_std_mode
     if mode is not None:
         return str(mode)
-    return "group" if bool(getattr(args, "grpo_std_normalization", True)) else "none"
+    return "group" if bool(args.grpo_std_normalization) else "none"
 
 
 def _advantage_std_mode_metrics(mode: str) -> Dict[str, float]:
@@ -468,7 +468,7 @@ def _get_manager(args):
 
     key = _manager_cache_key(args)
     if key not in _MANAGER_CACHE:
-        runtime = getattr(args, "reward_runtime", "cpu")
+        runtime = args.reward_runtime
         if runtime == "remote":
             _MANAGER_CACHE[key] = GenerativeRewardManager(args)
         else:

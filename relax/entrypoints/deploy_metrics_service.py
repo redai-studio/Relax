@@ -30,6 +30,8 @@ def create_demo_args() -> argparse.Namespace:
         "wandb_team": "demo-team",
         "wandb_group": "demo-group",
         "use_metrics_service": True,  # Enable metrics service
+        # TensorBoardAdapter reads args.save directly after Task 13 cleanup.
+        "save": None,
     }
     return create_namespace(args_dict)
 

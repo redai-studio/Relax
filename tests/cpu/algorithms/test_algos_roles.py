@@ -4,7 +4,6 @@
 
 import importlib.util
 import sys
-from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
@@ -12,6 +11,7 @@ from types import ModuleType
 import pytest
 
 from relax.algorithms import ALGORITHM_SPECS
+from tests.helpers.relax_args import make_args
 
 
 @pytest.fixture()
@@ -45,7 +45,7 @@ def load_registry(monkeypatch):
 
 
 def _args_for(name, **overrides):
-    return Namespace(
+    return make_args(
         **{
             "advantage_estimator": name,
             "multimodal_keys": None,
@@ -57,7 +57,7 @@ def _args_for(name, **overrides):
             "true_on_policy_mode": False,
             "debug_rollout_only": False,
             "debug_train_only": False,
-            "loss_type": None,
+            "loss_type": "policy_loss",
             **overrides,
         }
     )

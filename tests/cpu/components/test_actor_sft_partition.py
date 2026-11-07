@@ -11,6 +11,7 @@ import pytest
 def _mk_actor_config(loss_type: str):
     return Namespace(
         loss_type=loss_type,
+        generation_task=None,
         dpo_reference_free=False,
         kl_coef=0.0,
         use_kl_loss=False,

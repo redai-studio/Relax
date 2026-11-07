@@ -26,7 +26,13 @@ def component(request, monkeypatch):
     obj._logger_instance = Mock()
     obj.role = module_name
     obj.step = 0
-    obj.config = Namespace(num_rollout=1, fully_async=True, loss_type="policy_loss", use_health_check=False)
+    obj.config = Namespace(
+        num_rollout=1,
+        fully_async=True,
+        loss_type="policy_loss",
+        use_health_check=False,
+        sft_async_prepack=False,
+    )
     obj.healthy = Mock()
     obj.data_system_client = Mock()
     yield obj
@@ -165,6 +171,7 @@ async def test_component_constructor_initializes_shared_runner(component, monkey
         start_rollout_id=0,
         loss_type="policy_loss",
         num_rollout=0,
+        sft_async_prepack=False,
     )
     initialized = type(component)(healthy=Mock(), pgs=None, num_gpus=1, config=config, role=component.role)
     try:

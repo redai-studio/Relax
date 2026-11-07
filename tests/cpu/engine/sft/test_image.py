@@ -2,7 +2,6 @@
 """Image data ordering must survive restart without consuming training RNG."""
 
 import json
-from argparse import Namespace
 
 import pytest
 import torch
@@ -31,21 +30,24 @@ def test_sample_order_matches_eight_rank_reference(size):
 
 
 def _args(**overrides):
-    values = dict(
-        loss_type="sft",
-        generation_task="i2i",
-        train_backend="fsdp",
-        model_path="/worker/model",
-        prompt_data="/worker/data.json",
-        i2i_sft_config={"data_root": "/worker", "dataset_size": 19},
-        global_batch_size=8,
-        rollout_batch_size=8,
-        fsdp_trainable_mode="full",
-        num_rollout=None,
-        num_epoch=2,
-        seed=42,
-    )
-    return Namespace(**{**values, **overrides})
+    from tests.helpers.relax_args import make_args
+
+    values = {
+        "loss_type": "sft",
+        "generation_task": "i2i",
+        "train_backend": "fsdp",
+        "model_path": "/worker/model",
+        "prompt_data": "/worker/data.json",
+        "i2i_sft_config": {"data_root": "/worker", "dataset_size": 19},
+        "global_batch_size": 8,
+        "rollout_batch_size": 8,
+        "fsdp_trainable_mode": "full",
+        "num_rollout": None,
+        "num_epoch": 2,
+        "seed": 42,
+    }
+    values.update(overrides)
+    return make_args(**values)
 
 
 def test_head_validation_and_sizing_need_no_worker_mount():

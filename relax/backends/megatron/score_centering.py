@@ -17,7 +17,7 @@ from .cp_utils import all_gather_with_cp, slice_log_prob_with_cp
 def _mask_vocab_logits(logits: torch.Tensor, args: Namespace) -> torch.Tensor:
     """Exclude TP padding from the distribution used by SC and its
     regularizers."""
-    vocab_size = getattr(args, "score_centering_vocab_size", None)
+    vocab_size = args.score_centering_vocab_size
     if vocab_size is None or vocab_size <= 0:
         raise ValueError("Score centering requires the model's unpadded vocabulary size.")
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -93,7 +93,7 @@ def get_score_centering_chunk(
     vocabulary. Empty CP ranks retain the graph for collective backward.
     """
     logits = _mask_vocab_logits(logits, args)
-    with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
+    with_entropy_grad = with_entropy and args.entropy_coef != 0
     log_probs, entropy = calculate_log_probs_and_entropy(
         logits,
         tokens,

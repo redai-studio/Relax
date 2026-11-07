@@ -175,6 +175,7 @@ def test_reference_rebuild_preserves_actor_and_optimizer(
         no_load_rng=False,
         finetune=False,
         megatron_to_hf_mode="bridge",
+        model_source=None,
     )
     original_args = vars(instance.args).copy()
     instance.model = [object()]
@@ -284,6 +285,7 @@ def test_reference_rebuild_rejects_missing_or_ambiguous_checkpoint(tmp_path, ref
         no_load_optim=False,
         no_load_rng=False,
         finetune=False,
+        model_source=None,
     )
     original_args = vars(instance.args).copy()
     instance.model = [object()]

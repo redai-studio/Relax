@@ -371,7 +371,7 @@ class MegatronTrainStateOffloader:
         self.uses_tms: bool = False
 
         # Default is torch_memory_saver; --selective-offload forces the selective path.
-        force_selective = bool(getattr(args, "selective_offload", False))
+        force_selective = bool(args.selective_offload)
         if self.enabled and not force_selective:
             if torch_memory_saver_preloaded():
                 self.uses_tms = self._init_torch_memory_saver(args)
@@ -381,7 +381,7 @@ class MegatronTrainStateOffloader:
                     "offload. Pass --selective-offload to select it explicitly and silence this warning."
                 )
 
-        if self.enabled and not self.uses_tms and getattr(args, "optimizer", "adam") == "sgd":
+        if self.enabled and not self.uses_tms and args.optimizer == "sgd":
             raise ValueError(
                 "SGD does not support selective train-state offload; use a working "
                 "torch_memory_saver configuration or disable train-state offload."
@@ -400,7 +400,7 @@ class MegatronTrainStateOffloader:
         offload."""
         from torch_memory_saver import torch_memory_saver
 
-        margin = max(int(getattr(args, "train_memory_margin_bytes", 0)), 0)
+        margin = max(int(args.train_memory_margin_bytes), 0)
         try:
             torch_memory_saver.memory_margin_bytes = margin
             if margin > 0:

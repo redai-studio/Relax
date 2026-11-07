@@ -433,12 +433,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
 
     is_resuming = sample.status == Sample.Status.ABORTED and sample.response_length > 0
 
-    if (
-        getattr(args, "partial_rollout", False)
-        and is_resuming
-        and getattr(args, "mask_offpolicy_in_partial_rollout", False)
-        and sample.response_length > 0
-    ):
+    if args.partial_rollout and is_resuming and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
     (

@@ -38,7 +38,7 @@ def _collect_perf_metrics(monkeypatch, peak_tflops):
         lambda _args, metrics, step_key: logged_metrics.update(metrics),
     )
 
-    args = Namespace(wandb_always_use_train_step=False)
+    args = Namespace(wandb_always_use_train_step=False, only_train_params_name_list=None)
     train_metric_utils.log_perf_data_raw(
         rollout_id=3,
         args=args,

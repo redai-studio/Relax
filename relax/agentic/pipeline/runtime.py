@@ -1268,9 +1268,7 @@ class RuntimeDomain:
         }
 
     async def collect_agentic_kv_metrics(self) -> dict[str, float]:
-        if not getattr(self.args, "agentic_program_admission", False) and not getattr(
-            self.args, "agentic_session_lifecycle", False
-        ):
+        if not self.args.agentic_program_admission and not self.args.agentic_session_lifecycle:
             return {}
         shard_metrics = await asyncio.gather(
             *(shard.handle.agentic_kv_metrics.remote(reset=True) for shard in self._shards),

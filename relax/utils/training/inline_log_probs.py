@@ -75,7 +75,7 @@ def can_reuse_colocate_log_probs(
         invalid.append("rollout size must equal global_batch_size")
     if len(num_microbatches) != 1:
         invalid.append("exactly one optimizer step per rollout is required")
-    if getattr(args, "num_steps_per_rollout", None) not in (None, 1):
+    if args.num_steps_per_rollout not in (None, 1):
         invalid.append("num_steps_per_rollout")
     if args.moe_router_load_balancing_type not in ("none", ["none"]):
         invalid.append("moe_router_load_balancing_type")

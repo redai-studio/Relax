@@ -135,7 +135,7 @@ class SFTImagePrefetch:
         rather than a fixed PP rank: non-vision PP stages keep only the small
         multimodal metadata and never rebuild pixels.
         """
-        if not getattr(self.args, "is_vl_model", False):
+        if not self.args.is_vl_model:
             return False
         chunks = model if isinstance(model, list) else [model]
         for chunk in chunks:

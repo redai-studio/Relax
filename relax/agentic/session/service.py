@@ -2490,7 +2490,7 @@ class AgenticSessionShard:
                         return
                 if attempt:
                     raise RuntimeGroupError("SGLang router still has no available workers after recovery wait")
-                wait_s = float(getattr(self.args, "router_cb_timeout_duration_secs", 60)) + 2
+                wait_s = float(self.args.router_cb_timeout_duration_secs) + 2
                 logger.warning("SGLang router has no available workers; retrying generation once after %.1fs", wait_s)
                 await asyncio.sleep(wait_s)
         except asyncio.CancelledError:
