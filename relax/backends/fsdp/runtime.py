@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 __all__ = [
     "resolve_block_classes",
     "resolve_fine_grained_modules",
+    "resolve_replicated_modules",
     "fsdp2_wrap",
     "upcast_trainable_params",
     "offload_module_to_cpu",
@@ -70,6 +71,83 @@ def resolve_fine_grained_modules(model: torch.nn.Module) -> List[torch.nn.Module
     return [module for module in model.modules() if getattr(module, "_fsdp_fine_grained", False)]
 
 
+def _parameter_storage_identity(parameter: torch.nn.Parameter) -> tuple[torch.device, int] | None:
+    """Identify shared dense storage without reading data or synchronizing
+    CUDA."""
+    if parameter.device.type == "meta" or parameter.layout != torch.strided:
+        return None
+    storage = parameter.untyped_storage()
+    return (parameter.device, storage.data_ptr()) if storage.nbytes() else None
+
+
+def resolve_replicated_modules(model: torch.nn.Module) -> List[torch.nn.Module]:
+    """Validate optional frozen subtrees excluded from every FSDP boundary.
+
+    The adapter keeps modules registered and must place their parameters on the
+    correct device/dtype before wrapping: native ``ignored_params`` neither
+    moves nor casts them and never reduces their gradients. Sharing within one
+    frozen subtree is allowed; aliases outside it or into a sharded boundary
+    are rejected before any parameter or module mutation.
+    """
+    declared = getattr(model, "_fsdp_replicated_modules", ())
+    if not isinstance(declared, (list, tuple)):
+        raise ValueError("_fsdp_replicated_modules must be a sequence of modules")
+    if not declared:
+        return []
+    available = set(model.modules()) - {model}
+    owned_modules: set[torch.nn.Module] = set()
+    owned_parameters: set[torch.nn.Parameter] = set()
+    owned_storage: set[tuple[torch.device, int]] = set()
+    replicated = []
+    for module in declared:
+        if not isinstance(module, torch.nn.Module) or module not in available:
+            raise ValueError("FSDP replicated modules must be non-root modules belonging to the model")
+        descendants, parameters = set(module.modules()), set(module.parameters())
+        if any(parameter.requires_grad for parameter in parameters):
+            raise ValueError("FSDP replicated modules must contain only frozen parameters")
+        storage = {identity for parameter in parameters if (identity := _parameter_storage_identity(parameter))}
+        if (
+            owned_modules.intersection(descendants)
+            or owned_parameters.intersection(parameters)
+            or owned_storage.intersection(storage)
+        ):
+            raise ValueError("FSDP replicated modules must have disjoint module and parameter ownership")
+        owned_modules.update(descendants)
+        owned_parameters.update(parameters)
+        owned_storage.update(storage)
+        replicated.append(module)
+
+    blocks = tuple(resolve_block_classes(model))
+    boundaries = [
+        *resolve_fine_grained_modules(model),
+        *(module for module in model.modules() if isinstance(module, blocks)),
+    ]
+    for boundary in boundaries:
+        if owned_modules.intersection(boundary.modules()) or owned_parameters.intersection(boundary.parameters()):
+            raise ValueError("FSDP replicated modules overlap a fine-grained or block sharding boundary")
+
+    try:
+        registrations = list(model.named_modules(remove_duplicate=False))
+    except RecursionError as error:
+        raise ValueError("FSDP replicated modules require acyclic module registration") from error
+    prefixes = []
+    for module in replicated:
+        names = [name for name, candidate in registrations if candidate is module]
+        if len(names) != 1:
+            raise ValueError("FSDP replicated modules must not have multiple registration aliases")
+        prefixes.append(names[0])
+    for name, module in registrations:
+        inside = any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes)
+        if inside:
+            continue
+        if module in owned_modules:
+            raise ValueError("FSDP replicated module has an alias outside its declared subtree")
+        for parameter in module.parameters(recurse=False):
+            if parameter in owned_parameters or _parameter_storage_identity(parameter) in owned_storage:
+                raise ValueError("FSDP replicated parameter has an alias outside its declared subtree")
+    return replicated
+
+
 @torch.no_grad()
 def upcast_trainable_params(model: torch.nn.Module, dtype: torch.dtype) -> int:
     """Promote only the TRAINABLE parameters to ``dtype``; return the count.
@@ -111,9 +189,11 @@ def fsdp2_wrap(
 ) -> torch.nn.Module:
     """Apply FSDP2 ``fully_shard`` per transformer block, then to the root.
 
-    Only the trainable transformer is passed here; frozen VAE / text-encoder
-    modules live outside and carry no gradients (design doc 10.1). Each block
-    is sharded first so the root wrap only holds the leftover parameters.
+    RL passes its trainable transformer; image SFT passes the complete forward
+    root. Each block is sharded first so the root wrap only holds the leftover
+    parameters. An adapter may declare frozen ``_fsdp_replicated_modules`` to
+    exclude those parameters from the root as well. The adapter must put them
+    on the correct device/dtype; FSDP does not manage ignored parameters.
 
     When ``activation_checkpointing`` is set, each transformer block is wrapped
     with a non-reentrant checkpoint FIRST (so the block's forward activations are
@@ -142,6 +222,7 @@ def fsdp2_wrap(
     if offload_policy is not None:
         kwargs["offload_policy"] = offload_policy
 
+    replicated_modules = resolve_replicated_modules(model)
     if master_dtype is not None:
         promoted = upcast_trainable_params(model, _DTYPES[master_dtype])
         logger.info(f"fsdp2_wrap: promoted {promoted} trainable param(s) to {master_dtype} optimizer masters")
@@ -172,7 +253,11 @@ def fsdp2_wrap(
         for module in model.modules():
             if isinstance(module, shard_targets):
                 fully_shard(module, **kwargs)
-    fully_shard(model, **kwargs)
+    if replicated_modules:
+        ignored_params = {parameter for module in replicated_modules for parameter in module.parameters()}
+        fully_shard(model, ignored_params=ignored_params, **kwargs)
+    else:
+        fully_shard(model, **kwargs)
     logger.info(
         f"FSDP2 wrapped model; fine-grained modules: {len(fine_grained_modules)} "
         f"({sorted({type(m).__name__ for m in fine_grained_modules})}); "

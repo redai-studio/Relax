@@ -3069,9 +3069,9 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
     pre = _pre_parse_mode()
-    from relax.engine.sft.runtime import is_i2i_sft
+    from relax.engine.sft.runtime import is_image_sft
 
-    image_sft = is_i2i_sft(pre)
+    image_sft = is_image_sft(pre)
     skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None or image_sft
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
@@ -4023,7 +4023,7 @@ def slime_validate_args(args):
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
-    from relax.engine.sft.runtime import is_i2i_sft
+    from relax.engine.sft.runtime import is_image_sft
 
     if args.loss_type in ("sft_loss", "sft-loss"):
         warnings.warn(
@@ -4069,7 +4069,7 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
-    if getattr(args, "lora_rank", 0) > 0 and not is_i2i_sft(args):
+    if getattr(args, "lora_rank", 0) > 0 and not is_image_sft(args):
         if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
             raise ValueError(
                 "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
@@ -4194,8 +4194,8 @@ def slime_validate_args(args):
 
     validate_opd_args(args, is_offline=is_offline, log=logger)
 
-    if is_i2i_sft(args):
-        # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.
+    if is_image_sft(args):
+        # Image SFT uses task-specific DCP directories; do not erase --load for a missing Megatron marker.
         if args.train_backend != "fsdp":
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
@@ -4438,7 +4438,7 @@ def slime_validate_args(args):
         # path knows how to (a) cap per-GPU tokens (CP-aware) and (b) build
         # balanced micro-batches. Static --micro-batch-size cannot do either,
         # so we require --use-dynamic-batch-size.
-        if not args.use_dynamic_batch_size and not is_i2i_sft(args):
+        if not args.use_dynamic_batch_size and not is_image_sft(args):
             raise ValueError(
                 f"--loss-type {args.loss_type} requires --use-dynamic-batch-size (with --max-tokens-per-gpu). "
                 "Offline training relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "
@@ -4446,7 +4446,7 @@ def slime_validate_args(args):
             )
         # The controller installs SeqlenBalancedSampler for offline training, so keep the
         # Megatron data path in DP-balanced mode as well.
-        if not args.balance_data and not is_i2i_sft(args):
+        if not args.balance_data and not is_image_sft(args):
             logger.info("--loss-type %s: auto-enabling --balance-data for DP-balanced batching.", args.loss_type)
             args.balance_data = True
         from relax.engine.sft.runtime import validate_preference_args
