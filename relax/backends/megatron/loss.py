@@ -1253,7 +1253,9 @@ def policy_loss_function(
         loss = loss + opd_loss
 
     if weight_version_audit.PREPARED_FIELD in batch and (
-        args.use_opsm or (not is_score_centering and (args.get_mismatch_metrics or args.use_tis))
+        args.use_opsm
+        or getattr(args, "enable_mtp_training", False)
+        or (not is_score_centering and (args.get_mismatch_metrics or args.use_tis))
     ):
         batch["weight_audit_loss_masks"] = (
             modified_response_masks

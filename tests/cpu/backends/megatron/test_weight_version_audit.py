@@ -433,6 +433,60 @@ def test_opsm_audit_counts_union_of_active_losses(tmp_path, monkeypatch, auxilia
     assert batch["loss_masks"][0].tolist() == [1, 1]
 
 
+@pytest.mark.parametrize("prompt", [1, 2])
+def test_plain_mtp_initializes_audit_target_counts(tmp_path, monkeypatch, prompt):
+    from tests.cpu.backends.megatron.test_score_centering_loss import _args, _backend
+
+    monkeypatch.setenv("RELAX_WEIGHT_AUDIT_DIR", str(tmp_path))
+    loss_module, cp = _backend(monkeypatch)
+    args = _args(
+        advantage_estimator="grpo",
+        enable_mtp_training=True,
+        mtp_num_layers=2,
+        mtp_loss_scaling_factor=0.1,
+        opd_token_selection="student_sampled",
+        opd_loss_coef=0.0,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        entropy_coef=0.0,
+    )
+    mask = torch.tensor([1, 0, 1])
+    total = prompt + len(mask)
+    row = audit.prepare_row(
+        {"spans": [{"token_start": position, "token_end": position + 1} for position in range(prompt, total)]},
+        total,
+        len(mask),
+        mask.tolist(),
+    )
+    batch = {
+        "unconcat_tokens": [torch.arange(total) % 4],
+        "advantages": [torch.ones(len(mask))],
+        "log_probs": [torch.full((len(mask),), -math.log(4))],
+        "total_lengths": [total],
+        "response_lengths": [len(mask)],
+        "loss_masks": [mask],
+        audit.PREPARED_FIELD: [row],
+    }
+    reducer = cp.get_sum_of_sample_mean([total], [len(mask)], batch["loss_masks"])
+    loss_module.policy_loss_function(args, batch, torch.zeros((1, total, 4)), reducer)
+    counts = _counts_helper(loss_module, cp)(args, batch)
+    policy_targets = {position for position in range(prompt, total) if mask[position - prompt]}
+    mtp_targets = {
+        position + depth + 1
+        for depth in (1, 2)
+        for position in range(total)
+        if prompt <= position + depth + 1 < total and mask[position + depth + 1 - prompt]
+    }
+    targets = policy_targets | mtp_targets
+    assert mtp_targets
+    assert counts is not None
+    assert counts.tolist() == [len(targets), *(int(position in targets) for position in range(prompt, total))]
+    step = audit.AuditStep("plain-mtp")
+    step.observe(0, batch[audit.PREPARED_FIELD], counts=counts)
+    assert step.commit(0)["eligible_tokens"] == len(targets)
+    assert batch["loss_masks"][0].tolist() == [1, 0, 1]
+
+
 @pytest.mark.parametrize("prompt,response,scale", [(2, 3, 0.1), (1, 3, 0.1), (1, 1, 0.1), (2, 3, 0.0)])
 def test_rs_rejection_retains_mtp_target_coverage(monkeypatch, prompt, response, scale):
     from tests.cpu.backends.megatron.test_score_centering_loss import _backend
