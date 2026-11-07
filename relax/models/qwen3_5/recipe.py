@@ -75,7 +75,9 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
     _check_args(args)
     _TEXT_ONLY_CPT = getattr(args, "sft_training_mode", None) == "cpt"
     assert args.max_tokens_per_gpu == 262144
-    assert mpu.get_data_parallel_world_size(with_context_parallel=False) == 16
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    assert dp_size > 0 and dp_size % (args.expert_model_parallel_size // args.tensor_model_parallel_size) == 0
+    assert args.global_batch_size > 0 and args.global_batch_size % dp_size == 0
     assert tex.get_cublasLt_version() == 130300
     assert args.qkv_format == "thd" and not getattr(args, "dynamic_context_parallel", False)
     assert not getattr(args, "overlap_moe_expert_parallel_comm", False)
