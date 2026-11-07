@@ -81,8 +81,12 @@ def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgath
         [
             node
             for node in nodes
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
+            if isinstance(node, (ast.Assign, ast.If))
+            and any(
+                isinstance(child, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id in names for target in child.targets)
+                for child in ast.walk(node)
+            )
         ],
         partitioning,
     )

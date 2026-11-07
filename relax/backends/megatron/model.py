@@ -36,6 +36,7 @@ from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
+from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.device import device_module
@@ -1560,6 +1561,7 @@ def train_one_step(
         device_module.empty_cache()
         logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
     valid_step = True
+    step_capture = None
     skipped_nonfinite_grad = False
     if _is_global_zero_token_step(losses_reduced):
         # No effective loss tokens anywhere in the global batch. Gradients are
@@ -1578,7 +1580,22 @@ def train_one_step(
         num_zeros_in_grad = None
     else:
         try:
-            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+            capture_root = os.environ.get("RELAX_FLOPS_CAPTURE_DIR")
+            if capture_root and rollout_id == 0 and step_id == 0:
+                from relax.utils.training.optimizer_step_capture import OptimizerStepCapture
+
+                capture_group = torch.distributed.group.WORLD
+                capture_rank = torch.distributed.get_rank(capture_group)
+                step_capture = OptimizerStepCapture(
+                    optimizer,
+                    Path(capture_root) / f"rank-{capture_rank:05d}",
+                    group=capture_group,
+                    device=device_utils.make_current_torch_device(),
+                )
+                with step_capture:
+                    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+            else:
+                update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         except NonFiniteGradientNormError as exc:
             # Only the synchronized pre-update norm guard can take this path: it runs before
             # clipping or *any* child optimizer update. Do not swallow unrelated
@@ -1683,8 +1700,12 @@ def train_one_step(
             loss_reduced["rm/score_chosen_std"] = math.sqrt(max(chosen_second - chosen_mean**2, 0.0))
             loss_reduced["rm/score_rejected_std"] = math.sqrt(max(rejected_second - rejected_mean**2, 0.0))
 
+        if step_capture is not None:
+            step_capture.finish(loss_reduced, bool(update_successful))
         capture_hooks.end_step_for()
         return loss_reduced, grad_norm
+    if step_capture is not None:
+        step_capture.finish({}, bool(update_successful))
     capture_hooks.end_step_for()
     return {}, grad_norm
 

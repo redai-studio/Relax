@@ -187,3 +187,20 @@ def test_sft_packing_preserves_default_and_archived_recipe(arguments_module, cli
     parser = argparse.ArgumentParser()
     arguments_module.get_slime_extra_args_provider()(parser)
     assert parser.parse_args(cli).sft_packing_strategy == expected
+
+
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        ([], (False, False)),
+        (["--flops-microbatch-packing"], (True, False)),
+        (["--flops-dp-balancing"], (False, True)),
+        (["--flops-microbatch-packing", "--flops-dp-balancing"], (True, True)),
+    ],
+)
+def test_flops_scheduling_flags_are_independent_and_opt_in(arguments_module, flags, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+    args = parser.parse_args(flags)
+    assert (args.flops_microbatch_packing, args.flops_dp_balancing) == expected
