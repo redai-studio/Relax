@@ -1,0 +1,3934 @@
+{
+  "baseline_revision": "9ca8cedce9ef5e0f3bbd5b10d38ad2e81a6a0f13",
+  "candidate_source_lf_sha256": {
+    "relax/agentic/pipeline/__init__.py": "1186eb1886dfa77e35fd2dc50b1d6ac28c42fb44d36c9c1b773d8f8ec6afd343",
+    "relax/agentic/session/service.py": "168b78fac0bb443c43f7f3332c596fea95e733c19600ec322e234551d2dd9cc3",
+    "scripts/benchmarks/benchmark_agentic_session_export.py": "abe91aa4c3012b458302abab25d09b8892b5d8c9d8c3e88e4d78a8a0a258fc90"
+  },
+  "cases": {
+    "t8-c1": {
+      "baseline": [
+        {
+          "build_s": 0.04909636000002138,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.1418364270000003,
+            "shard_loop_s": 0.8539651589999999,
+            "threads_s": {
+              "bench-client": 0.22,
+              "bench-rss-sampler": 0.05,
+              "shard-loop": 0.86
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.04887014400003409,
+            "active_drain_per_s": 40.92478221465042,
+            "batch_elapsed_s": 4.024731688999964,
+            "batch_wallclock_per_s": 0.49692753568299247,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 24.95974600003592,
+              "mean": 24.435072000017044,
+              "p50": 24.435072000017044,
+              "p90": 24.854811200032145,
+              "p99": 24.949252520035543,
+              "p999": 24.958696652035883
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 24.95974600003592,
+              "mean": 24.435072000017044,
+              "p50": 24.435072000017044,
+              "p90": 24.854811200032145,
+              "p99": 24.949252520035543,
+              "p999": 24.958696652035883
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 23.75095600007171,
+            "mean": 1.1284588541859837,
+            "p50": 1.042907000055493,
+            "p90": 1.43270959996471,
+            "p99": 1.7685926800106684,
+            "p999": 18.515228888062737
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 22.35999111826459,
+            "mean": 0.6280674565906755,
+            "p50": 0.5908281019060269,
+            "p90": 0.9991983498025547,
+            "p99": 1.1237542910419056,
+            "p999": 16.361086218313144
+          },
+          "loop_lag_raw_ms": {
+            "count": 5979,
+            "max": 22.35999111826459,
+            "mean": 0.5937270324468545,
+            "p50": 0.5883131669861541,
+            "p90": 0.9956543024827624,
+            "p99": 1.1080015275501867,
+            "p999": 1.2780138885375512
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.00298163399998,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 639.53515625,
+            "start_mib": 637.2734375
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 2,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 26.200453999990714,
+            "mean": 4.024800135020807,
+            "p50": 3.9374680000037188,
+            "p90": 4.490725500079407,
+            "p99": 5.111175070024955,
+            "p999": 25.59560596301692
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0002805630000466408
+          },
+          "timeline_short_max_ms": [
+            5.1, 26.2, 4.9, 5.2, 5.2, 25.2, 4.6, 5.0, 4.5, 4.6, 4.7, 4.6, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.000987527999996, 5.000760057999969],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 0.050353866999898855,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.0650821389999998,
+            "shard_loop_s": 0.7924269370000001,
+            "threads_s": {
+              "bench-client": 0.2,
+              "bench-rss-sampler": 0.06,
+              "shard-loop": 0.79
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.04513598199991975,
+            "active_drain_per_s": 44.310545852387925,
+            "batch_elapsed_s": 4.022162247999972,
+            "batch_wallclock_per_s": 0.4972449833406158,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 23.354126999947766,
+              "mean": 22.567990999959875,
+              "p50": 22.567990999959875,
+              "p90": 23.196899799950188,
+              "p99": 23.33840427994801,
+              "p999": 23.35255472794779
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 23.354126999947766,
+              "mean": 22.567990999959875,
+              "p50": 22.567990999959875,
+              "p90": 23.196899799950188,
+              "p99": 23.33840427994801,
+              "p999": 23.35255472794779
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 17.294877999916025,
+            "mean": 1.14685522497003,
+            "p50": 1.0280964999651587,
+            "p90": 1.5369141999713065,
+            "p99": 1.9445300599863882,
+            "p999": 15.867596289926867
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 19.955381023692098,
+            "mean": 0.6191549032085959,
+            "p50": 0.5850255578820907,
+            "p90": 0.9906103635557884,
+            "p99": 1.1378652763403356,
+            "p999": 13.95610775592935
+          },
+          "loop_lag_raw_ms": {
+            "count": 5981,
+            "max": 19.955381023692098,
+            "mean": 0.5930441275371878,
+            "p50": 0.5828330494068723,
+            "p90": 0.9888172336331991,
+            "p99": 1.119885270895793,
+            "p999": 1.3878178445975737
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.002367781999965,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 640.69921875,
+            "start_mib": 637.30078125
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 2,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 22.903611999936402,
+            "mean": 3.9485762183030224,
+            "p50": 3.8779679999834116,
+            "p90": 4.469745300048089,
+            "p99": 4.894111609951324,
+            "p999": 22.064529205941067
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.00027178300001651223
+          },
+          "timeline_short_max_ms": [
+            4.8, 22.9, 5.0, 4.9, 4.8, 21.5, 4.3, 4.5, 4.9, 4.7, 4.7, 4.4, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.000186546000009, 5.0005686079999805],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 0.05140100000005532,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.0863675160000001,
+            "shard_loop_s": 0.8106237459999996,
+            "threads_s": {
+              "bench-client": 0.2,
+              "bench-rss-sampler": 0.05,
+              "shard-loop": 0.82
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.04712149400006638,
+            "active_drain_per_s": 42.443476006876665,
+            "batch_elapsed_s": 4.022681098000021,
+            "batch_wallclock_per_s": 0.4971808481150423,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 23.5791350000909,
+              "mean": 23.56074700003319,
+              "p50": 23.56074700003319,
+              "p90": 23.575457400079358,
+              "p99": 23.578767240089746,
+              "p999": 23.579098224090785
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 23.5791350000909,
+              "mean": 23.56074700003319,
+              "p50": 23.56074700003319,
+              "p90": 23.575457400079358,
+              "p99": 23.578767240089746,
+              "p999": 23.579098224090785
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 7.83397599991531,
+            "mean": 1.0646781207891347,
+            "p50": 1.0278459998858125,
+            "p90": 1.43952010000703,
+            "p99": 1.8773464699575015,
+            "p999": 7.482204805925257
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 20.848131023626593,
+            "mean": 0.6278807290278223,
+            "p50": 0.5882776038106385,
+            "p90": 1.005297327446897,
+            "p99": 1.1404982883038883,
+            "p999": 14.849165826864137
+          },
+          "loop_lag_raw_ms": {
+            "count": 5981,
+            "max": 20.848131023626593,
+            "mean": 0.5985381469423611,
+            "p50": 0.5868240964446159,
+            "p90": 1.002751251121481,
+            "p99": 1.127364172975831,
+            "p999": 1.33409706683324
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.002449472999956,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 639.90625,
+            "start_mib": 637.2265625
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 2,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 24.253477999991446,
+            "mean": 4.0067982466236645,
+            "p50": 3.9243279999823244,
+            "p90": 4.508152799940035,
+            "p99": 5.0816372999258865,
+            "p999": 23.704505880997377
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0002810339999541611
+          },
+          "timeline_short_max_ms": [
+            5.2, 24.3, 4.9, 5.2, 5.1, 23.3, 4.6, 4.8, 4.5, 4.9, 4.9, 4.6, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0011273970000047, 5.000231576999909],
+          "window_s": 12.0
+        }
+      ],
+      "candidate": [
+        {
+          "build_s": 0.05528594700001577,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.0484237450000005,
+            "shard_loop_s": 0.7647090029999997,
+            "threads_s": {
+              "agentic-session-export_0": 0.01,
+              "bench-client": 0.19,
+              "bench-rss-sampler": 0.05,
+              "shard-loop": 0.77
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.018512353000005533,
+            "active_drain_per_s": 108.03596927950771,
+            "batch_elapsed_s": 4.008927816999972,
+            "batch_wallclock_per_s": 0.4988865081378975,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 9.317805000023327,
+              "mean": 9.256176500002766,
+              "p50": 9.256176500002766,
+              "p90": 9.305479300019215,
+              "p99": 9.316572430022916,
+              "p999": 9.317681743023286
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 9.317805000023327,
+              "mean": 9.256176500002766,
+              "p50": 9.256176500002766,
+              "p90": 9.305479300019215,
+              "p99": 9.316572430022916,
+              "p999": 9.317681743023286
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 6.947003000050245,
+            "mean": 1.0210472749946575,
+            "p50": 0.9679009999672417,
+            "p90": 1.4289819000509851,
+            "p99": 1.8078167599776398,
+            "p999": 5.794631996029355
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 5.697725023651401,
+            "mean": 0.5853414839008337,
+            "p50": 0.5736856710427674,
+            "p90": 0.991786946872253,
+            "p99": 1.1279061424897918,
+            "p999": 1.5216014133344204
+          },
+          "loop_lag_raw_ms": {
+            "count": 5995,
+            "max": 5.697725023651401,
+            "mean": 0.5842298186680591,
+            "p50": 0.5733100384759382,
+            "p90": 0.990905692128763,
+            "p99": 1.123591921118533,
+            "p999": 1.3112078828301137
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.001953896000032,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 640.81640625,
+            "start_mib": 637.54296875
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 2,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 9.65686500001084,
+            "mean": 3.9014693199934904,
+            "p50": 3.8993999999661355,
+            "p90": 4.4796625000799395,
+            "p99": 4.9378032899960544,
+            "p999": 9.1477443510326
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0003738540000313151
+          },
+          "timeline_short_max_ms": [
+            5.0, 9.7, 4.9, 5.5, 4.9, 8.8, 4.6, 5.0, 4.6, 4.4, 4.6, 4.5, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0010040969999636, 5.000736856999993],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 0.050942130000066754,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.0329674949999998,
+            "shard_loop_s": 0.7525026260000001,
+            "threads_s": {
+              "agentic-session-export_0": 0.01,
+              "bench-client": 0.19,
+              "bench-rss-sampler": 0.06,
+              "shard-loop": 0.75
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.020882078000113324,
+            "active_drain_per_s": 95.77590889130605,
+            "batch_elapsed_s": 4.013144347000093,
+            "batch_wallclock_per_s": 0.4983623381239802,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 11.174506000088513,
+              "mean": 10.441039000056662,
+              "p50": 10.441039000056662,
+              "p90": 11.027812600082143,
+              "p99": 11.159836660087876,
+              "p999": 11.17303906608845
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 11.174506000088513,
+              "mean": 10.441039000056662,
+              "p50": 10.441039000056662,
+              "p90": 11.027812600082143,
+              "p99": 11.159836660087876,
+              "p999": 11.17303906608845
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 9.60203299996465,
+            "mean": 1.2892454166343252,
+            "p50": 1.0849965000261363,
+            "p90": 2.1782933999588745,
+            "p99": 3.0091366399972226,
+            "p999": 9.325770031977896
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 6.219117023647414,
+            "mean": 0.6237560760396642,
+            "p50": 0.613518119962464,
+            "p90": 1.0389586432552278,
+            "p99": 1.2661707474001114,
+            "p999": 2.21924838096712
+          },
+          "loop_lag_raw_ms": {
+            "count": 5992,
+            "max": 6.219117023647414,
+            "mean": 0.6223378677466662,
+            "p50": 0.6131416504331355,
+            "p90": 1.0382267062368558,
+            "p99": 1.2604660572094417,
+            "p999": 1.7730366592806215
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.002048839000054,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 640.453125,
+            "start_mib": 637.375
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 2,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 12.449634999939008,
+            "mean": 4.2734519383018705,
+            "p50": 4.0270284999905925,
+            "p90": 5.615261899924917,
+            "p99": 6.287169070045593,
+            "p999": 10.498497923971277
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0003774159999920812
+          },
+          "timeline_short_max_ms": [
+            4.9, 9.2, 6.5, 6.3, 6.4, 12.4, 4.4, 4.9, 4.8, 4.7, 4.5, 4.4, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0001668090000067, 5.0021379369999295],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 0.05164406300002611,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.061818282,
+            "shard_loop_s": 0.7731774799999998,
+            "threads_s": {
+              "agentic-session-export_0": 0.01,
+              "bench-client": 0.2,
+              "bench-rss-sampler": 0.06,
+              "shard-loop": 0.76
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.020632400999943457,
+            "active_drain_per_s": 96.93491319820127,
+            "batch_elapsed_s": 4.009356006999951,
+            "batch_wallclock_per_s": 0.49883322820627346,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 11.249848999909773,
+              "mean": 10.316200499971728,
+              "p50": 10.316200499971728,
+              "p90": 11.063119299922164,
+              "p99": 11.231176029911012,
+              "p999": 11.247981702909897
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 11.249848999909773,
+              "mean": 10.316200499971728,
+              "p50": 10.316200499971728,
+              "p90": 11.063119299922164,
+              "p99": 11.231176029911012,
+              "p999": 11.247981702909897
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 8.79112300003726,
+            "mean": 1.0467018541528244,
+            "p50": 1.0367500000256769,
+            "p90": 1.5384885999765174,
+            "p99": 1.989067669969695,
+            "p999": 7.215911523031127
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 6.771743023705312,
+            "mean": 0.5794850978903318,
+            "p50": 0.5694480844340433,
+            "p90": 0.9936697545526841,
+            "p99": 1.1331558148492609,
+            "p999": 1.5197353434045449
+          },
+          "loop_lag_raw_ms": {
+            "count": 5995,
+            "max": 6.771743023705312,
+            "mean": 0.5776524023409302,
+            "p50": 0.5691532280707179,
+            "p90": 0.9930368694540448,
+            "p99": 1.1278759914989678,
+            "p999": 1.3639183922448492
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.002606863999972,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 640.328125,
+            "start_mib": 637.27734375
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 2,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 10.651467000002413,
+            "mean": 3.9204505349867227,
+            "p50": 3.929676999973708,
+            "p90": 4.4508289999271256,
+            "p99": 4.973624689941971,
+            "p999": 9.60304628495999
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0003932370000256924
+          },
+          "timeline_short_max_ms": [
+            5.2, 10.7, 4.8, 5.0, 4.8, 8.9, 4.6, 4.6, 4.8, 4.6, 4.4, 4.5, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0003533589999734, 5.000328311999965],
+          "window_s": 12.0
+        }
+      ]
+    },
+    "t8-c8": {
+      "baseline": [
+        {
+          "build_s": 0.2468661069999598,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.4185896239999995,
+            "shard_loop_s": 1.1117508299999996,
+            "threads_s": {
+              "bench-client": 0.22,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.01,
+              "shard-loop": 1.11
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g0-s1": ["a5473427556d0f7925529f38d55e9d59ca29223d9914c423d1c5eb9d56d3b4cf"],
+            "long-g0-s2": ["37f2dbdfba6510115b39cb21fb761df173b232e4d286ef3b06ba17a5fbe6f100"],
+            "long-g0-s3": ["6b3a74aa3026492eeabea65d36553e97471061fee6b473a29a23bb442c96f3c3"],
+            "long-g0-s4": ["d18e1a761ce4630c382e0c6f2c6357c5a2eb5fdeea816eaa754c09f9b74035ce"],
+            "long-g0-s5": ["78421c5dfbf22ade72e7b7303b594cf2dce0e75a7e07718db8d70df3cf39b348"],
+            "long-g0-s6": ["cb61a53a7c2991d4298a0821ac9f49670d6d9e18819ce489a232aa5370aea2a0"],
+            "long-g0-s7": ["ca0069853588c911cb6ccbcdcf7770f127d4a27ac2828614b557f5323ef2a430"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"],
+            "long-g1-s1": ["c8618cee39b9d68751bad44a9a6d69e1a6c807762b14f8004bddd8ba1a349c6c"],
+            "long-g1-s2": ["85880ba55f1af8c2ee4982c23952354a5ebc0fdb19265203e5987e9d2ac0cfe5"],
+            "long-g1-s3": ["757239f62df594b83ea779ed985fb6d6d0186f78e6db5edd0eb74d850ea3d99e"],
+            "long-g1-s4": ["5712d55e5481223107eaf4bd8decdadb665098f85c3dd5ffbd5909c63a48af9d"],
+            "long-g1-s5": ["c89f1f2c4b5ea42d5cb0fc2a9459739335aab2d3bb8c6ef2a29af81ec844c033"],
+            "long-g1-s6": ["d45202d6d8365e03746a14758acd18f491b70b1530e908c405d337419ad8a47c"],
+            "long-g1-s7": ["95e9057647476586992040892a1e58735fd5246f931ad617e681ba2b935918d4"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 0.3385574449999922,
+            "active_drain_per_s": 47.259335856579284,
+            "batch_elapsed_s": 4.178234842999984,
+            "batch_wallclock_per_s": 3.829368286180859,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 177.51695099997278,
+              "mean": 169.23669456251034,
+              "p50": 169.25374749999378,
+              "p90": 177.47861699999135,
+              "p99": 177.5115695999773,
+              "p999": 177.51641285997323
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 177.51695099997278,
+              "mean": 169.2787224999961,
+              "p50": 169.2787224999961,
+              "p90": 175.86930529997744,
+              "p99": 177.35218642997324,
+              "p999": 177.50047454297282
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 124.01541499997393,
+            "mean": 2.7172123541565916,
+            "p50": 0.9985314999880757,
+            "p90": 1.6166819999739346,
+            "p99": 67.32190831996351,
+            "p999": 119.48932764398086
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 169.4723089760828,
+            "mean": 2.758048394411237,
+            "p50": 0.5884319811571004,
+            "p90": 1.0225111632848893,
+            "p99": 101.49244233614192,
+            "p999": 157.47630897602633
+          },
+          "loop_lag_raw_ms": {
+            "count": 5839,
+            "max": 169.4723089760828,
+            "mean": 0.6359746724624028,
+            "p50": 0.5734619668373853,
+            "p90": 0.9969441739599461,
+            "p99": 1.1116298542879122,
+            "p999": 1.4595505943572515
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.000640546999989,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 656.80078125,
+            "start_mib": 651.78125
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 12,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 174.07745399998475,
+            "mean": 6.400756556657446,
+            "p50": 3.9007085000264397,
+            "p90": 4.55909000002066,
+            "p99": 116.42111359996987,
+            "p999": 163.7574704869863
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.00030399799999258903
+          },
+          "timeline_short_max_ms": [
+            5.3, 156.8, 5.0, 5.0, 5.2, 174.1, 4.7, 4.8, 4.6, 4.4, 4.3, 5.2, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0004100969999854, 5.001130413999988],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 0.24953033600002072,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.4160362319999997,
+            "shard_loop_s": 1.108753036,
+            "threads_s": {
+              "bench-client": 0.22,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.01,
+              "shard-loop": 1.12
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g0-s1": ["a5473427556d0f7925529f38d55e9d59ca29223d9914c423d1c5eb9d56d3b4cf"],
+            "long-g0-s2": ["37f2dbdfba6510115b39cb21fb761df173b232e4d286ef3b06ba17a5fbe6f100"],
+            "long-g0-s3": ["6b3a74aa3026492eeabea65d36553e97471061fee6b473a29a23bb442c96f3c3"],
+            "long-g0-s4": ["d18e1a761ce4630c382e0c6f2c6357c5a2eb5fdeea816eaa754c09f9b74035ce"],
+            "long-g0-s5": ["78421c5dfbf22ade72e7b7303b594cf2dce0e75a7e07718db8d70df3cf39b348"],
+            "long-g0-s6": ["cb61a53a7c2991d4298a0821ac9f49670d6d9e18819ce489a232aa5370aea2a0"],
+            "long-g0-s7": ["ca0069853588c911cb6ccbcdcf7770f127d4a27ac2828614b557f5323ef2a430"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"],
+            "long-g1-s1": ["c8618cee39b9d68751bad44a9a6d69e1a6c807762b14f8004bddd8ba1a349c6c"],
+            "long-g1-s2": ["85880ba55f1af8c2ee4982c23952354a5ebc0fdb19265203e5987e9d2ac0cfe5"],
+            "long-g1-s3": ["757239f62df594b83ea779ed985fb6d6d0186f78e6db5edd0eb74d850ea3d99e"],
+            "long-g1-s4": ["5712d55e5481223107eaf4bd8decdadb665098f85c3dd5ffbd5909c63a48af9d"],
+            "long-g1-s5": ["c89f1f2c4b5ea42d5cb0fc2a9459739335aab2d3bb8c6ef2a29af81ec844c033"],
+            "long-g1-s6": ["d45202d6d8365e03746a14758acd18f491b70b1530e908c405d337419ad8a47c"],
+            "long-g1-s7": ["95e9057647476586992040892a1e58735fd5246f931ad617e681ba2b935918d4"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 0.3500330850000637,
+            "active_drain_per_s": 45.70996481660323,
+            "batch_elapsed_s": 4.186537573999999,
+            "batch_wallclock_per_s": 3.821773892432287,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 179.65770000000703,
+              "mean": 168.78931006250752,
+              "p50": 163.79695649999348,
+              "p90": 179.12975000001552,
+              "p99": 179.5813465500146,
+              "p999": 179.65006465500778
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 186.20107000003827,
+              "mean": 175.01654250003185,
+              "p50": 175.01654250003185,
+              "p90": 183.964164500037,
+              "p99": 185.97737945003814,
+              "p999": 186.17870094503826
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 129.4471410000142,
+            "mean": 2.9376417833375967,
+            "p50": 1.0318385000118724,
+            "p90": 1.5512378999801513,
+            "p99": 71.46380774998504,
+            "p999": 124.55155390802297
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 156.32003602365785,
+            "mean": 2.5783429422423487,
+            "p50": 0.5889450695804044,
+            "p90": 1.0188222387455426,
+            "p99": 94.32329181607436,
+            "p999": 148.32036160294243
+          },
+          "loop_lag_raw_ms": {
+            "count": 5832,
+            "max": 156.32003602365785,
+            "mean": 0.6379441981712546,
+            "p50": 0.5759581676443304,
+            "p90": 0.991846540455299,
+            "p99": 1.1177853459673763,
+            "p999": 1.6199313546604928
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.002382843000078,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 657.6875,
+            "start_mib": 652.90625
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 12,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 179.79405200003384,
+            "mean": 6.638853740002825,
+            "p50": 3.9244089999783682,
+            "p90": 4.615367599978981,
+            "p99": 123.09149130009924,
+            "p999": 168.10215243099168
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.00038375600001927523
+          },
+          "timeline_short_max_ms": [
+            4.7, 160.3, 5.0, 5.1, 4.8, 179.8, 4.5, 4.5, 4.6, 4.3, 4.6, 4.6, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0003823089999742, 5.000719989000004],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 0.21827218399994308,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.4288667469999994,
+            "shard_loop_s": 1.1246030620000003,
+            "threads_s": {
+              "bench-client": 0.23,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.01,
+              "shard-loop": 1.13
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g0-s1": ["a5473427556d0f7925529f38d55e9d59ca29223d9914c423d1c5eb9d56d3b4cf"],
+            "long-g0-s2": ["37f2dbdfba6510115b39cb21fb761df173b232e4d286ef3b06ba17a5fbe6f100"],
+            "long-g0-s3": ["6b3a74aa3026492eeabea65d36553e97471061fee6b473a29a23bb442c96f3c3"],
+            "long-g0-s4": ["d18e1a761ce4630c382e0c6f2c6357c5a2eb5fdeea816eaa754c09f9b74035ce"],
+            "long-g0-s5": ["78421c5dfbf22ade72e7b7303b594cf2dce0e75a7e07718db8d70df3cf39b348"],
+            "long-g0-s6": ["cb61a53a7c2991d4298a0821ac9f49670d6d9e18819ce489a232aa5370aea2a0"],
+            "long-g0-s7": ["ca0069853588c911cb6ccbcdcf7770f127d4a27ac2828614b557f5323ef2a430"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"],
+            "long-g1-s1": ["c8618cee39b9d68751bad44a9a6d69e1a6c807762b14f8004bddd8ba1a349c6c"],
+            "long-g1-s2": ["85880ba55f1af8c2ee4982c23952354a5ebc0fdb19265203e5987e9d2ac0cfe5"],
+            "long-g1-s3": ["757239f62df594b83ea779ed985fb6d6d0186f78e6db5edd0eb74d850ea3d99e"],
+            "long-g1-s4": ["5712d55e5481223107eaf4bd8decdadb665098f85c3dd5ffbd5909c63a48af9d"],
+            "long-g1-s5": ["c89f1f2c4b5ea42d5cb0fc2a9459739335aab2d3bb8c6ef2a29af81ec844c033"],
+            "long-g1-s6": ["d45202d6d8365e03746a14758acd18f491b70b1530e908c405d337419ad8a47c"],
+            "long-g1-s7": ["95e9057647476586992040892a1e58735fd5246f931ad617e681ba2b935918d4"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 0.3474724260000812,
+            "active_drain_per_s": 46.046819266160306,
+            "batch_elapsed_s": 4.170789049000064,
+            "batch_wallclock_per_s": 3.836204567535239,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 177.00701700005084,
+              "mean": 170.55255881254539,
+              "p50": 170.99020649999375,
+              "p90": 176.9664490000764,
+              "p99": 177.00119880005332,
+              "p999": 177.00643518005108
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 177.00701700005084,
+              "mean": 173.7362130000406,
+              "p50": 173.7362130000406,
+              "p90": 176.3528562000488,
+              "p99": 176.94160092005063,
+              "p999": 177.00047539205082
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 172.18291200003932,
+            "mean": 3.6930564583566174,
+            "p50": 0.984411999979784,
+            "p90": 1.5446263000058025,
+            "p99": 107.31088542002632,
+            "p999": 160.2342207640408
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 168.11219702367453,
+            "mean": 2.419258243427199,
+            "p50": 0.5846111730534176,
+            "p90": 1.0224944741139552,
+            "p99": 83.86795916818193,
+            "p999": 156.11419702396046
+          },
+          "loop_lag_raw_ms": {
+            "count": 5834,
+            "max": 168.11219702367453,
+            "mean": 0.6370249690382852,
+            "p50": 0.5714801311000883,
+            "p90": 0.9958753727232761,
+            "p99": 1.1094087688695708,
+            "p999": 2.2770151824971205
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.002018793000047,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 656.87109375,
+            "start_mib": 651.95703125
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 13,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 174.74389400001655,
+            "mean": 6.510821160018547,
+            "p50": 3.9571025000100235,
+            "p90": 4.596193900010803,
+            "p99": 115.48914070004676,
+            "p999": 168.49061972304995
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.00039459200002056605
+          },
+          "timeline_short_max_ms": [
+            5.3, 174.7, 4.7, 5.0, 4.7, 164.3, 4.4, 4.4, 4.6, 4.6, 4.7, 4.5, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0006496180000113, 5.000974683999971],
+          "window_s": 12.0
+        }
+      ],
+      "candidate": [
+        {
+          "build_s": 0.2528120819999913,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.2498329600000004,
+            "shard_loop_s": 0.8371161559999996,
+            "threads_s": {
+              "agentic-session-export_0": 0.09,
+              "bench-client": 0.24,
+              "bench-rss-sampler": 0.07,
+              "bench-transport_0": 0.01,
+              "shard-loop": 0.84
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g0-s1": ["a5473427556d0f7925529f38d55e9d59ca29223d9914c423d1c5eb9d56d3b4cf"],
+            "long-g0-s2": ["37f2dbdfba6510115b39cb21fb761df173b232e4d286ef3b06ba17a5fbe6f100"],
+            "long-g0-s3": ["6b3a74aa3026492eeabea65d36553e97471061fee6b473a29a23bb442c96f3c3"],
+            "long-g0-s4": ["d18e1a761ce4630c382e0c6f2c6357c5a2eb5fdeea816eaa754c09f9b74035ce"],
+            "long-g0-s5": ["78421c5dfbf22ade72e7b7303b594cf2dce0e75a7e07718db8d70df3cf39b348"],
+            "long-g0-s6": ["cb61a53a7c2991d4298a0821ac9f49670d6d9e18819ce489a232aa5370aea2a0"],
+            "long-g0-s7": ["ca0069853588c911cb6ccbcdcf7770f127d4a27ac2828614b557f5323ef2a430"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"],
+            "long-g1-s1": ["c8618cee39b9d68751bad44a9a6d69e1a6c807762b14f8004bddd8ba1a349c6c"],
+            "long-g1-s2": ["85880ba55f1af8c2ee4982c23952354a5ebc0fdb19265203e5987e9d2ac0cfe5"],
+            "long-g1-s3": ["757239f62df594b83ea779ed985fb6d6d0186f78e6db5edd0eb74d850ea3d99e"],
+            "long-g1-s4": ["5712d55e5481223107eaf4bd8decdadb665098f85c3dd5ffbd5909c63a48af9d"],
+            "long-g1-s5": ["c89f1f2c4b5ea42d5cb0fc2a9459739335aab2d3bb8c6ef2a29af81ec844c033"],
+            "long-g1-s6": ["d45202d6d8365e03746a14758acd18f491b70b1530e908c405d337419ad8a47c"],
+            "long-g1-s7": ["95e9057647476586992040892a1e58735fd5246f931ad617e681ba2b935918d4"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 0.12055923799994162,
+            "active_drain_per_s": 132.71484015192388,
+            "batch_elapsed_s": 4.062537025999973,
+            "batch_wallclock_per_s": 3.938425643286705,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 61.77881499996829,
+              "mean": 55.57142218748723,
+              "p50": 56.67975650004564,
+              "p90": 60.06568299997639,
+              "p99": 61.72745094997367,
+              "p999": 61.77367859496883
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 61.82098699997596,
+              "mean": 60.27961899997081,
+              "p50": 60.27961899997081,
+              "p90": 61.51271339997493,
+              "p99": 61.790159639975855,
+              "p999": 61.81790426397595
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 30.184270999995988,
+            "mean": 1.3031333583353917,
+            "p50": 1.010232500021857,
+            "p90": 1.5427496000256724,
+            "p99": 5.055245359970897,
+            "p999": 29.8928790929929
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 19.709161995137947,
+            "mean": 0.6442197664856195,
+            "p50": 0.5729829456981861,
+            "p90": 0.9967865847556823,
+            "p99": 1.2069023960577816,
+            "p999": 15.711751319081332
+          },
+          "loop_lag_raw_ms": {
+            "count": 5956,
+            "max": 19.709161995137947,
+            "mean": 0.5951784123201269,
+            "p50": 0.5691124788711477,
+            "p90": 0.9894509747994107,
+            "p99": 1.129892415025324,
+            "p999": 5.517525769294916
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.000381582999978,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 655.8046875,
+            "start_mib": 651.8359375
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 4,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 52.102735000005396,
+            "mean": 4.236382991668203,
+            "p50": 3.9556564999827515,
+            "p90": 4.534597100013116,
+            "p99": 5.831534980013567,
+            "p999": 43.01347186202355
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0004281949999835888
+          },
+          "timeline_short_max_ms": [
+            4.8, 52.1, 5.7, 4.8, 5.4, 36.9, 4.5, 4.6, 5.0, 5.2, 4.7, 5.1, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.000400806000016, 5.00111751899999],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 0.40786273200001233,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.4320944030000002,
+            "shard_loop_s": 0.9655789349999999,
+            "threads_s": {
+              "agentic-session-export_0": 0.1,
+              "bench-client": 0.26,
+              "bench-rss-sampler": 0.07,
+              "bench-transport_0": 0.01,
+              "shard-loop": 0.96
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g0-s1": ["a5473427556d0f7925529f38d55e9d59ca29223d9914c423d1c5eb9d56d3b4cf"],
+            "long-g0-s2": ["37f2dbdfba6510115b39cb21fb761df173b232e4d286ef3b06ba17a5fbe6f100"],
+            "long-g0-s3": ["6b3a74aa3026492eeabea65d36553e97471061fee6b473a29a23bb442c96f3c3"],
+            "long-g0-s4": ["d18e1a761ce4630c382e0c6f2c6357c5a2eb5fdeea816eaa754c09f9b74035ce"],
+            "long-g0-s5": ["78421c5dfbf22ade72e7b7303b594cf2dce0e75a7e07718db8d70df3cf39b348"],
+            "long-g0-s6": ["cb61a53a7c2991d4298a0821ac9f49670d6d9e18819ce489a232aa5370aea2a0"],
+            "long-g0-s7": ["ca0069853588c911cb6ccbcdcf7770f127d4a27ac2828614b557f5323ef2a430"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"],
+            "long-g1-s1": ["c8618cee39b9d68751bad44a9a6d69e1a6c807762b14f8004bddd8ba1a349c6c"],
+            "long-g1-s2": ["85880ba55f1af8c2ee4982c23952354a5ebc0fdb19265203e5987e9d2ac0cfe5"],
+            "long-g1-s3": ["757239f62df594b83ea779ed985fb6d6d0186f78e6db5edd0eb74d850ea3d99e"],
+            "long-g1-s4": ["5712d55e5481223107eaf4bd8decdadb665098f85c3dd5ffbd5909c63a48af9d"],
+            "long-g1-s5": ["c89f1f2c4b5ea42d5cb0fc2a9459739335aab2d3bb8c6ef2a29af81ec844c033"],
+            "long-g1-s6": ["d45202d6d8365e03746a14758acd18f491b70b1530e908c405d337419ad8a47c"],
+            "long-g1-s7": ["95e9057647476586992040892a1e58735fd5246f931ad617e681ba2b935918d4"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 0.1306606279999869,
+            "active_drain_per_s": 122.45463874551103,
+            "batch_elapsed_s": 4.066947288000051,
+            "batch_wallclock_per_s": 3.934154752192057,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 66.37944500005233,
+              "mean": 63.32782200001219,
+              "p50": 64.15336749995504,
+              "p90": 66.37488900003063,
+              "p99": 66.37893770004553,
+              "p999": 66.37939427005165
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 66.41438799999833,
+              "mean": 65.33031399999345,
+              "p50": 65.33031399999345,
+              "p90": 66.19757319999735,
+              "p99": 66.39270651999823,
+              "p999": 66.41221985199832
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 57.238246999986586,
+            "mean": 1.619724979174464,
+            "p50": 1.1095725000132006,
+            "p90": 1.550063999957274,
+            "p99": 9.388318230023685,
+            "p999": 56.52148862900238
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 23.493055119047312,
+            "mean": 0.6728724632469417,
+            "p50": 0.589646736159466,
+            "p90": 1.0312157906923858,
+            "p99": 1.3722922745512285,
+            "p999": 16.724622660153294
+          },
+          "loop_lag_raw_ms": {
+            "count": 5952,
+            "max": 23.493055119047312,
+            "mean": 0.6166190161202716,
+            "p50": 0.5859932169869353,
+            "p90": 1.0248090239997512,
+            "p99": 1.185830365418496,
+            "p999": 6.112710468777301
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.003661041999976,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 654.84375,
+            "start_mib": 652.13671875
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 3,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 57.308812999963266,
+            "mean": 4.448797050006495,
+            "p50": 4.072081499998603,
+            "p90": 4.7292221000475365,
+            "p99": 5.783777779971485,
+            "p999": 55.474043653966625
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.000709390999986681
+          },
+          "timeline_short_max_ms": [
+            5.6, 54.2, 5.6, 5.0, 5.1, 57.3, 4.5, 4.6, 4.5, 4.7, 5.4, 5.3, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.000228360000051, 5.000761861000001],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 0.23661981099996865,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.1681143599999997,
+            "shard_loop_s": 0.776245737,
+            "threads_s": {
+              "agentic-session-export_0": 0.09,
+              "bench-client": 0.22,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.01,
+              "shard-loop": 0.77
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["728fd6de656a4b76d3974f51616214a4568631b9f6168415735bf07503b58aae"],
+            "long-g0-s1": ["a5473427556d0f7925529f38d55e9d59ca29223d9914c423d1c5eb9d56d3b4cf"],
+            "long-g0-s2": ["37f2dbdfba6510115b39cb21fb761df173b232e4d286ef3b06ba17a5fbe6f100"],
+            "long-g0-s3": ["6b3a74aa3026492eeabea65d36553e97471061fee6b473a29a23bb442c96f3c3"],
+            "long-g0-s4": ["d18e1a761ce4630c382e0c6f2c6357c5a2eb5fdeea816eaa754c09f9b74035ce"],
+            "long-g0-s5": ["78421c5dfbf22ade72e7b7303b594cf2dce0e75a7e07718db8d70df3cf39b348"],
+            "long-g0-s6": ["cb61a53a7c2991d4298a0821ac9f49670d6d9e18819ce489a232aa5370aea2a0"],
+            "long-g0-s7": ["ca0069853588c911cb6ccbcdcf7770f127d4a27ac2828614b557f5323ef2a430"],
+            "long-g1-s0": ["ac41e55d72666735afc37e7062a8d57341578e59a0232779830d3ca2509bb4de"],
+            "long-g1-s1": ["c8618cee39b9d68751bad44a9a6d69e1a6c807762b14f8004bddd8ba1a349c6c"],
+            "long-g1-s2": ["85880ba55f1af8c2ee4982c23952354a5ebc0fdb19265203e5987e9d2ac0cfe5"],
+            "long-g1-s3": ["757239f62df594b83ea779ed985fb6d6d0186f78e6db5edd0eb74d850ea3d99e"],
+            "long-g1-s4": ["5712d55e5481223107eaf4bd8decdadb665098f85c3dd5ffbd5909c63a48af9d"],
+            "long-g1-s5": ["c89f1f2c4b5ea42d5cb0fc2a9459739335aab2d3bb8c6ef2a29af81ec844c033"],
+            "long-g1-s6": ["d45202d6d8365e03746a14758acd18f491b70b1530e908c405d337419ad8a47c"],
+            "long-g1-s7": ["95e9057647476586992040892a1e58735fd5246f931ad617e681ba2b935918d4"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 0.11786344899996948,
+            "active_drain_per_s": 135.75031221090555,
+            "batch_elapsed_s": 4.059399317999919,
+            "batch_wallclock_per_s": 3.9414698448250367,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 59.95772099993246,
+              "mean": 57.444127312507476,
+              "p50": 57.61795800009395,
+              "p90": 59.95400149993202,
+              "p99": 59.957346749934004,
+              "p999": 59.95768357493262
+            },
+            "mean_tokens": 13903.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 60.00115899996672,
+              "mean": 58.93172449998474,
+              "p50": 58.93172449998474,
+              "p90": 59.78727209997032,
+              "p99": 59.97977030996708,
+              "p999": 59.999020130966755
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 13.152079999940725,
+            "mean": 1.0553891958319166,
+            "p50": 0.9010025000293354,
+            "p90": 1.4739023999936762,
+            "p99": 3.911576499985995,
+            "p999": 11.248170149964345
+          },
+          "loop_lag_ms": {
+            "count": 6000,
+            "max": 25.86315611893042,
+            "mean": 0.6306458007352754,
+            "p50": 0.5661632371243286,
+            "p90": 0.9829498931139824,
+            "p99": 1.2224930184049767,
+            "p999": 13.86515611921636
+          },
+          "loop_lag_raw_ms": {
+            "count": 5955,
+            "max": 25.86315611893042,
+            "mean": 0.5852660646714034,
+            "p50": 0.5635371786638643,
+            "p90": 0.974872721826614,
+            "p99": 1.0950417386607114,
+            "p999": 6.3525174443264465
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.002166823000039,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 654.08984375,
+            "start_mib": 652.0546875
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 3,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 8,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 39.26444800003992,
+            "mean": 4.0862126366660805,
+            "p50": 3.883882499962965,
+            "p90": 4.4364433000055215,
+            "p99": 5.554377200009986,
+            "p999": 38.35887141405884
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0003744660000393196
+          },
+          "timeline_short_max_ms": [
+            5.4, 39.3, 5.3, 4.7, 4.8, 37.8, 4.3, 4.3, 4.3, 5.0, 4.5, 4.5, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0011320950000027, 5.000532460000045],
+          "window_s": 12.0
+        }
+      ]
+    },
+    "t96-c1": {
+      "baseline": [
+        {
+          "build_s": 2.4605770200000165,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.570454733,
+            "shard_loop_s": 1.2558750819999993,
+            "threads_s": {
+              "bench-client": 0.23,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.01,
+              "shard-loop": 1.26
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.5169383369999991,
+            "active_drain_per_s": 3.868933404333684,
+            "batch_elapsed_s": 4.258599763999996,
+            "batch_wallclock_per_s": 0.4696379351980826,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 258.9932789999807,
+              "mean": 258.46916849999957,
+              "p50": 258.46916849999957,
+              "p90": 258.8884568999845,
+              "p99": 258.9827967899811,
+              "p999": 258.99223077898074
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 258.9932789999807,
+              "mean": 258.46916849999957,
+              "p50": 258.46916849999957,
+              "p90": 258.8884568999845,
+              "p99": 258.9827967899811,
+              "p999": 258.99223077898074
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 203.42467500000794,
+            "mean": 5.487551791667045,
+            "p50": 1.0916119999819784,
+            "p90": 1.587757900034603,
+            "p99": 154.28933975996753,
+            "p999": 203.1202114660093
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 249.5978209761347,
+            "mean": 5.747836826329687,
+            "p50": 0.5968719913767018,
+            "p90": 1.0330611756216967,
+            "p99": 189.58581599456807,
+            "p999": 243.58559549516974
+          },
+          "loop_lag_raw_ms": {
+            "count": 5745,
+            "max": 249.5978209761347,
+            "mean": 0.6660679054836891,
+            "p50": 0.5751309978450081,
+            "p90": 0.9897845853629407,
+            "p99": 1.105089938901074,
+            "p999": 2.184442750751261
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.000598554999954,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 676.2421875,
+            "start_mib": 658.0078125
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 18,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 254.8974580000163,
+            "mean": 9.692609600002225,
+            "p50": 3.9027204999797505,
+            "p90": 4.6242639000070085,
+            "p99": 197.55850704998903,
+            "p999": 254.1275099889975
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.00022914099997706217
+          },
+          "timeline_short_max_ms": [
+            5.2, 253.6, 5.0, 4.7, 5.4, 254.9, 4.7, 4.5, 6.0, 4.6, 4.4, 4.6, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.001012564000007, 5.000621113000022],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 2.491778508999971,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.5456484599999998,
+            "shard_loop_s": 1.2416249990000008,
+            "threads_s": {
+              "bench-client": 0.22,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.02,
+              "shard-loop": 1.24
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.5036341249999623,
+            "active_drain_per_s": 3.9711367850622707,
+            "batch_elapsed_s": 4.255281744999991,
+            "batch_wallclock_per_s": 0.47000413130106483,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 254.98855099999673,
+              "mean": 251.81706249998115,
+              "p50": 251.81706249998115,
+              "p90": 254.35425329999362,
+              "p99": 254.92512122999642,
+              "p999": 254.9822080229967
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 254.98855099999673,
+              "mean": 251.81706249998115,
+              "p50": 251.81706249998115,
+              "p90": 254.35425329999362,
+              "p99": 254.92512122999642,
+              "p999": 254.9822080229967
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 199.6268240000063,
+            "mean": 5.095783970846431,
+            "p50": 0.96074500001464,
+            "p90": 1.557775099979608,
+            "p99": 148.09060801999914,
+            "p999": 198.66447831101087
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 245.09403397610185,
+            "mean": 5.515686498451596,
+            "p50": 0.57611095945731,
+            "p90": 1.0182183570236703,
+            "p99": 183.33863447454434,
+            "p999": 237.3063924431478
+          },
+          "loop_lag_raw_ms": {
+            "count": 5753,
+            "max": 245.09403397610185,
+            "mean": 0.6523733978595836,
+            "p50": 0.5575279778895492,
+            "p90": 0.9746441544734809,
+            "p99": 1.1010105692935206,
+            "p999": 1.9633970069077238
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.00061180199998,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 676.0234375,
+            "start_mib": 658.48828125
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 17,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 249.72950099999025,
+            "mean": 9.425081315014364,
+            "p50": 3.889436999997997,
+            "p90": 4.45221400001401,
+            "p99": 193.76019841002727,
+            "p999": 247.2872911449926
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0002698339999938071
+          },
+          "timeline_short_max_ms": [
+            4.6, 245.7, 4.9, 4.8, 4.7, 249.7, 4.4, 4.8, 4.4, 4.5, 4.6, 4.9, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0005618179999942, 5.000855753999986],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 2.411120411000013,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.5832017250000003,
+            "shard_loop_s": 1.2701030700000002,
+            "threads_s": {
+              "bench-client": 0.23,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.02,
+              "shard-loop": 1.27
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.5038210529999674,
+            "active_drain_per_s": 3.969663411425821,
+            "batch_elapsed_s": 4.242909954999959,
+            "batch_wallclock_per_s": 0.47137460403635156,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 260.5582499999741,
+              "mean": 251.9105264999837,
+              "p50": 251.9105264999837,
+              "p90": 258.82870529997604,
+              "p99": 260.3852955299743,
+              "p999": 260.54095455297414
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 260.5582499999741,
+              "mean": 251.9105264999837,
+              "p50": 251.9105264999837,
+              "p90": 258.82870529997604,
+              "p99": 260.3852955299743,
+              "p999": 260.54095455297414
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 204.18719899998905,
+            "mean": 5.049543245826982,
+            "p50": 1.005072999987533,
+            "p90": 1.6048333999833628,
+            "p99": 147.80787168995266,
+            "p999": 200.27456680598243
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 250.94381299521729,
+            "mean": 5.4918126877986975,
+            "p50": 0.5948769460246695,
+            "p90": 1.0341395541331622,
+            "p99": 182.9519008945122,
+            "p999": 238.94781299516083
+          },
+          "loop_lag_raw_ms": {
+            "count": 5755,
+            "max": 250.94381299521729,
+            "mean": 0.66546744633529,
+            "p50": 0.5728759726935095,
+            "p90": 0.9919891803406246,
+            "p99": 1.1063765536903247,
+            "p999": 1.8133211933270414
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.00003306100001,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 677.5703125,
+            "start_mib": 658.8046875
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 18,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 256.0668589999864,
+            "mean": 9.358257486660666,
+            "p50": 3.914642999973239,
+            "p90": 4.526947299990525,
+            "p99": 198.96591951999594,
+            "p999": 245.80439206601616
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0002675119999935305
+          },
+          "timeline_short_max_ms": [
+            4.7, 256.1, 4.9, 4.7, 4.7, 237.9, 4.4, 5.4, 4.7, 4.7, 4.4, 4.8, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0006632750000222, 5.00031196499998],
+          "window_s": 12.0
+        }
+      ],
+      "candidate": [
+        {
+          "build_s": 2.455206951999969,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.2959749070000006,
+            "shard_loop_s": 0.820077414,
+            "threads_s": {
+              "agentic-session-export_0": 0.15,
+              "bench-client": 0.23,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.02,
+              "shard-loop": 0.81
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.17385419000004276,
+            "active_drain_per_s": 11.50389300366881,
+            "batch_elapsed_s": 4.09468952900005,
+            "batch_wallclock_per_s": 0.4884375203138816,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 94.4412380000017,
+              "mean": 86.92709500002138,
+              "p50": 86.92709500002138,
+              "p90": 92.93840940000564,
+              "p99": 94.2909551400021,
+              "p999": 94.42620971400174
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 94.4412380000017,
+              "mean": 86.92709500002138,
+              "p50": 86.92709500002138,
+              "p90": 92.93840940000564,
+              "p99": 94.2909551400021,
+              "p999": 94.42620971400174
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 40.02456299997448,
+            "mean": 1.3221687666513067,
+            "p50": 1.020417000006546,
+            "p90": 1.4542987999732304,
+            "p99": 6.055725619971687,
+            "p999": 36.836853416975465
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 56.53606597604721,
+            "mean": 0.8670858563170784,
+            "p50": 0.593345992911054,
+            "p90": 1.0174421751116824,
+            "p99": 4.5520701957783185,
+            "p999": 49.444796907101924
+          },
+          "loop_lag_raw_ms": {
+            "count": 5919,
+            "max": 56.53606597604721,
+            "mean": 0.620795754061559,
+            "p50": 0.5871969591453308,
+            "p90": 1.0053147735675338,
+            "p99": 1.157359936846659,
+            "p999": 5.376341356463904
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.00093089699999,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 672.515625,
+            "start_mib": 658.7578125
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 5,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 74.63833899998917,
+            "mean": 4.517912473317456,
+            "p50": 3.9245895000021846,
+            "p90": 4.543013399967322,
+            "p99": 22.142104869966403,
+            "p999": 71.87799425499324
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0007950589999836666
+          },
+          "timeline_short_max_ms": [
+            4.8, 74.6, 5.2, 4.8, 5.5, 70.0, 5.0, 5.0, 4.9, 4.7, 4.6, 4.7, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0007761929999788, 5.001025040999991],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 2.442590014000018,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.3147823250000004,
+            "shard_loop_s": 0.8273528490000004,
+            "threads_s": {
+              "agentic-session-export_0": 0.16,
+              "bench-client": 0.22,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.02,
+              "shard-loop": 0.83
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.19080460499998253,
+            "active_drain_per_s": 10.481927309879042,
+            "batch_elapsed_s": 4.090411938999978,
+            "batch_wallclock_per_s": 0.4889483088319362,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 100.30982099999619,
+              "mean": 95.40230249999126,
+              "p50": 95.40230249999126,
+              "p90": 99.3283172999952,
+              "p99": 100.21167062999609,
+              "p999": 100.30000596299618
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 100.30982099999619,
+              "mean": 95.40230249999126,
+              "p50": 95.40230249999126,
+              "p90": 99.3283172999952,
+              "p99": 100.21167062999609,
+              "p999": 100.30000596299618
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 45.33957199998895,
+            "mean": 1.3337508083296257,
+            "p50": 1.021610000009332,
+            "p90": 1.4668567000057917,
+            "p99": 4.624065989993871,
+            "p999": 41.94480739598362
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 63.68608799516551,
+            "mean": 0.9225052185566633,
+            "p50": 0.5777039582994803,
+            "p90": 1.0010107728362525,
+            "p99": 9.972018096052231,
+            "p999": 54.69568076006596
+          },
+          "loop_lag_raw_ms": {
+            "count": 5912,
+            "max": 63.68608799516551,
+            "mean": 0.6083169126114958,
+            "p50": 0.5709284713475427,
+            "p90": 0.9874838515827379,
+            "p99": 1.1126948124683622,
+            "p999": 4.781803563026947
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.000903609000034,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 676.6015625,
+            "start_mib": 658.46875
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 5,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 81.13040900002488,
+            "mean": 4.711141879997551,
+            "p50": 3.9549699999668064,
+            "p90": 4.587151099991615,
+            "p99": 40.97517685999602,
+            "p999": 79.33394810001855
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0003980579999733891
+          },
+          "timeline_short_max_ms": [
+            4.7, 78.1, 5.1, 4.9, 5.5, 81.1, 4.9, 4.4, 4.4, 5.6, 4.8, 4.4, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.000351061999993, 5.000267833000009],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 2.4310657839999976,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 1.3040898629999997,
+            "shard_loop_s": 0.8257732789999999,
+            "threads_s": {
+              "agentic-session-export_0": 0.15,
+              "bench-client": 0.22,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.03,
+              "shard-loop": 0.82
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 2,
+            "active_drain_elapsed_s": 0.17844310900005667,
+            "active_drain_per_s": 11.208053991030637,
+            "batch_elapsed_s": 4.087712878000048,
+            "batch_wallclock_per_s": 0.4892711547241838,
+            "completed": 2,
+            "expected": 2,
+            "latency_ms": {
+              "count": 2,
+              "max": 91.11585700003388,
+              "mean": 89.22155450002833,
+              "p50": 89.22155450002833,
+              "p90": 90.73699650003277,
+              "p99": 91.07797095003377,
+              "p999": 91.11206839503387
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 91.11585700003388,
+              "mean": 89.22155450002833,
+              "p50": 89.22155450002833,
+              "p90": 90.73699650003277,
+              "p99": 91.07797095003377,
+              "p999": 91.11206839503387
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 35.4397969999809,
+            "mean": 1.339268437516002,
+            "p50": 1.050254999995559,
+            "p90": 1.587649599997576,
+            "p99": 2.6131337900170433,
+            "p999": 34.19131118998048
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 65.23405497608792,
+            "mean": 0.8833004347798101,
+            "p50": 0.5843869465138596,
+            "p90": 1.0104347506967315,
+            "p99": 5.84712187479887,
+            "p999": 53.23805497603146
+          },
+          "loop_lag_raw_ms": {
+            "count": 5918,
+            "max": 65.23405497608792,
+            "mean": 0.6090616800289553,
+            "p50": 0.5778989868758799,
+            "p90": 0.9964880759582684,
+            "p99": 1.1189907193676163,
+            "p999": 5.3165386378379775
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.00003596099998,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 671.84765625,
+            "start_mib": 658.62109375
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 5,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 1,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 80.21173600002385,
+            "mean": 4.653987075017767,
+            "p50": 3.936984000006305,
+            "p90": 4.493382399999746,
+            "p99": 33.69917935000037,
+            "p999": 78.10596707403455
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0005269929999940359
+          },
+          "timeline_short_max_ms": [
+            4.9, 76.7, 5.7, 5.7, 4.9, 80.2, 4.7, 5.5, 4.8, 4.9, 4.6, 4.6, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0005672270000332, 5.000954354000044],
+          "window_s": 12.0
+        }
+      ]
+    },
+    "t96-c8": {
+      "baseline": [
+        {
+          "build_s": 23.138666927999992,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 5.066201755999998,
+            "shard_loop_s": 4.523979333,
+            "threads_s": {
+              "bench-client": 0.27,
+              "bench-rss-sampler": 0.07,
+              "bench-transport_0": 0.18,
+              "shard-loop": 4.53
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g0-s1": ["f50c26509d3357c8596ebfa933e452f554319427285b13170fbd86fb57d0afad"],
+            "long-g0-s2": ["cb6afbabd514cda73f1d34970751f543a441baf19299334ec4a283dfa50ed4cc"],
+            "long-g0-s3": ["1c4d156e143fd521add5ee90730c91459d071dc8e76a69ffdb2c91130176079a"],
+            "long-g0-s4": ["14b709854415279f51bd79882c08f1bff9fbc85408d5e88cd318e13a632e4307"],
+            "long-g0-s5": ["4959c646b7691ff23b1ae34ba2ffd4d71dc1960cbdbfc8dee8ec5162457b0936"],
+            "long-g0-s6": ["5434ae3d10f484d57da8e4879c7940bb621869923b3300f2ddf92aabc9ad1f77"],
+            "long-g0-s7": ["7a5d30c4497ab05725f46b6608b5c72af59f9b03cbf1bc669717aa77136002e6"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"],
+            "long-g1-s1": ["a45f5b09ab8848f21d70f85201b51a3669ccf5d6054185df0c48ce95b6aa8a21"],
+            "long-g1-s2": ["d11bdb7ad507bb7c3b208aecf87f8a837afaf6b2126f3ae4de587ccb2c9221df"],
+            "long-g1-s3": ["dac162b443c4a01064d172c3f93fd4bffcbc4a22904b43e63382ba2e66d7ffef"],
+            "long-g1-s4": ["a5357d7fd78bfa9539cafcfa7f56f875ae346c638de2c84db70739a76cee676a"],
+            "long-g1-s5": ["3255e396e90a4dcb30673a993dd99c5b00025f55fd257b80c8743b1d791d0cd6"],
+            "long-g1-s6": ["ff928e9c7363ea3aa007426c9c5276ad3abc9da02ce25300efac91d2aa7ed4b4"],
+            "long-g1-s7": ["9063496717d00958e7a1abdac106ad432723afad2f32c85ec98c3b854bd3c273"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 4.223270918999958,
+            "active_drain_per_s": 3.7885327053062205,
+            "batch_elapsed_s": 6.128536476999983,
+            "batch_wallclock_per_s": 2.6107374998985495,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 2122.869925999993,
+              "mean": 2086.493766249998,
+              "p50": 2094.7871569999847,
+              "p90": 2094.8185549999894,
+              "p99": 2118.664751299991,
+              "p999": 2122.449408529993
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 2128.4354909999765,
+              "mean": 2111.6354594999793,
+              "p50": 2111.6354594999793,
+              "p90": 2125.075484699977,
+              "p99": 2128.0994903699766,
+              "p999": 2128.4018909369765
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 1997.6411719999874,
+            "mean": 308.64561220417914,
+            "p50": 1.283130000004462,
+            "p90": 1299.6516066000027,
+            "p99": 1878.1550940400004,
+            "p999": 1985.6928337669985
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 2026.4049859952138,
+            "mean": 303.8680939948646,
+            "p50": 0.853188979931474,
+            "p90": 1294.1307627774677,
+            "p99": 1906.44498599464,
+            "p999": 2014.4089859951573
+          },
+          "loop_lag_raw_ms": {
+            "count": 3905,
+            "max": 2026.4049859952138,
+            "mean": 1.6611151573798675,
+            "p50": 0.5782119582420364,
+            "p90": 1.0025035519220182,
+            "p99": 1.1722796636524901,
+            "p999": 20.999323767531507
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.000533087999997,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 883.328125,
+            "start_mib": 784.03125
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 141,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 2050.603114000012,
+            "mean": 359.4391756766783,
+            "p50": 4.2270200000160685,
+            "p90": 1466.0227252000284,
+            "p99": 2005.579193240001,
+            "p999": 2048.2909596240092
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.00032390199999099423
+          },
+          "timeline_short_max_ms": [
+            4.9, 2050.6, 1066.0, 67.9, 5.1, 2046.7, 1047.0, 76.3, 4.5, 4.4, 4.3, 4.8, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0002876780000065, 5.0003906040000174],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 22.919316080000016,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 5.069407558999998,
+            "shard_loop_s": 4.4989363440000005,
+            "threads_s": {
+              "bench-client": 0.27,
+              "bench-rss-sampler": 0.07,
+              "bench-transport_0": 0.21,
+              "shard-loop": 4.5
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g0-s1": ["f50c26509d3357c8596ebfa933e452f554319427285b13170fbd86fb57d0afad"],
+            "long-g0-s2": ["cb6afbabd514cda73f1d34970751f543a441baf19299334ec4a283dfa50ed4cc"],
+            "long-g0-s3": ["1c4d156e143fd521add5ee90730c91459d071dc8e76a69ffdb2c91130176079a"],
+            "long-g0-s4": ["14b709854415279f51bd79882c08f1bff9fbc85408d5e88cd318e13a632e4307"],
+            "long-g0-s5": ["4959c646b7691ff23b1ae34ba2ffd4d71dc1960cbdbfc8dee8ec5162457b0936"],
+            "long-g0-s6": ["5434ae3d10f484d57da8e4879c7940bb621869923b3300f2ddf92aabc9ad1f77"],
+            "long-g0-s7": ["7a5d30c4497ab05725f46b6608b5c72af59f9b03cbf1bc669717aa77136002e6"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"],
+            "long-g1-s1": ["a45f5b09ab8848f21d70f85201b51a3669ccf5d6054185df0c48ce95b6aa8a21"],
+            "long-g1-s2": ["d11bdb7ad507bb7c3b208aecf87f8a837afaf6b2126f3ae4de587ccb2c9221df"],
+            "long-g1-s3": ["dac162b443c4a01064d172c3f93fd4bffcbc4a22904b43e63382ba2e66d7ffef"],
+            "long-g1-s4": ["a5357d7fd78bfa9539cafcfa7f56f875ae346c638de2c84db70739a76cee676a"],
+            "long-g1-s5": ["3255e396e90a4dcb30673a993dd99c5b00025f55fd257b80c8743b1d791d0cd6"],
+            "long-g1-s6": ["ff928e9c7363ea3aa007426c9c5276ad3abc9da02ce25300efac91d2aa7ed4b4"],
+            "long-g1-s7": ["9063496717d00958e7a1abdac106ad432723afad2f32c85ec98c3b854bd3c273"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 4.1565512290000015,
+            "active_drain_per_s": 3.8493450744379105,
+            "batch_elapsed_s": 6.058600482999964,
+            "batch_wallclock_per_s": 2.6408739188026926,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 2092.4353320000364,
+              "mean": 2043.9160585625089,
+              "p50": 2058.5205655000036,
+              "p90": 2058.5529015000075,
+              "p99": 2087.355577800031,
+              "p999": 2091.927356580036
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 2097.9809250000017,
+              "mean": 2078.2756145000008,
+              "p50": 2078.2756145000008,
+              "p90": 2094.0398629000015,
+              "p99": 2097.5868187900014,
+              "p999": 2097.9415143790015
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 1943.606425999974,
+            "mean": 295.0972126416417,
+            "p50": 1.2508160000095359,
+            "p90": 1247.7376836999892,
+            "p99": 1824.1284034299786,
+            "p999": 1931.6591054289759
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 1989.9399479760973,
+            "mean": 288.78140763860176,
+            "p50": 0.8245819428225332,
+            "p90": 1243.7474335889192,
+            "p99": 1869.9799479755236,
+            "p999": 1977.9439479760408
+          },
+          "loop_lag_raw_ms": {
+            "count": 3947,
+            "max": 1989.9399479760973,
+            "mean": 1.6183346247015908,
+            "p50": 0.5732229478780937,
+            "p90": 0.9897031779701138,
+            "p99": 1.2307821304807474,
+            "p999": 20.757304788427206
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.00063449999999,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 840.16015625,
+            "start_mib": 783.73828125
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 139,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 2011.7181949999576,
+            "mean": 343.65127088330684,
+            "p50": 4.268689499951961,
+            "p90": 1414.8659411999693,
+            "p99": 1953.1240522299308,
+            "p999": 2010.7864990189923
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0003811820000123589
+          },
+          "timeline_short_max_ms": [
+            5.5, 1992.9, 993.3, 26.7, 5.3, 2011.7, 1030.4, 38.7, 4.5, 4.6, 4.4, 4.3, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0009144409999635, 5.0009455989999765],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 19.963514825999994,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 4.861748290000001,
+            "shard_loop_s": 4.368280940999998,
+            "threads_s": {
+              "bench-client": 0.25,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.17,
+              "shard-loop": 4.36
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g0-s1": ["f50c26509d3357c8596ebfa933e452f554319427285b13170fbd86fb57d0afad"],
+            "long-g0-s2": ["cb6afbabd514cda73f1d34970751f543a441baf19299334ec4a283dfa50ed4cc"],
+            "long-g0-s3": ["1c4d156e143fd521add5ee90730c91459d071dc8e76a69ffdb2c91130176079a"],
+            "long-g0-s4": ["14b709854415279f51bd79882c08f1bff9fbc85408d5e88cd318e13a632e4307"],
+            "long-g0-s5": ["4959c646b7691ff23b1ae34ba2ffd4d71dc1960cbdbfc8dee8ec5162457b0936"],
+            "long-g0-s6": ["5434ae3d10f484d57da8e4879c7940bb621869923b3300f2ddf92aabc9ad1f77"],
+            "long-g0-s7": ["7a5d30c4497ab05725f46b6608b5c72af59f9b03cbf1bc669717aa77136002e6"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"],
+            "long-g1-s1": ["a45f5b09ab8848f21d70f85201b51a3669ccf5d6054185df0c48ce95b6aa8a21"],
+            "long-g1-s2": ["d11bdb7ad507bb7c3b208aecf87f8a837afaf6b2126f3ae4de587ccb2c9221df"],
+            "long-g1-s3": ["dac162b443c4a01064d172c3f93fd4bffcbc4a22904b43e63382ba2e66d7ffef"],
+            "long-g1-s4": ["a5357d7fd78bfa9539cafcfa7f56f875ae346c638de2c84db70739a76cee676a"],
+            "long-g1-s5": ["3255e396e90a4dcb30673a993dd99c5b00025f55fd257b80c8743b1d791d0cd6"],
+            "long-g1-s6": ["ff928e9c7363ea3aa007426c9c5276ad3abc9da02ce25300efac91d2aa7ed4b4"],
+            "long-g1-s7": ["9063496717d00958e7a1abdac106ad432723afad2f32c85ec98c3b854bd3c273"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 3.9959113300000126,
+            "active_drain_per_s": 4.004092853581901,
+            "batch_elapsed_s": 5.996280644000024,
+            "batch_wallclock_per_s": 2.6683207391251544,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 1999.4831230000045,
+              "mean": 1997.9105595625128,
+              "p50": 1997.9033600000093,
+              "p90": 1999.4487654999773,
+              "p99": 1999.4782237000009,
+              "p999": 1999.482633070004
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 1999.4831230000045,
+              "mean": 1997.9556650000063,
+              "p50": 1997.9556650000063,
+              "p90": 1999.1776314000049,
+              "p99": 1999.4525738400046,
+              "p999": 1999.4800680840046
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 1954.7379869999872,
+            "mean": 319.2101565875161,
+            "p50": 1.1858390000440977,
+            "p90": 1354.921580299981,
+            "p99": 1874.3483831500203,
+            "p999": 1942.7898958929866
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 1934.4302409952547,
+            "mean": 312.64474504054965,
+            "p50": 0.8112819610914812,
+            "p90": 1334.7788653885684,
+            "p99": 1874.4651034345852,
+            "p999": 1928.4337272391886
+          },
+          "loop_lag_raw_ms": {
+            "count": 3993,
+            "max": 1934.4302409952547,
+            "mean": 1.5783611579206671,
+            "p50": 0.5703869840658626,
+            "p90": 0.9788489770244269,
+            "p99": 1.162760511542727,
+            "p999": 17.80599083090863
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.00049457,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 884.07421875,
+            "start_mib": 784.1875
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 136,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 1971.073084000011,
+            "mean": 330.25881447001643,
+            "p50": 4.108996000041998,
+            "p90": 1375.3536321000245,
+            "p99": 1912.3479405200371,
+            "p999": 1962.5003535370035
+          },
+          "src": "<baseline>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0003597529999979088
+          },
+          "timeline_short_max_ms": [
+            5.0, 1971.1, 971.4, 4.7, 5.4, 1956.8, 973.6, 5.3, 4.5, 4.3, 5.0, 4.4, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0004889680000133, 5.000342857000021],
+          "window_s": 12.0
+        }
+      ],
+      "candidate": [
+        {
+          "build_s": 21.55273920899998,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 3.0045406040000024,
+            "shard_loop_s": 1.094765890999998,
+            "threads_s": {
+              "agentic-session-export_0": 1.26,
+              "bench-client": 0.32,
+              "bench-rss-sampler": 0.09,
+              "bench-transport_0": 0.24,
+              "shard-loop": 1.11
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g0-s1": ["f50c26509d3357c8596ebfa933e452f554319427285b13170fbd86fb57d0afad"],
+            "long-g0-s2": ["cb6afbabd514cda73f1d34970751f543a441baf19299334ec4a283dfa50ed4cc"],
+            "long-g0-s3": ["1c4d156e143fd521add5ee90730c91459d071dc8e76a69ffdb2c91130176079a"],
+            "long-g0-s4": ["14b709854415279f51bd79882c08f1bff9fbc85408d5e88cd318e13a632e4307"],
+            "long-g0-s5": ["4959c646b7691ff23b1ae34ba2ffd4d71dc1960cbdbfc8dee8ec5162457b0936"],
+            "long-g0-s6": ["5434ae3d10f484d57da8e4879c7940bb621869923b3300f2ddf92aabc9ad1f77"],
+            "long-g0-s7": ["7a5d30c4497ab05725f46b6608b5c72af59f9b03cbf1bc669717aa77136002e6"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"],
+            "long-g1-s1": ["a45f5b09ab8848f21d70f85201b51a3669ccf5d6054185df0c48ce95b6aa8a21"],
+            "long-g1-s2": ["d11bdb7ad507bb7c3b208aecf87f8a837afaf6b2126f3ae4de587ccb2c9221df"],
+            "long-g1-s3": ["dac162b443c4a01064d172c3f93fd4bffcbc4a22904b43e63382ba2e66d7ffef"],
+            "long-g1-s4": ["a5357d7fd78bfa9539cafcfa7f56f875ae346c638de2c84db70739a76cee676a"],
+            "long-g1-s5": ["3255e396e90a4dcb30673a993dd99c5b00025f55fd257b80c8743b1d791d0cd6"],
+            "long-g1-s6": ["ff928e9c7363ea3aa007426c9c5276ad3abc9da02ce25300efac91d2aa7ed4b4"],
+            "long-g1-s7": ["9063496717d00958e7a1abdac106ad432723afad2f32c85ec98c3b854bd3c273"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 1.4174716109999963,
+            "active_drain_per_s": 11.287704018786195,
+            "batch_elapsed_s": 4.761567514999996,
+            "batch_wallclock_per_s": 3.360237978270064,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 762.1264809999957,
+              "mean": 660.1414431250046,
+              "p50": 655.2553049999972,
+              "p90": 762.1233939999996,
+              "p99": 762.1261746999949,
+              "p999": 762.1264503699956
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 762.1755579999956,
+              "mean": 708.7358054999982,
+              "p50": 708.7358054999982,
+              "p90": 751.4876074999961,
+              "p99": 761.1067629499956,
+              "p999": 762.0686784949957
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 349.81477600001654,
+            "mean": 18.943915487507468,
+            "p50": 1.2626375000053258,
+            "p90": 44.036675400016506,
+            "p99": 294.8019157600167,
+            "p999": 341.493129405011
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 271.68526397403525,
+            "mean": 8.205460370758368,
+            "p50": 0.685090958654655,
+            "p90": 6.035659175637393,
+            "p99": 167.70235589393582,
+            "p999": 259.68926397397877
+          },
+          "loop_lag_raw_ms": {
+            "count": 5304,
+            "max": 271.68526397403525,
+            "mean": 0.8860538089757923,
+            "p50": 0.6229319820931778,
+            "p90": 1.0499923610439055,
+            "p99": 1.6811777324659598,
+            "p999": 62.086389092964055
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.001077320000007,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 837.54296875,
+            "start_mib": 784.19921875
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 32,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 559.8231810000129,
+            "mean": 34.554738223341225,
+            "p50": 4.406377500018266,
+            "p90": 73.76941360001022,
+            "p99": 501.2198075999885,
+            "p999": 547.8465354000133
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.001144933999995601
+          },
+          "timeline_short_max_ms": [
+            5.3, 559.8, 5.3, 6.0, 5.6, 503.2, 5.0, 5.1, 4.9, 5.3, 5.3, 5.3, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0009407330000215, 5.0003335929999935],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 24.25998513799999,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 2.7446723929999983,
+            "shard_loop_s": 0.898191164,
+            "threads_s": {
+              "agentic-session-export_0": 1.27,
+              "bench-client": 0.26,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.24,
+              "shard-loop": 0.89
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g0-s1": ["f50c26509d3357c8596ebfa933e452f554319427285b13170fbd86fb57d0afad"],
+            "long-g0-s2": ["cb6afbabd514cda73f1d34970751f543a441baf19299334ec4a283dfa50ed4cc"],
+            "long-g0-s3": ["1c4d156e143fd521add5ee90730c91459d071dc8e76a69ffdb2c91130176079a"],
+            "long-g0-s4": ["14b709854415279f51bd79882c08f1bff9fbc85408d5e88cd318e13a632e4307"],
+            "long-g0-s5": ["4959c646b7691ff23b1ae34ba2ffd4d71dc1960cbdbfc8dee8ec5162457b0936"],
+            "long-g0-s6": ["5434ae3d10f484d57da8e4879c7940bb621869923b3300f2ddf92aabc9ad1f77"],
+            "long-g0-s7": ["7a5d30c4497ab05725f46b6608b5c72af59f9b03cbf1bc669717aa77136002e6"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"],
+            "long-g1-s1": ["a45f5b09ab8848f21d70f85201b51a3669ccf5d6054185df0c48ce95b6aa8a21"],
+            "long-g1-s2": ["d11bdb7ad507bb7c3b208aecf87f8a837afaf6b2126f3ae4de587ccb2c9221df"],
+            "long-g1-s3": ["dac162b443c4a01064d172c3f93fd4bffcbc4a22904b43e63382ba2e66d7ffef"],
+            "long-g1-s4": ["a5357d7fd78bfa9539cafcfa7f56f875ae346c638de2c84db70739a76cee676a"],
+            "long-g1-s5": ["3255e396e90a4dcb30673a993dd99c5b00025f55fd257b80c8743b1d791d0cd6"],
+            "long-g1-s6": ["ff928e9c7363ea3aa007426c9c5276ad3abc9da02ce25300efac91d2aa7ed4b4"],
+            "long-g1-s7": ["9063496717d00958e7a1abdac106ad432723afad2f32c85ec98c3b854bd3c273"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 1.4975179930000309,
+            "active_drain_per_s": 10.684345747289909,
+            "batch_elapsed_s": 4.820505732000015,
+            "batch_wallclock_per_s": 3.31915381695058,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 819.9123060000204,
+              "mean": 679.8981217500088,
+              "p50": 677.4867395000115,
+              "p90": 819.9085260000203,
+              "p99": 819.9119457000194,
+              "p999": 819.9122699700204
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 819.9691820000226,
+              "mean": 748.7589965000154,
+              "p50": 748.7589965000154,
+              "p90": 805.7271449000211,
+              "p99": 818.5449782900224,
+              "p999": 819.8267616290226
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 303.02189500000054,
+            "mean": 15.707842679169561,
+            "p50": 1.1907215000093174,
+            "p90": 38.9837983999967,
+            "p99": 243.09602702999504,
+            "p999": 293.32065986200286
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 175.27306797475717,
+            "mean": 7.006475019363081,
+            "p50": 0.6384129765422131,
+            "p90": 8.214191779217073,
+            "p99": 128.077854113248,
+            "p999": 165.27462876274794
+          },
+          "loop_lag_raw_ms": {
+            "count": 5283,
+            "max": 175.27306797475717,
+            "mean": 0.8533781172384369,
+            "p50": 0.5753579612814974,
+            "p90": 1.0000975817092694,
+            "p99": 1.4049689724430618,
+            "p999": 92.75349452747109
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.00136882199999,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 841.5078125,
+            "start_mib": 784.3203125
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 28,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 467.5703420000161,
+            "mean": 32.430813206670784,
+            "p50": 4.11128500000757,
+            "p90": 94.48741039999535,
+            "p99": 413.9184818100216,
+            "p999": 459.6898908120024
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0007430459999966388
+          },
+          "timeline_short_max_ms": [
+            5.1, 467.6, 5.4, 5.9, 5.5, 343.8, 4.9, 6.5, 4.7, 4.6, 4.7, 6.7, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.000663535000001, 5.001201393999992],
+          "window_s": 12.0
+        },
+        {
+          "build_s": 20.891719024999986,
+          "consumer_completed": true,
+          "cpu": {
+            "process_s": 2.462204052999997,
+            "shard_loop_s": 0.8303691519999994,
+            "threads_s": {
+              "agentic-session-export_0": 1.1,
+              "bench-client": 0.23,
+              "bench-rss-sampler": 0.06,
+              "bench-transport_0": 0.21,
+              "shard-loop": 0.83
+            }
+          },
+          "digests": {
+            "long-g0-s0": ["2f84681fcf4b88a4673a08871ebb948efaf3fc6d7e4c02b2db2050a498b8c063"],
+            "long-g0-s1": ["f50c26509d3357c8596ebfa933e452f554319427285b13170fbd86fb57d0afad"],
+            "long-g0-s2": ["cb6afbabd514cda73f1d34970751f543a441baf19299334ec4a283dfa50ed4cc"],
+            "long-g0-s3": ["1c4d156e143fd521add5ee90730c91459d071dc8e76a69ffdb2c91130176079a"],
+            "long-g0-s4": ["14b709854415279f51bd79882c08f1bff9fbc85408d5e88cd318e13a632e4307"],
+            "long-g0-s5": ["4959c646b7691ff23b1ae34ba2ffd4d71dc1960cbdbfc8dee8ec5162457b0936"],
+            "long-g0-s6": ["5434ae3d10f484d57da8e4879c7940bb621869923b3300f2ddf92aabc9ad1f77"],
+            "long-g0-s7": ["7a5d30c4497ab05725f46b6608b5c72af59f9b03cbf1bc669717aa77136002e6"],
+            "long-g1-s0": ["95bce996d5ad705d0bbc779bd74f7fd7bf6678282ecf59fb7244d3323158a6ec"],
+            "long-g1-s1": ["a45f5b09ab8848f21d70f85201b51a3669ccf5d6054185df0c48ce95b6aa8a21"],
+            "long-g1-s2": ["d11bdb7ad507bb7c3b208aecf87f8a837afaf6b2126f3ae4de587ccb2c9221df"],
+            "long-g1-s3": ["dac162b443c4a01064d172c3f93fd4bffcbc4a22904b43e63382ba2e66d7ffef"],
+            "long-g1-s4": ["a5357d7fd78bfa9539cafcfa7f56f875ae346c638de2c84db70739a76cee676a"],
+            "long-g1-s5": ["3255e396e90a4dcb30673a993dd99c5b00025f55fd257b80c8743b1d791d0cd6"],
+            "long-g1-s6": ["ff928e9c7363ea3aa007426c9c5276ad3abc9da02ce25300efac91d2aa7ed4b4"],
+            "long-g1-s7": ["9063496717d00958e7a1abdac106ad432723afad2f32c85ec98c3b854bd3c273"]
+          },
+          "error_samples": [],
+          "exports": {
+            "active_drain_completed": 16,
+            "active_drain_elapsed_s": 1.2319828699999675,
+            "active_drain_per_s": 12.987193563819943,
+            "batch_elapsed_s": 4.587365820999992,
+            "batch_wallclock_per_s": 3.487840434864684,
+            "completed": 16,
+            "expected": 16,
+            "latency_ms": {
+              "count": 16,
+              "max": 644.8320359999684,
+              "mean": 603.9370211874946,
+              "p50": 591.6467480000165,
+              "p90": 644.8287609999852,
+              "p99": 644.83177139997,
+              "p999": 644.8320095399686
+            },
+            "mean_tokens": 161039.0,
+            "wave_drain_ms": {
+              "count": 2,
+              "max": 644.8741579999933,
+              "mean": 615.9914349999838,
+              "p50": 615.9914349999838,
+              "p90": 639.0976133999914,
+              "p99": 644.2965035399931,
+              "p999": 644.8163925539933
+            }
+          },
+          "exports_in_window": true,
+          "health_errors": 0,
+          "health_ms": {
+            "count": 240,
+            "max": 286.31157799998164,
+            "mean": 14.315100329140288,
+            "p50": 1.1386679999816351,
+            "p90": 3.3458557999494922,
+            "p99": 231.28377107995325,
+            "p999": 274.3657638459749
+          },
+          "loop_lag_ms": {
+            "count": 5999,
+            "max": 202.43233599342147,
+            "mean": 6.3281019168159345,
+            "p50": 0.6452119475284235,
+            "p90": 1.9017499767528518,
+            "p99": 130.4600099126997,
+            "p999": 190.43633599336502
+          },
+          "loop_lag_raw_ms": {
+            "count": 5401,
+            "max": 202.43233599342147,
+            "mean": 0.818777327953949,
+            "p50": 0.5951809612270154,
+            "p90": 1.0083589540954563,
+            "p99": 1.2186239617903993,
+            "p999": 72.75052138295602
+          },
+          "measurement_scope": {
+            "configured_window_s": 12.0,
+            "cpu_rss_elapsed_s": 12.000624384000048,
+            "cpu_rss_scope": "sampling starts immediately before the formal window and ends after probe/consumer drain; includes transport and content hashing"
+          },
+          "memory": {
+            "peak_mib": 860.59765625,
+            "start_mib": 784.52734375
+          },
+          "probe_counts": {
+            "health": {
+              "attempted": 240,
+              "completed": 240,
+              "expected": 240,
+              "failed": 0,
+              "scheduled": 240,
+              "succeeded": 240
+            },
+            "short": {
+              "attempted": 600,
+              "completed": 600,
+              "expected": 600,
+              "failed": 0,
+              "scheduled": 600,
+              "succeeded": 600
+            }
+          },
+          "probe_inflight_peak": 26,
+          "python": "3.12.3",
+          "scenario": {
+            "decode_delay_s": 0.002,
+            "export_mode": "implicit",
+            "export_workers": 0,
+            "groups": 2,
+            "health_rps": 20.0,
+            "init_tokens": 2048,
+            "lag_tick_s": 0.002,
+            "obs_tokens": 1536,
+            "r3_layers": 0,
+            "r3_topk": 3,
+            "resp_tokens": 128,
+            "sessions_per_group": 8,
+            "short_resp_tokens": 16,
+            "short_rps": 50.0,
+            "short_sessions": 8,
+            "turns": 96,
+            "wave_interval_s": 4.0,
+            "window_s": 12.0
+          },
+          "short_errors": 0,
+          "short_ms": {
+            "count": 600,
+            "max": 466.32163399999627,
+            "mean": 27.62928648330823,
+            "p50": 4.054235499978631,
+            "p90": 9.639998100004734,
+            "p99": 406.3653215499693,
+            "p999": 454.34954079998175
+          },
+          "src": "<candidate>",
+          "teardown": {
+            "export_worker_threads": 0,
+            "groups": 0,
+            "inflight_exports": 0,
+            "leaked_threads": [],
+            "pending_task_names": [],
+            "pending_tasks": 0,
+            "session_records": 0,
+            "shutdown_s": 0.0004307659999653879
+          },
+          "timeline_short_max_ms": [
+            4.8, 466.3, 6.1, 5.0, 5.1, 428.3, 4.8, 4.9, 5.1, 4.8, 4.7, 4.8, 0.0
+          ],
+          "valid": true,
+          "validation_errors": [],
+          "wave_offsets_s": [1.0003517479999573, 5.000609306999991],
+          "window_s": 12.0
+        }
+      ]
+    }
+  },
+  "date": "2026-11-06",
+  "environment": {
+    "cpu_model": "13th Gen Intel(R) Core(TM) i7-13650HX",
+    "cuda_visible_devices": "",
+    "logical_cpus": 20,
+    "measurement_cpu_affinity": [0, 1, 2, 3, 4, 5, 6, 7],
+    "packages": {
+      "fastapi": "0.139.1",
+      "numpy": "1.26.4",
+      "psutil": "7.2.2",
+      "pydantic": "2.14.3",
+      "pytest": "9.2.0",
+      "pytest-asyncio": "1.4.1.post1",
+      "ray": "2.60.0",
+      "tokenizers": "0.23.3",
+      "torch": "2.6.0+cu124",
+      "transformers": "5.22.1"
+    },
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "tokenizer": {
+      "files": [
+        {
+          "file": "config.json",
+          "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"
+        },
+        {
+          "file": "merges.txt",
+          "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+        },
+        {
+          "file": "tokenizer.json",
+          "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        {
+          "file": "tokenizer_config.json",
+          "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+        },
+        {
+          "file": "vocab.json",
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      ],
+      "repo": "Qwen/Qwen3-0.6B",
+      "revision": "c1899de289a04d12100db370d81485cdf75e47ca"
+    }
+  },
+  "measured_source_sha256": {
+    "relax/agentic/pipeline/__init__.py": "1186eb1886dfa77e35fd2dc50b1d6ac28c42fb44d36c9c1b773d8f8ec6afd343",
+    "relax/agentic/session/service.py": "168b78fac0bb443c43f7f3332c596fea95e733c19600ec322e234551d2dd9cc3",
+    "scripts/benchmarks/benchmark_agentic_session_export.py": "5a4f450dadcdc688057f9aee7b7c9d3e8450e5a6af5972a636f1fbba6163532b"
+  },
+  "path_normalization": "Only local source/environment/artifact path prefixes are normalized; measurements are unchanged.",
+  "source_newlines": "LF-normalized hashes identify staged Git source; measured byte hashes retain original source line endings."
+}

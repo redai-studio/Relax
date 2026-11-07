@@ -104,6 +104,13 @@ class TrainingFieldArtifact:
 
     @classmethod
     def from_sample(cls, sample: Sample) -> "TrainingFieldArtifact":
+        """Take ownership of ``sample``; the caller must not reuse it.
+
+        The payload shares unconverted values with ``sample`` and does not copy
+        them: SessionShard exports build a fresh Sample per export and discard
+        it, and the payload crosses a Ray boundary next.
+        """
+
         return cls(sample_payload=_compact_sample_payload(sample.to_dict()))
 
     def to_sample(self) -> Sample:
@@ -111,7 +118,8 @@ class TrainingFieldArtifact:
 
 
 def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    compacted = copy.deepcopy(payload)
+    # Top-level rebinding only; nested values stay shared (see from_sample).
+    compacted = dict(payload)
 
     tokens = compacted.get("tokens")
     rollout_tokens = compacted.get("rollout_tokens")

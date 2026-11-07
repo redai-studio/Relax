@@ -12,6 +12,7 @@ import json
 import time
 from argparse import Namespace
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -101,6 +102,10 @@ _AGENTIC_SHARD_ALLOCATOR_ENV = {
 _AGENTIC_SHARD_MAX_CONCURRENCY = 4096
 _SESSION_CLOSE_TIMEOUT_S = 2.0
 _ADMISSION_SHUTDOWN_TIMEOUT_S = 5.0
+# Sample assembly runs off the Shard event loop on this many threads. The work
+# is GIL-bound Python plus tokenizer decode, so extra threads would mostly
+# contend with the event loop for the GIL instead of exporting faster.
+_SESSION_EXPORT_WORKERS = 1
 
 # Identity sentinels encode the complete result-cell state machine without a
 # parallel status field. They must remain unique objects and must never cross a
@@ -1455,6 +1460,8 @@ class _SessionRecord:
     resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
+    # Submitted export job; cleanup cancels it if the worker has not started it.
+    export_future: Optional["Future[SessionExportTransport]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
 
@@ -1499,6 +1506,13 @@ class AgenticSessionShard:
         self._lifecycle_close_count = 0
         self._lifecycle_close_failure_count = 0
         self._generation_backend = SGLangBackendAdapter(args)
+        self._export_executor = ThreadPoolExecutor(
+            max_workers=_SESSION_EXPORT_WORKERS,
+            thread_name_prefix="agentic-session-export",
+        )
+        # Every submitted export job until it ends, including jobs whose
+        # Session was already retired; shutdown awaits them before the worker.
+        self._inflight_exports: set["Future[SessionExportTransport]"] = set()
         self._agent_launcher = ManagedAgentLauncher(
             load_agent_app_spec_from_args(args),
             resolve_chat_api_base_url(),
@@ -1898,7 +1912,8 @@ class AgenticSessionShard:
         async with session.lock:
             forest = session.forest
             state_hash = session.resp_state_hash_by_request_id.get(request_id)
-            if forest is None or state_hash is None:
+            # A finalizing Forest is frozen: its export job reads it off-loop.
+            if session.phase is not SessionPhase.ACTIVE or forest is None or state_hash is None:
                 return False
             response_node = forest.nodes_by_hash.get(state_hash)
             if response_node is None:
@@ -1966,6 +1981,7 @@ class AgenticSessionShard:
             "live_process_count": sum(group["live_process_count"] for group in groups),
             "interrupted_group_ids": tuple(group["group_id"] for group in groups if group["interrupted"]),
             "permit_cleanup_task_count": len(self._permit_cleanup_tasks),
+            "pending_export_count": len(self._inflight_exports),
         }
 
     async def agentic_kv_metrics(self, reset: bool = False) -> dict[str, float]:
@@ -2020,6 +2036,12 @@ class AgenticSessionShard:
         for outcome in permit_cleanup_outcomes:
             if first_error is None and isinstance(outcome, BaseException):
                 first_error = outcome
+        # A Session retired by an infra failure mid-export is no longer in its
+        # group, so wait for every tracked job before joining the worker.
+        inflight = tuple(self._inflight_exports)
+        await asyncio.gather(*(asyncio.wrap_future(export) for export in inflight), return_exceptions=True)
+        self._inflight_exports.difference_update(inflight)
+        self._export_executor.shutdown(wait=True, cancel_futures=True)
         try:
             await self._generation_backend.shutdown()
         except BaseException as error:
@@ -2804,55 +2826,85 @@ class AgenticSessionShard:
         )
 
     async def _finalize_terminal_session(self, session: _SessionRecord) -> None:
-        """Build the compact export, release Session resources, then
-        publish."""
+        """Freeze the Session, build its export off the event loop, then
+        publish.
+
+        FINALIZING stops every Forest writer (chat commits, IR commits and
+        response trace marks all require ACTIVE), so the committed nodes and
+        the exited agent's output are a stable snapshot without a copy.
+        """
 
         finalize_arrive_at = time.time()
         outcome: _SessionResultPayload
-        async with session.lock:
-            finalize_lock_acquired_at = time.time()
-            if session.phase is not SessionPhase.ACTIVE:
-                return
-            session.phase = SessionPhase.FINALIZING
-            try:
+        export: Optional[Future[SessionExportTransport]] = None
+        try:
+            async with session.lock:
+                finalize_lock_acquired_at = time.time()
+                if session.phase is not SessionPhase.ACTIVE:
+                    return
+                session.phase = SessionPhase.FINALIZING
                 output = cast(SessionResources, session.resources).process.output
-                finalize_events = {
-                    "finalize_arrive_at": finalize_arrive_at,
-                    "finalize_lock_acquired_at": finalize_lock_acquired_at,
-                    "finalize_start_at": time.time(),
-                }
-                outcome = self._build_session_export_transport(
-                    session=session,
+                export = self._export_executor.submit(
+                    self._build_session_export_transport,
+                    forest=cast(SessionForest, session.forest),
+                    rollout_mode=session.group.rollout_mode,
                     reward=output.reward,
                     metadata=output.metadata,
                     output_records=output.records,
-                    finalize_events=finalize_events,
+                    finalize_events={
+                        "finalize_arrive_at": finalize_arrive_at,
+                        "finalize_lock_acquired_at": finalize_lock_acquired_at,
+                    },
                 )
-            except AgentExecutionError as error:
-                logger.error(
-                    "Dropping non-finalizable agentic session session_id=%s group_id=%s error_type=%s\n%s",
-                    session.session_id,
-                    session.group.group_id,
-                    type(error).__name__,
-                    error,
-                )
-                outcome = None
-            except Exception as error:
-                outcome = RuntimeGroupError(
-                    f"agent export failed for {session.session_id}: {type(error).__name__}: {error}"
-                )
+                session.export_future = export
+                self._inflight_exports.add(export)
+            # Shield so only Session cleanup (export.cancel) can discard the job.
+            outcome = await asyncio.shield(asyncio.wrap_future(export))
+        except asyncio.CancelledError:
+            if export is None or not export.cancelled():
+                if export is not None:
+                    # This task is being cancelled; a queued job has no consumer.
+                    export.cancel()
+                raise
+            # Cleanup took over before the worker started; its outcome wins.
+            outcome = None
+        except AgentExecutionError as error:
+            logger.error(
+                "Dropping non-finalizable agentic session session_id=%s group_id=%s error_type=%s\n%s",
+                session.session_id,
+                session.group.group_id,
+                type(error).__name__,
+                error,
+            )
+            outcome = None
+        except Exception as error:
+            outcome = RuntimeGroupError(
+                f"agent export failed for {session.session_id}: {type(error).__name__}: {error}"
+            )
+        finally:
+            session.export_future = None
+            if export is not None and export.done():
+                # A job still running after cancellation stays tracked for shutdown.
+                self._inflight_exports.discard(export)
         await self._finish_session(session, outcome)
 
     def _build_session_export_transport(
         self,
         *,
-        session: _SessionRecord,
+        forest: SessionForest,
+        rollout_mode: str,
         reward: Any,
         metadata: dict[str, Any],
         output_records: tuple[dict[str, Any], ...],
         finalize_events: dict[str, float],
     ) -> SessionExportTransport:
-        forest = cast(SessionForest, session.forest)
+        """Assemble every export on the Shard export worker.
+
+        Reads only the frozen Forest and agent output. The implicit export
+        merges metadata into its leaf node, which this job alone owns.
+        """
+
+        finalize_events["finalize_start_at"] = time.time()
         export_payloads: list[dict[str, Any]] = []
         if output_records:
             for output_record in output_records:
@@ -2895,7 +2947,7 @@ class AgenticSessionShard:
                 finalize_events=finalize_events,
             )
             export_payloads.append(self._export_payload(name=None, sample=sample))
-        if session.group.rollout_mode == "train" and self.args.use_rollout_routing_replay:
+        if rollout_mode == "train" and self.args.use_rollout_routing_replay:
             # NOTE(wulumeng): An observation leaf has no routed experts (None). Samples should never end there, so this safeguard should never trigger.
             for export_payload in export_payloads:
                 sample_payload = export_payload["sample_payload"]
@@ -2980,6 +3032,11 @@ class AgenticSessionShard:
         record."""
 
         group = session.group
+        export = session.export_future
+        if export is not None:
+            # A queued export is discarded; a running one finishes and its
+            # result is ignored because this task publishes first.
+            export.cancel()
         pre_backend_tasks: list[asyncio.Task[None]] = []
         backend_tasks: list[asyncio.Task[None]] = []
         backend_request_ids: list[str] = []
