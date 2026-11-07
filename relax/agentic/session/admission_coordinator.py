@@ -15,6 +15,7 @@ import httpx
 import ray
 
 from relax.agentic.session.admission import AdmissionAction, AdmissionReason, BudgetState, GrantResult, WorkerSnapshot
+from relax.agentic.weight_audit import PublicationLedger
 from relax.utils.http_utils import router_worker_base_urls
 
 
@@ -84,6 +85,7 @@ class AdmissionCoordinator:
     Shards."""
 
     def __init__(self, args: Any) -> None:
+        self._publications = PublicationLedger()
         self._program_admission = bool(args.agentic_program_admission)
         self._router_ip = args.sglang_router_ip
         self._router_port = args.sglang_router_port
@@ -137,11 +139,18 @@ class AdmissionCoordinator:
         self._cancelled_request_permits[permit_id] = True
 
     @ray.method(max_task_retries=2)
-    async def release_request_permit(self, permit_id: str) -> None:
+    async def record_publication(self, epoch: str, sequence: int, version: str) -> None:
+        self._publications.record(epoch, sequence, version)
+
+    @ray.method(max_task_retries=2)
+    async def release_request_permit(
+        self, permit_id: str, audit_version: str | None = None, audit: bool = False
+    ) -> dict[str, Any] | None:
         if permit_id not in self._active_request_permits:
             return
         self._active_request_permits.remove(permit_id)
         self._request_permits.release()
+        return self._publications.snapshot(audit_version) if audit else None
 
     async def acquire(self, request: dict[str, Any]) -> dict[str, Any]:
         ticket_id = str(request["ticket_id"])

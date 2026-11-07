@@ -1242,6 +1242,7 @@ async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix
     ir.pending_topk_token_ids_delta = [np.array([[300, 301]], dtype=np.int32)]
     ir.pending_topk_logprob_delta = [np.array([[-0.5, -2.0]], dtype=np.float32)]
     ir.pending_weight_version_delta = ["v1"]
+    ir.pending_weight_version_spans = [{"start": 0, "end": 1, "weight_version": "v1"}]
     ir.pending_spec_delta["completion_token_num"] = 1
     ir.pending_prefix_cache_delta["cached_tokens"] = 2
 
@@ -1259,6 +1260,7 @@ async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix
     np.testing.assert_array_equal(ir.pending_topk_token_ids_delta[0], [[300, 301]])
     np.testing.assert_array_equal(ir.pending_topk_logprob_delta[0], [[-0.5, -2.0]])
     assert ir.pending_weight_version_delta == ["v1"]
+    assert ir.pending_weight_version_spans == [{"start": 0, "end": 1, "weight_version": "v1"}]
     assert ir.pending_spec_delta["completion_token_num"] == 1
     assert ir.pending_prefix_cache_delta["cached_tokens"] == 2
 
@@ -1635,3 +1637,99 @@ def test_routing_replay_preserves_selected_session_branch():
     np.testing.assert_array_equal(sibling.rollout_routed_experts, sibling_routes)
     np.testing.assert_array_equal(first.rollout_routed_experts, first_routes)
     np.testing.assert_array_equal(next_routes, np.full((7, 2, 2), 20, dtype=np.int32))
+
+
+@pytest.mark.parametrize("tokens", [[], [97]])
+async def test_weight_provenance_excludes_late_cancelled_backend_result(tokens):
+    shard, _group, session, ir = _router_recovery_shard()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def generate(**_kwargs):
+        started.set()
+        await release.wait()
+        return BackendGenerateResult(
+            new_tokens=tokens,
+            new_log_probs=[-0.5] * len(tokens),
+            finish_type="stop",
+            meta_info={"weight_version": "cancelled"},
+            elapsed=0.1,
+        )
+
+    shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await started.wait()
+    session.live_irs.remove(ir)
+    ir.runner_task = None
+    release.set()
+    await task
+    assert ir.pending_token_delta == [300]
+    assert ir.pending_weight_version_spans == []
+
+
+@pytest.mark.parametrize("completion_snapshot", [{"epoch": "policy", "sequence": 3}, {}])
+async def test_partial_zero_token_finish_uses_request_completion_snapshot(completion_snapshot):
+    from relax.agentic.weight_audit import diagnose, prepare_audit
+
+    shard, _group, session, ir = _router_recovery_shard()
+    shard.args.agentic_reasoning_parser = None
+    shard.args.agentic_tool_call_parser = None
+    shard._generation_backend = SimpleNamespace(tokenizer=_FakeTokenizer())
+    forest, observation = _forest_with_initial_obs(
+        session_id=session.session_id,
+        messages=[{"role": "user", "content": "p"}],
+        train_token_delta=[112],
+        rollout_token_delta=[112],
+    )
+    session.forest = forest
+    ir.parent_state_hash = observation.state_hash
+    ir.pending_token_delta = []
+    ir.pending_logprob_delta = []
+    for tokens, finish, snapshot in [
+        ([97], "abort", {"epoch": "policy", "sequence": 1, "source_sequence": 1}),
+        ([], "stop", completion_snapshot),
+    ]:
+        shard._apply_generate_result(
+            ir,
+            BackendGenerateResult(
+                new_tokens=tokens,
+                new_log_probs=[-0.5] * len(tokens),
+                finish_type=finish,
+                meta_info={"weight_version": "1", "_relax_publication": snapshot},
+                elapsed=0.1,
+            ),
+        )
+    ir.pending_status = "completed"
+    shard._terminal_response_locked(session=session, ir=ir, finish_type="stop")
+    sample = forest.build_sample(
+        leaf_state_hash=session.resp_state_hash_by_request_id[ir.request_id], tokenizer=_FakeTokenizer()
+    )
+    report = diagnose(prepare_audit(sample), {"epoch": "policy", "sequence": 4})
+    assert sample.tokens == [112, 97]
+    assert len(report["spans"]) == 1
+    assert report["spans"][0]["consumption_age"] == 3
+    assert report["post_generation_wait_lag"] == (1 if completion_snapshot else None)
+    assert report["spans"][0]["generation_age"] == (2 if completion_snapshot else None)
+
+
+async def test_weight_provenance_tracks_partial_attempts_missing_and_zero_token_results():
+    shard, _group, _session, ir = _router_recovery_shard()
+    ir.pending_token_delta = []
+    ir.pending_logprob_delta = []
+    for tokens, version in [([97, 98], "10"), ([], "11"), ([99], None), ([100], "12")]:
+        shard._apply_generate_result(
+            ir,
+            BackendGenerateResult(
+                new_tokens=tokens,
+                new_log_probs=[-0.5] * len(tokens),
+                finish_type="abort",
+                meta_info={"weight_version": version},
+                elapsed=0.1,
+            ),
+        )
+    assert ir.pending_token_delta == [97, 98, 99, 100]
+    assert [(s["start"], s["end"], s["weight_version"]) for s in ir.pending_weight_version_spans] == [
+        (0, 2, "10"),
+        (2, 3, None),
+        (3, 4, "12"),
+    ]

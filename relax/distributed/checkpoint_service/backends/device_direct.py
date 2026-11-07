@@ -800,6 +800,10 @@ class DeviceDirectBackend(CommBackend):
                 push_failed = bool(flag.item())
             if dist.get_rank() == 0:
                 # Continue generation on all rollout nodes
+                if not push_failed:
+                    from relax.agentic.weight_audit import record_publication
+
+                    record_publication(self)
                 logger.info("Resuming generation on all rollout nodes...")
                 self._batch_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
