@@ -659,10 +659,15 @@ def validate_i2i_sft_config(args: Namespace) -> None:
             "image_prefetch_workers",
             "dp_tier_micro_balance",
             "dp_tier_rank_rotation",
+            "condition_cache_bytes",
+            "condition_cache_entries",
         }
     )
     _fail(errors, bool(unknown), f"Unknown i2i_sft_config keys: {sorted(unknown)}")
     args.i2i_sft_config = config = {**defaults, **config}
+    for field, default, minimum in (("condition_cache_bytes", 0, 0), ("condition_cache_entries", 128, 1)):
+        value = config.get(field, default)
+        _fail(errors, type(value) is not int or value < minimum, f"{field} must be an integer >= {minimum}")
     depth, workers = config.get("image_prefetch_depth", 0), config.get("image_prefetch_workers", 2)
     _fail(errors, type(depth) is not int or depth < 0, "image_prefetch_depth must be a nonnegative integer")
     _fail(errors, type(workers) is not int or workers <= 0, "image_prefetch_workers must be a positive integer")
@@ -701,11 +706,6 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         errors,
         type(config["prefix_gradient_checkpointing"]) is not bool,
         "prefix_gradient_checkpointing must be boolean",
-    )
-    _fail(
-        errors,
-        config["deterministic_attention"] and config["attention_implementation"] != "flash_attention_2",
-        "Deterministic image SFT currently requires flash_attention_2",
     )
     tiers = config.get("fixed_pixels_tiers")
     _fail(

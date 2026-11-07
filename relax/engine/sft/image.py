@@ -17,6 +17,38 @@ from typing import Any
 import torch
 
 
+def load_sft_image(path: Path, max_pixels: int, *, patch_size: int, fixed_pixels: int | None = None) -> Any:
+    """Decode RGB and apply the shared deterministic image-SFT resize/crop."""
+    from PIL import Image
+    from torchvision.transforms import InterpolationMode, functional
+
+    with Image.open(path) as source:
+        image = source.convert("RGB")
+    width, height = image.size
+    if fixed_pixels is not None and fixed_pixels > 0:
+        # Bi-directional rescale to the pixel budget (small images are
+        # upscaled), keeping the aspect ratio; mirrors the inference-side
+        # fixed-pixels tier semantics.
+        scale = (width * height / fixed_pixels) ** 0.5
+        height, width = int(round(height / scale)), int(round(width / scale))
+    elif width * height > max_pixels:
+        scale = (width * height / max_pixels) ** 0.5
+        height, width = int(height / scale), int(width / scale)
+    height, width = height // patch_size * patch_size, width // patch_size * patch_size
+    if fixed_pixels is not None and fixed_pixels > 0:
+        # A fixed budget is approximate after patch alignment. Keep at least
+        # one patch per axis, including for tiny budgets and extreme ratios.
+        height, width = max(patch_size, height), max(patch_size, width)
+    if min(height, width) <= 0:
+        raise ValueError(f"Image is smaller than patch size: {path}")
+    old_width, old_height = image.size
+    scale = max(width / old_width, height / old_height)
+    image = functional.resize(
+        image, (round(old_height * scale), round(old_width * scale)), interpolation=InterpolationMode.BILINEAR
+    )
+    return functional.center_crop(image, (height, width))
+
+
 def image_tier_budget(config: dict[str, Any], index: int) -> int | None:
     """CPU-only per-row tier policy shared by decoding and DP assignment."""
     tiers = config.get("fixed_pixels_tiers") or []
