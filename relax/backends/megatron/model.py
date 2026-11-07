@@ -1561,7 +1561,8 @@ def train_one_step(
         logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
     valid_step = True
     skipped_nonfinite_grad = False
-    if _is_global_zero_token_step(losses_reduced):
+    zero_token_step = _is_global_zero_token_step(losses_reduced)
+    if zero_token_step:
         # No effective loss tokens anywhere in the global batch. Gradients are
         # exactly zero (the loss is zero-connected), so skip both the parameter
         # and LR scheduler updates; momentum / weight decay must not move the
@@ -1626,6 +1627,15 @@ def train_one_step(
             opt_param_scheduler.step(increment=step_global_batch_size)
         else:
             grad_norm = float("nan")
+
+    if getattr(args, "disk_weight_sync_config", None):
+        logger.info(
+            "Disk sync optimizer result: rollout=%d step=%d updated=%s zero_tokens=%s",
+            rollout_id,
+            step_id,
+            bool(update_successful),
+            zero_token_step,
+        )
 
     if critic_value_head_snapshot is not None:
         from relax.backends.megatron.ci_utils import assert_critic_value_head_updated
