@@ -21,8 +21,8 @@ def attention_for_selection(
     """Preserve native selected blocks, expanding the causal tail exactly
     once."""
     batch, length, heads, width = query.shape
-    if width != 256 or heads != 12 or key.shape[2:] != (1, 256):
-        raise NotImplementedError("Mixed QSA requires TP2 local geometry 12Q/1KV/D256")
+    if width != 256 or key.shape[-1] != width or key.shape[2] <= 0 or heads % key.shape[2]:
+        raise NotImplementedError("Mixed QSA requires integral local GQA groups and D256")
     if selection.compress_ratio != 4 or selection.selected_ids is None:
         raise ValueError("Mixed QSA requires native selected four-token block IDs")
     bounds = getattr(selection, "_relax_qsa_mixed_bounds", None) if is_thd else (0, length)
