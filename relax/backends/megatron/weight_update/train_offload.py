@@ -207,54 +207,7 @@ class _SelectiveOffloadStrategy:
                     _clear_on(dispatcher)
                     _clear_on(getattr(dispatcher, "_comm_manager", None))
 
-    @torch.no_grad()
-    def offload(self) -> None:
-        import gc
-
-        # 0. Drop MoE token-dispatcher caches (token_probs/dispatched_probs carry
-        # grad_fn and pin the MoE forward graph + its activations on GPU).
-        self._clear_moe_dispatcher_caches()
-
-        # 1. Model DDP flat buffers.
-        for buffer in self._iter_ddp_buffers():
-            # param_data: copy to CPU, then free GPU storage (must survive sleep).
-            if buffer.param_data is not None and buffer.param_data.storage().size() > 0:
-                # Reuse one persistent pinned host buffer per DDP buffer instead of
-                # allocating a fresh pageable one every sleep. Pinned memory lets the
-                # driver DMA straight from the device rather than staging through its
-                # internal bounce buffer (~2x on D2H, and reload() gets the same on H2D).
-                # Reusing it also avoids re-paying the page-locking cost, and avoids the
-                # transient 2x host-memory peak that reallocating would cause: Python
-                # evaluates the new buffer before dropping the reference to the old one.
-                cpu_data = getattr(buffer.param_data, "cpu_data", None)
-                if cpu_data is None:
-                    cpu_data = torch.empty_like(buffer.param_data, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
-                    buffer.param_data.cpu_data = cpu_data
-                else:
-                    # A mismatch means something rebuilt param_data behind our back;
-                    # surface it rather than silently reallocating (2x peak again).
-                    assert cpu_data.shape == buffer.param_data.shape, (
-                        f"cpu_data shape {tuple(cpu_data.shape)} != param_data shape {tuple(buffer.param_data.shape)}"
-                    )
-                    assert cpu_data.dtype == buffer.param_data.dtype, (
-                        f"cpu_data dtype {cpu_data.dtype} != param_data dtype {buffer.param_data.dtype}"
-                    )
-                # Synchronous D2H: the copy must land before resize_(0) frees the source.
-                cpu_data.copy_(buffer.param_data.data, non_blocking=False)
-                buffer.param_data_size = buffer.param_data.storage().size()
-                # Give each contiguous param a CPU-backed view so code that reads
-                # param.data while offloaded doesn't hit the resized-to-0 storage.
-                # These views alias cpu_data, which the next offload() overwrites — safe
-                # only because reload() drops them before returning.
-                for param, (start, end, *_rest) in self._param_index_map(buffer).items():
-                    if end - start == param.numel():
-                        param._relax_cpu_offload_data = cpu_data[start:end].view(param.shape)
-                buffer.param_data.storage().resize_(0)
-            # grad_data: just free GPU storage (contents are recomputed on wake).
-            if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
-                buffer.grad_data_size = buffer.grad_data.storage().size()
-                buffer.grad_data.storage().resize_(0)
-
+    def _offload_optimizer(self) -> None:
         if not self._skip_optimizer:
             # 2. Optimizer fp32 master params (shard_fp32_from_float16_groups).
             for opt in self._iter_optimizers():
@@ -276,13 +229,165 @@ class _SelectiveOffloadStrategy:
                     if "exp_avg_sq" in state:
                         state["exp_avg_sq"] = state["exp_avg_sq"].to("cpu", non_blocking=False)
 
+    def fused_optimizer_reason(self) -> str | None:
+        """Check the exact state layout handled by our offload/reload pair."""
+        if self._skip_optimizer:
+            return None
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+        model_storages = {
+            tensor.untyped_storage().data_ptr()
+            for b in self._iter_ddp_buffers()
+            for tensor in (b.param_data, b.grad_data)
+            if tensor is not None and tensor.untyped_storage().nbytes()
+        }
+        for opt in self._iter_optimizers():
+            if not isinstance(opt, DistributedOptimizer) or getattr(
+                opt.config, "use_precision_aware_optimizer", False
+            ):
+                return "GPU optimizer master weights are not handled by selective offload"
+            inner = getattr(opt, "optimizer", None)
+            if inner is None or type(inner).__name__ not in ("Adam", "FusedAdam"):
+                return "unsupported GPU optimizer implementation"
+            masters = getattr(opt, "shard_fp32_from_float16_groups", None)
+            if masters is None:
+                return "GPU optimizer has no explicit FP32 master shards"
+            tensors = [p for group in masters for p in group if p is not None]
+            for state in inner.state.values():
+                if set(state) - {"step", "exp_avg", "exp_avg_sq"}:
+                    return "unknown optimizer state requires the original lifecycle"
+                if isinstance(state.get("step"), torch.Tensor) and state["step"].device.type != "cpu":
+                    return "device optimizer step counter is not handled by selective offload"
+                tensors.extend(state[name] for name in ("exp_avg", "exp_avg_sq") if name in state)
+            if any(
+                not isinstance(tensor, torch.Tensor) or tensor.untyped_storage().data_ptr() in model_storages
+                for tensor in tensors
+            ):
+                return "optimizer state is invalid or aliases model parameters/gradients"
+        return None
+
+    def _offload_gradients(self) -> None:
+        for buffer in self._iter_ddp_buffers():
+            if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
+                buffer.grad_data_size = buffer.grad_data.storage().size()
+                buffer.grad_data.storage().resize_(0)
+
+    def _backup_parameters(self, *, non_blocking: bool) -> None:
+        for buffer in self._iter_ddp_buffers():
+            param = buffer.param_data
+            if param is None or param.storage().size() == 0:
+                continue
+            cpu = getattr(param, "cpu_data", None)
+            if cpu is None:
+                cpu = torch.empty_like(param, device="cpu", pin_memory=_PIN_MEMORY)
+                param.cpu_data = cpu
+            if cpu.shape != param.shape or cpu.dtype != param.dtype:
+                raise RuntimeError("Train-state CPU backing no longer matches the parameter buffer")
+            cpu.copy_(param, non_blocking=non_blocking)
+            buffer.param_data_size = param.storage().size()
+
+    def _release_parameters(self) -> None:
+        for buffer in self._iter_ddp_buffers():
+            param = buffer.param_data
+            if param is None or param.storage().size() == 0:
+                continue
+            for tensor, (start, end, *_rest) in self._param_index_map(buffer).items():
+                if end - start == tensor.numel():
+                    tensor._relax_cpu_offload_data = param.cpu_data[start:end].view(tensor.shape)
+            param.storage().resize_(0)
+
+    @torch.no_grad()
+    def offload(self) -> None:
+        import gc
+
+        if getattr(self, "_forward_pending", False):
+            raise RuntimeError("A forward weight transfer still owns the training parameters")
+        self._clear_moe_dispatcher_caches()
+        self._backup_parameters(non_blocking=False)
+        self._release_parameters()
+        self._offload_gradients()
+        self._offload_optimizer()
         gc.collect()
         device_module.empty_cache()
+
+    @torch.no_grad()
+    def begin_forward_sync(self, weights: dict[str, torch.Tensor]) -> None:
+        """Offload training-only state, then back up immutable GPU parameters.
+
+        The caller must fence optimizer/parameter-gather writes first, and must
+        retain parameters until every receiver closes its IPC mappings. CPU
+        backing is shared with the actor snapshot, including tensors that do
+        not belong to a DDP parameter buffer (e.g. frozen vision weights).
+        """
+        if getattr(self, "_forward_pending", False):
+            raise RuntimeError("A forward weight transfer is already pending")
+        buffers = list(self._iter_ddp_buffers())
+        if not buffers or any(b.param_data is None or b.param_data.storage().size() == 0 for b in buffers):
+            raise RuntimeError("Forward sync requires resident DDP parameter allocations")
+        parameter_storages = {b.param_data.untyped_storage().data_ptr() for b in buffers}
+        if any(
+            b.grad_data is not None and b.grad_data.untyped_storage().data_ptr() in parameter_storages for b in buffers
+        ):
+            raise RuntimeError("Forward sync cannot release gradients that alias model parameters")
+        if any(t.device.type != "cuda" for t in weights.values()):
+            raise RuntimeError("Forward sync requires all exported parameters/buffers on CUDA")
+        reason = self.fused_optimizer_reason()
+        if reason is not None:
+            raise RuntimeError(f"Fused optimizer contract changed: {reason}")
+        self._clear_moe_dispatcher_caches()
+        self._offload_gradients()
+        # TODO(agent): overlap optimizer-state D2H with weight sync once pinned
+        # buffers, completion events, storage aliases and memory headroom are
+        # qualified. For now finish its blocking offload before sending weights.
+        self._offload_optimizer()
+        device_module.empty_cache()
+        self._forward_pending = True
+        self._forward_stream = torch.cuda.Stream()
+        self._forward_stream.wait_stream(torch.cuda.current_stream())
+        snapshot = {}
+        extras = getattr(self, "_extra_cpu_backing", {})
+        with torch.cuda.stream(self._forward_stream):
+            self._backup_parameters(non_blocking=True)
+            by_storage = {b.param_data.untyped_storage().data_ptr(): b.param_data for b in buffers}
+            for name, tensor in weights.items():
+                flat = by_storage.get(tensor.untyped_storage().data_ptr())
+                if flat is not None:
+                    if tensor.dtype != flat.dtype:
+                        raise RuntimeError("A parameter has a different dtype from its backing allocation")
+                    offset = tensor.storage_offset() - flat.storage_offset()
+                    snapshot[name] = flat.cpu_data.as_strided(tensor.shape, tensor.stride(), offset)
+                else:
+                    cpu = extras.get(name)
+                    if cpu is None:
+                        cpu = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                        extras[name] = cpu
+                    if cpu.shape != tensor.shape or cpu.dtype != tensor.dtype:
+                        raise RuntimeError("Standalone parameter layout changed during forward sync")
+                    cpu.copy_(tensor.detach(), non_blocking=True)
+                    snapshot[name] = cpu
+            self._forward_done = torch.cuda.Event()
+            self._forward_done.record()
+        self._extra_cpu_backing = extras
+        self._forward_snapshot = snapshot
+
+    @torch.no_grad()
+    def finish_forward_sync(self) -> dict[str, torch.Tensor]:
+        """Called only after GPU completion AND all receiver release ACKs."""
+        if not getattr(self, "_forward_pending", False):
+            raise RuntimeError("No forward weight transfer is pending")
+        self._forward_done.synchronize()
+        self._release_parameters()
+        self._forward_pending = False
+        snapshot, self._forward_snapshot = self._forward_snapshot, None
+        device_module.empty_cache()
+        return snapshot
 
     @torch.no_grad()
     def reload(self) -> None:
         import gc
 
+        if getattr(self, "_forward_pending", False):
+            raise RuntimeError("Cannot reload while a forward weight transfer is pending")
         device = device_utils.make_current_torch_device()
         # 1. Model DDP flat buffers.
         for buffer in self._iter_ddp_buffers():
@@ -428,6 +533,23 @@ class MegatronTrainStateOffloader:
         """
         if self.enabled:
             self._strategy.reload()
+
+    def begin_forward_sync(self, weights: dict[str, torch.Tensor]) -> None:
+        if not self.enabled or self.uses_tms:
+            raise RuntimeError("Fused forward sync requires selective train-state offload")
+        self._strategy.begin_forward_sync(weights)
+
+    def fused_support_reason(self) -> str | None:
+        if not self.enabled or self.uses_tms:
+            return "requires selective train-state offload"
+        if not torch.cuda.is_available() or torch.version.hip is not None:
+            return "native fused transfer requires CUDA"
+        return self._strategy.fused_optimizer_reason()
+
+    def finish_forward_sync(self) -> dict[str, torch.Tensor]:
+        if not self.enabled or self.uses_tms:
+            raise RuntimeError("Fused forward sync requires selective train-state offload")
+        return self._strategy.finish_forward_sync()
 
     def disable_during_update(self) -> ContextManager:
         """Context manager wrapping weight update so offload bookkeeping stays
