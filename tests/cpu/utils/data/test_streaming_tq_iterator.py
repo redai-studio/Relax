@@ -627,6 +627,8 @@ def test_missing_audit_field_preserves_consumed_token_denominator(monkeypatch, t
         assert report["missing_token_rate"] == 1
         assert report["age_coverage"] == 0
         assert report["token_weighted_age"] is None
+        assert report["aggregate_complete"] is False
+        assert report["audit_errors"] == 2
 
 
 @pytest.mark.parametrize("loss_type", ["dpo", "rm"])

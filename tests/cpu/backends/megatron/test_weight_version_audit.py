@@ -57,6 +57,76 @@ def test_failed_schedule_does_not_commit_staged_exposures(tmp_path, monkeypatch)
     assert not list(tmp_path.glob("*/consumed*.jsonl"))
 
 
+@pytest.mark.parametrize("converter", [None, "custom.tokens"])
+def test_audit_fetch_fields_match_converter_contract(tmp_path, monkeypatch, converter):
+    from relax.utils.training.data_fields import build_data_fields
+
+    monkeypatch.setenv("RELAX_WEIGHT_AUDIT_DIR", str(tmp_path))
+    args = Namespace(
+        loss_type="policy_loss",
+        advantage_estimator="grpo",
+        custom_convert_samples_to_train_data_path=converter,
+        use_routing_replay=False,
+        true_on_policy_mode=True,
+        kl_coef=0.0,
+        use_kl_loss=False,
+        multimodal_keys=None,
+        use_opd=False,
+    )
+    expected = converter is None
+    requested = build_data_fields(args)
+    assert (audit.AUDIT_FIELD in requested) is expected
+    if converter is not None:
+        from transfer_queue.controller import DataPartitionStatus
+
+        from relax.utils import utils
+
+        payload = {
+            "tokens": [[1, 2, 3]],
+            "total_lengths": [3],
+            "response_lengths": [2],
+            "loss_masks": [[1, 1]],
+            "rollout_log_probs": [[-0.5, -0.5]],
+            "rewards": [1.0],
+            "sample_indices": [0],
+            "sample_index_mask_sums": [2],
+            "group_index": [0],
+        }
+        monkeypatch.setattr(utils, "load_function", lambda _path: lambda _args, _samples: payload)
+        converted = utils.convert_samples_to_train_data(args, [])
+        partition = DataPartitionStatus(
+            partition_id="train_0",
+            production_status=torch.ones((1, len(converted)), dtype=torch.int8),
+            global_indexes={0},
+            field_name_mapping={key: index for index, key in enumerate(converted)},
+            production_completed=True,
+            actual_sample_count=1,
+        )
+        assert partition.scan_data_status(requested, "actor") == [0]
+
+    class FetchReached(Exception):
+        pass
+
+    def fetch(*_args, **kwargs):
+        assert (audit.AUDIT_FIELD in kwargs["data_fields"]) is expected
+        raise FetchReached
+
+    path = Path(__file__).resolve().parents[4] / "relax/backends/megatron/actor.py"
+    tree = ast.parse(path.read_text())
+    definition = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "train_async"
+    )
+    definition.decorator_list = []
+    namespace = {
+        "logger": logging.getLogger(__name__),
+        "create_stream_dataloader": fetch,
+        "mpu": SimpleNamespace(get_data_parallel_rank=lambda: 0),
+    }
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), str(path), "exec"), namespace)
+    with pytest.raises(FetchReached):
+        namespace["train_async"](SimpleNamespace(args=args, data_iterator=None), 0)
+
+
 def _load_definition(path, name, namespace):
     tree = ast.parse(path.read_text())
     definition = next(
@@ -229,6 +299,33 @@ def test_train_step_consumes_final_mask_counts(tmp_path, monkeypatch):
     assert _run(tmp_path, monkeypatch, final_mask=[1, 0])["eligible_tokens"] == 3
 
 
+@pytest.mark.parametrize("failures,dummy", [((1,), False), ((0, 1, 2), False), ((0, 1, 2), True)])
+def test_count_failure_marks_summary_incomplete(tmp_path, monkeypatch, failures, dummy):
+    original_load = _load_definition
+    calls = itertools.count()
+
+    def load(path, name, namespace):
+        definition = original_load(path, name, namespace)
+        if name != "_weight_audit_counts":
+            return definition
+
+        def count(*args, **kwargs):
+            if next(calls) in failures:
+                raise RuntimeError("injected audit count failure")
+            return definition(*args, **kwargs)
+
+        return count
+
+    monkeypatch.setitem(globals(), "_load_definition", load)
+    summary = _run(tmp_path, monkeypatch, final_mask=[1, 0], dummy=dummy)
+    if dummy:
+        assert summary is None
+    else:
+        assert summary["eligible_tokens"] == 3 - len(failures)
+        assert summary["aggregate_complete"] is False
+        assert summary["audit_errors"] == len(failures)
+
+
 def _counts_helper(loss_module, cp):
     path = Path(__file__).resolve().parents[4] / "relax/backends/megatron/model.py"
     return _load_definition(
@@ -343,7 +440,7 @@ def _cp_audit_worker(rank, rendezvous):
                 counts = helper(Namespace(qkv_format="thd"), batch)
                 assert counts.tolist() == ([4, 3] if prompt == 0 else [3, 3])
                 owners = offsets(8, 8 - prompt, dynamic_cp_size=2, dynamic_cp_rank=rank)[3]
-                batch["weight_audit_opsm_mask"] = torch.cat(
+                batch["weight_audit_policy_mask"] = torch.cat(
                     [torch.arange(lo, hi) != 4 for lo, hi in owners if lo < hi]
                 )
                 counts = helper(Namespace(qkv_format="thd"), batch)
@@ -430,6 +527,71 @@ def test_opsm_audit_counts_union_of_active_losses(tmp_path, monkeypatch, auxilia
     summary = step.commit(0)
     assert summary["eligible_tokens"] == (1 if auxiliary == "none" else 2)
     assert summary["token_weighted_age"] == (1 if auxiliary == "none" else 1.5)
+    assert batch["loss_masks"][0].tolist() == [1, 1]
+
+
+@pytest.mark.parametrize("auxiliary", ["none", "entropy", "kl", "opd", "mtp", "opsm"])
+def test_icepop_audit_counts_union_of_active_losses(tmp_path, monkeypatch, auxiliary):
+    from tests.cpu.backends.megatron.test_score_centering_loss import _args, _backend
+
+    monkeypatch.setenv("RELAX_WEIGHT_AUDIT_DIR", str(tmp_path))
+    loss_module, cp = _backend(monkeypatch)
+    args = _args(
+        advantage_estimator="grpo",
+        use_tis=True,
+        use_opsm=auxiliary == "opsm",
+        opsm_delta=0.01,
+        custom_tis_function_path="relax.backends.megatron.loss.icepop_function",
+        tis_clip_low=0.5,
+        tis_clip=2.0,
+        calculate_per_token_loss=False,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        entropy_coef=0.1 if auxiliary == "entropy" else 0.0,
+        use_kl_loss=auxiliary == "kl",
+        kl_loss_coef=0.2,
+        use_unbiased_kl=False,
+        kl_loss_type="k2",
+        opd_token_selection="student_sampled",
+        opd_loss_coef=0.5 if auxiliary == "opd" else 0.0,
+        opd_kl_type="reverse_kl",
+        opd_jsd_alpha=0.5,
+        enable_mtp_training=auxiliary == "mtp",
+        mtp_num_layers=1,
+        mtp_loss_scaling_factor=0.1,
+    )
+    row = audit.prepare_row({"spans": [{"token_start": 2, "token_end": 4}]}, 4, 2, [1, 1])
+    batch = {
+        "unconcat_tokens": [torch.tensor([0, 0, 1, 2])],
+        "advantages": [torch.ones(2)],
+        "log_probs": [torch.full((2,), -math.log(4))],
+        "rollout_log_probs": [torch.tensor([-math.log(4) - math.log(10), -math.log(4)])],
+        "ref_log_probs": [torch.full((2,), -2.0)],
+        "teacher_log_probs": [torch.full((2,), -2.0)],
+        "total_lengths": [4],
+        "response_lengths": [2],
+        "loss_masks": [torch.ones(2)],
+    }
+    if auxiliary == "opsm":
+        batch["advantages"] = [torch.tensor([1.0, -1.0])]
+        batch["log_probs"] = [batch["log_probs"][0] + 0.05]
+    gradients = []
+    for collect in (False, True):
+        if collect:
+            batch[audit.PREPARED_FIELD] = [row]
+        logits = torch.zeros((1, 4, 4), requires_grad=True)
+        reducer = cp.get_sum_of_sample_mean([4], [2], batch["loss_masks"])
+        loss, _ = loss_module.policy_loss_function(args, batch, logits, reducer)
+        loss.backward()
+        gradients.append(logits.grad.clone())
+    torch.testing.assert_close(*gradients)
+    if auxiliary == "none":
+        assert gradients[1][0, 1].abs().sum() == 0
+        assert gradients[1][0, 2].abs().sum() > 0
+    counts = _counts_helper(loss_module, cp)(args, batch)
+    step = audit.AuditStep("icepop")
+    step.observe(0, [row], counts=counts)
+    assert step.commit(0)["eligible_tokens"] == (0 if auxiliary == "opsm" else 1 if auxiliary == "none" else 2)
     assert batch["loss_masks"][0].tolist() == [1, 1]
 
 

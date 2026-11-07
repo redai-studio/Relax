@@ -90,8 +90,8 @@ def _weight_audit_counts(args: Namespace, batch: dict[str, Any]) -> torch.Tensor
         return None
     cp_size = batch.get("dynamic_cp_size", mpu.get_context_parallel_world_size())
     cp_rank = batch.get("dynamic_cp_rank", mpu.get_context_parallel_rank())
-    opsm_mask = batch.get("weight_audit_opsm_mask")
-    opsm_offset = 0
+    policy_mask = batch.get("weight_audit_policy_mask")
+    policy_offset = 0
     mtp_active = (
         getattr(args, "enable_mtp_training", False)
         and getattr(args, "mtp_num_layers", 0) > 0
@@ -137,9 +137,9 @@ def _weight_audit_counts(args: Namespace, batch: dict[str, Any]) -> torch.Tensor
                 continue
             local = mask.detach()[owner_lo - start : owner_hi - start] != 0
             length = owner_hi - owner_lo
-            if opsm_mask is not None:
-                local = local & (opsm_mask[opsm_offset : opsm_offset + length] != 0)
-            opsm_offset += length
+            if policy_mask is not None:
+                local = local & (policy_mask[policy_offset : policy_offset + length] != 0)
+            policy_offset += length
             if batch.get("weight_audit_opd") or mtp_active:
                 original = batch["loss_masks"][i].detach()[owner_lo - start : owner_hi - start] != 0
                 if not batch.get("weight_audit_opd"):
@@ -1589,6 +1589,13 @@ def train_one_step(
                 )
             except Exception:
                 logger.exception("Weight audit failed; actor loss remains unchanged")
+                if cp_rank == 0:
+                    audit_step.observe(
+                        audit_ordinal,
+                        batch.get(weight_version_audit.PREPARED_FIELD),
+                        dummy=batch.get("__is_dummy__", False),
+                        error="loss_observation_failed",
+                    )
             return result
 
         return output_tensor, loss_callback_with_packing_metrics

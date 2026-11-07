@@ -412,9 +412,24 @@ class AuditStep:
         self.masked_rows: dict[int, tuple[list[dict[str, Any]], Any]] = {}
 
     def observe(
-        self, ordinal: int, rows: list[dict[str, Any]] | None, *, dummy: bool = False, counts: Any = None
+        self,
+        ordinal: int,
+        rows: list[dict[str, Any]] | None,
+        *,
+        dummy: bool = False,
+        counts: Any = None,
+        error: str | None = None,
     ) -> None:
-        if not dummy and rows is not None and ordinal not in self.observed:
+        if not dummy and ordinal not in self.observed:
+            if error is not None:
+                # Unknown final counts must not be replaced by the pre-filter mask.
+                rows = [
+                    {**row, "eligible_tokens": 0, "uncovered_tokens": 0, "spans": [], "audit_error": error}
+                    for row in rows or [{}]
+                ]
+                counts = None
+            if rows is None:
+                return
             if counts is None:
                 self.observed[ordinal] = [
                     {**audit_row(row, self.frontier), "microbatch_index": ordinal} for row in rows

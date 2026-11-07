@@ -691,12 +691,14 @@ DCS 在所有策略权重 bucket 确认加载成功后分配发布序号。更�
 `weight_versions` token 区间时优先采用区间证据。未确认的标签、不可用的快照和无法映射的输出区间均保留为 unknown。
 标签确认或发布快照写入失败时，共享快照会被标为失效或删除；若两者均失败，所有训练 rank 一起报错并保持生成暂停，
 避免继续使用旧版本记录。消费批次缺少审计字段时，其有效 loss token 仍计入总数，来源记为 unknown。
+自定义样本转换器可能改变 token 坐标，因此取数时不请求审计 payload；保留转换后 loss mask 的计数，来源记为 unknown，摘要标为不完整。
 
 报告以实际 actor loss 中的 token 为统计对象，排除 prompt、工具观察、未提交的取消输出、零 mask 位置和对齐用的
 dummy microbatch，并保留 Session、轮次、request、attempt 和片段标识。原有采样、reward、GRPO 分组、loss mask
-及梯度权重保持原有语义。审计按各 CP 分片统计 TIS/RS、OPSM 过滤后仍参与策略损失的 token，并纳入非零系数的
+及梯度权重保持原有语义。审计按各 CP 分片统计 TIS/RS、ICEPOP、OPSM 过滤后仍参与策略损失的 token，并纳入非零系数的
 entropy、KL、OPD 和文本 MTP 辅助损失所覆盖的 token。文本 MTP 按各样本的预测目标位置计数，系数为零时不增加覆盖。
-计数在 forward/backward 完成后读取，零有效 token 的样本不计入完成后发布推进的分布。DPO/RM 的成对数据跳过该审计。
+计数在 forward/backward 完成后读取。loss 回调中的审计失败时仅保留已确认的计数，记录 `audit_error=loss_observation_failed`，
+并将该步及累计摘要标为 `aggregate_complete=false`。零有效 token 的样本不计入完成后发布推进的分布；DPO/RM 的成对数据跳过该审计。
 
 多模态 MTP 可能在模型内部使用额外监督 mask。过滤后的损失仍需依赖该 mask 才能确定完整消费集合时，当前审计只统计
 可确认的部分，并记录 `audit_error=mtp_target_coverage_unavailable`、`aggregate_complete=false`；训练继续执行。

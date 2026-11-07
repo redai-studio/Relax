@@ -715,14 +715,17 @@ Unconfirmed labels, unavailable snapshots, and unmapped output intervals remain 
 If tag confirmation or snapshot publication fails, the shared snapshot is invalidated or removed. If both operations
 fail, all training ranks raise and generation stays paused to prevent reuse of stale version evidence. Batches missing
 audit metadata still contribute their valid loss tokens to the denominator, with unknown provenance.
+Custom sample converters can change token coordinates, so their rows are fetched without audit payloads.
+Their final loss-mask counts are retained with unknown provenance and an incomplete summary.
 
 Reports use actual actor loss tokens, excluding prompt, tool observations, cancelled output, zero-mask positions,
 and alignment dummy microbatches. They preserve Session, turn, request, attempt, and fragment identifiers.
 Sampling, rewards, GRPO groups, loss masks, and gradient weighting remain unchanged. On each CP shard, the audit
-counts policy-loss tokens after TIS/RS and OPSM filtering, plus targets used by nonzero entropy, KL, OPD, and text MTP
-losses. Text MTP coverage follows each sample's prediction target positions; a zero coefficient adds no coverage.
-Counts are read after forward/backward completes. Rows with no eligible tokens leave the post-generation
-publication-advance distribution unchanged. DPO/RM preference pairs bypass this audit.
+counts policy-loss tokens after TIS/RS, ICEPOP, and OPSM filtering, plus targets used by nonzero entropy, KL, OPD,
+and text MTP losses. Text MTP coverage follows each sample's prediction target positions; a zero coefficient adds no coverage.
+Counts are read after forward/backward completes. If auditing a loss callback fails, only confirmed counts are retained;
+`audit_error=loss_observation_failed` marks the step and cumulative summary with `aggregate_complete=false`.
+Rows with no eligible tokens leave the post-generation publication-advance distribution unchanged. DPO/RM preference pairs bypass this audit.
 
 Multimodal MTP may apply an additional mask inside the model. When that mask is needed to determine the complete
 consumption set after filtering, the audit counts only confirmed coverage and records

@@ -1252,21 +1252,20 @@ def policy_loss_function(
     if opd_loss is not None:
         loss = loss + opd_loss
 
-    if weight_version_audit.PREPARED_FIELD in batch and (
-        args.use_opsm
-        or getattr(args, "enable_mtp_training", False)
-        or (not is_score_centering and (args.get_mismatch_metrics or args.use_tis))
-    ):
+    if weight_version_audit.PREPARED_FIELD in batch:
         batch["weight_audit_loss_masks"] = (
             modified_response_masks
             if not is_score_centering and (args.get_mismatch_metrics or args.use_tis)
             else batch["loss_masks"]
         )
-        # OPSM gates only PG; entropy/KL retain the reducer mask, OPD the original mask.
-        batch["weight_audit_opsm_mask"] = (
-            opsm_mask.detach()
-            if args.use_opsm and args.entropy_coef == 0 and not (args.use_kl_loss and args.kl_loss_coef != 0)
-            else None
+        # PG filters do not gate entropy/KL; OPD/MTP retain their original targets.
+        policy_mask = opsm_mask.detach() != 0 if args.use_opsm else None
+        if not is_score_centering and (args.get_mismatch_metrics or args.use_tis) and tis_func is icepop_function:
+            ratio = tis_metrics["tis"]
+            icepop_mask = (ratio >= args.tis_clip_low) & (ratio <= args.tis_clip) & (ratio != 0)
+            policy_mask = icepop_mask if policy_mask is None else policy_mask & icepop_mask
+        batch["weight_audit_policy_mask"] = (
+            policy_mask if args.entropy_coef == 0 and not (args.use_kl_loss and args.kl_loss_coef != 0) else None
         )
         batch["weight_audit_opd"] = opd_loss is not None
 
