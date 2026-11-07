@@ -1466,9 +1466,11 @@ def compute_policy_opd_loss(
                 _chunk = _chunk * _gate
                 if collect_audit:
                     audit_gates.append(_gate.detach() != 0)
-                _eopd_gate_sum += float(_gate.sum().item())
+                # Keep metric accumulation on device; converting to Python floats
+                # here would force a GPU->CPU sync in the loss hot path.
+                _eopd_gate_sum += _gate.detach().sum()
                 _eopd_tok_cnt += float(_gate.numel())
-                _eopd_ent_sum += float(_ent.sum().item())
+                _eopd_ent_sum += _ent.detach().sum()
             per_token_kl_chunks.append(_chunk)
         opd_per_token_kl = torch.cat(per_token_kl_chunks, dim=0).to(dtype=log_probs.dtype)
     else:
@@ -1488,8 +1490,8 @@ def compute_policy_opd_loss(
 
     reported_loss: dict[str, torch.Tensor] = {}
     if is_topk and bool(getattr(args, "opd_fkl_entropy_gate", False)) and _eopd_tok_cnt > 0:
-        reported_loss["opd_fkl_gate_frac"] = torch.tensor(_eopd_gate_sum / _eopd_tok_cnt)
-        reported_loss["opd_fkl_teacher_topk_entropy"] = torch.tensor(_eopd_ent_sum / _eopd_tok_cnt)
+        reported_loss["opd_fkl_gate_frac"] = _eopd_gate_sum / _eopd_tok_cnt
+        reported_loss["opd_fkl_teacher_topk_entropy"] = _eopd_ent_sum / _eopd_tok_cnt
     per_token_clip = getattr(args, "opd_per_token_clip", None)
     if per_token_clip is not None:
         tau = float(per_token_clip)
