@@ -458,10 +458,11 @@ def make_current_torch_device() -> torch.device:
 # Public API — NUMA affinity
 # ---------------------------------------------------------------------------
 def set_numa_affinity(local_rank: int) -> None:
-    """Set NUMA affinity for the given local rank.
+    """Bind process threads to CPUs near the selected CUDA device.
 
-    On NVIDIA GPUs, uses pynvml. On other backends, this is a no-op with a
-    warning.
+    ``local_rank`` is a CUDA-visible device index, not a physical GPU index.
+    Existing CPU restrictions are preserved; memory policy is unchanged.
+    Unsupported environments skip binding with a log message.
     """
     accel = _detect_accelerator()
     if accel in (AcceleratorType.CUDA, AcceleratorType.PPU):
@@ -469,10 +470,30 @@ def set_numa_affinity(local_rank: int) -> None:
             import pynvml
 
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
-            pynvml.nvmlDeviceSetCpuAffinity(handle)
-            logger.info(f"Set NUMA affinity for GPU {local_rank}")
-            pynvml.nvmlShutdown()
+            try:
+                uuid = str(torch.cuda.get_device_properties(local_rank).uuid)
+                if not uuid.startswith(("GPU-", "MIG-")):
+                    uuid = f"GPU-{uuid}"
+                handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+                allowed_cpus = os.sched_getaffinity(0)
+                mask = pynvml.nvmlDeviceGetCpuAffinity(handle, max(allowed_cpus) // 64 + 1)
+                cpus = {cpu for cpu in allowed_cpus if mask[cpu // 64] & (1 << (cpu % 64))}
+                if not cpus:
+                    logger.info(f"No allowed CPUs near GPU {uuid}, skipping NUMA affinity setup")
+                    return
+
+                # NVML's CPU setter only binds the calling thread. Include existing
+                # worker threads; newly created threads inherit their parent's mask.
+                for tid in os.listdir("/proc/self/task"):
+                    try:
+                        thread_cpus = cpus & os.sched_getaffinity(int(tid))
+                        if thread_cpus:
+                            os.sched_setaffinity(int(tid), thread_cpus)
+                    except ProcessLookupError:
+                        pass  # The thread exited during enumeration.
+                logger.info(f"Set CPU affinity for CUDA device {local_rank} ({uuid}): {sorted(cpus)}")
+            finally:
+                pynvml.nvmlShutdown()
         except ImportError:
             logger.info("pynvml not available, skipping NUMA affinity setup")
         except Exception as e:
