@@ -291,6 +291,7 @@ export default defineConfig({
 
                 { text: 'KEDA Autoscaling', link: '/en/guide/autoscaler-k8s-keda' },
                 { text: 'Dynamic Context Parallelism', link: '/en/guide/dynamic-context-parallel' },
+                { text: 'ChunkFlow', link: '/en/guide/chunkflow' },
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
                 { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' },
@@ -431,6 +432,7 @@ export default defineConfig({
 
                 { text: 'KEDA 弹性扩缩容', link: '/zh/guide/autoscaler-k8s-keda' },
                 { text: 'Dynamic Context Parallelism', link: '/zh/guide/dynamic-context-parallel' },
+                { text: 'ChunkFlow', link: '/zh/guide/chunkflow' },
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
