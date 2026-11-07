@@ -176,6 +176,43 @@ def test_adapter_invalidates_old_tag_and_publishes_after_adapter_load(backend):
     assert events[tag_positions[1]][1]["new_version"].endswith(":1")
 
 
+def test_adapter_push_failure_invalidates_before_resume_and_recovers(backend, monkeypatch):
+    value, events = backend
+    value._lora_adapter_mode = True
+    old_tag = value._weight_audit_publisher.publish()
+    error = RuntimeError("adapter push failed")
+    original_request = value._batch_request
+
+    def fail_push(**_kwargs):
+        raise error
+
+    def request(endpoint, payload=None):
+        if endpoint == "/continue_generation":
+            assert audit.read_frontier() is None
+        return original_request(endpoint, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(value, "_push_lora_adapter_distributed", fail_push)
+        patch.setattr(value, "_batch_request", request)
+        with pytest.raises(RuntimeError, match="LoRA adapter push") as caught:
+            value.update_weights_for_rollout()
+    assert caught.value.__cause__ is error
+    assert value._weight_audit_publisher.published_seq == 1
+    assert any(endpoint == "/continue_generation" for endpoint, _ in events)
+    value.update_weights_for_rollout()
+    assert audit.read_frontier()["published_seq"] == 2
+    late = audit.generation_spans(
+        {"weight_version": old_tag, "_weight_audit_scalar_bound": True},
+        1,
+        offset=0,
+        request_id="late",
+        attempt_id="late:0",
+        piece_index=0,
+    )
+    assert late[0]["published_seq"] is None
+    assert late[0]["unknown_reason"] == "publication_scope_mismatch"
+
+
 def test_audit_io_failure_does_not_strand_normal_adapter_update(backend, tmp_path):
     value, events = backend
     value._lora_adapter_mode = True

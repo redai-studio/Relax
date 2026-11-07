@@ -820,10 +820,6 @@ class DeviceDirectBackend(CommBackend):
                 flag = torch.tensor([1 if push_error is not None else 0], dtype=torch.int32)
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
                 push_failed = bool(flag.item())
-            if dist.get_rank() == 0:
-                # Continue generation on all rollout nodes
-                if weight_version_audit.enabled() and push_failed:
-                    self._invalidate_weight_audit()
             if weight_version_audit.enabled():
                 self._publish_weight_audit_version(push_failed=push_failed)
             if dist.get_rank() == 0:
