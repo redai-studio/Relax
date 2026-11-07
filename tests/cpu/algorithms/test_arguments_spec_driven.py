@@ -49,6 +49,7 @@ def arguments_module(monkeypatch):
 def _args(estimator="grpo", **overrides):
     base = dict(
         advantage_estimator=estimator,
+        loss_type="policy_loss",
         normalize_advantages=False,
         rewards_normalization=True,
         custom_reward_post_process_path=None,

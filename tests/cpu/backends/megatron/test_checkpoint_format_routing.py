@@ -66,7 +66,7 @@ def _files(path, names):
 
 
 def _route(checkpoint, monkeypatch, path, expected_path):
-    args = SimpleNamespace(load=str(path), hf_checkpoint="base-model")
+    args = SimpleNamespace(load=str(path), hf_checkpoint="base-model", loss_type="policy_loss")
     monkeypatch.setattr(checkpoint, "get_args", lambda: args, raising=False)
     hf = Mock(return_value=(0, 123))
     native = Mock(side_effect=AssertionError("unexpected Megatron load"))
@@ -117,7 +117,9 @@ def test_checkpoint_native_markers_take_priority(checkpoint, monkeypatch, tmp_pa
         (path / marker).write_text('{"sharded_backend": "torch_dist", "sharded_backend_version": 1}')
     if with_hf:
         _files(path, ["config.json", "model.safetensors"])
-    monkeypatch.setattr(checkpoint, "get_args", lambda: SimpleNamespace(load=str(path)), raising=False)
+    monkeypatch.setattr(
+        checkpoint, "get_args", lambda: SimpleNamespace(load=str(path), loss_type="policy_loss"), raising=False
+    )
     metadata = Mock(return_value={})
     native = Mock(return_value=(82, 456))
     monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", metadata, raising=False)
@@ -138,7 +140,9 @@ def test_checkpoint_fallback_unchanged(checkpoint, monkeypatch, tmp_path, name, 
 @pytest.mark.parametrize("marker", ["unrelated.txt", "metadata.json", ".metadata"])
 def test_checkpoint_incomplete_iteration_propagates_error(checkpoint, monkeypatch, tmp_path, marker):
     path = _files(tmp_path / "iter_0000082", [marker])
-    monkeypatch.setattr(checkpoint, "get_args", lambda: SimpleNamespace(load=str(path)), raising=False)
+    monkeypatch.setattr(
+        checkpoint, "get_args", lambda: SimpleNamespace(load=str(path), loss_type="policy_loss"), raising=False
+    )
     monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *_: {}, raising=False)
     monkeypatch.setattr(
         checkpoint, "_load_checkpoint_megatron", Mock(side_effect=RuntimeError("incomplete checkpoint")), raising=False
@@ -151,7 +155,7 @@ def test_checkpoint_incomplete_iteration_propagates_error(checkpoint, monkeypatc
 @pytest.mark.parametrize("skip_load", [False, True])
 def test_checkpoint_lora_iteration_resume_order(checkpoint, monkeypatch, tmp_path, skip_load):
     path = _files(tmp_path / "iter_0000082", ["metadata.json", "config.json"])
-    args = SimpleNamespace(load=str(path), hf_checkpoint="base-model")
+    args = SimpleNamespace(load=str(path), hf_checkpoint="base-model", loss_type="policy_loss")
     calls = []
     monkeypatch.setattr(checkpoint, "get_args", lambda: args, raising=False)
     monkeypatch.setattr(

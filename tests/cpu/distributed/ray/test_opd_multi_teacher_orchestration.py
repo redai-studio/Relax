@@ -68,6 +68,8 @@ def _base_args(**overrides):
         rollout_num_gpus=8,
         teacher_num_gpus_per_engine=None,
         opd_teacher_key=None,
+        teacher_hf_checkpoint=None,
+        opd_teacher_routes=None,
         resource={"actor": [1, 16], "rollout": [1, 8], "teacher": [1, 8]},
     )
     defaults.update(overrides)

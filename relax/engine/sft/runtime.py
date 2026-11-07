@@ -101,9 +101,9 @@ def validate_preference_args(args: Namespace) -> None:
 
     if getattr(args, "sft_async_prepack", False):
         raise ValueError("preference objectives v1 do not support --sft-async-prepack")
-    if getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if args.task_type != "causal_lm":
         raise ValueError("preference objectives require --task-type causal_lm")
-    if getattr(args, "mtp_only_training", False):
+    if args.mtp_only_training:
         raise ValueError("preference objectives v1 do not support MTP-only training")
     if getattr(args, "custom_dataset_class_path", None):
         raise ValueError("preference objectives do not support --custom-dataset-class")
@@ -123,7 +123,7 @@ def validate_preference_args(args: Namespace) -> None:
         raise ValueError("preference objectives v1 do not support dynamic context parallelism")
     if getattr(args, "qkv_format", "thd") != "thd":
         raise ValueError("preference objectives v1 require --qkv-format thd")
-    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+    if args.fully_async or args.hybrid:
         raise ValueError("preference objectives v1 support synchronous offline training only")
     if not getattr(args, "use_gloo_process_groups", False):
         raise ValueError("preference objectives require --use-gloo-process-groups for DP iterator control data")
@@ -192,7 +192,7 @@ def should_skip_sft_weight_management(
 def should_bypass_main_output_layer(args: Namespace) -> bool:
     """Return whether training needs hidden states instead of main language-
     model logits."""
-    return getattr(args, "mtp_only_training", False) or should_use_sft_chunked(args)
+    return args.mtp_only_training or should_use_sft_chunked(args)
 
 
 def should_use_sft_chunked(args: Namespace) -> bool:

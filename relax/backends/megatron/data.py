@@ -941,7 +941,7 @@ def prepack_sft_micro_batch_cpu(args: Namespace, batch: RolloutBatch) -> Prepack
         args.data_pad_size_multiplier,
         args.qkv_format,
         args.allgather_cp,
-        getattr(args, "is_vl_model", False),
+        args.is_vl_model,
         pack_device=torch.device("cpu"),
     )
     pinned = pin_tensors(packed)
@@ -1364,7 +1364,7 @@ def get_data_iterator(
         # Bridge pads each THD document before CP splitting, including text-only
         # batches of VL models. Plan with those physical lengths as well.
         needs_unsplit_input = (
-            getattr(args, "is_vl_model", False)
+            args.is_vl_model
             or getattr(args, "uses_unsplit_forward", False)
             or rollout_data.get("multimodal_train_inputs") is not None
         )
@@ -1501,7 +1501,7 @@ def log_rollout_data(
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             args.qkv_format,
-            getattr(args, "is_vl_model", False)
+            args.is_vl_model
             or rollout_data.get("multimodal_train_inputs") is not None
             or getattr(args, "uses_unsplit_forward", False),
         )

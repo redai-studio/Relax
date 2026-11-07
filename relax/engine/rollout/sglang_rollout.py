@@ -1333,7 +1333,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     state.evaluating += 1
     try:
         coros = []
-        for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+        for dataset_cfg in args.eval_datasets or []:
             coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
         results_list = await asyncio.gather(*coros)
         results = {}
