@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Tuple
+from typing import Any, Iterator, Tuple
 
 import numpy as np
 
@@ -110,7 +110,56 @@ class TrainingFieldArtifact:
         return Sample.from_dict(_expand_sample_payload(self.sample_payload))
 
 
-def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _can_compact_without_deepcopy_hooks(payload: dict[str, Any]) -> bool:
+    """Admit only a bounded-depth, unaliased tree of exact builtin values.
+
+    Inspecting an unknown value must not invoke its iteration, comparison,
+    hashing, conversion or copy hooks. NumPy/Torch values, subclasses, cycles
+    and repeated container identities therefore use the original path. The scan
+    is O(n), with O(depth) iterator storage and O(containers) identities; its
+    cost must be measured rather than assumed negligible.
+    """
+    if type(payload) is not dict:
+        return False
+    seen: set[int] = set()
+    pending: list[Iterator[Any]] = [iter((payload,))]
+    while pending:
+        try:
+            value = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        value_type = type(value)
+        # Identity checks avoid custom metaclass equality or hashing during
+        # eligibility checks. These exact immutable builtin leaves have no
+        # object-defined deepcopy/conversion hooks.
+        if (
+            value is None
+            or value_type is int
+            or value_type is float
+            or value_type is bool
+            or value_type is str
+            or value_type is bytes
+            or value_type is complex
+        ):
+            continue
+        if value_type is dict:
+            if any(type(key) is not str for key in value):
+                return False
+            children = iter(value.values())
+        elif value_type is list or value_type is tuple:
+            children = iter(value)
+        else:
+            return False
+        identity = id(value)
+        if identity in seen or len(pending) >= 128:
+            return False
+        seen.add(identity)
+        pending.append(children)
+    return True
+
+
+def _compact_sample_payload_original(payload: dict[str, Any]) -> dict[str, Any]:
     compacted = copy.deepcopy(payload)
 
     tokens = compacted.get("tokens")
@@ -124,6 +173,33 @@ def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, list) or not value:
             continue
         compacted[field_name] = np.asarray(value, dtype=dtype)
+    return compacted
+
+
+def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not _can_compact_without_deepcopy_hooks(payload):
+        return _compact_sample_payload_original(payload)
+
+    # Numeric lists become independently owned arrays below. Deep-copying
+    # them first duplicates every Python element immediately before discarding
+    # the intermediate lists. Keep deepcopy for all other (including dynamic)
+    # Sample fields so the transport retains its ownership boundary.
+    compacted = dict(payload)
+
+    tokens = compacted.get("tokens")
+    rollout_tokens = compacted.get("rollout_tokens")
+    if isinstance(tokens, list) and isinstance(rollout_tokens, list) and rollout_tokens == tokens:
+        compacted["rollout_tokens"] = None
+        compacted["_rollout_tokens_shared"] = True
+
+    arrays: dict[str, np.ndarray] = {}
+    for field_name, dtype in _TRAINING_ARTIFACT_ARRAY_FIELDS:
+        value = compacted.get(field_name)
+        if not isinstance(value, list) or not value:
+            continue
+        arrays[field_name] = np.asarray(value, dtype=dtype)
+    compacted = copy.deepcopy({key: value for key, value in compacted.items() if key not in arrays})
+    compacted.update(arrays)
     return compacted
 
 
