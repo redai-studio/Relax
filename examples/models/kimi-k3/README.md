@@ -8,6 +8,92 @@ Relax provides full-parameter and LoRA SFT for Kimi K3, with image inputs, packi
 
 Use a training image built with the pinned Megatron/Bridge, FLA and NVRx dependencies in `docker/Dockerfile` or `docker/Dockerfile.cu13`. Model and dataset directories must be readable from every training node. These recipes are reference configurations; validate memory use and numerical behavior on the target cluster before a long run.
 
+## Open-Data Reproduction Results
+
+The following Kimi K3 runs use HellaSwag, multimodal-open-r1-8k-verified (OpenR1-MM), Pokémon captions and LLaVA-OneVision v1.5 Instruct. Measurements below were collected on 128×280G Blackwell GPUs for full-parameter SFT/GRPO and 64×280G Blackwell GPUs for LoRA. They describe those experiment configurations; current recipe defaults may differ. Curves show raw steps with smoothing 0.25 and the unsmoothed trace in the background.
+
+| Dataset                       | Experiment                      | Observed result                                                                                                   |
+| ----------------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| HellaSwag                     | Raw context/target SFT          | Training loss settles around 1.4 over 100 steps; validation loss decreases to about 1.93.                         |
+| OpenR1-MM                     | Full-parameter multimodal SFT   | Exported MXFP4 checkpoint improves pass@k on a 256-example held-out split; detailed scoring below.                |
+| Pokémon captions (Chinese)    | Language-backbone LoRA          | Training loss decreases through step 198.                                                                         |
+| LLaVA-OneVision v1.5 Instruct | Long-context SFT, frozen vision | Recorded through step 680; packed sequences around 110k tokens and step time around 60 s, with occasional spikes. |
+| OpenR1-MM                     | Multimodal GRPO                 | Rollout reward increases; train/rollout logprob differences remain small and decrease during the illustrated run. |
+
+### HellaSwag SFT
+
+The raw-text recipe supervises the target ending from the original context. These are language-model loss measurements, not HellaSwag multiple-choice accuracy. The recorded training step time was approximately 40 s on 128×280G Blackwell.
+
+|                      Training loss                      |                        Validation loss                         |
+| :-----------------------------------------------------: | :------------------------------------------------------------: |
+| ![HellaSwag training loss](./assets/hellaswag-loss.png) | ![HellaSwag validation loss](./assets/hellaswag-eval-loss.png) |
+
+Recipe: [`run-kimi-k3-hellaswag-128xblackwell-rawtext.sh`](./scripts/run-kimi-k3-hellaswag-128xblackwell-rawtext.sh).
+
+### OpenR1-MM SFT and Evaluation
+
+The SFT experiment uses 7424 training examples and 256 held-out evaluation examples from multimodal-open-r1-8k-verified. Evaluation compares the original Kimi K3 weights with SFT checkpoint **iter86 after export to native MXFP4 HF weights**.
+
+| Scoring rule                               | Model            |     pass@1 |     pass@4 |     pass@8 |    pass@16 |
+| ------------------------------------------ | ---------------- | ---------: | ---------: | ---------: | ---------: |
+| Original OpenR1-MM reward: format + answer | Original Kimi K3 |      7.50% |     11.92% |     14.98% |     20.00% |
+| Original OpenR1-MM reward: format + answer | SFT iter86       | **66.25%** | **77.64%** | **84.00%** | **90.00%** |
+| Final-answer scorer v2                     | Original Kimi K3 |     43.44% |     49.31% |     52.29% |     55.00% |
+| Final-answer scorer v2                     | SFT iter86       | **56.25%** | **64.84%** | **70.10%** | **75.00%** |
+
+These are two separate scoring implementations; their scores are not nested and should only be compared within the same rule. This is a held-out split of the SFT dataset, not an independent benchmark suite. The recorded summary does not specify all decoding settings, so these values should not be treated as a fully specified evaluation protocol. The current [`eval_openr1mm.py`](../../../scripts/tools/eval_openr1mm.py) provides a final-answer evaluator; its defaults do not establish the historical settings.
+
+|                         Representative SFT training-loss curve                         |
+| :------------------------------------------------------------------------------------: |
+| ![OpenR1-MM SFT training loss, first recorded segment](./assets/openr1mm-sft-loss.png) |
+
+The curve shows one recorded training segment, rather than the full trajectory to iter86. The context-capacity experiments on 128×280G Blackwell reported:
+
+| Global batch size | Context | Vision tower | Outcome                             |
+| ----------------: | ------: | ------------ | ----------------------------------- |
+|               256 |     64k | Trainable    | Stable training in the recorded run |
+|               256 |     96k | Trainable    | OOM at step 16                      |
+|               256 |     96k | Frozen       | Stable training in the recorded run |
+|               512 |    128k | Frozen       | Stable training in the recorded run |
+
+Recipe: [`run-kimi-k3-openr1mm-128xblackwell.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell.sh).
+
+### Pokémon LoRA
+
+The 64×280G Blackwell LoRA run uses the Chinese Pokémon GPT-4o captions preparation (`pokemon_gpt4o_zh.parquet`). This run demonstrates LoRA optimization on image-caption data; no held-out accuracy was reported.
+
+|                         Training loss                         |                           Gradient norm                            |
+| :-----------------------------------------------------------: | :----------------------------------------------------------------: |
+| ![Pokémon LoRA training loss](./assets/pokemon-lora-loss.png) | ![Pokémon LoRA gradient norm](./assets/pokemon-lora-grad-norm.png) |
+
+Recipe: [`run-kimi-k3-pokemon-lora-64xblackwell.sh`](./scripts/run-kimi-k3-pokemon-lora-64xblackwell.sh).
+
+### LLaVA-OneVision Long-Context SFT
+
+The 128×280G Blackwell run uses frozen vision, global batch size 512 and CP8. Its training log spans steps 0–680, with packed sequences typically around 110k tokens under a 128k context budget. Loss trends downward and most steps take approximately 60 s; initialization and occasional spikes take longer. The run had a large gradient-norm spike later attributed to an FLA KDA issue; FLA 0.5.2 was reported to fix it. No downstream accuracy score was reported for this run.
+
+|                      Training loss                      |                      Step time (s)                       |                              Packed tokens                              |
+| :-----------------------------------------------------: | :------------------------------------------------------: | :---------------------------------------------------------------------: |
+| ![OneVision training loss](./assets/onevision-loss.png) | ![OneVision step time](./assets/onevision-step-time.png) | ![OneVision packed sequence tokens](./assets/onevision-pack-tokens.png) |
+
+Recipe: [`run-kimi-k3-llava-onevision-128xblackwell.sh`](./scripts/run-kimi-k3-llava-onevision-128xblackwell.sh).
+
+### OpenR1-MM GRPO
+
+The full-parameter multimodal GRPO run uses 128×280G Blackwell. In the illustrated run (steps 0–60), rollout reward rises from roughly 0.16 to 0.44, mismatch KL stays around 0.002–0.003, and mean absolute train/rollout logprob difference stays around 0.03. These are training diagnostics, not held-out pass@k results.
+
+|                           Rollout reward                            |                       Train/rollout mismatch KL                       |                              Absolute logprob difference                               |
+| :-----------------------------------------------------------------: | :-------------------------------------------------------------------: | :------------------------------------------------------------------------------------: |
+| ![OpenR1-MM GRPO rollout reward](./assets/openr1mm-grpo-reward.png) | ![OpenR1-MM GRPO mismatch KL](./assets/openr1mm-grpo-mismatch-kl.png) | ![OpenR1-MM GRPO absolute logprob difference](./assets/openr1mm-grpo-logprob-diff.png) |
+
+The recorded optimization results reduced representative iteration time from about **1100 s to 770 s** (30%) and weight synchronization from about **270 s to 80 s** (70%). These are approximate measurements from separate runs, not controlled throughput benchmarks. The timing comparison below includes a short optimized run recorded through step 8; startup and sequence-length variation affect the curves. Blue is the September 29 optimized run; yellow is the September 28 comparison run.
+
+|                                        Before optimization                                        |                                    Later timing runs                                    |
+| :-----------------------------------------------------------------------------------------------: | :-------------------------------------------------------------------------------------: |
+| ![OpenR1-MM GRPO iteration time before optimization](./assets/openr1mm-grpo-step-time-before.png) | ![OpenR1-MM GRPO later iteration-time comparison](./assets/openr1mm-grpo-step-time.png) |
+
+Recipe: [`run-kimi-k3-openr1mm-128xblackwell-grpo.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh).
+
 ## Training
 
 Run commands from the repository root on an existing Ray cluster. `MODEL_DIR` points directly to the original HF model directory; `DATA_DIR` points to the prepared dataset directory. Existing `HF_CHECKPOINT`, `HELLASWAG_DATA_DIR`, `OPENR1MM_DATA_DIR`, `POKEMON_DATA_DIR` and `LLAVA_DATA_DIR` overrides remain supported.
