@@ -285,3 +285,13 @@ def test_legacy_models_keep_train_and_forward_metric_values(monkeypatch):
     logs = _logged_metrics(monkeypatch, counter, freeze_vision_model=True, lora_rank=8)
     assert logs["perf/actor_train_tflops"] == pytest.approx(train / 128 / 2)
     assert logs["perf/log_probs_tflops"] == pytest.approx(train / 3 / 128)
+
+
+def test_k31_omits_dense_fallback_mfu_and_preserves_throughput(monkeypatch):
+    config = k3_config()
+    config.model_type = "kimi_k31"
+    logs = _logged_metrics(monkeypatch, FlopsCounter(config))
+    assert "perf/actor_train_tflops" not in logs
+    assert "perf/log_probs_tflops" not in logs
+    assert not any(key.startswith("perf/mfu/") for key in logs)
+    assert logs["perf/actor_train_tok_per_s"] == 4096

@@ -21,6 +21,7 @@ class KimiK3VLModelProvider(KimiK3ModelProvider):
     freeze_vision_model: bool = False
     freeze_vision_projection: bool = False
     vision_dp_when_tp: bool = False
+    kimi_dsa_config: dict[str, Any] | None = None
 
     def provide(
         self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
