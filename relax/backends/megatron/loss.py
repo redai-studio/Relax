@@ -358,6 +358,7 @@ def get_log_probs_and_entropy(
     dynamic_cp_rank: int | None = None,
     lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
     selective_logit_rows: list[tuple[int, torch.Tensor]] | None = None,
+    rl_fused: bool = False,
     **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     """Compute per-token log-probabilities (and optionally entropy) on
@@ -411,6 +412,32 @@ def get_log_probs_and_entropy(
         includes "topk_log_probs" key with list of `[R, K]` tensors.
     """
     assert non_loss_data
+
+    if rl_fused:
+        # Model returned FP32 statistics, already temperature-scaled. Reuse
+        # exact response/packing coordinates; objectives and masks stay here.
+        assert not with_topk and gather_topk_token_ids is None and lm_head_forward is None
+        assert logits.shape[-1] == 2
+        pairs = list(
+            get_responses(
+                logits,
+                args=args,
+                unconcat_tokens=unconcat_tokens,
+                total_lengths=total_lengths,
+                response_lengths=response_lengths,
+                max_seq_lens=max_seq_lens,
+                padded_total_lengths=padded_total_lengths,
+                cp_output_is_zigzag=cp_output_is_zigzag,
+                dynamic_cp_size=dynamic_cp_size,
+                dynamic_cp_rank=dynamic_cp_rank,
+                apply_temperature=False,
+            )
+        )
+        result = {"log_probs": [chunk[:, 0] for chunk, _ in pairs]}
+        if with_entropy:
+            entropy_grad = getattr(args, "entropy_coef", 0.0) != 0
+            result["entropy"] = [chunk[:, 1] if entropy_grad else chunk[:, 1].detach() for chunk, _ in pairs]
+        return torch.empty(0, device=logits.device), result
 
     is_score_centering = (
         getattr(args, "advantage_estimator", None) is not None
@@ -529,7 +556,9 @@ def get_log_probs_and_entropy(
                 h_sub = logits_chunk[s:e].unsqueeze(1)  # [sub, 1, H]
                 fused_ce = getattr(lm_head_forward, "_relax_fused_linear_ce", None)
                 fused_losses = None
-                if fused_ce is not None and Envs.RELAX_SFT_FUSED_LINEAR_CE:
+                if fused_ce is not None and (
+                    getattr(args, "fused_linear_ce", False) or Envs.RELAX_SFT_FUSED_LINEAR_CE
+                ):
                     fused_losses = fused_ce(h_sub, tokens_chunk[s:e], args.rollout_temperature)
                 if fused_losses is not None:
                     # The fused Function retains no vocab activations and already
@@ -958,6 +987,8 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    rl_fused: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO/SAPO) and metrics.
 
@@ -1019,6 +1050,7 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
+        rl_fused=rl_fused,
         gather_topk_token_ids=(
             batch["rollout_topk_token_ids"] if is_score_centering else resolve_opd_gather_topk_token_ids(args, batch)
         ),
@@ -1748,6 +1780,7 @@ def loss_function(
     logits: torch.Tensor,
     *,
     lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
+    rl_fused: bool = False,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1817,7 +1850,7 @@ def loss_function(
     else:
         match args.loss_type:
             case "policy_loss":
-                func = policy_loss_function
+                func = partial(policy_loss_function, rl_fused=True) if rl_fused else policy_loss_function
             case "value_loss":
                 func = value_loss_function
             case "dpo":

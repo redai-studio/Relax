@@ -32,7 +32,12 @@ def ce(labels, logits):
     return F.cross_entropy(logits[:, 0], labels[0], reduction="none").unsqueeze(0)
 
 
-def test_fused_mtp_preserves_selective_mask_gradients_and_acceptance(monkeypatch):
+@pytest.mark.parametrize("cli", [False, True])
+def test_fused_mtp_preserves_selective_mask_gradients_and_acceptance(monkeypatch, cli):
+    from megatron.training import global_vars
+
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(loss_type="sft", fused_linear_ce=cli))
+    monkeypatch.setenv("RELAX_SFT_FUSED_LINEAR_CE", "0" if cli else "1")
     from relax.backends.megatron import fused_linear_ce as fused
 
     torch.manual_seed(14)
@@ -48,12 +53,13 @@ def test_fused_mtp_preserves_selective_mask_gradients_and_acceptance(monkeypatch
     calls = []
 
     def linear(hidden, weight, labels, group, **kwargs):
+        assert kwargs["enabled"] is cli
         calls.append((len(hidden), kwargs["return_logits"]))
         logits = F.linear(hidden, weight)
         losses = F.cross_entropy(logits[:, 0], labels[:, 0], reduction="none").unsqueeze(1)
         return losses, logits[:, 0].detach()
 
-    monkeypatch.setattr(fused, "supported", lambda *_args: True)
+    monkeypatch.setattr(fused, "supported", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(fused, "linear_cross_entropy", linear)
     monkeypatch.setattr(
         patch,
@@ -344,3 +350,30 @@ def test_teacher_mask_multi_depth_loss_gradients_and_acceptance(monkeypatch, all
             torch.testing.assert_close(got, ref)
     assert dense[3] == 16
     assert selected[3] == 10
+
+
+def test_rl_cli_does_not_partially_enable_sft_mtp_kernel(monkeypatch):
+    from megatron.training import global_vars
+
+    from relax.backends.megatron import fused_linear_ce as fused
+
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(loss_type="policy_loss", fused_linear_ce=True))
+    monkeypatch.setenv("RELAX_SFT_FUSED_LINEAR_CE", "0")
+    observed = []
+
+    def supported(*_args, enabled):
+        observed.append(enabled)
+        return enabled
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("RL+MTP must retain the original path")
+
+    monkeypatch.setattr(fused, "supported", supported)
+    monkeypatch.setattr(fused, "linear_cross_entropy", forbidden)
+    head = Head()
+    hidden = torch.randn(7, 1, 5, requires_grad=True)
+    labels = torch.randint(11, (1, 7))
+    actual, _, _ = patch._chunked_head_ce(hidden, labels, head, None, None, ce, None, 3)
+    expected = ce(labels, torch.nn.functional.linear(hidden, head.weight))
+    torch.testing.assert_close(actual, expected)
+    assert observed == [False, False, False]

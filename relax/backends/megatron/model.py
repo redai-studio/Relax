@@ -70,7 +70,8 @@ from .checkpoint import (
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
-from .loss import loss_function, normalize_reduced_loss_metrics
+from .fused_linear_ce import prepare_output_processor
+from .loss import get_log_probs_and_entropy, loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
     get_model_provider_func,
     validate_mtp_only_trainable_params,
@@ -129,6 +130,7 @@ def _bypass_output_layer(
     gather_passthrough: bool = True,
     unfused_head_wgrad: bool = False,
     recompute_chunks: bool = False,
+    fused_linear_ce: bool = False,
 ) -> Iterator[Callable | None]:
     """Defer the main output_layer so model() returns hidden_states.
 
@@ -234,7 +236,7 @@ def _bypass_output_layer(
         from .fused_linear_ce import linear_cross_entropy, supported
 
         weight = deferred_weight if deferred_weight is not None else output_layer.weight
-        if not supported(output_layer, input_, weight):
+        if not supported(output_layer, input_, weight, enabled=fused_linear_ce):
             return None
         loss, _ = linear_cross_entropy(
             input_,
@@ -242,6 +244,7 @@ def _bypass_output_layer(
             labels,
             tp_group,
             temperature=temperature,
+            enabled=fused_linear_ce,
             accumulate=output_layer.gradient_accumulation_fusion,
         )
         return loss
@@ -1058,6 +1061,12 @@ def forward_only(
         }
         if batch.get("padding_mask") is not None:
             forward_kwargs["padding_mask"] = batch["padding_mask"]
+        # Only this exact consumer, on the actor's own weight pass, accepts
+        # fused statistics. Reference/teacher/top-k/value callbacks keep logits.
+        rl_output = prepare_output_processor(
+            model, args, batch, consumer="log_probs" if f is get_log_probs_and_entropy and not store_prefix else None
+        )
+        forward_kwargs.update(rl_output)
         output_tensor = model(**forward_kwargs)
 
         if _orig_cp_group is not None:
@@ -1080,6 +1089,8 @@ def forward_only(
             classification_labels=batch.get("classification_labels", None),
             sample_weights=batch.get("sample_weights", None),
         )
+        if rl_output:
+            f_partial = partial(f_partial, rl_fused=rl_output["output_processor_context"].fused)
 
         if getattr(args, "dynamic_context_parallel", False) and per_sample_output:
             # Carry per-mb dynamic-CP metadata on the result so
@@ -1398,6 +1409,8 @@ def train_one_step(
             }
             if batch.get("padding_mask") is not None:
                 forward_kwargs["padding_mask"] = batch["padding_mask"]
+            rl_output = prepare_output_processor(model, args, batch, consumer=args.loss_type)
+            forward_kwargs.update(rl_output)
 
             # thd VL+CP: bridge needs per-sample attention_mask + matching thd
             # packed_seq_params (align_size = tp*cp*2).  loss_mask is None
@@ -1456,6 +1469,7 @@ def train_one_step(
                     gather_passthrough=not mtp_only,
                     unfused_head_wgrad=(not mtp_enabled and getattr(args, "recompute_loss_function", False)),
                     recompute_chunks=not mtp_only and getattr(args, "recompute_loss_function", False),
+                    fused_linear_ce=getattr(args, "fused_linear_ce", False),
                 ) as lm_head_forward:
                     if use_indexer_replay:
                         with IndexerReplay.forward_stage():
@@ -1477,7 +1491,14 @@ def train_one_step(
         # Always dispatch via loss_function. MTP-only consumes the bypassed
         # hidden states directly; chunked SFT uses lm_head_forward to compute
         # the regular language loss in bounded chunks.
-        loss_callback = partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
+        loss_callback = partial(
+            loss_function,
+            args,
+            batch,
+            num_microbatches,
+            lm_head_forward=lm_head_forward,
+            rl_fused=not return_schedule_plan and bool(rl_output) and rl_output["output_processor_context"].fused,
+        )
 
         def loss_callback_with_packing_metrics(
             logits: torch.Tensor,

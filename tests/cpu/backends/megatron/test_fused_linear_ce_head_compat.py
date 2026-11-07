@@ -51,7 +51,8 @@ def heads(monkeypatch):
     hidden = SimpleNamespace(is_cuda=True, device=device, shape=(8, 1, 64))
     weight = SimpleNamespace(device=device, dtype=torch.bfloat16, ndim=2, shape=(512, 64), is_contiguous=lambda: True)
     return SimpleNamespace(
-        supported=lambda layer: scope["supported"](layer, hidden, weight),
+        supported=lambda layer, **kwargs: scope["supported"](layer, hidden, weight, **kwargs),
+        settings=scope["Envs"],
         Column=Column,
         Native=Native,
         Adapter=Adapter,
@@ -84,3 +85,10 @@ def test_old_runtime_without_native_head_remains_supported(heads, monkeypatch):
     monkeypatch.delitem(sys.modules, "megatron.core.transformer.linear_cross_entropy")
     assert heads.supported(heads.Column())
     assert not heads.supported(heads.Adapter())
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("cli", [False, True])
+def test_fused_ce_accepts_cli_or_legacy_env(heads, cli, legacy):
+    heads.settings.RELAX_SFT_FUSED_LINEAR_CE = legacy
+    assert heads.supported(heads.Column(), enabled=cli) is (cli or legacy)

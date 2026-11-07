@@ -62,13 +62,17 @@ def _run(args, hidden, weight, labels, *, main_grad=False):
 
 
 @pytest.mark.parametrize("frozen_hidden", [False, True])
-def test_sft_fused_ce_keeps_response_rows_temperature_without_duplicate_recompute(monkeypatch, frozen_hidden):
-    monkeypatch.setenv("RELAX_SFT_FUSED_LINEAR_CE", "1")
+@pytest.mark.parametrize("enable_with_cli", [False, True])
+def test_sft_fused_ce_keeps_response_rows_temperature_without_duplicate_recompute(
+    monkeypatch, frozen_hidden, enable_with_cli
+):
+    monkeypatch.setenv("RELAX_SFT_FUSED_LINEAR_CE", "0" if enable_with_cli else "1")
     torch.manual_seed(36)
     hidden = torch.randn(13, 9, requires_grad=not frozen_hidden)
     weight = torch.randn(31, 9, requires_grad=True)
     labels = torch.randint(0, 31, (13,))
     args = _setup(monkeypatch, labels, 5, 0.7)
+    args.fused_linear_ce = enable_with_cli
     calls = []
 
     def head(_):

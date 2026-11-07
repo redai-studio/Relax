@@ -96,6 +96,13 @@ def _chunked_head_ce(
     outer trace is globally disabled. Pure memory orchestration; no numeric
     effect.
     """
+    try:
+        from megatron.training.global_vars import get_args
+
+        args = get_args()
+        fused_linear_ce = getattr(args, "loss_type", None) == "sft" and bool(getattr(args, "fused_linear_ce", False))
+    except (ImportError, AssertionError):
+        fused_linear_ce = False
     head_forward = type(output_layer).forward  # bypass _passthrough (instance-level)
     sp_enabled = bool(getattr(output_layer, "sequence_parallel", False))
     with torch._dynamo.config.patch(disable=True):
@@ -145,7 +152,7 @@ def _chunked_head_ce(
                 from relax.backends.megatron.fused_linear_ce import linear_cross_entropy, supported
 
                 fused = scale_logits_fn is None and supported(
-                    output_layer, mtp_hidden[start:end], weight, runtime_gather_output
+                    output_layer, mtp_hidden[start:end], weight, runtime_gather_output, enabled=fused_linear_ce
                 )
                 if fused:
                     needs_metrics = _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None
@@ -156,6 +163,7 @@ def _chunked_head_ce(
                         tp_group or output_layer.tp_group,
                         accumulate=output_layer.gradient_accumulation_fusion,
                         return_logits=needs_metrics,
+                        enabled=fused_linear_ce,
                     )
                     loss_slice = loss_sb.T.contiguous()
                     if logits_slice is not None:
