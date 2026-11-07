@@ -79,7 +79,7 @@ def is_managed_opd_teacher_colocate(args: Any) -> bool:
     return (
         is_managed_opd_teacher_enabled(args)
         and getattr(args, "colocate", False)
-        and not getattr(args, "hybrid", False)
+        and not args.hybrid
         and "actor" in args.resource
         and "rollout" in args.resource
     )
