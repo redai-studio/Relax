@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""CPU image-edit SFT producer; media stays on the training workers."""
+"""CPU image SFT producer; media stays on the training workers."""
 
 import asyncio
 from contextlib import suppress
@@ -11,7 +11,7 @@ from tensordict import TensorDict
 
 from relax.components.base import Base
 from relax.engine.sft.image import ImageBatchSampler
-from relax.engine.sft.runtime import sft_partition_id, sft_partition_prefix
+from relax.engine.sft.runtime import get_image_sft_config, sft_partition_id, sft_partition_prefix
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
@@ -22,7 +22,9 @@ class ImageSFT(Base):
         self.config, self.role, self.healthy = config, role, healthy
         self._partition_prefix = sft_partition_prefix(config)
         self.step = getattr(config, "start_rollout_id", 0) or 0
-        self.sampler = ImageBatchSampler(config.i2i_sft_config["dataset_size"], config.global_batch_size, config.seed)
+        self.sampler = ImageBatchSampler(
+            get_image_sft_config(config)["dataset_size"], config.global_batch_size, config.seed
+        )
         self.data_system_client = attach_tq_client(config.tq_config, role=role)
         self.client = self.data_system_client
         self._stop_event = asyncio.Event()

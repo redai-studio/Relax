@@ -298,6 +298,7 @@ export default defineConfig({
                   text: 'Low-Rank Adaptation (LoRA) Training',
                   link: '/en/guide/low-rank-adaptation-training',
                 },
+                { text: 'Frozen Conditioning Cache', link: '/en/guide/frozen-conditioning-cache' },
                 { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' },
                 {
                   text: 'Multimodal Training Optimizations',
@@ -435,6 +436,7 @@ export default defineConfig({
                 { text: '通知系统', link: '/zh/guide/notification-system' },
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
                 { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' },
+                { text: '冻结条件特征缓存', link: '/zh/guide/frozen-conditioning-cache' },
                 { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' },
                 { text: '多模态训练优化', link: '/zh/guide/multimodal-training' },
               ],

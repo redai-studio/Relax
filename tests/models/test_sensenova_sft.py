@@ -132,12 +132,18 @@ def test_full_sft_keeps_conditioning_gradient(monkeypatch) -> None:
 
     pipe = torch.nn.Module()
     pipe.device = "cpu"
+    pipe.dit = torch.nn.Module()
+    pipe.dit.vision_model = torch.nn.Module()
+    pipe.dit.vision_model.register_parameter("prefix_weight", prefix_weight)
+    pipe.dit.language_model = torch.nn.Module()
+    pipe.dit.language_model.model = torch.nn.Module()
     pipe.units = [object()]
     pipe.unit_runner = unit_runner
     data = {"image": SimpleNamespace(height=32, width=32), "edit_image": [object()], "prompt": "edit"}
     monkeypatch.setattr(sft, "flow_matching_loss", lambda pipe, inputs: inputs["prefix"])
     sft.SenseNovaSFTModel(pipe, training_mode="full")(data).backward()
     assert prefix_weight.grad == 3
+    prefix_weight.requires_grad_(False)
     assert not sft.SenseNovaSFTModel(pipe, training_mode="lora")(data).requires_grad
 
 

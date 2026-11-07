@@ -354,7 +354,7 @@ class Controller:
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
         dp_size = compute_dp_size(self.config)
-        from relax.engine.sft.runtime import is_i2i_sft
+        from relax.engine.sft.runtime import is_image_sft
 
         required_node_resources = with_control_plane_affinity(self.config).get("resources", {})
         required_node_resource = next(iter(required_node_resources), None)
@@ -371,7 +371,7 @@ class Controller:
                 balance_unit_multiplier=self.config.n_samples_per_prompt,
             )
             logger.info("Using IdentityWindowSampler (fully_async + dynamic batch)")
-        elif is_i2i_sft(self.config):
+        elif is_image_sft(self.config):
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")
         elif algo_key == "sft":
             from relax.utils.data.wholepack import WholepackSampler, config_contract, enabled
@@ -1455,9 +1455,9 @@ class Controller:
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 
-        from relax.engine.sft.runtime import is_i2i_sft
+        from relax.engine.sft.runtime import is_image_sft
 
-        if is_i2i_sft(getattr(self, "config", None)) and ROLES.sft in self.serve_dict:
+        if is_image_sft(getattr(self, "config", None)) and ROLES.sft in self.serve_dict:
 
             async def stop_image_producer() -> None:
                 await asyncio.wait_for(self.serve_dict[ROLES.sft].handle.stop.remote(), timeout=10)
