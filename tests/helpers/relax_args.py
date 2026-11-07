@@ -21,7 +21,8 @@ This module collects the parser defaults from the **real** parser registration
 Post-parse validation deliberately does not run.  The small set of derived
 fields that are deterministic without a model, a dataset or a GPU are applied
 by :func:`apply_safe_derivations`, using the same assignments production
-makes (including forcing ``use_critic`` off for offline objectives). Fields
+makes (including deprecated loss-type alias normalization, forcing RL-only
+state and ``use_critic`` off for offline objectives). Fields
 produced by worker/controller initialization (``is_vl_model``,
 ``num_rollout_per_epoch``, ...) stay absent and must be supplied explicitly by
 the tests that exercise them.
@@ -32,6 +33,7 @@ from __future__ import annotations
 import argparse
 import copy
 import sys
+import warnings
 from typing import Any
 
 
@@ -104,10 +106,33 @@ def apply_safe_derivations(args: argparse.Namespace) -> argparse.Namespace:
     from relax.algorithms import get_algorithm
     from relax.engine.sft.runtime import is_offline_mode
 
-    # Mirror production ordering: validate_algorithm_args first assigns the
-    # algorithm spec's needs_critic, then slime_validate_args forces no critic
-    # for offline objectives (SFT/DPO/RM spawn no critic role).
-    args.use_critic = get_algorithm(args.advantage_estimator).needs_critic and not is_offline_mode(args)
+    # slime_validate_args normalizes deprecated offline loss-type aliases
+    # BEFORE classifying the objective, so is_offline_mode sees canonical
+    # names here as well.
+    if args.loss_type in ("sft_loss", "sft-loss"):
+        warnings.warn(
+            f"--loss-type {args.loss_type} is deprecated; use --loss-type sft instead. "
+            "This alias will be removed in the next minor release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        args.loss_type = "sft"
+
+    is_offline = is_offline_mode(args)
+    if is_offline:
+        # Mirror slime_validate_args' offline block: RL-only state is disabled
+        # unconditionally and validate_algorithm_args is not called offline, so
+        # no critic role exists regardless of the advantage estimator.
+        args.compute_advantages_and_returns = False
+        args.use_kl_loss = False
+        args.kl_coef = 0.0
+        args.kl_loss_coef = 0.0
+        args.use_opd = False
+        args.rollout_global_dataset = False
+        args.use_critic = False
+    else:
+        # Online only: validate_algorithm_args assigns the spec's needs_critic.
+        args.use_critic = get_algorithm(args.advantage_estimator).needs_critic
     return args
 
 

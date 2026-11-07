@@ -77,6 +77,41 @@ def test_offline_objectives_force_no_critic_even_for_ppo(loss_type):
     assert args.use_critic is False
 
 
+@pytest.mark.parametrize("alias", ["sft_loss", "sft-loss"])
+def test_deprecated_loss_type_aliases_normalize_before_offline_derivations(alias):
+    # Production normalizes the aliases in slime_validate_args before
+    # classifying the objective; the factory must do the same in the same
+    # order so an alias still yields the offline no-critic contract.
+    with pytest.warns(DeprecationWarning, match="deprecated; use --loss-type sft"):
+        args = make_args(loss_type=alias, advantage_estimator="ppo")
+    assert args.loss_type == "sft"
+    assert args.use_critic is False
+
+
+def test_offline_objectives_disable_rl_only_state():
+    # Mirrors the offline block in slime_validate_args. The two inverted
+    # ``--disable-*`` flags default to True at the parser, so assert against
+    # the raw defaults first to prove the derivation is load-bearing.
+    raw = make_raw_args(loss_type="sft")
+    assert raw.compute_advantages_and_returns is True
+    assert raw.rollout_global_dataset is True
+
+    args = make_args(loss_type="sft")
+    assert args.compute_advantages_and_returns is False
+    assert args.rollout_global_dataset is False
+    assert args.use_kl_loss is False
+    assert args.use_opd is False
+    assert args.kl_coef == 0.0
+    assert args.kl_loss_coef == 0.0
+
+
+def test_online_objectives_keep_rl_state_at_parser_defaults():
+    args = make_args(loss_type="policy_loss")
+    assert args.compute_advantages_and_returns is True
+    assert args.rollout_global_dataset is True
+    assert args.use_critic is False
+
+
 def test_explicit_use_critic_override_still_wins():
     assert make_args(loss_type="sft", use_critic=True).use_critic is True
     assert make_args(advantage_estimator="ppo", use_critic=False).use_critic is False
