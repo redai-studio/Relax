@@ -54,7 +54,8 @@ _DERIVED_FIELDS = ("model_source", "_start_rollout_id_explicit", "lora_target_mo
 
 
 def _collect_defaults() -> argparse.Namespace:
-    """Parse an empty command line through the real parser registration once."""
+    """Parse an empty command line through the real parser registration
+    once."""
     global _DEFAULTS
     if _DEFAULTS is not None:
         return _DEFAULTS
@@ -83,9 +84,10 @@ def _collect_defaults() -> argparse.Namespace:
 def apply_safe_derivations(args: argparse.Namespace) -> argparse.Namespace:
     """Apply the post-parse assignments that are deterministic without I/O.
 
-    Mirrors the corresponding lines in ``relax.utils.arguments._parse_args_impl``
-    and ``slime_validate_args``. Data- and model-dependent derivations are
-    intentionally excluded; callers set them per test.
+    Mirrors the corresponding lines in
+    ``relax.utils.arguments._parse_args_impl`` and ``slime_validate_args``.
+    Data- and model-dependent derivations are intentionally excluded; callers
+    set them per test.
     """
     # Driver-only descriptor; worker namespaces serialize without it and tests
     # that exercise model-source resolution provide their own ModelSource.
