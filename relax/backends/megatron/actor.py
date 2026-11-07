@@ -453,6 +453,10 @@ class MegatronTrainRayActor(TrainRayActor):
         from relax.utils.training.flops_counter import FlopsCounter
 
         self.flops_counter = FlopsCounter(self.hf_config)
+        if getattr(args, "balance_by_flops", False):
+            from relax.utils.data.flops_balancing import FlopsWorkload
+
+            self.args.flops_workload = FlopsWorkload.from_config(self.hf_config)
 
         self.train_parallel_config = {
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
