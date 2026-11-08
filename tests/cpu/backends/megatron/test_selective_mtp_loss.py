@@ -32,6 +32,44 @@ def ce(labels, logits):
     return F.cross_entropy(logits[:, 0], labels[0], reduction="none").unsqueeze(0)
 
 
+@pytest.mark.parametrize("runtime_gather_output", [None, False])
+def test_te_scores_original_mtp_logits(monkeypatch, runtime_gather_output):
+    head = Head()
+    head.gather_output = True
+    hidden = torch.randn(4, 1, 5)
+    expected = head(hidden)[0].detach()
+    labels = expected.argmax(-1).T
+    group = object()
+
+    def inplace_ce(logits, targets, tp_group):
+        assert tp_group is (group if runtime_gather_output is False else None)
+        losses = ce(targets.T, logits).T
+        with torch.no_grad():
+            logits.fill_(0)
+        return losses
+
+    def counts(logits, targets, *_args):
+        torch.testing.assert_close(logits, expected)
+        return targets.numel(), targets.numel()
+
+    monkeypatch.setenv("RELAX_MTP_CE_IMPL", "te")
+    monkeypatch.setattr(patch, "te_cross_entropy", inplace_ce)
+    monkeypatch.setattr(patch, "_COMPUTE_MTP_ACCEPTANCE_COUNTS", counts)
+    _, correct, total = patch._chunked_head_ce(
+        hidden,
+        labels,
+        head,
+        None,
+        runtime_gather_output,
+        ce,
+        None,
+        4,
+        tp_group=group,
+        loss_mask=torch.ones_like(labels),
+    )
+    assert correct == total == 4
+
+
 def test_fused_mtp_preserves_selective_mask_gradients_and_acceptance(monkeypatch):
     from relax.backends.megatron import fused_linear_ce as fused
 
