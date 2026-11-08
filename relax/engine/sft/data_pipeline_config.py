@@ -36,3 +36,7 @@ def configure_sft_data_pipeline(args: Namespace) -> None:
     else:
         args.sft_train_data_prefetch = False
     configure_image_preprocessing(args, is_sft)
+    if getattr(args, "balance_by_flops", False):
+        from relax.utils.data.flops_config import validate_flops_balancing
+
+        validate_flops_balancing(args)

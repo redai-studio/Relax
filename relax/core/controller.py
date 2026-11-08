@@ -389,6 +389,23 @@ class Controller:
                     n_samples_per_prompt=self.config.n_samples_per_prompt,
                     dp_size=dp_size,
                 )
+                if getattr(self.config, "balance_by_flops", False):
+                    from relax.utils.data.flops_config import (
+                        get_flops_capacity_settings,
+                        get_sample_flops_cost,
+                        validate_flops_balancing,
+                    )
+                    from relax.utils.data.flops_sampler import FlopsBalancedSampler
+
+                    validate_flops_balancing(self.config)
+                    capacity, alignment = get_flops_capacity_settings(self.config)
+                    sampler = FlopsBalancedSampler(
+                        sampler,
+                        get_sample_flops_cost(self.config),
+                        capacity,
+                        packing_strategy=getattr(self.config, "sft_packing_strategy", "balanced"),
+                        capacity_alignment=alignment,
+                    )
             logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
         elif getattr(self.config, "balance_data", False):
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")

@@ -3,6 +3,9 @@
 # FLOPS estimation adapted from verl (volcengine/verl) under Apache License 2.0.
 
 import inspect
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.training.kimi_k3_flops import estimate_kimi_k3_flops
@@ -86,58 +89,34 @@ def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> fl
 # ---------------------------------------------------------------------------
 
 
-def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
-    """Dense transformer: Qwen2, Qwen3, LLaMA, Mistral, etc."""
+def _qwen2_flops_coefficients(config: Any, *, moe: bool = False) -> tuple[int, int]:
+    """Return shared training (linear, quadratic) coefficients in raw FLOPs."""
     hidden_size = config.hidden_size
-    vocab_size = config.vocab_size
-    num_hidden_layers = config.num_hidden_layers
-    num_key_value_heads = config.num_key_value_heads
     num_attention_heads = config.num_attention_heads
-    intermediate_size = config.intermediate_size
-
     head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
     q_size = num_attention_heads * head_dim
-    k_size = num_key_value_heads * head_dim
-    v_size = num_key_value_heads * head_dim
+    kv_size = config.num_key_value_heads * head_dim
+    if moe:
+        mlp_N = hidden_size * config.num_experts_per_tok * config.moe_intermediate_size * 3
+        mlp_N += hidden_size * config.num_experts
+    else:
+        mlp_N = hidden_size * config.intermediate_size * 3
+    attn_linear_N = hidden_size * (2 * q_size + 2 * kv_size)
+    emd_and_lm_head_N = config.vocab_size * hidden_size * 2
+    dense_N = (mlp_N + attn_linear_N) * config.num_hidden_layers + emd_and_lm_head_N
+    return 6 * dense_N, 6 * head_dim * num_attention_heads * config.num_hidden_layers
 
-    mlp_N = hidden_size * intermediate_size * 3
-    attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
-    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
-    dense_N_flops = 6 * dense_N * tokens_sum
 
-    seqlen_square_sum = sum(s * s for s in batch_seqlens)
-    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
-
-    return (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
+def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
+    """Dense transformer: Qwen2, Qwen3, LLaMA, Mistral, etc."""
+    linear, quadratic = _qwen2_flops_coefficients(config)
+    return (linear * tokens_sum + quadratic * sum(s * s for s in batch_seqlens)) / delta_time / 1e12
 
 
 def _estimate_qwen2_moe_flops(config, tokens_sum, batch_seqlens, delta_time):
     """MoE transformer: Qwen2-MoE, Qwen3-MoE."""
-    hidden_size = config.hidden_size
-    vocab_size = config.vocab_size
-    num_hidden_layers = config.num_hidden_layers
-    num_key_value_heads = config.num_key_value_heads
-    num_attention_heads = config.num_attention_heads
-    moe_intermediate_size = config.moe_intermediate_size
-    moe_topk = config.num_experts_per_tok
-    num_experts = config.num_experts
-
-    head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
-    q_size = num_attention_heads * head_dim
-    k_size = num_key_value_heads * head_dim
-    v_size = num_key_value_heads * head_dim
-
-    moe_mlp_N = hidden_size * moe_topk * moe_intermediate_size * 3 + hidden_size * num_experts
-    attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-    emd_and_lm_head_N = vocab_size * hidden_size * 2
-    dense_N = (moe_mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
-    dense_N_flops = 6 * dense_N * tokens_sum
-
-    seqlen_square_sum = sum(s * s for s in batch_seqlens)
-    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
-
-    return (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
+    linear, quadratic = _qwen2_flops_coefficients(config, moe=True)
+    return (linear * tokens_sum + quadratic * sum(s * s for s in batch_seqlens)) / delta_time / 1e12
 
 
 def _estimate_qwen3_vl_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
@@ -384,10 +363,9 @@ def _compute_qwen3_5_gdn_recurrence_flops(config, tokens_sum, num_linear_attn_la
     )
 
 
-def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
-    """Qwen3.5 hybrid attention (full attention + GatedDeltaNet linear
-    attention)."""
-    text_config = config.text_config if hasattr(config, "text_config") else config
+def _qwen3_5_flops_coefficients(text_config: Any) -> tuple[int, int]:
+    """Shared text training coefficients, including GatedDeltaNet
+    recurrence."""
     hidden_size = text_config.hidden_size
     vocab_size = text_config.vocab_size
     num_hidden_layers = text_config.num_hidden_layers
@@ -406,12 +384,20 @@ def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kar
         mlp_N = hidden_size * text_config.intermediate_size * 3 * num_hidden_layers
 
     emd_and_lm_head_N = vocab_size * hidden_size * 2
-    dense_N_flops = 6 * (mlp_N + attn_linear_N + emd_and_lm_head_N) * tokens_sum
+    linear = 6 * (mlp_N + attn_linear_N + emd_and_lm_head_N)
 
-    seqlen_square_sum = sum(s * s for s in batch_seqlens)
-    attn_qkv_flops = 6 * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
+    quadratic = 6 * head_dim * num_attention_heads * num_full_attn_layers
 
-    gdn_recurrence_flops = _compute_qwen3_5_gdn_recurrence_flops(text_config, tokens_sum, num_linear_attn_layers)
+    linear += _compute_qwen3_5_gdn_recurrence_flops(text_config, 1, num_linear_attn_layers)
+    return linear, quadratic
+
+
+def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    """Qwen3.5 hybrid attention (full attention + GatedDeltaNet linear
+    attention)."""
+    text_config = config.text_config if hasattr(config, "text_config") else config
+    linear, quadratic = _qwen3_5_flops_coefficients(text_config)
+    text_flops = linear * tokens_sum + quadratic * sum(s * s for s in batch_seqlens)
 
     images_seqlens = kargs.get("images_seqlens", None)
     if images_seqlens is not None and hasattr(config, "vision_config"):
@@ -419,7 +405,7 @@ def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time, **kar
     else:
         vit_flops = 0
 
-    flops_all_token = dense_N_flops + attn_qkv_flops + gdn_recurrence_flops + vit_flops
+    flops_all_token = text_flops + vit_flops
     return flops_all_token / delta_time / 1e12
 
 
@@ -534,6 +520,96 @@ _ESTIMATE_FUNC = {
     "qwen4_exp": _estimate_qwen38_flops,
     "qwen4_exp_text": _estimate_qwen38_flops,
 }
+
+
+def _positive_config_int(config: Any, name: str, *, allow_zero: bool = False) -> int:
+    value = getattr(config, name, None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < (0 if allow_zero else 1):
+        raise ValueError(
+            f"FLOPs workload requires {name} to be a {'nonnegative' if allow_zero else 'positive'} integer"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class SampleFlopsCost:
+    """Precomputed text forward FLOPs: ``linear*S + quadratic*S**2``.
+
+    This is the existing model FLOPs convention, not a measured runtime or
+    memory estimate. It excludes padding and communication. Configuration is
+    parsed once; estimating a batch performs only CPU integer arithmetic.
+    """
+
+    linear_flops: int
+    quadratic_flops: int
+
+    @classmethod
+    def from_config(cls, config: Any) -> "SampleFlopsCost":
+        model_type = getattr(config, "model_type", None)
+        supported = {
+            "qwen2",
+            "qwen3",
+            "qwen2_moe",
+            "qwen3_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        }
+        if not isinstance(model_type, str) or model_type not in supported:
+            raise ValueError(f"Unsupported model_type for FLOPs workload: {model_type!r}")
+        hybrid = model_type.startswith("qwen3_5")
+        moe = "moe" in model_type
+        text = getattr(config, "text_config", config) if hybrid else config
+        for name in ("hidden_size", "vocab_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads"):
+            _positive_config_int(text, name)
+        if hasattr(text, "head_dim"):
+            _positive_config_int(text, "head_dim")
+        elif text.hidden_size % text.num_attention_heads:
+            raise ValueError("hidden_size must be divisible by num_attention_heads when head_dim is absent")
+        if moe:
+            for name in ("num_experts", "num_experts_per_tok", "moe_intermediate_size"):
+                _positive_config_int(text, name)
+            if text.num_experts_per_tok > text.num_experts:
+                raise ValueError("num_experts_per_tok must not exceed num_experts")
+        else:
+            _positive_config_int(text, "intermediate_size")
+            if hybrid and hasattr(text, "num_experts"):
+                raise ValueError("Dense model_type cannot contain num_experts")
+        if hybrid:
+            for name in (
+                "linear_num_key_heads",
+                "linear_num_value_heads",
+                "linear_key_head_dim",
+                "linear_value_head_dim",
+                "linear_conv_kernel_dim",
+            ):
+                _positive_config_int(text, name)
+            if moe:
+                _positive_config_int(text, "shared_expert_intermediate_size", allow_zero=True)
+            layer_types = getattr(text, "layer_types", None)
+            if layer_types is not None:
+                if (
+                    not isinstance(layer_types, (list, tuple))
+                    or len(layer_types) != text.num_hidden_layers
+                    or any(kind not in ("full_attention", "linear_attention") for kind in layer_types)
+                ):
+                    raise ValueError("layer_types must describe every layer as full_attention or linear_attention")
+            elif hasattr(text, "full_attention_interval"):
+                _positive_config_int(text, "full_attention_interval")
+            linear, quadratic = _qwen3_5_flops_coefficients(text)
+        else:
+            linear, quadratic = _qwen2_flops_coefficients(text, moe=moe)
+        # Existing estimators count forward + 2*forward backward, including GDN.
+        return cls(linear // 3, quadratic // 3)
+
+    def estimate(self, lengths: Sequence[int]) -> list[int]:
+        result = []
+        for length in lengths:
+            if isinstance(length, bool) or not isinstance(length, int) or length < 0:
+                raise ValueError("sequence length must be a nonnegative integer")
+            result.append(self.linear_flops * length + self.quadratic_flops * length * length)
+        return result
 
 
 class FlopsCounter:

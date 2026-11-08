@@ -20,7 +20,7 @@ from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.packing import get_binpack_partitions
-from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
+from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions as get_seqlen_balanced_partitions
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
@@ -205,92 +205,24 @@ def _round_up_to_microbatch_group(num_microbatches: torch.Tensor, microbatch_gro
 
 
 def _get_micro_batch_token_capacity(args: Namespace, max_tokens: int, cp_size: int) -> int:
-    if getattr(args, "allgather_cp", False):
-        pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
-        if pad_size <= 0 or max_tokens < pad_size:
-            raise ValueError(
-                "allgather CP padding must fit within max_tokens_per_gpu: "
-                f"max_tokens_per_gpu={max_tokens}, local_pad_size={pad_size}"
-            )
-        return cp_size * (max_tokens // pad_size) * pad_size
-    return max_tokens * cp_size
+    from relax.utils.data.packing import get_microbatch_token_capacity
 
-
-def _get_first_fit_partitions(total_lengths: Sequence[int], capacity: int) -> list[list[int]]:
-    partitions: list[list[int]] = []
-    partition_token_counts: list[int] = []
-    for sample_idx, length in enumerate(total_lengths):
-        length = int(length)
-        for partition_idx, token_count in enumerate(partition_token_counts):
-            if token_count + length <= capacity:
-                partitions[partition_idx].append(sample_idx)
-                partition_token_counts[partition_idx] += length
-                break
-        else:
-            partitions.append([sample_idx])
-            partition_token_counts.append(length)
-    return partitions
-
-
-def _partitions_fit_capacity_or_singleton_oversize(
-    partitions: Sequence[Sequence[int]],
-    partition_token_counts: Sequence[int],
-    total_lengths: Sequence[int],
-    capacity: int,
-) -> bool:
-    return all(
-        token_count <= capacity or (len(partition) == 1 and int(total_lengths[partition[0]]) > capacity)
-        for partition, token_count in zip(partitions, partition_token_counts)
+    allgather = getattr(args, "allgather_cp", False)
+    return get_microbatch_token_capacity(
+        max_tokens,
+        cp_size,
+        tp_size=mpu.get_tensor_model_parallel_world_size() if allgather else 1,
+        allgather_cp=allgather,
+        data_pad_size_multiplier=getattr(args, "data_pad_size_multiplier", 1),
     )
 
 
 def _get_capacity_safe_balanced_partitions(
     total_lengths: Sequence[int], num_partitions: int, capacity: int
 ) -> list[list[int]]:
-    partitions = get_seqlen_balanced_partitions(total_lengths, num_partitions, equal_size=False)
-    partition_token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
-    if _partitions_fit_capacity_or_singleton_oversize(partitions, partition_token_counts, total_lengths, capacity):
-        return partitions
+    from relax.utils.data.packing import get_capacity_safe_balanced_partitions
 
-    balanced_max_tokens = max(partition_token_counts)
-    partitions = _get_first_fit_partitions(total_lengths, capacity)
-    partition_token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
-    if len(partitions) > num_partitions or not _partitions_fit_capacity_or_singleton_oversize(
-        partitions, partition_token_counts, total_lengths, capacity
-    ):
-        raise RuntimeError(
-            "first-fit dynamic microbatch partitions cannot satisfy the synchronised schedule: "
-            f"first_fit_partitions={len(partitions)}, num_partitions={num_partitions}, capacity={capacity}"
-        )
-
-    while len(partitions) < num_partitions:
-        splittable = [idx for idx, partition in enumerate(partitions) if len(partition) > 1]
-        if not splittable:
-            raise RuntimeError(
-                "dynamic microbatch partitions cannot be split into the synchronised number of non-empty batches: "
-                f"current={len(partitions)}, requested={num_partitions}"
-            )
-        partition_idx = max(splittable, key=lambda idx: (partition_token_counts[idx], -idx))
-        partition = partitions[partition_idx]
-        sample_idx = max(partition, key=lambda idx: (int(total_lengths[idx]), -idx))
-        partition.remove(sample_idx)
-        sample_length = int(total_lengths[sample_idx])
-        partition_token_counts[partition_idx] -= sample_length
-        partitions.append([sample_idx])
-        partition_token_counts.append(sample_length)
-
-    flat_indices = [idx for partition in partitions for idx in partition]
-    if sorted(flat_indices) != list(range(len(total_lengths))) or not _partitions_fit_capacity_or_singleton_oversize(
-        partitions, partition_token_counts, total_lengths, capacity
-    ):
-        raise RuntimeError("capacity-safe dynamic microbatch partitioning produced an invalid partition")
-
-    logger.warning(
-        "Balanced dynamic microbatches violated token capacity; using first-fit partitions with any oversized "
-        "samples isolated: "
-        f"balanced_max_tokens={balanced_max_tokens}, capacity={capacity}, num_partitions={num_partitions}"
-    )
-    return partitions
+    return get_capacity_safe_balanced_partitions(total_lengths, num_partitions, capacity)
 
 
 def _get_seqlen_partitions_with_dummy_padding(
@@ -1222,6 +1154,15 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    balance_by_flops = getattr(args, "balance_by_flops", False)
+    if balance_by_flops:
+        from time import perf_counter
+
+        from relax.utils.data.flops_balancing import partition_by_flops, summarize_partitions
+        from relax.utils.data.flops_config import get_sample_flops_cost, validate_flops_balancing
+
+        validate_flops_balancing(args)
+        planning_started = perf_counter()
     if is_preference_mode(args):
         return _get_preference_data_iterator(args, rollout_data, max_tokens_per_gpu)
 
@@ -1238,6 +1179,15 @@ def get_data_iterator(
     cp_size = mpu.get_context_parallel_world_size()
 
     num_local_samples = len(rollout_data["total_lengths"])
+    if balance_by_flops:
+        # Empty shards have no real template for dummy communication. Agree on
+        # this error before any rank enters the ordinary step-count collective.
+        invalid = torch.tensor(
+            [int(num_local_samples == 0)], dtype=torch.int, device=device_utils.make_current_torch_device()
+        )
+        dist.all_reduce(invalid, op=dist.ReduceOp.MAX, group=dp_group)
+        if invalid.item():
+            raise ValueError("FLOPs balancing requires a non-empty SFT shard on every DP rank")
     step_global_sample_counts = rollout_data.get(ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY)
     if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
         if step_global_sample_counts is not None:
@@ -1373,6 +1323,20 @@ def get_data_iterator(
             samples = [(length + alignment - 1) // alignment * alignment for length in samples]
         num_microbatches = []
         step_offsets = np.cumsum([0, *step_local_sample_counts]).tolist()
+        if balance_by_flops:
+            local_error = None
+            try:
+                workloads = get_sample_flops_cost(args).estimate(rollout_data["total_lengths"])
+            except (ValueError, OSError) as error:
+                local_error = error
+            invalid = torch.tensor(
+                [int(local_error is not None)], dtype=torch.int, device=device_utils.make_current_torch_device()
+            )
+            dist.all_reduce(invalid, op=dist.ReduceOp.MAX, group=dp_group)
+            if invalid.item():
+                raise ValueError(
+                    "FLOPs planning failed on a DP rank; check model config and sample lengths"
+                ) from local_error
         for i in range(num_steps_per_rollout):
             start = step_offsets[i]
             end = step_offsets[i + 1]
@@ -1411,6 +1375,17 @@ def get_data_iterator(
                 micro_batch_token_capacity,
                 packing_strategy=packing_strategy,
             )
+            if balance_by_flops:
+                real_count = len(partitions) - len(local_dummy_offsets)
+                repair_stats = {}
+                partitions[:real_count] = partition_by_flops(
+                    step_samples,
+                    workloads[start:end],
+                    micro_batch_token_capacity,
+                    partitions[:real_count],
+                    stats=repair_stats,
+                )
+                logger.debug("FLOPs fixed-K repair: %s", repair_stats)
             base_offset = len(micro_batch_indices)
             micro_batch_indices.extend([[idx + start for idx in partition] for partition in partitions])
             dummy_micro_batch_offsets.update(base_offset + offset for offset in local_dummy_offsets)
@@ -1449,6 +1424,17 @@ def get_data_iterator(
             f"After dynamic batching, num_microbatches: {num_microbatches}, micro_batch_indices: {micro_batch_indices}, "
             f"dummy_microbatches={len(dummy_micro_batch_offsets)}"
         )
+        if balance_by_flops:
+            real_partitions = [
+                part for offset, part in enumerate(micro_batch_indices) if offset not in dummy_micro_batch_offsets
+            ]
+            logger.debug(
+                "FLOPs microbatches: counts=%s dummy_count=%s workload=%s scheduler_seconds=%s",
+                num_microbatches,
+                len(dummy_micro_batch_offsets),
+                summarize_partitions(samples, workloads, real_partitions),
+                perf_counter() - planning_started,
+            )
         data_iterator = _generate_data_iterator(
             rollout_data,
             None,
