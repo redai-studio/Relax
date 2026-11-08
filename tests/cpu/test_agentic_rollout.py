@@ -128,6 +128,80 @@ async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) ->
     assert sample.reward == 1.0
 
 
+async def test_resident_teacher_binds_before_prepare_and_preserves_teacher_on_export(monkeypatch) -> None:
+    from relax.utils.opd.opd_main_worker import LogprobResponse
+
+    args = _runtime_args(
+        rollout_global_dataset=True,
+        use_opd=True,
+        opd_type="sglang",
+        opd_token_selection="student_sampled",
+        opd_teacher_key="domain",
+        opd_teacher_routes_map={"A": ["http://a"], "B": ["http://b"]},
+        opd_teacher_timeout_s=10,
+    )
+    shard = runtime_mod._SessionShardBinding("shard", MagicMock())
+    runtime = RuntimeDomain(args, "train", [shard], 1)
+    monkeypatch.setattr(runtime, "_start_shard_observers", lambda: None)
+    session_specs = []
+
+    async def start_group(mode, group_id, specs):
+        assert specs[0].metadata["teacher_id"] == "A"
+        session_specs.extend(specs)
+        shard.group_streams[group_id].first_request_barrier.set_result(True)
+
+    shard.handle.start_group.remote = start_group
+    shard.handle.lease_group.remote = AsyncMock()
+    shard.handle.release_group.remote = AsyncMock()
+    prepare = PrepareDomain("train", None, runtime)
+    reward = MagicMock(group_rm=True, custom_advantage_func=None)
+    reward.score_group = AsyncMock()
+    reward.finalize_group.side_effect = lambda group: group
+    pipeline = AgenticResidentPipeline(args, prepare, runtime, reward, SimpleNamespace(total_debt=1), None)
+    sample = Sample(prompt="q", metadata={"data_source": "math", "domain": "A"})
+    prepare._start_prepare(GroupInput("g", [sample]))
+    await asyncio.gather(*prepare._warming_prepare_tasks)
+
+    (spec,) = session_specs
+    forest, prompt = _forest_with_initial_obs(
+        session_id=spec.session_id,
+        metadata=spec.metadata,
+        messages=spec.input_payload["messages"],
+        train_token_delta=_chars("q"),
+        rollout_token_delta=_chars("q"),
+    )
+    exports = []
+    for answer, fields in (("x", {"turn_index": 0}), ("y", {"outcome": "won"})):
+        leaf = forest.append_resp(
+            parent_state_hash=prompt.state_hash,
+            rollout_id=0,
+            abort_count=0,
+            messages_delta=[{"role": "assistant", "content": answer}],
+            token_delta=_chars(answer),
+            logprob_delta=[-1.0],
+            export_metadata_patch=fields,
+        )
+        row = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
+        exports.append(SampleExport(answer, row))
+
+    async def post(session, url, payload, row, tag, expected_ids):
+        assert url == "http://a"
+        score = {"x": -0.25, "y": -0.75}[row.response]
+        token_logprobs = [[None, row.tokens[0]], [score, row.tokens[1]]]
+        return LogprobResponse({"meta_info": {"input_token_logprobs": token_logprobs}})
+
+    monkeypatch.setattr(pipeline._opd_manager, "_post_logprob", post)
+    await pipeline._lease_prepared_groups(_StepContext(rollout_id=0, final_backfill=False))
+    shard.group_streams["g"].session_results[0].completion.set_result(SessionExport(tuple(exports)))
+    (group,) = await asyncio.gather(*pipeline._active_group_tasks)
+    first, second = group.samples
+    assert first.session_id == second.session_id == spec.session_id
+    assert first.metadata["teacher_id"] == second.metadata["teacher_id"] == "A"
+    assert first.metadata["turn_index"] == 0
+    assert second.metadata["outcome"] == "won"
+    assert [first.teacher_log_probs, second.teacher_log_probs] == [[-0.25], [-0.75]]
+
+
 async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> None:
     calls: list[list[Sample]] = []
 

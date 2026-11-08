@@ -99,7 +99,7 @@ def _create_teacher_client_session(args) -> aiohttp.ClientSession:
 # --- Teacher URL selection: MOPD routing (by data_source) x replica round-robin ---
 # Two layers:
 #   1. Routing (MOPD): when ``args.opd_teacher_routes_map`` is set, pick the
-#      teacher for this sample by ``sample.metadata[args.opd_teacher_key]``.
+#      teacher bound before generation in ``sample.metadata["teacher_id"]``.
 #      Each route value is a LIST of that teacher's replica URLs.
 #   2. Replica round-robin: spread requests across a teacher's replicas with a
 #      per-teacher in-process counter (single-threaded asyncio makes ``+= 1`` safe).
@@ -121,11 +121,11 @@ def _round_robin(urls: list[str], key: str) -> str:
     return urls[i % len(urls)]
 
 
-def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
+def _pick_replica(replicas: list[str], sample: Sample, rr_key: str) -> str:
     """Load-balance across ONE teacher's replicas at GRPO-group granularity.
 
     ``rr_key`` already identifies the teacher — the caller resolved
-    ``data_source`` to a replica list first — so this only decides which copy of
+    the replica list first — so this only decides which copy of
     that same model serves the request. Text/VL teacher routing is unaffected.
 
     The ``n_samples_per_prompt`` samples of a prompt share ``group_index``
@@ -143,7 +143,7 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
     """
     if len(replicas) == 1:
         return replicas[0]
-    group_index = getattr(sample, "group_index", None) if sample is not None else None
+    group_index = sample.group_index
     if group_index is None:
         return _round_robin(replicas, rr_key)
     key = (rr_key, int(group_index))
@@ -157,26 +157,19 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
     return replicas[idx % len(replicas)]
 
 
-def _pick_teacher_url(args, sample=None) -> str:
+def bind_teacher(args, sample: Sample) -> None:
+    field = args.opd_teacher_key
+    teacher_id = sample.metadata[field]
+    if not args.opd_teacher_routes_map.get(teacher_id):
+        raise KeyError(f"MOPD routing: no teacher route for {field}={teacher_id!r}.")
+    sample.metadata["teacher_id"] = teacher_id
+
+
+def _pick_teacher_url(args, sample: Sample) -> str:
     routes_map = getattr(args, "opd_teacher_routes_map", None)
-    if routes_map and sample is not None:
-        key_field = getattr(args, "opd_teacher_key", None) or "data_source"
-        metadata = getattr(sample, "metadata", None) or {}
-        routing_value = metadata.get(key_field)
-        if routing_value is None:
-            raise ValueError(
-                f"MOPD routing: sample missing key '{key_field}' in metadata. "
-                f"Available metadata keys: {list(metadata.keys())}. "
-                f"Ensure the dataset has a '{key_field}' column and it is surfaced "
-                "via --metadata-key or the data pipeline."
-            )
-        replicas = routes_map.get(routing_value)
-        if not replicas:
-            raise KeyError(
-                f"MOPD routing: no teacher route for '{key_field}={routing_value}'. "
-                f"Available routes: {list(routes_map.keys())}."
-            )
-        return _pick_replica(replicas, sample, routing_value)
+    if routes_map:
+        teacher_id = sample.metadata["teacher_id"]
+        return _pick_replica(routes_map[teacher_id], sample, teacher_id)
     # Single-teacher path: round-robin over replicas if configured.
     urls = getattr(args, "opd_teacher_urls", None)
     if urls and len(urls) > 1:

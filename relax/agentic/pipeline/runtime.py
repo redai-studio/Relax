@@ -36,6 +36,7 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.engine.rollout import on_policy_distillation as opd
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
@@ -952,6 +953,14 @@ class RuntimeDomain:
         controlled drop before the barrier resolves this operation without a
         Runtime capability.
         """
+
+        if (
+            self.rollout_mode == "train"
+            and opd.is_opd_enabled(self.args)
+            and getattr(self.args, "opd_teacher_routes_map", None)
+        ):
+            for sample in group_input.samples:
+                opd.bind_teacher(self.args, sample)
 
         await self._resident_group_permits.acquire()
         try:

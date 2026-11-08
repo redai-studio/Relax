@@ -117,7 +117,8 @@ MODEL_DIR=/root/models DATA_DIR=/root/data bash run-mopd-qwen35-35ba3b-16xgpu-co
 }
 ```
 
-rollout 阶段按每条样本的 `data_source` 找到对应教师，请求 token 级 log-probability；某个教师请求失败或超时会逐样本回退到 rollout log-probs，仅当一整步内所有非空样本都失败才报错中断。
+Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确定 `Sample.metadata["teacher_id"]`。
+回答生成后，评分直接使用这个 Teacher 身份选择副本，结果写回对应回答。
 
 > `--resource` 里 `teacher` 的 GPU 数是教师总预算，先在教师间平均分配（要求整除），每个教师再按 `--teacher-num-gpus-per-engine` 拆成若干副本（副本 TP=该值），rollout 时先路由到教师再在其副本间 round-robin。
 

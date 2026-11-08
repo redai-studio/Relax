@@ -798,6 +798,10 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
+    if opd.is_opd_enabled(args, evaluation=evaluation) and getattr(args, "opd_teacher_routes_map", None):
+        for sample in group:
+            opd.bind_teacher(args, sample)
+
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
