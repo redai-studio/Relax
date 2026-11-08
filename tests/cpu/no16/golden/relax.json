@@ -1,0 +1,1280 @@
+{
+  "equal_dp1": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["equal_dp1-s000", "equal_dp1-s007"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              },
+              {
+                "ids": ["equal_dp1-s001", "equal_dp1-s006"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              },
+              {
+                "ids": ["equal_dp1-s002", "equal_dp1-s005"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              },
+              {
+                "ids": ["equal_dp1-s003", "equal_dp1-s004"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "equal_dp2": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["equal_dp2-s000", "equal_dp2-s007"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              },
+              {
+                "ids": ["equal_dp2-s002", "equal_dp2-s004"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["equal_dp2-s001", "equal_dp2-s006"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              },
+              {
+                "ids": ["equal_dp2-s003", "equal_dp2-s005"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "equal_dp4": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 16,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["equal_dp4-s000", "equal_dp4-s015"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              },
+              {
+                "ids": ["equal_dp4-s004", "equal_dp4-s008"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["equal_dp4-s001", "equal_dp4-s014"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              },
+              {
+                "ids": ["equal_dp4-s005", "equal_dp4-s009"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 2,
+            "microbatches": [
+              {
+                "ids": ["equal_dp4-s002", "equal_dp4-s013"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              },
+              {
+                "ids": ["equal_dp4-s006", "equal_dp4-s010"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 3,
+            "microbatches": [
+              {
+                "ids": ["equal_dp4-s003", "equal_dp4-s012"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              },
+              {
+                "ids": ["equal_dp4-s007", "equal_dp4-s011"],
+                "dummy": false,
+                "tokens": 8,
+                "reference_fwd_flops": 23552.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "mixed_dp2": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["mixed_dp2-s004", "mixed_dp2-s005"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30016.0
+              },
+              {
+                "ids": ["mixed_dp2-s002", "mixed_dp2-s003"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30336.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["mixed_dp2-s006", "mixed_dp2-s007"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 29824.0
+              },
+              {
+                "ids": ["mixed_dp2-s000", "mixed_dp2-s001"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30784.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "long_tail_dp4": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 16,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": [
+                  "long_tail_dp4-s001",
+                  "long_tail_dp4-s006",
+                  "long_tail_dp4-s011",
+                  "long_tail_dp4-s012"
+                ],
+                "dummy": false,
+                "tokens": 243,
+                "reference_fwd_flops": 2527584.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": [
+                  "long_tail_dp4-s002",
+                  "long_tail_dp4-s007",
+                  "long_tail_dp4-s008",
+                  "long_tail_dp4-s013"
+                ],
+                "dummy": false,
+                "tokens": 243,
+                "reference_fwd_flops": 2527584.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 2,
+            "microbatches": [
+              {
+                "ids": [
+                  "long_tail_dp4-s003",
+                  "long_tail_dp4-s004",
+                  "long_tail_dp4-s009",
+                  "long_tail_dp4-s014"
+                ],
+                "dummy": false,
+                "tokens": 243,
+                "reference_fwd_flops": 2527584.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 3,
+            "microbatches": [
+              {
+                "ids": [
+                  "long_tail_dp4-s000",
+                  "long_tail_dp4-s005",
+                  "long_tail_dp4-s010",
+                  "long_tail_dp4-s015"
+                ],
+                "dummy": false,
+                "tokens": 243,
+                "reference_fwd_flops": 2527584.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "capacity_conflict": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 3,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["capacity_conflict-s002"],
+                "dummy": false,
+                "tokens": 6,
+                "reference_fwd_flops": 18048.0
+              },
+              {
+                "ids": ["capacity_conflict-s001"],
+                "dummy": false,
+                "tokens": 6,
+                "reference_fwd_flops": 18048.0
+              },
+              {
+                "ids": ["capacity_conflict-s000"],
+                "dummy": false,
+                "tokens": 6,
+                "reference_fwd_flops": 18048.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "legacy_capacity_repair": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 9,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["legacy_capacity_repair-s000", "legacy_capacity_repair-s002"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30016.0
+              },
+              {
+                "ids": ["legacy_capacity_repair-s001"],
+                "dummy": false,
+                "tokens": 9,
+                "reference_fwd_flops": 27936.0
+              },
+              {
+                "ids": [
+                  "legacy_capacity_repair-s003",
+                  "legacy_capacity_repair-s004",
+                  "legacy_capacity_repair-s006"
+                ],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 29568.0
+              },
+              {
+                "ids": ["legacy_capacity_repair-s005", "legacy_capacity_repair-s007"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 29760.0
+              },
+              {
+                "ids": ["legacy_capacity_repair-s008"],
+                "dummy": false,
+                "tokens": 9,
+                "reference_fwd_flops": 27936.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": [
+      "Balanced dynamic microbatches violated token capacity; using first-fit partitions with any oversized samples isolated: balanced_max_tokens=11, capacity=10, num_partitions=5"
+    ]
+  },
+  "oversized_singleton": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 4,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["oversized_singleton-s000"],
+                "dummy": false,
+                "tokens": 25,
+                "reference_fwd_flops": 90400.0
+              },
+              {
+                "ids": ["oversized_singleton-s001"],
+                "dummy": false,
+                "tokens": 1,
+                "reference_fwd_flops": 2848.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["oversized_singleton-s003"],
+                "dummy": false,
+                "tokens": 6,
+                "reference_fwd_flops": 18048.0
+              },
+              {
+                "ids": ["oversized_singleton-s002"],
+                "dummy": false,
+                "tokens": 4,
+                "reference_fwd_flops": 11776.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "dummy_vpp": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 4,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["dummy_vpp-s003"],
+                "dummy": false,
+                "tokens": 1,
+                "reference_fwd_flops": 2848.0
+              },
+              {
+                "ids": ["dummy_vpp-s000"],
+                "dummy": false,
+                "tokens": 1,
+                "reference_fwd_flops": 2848.0
+              },
+              {
+                "ids": ["dummy_vpp-s003"],
+                "dummy": true,
+                "tokens": 1,
+                "reference_fwd_flops": 2848.0
+              },
+              {
+                "ids": ["dummy_vpp-s003"],
+                "dummy": true,
+                "tokens": 1,
+                "reference_fwd_flops": 2848.0
+              }
+            ],
+            "iterator_copies": 2
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["dummy_vpp-s002"],
+                "dummy": false,
+                "tokens": 1,
+                "reference_fwd_flops": 2848.0
+              },
+              {
+                "ids": ["dummy_vpp-s001"],
+                "dummy": false,
+                "tokens": 1,
+                "reference_fwd_flops": 2848.0
+              },
+              {
+                "ids": ["dummy_vpp-s002"],
+                "dummy": true,
+                "tokens": 1,
+                "reference_fwd_flops": 2848.0
+              },
+              {
+                "ids": ["dummy_vpp-s002"],
+                "dummy": true,
+                "tokens": 1,
+                "reference_fwd_flops": 2848.0
+              }
+            ],
+            "iterator_copies": 2
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "vpp_feasible": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 16,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": [
+                  "vpp_feasible-s000",
+                  "vpp_feasible-s004",
+                  "vpp_feasible-s008",
+                  "vpp_feasible-s015"
+                ],
+                "dummy": false,
+                "tokens": 4,
+                "reference_fwd_flops": 11392.0
+              },
+              {
+                "ids": [
+                  "vpp_feasible-s002",
+                  "vpp_feasible-s006",
+                  "vpp_feasible-s010",
+                  "vpp_feasible-s012"
+                ],
+                "dummy": false,
+                "tokens": 4,
+                "reference_fwd_flops": 11392.0
+              }
+            ],
+            "iterator_copies": 2
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": [
+                  "vpp_feasible-s001",
+                  "vpp_feasible-s005",
+                  "vpp_feasible-s009",
+                  "vpp_feasible-s014"
+                ],
+                "dummy": false,
+                "tokens": 4,
+                "reference_fwd_flops": 11392.0
+              },
+              {
+                "ids": [
+                  "vpp_feasible-s003",
+                  "vpp_feasible-s007",
+                  "vpp_feasible-s011",
+                  "vpp_feasible-s013"
+                ],
+                "dummy": false,
+                "tokens": 4,
+                "reference_fwd_flops": 11392.0
+              }
+            ],
+            "iterator_copies": 2
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "tail_admission": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["tail_admission-s000", "tail_admission-s007"],
+                "dummy": false,
+                "tokens": 7,
+                "reference_fwd_flops": 20640.0
+              },
+              {
+                "ids": ["tail_admission-s001", "tail_admission-s002"],
+                "dummy": false,
+                "tokens": 7,
+                "reference_fwd_flops": 20512.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["tail_admission-s005", "tail_admission-s006"],
+                "dummy": false,
+                "tokens": 7,
+                "reference_fwd_flops": 20512.0
+              },
+              {
+                "ids": ["tail_admission-s003", "tail_admission-s004"],
+                "dummy": false,
+                "tokens": 7,
+                "reference_fwd_flops": 20640.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": ["tail_admission-s008", "tail_admission-s009"],
+    "fallback_warnings": []
+  },
+  "multiple_steps": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["multiple_steps-s004", "multiple_steps-s005"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30016.0
+              },
+              {
+                "ids": ["multiple_steps-s002", "multiple_steps-s003"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30336.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["multiple_steps-s006", "multiple_steps-s007"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 29824.0
+              },
+              {
+                "ids": ["multiple_steps-s000", "multiple_steps-s001"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30784.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      },
+      {
+        "step": 1,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["multiple_steps-s012", "multiple_steps-s013"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30016.0
+              },
+              {
+                "ids": ["multiple_steps-s010", "multiple_steps-s011"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30336.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["multiple_steps-s014", "multiple_steps-s015"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 29824.0
+              },
+              {
+                "ids": ["multiple_steps-s008", "multiple_steps-s009"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30784.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "grouped_rollouts": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 4,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["grouped_rollouts-s002", "grouped_rollouts-s005", "grouped_rollouts-s007"],
+                "dummy": false,
+                "tokens": 7,
+                "reference_fwd_flops": 20256.0
+              },
+              {
+                "ids": ["grouped_rollouts-s003"],
+                "dummy": false,
+                "tokens": 7,
+                "reference_fwd_flops": 21280.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["grouped_rollouts-s000", "grouped_rollouts-s004"],
+                "dummy": false,
+                "tokens": 7,
+                "reference_fwd_flops": 20512.0
+              },
+              {
+                "ids": ["grouped_rollouts-s001", "grouped_rollouts-s006"],
+                "dummy": false,
+                "tokens": 6,
+                "reference_fwd_flops": 17728.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "sequential_dp2": {
+    "status": "ok",
+    "engine": "relax_legacy_sequential",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["sequential_dp2-s002", "sequential_dp2-s003"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30336.0
+              },
+              {
+                "ids": ["sequential_dp2-s000", "sequential_dp2-s001"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30784.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["sequential_dp2-s006", "sequential_dp2-s007"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 29824.0
+              },
+              {
+                "ids": ["sequential_dp2-s004", "sequential_dp2-s005"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30016.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "sft_dp2": {
+    "status": "ok",
+    "engine": "relax_legacy_sft",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["sft_dp2-s004", "sft_dp2-s005"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30016.0
+              },
+              {
+                "ids": ["sft_dp2-s002", "sft_dp2-s003"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30336.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["sft_dp2-s006", "sft_dp2-s007"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 29824.0
+              },
+              {
+                "ids": ["sft_dp2-s000", "sft_dp2-s001"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30784.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "binpack_dp2": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["binpack_dp2-s004"],
+                "dummy": false,
+                "tokens": 12,
+                "reference_fwd_flops": 38400.0
+              },
+              {
+                "ids": ["binpack_dp2-s001", "binpack_dp2-s005", "binpack_dp2-s007"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 29632.0
+              },
+              {
+                "ids": ["binpack_dp2-s001", "binpack_dp2-s005", "binpack_dp2-s007"],
+                "dummy": true,
+                "tokens": 10,
+                "reference_fwd_flops": 29632.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["binpack_dp2-s000"],
+                "dummy": false,
+                "tokens": 9,
+                "reference_fwd_flops": 27936.0
+              },
+              {
+                "ids": ["binpack_dp2-s002"],
+                "dummy": false,
+                "tokens": 7,
+                "reference_fwd_flops": 21280.0
+              },
+              {
+                "ids": ["binpack_dp2-s003", "binpack_dp2-s006"],
+                "dummy": false,
+                "tokens": 6,
+                "reference_fwd_flops": 17536.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "static_dp2": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["static_dp2-s000", "static_dp2-s002"],
+                "dummy": false,
+                "tokens": 4,
+                "reference_fwd_flops": 11520.0
+              },
+              {
+                "ids": ["static_dp2-s004", "static_dp2-s007"],
+                "dummy": false,
+                "tokens": 4,
+                "reference_fwd_flops": 11520.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["static_dp2-s001", "static_dp2-s003"],
+                "dummy": false,
+                "tokens": 4,
+                "reference_fwd_flops": 11520.0
+              },
+              {
+                "ids": ["static_dp2-s005", "static_dp2-s006"],
+                "dummy": false,
+                "tokens": 4,
+                "reference_fwd_flops": 11520.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "cp_capacity": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 4,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["cp_capacity-s003"],
+                "dummy": false,
+                "tokens": 17,
+                "reference_fwd_flops": 57120.0
+              },
+              {
+                "ids": ["cp_capacity-s000"],
+                "dummy": false,
+                "tokens": 17,
+                "reference_fwd_flops": 57120.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["cp_capacity-s002"],
+                "dummy": false,
+                "tokens": 17,
+                "reference_fwd_flops": 57120.0
+              },
+              {
+                "ids": ["cp_capacity-s001"],
+                "dummy": false,
+                "tokens": 17,
+                "reference_fwd_flops": 57120.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "unsplit_cp": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 2,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["unsplit_cp-s001"],
+                "dummy": false,
+                "tokens": 17,
+                "reference_fwd_flops": 57120.0
+              },
+              {
+                "ids": ["unsplit_cp-s000"],
+                "dummy": false,
+                "tokens": 17,
+                "reference_fwd_flops": 57120.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "dynamic_cp_order": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["dynamic_cp_order-s004", "dynamic_cp_order-s005"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30016.0
+              },
+              {
+                "ids": ["dynamic_cp_order-s002", "dynamic_cp_order-s003"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30336.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["dynamic_cp_order-s006", "dynamic_cp_order-s007"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 29824.0
+              },
+              {
+                "ids": ["dynamic_cp_order-s000", "dynamic_cp_order-s001"],
+                "dummy": false,
+                "tokens": 10,
+                "reference_fwd_flops": 30784.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "moe_reference": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": [
+                  "moe_reference-s000",
+                  "moe_reference-s001",
+                  "moe_reference-s005",
+                  "moe_reference-s007"
+                ],
+                "dummy": false,
+                "tokens": 600,
+                "reference_fwd_flops": 11601920.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": [
+                  "moe_reference-s002",
+                  "moe_reference-s003",
+                  "moe_reference-s004",
+                  "moe_reference-s006"
+                ],
+                "dummy": false,
+                "tokens": 424,
+                "reference_fwd_flops": 4827136.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "equal_dense_long": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 8,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["equal_dense_long-s000", "equal_dense_long-s007"],
+                "dummy": false,
+                "tokens": 1024,
+                "reference_fwd_flops": 19660800.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 1,
+            "microbatches": [
+              {
+                "ids": ["equal_dense_long-s001", "equal_dense_long-s006"],
+                "dummy": false,
+                "tokens": 1024,
+                "reference_fwd_flops": 19660800.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 2,
+            "microbatches": [
+              {
+                "ids": ["equal_dense_long-s002", "equal_dense_long-s005"],
+                "dummy": false,
+                "tokens": 1024,
+                "reference_fwd_flops": 19660800.0
+              }
+            ],
+            "iterator_copies": 1
+          },
+          {
+            "rank": 3,
+            "microbatches": [
+              {
+                "ids": ["equal_dense_long-s003", "equal_dense_long-s004"],
+                "dummy": false,
+                "tokens": 1024,
+                "reference_fwd_flops": 19660800.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  },
+  "alignment_510_2_512": {
+    "status": "ok",
+    "engine": "relax_legacy_balanced",
+    "steps": [
+      {
+        "step": 0,
+        "logical_count": 3,
+        "ranks": [
+          {
+            "rank": 0,
+            "microbatches": [
+              {
+                "ids": ["alignment_510_2_512-s000", "alignment_510_2_512-s001"],
+                "dummy": false,
+                "tokens": 512,
+                "reference_fwd_flops": 9765120.0
+              },
+              {
+                "ids": ["alignment_510_2_512-s002"],
+                "dummy": false,
+                "tokens": 512,
+                "reference_fwd_flops": 9830400.0
+              }
+            ],
+            "iterator_copies": 1
+          }
+        ]
+      }
+    ],
+    "unadmitted_ids": [],
+    "fallback_warnings": []
+  }
+}

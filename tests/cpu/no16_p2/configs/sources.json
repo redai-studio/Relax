@@ -1,0 +1,18 @@
+[
+  {
+    "revision": "fc05daec18b0a78c049392ed2e771dde82bdf654",
+    "model": "Qwen/Qwen3.5-27B",
+    "artifact_sha256": "94fd5c06e65b0382802417f8b60ba9749190fb74de4c2688c357d5a5f79ae291",
+    "config_url": "https://huggingface.co/Qwen/Qwen3.5-27B/raw/fc05daec18b0a78c049392ed2e771dde82bdf654/config.json",
+    "upstream_sha256": "f8d190c5b89c1521220f935d2567a587d6e291ed69066a45a106560b05a2174c",
+    "normalization": "One terminal LF appended by the repository end-of-file hook; removing it reconstructs upstream bytes"
+  },
+  {
+    "revision": "59d61f3ce65a6d9863b86d2e96597125219dc754",
+    "model": "Qwen/Qwen3.5-35B-A3B",
+    "artifact_sha256": "a2619dc4d764affa76f420443393196d2bda5d8cfecfc7da235ff4a05a442ace",
+    "config_url": "https://huggingface.co/Qwen/Qwen3.5-35B-A3B/raw/59d61f3ce65a6d9863b86d2e96597125219dc754/config.json",
+    "upstream_sha256": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
+    "normalization": "One terminal LF appended by the repository end-of-file hook; removing it reconstructs upstream bytes"
+  }
+]

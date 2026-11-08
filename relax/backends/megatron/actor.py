@@ -453,6 +453,13 @@ class MegatronTrainRayActor(TrainRayActor):
         from relax.utils.training.flops_counter import FlopsCounter
 
         self.flops_counter = FlopsCounter(self.hf_config)
+        self._flops_context = None
+        if role == "actor" and getattr(args, "flops_scheduling", "off") != "off":
+            from dataclasses import replace
+
+            from relax.utils.data.flops_scheduling import runtime_context
+
+            self._flops_context = replace(runtime_context(args, self.hf_config), control_group=get_gloo_group())
 
         self.train_parallel_config = {
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
@@ -478,6 +485,15 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        self._pack_first_contract = None
+        if role == "actor" and getattr(args, "flops_scheduling_order", "dp-first") == "pack-first":
+            from megatron.core.utils import get_model_config
+
+            from relax.utils.data.global_flops_pack_protocol import execution_contract
+
+            self._pack_first_contract = execution_contract(
+                args, mpu, get_model_config(self.model[0]), self._flops_context.estimator
+            )
         if role == "actor":
             from relax.utils.record_function_tags import install_record_function_tags
 
@@ -1480,6 +1496,14 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_mini_batch_metas: list = []
             rollout_mini_local_sample_counts: list[int] = []
             fetch_iter = 0
+            if getattr(self, "_pack_first_contract", None) is not None:
+                from relax.utils.data.global_flops_pack_protocol import agree_cpu, agree_invocation
+
+                agree_invocation(
+                    num_rollout_minis,
+                    batch_index,
+                    lambda values: agree_cpu(values, self._flops_context.control_group),
+                )
             while batch_index < num_rollout_minis:
                 # ``get_meta`` marks a TQ partition consumed.  A CPU-prefetched
                 # SFT batch therefore looks consumed before the main training
@@ -1494,9 +1518,17 @@ class MegatronTrainRayActor(TrainRayActor):
                 from relax.utils.data.wholepack import all_ready
                 from relax.utils.data.wholepack import enabled as wholepack_enabled
 
-                drained = not has_prefetched_sft_batch and self.all_consumed(task_name, rollout_id)
-                if wholepack_enabled(self.args):
-                    drained = all_ready(drained)
+                if getattr(self, "_pack_first_contract", None) is not None:
+                    from relax.utils.data.global_flops_pack_protocol import agree_cpu, checked_drained
+
+                    drained = checked_drained(
+                        lambda: self._pack_first_local_consumed(task_name, rollout_id),
+                        lambda values: agree_cpu(values, self._flops_context.control_group),
+                    )
+                else:
+                    drained = not has_prefetched_sft_batch and self.all_consumed(task_name, rollout_id)
+                    if wholepack_enabled(self.args):
+                        drained = all_ready(drained)
                 if drained:
                     break
                 consumer = "critic" if self.role == "critic" else "actor"
@@ -1542,12 +1574,28 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_mini_local_sample_counts.append(len(rollout_data["total_lengths"]))
 
             if not is_offline_mode(self.args):
+                if getattr(self, "_pack_first_contract", None) is not None:
+                    from relax.utils.data.global_flops_pack_protocol import agree_cpu
+
+                    merge_error = None
+                    try:
+                        if len(rollout_mini_batches) != num_rollout_minis:
+                            raise ValueError("Pack-first fetched an incomplete logical mini sequence")
+                        rollout_data = concat_rollout_batches(rollout_mini_batches)
+                    except Exception as exc:
+                        merge_error = str(exc)
+                    control = agree_cpu([int(merge_error is not None)], self._flops_context.control_group)
+                    if control[0]:
+                        raise ValueError(
+                            "Pack-first mini merge failed on an Actor rank: " + (merge_error or "peer error")
+                        )
                 if len(rollout_mini_batches) != num_rollout_minis:
                     raise RuntimeError(
                         f"Expected {num_rollout_minis} rollout mini batches for rollout_id={rollout_id}, "
                         f"got {len(rollout_mini_batches)}."
                     )
-                rollout_data = concat_rollout_batches(rollout_mini_batches)
+                if getattr(self, "_pack_first_contract", None) is None:
+                    rollout_data = concat_rollout_batches(rollout_mini_batches)
                 if getattr(self.args, "use_rollout_indexer_replay", False):
                     for mini_batch in rollout_mini_batches:
                         mini_batch.pop("rollout_indexer_topk", None)
@@ -1988,9 +2036,37 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         return window
 
+    def _get_data_iterator(
+        self, rollout_data: RolloutBatch, max_tokens_per_gpu: int | None = None, *, training: bool = True
+    ) -> Any:
+        context = getattr(self, "_flops_context", None)
+        contract = getattr(self, "_pack_first_contract", None)
+        if contract is not None:
+            if training:
+                return get_data_iterator(
+                    self.args,
+                    self.model,
+                    rollout_data,
+                    max_tokens_per_gpu=max_tokens_per_gpu,
+                    flops_context=context,
+                    pack_first_contract=contract,
+                )
+            return get_data_iterator(self.args, self.model, rollout_data, max_tokens_per_gpu=max_tokens_per_gpu)
+        if context is None:
+            if max_tokens_per_gpu is None:
+                return get_data_iterator(self.args, self.model, rollout_data)
+            return get_data_iterator(self.args, self.model, rollout_data, max_tokens_per_gpu=max_tokens_per_gpu)
+        return get_data_iterator(
+            self.args,
+            self.model,
+            rollout_data,
+            max_tokens_per_gpu=max_tokens_per_gpu,
+            flops_context=context,
+        )
+
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        data_iterator, num_microbatches = self._get_data_iterator(rollout_data)
         rollout_data.update(
             forward_only(
                 get_values,
@@ -2066,7 +2142,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # Create data iterator for actor forward + routing replay + train.
         uses_prepared_sft_window = prepared_data_iterator is not None and prepared_num_microbatches is not None
         if not uses_prepared_sft_window:
-            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            data_iterator, num_microbatches = self._get_data_iterator(rollout_data)
         else:
             data_iterator, num_microbatches = prepared_data_iterator, prepared_num_microbatches
         inline_old_log_probs = hasattr(self, "weights_backuper") and can_reuse_colocate_log_probs(
@@ -2081,11 +2157,10 @@ class MegatronTrainRayActor(TrainRayActor):
             and self.args.use_dynamic_batch_size
             and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu
         ):
-            data_iterator_logprobs, num_microbatches_logprobs = get_data_iterator(
-                self.args,
-                self.model,
+            data_iterator_logprobs, num_microbatches_logprobs = self._get_data_iterator(
                 rollout_data,
                 max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu,
+                training=False,
             )
         else:
             data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
@@ -2331,8 +2406,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info(
                     f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob"
                 )
-                data_iterator, num_microbatches = get_data_iterator(
-                    self.args, self.model, data, max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu
+                data_iterator, num_microbatches = self._get_data_iterator(
+                    data, max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu, training=False
                 )
                 output_dict = self.compute_log_prob(
                     data_iterator,
@@ -2381,8 +2456,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info(
                     f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob"
                 )
-                data_iterator, num_microbatches = get_data_iterator(
-                    self.args, self.model, data, max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu
+                data_iterator, num_microbatches = self._get_data_iterator(
+                    data, max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu, training=False
                 )
 
                 output_dict = self.compute_log_prob(
@@ -2405,14 +2480,13 @@ class MegatronTrainRayActor(TrainRayActor):
         Shared by the streaming and debug_train_only paths so both compute
         identical log-probs before advantages are merged.
         """
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, sub_batch)
+        data_iterator, num_microbatches = self._get_data_iterator(sub_batch, training=False)
         # Separate iterator with larger token budget for ref/teacher log-probs (fallthrough mode).
         if self.args.use_dynamic_batch_size and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu:
-            data_iterator_logprobs, num_microbatches_logprobs = get_data_iterator(
-                self.args,
-                self.model,
+            data_iterator_logprobs, num_microbatches_logprobs = self._get_data_iterator(
                 sub_batch,
                 max_tokens_per_gpu=self.args.log_probs_max_tokens_per_gpu,
+                training=False,
             )
         else:
             data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
@@ -2679,7 +2753,7 @@ class MegatronTrainRayActor(TrainRayActor):
             log_rollout_data(rollout_id, self.args, rollout_data)
 
             # ── Phase 3: Train on the full merged batch ──
-            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            data_iterator, num_microbatches = self._get_data_iterator(rollout_data)
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
@@ -3304,6 +3378,24 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
 
+    def _pack_first_local_consumed(self, task_name: str, rollout_id: int, partition_id: str | None = None) -> bool:
+        """Query on the replica leader without entering any model-parallel
+        collective.
+
+        Pack-first's Actor CPU agreement coordinates both RPC errors and
+        readiness. Calling legacy all_consumed here would put peers in its
+        inner collective before an RPC error is shared.
+        """
+        if (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == 0
+            and mpu.get_context_parallel_rank() == 0
+        ):
+            if partition_id is None:
+                partition_id = sft_partition_id(self.args, rollout_id)
+            return bool(run(self.data_system_client.async_check_consumption_status(task_name, partition_id)))
+        return True
+
     def all_consumed(self, task_name, rollout_id, partition_id: str | None = None, streaming: bool = False):
         # Only (TP=0, PP=0, CP=0) queries the transfer queue; otherwise different cp_ranks
         # may observe different consumption status due to concurrent fetches and diverge,
@@ -3695,6 +3787,16 @@ class MegatronTrainRayActor(TrainRayActor):
             "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
             "task_name": task_name,
         }
+        pack_context = None
+        if getattr(self, "_pack_first_contract", None) is not None:
+            from dataclasses import asdict
+
+            from relax.utils.data.global_flops_pack_planner import TRAIN_TASKS
+            from relax.utils.data.global_flops_pack_protocol import REQUEST_CONTRACT
+
+            if task_name in TRAIN_TASKS:
+                sampling_config[REQUEST_CONTRACT] = asdict(self._pack_first_contract)
+                pack_context = self._flops_context
         # Skip the PP broadcast when PP world size is 1: it's a self-broadcast
         # but still pays the full pickle cost on every TP rank-0 fetcher
         # (multimodal pixel_values can be hundreds of MB → seconds per call).
@@ -3729,6 +3831,16 @@ class MegatronTrainRayActor(TrainRayActor):
             per_rank_fetch=per_rank_fetch,
             prefetched_rollout_data=prefetched_rollout_data,
             prefetched_fetch_time_s=prefetched_fetch_time_s,
+            **(
+                {
+                    "pack_first_context": pack_context,
+                    "pack_first_is_drained": lambda: self._pack_first_local_consumed(
+                        task_name, rollout_id, partition_id=partition_id
+                    ),
+                }
+                if pack_context is not None
+                else {}
+            ),
         )
         if wholepack_training:
             from relax.utils.data.wholepack import agree, await_batch, restore_checked

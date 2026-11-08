@@ -1209,6 +1209,9 @@ def get_data_iterator(
     model: torch.nn.Module | Sequence[torch.nn.Module],
     rollout_data: RolloutBatch,
     max_tokens_per_gpu: int | None = None,
+    *,
+    flops_context: Any = None,
+    pack_first_contract: Any = None,
 ) -> tuple[list[DataIterator], list[int]]:
     """Create iterators and a micro-batch schedule for a rollout step.
 
@@ -1236,6 +1239,59 @@ def get_data_iterator(
         config = get_model_config(model[0])
         microbatch_group_size_per_vp_stage = config.microbatch_group_size_per_vp_stage
     cp_size = mpu.get_context_parallel_world_size()
+
+    if flops_context is not None and getattr(args, "flops_scheduling_order", "dp-first") == "pack-first":
+        from megatron.core.utils import get_model_config
+
+        from relax.utils.data.global_flops_pack_protocol import agree_cpu, checked_schedule, execution_contract
+
+        indices, counts, dummy = checked_schedule(
+            rollout_data,
+            pack_first_contract,
+            flops_context.estimator,
+            mpu.get_data_parallel_rank(with_context_parallel=False),
+            lambda values: agree_cpu(values, flops_context.control_group),
+            contract_provider=lambda: execution_contract(
+                args, mpu, get_model_config(model[0]), flops_context.estimator
+            ),
+        )
+        return [
+            DataIterator(
+                rollout_data,
+                micro_batch_indices=indices,
+                max_tokens_per_gpu=args.max_tokens_per_gpu,
+                dummy_micro_batch_offsets=dummy,
+            )
+            for _ in range(vpp_size)
+        ], counts
+
+    flops_weights = None
+    if flops_context is not None:
+        from relax.utils.data.flops_scheduling import metadata_step_count, row_weights
+
+        error = None
+        planned_steps, planned_gbs = 0, 0
+        try:
+            if (
+                rollout_data.get("multimodal_train_inputs") is not None
+                or rollout_data.get("_sft_wholepack_v1") is not None
+            ):
+                raise ValueError("FLOPs scheduling requires ordinary text row metadata")
+            flops_weights = row_weights(flops_context.estimator, rollout_data["total_lengths"])
+            planned_steps, planned_gbs = metadata_step_count(args, rollout_data, dp_size)
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
+            error = str(exc)
+        if flops_context.control_group is None:
+            raise ValueError("FLOPs metadata agreement requires the Actor's explicit CPU Gloo control group")
+        failed = torch.tensor(
+            [int(error is not None), planned_steps, -planned_steps, planned_gbs, -planned_gbs],
+            dtype=torch.int,
+            device="cpu",
+        )
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=flops_context.control_group)
+        control = failed.tolist()
+        if control[0] or control[1] != -control[2] or control[3] != -control[4]:
+            raise ValueError("FLOPs scheduling metadata validation failed on a DP peer: " + (error or "peer error"))
 
     num_local_samples = len(rollout_data["total_lengths"])
     step_global_sample_counts = rollout_data.get(ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY)
@@ -1405,12 +1461,40 @@ def get_data_iterator(
             start = step_offsets[i]
             end = step_offsets[i + 1]
             step_samples = samples[start:end]
-            partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(
-                step_samples,
-                num_mbs,
-                micro_batch_token_capacity,
-                packing_strategy=packing_strategy,
-            )
+            if flops_context is not None and flops_context.mode in ("microbatch", "both"):
+                from relax.utils.data.flops_scheduling import plan_microbatches
+
+                plan = plan_microbatches(
+                    rollout_data["total_lengths"][start:end],
+                    step_samples,
+                    flops_weights[start:end],
+                    num_mbs,
+                    micro_batch_token_capacity,
+                    lambda lengths, count, capacity: _get_seqlen_partitions_with_dummy_padding(
+                        lengths, count, capacity, packing_strategy=packing_strategy
+                    ),
+                )
+                partitions = [list(group) for group in plan.indices]
+                local_dummy_offsets = set(plan.dummy_offsets)
+                logger.info(
+                    "FLOPs microbatch planning: K=%s logical_tokens=%s physical_tokens=%s flops=%s "
+                    "dummy=%s oversized_singletons=%s fallback=%s cpu_seconds=%s",
+                    num_mbs,
+                    plan.logical_tokens,
+                    plan.physical_tokens,
+                    plan.flops,
+                    sorted(plan.dummy_offsets),
+                    plan.oversized_singletons,
+                    plan.fallback_reason,
+                    plan.cpu_seconds,
+                )
+            else:
+                partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(
+                    step_samples,
+                    num_mbs,
+                    micro_batch_token_capacity,
+                    packing_strategy=packing_strategy,
+                )
             base_offset = len(micro_batch_indices)
             micro_batch_indices.extend([[idx + start for idx in partition] for partition in partitions])
             dummy_micro_batch_offsets.update(base_offset + offset for offset in local_dummy_offsets)
@@ -1524,6 +1608,7 @@ def log_rollout_data(
                 "vlm_packed_seq_params",
                 "__loss_scale__",
                 "_sft_wholepack_v1",
+                "_no16_global_pack_steps_v1",
                 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,

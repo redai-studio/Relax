@@ -397,6 +397,14 @@ class Controller:
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")
             logger.info(f"Using IdentityWindowSampler with sequential row placement, dp_size={dp_size}")
 
+        if (
+            getattr(self.config, "flops_scheduling", "off") != "off"
+            or getattr(self.config, "flops_scheduling_order", "dp-first") != "dp-first"
+        ):
+            from relax.utils.data.flops_sampler import configure_sampler
+
+            sampler = configure_sampler(self.config, sampler, dp_size)
+
         controller_config = {
             "sampler": sampler,
             "polling_mode": self.config.polling_mode,
