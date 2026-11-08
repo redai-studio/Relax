@@ -55,6 +55,8 @@ The existing Ray entrypoint performs cluster cleanup; use it with the intended d
 
 Override `CHUNK_SIZE` (2048), `KEEP_LAST_K` (1), `SEQ_LENGTH` (8192), `NUM_STEPS` (100), or `SAVE_INTERVAL` (10) through environment variables. `KEEP_LAST_K=0` retains every chunk's activation graph. Model and training options are visible in each recipe; `_common.sh` only handles submission.
 
+All three recipes accept `PROMPT_DATA` to override `${DATA_DIR}/train.jsonl`. For LongAlign with a `messages` column, set `PROMPT_DATA="${DATA_DIR}/LongAlign-10k/long.jsonl"` and choose `SEQ_LENGTH` for the tokenized conversations, for example `65536`. Samples exceeding that limit are skipped; the dataset's stored length may differ from the model tokenizer's count.
+
 Save and resume use `${SAVE_DIR}/${EXP_NAME}` and retain two checkpoints. Keep those values stable to resume; change `EXP_NAME` for a separate experiment. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`. Timestamps affect ClearML task names and logs under `scripts/log/`, not checkpoint paths.
 
 ## Qwen3.8-Flash-Next (QSA + GDN + PLE)

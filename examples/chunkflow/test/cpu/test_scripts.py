@@ -62,9 +62,12 @@ def test_recipe_preview_has_recoverable_paths_and_supported_configuration(tmp_pa
         "CHUNK_SIZE": "1024",
         "KEEP_LAST_K": "2",
     }
+    env.pop("PROMPT_DATA", None)
     command = ["bash", str(ROOT / "examples/chunkflow/scripts" / script)]
     outputs = [subprocess.check_output(command, env=env, text=True) for _ in range(2)]
-    for output in outputs:
+    prompt_data = str(tmp_path / "data" / "LongAlign-10k" / "long.jsonl")
+    outputs.append(subprocess.check_output(command, env={**env, "PROMPT_DATA": prompt_data}, text=True))
+    for index, output in enumerate(outputs):
         argv = shlex.split(output)
 
         def value(option):
@@ -74,6 +77,7 @@ def test_recipe_preview_has_recoverable_paths_and_supported_configuration(tmp_pa
         assert argv[:3] == ["python3", "-m", "relax.entrypoints.train"]
         assert value("--hf-checkpoint") == str(tmp_path / "models with spaces" / model)
         assert value("--load") == value("--save") == str(tmp_path / "checkpoints/resume-test")
+        assert value("--prompt-data") == (prompt_data if index == 2 else str(tmp_path / "data" / "train.jsonl"))
         assert value("--context-parallel-size") == value("--pipeline-model-parallel-size") == "1"
         assert value("--expert-model-parallel-size") == experts
         expected_gpus = 32 if model == "Qwen3.8-Flash-Next" else 8

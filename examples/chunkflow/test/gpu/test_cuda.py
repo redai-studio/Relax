@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +40,33 @@ def _native_te(heads, kv_heads, dim):
     return TEDotProductAttention(config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self")
 
 
+def _run_native_te_check(check: str, *args) -> None:
+    # Match the recipes' --attention-backend flash before TE imports or caches
+    # a backend. A fresh process also isolates this setting from other tests.
+    environment = {
+        **os.environ,
+        "NVTE_FLASH_ATTN": "1",
+        "NVTE_FUSED_ATTN": "0",
+        "NVTE_UNFUSED_ATTN": "0",
+    }
+    code = """import json
+import runpy
+import sys
+
+module = runpy.run_path(sys.argv[1])
+with module["_megatron_context"]():
+    module[sys.argv[2]](*json.loads(sys.argv[3]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, __file__, check, json.dumps(args)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="native MCore/TE validation requires a CUDA GPU")
 @pytest.mark.parametrize(
     "bounds_q,bounds_k,heads,kv_heads,dim",
@@ -45,7 +76,11 @@ def _native_te(heads, kv_heads, dim):
         ([0, 8192], [0, 8192], 8, 1, 256),
     ],
 )
-def test_native_te_matches_cuda_reference(rope_module, bounds_q, bounds_k, heads, kv_heads, dim):
+def test_native_te_matches_cuda_reference(bounds_q, bounds_k, heads, kv_heads, dim):
+    _run_native_te_check("_assert_native_te_matches_cuda_reference", bounds_q, bounds_k, heads, kv_heads, dim)
+
+
+def _assert_native_te_matches_cuda_reference(bounds_q, bounds_k, heads, kv_heads, dim):
     flash_attn = pytest.importorskip("flash_attn")
     flash_attn_varlen_func = flash_attn.flash_attn_varlen_func
     core = _native_te(heads, kv_heads, dim)
@@ -94,7 +129,11 @@ def test_gdn_fla_state_outputs_and_gradients_match_full_sequence(kernels, mode):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires native MCore/TE CUDA forward and backward")
 @pytest.mark.parametrize("keep_last_k", [1, 1000])
-def test_native_te_history_gradients_and_recomputation(rope_module, keep_last_k):
+def test_native_te_history_gradients_and_recomputation(keep_last_k):
+    _run_native_te_check("_assert_native_te_history_gradients_and_recomputation", keep_last_k)
+
+
+def _assert_native_te_history_gradients_and_recomputation(keep_last_k):
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.enums import AttnMaskType
 
@@ -213,6 +252,12 @@ class _Cfg:
 
 @pytest.fixture(scope="module")
 def rope_module():
+    with _megatron_context() as rotary_embedding:
+        yield rotary_embedding
+
+
+@contextmanager
+def _megatron_context():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA and Megatron model-parallel groups")
     import torch.distributed as dist

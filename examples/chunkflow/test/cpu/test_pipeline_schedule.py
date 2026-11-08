@@ -190,7 +190,7 @@ def test_plan_preserves_real_samples_and_excludes_alignment_padding(padding):
         (1, 0, 512),
     ]
     batches = [slice_parent_batch(parent, unit, pad_token_id=0) for unit in units]
-    targets = torch.cat([b["unconcat_tokens"][0][b["loss_masks"][0].bool()] for b in batches])
+    targets = torch.cat([b["unconcat_tokens"][0][1:][b["loss_masks"][0].bool()] for b in batches])
     torch.testing.assert_close(targets, torch.arange(1091, 1100))
     for source_lengths in (None, [1099, 513]):
         parent["total_lengths"] = source_lengths

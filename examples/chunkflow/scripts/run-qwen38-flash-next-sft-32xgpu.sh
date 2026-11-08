@@ -48,7 +48,7 @@ CKPT_ARGS=(
 
 SFT_ARGS=(
     --loss-type sft
-    --prompt-data "${DATA_DIR}/train.jsonl"
+    --prompt-data "${PROMPT_DATA:-${DATA_DIR}/train.jsonl}"
     --input-key messages
     --num-rollout "${NUM_STEPS:-100}"
     --global-batch-size 32

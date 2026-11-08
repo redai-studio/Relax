@@ -55,6 +55,8 @@ bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen36-35B-A3B
 
 可用环境变量覆盖 `CHUNK_SIZE`（2048）、`KEEP_LAST_K`（1）、`SEQ_LENGTH`（8192）、`NUM_STEPS`（100）或 `SAVE_INTERVAL`（10）。`KEEP_LAST_K=0` 保留全部块的激活计算图。每个脚本直接列出模型和训练参数，`_common.sh` 只处理提交。
 
+三个脚本都支持用 `PROMPT_DATA` 覆盖默认的 `${DATA_DIR}/train.jsonl`。使用包含 `messages` 列的 LongAlign 时，设置 `PROMPT_DATA="${DATA_DIR}/LongAlign-10k/long.jsonl"`，并按分词后的对话长度选择 `SEQ_LENGTH`，例如 `65536`。超过上限的样本会被跳过；数据集记录的长度可能与模型 tokenizer 的统计不同。
+
 保存和恢复使用 `${SAVE_DIR}/${EXP_NAME}`，保留最近两个 checkpoint。恢复时保持两者不变；新实验显式更换 `EXP_NAME`。`PROJECT_NAME` 默认为 `Relax/sft/chunkflow`。时间戳只进入 ClearML task 名和 `scripts/log/` 日志，不进入 checkpoint 路径。
 
 ## Qwen3.8-Flash-Next（QSA + GDN + PLE）
