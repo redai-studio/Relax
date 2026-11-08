@@ -58,8 +58,6 @@ def install(module: Any, chunk_size: int, runtime: ChunkflowRuntime) -> Callable
     original = module.forward
     original_pool = module.indexer._pool_keys
     original_select = module.indexer._select_blocks
-    had_pool = "_pool_keys" in module.indexer.__dict__
-    had_select = "_select_blocks" in module.indexer.__dict__
     signature = inspect.signature(original)
     parent_length: ContextVar[int | None] = ContextVar("chunkflow_qsa_parent_length", default=None)
     selection_layout: ContextVar[Any] = ContextVar("chunkflow_qsa_selection_layout", default=None)
@@ -172,13 +170,7 @@ def install(module: Any, chunk_size: int, runtime: ChunkflowRuntime) -> Callable
 
     def undo() -> None:
         del module.forward
-        if had_pool:
-            module.indexer._pool_keys = original_pool
-        else:
-            del module.indexer._pool_keys
-        if had_select:
-            module.indexer._select_blocks = original_select
-        else:
-            del module.indexer._select_blocks
+        del module.indexer._pool_keys
+        del module.indexer._select_blocks
 
     return undo

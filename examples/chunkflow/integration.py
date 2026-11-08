@@ -137,6 +137,18 @@ class ChunkedCoreAttention(nn.Module):
         return out
 
 
+def _adaptation_root(model: nn.Module) -> nn.Module:
+    # Bridge uses the same attention class for its causal text decoder and
+    # bidirectional vision encoder. Only the text subtree is chunk-scheduled.
+    model_type = f"{type(model).__module__}.{type(model).__qualname__}"
+    if model_type == "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model.Qwen3VLModel":
+        language_model = getattr(model, "language_model", None)
+        if not isinstance(language_model, nn.Module):
+            raise NotImplementedError("ChunkFlow requires a language_model on this Qwen3VL pipeline stage")
+        return language_model
+    return model
+
+
 def install(model, chunk_size: int) -> int:
     from examples.chunkflow import rope as chunkflow_rope
     from examples.chunkflow.runtime import RUNTIME_ATTR, attach_runtime
@@ -151,18 +163,19 @@ def install(model, chunk_size: int) -> int:
     if existing_runtime is not None and existing_runtime.chunk_size != chunk_size:
         raise ValueError("ChunkFlow is already configured with a different chunk size")
 
-    # Validate the complete model before replacing even its first layer.
+    # Validate the complete text subtree before replacing even its first layer.
+    backbone = _adaptation_root(model)
     ple_layers = {
         id(layer): layer
-        for module in model.modules()
+        for module in backbone.modules()
         if (layer := getattr(module, "per_layer_embedding", None)) is not None
     }
     if not ple_layers and any(
-        getattr(getattr(module, "config", None), "ple_layer_ids", None) for module in model.modules()
+        getattr(getattr(module, "config", None), "ple_layer_ids", None) for module in backbone.modules()
     ):
         raise NotImplementedError("ChunkFlow PLE configuration requires native per_layer_embedding modules")
     plan = []
-    for attention in attention_modules(model):
+    for attention in attention_modules(backbone):
         if hasattr(attention, _ADAPTER_ATTR):
             continue
         adapter = resolve_attention_adapter(attention)
@@ -196,7 +209,7 @@ def install(model, chunk_size: int) -> int:
     chunkflow_rope.install()
 
     # TE's first-forward flag can overwrite gradients after a later chunk's backward.
-    for module in model.modules():
+    for module in backbone.modules():
         if hasattr(module, "disable_parameter_transpose_cache") and hasattr(module, "is_first_microbatch"):
             if not hasattr(module, _TRANSPOSE_CACHE_ATTR):
                 setattr(module, _TRANSPOSE_CACHE_ATTR, module.disable_parameter_transpose_cache)
@@ -206,7 +219,7 @@ def install(model, chunk_size: int) -> int:
     n = len(installed)
     if n:
         seen_configs: set[int] = set()
-        for module in model.modules():
+        for module in backbone.modules():
             cfg = getattr(module, "config", None)
             if cfg is not None and hasattr(cfg, "apply_rope_fusion") and id(cfg) not in seen_configs:
                 seen_configs.add(id(cfg))

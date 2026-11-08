@@ -10,15 +10,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from examples.chunkflow.adapters import dense_attention_adapter, register_attention_adapter
+from examples.chunkflow.adapters import DenseAttentionCall, dense_attention_adapter, register_attention_adapter
 from examples.chunkflow.integration import (
     ChunkedCoreAttention,
     install,
     uninstall,
 )
-from examples.chunkflow.runtime import ChunkflowRuntime
+from examples.chunkflow.runtime import ChunkflowRuntime, require_runtime
 from examples.chunkflow.scheduler import build_chunks
-from examples.chunkflow.test.cpu.test_attention_ops import SDPAttention, native_sdpa
 from examples.chunkflow.units import build_micro_batches
 
 
@@ -39,6 +38,59 @@ def restore_rope_patch():
         else:
             rope._ORIGINAL_GET_ROTARY_SEQ_LEN = original
             RotaryEmbedding.get_rotary_seq_len = patched_method
+
+
+class SDPAttention(torch.nn.Module):
+    """Native PyTorch oracle shared by dense adapter and gradient tests."""
+
+    def __init__(self, gain: bool = False):
+        super().__init__()
+        if gain:
+            self.gain = torch.nn.Parameter(torch.tensor(0.7, dtype=torch.float64))
+
+    def forward(self, query, key, value, *, q_lengths, kv_lengths, scale):
+        outputs = []
+        q_start = k_start = 0
+        repeat = query.shape[1] // key.shape[1]
+        for q_length, kv_length in zip(q_lengths, kv_lengths):
+            q = query[q_start : q_start + q_length]
+            k = key[k_start : k_start + kv_length].repeat_interleave(repeat, dim=1)
+            v = value[k_start : k_start + kv_length].repeat_interleave(repeat, dim=1)
+            q_pos = torch.arange(q_length, device=q.device) + kv_length - q_length
+            k_pos = torch.arange(kv_length, device=q.device)
+            mask = k_pos[None, :] <= q_pos[:, None]
+            output = F.scaled_dot_product_attention(
+                q.permute(1, 0, 2), k.permute(1, 0, 2), v.permute(1, 0, 2), attn_mask=mask, scale=scale
+            ).permute(1, 0, 2)
+            outputs.append(output * self.gain if hasattr(self, "gain") else output)
+            q_start += q_length
+            k_start += kv_length
+        return torch.cat(outputs)
+
+
+def native_sdpa(original, call: DenseAttentionCall):
+    key, value = call.joined_kv()
+    return original(
+        call.query,
+        key,
+        value,
+        q_lengths=call.q_lengths,
+        kv_lengths=call.kv_lengths,
+        scale=call.softmax_scale,
+    )
+
+
+def test_schedule_reuses_runtime_installed_below_model_wrappers():
+    class Wrapper:
+        def __init__(self, module):
+            self.module = module
+
+    bare = Wrapper(None)
+    runtime = ChunkflowRuntime(chunk_size=16)
+    bare.chunkflow_runtime = runtime
+    wrapped = Wrapper(Wrapper(bare))
+    assert require_runtime(wrapped) is runtime
+    assert not hasattr(wrapped, "chunkflow_runtime")
 
 
 class _FakeAttn(torch.nn.Module):
@@ -114,6 +166,73 @@ def test_install_preserves_module_and_uninstall_restores_forward():
     assert model[0].core_attention is original
     assert original.forward == original_forward
     assert model[0].config.apply_rope_fusion is True
+
+
+def _qwen3_vl_container():
+    # CPU coverage of the explicit container contract; the GPU test constructs
+    # the real Bridge model, including its native vision and GDN/MoE branches.
+    model_type = type(
+        "Qwen3VLModel",
+        (torch.nn.Module,),
+        {"__module__": "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model"},
+    )
+    model = model_type()
+    for name in ("language_model", "vision_model"):
+        layer = _FakeAttn()
+        layer.config.apply_rope_fusion = True
+        layer.projection = torch.nn.Linear(4, 4)
+        layer.projection.disable_parameter_transpose_cache = False
+        layer.projection.is_first_microbatch = True
+        setattr(model, name, layer)
+    model.vision_model.attn_mask_type = "no_mask"
+    return model
+
+
+def test_qwen3_vl_install_only_changes_language_subtree():
+    model = _qwen3_vl_container()
+    text, vision = model.language_model, model.vision_model
+    original = (text.core_attention.forward, vision.core_attention.forward)
+    parameters, state_keys = tuple(model.parameters()), tuple(model.state_dict())
+    assert install(model, 4) == 1
+    assert install(model, 4) == 0
+    assert require_runtime(model).chunk_size == 4
+    assert not hasattr(text, "chunkflow_runtime")
+    assert text.core_attention.forward != original[0]
+    assert text.config.apply_rope_fusion is False
+    assert text.projection.disable_parameter_transpose_cache is True
+    assert vision.core_attention.forward == original[1]
+    assert vision.config.apply_rope_fusion is True
+    assert vision.projection.disable_parameter_transpose_cache is False
+    assert tuple(model.parameters()) == parameters and tuple(model.state_dict()) == state_keys
+    assert uninstall(model) == 1
+    assert text.core_attention.forward == original[0]
+    assert text.config.apply_rope_fusion is True
+    assert text.projection.disable_parameter_transpose_cache is False
+    assert vision.core_attention.forward == original[1]
+
+
+@pytest.mark.parametrize("invalid", ["no_mask", "unknown_attention", "missing_language", "unknown_container"])
+def test_qwen3_vl_subtree_selection_keeps_validation_strict(invalid):
+    model = _qwen3_vl_container()
+    if invalid == "no_mask":
+        model.language_model.attn_mask_type = "no_mask"
+        match = "mask type no_mask"
+    elif invalid == "unknown_attention":
+        model.language_model = type("UnknownAttention", (_FakeAttn,), {})()
+        match = "no attention adapter"
+    elif invalid == "missing_language":
+        model.language_model = None
+        match = "requires a language_model"
+    else:
+        unknown = torch.nn.Module()
+        unknown.language_model, unknown.vision_model = model.language_model, model.vision_model
+        model = unknown
+        match = "mask type no_mask"
+    forwards = [layer.core_attention.forward for layer in model.modules() if isinstance(layer, _FakeAttn)]
+    with pytest.raises(NotImplementedError, match=match):
+        install(model, 4)
+    assert not hasattr(model, "chunkflow_runtime")
+    assert [layer.core_attention.forward for layer in model.modules() if isinstance(layer, _FakeAttn)] == forwards
 
 
 def _unit_attn(chunk_size, layer=1):

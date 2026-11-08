@@ -13,13 +13,12 @@ from examples.chunkflow.scheduler import Segment
 from examples.chunkflow.units import Unit
 
 
-def _segment_rows(parent_cu: Sequence[int], segment: Segment) -> tuple[int, int]:
-    start = parent_cu[segment.seq_id] + segment.prefix
-    return start, start + segment.length
-
-
 def _rows_for_unit(parent_cu: Sequence[int], unit: Unit) -> list[tuple[int, int]]:
-    return [_segment_rows(parent_cu, s) for seg in unit.chunks for s in seg.segments]
+    return [
+        (parent_cu[s.seq_id] + s.prefix, parent_cu[s.seq_id] + s.prefix + s.length)
+        for chunk in unit.chunks
+        for s in chunk.segments
+    ]
 
 
 def _rope_offsets(unit: Unit) -> list[int]:

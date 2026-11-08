@@ -23,9 +23,9 @@ from examples.chunkflow.adapters import (
 from examples.chunkflow.integration import install, uninstall
 from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
 from examples.chunkflow.scheduler import build_chunks
-from examples.chunkflow.test.cpu.test_attention_ops import SDPAttention, native_sdpa
 from examples.chunkflow.test.cpu.test_gdn import GatedDeltaNet
 from examples.chunkflow.test.cpu.test_gdn import kernels as kernels
+from examples.chunkflow.test.cpu.test_integration import SDPAttention, native_sdpa
 from examples.chunkflow.test.cpu.test_integration import restore_rope_patch as restore_rope_patch
 from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 

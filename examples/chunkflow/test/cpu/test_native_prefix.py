@@ -372,3 +372,11 @@ def test_prefix_rejects_unsupported_modes_before_installing(native, monkeypatch)
     with pytest.raises(NotImplementedError, match="PLE_STREAMED"):
         install(current, 5)
     assert "forward" not in current.self_attention.__dict__
+    monkeypatch.delenv("RELAX_QWEN38_PLE_STREAMED")
+    indexer = current.self_attention.indexer
+    original_select = indexer._select_blocks
+    monkeypatch.setattr(indexer, "_select_blocks", original_select)
+    with pytest.raises(NotImplementedError, match="Patched QSA"):
+        install(current, 5)
+    assert indexer._select_blocks == original_select
+    assert not hasattr(current, RUNTIME_ATTR)

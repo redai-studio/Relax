@@ -188,6 +188,80 @@ def _assert_native_te_history_gradients_and_recomputation(keep_last_k):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires native Bridge Qwen3VL and TE CUDA execution")
+def test_qwen35_native_model_installs_only_language_adapters():
+    _run_native_te_check("_assert_qwen35_native_model_installs_only_language_adapters")
+
+
+def _assert_qwen35_native_model_installs_only_language_adapters():
+    from megatron.bridge.models.qwen_vl.qwen35_vl_provider import Qwen35VLMoEModelProvider
+    from megatron.core.transformer.enums import AttnBackend
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeVisionConfig
+
+    from examples.chunkflow.adapters import attention_modules
+    from examples.chunkflow.runtime import require_runtime
+
+    provider = Qwen35VLMoEModelProvider(
+        num_layers=4,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=64,
+        rotary_percent=1.0,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_ffn_hidden_size=128,
+        moe_shared_expert_intermediate_size=128,
+        moe_router_load_balancing_type="none",
+        moe_aux_loss_coeff=0.0,
+        vocab_size=512,
+        language_max_sequence_length=512,
+        gdn_pre_gated_delta_rule_fusion=False,
+        attention_backend=AttnBackend.flash,
+        gradient_accumulation_fusion=False,
+        apply_rope_fusion=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        vision_config=Qwen3_5MoeVisionConfig(
+            depth=1,
+            hidden_size=64,
+            num_heads=4,
+            intermediate_size=128,
+            out_hidden_size=256,
+            num_position_embeddings=16,
+            patch_size=2,
+            spatial_merge_size=2,
+        ),
+    )
+    provider.finalize()
+    model = provider.provide(pre_process=True, post_process=True)
+    vision_attention = list(attention_modules(model.vision_model))
+    assert len(vision_attention) == 1
+    assert vision_attention[0].attn_mask_type.name == "no_mask"
+    vision_modules = tuple(model.vision_model.modules())
+    vision_forwards = tuple(module.forward for module in vision_modules)
+    vision_configs = [module.config for module in vision_modules if hasattr(module, "config")]
+    vision_rope = [config.apply_rope_fusion for config in vision_configs]
+    vision_te = [module for module in vision_modules if hasattr(module, "disable_parameter_transpose_cache")]
+    vision_cache = [module.disable_parameter_transpose_cache for module in vision_te]
+    parameters, state_keys = tuple(model.parameters()), tuple(model.state_dict())
+    # Three native GDN layers and one native dense layer; no vision adapter.
+    assert install(model, 128) == 4
+    assert install(model, 128) == 0
+    assert require_runtime(model).chunk_size == 128
+    assert tuple(model.parameters()) == parameters and tuple(model.state_dict()) == state_keys
+    assert tuple(module.forward for module in vision_modules) == vision_forwards
+    assert [config.apply_rope_fusion for config in vision_configs] == vision_rope
+    assert [module.disable_parameter_transpose_cache for module in vision_te] == vision_cache
+    assert uninstall(model) == 4
+    assert not hasattr(model, "chunkflow_runtime")
+    assert tuple(module.forward for module in vision_modules) == vision_forwards
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires native Bridge Qwen3VL and TE CUDA execution")
 @pytest.mark.parametrize("keep_last_k", [1, 1000])
 def test_qwen3_vl_native_layer_outputs_and_gradients(keep_last_k):
     _run_native_te_check("_assert_qwen3_vl_native_layer_outputs_and_gradients", keep_last_k)

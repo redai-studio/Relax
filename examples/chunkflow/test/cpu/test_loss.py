@@ -18,12 +18,35 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from examples.chunkflow.arguments import validate_args
 from examples.chunkflow.scheduler import build_chunks
 from examples.chunkflow.unit_batch import _rows_for_unit, slice_parent_batch
 from examples.chunkflow.units import build_micro_batches
 
 
 ROOT = Path(__file__).resolve().parents[4]
+
+
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ({"calculate_per_token_loss": False}, "--calculate-per-token-loss"),
+        ({"fully_async": True, "use_dynamic_batch_size": True}, "streaming iterators"),
+        ({"fully_async": False, "use_dynamic_batch_size": True}, None),
+        ({"fully_async": True, "use_dynamic_batch_size": False}, None),
+        ({"use_chunkflow": False, "calculate_per_token_loss": False}, None),
+        ({"use_chunkflow": False, "fully_async": True, "use_dynamic_batch_size": True}, None),
+    ],
+)
+def test_validation_rejects_unsupported_loss_and_streaming_contracts(options, error):
+    args = SimpleNamespace(
+        **{"use_chunkflow": True, "chunkflow_chunk_size": 128, "calculate_per_token_loss": True, **options}
+    )
+    if error is None:
+        validate_args(args)
+    else:
+        with pytest.raises(ValueError, match=error):
+            validate_args(args)
 
 
 def _load_functions(path, names, namespace):
