@@ -99,6 +99,7 @@ PP greater than 1 uses an experimental non-interleaved pipeline executor and als
 
 - The built-in dense adapter accepts the exact Megatron `SelfAttention` + `TEDotProductAttention` pair. Other classes and subclasses require explicit adapters. The non-TE `DotProductAttention` implementation does not support the required packed THD call and is not substituted with a custom kernel.
 - The current path requires CP=1, packed THD, causal attention, per-token loss, and a single model chunk. VPP is unsupported.
+- `--calculate-per-token-loss` is enforced at startup: averaging each chunk as a separate sample changes the training objective. ChunkFlow also rejects `--fully-async` together with `--use-dynamic-batch-size`; its fixed plan cannot consume a streaming iterator with an unknown micro-batch count. Disable one of those two options.
 - Use zero dropout and disable RoPE fusion. The explicit MRoPE position path currently supports text-only batches.
 - Use `--chunkflow-keep-last-k` for attention recomputation. Megatron full-layer recomputation and selective `core_attn` recomputation are rejected because they replay cache writes without the ChunkFlow replay marker.
 - Sliding windows, non-vanilla softmax, QK clipping/logit statistics, external attention masks/biases, and the Qwen3.5 optimized recipe need separate adapters. QSA and PLE use the restricted native-prefix adapters described above; they require PP1 even when the experimental pipeline is enabled.

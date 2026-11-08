@@ -218,9 +218,12 @@ def rope_module():
     import torch.distributed as dist
     from megatron.core import parallel_state
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker, model_parallel_cuda_manual_seed
 
     own_dist = not dist.is_initialized()
     own_parallel = not parallel_state.is_initialized()
+    rng_tracker = get_cuda_rng_tracker()
+    rng_states = rng_tracker.get_states()
     with pytest.MonkeyPatch.context() as patcher:
         patcher.setattr(cf_rope, "_ORIGINAL_GET_ROTARY_SEQ_LEN", cf_rope._ORIGINAL_GET_ROTARY_SEQ_LEN)
         patcher.setattr(RotaryEmbedding, "get_rotary_seq_len", RotaryEmbedding.get_rotary_seq_len)
@@ -232,9 +235,14 @@ def rope_module():
                 dist.init_process_group("nccl", rank=0, world_size=1)
             if own_parallel:
                 parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+            # TE enters Megatron's named RNG stream even with dropout=0.
+            # Process-group initialization alone does not create that stream.
+            with torch.random.fork_rng():
+                model_parallel_cuda_manual_seed(1234)
             cf_rope.install()
             yield RotaryEmbedding
         finally:
+            rng_tracker.set_states(rng_states)
             if own_parallel and parallel_state.is_initialized():
                 parallel_state.destroy_model_parallel()
             if own_dist and dist.is_initialized():

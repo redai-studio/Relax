@@ -99,6 +99,7 @@ PP 大于 1 使用实验性的非交错流水线执行器，还须设置 `RELAX_
 
 - 内置 Dense 适配器只接受 Megatron `SelfAttention` 与 `TEDotProductAttention` 的精确类型组合。其他类型及子类需要显式注册适配器。非 TE 的 `DotProductAttention` 不支持所需的 packed THD 调用，框架不会用自定义 kernel 替代它。
 - 当前路径要求 CP=1、packed THD、因果注意力、per-token loss 和单个 model chunk，不支持 VPP。
+- 启动时会检查 `--calculate-per-token-loss`：将各 chunk 当成独立样本求均值会改变训练目标。ChunkFlow 也会拒绝同时启用 `--fully-async` 和 `--use-dynamic-batch-size`，因为固定执行计划无法消费 micro-batch 数量未知的流式迭代器；请关闭这两个选项之一。
 - 使用 dropout=0 并关闭 RoPE fusion。显式 MRoPE 位置路径目前仅支持纯文本 batch。
 - Attention 重计算使用 `--chunkflow-keep-last-k`。Megatron full-layer recompute 和 selective `core_attn` 重计算会在没有 ChunkFlow 重放标记的情况下重复写入缓存，因此会被拒绝。
 - 滑动窗口、非 vanilla softmax、QK clipping/logit 统计、外部 Attention mask/bias 和 Qwen3.5 optimized recipe 需要单独适配。QSA 和 PLE 使用上文受限的原生前缀适配器，即使启用了实验流水线也必须保持 PP1。

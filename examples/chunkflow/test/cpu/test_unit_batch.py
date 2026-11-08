@@ -88,7 +88,8 @@ def test_units_preserve_tokens_targets_masks_and_loss(policy, lengths, chunk_siz
             if part.numel() < end - start:
                 part = torch.cat([part, tokens.new_full((end - start - part.numel(),), PAD)])
             targets.append(part)
-        torch.testing.assert_close(batch["unconcat_tokens"][0][:real], torch.cat(targets))
+        assert batch["unconcat_tokens"][0].numel() == batch["total_lengths"][0]
+        torch.testing.assert_close(batch["unconcat_tokens"][0][1:], torch.cat(targets))
         assert batch["full_loss_masks"].shape == batch["tokens"].shape
         assert (batch["tokens"][0][real:] == PAD).all()
         assert (batch["full_loss_masks"][0][real:] == 0).all()

@@ -20,6 +20,7 @@ from examples.chunkflow.units import build_micro_batches, completed_groups, gen_
 
 _BATCH_KEYS = (
     "tokens",
+    "pre_shifted_labels",
     "packed_seq_params",
     "total_lengths",
     "response_lengths",

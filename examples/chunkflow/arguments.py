@@ -58,12 +58,8 @@ def add_arguments(parser: ArgumentParser) -> ArgumentParser:
 
 
 def validate_args(args: Namespace) -> None:
-    """Reject chunkflow configurations that cannot work, at parse time.
-
-    Both checks would otherwise surface much later: a missing chunk size as a
-    silently unchunked run, and CP>1 as a ``NotImplementedError`` from deep
-    inside the first attention call.
-    """
+    """Reject unsupported execution and loss contracts before training
+    starts."""
     if not getattr(args, "use_chunkflow", False):
         return
 
@@ -78,6 +74,17 @@ def validate_args(args: Namespace) -> None:
             "--use-chunkflow is incompatible with --context-parallel-size > 1: context parallelism "
             "splits the very sequence chunkflow caches in its per-layer StateStore. "
             "Remove one of the two."
+        )
+    if not getattr(args, "calculate_per_token_loss", False):
+        raise ValueError(
+            "--use-chunkflow requires --calculate-per-token-loss: sample-mean loss would treat "
+            "each chunk as a separate sample and change the training objective."
+        )
+    if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
+        raise ValueError(
+            "--use-chunkflow does not support --fully-async with --use-dynamic-batch-size: "
+            "streaming iterators have an unknown micro-batch count, but ChunkFlow requires a fixed plan. "
+            "Disable --fully-async or --use-dynamic-batch-size."
         )
     if getattr(args, "chunkflow_keep_last_k", 0) < 0:
         raise ValueError(

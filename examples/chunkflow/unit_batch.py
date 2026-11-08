@@ -52,7 +52,12 @@ def slice_parent_batch(
     token_parts = [flat_tokens[s:e] for s, e in rows]
     # Shift targets within sequence boundaries.
     target_parts = []
+    pre_shifted_labels = parent.get("unconcat_pre_shifted_labels")
     for (s, e), length, seg in zip(rows, lengths, segments, strict=True):
+        if pre_shifted_labels is not None:
+            labels = pre_shifted_labels[seg.seq_id][seg.prefix : seg.prefix + length]
+            target_parts.append(labels.masked_fill(labels.eq(-100), pad_token_id))
+            continue
         seq_end = parent_cu[seg.seq_id + 1]
         target = flat_tokens[s + 1 : min(e + 1, seq_end)]
         if target.size(0) < length:
@@ -100,7 +105,10 @@ def slice_parent_batch(
     batch: dict = PrepackedBatch(
         {
             "tokens": unit_tokens.unsqueeze(0),
-            "unconcat_tokens": [unit_targets],
+            # The native loss slicer expects one prompt token followed by T
+            # targets for total=T+1, response=T. This prefix is loss metadata
+            # only; the model still receives exactly the T input tokens.
+            "unconcat_tokens": [torch.cat([unit_tokens[:1], unit_targets])],
             "full_loss_masks": full_mask.unsqueeze(0),
             "loss_masks": [unit_mask],
             "total_lengths": [sum(lengths) + 1],
@@ -125,7 +133,7 @@ def slice_parent_batch(
             positions = torch.cat([positions, positions.new_ones(pad)])
         batch["position_ids"] = positions.view(1, 1, -1).expand(3, 1, -1)
 
-    _slice_response_aligned_keys(parent, batch, rows)
+    _slice_response_aligned_keys(parent, batch, segments)
     for key in ("__is_dummy__", "__loss_scale__", "replay_micro_batch_index"):
         if key in parent:
             batch[key] = parent[key]
@@ -155,27 +163,29 @@ def _build_packed_seq_params(unit_tokens: torch.Tensor, lengths: list[int], offs
     return packed
 
 
-def _slice_response_aligned_keys(parent: dict, batch: dict, rows: list[tuple[int, int]]) -> None:
+def _slice_response_aligned_keys(parent: dict, batch: dict, segments: list[Segment]) -> None:
     total_lengths = parent.get("total_lengths") or []
     response_lengths = parent.get("response_lengths") or []
     keys = ("log_probs", "ref_log_probs", "values", "advantages", "returns", "rollout_log_probs")
     if not any(parent.get(k) is not None for k in keys):
         return
 
-    parent_cu = parent["packed_seq_params"].cu_seqlens_q_cpu
-    sample_of_row: dict[int, tuple[int, int]] = {}
-    for k, (cu_lo, cu_hi) in enumerate(zip(parent_cu[:-1], parent_cu[1:], strict=True)):
-        prompt_len = (total_lengths[k] - response_lengths[k]) if k < len(total_lengths) else 0
-        for r in range(int(cu_lo), int(cu_hi)):
-            sample_of_row[r] = (k, max(r - int(cu_lo) - prompt_len, 0))
-
     for key in keys:
         vals = parent.get(key)
         if vals is None:
             continue
         picked = []
-        for s, e in rows:
-            idx = [sample_of_row.get(r, (0, 0)) for r in range(s, e)]
-            tensor = vals[idx[0][0]] if idx else vals[0]
-            picked.append(tensor[[i for _, i in idx]])
+        for segment in segments:
+            k = segment.seq_id
+            tensor = vals[k]
+            prompt_len = total_lengths[k] - response_lengths[k]
+            # RL values are indexed by target token; a logit at row r predicts
+            # r+1. SFT vectors already use predictor coordinates (CP=1).
+            offset = segment.prefix + (1 - prompt_len if prompt_len else 0)
+            start = max(0, -offset)
+            end = min(segment.length, tensor.size(0) - offset)
+            part = tensor.new_zeros((segment.length, *tensor.shape[1:]))
+            if end > start:
+                part[start:end] = tensor[offset + start : offset + end]
+            picked.append(part)
         batch[key] = [torch.cat(picked)]
