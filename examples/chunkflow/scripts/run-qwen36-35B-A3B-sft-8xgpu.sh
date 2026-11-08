@@ -13,7 +13,6 @@ source "${SCRIPT_DIR}/_common.sh"
 
 : "${MODEL_DIR:?Set MODEL_DIR to the directory containing Qwen3.6-35B-A3B}"
 : "${DATA_DIR:?Set DATA_DIR to the directory containing train.jsonl}"
-: "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/chunkflow}"
 EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-text-sft-8xgpu}"
 now=$(date "+%Y%m%d-%H%M%S")
@@ -21,10 +20,6 @@ now=$(date "+%Y%m%d-%H%M%S")
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}/Qwen3.6-35B-A3B"
     --megatron-to-hf-mode bridge
-    --load "${SAVE_DIR}/${EXP_NAME}"
-    --save "${SAVE_DIR}/${EXP_NAME}"
-    --save-interval "${SAVE_INTERVAL:-10}"
-    --max-actor-ckpt-to-keep 2
 )
 
 SFT_ARGS=(
@@ -42,7 +37,7 @@ SFT_ARGS=(
 
 CHUNKFLOW_ARGS=(
     --use-chunkflow
-    --chunkflow-chunk-size "${CHUNK_SIZE:-2048}"
+    --chunkflow-chunk-size "${CHUNK_SIZE:-4096}"
     --chunkflow-pack-policy staggered
     --chunkflow-keep-last-k "${KEEP_LAST_K:-1}"
     --custom-config-path examples/chunkflow/configs/gdn.yaml

@@ -25,7 +25,6 @@ Provide these directories on the training nodes:
 | ----------- | --------------------------------------------------------- |
 | `MODEL_DIR` | `Qwen3-4B/` or `Qwen3.6-35B-A3B/` Hugging Face checkpoint |
 | `DATA_DIR`  | `train.jsonl`, each row containing a `messages` list      |
-| `SAVE_DIR`  | Persistent training checkpoints                           |
 
 For example, one data row is:
 
@@ -37,7 +36,7 @@ Use longer conversations to exercise multiple chunks. Both recipes are text-only
 
 ChunkFlow requires `--calculate-per-token-loss` to keep normalization independent of chunk boundaries. It rejects `--fully-async` combined with `--use-dynamic-batch-size`, because its fixed execution plan cannot consume an unknown number of streaming micro-batches. The supplied recipes use per-token loss and synchronous training.
 
-After exporting the three directory variables, preview without Ray or GPUs:
+After exporting `MODEL_DIR` and `DATA_DIR`, preview without Ray or GPUs:
 
 ```bash
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
@@ -55,11 +54,11 @@ The scripts check the integration patch, then reuse `scripts/entrypoint/local.sh
 
 To use an existing cluster, set `RAY_ADDRESS` to its GCS address and `RAY_JOBS_ADDRESS` to its Jobs HTTP URL before running the same command. The script uses the standard `ray-job.sh` environment and cleanup; an unreachable cluster causes an error rather than a local restart. An external entrypoint that already set `RELAX_ENTRYPOINT_MODE` is reused. Submission blocks unless `RAY_NO_WAIT=1` is set. The repository is uploaded as the working directory by default, including this example and the applied patch.
 
-Override `CHUNK_SIZE` (2048), `KEEP_LAST_K` (1), `SEQ_LENGTH` (8192), `NUM_STEPS` (100), or `SAVE_INTERVAL` (10) through environment variables. `KEEP_LAST_K=0` retains every chunk's activation graph. Model and training options are visible in each recipe; `_common.sh` handles standard entrypoint selection and submission.
+Override `CHUNK_SIZE` (4096), `KEEP_LAST_K` (1), `SEQ_LENGTH` (8192), or `NUM_STEPS` (100) through environment variables. `KEEP_LAST_K=0` retains every chunk's activation graph. Model and training options are visible in each recipe; `_common.sh` handles standard entrypoint selection and submission.
 
 All three recipes accept `PROMPT_DATA` to override `${DATA_DIR}/train.jsonl`. For LongAlign with a `messages` column, set `PROMPT_DATA="${DATA_DIR}/LongAlign-10k/long.jsonl"` and choose `SEQ_LENGTH` for the tokenized conversations, for example `65536`. Samples exceeding that limit are skipped; the dataset's stored length may differ from the model tokenizer's count.
 
-Save and resume use `${SAVE_DIR}/${EXP_NAME}` and retain two checkpoints. Keep those values stable to resume; change `EXP_NAME` for a separate experiment. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`. Timestamps affect ClearML task names and logs under `scripts/log/`, not checkpoint paths.
+All three recipes load initial Hugging Face weights and do not save or resume training checkpoints. They do not use `SAVE_DIR` or `SAVE_INTERVAL`, including previously exported values. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`; `EXP_NAME` identifies the experiment. ClearML task names and logs under `scripts/log/` include a timestamp for each run.
 
 ## Qwen3.8-Flash-Next (QSA + GDN + PLE)
 

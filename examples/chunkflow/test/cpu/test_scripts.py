@@ -52,7 +52,7 @@ def test_validation_rejects_unsupported_loss_and_streaming_contracts(options, er
         ("run-qwen38-flash-next-sft-32xgpu.sh", "Qwen3.8-Flash-Next", "8"),
     ],
 )
-def test_recipe_preview_has_recoverable_paths_and_supported_configuration(tmp_path, script, model, experts):
+def test_recipe_preview_disables_checkpoints_and_supports_chunk_size_override(tmp_path, script, model, experts):
     from argparse import ArgumentParser
 
     env = {
@@ -60,16 +60,28 @@ def test_recipe_preview_has_recoverable_paths_and_supported_configuration(tmp_pa
         "DRY_RUN": "1",
         "MODEL_DIR": str(tmp_path / "models with spaces"),
         "DATA_DIR": str(tmp_path / "data"),
-        "SAVE_DIR": str(tmp_path / "checkpoints"),
-        "EXP_NAME": "resume-test",
-        "CHUNK_SIZE": "1024",
+        "EXP_NAME": "preview-test",
         "KEEP_LAST_K": "2",
     }
-    env.pop("PROMPT_DATA", None)
+    for key in ("PROMPT_DATA", "SAVE_DIR", "SAVE_INTERVAL", "CHUNK_SIZE"):
+        env.pop(key, None)
     command = ["bash", str(ROOT / "examples/chunkflow/scripts" / script)]
-    outputs = [subprocess.check_output(command, env=env, text=True) for _ in range(2)]
+    outputs = [subprocess.check_output(command, env=env, text=True)]
     prompt_data = str(tmp_path / "data" / "LongAlign-10k" / "long.jsonl")
-    outputs.append(subprocess.check_output(command, env={**env, "PROMPT_DATA": prompt_data}, text=True))
+    # Old exported save settings must not re-enable checkpointing.
+    outputs.append(
+        subprocess.check_output(
+            command,
+            env={
+                **env,
+                "PROMPT_DATA": prompt_data,
+                "CHUNK_SIZE": "1024",
+                "SAVE_DIR": str(tmp_path / "unused-checkpoints"),
+                "SAVE_INTERVAL": "1",
+            },
+            text=True,
+        )
+    )
     for index, output in enumerate(outputs):
         argv = shlex.split(output)
 
@@ -79,8 +91,8 @@ def test_recipe_preview_has_recoverable_paths_and_supported_configuration(tmp_pa
 
         assert argv[:3] == ["python3", "-m", "relax.entrypoints.train"]
         assert value("--hf-checkpoint") == str(tmp_path / "models with spaces" / model)
-        assert value("--load") == value("--save") == str(tmp_path / "checkpoints/resume-test")
-        assert value("--prompt-data") == (prompt_data if index == 2 else str(tmp_path / "data" / "train.jsonl"))
+        assert set(argv).isdisjoint({"--load", "--save", "--save-interval", "--save-hf", "--max-actor-ckpt-to-keep"})
+        assert value("--prompt-data") == (prompt_data if index == 1 else str(tmp_path / "data" / "train.jsonl"))
         assert value("--context-parallel-size") == value("--pipeline-model-parallel-size") == "1"
         assert value("--expert-model-parallel-size") == experts
         expected_gpus = 32 if model == "Qwen3.8-Flash-Next" else 8
@@ -90,7 +102,8 @@ def test_recipe_preview_has_recoverable_paths_and_supported_configuration(tmp_pa
         parser.add_argument("--calculate-per-token-loss", action="store_true")
         args, _ = add_arguments(parser).parse_known_args(argv[3:])
         validate_args(args)
-        assert args.use_chunkflow and args.chunkflow_chunk_size == 1024 and args.chunkflow_keep_last_k == 2
+        assert args.use_chunkflow and args.chunkflow_keep_last_k == 2
+        assert args.chunkflow_chunk_size == (4096 if index == 0 else 1024)
         if experts != "1":
             assert (ROOT / value("--custom-config-path")).is_file()
             assert value("--moe-router-load-balancing-type") == "none"
@@ -221,7 +234,6 @@ elif name == 'grep':
         "RAY_NO_WAIT": "",
         "MODEL_DIR": str(tmp_path / "models with spaces"),
         "DATA_DIR": str(tmp_path / "data"),
-        "SAVE_DIR": str(tmp_path / "checkpoints"),
         "TEST_COMMANDS": str(tmp_path / "commands.jsonl"),
     }
     for key in (
@@ -236,6 +248,8 @@ elif name == 'grep':
         "CUDA_VISIBLE_DEVICES",
         "RUNTIME_ENV_JSON",
         "WORKING_DIR",
+        "SAVE_DIR",
+        "SAVE_INTERVAL",
         "_RAY_JOB_RUN_SCRIPT",
         "_RELAX_KERNEL_CACHE_HELPER_SOURCED",
     ):

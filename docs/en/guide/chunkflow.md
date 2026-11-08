@@ -23,7 +23,7 @@ Use `python examples/chunkflow/setup.py --reverse` to remove the integration pat
 
 Both examples run text-only SFT on eight GPUs with TP=2, PP=1, and CP=1. Qwen3-4B uses EP=1; Qwen3.6-35B-A3B uses EP=8 and ETP=1, including GDN state adaptation.
 
-Set `MODEL_DIR`, `DATA_DIR`, and `SAVE_DIR` first. Model directories are `${MODEL_DIR}/Qwen3-4B` and `${MODEL_DIR}/Qwen3.6-35B-A3B`. Data is `${DATA_DIR}/train.jsonl`, with a `messages` conversation list in each row; see [SFT Training](./sft-training.md). `SAVE_DIR` must be persistent and accessible to the training nodes.
+Set `MODEL_DIR` and `DATA_DIR` to paths accessible to the training nodes. Model directories are `${MODEL_DIR}/Qwen3-4B` and `${MODEL_DIR}/Qwen3.6-35B-A3B`. Data is `${DATA_DIR}/train.jsonl`, with a `messages` conversation list in each row; see [SFT Training](./sft-training.md).
 
 ```bash
 # Preview arguments without connecting to Ray or requiring GPUs.
@@ -39,7 +39,7 @@ The scripts check the integration patch before using `scripts/entrypoint/local.s
 
 For an existing cluster, set `RAY_ADDRESS` to its GCS address and `RAY_JOBS_ADDRESS` to its Jobs HTTP URL, then run the same recipe. It uses the standard `ray-job.sh` environment and cleanup; an unreachable cluster fails without restarting Ray locally. An external entrypoint that already set `RELAX_ENTRYPOINT_MODE` is reused. Submission blocks by default; set `RAY_NO_WAIT=1` for nonblocking submission. Scripts upload the repository working directory by default so both driver and workers can import the example. A custom `WORKING_DIR` must also contain patched Relax and the complete example.
 
-Script defaults are `SEQ_LENGTH=8192`, `CHUNK_SIZE=2048`, `KEEP_LAST_K=1`, `NUM_STEPS=100`, and `SAVE_INTERVAL=10`; override them with the corresponding environment variables. Save and resume use the stable `${SAVE_DIR}/${EXP_NAME}` directory and retain two training checkpoints. Keep both values unchanged to resume. Timestamps appear only in ClearML task names and logs under `examples/chunkflow/scripts/log/`. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`; each model has a distinct, overridable `EXP_NAME`.
+Script defaults are `SEQ_LENGTH=8192`, `CHUNK_SIZE=4096`, `KEEP_LAST_K=1`, and `NUM_STEPS=100`; override them with the corresponding environment variables. All three recipes load initial Hugging Face weights and do not save or resume training checkpoints. They do not use `SAVE_DIR` or `SAVE_INTERVAL`, including previously exported values. ClearML task names and logs under `examples/chunkflow/scripts/log/` include a timestamp for each run. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`; each model has a distinct, overridable `EXP_NAME`.
 
 The MoE example uses native all-to-all dispatch, disables router auxiliary loss, and disables GDN preprocessing fusion through `examples/chunkflow/configs/gdn.yaml`. CPU optimizer offload requires sufficient host memory. Neither example enables full-layer recomputation, VPP, MTP, or multimodal input.
 

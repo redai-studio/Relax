@@ -23,7 +23,7 @@ python examples/chunkflow/setup.py --check
 
 两个示例都使用 8 张 GPU 进行纯文本 SFT，默认 TP=2、PP=1、CP=1。Qwen3-4B 使用 EP=1，Qwen3.6-35B-A3B 使用 EP=8、ETP=1，并包含 GDN 状态适配。
 
-先提供 `MODEL_DIR`、`DATA_DIR`、`SAVE_DIR`：模型分别位于 `${MODEL_DIR}/Qwen3-4B` 或 `${MODEL_DIR}/Qwen3.6-35B-A3B`；数据为 `${DATA_DIR}/train.jsonl`，每行包含 `messages` 对话列表。数据格式参见 [SFT 训练](./sft-training.md)。`SAVE_DIR` 必须是训练节点可访问的持久化目录。
+先提供训练节点可访问的 `MODEL_DIR` 和 `DATA_DIR`：模型分别位于 `${MODEL_DIR}/Qwen3-4B` 或 `${MODEL_DIR}/Qwen3.6-35B-A3B`；数据为 `${DATA_DIR}/train.jsonl`，每行包含 `messages` 对话列表。数据格式参见 [SFT 训练](./sft-training.md)。
 
 ```bash
 # 预览参数，不连接 Ray，也不要求 GPU。
@@ -39,7 +39,7 @@ bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 
 已有集群时，先将 `RAY_ADDRESS` 设为 GCS 地址、`RAY_JOBS_ADDRESS` 设为 Jobs HTTP 地址，再执行相同脚本。它会使用标准 `ray-job.sh` 的环境和清理流程；连接失败直接退出，不会回退重启本机 Ray。外部入口已经设置 `RELAX_ENTRYPOINT_MODE` 时直接复用。脚本默认阻塞等待；`RAY_NO_WAIT=1` 可改为非阻塞。默认上传仓库工作目录，以便 driver 和 worker 能导入 example；使用自定义 `WORKING_DIR` 时也须包含打好补丁的 Relax 和完整 example。
 
-脚本默认 `SEQ_LENGTH=8192`、`CHUNK_SIZE=2048`、`KEEP_LAST_K=1`、`NUM_STEPS=100`、`SAVE_INTERVAL=10`，均可用同名环境变量覆盖。保存与恢复路径固定为 `${SAVE_DIR}/${EXP_NAME}`，保留最近两个训练 checkpoint；恢复时保持两者不变。时间戳只用于 ClearML task 和 `examples/chunkflow/scripts/log/` 下的日志。`PROJECT_NAME` 默认 `Relax/sft/chunkflow`，`EXP_NAME` 按模型区分且可覆盖。
+脚本默认 `SEQ_LENGTH=8192`、`CHUNK_SIZE=4096`、`KEEP_LAST_K=1`、`NUM_STEPS=100`，均可用同名环境变量覆盖。三个脚本都从 Hugging Face 初始权重加载，不保存或恢复训练 checkpoint；无需设置 `SAVE_DIR` 或 `SAVE_INTERVAL`，此前导出的这两个变量也不会生效。每次运行的 ClearML task 名和 `examples/chunkflow/scripts/log/` 下的日志带有时间戳。`PROJECT_NAME` 默认 `Relax/sft/chunkflow`，`EXP_NAME` 按模型区分且可覆盖。
 
 MoE 示例使用原生 all-to-all 分发，关闭路由辅助损失，并通过 `examples/chunkflow/configs/gdn.yaml` 关闭 GDN 预处理融合。它采用 CPU optimizer offload，需要足够的主机内存。两个示例均不启用 full-layer recompute、VPP、MTP 或多模态输入。
 
