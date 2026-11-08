@@ -272,6 +272,16 @@ register_attention_adapter(
     ),
 )
 
+# Qwen3.5/3.6 text layers use Bridge's absolute-RoPE attention class. Its
+# native QKV, RoPE and output gate surround the same TE core call.
+register_attention_adapter(
+    "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention.Qwen3VLSelfAttention",
+    "megatron.core.extensions.transformer_engine.TEDotProductAttention",
+    dense_attention_adapter(
+        name="megatron-native-qwen3vl-te", execute=megatron_native_attention, validate=_validate_megatron_attention
+    ),
+)
+
 
 register_attention_adapter(
     "megatron.core.ssm.gated_delta_net.GatedDeltaNet",

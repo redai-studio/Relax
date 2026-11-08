@@ -166,6 +166,35 @@ def test_unknown_outer_attention_does_not_inherit_dense_adapter():
     assert not hasattr(layer, "chunkflow_runtime")
 
 
+def test_qwen3_vl_native_te_registration_preserves_exact_type_boundary():
+    # Reproduce Bridge's concrete type identity without importing CUDA-backed
+    # constructors. Native Qwen3VL forward/backward has a separate GPU test.
+    layer_type = type(
+        "Qwen3VLSelfAttention",
+        (NativeLayer,),
+        {"__module__": "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention"},
+    )
+    core_type = type(
+        "TEDotProductAttention",
+        (SDPAttention,),
+        {"__module__": "megatron.core.extensions.transformer_engine", "te_forward_mask_type": True},
+    )
+    layer = layer_type()
+    layer.core_attention = core_type()
+    original = layer.core_attention.forward
+    assert install(layer, 4) == 1
+    assert uninstall(layer) == 1
+    assert layer.core_attention.forward == original
+
+    unknown = type("UnknownAttention", (layer_type,), {})()
+    unknown.core_attention = core_type()
+    with pytest.raises(NotImplementedError, match="no attention adapter"):
+        install(unknown, 4)
+    layer.core_attention = SDPAttention()
+    with pytest.raises(NotImplementedError, match="no attention adapter"):
+        install(layer, 4)
+
+
 def test_uninstalled_model_accepts_a_new_chunk_size():
     layer = NativeLayer()
     # TE represents unrestricted causal attention with this window pair.

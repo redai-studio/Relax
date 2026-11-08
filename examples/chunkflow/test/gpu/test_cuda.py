@@ -14,7 +14,7 @@ import torch
 
 from examples.chunkflow import rope as cf_rope
 from examples.chunkflow.adapters import DenseAttentionCall, megatron_native_attention
-from examples.chunkflow.integration import ChunkedCoreAttention
+from examples.chunkflow.integration import ChunkedCoreAttention, install, uninstall
 from examples.chunkflow.metadata import int32_metadata
 from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
 from examples.chunkflow.scheduler import build_chunks
@@ -185,6 +185,109 @@ def _assert_native_te_history_gradients_and_recomputation(keep_last_k):
     torch.testing.assert_close(torch.cat([actual[u.unit_id] for u in units]), expected, atol=0.02, rtol=0.02)
     for got, want in zip(leaves, reference):
         torch.testing.assert_close(got.grad, want.grad, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires native Bridge Qwen3VL and TE CUDA execution")
+@pytest.mark.parametrize("keep_last_k", [1, 1000])
+def test_qwen3_vl_native_layer_outputs_and_gradients(keep_last_k):
+    _run_native_te_check("_assert_qwen3_vl_native_layer_outputs_and_gradients", keep_last_k)
+
+
+def _assert_qwen3_vl_native_layer_outputs_and_gradients(keep_last_k):
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import Qwen3VLSelfAttention
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import Qwen3VLMultimodalRotaryEmbedding, get_rope_index
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import Qwen3VLTransformerConfig
+    from megatron.core import parallel_state
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TEDotProductAttention,
+        TERowParallelLinear,
+    )
+    from megatron.core.transformer.attention import SelfAttentionSubmodules
+    from megatron.core.transformer.enums import AttnMaskType
+
+    from examples.chunkflow.test.cpu.test_unit_batch import _parent
+    from examples.chunkflow.unit_batch import _rows_for_unit, slice_parent_batch
+
+    torch.manual_seed(37)
+    chunk_size, hidden, dim = 128, 256, 64
+    config = Qwen3VLTransformerConfig(
+        num_layers=1,
+        hidden_size=hidden,
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=dim,
+        attention_dropout=0,
+        hidden_dropout=0,
+        attention_output_gate=True,
+        add_bias_linear=False,
+        gradient_accumulation_fusion=False,
+        apply_rope_fusion=False,
+        params_dtype=torch.bfloat16,
+    )
+    layer = Qwen3VLSelfAttention(
+        config,
+        SelfAttentionSubmodules(TEColumnParallelLinear, TEDotProductAttention, TERowParallelLinear),
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+    )
+    rope = Qwen3VLMultimodalRotaryEmbedding(dim, cp_group=parallel_state.get_context_parallel_group())
+    rope.is_thd_format = True
+    # Exercise a dependent prefix, packed short documents and physical padding.
+    lengths = [301, 11, 13]
+    parent = _parent(lengths, device="cuda")
+    full_positions, _ = get_rope_index(1, -1, -2, -3, parent["tokens"], packed_seq_params=parent["packed_seq_params"])
+    x = torch.randn(sum(lengths), 1, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    expected, _ = layer(
+        x, None, rotary_pos_emb=rope(full_positions, [11, 11, 10]), packed_seq_params=parent["packed_seq_params"]
+    )
+    dout = torch.randn_like(expected)
+    expected.backward(dout)
+    reference_input_grad = x.grad.clone()
+    reference_grads = {name: parameter.grad.clone() for name, parameter in layer.named_parameters()}
+    layer.zero_grad(set_to_none=True)
+    x.grad = None
+
+    core, outer_forward = layer.core_attention, layer.forward
+    parameters, state_keys = tuple(layer.parameters()), tuple(layer.state_dict())
+    assert install(layer, chunk_size) == 1
+    assert layer.core_attention is core and layer.forward == outer_forward
+    assert tuple(layer.parameters()) == parameters and tuple(layer.state_dict()) == state_keys
+    chunks = build_chunks(lengths, chunk_size)
+    units = build_micro_batches(chunks)
+    actual, pending = torch.empty_like(expected), {}
+    for kind, uid in gen_unit_ops(units, chunks, keep_last_k):
+        unit = units[uid]
+        rows = _rows_for_unit(parent["packed_seq_params"].cu_seqlens_q_cpu, unit)
+        indices = [index for start, end in rows for index in range(start, end)]
+        if kind == "B":
+            pending.pop(uid).backward(dout[indices])
+            for group in completed_groups(unit):
+                layer.chunkflow_runtime.release_group(group)
+            continue
+        batch = slice_parent_batch(parent, unit, pad_token_id=0, args=SimpleNamespace(uses_unsplit_forward=True))
+        packed = batch["packed_seq_params"]
+        setattr(packed, UNIT_ATTR, unit)
+        setattr(packed, RECOMPUTE_ATTR, kind == "Fr")
+        with torch.set_grad_enabled(kind != "Fp"):
+            inputs = x[indices]
+            inputs = torch.cat((inputs, inputs.new_zeros(batch["tokens"].numel() - len(indices), 1, hidden)))
+            output, _ = layer(
+                inputs,
+                None,
+                rotary_pos_emb=rope(batch["position_ids"], [11, 11, 10], packed),
+                packed_seq_params=packed,
+            )
+        if kind != "Fp":
+            pending[uid] = output[: len(indices)]
+            actual[indices] = output[: len(indices)].detach()
+    layer.chunkflow_runtime.assert_empty("Qwen3VL native layer")
+    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.03)
+    torch.testing.assert_close(x.grad, reference_input_grad, atol=0.02, rtol=0.03)
+    for name, parameter in layer.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference_grads[name], atol=0.03, rtol=0.03)
+    assert uninstall(layer) == 1
+    assert layer.forward == outer_forward and tuple(layer.state_dict()) == state_keys
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
