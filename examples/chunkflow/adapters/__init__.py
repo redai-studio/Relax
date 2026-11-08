@@ -284,7 +284,7 @@ register_attention_adapter(
 
 
 register_attention_adapter(
-    "megatron.core.ssm.gated_delta_net.GatedDeltaNet",
+    "megatron.core.ssm.gated_delta_net.gdn.GatedDeltaNet",
     None,
     AttentionAdapter("megatron-native-gdn", gdn.validate, gdn.install),
 )
