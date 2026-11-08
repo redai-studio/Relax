@@ -357,6 +357,8 @@ patch 按样本、按调用生效，绝不会修改 `tokenizer.chat_template`。
 
 除了 JSON 布尔值和 `null` 之外的值（例如 `"false"`）会触发 `ValueError`。如果疑似 Qwen 的模板包含重复、冲突或无法识别的 history gate，Relax 会触发 `RuntimeError`，而不是猜测如何 patch。可以通过 SFT 日志中的 `source=qwen_history_thinking (patched|native)` 和最终 `preserve_thinking` 值确认实际分支。
 
+较新的 Qwen3.8 模板用原生 `{% generation %}` 标签标记 assistant 轮次。SFT 渲染时 Relax 会去掉这些标签，token 和 loss mask 与早期 Qwen3.8 模板一致。
+
 ### 评估与 predict
 
 PPL 评估由以下参数控制：
