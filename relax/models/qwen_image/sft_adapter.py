@@ -1,14 +1,15 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Qwen-Image-Edit LoRA SFT with reusable frozen text/vision conditions.
 
-Uses Diffusers Edit conditioning and latent geometry. VAE encoding and flow
-noise sampling run on every training sample.
+Uses Diffusers Edit conditioning and latent geometry. The frozen text/vision
+encoder output and the VAE argmax (posterior mode) latents are deterministic
+and reusable; flow noise and sigma sampling run online on every sample.
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
+import json
 from contextlib import nullcontext
 from copy import copy
 from pathlib import Path
@@ -17,11 +18,14 @@ from typing import Any
 import torch
 
 from relax.models.condition_cache import (
-    ConditionFeatureCache,
     FrozenConditionSpec,
     all_ranks_hit,
+    bind_condition_cache,
+    build_condition_cache,
     condition_cache_key,
+    encoder_identity,
 )
+from relax.utils.env import Envs
 
 
 def _processor_cache_identity(processor: Any) -> str:
@@ -73,30 +77,29 @@ class QwenImageEditSFTModel(torch.nn.Module):
         self.condition_cache_group = None
         self._encoder_versions = None
         self._condition_metrics = dict(prefix_encodes=0, global_hits=0, global_misses=0, bypasses=0)
-        self.condition_cache = ConditionFeatureCache(
-            int(os.environ.get("RELAX_CONDITION_CACHE_BYTES", "0")),
-            storage_device=os.environ.get("RELAX_CONDITION_CACHE_DEVICE", "cpu"),
-        )
+        self.condition_cache = build_condition_cache(Envs.RELAX_CONDITION_CACHE_BYTES)
         self.condition_spec = FrozenConditionSpec(
             encoder_identity=identity,
             preprocessing_version=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             dtype="bfloat16",
-            feature_schema="qwen-edit-text-vision-embeds-mask-v1",
-            adapter_version="qwen-image-edit-sft-v1",
+            feature_schema="qwen-edit-text-vision-embeds-mask-vae-mode-latents-v2",
+            adapter_version="qwen-image-edit-sft-v2",
         )
 
         self.register_load_state_dict_post_hook(lambda module, incompatible: module.clear_condition_cache())
 
     def clear_condition_cache(self) -> None:
-        self.condition_cache.clear()
+        if self.condition_cache is not None:
+            self.condition_cache.clear()
 
     def close_condition_cache(self) -> None:
-        self.condition_cache.close()
+        if self.condition_cache is not None:
+            self.condition_cache.close()
 
     def condition_cache_stats(self) -> dict[str, Any]:
         return {
-            "enabled": self.condition_cache.max_bytes > 0,
-            **self.condition_cache.stats(),
+            "enabled": self.condition_cache is not None,
+            **(self.condition_cache.stats() if self.condition_cache is not None else {}),
             **self._condition_metrics,
         }
 
@@ -107,62 +110,88 @@ class QwenImageEditSFTModel(torch.nn.Module):
         self.vae.eval()
         return self
 
-    def encode_conditions(self, data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Content is the actual post-resize image and effective prompt."""
-        cache_on = self.condition_cache.max_bytes > 0 and not any(
-            p.requires_grad for p in self.text_encoder.parameters()
+    def _frozen(self) -> bool:
+        return not any(p.requires_grad for p in self.text_encoder.parameters()) and not any(
+            p.requires_grad for p in self.vae.parameters()
         )
-        key = None
-        value = None
-        versions = tuple((name, parameter._version) for name, parameter in self.text_encoder.named_parameters())
-        if self._encoder_versions is not None and versions != self._encoder_versions:
-            self.condition_cache.clear()
-        self._encoder_versions = versions
-        cache_on = all_ranks_hit(cache_on, self.condition_cache_group)
-        if not cache_on:
-            self.condition_cache.clear()
-            self._condition_metrics["bypasses"] += 1
-        if cache_on:
-            image = data["edit_image"][0]
-            key = condition_cache_key(
-                self.condition_spec,
-                {
-                    "prompt": data["prompt"],
-                    "size": list(image.size),
-                    "mode": image.mode,
-                    "pixels": image.tobytes(),
-                    "template": getattr(self.pipe, "prompt_template_encode", ""),
-                    "template_start": getattr(self.pipe, "prompt_template_encode_start_idx", 0),
-                    "encoder_attention": getattr(
-                        getattr(self.text_encoder, "config", None), "_attn_implementation", None
-                    ),
-                    "encoder_dtype": str(next(self.text_encoder.parameters()).dtype),
-                    "autocast": torch.is_autocast_enabled("cuda"),
-                    "autocast_dtype": str(torch.get_autocast_dtype("cuda")),
-                    "processor": _processor_cache_identity(getattr(self.pipe, "processor", "")),
-                },
-            )
-        # All ranks must enter or skip the frozen encoder's FSDP collectives.
-        if cache_on and all_ranks_hit(self.condition_cache.contains(key), self.condition_cache_group):
-            self._condition_metrics["global_hits"] += 1
-            value = self.condition_cache.get(key, device=self.device)
-            return value["embeds"], value["mask"]
-        self._condition_metrics["global_misses"] += int(cache_on)
-        self._condition_metrics["prefix_encodes"] += 1
-        context = (
-            torch.no_grad() if not any(p.requires_grad for p in self.text_encoder.parameters()) else nullcontext()
-        )
-        with context:
+
+    def _encode_online(self, data: dict[str, Any]) -> dict[str, Any]:
+        text_frozen = not any(p.requires_grad for p in self.text_encoder.parameters())
+        with torch.no_grad() if text_frozen else nullcontext():
             embeds, mask = self.pipe.encode_prompt(
                 prompt=data["prompt"],
                 image=data["edit_image"][0],
                 device=self.device,
             )
-        if cache_on:
-            self.condition_cache.put(
-                key, {"embeds": embeds.detach(), "mask": mask.detach() if mask is not None else None}
-            )
-        return embeds, mask
+        vae_frozen = not any(p.requires_grad for p in self.vae.parameters())
+        with torch.no_grad() if vae_frozen else nullcontext():
+            clean = self._image_latents(data["image"])
+            condition = self._image_latents(data["edit_image"][0])
+        return {"embeds": embeds, "mask": mask, "clean": clean, "condition": condition}
+
+    def _condition_key(self, data: dict[str, Any]) -> str:
+        image, target = data["edit_image"][0], data["image"]
+        vae_config = getattr(self.vae, "config", None)
+        return condition_cache_key(
+            self.condition_spec,
+            {
+                "prompt": data["prompt"],
+                "size": list(image.size),
+                "mode": image.mode,
+                "pixels": image.tobytes(),
+                # Target pixels select the VAE mode latents of the clean image.
+                "target_size": list(target.size),
+                "target_mode": target.mode,
+                "target_pixels": target.tobytes(),
+                "template": getattr(self.pipe, "prompt_template_encode", ""),
+                "template_start": getattr(self.pipe, "prompt_template_encode_start_idx", 0),
+                "encoder_attention": getattr(getattr(self.text_encoder, "config", None), "_attn_implementation", None),
+                "encoder_dtype": str(next(self.text_encoder.parameters()).dtype),
+                "vae_dtype": str(next(self.vae.parameters()).dtype),
+                "vae_config": json.dumps(dict(vae_config), sort_keys=True, default=str) if vae_config else "",
+                "vae_tiling": bool(getattr(self.vae, "use_tiling", False)),
+                "vae_slicing": bool(getattr(self.vae, "use_slicing", False)),
+                "autocast": torch.is_autocast_enabled("cuda"),
+                "autocast_dtype": str(torch.get_autocast_dtype("cuda")),
+                "processor": _processor_cache_identity(getattr(self.pipe, "processor", "")),
+            },
+        )
+
+    def encode_conditions(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Frozen text/vision embeddings and VAE mode latents of one sample.
+
+        Content is the actual post-resize images and the effective prompt.
+        """
+        if self.condition_cache is None:
+            self._condition_metrics["prefix_encodes"] += 1
+            return self._encode_online(data)
+        versions = tuple(
+            (name, parameter._version)
+            for module in (self.text_encoder, self.vae)
+            for name, parameter in module.named_parameters()
+        )
+        if self._encoder_versions is not None and versions != self._encoder_versions:
+            self.condition_cache.clear()
+        self._encoder_versions = versions
+        cache_on = all_ranks_hit(self._frozen(), self.condition_cache_group)
+        if not cache_on:
+            self.condition_cache.clear()
+            self._condition_metrics["bypasses"] += 1
+            self._condition_metrics["prefix_encodes"] += 1
+            return self._encode_online(data)
+        key = self._condition_key(data)
+        # All ranks must enter or skip the frozen encoder's FSDP collectives.
+        if all_ranks_hit(self.condition_cache.contains(key), self.condition_cache_group):
+            value = self.condition_cache.get(key, device=self.device)
+            if value is None:
+                raise RuntimeError("Frozen condition disappeared after collective hit agreement")
+            self._condition_metrics["global_hits"] += 1
+            return value
+        self._condition_metrics["global_misses"] += 1
+        self._condition_metrics["prefix_encodes"] += 1
+        value = self._encode_online(data)
+        self.condition_cache.put(key, {name: None if t is None else t.detach() for name, t in value.items()})
+        return value
 
     def _image_latents(self, image: Any) -> torch.Tensor:
         pixels = self.pipe.image_processor.preprocess(image, height=image.height, width=image.width)
@@ -172,11 +201,9 @@ class QwenImageEditSFTModel(torch.nn.Module):
         return self.pipe._encode_vae_image(pixels, generator=None)
 
     def forward(self, data: dict[str, Any]) -> torch.Tensor:
-        embeds, mask = self.encode_conditions(data)
-        context = torch.no_grad() if not any(p.requires_grad for p in self.vae.parameters()) else nullcontext()
-        with context:
-            clean = self._image_latents(data["image"])
-            condition = self._image_latents(data["edit_image"][0])
+        conditions = self.encode_conditions(data)
+        embeds, mask = conditions["embeds"], conditions["mask"]
+        clean, condition = conditions["clean"], conditions["condition"]
         # Rectified flow, uniform sigma training, target velocity epsilon-x0.
         # Same exact sampling position in A/B; no sampling in cache callbacks.
         noise = torch.randn_like(clean)
@@ -231,12 +258,9 @@ class QwenImageEditSFTAdapter:
         for module in (pipe.transformer, pipe.text_encoder, pipe.vae):
             module.requires_grad_(False)
         pipe.transformer.enable_gradient_checkpointing()
-        identity = os.environ.get("RELAX_CONDITION_CACHE_IDENTITY", "")
-        if not identity:
-            # Verified asset manifest identity is mandatory for cache runs.
-            if int(os.environ.get("RELAX_CONDITION_CACHE_BYTES", "0")):
-                raise ValueError("A verified model identity is required before enabling condition cache")
-            identity = "cache-disabled"
+        # Verified SHA if provided, else a cheap directory identity; the
+        # weights are not reread on every rank at startup.
+        identity = encoder_identity(args.model_path) if Envs.RELAX_CONDITION_CACHE_BYTES else "cache-disabled"
         return QwenImageEditSFTModel(pipe, identity)
 
     def prepare_for_sharding(self, model: QwenImageEditSFTModel) -> None:
@@ -244,6 +268,19 @@ class QwenImageEditSFTAdapter:
 
     def on_device_ready(self, model: QwenImageEditSFTModel, device: torch.device) -> None:
         model.device = device
+        if model.condition_cache is None:
+            return
+        import torch.distributed as dist
+
+        if dist.is_initialized() and dist.get_world_size(dist.group.WORLD) > 1:
+            from relax.utils.distributed_utils import get_gloo_group
+
+            # CPU control group: the hit agreement never syncs a CUDA scalar.
+            try:
+                model.condition_cache_group = get_gloo_group()
+            except RuntimeError:
+                model.condition_cache_group = dist.group.WORLD
+        bind_condition_cache(model.condition_cache, model.condition_cache_group)
 
     def prepare_sample(
         self, row: dict[str, Any], root: Path, config: dict[str, Any], index: int = 0

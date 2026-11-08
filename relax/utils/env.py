@@ -297,9 +297,15 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_DSV4_FP4_STATS_INTERVAL = EnvProperty("RELAX_DSV4_FP4_STATS_INTERVAL", int, 10)
 
     # ------------- Frozen multimodal SFT conditions -------------
-    # Disabled by default; byte accounting and lifetime are per training worker.
+    # Disabled by default. With "shm" the byte budget bounds one node's shared
+    # run directory; with "cpu"/"cuda" it bounds each worker's private LRU.
     RELAX_CONDITION_CACHE_BYTES = EnvProperty("RELAX_CONDITION_CACHE_BYTES", int, 0)
-    RELAX_CONDITION_CACHE_DEVICE = EnvProperty("RELAX_CONDITION_CACHE_DEVICE", str, "cpu")
+    RELAX_CONDITION_CACHE_DEVICE = EnvProperty("RELAX_CONDITION_CACHE_DEVICE", str, "shm")
+    # Node-local root of shared run directories (tmpfs recommended).
+    RELAX_CONDITION_CACHE_DIR = EnvProperty("RELAX_CONDITION_CACHE_DIR", str, "/dev/shm/relax-condition-cache")
+    RELAX_CONDITION_CACHE_MAX_ENTRIES = EnvProperty("RELAX_CONDITION_CACHE_MAX_ENTRIES", int, 4096)
+    # Per-worker bound on pinned host memory held by not-yet-committed writes.
+    RELAX_CONDITION_CACHE_STAGING_BYTES = EnvProperty("RELAX_CONDITION_CACHE_STAGING_BYTES", int, 2 * 1024**3)
     # Content SHA of a launcher-verified weights/tokenizer/config manifest.
     RELAX_CONDITION_CACHE_IDENTITY = EnvProperty("RELAX_CONDITION_CACHE_IDENTITY", str, "")
 

@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from PIL import Image
 
@@ -44,9 +45,15 @@ class FakePipe:
         )
 
 
+@pytest.fixture(params=["cpu", "shm"])
+def storage(request, monkeypatch, tmp_path):
+    monkeypatch.setenv("RELAX_CONDITION_CACHE_DEVICE", request.param)
+    monkeypatch.setenv("RELAX_CONDITION_CACHE_DIR", str(tmp_path / "shm"))
+    return request.param
+
+
 def make_model(monkeypatch, budget):
     monkeypatch.setenv("RELAX_CONDITION_CACHE_BYTES", str(budget))
-    monkeypatch.setenv("RELAX_CONDITION_CACHE_DEVICE", "cpu")
     return QwenImageEditSFTModel(FakePipe(), "a" * 64)
 
 
@@ -54,7 +61,7 @@ def data(prompt="edit"):
     return {"prompt": prompt, "image": Image.new("RGB", (32, 32)), "edit_image": [Image.new("RGB", (32, 32))]}
 
 
-def test_cold_warm_loss_grad_and_rng_equal(monkeypatch):
+def test_cold_warm_loss_grad_and_rng_equal(monkeypatch, storage):
     online = make_model(monkeypatch, 0)
     cached = make_model(monkeypatch, 1 << 20)
     expected = None
@@ -63,6 +70,8 @@ def test_cold_warm_loss_grad_and_rng_equal(monkeypatch):
         torch.manual_seed(19)
         loss = model(data())
         loss.backward()
+        if storage == "shm" and model is cached:
+            assert cached.condition_cache.flush()
         current = (loss.detach().clone(), model.transformer.weight.grad.clone(), torch.get_rng_state().clone())
         if expected is None:
             expected = current
@@ -70,11 +79,25 @@ def test_cold_warm_loss_grad_and_rng_equal(monkeypatch):
             for left, right in zip(expected, current):
                 assert torch.equal(left, right)
     assert cached.pipe.calls == 1
-    assert cached.pipe.vae_calls == 4
+    # VAE argmax latents are deterministic and reused; noise/sigma stay online.
+    assert cached.pipe.vae_calls == 2
     assert cached.condition_cache_stats()["global_hits"] == 1
+    cached.close_condition_cache()
+    online.close_condition_cache()
 
 
-def test_effective_prompt_and_image_content_invalidate(monkeypatch):
+def test_target_pixels_invalidate_vae_latents(monkeypatch, storage):
+    model = make_model(monkeypatch, 1 << 20)
+    model.encode_conditions(data())
+    changed = data()
+    changed["image"].putpixel((0, 0), (255, 0, 0))
+    model.encode_conditions(changed)
+    assert model.pipe.calls == 2
+    assert model.pipe.vae_calls == 4
+    model.close_condition_cache()
+
+
+def test_effective_prompt_and_image_content_invalidate(monkeypatch, storage):
     model = make_model(monkeypatch, 1 << 20)
     model.encode_conditions(data())
     model.encode_conditions(data("different"))
@@ -82,11 +105,14 @@ def test_effective_prompt_and_image_content_invalidate(monkeypatch):
     changed["edit_image"][0].putpixel((0, 0), (255, 0, 0))
     model.encode_conditions(changed)
     assert model.pipe.calls == 3
+    model.close_condition_cache()
 
 
-def test_trainable_encoder_bypasses_and_close_releases(monkeypatch):
+def test_trainable_encoder_bypasses_and_close_releases(monkeypatch, storage):
     model = make_model(monkeypatch, 1 << 20)
     model.encode_conditions(data())
+    if storage == "shm":
+        assert model.condition_cache.flush()
     model.text_encoder.requires_grad_(True)
     model.encode_conditions(data())
     assert model.pipe.calls == 2
@@ -95,20 +121,22 @@ def test_trainable_encoder_bypasses_and_close_releases(monkeypatch):
     assert model.condition_cache.stats()["bytes"] == 0
 
 
-def test_frozen_modules_remain_eval(monkeypatch):
+def test_frozen_modules_remain_eval(monkeypatch, storage):
     model = make_model(monkeypatch, 1 << 20).train()
     assert model.transformer.training
     assert not model.text_encoder.training
     assert not model.vae.training
+    model.close_condition_cache()
 
 
-def test_encoder_inplace_update_invalidates(monkeypatch):
+def test_encoder_inplace_update_invalidates(monkeypatch, storage):
     model = make_model(monkeypatch, 1 << 20)
     model.encode_conditions(data())
     with torch.no_grad():
         model.text_encoder.weight.add_(1)
     model.encode_conditions(data())
     assert model.pipe.calls == 2
+    model.close_condition_cache()
 
 
 def test_real_tiny_qwen_dit_geometry_and_backward(monkeypatch):
@@ -134,11 +162,12 @@ def test_real_tiny_qwen_dit_geometry_and_backward(monkeypatch):
     assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in grads)
 
 
-def test_trainable_condition_bypass_does_not_detach_gradient(monkeypatch):
+def test_trainable_condition_bypass_does_not_detach_gradient(monkeypatch, storage):
     model = make_model(monkeypatch, 1 << 20)
     model.text_encoder.requires_grad_(True)
     model.pipe.encode_prompt = lambda **kwargs: (model.text_encoder.weight.reshape(1, 1, 1), None)
-    embeds, _ = model.encode_conditions(data())
+    embeds = model.encode_conditions(data())["embeds"]
     embeds.sum().backward()
     assert model.text_encoder.weight.grad is not None
     assert model.condition_cache.stats()["entries"] == 0
+    model.close_condition_cache()

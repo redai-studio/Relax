@@ -19,8 +19,12 @@ import torch
 from relax.models.condition_cache import (
     ConditionFeatureCache,
     FrozenConditionSpec,
+    SharedConditionStore,
     all_ranks_hit,
+    bind_condition_cache,
+    build_condition_cache,
     condition_cache_key,
+    encoder_identity,
 )
 from relax.utils.env import Envs
 
@@ -37,28 +41,13 @@ LORA_TARGETS = (
 
 
 def _condition_encoder_identity(model_path: str) -> str:
-    """Bind a preverified asset manifest or hash the offline assets once.
+    """Verified external SHA if provided, else a cheap model-directory
+    identity.
 
-    The manifest identity must be a content SHA validated by the launcher, not
-    a model name/path. Without it we pay one cold-start sequential read. The
-    cache is process-local and is never restored across model construction.
+    Never rereads the multi-GB weights on every rank at startup: the cache does
+    not outlive the run that loaded those frozen weights.
     """
-    identity = Envs.RELAX_CONDITION_CACHE_IDENTITY
-    if identity:
-        if len(identity) != 64 or any(c not in "0123456789abcdef" for c in identity.lower()):
-            raise ValueError("RELAX_CONDITION_CACHE_IDENTITY must be a verified asset-manifest SHA256")
-        return identity.lower()
-    digest = hashlib.sha256()
-    root = Path(model_path)
-    files = sorted(p for p in root.iterdir() if p.is_file())
-    if not any(p.name.startswith("model") and p.suffix == ".safetensors" for p in files):
-        raise FileNotFoundError("Frozen encoder identity requires the complete SenseNova assets")
-    for path in files:
-        digest.update(path.name.encode() + b"\0")
-        with path.open("rb") as source:
-            for block in iter(lambda: source.read(8 * 1024 * 1024), b""):
-                digest.update(block)
-    return digest.hexdigest()
+    return encoder_identity(model_path)
 
 
 def _condition_adapter_version() -> str:
@@ -140,6 +129,7 @@ class SenseNovaSFTModel(torch.nn.Module):
         self.condition_identity = condition_identity
         self.condition_cache_group = None
         self._condition_version = _condition_adapter_version() if condition_cache is not None else ""
+        self._prefix_device_identities: dict[int, dict[str, Any]] = {}
         self._prefix_versions = None
         self._condition_metrics = dict(
             prefix_encodes=0, local_hits=0, global_hits=0, global_misses=0, bypasses=0, invalidations=0
@@ -175,6 +165,29 @@ class SenseNovaSFTModel(torch.nn.Module):
                 return False
         return True
 
+    def _prefix_encoder_device(self) -> str | dict[str, Any]:
+        # A shared entry follows a sample when the sampler assigns it to a
+        # different rank. Local CUDA ordinals identify placement, not encoder
+        # semantics; heterogeneous devices must still use different keys.
+        if not isinstance(self.condition_cache, SharedConditionStore):
+            return str(self.pipe.device)
+        device = torch.device(self.pipe.device)
+        if device.type != "cuda":
+            return str(device)
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        if index not in self._prefix_device_identities:
+            properties = torch.cuda.get_device_properties(index)
+            self._prefix_device_identities[index] = {
+                "type": device.type,
+                "backend": "hip" if torch.version.hip else "cuda",
+                "runtime": torch.version.hip or torch.version.cuda,
+                "name": properties.name,
+                "capability": (properties.major, properties.minor),
+                "multiprocessors": properties.multi_processor_count,
+                "memory_bytes": properties.total_memory,
+            }
+        return self._prefix_device_identities[index]
+
     def _prefix_key(self, data: dict[str, Any], unit: Any) -> str:
         images = data["edit_image"]
         if images is None:
@@ -193,7 +206,7 @@ class SenseNovaSFTModel(torch.nn.Module):
             "attention": os.environ.get("RELAX_ATTENTION_IMPLEMENTATION", "flash_attention_2"),
             "deterministic_attention": os.environ.get("RELAX_DETERMINISTIC_ATTENTION", "0"),
             "torch_version": str(torch.__version__),
-            "encoder_device": str(self.pipe.device),
+            "encoder_device": self._prefix_encoder_device(),
             "autocast": autocast,
             "autocast_dtype": str(torch.get_autocast_dtype(device_type)) if autocast else None,
         }
@@ -344,7 +357,7 @@ class SenseNovaSFTAdapter:
         identity = None
         if budget and mode == "lora":
             identity = _condition_encoder_identity(args.model_path)
-            condition_cache = ConditionFeatureCache(budget, storage_device=Envs.RELAX_CONDITION_CACHE_DEVICE)
+            condition_cache = build_condition_cache(budget)
         return SenseNovaSFTModel(
             pipe,
             training_mode=mode,
@@ -372,6 +385,11 @@ class SenseNovaSFTAdapter:
                     model.condition_cache_group = get_gloo_group()
                 except RuntimeError:
                     model.condition_cache_group = dist.group.WORLD
+            # All ranks of the node share one run directory (no-op for
+            # private caches), so samples reassigned across ranks still hit.
+            bind_condition_cache(model.condition_cache, model.condition_cache_group)
+            # Query device metadata once here, before the per-sample hot path.
+            model._prefix_encoder_device()
 
     def prepare_sample(
         self, row: dict[str, Any], root: Path, config: dict[str, Any], index: int = 0

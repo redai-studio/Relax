@@ -7,6 +7,7 @@ belong to the adapter; initialization, FSDP and DCP belong to the common actor.
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import time
@@ -24,6 +25,26 @@ from relax.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 TASK = "i2i_sft"
+_CACHE_METRICS = (
+    "global_hits",
+    "global_misses",
+    "bypasses",
+    "prefix_encodes",
+    "encode_seconds_host",
+    "bytes",
+    "entries",
+    "evictions",
+    "oversized",
+    "corruptions",
+    "committed",
+    "write_dropped",
+    "write_errors",
+    "pending_bytes",
+    "read_seconds",
+    "write_seconds",
+    "h2d_bytes",
+    "d2h_bytes",
+)
 
 
 def _report_sft_metrics(args: Any, values: dict[str, Any]) -> None:
@@ -210,9 +231,24 @@ class FSDPSFTTrainer:
     def close(self) -> None:
         if self.prefetch:
             self.prefetch.close()
+        self._close_condition_cache()
+
+    def _close_condition_cache(self) -> None:
         close_cache = getattr(self.actor.model, "close_condition_cache", None)
         if close_cache is not None:
             close_cache()
+
+    def _condition_cache_metrics(self) -> dict[str, Any]:
+        """Rank-0 view of the frozen-condition cache, for step metrics."""
+        stats_fn = getattr(self.actor.model, "condition_cache_stats", None)
+        stats = stats_fn() if stats_fn is not None else None
+        if not stats or not stats.get("enabled"):
+            return {}
+        hits, misses = stats.get("global_hits", 0), stats.get("global_misses", 0)
+        values = {f"cache/{name}": stats[name] for name in _CACHE_METRICS if isinstance(stats.get(name), (int, float))}
+        values["cache/hit_rate"] = hits / (hits + misses) if hits + misses else 0.0
+        logger.info("i2i SFT condition cache step=%s %s", self.step, json.dumps(values, sort_keys=True))
+        return values
 
     def _train_step(self, step: int) -> None:
         from relax.backends.fsdp.sft_collectives import collect_weight_sync_errors as _collect_weight_sync_errors
@@ -290,16 +326,25 @@ class FSDPSFTTrainer:
                 "perf/peak_allocated_bytes": peak_allocated,
                 "perf/peak_reserved_bytes": peak_reserved,
             }
+            values.update(self._condition_cache_metrics())
             values["train/step"] = self.step
             _report_sft_metrics(self.args, values)
             logger.info(
-                "i2i SFT step=%s loss=%.8f grad_norm=%.8f lr=%g peak_allocated=%d peak_reserved=%d",
+                "i2i SFT step=%s loss=%.8f grad_norm=%.8f lr=%g peak_allocated=%d peak_reserved=%d "
+                "train_seconds=%.4f data_wait_seconds=%.4f wall=%.3f",
                 self.step,
                 *metrics,
                 lr,
                 peak_allocated,
                 peak_reserved,
+                values["perf/train_seconds"],
+                values["perf/data_wait_seconds"],
+                time.time(),
             )
+        if self.step == self.args.num_rollout:
+            # Release staging memory; the last owner on each node removes the
+            # shared cache directory. Checkpointing never reads the cache.
+            self._close_condition_cache()
         interval = self.args.save_interval
         if self.args.save and (self.step == self.args.num_rollout or (interval and self.step % interval == 0)):
             self.save()

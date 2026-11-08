@@ -4,6 +4,7 @@
 import copy
 from dataclasses import replace
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +13,7 @@ from PIL import Image
 from relax.models.condition_cache import (
     ConditionFeatureCache,
     FrozenConditionSpec,
+    SharedConditionStore,
     all_ranks_hit,
     condition_cache_key,
 )
@@ -176,16 +178,25 @@ def _data(prompt="edit", color=(20, 40, 60), size=(32, 32)):
     return {"image": Image.new("RGB", size), "edit_image": [Image.new("RGB", size, color)], "prompt": prompt}
 
 
-def _toy_model(cached=True):
+def _toy_model(cached=True, shared_root=None):
+    cache = None
+    if cached:
+        cache = (
+            ConditionFeatureCache(100_000)
+            if shared_root is None
+            else SharedConditionStore(100_000, shared_root, run_id="toy")
+        )
     return sense.SenseNovaSFTModel(
         _ToyPipe(),
-        condition_cache=ConditionFeatureCache(100_000) if cached else None,
+        condition_cache=cache,
         condition_identity="verified-assets" if cached else None,
     )
 
 
-def test_cached_online_full_batch_loss_grad_delta_and_rng_are_exact(monkeypatch):
+@pytest.mark.parametrize("storage", ["cpu", "shm"])
+def test_cached_online_full_batch_loss_grad_delta_and_rng_are_exact(monkeypatch, tmp_path, storage):
     monkeypatch.setattr(sense, "flow_matching_loss", _toy_loss)
+    shared_root = tmp_path if storage == "shm" else None
     torch.manual_seed(14)
     base = _toy_model(False)
     initial = copy.deepcopy(base.state_dict())
@@ -193,17 +204,21 @@ def test_cached_online_full_batch_loss_grad_delta_and_rng_are_exact(monkeypatch)
     data = [_data(), _data("caption"), _data(), _data("caption")]
 
     def update(cached, warm):
-        model = _toy_model(cached)
+        model = _toy_model(cached, shared_root if cached else None)
         model.load_state_dict(initial)
         if warm:
             for sample in data:
                 model(sample)
+                if shared_root is not None:
+                    assert model.condition_cache.flush()
         torch.set_rng_state(rng)
         optimizer = torch.optim.AdamW(model.pipe.dit.fm_modules.parameters(), lr=0.01)
         before = {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
         losses = []
         for sample in data:
             loss = model(sample) / len(data)
+            if cached and shared_root is not None:
+                assert model.condition_cache.flush()
             losses.append(loss.detach())
             loss.backward()
         grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.requires_grad}
@@ -221,6 +236,7 @@ def test_cached_online_full_batch_loss_grad_delta_and_rng_are_exact(monkeypatch)
         assert torch.equal(reference[4], actual[4])
         assert actual[0].condition_cache_stats()["global_hits"] >= 2
         assert actual[0].pipe.calls == 2
+        actual[0].close_condition_cache()
 
 
 def test_effective_pixels_caption_shape_and_weights_invalidate(monkeypatch):
@@ -255,6 +271,160 @@ def test_encoder_backend_and_autocast_are_key_dependencies(monkeypatch):
     assert key != torch_key
     with torch.autocast("cpu", dtype=torch.bfloat16):
         assert torch_key != model._prefix_key(data, unit)
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_sensenova_actual_keys_follow_images_across_sampler_ranks(tmp_path, monkeypatch, shared):
+    """Replay real preprocessing/sampler keys without constructing CUDA
+    tensors."""
+    from relax.engine.sft.image import ImageBatchSampler
+
+    properties = SimpleNamespace(
+        name="homogeneous-test-GPU", major=8, minor=0, multi_processor_count=108, total_memory=80 << 30
+    )
+    queries = []
+
+    def device_properties(index):
+        queries.append(index)
+        return properties
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", device_properties)
+    adapter = sense.SenseNovaSFTAdapter()
+    samples = []
+    for index in range(12):
+        name = f"image-{index}.png"
+        Image.new("RGB", (67, 41), (index * 17, 40, 60)).save(tmp_path / name)
+        samples.append(
+            adapter.prepare_sample(
+                {"prompt": "edit", "image": name, "edit_image": [name]}, tmp_path, {"max_pixels": 4096}, index
+            )
+        )
+    models = [_toy_model(shared_root=tmp_path / "cache" if shared else None) for _ in range(4)]
+    initial = copy.deepcopy(models[0].state_dict())
+    for rank, model in enumerate(models):
+        model.load_state_dict(initial)
+        adapter.on_device_ready(model, torch.device("cuda", rank))
+    sampler = ImageBatchSampler(len(samples), 4, seed=42)
+    private_resident = [set() for _ in models]
+    previous_rank = {}
+    moved, decisions = 0, []
+    try:
+        first_keys = [model._prefix_key(samples[0], _PrefixUnit()) for model in models]
+        assert len(set(first_keys)) == (1 if shared else len(models))
+        for step in range(4 * sampler.steps_per_epoch):
+            ids = sampler.batch(step)
+            keys = [model._prefix_key(samples[index], _PrefixUnit()) for model, index in zip(models, ids)]
+            for rank, index in enumerate(ids):
+                moved += index in previous_rank and previous_rank[index] != rank
+                previous_rank[index] = rank
+            hits = [model.condition_cache.contains(key) for model, key in zip(models, keys)]
+            collective_hit = all(hits)
+            expected = (
+                step >= sampler.steps_per_epoch
+                if shared
+                else all(index in private_resident[rank] for rank, index in enumerate(ids))
+            )
+            assert collective_hit == expected
+            decisions.append(collective_hit)
+            for rank, (model, index, key) in enumerate(zip(models, ids, keys)):
+                cache = model.condition_cache
+                if collective_hit:
+                    assert torch.equal(
+                        cache.get(key)["prefix"], torch.tensor(samples[index]["edit_image"][0].getpixel((0, 0)))
+                    )
+                else:
+                    assert cache.put(key, {"prefix": torch.tensor(samples[index]["edit_image"][0].getpixel((0, 0)))})
+                    if shared:
+                        assert cache.flush()
+                private_resident[rank].add(index)
+        assert moved > 0
+        if shared:
+            assert sum(decisions) == 9
+            assert queries == [0, 1, 2, 3]
+        else:
+            assert sum(decisions) < 9
+            assert queries == []
+    finally:
+        for model in models:
+            model.close_condition_cache()
+
+
+def test_sensenova_shared_key_keeps_hardware_backend_and_condition_dependencies(tmp_path, monkeypatch):
+    """Only ordinal is ignored; incompatible encoders must remain separate."""
+    properties = dict(name="test-GPU", major=8, minor=0, multi_processor_count=108, total_memory=80 << 30)
+    devices = {0: properties, 1: properties}
+    for index, (field, value) in enumerate(
+        (("name", "other-GPU"), ("minor", 1), ("multi_processor_count", 80), ("total_memory", 40 << 30)), 2
+    ):
+        devices[index] = {**properties, field: value}
+    queries = []
+
+    def device_properties(index):
+        queries.append(index)
+        return SimpleNamespace(**devices[index])
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", device_properties)
+    model, unit = _toy_model(shared_root=tmp_path / "cache"), _PrefixUnit()
+    image = tmp_path / "input.png"
+    Image.new("RGB", (67, 41), (20, 40, 60)).save(image)
+    data = sense.SenseNovaSFTAdapter().prepare_sample(
+        {"prompt": "edit", "image": image.name, "edit_image": [image.name]}, tmp_path, {"max_pixels": 4096}
+    )
+    try:
+        model.pipe.device = torch.device("cuda", 0)
+        key = model._prefix_key(data, unit)
+        model.pipe.device = torch.device("cuda", 1)
+        assert model._prefix_key(data, unit) == key
+        for index in range(2, len(devices)):
+            model.pipe.device = torch.device("cuda", index)
+            assert model._prefix_key(data, unit) != key
+        model.pipe.device = torch.device("cuda", 0)
+        assert model._prefix_key(data, unit) == key
+        assert queries == list(range(len(devices)))  # no per-sample property queries
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "current_device", lambda: 1)
+            model.pipe.device = torch.device("cuda")
+            assert model._prefix_key(data, unit) == key
+        model.pipe.device = torch.device("cuda", 0)
+        different_pixels = data["edit_image"][0].copy()
+        different_pixels.putpixel((0, 0), (21, 40, 60))
+        for changed in (
+            {**data, "prompt": "new caption"},
+            {**data, "edit_image": [different_pixels]},
+            {**data, "image": Image.new("RGB", (32, 64))},
+        ):
+            assert model._prefix_key(changed, unit) != key
+        with monkeypatch.context() as patch:
+            patch.setenv("RELAX_ATTENTION_IMPLEMENTATION", "torch")
+            assert model._prefix_key(data, unit) != key
+        with monkeypatch.context() as patch:
+            patch.setenv("RELAX_DETERMINISTIC_ATTENTION", "1")
+            assert model._prefix_key(data, unit) != key
+        model.pipe.torch_dtype = torch.bfloat16
+        assert model._prefix_key(data, unit) != key
+        model.pipe.torch_dtype = torch.float32
+        model.condition_identity = "different-weights"
+        assert model._prefix_key(data, unit) != key
+        model.condition_identity = "verified-assets"
+        unit.frozen_condition_schema = "different-schema"
+        assert model._prefix_key(data, unit) != key
+        unit.frozen_condition_schema = "toy-prefix-v1"
+        for backend in ("cuda", "hip"):
+            with monkeypatch.context() as patch:
+                patch.setattr(torch.version, backend, "different-runtime")
+                other = _toy_model(shared_root=tmp_path / "cache")
+                try:
+                    other.pipe.device = torch.device("cuda", 0)
+                    assert other._prefix_key(data, unit) != key
+                finally:
+                    other.close_condition_cache()
+        model.pipe.device = torch.device("cpu")
+        assert model._prefix_key(data, unit) != key
+        cpu_key = model._prefix_key(data, unit)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            assert model._prefix_key(data, unit) != cpu_key
+    finally:
+        model.close_condition_cache()
 
 
 def test_random_prefix_bypasses_and_exception_releases(monkeypatch):
@@ -304,6 +474,9 @@ def test_condition_cache_environment_is_registered_and_typed(monkeypatch):
     values = {
         "RELAX_CONDITION_CACHE_BYTES": "4096",
         "RELAX_CONDITION_CACHE_DEVICE": "cpu",
+        "RELAX_CONDITION_CACHE_DIR": "/tmp/relax-test-cache",
+        "RELAX_CONDITION_CACHE_MAX_ENTRIES": "16",
+        "RELAX_CONDITION_CACHE_STAGING_BYTES": "2048",
         "RELAX_CONDITION_CACHE_IDENTITY": "a" * 64,
     }
     # validate_env also reads os.environ; this unit test owns only its cache inputs.
@@ -312,8 +485,13 @@ def test_condition_cache_environment_is_registered_and_typed(monkeypatch):
     validate_env({**values, "RELAX_STRICT_ENV": "1"})
     monkeypatch.setenv("RELAX_CONDITION_CACHE_BYTES", "4096")
     assert Envs.RELAX_CONDITION_CACHE_BYTES == 4096
-    with pytest.raises(ValueError, match="RELAX_CONDITION_CACHE_BYTES"):
-        validate_env({"RELAX_CONDITION_CACHE_BYTES": "typo"})
+    for name in (
+        "RELAX_CONDITION_CACHE_BYTES",
+        "RELAX_CONDITION_CACHE_MAX_ENTRIES",
+        "RELAX_CONDITION_CACHE_STAGING_BYTES",
+    ):
+        with pytest.raises(ValueError, match=name):
+            validate_env({name: "typo"})
 
 
 def test_real_dynamic_cache_is_rebuilt_without_mutable_aliases():
