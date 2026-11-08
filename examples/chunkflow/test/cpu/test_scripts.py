@@ -1,13 +1,16 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Preview the real recipes without sourcing a cluster entrypoint."""
+"""Check recipes and standard entrypoints without starting Ray or touching
+GPUs."""
 
 from __future__ import annotations
 
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -132,7 +135,7 @@ def test_submission_forwards_model_settings_to_workers(tmp_path):
     }
     common = ROOT / "examples/chunkflow/scripts/_common.sh"
     subprocess.run(
-        ["bash", "-c", 'set -eo pipefail; source "$1"; submit_training --use-chunkflow', "test", str(common)],
+        ["bash", "-c", 'set -eo pipefail; source "$1"; submit_training local --use-chunkflow', "test", str(common)],
         env=env,
         check=True,
         capture_output=True,
@@ -149,3 +152,191 @@ def test_submission_forwards_model_settings_to_workers(tmp_path):
         "QWEN38_PLE_CPU_OFFLOAD",
     ):
         assert runtime["env_vars"][key] == env[key]
+
+
+@pytest.fixture
+def launch_recipe(tmp_path):
+    """Run real shell entrypoints with isolated, recording process/GPU/Ray
+    commands.
+
+    This covers accidental local cleanup, duplicate multi-node submission and
+    wrong Jobs addresses in seconds on CPU, without a Ray or GPU dependency.
+    """
+    for directory in ("examples/chunkflow/scripts", "scripts/models", "scripts/entrypoint"):
+        shutil.copytree(ROOT / directory, tmp_path / directory, ignore=shutil.ignore_patterns("log"))
+    setup = tmp_path / "examples/chunkflow/setup.py"
+    setup.write_text(
+        "import os, sys\nassert sys.argv[-1] == '--check'\nsys.exit(int(os.getenv('TEST_SETUP_FAIL', '0')))\n"
+    )
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    for name in ("python", "python3"):
+        (binary / name).symlink_to(sys.executable)
+    command = binary / "record-command"
+    command.write_text(
+        f"#!{sys.executable}\n"
+        """import json, os, sys
+from pathlib import Path
+
+name, args = Path(sys.argv[0]).name, sys.argv[1:]
+with open(os.environ['TEST_COMMANDS'], 'a') as stream:
+    stream.write(json.dumps([name, *args]) + '\\n')
+if name == 'ray':
+    if args[0] == 'status':
+        print('0.0/32.0 GPU')
+        sys.exit(int(os.getenv('TEST_RAY_UNREACHABLE', '0')))
+    if args[:2] == ['list', 'nodes']:
+        print('[{"is_head_node": true, "node_ip": "192.0.2.1"}]')
+    if args[:2] == ['job', 'submit']:
+        sys.exit(int(os.getenv('TEST_SUBMIT_FAIL', '0')))
+elif name == 'nvidia-smi':
+    print('NV4' if args == ['topo', '-m'] else 'GPU 0')
+elif name == 'jq':
+    json.load(sys.stdin)
+    print('192.0.2.1')
+elif name == 'timeout':
+    # The SPMD worker's TCP readiness probe must never open a real socket.
+    if args[1] != 'bash':
+        os.execvp(args[1], args[1:])
+elif name == 'grep':
+    if args[0] == '-oP':
+        # BSD grep lacks -P; emulate the entrypoint's GPU resource extraction.
+        import re
+        for match in re.findall(args[1], sys.stdin.read()):
+            print(match)
+    else:
+        os.execv('/usr/bin/grep', ['grep', *args])
+"""
+    )
+    command.chmod(0o755)
+    for name in ("ray", "pkill", "sleep", "nvidia-smi", "sysctl", "timeout", "jq", "grep"):
+        (binary / name).symlink_to(command)
+    env = {
+        **os.environ,
+        "PATH": f"{binary}:{os.environ['PATH']}",
+        "RELAX": str(tmp_path),
+        "DRY_RUN": "0",
+        "RELAX_KERNEL_CACHE_DIR": "",
+        "RELAX_SKIP_CLUSTER_CLEANUP": "1",
+        "RAY_NO_WAIT": "",
+        "MODEL_DIR": str(tmp_path / "models with spaces"),
+        "DATA_DIR": str(tmp_path / "data"),
+        "SAVE_DIR": str(tmp_path / "checkpoints"),
+        "TEST_COMMANDS": str(tmp_path / "commands.jsonl"),
+    }
+    for key in (
+        "RELAX_ENTRYPOINT_MODE",
+        "RAY_ADDRESS",
+        "RAY_JOBS_ADDRESS",
+        "MASTER_ADDR",
+        "POD_NAME",
+        "HOST_IP",
+        "WORLD_SIZE",
+        "NUM_GPUS",
+        "CUDA_VISIBLE_DEVICES",
+        "RUNTIME_ENV_JSON",
+        "WORKING_DIR",
+        "_RAY_JOB_RUN_SCRIPT",
+        "_RELAX_KERNEL_CACHE_HELPER_SOURCED",
+    ):
+        env.pop(key, None)
+
+    def run(script, **overrides):
+        result = subprocess.run(
+            ["bash", str(tmp_path / "examples/chunkflow/scripts" / script)],
+            env={**env, **overrides},
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        log = Path(env["TEST_COMMANDS"])
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        submissions = [call[1:] for call in calls if call[:3] == ["ray", "job", "submit"]]
+        return result, calls, submissions
+
+    return run
+
+
+@pytest.mark.parametrize("script", ["run-qwen3-4B-sft-8xgpu.sh", "run-qwen36-35B-A3B-sft-8xgpu.sh"])
+def test_launch_single_node_starts_ray_and_submits_locally(launch_recipe, script):
+    result, calls, submissions = launch_recipe(script)
+    assert result.returncode == 0, result.stderr
+    starts = [call for call in calls if call[:2] == ["ray", "start"]]
+    assert len(starts) == len(submissions) == 1
+    assert "--head" in starts[0] and starts[0][starts[0].index("--num-gpus") + 1] == "8"
+    assert "--address=http://127.0.0.1:8265" in submissions[0]
+    assert "--no-wait" not in submissions[0]
+    assert json.loads(submissions[0][submissions[0].index("--resource") + 1])["actor"] == [1, 8]
+
+
+@pytest.mark.parametrize("script", ["run-qwen3-4B-sft-8xgpu.sh", "run-qwen38-flash-next-sft-32xgpu.sh"])
+def test_launch_existing_cluster_never_restarts_ray(launch_recipe, script):
+    result, calls, submissions = launch_recipe(
+        script,
+        RAY_ADDRESS="192.0.2.1:6379",
+        RAY_JOBS_ADDRESS="http://192.0.2.1:8265",
+    )
+    assert result.returncode == 0, result.stderr
+    assert len(submissions) == 1
+    assert "--address=http://192.0.2.1:8265" in submissions[0]
+    assert not any(call[0] == "pkill" or call[:2] in (["ray", "start"], ["ray", "stop"]) for call in calls)
+
+
+@pytest.mark.parametrize("worker", [False, True])
+def test_launch_multinode_only_head_submits(launch_recipe, worker):
+    result, calls, submissions = launch_recipe(
+        "run-qwen38-flash-next-sft-32xgpu.sh",
+        MASTER_ADDR="test-head",
+        POD_NAME="test-worker" if worker else "test-head",
+        HOST_IP="192.0.2.2" if worker else "192.0.2.1",
+    )
+    assert result.returncode == 0, result.stderr
+    starts = [call for call in calls if call[:2] == ["ray", "start"]]
+    assert len(starts) == 1
+    assert starts[0][starts[0].index("--num-gpus") + 1] == "8"
+    if worker:
+        assert "--address=test-head:6379" in starts[0]
+        assert ["sleep", "inf"] in calls and not submissions
+    else:
+        assert "--head" in starts[0] and len(submissions) == 1
+        assert "--address=http://127.0.0.1:8265" in submissions[0]
+        assert json.loads(submissions[0][submissions[0].index("--resource") + 1])["actor"] == [1, 32]
+        runtime = json.loads(
+            next(arg.split("=", 1)[1] for arg in submissions[0] if arg.startswith("--runtime-env-json="))
+        )
+        assert runtime["env_vars"]["MASTER_ADDR"] == "192.0.2.1"
+        assert runtime["env_vars"]["MCORE_QSA_SPARSE_BACKEND"] == "flex"
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({}, "MASTER_ADDR"),
+        ({"MASTER_ADDR": "head", "POD_NAME": "head", "HOST_IP": "192.0.2.1", "WORLD_SIZE": "2"}, "= 32"),
+        ({"MASTER_ADDR": "head", "POD_NAME": "head", "HOST_IP": "192.0.2.1", "NUM_GPUS": "zero"}, "= 32"),
+        ({"RAY_ADDRESS": "192.0.2.1:6379"}, "RAY_JOBS_ADDRESS"),
+        (
+            {
+                "RAY_ADDRESS": "192.0.2.1:6379",
+                "RAY_JOBS_ADDRESS": "http://192.0.2.1:8265",
+                "TEST_RAY_UNREACHABLE": "1",
+            },
+            "Cannot reach",
+        ),
+    ],
+)
+def test_launch_invalid_cluster_fails_before_cleanup(launch_recipe, overrides, error):
+    result, calls, submissions = launch_recipe("run-qwen38-flash-next-sft-32xgpu.sh", **overrides)
+    assert result.returncode != 0 and error in result.stderr
+    assert not submissions
+    assert not any(call[0] == "pkill" or call[:2] in (["ray", "start"], ["ray", "stop"]) for call in calls)
+
+
+def test_launch_missing_patch_fails_before_starting_ray(launch_recipe):
+    result, calls, submissions = launch_recipe("run-qwen3-4B-sft-8xgpu.sh", TEST_SETUP_FAIL="1")
+    assert result.returncode != 0 and not calls and not submissions
+
+
+def test_launch_submission_failure_is_not_hidden_by_tee(launch_recipe):
+    result, _, submissions = launch_recipe("run-qwen3-4B-sft-8xgpu.sh", TEST_SUBMIT_FAIL="7")
+    assert result.returncode == 7 and len(submissions) == 1

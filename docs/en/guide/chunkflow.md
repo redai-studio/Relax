@@ -30,12 +30,14 @@ Set `MODEL_DIR`, `DATA_DIR`, and `SAVE_DIR` first. Model directories are `${MODE
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 
-# Set RAY_ADDRESS and RAY_JOBS_ADDRESS for an existing cluster, then choose one model.
-bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
-bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+# Choose one model on a dedicated eight-GPU node; Ray starts automatically.
+bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
+bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-`RAY_JOBS_ADDRESS` is the cluster's Jobs HTTP URL. Submission blocks by default; set `RAY_NO_WAIT=1` for nonblocking submission. Scripts upload the repository working directory by default so both driver and workers can import the example. A custom `WORKING_DIR` must also contain patched Relax and the complete example.
+The scripts check the integration patch before using `scripts/entrypoint/local.sh` to start Ray and submit to the local Jobs service. This standard entrypoint clears local Python, SGLang, and Ray processes; use a dedicated training node. No manual `ray start` is needed.
+
+For an existing cluster, set `RAY_ADDRESS` to its GCS address and `RAY_JOBS_ADDRESS` to its Jobs HTTP URL, then run the same recipe. It uses the standard `ray-job.sh` environment and cleanup; an unreachable cluster fails without restarting Ray locally. An external entrypoint that already set `RELAX_ENTRYPOINT_MODE` is reused. Submission blocks by default; set `RAY_NO_WAIT=1` for nonblocking submission. Scripts upload the repository working directory by default so both driver and workers can import the example. A custom `WORKING_DIR` must also contain patched Relax and the complete example.
 
 Script defaults are `SEQ_LENGTH=8192`, `CHUNK_SIZE=2048`, `KEEP_LAST_K=1`, `NUM_STEPS=100`, and `SAVE_INTERVAL=10`; override them with the corresponding environment variables. Save and resume use the stable `${SAVE_DIR}/${EXP_NAME}` directory and retain two training checkpoints. Keep both values unchanged to resume. Timestamps appear only in ClearML task names and logs under `examples/chunkflow/scripts/log/`. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`; each model has a distinct, overridable `EXP_NAME`.
 
@@ -47,9 +49,13 @@ The experimental 32-GPU recipe uses `${MODEL_DIR}/Qwen3.8-Flash-Next`, the same 
 
 ```bash
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
-# Submit after setting the directories and existing cluster addresses.
-bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+# Run on every node after setting the directories and node variables below.
+bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 ```
+
+For a new cluster, the recipe defaults to `WORLD_SIZE=4` nodes and `NUM_GPUS=8` per node; their product must be 32. Set `MASTER_ADDR` on every node to the head node's resolvable **`POD_NAME`**, set `POD_NAME` to the current node's hostname, and set `HOST_IP` to its reachable IP. The standard `spmd-multinode.sh` entrypoint identifies the head by the exact equality `MASTER_ADDR == POD_NAME`, starts Ray on each node, and submits once from the head after all nodes join. Workers remain running; starting only the head leaves it waiting for workers. Use dedicated nodes: this entrypoint clears local processes and requires permission to set reserved network ports with `sysctl`.
+
+For an existing 32-GPU cluster, set `RAY_ADDRESS` and `RAY_JOBS_ADDRESS` and run the same recipe only on the submitter. No node variables or cluster startup are needed in this mode. Preview mode initializes neither kind of cluster.
 
 `configs/qwen38.yaml` disables GDN preprocessing fusion and QSA Stage-2 indexer loss. The script selects native `flex` attention and disables the Qwen3.8 fused/community selector overrides, local-query/replay patches, and streamed PLE. `_common.sh` forwards these model environment settings to Ray workers. Use the same settings when running an unchunked reference.
 

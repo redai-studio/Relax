@@ -44,16 +44,18 @@ DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-将 `RAY_ADDRESS` 和 `RAY_JOBS_ADDRESS` 分别设为现有集群的 GCS 地址和 Jobs HTTP 地址，再选择一个脚本：
+在独占的八卡节点上，选择一个脚本直接执行：
 
 ```bash
-bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
-bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
+bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-现有 Ray 入口会清理集群训练状态，请用于预期的独占训练集群。默认阻塞等待，设置 `RAY_NO_WAIT=1` 可非阻塞提交。脚本默认上传仓库工作目录，包含本示例与已经应用的补丁。
+脚本先检查接入补丁，再复用 `scripts/entrypoint/local.sh` 启动 Ray 并向本机 Jobs 服务提交，无需手动执行 `ray start`。这个标准入口会清理本机 Python、SGLang 和 Ray 进程，请用于独占训练节点。
 
-可用环境变量覆盖 `CHUNK_SIZE`（2048）、`KEEP_LAST_K`（1）、`SEQ_LENGTH`（8192）、`NUM_STEPS`（100）或 `SAVE_INTERVAL`（10）。`KEEP_LAST_K=0` 保留全部块的激活计算图。每个脚本直接列出模型和训练参数，`_common.sh` 只处理提交。
+复用现有集群时，先将 `RAY_ADDRESS` 设为 GCS 地址、`RAY_JOBS_ADDRESS` 设为 Jobs HTTP 地址，再执行相同命令。脚本会使用标准 `ray-job.sh` 的环境和清理流程；集群连接失败会报错退出，不会回退重启本机。外部入口已经设置 `RELAX_ENTRYPOINT_MODE` 时直接复用。默认阻塞等待，设置 `RAY_NO_WAIT=1` 可非阻塞提交。脚本默认上传仓库工作目录，包含本示例与已经应用的补丁。
+
+可用环境变量覆盖 `CHUNK_SIZE`（2048）、`KEEP_LAST_K`（1）、`SEQ_LENGTH`（8192）、`NUM_STEPS`（100）或 `SAVE_INTERVAL`（10）。`KEEP_LAST_K=0` 保留全部块的激活计算图。每个脚本直接列出模型和训练参数，`_common.sh` 负责选择标准入口和提交任务。
 
 三个脚本都支持用 `PROMPT_DATA` 覆盖默认的 `${DATA_DIR}/train.jsonl`。使用包含 `messages` 列的 LongAlign 时，设置 `PROMPT_DATA="${DATA_DIR}/LongAlign-10k/long.jsonl"`，并按分词后的对话长度选择 `SEQ_LENGTH`，例如 `65536`。超过上限的样本会被跳过；数据集记录的长度可能与模型 tokenizer 的统计不同。
 
@@ -65,9 +67,13 @@ bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen36-35B-A3B
 
 ```bash
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
-# 设置目录和现有集群地址后提交。
-bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+# 设置目录和下述节点变量后，在每个节点执行。
+bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 ```
+
+新集群默认 `WORLD_SIZE=4` 个节点、每节点 `NUM_GPUS=8` 张卡，两者乘积必须为 32。所有节点的 `MASTER_ADDR` 都填写主节点可解析的 **`POD_NAME`**，各自的 `POD_NAME` 填本节点名称，`HOST_IP` 填本节点可通信的 IP。标准 `spmd-multinode.sh` 入口通过 `MASTER_ADDR == POD_NAME` 的严格相等判断主节点，自动启动各节点的 Ray，等全部节点加入后仅由主节点提交一次训练。worker 持续运行；只启动主节点会一直等待其他节点。请使用独占节点：该入口会清理本机进程，并要求有权限通过 `sysctl` 设置预留网络端口。
+
+已有 32 卡集群时，设置 `RAY_ADDRESS` 和 `RAY_JOBS_ADDRESS`，只在提交节点执行同一脚本；此模式不要求节点变量，也不重新组建集群。预览模式不会初始化任何集群。
 
 `configs/qwen38.yaml` 关闭 GDN 预处理融合和 QSA Stage-2 indexer 辅助损失。脚本使用原生 `flex` attention，关闭 Qwen3.8 的融合/社区 selector 覆盖、local-query/replay 补丁及 streamed PLE。`_common.sh` 将这些模型环境变量传给 Ray worker。运行不切块对照时也应保留相同设置。
 

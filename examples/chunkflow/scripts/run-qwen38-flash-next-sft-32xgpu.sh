@@ -1,7 +1,9 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # QSA + GDN + PLE, experimental native-prefix text-only SFT. DATA_DIR/train.jsonl contains a messages column.
-# Usage: bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+# Usage on each node: bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+# New cluster: MASTER_ADDR (head POD_NAME), POD_NAME, HOST_IP; defaults to 4 nodes x 8 GPUs.
+# Existing cluster: RAY_ADDRESS and RAY_JOBS_ADDRESS; run on the submitter only.
 # Preview without Ray or GPUs: DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 
 set -eo pipefail
@@ -109,7 +111,21 @@ TRACKING_ARGS=(
     --tb-experiment-name "${EXP_NAME}-${now}"
 )
 
-submit_training \
+# Validate a fresh cluster before the standard entrypoint cleans up processes.
+if [ "${DRY_RUN:-0}" != 1 ] && [ -z "${RELAX_ENTRYPOINT_MODE:-}${RAY_ADDRESS:-}${RAY_JOBS_ADDRESS:-}" ]; then
+    : "${MASTER_ADDR:?Set MASTER_ADDR to the head node POD_NAME}"
+    : "${POD_NAME:?Set POD_NAME to the current node hostname}"
+    : "${HOST_IP:?Set HOST_IP to the current node reachable IP}"
+    export WORLD_SIZE="${WORLD_SIZE:-4}"
+    export NUM_GPUS="${NUM_GPUS:-8}"
+    if ! [[ "$WORLD_SIZE" =~ ^[1-9][0-9]*$ && "$NUM_GPUS" =~ ^[1-9][0-9]*$ ]] ||
+        (( WORLD_SIZE * NUM_GPUS != 32 )); then
+        echo "This recipe requires WORLD_SIZE (nodes) * NUM_GPUS (per node) = 32." >&2
+        exit 1
+    fi
+fi
+
+submit_training spmd-multinode \
     --resource '{"sft": [1, 0], "actor": [1, 32]}' \
     --colocate \
     --num-data-storage-units 1 \

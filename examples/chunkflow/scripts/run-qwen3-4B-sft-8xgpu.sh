@@ -1,7 +1,7 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Dense, text-only SFT. DATA_DIR/train.jsonl contains a messages column.
-# Usage: bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
+# Usage: bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 # Preview without Ray or GPUs: DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 
 set -eo pipefail
@@ -83,7 +83,7 @@ TRACKING_ARGS=(
     --tb-experiment-name "${EXP_NAME}-${now}"
 )
 
-submit_training \
+submit_training local \
     --resource '{"sft": [1, 0], "actor": [1, 8]}' \
     --colocate \
     --num-data-storage-units 1 \

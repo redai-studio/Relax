@@ -44,16 +44,18 @@ DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-Set `RAY_ADDRESS` and `RAY_JOBS_ADDRESS` to your existing cluster's GCS and Jobs HTTP addresses. Choose one recipe:
+On a dedicated eight-GPU node, choose one recipe and run it directly:
 
 ```bash
-bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
-bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
+bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-The existing Ray entrypoint performs cluster cleanup; use it with the intended dedicated training cluster. Submission blocks unless `RAY_NO_WAIT=1` is set. The repository is uploaded as the working directory by default, including this example and the applied patch.
+The scripts check the integration patch, then reuse `scripts/entrypoint/local.sh` to start Ray and submit to the local Jobs service. No manual `ray start` is needed. This standard entrypoint clears local Python, SGLang, and Ray processes, so use a dedicated training node.
 
-Override `CHUNK_SIZE` (2048), `KEEP_LAST_K` (1), `SEQ_LENGTH` (8192), `NUM_STEPS` (100), or `SAVE_INTERVAL` (10) through environment variables. `KEEP_LAST_K=0` retains every chunk's activation graph. Model and training options are visible in each recipe; `_common.sh` only handles submission.
+To use an existing cluster, set `RAY_ADDRESS` to its GCS address and `RAY_JOBS_ADDRESS` to its Jobs HTTP URL before running the same command. The script uses the standard `ray-job.sh` environment and cleanup; an unreachable cluster causes an error rather than a local restart. An external entrypoint that already set `RELAX_ENTRYPOINT_MODE` is reused. Submission blocks unless `RAY_NO_WAIT=1` is set. The repository is uploaded as the working directory by default, including this example and the applied patch.
+
+Override `CHUNK_SIZE` (2048), `KEEP_LAST_K` (1), `SEQ_LENGTH` (8192), `NUM_STEPS` (100), or `SAVE_INTERVAL` (10) through environment variables. `KEEP_LAST_K=0` retains every chunk's activation graph. Model and training options are visible in each recipe; `_common.sh` handles standard entrypoint selection and submission.
 
 All three recipes accept `PROMPT_DATA` to override `${DATA_DIR}/train.jsonl`. For LongAlign with a `messages` column, set `PROMPT_DATA="${DATA_DIR}/LongAlign-10k/long.jsonl"` and choose `SEQ_LENGTH` for the tokenized conversations, for example `65536`. Samples exceeding that limit are skipped; the dataset's stored length may differ from the model tokenizer's count.
 
@@ -65,9 +67,13 @@ The experimental 32-GPU recipe uses `${MODEL_DIR}/Qwen3.8-Flash-Next`, the same 
 
 ```bash
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
-# Submit after setting the directories and existing cluster addresses.
-bash scripts/entrypoint/ray-job.sh examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+# Run on every node after setting the directories and node variables below.
+bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 ```
+
+For a new cluster, the recipe defaults to `WORLD_SIZE=4` nodes and `NUM_GPUS=8` per node; their product must be 32. Set `MASTER_ADDR` on every node to the head node's resolvable **`POD_NAME`**, set `POD_NAME` to the current node's hostname, and set `HOST_IP` to its reachable IP. The standard `spmd-multinode.sh` entrypoint identifies the head by the exact equality `MASTER_ADDR == POD_NAME`, starts Ray on each node, and submits once from the head after all nodes join. Workers remain running; starting only the head leaves it waiting for workers. Use dedicated nodes: this entrypoint clears local processes and requires permission to set reserved network ports with `sysctl`.
+
+For an existing 32-GPU cluster, set `RAY_ADDRESS` and `RAY_JOBS_ADDRESS` and run the same recipe only on the submitter. No node variables or cluster startup are needed in this mode. Preview mode initializes neither kind of cluster.
 
 `configs/qwen38.yaml` disables GDN preprocessing fusion and QSA Stage-2 indexer loss. The script selects native `flex` attention and disables the Qwen3.8 fused/community selector overrides, local-query/replay patches, and streamed PLE. `_common.sh` forwards these model environment settings to Ray workers. Use the same settings when running an unchunked reference.
 
