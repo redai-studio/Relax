@@ -32,7 +32,7 @@ python examples/chunkflow/setup.py --check
 {"messages": [{"role": "user", "content": "What is 1 + 1?"}, {"role": "assistant", "content": "2"}]}
 ```
 
-使用较长对话才能覆盖多个 chunk。两个脚本均为八卡纯文本 SFT，采用 TP2/PP1/CP1、零 dropout 和 ChunkFlow 激活重计算。MoE 脚本采用 EP8/ETP1、原生 all-to-all 分发，关闭路由辅助损失与 GDN 预处理融合，并使用 CPU optimizer offload。
+使用较长对话才能覆盖多个 chunk。两个脚本均为八卡纯文本 SFT，采用零 dropout 和 ChunkFlow 激活重计算。Dense 脚本使用 TP2/PP1/CP1；MoE 脚本使用 TP2/PP4/CP1、EP2/ETP1、原生 all-to-all 分发，关闭路由辅助损失与 GDN 预处理融合，并使用 CPU optimizer offload。MoE 脚本设置 `--chunkflow-pipeline 4`，并向 worker 传递 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`，启用实验性的流水线执行器。
 
 ChunkFlow 要求启用 `--calculate-per-token-loss`，使归一化不受切块边界影响。它会拒绝同时启用 `--fully-async` 和 `--use-dynamic-batch-size`，因为固定执行计划无法消费数量未知的流式 micro-batch。示例脚本已经使用 per-token loss 和同步训练。
 

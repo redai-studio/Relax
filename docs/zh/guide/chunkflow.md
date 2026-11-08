@@ -21,7 +21,7 @@ python examples/chunkflow/setup.py --check
 
 ## Dense 与 MoE 示例
 
-两个示例都使用 8 张 GPU 进行纯文本 SFT，默认 TP=2、PP=1、CP=1。Qwen3-4B 使用 EP=1，Qwen3.6-35B-A3B 使用 EP=8、ETP=1，并包含 GDN 状态适配。
+两个示例都使用 8 张 GPU 进行纯文本 SFT，默认 TP=2、CP=1。Qwen3-4B 使用 PP=1、EP=1；Qwen3.6-35B-A3B 使用 PP=4、EP=2、ETP=1，并包含 GDN 状态适配。MoE 脚本设置 `--chunkflow-pipeline 4`，并向 worker 传递 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`，启用实验性的流水线执行器。
 
 先提供训练节点可访问的 `MODEL_DIR` 和 `DATA_DIR`：模型分别位于 `${MODEL_DIR}/Qwen3-4B` 或 `${MODEL_DIR}/Qwen3.6-35B-A3B`；数据为 `${DATA_DIR}/train.jsonl`，每行包含 `messages` 对话列表。数据格式参见 [SFT 训练](./sft-training.md)。
 

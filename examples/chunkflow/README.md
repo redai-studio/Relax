@@ -32,7 +32,7 @@ For example, one data row is:
 {"messages": [{"role": "user", "content": "What is 1 + 1?"}, {"role": "assistant", "content": "2"}]}
 ```
 
-Use longer conversations to exercise multiple chunks. Both recipes are text-only SFT with eight GPUs, TP2/PP1/CP1, zero dropout, and ChunkFlow activation recomputation. The MoE recipe uses EP8/ETP1, native all-to-all dispatch, no router auxiliary loss, and unfused GDN preprocessing. It also uses CPU optimizer offload.
+Use longer conversations to exercise multiple chunks. Both recipes are text-only SFT with eight GPUs, zero dropout, and ChunkFlow activation recomputation. The Dense recipe uses TP2/PP1/CP1. The MoE recipe uses TP2/PP4/CP1, EP2/ETP1, native all-to-all dispatch, no router auxiliary loss, and unfused GDN preprocessing. It also uses CPU optimizer offload. The MoE script sets `--chunkflow-pipeline 4` and forwards `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1` to enable the experimental pipeline executor.
 
 ChunkFlow requires `--calculate-per-token-loss` to keep normalization independent of chunk boundaries. It rejects `--fully-async` combined with `--use-dynamic-batch-size`, because its fixed execution plan cannot consume an unknown number of streaming micro-batches. The supplied recipes use per-token loss and synchronous training.
 

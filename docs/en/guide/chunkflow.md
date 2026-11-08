@@ -21,7 +21,7 @@ Use `python examples/chunkflow/setup.py --reverse` to remove the integration pat
 
 ## Dense and MoE examples
 
-Both examples run text-only SFT on eight GPUs with TP=2, PP=1, and CP=1. Qwen3-4B uses EP=1; Qwen3.6-35B-A3B uses EP=8 and ETP=1, including GDN state adaptation.
+Both examples run text-only SFT on eight GPUs with TP=2 and CP=1. Qwen3-4B uses PP=1 and EP=1; Qwen3.6-35B-A3B uses PP=4, EP=2, and ETP=1, including GDN state adaptation. The MoE script sets `--chunkflow-pipeline 4` and forwards `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1` to enable the experimental pipeline executor.
 
 Set `MODEL_DIR` and `DATA_DIR` to paths accessible to the training nodes. Model directories are `${MODEL_DIR}/Qwen3-4B` and `${MODEL_DIR}/Qwen3.6-35B-A3B`. Data is `${DATA_DIR}/train.jsonl`, with a `messages` conversation list in each row; see [SFT Training](./sft-training.md).
 
