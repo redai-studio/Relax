@@ -2802,6 +2802,13 @@ class MegatronTrainRayActor(TrainRayActor):
             "sample_index_mask_sums",
             "group_index",
         ]
+        from relax.utils import weight_version_audit
+
+        if (
+            weight_version_audit.enabled()
+            and getattr(self.args, "custom_convert_samples_to_train_data_path", None) is None
+        ):
+            data_fields.append(weight_version_audit.AUDIT_FIELD)
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
         if self.args.advantage_estimator == "score_centering":

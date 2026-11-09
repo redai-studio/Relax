@@ -36,7 +36,7 @@ from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
-from relax.utils import tracking_utils
+from relax.utils import tracking_utils, weight_version_audit
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.device import device_module
 from relax.utils.env import Envs
@@ -69,6 +69,7 @@ from .checkpoint import (
     save_checkpoint,
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
+from .cp_utils import get_logits_and_tokens_offset_with_cp
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
@@ -79,6 +80,65 @@ from .model_provider import (
 
 
 logger = get_logger(__name__)
+
+
+def _weight_audit_counts(args: Namespace, batch: dict[str, Any]) -> torch.Tensor | None:
+    """Pack each row's total, span counts and unconfirmed MTP count, then
+    reduce CP owners."""
+    masks = batch.get("weight_audit_loss_masks")
+    if masks is None:
+        return None
+    cp_size = batch.get("dynamic_cp_size", mpu.get_context_parallel_world_size())
+    cp_rank = batch.get("dynamic_cp_rank", mpu.get_context_parallel_rank())
+    counts = []
+    for i, (row, mask, total, response, unconfirmed) in enumerate(
+        zip(
+            batch[weight_version_audit.PREPARED_FIELD],
+            masks,
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["weight_audit_unconfirmed"],
+            strict=True,
+        )
+    ):
+        prompt = total - response
+        start = max(prompt, 1)
+        owners = [(start, total)]
+        if cp_size > 1:
+            _, _, _, owners = get_logits_and_tokens_offset_with_cp(
+                total,
+                response,
+                args.qkv_format,
+                batch["max_seq_lens"][i] if batch.get("max_seq_lens") is not None else None,
+                batch["padded_total_lengths"][i] if batch.get("padded_total_lengths") is not None else None,
+                dynamic_cp_size=cp_size,
+                dynamic_cp_rank=cp_rank,
+            )
+        owned_masks = []
+        offset = 0
+        for owner_lo, owner_hi in owners:
+            if owner_lo < owner_hi:
+                length = owner_hi - owner_lo
+                owned_masks.append((owner_lo, owner_hi, mask[offset : offset + length]))
+                offset += length
+        counts.append(mask.sum(dtype=torch.int64))
+        for span in row["spans"]:
+            count = torch.zeros((), dtype=torch.int64, device=mask.device)
+            for owner_lo, owner_hi, valid in owned_masks:
+                left, right = max(span["token_start"], owner_lo), min(span["token_end"], owner_hi)
+                if left < right:
+                    count = count + valid[left - owner_lo : right - owner_lo].sum(dtype=torch.int64)
+            counts.append(count)
+        counts.append(unconfirmed)
+    result = torch.stack(counts)
+    if cp_size > 1:
+        group = (
+            mpu.get_dynamic_data_context_parallel_groups(group_size=cp_size)
+            if "dynamic_cp_size" in batch
+            else mpu.get_context_parallel_group()
+        )
+        torch.distributed.all_reduce(result, op=torch.distributed.ReduceOp.SUM, group=group)
+    return result
 
 
 def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None:
@@ -1289,6 +1349,12 @@ def train_one_step(
 
     main_loss_has_tokens = False
     packing_metrics = PackingMetrics()
+    audit_step = (
+        weight_version_audit.AuditStep(f"rollout-{rollout_id}/step-{step_id}")
+        if weight_version_audit.enabled() and getattr(model[0], "role", "actor") == "actor"
+        else None
+    )
+    audit_ordinals = itertools.count()
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -1339,6 +1405,7 @@ def train_one_step(
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
+                    *([weight_version_audit.PREPARED_FIELD] if audit_step is not None else []),
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1346,6 +1413,7 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
+        audit_ordinal = next(audit_ordinals)
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
@@ -1485,7 +1553,32 @@ def train_one_step(
             # Megatron invokes the loss callback only on the final physical and
             # virtual pipeline stage, so VPP chunks count each microbatch once.
             packing_metrics.add(batch, mpu.get_context_parallel_world_size())
-            return loss_callback(logits)
+            result = loss_callback(logits)
+            if audit_step is None:
+                return result
+            cp_rank = batch.get("dynamic_cp_rank", mpu.get_context_parallel_rank())
+            if mpu.get_tensor_model_parallel_rank() != 0:
+                return result
+            try:
+                counts = _weight_audit_counts(args, batch)
+                if cp_rank != 0:
+                    return result
+                audit_step.observe(
+                    audit_ordinal,
+                    batch.get(weight_version_audit.PREPARED_FIELD),
+                    dummy=batch.get("__is_dummy__", False),
+                    counts=counts,
+                )
+            except Exception:
+                logger.exception("Weight audit failed; actor loss remains unchanged")
+                if cp_rank == 0:
+                    audit_step.observe(
+                        audit_ordinal,
+                        batch.get(weight_version_audit.PREPARED_FIELD),
+                        dummy=batch.get("__is_dummy__", False),
+                        error="loss_observation_failed",
+                    )
+            return result
 
         return output_tensor, loss_callback_with_packing_metrics
 
@@ -1531,6 +1624,12 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+
+    if audit_step is not None and audit_step.observed:
+        try:
+            audit_step.commit(torch.distributed.get_rank(group=torch.distributed.group.WORLD))
+        except Exception:
+            logger.exception("Unable to write consumed weight audit; actor training continues")
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group

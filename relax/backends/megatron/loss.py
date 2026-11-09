@@ -16,6 +16,7 @@ from relax.algorithms.advantages import compute_advantages_and_returns as comput
 from relax.algorithms.policy import compute_policy_loss_for
 from relax.algorithms.spec import ALGORITHM_SPECS
 from relax.engine.sft.runtime import is_sft_mode
+from relax.utils import weight_version_audit
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.env import Envs
 from relax.utils.misc import load_function
@@ -46,6 +47,7 @@ from relax.utils.training.preference_utils import (
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
+    _slice_loss_mask_with_cp,
     all_gather_with_cp,
     get_cp_local_num_tokens,
     get_logits_and_tokens_offset_with_cp,
@@ -891,6 +893,7 @@ def vanilla_tis_function(
     mismatch_k3_kl = tis - log_ratio - 1
     mismatch_kl = -log_ratio
     metrics = {
+        "_weight_audit_weights": tis_weights.detach(),
         "tis": tis.clone().detach(),
         "tis_clipfrac": tis_clipfrac.clone().detach(),
         "tis_abs": tis_abs.clone().detach(),
@@ -923,6 +926,7 @@ def icepop_function(
     mismatch_k3_kl = ice_ratio - log_ratio - 1
     mismatch_kl = -log_ratio
     metrics = {
+        "_weight_audit_weights": ice_weight.detach(),
         "tis": ice_ratio.clone().detach(),
         "tis_clipfrac": ice_clipfrac.clone().detach(),
         "tis_abs": ice_abs.clone().detach(),
@@ -951,6 +955,75 @@ def _get_reinforce_plus_plus_mask_safe_reducer(
         return reducer(safe_values)
 
     return reduce_valid_tokens
+
+
+def _weight_audit_masks(
+    args: Namespace,
+    batch: RolloutBatch,
+    reducer_masks: list[torch.Tensor],
+    policy_mask: torch.Tensor | None,
+    opd_mask: torch.Tensor | None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Union actual loss targets in CP-local order; retain unconfirmed MTP
+    counts."""
+    cp_size = batch.get("dynamic_cp_size", mpu.get_context_parallel_world_size())
+
+    def local_masks(masks: list[torch.Tensor]) -> list[torch.Tensor]:
+        result = []
+        for i, (mask, total, response) in enumerate(
+            zip(masks, batch["total_lengths"], batch["response_lengths"], strict=True)
+        ):
+            if cp_size > 1:
+                mask = _slice_loss_mask_with_cp(
+                    mask,
+                    total,
+                    response,
+                    args.qkv_format,
+                    batch["max_seq_lens"][i] if batch.get("max_seq_lens") is not None else None,
+                    batch["padded_total_lengths"][i] if batch.get("padded_total_lengths") is not None else None,
+                    cp_size,
+                    batch.get("dynamic_cp_rank"),
+                )
+            else:
+                mask = mask[: total - max(total - response, 1)]
+            result.append(mask.detach() != 0)
+        return result
+
+    original = local_masks(batch["loss_masks"])
+    reduced = original if reducer_masks is batch["loss_masks"] else local_masks(reducer_masks)
+    coverage = torch.cat(reduced)
+    if policy_mask is not None:
+        coverage = coverage & policy_mask
+    if opd_mask is not None:
+        coverage = coverage | (torch.cat(original) & opd_mask)
+    lengths = [mask.numel() for mask in original]
+    masks = list(coverage.split(lengths))
+    unconfirmed = [torch.zeros((), dtype=torch.int64, device=mask.device) for mask in masks]
+    if (
+        getattr(args, "enable_mtp_training", False)
+        and getattr(args, "mtp_num_layers", 0) > 0
+        and getattr(args, "mtp_loss_scaling_factor", 0) != 0
+    ):
+        # The first MTP head covers targets j>=2; deeper heads cover subsets.
+        candidates = local_masks(
+            [
+                (mask != 0) & (torch.arange(mask.numel(), device=mask.device) + max(total - response, 1) >= 2)
+                for mask, total, response in zip(
+                    batch["loss_masks"],
+                    batch["total_lengths"],
+                    batch["response_lengths"],
+                    strict=True,
+                )
+            ]
+        )
+        if getattr(args, "is_vl_model", False) or batch.get("multimodal_train_inputs") is not None:
+            # The bridge's internal MTP mask can only remove these candidates.
+            unconfirmed = [
+                (candidate & ~mask).sum(dtype=torch.int64) for candidate, mask in zip(candidates, masks, strict=True)
+            ]
+        else:
+            masks = [mask | candidate for mask, candidate in zip(masks, candidates, strict=True)]
+    return masks, unconfirmed
 
 
 def policy_loss_function(
@@ -1135,6 +1208,9 @@ def policy_loss_function(
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
 
+    audit_reducer_masks = batch["loss_masks"]
+    audit_tis_weights = None
+
     # Apply off-policy correction using importance sampling if enabled
     if not is_score_centering and (args.get_mismatch_metrics or args.use_tis):
         # NOTE:
@@ -1171,6 +1247,8 @@ def policy_loss_function(
         else:
             tis_func = vanilla_tis_function
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
+        audit_reducer_masks = modified_response_masks
+        audit_tis_weights = tis_metrics.pop("_weight_audit_weights", None)
 
         # Rebuild with the modified numerator mask while preserving the original
         # logical-sample denominator. The masks are sliced with CP in the reducer.
@@ -1250,6 +1328,18 @@ def policy_loss_function(
     )
     if opd_loss is not None:
         loss = loss + opd_loss
+
+    if weight_version_audit.PREPARED_FIELD in batch:
+        policy_mask = opsm_mask.detach() != 0 if args.use_opsm else None
+        if audit_tis_weights is not None:
+            tis_mask = audit_tis_weights != 0
+            policy_mask = tis_mask if policy_mask is None else policy_mask & tis_mask
+        # Entropy/KL share the reducer mask but are not gated by PG filters.
+        if args.entropy_coef != 0 or (args.use_kl_loss and args.kl_loss_coef != 0):
+            policy_mask = None
+        batch["weight_audit_loss_masks"], batch["weight_audit_unconfirmed"] = _weight_audit_masks(
+            args, batch, audit_reducer_masks, policy_mask, batch.pop("weight_audit_opd_mask", None)
+        )
 
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()

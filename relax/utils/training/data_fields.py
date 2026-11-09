@@ -30,6 +30,10 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "sample_index_mask_sums",
         "group_index",
     ]
+    from relax.utils import weight_version_audit
+
+    if weight_version_audit.enabled() and getattr(args, "custom_convert_samples_to_train_data_path", None) is None:
+        fields.append(weight_version_audit.AUDIT_FIELD)
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")
     if getattr(args, "multimodal_keys", None) is not None:

@@ -674,6 +674,60 @@ Fully async 留存不要求每个 session 都经过同一套 abort/resume 时序
 Program-aware admission 可以根据预测的 KV 使用量延迟 backend attempt。Session lifecycle 可以在 session 结束时
 释放 Session radix-cache entry。参见 [Agentic KV Scheduling](./agentic-kv-scheduling.md)。
 
+## 权重版本审计
+
+Megatron fully-async 训练使用 DCS 同步权重时，可将 `RELAX_WEIGHT_AUDIT_DIR` 设为发布端、Session shard 和训练
+rank 都能访问的共享目录，启用旁路审计。每个训练作业使用独立的新目录；不设置该变量时沿用原训练路径。
+请将变量传入 Ray runtime environment，例如在启动使用的环境 YAML 中配置：
+
+```yaml
+env_vars:
+  RELAX_WEIGHT_AUDIT_DIR: /shared/experiments/my-run/weight-audit
+```
+
+DCS 在所有策略权重 bucket 确认加载成功后分配发布序号。更新失败或仅同步 actor_fwd 时不推进序号；发布者重启后
+使用新的 lineage。发布证据失效后也会更换 lineage，迟到的旧标签不会在恢复发布后重新生效；跨 lineage 的来源保守记为 unknown。
+更新前会终止并排空在途生成，因此受控 SGLang 响应可使用请求绑定的标量版本；后端提供
+`weight_versions` token 区间时优先采用区间证据。未确认的标签、不可用的快照和无法映射的输出区间均保留为 unknown。
+标签确认或发布快照写入失败时，共享快照会被标为失效或删除；若两者均失败，所有训练 rank 一起报错并保持生成暂停，
+避免继续使用旧版本记录。消费批次缺少审计字段时，其有效 loss token 仍计入总数，来源记为 unknown。
+自定义样本转换器可能改变 token 坐标，因此取数时不请求审计 payload；保留转换后 loss mask 的计数，来源记为 unknown，摘要标为不完整。
+
+报告以实际 actor loss 中的 token 为统计对象，排除 prompt、工具观察、未提交的取消输出、零 mask 位置和对齐用的
+dummy microbatch，并保留 Session、轮次、request、attempt 和片段标识。原有采样、reward、GRPO 分组、loss mask
+及梯度权重保持原有语义。审计按各 CP 分片统计 TIS/RS、ICEPOP、OPSM 过滤后仍参与策略损失的 token，并纳入非零系数的
+entropy、KL、OPD 和文本 MTP 辅助损失所覆盖的 token。OPD 中被教师熵门控屏蔽的目标，只有仍被其他损失覆盖时才计入。
+文本 MTP 按各样本的预测目标位置计数，系数为零时不增加覆盖。
+计数在 forward/backward 完成后读取。loss 回调中的审计失败时仅保留已确认的计数，记录 `audit_error=loss_observation_failed`，
+并将该步及累计摘要标为 `aggregate_complete=false`。零有效 token 的样本不计入完成后发布推进的分布；DPO/RM 的成对数据跳过该审计。
+
+多模态 MTP 可能在模型内部使用额外监督 mask。只有存在尚未被其他损失覆盖、且依赖该内部 mask 才能确认的 MTP 候选目标时，
+审计才记录 `audit_error=mtp_target_coverage_unavailable`、`aggregate_complete=false`，并只统计已确认的部分；训练继续执行。
+
+各代表 rank 写入 `<lineage>/consumed-rank-<rank>.jsonl` 和累计 `.summary.json`。每个 rank、每个 lineage 的详细
+报告上限为 8 MiB；`detail_records_dropped` 表示省略的详细记录数，累计摘要仍统计全部已观察到的训练消费。
+可用 `relax.utils.weight_version_audit.aggregate` 合并同一 lineage 的摘要，按分子和分母归并，不直接平均各 rank
+的均值。读取旧摘要或写入失败时，当前进程先保留本步增量，在后续消费提交时重试并与旧统计合并，包括旧 lineage 的摘要；错误状态会保留为
+`aggregate_complete=false`。进程退出前未能写入的内存计数无法恢复。该标志为 false 的摘要不能当作完整统计。
+
+`observed_generation_span` 表示同一训练行中已知来源发布序号的跨度。`token_weighted_age` 使用训练子步开始前的
+发布快照，仅对可比较的已知来源 token 加权，需同时查看 `version_coverage`、`age_coverage` 和
+`missing_token_rate`。年龄单位均为发布次数，不是秒。
+`post_generation_published_advance` 从最后一次成功提交 Session 响应的边界开始计算后续发布推进，包含其后的
+工具处理、打分、组等待和训练排队；它不等于纯队列停留时间，也不以推理服务器最后一个 token 的时间为起点。
+`finish_frontier_gap` 单独呈现该完成边界已经存在的来源滞后。
+
+在仓库根目录运行以下 CPU 示例，可复现工具等待期间的两次更新：
+
+```bash
+python -m examples.weight_version_audit.demo --scenario complete --output /tmp/weight-audit.json
+python -m examples.weight_version_audit.demo --scenario missing --output /tmp/weight-audit-missing.json
+python -m examples.weight_version_audit.demo --scenario lagging --output /tmp/weight-audit-lagging.json
+```
+
+示例执行真实 Session 提交与导出、数值训练字段序列化和 CPU loss，以事件屏障控制工具等待和模拟发布通知，不启动
+Ray 集群或 GPU 训练。
+
 ## 运维与故障排除
 
 ### Metrics 与 Dump
