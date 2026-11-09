@@ -36,7 +36,7 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
 
 TIMESTAMP="$(date '+%Y-%m-%d-%H:%M:%S')"
-PROJECT_NAME="${PROJECT_NAME:-Relax/dev/wulumeng/codex}"
+PROJECT_NAME="${PROJECT_NAME:-Relax/dev/codex}"
 EXP_NAME="${EXP_NAME:-qwen35-35B-A3B-codex-r2e-${TIMESTAMP}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-1000}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"

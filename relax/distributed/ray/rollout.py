@@ -1015,6 +1015,11 @@ class RolloutManager(ReloadableMixin):
             return rank_offset
 
     @property
+    def training_weight_updating(self) -> bool:
+        with self._engine_lifecycle_lock:
+            return self._training_weight_updating
+
+    @property
     def _is_weight_updating(self) -> bool:
         with self._engine_lifecycle_lock:
             return self._training_weight_updating or self._scale_out_weight_updating
