@@ -1949,3 +1949,19 @@ diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_para
          tp_group = expert_tp_group
      # Prefer provided tp_group when available (new explicit path).
      if tp_group is not None:
+diff --git a/megatron/bridge/peft/recompute.py b/megatron/bridge/peft/recompute.py
+--- a/megatron/bridge/peft/recompute.py
++++ b/megatron/bridge/peft/recompute.py
+@@ -101,10 +101,11 @@
+                     @wraps(original_forward)
+                     def patched_forward(hidden_states, *args, _original_forward=original_forward, **kwargs):
+-                        # Ensure hidden_states requires grad so checkpoint backward is called
++                        # Only trainable blocks need a synthetic input gradient for checkpoint backward.
+                         if (
+                             torch.is_tensor(hidden_states)
+                             and not hidden_states.requires_grad
+                             and hidden_states.is_floating_point()
++                            and any(p.requires_grad for p in module.parameters())
+                         ):
+                             hidden_states = hidden_states.detach().requires_grad_(True)
+                         return _original_forward(hidden_states, *args, **kwargs)
