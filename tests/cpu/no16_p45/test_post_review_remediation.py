@@ -9,9 +9,9 @@ from dataclasses import replace
 from types import MethodType, SimpleNamespace
 
 import pytest
-from no16.source import ROOT, load
 
 from relax.utils.data.global_flops_pack_protocol import PackFirstExhausted, checked_fetch
+from tests.cpu.no16.source import ROOT, load
 
 from .support import Meta, SourceContractClient, backend, fetch_through_actor, partition, pull, setup
 

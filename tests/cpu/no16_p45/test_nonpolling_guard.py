@@ -9,10 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
-from no16.harness import EvidenceLog
-from no16.source import ROOT, load
 
 from relax.utils.data import global_flops_pack_protocol as protocol
+from tests.cpu.no16.harness import EvidenceLog
+from tests.cpu.no16.source import ROOT, load
 
 from .support import partition, pull, setup
 

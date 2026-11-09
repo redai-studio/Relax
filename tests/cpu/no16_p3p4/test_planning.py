@@ -6,9 +6,6 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from no16.harness import Partition, evaluate, production_partitioner
-from no16.source import HERE, ROOT, load, samplers
-from no16_p2.test_estimator import tiny_config
 
 from relax.utils.data.flops_scheduling import (
     RowPlacement,
@@ -17,6 +14,9 @@ from relax.utils.data.flops_scheduling import (
     plan_microbatches,
     runtime_context,
 )
+from tests.cpu.no16.harness import Partition, evaluate, production_partitioner
+from tests.cpu.no16.source import HERE, ROOT, load, samplers
+from tests.cpu.no16_p2.test_estimator import tiny_config
 
 from .support import iterator
 
@@ -212,7 +212,7 @@ def test_actual_sft_prepublication_hook_and_cache_resume():
 @pytest.mark.parametrize("mode", ["off", "microbatch", "dp", "both"])
 @pytest.mark.parametrize("objective", ["rl", "sft"])
 def test_actual_controller_mode_routing(mode, objective, tmp_path):
-    from no16.harness import EvidenceLog
+    from tests.cpu.no16.harness import EvidenceLog
 
     refs = samplers()
     adapter = load(

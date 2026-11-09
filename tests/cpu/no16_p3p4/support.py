@@ -6,7 +6,8 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
-from no16.harness import EvidenceLog, production_partitioner
+
+from tests.cpu.no16.harness import EvidenceLog, production_partitioner
 
 
 def iterator(

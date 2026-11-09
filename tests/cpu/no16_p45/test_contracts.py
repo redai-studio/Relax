@@ -10,10 +10,10 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from no16.harness import EvidenceLog
-from no16.source import ROOT, load
 
 from relax.utils.data.global_flops_pack_protocol import STEP_PLANS, checked_schedule, seal_header
+from tests.cpu.no16.harness import EvidenceLog
+from tests.cpu.no16.source import ROOT, load
 
 from .support import partition, pull, restore, setup
 

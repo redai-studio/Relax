@@ -142,9 +142,8 @@ def test_rl_training_task_aliases_have_explicit_scoped_plan(task, tmp_path, monk
 def test_training_task_scope_includes_actual_runtime_names():
     from types import SimpleNamespace
 
-    from no16.source import ROOT, load
-
     from relax.utils.data.global_flops_pack_planner import TRAIN_TASKS
+    from tests.cpu.no16.source import ROOT, load
 
     runtime = load(ROOT / "relax/engine/sft/runtime.py", names={"sft_task_name", "is_offline_mode"})
     for loss_type in ("sft", "policy_loss"):

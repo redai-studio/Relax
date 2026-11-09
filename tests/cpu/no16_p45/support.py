@@ -13,12 +13,12 @@ from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import numpy as np
-from no16.harness import EvidenceLog, Partition, production_partitioner
-from no16.source import ROOT, load, samplers
 
 from relax.utils.data.flops_scheduling import runtime_context
 from relax.utils.data.global_flops_pack_planner import ExecutionContract
 from relax.utils.data.global_flops_pack_protocol import REQUEST_CONTRACT, checkpoint_identity, restore_plan
+from tests.cpu.no16.harness import EvidenceLog, Partition, production_partitioner
+from tests.cpu.no16.source import ROOT, load, samplers
 
 
 # Reuse the exact P2 fixture constructor without importing pytest in the existing Torch environment.

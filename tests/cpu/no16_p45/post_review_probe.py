@@ -13,9 +13,8 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-from no16.source import ROOT, load
-
 from relax.utils.data.global_flops_pack_protocol import PackFirstExhausted, agree_cpu, checked_fetch
+from tests.cpu.no16.source import ROOT, load
 
 
 def worker(rank, world, directory):

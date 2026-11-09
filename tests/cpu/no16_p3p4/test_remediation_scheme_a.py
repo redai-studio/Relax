@@ -7,11 +7,11 @@ import copy
 import json
 
 import pytest
-from no16.harness import Partition
-from no16.source import ROOT, load, samplers
-from no16_p2.test_estimator import tiny_config
 
 from relax.utils.data.flops_scheduling import row_weights, runtime_context
+from tests.cpu.no16.harness import Partition
+from tests.cpu.no16.source import ROOT, load, samplers
+from tests.cpu.no16_p2.test_estimator import tiny_config
 
 from .support import iterator
 from .test_planning import args
