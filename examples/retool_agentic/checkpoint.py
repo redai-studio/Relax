@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Reject incomplete native resumes before Relax can fall back to HF
-weights."""
+"""Check ReTool sampling state before starting or resuming an experiment."""
 
 import argparse
 import json
@@ -26,27 +25,8 @@ def validate_checkpoint(root: Path) -> int | None:
             raise ValueError("Uncheckpointed rollout results exist; choose a new experiment instead of resetting")
         raise ValueError("Nonempty training directory lacks a committed native checkpoint; choose a new experiment")
     step = int(tracker.read_text().strip())
-    checkpoint = root / f"iter_{step:07d}"
-    if step < 0 or not (checkpoint / ".metadata").is_file():
-        raise ValueError("Incomplete native checkpoint; refusing an HF-only restart")
-    from megatron.core.dist_checkpointing import load_common_state_dict
-    from torch.distributed.checkpoint import FileSystemReader
-
-    metadata = FileSystemReader(checkpoint).read_metadata()
-    if not metadata.storage_data:
-        raise ValueError("Native checkpoint has no tensor storage metadata")
-    for item in metadata.storage_data.values():
-        path = checkpoint / item.relative_path
-        if not path.resolve().is_relative_to(checkpoint.resolve()) or not path.is_file():
-            raise ValueError("Native checkpoint tensor storage is missing or outside the checkpoint")
-        if path.stat().st_size < item.offset + item.length:
-            raise ValueError("Native checkpoint tensor storage is truncated")
-    keys = [str(key) for key in metadata.state_dict_metadata]
-    if not any("optimizer" in key for key in keys) or not any("rng_state" in key for key in keys):
-        raise ValueError("Resume requires saved optimizer and RNG state")
-    common = load_common_state_dict(checkpoint)
-    if "opt_param_scheduler" not in common or common.get("iteration") != step:
-        raise ValueError("Resume requires the matching scheduler and native iteration")
+    if step < 0:
+        raise ValueError("ReTool resume requires a non-negative training iteration")
     state_path = root / "dataset" / f"retool_{step}.json"
     if not state_path.is_file():
         raise ValueError("Resume requires the matching ReTool sampling cursor")

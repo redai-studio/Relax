@@ -3,18 +3,17 @@
 
 import asyncio
 import json
+import random
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
 import pytest
-import torch
 
 from examples.retool_agentic.checkpoint import validate_checkpoint
 from examples.retool_agentic.prepare_data import LEAD, TAIL, deduplicate
 from examples.retool_agentic.protocol import PREFIX
 from examples.retool_agentic.reward import score
 from examples.retool_agentic.sandbox import SandboxClient, parse_result
-from examples.retool_agentic.vocab import mask_shard
 
 
 @pytest.mark.parametrize(
@@ -96,21 +95,25 @@ def test_retool_dapo_dedup_and_conflicting_labels():
         deduplicate([a, row(1, "1+1?", "5")])
 
 
-def test_retool_vocab_mask_matches_unsplit_distribution():
-    logits = torch.tensor([[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]])
-    parts = [mask_shard(part, limit=6, rank=rank, world_size=2) for rank, part in enumerate(logits.chunk(2, -1))]
-    assert torch.equal(torch.log_softmax(torch.cat(parts, -1), -1)[:, :6], torch.log_softmax(logits[:, :6], -1))
-    assert torch.equal(torch.softmax(torch.cat(parts, -1), -1)[:, 6:], torch.zeros(1, 2))
-
-
-def test_retool_resume_refuses_nonempty_or_missing_checkpoint(tmp_path):
+def test_retool_resume_requires_matching_sampling_state(tmp_path):
     assert validate_checkpoint(tmp_path) is None
     (tmp_path / "junk").touch()
     with pytest.raises(ValueError, match="Nonempty"):
         validate_checkpoint(tmp_path)
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("24")
-    with pytest.raises(ValueError, match="Incomplete"):
+    with pytest.raises(ValueError, match="sampling cursor"):
         validate_checkpoint(tmp_path)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    state_path = dataset / "retool_24.json"
+    state = dict(cursor=24, rng_state_version=1, rng_state=random.Random(0).getstate())
+    state_path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="matching ReTool cursor"):
+        validate_checkpoint(tmp_path)
+    state["cursor"] = 25
+    state_path.write_text(json.dumps(state))
+    # Native model/optimizer validation belongs to the framework load path.
+    assert validate_checkpoint(tmp_path) == 24
 
 
 def test_retool_resume_accepts_only_initialization_without_rollouts(tmp_path):

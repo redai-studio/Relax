@@ -14,14 +14,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
-from examples.retool_agentic import data_source as source_module
 from examples.retool_agentic.agent import ModelClient, run_episode
 from examples.retool_agentic.data_source import ReToolAgenticDataSource
 from examples.retool_agentic.protocol import CHAT_TEMPLATE, PREFIX, VERSION, observation_text, render_prompt
 from examples.retool_agentic.reward import reward_func
 from examples.retool_agentic.tests.native_reference import run_episode as native_episode
-from relax.agentic.pipeline.runtime import SGLangMessageCompiler, _build_session_specs
+from relax.agentic.pipeline.runtime import SGLangMessageCompiler
 from relax.agentic.runner.ipc import SessionOutput
 from relax.agentic.session.service import AgenticSessionShard, _normalized_chat_request
 from relax.agentic.session.state import SessionForest, check_messages
@@ -304,7 +304,7 @@ def test_agent_process_http_contract_and_prefix(tokenizer, tmp_path):
         thread.join(timeout=5)
 
 
-def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path, monkeypatch):
+def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path):
     model = tmp_path / "model"
     tokenizer.save_pretrained(model)
     data = tmp_path / "train.jsonl"
@@ -314,9 +314,8 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path,
             for i in range(17)
         )
     )
-    monkeypatch.setattr(source_module, "TOKENIZER_LIMIT", len(tokenizer))
-    monkeypatch.setattr(source_module, "MODEL_VOCAB", len(tokenizer) + 3)
     args = SimpleNamespace(
+        policy_vocab_size=len(tokenizer),
         prompt_data=str(data),
         hf_checkpoint=str(model),
         rollout_max_prompt_len=2048,
@@ -337,7 +336,6 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path,
     assert [g[0].metadata["scheduled_question"] for g in groups] == [rng.randrange(17) for _ in range(4)]
     assert [s.index for g in groups for s in g] == list(range(8))
     assert groups[0][0].prompt[0]["role"] == "user"
-    assert len(groups[0][0].sampling_params["logit_bias"]) == 3
     source.save(0)
     args.load = args.save
     restored = ReToolAgenticDataSource(args)
@@ -370,29 +368,6 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path,
 
 def test_model_client_preserves_relax_route_prefix():
     assert ModelClient("http://host/agentic/", "sid").url == "http://host/agentic/v1/chat/completions"
-
-
-def test_session_sampling_keeps_padded_vocab_mask():
-    import cloudpickle
-
-    mask = {str(i): -1e30 for i in range(151665, 152064)}
-    sample = Sample(prompt=[dict(role="user", content="question")], index=7)
-    sample.sampling_params = dict(logit_bias=mask)
-    sample = cloudpickle.loads(cloudpickle.dumps(sample))
-    spec = _build_session_specs([sample], session_ids=["session-7"], include_input_payload=True)[0]
-    shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
-    shard.args = SimpleNamespace(
-        rollout_temperature=1,
-        rollout_top_p=1,
-        rollout_top_k=-1,
-        rollout_max_response_len=8192,
-        rollout_stop=None,
-        rollout_stop_token_ids=None,
-        rollout_skip_special_tokens=False,
-        sglang_enable_deterministic_inference=False,
-    )
-    params = shard._session_sampling_params(spec, 0)
-    assert params["logit_bias"] == mask and params["no_stop_trim"] is True
 
 
 def test_reward_checks_resumed_policy_version():
@@ -477,14 +452,13 @@ def test_tool_tail_budget_preserves_feedback_and_export(
     assert sandbox.closed
 
 
-def test_hybrid_draws_cross_batch_boundary_and_refuse_incomplete_resume(tokenizer, tmp_path, monkeypatch):
+def test_hybrid_draws_cross_batch_boundary_and_refuse_incomplete_resume(tokenizer, tmp_path):
     model = tmp_path / "model"
     tokenizer.save_pretrained(model)
     data = tmp_path / "train.jsonl"
     data.write_text(json.dumps(dict(prompt=[dict(role="user", content=PREFIX + "What is 1+1?")], label="2")))
-    monkeypatch.setattr(source_module, "TOKENIZER_LIMIT", len(tokenizer))
-    monkeypatch.setattr(source_module, "MODEL_VOCAB", len(tokenizer))
     args = SimpleNamespace(
+        policy_vocab_size=len(tokenizer),
         prompt_data=str(data),
         hf_checkpoint=str(model),
         rollout_max_prompt_len=2048,
@@ -581,7 +555,10 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, 
     assert "--use-agentic-rollout" in command
     assert "--custom-generate-function-path" not in command
     assert command[command.index("-m") + 1] == "examples.retool_agentic.train"
-    assert "examples.retool_agentic.vocab.before_train_step" in command
+    assert "--custom-megatron-before-train-step-hook-path" not in command
+    assert "--custom-megatron-before-log-prob-hook-path" not in command
+    config = yaml.safe_load(Path(command[command.index("--custom-config-path") + 1]).read_text())
+    assert config["policy_vocab_size"] == 151665
     assert command[command.index("--agentic-concurrency") + 1] == "16"
     assert command[command.index("--agent-env") + 1] == f"RETOOL_TOKENIZER_PATH={model}/tokenizer.json"
     expected = str(save / f"qwen25-7b-retool-agentic-grpo-8xgpu{suffix}")

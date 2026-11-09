@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from examples.retool_agentic.protocol import PREFIX, VERSION, render_prompt
-from examples.retool_agentic.vocab import MODEL_VOCAB, TOKENIZER_LIMIT
 from relax.engine.rollout.data_source import DataSource
 from relax.utils.types import Sample
 
@@ -51,7 +50,7 @@ class ReToolAgenticDataSource(DataSource):
             self.prompts.append(prompt)
         self.cursor = 0
         self.rng = random.Random(args.rollout_seed)
-        if len(self.tokenizer) != TOKENIZER_LIMIT:
+        if len(self.tokenizer) != (getattr(args, "policy_vocab_size", None) or 151665):
             raise ValueError("This recipe requires the original Qwen2.5 ReTool tokenizer")
         for case, prompt in zip(self.cases, self.prompts, strict=True):
             if render_prompt(case["prompt"]) != prompt:
@@ -97,10 +96,6 @@ class ReToolAgenticDataSource(DataSource):
                     group_index=self.group_cursor,
                     index=index,
                 )
-                # Agentic transports sampling_params to the native /generate
-                # backend. Keep padded model vocabulary out of both rollout
-                # and training, without a custom HTTP request extension.
-                sample.sampling_params = {"logit_bias": {str(i): -1e30 for i in range(TOKENIZER_LIMIT, MODEL_VOCAB)}}
                 group.append(sample)
             groups.append(group)
             self.group_cursor += 1

@@ -2,11 +2,13 @@
 
 使用 Qwen2.5-7B 进行多轮 Python 工具调用与 GRPO 或 Score Centering 训练。模型生成 `<code> ... </code>` 后执行一次隔离的 Python 程序，将真实结果放入 `<interpreter>`，再继续推理。`relax/agentic` 管理每条轨迹的进程、上下文、生成 token/logprob 和训练导出；工具反馈只作为上下文，不参与 loss。
 
-本目录包含 agent、数据准备、判分、词表 hook、sandbox、checkpoint 校验、训练脚本和测试。除 Relax 框架及其标准训练依赖外，不依赖其他 example，可单独加入兼容的 Relax 仓库。目录内不包含模型权重、训练数据或 sandbox 镜像。
+本目录包含 agent、数据准备、判分、sandbox、Retool 恢复状态检查、训练脚本和测试。除 Relax 框架及其标准训练依赖外，不依赖其他 example，可单独加入兼容的 Relax 仓库。目录内不包含模型权重、训练数据或 sandbox 镜像。
 
 ## 环境与模型
 
 需要已安装 Relax 及其 Megatron、SGLang 训练依赖的 Linux 单机 8 卡环境。模型目录应包含完整 HF 权重、config 和 `tokenizer.json`。本例针对 Qwen2.5-7B 的词表和模板；可以使用公开的 Qwen2.5-7B-Instruct，或使用该模型前序 SFT 导出的 HF checkpoint。本例提供 RL 训练，不包含 SFT 训练流程；更换初始权重会影响结果。
+
+Relax 版本需包含原生续训完整性检查（[#598](https://github.com/redai-studio/Relax/pull/598)）和统一策略输出词表支持（[#599](https://github.com/redai-studio/Relax/pull/599)）。这些能力由框架维护，本目录不再提供替代补丁或 monkey patch。
 
 本地工具执行需要以下任一后端：
 
@@ -65,7 +67,7 @@ RAY_ADDRESS=http://ray-head:8265 \
   examples/retool_agentic/scripts/run-qwen25-7B-grpo-8xgpu.sh
 ```
 
-默认 ClearML project 为 `Relax/retool-agentic`，稳定实验名为 `qwen25-7b-retool-agentic-grpo-8xgpu`；分别可用 `PROJECT_NAME` 和 `EXP_NAME` 覆盖。ClearML 使用运行环境已有凭证，每次启动创建带时间戳的新 task。无需 ClearML 时在命令后追加 `--no-use-clearml`。显式设置非空 `RAY_NO_WAIT` 才非阻塞，此时脚本日志只包含提交输出，需用 `ray job logs` 查看训练。
+默认 ClearML project 为 `Relax/retool-agentic`，稳定实验名为 `qwen25-7b-retool-agentic-grpo-8xgpu`；分别可用 `PROJECT_NAME` 和 `EXP_NAME` 覆盖。ClearML 使用运行环境已有凭证，每次启动创建带时间戳的新 task。显式设置非空 `RAY_NO_WAIT` 才非阻塞，此时脚本日志只包含提交输出，需用 `ray job logs` 查看训练。
 
 ### Hybrid 异步：4 卡训练 + 4 卡推理
 
@@ -139,6 +141,8 @@ SANDBOX_IMAGE=/path/to/sandboxfusion.sif \
 
 保持 `SAVE_DIR`、`EXP_NAME`、初始模型配置/tokenizer、数据内容、seed、batch 和每题轨迹数不变，再执行同一脚本，即从最新完整 checkpoint 恢复。迁移训练环境时携带完整实验目录，包括 tracker、native 模型/optimizer 状态和 `dataset/retool_*.json`。单独复制 `hf_*` 只能从权重开始新实验，不能恢复完整训练状态。改变 `SAVE_DIR` 或 `EXP_NAME` 可以新开实验。
 
+原生分片、optimizer、scheduler 和训练 RNG 的完整性由 Relax 续训入口检查。示例的 `checkpoint.py` 只负责实验目录启动条件及匹配的 Retool 抽样游标/RNG 快照；`data_source.py` 负责保存和恢复该自定义状态。
+
 Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batch。同步配方的抽样编号和训练轮次分别计数，checkpoint 同时记录 RNG 与下一抽样编号；权重版本校验使用 Session 的实际生成轮次。兼容补样前格式的同协议 RNG checkpoint。同步脚本不支持额外 oversampling、prelaunch 或异步选项；异步脚本的保存边界见上节。两个变体均不支持动态过滤、单独的 partial rollout、纯 fully async 或 Eval。
 
 ## 默认配置与行为
@@ -155,7 +159,7 @@ Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batc
 | 训练               | Actor TP=2，lr=1e-6，clip=0.2，KL/entropy=0                 |
 | 工具执行           | 32 路并发，每次 30 秒 / 1 GiB                               |
 
-每次模型请求发送完整历史，使用固定模板和 `stream=false`。工具结果原样追加为非空的 `\n<interpreter>\n...\n</interpreter>\n`，继续同一 assistant token 流，不额外插入 ChatML 边界；无需 reasoning/tool-call parser。Session 形成线性上下文并导出一份训练样本。生成 token 的 mask 为 1，实际反馈 token 的 mask 为 0，logprob 来自原生推理后端。词表 hook 和 sampling bias 屏蔽 padded token。
+每次模型请求发送完整历史，使用固定模板和 `stream=false`。工具结果原样追加为非空的 `\n<interpreter>\n...\n</interpreter>\n`，继续同一 assistant token 流，不额外插入 ChatML 边界；无需 reasoning/tool-call parser。Session 形成线性上下文并导出一份训练样本。生成 token 的 mask 为 1，实际反馈 token 的 mask 为 0，logprob 来自原生推理后端。配方设置 `policy_vocab_size=151665`，由 Relax 在采样和训练评分中统一屏蔽 padded token。
 
 奖励为答案判分的 ±1，减去每次工具失败的 0.1，无下限；保留 DAPO verifier 的 `Answer:` 优先、boxed 回退规则。默认配方使用 GRPO，另提供上述 Score Centering 变体；均不是原论文 PPO 配方的等价复现。
 
@@ -167,8 +171,8 @@ Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batc
 
 - `agent.py`、`protocol.py`：模型请求、工具循环、提示词与上下文模板。
 - `data_source.py`、`prepare_data.py`：抽样、恢复和 DAPO 转换。
-- `reward.py`、`math_dapo.py`、`vocab.py`：奖励、答案判分和词表训练 hook。
-- `train.py`、`checkpoint.py`：工具服务生命周期与完整恢复检查。
+- `reward.py`、`math_dapo.py`：奖励与答案判分。
+- `train.py`、`checkpoint.py`：工具服务生命周期与 Retool 恢复状态检查。
 - `sandbox*.py`、`landlock*.py`、`tool_service.py`：隔离执行后端及客户端。
 - `scripts/`：训练与独立 sandbox 入口。
 

@@ -53,8 +53,6 @@ ROLLOUT_ARGS=(
     --agent-cwd "${RELAX_ROOT}" --agent-env "RETOOL_TOKENIZER_PATH=${MODEL_DIR}/tokenizer.json"
     --agentic-concurrency 16 --agent-timeout 1800
     --custom-rm-path examples.retool_agentic.reward.reward_func --reward-key score --eval-reward-key acc
-    --custom-megatron-before-log-prob-hook-path examples.retool_agentic.vocab.before_log_prob
-    --custom-megatron-before-train-step-hook-path examples.retool_agentic.vocab.before_train_step
     --num-rollout 200 --rollout-batch-size 64 --n-samples-per-prompt 16 --global-batch-size 1024
     --num-steps-per-rollout 1 --num-iters-per-train-update 1
     --rollout-max-prompt-len 2048 --rollout-max-response-len 8192 --rollout-max-context-len 10240
