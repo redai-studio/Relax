@@ -568,11 +568,6 @@ class SGLangBackendAdapter:
     def __init__(self, args: Namespace) -> None:
         init_http_client(args)
         self._args = args
-        self._native_replay = None
-        if replay_dir := getattr(args, "agentic_native_replay_dir", None):
-            from relax.agentic.native_replay import NativeReplayRecorder
-
-            self._native_replay = NativeReplayRecorder(replay_dir)
         self._resources = load_agentic_compiler_resources(args)
         if score_centering_enabled(args):
             resolve_score_centering_vocab_size(args)
@@ -632,12 +627,6 @@ class SGLangBackendAdapter:
         headers = None
         if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
             headers = {"X-SMG-Routing-Key": session_id}
-        recorder = getattr(self, "_native_replay", None)
-        capture_seq = (
-            recorder.record_request(payload, session_id=session_id, routing_key=session_id if headers else None)
-            if recorder is not None
-            else None
-        )
         started = time.monotonic()
         try:
             output = await post(
@@ -647,8 +636,6 @@ class SGLangBackendAdapter:
                 fail_fast_no_workers=fail_fast_no_workers,
             )
         except httpx.HTTPStatusError as error:
-            if recorder is not None:
-                recorder.record_exception(capture_seq, error, elapsed_s=time.monotonic() - started)
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error
             if is_expected_sglang_499(error):
@@ -660,13 +647,7 @@ class SGLangBackendAdapter:
                     elapsed=time.monotonic() - started,
                 )
             raise
-        except BaseException as error:
-            if recorder is not None:
-                recorder.record_exception(capture_seq, error, elapsed_s=time.monotonic() - started)
-            raise
         elapsed = time.monotonic() - started
-        if recorder is not None:
-            recorder.record_response(capture_seq, output, elapsed_s=elapsed)
         meta_info = dict(output["meta_info"])
         token_logprobs = list(meta_info.get("output_token_logprobs") or ())
         tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
@@ -736,18 +717,8 @@ class SGLangBackendAdapter:
         response = await get(f"{self._router_url}/list_workers")
         return router_worker_base_urls(response["urls"])
 
-    def record_session_outcome(self, session_id: str, metadata: dict[str, Any]) -> None:
-        recorder = getattr(self, "_native_replay", None)
-        if recorder is not None:
-            recorder.record_session(session_id, metadata)
-
     async def shutdown(self) -> None:
-        try:
-            self._resources.shutdown()
-        finally:
-            recorder = getattr(self, "_native_replay", None)
-            if recorder is not None:
-                await asyncio.to_thread(recorder.close)
+        self._resources.shutdown()
 
 
 def _normalize_prompt(prompt: Any) -> list[dict[str, Any]]:

@@ -3583,54 +3583,6 @@ class AgenticSessionShard:
                 session.finish_task = finish_task
         return await asyncio.shield(finish_task)
 
-    def _record_native_replay_session_outcome(
-        self, session: _SessionRecord, outcome: _SessionResultPayload, *, lifecycle_closed: bool
-    ) -> None:
-        if not getattr(self.args, "agentic_native_replay_dir", None):
-            return
-        group = session.group
-        try:
-            # This is the Session export fact, before group RM/advantage and
-            # filtering. It must not claim the Session reached training.
-            forest = session.forest
-            exports = []
-            if isinstance(outcome, SessionExportTransport):
-                for export in outcome.exports:
-                    sample = export["sample_payload"]
-                    metadata = sample.get("metadata") or {}
-                    trace = metadata.get("agentic_trace") or {}
-                    exports.append(
-                        {
-                            "name": export["name"],
-                            "reward": sample.get("reward"),
-                            "outcome_reward": metadata.get("outcome_reward"),
-                            "leaf_state_hash": trace.get("leaf_state_hash"),
-                            "turns": trace.get("turns", []),
-                        }
-                    )
-            self._generation_backend.record_session_outcome(
-                session.session_id,
-                {
-                    "stage": "session_export_before_group_reward_and_filter",
-                    "group_id": group.group_id,
-                    "group_index": forest.group_index if forest is not None else None,
-                    "sample_index": forest.index if forest is not None else None,
-                    "task": (forest.static_metadata.get("harbor") or {}).get("task") if forest is not None else None,
-                    "rollout_id": session.rollout_id,
-                    "mode": group.rollout_mode,
-                    "outcome_type": type(outcome).__name__,
-                    "error_type": type(outcome).__name__ if isinstance(outcome, BaseException) else None,
-                    "error_message": str(outcome) if isinstance(outcome, BaseException) else None,
-                    "exports": exports,
-                    "lifecycle_closed": lifecycle_closed,
-                    "group_filter_result": None,
-                },
-            )
-        except Exception as error:
-            recorder = getattr(self._generation_backend, "_native_replay", None)
-            if recorder is not None:
-                recorder.record_gap(error)
-
     async def _abort_finalizing_requests(self, session: _SessionRecord, request_ids: list[str]) -> list[BaseException]:
         """Bound terminal abort RPCs and retain any unsettled task
         ownership."""
@@ -3783,8 +3735,6 @@ class AgenticSessionShard:
             session.observation.active_ms = getattr(resources.process, "active_ms", 0.0)
             session.observation.log_ref = getattr(resources.process, "observation_log_ref", None)
         async with session.lock:
-            if getattr(self.args, "agentic_native_replay_dir", None):
-                self._record_native_replay_session_outcome(session, outcome, lifecycle_closed=lifecycle_closed)
             session.forest = None
             session.resp_state_hash_by_request_id.clear()
             session.resources = None
