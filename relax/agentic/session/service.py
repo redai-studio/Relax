@@ -7,11 +7,13 @@ from __future__ import annotations
 import asyncio
 import copy
 import ctypes
+import functools
 import hashlib
 import json
 import time
 from argparse import Namespace
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -1486,6 +1488,9 @@ class _SessionRecord:
 class AgenticSessionShard:
     """Group-affine owner of every live Session, IR, process, and barrier."""
 
+    # Started by the first export; see ``_build_session_export_transport``.
+    _export_executor: Optional[ThreadPoolExecutor] = None
+
     def __init__(
         self,
         args: Namespace,
@@ -2099,6 +2104,11 @@ class AgenticSessionShard:
         for outcome in permit_cleanup_outcomes:
             if first_error is None and isinstance(outcome, BaseException):
                 first_error = outcome
+        if self._export_executor is not None:
+            # Each finalizer holds its Session lock until its export returns,
+            # and dropping the groups above waited for those locks, so this
+            # join only stops the idle worker thread.
+            self._export_executor.shutdown(wait=True)
         # Drain queued trajectories before the backend goes away: shards run with
         # max_restarts=0, so anything still in the writer queue is lost for good.
         try:
@@ -3038,7 +3048,7 @@ class AgenticSessionShard:
                     "finalize_lock_acquired_at": finalize_lock_acquired_at,
                     "finalize_start_at": time.time(),
                 }
-                outcome = self._build_session_export_transport(
+                outcome = await self._build_session_export_transport(
                     session=session,
                     reward=output.reward,
                     metadata=output.metadata,
@@ -3062,7 +3072,7 @@ class AgenticSessionShard:
                 failure = ("export_failed", "infra", str(outcome))
         await self._finish_session(session, outcome, failure=failure)
 
-    def _build_session_export_transport(
+    async def _build_session_export_transport(
         self,
         *,
         session: _SessionRecord,
@@ -3071,7 +3081,41 @@ class AgenticSessionShard:
         output_records: tuple[dict[str, Any], ...],
         finalize_events: dict[str, float],
     ) -> SessionExportTransport:
-        forest = cast(SessionForest, session.forest)
+        """Materialize exports on the Shard's export worker, then publish.
+
+        Sample assembly, decoding, and payload compaction are CPU work that
+        grows with trajectory length; running them on the event loop stalls
+        every other Session on the Shard. The caller holds the Session lock, so
+        this Session's Forest has no concurrent writer while the worker reads
+        it. One worker per Shard bounds the extra CPU and memory.
+        """
+
+        if self._export_executor is None:
+            self._export_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentic-session-export")
+        prepared = await asyncio.get_running_loop().run_in_executor(
+            self._export_executor,
+            functools.partial(
+                self._materialize_session_exports,
+                forest=cast(SessionForest, session.forest),
+                reward=reward,
+                metadata=metadata,
+                output_records=output_records,
+                finalize_events=finalize_events,
+            ),
+        )
+        return self._publish_session_exports(session=session, prepared=prepared)
+
+    def _materialize_session_exports(
+        self,
+        *,
+        forest: SessionForest,
+        reward: Any,
+        metadata: dict[str, Any],
+        output_records: tuple[dict[str, Any], ...],
+        finalize_events: dict[str, float],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Build compact export payloads; runs on the export worker."""
+
         prepared: list[tuple[str, dict[str, Any]]] = []
         if output_records:
             for output_record in output_records:
@@ -3097,8 +3141,6 @@ class AgenticSessionShard:
                     mutate_node=False,
                     finalize_events=finalize_events,
                 )
-                sample.sample_export_id = self._trajectory_recorder.next_sample_export_id()
-                sample.agentic_group_id = session.group.group_id
                 prepared.append((state_hash, self._export_payload(name=output_record["name"], sample=sample)))
         else:
             state_hash = self._implicit_export_state_hash(forest)
@@ -3110,12 +3152,25 @@ class AgenticSessionShard:
                 mutate_node=True,
                 finalize_events=finalize_events,
             )
-            sample.sample_export_id = self._trajectory_recorder.next_sample_export_id()
-            sample.agentic_group_id = session.group.group_id
             prepared.append((state_hash, self._export_payload(name=None, sample=sample)))
         # Retain only compact payloads; full Samples contain long training arrays.
         del sample
+        return prepared
+
+    def _publish_session_exports(
+        self,
+        *,
+        session: _SessionRecord,
+        prepared: list[tuple[str, dict[str, Any]]],
+    ) -> SessionExportTransport:
+        """Assign export IDs and record trajectories on the event loop."""
+
+        forest = cast(SessionForest, session.forest)
         export_payloads = [payload for _, payload in prepared]
+        for export_payload in export_payloads:
+            sample_payload = export_payload["sample_payload"]
+            sample_payload["sample_export_id"] = self._trajectory_recorder.next_sample_export_id()
+            sample_payload["agentic_group_id"] = session.group.group_id
         if session.group.rollout_mode == "train" and self.args.use_rollout_routing_replay:
             # NOTE(wulumeng): An observation leaf has no routed experts (None). Samples should never end there, so this safeguard should never trigger.
             for export_payload in export_payloads:

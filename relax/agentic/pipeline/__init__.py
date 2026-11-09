@@ -21,6 +21,7 @@ _TRAINING_ARTIFACT_ARRAY_FIELDS: list[tuple[str, Any]] = [
     ("teacher_log_probs", np.float64),
     ("teacher_topk_token_ids", np.int32),
 ]
+_IMMUTABLE_SCALAR_TYPES = frozenset({str, int, float, bool, type(None)})
 
 
 class RuntimeGroupError(RuntimeError):
@@ -113,19 +114,30 @@ class TrainingFieldArtifact:
 
 
 def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    compacted = copy.deepcopy(payload)
+    # Build training arrays straight from the source lists: ``np.array`` already
+    # owns its storage, so deep-copying those lists first only to discard the
+    # copy was most of the export CPU time. One memo keeps the other fields'
+    # shared references intact, as a single ``deepcopy`` of the payload did.
+    tokens = payload.get("tokens")
+    rollout_tokens = payload.get("rollout_tokens")
+    rollout_tokens_shared = isinstance(tokens, list) and isinstance(rollout_tokens, list) and rollout_tokens == tokens
 
-    tokens = compacted.get("tokens")
-    rollout_tokens = compacted.get("rollout_tokens")
-    if isinstance(tokens, list) and isinstance(rollout_tokens, list) and rollout_tokens == tokens:
-        compacted["rollout_tokens"] = None
+    array_dtypes = dict(_TRAINING_ARTIFACT_ARRAY_FIELDS)
+    memo: dict[int, Any] = {}
+    compacted: dict[str, Any] = {}
+    for field_name, value in payload.items():
+        if field_name == "rollout_tokens" and rollout_tokens_shared:
+            compacted[field_name] = None
+        elif field_name in array_dtypes and isinstance(value, list) and value:
+            compacted[field_name] = np.array(value, dtype=array_dtypes[field_name])
+        elif type(value) is list and _IMMUTABLE_SCALAR_TYPES.issuperset(map(type, value)):
+            # Per-token lists such as ``weight_versions``: a shallow copy of
+            # immutable scalars is already a deep copy.
+            compacted[field_name] = memo.setdefault(id(value), value.copy())
+        else:
+            compacted[field_name] = copy.deepcopy(value, memo)
+    if rollout_tokens_shared:
         compacted["_rollout_tokens_shared"] = True
-
-    for field_name, dtype in _TRAINING_ARTIFACT_ARRAY_FIELDS:
-        value = compacted.get(field_name)
-        if not isinstance(value, list) or not value:
-            continue
-        compacted[field_name] = np.asarray(value, dtype=dtype)
     return compacted
 
 

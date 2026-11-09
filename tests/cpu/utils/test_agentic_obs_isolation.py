@@ -43,7 +43,8 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
     cls.body = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_build_session_export_transport"
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("_materialize_session_exports", "_publish_session_exports")
     ]
     cls.bases, cls.decorator_list = [], []
     hashes = iter(["leaf", "missing" if failure == "validation" else "leaf", "leaf", "leaf"])
@@ -80,7 +81,6 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
         payload = {
             "name": name,
             "sample_payload": {
-                "sample_export_id": sample.sample_export_id,
                 "metadata": copy.deepcopy(sample.metadata),
                 "tokens": [1, 2],
                 "rollout_routed_experts": None,
@@ -96,16 +96,17 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
             recorded.append(kwargs)
 
     shard._build_sample, shard._export_payload = build_sample, compact
-    shard._trajectory_recorder = NS(next_sample_export_id=lambda: len(payloads), record=record)
+    shard._trajectory_recorder = NS(next_sample_export_id=iter(range(4)).__next__, record=record)
     session = NS(
         forest=NS(nodes_by_hash={"leaf": None}), group=NS(group_id="g", rollout_mode="train"), observation=NS()
     )
     records = tuple({"name": str(i), "metadata": {"export": i}, "messages": []} for i in range(4))
 
     def export():
-        return shard._build_session_export_transport(
-            session=session, reward=None, metadata={}, output_records=records, finalize_events={}
+        prepared = shard._materialize_session_exports(
+            forest=session.forest, reward=None, metadata={}, output_records=records, finalize_events={}
         )
+        return shard._publish_session_exports(session=session, prepared=prepared)
 
     if failure is not None:
         with pytest.raises(ValueError):
