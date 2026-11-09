@@ -742,10 +742,10 @@ def test_recovery_global_freezes_bounded_nonfatal_members(make_runtime, fatal):
     expected_members = tuple(fault for fault in faults if not fault.fatal)
     recovery = runtime.start_recovery(expected_members[0].role, "global", 63)
     assert recovery is not None and recovery.members == expected_members
-    assert len(recovery.members) == 9 - int(fatal)
+    assert len(recovery.members) == len(ROLES) - int(fatal)
     runtime.retire_source(0)
     runtime.finish(recovery, "recovery_failed", "restart_exception")
-    probe.wait_count(9 + 2 * len(expected_members))
+    probe.wait_count(len(ROLES) + 2 * len(expected_members))
     terminals = [event for event in _events(runtime) if event["event_type"] == "recovery_failed"]
     assert {event["fault_id"] for event in terminals} == {fault.fault_id for fault in expected_members}
     assert all(event["expected_evidence"] == 63 and event["source_generation"] == 0 for event in terminals)
@@ -813,9 +813,9 @@ def test_publication_and_snapshot_state_stay_bounded_across_generations(make_run
             assert runtime.bind_source() == (generation, None)
         faults = [_fault(role, generation) for role in sorted(ROLES)]
         runtime.observe_snapshot(_snapshot(runtime, *faults))
-        assert len(runtime._publications) == 9
-        assert runtime.diagnostics()["publications"] <= 18
-        assert runtime.diagnostics()["snapshot_size"] <= 9
+        assert len(runtime._publications) == len(ROLES)
+        assert runtime.diagnostics()["publications"] <= 2 * len(ROLES)
+        assert runtime.diagnostics()["snapshot_size"] <= len(ROLES)
     probe.wait_ids(*(fault.event_id for fault in faults))
     assert runtime.diagnostics()["known_lost_events"] == 0
 
