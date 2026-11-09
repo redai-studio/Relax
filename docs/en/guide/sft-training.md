@@ -523,6 +523,8 @@ For context parallelism, capacity is `--max-tokens-per-gpu * --context-parallel-
 
 ### 2. Improve Throughput
 
+Background prefetch groups a bounded raw-row window by source and file, then restores logical sample order before preprocessing; raw rows and processed samples share the configured prefetch capacity. This reduces repeated file opens without changing mixture weights, shuffle, or checkpoint cursors. Initial directory enumeration and index construction remain separate costs.
+
 If GPUs wait on SFT data:
 
 | Knob | Direction | Effect |

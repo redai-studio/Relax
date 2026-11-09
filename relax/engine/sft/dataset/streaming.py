@@ -672,6 +672,7 @@ class SFTStreamingDataset:
                 chunk_size=prefetch_chunk_size,
                 max_cached=prefetch_max_cached,
                 num_workers=prefetch_num_workers,
+                prepare_fn=self._prepare_rows,
             )
             logger.info(
                 f"SFTStreamingDataset: prefetch enabled "
@@ -1000,7 +1001,15 @@ class SFTStreamingDataset:
             )
         return out, crossed_epoch
 
-    def _process_one_safe(self, idx: int) -> ProcessedSample | None:
+    def _prepare_rows(self, indices: list[int]) -> dict[int, dict[str, Any]]:
+        """Read a bounded window by source/file; keep logical row identity."""
+        try:
+            return dict(self.reader.iter_batch(indices))
+        except Exception as exc:
+            self._record_first_error(exc)
+            raise
+
+    def _process_one_safe(self, idx: int, row: dict[str, Any] | None = None) -> ProcessedSample | None:
         """Wrapper passed to ``PrefetchBuffer`` worker threads.
 
         The buffer's internal ``try/except`` would otherwise drop the exception
@@ -1010,14 +1019,14 @@ class SFTStreamingDataset:
         the asyncio context.
         """
         try:
-            return self._process_one(idx)
+            return self._process_one(idx, row=row)
         except Exception as exc:
             logger.exception(f"SFTStreamingDataset: failed to process sample idx={idx}")
             self._record_first_error(exc)
             return None
 
-    def _process_one(self, idx: int) -> ProcessedSample | None:
-        rendered = self._render_one(idx)
+    def _process_one(self, idx: int, *, row: dict[str, Any] | None = None) -> ProcessedSample | None:
+        rendered = self._render_one(idx, row=row)
         if rendered is None:
             return None
         try:
@@ -1033,10 +1042,11 @@ class SFTStreamingDataset:
             return None
         return self._build_processed(rendered, prompt_ids, mm_inputs)
 
-    def _render_one(self, idx: int) -> "_RenderedSample | None":
+    def _render_one(self, idx: int, *, row: dict[str, Any] | None = None) -> "_RenderedSample | None":
         if self.tokenizer is None:
             raise RuntimeError("SFTStreamingDataset: tokenizer is required for _render_one")
-        row = self.reader[idx]
+        if row is None:
+            row = self.reader[idx]
         try:
             sample = self.get_canonical_sample(idx, row=row)
         except SFTMultimodalContractError as exc:
