@@ -690,8 +690,13 @@ class AgenticResidentPipeline:
             "agentic-generation-pause",
         )
         retain_resident_tail = not context.final_backfill and (self.args.partial_rollout or self.args.fully_async)
+        retain_prepared = (
+            self.args.agentic_prelaunch
+            and not context.final_backfill
+            and context.rollout_id + 1 < self.args.num_rollout
+        )
         if not retain_resident_tail:
-            if getattr(self.args, "agentic_session_capacity_per_node", None) is not None:
+            if getattr(self.args, "agentic_session_capacity_per_node", None) is not None and not retain_prepared:
                 await self.prepare_domain.discard_step()
             await finish_before_cancellation(
                 self._cancel_active_group_tasks(
@@ -702,12 +707,22 @@ class AgenticResidentPipeline:
                 "agentic-groups-discard",
             )
             if getattr(self.args, "agentic_session_capacity_per_node", None) is not None:
-                self.runtime_domain._assert_epoch_drained()
+                self.runtime_domain._assert_epoch_drained(allow_prepared=retain_prepared)
         elif dynamic_close:
             # Generation is now paused. Harvest Group tasks already complete,
             # append their aligned FIFO prefix, seal the partition, and wait for
             # its remaining TQ batches. Reward-inflight Groups stay resident.
             await self._seal_dynamic_partition(context)
+
+        if (
+            retain_resident_tail
+            and not self.args.fully_async
+            and context.rollout_id + 1 >= self.args.num_rollout
+            and getattr(self.args, "agentic_session_capacity_per_node", None) is not None
+        ):
+            # The final partial step has no next lease for prepared work. Its
+            # Runtime tail is still owned until the normal pipeline shutdown.
+            await self.prepare_domain.discard_step()
 
         await self.runtime_domain.trim_memory()
         capacity = self.runtime_domain.session_capacity_snapshot()
@@ -746,9 +761,9 @@ class AgenticResidentPipeline:
     async def _lease_prepared_groups(self, context: _StepContext) -> None:
         """Open generation for the ready FIFO prefix visible at this check.
 
-        Each ready task already owns a Shard-resident Group whose Sessions have
-        crossed the first-IR barrier. Leasing changes ownership to Runtime and
-        opens its generation gate.
+        Each ready task owns a Shard-resident Group. Capacity-managed Groups
+        may still await members' first IRs; leasing opens only the ready
+        members' generation gates and lets the remaining members join later.
         """
 
         for stream, teacher_id, response_keys in self.prepare_domain.take_ready(self._runtime_group_gap(context)):

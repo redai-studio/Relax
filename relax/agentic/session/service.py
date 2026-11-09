@@ -2002,10 +2002,22 @@ class AgenticSessionShard:
                     or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
                 ):
                     raise RuntimeGroupError("Eager generation requires a new paused rollout")
-                if not getattr(self.args, "fully_async", False) and any(
-                    group.rollout_mode == "train" for group in self._groups.values()
-                ):
-                    raise RuntimeGroupError("Synchronous eager resume requires all train groups to be released")
+                if not (getattr(self.args, "partial_rollout", False) or getattr(self.args, "fully_async", False)):
+                    allow_prepared = getattr(self.args, "agentic_prelaunch", False)
+                    if any(
+                        group.rollout_mode == "train"
+                        and (
+                            not allow_prepared
+                            or group.ownership is not GroupOwnership.PREPARE
+                            # A controlled prelaunch failure is still collected
+                            # as a dropped Group; it has never generated. Fatal
+                            # cleanup errors must continue to stop the epoch.
+                            or (group.closing and not group.eager_controlled_drop)
+                            or group.first_error() is not None
+                        )
+                        for group in self._groups.values()
+                    ):
+                        raise RuntimeGroupError("Synchronous eager resume requires Runtime groups to be released")
                 self._rollout_epoch = rollout_id
             for group in tuple(self._groups.values()):
                 if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME:

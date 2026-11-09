@@ -872,6 +872,9 @@ class RuntimeGroupStream:
     interrupted: bool = False
     protected: bool = False
     dropping: bool = False
+    # Submission may commit remotely even if the lease response is lost. Keep
+    # this ownership boundary until the stream's resources are fully retired.
+    lease_submitted: bool = False
     stop_reason: tuple[str, str, str] | None = None
     eager_session_generation: bool = False
     preparation_task: Optional["asyncio.Task[bool]"] = None
@@ -911,14 +914,6 @@ class RuntimeDomain:
         self._rollout_epoch: int | None = None
         self._eager_generation_open = False
         self._eager_closing = False
-        if per_node is not None and any(
-            getattr(args, name, False)
-            for name in ("partial_rollout", "agentic_prelaunch", "use_dynamic_global_batch_size")
-        ):
-            raise ValueError(
-                "Session capacity requires synchronous or fully-async steps; "
-                "partial rollout, prelaunch and dynamic global batch are unsupported"
-            )
         self._session_capacity = (
             SessionCapacity({shard.node_id for shard in shards}, per_node) if per_node is not None else None
         )
@@ -1027,6 +1022,9 @@ class RuntimeDomain:
             if self._session_capacity is not None and self._eager_closing:
                 raise RuntimeGroupError("Eager Runtime is closing")
             reservation = await self._reserve_group_shard(group_id, launch_decision, len(group_input.samples))
+            if reservation is None:
+                self._resident_group_permits.release()
+                return None
             if self._session_capacity is not None and self._eager_closing:
                 raise RuntimeGroupError("Eager Runtime is closing")
             shard = reservation.shard
@@ -1213,36 +1211,53 @@ class RuntimeDomain:
 
     async def _reserve_group_shard(
         self, group_id: str, launch_decision: Optional[asyncio.Future[bool]], session_count: int = 0
-    ) -> _GroupShardReservation:
+    ) -> Optional[_GroupShardReservation]:
         """Keep one Group owner while balancing pending and resident Groups by
         node."""
 
-        while previous := self._reserved_group_shards.get(group_id):
-            decision = previous.launch_decision
-            if (
-                decision is None
-                or not decision.done()
-                or decision.cancelled()
-                or decision.result() is not False
-                or group_id in previous.shard.group_streams
-            ):
-                raise RuntimeGroupError(f"group token is already resident: {group_id}")
-            # close_step can requeue a declined Prepare while its specs executor
-            # is still running. Join only that explicitly deferred predecessor.
-            await previous.released.wait()
-        candidates = self._shards
         if self._session_capacity is not None:
             if not 0 < session_count <= self._session_capacity.per_node:
                 raise RuntimeGroupError("A complete Group must fit within one host's Session capacity")
+
+        def wake_placement(_decision: asyncio.Future[bool]) -> None:
+            self._state_changed.set()
+
+        if launch_decision is not None:
+            launch_decision.add_done_callback(wake_placement)
+        try:
             while True:
                 self._state_changed.clear()
-                candidates = [shard for shard in self._shards if self._session_capacity.can_reserve(shard.node_id)]
+                if launch_decision is not None and launch_decision.done() and not launch_decision.result():
+                    return None
+                previous = self._reserved_group_shards.get(group_id)
+                if previous is not None:
+                    decision = previous.launch_decision
+                    if (
+                        decision is None
+                        or not decision.done()
+                        or decision.cancelled()
+                        or decision.result() is not False
+                        or group_id in previous.shard.group_streams
+                    ):
+                        raise RuntimeGroupError(f"group token is already resident: {group_id}")
+                    # close_step can requeue a declined Prepare while its specs
+                    # executor is still running. Join that exact predecessor.
+                    await previous.released.wait()
+                    continue
+                candidates = self._shards
+                if self._session_capacity is not None:
+                    candidates = [shard for shard in self._shards if self._session_capacity.can_reserve(shard.node_id)]
                 if candidates:
                     break
                 for shard in self._shards:
                     if shard.observer_task is not None and shard.observer_task.done():
                         shard.observer_task.result()
+                # Recheck both the launch decision and the Group owner after
+                # every wake: a declined Prepare may be requeued across steps.
                 await self._state_changed.wait()
+        finally:
+            if launch_decision is not None:
+                launch_decision.remove_done_callback(wake_placement)
         node_load: Dict[str, int] = {}
         shard_load: Dict[str, int] = {}
         for previous in self._reserved_group_shards.values():
@@ -1299,6 +1314,7 @@ class RuntimeDomain:
                 if stream.preparation_task is not None and stream.preparation_task.done():
                     if not stream.preparation_task.result():
                         return  # Controlled drop is collected through its original None result.
+            stream.lease_submitted = True
             await stream.shard.handle.lease_group.remote(stream.group_id, rollout_id)
         except BaseException:
             await finish_before_cancellation(
@@ -1316,8 +1332,10 @@ class RuntimeDomain:
             or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
         ):
             raise RuntimeGroupError("Eager generation must open a new paused rollout")
-        if self._session_capacity is not None and not getattr(self.args, "fully_async", False):
-            self._assert_epoch_drained()
+        if self._session_capacity is not None and not (
+            getattr(self.args, "partial_rollout", False) or getattr(self.args, "fully_async", False)
+        ):
+            self._assert_epoch_drained(allow_prepared=getattr(self.args, "agentic_prelaunch", False))
         self._start_shard_observers()
         revisions = await asyncio.gather(
             *(shard.handle.resume_generation.remote(rollout_id) for shard in self._shards)
@@ -1336,7 +1354,26 @@ class RuntimeDomain:
         await self._wait_for_no_protected_groups()
         self._eager_generation_open = False
 
-    def _assert_epoch_drained(self) -> None:
+    def _assert_epoch_drained(self, *, allow_prepared: bool = False) -> None:
+        if allow_prepared:
+            # A never-leased Prepare cannot have generated with the old
+            # weights. Failed cleanup is not eligible for this exemption.
+            for shard in self._shards:
+                for stream in shard.group_streams.values():
+                    task = stream.preparation_task
+                    if (
+                        stream.lease_submitted
+                        or stream.closing
+                        or stream.error is not None
+                        or (task is not None and task.done() and (task.cancelled() or task.exception() is not None))
+                    ):
+                        raise RuntimeGroupError("Synchronous eager cannot retain a Runtime or failed Prepare owner")
+            if any(
+                reservation.session_capacity is not None and reservation.session_capacity.closing
+                for reservation in self._reserved_group_shards.values()
+            ):
+                raise RuntimeGroupError("Synchronous eager cannot retain task resources awaiting cleanup")
+            return
         capacity = self.session_capacity_snapshot()
         if self.resident_group_count or self._reserved_group_shards or (capacity and capacity["outstanding"]):
             raise RuntimeGroupError("Synchronous eager cannot change weights with resident task resources")
@@ -1733,6 +1770,7 @@ class RuntimeDomain:
     async def _release_shard_group(self, stream: RuntimeGroupStream) -> None:
         """Release driver refs after Shard export/drop commits."""
 
+        stream.closing = True
         if stream.preparation_task is not None:
             if not stream.preparation_task.done():
                 raise RuntimeGroupError("Cannot retire an unsettled eager preparation owner")

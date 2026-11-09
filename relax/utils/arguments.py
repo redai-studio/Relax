@@ -1745,7 +1745,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Physical train Session limit per host. Starts members incrementally and generates ready members "
                     "before the full Group reaches its first request; requires confirmed agent resource release. "
-                    "Supports synchronous and fully-async steps; eval keeps its ordinary Group lifecycle."
+                    "Supports partial rollout, prelaunch, dynamic global batching and fully-async steps under their "
+                    "existing mode constraints; eval keeps its ordinary Group lifecycle."
                 ),
             )
             parser.add_argument(
@@ -3544,14 +3545,6 @@ def _validate_agentic_rollout_args(args) -> None:
     capacity = getattr(args, "agentic_session_capacity_per_node", None)
     if capacity is not None and capacity < args.n_samples_per_prompt:
         raise ValueError("--agentic-session-capacity-per-node must fit one complete Group.")
-    if capacity is not None and any(
-        getattr(args, name, False)
-        for name in ("partial_rollout", "agentic_prelaunch", "use_dynamic_global_batch_size")
-    ):
-        raise ValueError(
-            "--agentic-session-capacity-per-node requires synchronous or fully-async steps; "
-            "partial rollout, prelaunch and dynamic global batch are unsupported."
-        )
     if args.agentic_program_admission:
         if args.agentic_admission_expected_decode_cap is None:
             args.agentic_admission_expected_decode_cap = args.rollout_max_response_len
