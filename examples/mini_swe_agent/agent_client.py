@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import signal
@@ -54,6 +55,7 @@ def run() -> int:
         atomic_json(release_path, {**expected, "status": "unknown"})
     cancel_deadline: float | None = None
     cancel_reason = ""
+    protocol_error = False
     poll_interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.5"))
     initial_poll_delay = float(os.environ.get("INITIAL_POLL_DELAY_SECONDS", "0"))
     cancel_timeout = float(os.environ.get("CANCEL_REQUEST_TIMEOUT_SECONDS", "5"))
@@ -61,11 +63,11 @@ def run() -> int:
     if poll_interval <= 0 or initial_poll_delay < 0 or cancel_timeout <= 0 or failure_limit <= 0:
         raise ValueError("Client polling and cancellation limits must be positive; initial delay may be zero")
 
-    def cancel(_signum, _frame):
+    def cancel(_signum, _frame, *, reason: str | None = None):
         nonlocal cancel_deadline, cancel_reason
         if cancel_deadline is None:
             cancel_deadline = time.monotonic() + 40.0
-            cancel_reason = f"signal:{_signum}" if _signum else "consecutive_io_failures"
+            cancel_reason = reason or (f"signal:{_signum}" if _signum else "consecutive_io_failures")
             _diagnostic(f"cancelling reason={cancel_reason}")
 
     signal.signal(signal.SIGTERM, cancel)
@@ -84,7 +86,10 @@ def run() -> int:
         # Node-local traffic must not be sent to an HTTP proxy.
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as response:
             raw = response.read()
-            return json.loads(raw) if raw else {}
+            result = json.loads(raw) if raw else {}
+            if not isinstance(result, dict):
+                raise ValueError("Agent server response must be an object")
+            return result
 
     payload = {
         "session_id": sid,
@@ -102,7 +107,10 @@ def run() -> int:
         phase = "create"
         try:
             if server_sid is None:
-                server_sid = request("/sessions", payload)["session_id"]
+                created_sid = request("/sessions", payload)["session_id"]
+                if not isinstance(created_sid, str) or not created_sid:
+                    raise ValueError("Agent server Session ID must be a nonempty string")
+                server_sid = created_sid
                 # An explicit warmup delay remains configurable, but cancellation
                 # must never wait for it. The default starts polling immediately.
                 first_poll_at = time.monotonic() + initial_poll_delay
@@ -114,10 +122,19 @@ def run() -> int:
                 cancel_sent = True
             phase = "poll"
             result = request(f"/sessions/{server_sid}")
-            errors = 0
-            released = result.get("resource_release") == expected
             if result.get("client_session_id") != sid or result.get("session_id") != server_sid:
                 raise RuntimeError("Agent server Session identity mismatch")
+            release = result.get("resource_release")
+            if (
+                not isinstance(release, dict)
+                or type(release.get("schema")) is not int
+                or release.get("schema") != 1
+                or release.get("session_id") != sid
+                or release.get("nonce") != nonce
+                or release.get("status") not in {"unknown", "released"}
+            ):
+                raise RuntimeError("Agent server resource-release identity mismatch")
+            released = release == expected
             if released and release_path is not None:
                 phase = "release_receipt"
                 atomic_json(release_path, expected)
@@ -128,6 +145,9 @@ def run() -> int:
             # Mini SWE always owns external resources. Even without a Runtime
             # capacity limit, returning a result must wait for their release.
             if result.get("status") in {"completed", "failed", "cancelled"} and released:
+                if protocol_error:
+                    _diagnostic("failed after invalid server response; resources released")
+                    return 1
                 if cancel_deadline is not None:
                     _diagnostic(f"cancelled released={released} reason={cancel_reason}")
                     return 143
@@ -148,6 +168,7 @@ def run() -> int:
                     trace_failure(sid, result)
                     sys.stderr.write(f"Agent session {result['status']}: {result.get('error', '')}\n")
                 return int(result.get("exit_code", 1))
+            errors = 0
         except (OSError, urllib.error.URLError, TimeoutError) as exc:
             errors += 1
             if errors in {1, failure_limit}:
@@ -160,11 +181,14 @@ def run() -> int:
                 )
             if errors >= failure_limit and cancel_deadline is None:
                 cancel(0, None)
+        except (ValueError, KeyError, TypeError, RuntimeError, http.client.HTTPException) as exc:
+            protocol_error = True
+            cancel(0, None, reason=f"invalid_response:{type(exc).__name__}")
         time.sleep(
             min(poll_interval, max(0.0, cancel_deadline - time.monotonic())) if cancel_deadline else poll_interval
         )
     _diagnostic(f"release deadline elapsed reason={cancel_reason}")
-    return 143 if cancel_deadline is not None else 1
+    return 143 if cancel_deadline is not None and not protocol_error else 1
 
 
 if __name__ == "__main__":

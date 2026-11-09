@@ -874,7 +874,6 @@ class RuntimeGroupStream:
     dropping: bool = False
     stop_reason: tuple[str, str, str] | None = None
     eager_session_generation: bool = False
-    rollout_epoch: int | None = None
     preparation_task: Optional["asyncio.Task[bool]"] = None
     closing: bool = False
     drop_task: Optional["asyncio.Task[None]"] = None
@@ -1011,7 +1010,6 @@ class RuntimeDomain:
         prepare_started_at_utc = utc_now()
         group_id = group_input.group_id
         session_ids: Tuple[str, ...] = ()
-        epoch = self._rollout_epoch
         try:
             if self.teacher_routing_enabled:
                 for sample in group_input.samples:
@@ -1068,7 +1066,6 @@ class RuntimeDomain:
                     _SessionResultRef(session_spec.session_id, loop.create_future()) for session_spec in session_specs
                 ),
                 eager_session_generation=self._session_capacity is not None,
-                rollout_epoch=epoch,
             )
             # The reservation above already excludes duplicate pending Groups.
             if group_id in shard.group_streams:
@@ -1200,23 +1197,13 @@ class RuntimeDomain:
                     shard.observer_task.result()
             if self._session_capacity.available(reservation.node_id):
                 ids = self._session_capacity.grant(reservation)
-                logger.info(
-                    "Agentic incremental grant group=%s epoch=%s created_epoch=%s members=%d pending=%d used=%d limit=%d",
-                    stream.group_id,
-                    self._rollout_epoch,
-                    stream.rollout_epoch,
-                    len(ids),
-                    len(reservation.pending_ids),
-                    self._session_capacity.used[reservation.node_id],
-                    self._session_capacity.per_node,
-                )
                 # The debit precedes the RPC. An unknown response never refunds
                 # it; cleanup must obtain the same identity-bound receipts.
                 started = await finish_before_cancellation(
                     stream.shard.handle.start_group_sessions.remote(stream.group_id, ids),
                     f"start-group-sessions:{stream.group_id}",
                 )
-                if stream.eager_session_generation and started is False:
+                if started is False:
                     if not stream.first_request_barrier.done():
                         stream.first_request_barrier.set_result(False)
                     return
@@ -1624,13 +1611,9 @@ class RuntimeDomain:
             await asyncio.gather(*take_tasks, return_exceptions=True)
         if stream.shard.group_streams.get(stream.group_id) is not stream:
             return
-        if self._session_capacity is not None:
-            self._session_capacity.close(self._reserved_group_shards[stream.group_id].session_capacity)
-            self._state_changed.set()
-        receipt = await stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason)
+        await stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason)
         if stream.shard.group_streams.get(stream.group_id) is not stream:
             return  # Another joined drop already retired this exact stream.
-        self._confirm_session_resources(stream, receipt or ())
         if not stream.first_request_barrier.done():
             stream.first_request_barrier.set_result(False)
         for result in stream.session_results:
@@ -1704,7 +1687,6 @@ class RuntimeDomain:
                     stream.stop_reason = ("shutdown", "selection", "runtime shut down")
             outcomes = await asyncio.gather(*(self.drop_group(stream) for stream in streams), return_exceptions=True)
             first_error = next((outcome for outcome in outcomes if isinstance(outcome, BaseException)), None)
-        if self._session_capacity is not None:
             for reservation in self._reserved_group_shards.values():
                 self._session_capacity.close(reservation.session_capacity)
             self._state_changed.set()

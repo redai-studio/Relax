@@ -59,7 +59,6 @@ def _reward_concurrency_limit() -> int:
 
 
 _REWARD_CONCURRENCY = _reward_concurrency_limit()
-_reward_semaphore = threading.Semaphore(_REWARD_CONCURRENCY) if _REWARD_CONCURRENCY > 0 else None
 # Graceful `instance stop` timeout (s). Must be generous enough for apptainer to
 # unmount the squashfs rootfs and detach its loop device before we SIGKILL --
 # a hard kill leaks the loop device (see _stop_apptainer_instance).
@@ -729,8 +728,8 @@ class MyLitellmModel(LitellmModel):
 @contextmanager
 def _reward_slot() -> Iterator[None]:
     """Keep one reward budget across independent Session workers."""
-    directory = os.environ.get("AGENT_SERVER_REWARD_LOCK_DIR")
-    if directory and _REWARD_CONCURRENCY > 0:
+    if _REWARD_CONCURRENCY > 0:
+        directory = os.environ["AGENT_SERVER_REWARD_LOCK_DIR"]
         held = None
         try:
             while held is None:
@@ -749,13 +748,7 @@ def _reward_slot() -> Iterator[None]:
             if held is not None:
                 held.close()
     else:
-        if _reward_semaphore is not None:
-            _reward_semaphore.acquire()
-        try:
-            yield
-        finally:
-            if _reward_semaphore is not None:
-                _reward_semaphore.release()
+        yield
 
 
 class MyAgent(DefaultAgent):
@@ -917,7 +910,6 @@ class AgentServer:
             "eval": ThreadPoolExecutor(max_workers=eval_concurrency),
         }
         self.lock = threading.Lock()
-        self._event_lock = threading.Lock()
         self._record_ttl = float(os.environ.get("AGENT_SERVER_RECORD_TTL_SECONDS", SESSION_RECORD_TTL_SECONDS))
         threading.Thread(target=self._record_sweep_loop, name="record-sweeper", daemon=True).start()
 
@@ -1042,36 +1034,41 @@ class AgentServer:
                 record.resources_released = True
                 return
             record.status = "running"
-        control = self.tmp_base / f"{server_session_id}-control"
-        control.mkdir(mode=0o700)
-        spec = {
-            "record": {
-                key: getattr(record, key)
-                for key in ("session_id", "group_id", "sample_idx", "mode", "base_url", "api_key")
-            },
-            "server_session_id": server_session_id,
-            "row": self.modes[record.mode].get(sample_idx),
-            "base_config": self.base_config,
-            "r2e_config": self.r2e_config,
-            "sifs": {key: str(value) for key, value in self.sifs.items()},
-            "sif_dir": str(self.sif_dir),
-            "wheel_dir": str(self.wheel_dir),
-            "tmp_base": str(self.tmp_base),
-            "work_dir": str(self.work_dir),
-            "apptainer_args": self.apptainer_args,
-            "instance_name": _new_instance_name(),
-            "server_pid": os.getpid(),
-            "release_nonce": record.release_nonce,
-        }
-        spec_path, report_path = control / "spec.json", control / "release.json"
-        spec_path.write_text(json.dumps(spec))
-        env = dict(os.environ, AGENT_SERVER_REWARD_LOCK_DIR=str(self.tmp_base / "reward_slots"))
         error = ""
         info: dict[str, Any] = {}
         proc = None
+        launch_attempted = False
         try:
+            control = self.tmp_base / f"{server_session_id}-control"
+            control.mkdir(mode=0o700)
+            spec = {
+                "record": {
+                    key: getattr(record, key)
+                    for key in ("session_id", "group_id", "sample_idx", "mode", "base_url", "api_key")
+                },
+                "server_session_id": server_session_id,
+                "row": self.modes[record.mode].get(sample_idx),
+                "base_config": self.base_config,
+                "r2e_config": self.r2e_config,
+                "sifs": {key: str(value) for key, value in self.sifs.items()},
+                "sif_dir": str(self.sif_dir),
+                "wheel_dir": str(self.wheel_dir),
+                "tmp_base": str(self.tmp_base),
+                "work_dir": str(self.work_dir),
+                "apptainer_args": self.apptainer_args,
+                "instance_name": _new_instance_name(),
+                "server_pid": os.getpid(),
+                "release_nonce": record.release_nonce,
+            }
+            spec_path, report_path = control / "spec.json", control / "release.json"
+            spec_path.write_text(json.dumps(spec))
+            env = dict(os.environ, AGENT_SERVER_REWARD_LOCK_DIR=str(self.tmp_base / "reward_slots"))
             with (control / "worker.log").open("w") as log:
                 with _owned_lock:
+                    # Once Popen is called, an exception is not proof that no
+                    # external worker was launched. Only earlier failures own
+                    # an empty allocation that can be released immediately.
+                    launch_attempted = True
                     proc = subprocess.Popen(
                         [
                             sys.executable,
@@ -1103,39 +1100,28 @@ class AgentServer:
             if not record.resources_released:
                 error = (error + "\nSession resources remain unconfirmed: " + record.cleanup_error).strip()
         except Exception as exc:
+            if not launch_attempted:
+                record.resources_released = True
             error = f"{type(exc).__name__}: {exc}"
         finally:
             if proc is not None and proc.poll() is not None:
                 _unregister_child(proc.pid)
         with self.lock:
             record.finish(info, error)
-        self._write_session_event(server_session_id, record, spec["row"])
         if record.status == "completed" and record.resources_released:
-            shutil.rmtree(control)
-
-    def _write_session_event(self, server_session_id: str, record: SessionRecord, row: dict) -> None:
-        with self.lock:
-            event = {
-                "time": time.time(),
-                "session_id": server_session_id,
-                "client_session_id": record.session_id,
-                "group_id": record.group_id,
-                "mode": record.mode,
-                "sample_idx": record.sample_idx,
-                "docker_image": row.get("docker_image"),
-                "status": record.status,
-                "exit_code": record.exit_code,
-                "error": record.error,
-                "resources_released": record.resources_released,
-            }
-            filename = "session_releases.jsonl" if record.status == "completed" else "agent_server_events.jsonl"
-        self._append_event(filename, event)
+            try:
+                shutil.rmtree(control)
+            except OSError as exc:
+                logging.warning("could not remove released session control directory %s: %s", control, exc)
 
     def _append_event(self, filename: str, event: dict[str, Any]) -> None:
-        # Shared-filesystem writes may stall. Serialize them separately so GET,
-        # create and cancel remain responsive. The worker Future still gates ACK.
-        with self._event_lock, (self.work_dir / filename).open("a") as file:
-            file.write(json.dumps(event, ensure_ascii=False) + "\n")
+        try:
+            with (self.work_dir / filename).open("a") as file:
+                file.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            # Failure diagnostics must not replace the task's original error
+            # or prevent the worker from reporting its cleanup result.
+            logging.warning("could not write session failure event: %s", exc)
 
     def _run_session_worker(self, server_session_id: str, sample_idx: int) -> None:
         """Execute agent business logic only inside the supervised worker."""
@@ -1255,8 +1241,8 @@ class AgentServer:
     def _public_record(self, server_session_id: str, record: SessionRecord) -> dict[str, Any]:
         status = record.status
         if status in TERMINAL_STATUSES and record.future is not None and not record.future.done():
-            # Clients must wait for finalization: event I/O can
-            # still fail before the worker returns, changing completed to failed.
+            # The supervisor and finalization must finish before a client can
+            # accept the result or publish the physical release receipt.
             status = "running"
         data: dict[str, Any] = {
             "session_id": server_session_id,
@@ -1370,7 +1356,6 @@ def session_worker(spec_path: str, result_path: str) -> None:
     spec = json.loads(Path(spec_path).read_text())
     server = AgentServer.__new__(AgentServer)
     server.lock = threading.Lock()
-    server._event_lock = threading.Lock()
     record = SessionRecord(**spec["record"])
     server.records = {spec["server_session_id"]: record}
     server.modes = {record.mode: SimpleNamespace(get=lambda _index: spec["row"])}

@@ -1887,14 +1887,6 @@ class AgenticSessionShard:
                 if not session.eager_timeout_active:
                     await session.resources.process.set_timeout_active(True)
                     session.eager_timeout_active = True
-                    logger.info(
-                        "Agentic eager start group=%s epoch=%s session=%s first_ir=%d/%d",
-                        group.group_id,
-                        session.rollout_id,
-                        session.session_id,
-                        len(group.first_ir_seen_session_ids),
-                        len(group.result_cells),
-                    )
                 if self._group_generation_open(group) and session.phase is SessionPhase.ACTIVE:
                     self._mark_group_timing(group, "group_generation_open_at")
                     self._dispatch_queued_irs_locked(session)

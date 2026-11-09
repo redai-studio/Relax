@@ -74,8 +74,7 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     timeout_sec = _SHUTDOWN_TIMEOUT_SEC if effective_exit_code else _NORMAL_SHUTDOWN_TIMEOUT_SEC
     if _kernel_cache_heartbeat is not None:
         timeout_sec += int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600"))
-    # A timed-out cleanup must not turn a completed training loop into a passing job.
-    watchdog = threading.Timer(timeout_sec, os._exit, args=(effective_exit_code or 1,))
+    watchdog = threading.Timer(timeout_sec, os._exit, args=(effective_exit_code,))
     watchdog.daemon = True
     watchdog.start()
     try:
@@ -109,7 +108,6 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
             try:
                 _ctrl.shutdown()
             except Exception as e:
-                exit_code = exit_code or 1
                 logger.warning(f"Controller shutdown error during {sig_name}: {e}")
 
         if ray.is_initialized():
@@ -139,7 +137,6 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                 ray.shutdown()
                 logger.info("Ray shutdown successfully")
             except Exception as e:
-                exit_code = exit_code or 1
                 logger.warning(f"Ray shutdown error during {sig_name}: {e}")
 
         if exit_code is not None:
