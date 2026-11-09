@@ -560,8 +560,8 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
         await asyncio.sleep(0)
 
     assert handle.start_group.remote.await_count == 2
-    handle.drop_group.remote.assert_any_await("first")
-    handle.drop_group.remote.assert_any_await("second")
+    handle.drop_group.remote.assert_any_await("first", reason=None)
+    handle.drop_group.remote.assert_any_await("second", reason=None)
     assert runtime.resident_group_count == 0
     assert warning.call_count == 2
     assert not prepare._warming_prepare_tasks
@@ -952,6 +952,14 @@ async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
     posts.clear()
     assert await adapter.close_session("session-1", timeout_s=1.0)
     assert posts == []
+
+
+def test_session_shard_actor_class_serialization() -> None:
+    from ray import cloudpickle
+
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    # Ray serializes this class before creating any actor instance.
+    assert cloudpickle.dumps(shard_cls)
 
 
 async def test_terminal_session_closes_lifecycle_once() -> None:
@@ -1580,18 +1588,29 @@ async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("history", [[], [100, 200]])
-async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch, history):
+@pytest.mark.parametrize("observe", [False, True])
+async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch, tmp_path, history, observe):
+    from relax.agentic.observability import SessionObservation, ShardTrajectoryRecorder
+    from relax.utils.http_utils import post_observation
+
     shard, _group, session, ir = _router_recovery_shard()
     ir.history_rollout_token_prefix = history
     calls, sleeps = [], []
+    if observe:
+        session.observation = SessionObservation()
+        shard._trajectory_recorder = ShardTrajectoryRecorder(
+            Namespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="retry"), shard_ordinal=0
+        )
 
     async def generate(**kwargs):
+        assert (post_observation.get() is not None) is observe
         calls.append(kwargs)
         if len(calls) == 1:
             raise _router_503()
         return SimpleNamespace(new_tokens=[7], new_log_probs=[], finish_type="stop", meta_info={}, elapsed=0.0)
 
     async def sleep(seconds):
+        assert post_observation.get() is None
         sleeps.append(seconds)
 
     shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
@@ -1608,6 +1627,14 @@ async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch, 
     assert sleeps == [2.0]
     assert ir.pending_token_delta == [300, 7]
     assert ir.waiter.result() == {"ok": True}
+    if observe:
+        await shard._trajectory_recorder.aclose()
+        observation = session.observation
+        assert observation.request_count == 1 and observation.attempt_count == 2
+        assert observation.generated_tokens == 1 and observation.token_count_complete
+        attempts = observation.calls[ir.request_id]["attempts"]
+        assert [attempt["status"] for attempt in attempts] == ["failed", "completed"]
+        assert all(attempt["started_at"] <= attempt["finished_at"] for attempt in attempts)
 
 
 @pytest.mark.asyncio

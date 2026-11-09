@@ -13,6 +13,8 @@ from tensordict import TensorDict
 
 from relax.algorithms import get_algorithm
 from relax.algorithms.rewards import REWARD_NORMALIZERS
+from relax.utils.agentic_obs import agentic_obs_enabled
+from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID, encode_group_ids, group_ids_to_tensor
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
@@ -104,6 +106,41 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
                 raise ValueError(
                     f"Score Centering custom converter omitted required behavior probability fields: {missing}"
                 )
+        if agentic_obs_enabled(args):
+            # Output rows may be reordered/expanded. Missing observation IDs
+            # degrade to unknown, while both TQ columns must still be published.
+            rows = (
+                int(train_data.batch_size[0])
+                if isinstance(train_data, TensorDict)
+                else len(
+                    next(train_data[key] for key in ("total_lengths", "tokens", "sample_indices") if key in train_data)
+                )
+            )
+            try:
+                ids = train_data.get("sample_export_ids")
+                if isinstance(ids, torch.Tensor):
+                    if ids.device.type != "cpu" or ids.dtype != torch.int64 or ids.ndim != 1:
+                        raise ValueError("sample_export_ids must be a one-dimensional CPU int64 column")
+                    ids = ids.tolist()
+                flat_samples = [sample for item in samples for sample in (item if isinstance(item, list) else [item])]
+                by_id = {sample.sample_export_id: sample.agentic_group_id or "" for sample in flat_samples}
+                if (
+                    ids is None
+                    or len(ids) != rows
+                    or any(type(value) is not int or not UNASSIGNED_SAMPLE_EXPORT_ID <= value < 2**63 for value in ids)
+                ):
+                    raise ValueError("missing or misaligned sample_export_ids")
+                groups = [by_id[export_id] if export_id >= 0 else "" for export_id in ids]
+            except Exception as error:
+                logger.warning("agentic_obs: custom converter identities unavailable: %s", error)
+                ids, groups = [UNASSIGNED_SAMPLE_EXPORT_ID] * rows, [""] * rows
+            train_data["sample_export_ids"] = (
+                torch.tensor(ids, dtype=torch.int64) if isinstance(train_data, TensorDict) else ids
+            )
+            encoded = encode_group_ids(groups)
+            train_data["agentic_group_ids"] = (
+                group_ids_to_tensor(encoded) if isinstance(train_data, TensorDict) else encoded
+            )
         return train_data
 
     rewards = post_process_rewards(args, samples)
@@ -209,6 +246,14 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         from relax.engine.rollout.on_policy_distillation import produce_opd_transfer_data
 
         produce_opd_transfer_data(args, samples, train_data)
+
+    if agentic_obs_enabled(args):
+        # The join key linking this row to its trajectory and stage records.
+        # Written only when observability is on, because the consumer-side field
+        # whitelist is gated on the same flag and a requested-but-absent column
+        # makes async_get_meta wait forever.
+        train_data["sample_export_ids"] = [sample.sample_export_id for sample in samples]
+        train_data["agentic_group_ids"] = encode_group_ids([sample.agentic_group_id or "" for sample in samples])
 
     total_lengths = [len(t) for t in train_data["tokens"]]
     train_data["total_lengths"] = total_lengths
@@ -331,6 +376,9 @@ def dict_to_tensordict(
                 torch.from_numpy(np.ascontiguousarray(arr.reshape(arr.shape[0], -1))).to(torch.int32) for arr in value
             ]
             result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+            continue
+        if key == "agentic_group_ids":
+            result[key] = group_ids_to_tensor(value, device=device)
             continue
         if key == "rollout_indexer_topk":
             # Normalize each replay payload to 2-D (seq_i, flattened replay width)
