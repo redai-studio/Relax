@@ -35,6 +35,8 @@ def _validate_flops_configuration(args: Namespace) -> None:
         raise ValueError("FLOPs balancing does not support microbatch-dependent M2PO clipping")
     if getattr(args, "loss_type", None) in ("dpo", "rm"):
         raise ValueError("FLOPs balancing does not support preference pairs")
+    if getattr(args, "use_opd", False) and float(getattr(args, "opd_loss_coef", 0.0) or 0.0) != 0.0:
+        raise ValueError("FLOPs balancing does not support microbatch-dependent direct OPD loss")
     auxiliary = getattr(args, "moe_aux_loss_coeff", 0.0)
     auxiliary = auxiliary if isinstance(auxiliary, (list, tuple)) else [auxiliary]
     if any(value is not None and value != 0 for value in auxiliary):
