@@ -96,7 +96,7 @@ ClearML 打开 `PROJECT_NAME` 下对应 `RUN_NAME` 的 Scalars，保持 **Group 
 | `GLOBAL_BATCH_SIZE`                    | `32`         | 全局每步样本数                                |
 | `SEQ_LENGTH`                           | `1024`       | 模型序列长度配置                              |
 | `MAX_TOKENS_PER_GPU`                   | `2048`       | 动态打包 token 容量及数据截断容量（当前 CP1） |
-| `PREFETCH_WORKERS` / `PREFETCH_BUFFER` | `4` / `1024` | 预处理线程数 / 原始与已处理样本共享的缓存容量 |
+| `PREFETCH_WORKERS` / `PREFETCH_BUFFER` | `4` / `1024` | 预处理线程数 / 已处理样本缓存容量             |
 | `IN_FLIGHT_STEPS`                      | `2`          | CPU prepack 和训练重叠的窗口                  |
 | `SAVE_CHECKPOINT` / `SAVE_INTERVAL`    | `1` / `1000` | 启用保存 / 保存间隔，训练正常结束时也保存     |
 
@@ -106,14 +106,11 @@ Checkpoint 保存到 `${CPT_ROOT}/checkpoints/${RUN_NAME}`，包含 Megatron 模
 
 ### 换业务数据后的验收
 
-先短跑，再在相同模型、硬件、配比、数据快照和 token 预算下做新旧对照。分别记录目录枚举/索引、首批和预热后稳定阶段的耗时，不把初始化或 JIT 时间混入稳态比较。检查：
+先短跑，保持模型、硬件、配比、数据快照和 token 预算一致。检查：
 
 - 每步整体和分源 loss 有限，分源 counts 可加总，零监督源不伪造 loss；当前按 token 归一化配置下，分源 loss 按实际 token 占比加权应与整体 loss 对齐。
 - 实际样本 / token 占比合理；单步波动正常，不能用单步是否严格满足 YAML 比例判断采样错误。
-- 样本顺序、token、mask、来源和断点游标与对照一致，再比较数据批次 P50/P95、文件打开次数、CPU/RSS、数据等待比例和稳定 tokens/s；GPU 利用率作为辅助观察。
 - 确认 Ray 状态成功、ClearML 曲线步数完整、checkpoint 与游标实际落盘。完整训练数值等价仍需独立验证，不能仅凭输入哈希一致认定梯度轨迹等价。
-
-此前 384 文件、约 26 MB 合成数据的暖缓存对照中，producer 稳态吞吐提升约 2.24 倍，批次 P95 从 22.5 ms 降到 9.2 ms。首批增加约 60 ms，首次目录枚举和索引没有明显改善；这些结果不是业务大目录或端到端 GPU 吞吐的验收结论。
 
 35B-A3B 示例：
 
