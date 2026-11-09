@@ -50,6 +50,9 @@ from relax.engine.sft.runtime import (
 )
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
+from relax.utils.agentic_obs import agentic_obs_enabled
+from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
+from relax.utils.agentic_obs.run_hooks import annotate_failure_stage
 from relax.utils.async_utils import run
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.micro_batch_ring import (
@@ -76,7 +79,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_merge_mode,
     summarize_lora_modules,
 )
-from relax.utils.memory_utils import clear_memory, print_memory
+from relax.utils.memory_utils import clear_memory, manual_gc_eval, manual_gc_training, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.opd.opd_utils import (
@@ -1345,10 +1348,12 @@ class MegatronTrainRayActor(TrainRayActor):
                                 )
                             )
                     dist.barrier(group=get_gloo_group())
-                    run_sft_eval(self, rollout_id)
+                    with manual_gc_eval(self.args):
+                        run_sft_eval(self, rollout_id)
 
                 if should_run_predict:
-                    run_sft_predict(self, rollout_id)
+                    with manual_gc_eval(self.args):
+                        run_sft_predict(self, rollout_id)
             except Exception as e:
                 logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
                 raise
@@ -1387,6 +1392,7 @@ class MegatronTrainRayActor(TrainRayActor):
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    @manual_gc_training
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
@@ -2541,6 +2547,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if clear_routing_replay_forward:
                 RoutingReplay.clear_all_forward()
 
+    @manual_gc_training
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -2618,6 +2625,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
                     data_fields.append("teacher_log_probs")
+                if agentic_obs_enabled(self.args):
+                    data_fields.extend(OBSERVATION_DATA_FIELDS)
                 with timer("train_get_data"):
                     sub_batch, batch_meta = self._get_data_from_transfer_queue(
                         "train", rollout_id, data_fields, batch_size, batch_index
@@ -2783,6 +2792,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_train_done:
             self._wait_for_previous_eval()
 
+    @manual_gc_training
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -2815,6 +2825,8 @@ class MegatronTrainRayActor(TrainRayActor):
             data_fields.append("multimodal_train_inputs")
         if self.args.use_opd:
             consume_opd_train_data(data_fields, self.args)
+        if agentic_obs_enabled(self.args):
+            data_fields.extend(OBSERVATION_DATA_FIELDS)
         if getattr(self.args, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
             # using token-budget fetches, align num_microbatches across DPs
@@ -2977,6 +2989,7 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data[AUDIT_FIELD] = reports + [None] * (len(rollout_data[AUDIT_FIELD]) - len(reports))
 
     @timer
+    @annotate_failure_stage("checkpoint")
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
             return
@@ -3087,7 +3100,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if reconnect_rollout_engines:
             self.wake_up()
         elif self.args.offload_train:
-            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+            reload_process_groups(
+                timeout_minutes=self.args.distributed_timeout_minutes,
+                process_groups=getattr(self.weight_updater, "process_groups_for_update", None),
+            )
 
         if num_new_engines > 0 or reconnect_rollout_engines:
             self.weight_updater.connect_rollout_engines(

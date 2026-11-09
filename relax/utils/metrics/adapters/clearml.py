@@ -94,6 +94,12 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
             reuse_last_task_id=False,
             auto_connect_frameworks={"tensorboard": False, "pytorch": False},
         )
+        try:
+            from relax.utils.agentic_obs.tracking import record_clearml_task
+
+            record_clearml_task(args, self._task)
+        except Exception as error:
+            logger.warning("agentic_obs: ClearML task binding unavailable: %s", error)
         self._connect_git_metadata(args)
         logger.info(
             f"Saving clearml log to project: {self.project_name}, experiment: {self.experiment_name}, tags: {self.tags}"

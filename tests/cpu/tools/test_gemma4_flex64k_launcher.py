@@ -20,7 +20,15 @@ _MULTI = "run-gemma4-31B-multiturn-flex64k.sh"
 def _launch(tmp_path, *, script=_BASE, **overrides):
     capture = tmp_path / "arguments.json"
     env = os.environ.copy()
-    for name in ("ACTOR_GPUS", "EXTRA_TRAIN_ARGS", "LABEL_KEY", "RAY_NO_WAIT", "WORKING_DIR"):
+    for name in (
+        "ACTOR_GPUS",
+        "EXTRA_TRAIN_ARGS",
+        "LABEL_KEY",
+        "RAY_NO_WAIT",
+        "WORKING_DIR",
+        "GEMMA4_SFT_CONVERSION_MODE",
+        "MULTIMODAL_KEYS",
+    ):
         env.pop(name, None)
     env.update(
         RELAX_ENTRYPOINT_MODE="ray-job",
@@ -95,6 +103,21 @@ def test_text_64k_launcher_can_disable_saves_and_cpu_offload(tmp_path):
     assert "--save" not in args and "--save-hf" not in args and "--save-hf-post-hook-path" not in args
     assert "--optimizer-cpu-offload" not in args
     assert "--recompute-loss-function" in args
+
+
+def test_image_64k_launcher_selects_vl_and_preserves_export_and_loss_options(tmp_path):
+    result, args = _launch(tmp_path, script="run-gemma4-31B-multimodal-flex64k.sh")
+    assert result.returncode == 0, result.stderr
+    runtime = json.loads(next(arg.split("=", 1)[1] for arg in args if arg.startswith("--runtime-env-json=")))
+    assert runtime["env_vars"]["GEMMA4_CONVERSION_MODE"] == "vl"
+    assert runtime["env_vars"]["RELAX_GEMMA4_FORCE_FLEX_GLOBAL"] == "1"
+    assert json.loads(args[args.index("--multimodal-keys") + 1]) == {"image": "images"}
+    assert args[args.index("--context-parallel-size") + 1] == "1"
+    assert args[args.index("--pipeline-model-parallel-size") + 1] == "1"
+    assert "--sft-chunked-logits" in args and "--recompute-loss-function" in args
+    assert args[args.index("--save-hf-post-hook-path") + 1] == (
+        "scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template"
+    )
 
 
 @pytest.mark.parametrize(

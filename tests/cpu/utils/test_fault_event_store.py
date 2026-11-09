@@ -12,7 +12,7 @@ from dataclasses import FrozenInstanceError, asdict, replace
 import pytest
 
 from relax.utils.fault_events import EventDraft, FaultEventStore
-from relax.utils.fault_events.models import MAX_EVENT_BYTES, MAX_UINT, encode, new_id
+from relax.utils.fault_events.models import MAX_EVENT_BYTES, MAX_UINT, RecoveryEvidence, encode, new_id, valid_uint
 
 
 def event(run_id, *, role="actor", fault_id=None):
@@ -132,6 +132,23 @@ def test_success_requires_every_expected_bit_and_no_failed_bit(observed, failed)
     )
     with pytest.raises(ValueError, match="^INVALID_EVENT$"):
         draft.validate()
+
+
+@pytest.mark.parametrize("field", ["expected_evidence", "observed_evidence", "failed_evidence"])
+def test_schema_rejects_evidence_flags_without_runtime_normalization(field):
+    draft = replace(
+        event(new_id()),
+        event_type="handling_started",
+        reason_code=None,
+        recovery_id=new_id(),
+        recovery_mode="local",
+        expected_evidence=7,
+    )
+    draft.validate()
+    flag = RecoveryEvidence.LOCAL if field == "expected_evidence" else RecoveryEvidence(0)
+    assert not valid_uint(flag)
+    with pytest.raises(ValueError, match="^INVALID_EVENT$"):
+        replace(draft, **{field: flag}).validate()
 
 
 def test_unknown_fields_and_objects_are_not_serialized_or_echoed():

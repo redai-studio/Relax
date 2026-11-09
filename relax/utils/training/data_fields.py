@@ -3,6 +3,8 @@
 from argparse import Namespace
 
 from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
+from relax.utils.agentic_obs import agentic_obs_enabled
+from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.data.image_refs import sft_multimodal_data_fields
 from relax.utils.env import Envs
 
@@ -34,6 +36,9 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         fields.append("rollout_routed_experts")
     if getattr(args, "multimodal_keys", None) is not None:
         fields.append("multimodal_train_inputs")
+    if agentic_obs_enabled(args):
+        # Produced by convert_samples_to_train_data under the same gate.
+        fields.extend(OBSERVATION_DATA_FIELDS)
     return fields
 
 

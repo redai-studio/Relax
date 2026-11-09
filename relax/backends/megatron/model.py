@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
-import gc
 import itertools
 import json
 import math
@@ -38,13 +37,15 @@ from megatron.training.training import get_model
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
 from relax.utils import tracking_utils
+from relax.utils.agentic_obs import agentic_obs_enabled
+from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.device import device_module
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_bridge_utils import patch_megatron_model
 from relax.utils.megatron_peft_utils import is_lora_enabled
-from relax.utils.memory_utils import available_memory, clear_memory, log_step_peak_memory
+from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
@@ -293,6 +294,8 @@ def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dic
                 if legacy_bshd
                 else batch.get("unsplit_full_mtp_loss_mask", batch["unsplit_mtp_loss_mask"])
             )
+        if batch.get("__is_dummy__", False):
+            forward_kwargs["loss_mask"] = torch.zeros_like(forward_kwargs["loss_mask"])
         return
 
     # MCore rolls raw text labels once before the depth-specific roll. Its
@@ -300,6 +303,10 @@ def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dic
     forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
     if forward_kwargs.get("loss_mask") is None:
         forward_kwargs["loss_mask"] = batch["full_loss_masks"]
+
+    if batch.get("__is_dummy__", False):
+        # MTPLossAutoScaler injects its gradient independently of the main loss.
+        forward_kwargs["loss_mask"] = torch.zeros_like(forward_kwargs["loss_mask"])
 
 
 def _unwrap_single_sequence_cp_output(
@@ -1274,6 +1281,8 @@ def train_one_step(
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
+    collect_manual_gc(args)
+
     if args.custom_megatron_before_train_step_hook_path:
         from relax.utils.misc import load_function
 
@@ -1332,6 +1341,7 @@ def train_one_step(
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
+                    *(OBSERVATION_DATA_FIELDS if agentic_obs_enabled(args) else ()),
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1552,6 +1562,8 @@ def train_one_step(
         memory_before = available_memory()
         device_module.empty_cache()
         logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
+    from relax.utils.agentic_obs.train_hooks import record_optimizer_result
+
     valid_step = True
     skipped_nonfinite_grad = False
     if _is_global_zero_token_step(losses_reduced):
@@ -1569,6 +1581,7 @@ def train_one_step(
         update_successful = False
         grad_norm = 0.0
         num_zeros_in_grad = None
+        record_optimizer_result(False)
     else:
         try:
             update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
@@ -1593,6 +1606,7 @@ def train_one_step(
                 exc,
                 exc_info=True,
             )
+        record_optimizer_result(bool(update_successful))
 
         if not getattr(args, "check_for_nan_in_loss_and_grad", True):
             # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
@@ -1781,13 +1795,6 @@ def train(
                 if "momentum_buffer" in state:
                     state["momentum_buffer"].zero_()
 
-    if args.manual_gc:
-        # Disable the default garbage collector and perform the collection manually.
-        # This is to align the timing of garbage collection across ranks.
-        assert args.manual_gc_interval >= 0, "Manual garbage collection interval should be larger than or equal to 0"
-        gc.disable()
-        gc.collect()
-
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
@@ -1846,9 +1853,14 @@ def train(
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
+        from relax.utils.agentic_obs.train_hooks import observe_train_step
+
         # Cover all micro-batches, the optimizer, and post-step parameter gather.
         with log_step_peak_memory(rollout_id, rollout_id * num_steps_per_rollout + step_id, memory_ranks, memory_role):
-            with timer(f"train_micro_batch_{step_id}", keep=False):
+            with (
+                timer(f"train_micro_batch_{step_id}", keep=False),
+                observe_train_step(args, rollout_id, step_id, role=getattr(model[0], "role", "actor")),
+            ):
                 loss_dict, grad_norm = train_one_step(
                     args,
                     rollout_id,
@@ -2031,6 +2043,10 @@ def train(
         # branch/parameter-gather order. Per-step sync above has made weights current.
         enable_forward_pre_hook(model)
         config.param_sync_func = param_sync_func
+
+    # Include final collection in the training timer, before publishing performance metrics.
+    if getattr(args, "manual_gc", False) and rollout_id + 1 == args.num_rollout:
+        collect_manual_gc(args, final=True)
 
 
 def save(

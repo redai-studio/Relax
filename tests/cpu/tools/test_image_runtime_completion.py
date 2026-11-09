@@ -49,8 +49,12 @@ def test_hybridep_validation_preserves_sglang_package(tmp_path):
     hybrid = next(d for d in distributions if d.metadata["Name"] == "relax_hybrid_ep")
     validator.validate(hybrid, distributions)
     assert all(file.read_text() == "SGLANG = True\n" for file in public_files)
+    before = private.stat()
     (private / "utils").mkdir()
     (private / "utils/__init__.py").write_text("")
+    # A wheel update within one filesystem timestamp tick must invalidate the
+    # previous FileFinder result instead of silently accepting the old module.
+    os.utime(private, ns=(before.st_atime_ns, before.st_mtime_ns))
     with pytest.raises(ValueError, match="shadowed"):
         validator.validate(hybrid, distributions)
 
