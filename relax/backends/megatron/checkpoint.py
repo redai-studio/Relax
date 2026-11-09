@@ -28,7 +28,11 @@ from relax.utils.training.ppo_utils import (
     use_sequence_classification_lm_head_for_hf_load,
 )
 
-from .checkpoint_metadata import _checkpoint_has_optimizer_state, _collective_checkpoint_probe
+from .checkpoint_metadata import (
+    _checkpoint_has_optimizer_state,
+    _collective_checkpoint_probe,
+    validate_native_checkpoint,
+)
 from .compat import patch_hybrid_optimizer_native_fp32_checkpoint_load, preserve_hdo_dp_reshardable_steps_on_load
 
 
@@ -644,9 +648,7 @@ def _checkpoint_load_state(load_path: str, args: Namespace, load_optimizer: bool
         "megatron": megatron,
         "iteration_dir": str(iteration_dir) if iteration_dir is not None else None,
         "valid_iteration": valid_iteration,
-        "has_optimizer": (
-            _checkpoint_has_optimizer_state(iteration_dir, args) if valid_iteration and load_optimizer else True
-        ),
+        "has_optimizer": (_checkpoint_has_optimizer_state(iteration_dir, args) if valid_iteration else True),
         "hf": exists and not megatron and _is_hf_checkpoint(load_path),
     }
 
@@ -665,24 +667,24 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     if state["megatron"]:
         current_is_rm = is_rm_mode(args) and getattr(ddp_model[0], "role", "actor") == "actor"
         iter_dir = state["iteration_dir"]
+        # A Megatron release checkpoint is explicitly a weights-only source.
+        release = iter_dir is not None and Path(iter_dir).name == "release"
+        load_optimizer = load_optimizer and not release
         if not state["valid_iteration"]:
             if current_is_rm:
                 raise RuntimeError(f"RM resume requires an existing checkpoint iteration: {iter_dir}")
-            logger.warning(
+            raise RuntimeError(
                 f"Cannot resume from {load_path}: iteration directory {iter_dir} does not exist "
-                "(deleted or interrupted save). Falling back to the HF checkpoint, "
-                "training restarts from scratch."
+                "(deleted or interrupted save). Choose an explicit HF source to start a new run."
             )
-            return _load_checkpoint_hf(ddp_model=ddp_model, optimizer=optimizer, args=args, load_path=None)
 
         if load_optimizer and not state["has_optimizer"]:
             if current_is_rm:
                 raise RuntimeError(f"RM resume requires optimizer state in checkpoint {iter_dir}")
-            logger.warning(
+            raise RuntimeError(
                 f"Checkpoint {iter_dir} contains no optimizer state (saved with --no-save-optim). "
-                "Loading model weights only; the optimizer and LR scheduler start from scratch."
+                "Use --no-load-optim or --finetune for intentional weights-only loading."
             )
-            args.no_load_optim = True
 
         _alias_renamed_transfer_queue_enum()
         if (
@@ -691,12 +693,24 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             and patch_hybrid_optimizer_native_fp32_checkpoint_load()
         ):
             logger.info("Applied compatibility fix for native-FP32 CPU-offloaded optimizer checkpoint load")
-        lora_metadata = _collective_checkpoint_probe(
-            lambda: _metadata_value(
-                _load_checkpoint_metadata(args, ddp_model, Path(iter_dir)).get("args"),
-                _LORA_CHECKPOINT_METADATA_ATTR,
-            )
-        )
+
+        def probe_metadata():
+            common = _load_checkpoint_metadata(args, ddp_model, Path(iter_dir))
+            if (Path(iter_dir) / ".metadata").is_file():
+                validate_native_checkpoint(
+                    iter_dir,
+                    require_optimizer=load_optimizer,
+                    require_rng=(
+                        optimizer is not None
+                        and not release
+                        and not getattr(args, "finetune", False)
+                        and not getattr(args, "no_load_rng", False)
+                    ),
+                    common_state=common,
+                )
+            return _metadata_value(common.get("args"), _LORA_CHECKPOINT_METADATA_ATTR)
+
+        lora_metadata = _collective_checkpoint_probe(probe_metadata)
         try:
             if lora_metadata is None:
                 step_context = (

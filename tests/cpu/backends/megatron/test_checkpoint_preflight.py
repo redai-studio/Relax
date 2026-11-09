@@ -59,6 +59,7 @@ def _load_checkpoint_module():
         is_rm_mode=is_rm_mode,
         _collective_checkpoint_probe=checkpoint_metadata._collective_checkpoint_probe,
         _checkpoint_has_optimizer_state=checkpoint_metadata._checkpoint_has_optimizer_state,
+        validate_native_checkpoint=checkpoint_metadata.validate_native_checkpoint,
         patch_hybrid_optimizer_native_fp32_checkpoint_load=compat.patch_hybrid_optimizer_native_fp32_checkpoint_load,
         preserve_hdo_dp_reshardable_steps_on_load=compat.preserve_hdo_dp_reshardable_steps_on_load,
         REWARD_MODEL_HEAD_TYPE="reward_model_terminal_v1",
@@ -138,28 +139,118 @@ def _stub_loaders(monkeypatch, args):
         checkpoint, "_load_checkpoint_hf", lambda **kw: calls.append(("hf", kw["load_path"])) or (0, 0)
     )
     monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **kw: calls.append(("dcp",)) or (7, 0))
-    monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        checkpoint,
+        "_load_checkpoint_metadata",
+        lambda *a, **kw: {"iteration": 7, "opt_param_scheduler": {}, "rng_state": []},
+    )
     return calls
 
 
-def test_checkpoint_missing_iteration_falls_back_to_hf(monkeypatch, tmp_path):
+def test_checkpoint_missing_iteration_never_restarts_from_hf(monkeypatch, tmp_path):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
     calls = _stub_loaders(monkeypatch, Namespace(load=str(tmp_path)))
-    assert checkpoint.load_checkpoint(None, None, None, {}, False) == (0, 0)
-    assert calls == [("hf", None)]
+    with pytest.raises(RuntimeError, match="iteration directory.*does not exist"):
+        checkpoint.load_checkpoint(None, None, None, {}, False)
+    assert calls == []
 
 
-@pytest.mark.parametrize(
-    "no_load_optim,finetune,expected", [(False, False, True), (True, False, True), (False, True, False)]
-)
-def test_checkpoint_model_only_sets_optimizer_policy(monkeypatch, tmp_path, no_load_optim, finetune, expected):
+@pytest.mark.parametrize("no_load_optim,finetune", [(True, False), (False, True)])
+def test_checkpoint_explicit_model_only_load(monkeypatch, tmp_path, no_load_optim, finetune):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
     save({"model": torch.zeros(2)}, checkpoint_id=tmp_path / "iter_0000007")
     args = Namespace(load=str(tmp_path), ckpt_format="torch_dist", no_load_optim=no_load_optim, finetune=finetune)
     calls = _stub_loaders(monkeypatch, args)
     checkpoint.load_checkpoint(None, object(), None, {}, False)
     assert calls == [("dcp",)]
-    assert args.no_load_optim is expected
+    assert args.no_load_optim is no_load_optim
+
+
+def test_checkpoint_missing_optimizer_requires_explicit_reset(monkeypatch, tmp_path):
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
+    save({"model": torch.zeros(2)}, checkpoint_id=tmp_path / "iter_0000007")
+    args = Namespace(load=str(tmp_path), ckpt_format="torch_dist")
+    calls = _stub_loaders(monkeypatch, args)
+    with pytest.raises(RuntimeError, match="no optimizer state"):
+        checkpoint.load_checkpoint(None, object(), None, {}, False)
+    assert calls == []
+
+
+def test_checkpoint_release_remains_an_explicit_weights_only_source(monkeypatch, tmp_path):
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("release")
+    save({"model": torch.zeros(2)}, checkpoint_id=tmp_path / "release")
+    args = Namespace(load=str(tmp_path), ckpt_format="torch_dist")
+    calls = _stub_loaders(monkeypatch, args)
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *a: {"iteration": 0})
+    checkpoint.load_checkpoint(None, object(), None, {}, False)
+    assert calls == [("dcp",)]
+
+
+@pytest.mark.parametrize("damage", ["missing", "truncated", "outside"])
+def test_checkpoint_shard_damage_is_detected_before_loading(monkeypatch, tmp_path, damage):
+    from torch.distributed.checkpoint import FileSystemReader
+
+    directory = tmp_path / "iter_0000007"
+    save({"model": torch.zeros(2), "optimizer": torch.ones(2)}, checkpoint_id=directory)
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
+    metadata = FileSystemReader(directory).read_metadata()
+    storage = next(iter(metadata.storage_data.values()))
+    shard = directory / storage.relative_path
+    if damage == "missing":
+        shard.unlink()
+    elif damage == "truncated":
+        shard.write_bytes(b"partial")
+    else:
+        # A symlink must not let a snapshot depend on storage outside its root.
+        outside = tmp_path / "external-shard"
+        shard.rename(outside)
+        shard.symlink_to(outside)
+    args = Namespace(load=str(tmp_path), ckpt_format="torch_dist")
+    calls = _stub_loaders(monkeypatch, args)
+    with pytest.raises(RuntimeError, match="missing|truncated|outside"):
+        checkpoint.load_checkpoint(None, object(), None, {}, False)
+    assert calls == []
+
+
+@pytest.mark.parametrize("missing", [None, "optimizer", "scheduler", "rng", "iteration", "legacy_scheduler"])
+def test_checkpoint_resume_state_contract(tmp_path, missing):
+    directory = tmp_path / "iter_0000007"
+    state = {"model": torch.zeros(2)}
+    if missing != "optimizer":
+        state["optimizer"] = torch.ones(2)
+    save(state, checkpoint_id=directory)
+    common = {"iteration": 7, "opt_param_scheduler": {}, "rng_state": []}
+    if missing == "scheduler":
+        del common["opt_param_scheduler"]
+    if missing == "rng":
+        del common["rng_state"]
+    if missing == "iteration":
+        common["iteration"] = 6
+    if missing == "legacy_scheduler":
+        common["lr_scheduler"] = common.pop("opt_param_scheduler")
+    if missing in {None, "legacy_scheduler"}:
+        assert checkpoint_metadata.validate_native_checkpoint(directory, common_state=common) == common
+    else:
+        with pytest.raises(RuntimeError, match="optimizer|scheduler|RNG|iteration"):
+            checkpoint_metadata.validate_native_checkpoint(directory, common_state=common)
+    if missing in {"optimizer", "scheduler", "rng"}:
+        assert (
+            checkpoint_metadata.validate_native_checkpoint(
+                directory, require_optimizer=False, require_rng=False, common_state=common
+            )
+            == common
+        )
+
+
+def test_checkpoint_recipe_preflight_reads_native_common_state(tmp_path):
+    from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
+
+    directory = tmp_path / "iter_0000007"
+    save({"model": torch.zeros(2), "optimizer": torch.ones(2)}, checkpoint_id=directory)
+    common = {"iteration": 7, "opt_param_scheduler": {}, "rng_state": []}
+    torch.save(common, directory / "common.pt")
+    save_config(CheckpointingConfig(sharded_backend="torch_dist"), str(directory))
+    assert checkpoint_metadata.validate_native_checkpoint(directory) == common
 
 
 @pytest.mark.parametrize("missing", ["iteration", "optimizer"])
