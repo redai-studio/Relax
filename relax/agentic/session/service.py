@@ -29,6 +29,8 @@ from ray import serve
 from starlette.requests import ClientDisconnect
 
 from relax.agentic import AGENTIC_CHAT_API_ROUTE_PREFIX, AGENTIC_CHAT_API_SERVICE_NAME
+from relax.agentic.inventory import session_sampling_config
+from relax.agentic.observability import SessionObservation, ShardTrajectoryRecorder, shard_generation_args
 from relax.agentic.pipeline import (
     RuntimeGroupError,
     SessionExportTransport,
@@ -70,6 +72,8 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
+from relax.utils.agentic_obs.records import utc_now
+from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import get_spec_token_counts
@@ -154,6 +158,13 @@ async def _wait_process(process: ManagedAgentProcess) -> Optional[BaseException]
     except Exception as error:
         return error
     return None
+
+
+def _is_ray_task_cancelled(error: BaseException) -> bool:
+    return isinstance(error, ray.exceptions.TaskCancelledError) or (
+        isinstance(error, ray.exceptions.RayTaskError)
+        and isinstance(error.as_instanceof_cause(), ray.exceptions.TaskCancelledError)
+    )
 
 
 def _extend_token_ids(target: set[int], value: Any) -> None:
@@ -1350,6 +1361,7 @@ class GroupOwnership(Enum):
 
 
 _SessionResultPayload = SessionExportTransport | RuntimeGroupError | None
+_PreparedSessionExports = tuple[tuple[str, dict[str, Any]], ...]
 
 
 @dataclass(eq=False)
@@ -1406,6 +1418,7 @@ class ResidentGroup:
     ownership: GroupOwnership = GroupOwnership.PREPARE
     change_revision: int = 0
     drop_task: Optional[asyncio.Task[None]] = None
+    stop_reason: tuple[str, str, str] | None = None
 
     @property
     def first_request_barrier_crossed(self) -> bool:
@@ -1461,9 +1474,10 @@ class _SessionRecord:
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
     # Submitted export job; cleanup cancels it if the worker has not started it.
-    export_future: Optional["Future[SessionExportTransport]"] = None
+    export_future: Optional["Future[_PreparedSessionExports]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
+    observation: SessionObservation | None = None
 
     @property
     def interrupted(self) -> bool:
@@ -1503,6 +1517,7 @@ class AgenticSessionShard:
         self._sglang_request_limiter = admission_coordinator
         self._admission_client = RayAdmissionClient(admission_coordinator) if args.agentic_program_admission else None
         self._permit_cleanup_tasks: set["asyncio.Task[None]"] = set()
+        self._trajectory_recorder = ShardTrajectoryRecorder(args)
         self._lifecycle_close_count = 0
         self._lifecycle_close_failure_count = 0
         self._generation_backend = SGLangBackendAdapter(args)
@@ -1512,7 +1527,7 @@ class AgenticSessionShard:
         )
         # Every submitted export job until it ends, including jobs whose
         # Session was already retired; shutdown awaits them before the worker.
-        self._inflight_exports: set["Future[SessionExportTransport]"] = set()
+        self._inflight_exports: set["Future[_PreparedSessionExports]"] = set()
         self._agent_launcher = ManagedAgentLauncher(
             load_agent_app_spec_from_args(args),
             resolve_chat_api_base_url(),
@@ -1531,7 +1546,20 @@ class AgenticSessionShard:
         self._state_revision += 1
         if group is not None:
             group.change_revision = self._state_revision
+            if group.first_request_barrier_crossed:
+                self._mark_group_timing(group, "group_first_requests_ready_at")
         self._state_changed.set()
+
+    @best_effort
+    def _mark_group_timing(self, group: ResidentGroup, event: str) -> None:
+        """First-start milestones only; never participate in scheduling."""
+        if not self._trajectory_recorder.enabled:
+            return
+        timestamp = time.time()
+        for session in group.sessions:
+            if session.phase is SessionPhase.ACTIVE and session.forest is not None:
+                events = agentic_trace_events(session.forest.static_metadata)
+                mark_agentic_event_once(events, event, timestamp)
 
     def _current_progress(self, known_revision: int) -> SessionShardProgress:
         """Project progress from Groups changed after one cursor."""
@@ -1598,15 +1626,15 @@ class AgenticSessionShard:
                 _SessionRecord(
                     group=group,
                     session_id=session_id,
-                    session_sampling_params=self._session_sampling_params(session_spec, sample_position),
+                    session_sampling_params={},
                     result_cell=result_cells[session_id],
-                    forest=SessionForest.create_empty(
-                        session_id=session_id,
-                        group_index=session_spec.group_index,
-                        index=session_spec.index,
-                        label=session_spec.label,
-                        train_metadata=session_spec.train_metadata,
-                        metadata=session_spec.metadata,
+                    observation=(
+                        SessionObservation(
+                            stage_id=session_spec.observation_stage_id or f"session:{session_id}:rollout",
+                            started_at_utc=session_spec.observation_started_at or utc_now(),
+                        )
+                        if self._trajectory_recorder.enabled
+                        else None
                     ),
                 )
             )
@@ -1614,7 +1642,16 @@ class AgenticSessionShard:
         self._session_records.update((session.session_id, session) for session in group.sessions)
 
         try:
-            for session, session_spec in zip(group.sessions, session_specs, strict=True):
+            for sample_position, (session, session_spec) in enumerate(zip(group.sessions, session_specs, strict=True)):
+                session.session_sampling_params = self._session_sampling_params(session_spec, sample_position)
+                session.forest = SessionForest.create_empty(
+                    session_id=session.session_id,
+                    group_index=session_spec.group_index,
+                    index=session_spec.index,
+                    label=session_spec.label,
+                    train_metadata=session_spec.train_metadata,
+                    metadata=session_spec.metadata,
+                )
                 self._start_session(
                     session,
                     SessionInput(
@@ -1624,7 +1661,14 @@ class AgenticSessionShard:
                         input_payload=session_spec.input_payload,
                     ),
                 )
-        except BaseException:
+        except BaseException as error:
+            for session in tuple(group.sessions):
+                if session.observation is not None:
+                    session.observation.failure = (
+                        "session_prepare_failed",
+                        "infra",
+                        f"{type(error).__name__}: {error}",
+                    )
             await self.drop_group(group_id)
             raise
 
@@ -1635,22 +1679,26 @@ class AgenticSessionShard:
     ) -> Dict[str, Any]:
         """Apply sampling precedence before the first OpenAI request."""
 
-        sampling_params = {
-            "temperature": self.args.rollout_temperature,
-            "top_p": self.args.rollout_top_p,
-            "top_k": self.args.rollout_top_k,
-            "max_new_tokens": self.args.rollout_max_response_len,
-            "stop": self.args.rollout_stop,
-            "stop_token_ids": self.args.rollout_stop_token_ids,
-            "skip_special_tokens": self.args.rollout_skip_special_tokens,
-            "no_stop_trim": True,
-            "spaces_between_special_tokens": False,
-        }
-        if self.args.sglang_enable_deterministic_inference:
-            sampling_params["sampling_seed"] = self.args.rollout_seed + sample_position
-        if session_spec.sampling_params is not None:
-            sampling_params.update(session_spec.sampling_params)
-        return {key: value for key, value in sampling_params.items() if value is not None}
+        return session_sampling_config(self.args, session_spec.sampling_params, sample_position)
+
+    def _observe_session(self, session: _SessionRecord, stage: str, status: str, **fields: Any) -> None:
+        observation = session.observation
+        if observation is None:
+            return
+        if session.resources is not None:
+            process = session.resources.process
+            observation.active_ms = getattr(process, "active_ms", observation.active_ms)
+            observation.log_ref = getattr(process, "observation_log_ref", None)
+        self._trajectory_recorder.record_session(
+            observation,
+            session_id=session.session_id,
+            group_id=session.group.group_id,
+            rollout_mode=session.group.rollout_mode,
+            rollout_id=session.rollout_id if session.group.ownership is GroupOwnership.RUNTIME else None,
+            stage=stage,
+            status=status,
+            **fields,
+        )
 
     @staticmethod
     def _accumulate_request_meta(request, *, meta_info: dict[str, Any]) -> None:
@@ -1670,14 +1718,15 @@ class AgenticSessionShard:
 
         group = self._groups[group_id]
         self._raise_group_error(group)
-        if group.dropped:
-            raise RuntimeGroupError(f"cannot lease group that failed during Prepare: {group.group_id}")
+        if group.drop_task is not None or group.dropped:
+            return
         if not group.first_request_barrier_crossed:
             raise RuntimeGroupError(f"cannot lease group before every first IR exists: {group.group_id}")
+        # Commit every Session ID and Runtime ownership before a drop can interleave at an await.
         for session in group.sessions:
-            async with session.lock:
-                session.rollout_id = rollout_id
+            session.rollout_id = rollout_id
         group.ownership = GroupOwnership.RUNTIME
+        self._mark_group_timing(group, "group_runtime_leased_at")
         await self._set_group_timeout_active(group, self._group_generation_open(group))
         await self._open_group(group)
 
@@ -1696,6 +1745,7 @@ class AgenticSessionShard:
         if group.ownership is not GroupOwnership.RUNTIME or group.dropped or group.terminal:
             return
         if self._group_generation_open(group):
+            self._mark_group_timing(group, "group_generation_open_at")
             for session in tuple(group.sessions):
                 if session.result_cell.terminal:
                     continue
@@ -1720,8 +1770,17 @@ class AgenticSessionShard:
     async def _interrupt_running_requests(self) -> None:
         """Ask selected backend attempts to return their generated prefix."""
 
+        async def abort_owned_request(session: _SessionRecord, request_id: str) -> None:
+            try:
+                await self._generation_backend.abort_request(request_id)
+            except BaseException as error:
+                cancelled = isinstance(error, asyncio.CancelledError) or _is_ray_task_cancelled(error)
+                if cancelled and session.phase is SessionPhase.FINALIZING:
+                    return
+                raise
+
         runner_tasks: list[asyncio.Task[None]] = []
-        backend_request_ids: list[str] = []
+        backend_aborts: list[tuple[_SessionRecord, str]] = []
         try:
             for group in tuple(self._groups.values()):
                 self._raise_group_error(group)
@@ -1751,13 +1810,13 @@ class AgenticSessionShard:
                                 runner.cancel()
                                 runner_tasks.append(runner)
                                 continue
-                            backend_request_ids.append(_backend_request_id(ir))
+                            backend_aborts.append((session, _backend_request_id(ir)))
                             runner_tasks.append(runner)
                         session.queued_irs.extendleft(reversed(requeued_irs))
                 self._notify_state_change(group)
         finally:
             abort_outcomes = await asyncio.gather(
-                *(self._generation_backend.abort_request(request_id) for request_id in backend_request_ids),
+                *(abort_owned_request(session, request_id) for session, request_id in backend_aborts),
                 return_exceptions=True,
             )
             await asyncio.gather(*runner_tasks, return_exceptions=True)
@@ -1847,7 +1906,7 @@ class AgenticSessionShard:
         self._groups.pop(group_id)
         self._notify_state_change()
 
-    async def drop_group(self, group_id: str) -> None:
+    async def drop_group(self, group_id: str, *, reason: tuple[str, str, str] | None = None) -> None:
         """Discard one group through an idempotent cleanup path."""
 
         group = self._groups.get(group_id)
@@ -1855,6 +1914,7 @@ class AgenticSessionShard:
             # Driver cancellation may retry after the remote release committed.
             return
         if group.drop_task is None:
+            group.stop_reason = reason
             group.drop_task = asyncio.create_task(
                 self._drop_group(group),
                 name=f"drop-group:{group.group_id}",
@@ -1878,12 +1938,19 @@ class AgenticSessionShard:
     ) -> dict[str, Any]:
         """Resolve one HTTP route token to the actor-local Session ref."""
 
+        request_id = None
         try:
             session = self._session_records.get(session_id)
             if session is None:
                 raise _session_discarded_error(session_id)
+            if session.phase is SessionPhase.ACTIVE:
+                request_id = f"req_{session.session_id}_{session.next_ir_sequence}"
+                session.next_ir_sequence += 1
+                if session.observation is not None:
+                    session.observation.begin_call(request_id)
             return await self._chat(
                 session=session,
+                request_id=request_id,
                 messages=messages,
                 tools=tools,
                 chat_template_kwargs=chat_template_kwargs,
@@ -1892,8 +1959,37 @@ class AgenticSessionShard:
                 seed=seed,
                 logprobs=logprobs,
             )
+        except asyncio.CancelledError:
+            # A disconnected caller does not cancel a shielded live IR. Only
+            # requests that never reached the scheduler ended at this boundary.
+            if session is not None and session.observation is not None and request_id is not None:
+                if not any(ir.request_id == request_id for ir in session.live_irs):
+                    session.observation.finish_call(request_id, "cancelled", reason_code="request_cancelled")
+            raise
         except AgenticChatRequestError as error:
+            if session is not None and session.phase is SessionPhase.ACTIVE:
+                self._observe_session(
+                    session,
+                    "request",
+                    "failed",
+                    request_id=request_id,
+                    reason_code="request_rejected",
+                    category="execution",
+                    reason=str(error),
+                )
             return _error_from_exception(error)
+        except Exception as error:
+            if session is not None and session.phase is SessionPhase.ACTIVE:
+                self._observe_session(
+                    session,
+                    "request",
+                    "failed",
+                    request_id=request_id,
+                    reason_code="request_prepare_failed",
+                    category="execution",
+                    reason=f"{type(error).__name__}: {error}",
+                )
+            raise
 
     async def mark_chat_service_response_ready(
         self,
@@ -1964,7 +2060,7 @@ class AgenticSessionShard:
             "ir_queue": {"queued": sum(len(session.queued_irs) for session in sessions)},
         }
 
-    async def debug_state(self, *, sample_limit: int = 8) -> dict[str, Any]:
+    async def debug_state(self) -> dict[str, Any]:
         """Project actor-local refs into a debug dictionary."""
 
         groups = tuple(self._group_debug_state(group) for group in self._groups.values())
@@ -1974,7 +2070,7 @@ class AgenticSessionShard:
             "groups": groups,
             "group_ids": tuple(group["group_id"] for group in groups),
             "group_count": len(groups),
-            "session_ids": session_ids[:sample_limit],
+            "session_ids": session_ids,
             "session_count": len(session_ids),
             "retained_request_count": sum(group["retained_request_count"] for group in groups),
             "backend_request_count": sum(group["backend_request_count"] for group in groups),
@@ -2024,7 +2120,7 @@ class AgenticSessionShard:
         first_error: Optional[BaseException] = None
         for group in tuple(self._groups.values()):
             try:
-                await self.drop_group(group.group_id)
+                await self.drop_group(group.group_id, reason=("shutdown", "selection", "shard shut down"))
             except BaseException as error:
                 if first_error is None:
                     first_error = error
@@ -2042,6 +2138,13 @@ class AgenticSessionShard:
         await asyncio.gather(*(asyncio.wrap_future(export) for export in inflight), return_exceptions=True)
         self._inflight_exports.difference_update(inflight)
         self._export_executor.shutdown(wait=True, cancel_futures=True)
+        # Drain queued trajectories before the backend goes away: shards run with
+        # max_restarts=0, so anything still in the writer queue is lost for good.
+        try:
+            await self._trajectory_recorder.aclose()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         try:
             await self._generation_backend.shutdown()
         except BaseException as error:
@@ -2061,6 +2164,7 @@ class AgenticSessionShard:
         stop: Optional[list[str] | str],
         seed: Optional[int],
         logprobs: bool,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Commit one full OpenAI request to the Forest before scheduling
         it."""
@@ -2100,6 +2204,8 @@ class AgenticSessionShard:
                 tools=tools,
                 chat_template_kwargs=chat_template_kwargs,
             )
+            if session.observation is not None and request_id is not None:
+                session.observation.calls[request_id]["parent_state_hash"] = generation_parent.state_hash
             kind = forest.resolve_request_kind(
                 abort_count=generation_parent.abort_count,
                 protected_abort_count_threshold=(
@@ -2120,8 +2226,12 @@ class AgenticSessionShard:
                     )
                 if int(sampling_params["max_new_tokens"]) > context_budget:
                     sampling_params["max_new_tokens"] = context_budget
-            request_id = f"req_{session.session_id}_{session.next_ir_sequence}"
-            session.next_ir_sequence += 1
+            if request_id is None:
+                request_id = f"req_{session.session_id}_{session.next_ir_sequence}"
+                session.next_ir_sequence += 1
+            if session.observation is not None:
+                session.observation.begin_call(request_id)
+                session.observation.calls[request_id]["parent_state_hash"] = generation_parent.state_hash
             waiter = asyncio.get_running_loop().create_future()
             ir = InflightRequest(
                 request_id=request_id,
@@ -2146,6 +2256,14 @@ class AgenticSessionShard:
             mark_agentic_event(profile, "ir_created_at")
             session.live_irs.add(ir)
             session.queued_irs.append(ir)
+            if session.observation is not None:
+                self._observe_session(
+                    session,
+                    "request",
+                    "running",
+                    request_id=request_id,
+                    sampling_config=copy.deepcopy(sampling_params),
+                )
             self._dispatch_queued_irs_locked(session)
         self._notify_state_change(group)
         try:
@@ -2258,6 +2376,10 @@ class AgenticSessionShard:
         """Attach a record-owned process to one Session."""
 
         process = self._agent_launcher.start_agent(session_input)
+        if session.observation is not None:
+            log_path = self._trajectory_recorder.session_log_path(session.session_id)
+            if log_path is not None:
+                process.configure_observability(log_path)
         process_wait = asyncio.create_task(
             _wait_process(process),
             name=f"agent-process-wait:{session.session_id}",
@@ -2305,6 +2427,14 @@ class AgenticSessionShard:
                 except Exception as error:
                     self._fail_ir_locked(session, ir, error)
                     continue
+                self._observe_session(
+                    session,
+                    "request",
+                    "failed" if "error" in payload else "completed",
+                    request_id=ir.request_id,
+                    reason_code="completion_budget_exhausted",
+                    category="execution",
+                )
                 session.live_irs.remove(ir)
                 ir.waiter.set_result(payload)
                 continue
@@ -2326,6 +2456,15 @@ class AgenticSessionShard:
     ) -> None:
         """Release one failed IR, wake its caller, and continue sibling IRs."""
 
+        self._observe_session(
+            session,
+            "request",
+            "failed",
+            request_id=ir.request_id,
+            reason_code="request_failed",
+            category="execution",
+            reason=f"{type(error).__name__}: {error}",
+        )
         session.live_irs.remove(ir)
         ir.runner_task = None
         ir.waiter.set_exception(error)
@@ -2346,6 +2485,8 @@ class AgenticSessionShard:
         try:
             acquired = await acquire_ref
         except Exception as error:
+            if _is_ray_task_cancelled(error):
+                return
             await self._cancel_sglang_request_permit(permit_id)
             raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
         if acquired:
@@ -2411,10 +2552,12 @@ class AgenticSessionShard:
             cleanup_task.add_done_callback(self._discard_successful_permit_cleanup)
             raise
         except Exception as error:
+            if _is_ray_task_cancelled(error):
+                raise asyncio.CancelledError() from error
             await self._cancel_sglang_request_permit(permit_id)
             raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
         if not acquired:
-            raise RuntimeGroupError("SGLang permit acquire was cancelled")
+            raise asyncio.CancelledError()
         try:
             yield
         finally:
@@ -2432,6 +2575,9 @@ class AgenticSessionShard:
         ir: InflightRequest,
     ) -> None:
         """Run one IR while keeping all partial deltas on that ref."""
+
+        # Import in the worker so Ray does not capture the unpicklable ContextVar.
+        from relax.utils.http_utils import PostObservation, post_observation
 
         group = session.group
         runner_task = asyncio.current_task()
@@ -2454,7 +2600,7 @@ class AgenticSessionShard:
                 return
 
         try:
-            for attempt in range(2):
+            for recovery_attempt in range(2):
                 router_unavailable = False
                 async with self._admission_lease(session, ir):
                     async with self._sglang_request_permit():
@@ -2474,6 +2620,14 @@ class AgenticSessionShard:
                                 "generation_start_at",
                             )
 
+                        observation = session.observation
+                        http_observation = PostObservation() if observation is not None else None
+                        observation_token = (
+                            post_observation.set(http_observation) if http_observation is not None else None
+                        )
+                        observation_attempt = (
+                            observation.begin_attempt(ir.request_id, ir.rollout_id) if observation else None
+                        )
                         try:
                             result = await self._generation_backend.generate(
                                 input_ids=ir.history_rollout_token_prefix + ir.pending_token_delta,
@@ -2487,15 +2641,43 @@ class AgenticSessionShard:
                                 collect_score_centering=group.rollout_mode == "train",
                                 fail_fast_no_workers=router_recovery_enabled,
                             )
-                        except httpx.HTTPStatusError as error:
-                            router_unavailable = router_recovery_enabled and is_router_no_available_workers(error)
+                            if observation is not None:
+                                # Count each returned delta before cleanup or a
+                                # superseding generation gate can discard it.
+                                observation.record_backend_timing(observation_attempt, result.meta_info)
+                                observation.generated_tokens += len(result.new_tokens)
+                                observation_attempt.update(
+                                    status="aborted" if result.finish_type == "abort" else "completed",
+                                    generated_tokens=len(result.new_tokens),
+                                    finish_reason=result.finish_type,
+                                )
+                        except BaseException as error:
+                            router_unavailable = (
+                                router_recovery_enabled
+                                and isinstance(error, httpx.HTTPStatusError)
+                                and is_router_no_available_workers(error)
+                            )
+                            if router_unavailable:
+                                # The router rejected this attempt before dispatch. Clear
+                                # backend ownership before context cleanup can await, so a
+                                # concurrent pause treats the runner as cancellable waiting.
+                                ir.backend_started = False
+                            if observation is not None:
+                                # A pre-dispatch rejection cannot hide generated tokens.
+                                if not router_unavailable:
+                                    observation.token_count_complete = False
+                                observation_attempt.update(
+                                    status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed",
+                                    reason_code=type(error).__name__,
+                                )
                             if not router_unavailable:
                                 raise
-                            # The router rejected this attempt before dispatch. Clear
-                            # backend ownership before context cleanup can await, so a
-                            # concurrent pause treats the runner as cancellable waiting.
-                            ir.backend_started = False
                         finally:
+                            if observation_attempt is not None:
+                                observation_attempt["finished_at"] = utc_now()
+                            if observation_token is not None:
+                                post_observation.reset(observation_token)
+                                observation.token_count_complete &= http_observation.token_count_complete
                             mark_agentic_event(
                                 agentic_trace_events(ir.pending_export_metadata_patch),
                                 "generation_end_at",
@@ -2510,7 +2692,7 @@ class AgenticSessionShard:
                         session.queued_irs.appendleft(ir)
                         self._notify_state_change(group)
                         return
-                if attempt:
+                if recovery_attempt:
                     raise RuntimeGroupError("SGLang router still has no available workers after recovery wait")
                 wait_s = float(getattr(self.args, "router_cb_timeout_duration_secs", 60)) + 2
                 logger.warning("SGLang router has no available workers; retrying generation once after %.1fs", wait_s)
@@ -2522,6 +2704,14 @@ class AgenticSessionShard:
                     ir.runner_task = None
                     ir.backend_started = False
             if not expected_runtime_cancel:
+                self._observe_session(
+                    session,
+                    "request",
+                    "failed",
+                    request_id=ir.request_id,
+                    reason_code="request_runner_cancelled",
+                    category="infra",
+                )
                 await self._handle_infra_failure(
                     session,
                     RuntimeGroupError(f"chat runner cancelled itself for {session.session_id}/{ir.request_id}"),
@@ -2537,12 +2727,29 @@ class AgenticSessionShard:
                     except Exception as error:
                         self._fail_ir_locked(session, ir, error)
                     else:
+                        self._observe_session(
+                            session,
+                            "request",
+                            "failed" if "error" in payload else "completed",
+                            request_id=ir.request_id,
+                            reason_code="context_length_exceeded",
+                            category="execution",
+                        )
                         session.live_irs.remove(ir)
                         ir.waiter.set_result(payload)
                         self._dispatch_queued_irs_locked(session)
             self._notify_state_change(group)
             return
         except RuntimeGroupError as error:
+            self._observe_session(
+                session,
+                "request",
+                "failed",
+                request_id=ir.request_id,
+                reason_code="request_infra_failed",
+                category="infra",
+                reason=str(error),
+            )
             async with session.lock:
                 if ir in session.live_irs and ir.runner_task is runner_task:
                     ir.runner_task = None
@@ -2581,6 +2788,9 @@ class AgenticSessionShard:
                     self._fail_ir_locked(session, ir, RuntimeGroupError("SGLang aborted an evaluation request"))
                     self._notify_state_change(group)
                     return
+                self._observe_session(
+                    session, "request", "paused", request_id=ir.request_id, reason_code="generation_aborted"
+                )
                 ir.abort_count += 1
                 protected_abort_count_threshold = (
                     self.args.partial_rollout_max_aborted_count if self.args.partial_rollout else None
@@ -2610,6 +2820,21 @@ class AgenticSessionShard:
                 self._notify_state_change(group)
                 return
             session.live_irs.remove(ir)
+            if session.observation is not None:
+                call = session.observation.calls.get(ir.request_id)
+                if call is not None:
+                    call.update(
+                        resp_state_hash=session.resp_state_hash_by_request_id.get(ir.request_id),
+                        response_length=len(ir.pending_token_delta),
+                        finish_reason=finish_type,
+                    )
+            self._observe_session(
+                session,
+                "request",
+                "failed" if "error" in payload else "completed",
+                request_id=ir.request_id,
+                reason_code="context_length_exceeded" if "error" in payload else None,
+            )
             ir.waiter.set_result(payload)
             self._dispatch_queued_irs_locked(session)
         self._notify_state_change(group)
@@ -2764,7 +2989,7 @@ class AgenticSessionShard:
                 type(process_error).__name__,
                 process_error,
             )
-            await self._handle_controlled_agent_failure(session)
+            await self._handle_controlled_agent_failure(session, process_error)
             return
         if (
             group.rollout_mode == "eval"
@@ -2778,7 +3003,10 @@ class AgenticSessionShard:
                     session.session_id,
                     group.group_id,
                 )
-                await self._handle_controlled_agent_failure(session)
+                await self._handle_controlled_agent_failure(
+                    session,
+                    AgentExecutionError("agent exited before its first request", reason_code="agent_no_request"),
+                )
             else:
                 if not isinstance(process_error, Exception):
                     process_error = RuntimeGroupError(
@@ -2800,11 +3028,20 @@ class AgenticSessionShard:
     async def _handle_controlled_agent_failure(
         self,
         session: _SessionRecord,
+        error: AgentExecutionError | None = None,
     ) -> None:
         """Map a controlled agent failure to whole-group drop."""
 
         await finish_before_cancellation(
-            self._finish_session(session, None),
+            self._finish_session(
+                session,
+                None,
+                failure=(
+                    getattr(error, "reason_code", "agent_execution_failed"),
+                    "execution",
+                    str(error or "agent failed"),
+                ),
+            ),
             f"dropped-session-cleanup:{session.session_id}",
         )
 
@@ -2821,31 +3058,28 @@ class AgenticSessionShard:
             else RuntimeGroupError(f"agent process failed for {session.session_id}: {type(error).__name__}: {error}")
         )
         await finish_before_cancellation(
-            self._finish_session(session, wrapped),
+            self._finish_session(session, wrapped, failure=("session_infra_failed", "infra", str(wrapped))),
             f"failed-session-cleanup:{session.session_id}",
         )
 
     async def _finalize_terminal_session(self, session: _SessionRecord) -> None:
         """Freeze the Session, build its export off the event loop, then
-        publish.
-
-        FINALIZING stops every Forest writer (chat commits, IR commits and
-        response trace marks all require ACTIVE), so the committed nodes and
-        the exited agent's output are a stable snapshot without a copy.
-        """
+        publish."""
 
         finalize_arrive_at = time.time()
         outcome: _SessionResultPayload
-        export: Optional[Future[SessionExportTransport]] = None
+        failure = None
+        export: Optional[Future[_PreparedSessionExports]] = None
         try:
             async with session.lock:
                 finalize_lock_acquired_at = time.time()
                 if session.phase is not SessionPhase.ACTIVE:
                     return
+                # FINALIZING excludes Forest writes while the worker reads it.
                 session.phase = SessionPhase.FINALIZING
                 output = cast(SessionResources, session.resources).process.output
                 export = self._export_executor.submit(
-                    self._build_session_export_transport,
+                    self._prepare_session_exports,
                     forest=cast(SessionForest, session.forest),
                     rollout_mode=session.group.rollout_mode,
                     reward=output.reward,
@@ -2859,7 +3093,11 @@ class AgenticSessionShard:
                 session.export_future = export
                 self._inflight_exports.add(export)
             # Shield so only Session cleanup (export.cancel) can discard the job.
-            outcome = await asyncio.shield(asyncio.wrap_future(export))
+            prepared = await asyncio.shield(asyncio.wrap_future(export))
+            if session.finish_task is not None:
+                # Cleanup owns this Session now; do not record a late export.
+                return
+            outcome = self._build_session_export_transport(session=session, prepared=prepared)
         except asyncio.CancelledError:
             if export is None or not export.cancelled():
                 if export is not None:
@@ -2877,18 +3115,21 @@ class AgenticSessionShard:
                 error,
             )
             outcome = None
+            failure = ("export_validation_failed", "execution", str(error))
         except Exception as error:
             outcome = RuntimeGroupError(
                 f"agent export failed for {session.session_id}: {type(error).__name__}: {error}"
             )
+            failure = ("export_failed", "infra", str(outcome))
         finally:
-            session.export_future = None
-            if export is not None and export.done():
-                # A job still running after cancellation stays tracked for shutdown.
-                self._inflight_exports.discard(export)
-        await self._finish_session(session, outcome)
+            if export is not None:
+                session.export_future = None
+                if export.done():
+                    # A job still running after cancellation stays tracked for shutdown.
+                    self._inflight_exports.discard(export)
+        await self._finish_session(session, outcome, failure=failure)
 
-    def _build_session_export_transport(
+    def _prepare_session_exports(
         self,
         *,
         forest: SessionForest,
@@ -2897,15 +3138,15 @@ class AgenticSessionShard:
         metadata: dict[str, Any],
         output_records: tuple[dict[str, Any], ...],
         finalize_events: dict[str, float],
-    ) -> SessionExportTransport:
-        """Assemble every export on the Shard export worker.
+    ) -> _PreparedSessionExports:
+        """Build and validate compact payloads on the Shard's export worker.
 
-        Reads only the frozen Forest and agent output. The implicit export
-        merges metadata into its leaf node, which this job alone owns.
+        Reads the frozen Forest and agent output. Only this job may merge
+        metadata into the implicit export's leaf node.
         """
 
         finalize_events["finalize_start_at"] = time.time()
-        export_payloads: list[dict[str, Any]] = []
+        prepared: list[tuple[str, dict[str, Any]]] = []
         if output_records:
             for output_record in output_records:
                 unit_metadata = copy.deepcopy(metadata)
@@ -2930,12 +3171,7 @@ class AgenticSessionShard:
                     mutate_node=False,
                     finalize_events=finalize_events,
                 )
-                export_payloads.append(
-                    self._export_payload(
-                        name=output_record["name"],
-                        sample=sample,
-                    )
-                )
+                prepared.append((state_hash, self._export_payload(name=output_record["name"], sample=sample)))
         else:
             state_hash = self._implicit_export_state_hash(forest)
             sample = self._build_sample(
@@ -2946,10 +3182,12 @@ class AgenticSessionShard:
                 mutate_node=True,
                 finalize_events=finalize_events,
             )
-            export_payloads.append(self._export_payload(name=None, sample=sample))
+            prepared.append((state_hash, self._export_payload(name=None, sample=sample)))
+        # Retain only compact payloads; full Samples contain long training arrays.
+        del sample
         if rollout_mode == "train" and self.args.use_rollout_routing_replay:
             # NOTE(wulumeng): An observation leaf has no routed experts (None). Samples should never end there, so this safeguard should never trigger.
-            for export_payload in export_payloads:
+            for _, export_payload in prepared:
                 sample_payload = export_payload["sample_payload"]
                 expected_shape = (len(sample_payload["tokens"]) - 1, self.args.num_layers, self.args.moe_router_topk)
                 routed_experts = sample_payload["rollout_routed_experts"]
@@ -2958,7 +3196,33 @@ class AgenticSessionShard:
                     raise _NonFinalizableExportError(
                         f"R3 export routed-experts shape {actual_shape} does not match expected {expected_shape}"
                     )
-        return SessionExportTransport(exports=tuple(export_payloads))
+        return tuple(prepared)
+
+    def _build_session_export_transport(
+        self, *, session: _SessionRecord, prepared: _PreparedSessionExports
+    ) -> SessionExportTransport:
+        """Assign export IDs and record validated trajectories on the Shard
+        loop."""
+
+        forest = cast(SessionForest, session.forest)
+        group = session.group
+        export_ids = [self._trajectory_recorder.next_sample_export_id() for _ in prepared]
+        for (state_hash, export_payload), export_id in zip(prepared, export_ids, strict=True):
+            sample_payload = export_payload["sample_payload"]
+            sample_payload["sample_export_id"] = export_id
+            sample_payload["agentic_group_id"] = group.group_id
+            self._trajectory_recorder.record(
+                forest=forest,
+                state_hash=state_hash,
+                sample_export_id=export_id,
+                metadata=sample_payload["metadata"],
+                export_name=export_payload["name"],
+                group_id=group.group_id,
+                rollout_mode=group.rollout_mode,
+            )
+        if session.observation is not None:
+            session.observation.export_ids = export_ids
+        return SessionExportTransport(exports=tuple(payload for _, payload in prepared))
 
     def _build_sample(
         self,
@@ -3009,6 +3273,8 @@ class AgenticSessionShard:
         self,
         session: _SessionRecord,
         outcome: _SessionResultPayload,
+        *,
+        failure: tuple[str, str, str] | None = None,
     ) -> Optional[BaseException]:
         """Give cleanup, publication, and Group removal one task owner."""
 
@@ -3016,6 +3282,8 @@ class AgenticSessionShard:
             finish_task = session.finish_task
             if finish_task is None:
                 session.phase = SessionPhase.FINALIZING
+                if session.observation is not None and session.observation.failure is None and failure is not None:
+                    session.observation.failure = failure
                 finish_task = asyncio.create_task(
                     self._finish_session_once(session, outcome),
                     name=f"session-finish:{session.session_id}",
@@ -3081,6 +3349,9 @@ class AgenticSessionShard:
         if process_wait is not None:
             process_wait.cancel()
             await asyncio.gather(process_wait, return_exceptions=True)
+        if resources is not None and session.observation is not None:
+            session.observation.active_ms = getattr(resources.process, "active_ms", 0.0)
+            session.observation.log_ref = getattr(resources.process, "observation_log_ref", None)
         async with session.lock:
             session.forest = None
             session.resp_state_hash_by_request_id.clear()
@@ -3094,7 +3365,29 @@ class AgenticSessionShard:
         if self.args.agentic_session_lifecycle:
             self._lifecycle_close_count += 1
             self._lifecycle_close_failure_count += int(not lifecycle_closed)
+            if not lifecycle_closed:
+                self._observe_session(
+                    session,
+                    "cleanup",
+                    "failed",
+                    reason_code="session_close_failed",
+                    category="infra",
+                    reason="backend session close was not confirmed",
+                )
         if cleanup_error is not None:
+            if session.observation is not None:
+                session.observation.failure = (
+                    "session_cleanup_failed",
+                    "infra",
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
+                )
+            if isinstance(outcome, SessionExportTransport):
+                self._trajectory_recorder.record_export_failure(
+                    outcome.exports,
+                    group_id=group.group_id,
+                    rollout_mode=group.rollout_mode,
+                    reason=f"{type(cleanup_error).__name__}: {cleanup_error}",
+                )
             if isinstance(outcome, RuntimeGroupError):
                 outcome = RuntimeGroupError(
                     f"{outcome}; cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
@@ -3104,6 +3397,25 @@ class AgenticSessionShard:
                     f"agent cleanup failed for {session.session_id}: {type(cleanup_error).__name__}: {cleanup_error}"
                 )
 
+        failure = session.observation.failure if session.observation is not None else None
+        if not isinstance(outcome, SessionExportTransport):
+            if failure is None:
+                failure = (
+                    ("session_infra_failed", "infra", str(outcome))
+                    if isinstance(outcome, RuntimeGroupError)
+                    else ("group_discarded", "selection", "group discarded before session completion")
+                )
+            self._observe_session(
+                session,
+                "rollout",
+                "cancelled" if failure[1] == "selection" else "failed",
+                is_terminal=True,
+                reason_code=failure[0],
+                category=failure[1],
+                reason=failure[2],
+            )
+        else:
+            self._observe_session(session, "rollout", "completed", is_terminal=True)
         session.result_cell.publish(outcome)
         group.sessions.remove(session)
         self._notify_state_change(group)
@@ -3121,11 +3433,29 @@ class AgenticSessionShard:
         for watcher in watcher_tasks:
             watcher.cancel()
 
+        failure = (
+            ("group_member_failed", "selection", "another session in the group failed")
+            if group.dropped or group.first_error() is not None
+            else group.stop_reason
+        )
         cleanup_outcomes = await asyncio.gather(
-            *(self._finish_session(session, None) for session in sessions),
+            *(self._finish_session(session, None, failure=failure) for session in sessions),
             return_exceptions=True,
         )
         await asyncio.gather(*watcher_tasks, return_exceptions=True)
+        # Driver-side drop accounting can only see delivered results. Retire
+        # successful exports still owned by this shard before deleting them.
+        # A result already taken by an RPC is the driver's responsibility.
+        for cell in group.result_cells.values():
+            if isinstance(cell.payload, SessionExportTransport):
+                self._trajectory_recorder.record_export_failure(
+                    cell.payload.exports,
+                    group_id=group_id,
+                    rollout_mode=group.rollout_mode,
+                    reason="group discarded before export delivery",
+                    reason_code="group_discarded_before_delivery",
+                    category="selection",
+                )
         self._groups.pop(group_id, None)
         self._notify_state_change()
         for outcome in cleanup_outcomes:
@@ -3144,6 +3474,7 @@ def create_agentic_session_shards(
     """
 
     shard_entries: list[tuple[str, Any]] = []
+    shard_config = shard_generation_args(config)
     try:
         for placement in range(_DEFAULT_SESSION_SHARD_COUNT):
             actor_name = agentic_session_shard_name(placement)
@@ -3155,7 +3486,7 @@ def create_agentic_session_shards(
                 scheduling_strategy="SPREAD",
                 runtime_env={"env_vars": dict(_AGENTIC_SHARD_ALLOCATOR_ENV)},
             ).remote(
-                config,
+                shard_config,
                 admission_coordinator,
             )
             shard_entries.append((actor_name, shard))
@@ -3204,9 +3535,7 @@ class AgenticChatAPIService:
                 logprobs=normalized["logprobs"],
             )
         except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError) as error:
-            if isinstance(error, ray.exceptions.RayTaskError) and not isinstance(
-                error.as_instanceof_cause(), ray.exceptions.TaskCancelledError
-            ):
+            if not _is_ray_task_cancelled(error):
                 raise
             return _error_result(
                 "client disconnected before agentic completion was produced",
@@ -3313,10 +3642,8 @@ class AgenticChatAPIService:
         return {"ok": True, "shards": snapshots}
 
     @app.get("/debug_state")
-    async def debug_state(self, sample_limit: int = 8) -> dict[str, Any]:
-        snapshots = await asyncio.gather(
-            *(shard.debug_state.remote(sample_limit=sample_limit) for shard in self._session_shards.values())
-        )
+    async def debug_state(self) -> dict[str, Any]:
+        snapshots = await asyncio.gather(*(shard.debug_state.remote() for shard in self._session_shards.values()))
         return {
             "totals": {
                 "group_count": sum(snapshot["group_count"] for snapshot in snapshots),

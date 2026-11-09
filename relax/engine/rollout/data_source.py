@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from relax.utils.agentic_obs.config import agentic_obs_enabled
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import load_processor, load_tokenizer
 from relax.utils.logging_utils import get_logger
@@ -103,6 +104,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             custom_prompt_func=custom_prompt_func,
             teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
             teacher_multimodal_keys=teacher_mm_keys,
+            record_source=agentic_obs_enabled(args),
         )
     else:
         logger.info("Using traditional Dataset (eager loading)")
@@ -125,6 +127,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             custom_prompt_func=custom_prompt_func,
             teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
             teacher_multimodal_keys=teacher_mm_keys,
+            record_source=agentic_obs_enabled(args),
         )
 
 

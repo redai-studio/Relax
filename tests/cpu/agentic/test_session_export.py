@@ -107,6 +107,9 @@ class _FakeProcess:
         self.output = output
         self._done.set()
 
+    def configure_observability(self, log_path) -> None:
+        del log_path
+
     async def wait(self) -> None:
         await self._done.wait()
 
@@ -176,6 +179,7 @@ async def shard(monkeypatch):
     """A real SessionShard with fake SGLang, agent processes and permits."""
 
     launcher = _FakeLauncher()
+    monkeypatch.setattr(service.ray, "get_runtime_context", lambda: SimpleNamespace(get_actor_name=lambda: None))
     monkeypatch.setattr(service, "SGLangBackendAdapter", lambda _args: _FakeBackend())
     monkeypatch.setattr(service, "ManagedAgentLauncher", lambda *_: launcher)
     monkeypatch.setattr(service, "load_agent_app_spec_from_args", lambda _args: None)
@@ -193,7 +197,7 @@ async def shard(monkeypatch):
 def _gate_exports(shard) -> None:
     """Park export jobs on the worker until ``shard.test_release`` is set."""
 
-    build = shard._build_session_export_transport
+    build = shard._prepare_session_exports
 
     def gated(**kwargs):
         shard.test_started.append(kwargs["metadata"].get("session"))
@@ -204,7 +208,7 @@ def _gate_exports(shard) -> None:
             raise TimeoutError("export gate was never released")
         return build(**kwargs)
 
-    shard._build_session_export_transport = gated
+    shard._prepare_session_exports = gated
 
 
 async def _until_exporting(shard, session_ids: list[str]) -> None:
@@ -435,13 +439,16 @@ def test_compaction_does_not_copy_unconverted_fields() -> None:
     assert payload["metadata"] is sample.metadata
 
 
-async def test_export_runs_off_the_event_loop_and_freezes_the_forest(shard) -> None:
+async def test_export_runs_off_the_event_loop_and_freezes_the_forest(shard, tmp_path) -> None:
+    shard.args.dump_agentic_obs = tmp_path
+    shard._trajectory_recorder = service.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
     _gate_exports(shard)
     await _run_group(shard, "g", ["s0"], turns=2)
     session = shard._session_records["s0"]
     request_id = next(iter(session.resp_state_hash_by_request_id))
     node = session.forest.nodes_by_hash[session.resp_state_hash_by_request_id[request_id]]
     patch_before = copy.deepcopy(node.export_metadata_patch)
+    static_before = copy.deepcopy(session.forest.static_metadata)
     _finish(shard, "s0")
     await _until_exporting(shard, ["s0"])
 
@@ -454,10 +461,19 @@ async def test_export_runs_off_the_event_loop_and_freezes_the_forest(shard) -> N
         session_id="s0", request_id=request_id, remote_return_at=1.0, response_ready_at=1.0, http_return_at=1.0
     )
     assert marked is False and node.export_metadata_patch == patch_before
+    shard._mark_group_timing(session.group, "group_late_milestone_at")
+    assert session.forest.static_metadata == static_before
 
     shard.test_release.set()
     (export,) = (await _take(shard, "g", "s0")).exports
-    assert export["sample_payload"]["tokens"].tolist() == _expected_fields("s0", 2)["tokens"]
+    payload = export["sample_payload"]
+    assert payload["tokens"].tolist() == _expected_fields("s0", 2)["tokens"]
+    assert payload["agentic_group_id"] == "g"
+    assert session.observation.export_ids == [payload["sample_export_id"]]
+    await shard._trajectory_recorder.aclose()
+    records = (tmp_path / "run_unknown/trajectories/shard_00.jsonl").read_text().splitlines()
+    (record,) = map(json.loads, records)
+    assert record["sample_export_id"] == str(payload["sample_export_id"])
     assert (await shard.debug_state())["pending_export_count"] == 0
 
 
@@ -503,9 +519,11 @@ async def test_shutdown_waits_for_a_running_export_and_stops_the_worker(shard) -
         shard._export_executor.submit(lambda: None)
 
 
-async def test_shutdown_waits_for_an_export_whose_session_was_retired(shard) -> None:
+async def test_shutdown_waits_for_an_export_whose_session_was_retired(shard, tmp_path) -> None:
     """An infra failure retires a Session while its export still runs."""
 
+    shard.args.dump_agentic_obs = tmp_path
+    shard._trajectory_recorder = service.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
     _gate_exports(shard)
     await _run_group(shard, "g", ["s0"], turns=1)
     session = shard._session_records["s0"]
@@ -528,6 +546,8 @@ async def test_shutdown_waits_for_an_export_whose_session_was_retired(shard) -> 
 
     # The late export result is discarded; the cell keeps its single publication.
     assert isinstance(cell.payload, RuntimeGroupError) and "permit release failed" in str(cell.payload)
+    assert session.observation.export_ids == []
+    assert not (tmp_path / "run_unknown/trajectories/shard_00.jsonl").exists()
     assert not shard._inflight_exports
     assert not any(thread.is_alive() for thread in shard._export_executor._threads)
 
@@ -542,7 +562,7 @@ async def test_export_failures_keep_their_outcome_mapping(shard, error, dropped)
     def failing(**_):
         raise error
 
-    shard._build_session_export_transport = failing
+    shard._prepare_session_exports = failing
     _finish(shard, "s0")
     group = shard._groups["g"]
     cell = group.result_cells["s0"]

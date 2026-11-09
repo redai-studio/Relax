@@ -44,6 +44,7 @@ def preflight(monkeypatch, tmp_path):
     dist.get_world_size = lambda group: 32 if group is world else 8
     dist.get_rank = lambda group: 0
     dist.get_global_rank = lambda group, rank: rank
+    dist.get_process_group_ranks = lambda group: list(range(dist.get_world_size(group)))
 
     def gather(output, value, group):
         assert group is expert
@@ -81,17 +82,21 @@ def preflight(monkeypatch, tmp_path):
     return module, mpu, dist, detect, expert, logger
 
 
-@pytest.mark.parametrize("tp", [2, 8])
-def test_valid_group_uses_real_peer_detection(preflight, tp):
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+@pytest.mark.parametrize("pp", [2, 4])
+@pytest.mark.parametrize("world", [32, 64])
+def test_valid_group_uses_real_peer_detection(preflight, tp, pp, world):
     module, mpu, dist, detect, expert, logger = preflight
     mpu.get_tensor_model_parallel_world_size = lambda: tp
+    mpu.get_pipeline_model_parallel_world_size = lambda: pp
+    dist.get_world_size = lambda group: world if group is dist.group.WORLD else 8
     module.validate_hybridep_worker_group()
     detect.assert_called_once_with(expert)
     assert dist.all_gather_object.call_count == 2
     logger.info.assert_called_once()
 
 
-@pytest.mark.parametrize("tp", [2, 8])
+@pytest.mark.parametrize("tp", [2, 4, 8])
 def test_cross_node_group_is_rejected_before_peer_detection(preflight, tp):
     module, mpu, dist, detect, _, _ = preflight
     mpu.get_tensor_model_parallel_world_size = lambda: tp
@@ -204,3 +209,50 @@ def test_alignment_script_dry_run_preserves_baseline_and_worker_environment():
         "RELAX_SFT_MTP_ACCEPTANCE_METRICS": "0",
     }.items():
         assert actor[name] == driver[name] == expected
+
+
+@pytest.mark.parametrize("value", ["", "0", "8"])
+def test_forced_peer_override_presence_is_rejected(preflight, monkeypatch, value):
+    module, _, _, detect, _, _ = preflight
+    monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", value)
+    with pytest.raises(RuntimeError, match="Forced HybridEP"):
+        module.validate_hybridep_worker_group()
+    detect.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "wrong_member", "size", "remote_import", "inconsistent_detection"])
+def test_actual_collective_members_are_validated(preflight, failure):
+    module, _, dist, detect, _, _ = preflight
+    if failure == "size":
+        dist.get_world_size = lambda group: 32 if group is dist.group.WORLD else 7
+
+    def gather(output, value, group):
+        if isinstance(value, dict):
+            output[:] = [dict(value, rank=i) for i in range(len(output))]
+            if failure == "duplicate":
+                output[-1]["rank"] = 0
+            elif failure == "wrong_member":
+                output[-1]["rank"] = 15
+            elif failure == "remote_import":
+                output[-1]["errors"] = ["Installed module validation failed"]
+        else:
+            output[:] = [value] * len(output)
+            if failure == "inconsistent_detection":
+                output[-1] = 4
+
+    dist.all_gather_object.side_effect = gather
+    with pytest.raises(RuntimeError):
+        module.validate_hybridep_worker_group()
+    if failure != "inconsistent_detection":
+        detect.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "name,value", [("expert_tensor", 2), ("expert_model", 16), ("tensor_model", 3), ("pipeline_model", 0)]
+)
+def test_unsupported_or_nondivisible_geometry_fails(preflight, name, value):
+    module, mpu, _, detect, _, _ = preflight
+    setattr(mpu, "get_" + name + "_parallel_world_size", lambda: value)
+    with pytest.raises(RuntimeError, match="Unsupported topology"):
+        module.validate_hybridep_worker_group()
+    detect.assert_not_called()

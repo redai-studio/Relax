@@ -105,7 +105,15 @@ class Advantages(Base):
                     )
                     advantages_and_returns = self.compute_advantages_and_returns(rollout_data)
                     advantages_and_returns = TensorDict(advantages_and_returns, batch_size=[len(batch_meta.samples)])
+                    # Actor can delete the partition as soon as the final advantages become readable.
+                    partition_drained = getattr(self.config, "fully_async", False) and run_(
+                        self.data_system_client.async_check_stream_drained(
+                            "compute_advantages_and_returns", f"train_{step}"
+                        )
+                    )
                     run_(self.data_system_client.async_put(data=advantages_and_returns, metadata=batch_meta))
+                    if partition_drained:
+                        break
                 self._logger.info(f"Successfully run compute advantages and returns for step {step}.")
                 step += 1
         except Exception as e:

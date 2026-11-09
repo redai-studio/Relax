@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 from argparse import Namespace
@@ -65,6 +66,48 @@ def _make_iterator(stream_module, *, get_data_fn, all_consumed_fn, **kwargs):
     )
     monkeypatch_kwargs.update(kwargs)
     return stream_module.StreamingTQIterator(**monkeypatch_kwargs)
+
+
+def test_micro_batch_list_iterator_observability_excludes_vpp_padding(monkeypatch, tmp_path):
+    from relax.utils.agentic_obs import resolve_agentic_obs_config
+    from relax.utils.agentic_obs.train_hooks import (
+        capture_training_input,
+        close_train_appenders,
+        observe_train_step,
+        record_optimizer_result,
+    )
+
+    stream_module = _load_stream_module(monkeypatch)
+    mpu = stream_module.mpu
+    mpu.get_tensor_model_parallel_rank = lambda: 0
+    mpu.is_pipeline_last_stage = lambda **kwargs: True
+    mpu.get_context_parallel_world_size = lambda: 1
+    mpu.get_data_parallel_rank = lambda **kwargs: 0
+    mpu.get_data_parallel_world_size = lambda **kwargs: 1
+    batch = {
+        "sample_export_ids": [7, 8],
+        "agentic_group_ids": ["group-7", "group-8"],
+        "response_lengths": [2, 2],
+        "total_lengths": [4, 4],
+        "loss_masks": [torch.ones(2), torch.ones(2)],
+        "advantages": [torch.ones(2), torch.ones(2)],
+    }
+    iterator = stream_module.MicroBatchListIterator([(batch, None), (batch, None)], dummy_after=1)
+    args = Namespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test")
+    with observe_train_step(args, 1, 0):
+        actual, _ = next(iterator)
+        capture_training_input(actual)
+        # Actual capture precedes dynamic CP's destructive subgroup selection.
+        actual["sample_export_ids"] = [8]
+        dummy, _ = next(iterator)
+        assert dummy["__is_dummy__"]
+        capture_training_input(dummy)
+        record_optimizer_result(True)
+    assert len(iterator.get_buffer()) == 2
+    close_train_appenders()
+    path = resolve_agentic_obs_config(args).train_scalar_path(1, 0)
+    (record,) = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [(row["sample_export_id"], row["effective_tokens"]) for row in record["samples"]] == [("7", 2), ("8", 2)]
 
 
 def test_streaming_tq_iterator_sampling_config_carries_window_quota(monkeypatch):

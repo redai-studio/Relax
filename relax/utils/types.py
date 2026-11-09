@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID
+
 
 _SPEC_TOKEN_COUNT_KEYS = (
     ("spec_num_correct_drafts", "spec_num_proposed_drafts"),
@@ -89,6 +91,17 @@ class Sample:
 
     # Session ID for consistent hashing routing (used when router policy is consistent_hashing)
     session_id: str | None = None
+
+    # Join key for agentic observability: stamped by the owning SessionShard at
+    # export time and carried unchanged through reward, transfer and training so
+    # the JSONL streams under --dump-agentic-obs can be joined. -1 means
+    # "not an agentic export" (see relax.utils.agentic_obs.records).
+    sample_export_id: int = UNASSIGNED_SAMPLE_EXPORT_ID
+    agentic_group_id: str | None = None
+    agentic_event_seq: int = 0
+    agentic_terminal: bool = False
+    # Immutable source snapshot shared by replicas; never sent through TQ.
+    agentic_prompt_source: dict[str, Any] | None = None
 
     non_generation_time: float = 0.0  # time spent in non-generation steps
 
