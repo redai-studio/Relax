@@ -70,7 +70,7 @@ from .checkpoint import (
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
-from .fused_linear_ce import prepare_output_processor
+from .fused_linear_ce import _tp_control_group, prepare_output_processor
 from .loss import get_log_probs_and_entropy, loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
     get_model_provider_func,
@@ -2410,6 +2410,11 @@ def initialize_model_and_optimizer(
         tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
             DDP-wrapped model chunks, optimizer, scheduler, and iteration index.
     """
+
+    if getattr(args, "fused_linear_ce", False) and mpu.get_tensor_model_parallel_world_size() > 1:
+        # Create on every role/stage before weight sync registers extra groups
+        # on source ranks only; local-sync names depend on that local registry.
+        _tp_control_group(mpu.get_tensor_model_parallel_group())
 
     if torch.version.hip:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module

@@ -358,7 +358,8 @@ def _diagnostic(reason: str) -> None:
 
 @lru_cache(maxsize=None)
 def _tp_control_group(group: Any) -> Any:
-    # Only output PP stages participate; other TP groups need not enter creation.
+    # Prewarmed during model initialization, before asymmetric weight-sync groups.
+    # Only this TP group's members participate; no WORLD forward rendezvous.
     return dist.new_group(ranks=dist.get_process_group_ranks(group), backend="gloo", use_local_synchronization=True)
 
 
