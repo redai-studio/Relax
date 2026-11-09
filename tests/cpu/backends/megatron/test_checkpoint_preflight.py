@@ -253,6 +253,56 @@ def test_checkpoint_recipe_preflight_reads_native_common_state(tmp_path):
     assert checkpoint_metadata.validate_native_checkpoint(directory) == common
 
 
+@pytest.mark.parametrize(
+    "overrides,missing,error",
+    [
+        ({}, None, None),
+        ({"no_load_optim": True, "no_load_rng": True}, "optimizer", None),
+        ({"finetune": True}, "opt_param_scheduler", None),
+        ({}, "opt_param_scheduler", "scheduler"),
+        ({}, "rng_state", "RNG"),
+        ({}, "iteration", "iteration"),
+        ({}, "wrong_iteration", "iteration"),
+    ],
+)
+def test_checkpoint_fsdp_dtensor_reads_real_dcp_state(monkeypatch, tmp_path, overrides, missing, error):
+    directory = tmp_path / "iter_0000007"
+    state = {
+        "model": {"weight": torch.zeros(2)},
+        "optimizer": {"exp_avg": torch.ones(2)},
+        "args": Namespace(ckpt_format="fsdp_dtensor"),
+        "iteration": 7,
+        "opt_param_scheduler": {"num_steps": 7},
+        "rng_state": {"(0, 0)": [{"torch_rng_state": torch.get_rng_state()}]},
+    }
+    if missing == "wrong_iteration":
+        state["iteration"] = 6
+    elif missing:
+        del state[missing]
+    save(state, checkpoint_id=directory)
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
+    assert not (directory / "metadata.json").exists() and not (directory / "common.pt").exists()
+    args = Namespace(load=str(tmp_path), ckpt_format="fsdp_dtensor", **overrides)
+    calls = []
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **kw: calls.append("native") or (7, 0))
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_hf", lambda **kw: calls.append("hf"))
+    if error:
+        with pytest.raises(RuntimeError, match=error):
+            checkpoint.load_checkpoint([Namespace(role="actor")], object(), None, {}, False)
+        assert calls == []
+    else:
+        assert checkpoint.load_checkpoint([Namespace(role="actor")], object(), None, {}, False) == (7, 0)
+        assert calls == ["native"]
+        common = checkpoint_metadata.validate_native_checkpoint(
+            directory,
+            require_optimizer=not (overrides.get("no_load_optim") or overrides.get("finetune")),
+            require_rng=not (overrides.get("no_load_rng") or overrides.get("finetune")),
+        )
+        assert common["iteration"] == 7
+        assert common["args"].ckpt_format == "fsdp_dtensor"
+
+
 @pytest.mark.parametrize("missing", ["iteration", "optimizer"])
 def test_reward_model_resume_rejects_incomplete_checkpoint(monkeypatch, tmp_path, missing):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
@@ -320,6 +370,15 @@ def _probe_worker(rank, rendezvous, output):
                 outcomes.append((mode, "ok", calls))
             except RuntimeError:
                 outcomes.append((mode, "error", calls))
+        try:
+            checkpoint_metadata._collective_checkpoint_probe(
+                lambda: checkpoint_metadata.validate_native_checkpoint(
+                    Path(output, f"rank-{rank}", "iter_0000007"), require_optimizer=False, require_rng=False
+                )
+            )
+            outcomes.append(("dcp_common_read", "ok", []))
+        except RuntimeError:
+            outcomes.append(("dcp_common_read", "error", []))
         Path(output, f"rank-{rank}.txt").write_text(repr(outcomes))
     finally:
         dist.destroy_process_group()
@@ -328,6 +387,19 @@ def _probe_worker(rank, rendezvous, output):
 def test_checkpoint_two_rank_probe_errors_never_enter_loader(tmp_path):
     import ast
 
+    from torch.distributed.checkpoint import FileSystemReader
+
+    # A corrupt scalar on just one rank must not bypass the probe's error
+    # agreement or cause the healthy rank to enter DCP collectives alone.
+    for rank in range(2):
+        directory = tmp_path / f"rank-{rank}" / "iter_0000007"
+        save({"model": torch.zeros(2), "iteration": 7}, checkpoint_id=directory)
+        if rank == 1:
+            metadata = FileSystemReader(directory).read_metadata()
+            storage = next(entry for key, entry in metadata.storage_data.items() if key.fqn == "iteration")
+            with (directory / storage.relative_path).open("r+b") as shard:
+                shard.seek(storage.offset)
+                shard.write(bytes(storage.length))
     ctx = multiprocessing.get_context("spawn")
     workers = [
         ctx.Process(target=_probe_worker, args=(rank, str(tmp_path / "rendezvous"), str(tmp_path)))

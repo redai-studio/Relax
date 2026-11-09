@@ -105,13 +105,29 @@ def validate_native_checkpoint(
         raise RuntimeError(f"Expected a native DCP checkpoint: {checkpoint_dir}")
     metadata = _validate_dcp_storage(checkpoint_dir)
     if common_state is None:
-        from megatron.core.dist_checkpointing import load_common_state_dict
+        if (checkpoint_dir / "metadata.json").is_file():
+            from megatron.core.dist_checkpointing import load_common_state_dict
 
-        common_state = load_common_state_dict(checkpoint_dir)
-    has_scheduler = any(key in common_state for key in ("opt_param_scheduler", "lr_scheduler"))
+            common_state = load_common_state_dict(checkpoint_dir)
+        else:
+            from torch.distributed.checkpoint import CheckpointException, load
+
+            # fsdp_dtensor/torch_dcp store common fields directly in DCP.
+            # Read only host scalars, independently on each rank, before the
+            # enclosing probe agrees on errors. Model/optimizer tensors stay on disk.
+            common_state = {key: None for key in ("args", "iteration") if key in metadata.state_dict_metadata}
+            try:
+                load(common_state, checkpoint_id=checkpoint_dir, no_dist=True)
+            except CheckpointException as exc:
+                # DCP wraps read failures in BaseException, outside the probe's
+                # Exception handler. Convert it so all ranks can agree on failure.
+                raise RuntimeError(f"Cannot read DCP common state: {checkpoint_dir}") from exc
+    keys = metadata.state_dict_metadata
+    has_scheduler = any(key in common_state for key in ("opt_param_scheduler", "lr_scheduler")) or any(
+        re.match(r"^(?:opt_param_scheduler|lr_scheduler)(?:[./]|$)", str(key)) is not None for key in keys
+    )
     if require_optimizer and (not _has_optimizer_keys(metadata) or not has_scheduler):
         raise RuntimeError("Native resume requires optimizer and scheduler state; use explicit weights-only loading")
-    keys = metadata.state_dict_metadata
     if (
         require_rng
         and "rng_state" not in common_state

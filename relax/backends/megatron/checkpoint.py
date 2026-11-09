@@ -697,7 +697,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         def probe_metadata():
             common = _load_checkpoint_metadata(args, ddp_model, Path(iter_dir))
             if (Path(iter_dir) / ".metadata").is_file():
-                validate_native_checkpoint(
+                common = validate_native_checkpoint(
                     iter_dir,
                     require_optimizer=load_optimizer,
                     require_rng=(
@@ -706,7 +706,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                         and not getattr(args, "finetune", False)
                         and not getattr(args, "no_load_rng", False)
                     ),
-                    common_state=common,
+                    common_state=common or None,
                 )
             return _metadata_value(common.get("args"), _LORA_CHECKPOINT_METADATA_ATTR)
 
