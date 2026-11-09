@@ -42,7 +42,7 @@ datasets:
     weight: 1
 ```
 
-YAML key 是曲线中的数据集名称；这里用 `science` 会生成 `loss_domain_science`。权重按逻辑 epoch 的样本配额生效，单个 step 不保证固定比例。目录下使用 JSONL / Parquet，三种来源采用相同的字段结构。相对路径以 YAML 所在目录为基准。长文档应提前切分；当前脚本使用右侧截断，超过容量的尾部会被丢弃。
+YAML key 是曲线中的数据集名称；这里用 `science` 会生成 `loss/science`。权重按逻辑 epoch 的样本配额生效，单个 step 不保证固定比例。目录下使用 JSONL / Parquet，三种来源采用相同的字段结构。相对路径以 YAML 所在目录为基准。长文档应提前切分；当前脚本使用右侧截断，超过容量的尾部会被丢弃。
 
 ### 启动一次新实验
 
@@ -77,12 +77,12 @@ ClearML 打开 `PROJECT_NAME` 下对应任务，在任务列表的 **Scalars 对
 | SDK title | SDK series / 图名         | 内容                              |
 | --------- | ------------------------- | --------------------------------- |
 | `train`   | `loss`                    | 整体训练 loss                     |
-| `train`   | `loss_domain_general`     | general 有效监督 token 的平均 NLL |
-| `train`   | `loss_domain_code`        | code 有效监督 token 的平均 NLL    |
-| `train`   | `loss_domain_science`     | science 有效监督 token 的平均 NLL |
+| `train`   | `loss/general`            | general 有效监督 token 的平均 NLL |
+| `train`   | `loss/code`               | code 有效监督 token 的平均 NLL    |
+| `train`   | `loss/science`            | science 有效监督 token 的平均 NLL |
 | `train`   | `grad_norm`、`lr-pg_*` 等 | 原有训练指标                      |
 
-所有分源 loss 与原有指标共用 `train` 分类，每个 series 对应一张独立图，图名包含数据集名称；不再创建 `train/loss`、`train/loss_domain_*` 或 `train/dataset/*` 分类。分源 samples、tokens 及占比仍保留为原始训练指标，但不额外绘制到 ClearML。
+所有分源 loss 与原有指标共用 `train` 分类，每个 series 对应一张独立图；`loss/<name>` 作为完整 series 保留，SDK title 始终为 `train`。分源 samples、tokens 及占比仍保留为原始训练指标，但不额外绘制到 ClearML。
 
 原始指标 key 仍是 `train/loss` 和 `train/dataset/<name>/<stat>`；仅 ClearML 展示映射发生变化。某源本步没有有效监督 token 时不填零 loss。总 loss 及各源统计均复用训练 forward，不额外遍历数据集。
 

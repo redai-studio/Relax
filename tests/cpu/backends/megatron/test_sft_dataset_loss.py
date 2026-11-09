@@ -85,23 +85,25 @@ def test_source_metrics_preserve_training_loss_and_gradients(monkeypatch, path, 
     def run(enabled):
         args._sft_dataset_names = ("general", "code/a", "unused") if enabled else ()
         hidden = base.clone().requires_grad_()
+        head_weight = weight.clone().requires_grad_()
 
         def head(values):
-            return F.linear(values, weight), None
+            return F.linear(values, head_weight), None
 
-        values = F.linear(hidden, weight) if ordinary else hidden
+        values = F.linear(hidden, head_weight) if ordinary else hidden
         loss, count, log = loss_module.loss_function(
             args, batch, 1, values, lm_head_forward=None if ordinary else head
         )
         loss.backward()
         denominator = count.item() if per_token else len(tokens)
         metrics = loss_module.normalize_reduced_loss_metrics(log["keys"], [denominator, *log["values"].tolist()[1:]])
-        return loss.detach(), hidden.grad, metrics
+        return loss.detach(), hidden.grad, head_weight.grad, metrics
 
-    before_loss, before_grad, before_metrics = run(False)
-    after_loss, after_grad, metrics = run(True)
-    torch.testing.assert_close(after_loss, before_loss)
-    torch.testing.assert_close(after_grad, before_grad)
+    before_loss, before_grad, before_head_grad, before_metrics = run(False)
+    after_loss, after_grad, after_head_grad, metrics = run(True)
+    torch.testing.assert_close(after_loss, before_loss, rtol=0, atol=0)
+    torch.testing.assert_close(after_grad, before_grad, rtol=0, atol=0)
+    torch.testing.assert_close(after_head_grad, before_head_grad, rtol=0, atol=0)
     assert metrics["loss"] == before_metrics["loss"]
     assert metrics["dataset/general/loss"] == pytest.approx(reference_nll[1:3].mean().item())
     assert metrics["dataset/code%2Fa/loss"] == pytest.approx(reference_nll[4:6].mean().item())
@@ -134,6 +136,56 @@ def test_dummy_and_fully_masked_source_statistics(monkeypatch):
         assert metrics["dataset/general/token_fraction"] == 0
         assert metrics["dataset/general/sample_fraction"] == (0 if dummy else 1)
         assert "dataset/general/loss" not in metrics
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_masked_nonfinite_source_does_not_abort_step_metrics(monkeypatch, bad):
+    from tests.cpu.backends.megatron.test_nonfinite_step_skip_cpu import Chunk, Optimizer, guard_module, update_block
+
+    loss_module, _ = _backend(monkeypatch)
+    args = _args()
+    batch = dict(
+        unconcat_tokens=[torch.tensor([1, 2]), torch.tensor([2, 1])],
+        total_lengths=[2, 2],
+        response_lengths=[2, 2],
+        loss_masks=[torch.zeros(2), torch.tensor([1, 0])],
+        dataset_ids=[0, 1],
+    )
+    base = torch.zeros(1, 4, 4)
+    base[:, :2] = bad
+
+    def run(enabled):
+        args._sft_dataset_names = ("general", "code/a", "unused") if enabled else ()
+        logits = base.clone().requires_grad_()
+        loss, count, log = loss_module.loss_function(args, batch, 1, logits)
+        loss.backward()
+        grad = logits.grad.clone()
+        guard = guard_module()
+        optimizer = Optimizer(guard)
+        optimizer.param = logits
+        optimizer.adam = torch.optim.AdamW([logits], lr=0.01)
+        scheduler = SimpleNamespace(step=lambda **_: pytest.fail("skipped step must not advance LR"))
+        result = update_block(guard)(optimizer, scheduler, [Chunk()])
+        assert result["skipped_nonfinite_grad"] and not result["update_successful"]
+        assert optimizer.param.grad is None and not optimizer.adam.state
+        torch.testing.assert_close(logits, base, rtol=0, atol=0, equal_nan=True)
+        metrics = loss_module.normalize_reduced_loss_metrics(log["keys"], log["values"].tolist())
+        return loss.detach(), grad, count, metrics
+
+    before_loss, before_grad, before_count, before_metrics = run(False)
+    loss, grad, count, metrics = run(True)
+    torch.testing.assert_close(loss, before_loss, equal_nan=True)
+    torch.testing.assert_close(grad, before_grad, equal_nan=True)
+    torch.testing.assert_close(count, before_count)
+    assert not torch.isfinite(torch.tensor(metrics["loss"]))
+    assert not torch.isfinite(torch.tensor(before_metrics["loss"]))
+    assert metrics["dataset/general/tokens"] == 0
+    assert "dataset/general/loss" not in metrics
+    assert metrics["dataset/code%2Fa/loss"] == pytest.approx(torch.log(torch.tensor(4.0)).item())
+    # A nonfinite supervised token must remain visible; do not sanitize it.
+    sums = dataset_loss_sums(("active",), [0], torch.tensor([bad]), [torch.ones(1)], count_samples=True)
+    active = finalize_dataset_loss_metrics({key: value.item() for key, value in sums.items()})
+    torch.testing.assert_close(torch.tensor(active["dataset/active/loss"]), torch.tensor(bad), equal_nan=True)
 
 
 @pytest.mark.parametrize("cp_size", [None, 1, 2], ids=["static", "dynamic-1", "dynamic-2"])

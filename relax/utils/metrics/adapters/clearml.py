@@ -139,7 +139,7 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
                         and metric in {"loss", "tokens", "samples", "token_fraction", "sample_fraction"}
                     ):
                         if metric == "loss":
-                            series = f"loss_domain_{source}"
+                            series = f"loss/{source}"
                         else:
                             continue
                 _logger.report_scalar(

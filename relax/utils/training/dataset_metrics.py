@@ -35,8 +35,15 @@ def dataset_loss_sums(
     if sum(lengths) != losses.numel():
         raise ValueError("per-token losses and CP-local loss masks must have the same length")
     masks = [mask.to(device=losses.device, dtype=torch.float32) for mask in local_masks]
+    # Exclude masked NaN/Inf before multiplication: diagnostics must not abort
+    # an otherwise recoverable nonfinite-gradient skip. Keep supervised NaN/Inf.
     row_nll = (
-        torch.stack([(row * mask).sum() for row, mask in zip(losses.split(lengths), masks, strict=True)])
+        torch.stack(
+            [
+                (torch.where(mask != 0, row, 0.0) * mask).sum()
+                for row, mask in zip(losses.split(lengths), masks, strict=True)
+            ]
+        )
         if masks
         else losses.new_empty(0)
     )
