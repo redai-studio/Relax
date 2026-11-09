@@ -238,19 +238,23 @@ class Sample:
         # Collect prefix cache statistics
         self.prefix_cache_info.add(meta_info=meta_info)
 
-        if "weight_version" in meta_info:
-            weight_version = str(meta_info["weight_version"])
-            self.weight_versions.append(weight_version)
-            if response_delta:
-                token_end = self.response_length
-                self.generation_segments.append(
-                    GenerationSegment(
-                        turn_index=len(self.generation_segments),
-                        token_start=max(token_end - response_delta, 0),
-                        token_end=token_end,
-                        weight_versions=[weight_version],
-                    )
+        weight_version = meta_info.get("weight_version")
+        if weight_version is not None:
+            self.weight_versions.append(str(weight_version))
+        if response_delta:
+            # Always close a span, even without a version: an unversioned
+            # generation must still show up as unknown in the audit instead of
+            # silently producing no data at all.
+            token_end = self.response_length
+            token_start = max(token_end - response_delta, 0)
+            self.generation_segments.append(
+                GenerationSegment(
+                    turn_index=len(self.generation_segments),
+                    token_start=token_start,
+                    token_end=token_end,
+                    weight_versions=[str(weight_version)] if weight_version is not None else [],
                 )
+            )
 
         match meta_info["finish_reason"]["type"]:
             case "length":

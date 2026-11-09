@@ -62,6 +62,18 @@ def test_partial_rollout_appends_adjacent_segments():
     assert [s.weight_versions for s in sample.generation_segments] == [["7"], ["8"]]
 
 
+def test_update_from_meta_info_records_span_even_without_version():
+    sample = Sample()
+    sample.response_length = 3
+
+    sample.update_from_meta_info(_args(), _meta(None), response_delta=3)
+
+    assert sample.weight_versions == []
+    assert len(sample.generation_segments) == 1
+    assert sample.generation_segments[0].weight_versions == []
+    assert (sample.generation_segments[0].token_start, sample.generation_segments[0].token_end) == (0, 3)
+
+
 def test_metrics_separate_known_from_missing_tokens():
     samples = [
         _sample(10, [GenerationSegment(0, 0, 10, ["7"])]),
@@ -95,10 +107,11 @@ def test_metrics_without_consumption_version_report_batch_age():
     assert not any(key.startswith("weight_version/lag") for key in metrics)
 
 
-def test_metrics_stay_empty_without_any_audited_segment():
+def test_metrics_report_missing_when_nothing_was_audited():
     metrics = compute_metrics_from_samples(_args(), [_sample(10)])
 
-    assert not any(key.startswith("weight_version/") for key in metrics)
+    assert metrics["weight_version/coverage"] == 0.0
+    assert metrics["weight_version/missing_ratio"] == 1.0
 
 
 def test_parse_weight_version_rejects_unknown_values():

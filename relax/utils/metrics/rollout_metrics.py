@@ -119,7 +119,12 @@ def _compute_weight_version_metrics(
         unknown_tokens += sample_unknown + unsegmented
 
     if segment_count == 0:
-        return {}
+        # No auditable span at all: say so explicitly instead of emitting nothing,
+        # otherwise a run without version metadata looks like a healthy audit.
+        total_tokens = sum(sample.effective_response_length for sample in samples)
+        if total_tokens == 0:
+            return {}
+        return {"weight_version/coverage": 0.0, "weight_version/missing_ratio": 1.0}
 
     total_tokens = known_tokens + unknown_tokens
     metrics: dict[str, float] = {
