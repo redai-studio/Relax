@@ -77,9 +77,9 @@ ClearML 打开 `PROJECT_NAME` 下对应 `RUN_NAME` 的 Scalars，保持 **Group 
 | ClearML 图表 title                                | 曲线 series               | 内容                              |
 | ------------------------------------------------- | ------------------------- | --------------------------------- |
 | `train/loss`                                      | `loss`                    | 本 step 的整体训练 loss，独立纵轴 |
-| `train/dataset/loss_domain_general`               | `loss`                    | general 有效监督 token 的平均 NLL |
-| `train/dataset/loss_domain_code`                  | `loss`                    | code 有效监督 token 的平均 NLL    |
-| `train/dataset/loss_domain_science`               | `loss`                    | science 有效监督 token 的平均 NLL |
+| `train/loss_domain_general`                       | `loss`                    | general 有效监督 token 的平均 NLL |
+| `train/loss_domain_code`                          | `loss`                    | code 有效监督 token 的平均 NLL    |
+| `train/loss_domain_science`                       | `loss`                    | science 有效监督 token 的平均 NLL |
 | `train/dataset/tokens`、`samples`                 | 各数据集名称              | 各源实际 token 数、样本数         |
 | `train/dataset/token_fraction`、`sample_fraction` | 各数据集名称              | 各源实际占比                      |
 | `train`                                           | `grad_norm`、`lr-pg_*` 等 | 其他训练指标                      |

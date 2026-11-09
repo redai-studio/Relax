@@ -49,7 +49,7 @@ YAML 混合数据自动启用按源训练指标，不需要额外参数。每个
 
 配比按完整逻辑 epoch 的样本配额生效，不保证逐 step 的固定比例；过滤和跳过样本也会影响实际训练配比，可结合各源 `samples`、`tokens` 观察。这些指标针对主语言模型训练 loss，不包含 MTP 辅助 loss，不改变已有 eval 指标；FSDP、序列分类、DPO/RM 和自定义 dataset 不在此分源统计范围内。续训时应保持 YAML 和数据快照不变。
 
-开启 `--use-clearml --use-metrics-service` 后，ClearML 为每个数据集单独绘制 `train/dataset/loss_domain_<name>`，图中只有一条 `loss` 曲线；token 数、样本数及占比分别放在 `train/dataset/tokens`、`train/dataset/samples`、`train/dataset/token_fraction`、`train/dataset/sample_fraction` 四张对比图中，以数据集名称区分曲线；整体训练 loss 单独放在 `train/loss` 图（series 为 `loss`），其他训练指标在 `train` 图中；CPT 复用同一统计口径。
+开启 `--use-clearml --use-metrics-service` 后，ClearML 将所有分数据集 loss 图归入 `train` 分组，图表标题 `train/loss_domain_<name>` 显示数据集名称，每张图只有一条 `loss` 曲线；token 数、样本数及占比分别放在 `train/dataset/tokens`、`train/dataset/samples`、`train/dataset/token_fraction`、`train/dataset/sample_fraction` 四张对比图中，以数据集名称区分曲线；整体训练 loss 单独放在 `train/loss` 图（series 为 `loss`），其他训练指标在 `train` 图中；CPT 复用同一统计口径。
 
 ## 数据准备
 
