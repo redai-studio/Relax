@@ -2,7 +2,16 @@
 
 The optional cuDNN QSA backend replaces the long-document Grouped attention branch of Qwen3.8 mixed QSA. Short documents still use causal Flash Attention. The selector and its native four-token block IDs remain unchanged.
 
-The adapter supports CUDA BF16, TP2 local 12Q/1KV heads with D256, CP1, and a frozen Stage-1 indexer. It does not enable TP8 local 3Q/1KV attention. Packed inputs require the producer's CPU document boundaries; token positions and the incomplete causal tail remain local to each document.
+Mixed QSA requires CUDA BF16, D256, CP1, and a frozen Stage-1 indexer. Local head geometry depends on the selected long-document backend:
+
+| Long backend | Accepted local geometry |
+| --- | --- |
+| `grouped` | Positive Q and KV head counts with Q divisible by KV, including 12Q/1KV, 24Q/2KV, 6Q/1KV, and 3Q/1KV; these examples are not a whitelist |
+| `cudnn_pr1765` | The current Relax adapter accepts only 12Q/1KV/D256, including batches containing only short documents |
+
+The framework default for `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND` is `grouped`; the NV example scripts below select `cudnn_pr1765`. For layouts such as 24Q/2KV, 6Q/1KV, or 3Q/1KV, explicitly set `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped`. An unsupported NV layout raises an error before execution; it does not fall back to Grouped. Capabilities of the pinned NVIDIA package do not expand the geometry accepted by the current Relax adapter.
+
+Passing the local geometry check does not establish GPU output/gradient correctness or validate a complete TP/CP/EP training topology. Megatron and HybridEP topology constraints still apply. Packed inputs require the producer's CPU document boundaries; token positions and the incomplete causal tail remain local to each document.
 
 ## Runtime requirements
 

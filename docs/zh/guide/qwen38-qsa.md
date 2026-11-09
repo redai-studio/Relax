@@ -2,7 +2,16 @@
 
 可选的 cuDNN QSA 后端替换 Qwen3.8 mixed QSA 的长文档 Grouped attention 分支，短文档仍使用因果 Flash Attention。原有 selector 及其四 token block ID 保持不变。
 
-适配器支持 CUDA BF16、TP2 下 local 12Q/1KV、D256、CP1，以及冻结的 Stage-1 indexer，不支持 TP8 下的 local 3Q/1KV attention。Packed 输入必须携带 producer 提供的 CPU 文档边界；每篇文档独立处理 token 位置和不完整的因果尾块。
+Mixed QSA 要求 CUDA BF16、D256、CP1，以及冻结的 Stage-1 indexer。本地头数的支持范围取决于所选长文档后端：
+
+| 长分支后端 | 允许的本地头数布局 |
+| --- | --- |
+| `grouped` | Q、KV 头数为正，且 Q 头数能被 KV 头数整除，包括 12Q/1KV、24Q/2KV、6Q/1KV 和 3Q/1KV；这些示例不是白名单 |
+| `cudnn_pr1765` | 当前 Relax 适配器仅接受 12Q/1KV/D256，全为短文档的 batch 也保留这一限制 |
+
+框架中 `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND` 的默认值为 `grouped`；下文的 NV 示例脚本选择 `cudnn_pr1765`。使用 24Q/2KV、6Q/1KV、3Q/1KV 等布局时，应显式设置 `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped`。NV 路线遇到不支持的布局会在执行前报错，不会自动回退到 Grouped。固定版本 NVIDIA 包的底层能力不等于当前 Relax 适配器已开放相同的头数布局。
+
+通过本地几何检查不代表 GPU 输出与梯度数值正确性或完整 TP/CP/EP 训练拓扑已经验证，仍须满足 Megatron 和 HybridEP 的拓扑约束。Packed 输入必须携带 producer 提供的 CPU 文档边界；每篇文档独立处理 token 位置和不完整的因果尾块。
 
 ## 运行环境
 
