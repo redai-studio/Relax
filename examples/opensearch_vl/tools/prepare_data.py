@@ -19,7 +19,6 @@ from pathlib import Path
 
 from common import (
     DATA_REVISION,
-    MODEL_REVISION,
     REFERENCE_REVISION,
     SOURCE_FILES,
     digest,
@@ -240,7 +239,6 @@ def main() -> None:
         {
             "dataset_revision": DATA_REVISION,
             "reference_revision": REFERENCE_REVISION,
-            "model_revision": MODEL_REVISION,
             "seed": args.seed,
             "max_length": None,
             "image_max_pixels": 262144,

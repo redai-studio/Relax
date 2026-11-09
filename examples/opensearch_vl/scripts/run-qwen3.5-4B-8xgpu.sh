@@ -28,7 +28,7 @@ case "${MODE}" in
         : "${3:?Supply base or relax as the evaluation label}"
         case "$3" in base|relax) ;; *) echo "Evaluation label must be base or relax" >&2; exit 2 ;; esac
         python3 "${SCRIPT_DIR}/../tools/evaluate.py" \
-            --model "$2" --processor "${MODEL_DIR}/Qwen3.5-4B" \
+            --model "$2" --processor "${HF_CHECKPOINT}" \
             --data "${DATA_DIR}/opensearch_vl/32k/test_steps.jsonl" \
             --output "${SAVE_DIR}/${EXP_NAME}/eval/$3" \
             2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-eval-$3-${now}.log"
@@ -50,10 +50,17 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${RELAX_ROOT}/scripts/entrypoint/local.sh"
 fi
 source "${RELAX_ROOT}/scripts/models/${MODEL_CONFIG:-qwen35-4B}.sh"
-# Qwen3.5-4B ties its embedding and output weights. Remove the legacy model flag.
+# Match embedding sharing to the downloaded model (4B is tied; 27B is untied).
+TIE_EMBEDDINGS=$(python3 - "${HF_CHECKPOINT}/config.json" <<'PY'
+import json
+import sys
+config = json.load(open(sys.argv[1]))
+print(int(config.get("tie_word_embeddings", config.get("text_config", {}).get("tie_word_embeddings", False))))
+PY
+)
 TIED_MODEL_ARGS=()
 for argument in "${MODEL_ARGS[@]}"; do
-    if [ "${argument}" != --untie-embeddings-and-output-weights ]; then
+    if [[ "${TIE_EMBEDDINGS}" != 1 || "${argument}" != --untie-embeddings-and-output-weights ]]; then
         TIED_MODEL_ARGS+=("${argument}")
     fi
 done
@@ -76,6 +83,8 @@ if [[ "${BENCHMARK_ONLY:-0}" != 1 ]]; then
         --save-hf "${SAVE_DIR}/${EXP_NAME}/final-hf-{rollout_id}"
         --save-interval 2147483647
         --max-actor-ckpt-to-keep 1
+        --no-save-optim
+        --no-save-rng
     )
 else
     CKPT_ARGS+=(--num-rollout "${BENCHMARK_STEPS:-8}")
@@ -108,7 +117,7 @@ EVAL_ARGS=(
 if [[ "${BENCHMARK_ONLY:-0}" == 1 ]]; then EVAL_ARGS=(); fi
 PERF_ARGS=(
     --tensor-model-parallel-size "${TP_SIZE:-2}"
-    --pipeline-model-parallel-size 1
+    --pipeline-model-parallel-size "${PP_SIZE:-1}"
     --context-parallel-size 1
     --expert-model-parallel-size 1
     --expert-tensor-parallel-size 1
