@@ -110,7 +110,7 @@ def test_sft_train_prefetch_pauses_at_step_boundary(monkeypatch):
     actor._sft_train_prefetch = None
     actor._sft_train_prefetch_cancel = None
     actor._sft_train_prefetch_rollout_id = None
-    monkeypatch.setattr(actor_module, "_should_pause_sft_lookahead", lambda *_args: True)
+    monkeypatch.setattr(actor_module, "_should_pause_sft_lookahead", lambda *_args, **_kwargs: True)
 
     actor._start_sft_train_prefetch(3, "sft_train", ["tokens"], 2)
 

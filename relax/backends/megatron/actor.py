@@ -259,9 +259,11 @@ def _raise_if_sft_peer_error(
     raise RuntimeError(f"SFT prepack {phase} failed on a peer rank; aborting to avoid a distributed hang.")
 
 
-def _should_pause_sft_lookahead(args: Namespace, rollout_id: int) -> bool:
-    """Avoid retaining the next prefetched window across memory-heavy step
-    boundaries."""
+def _should_pause_sft_lookahead(args: Namespace, rollout_id: int, *, raw_cpu_only: bool = False) -> bool:
+    """Pause lookahead at boundaries that cannot overlap a next-step read.
+
+    Only the raw CPU path can carry a prefetched batch across a save.
+    """
     next_rollout_id = rollout_id + 1
     is_train_done = next_rollout_id == args.num_rollout
     should_save_after_step = args.save is not None and (
@@ -272,7 +274,7 @@ def _should_pause_sft_lookahead(args: Namespace, rollout_id: int) -> bool:
     return (
         should_run_sft_eval(args, completed_steps)
         or should_run_sft_predict(args, completed_steps)
-        or should_save_after_step
+        or (should_save_after_step and not raw_cpu_only)
     )
 
 
@@ -3567,7 +3569,11 @@ class MegatronTrainRayActor(TrainRayActor):
         if rollout_id + 1 >= self.args.num_rollout:
             self._shutdown_sft_train_prefetch()
             return
-        if _should_pause_sft_lookahead(self.args, rollout_id):
+        image_preprocess_on_rank = getattr(self, "_sft_image_preprocess_on_rank", False)
+        # A raw SFT read holds one CPU batch and does not use model state.
+        if _should_pause_sft_lookahead(
+            self.args, rollout_id, raw_cpu_only=is_sft_mode(self.args) and not image_preprocess_on_rank
+        ):
             return
         if self._sft_train_prefetch is not None:
             raise RuntimeError("SFT train-data prefetch was not consumed before scheduling the next step.")
@@ -3581,7 +3587,7 @@ class MegatronTrainRayActor(TrainRayActor):
         cancel_event = Event()
         self._sft_train_prefetch_cancel = cancel_event
         self._sft_train_prefetch_rollout_id = next_rollout_id
-        if getattr(self, "_sft_image_preprocess_on_rank", False):
+        if image_preprocess_on_rank:
             # The TQ payload carries image references instead of pixels; the
             # same background worker continues with the file read + pixel
             # rebuild so the CPU tensors are ready before step N+1 starts.

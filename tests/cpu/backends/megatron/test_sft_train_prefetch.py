@@ -13,6 +13,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from relax.engine.sft.runtime import is_sft_mode
+
 
 def _load_functions(path, names, namespace):
     tree = ast.parse(Path(path).read_text())
@@ -58,7 +60,8 @@ def runtime():
         sft_partition_id=lambda args, rollout_id: f"sft_{rollout_id}",
         evaluation_step_for_rollout=lambda args, rollout_id: rollout_id + 1,
         should_run_sft_eval=lambda args, rollout_id: getattr(args, "eval_at", None) == rollout_id,
-        should_run_sft_predict=lambda args, rollout_id: False,
+        should_run_sft_predict=lambda args, rollout_id: getattr(args, "predict_at", None) == rollout_id,
+        is_sft_mode=is_sft_mode,
         device_utils=SimpleNamespace(make_current_torch_device=main_only(torch.device("cpu"))),
         mpu=SimpleNamespace(
             get_data_parallel_rank=main_only(3),
@@ -85,7 +88,7 @@ def runtime():
         namespace,
     )
     actor = namespace["Actor"]()
-    actor.args = SimpleNamespace(num_rollout=100, save=None, rotate_ckpt=False, save_interval=None)
+    actor.args = SimpleNamespace(loss_type="sft", num_rollout=100, save=None, rotate_ckpt=False, save_interval=None)
     actor._sft_train_prefetch = None
     actor._sft_train_prefetch_rollout_id = None
     actor._sft_train_prefetch_cancel = None
@@ -112,7 +115,10 @@ def _submit(runtime, client, *, cancel=None, timeout=2.0, poll_interval=0.005):
     )
 
 
-def test_prefetch_waits_for_publish_and_fetches_before_main_thread_take(runtime):
+@pytest.mark.parametrize("checkpoint", [None, "interval", "rotate"], ids=["no-save", "periodic-save", "rotating-save"])
+def test_prefetch_waits_for_publish_and_fetches_before_main_thread_take(
+    runtime: SimpleNamespace, checkpoint: str | None
+) -> None:
     ready, empty_seen, fetched = Event(), Event(), Event()
     requests = []
     data_calls = []
@@ -134,6 +140,10 @@ def test_prefetch_waits_for_publish_and_fetches_before_main_thread_take(runtime)
         return payload
 
     actor = runtime.actor
+    if checkpoint is not None:
+        actor.args.save = "checkpoint"
+        actor.args.rotate_ckpt = checkpoint == "rotate"
+        actor.args.save_interval = 4 if checkpoint == "interval" else None
     actor.data_system_client = SimpleNamespace(get_meta=get_meta, get_data=get_data)
     actor._start_sft_train_prefetch(3, "sft_train", ["tokens"], 2)
     assert empty_seen.wait(1)
@@ -229,16 +239,25 @@ def test_cancelled_prefetch_does_not_claim_metadata(runtime):
     client.get_data.assert_not_called()
 
 
-@pytest.mark.parametrize("boundary", ["save", "eval", "last"])
-def test_prefetch_respects_step_boundaries(runtime, boundary):
+@pytest.mark.parametrize(
+    ("arg_overrides", "image_preprocess_on_rank"),
+    [
+        ({"save_interval": 4}, True),
+        ({"save_interval": 4, "loss_type": "dpo"}, False),
+        ({"save_interval": 4, "eval_at": 4}, False),
+        ({"save_interval": 4, "predict_at": 4}, False),
+        ({"save_interval": 4, "num_rollout": 4}, False),
+    ],
+    ids=["image-rebuild", "preference-training", "eval", "predict", "last"],
+)
+def test_prefetch_respects_step_boundaries(
+    runtime: SimpleNamespace, arg_overrides: dict[str, int | str], image_preprocess_on_rank: bool
+) -> None:
     actor = runtime.actor
     actor.data_system_client = SimpleNamespace(get_meta=Mock(), get_data=Mock())
-    if boundary == "save":
-        actor.args.save, actor.args.save_interval = "checkpoint", 4
-    elif boundary == "eval":
-        actor.args.eval_at = 4
-    else:
-        actor.args.num_rollout = 4
+    actor.args.save = "checkpoint"
+    vars(actor.args).update(arg_overrides)
+    actor._sft_image_preprocess_on_rank = image_preprocess_on_rank
     actor._start_sft_train_prefetch(3, "sft_train", ["tokens"], 2)
     assert actor._sft_train_prefetch is None
     actor.data_system_client.get_meta.assert_not_called()
