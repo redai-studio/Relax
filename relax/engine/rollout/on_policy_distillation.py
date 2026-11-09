@@ -2,7 +2,8 @@
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections import Counter
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 import aiohttp
 import numpy as np
@@ -87,6 +88,10 @@ def _aiohttp_json_post_kwargs(payload: dict) -> dict:
 
 def is_opd_enabled(args, evaluation: bool = False) -> bool:
     return not evaluation and getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
+
+
+def is_teacher_routing_enabled(args, evaluation: bool = False) -> bool:
+    return is_opd_enabled(args, evaluation=evaluation) and bool(getattr(args, "opd_teacher_routes_map", None))
 
 
 def _create_teacher_client_session(args) -> aiohttp.ClientSession:
@@ -177,9 +182,43 @@ def _pick_teacher_url(args, sample: Sample) -> str:
     return args.opd_teacher_url
 
 
+class TeacherResponseStats:
+    """Track each Student response once per rollout window, including those
+    still awaiting Teacher submission."""
+
+    def __init__(self, teacher_ids: Iterable[str]) -> None:
+        self._teacher_ids = tuple(teacher_ids)
+        self._teacher_by_response: dict[int | str, str] = {}
+        self._awaiting_submission: set[int | str] = set()
+
+    def admit(self, key: int | str | None, teacher_id: str) -> None:
+        if key is None:
+            raise ValueError("A response must have an index or session_id before admission.")
+        self._teacher_by_response[key] = teacher_id
+        self._awaiting_submission.add(key)
+
+    def finish(self, key: int | str | None) -> None:
+        self._awaiting_submission.discard(key)
+
+    def new_window(self) -> None:
+        self._teacher_by_response = {key: self._teacher_by_response[key] for key in self._awaiting_submission}
+
+    def metrics(self) -> dict[str, int]:
+        responses = Counter(self._teacher_by_response.values())
+        awaiting = Counter(self._teacher_by_response[key] for key in self._awaiting_submission)
+        metrics = {}
+        for teacher_id in self._teacher_ids:
+            prefix = f"mopd/by_teacher/{teacher_id}"
+            metrics[f"{prefix}/responses"] = responses[teacher_id]
+            metrics[f"{prefix}/awaiting_submission"] = awaiting[teacher_id]
+        return metrics
+
+
 class OpdManager:
     def __init__(self, args):
         self.args = args
+        routes = args.opd_teacher_routes_map
+        self.response_stats = TeacherResponseStats(routes) if routes else None
         self.student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
         self.teacher_eos_token_id = getattr(args, "opd_teacher_eos_token_id", None)
         self.teacher_response_prefix_token_ids = tuple(
@@ -375,6 +414,9 @@ class OpdManager:
             raise ValueError("Native image OPD requires complete R x K query IDs before cross-topk prefill.")
 
     async def _teacher_prefill(self, sample: Sample, session: aiohttp.ClientSession) -> bool:
+        if self.response_stats is not None:
+            self.response_stats.finish(sample.response_key)
+
         response_length = int(sample.response_length or 0)
         if response_length <= 0:
             return True
