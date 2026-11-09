@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -381,7 +382,29 @@ def _decode_tokens(
 ) -> str:
     if not token_ids:
         return ""
-    return tokenizer.decode(token_ids, skip_special_tokens=False)
+    decode = tokenizer.decode
+    try:
+        from tokenizers import Tokenizer
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+        from transformers.tokenization_utils_tokenizers import TokenizersBackend
+    except ImportError:
+        return decode(token_ids, skip_special_tokens=False)
+
+    # Only bypass the HF wrapper when it would call exactly this Rust decoder
+    # with no Python post-processing. Custom decoders keep their public API.
+    if (
+        isinstance(tokenizer, TokenizersBackend)
+        and getattr(decode, "__func__", None) is PreTrainedTokenizerBase.decode
+        and getattr(tokenizer._decode, "__func__", None) is TokenizersBackend._decode
+        and tokenizer.clean_up_tokenization_spaces is False
+        and type(backend := tokenizer._tokenizer) is Tokenizer
+    ):
+        # Rust decode_batch releases the GIL. With parallelism enabled it can
+        # start a Rayon pool, so use single decode unless serial mode is set.
+        if os.environ.get("TOKENIZERS_PARALLELISM", "true").lower() in ("", "0", "false", "f", "off", "no", "n"):
+            return backend.decode_batch([token_ids], skip_special_tokens=False)[0]
+        return backend.decode(token_ids, skip_special_tokens=False)
+    return decode(token_ids, skip_special_tokens=False)
 
 
 def _multimodal_inputs_from_messages(messages: list[dict[str, Any]]) -> dict[str, Any] | None:

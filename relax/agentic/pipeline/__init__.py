@@ -105,23 +105,20 @@ class TrainingFieldArtifact:
     sample_payload: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_sample(cls, sample: Sample) -> "TrainingFieldArtifact":
-        """Take ownership of ``sample``; the caller must not reuse it.
+    def from_sample(cls, sample: Sample, *, take_ownership: bool = False) -> "TrainingFieldArtifact":
+        """Snapshot a Sample, or take ownership of a newly built export.
 
-        The payload shares unconverted values with ``sample`` and does not copy
-        them: SessionShard exports build a fresh Sample per export and discard
-        it, and the payload crosses a Ray boundary next.
+        With take_ownership, unconverted fields are shared; the caller must not
+        retain or mutate those fields.
         """
-
-        return cls(sample_payload=_compact_sample_payload(sample.to_dict()))
+        return cls(sample_payload=_compact_sample_payload(sample.to_dict(), take_ownership=take_ownership))
 
     def to_sample(self) -> Sample:
         return Sample.from_dict(_expand_sample_payload(self.sample_payload))
 
 
-def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    # Top-level rebinding only; nested values stay shared (see from_sample).
-    compacted = dict(payload)
+def _compact_sample_payload(payload: dict[str, Any], *, take_ownership: bool) -> dict[str, Any]:
+    compacted = payload if take_ownership else copy.deepcopy(payload)
 
     tokens = compacted.get("tokens")
     rollout_tokens = compacted.get("rollout_tokens")

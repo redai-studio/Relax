@@ -12,10 +12,11 @@ import json
 import time
 from argparse import Namespace
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import partial
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple, cast
 from uuid import uuid4
@@ -1473,8 +1474,7 @@ class _SessionRecord:
     resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
-    # Submitted export job; cleanup cancels it if the worker has not started it.
-    export_future: Optional["Future[_PreparedSessionExports]"] = None
+    export_task: Optional["asyncio.Task[_PreparedSessionExports]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
     observation: SessionObservation | None = None
@@ -1525,9 +1525,8 @@ class AgenticSessionShard:
             max_workers=_SESSION_EXPORT_WORKERS,
             thread_name_prefix="agentic-session-export",
         )
-        # Every submitted export job until it ends, including jobs whose
-        # Session was already retired; shutdown awaits them before the worker.
-        self._inflight_exports: set["Future[_PreparedSessionExports]"] = set()
+        self._export_slots = asyncio.Semaphore(_SESSION_EXPORT_WORKERS)
+        self._inflight_exports: set[asyncio.Task[_PreparedSessionExports]] = set()
         self._agent_launcher = ManagedAgentLauncher(
             load_agent_app_spec_from_args(args),
             resolve_chat_api_base_url(),
@@ -2134,9 +2133,7 @@ class AgenticSessionShard:
                 first_error = outcome
         # A Session retired by an infra failure mid-export is no longer in its
         # group, so wait for every tracked job before joining the worker.
-        inflight = tuple(self._inflight_exports)
-        await asyncio.gather(*(asyncio.wrap_future(export) for export in inflight), return_exceptions=True)
-        self._inflight_exports.difference_update(inflight)
+        await asyncio.gather(*tuple(self._inflight_exports), return_exceptions=True)
         self._export_executor.shutdown(wait=True, cancel_futures=True)
         # Drain queued trajectories before the backend goes away: shards run with
         # max_restarts=0, so anything still in the writer queue is lost for good.
@@ -3069,7 +3066,7 @@ class AgenticSessionShard:
         finalize_arrive_at = time.time()
         outcome: _SessionResultPayload
         failure = None
-        export: Optional[Future[_PreparedSessionExports]] = None
+        export: asyncio.Task[_PreparedSessionExports] | None = None
         try:
             async with session.lock:
                 finalize_lock_acquired_at = time.time()
@@ -3078,7 +3075,7 @@ class AgenticSessionShard:
                 # FINALIZING excludes Forest writes while the worker reads it.
                 session.phase = SessionPhase.FINALIZING
                 output = cast(SessionResources, session.resources).process.output
-                export = self._export_executor.submit(
+                prepare = partial(
                     self._prepare_session_exports,
                     forest=cast(SessionForest, session.forest),
                     rollout_mode=session.group.rollout_mode,
@@ -3090,22 +3087,26 @@ class AgenticSessionShard:
                         "finalize_lock_acquired_at": finalize_lock_acquired_at,
                     },
                 )
-                session.export_future = export
+                export = asyncio.create_task(
+                    self._run_session_export(session, prepare), name=f"session-export:{session.session_id}"
+                )
+                session.export_task = export
                 self._inflight_exports.add(export)
-            # Shield so only Session cleanup (export.cancel) can discard the job.
-            prepared = await asyncio.shield(asyncio.wrap_future(export))
+                export.add_done_callback(self._inflight_exports.discard)
+            prepared = await asyncio.shield(export)
             if session.finish_task is not None:
                 # Cleanup owns this Session now; do not record a late export.
                 return
             outcome = self._build_session_export_transport(session=session, prepared=prepared)
         except asyncio.CancelledError:
-            if export is None or not export.cancelled():
-                if export is not None:
-                    # This task is being cancelled; a queued job has no consumer.
-                    export.cancel()
-                raise
-            # Cleanup took over before the worker started; its outcome wins.
-            outcome = None
+            if export is not None and export.cancelled() and session.finish_task is not None:
+                return
+            if export is not None:
+                export.cancel()
+                await finish_before_cancellation(
+                    asyncio.gather(export, return_exceptions=True), f"drain-export:{session.session_id}"
+                )
+            raise
         except AgentExecutionError as error:
             logger.error(
                 "Dropping non-finalizable agentic session session_id=%s group_id=%s error_type=%s\n%s",
@@ -3123,11 +3124,19 @@ class AgenticSessionShard:
             failure = ("export_failed", "infra", str(outcome))
         finally:
             if export is not None:
-                session.export_future = None
-                if export.done():
-                    # A job still running after cancellation stays tracked for shutdown.
-                    self._inflight_exports.discard(export)
+                session.export_task = None
         await self._finish_session(session, outcome, failure=failure)
+
+    async def _run_session_export(
+        self, session: _SessionRecord, prepare: Callable[[], _PreparedSessionExports]
+    ) -> _PreparedSessionExports:
+        # Wait outside the pool: cancelling a queued executor Future does not
+        # release its arguments until the worker dequeues it.
+        async with self._export_slots:
+            if session.finish_task is not None:
+                raise asyncio.CancelledError
+            work = asyncio.get_running_loop().run_in_executor(self._export_executor, prepare)
+            return await finish_before_cancellation(work, f"export-worker:{session.session_id}")
 
     def _prepare_session_exports(
         self,
@@ -3266,7 +3275,7 @@ class AgenticSessionShard:
         mark_sample_agentic_event(sample, "sample_export_ready_at")
         return {
             "name": name,
-            "sample_payload": TrainingFieldArtifact.from_sample(sample).sample_payload,
+            "sample_payload": TrainingFieldArtifact.from_sample(sample, take_ownership=True).sample_payload,
         }
 
     async def _finish_session(
@@ -3300,11 +3309,8 @@ class AgenticSessionShard:
         record."""
 
         group = session.group
-        export = session.export_future
-        if export is not None:
-            # A queued export is discarded; a running one finishes and its
-            # result is ignored because this task publishes first.
-            export.cancel()
+        if session.export_task is not None:
+            session.export_task.cancel()
         pre_backend_tasks: list[asyncio.Task[None]] = []
         backend_tasks: list[asyncio.Task[None]] = []
         backend_request_ids: list[str] = []

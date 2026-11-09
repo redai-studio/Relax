@@ -9,6 +9,7 @@ import copy
 import json
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,7 +26,6 @@ from relax.agentic.pipeline import (
 from relax.agentic.pipeline.runtime import BackendGenerateResult, EncodedMessages
 from relax.agentic.runner.ipc import SessionOutput
 from relax.agentic.session import service
-from relax.agentic.session.state import SessionForest, check_messages
 from relax.utils.types import Sample
 
 
@@ -364,79 +364,61 @@ def _assert_same(actual: Any, expected: Any, path: str = "payload") -> None:
         assert actual == expected, path
 
 
-def _rich_sample() -> Sample:
-    """Two turns with top-k candidates, R3 routes and multimodal inputs."""
-
-    forest = SessionForest.create_empty(session_id="s", group_index=1, index=2, metadata={"origin": {"k": [1]}})
-    first = forest.append_obs(
-        parent_state_hash=forest.root_state_hash,
-        rollout_id=1,
-        abort_count=0,
-        messages_delta=check_messages([_SYSTEM, _task("s")]),
-        train_token_delta=[10, 11, 12],
-        rollout_token_delta=[10, 11, 12],
-        tools=[],
-        chat_template_kwargs={},
+@pytest.mark.parametrize("shared_rollout_tokens", [False, True])
+def test_owned_compaction_matches_the_old_snapshot(shared_rollout_tokens: bool) -> None:
+    tokens = [10, 11, 12, 97, 98, 20, 21, 99, 100]
+    sample = Sample(
+        tokens=tokens,
+        rollout_tokens=list(tokens) if shared_rollout_tokens else [*tokens, 101],
+        response_length=6,
+        loss_mask=[1, 1, 0, 0, 1, 1],
+        rollout_log_probs=[-0.5, -0.25, 0.0, 0.0, -0.125, -0.0625],
+        rollout_topk_token_ids=np.arange(12, dtype=np.int32).reshape(6, 2),
+        rollout_topk_log_probs=np.full((6, 2), -0.5, dtype=np.float32),
+        rollout_routed_experts=np.arange(48, dtype=np.int32).reshape(8, 3, 2),
+        multimodal_train_inputs={"pixel_values": torch.ones(2, 3)},
+        metadata={"origin": {"k": [1]}, "agentic_trace": {"events": {"chat_end_at": 1.0}}},
+        weight_versions=["7", "8"],
+        reward={"score": 0.5},
     )
-    resp = forest.append_resp(
-        parent_state_hash=first.state_hash,
-        rollout_id=1,
-        abort_count=0,
-        messages_delta=check_messages([{"role": "assistant", "content": "ab"}]),
-        token_delta=[97, 98],
-        logprob_delta=[-0.5, -0.25],
-        topk_token_ids_delta=np.array([[97, 1], [98, 2]], dtype=np.int32),
-        topk_logprob_delta=np.array([[-0.5, -2.0], [-0.25, -3.0]], dtype=np.float32),
-        weight_version_delta=["7"],
-        rollout_routed_experts=np.arange(4 * 3 * 2, dtype=np.int32).reshape(4, 3, 2),
-        export_metadata_patch={"agentic_trace": {"events": {"chat_end_at": 1.0}}, "request_id": "r0"},
-    )
-    obs = forest.append_obs(
-        parent_state_hash=resp.state_hash,
-        rollout_id=1,
-        abort_count=0,
-        messages_delta=check_messages([_observation("s", 0)]),
-        train_token_delta=[20, 21],
-        rollout_token_delta=[20, 21],
-        multimodal_train_inputs_delta={"pixel_values": torch.ones(2, 3)},
-    )
-    leaf = forest.append_resp(
-        parent_state_hash=obs.state_hash,
-        rollout_id=2,
-        abort_count=1,
-        messages_delta=check_messages([{"role": "assistant", "content": "c"}]),
-        token_delta=[99, 100],
-        logprob_delta=[-0.125, -0.0625],
-        topk_token_ids_delta=np.array([[99, 3], [100, 4]], dtype=np.int32),
-        topk_logprob_delta=np.array([[-0.125, -4.0], [-0.0625, -5.0]], dtype=np.float32),
-        weight_version_delta=["8"],
-        rollout_routed_experts=np.arange(8 * 3 * 2, dtype=np.int32).reshape(8, 3, 2),
-    )
-    sample = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_CharTokenizer())
-    sample.reward = {"score": 0.5}
-    return sample
-
-
-def test_compaction_matches_deepcopy_reference_and_leaves_sample_intact() -> None:
-    sample = _rich_sample()
     before = copy.deepcopy(sample.to_dict())
-    expected = _deepcopy_compaction(sample.to_dict())
-
-    payload = TrainingFieldArtifact.from_sample(sample).sample_payload
-
-    _assert_same(payload, expected)
+    artifact = TrainingFieldArtifact.from_sample(sample, take_ownership=True)
+    _assert_same(artifact.sample_payload, _deepcopy_compaction(before))
+    for name in ("rollout_routed_experts", "multimodal_train_inputs", "metadata"):
+        assert artifact.sample_payload[name] is getattr(sample, name)
     _assert_same(sample.to_dict(), before, "sample")
-    _assert_same(TrainingFieldArtifact(sample_payload=payload).to_sample().to_dict(), before, "round-trip")
+    _assert_same(artifact.to_sample().to_dict(), before, "round-trip")
 
 
-def test_compaction_does_not_copy_unconverted_fields() -> None:
-    """Performance guard: assembly must not deep-copy the payload again."""
+@pytest.mark.parametrize("mode", ["default", "serial", "cleanup", "custom"])
+def test_export_decoding_preserves_tokenizer_semantics(monkeypatch, mode) -> None:
+    from tokenizers import Tokenizer, models
 
-    sample = _rich_sample()
-    payload = TrainingFieldArtifact.from_sample(sample).sample_payload
-    assert payload["rollout_routed_experts"] is sample.rollout_routed_experts
-    assert payload["multimodal_train_inputs"] is sample.multimodal_train_inputs
-    assert payload["metadata"] is sample.metadata
+    from relax.agentic.session.state import _decode_tokens
+
+    TokenizersBackend = pytest.importorskip("transformers.tokenization_utils_tokenizers").TokenizersBackend
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "多": 1, ",": 2, "é": 3, "[SEP]": 4}, unk_token="[UNK]"))
+    backend.add_special_tokens(["[SEP]"])
+    tokenizer = TokenizersBackend(tokenizer_object=backend, clean_up_tokenization_spaces=mode == "cleanup")
+    if mode == "default":
+        monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
+    else:
+        monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+    if mode == "custom":
+        public_decode = tokenizer._decode
+        monkeypatch.setattr(tokenizer, "_decode", lambda *a, **kw: "custom:" + public_decode(*a, **kw))
+    ids = [1, 2, 3, 4]
+    expected = tokenizer.decode(ids, skip_special_tokens=False)
+    assert "[SEP]" in expected
+    assert _decode_tokens(tokenizer=tokenizer, token_ids=ids) == expected
+    assert _decode_tokens(tokenizer=tokenizer, token_ids=[]) == ""
+
+
+def test_default_artifact_is_a_snapshot() -> None:
+    sample = Sample(metadata={"nested": [1]})
+    artifact = TrainingFieldArtifact.from_sample(sample)
+    sample.metadata["nested"].append(2)
+    assert artifact.sample_payload["metadata"] == {"nested": [1]}
 
 
 async def test_export_runs_off_the_event_loop_and_freezes_the_forest(shard, tmp_path) -> None:
@@ -453,9 +435,9 @@ async def test_export_runs_off_the_event_loop_and_freezes_the_forest(shard, tmp_
     await _until_exporting(shard, ["s0"])
 
     # The Shard loop keeps serving while the job is parked on the worker.
-    export_future = session.export_future
+    export_task = session.export_task
     assert (await shard.health())["ok"]
-    assert not export_future.done()
+    assert not export_task.done()
     assert (await shard.debug_state())["pending_export_count"] == 1
     marked = await shard.mark_chat_service_response_ready(
         session_id="s0", request_id=request_id, remote_return_at=1.0, response_ready_at=1.0, http_return_at=1.0
@@ -484,12 +466,11 @@ async def test_drop_discards_a_queued_export_and_waits_for_a_running_one(shard) 
     _finish(shard, "s0")
     await _until_exporting(shard, ["s0"])
     _finish(shard, "s1")
-    await _until(lambda: shard._session_records["s1"].export_future is not None)
-    queued = shard._session_records["s1"].export_future
+    await _until(lambda: shard._session_records["s1"].export_task is not None)
+    queued = shard._session_records["s1"].export_task
 
     drop = asyncio.ensure_future(shard.drop_group("g"))
-    await _until(queued.cancelled)
-    await asyncio.sleep(0.05)
+    await _until(lambda: queued.cancelled() and all(cell.dropped for cell in group.result_cells.values()))
     assert not drop.done(), "drop must wait for the export the worker is running"
     assert (await shard.debug_state())["pending_export_count"] == 1
     shard.test_release.set()
@@ -501,55 +482,59 @@ async def test_drop_discards_a_queued_export_and_waits_for_a_running_one(shard) 
     assert "g" not in shard._groups and not shard._session_records
 
 
-async def test_shutdown_waits_for_a_running_export_and_stops_the_worker(shard) -> None:
+async def test_cancelling_other_groups_releases_forests_while_worker_is_busy(shard) -> None:
     _gate_exports(shard)
-    await _run_group(shard, "g", ["s0"], turns=1)
+    await _run_group(shard, "running", ["s0"], turns=1)
     _finish(shard, "s0")
     await _until_exporting(shard, ["s0"])
 
-    shutdown = asyncio.ensure_future(shard.shutdown())
-    await asyncio.sleep(0.05)
-    assert not shutdown.done()
-    shard.test_release.set()
-    await asyncio.wait_for(shutdown, timeout=5.0)
+    abandoned = []
+    for index in range(3):
+        sid = f"abandoned-{index}"
+        await _run_group(shard, sid, [sid], turns=1)
+        abandoned.append(weakref.ref(shard._session_records[sid].forest))
+        _finish(shard, sid)
+        await _until(lambda: shard._session_records[sid].export_task is not None)
+        await asyncio.wait_for(shard.drop_group(sid), timeout=5.0)
 
-    assert not shard._groups and not shard._session_records
-    assert not any(thread.is_alive() for thread in shard._export_executor._threads)
-    with pytest.raises(RuntimeError):
-        shard._export_executor.submit(lambda: None)
+    assert shard.test_started == ["s0"] and not shard.test_release.is_set()
+    assert (await shard.debug_state())["pending_export_count"] == 1
+    assert all(ref() is None for ref in abandoned), "cancelled exports retain retired Forests"
 
 
-async def test_shutdown_waits_for_an_export_whose_session_was_retired(shard, tmp_path) -> None:
-    """An infra failure retires a Session while its export still runs."""
-
-    shard.args.dump_agentic_obs = tmp_path
-    shard._trajectory_recorder = service.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+@pytest.mark.parametrize("retired", [False, True])
+async def test_shutdown_drains_running_exports(shard, tmp_path, retired: bool) -> None:
+    if retired:
+        shard.args.dump_agentic_obs = tmp_path
+        shard._trajectory_recorder = service.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
     _gate_exports(shard)
     await _run_group(shard, "g", ["s0"], turns=1)
     session = shard._session_records["s0"]
+    group = session.group
     watcher = session.resources.watcher_task
-    cell = shard._groups["g"].result_cells["s0"]
     _finish(shard, "s0")
     await _until_exporting(shard, ["s0"])
 
-    await shard._handle_infra_failure(session, RuntimeGroupError("permit release failed"))
-    assert "s0" not in shard._session_records and not shard._groups["g"].sessions
-    assert isinstance(cell.payload, RuntimeGroupError)
-    assert (await shard.debug_state())["pending_export_count"] == 1
+    if retired:
+        await shard._handle_infra_failure(session, RuntimeGroupError("permit release failed"))
+        assert not shard._session_records and not group.sessions
+        assert (await shard.debug_state())["pending_export_count"] == 1
 
-    shutdown = asyncio.ensure_future(shard.shutdown())
-    await asyncio.sleep(0.05)
-    assert not shutdown.done(), "shutdown must not join the worker while a retired Session's export runs"
+    shutdown = asyncio.create_task(shard.shutdown())
+    await _until(lambda: group.drop_task is not None)
+    assert not shutdown.done()
     shard.test_release.set()
     await asyncio.wait_for(shutdown, timeout=5.0)
-    await asyncio.wait_for(watcher, timeout=5.0)
-
-    # The late export result is discarded; the cell keeps its single publication.
-    assert isinstance(cell.payload, RuntimeGroupError) and "permit release failed" in str(cell.payload)
-    assert session.observation.export_ids == []
-    assert not (tmp_path / "run_unknown/trajectories/shard_00.jsonl").exists()
-    assert not shard._inflight_exports
+    assert watcher.done()
+    assert not (shard._groups or shard._session_records or shard._inflight_exports)
     assert not any(thread.is_alive() for thread in shard._export_executor._threads)
+    with pytest.raises(RuntimeError):
+        shard._export_executor.submit(lambda: None)
+    if retired:
+        payload = group.result_cells["s0"].payload
+        assert isinstance(payload, RuntimeGroupError) and "permit release failed" in str(payload)
+        assert session.observation.export_ids == []
+        assert not (tmp_path / "run_unknown/trajectories/shard_00.jsonl").exists()
 
 
 @pytest.mark.parametrize(

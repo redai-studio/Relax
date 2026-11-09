@@ -1,110 +1,87 @@
 # Agentic Session 导出 CPU 性能对照
 
-这是贡献者计划第二期 [No.14](https://github.com/redai-studio/community/blob/main/contributor-program/2026-cohort-2/official-task.md#task-14) 的验证证据，不是端到端训练吞吐保证。测量日期为 2026-11-06。
+此报告对应 [贡献者计划 No.14](https://github.com/redai-studio/community/blob/main/contributor-program/2026-cohort-2/official-task.md#task-14)。测量是 CPU 导出和请求调度，不是模型训练吞吐。
 
-## 实现与瓶颈
+## 实现
 
-基线在 Session Shard 事件循环内构建训练 Sample、深拷贝 payload 并转换数组。优化版在终止会话进入 FINALIZING 后冻结可达写入，将组装提交到每个 Shard 的单个后台线程，并在交付时采用明确的 Sample 所有权约定，省去立即被转换或交付的字段副本。没有新增工作进程、生产依赖或 GPU。取消排队任务、跟踪运行中的导出以及关闭时等待 worker 的行为由 Session 测试覆盖。
+- Session 进入 FINALIZING 后禁止其他路径写 Forest；每个 Shard 只运行一个导出 worker。拿到异步名额才提交到线程池，尚未提交的任务可取消并释放 Forest；开始执行的工作仍要收尾。结果 ID 和轨迹记录继续在 Shard 循环发布。
+- 普通 Sample 打包保留原有快照隔离。Shard 专用路径明确交付刚构建的 Sample，不重复深拷贝交付字段；训练数组仍在打包时转换。
+- 标准 HF fast tokenizer 无自定义解码或清理空格时，使用同一个 Rust 解码器。仅在已有 `TOKENIZERS_PARALLELISM` 配置明确关闭并行时使用释放 GIL 的单项批解码；否则用单项解码，避免启动额外 Rayon 线程池。自定义 tokenizer 和空格清理走原路径，保留 special token。
+- [Miles #3736](https://github.com/radixark/miles/pull/3736) 提供了有界后台组装的参考；[Miles #4044](https://github.com/radixark/miles/pull/4044) 提供了 CPU 压测参考。参考了 [Relax #519](https://github.com/redai-studio/Relax/pull/519) 的提交前准入和 [#601](https://github.com/redai-studio/Relax/pull/601) 的解码观察。公开 HF `batch_decode` 在 [Transformers 5.16.0](https://github.com/huggingface/transformers/blob/v5.16.0/src/transformers/tokenization_utils_base.py#L2590-L2667) 仍逐条调用解码；释放 GIL 的是 [Tokenizers Rust 绑定](https://github.com/huggingface/tokenizers/blob/v0.23.2/bindings/python/src/tokenizer.rs#L1456-L1495)。
 
-基线为 `9ca8cedce9ef5e0f3bbd5b10d38ad2e81a6a0f13`。候选源文件 SHA256 与运行环境记录在 [results.json](./results.json) 中。[独立 CPU 剖析](./profile.json) 使用一个 96 轮会话、重复 3 次，观测到 161,039 个 token；非 profiler 阶段计时中位数：
+## 原压测工具的同机对照
 
-| 操作                  | 基线耗时 / ms |
-| --------------------- | ------------: |
-| `build_sample`        |        49.886 |
-| `deepcopy_to_dict`    |       166.184 |
-| `from_sample`         |       174.990 |
-| `explicit_state_hash` |         4.080 |
+用 [原工具](https://github.com/3516027002att-ui/Relax/blob/9a57276c7dfbc18b88686b2d5f824a40f43bd73c/scripts/benchmarks/benchmark_agentic_session_export.py) 保持负载和测量不变，对比原 PR 提交 9a57276 和本版；原工具模拟 protocol-5 序列化与缓冲区复制，不启动 Ray 服务。96 轮 / 每波并发 8，两波，固定 12 秒；每次完成 16 次导出、600 个短 chat、240 个 health。每版 3 次，交替顺序；下表为中位数 \[最小值, 最大值\]，没有跨次混合 P99。使用 2026-11-09 本机 i7-13650HX / WSL2 / CPU 0–7、Python 3.12.3、PyTorch 2.6.0、NumPy 1.26.4、Ray 2.60.0、Transformers 5.22.1 / Tokenizers 0.23.3，两侧均设 `TOKENIZERS_PARALLELISM=false`。
 
-这些是定位成本来源的诊断数据；cProfile 的开销不混入下面的性能对照。`deepcopy_to_dict` 是对同一 payload 独立计时的诊断操作，不与 `from_sample` 相加作为总耗时。
+| 指标                    |                     原 PR |                    重写版 |
+| ----------------------- | ------------------------: | ------------------------: |
+| 事件循环 P99 / ms       |    66.34 \[54.80, 67.83\] |       4.89 \[4.66, 5.63\] |
+| 短 chat P99 / ms        | 256.76 \[190.31, 287.30\] |    18.66 \[17.22, 19.07\] |
+| 导出 P99 / ms（含排队） | 643.65 \[625.68, 648.10\] | 482.67 \[476.14, 492.65\] |
+| 整批吞吐 / exports/s    |       3.44 \[3.44, 3.48\] |       3.57 \[3.57, 3.57\] |
+| 进程 CPU / s            |       2.29 \[2.28, 2.37\] |       2.21 \[2.21, 2.24\] |
+| 峰值 RSS / MiB          | 829.41 \[826.26, 845.19\] | 802.83 \[802.57, 803.49\] |
 
-## 环境与负载
+六次均有效，校验字段摘要一致，后台资源无残留。历史 [24 次原始数据](https://github.com/3516027002att-ui/Relax/blob/3a3461174f9e14e4435bb88cbc7ad26c5c521683/scripts/benchmarks/reports/agentic-session-export/results.json) 与 [CPU 剖析](https://github.com/3516027002att-ui/Relax/blob/3a3461174f9e14e4435bb88cbc7ad26c5c521683/scripts/benchmarks/reports/agentic-session-export/profile.json) 留在固定提交，不与本轮混用。
 
-- 13th Gen Intel(R) Core(TM) i7-13650HX，WSL2 / Linux 6.6，Python 3.12.3；两版本及其子进程均固定在逻辑 CPU 0–7。宿主机为共享笔记本环境，不是独占服务器。
-- PyTorch 2.6.0+cu124、NumPy 1.26.4、Ray 2.60.0、Transformers 5.22.1、Tokenizers 0.23.3；`CUDA_VISIBLE_DEVICES` 为空。
-- 两侧使用同一份 Qwen3-0.6B tokenizer，固定 revision `c1899de289a04d12100db370d81485cdf75e47ca`；仅使用 tokenizer/config，不加载模型权重。文件校验值见结果 JSON。
-- 使用真实的 SessionShard、SessionForest、Sample、TrainingFieldArtifact、会话退出与结果获取逻辑；推理后端、消息编译器、Agent 进程和许可服务为确定性模拟实现。Shard 运行在主线程事件循环，调用者在独立客户端线程中模拟异步 RPC；结果经过 protocol-5 pickle 往返后计算内容摘要。没有启动真实 Ray 集群或 HTTP/TCP 服务。
-- 矩阵为 8 / 96 轮 × 每波 1 / 8 个并发长会话。每次共 2 波，在窗口第 1、5 秒发出退出信号；初始目标 2048 token、每次观察 1536 token、每轮响应 128 token。实际长度包含消息封装开销，见下表。
-- 正式窗口固定 12 秒，8 个短会话轮转发送 50 个短 chat/s，另发送 20 个 health/s：每次必须完成 600 个 chat 和 240 个 health 请求。
-- 每个独立进程先构建全部长轨迹，再导出一个不计入测量的预热会话（轮数为该场景的四分之一，至少 2 轮）、打开短会话，静默 1 秒后开始正式窗口。每组各版本重复 3 次，运行顺序按重复交替；所有计划请求必须完成。
+同一负载下不设置 `TOKENIZERS_PARALLELISM`（单项 Rust 解码），另做 2 对：事件循环 P99 **61.56 → 44.24 ms**，短 chat P99 **221.04 → 122.47 ms**，导出 P99 **617.00 → 539.18 ms**，吞吐 **3.47 → 3.53 exports/s**。进程 CPU 2.29 → 2.17 s，峰值 RSS 831.90 → 832.72 MiB（两侧范围重叠）。四次均有效、校验字段一致。明确关闭 tokenizer 并行时的降幅不能直接用于默认配置。
 
-## 统计口径
+## 精简工具的上游基线对照
 
-- 事件循环 probe 以 2 ms 为间隔，只统计正式 12 秒内的 deadline。循环被阻塞后，为每个错过的 deadline 补记迟延；窗口内 deadline 即使在窗口结束后才被执行，也保留其迟延，不添加窗口外的新 deadline。
-- chat/health 延迟从计划发送时刻算到响应完成，含生产者迟延、排队和服务时间；导出延迟从 Agent 退出信号算到结果经过模拟传输的完成时刻，含后台任务排队。
-- 每次运行分别用 NumPy `percentile` 的默认 linear 插值计算 P99；表中给出 3 次运行的中位数和 \[最小值, 最大值\]，不合并不同运行的样本计算 P99。
-- 整批吞吐 = 完成导出数 /（最后一次结果传输完成 − 第一次退出信号）。另列活动排空速率 = 完成导出数 / 各波排空时长之和；后者排除波次空闲并可能重复计入重叠区间，不能当作整批吞吐。
-- CPU/RSS 采样在正式窗口前紧邻启动，并持续到短请求及导出消费者排空完成，包含模拟传输、内容哈希和采样线程成本，不包含 teardown；每次实际区间长度记录于 `measurement_scope.cpu_rss_elapsed_s`。CPU 是进程全部线程的 `process_time`，RSS 为本进程每 20 ms 采样的峰值，可能漏掉更短峰值。
-- 缺少核心训练字段、请求失败/漏发/未完成、导出未全部在窗口内取得、内容摘要不一致或清理后存在残留时，CLI 非零退出并保存诊断，不生成通过百分比。候选单独覆盖只允许 `export_workers`，不能降低工作负载。
+基线固定为 [46701c8](https://github.com/redai-studio/Relax/commit/46701c8f2072810b4d908ea1d1ed42a237f2514f)。同一机器、软件环境和 tokenizer，两侧均设 `TOKENIZERS_PARALLELISM=false`。每个场景各跑 3 次，基线与候选交替先跑；每次用新进程。以下结果与原工具对照独立，不跨表计算增幅。
 
-## 全部矩阵结果
+- 使用真实 SessionShard、SessionForest、Sample 和 TrainingFieldArtifact。推理、消息编译、Agent 进程和许可服务为确定性模拟。Shard 和客户端在不同事件循环；用 protocol-5 序列化、复制缓冲区、反序列化模拟结果传输，不启动 Ray 服务。
+- 预建长轨迹，预热一次导出。正式窗口 12 秒；两波退出安排在第 1、5 秒；短 chat 50/s、health 20/s。短请求按计划发起时刻起算，含排队；导出从退出信号计至模拟传输完成。
+- 循环迟延按 2 ms deadline 统计，阻塞错过的 deadline 保留迟延。整批导出吞吐为完成数除以首个退出到末次取回的间隔（含波次空闲）；CPU 为进程总时间，峰值 RSS 每 20 ms 采样，含模拟传输与摘要计算，均不含 teardown。
+- 缺失请求、窗口内未完成全部导出、训练字段摘要不等或清理后有残留均判失败；不生成成功摘要。比较目录必须为新路径。
 
-下表每格为 3 次的中位数；全部原始运行指标、计数与内容摘要见 [results.json](./results.json)。
+| 轮数 / 并发 | 平均 token / 导出 | 导出数 / 次 |  循环 P99 / ms | 循环 P99 变化 | 短 chat P99 / ms |
+| ----------- | ----------------: | ----------: | -------------: | ------------: | ---------------: |
+| 8 / 1       |            13,903 |           2 |    1.25 → 1.21 |         -3.5% |      5.29 → 5.25 |
+| 8 / 8       |            13,903 |          16 |   93.42 → 1.22 |        -98.7% |    103.84 → 5.28 |
+| 96 / 1      |           161,039 |           2 |  172.90 → 1.28 |        -99.3% |    188.54 → 5.51 |
+| 96 / 8      |           161,039 |          16 | 1807.36 → 5.77 |        -99.7% |  1849.37 → 20.75 |
 
-| 轮数 / 每波并发 | 实际平均 tokens | 每次导出数 | 事件循环 P99 / ms，基线 → 优化 |    变化 | 短请求 P99 / ms，基线 → 优化 |
-| --------------- | --------------: | ---------: | ------------------------------ | ------: | ---------------------------- |
-| 8 / 1           |          13,903 |          2 | 1.138 → 1.133                  |  -0.41% | 5.082 → 4.974                |
-| 8 / 8           |          13,903 |         16 | 94.323 → 1.222                 | -98.70% | 116.421 → 5.784              |
-| 96 / 1          |         161,039 |          2 | 183.339 → 5.847                | -96.81% | 197.559 → 33.699             |
-| 96 / 8          |         161,039 |         16 | 1874.465 → 130.460             | -93.04% | 1953.124 → 413.918           |
+### 96 轮 / 并发 8（中位数 \[最小, 最大\]）
 
-### 长轨迹、每波并发 8 的详细对照
+| 指标                     |                     上游基线 |                    重写版 |
+| ------------------------ | ---------------------------: | ------------------------: |
+| 事件循环 P99 / ms        | 1807.36 \[1752.55, 1839.42\] |       5.77 \[5.31, 6.50\] |
+| 短 chat P99 / ms         | 1849.37 \[1795.10, 1884.38\] |    20.75 \[19.57, 22.81\] |
+| health P99 / ms          | 1804.78 \[1718.22, 1806.49\] |    14.02 \[10.45, 14.13\] |
+| 导出 P99 / ms            | 1973.00 \[1899.81, 2022.06\] | 494.72 \[469.81, 503.97\] |
+| 整批导出吞吐 / exports/s |          2.70 \[2.69, 2.71\] |       3.58 \[3.57, 3.58\] |
+| 进程 CPU / s             |          4.77 \[4.73, 4.81\] |       2.31 \[2.28, 2.33\] |
+| 峰值 RSS / MiB           |    883.87 \[883.32, 885.21\] | 809.11 \[808.67, 809.18\] |
 
-| 指标                     |     基线，中位数 \[最小, 最大\] |  优化，中位数 \[最小, 最大\] |     变化 |
-| ------------------------ | ------------------------------: | ---------------------------: | -------: |
-| 事件循环 P99 / ms        | 1874.465 \[1869.980, 1906.445\] | 130.460 \[128.078, 167.702\] |  -93.04% |
-| 短 chat P99 / ms         | 1953.124 \[1912.348, 2005.579\] | 413.918 \[406.365, 501.220\] |  -78.81% |
-| health P99 / ms          | 1874.348 \[1824.128, 1878.155\] | 243.096 \[231.284, 294.802\] |  -87.03% |
-| 导出 P99 / ms            | 2087.356 \[1999.478, 2118.665\] | 762.126 \[644.832, 819.912\] |  -63.49% |
-| 整批墙钟导出区间 / s     |          6.059 \[5.996, 6.129\] |       4.762 \[4.587, 4.821\] |  -21.41% |
-| 整批导出吞吐 / exports/s |          2.641 \[2.611, 2.668\] |       3.360 \[3.319, 3.488\] |  +27.24% |
-| 活动排空速率 / exports/s |          3.849 \[3.789, 4.004\] |    11.288 \[10.684, 12.987\] | +193.24% |
-| 进程 CPU / s             |          5.066 \[4.862, 5.069\] |       2.745 \[2.462, 3.005\] |  -45.82% |
-| 采样峰值 RSS / MiB       |    883.328 \[840.160, 884.074\] | 841.508 \[837.543, 860.598\] |   -4.73% |
-| CPU/RSS 实际采样区间 / s |       12.001 \[12.000, 12.001\] |    12.001 \[12.001, 12.001\] |   +0.00% |
+24 次运行共完成 216 次导出、14,400 个短 chat 与 5,760 个 health 请求；各场景的训练字段摘要一致，teardown 无残留。长轨迹高并发场景的循环 P99 降低 **99.7%**，超过任务 50% 的数值门槛，不代表所有负载都会有同等收益。
 
-本机上述长轨迹并发负载的事件循环 P99 中位数降低 **93.04%**，达到任务的 50% 数值门槛。短轨迹场景保留在矩阵中，不将其结果外推为所有负载都获得同样收益。
+## 复现
 
-24 次正式运行均通过有效性检查：合计完成 216 次长导出、14,400 个短 chat 与 5,760 个 health 请求，失败数为 0；各场景六次运行的脚本列出训练字段摘要一致。所有运行 teardown 后的任务、Group、Session、导出 Future、导出 worker 线程及额外线程残留均为 0。
-
-## 复现持续短请求与长导出
-
-在同一 CPU Python 环境中准备基线 checkout 和同一 tokenizer。以下命令的 BASELINE_SRC、TOKENIZER_DIR 和输出目录由复跑者指定；不要为两个版本使用不同的数据或 tokenizer。
+在安装项目现有 CPU 依赖的同一环境中运行。仅下载 tokenizer/config，不下载模型权重。
 
 ```bash
-git worktree add --detach /tmp/relax-session-export-baseline 9ca8cedce9ef5e0f3bbd5b10d38ad2e81a6a0f13
+git worktree add --detach /tmp/relax-export-baseline 46701c8f2072810b4d908ea1d1ed42a237f2514f
 hf download Qwen/Qwen3-0.6B tokenizer.json tokenizer_config.json vocab.json merges.txt config.json \
-  --revision c1899de289a04d12100db370d81485cdf75e47ca \
-  --local-dir /tmp/qwen3-tokenizer
+  --revision c1899de289a04d12100db370d81485cdf75e47ca --local-dir /tmp/qwen3-tokenizer
 
 export CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false
-export PYTHONNOUSERSITE=1
-BASELINE_SRC=/tmp/relax-session-export-baseline
-TOKENIZER_DIR=/tmp/qwen3-tokenizer
-
-taskset -c 0-7 python scripts/benchmarks/benchmark_agentic_session_export.py compare \
-  --baseline-src "$BASELINE_SRC" --candidate-src "$PWD" \
-  --tokenizer "$TOKENIZER_DIR" --preset long \
-  --set groups=2 --set turns=96 --set sessions_per_group=8 \
-  --set window_s=12.0 --set wave_interval_s=4.0 \
-  --repeats 3 --out-dir /tmp/session-export-t96-c8
+export OPENBLAS_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false PYTHONNOUSERSITE=1 RAY_ENABLE_AUTO_CONNECT=0
+RUNS=$(mktemp -d)
+for turns in 8 96; do
+  for concurrency in 1 8; do
+    taskset -c 0-7 python scripts/benchmarks/benchmark_agentic_session_export.py compare \
+      --baseline-src /tmp/relax-export-baseline --candidate-src "$PWD" \
+      --tokenizer /tmp/qwen3-tokenizer --preset long --set groups=2 \
+      --set turns="$turns" --set sessions_per_group="$concurrency" \
+      --set window_s=12 --set wave_interval_s=4 --repeats 3 \
+      --out-dir "$RUNS/t${turns}-c${concurrency}"
+  done
+done
 ```
 
-完整矩阵对 `turns=8,96`、`sessions_per_group=1,8` 的四种组合各执行上述比较，并分别指定输出目录。比较命令会交替版本顺序，逐进程保存 JSON 和包含每秒短请求最大延迟的摘要。
+每组生成各次原始 JSON 和带范围的 `summary.md`，不把逐次文件提交到仓库。
 
-## 验证与范围
+## 其他验证
 
-本 PR 的相关 CPU 回归和工具验证命令：
-
-```bash
-PYTHONPATH=. CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-  OPENBLAS_NUM_THREADS=1 python -m pytest \
-  tests/cpu/agentic/test_session_export.py tests/cpu/test_agentic_rollout.py \
-  tests/agentic/test_tool_result_images.py tests/cpu/agentic \
-  tests/cpu/tools/test_agentic_session_export_benchmark.py -q
-pre-commit run --all-files --show-diff-on-failure
-```
-
-相关 CPU 测试为 **159 passed**。测试包括导出内容与旧 deepcopy 路径一致、状态冻结、排队取消、运行中导出的关闭等待、异常映射、重复生命周期，以及压测 CLI 的失败判定、窗口边界和吞吐口径。
-
-未运行整个仓库的 GPU/多节点训练与集成套件；本对照不证明真实 HTTP/Ray 网络时延、SGLang 模型推理或训练吞吐收益。原始测量仅对本机、已声明的负载与字段成立；活动资格、CI、代码审查和最终验收由维护者确认。
+导出测试覆盖隐式与显式结果、快照隔离、R3、冻结、取消和关闭等待。使用镜像固定的 Transformers 5.16.0 / Tokenizers 0.23.2 复跑导出测试，另对真实 Qwen tokenizer 检查长 token 序列及多语言、特殊 token 的解码一致性。独立本机 Ray / HTTP 冒烟验证了导出 worker 卡住时另一个会话仍能 chat、health，且等待导出的组被取消后可释放 Forest。没有运行真实模型推理、训练、GPU/多节点套件。
