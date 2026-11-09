@@ -11,6 +11,7 @@ from typing import Any
 
 from examples.retool_agentic.protocol import PREFIX, VERSION, render_prompt
 from relax.engine.rollout.data_source import DataSource
+from relax.utils.agentic_obs.source import SourceRow, snapshot_source
 from relax.utils.types import Sample
 
 
@@ -36,7 +37,11 @@ class ReToolAgenticDataSource(DataSource):
         self.args = args
         raw = Path(args.prompt_data).read_bytes()
         self.digest = hashlib.sha256(raw).hexdigest()
-        self.cases = [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
+        self.cases = [
+            SourceRow(json.loads(line), args.prompt_data, row_id)
+            for row_id, line in enumerate(raw.decode().splitlines())
+            if line.strip()
+        ]
         if not self.cases:
             raise ValueError("Empty ReTool training data")
         self.tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, local_files_only=True)
@@ -72,6 +77,8 @@ class ReToolAgenticDataSource(DataSource):
         for _ in range(count):
             question = self.rng.randrange(len(self.cases))
             case = self.cases[question]
+            # Capture the original row before adding per-replica sampling metadata.
+            prompt_source = snapshot_source(case, metadata_key="metadata", split="train")
             group = []
             for member in range(k):
                 index = self.group_cursor * k + member
@@ -95,6 +102,7 @@ class ReToolAgenticDataSource(DataSource):
                     metadata=metadata,
                     group_index=self.group_cursor,
                     index=index,
+                    agentic_prompt_source=prompt_source,
                 )
                 group.append(sample)
             groups.append(group)

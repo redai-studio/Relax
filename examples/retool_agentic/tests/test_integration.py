@@ -21,6 +21,7 @@ from examples.retool_agentic.data_source import ReToolAgenticDataSource
 from examples.retool_agentic.protocol import CHAT_TEMPLATE, PREFIX, VERSION, observation_text, render_prompt
 from examples.retool_agentic.reward import reward_func
 from examples.retool_agentic.tests.native_reference import run_episode as native_episode
+from relax.agentic.inventory import InventoryRecorder
 from relax.agentic.pipeline.runtime import SGLangMessageCompiler
 from relax.agentic.runner.ipc import SessionOutput
 from relax.agentic.session.service import AgenticSessionShard, _normalized_chat_request
@@ -309,7 +310,7 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path)
     tokenizer.save_pretrained(model)
     data = tmp_path / "train.jsonl"
     data.write_text(
-        "\n".join(
+        "\n\n".join(
             json.dumps(dict(prompt=[dict(role="user", content=PREFIX + f"question {i}")], label=str(i)))
             for i in range(17)
         )
@@ -336,6 +337,35 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path)
     assert [g[0].metadata["scheduled_question"] for g in groups] == [rng.randrange(17) for _ in range(4)]
     assert [s.index for g in groups for s in g] == list(range(8))
     assert groups[0][0].prompt[0]["role"] == "user"
+    for group in groups:
+        assert all(s.agentic_prompt_source is not None for s in group)
+        assert len({s.agentic_prompt_source["prompt_id"] for s in group}) == 1
+        question = group[0].metadata["scheduled_question"]
+        provenance = group[0].agentic_prompt_source
+        assert provenance["source_row_id"] == str(2 * question)
+        assert provenance["input_payload"] == source.cases[question]
+        assert [s.metadata["retool_agentic"]["seed"] for s in group] == [
+            args.rollout_seed + s.index * 1009 for s in group
+        ]
+
+    args.dump_agentic_obs = str(tmp_path / "obs")
+    args.agentic_obs_run_id = "test_provenance"
+
+    async def record_inventory():
+        recorder = InventoryRecorder(args, "train")
+        for i, group in enumerate(groups):
+            recorder.record_group(f"group_{i}", group, [f"test_session_{s.index}" for s in group])
+        await recorder.aclose()
+
+    asyncio.run(record_inventory())
+    obs = tmp_path / "obs/test_provenance"
+    inventories = {
+        stream: [json.loads(line) for path in (obs / stream).glob("*.jsonl") for line in path.read_text().splitlines()]
+        for stream in ("groups", "sessions")
+    }
+    group_prompts = {g["group_id"]: g["prompt_id"] for g in inventories["groups"]}
+    assert len(group_prompts) == 4 and len(inventories["sessions"]) == 8
+    assert all(s["prompt_id"] == group_prompts[s["group_id"]] for s in inventories["sessions"])
     source.save(0)
     args.load = args.save
     restored = ReToolAgenticDataSource(args)
@@ -353,6 +383,7 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path)
     assert after_drop.group_cursor == 9
     continued, replayed = restored.get_samples(1), after_drop.get_samples(1)
     assert continued[0][0].metadata == replayed[0][0].metadata
+    assert continued[0][0].agentic_prompt_source == replayed[0][0].agentic_prompt_source
     assert continued[0][0].index == replayed[0][0].index == 18
     with pytest.raises(RuntimeError, match="complete Agentic prompt batch"):
         restored.save(2)
