@@ -881,6 +881,7 @@ class RuntimeDomain:
     ) -> None:
         self.args = args
         self.rollout_mode = rollout_mode
+        self.teacher_routing_enabled = rollout_mode == "train" and opd.is_teacher_routing_enabled(args)
         self._shards = shards
         self.concurrency = concurrency
         self._admission_coordinator = admission_coordinator
@@ -954,11 +955,7 @@ class RuntimeDomain:
         Runtime capability.
         """
 
-        if (
-            self.rollout_mode == "train"
-            and opd.is_opd_enabled(self.args)
-            and getattr(self.args, "opd_teacher_routes_map", None)
-        ):
+        if self.teacher_routing_enabled:
             for sample in group_input.samples:
                 opd.bind_teacher(self.args, sample)
 

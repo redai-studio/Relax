@@ -120,7 +120,7 @@ MODEL_DIR=/root/models DATA_DIR=/root/data bash run-mopd-qwen35-35ba3b-16xgpu-co
 Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确定 `Sample.metadata["teacher_id"]`。
 回答生成后，评分直接使用这个 Teacher 身份选择副本，结果写回对应回答。
 
-普通 rollout 每轮按 Teacher 记录两项指标。
+普通 rollout 和 Agentic rollout 每轮按 Teacher 记录两项指标。Agentic 在放行 Session 生成前登记，同一个 Session 导出多条样本只计一条回答。
 
 - `mopd/by_teacher/<teacher_id>/responses` 统计本轮登记的 Student 回答，也包括上轮仍待提交的回答。同一回答在本轮重试只算一次。
 - `mopd/by_teacher/<teacher_id>/awaiting_submission` 统计其中尚待提交评分的回答。回答进入 `_teacher_prefill()`、逐条生成被取消或整组跳过评分时移出，重试时重新计入。

@@ -154,7 +154,7 @@ class AgenticResidentPipeline:
         warming, ready = self.prepare_domain.counts
         runtime_reward = len(self._active_group_tasks)
         finalized = len(self._finalized_groups)
-        return {
+        snapshot: dict[str, object] = {
             "active_rollout_id": context.rollout_id if context is not None else None,
             "warming_prepare_group_count": warming,
             "ready_prepare_group_count": ready,
@@ -164,6 +164,9 @@ class AgenticResidentPipeline:
             "resident_group_count": self.runtime_domain.resident_group_count,
             "interrupted_runtime_group_count": len(self.runtime_domain.interrupted_group_ids),
         }
+        if self.runtime_domain.teacher_routing_enabled:
+            snapshot["teacher_responses"] = self._opd_manager.response_stats.metrics()
+        return snapshot
 
     async def run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
         """Generate one rollout step while resident Group refs may cross
@@ -181,6 +184,8 @@ class AgenticResidentPipeline:
             final_backfill=final_backfill,
         )
         self._active_step = context
+        if self.runtime_domain.teacher_routing_enabled:
+            self._opd_manager.response_stats.new_window()
         try:
             self.prepare_domain.open_step(
                 prelaunch_next_step=self.args.agentic_prelaunch and rollout_id + 1 < self.args.num_rollout
@@ -193,6 +198,8 @@ class AgenticResidentPipeline:
             metrics = dict(output.metrics or {})
             metrics.update(_aggregate_agentic_timing(samples))
             metrics.update(self.reward_domain.collect_metrics())
+            if self.runtime_domain.teacher_routing_enabled:
+                metrics.update(self._opd_manager.response_stats.metrics())
             if getattr(self.args, "agentic_program_admission", False) or getattr(
                 self.args, "agentic_session_lifecycle", False
             ):
@@ -477,14 +484,22 @@ class AgenticResidentPipeline:
         opens its generation gate.
         """
 
-        for stream in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
+        for stream, teacher_id, response_keys in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
+            for key in response_keys:
+                self._opd_manager.response_stats.admit(key, cast(str, teacher_id))
             await self.runtime_domain.lease_group(stream, context.rollout_id)
             group_task = asyncio.create_task(
                 _run_group(self.runtime_domain, self.reward_domain, stream, self._opd_manager),
                 name=f"agentic-group:{stream.group_id}",
             )
-            group_task.add_done_callback(lambda _task: self._changed.set())
+            # A task cancelled before its coroutine starts still has to release its response counts.
+            group_task.add_done_callback(lambda _task, keys=response_keys: self._finish_group(keys))
             self._active_group_tasks.append(group_task)
+
+    def _finish_group(self, response_keys: tuple[int | str, ...]) -> None:
+        for key in response_keys:
+            self._opd_manager.response_stats.finish(key)
+        self._changed.set()
 
     def _runtime_group_gap(self, context: _StepContext) -> int:
         oversample_groups = 0
