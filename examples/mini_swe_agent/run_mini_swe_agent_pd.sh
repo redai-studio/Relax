@@ -252,6 +252,7 @@ AGENTIC_ARGS=(
    --agentic-concurrency "${ROLLOUT_BATCH_SIZE}"
    --agent-command "bash ${SCRIPT_DIR}/agent_client.sh"
    --agent-cwd "${SCRIPT_DIR}"
+   --agent-resource-owner-path relax.agentic.runner.resources.ReceiptResourceOwner
    --agent-timeout 7200
    --agent-env "AGENT_SERVER_URL=${AGENT_SERVER_URL}" "AGENT_CLIENT_TRACE_DIR=${AGENT_SERVER_WORK_DIR}/client_events"
    --agentic-tool-call-parser qwen3_coder

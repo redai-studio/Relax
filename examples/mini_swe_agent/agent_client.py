@@ -30,6 +30,19 @@ def _diagnostic(message: str) -> None:
         pass
 
 
+def trace_failure(session_id: str, result: dict) -> None:
+    """Keep the former shell client's opt-in failure snapshots in Python."""
+    directory = os.environ.get("AGENT_CLIENT_TRACE_DIR")
+    if not directory or result.get("status") != "failed":
+        return
+    try:
+        path = Path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        atomic_json(path / f"{session_id}.failed.json", result)
+    except OSError as error:
+        _diagnostic(f"failure trace unavailable error={type(error).__name__}")
+
+
 def run() -> int:
     base = os.environ["AGENT_SERVER_URL"].rstrip("/")
     sid = os.environ["RELAX_SESSION_ID"]
@@ -41,6 +54,12 @@ def run() -> int:
         atomic_json(release_path, {**expected, "status": "unknown"})
     cancel_deadline: float | None = None
     cancel_reason = ""
+    poll_interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.5"))
+    initial_poll_delay = float(os.environ.get("INITIAL_POLL_DELAY_SECONDS", "0"))
+    cancel_timeout = float(os.environ.get("CANCEL_REQUEST_TIMEOUT_SECONDS", "5"))
+    failure_limit = int(os.environ.get("MAX_POLL_FAILURES", "20"))
+    if poll_interval <= 0 or initial_poll_delay < 0 or cancel_timeout <= 0 or failure_limit <= 0:
+        raise ValueError("Client polling and cancellation limits must be positive; initial delay may be zero")
 
     def cancel(_signum, _frame):
         nonlocal cancel_deadline, cancel_reason
@@ -52,8 +71,7 @@ def run() -> int:
     signal.signal(signal.SIGTERM, cancel)
     signal.signal(signal.SIGINT, cancel)
 
-    def request(path: str, payload: dict | None = None) -> dict:
-        timeout = 2.0
+    def request(path: str, payload: dict | None = None, *, timeout: float = 2.0) -> dict:
         if cancel_deadline is not None:
             timeout = min(timeout, cancel_deadline - time.monotonic())
             if timeout <= 0:
@@ -80,15 +98,19 @@ def run() -> int:
     errors = 0
     cancel_sent = False
     result: dict = {}
-    interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.5"))
     while cancel_deadline is None or time.monotonic() < cancel_deadline:
         phase = "create"
         try:
             if server_sid is None:
                 server_sid = request("/sessions", payload)["session_id"]
+                # An explicit warmup delay remains configurable, but cancellation
+                # must never wait for it. The default starts polling immediately.
+                first_poll_at = time.monotonic() + initial_poll_delay
+                while cancel_deadline is None and time.monotonic() < first_poll_at:
+                    time.sleep(min(0.1, max(0.0, first_poll_at - time.monotonic())))
             if cancel_deadline is not None and not cancel_sent:
                 phase = "cancel"
-                request(f"/sessions/{server_sid}/cancel", {})
+                request(f"/sessions/{server_sid}/cancel", {}, timeout=cancel_timeout)
                 cancel_sent = True
             phase = "poll"
             result = request(f"/sessions/{server_sid}")
@@ -99,10 +121,13 @@ def run() -> int:
             if released and release_path is not None:
                 phase = "release_receipt"
                 atomic_json(release_path, expected)
-            if required and result.get("resource_release_failed"):
+            if result.get("resource_release_failed"):
+                trace_failure(sid, result)
                 sys.stderr.write("Agent Session cleanup failed; physical release remains unconfirmed\n")
                 return 1
-            if result.get("status") in {"completed", "failed", "cancelled"} and (released or not required):
+            # Mini SWE always owns external resources. Even without a Runtime
+            # capacity limit, returning a result must wait for their release.
+            if result.get("status") in {"completed", "failed", "cancelled"} and released:
                 if cancel_deadline is not None:
                     _diagnostic(f"cancelled released={released} reason={cancel_reason}")
                     return 143
@@ -120,12 +145,12 @@ def run() -> int:
                         },
                     )
                 else:
+                    trace_failure(sid, result)
                     sys.stderr.write(f"Agent session {result['status']}: {result.get('error', '')}\n")
                 return int(result.get("exit_code", 1))
         except (OSError, urllib.error.URLError, TimeoutError) as exc:
             errors += 1
-            limit = int(os.environ.get("MAX_POLL_FAILURES", "20"))
-            if errors in {1, limit}:
+            if errors in {1, failure_limit}:
                 reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
                 # Do not log URLs, payloads or exception text containing credentials.
                 _diagnostic(
@@ -133,9 +158,11 @@ def run() -> int:
                     f"error={type(exc).__name__} reason_type={type(reason).__name__} "
                     f"errno={getattr(reason, 'errno', None)} http_status={getattr(exc, 'code', None)}"
                 )
-            if errors >= limit and cancel_deadline is None:
+            if errors >= failure_limit and cancel_deadline is None:
                 cancel(0, None)
-        time.sleep(min(interval, max(0.0, cancel_deadline - time.monotonic())) if cancel_deadline else interval)
+        time.sleep(
+            min(poll_interval, max(0.0, cancel_deadline - time.monotonic())) if cancel_deadline else poll_interval
+        )
     _diagnostic(f"release deadline elapsed reason={cancel_reason}")
     return 143 if cancel_deadline is not None else 1
 

@@ -123,17 +123,6 @@ class PrepareDomain:
         self.close_step()
         await self._discard_prepared_tasks()
 
-    async def drain_step(self) -> None:
-        """Join declined preparation before a fixed-step weight update."""
-        self.close_step()
-        tasks = tuple(self._warming_prepare_tasks)
-        if self._prepare_fetch_task is not None:
-            tasks += (self._prepare_fetch_task,)
-        await asyncio.gather(*tasks)
-        self.collect()
-        if self._ready_prepare_tasks or self._warming_prepare_tasks:
-            raise RuntimeError("Fixed-step close still owns prepared Groups")
-
     async def _fetch_group_inputs(self, requested_group_count: int) -> None:
         sample_groups = await self.data_source.get_samples.remote(requested_group_count)
         if not sample_groups:

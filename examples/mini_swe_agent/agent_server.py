@@ -408,7 +408,6 @@ class SessionRecord:
     status: str = "queued"
     exit_code: int | None = None
     error: str = ""
-    env: Any | None = None
     agent_exit_status: str = ""
     submission: str = ""
     reward: float | None = None
@@ -868,9 +867,8 @@ class AgentServer:
         if max_turns <= 0:
             raise ValueError("AGENT_SERVER_MAX_TURNS must be positive")
         self.base_config["agent"]["step_limit"] = max_turns
-        self._supervised = os.environ.get("AGENT_SERVER_SUPERVISED_SESSIONS", "0") == "1"
         self._memory_limit_mib = int(os.environ.get("AGENT_SERVER_SESSION_MEMORY_MIB", "0"))
-        validate_memory_limit(self._memory_limit_mib, supervised=self._supervised)
+        validate_memory_limit(self._memory_limit_mib)
         self._stopping = False
         environment_config = self.base_config["environment"]
         self.apptainer_args = (
@@ -950,14 +948,13 @@ class AgentServer:
             )
             self.records[server_session_id] = record
             self._session_keys[key] = server_session_id
-            runner = self._run_supervised_session if self._supervised else self._run_session
-            record.future = self.executors[mode].submit(runner, server_session_id, sample_idx)
+            record.future = self.executors[mode].submit(self._run_supervised_session, server_session_id, sample_idx)
         return {"session_id": server_session_id, "status": "queued"}
 
     def get_session(self, server_session_id: str) -> dict[str, Any]:
         # Do NOT pop terminal records here. Popping on the first terminal GET made
         # the endpoint non-idempotent: if that response was lost, the client's
-        # retry hit 404 and (agent_client.sh gates on `curl -fsS`) looped forever.
+        # retry hit 404 instead of receiving the same terminal result.
         # Records are instead reclaimed by the background TTL sweeper, so a GET is
         # retryable across a dropped response and cancelled/unfetched records
         # (whose clients exit without a final GET) no longer leak.
@@ -974,6 +971,8 @@ class AgentServer:
         """
         cutoff = time.time() - self._record_ttl
         with self.lock:
+            if self._stopping:
+                return 0
             stale = [
                 sid
                 for sid, record in self.records.items()
@@ -1003,33 +1002,20 @@ class AgentServer:
             if record.status == "queued":
                 record.cancel()
             future = record.future
-            env = record.env
-        if future is not None:
-            if future.cancel():
-                with self.lock:
-                    record.resources_released = True  # No worker was ever launched.
-        if env is not None:
-            try:
-                env.cleanup()
-            except Exception as exc:
-                logging.warning("failed to cleanup cancelled session %s: %s", server_session_id, exc)
+            # GET must not observe a cancelled Future before its no-worker
+            # release proof, which would incorrectly report cleanup failure.
+            if future is not None and future.cancel():
+                record.resources_released = True
 
     def shutdown(self) -> None:
         errors = []
         with self.lock:
             self._stopping = True
-            records = list(self.records.values())
-            for record in records:
-                record.cancel_event.set()
-        for record in records:
-            if record.env is not None:
-                try:
-                    record.env.cleanup()
-                except Exception as exc:
-                    errors.append(str(exc))
-                    logging.warning("failed to cleanup session during shutdown: %s", exc)
+            session_ids = tuple(self.records)
+        for session_id in session_ids:
+            self.cancel_session(session_id)
         for executor in self.executors.values():
-            executor.shutdown(wait=self._supervised, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
         try:
             _stop_mswe_instances(
                 *self.apptainer_args,
@@ -1158,7 +1144,8 @@ class AgentServer:
         with self._event_lock, (self.work_dir / filename).open("a") as file:
             file.write(json.dumps(event, ensure_ascii=False) + "\n")
 
-    def _run_session(self, server_session_id: str, sample_idx: int) -> None:
+    def _run_session_worker(self, server_session_id: str, sample_idx: int) -> None:
+        """Execute agent business logic only inside the supervised worker."""
         with self.lock:
             record = self.records.get(server_session_id)
             if record is None or record.status == "cancelled":
@@ -1173,7 +1160,7 @@ class AgentServer:
         # `env.cleanup()` never runs -> the instance leaks, accumulates, and
         # eventually exhausts host resources so every new `instance start` fails
         # with exit 255, collapsing whole rollout groups to zero reward).
-        instance_name = getattr(self, "_worker_instance_name", None) or _new_instance_name()
+        instance_name = self._worker_instance_name
         info: dict[str, Any] = {}
         error = ""
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -1205,17 +1192,8 @@ class AgentServer:
             environment.pop("environment_class", None)
             model = MyLitellmModel(**config["model"])
             env = ApptainerInstanceEnvironment(tmp_dir=tmp_dir, instance_name=instance_name, **config["environment"])
-            # Bind env FIRST (so a concurrent cancel_session can cleanup()), then
-            # re-check cancel under the lock. A cancel arriving DURING the
-            # constructor above (which `instance start`s a sandbox, seconds long)
-            # saw record.env is None -> skipped cleanup, and future.cancel() no-ops
-            # once running, so without this the agent would run the full 7200s
-            # holding a sandbox + concurrency slot after being cancelled.
-            with self.lock:
-                record.env = env
-                cancelled = record.cancel_event.is_set()
-            if cancelled:
-                raise RuntimeError("session cancelled")
+            # The supervisor owns cancellation and container cleanup even when
+            # the worker is interrupted inside environment construction.
             info = MyAgent(
                 model,
                 env,
@@ -1263,7 +1241,6 @@ class AgentServer:
         event = None
         with self.lock:
             record = self.records[server_session_id]
-            record.env = None
             record.cleanup_error = cleanup_error
             record.finish(info, error)
             if record.status in {"failed", "cancelled"}:
@@ -1285,7 +1262,7 @@ class AgentServer:
     def _public_record(self, server_session_id: str, record: SessionRecord) -> dict[str, Any]:
         status = record.status
         if status in TERMINAL_STATUSES and record.future is not None and not record.future.done():
-            # Legacy clients also need to wait for finalization: event I/O can
+            # Clients must wait for finalization: event I/O can
             # still fail before the worker returns, changing completed to failed.
             status = "running"
         data: dict[str, Any] = {
@@ -1410,7 +1387,7 @@ def session_worker(spec_path: str, result_path: str) -> None:
         setattr(server, key, Path(spec[key]))
     server.sifs = {key: Path(value) for key, value in spec["sifs"].items()}
     server._worker_instance_name = spec["instance_name"]
-    server._run_session(spec["server_session_id"], record.sample_idx)
+    server._run_session_worker(spec["server_session_id"], record.sample_idx)
     temporary = Path(result_path).with_suffix(".tmp")
     temporary.write_text(
         json.dumps(
