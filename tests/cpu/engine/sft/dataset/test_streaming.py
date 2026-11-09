@@ -1847,11 +1847,15 @@ def test_normalize_tool_calls_rejects_non_object_arguments(arguments):
 
 def test_tool_normalization_rejects_malformed_json_and_preserves_empty_values():
     assert streaming_module._normalize_tools(None) is None
+    assert streaming_module._normalize_tools("") is None
+    assert streaming_module._normalize_tools(" \n\t") is None
     assert streaming_module._normalize_tools([]) == []
     assert streaming_module._normalize_tool_calls(None) is None
     assert streaming_module._normalize_tool_calls([]) == []
     with pytest.raises(json.JSONDecodeError):
         streaming_module._normalize_tools(["{invalid"])
+    with pytest.raises(json.JSONDecodeError):
+        streaming_module._normalize_tools("{invalid")
     with pytest.raises(json.JSONDecodeError):
         streaming_module._normalize_tool_calls([{"function": {"arguments": "{invalid"}}])
 

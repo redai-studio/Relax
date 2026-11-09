@@ -186,6 +186,8 @@ def _normalize_tools(value: Any) -> list[dict] | None:
     if value is None:
         return None
     if isinstance(value, str):
+        if not value or value.isspace():
+            return None
         value = json.loads(value)
     elif hasattr(value, "tolist"):
         value = value.tolist()
