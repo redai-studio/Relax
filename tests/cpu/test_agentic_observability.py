@@ -1435,8 +1435,14 @@ def test_runtime_drop_joins_inflight_export_delivery(tmp_path, cancelled):
     asyncio.run(scenario())
 
 
-def test_eager_prepare_failure_preserves_inflight_export_observation(tmp_path):
-    from relax.agentic.pipeline import RuntimeGroupError, SessionExportTransport
+@pytest.mark.parametrize("failure_source", ["prepare", "finalization"])
+def test_group_failure_preserves_inflight_export_observation(tmp_path, failure_source):
+    from relax.agentic.pipeline import (
+        RuntimeGroupError,
+        SessionExportTransport,
+        SessionGroupProgress,
+        SessionShardProgress,
+    )
     from relax.agentic.pipeline import runtime as runtime_module
 
     args = _obs_args(tmp_path)
@@ -1461,6 +1467,7 @@ def test_eager_prepare_failure_preserves_inflight_export_observation(tmp_path):
         loop = asyncio.get_running_loop()
         results = tuple(runtime_module._SessionResultRef(sid, loop.create_future()) for sid in ("done", "waiting"))
         stream = runtime_module.RuntimeGroupStream("g", binding, loop.create_future(), results)
+        binding.group_streams[stream.group_id] = stream
         take_task = asyncio.create_task(runtime_module._take_session_results(stream, results[:1]))
         results[0].take_task = take_task
         await started.wait()
@@ -1472,7 +1479,13 @@ def test_eager_prepare_failure_preserves_inflight_export_observation(tmp_path):
         preparation = asyncio.create_task(fail())
         await asyncio.gather(preparation, return_exceptions=True)
         try:
-            runtime._eager_preparation_done(stream, preparation)
+            if failure_source == "prepare":
+                runtime._eager_preparation_done(stream, preparation)
+            else:
+                runtime._apply_shard_progress(
+                    binding,
+                    SessionShardProgress(1, (SessionGroupProgress("g", False, (), False, False, error=error),)),
+                )
             assert stream.first_request_barrier.exception() is error
             assert results[1].completion.exception() is error
             assert not results[0].completion.done()

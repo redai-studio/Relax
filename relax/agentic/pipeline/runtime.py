@@ -907,6 +907,7 @@ class RuntimeGroupStream:
     preparation_task: Optional["asyncio.Task[bool]"] = None
     closing: bool = False
     drop_task: Optional["asyncio.Task[None]"] = None
+    error: RuntimeGroupError | None = None
 
 
 def agentic_eval_concurrency_from_args(args: Namespace, eval_group_size: int) -> int:
@@ -1529,9 +1530,24 @@ class RuntimeDomain:
             if stream is None:
                 continue
             self._confirm_session_resources(stream, getattr(group_progress, "resource_released_session_ids", ()))
-            # The step close predicate reads interrupted Group IDs as Fully-async credit.
+            # Preserve the real protection/resource state even when cleanup
+            # fails; an error is not an interruption or release receipt.
             stream.interrupted = group_progress.interrupted
             stream.protected = group_progress.protected
+            error = getattr(group_progress, "error", None)
+            if error is not None:
+                stream.error = error
+                for ref in (
+                    stream.first_request_barrier,
+                    *(
+                        result.completion
+                        for result in stream.session_results
+                        if result.take_task is None or result.take_task.done()
+                    ),
+                ):
+                    if not ref.done():
+                        ref.set_exception(error)
+                continue
             if stream.dropping:
                 continue
             # RuntimeDomain.prepare_group() owns the first-IR readiness waiter.
@@ -1567,6 +1583,10 @@ class RuntimeDomain:
 
         self._start_shard_observers()
         while any(stream.protected for shard in self._shards for stream in shard.group_streams.values()):
+            for shard in self._shards:
+                for stream in shard.group_streams.values():
+                    if stream.error is not None:
+                        raise stream.error
             self._state_changed.clear()
             if not any(stream.protected for shard in self._shards for stream in shard.group_streams.values()):
                 break

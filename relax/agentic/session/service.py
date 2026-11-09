@@ -1430,6 +1430,7 @@ class ResidentGroup:
     closing: bool = False
     eager_failure: RuntimeGroupError | None = None
     eager_controlled_drop: bool = False
+    finalization_error: RuntimeGroupError | None = None
 
     @property
     def all_first_ir_arrived(self) -> bool:
@@ -1468,6 +1469,8 @@ class ResidentGroup:
         return all(cell.terminal for cell in self.result_cells.values())
 
     def first_error(self) -> Optional[RuntimeGroupError]:
+        if self.finalization_error is not None:
+            return self.finalization_error
         if self.eager_failure is not None:
             return self.eager_failure
         for cell in self.result_cells.values():
@@ -1500,6 +1503,7 @@ class _SessionRecord:
     process_launch_attempted: bool = False
     eager_timeout_active: bool = False
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
+    finalization_retryable: bool = False
     backend_cleanup_tasks: set["asyncio.Task[None]"] = field(default_factory=set)
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
@@ -1609,6 +1613,7 @@ class AgenticSessionShard:
                     protected=group.protected,
                     resource_released_session_ids=tuple(sorted(group.resource_released_session_ids)),
                     all_first_ir_arrived=group.eager_session_generation and group.all_first_ir_arrived,
+                    error=group.finalization_error,
                 )
                 for group in groups
             ),
@@ -2193,8 +2198,11 @@ class AgenticSessionShard:
             return self._resource_release_receipts.get(group_id, ())
         if group.eager_session_generation:
             await self._close_eager_group(group)
-        if group.drop_task is None:
-            group.stop_reason = reason
+        if group.drop_task is None or (
+            group.drop_task.done() and (group.drop_task.cancelled() or group.drop_task.exception() is not None)
+        ):
+            if group.stop_reason is None:
+                group.stop_reason = reason
             group.drop_task = asyncio.create_task(
                 self._drop_group(group),
                 name=f"drop-group:{group.group_id}",
@@ -3553,10 +3561,21 @@ class AgenticSessionShard:
             )
         async with session.lock:
             finish_task = session.finish_task
-            if finish_task is None:
+            retry = (
+                session.finalization_retryable
+                and finish_task is not None
+                and finish_task.done()
+                and (finish_task.cancelled() or finish_task.exception() is not None)
+            )
+            if finish_task is None or retry:
                 session.phase = SessionPhase.FINALIZING
                 if session.observation is not None and session.observation.failure is None and failure is not None:
                     session.observation.failure = failure
+                if retry:
+                    # Only an unsettled backend join is restartable. Its fatal
+                    # outcome survives a later controlled drop or late success.
+                    outcome = session.group.finalization_error
+                session.finalization_retryable = False
                 finish_task = asyncio.create_task(
                     self._finish_session_once(session, outcome),
                     name=f"session-finish:{session.session_id}",
@@ -3709,7 +3728,39 @@ class AgenticSessionShard:
 
         for runner_task in pre_backend_tasks:
             runner_task.cancel()
-        abort_outcomes = await self._join_finalizing_requests(session, pre_backend_tasks, backend_tasks)
+        try:
+            abort_outcomes = await self._join_finalizing_requests(session, pre_backend_tasks, backend_tasks)
+        except RuntimeGroupError as error:
+            # No IR, process, or result ownership has been retired yet. Keep
+            # those refs for a later drop/shutdown retry, but wake Runtime now
+            # without claiming a terminal result or a physical release.
+            session.finalization_retryable = True
+            if group.finalization_error is None:
+                group.finalization_error = error
+            if session.observation is not None:
+                failure = session.observation.failure
+                if failure is None or failure[0] != "session_cleanup_failed":
+                    failure = ("session_cleanup_failed", "infra", str(error))
+                    session.observation.failure = failure
+                self._observe_session(
+                    session,
+                    "cleanup",
+                    "failed",
+                    reason_code=failure[0],
+                    category=failure[1],
+                    reason=failure[2],
+                )
+            if isinstance(outcome, SessionExportTransport):
+                # The retry keeps only the fatal error, so retire this export
+                # observation now without publishing or refunding the Session.
+                self._trajectory_recorder.record_export_failure(
+                    outcome.exports,
+                    group_id=group.group_id,
+                    rollout_mode=group.rollout_mode,
+                    reason=str(error),
+                )
+            self._notify_state_change(group)
+            raise
         lifecycle_closed = True
         if self.args.agentic_session_lifecycle:
             lifecycle_closed = await self._generation_backend.close_session(
@@ -3857,6 +3908,11 @@ class AgenticSessionShard:
         for outcome in cleanup_outcomes:
             if isinstance(outcome, BaseException):
                 raise outcome
+        if group.finalization_error is not None:
+            # Cleanup may have committed while a sibling's controlled drop
+            # raced the error notification. Preserve the fatal error; the
+            # committed resource receipt is replayable on the next RPC.
+            raise group.finalization_error
         if group.eager_session_generation and group.eager_failure is not None:
             # A member may already have retired before a sibling's controlled
             # drop reaches us. Its fatal result must survive that drop; the
