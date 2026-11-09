@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.utils.data.global_flops_pack_protocol import STEP_PLANS, checked_schedule, seal_header
+from relax.utils.data.global_flops_pack_protocol import STEP_PLANS, checked_schedule, execution_contract, seal_header
 from tests.cpu.no16.harness import EvidenceLog
 from tests.cpu.no16.source import ROOT, load
 
@@ -292,3 +292,39 @@ def test_checkpoint_geometry_signature_rejects_even_empty_incompatible_state(tmp
         with pytest.raises(ValueError):
             fresh.load_checkpoint(before)
         assert fresh.save_checkpoint() == empty
+
+
+@pytest.mark.parametrize("kind", ["sft", "rl"])
+@pytest.mark.parametrize("cp", [1, 2])
+def test_model_discovered_unsplit_layout_preserves_shared_identity_and_validates_replay(kind, cp, tmp_path):
+    args, context, _, sampler, refs = setup(tmp_path, kind, cp=cp, capacity=4)
+    assert not hasattr(args, "uses_unsplit_forward")
+    marker = load(
+        ROOT / "relax/backends/megatron/model_provider.py", names={"_maybe_mark_unsplit_forward"}
+    )._maybe_mark_unsplit_forward
+    marker(args, SimpleNamespace(uses_unsplit_forward=True))
+    mpu = SimpleNamespace(
+        get_virtual_pipeline_model_parallel_world_size=lambda: None,
+        get_data_parallel_world_size=lambda **kwargs: 2,
+        get_tensor_model_parallel_world_size=lambda: 1,
+        get_pipeline_model_parallel_world_size=lambda: 1,
+        get_context_parallel_world_size=lambda: cp,
+    )
+    contract = execution_contract(args, mpu, SimpleNamespace(), context.estimator)
+    assert contract.unsplit is True
+    assert contract.checkpoint_signature == sampler.signature
+    part = partition([1, 3, 2, 5])
+    task = "sft_train" if kind == "sft" else "train"
+    rows, meta = pull(sampler, part, contract, 0, task=task)
+    restore(part, rows, meta, context, contract, 0, task=task)
+    saved = sampler.save_checkpoint()
+    restored = refs["factory"].configure_sampler(args, refs["original"], 2)
+    restored.load_checkpoint(saved)
+    assert pull(restored, part, contract, 0, task=task)[0] == rows
+    changed = replace(contract, unsplit=False)
+    assert changed.signature != contract.signature
+    with pytest.raises(ValueError, match="replay execution geometry changed"):
+        pull(restored, part, changed, 1, task=task)
+    with pytest.raises(ValueError, match="execution contract mismatch"):
+        restore(part, rows, meta, context, changed, 0, task=task)
+    assert restored.save_checkpoint() == saved

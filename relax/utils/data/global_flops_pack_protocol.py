@@ -92,6 +92,8 @@ def validate_pack_runtime(args: Any) -> None:
 
 
 def checkpoint_identity(args: Any, estimator: Any, dp_size: int) -> str:
+    # Model construction discovers uses_unsplit_forward only on the Actor.
+    # Its physical layout remains part of the complete ExecutionContract.
     model, cost = cost_identity(estimator)
     data = {
         name: _plain(getattr(args, name, None))
@@ -121,7 +123,6 @@ def checkpoint_identity(args: Any, estimator: Any, dp_size: int) -> str:
             "data_pad_size_multiplier",
             "allgather_cp",
             "qkv_format",
-            "uses_unsplit_forward",
         )
     }
     return digest(
