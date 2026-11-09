@@ -339,6 +339,7 @@ RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target
     --mount=type=bind,source=docker/patch/megatron/20261020-model-operators.patch,target=/tmp/relax-patches/20261020-model-operators.patch \
     --mount=type=bind,source=docker/patch/megatron/mtp-cp-normalization.patch,target=/tmp/relax-patches/mtp-cp-normalization.patch \
     --mount=type=bind,source=docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch,target=/tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch \
+    --mount=type=bind,source=docker/patch/megatron/fully-reshardable-checkpoint-padding.patch,target=/tmp/relax-patches/fully-reshardable-checkpoint-padding.patch \
     --mount=type=bind,source=docker/scripts/setup_memory_saver.py,target=/tmp/setup_memory_saver.py \
     cp /tmp/relax-patches/megatron.patch \
     /tmp/relax-patches/sync-save-bounded-staging.patch \
@@ -347,7 +348,8 @@ RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target
     /tmp/relax-patches/20261020-qwen35-optimized.patch \
     /tmp/relax-patches/20261020-model-operators.patch \
     /tmp/relax-patches/mtp-cp-normalization.patch \
-    /tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch /root/Megatron-LM/ && \
+    /tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch \
+    /tmp/relax-patches/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/ && \
     cd /root/Megatron-LM && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
     patch --batch --forward --fuzz=0 -p1 < /root/Megatron-LM/megatron.patch && \
@@ -365,10 +367,11 @@ RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target
     echo 'e8cbb2b2a895154622678516a6f67ef47e4b934dc7dc196115cd56a6cea235e6  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
     patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \
     echo 'e88edbe5c69536a4dcfdd9bf6e24d79634d1058ccdd62660bab5ae0b48ae7f76  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
+    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch kimi-packed-sequence-api.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch kimi-packed-sequence-api.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch fully-reshardable-checkpoint-padding.patch && \
     cd /root && python /tmp/setup_memory_saver.py
 
 # Hold the architecture-specific cache lock only while building sampling.so.

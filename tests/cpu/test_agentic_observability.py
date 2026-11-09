@@ -589,6 +589,7 @@ def rollout_module(monkeypatch):
 
     logging_module = ModuleType("relax.distributed.ray.rollout")
     logging_module._log_rollout_data = lambda *args, **kwargs: None
+    logging_module.get_local_rollout_manager = lambda: SimpleNamespace(training_weight_updating=False)
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", logging_module)
     monkeypatch.delitem(sys.modules, "relax.agentic.rollout", raising=False)
     module = importlib.import_module("relax.agentic.rollout")
