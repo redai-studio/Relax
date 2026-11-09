@@ -47,7 +47,6 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 # Increasing it retains Session resources longer; decreasing it risks cutting
 # off an agent while it is flushing output and cleanup.
 _TERMINATION_GRACE_SECONDS = 5.0
-_TERMINATION_RESPONSE_TIMEOUT_SECONDS = 2 * _TERMINATION_GRACE_SECONDS + 1.0
 # A private, per-process policy selected by Session's resource-release contract.
 # The enum is overwritten after merging ambient/user environment; no arbitrary
 # timeout supplied by an agent can extend the launcher's ownership window.
@@ -426,7 +425,6 @@ class ManagedAgentProcess:
     ) -> None:
         self._require_resource_release = require_resource_release
         self._resource_owner_type = spec.resource_owner_type
-        self._resource_owner: SessionResourceOwner | None = None
         external_cleanup = self._resource_owner_type.requires_external_cleanup
         self._termination_profile = _RESOURCE_RELEASE_PROFILE if external_cleanup else "default"
         self._termination_policy = _termination_policy(
@@ -455,7 +453,7 @@ class ManagedAgentProcess:
         self._observation_log_path: Optional[Path] = None
         self.observation_log_ref: Optional[str] = None
         self._task = asyncio.create_task(
-            self._run(session_input.to_agent_payload()),
+            self._run(session_input),
             name=f"managed-agent:{session_input.session_id}",
         )
         self._task.add_done_callback(lambda _: self._launch_finished.set())
@@ -553,167 +551,173 @@ class ManagedAgentProcess:
             self.resource_released = False
         return not self._cleanup_timed_out
 
-    async def _run(self, input_payload: Mapping[str, Any]) -> None:
+    async def _run(self, session_input: SessionInput) -> None:
         """Run one external agent process for its owning Session."""
 
-        process_events: dict[str, Any] = {}
-        mark_agentic_event(process_events, "managed_prepare_start_at")
-        with tempfile.TemporaryDirectory(prefix="relax-agentic-command-") as session_dir:
-            session_path = Path(session_dir)
-            input_path = session_path / "session_input.json"
-            output_path = session_path / "session_output.json"
-            log_path = session_path / "command.log"
-            input_path.write_text(
-                json.dumps(input_payload, separators=(",", ":"), ensure_ascii=False),
-                encoding="utf-8",
-            )
-            del input_payload
-            env = {
-                **os.environ,
-                **{str(key): str(value) for key, value in self._spec.env.items()},
-                "RELAX_SESSION_ID": self._session_id,
-                "RELAX_ROLLOUT_MODE": self._rollout_mode,
-                "RELAX_GROUP_ID": self._group_id,
-                "RELAX_SESSION_IO_DIR": session_dir,
-                "RELAX_INPUT_JSON": str(input_path),
-                "RELAX_OUTPUT_JSON": str(output_path),
-                _TERMINATION_PROFILE_ENV: self._termination_profile,
-            }
-            release_path = session_path / "task-resource-release.json"
-            release_nonce = secrets.token_hex(24)
-            mark_agentic_event(process_events, "managed_prepare_end_at")
-            return_code = None
-            launch_attempted = False
-            try:
-                lease = ResourceLease(self._session_id, self._group_id, release_nonce, release_path)
-                self._resource_owner = self._resource_owner_type(lease)
-                owner_env = self._resource_owner.launch_environment()
-                if not isinstance(owner_env, Mapping) or not all(
-                    isinstance(key, str) and isinstance(value, str) for key, value in owner_env.items()
-                ):
-                    raise TypeError("Resource owner launch_environment must map strings to strings")
-                protected = {
-                    "RELAX_SESSION_ID",
-                    "RELAX_GROUP_ID",
-                    "RELAX_ROLLOUT_MODE",
-                    "RELAX_SESSION_IO_DIR",
-                    "RELAX_INPUT_JSON",
-                    "RELAX_OUTPUT_JSON",
-                    _TERMINATION_PROFILE_ENV,
+        launch_attempted = False
+        try:
+            process_events: dict[str, Any] = {}
+            mark_agentic_event(process_events, "managed_prepare_start_at")
+            input_payload = session_input.to_agent_payload()
+            del session_input
+            with tempfile.TemporaryDirectory(prefix="relax-agentic-command-") as session_dir:
+                session_path = Path(session_dir)
+                input_path = session_path / "session_input.json"
+                output_path = session_path / "session_output.json"
+                log_path = session_path / "command.log"
+                input_path.write_text(
+                    json.dumps(input_payload, separators=(",", ":"), ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                del input_payload
+                env = {
+                    **os.environ,
+                    **{str(key): str(value) for key, value in self._spec.env.items()},
+                    "RELAX_SESSION_ID": self._session_id,
+                    "RELAX_ROLLOUT_MODE": self._rollout_mode,
+                    "RELAX_GROUP_ID": self._group_id,
+                    "RELAX_SESSION_IO_DIR": session_dir,
+                    "RELAX_INPUT_JSON": str(input_path),
+                    "RELAX_OUTPUT_JSON": str(output_path),
+                    _TERMINATION_PROFILE_ENV: self._termination_profile,
                 }
-                if protected.intersection(owner_env):
-                    raise ValueError("Resource owner cannot override managed Session identity or launch policy")
-                env.update(owner_env)
-                # Clear inherited proof settings even when an adapter supplies only extra environment.
-                env.update(
-                    RELAX_REQUIRE_RESOURCE_RELEASE="1" if self._resource_owner_type.requires_external_cleanup else "0",
-                    RELAX_RESOURCE_RELEASE_PATH=str(release_path),
-                    RELAX_RESOURCE_RELEASE_NONCE=release_nonce,
-                )
-                mark_agentic_event(process_events, "managed_launch_start_at")
-                mark_agentic_event(process_events, "managed_process_start_at")
-                # Once the RPC begins, a lost response cannot prove that the
-                # daemon did not start resources. Keep the debit on ambiguity.
-                launch_attempted = True
-                self._process = await self._launcher.launch(
-                    command=self._spec.command,
-                    cwd=self._spec.cwd,
-                    env=env,
-                    log_path=str(log_path),
-                    session_dir=session_dir,
-                )
-                mark_agentic_event(process_events, "managed_process_spawn_return_at")
-                mark_agentic_event(process_events, "managed_launch_return_at")
-                self._launch_finished.set()
-                return_code = await self._process.wait()
-                mark_agentic_event(process_events, "managed_process_exit_at")
-                log_tail = _read_log_tail(log_path)
-                if self._timed_out:
-                    raise AgentExecutionError(
-                        f"Managed command agent timed out after {self._spec.timeout_s} seconds.\n{log_tail}".rstrip(),
-                        reason_code="agent_timeout",
-                    )
-                if return_code != 0 and not self._terminated:
-                    raise AgentExecutionError(
-                        f"Managed command agent exited with code {return_code}.\n{log_tail}".rstrip(),
-                        reason_code="agent_exit_nonzero",
-                    )
-                if output_path.exists():
-                    try:
-                        output_text = output_path.read_text(encoding="utf-8")
-                        mark_agentic_event(process_events, "managed_output_read_at")
-                        self._output = _session_output_from_text(output_text)
-                    except Exception as error:
-                        raise AgentExecutionError(
-                            f"Managed command agent produced invalid output.\n{log_tail}".rstrip(),
-                            reason_code="agent_output_invalid",
-                        ) from error
-                mark_agentic_event(process_events, "managed_output_ready_at")
-                agentic_trace_events(self._output.metadata).update(process_events)
-            finally:
-                execution_error = sys.exc_info()[1]
-                self._launch_finished.set()
+                release_path = session_path / "task-resource-release.json"
+                release_nonce = secrets.token_hex(24)
+                mark_agentic_event(process_events, "managed_prepare_end_at")
+                return_code = None
                 try:
-                    await self._pause_timeout()
-                    if self._observation_log_path is not None:
+                    lease = ResourceLease(self._session_id, self._group_id, release_nonce, release_path)
+                    resource_owner = self._resource_owner_type(lease)
+                    owner_env = resource_owner.launch_environment()
+                    if not isinstance(owner_env, Mapping) or not all(
+                        isinstance(key, str) and isinstance(value, str) for key, value in owner_env.items()
+                    ):
+                        raise TypeError("Resource owner launch_environment must map strings to strings")
+                    protected = {
+                        "RELAX_SESSION_ID",
+                        "RELAX_GROUP_ID",
+                        "RELAX_ROLLOUT_MODE",
+                        "RELAX_SESSION_IO_DIR",
+                        "RELAX_INPUT_JSON",
+                        "RELAX_OUTPUT_JSON",
+                        _TERMINATION_PROFILE_ENV,
+                    }
+                    if protected.intersection(owner_env):
+                        raise ValueError("Resource owner cannot override managed Session identity or launch policy")
+                    env.update(owner_env)
+                    # Clear inherited proof settings even when an adapter supplies only extra environment.
+                    env.update(
+                        RELAX_REQUIRE_RESOURCE_RELEASE="1"
+                        if self._resource_owner_type.requires_external_cleanup
+                        else "0",
+                        RELAX_RESOURCE_RELEASE_PATH=str(release_path),
+                        RELAX_RESOURCE_RELEASE_NONCE=release_nonce,
+                    )
+                    mark_agentic_event(process_events, "managed_launch_start_at")
+                    mark_agentic_event(process_events, "managed_process_start_at")
+                    # Once the RPC begins, a lost response cannot prove that the
+                    # daemon did not start resources. Keep the debit on ambiguity.
+                    launch_attempted = True
+                    self._process = await self._launcher.launch(
+                        command=self._spec.command,
+                        cwd=self._spec.cwd,
+                        env=env,
+                        log_path=str(log_path),
+                        session_dir=session_dir,
+                    )
+                    mark_agentic_event(process_events, "managed_process_spawn_return_at")
+                    mark_agentic_event(process_events, "managed_launch_return_at")
+                    self._launch_finished.set()
+                    return_code = await self._process.wait()
+                    mark_agentic_event(process_events, "managed_process_exit_at")
+                    log_tail = _read_log_tail(log_path)
+                    if self._timed_out:
+                        raise AgentExecutionError(
+                            f"Managed command agent timed out after {self._spec.timeout_s} seconds.\n{log_tail}".rstrip(),
+                            reason_code="agent_timeout",
+                        )
+                    if return_code != 0 and not self._terminated:
+                        raise AgentExecutionError(
+                            f"Managed command agent exited with code {return_code}.\n{log_tail}".rstrip(),
+                            reason_code="agent_exit_nonzero",
+                        )
+                    if output_path.exists():
                         try:
-                            await self._persist_observation_log(log_path)
-                        except asyncio.CancelledError:
-                            if execution_error is None:
-                                raise
+                            output_text = output_path.read_text(encoding="utf-8")
+                            mark_agentic_event(process_events, "managed_output_read_at")
+                            self._output = _session_output_from_text(output_text)
+                        except Exception as error:
+                            raise AgentExecutionError(
+                                f"Managed command agent produced invalid output.\n{log_tail}".rstrip(),
+                                reason_code="agent_output_invalid",
+                            ) from error
+                    mark_agentic_event(process_events, "managed_output_ready_at")
+                    agentic_trace_events(self._output.metadata).update(process_events)
                 finally:
-                    if self._process is not None:
-                        process = self._process
-                        confirmed = False
-                        proof: dict[str, Any] = {}
-                        try:
-                            if not self._cleanup_timed_out and getattr(process, "group_closed", None) is True:
-                                try:
-                                    receipt = self._resource_owner.confirm_release()
-                                    confirmed = type(receipt) is ResourceReleaseReceipt and receipt.matches(lease)
-                                except Exception as error:
-                                    proof["confirmation_error"] = type(error).__name__
-                            if not confirmed:
-                                try:
-                                    proof.update(self._resource_owner.diagnostics())
-                                except Exception as error:
-                                    proof["diagnostic_error"] = type(error).__name__
-                        finally:
-                            # A broken owner must never bypass launcher capability cleanup.
+                    execution_error = sys.exc_info()[1]
+                    self._launch_finished.set()
+                    try:
+                        await self._pause_timeout()
+                        if self._observation_log_path is not None:
                             try:
-                                await process.close()
-                            except BaseException:
-                                self.resource_released = False
-                                raise
-                            else:
-                                self._process = None
-                        self.resource_released = confirmed and self._within_cleanup_deadline()
-                        if (
-                            self._require_resource_release or self._resource_owner_type.requires_external_cleanup
-                        ) and not self.resource_released:
-                            proof["process"] = {
-                                "return_code": return_code,
-                                "terminated": self._terminated,
-                                "timed_out": self._timed_out,
-                            }
+                                await self._persist_observation_log(log_path)
+                            except asyncio.CancelledError:
+                                if execution_error is None:
+                                    raise
+                    finally:
+                        if self._process is not None:
+                            process = self._process
+                            confirmed = False
+                            proof: dict[str, Any] = {}
                             try:
-                                proof["command_log_tail"] = _redact_cleanup_log(
-                                    _read_log_tail(log_path, limit=4096), release_nonce
+                                if not self._cleanup_timed_out and getattr(process, "group_closed", None) is True:
+                                    try:
+                                        receipt = resource_owner.confirm_release()
+                                        confirmed = type(receipt) is ResourceReleaseReceipt and receipt.matches(lease)
+                                    except Exception as error:
+                                        proof["confirmation_error"] = type(error).__name__
+                                if not confirmed:
+                                    try:
+                                        proof.update(resource_owner.diagnostics())
+                                    except Exception as error:
+                                        proof["diagnostic_error"] = type(error).__name__
+                            finally:
+                                # A broken owner must never bypass launcher capability cleanup.
+                                try:
+                                    await process.close()
+                                except BaseException:
+                                    self.resource_released = False
+                                    raise
+                                else:
+                                    self._process = None
+                            self.resource_released = confirmed and self._within_cleanup_deadline()
+                            if (
+                                self._require_resource_release or self._resource_owner_type.requires_external_cleanup
+                            ) and not self.resource_released:
+                                proof["process"] = {
+                                    "return_code": return_code,
+                                    "terminated": self._terminated,
+                                    "timed_out": self._timed_out,
+                                }
+                                try:
+                                    proof["command_log_tail"] = _redact_cleanup_log(
+                                        _read_log_tail(log_path, limit=4096), release_nonce
+                                    )
+                                except OSError as error:
+                                    proof["command_log_tail"] = {"error": type(error).__name__}
+                                logger.error(
+                                    "Session task resource release unconfirmed session_id=%s group_id=%s group_closed=%r proof=%s",
+                                    self._session_id,
+                                    self._group_id,
+                                    getattr(process, "group_closed", None),
+                                    json.dumps(proof),
                                 )
-                            except OSError as error:
-                                proof["command_log_tail"] = {"error": type(error).__name__}
-                            logger.error(
-                                "Session task resource release unconfirmed session_id=%s group_id=%s group_closed=%r proof=%s",
-                                self._session_id,
-                                self._group_id,
-                                getattr(process, "group_closed", None),
-                                json.dumps(proof),
-                            )
-                    elif not launch_attempted:
-                        # Owner construction/environment validation is local and
-                        # must not allocate resources. No launch was attempted,
-                        # so admission can refund this proven empty scope.
-                        self.resource_released = self._within_cleanup_deadline()
+        finally:
+            if not launch_attempted:
+                # Payload preparation, temporary I/O and owner setup cannot
+                # allocate agent resources. Only a launch RPC makes their
+                # existence uncertain and requires an owner release proof.
+                self.resource_released = self._within_cleanup_deadline()
 
     @best_effort
     async def _persist_observation_log(self, source: Path) -> None:
