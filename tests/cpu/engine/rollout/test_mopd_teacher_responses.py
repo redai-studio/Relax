@@ -14,8 +14,7 @@ from relax.utils.opd.opd_main_worker import LogprobResponse
 from relax.utils.types import Sample
 
 
-@pytest.fixture
-def rollout(monkeypatch):
+def _args(**overrides) -> Namespace:
     args = Namespace(
         use_opd=True,
         opd_type="sglang",
@@ -27,6 +26,13 @@ def rollout(monkeypatch):
         opd_teacher_key="data_source",
         opd_teacher_routes_map={"A": ["http://a/generate"], "B": ["http://b/generate"]},
     )
+    vars(args).update(overrides)
+    return args
+
+
+@pytest.fixture
+def rollout(monkeypatch):
+    args = _args()
     manager = opd.OpdManager(args)
     state = SimpleNamespace(
         aborted=False, opd_manager=manager, dp_rank_context=nullcontext, semaphore=asyncio.Semaphore(3)
@@ -180,3 +186,133 @@ def test_response_window_carries_only_pending_responses(rollout):
     stats.new_window()
     assert _counts(manager, "A") == (0, 0)
     assert _counts(manager, "B") == (1, 1)
+
+
+def _shared_manager(score, **args):
+    handle = SimpleNamespace(score=SimpleNamespace(remote=score))
+    return opd.OpdManager(_args(opd_shared_teacher=True, _opd_shared_teacher_manager=handle, **args))
+
+
+def _scoring_sample(manager, teacher, index=0):
+    sample = Sample(index=index, tokens=[1, 2 + index], response_length=1, metadata={"data_source": teacher})
+    opd.bind_teacher(manager.args, sample)
+    return sample
+
+
+@pytest.mark.asyncio
+async def test_shared_teacher_returns_scores_to_bound_responses_out_of_order():
+    a_entered, release_a = asyncio.Event(), asyncio.Event()
+
+    async def score(teacher, payload):
+        sample = {2: a, 3: b}[payload["input_ids"][-1]]
+        assert teacher == sample.metadata["teacher_id"]
+        assert payload["input_ids"] == sample.tokens
+        if teacher == "A":
+            a_entered.set()
+            await release_a.wait()
+        logprob = -0.25 if teacher == "A" else -0.75
+        return {"meta_info": {"input_token_logprobs": [[None, 1], [logprob, sample.tokens[-1]]]}}
+
+    manager = _shared_manager(score)
+    a, b = _scoring_sample(manager, "A"), _scoring_sample(manager, "B", 1)
+    for sample in (a, b):
+        manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
+        # The bound teacher survives a later metadata projection.
+        del sample.metadata["data_source"]
+
+    task = asyncio.create_task(manager.prefill(a))
+    try:
+        await asyncio.wait_for(a_entered.wait(), 5)
+        await asyncio.wait_for(manager.prefill(b), 5)
+        assert _counts(manager, "A") == _counts(manager, "B") == (1, 0)
+        assert a.teacher_log_probs is None
+        assert b.teacher_log_probs == [-0.75]
+    finally:
+        release_a.set()
+        await asyncio.wait_for(task, 5)
+    assert a.teacher_log_probs == [-0.25]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_error", [None, RuntimeError("actor unavailable")])
+async def test_cancelling_shared_prefill_cancels_only_its_ray_score(monkeypatch, cancel_error):
+    # Like an ObjectRef, cancelling the local await leaves the remote work running.
+    remote_work = asyncio.get_running_loop().create_future()
+    score_ref = asyncio.shield(remote_work)
+    submitted = asyncio.Event()
+
+    def score(teacher, payload):
+        submitted.set()
+        return score_ref
+
+    cancel = Mock(side_effect=cancel_error)
+    monkeypatch.setattr("ray.cancel", cancel)
+    manager = _shared_manager(score)
+    sample = _scoring_sample(manager, "A")
+
+    task = asyncio.create_task(manager.prefill(sample))
+    try:
+        await asyncio.wait_for(submitted.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        cancel.assert_called_once_with(score_ref, recursive=False)
+        assert not remote_work.done()
+        assert sample.teacher_log_probs is None
+    finally:
+        remote_work.set_result(None)
+
+
+@pytest.mark.asyncio
+async def test_bad_shared_response_rejects_batch_with_successful_sibling():
+    async def score(teacher, payload):
+        if teacher == "B":
+            return {"meta_info": {"input_token_logprobs": []}}
+        return {"meta_info": {"input_token_logprobs": [[None, 1], [-0.5, 2]]}}
+
+    manager = _shared_manager(score)
+    a, b = _scoring_sample(manager, "A"), _scoring_sample(manager, "B", 1)
+    with pytest.raises(RuntimeError, match="complete logprobs"):
+        await manager.prefill([a, b])
+    assert a.teacher_log_probs == [-0.5]
+    assert b.teacher_log_probs is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("topk", [None, [None, [[float("nan"), 2]]]], ids=["missing", "nan"])
+async def test_shared_teacher_rejects_unusable_topk_scores(topk):
+    meta = {"input_token_logprobs": [[None, 1], [-0.5, 2]], "input_top_logprobs": topk}
+    manager = _shared_manager(
+        AsyncMock(return_value={"meta_info": meta}),
+        opd_token_selection="teacher_topk",
+        opd_log_prob_top_k=1,
+        opd_loss_coef=1.0,
+        opd_kl_coef=0.0,
+    )
+    with pytest.raises(ValueError, match="for sample 0"):
+        await manager.prefill(_scoring_sample(manager, "A"))
+
+
+@pytest.mark.asyncio
+async def test_shared_teacher_topk_queries_student_via_original_router(monkeypatch):
+    score = AsyncMock(
+        return_value={
+            "meta_info": {"input_token_logprobs": [[None, 1], [-0.5, 2]], "input_top_logprobs": [None, [[-0.2, 3]]]},
+        }
+    )
+    manager = _shared_manager(
+        score,
+        opd_token_selection="teacher_topk",
+        opd_log_prob_top_k=1,
+        opd_kl_coef=1.0,
+        opd_loss_coef=0.0,
+        sglang_router_ip="student",
+        sglang_router_port=80,
+    )
+    direct = AsyncMock(return_value=LogprobResponse({"meta_info": {"input_token_ids_logprobs": [None, [[-0.25, 3]]]}}))
+    monkeypatch.setattr(manager, "_post_logprob", direct)
+    sample = _scoring_sample(manager, "A")
+    await manager.prefill(sample)
+    assert score.await_count == direct.await_count == 1
+    assert direct.await_args.args[1] == "http://student:80/generate"
+    assert sample.student_at_teacher_topk_log_probs.tolist() == [[-0.25]]

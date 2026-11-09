@@ -9,10 +9,12 @@ contract: default equal-split validation, one TeacherManager per data_source at 
 non-overlapping bundle_offset, and a ``(pg, list[manager])`` return shape.
 """
 
+import argparse
 import json
 import sys
 from argparse import Namespace
 from types import ModuleType
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -217,3 +219,142 @@ def test_multi_teacher_rejects_invalid_route_budgets(routes: object, total: int,
 
     with pytest.raises(ValueError, match=message):
         opd_utils._parse_teacher_routes(json.dumps(routes), total, tp)
+
+
+@pytest.mark.parametrize(("total", "tp"), [(2, 1), (1, 2)])
+def test_shared_teacher_rejects_invalid_engine_budget(total: int, tp: int) -> None:
+    from relax.utils.opd import opd_utils
+
+    with pytest.raises(ValueError, match="must equal the Teacher GPU budget"):
+        opd_utils._parse_teacher_routes('{"a":"/a"}', total, tp, shared=True)
+
+
+def test_shared_teacher_cli_validates_physical_budget_independently_of_routes():
+    from relax.utils.opd import opd_utils
+
+    parser = opd_utils.add_opd_arguments(argparse.ArgumentParser())
+    assert not parser.parse_args([]).opd_shared_teacher
+    args = parser.parse_args(
+        ["--use-opd", "--opd-type", "sglang", "--opd-teacher-routes", '{"a":"/a","b":"/b"}', "--opd-shared-teacher"]
+    )
+    args.colocate = True
+    args.resource = {"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]}
+    opd_utils.validate_opd_args(args, is_offline=False)
+    args.teacher_num_gpus_per_engine = 2
+    with pytest.raises(ValueError, match="must equal the Teacher GPU budget"):
+        opd_utils.validate_opd_args(args, is_offline=False)
+
+
+def test_shared_teacher_rejects_separate_draft_checkpoint():
+    from relax.utils.opd import opd_utils
+
+    args = _base_args(
+        opd_shared_teacher=True,
+        opd_teacher_routes='{"a":"/a","b":"/b"}',
+        teacher_sglang_speculative_draft_model_path="/draft",
+    )
+    with pytest.raises(ValueError, match="reloads both target and draft from the same checkpoint path"):
+        opd_utils.maybe_start_managed_opd_teacher(args)
+
+
+@pytest.mark.parametrize(
+    ("budget", "teacher_tp", "failure"), [(1, None, False), (2, 2, False), (4, None, False), (2, 2, True)]
+)
+def test_shared_teacher_allocates_one_engine_and_owns_its_lifecycle(monkeypatch, budget, teacher_tp, failure) -> None:
+    import ray
+
+    from relax.utils.opd import opd_utils
+
+    module = ModuleType("relax.distributed.ray.teacher_manager")
+    physical = MagicMock()
+    owner = MagicMock()
+    module.TeacherManager = MagicMock()
+    module.TeacherManager.options.return_value.remote.return_value = physical
+    module.SharedTeacherManager = MagicMock()
+    module.SharedTeacherManager.options.return_value.remote.return_value = owner
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    gpu_ids = list(range(2 * budget))
+    pg = ("pg", gpu_ids, gpu_ids)
+    create = MagicMock(return_value=pg)
+    remove = MagicMock()
+    kill = MagicMock()
+    monkeypatch.setattr("relax.core.service.create_placement_group", create)
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", remove)
+    monkeypatch.setattr(ray, "kill", kill)
+    monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
+    url = "http://engine/generate"
+    physical.get_urls.remote.return_value = [url]
+    routes = {key: f"/checkpoints/{key}" for key in ("a", "b", "c")}
+    monkeypatch.setattr(opd_utils, "_shared_checkpoints", lambda specs: routes)
+    args = _base_args(
+        opd_shared_teacher=True,
+        offload_rollout=True,
+        opd_teacher_routes=json.dumps(routes),
+        rollout_num_gpus=budget,
+        teacher_num_gpus_per_engine=teacher_tp,
+        teacher_sglang_dtype="float16",
+        resource={"actor": [1, 2 * budget], "rollout": [1, budget], "teacher": [1, budget]},
+    )
+    if failure:
+        owner.initialize.remote.side_effect = RuntimeError("initialization failed")
+        with pytest.raises(RuntimeError, match="initialization failed"):
+            opd_utils.maybe_start_managed_opd_teacher(args)
+        physical.shutdown.remote.assert_called_once()
+        assert [call.args for call in kill.call_args_list] == [(owner,), (physical,)]
+        remove.assert_called_once_with(pg[0])
+        return
+
+    assert opd_utils.maybe_start_managed_opd_teacher(args) == (pg, [owner])
+    create.assert_called_once()
+    spawn = module.TeacherManager.options.return_value.remote
+    spawn.assert_called_once()
+    engine_args, replicas, tp = spawn.call_args.args
+    assert (engine_args.teacher_hf_checkpoint, replicas, tp) == (routes["a"], 1, budget)
+    assert engine_args.teacher_sglang_dtype == "float16"
+    assert spawn.call_args.kwargs == {"pg": pg, "shared_pg": True}
+    module.SharedTeacherManager.options.return_value.remote.assert_called_once_with(args, physical, url, routes)
+    owner.initialize.remote.assert_called_once()
+    owner.offload.remote.assert_called_once()
+    assert args.opd_teacher_routes_map == {key: [url] for key in routes}
+
+
+def test_only_rollout_configuration_receives_shared_teacher_handle(monkeypatch):
+    from relax.core import controller
+
+    ctrl = controller.Controller.__new__(controller.Controller)
+    ctrl.config = Namespace(opd_shared_teacher=True)
+    ctrl.runtime_env = None
+    ctrl._health_manager = Namespace(status=None)
+    owner = object()
+    ctrl._teacher_manager = [owner]
+    service = MagicMock()
+    monkeypatch.setattr(controller, "Service", service)
+    for role in ("rollout", "actor"):
+        _, _, error = ctrl._create_service_task(role, object(), 1, None, None, defer_deploy=True)
+        assert error is None
+        config = service.call_args.kwargs["config"]
+        if role == "rollout":
+            assert config is not ctrl.config
+            assert config._opd_shared_teacher_manager is owner
+        else:
+            assert config is ctrl.config
+    assert not hasattr(ctrl.config, "_opd_shared_teacher_manager")
+
+
+def test_shared_checkpoints_match_architectures_and_text_vocab_size(tmp_path) -> None:
+    from relax.utils.opd import opd_utils
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    routes = {"a": {"checkpoint_path": str(a)}, "b": {"checkpoint_path": str(b)}}
+    config = {"architectures": ["Teacher"], "vocab_size": 32}
+    (a / "config.json").write_text(json.dumps(config))
+    config_b = b / "config.json"
+    config_b.write_text(json.dumps({"architectures": ["Teacher"], "text_config": {"vocab_size": 32}}))
+    assert opd_utils._shared_checkpoints(routes) == {"a": str(a), "b": str(b)}
+
+    for mismatch in ({"architectures": ["OtherTeacher"]}, {"text_config": {"vocab_size": 64}}):
+        config_b.write_text(json.dumps({**config, **mismatch}))
+        with pytest.raises(ValueError, match="architectures, vocab_size"):
+            opd_utils._shared_checkpoints(routes)
