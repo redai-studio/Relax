@@ -44,7 +44,7 @@ from relax.agentic.stage_recorder import (
     STAGE_SHUTDOWN,
     StageRecorder,
 )
-from relax.distributed.ray.rollout import _log_rollout_data
+from relax.distributed.ray.rollout import _log_rollout_data, get_local_rollout_manager
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.agentic_obs import agentic_obs_enabled
@@ -645,12 +645,16 @@ class AgenticResidentPipeline:
         if debt == 0:
             return True
 
-        # Fully async may close with unfinished physical debt only when the
+        # During an Actor weight update, fully async may carry debt when the
         # same number of resident Groups is confirmed interrupted. Debt from
         # the older partition must finish first: only two physical partitions
         # can be active, so carrying it again would make the next open fail.
         if self.args.fully_async and not context.final_backfill:
-            return self.transfer_domain.previous_debt == 0 and debt <= len(self.runtime_domain.interrupted_group_ids)
+            return (
+                get_local_rollout_manager().training_weight_updating
+                and self.transfer_domain.previous_debt == 0
+                and debt <= len(self.runtime_domain.interrupted_group_ids)
+            )
         return False
 
     async def _close_rollout_step(self, context: _StepContext) -> RolloutFnTrainOutput:
