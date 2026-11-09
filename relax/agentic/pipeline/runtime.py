@@ -900,8 +900,6 @@ class RuntimeDomain:
         shards: List[_SessionShardBinding],
         concurrency: int,
         admission_coordinator: Any | None = None,
-        *,
-        standalone_eager_session_generation: bool = False,
     ) -> None:
         self.args = args
         self.rollout_mode = rollout_mode
@@ -912,49 +910,20 @@ class RuntimeDomain:
         self._resident_group_permits = asyncio.Semaphore(concurrency)
         per_node = getattr(args, "agentic_session_capacity_per_node", None) if rollout_mode == "train" else None
         incremental = rollout_mode == "train" and getattr(args, "agentic_incremental_session_start", False)
-        if type(standalone_eager_session_generation) is not bool:
-            raise ValueError("Standalone eager generation must be an explicit boolean")
-        self._standalone_eager_session_generation = standalone_eager_session_generation
-        self._fixed_step_eager = rollout_mode == "train" and getattr(args, "agentic_fixed_step_eager", False)
-        self._resumable_eager = rollout_mode == "train" and getattr(args, "agentic_eager_session_generation", False)
-        self._eager_enabled = standalone_eager_session_generation or self._fixed_step_eager or self._resumable_eager
+        self._eager_enabled = rollout_mode == "train" and getattr(args, "agentic_eager_session_generation", False)
         self._rollout_epoch: int | None = None
         self._eager_generation_open = False
         self._eager_closing = False
-        if standalone_eager_session_generation:
-            if (
-                rollout_mode != "train"
-                or getattr(args, "n_samples_per_prompt", None) != 16
-                or per_node not in (64, 68, 72)
-                or incremental is not True
-                or concurrency != 32
-                or any(getattr(args, name, False) for name in ("partial_rollout", "fully_async", "agentic_prelaunch"))
-            ):
-                raise ValueError(
-                    "Standalone eager generation requires fixed-step train n16/R32/host64-or68-or72/incremental"
-                )
         if incremental and per_node is None:
             raise ValueError("Incremental startup requires confirmed Session resource accounting")
-        if self._resumable_eager and (
-            standalone_eager_session_generation
-            or self._fixed_step_eager
-            or incremental is not True
+        if self._eager_enabled and (
+            incremental is not True
             or any(
                 getattr(args, name, False)
                 for name in ("partial_rollout", "agentic_prelaunch", "use_dynamic_global_batch_size")
             )
         ):
             raise ValueError("Eager Session generation requires incremental synchronous or fully-async steps")
-        if self._fixed_step_eager and (
-            standalone_eager_session_generation
-            or incremental is not True
-            or any(
-                getattr(args, name, False)
-                for name in ("partial_rollout", "fully_async", "agentic_prelaunch", "use_dynamic_global_batch_size")
-            )
-            or getattr(args, "over_sampling_batch_size", None) != getattr(args, "rollout_batch_size", None)
-        ):
-            raise ValueError("Fixed-step eager requires incremental capacity and complete synchronous steps")
         self._session_capacity = (
             SessionCapacity({shard.node_id for shard in shards}, per_node, incremental=incremental)
             if per_node is not None
@@ -978,8 +947,6 @@ class RuntimeDomain:
         args: Namespace,
         rollout_mode: Literal["train", "eval"],
         concurrency: int,
-        *,
-        standalone_eager_session_generation: bool = False,
     ) -> "RuntimeDomain":
         """Borrow Shard handles from the named Ray Serve deployment.
 
@@ -1006,7 +973,6 @@ class RuntimeDomain:
             ],
             concurrency,
             admission_coordinator,
-            standalone_eager_session_generation=standalone_eager_session_generation,
         )
 
     @property
@@ -1051,14 +1017,7 @@ class RuntimeDomain:
         prepare_started_at_utc = utc_now()
         group_id = group_input.group_id
         session_ids: Tuple[str, ...] = ()
-        if self._standalone_eager_session_generation:
-            if launch_decision is not None or not self._eager_generation_open or self._eager_closing:
-                raise RuntimeGroupError("Eager preparation requires the open fixed rollout and no Prepare handoff")
-            if len(group_input.samples) != 16:
-                raise RuntimeGroupError("Eager preparation requires every n16 member")
         epoch = self._rollout_epoch
-        if self._fixed_step_eager and (not self._eager_generation_open or self._eager_closing):
-            raise RuntimeGroupError("Fixed-step preparation requires an open epoch")
         try:
             if self.teacher_routing_enabled:
                 for sample in group_input.samples:
@@ -1078,10 +1037,6 @@ class RuntimeDomain:
             reservation = await self._reserve_group_shard(group_id, launch_decision, len(group_input.samples))
             if self._eager_enabled and self._eager_closing:
                 raise RuntimeGroupError("Eager Runtime is closing")
-            if self._fixed_step_eager and (
-                epoch != self._rollout_epoch or not self._eager_generation_open or self._eager_closing
-            ):
-                raise RuntimeGroupError("Preparation crossed a rollout epoch")
             shard = reservation.shard
             self._start_shard_observers()
             session_ids = tuple(f"{shard.actor_name}.session-{uuid.uuid4().hex}" for _ in group_input.samples)
@@ -1102,10 +1057,6 @@ class RuntimeDomain:
                     spec.require_resource_release = True
             if self._eager_enabled and self._eager_closing:
                 raise RuntimeGroupError("Eager Runtime is closing")
-            if self._fixed_step_eager and (
-                epoch != self._rollout_epoch or not self._eager_generation_open or self._eager_closing
-            ):
-                raise RuntimeGroupError("Session specification crossed a rollout epoch")
             if launch_decision is not None:
                 if not launch_decision.done():
                     launch_decision.set_result(True)
@@ -1146,13 +1097,7 @@ class RuntimeDomain:
         if reservation.session_capacity is not None:
             reservation.session_capacity.submitted = True
         try:
-            start_options = {}
-            if self._standalone_eager_session_generation:
-                start_options["standalone_eager_session_generation"] = True
-            if self._fixed_step_eager:
-                start_options["fixed_step_eager_epoch"] = epoch
-            if self._resumable_eager:
-                start_options["resumable_eager_session_generation"] = True
+            start_options = {"eager_session_generation": True} if self._eager_enabled else {}
             if self._session_capacity is not None and self._session_capacity.incremental:
                 start_options["start_session_ids"] = tuple(
                     sid for sid in session_ids if sid in reservation.session_capacity.allocated_ids
@@ -1251,10 +1196,6 @@ class RuntimeDomain:
         """Fill the host's one partial Group before admitting another partial
         owner."""
         while reservation.pending_ids:
-            if self._fixed_step_eager and (
-                stream.rollout_epoch != self._rollout_epoch or not self._eager_generation_open
-            ):
-                raise RuntimeGroupError("Incremental grant crossed a rollout epoch")
             self._state_changed.clear()
             if reservation.closing:
                 raise RuntimeGroupError("Group closed while waiting for Session startup credits")
@@ -1371,16 +1312,8 @@ class RuntimeDomain:
 
         try:
             if stream.eager_session_generation:
-                expected_epoch = (
-                    self._rollout_epoch
-                    if self._resumable_eager
-                    else stream.rollout_epoch
-                    if self._fixed_step_eager
-                    else 0
-                )
                 if (
-                    rollout_id != expected_epoch
-                    or (self._fixed_step_eager and expected_epoch != self._rollout_epoch)
+                    rollout_id != self._rollout_epoch
                     or stream.closing
                     or self._eager_closing
                     or not self._eager_generation_open
@@ -1400,25 +1333,14 @@ class RuntimeDomain:
     async def resume_generation(self, rollout_id: int) -> None:
         """Release the partial-resume gate for the same requests."""
 
-        if self._standalone_eager_session_generation:
-            if rollout_id != 0 or self._eager_closing:
-                raise RuntimeGroupError("Standalone eager generation cannot change step or reopen after shutdown")
-            if self._eager_generation_open:
-                return
-        if self._fixed_step_eager:
-            self._assert_epoch_drained()
-            if (
-                self._eager_closing
-                or self._eager_generation_open
-                or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
-            ):
-                raise RuntimeGroupError("Fixed-step eager must open a new drained epoch")
-        if self._resumable_eager and (
+        if self._eager_enabled and (
             self._eager_closing
             or self._eager_generation_open
             or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
         ):
-            raise RuntimeGroupError("Resumable eager generation must open a new paused rollout")
+            raise RuntimeGroupError("Eager generation must open a new paused rollout")
+        if self._eager_enabled and not getattr(self.args, "fully_async", False):
+            self._assert_epoch_drained()
         self._start_shard_observers()
         revisions = await asyncio.gather(
             *(shard.handle.resume_generation.remote(rollout_id) for shard in self._shards)
@@ -1431,10 +1353,6 @@ class RuntimeDomain:
         """Seal train IR admission, abort active attempts, and join
         protection."""
 
-        if self._standalone_eager_session_generation:
-            raise RuntimeGroupError("Standalone eager generation supports permanent shutdown, not partial pause")
-        if self._fixed_step_eager:
-            self._assert_epoch_drained()
         await self._wait_for_no_protected_groups()
         revisions = await asyncio.gather(*(shard.handle.pause_generation.remote() for shard in self._shards))
         await self._wait_for_shard_revisions(revisions)
@@ -1444,7 +1362,7 @@ class RuntimeDomain:
     def _assert_epoch_drained(self) -> None:
         capacity = self.session_capacity_snapshot()
         if self.resident_group_count or self._reserved_group_shards or (capacity and capacity["outstanding"]):
-            raise RuntimeGroupError("Fixed-step eager cannot change weights with resident task resources")
+            raise RuntimeGroupError("Synchronous eager cannot change weights with resident task resources")
 
     def _start_shard_observers(self) -> None:
         """Start the sole progress observer for each Ray Shard."""

@@ -673,8 +673,6 @@ class AgenticResidentPipeline:
         policy."""
 
         self.prepare_domain.close_step()
-        if getattr(self.args, "agentic_fixed_step_eager", False):
-            await self.prepare_domain.drain_step()
         dynamic_close = self.args.use_dynamic_global_batch_size
         # Normal partitions are already sealed, so their partial batch can be
         # flushed now. A dynamic current partition stays unsealed until its
@@ -721,8 +719,7 @@ class AgenticResidentPipeline:
                     "session_capacity/peak": capacity["global_peak"],
                     "session_capacity/confirmed_releases": capacity["confirmed_releases"],
                     "session_capacity/incremental": int(capacity["incremental_session_start"]),
-                    "session_capacity/fixed_step_eager": int(getattr(self.args, "agentic_fixed_step_eager", False)),
-                    "session_capacity/resumable_eager": int(
+                    "session_capacity/eager_session_generation": int(
                         getattr(self.args, "agentic_eager_session_generation", False)
                     ),
                 }

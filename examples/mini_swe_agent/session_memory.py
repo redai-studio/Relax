@@ -96,9 +96,9 @@ class SessionMemory:
         return [sys.executable, str(Path(__file__).resolve()), str(self.path), *command]
 
 
-def validate_memory_limit(limit_mib: int, *, supervised: bool) -> None:
-    if limit_mib < 0 or (limit_mib and not supervised):
-        raise ValueError("AGENT_SERVER_SESSION_MEMORY_MIB must be nonnegative and requires supervised sessions")
+def validate_memory_limit(limit_mib: int) -> None:
+    if limit_mib < 0:
+        raise ValueError("AGENT_SERVER_SESSION_MEMORY_MIB must be nonnegative")
     if limit_mib:
         group = SessionMemory.create(limit_mib)
         try:
