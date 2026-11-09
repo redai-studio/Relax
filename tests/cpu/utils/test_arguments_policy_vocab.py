@@ -58,3 +58,53 @@ def test_policy_vocab_cli_rejects_range_larger_than_model(parser):
     args.train_backend = "megatron"
     with pytest.raises(ValueError, match="integer in"):
         resolve_policy_vocab_size(args, model_vocab_size=31000)
+
+
+@pytest.mark.parametrize("selection", ["teacher_topk", "union"])
+def test_policy_vocab_cli_rejects_unrestricted_opd_student_prefill(parser, selection):
+    args = parser.parse_args(
+        [
+            "--policy-vocab-size",
+            "32000",
+            "--use-opd",
+            "--opd-type",
+            "sglang",
+            "--opd-token-selection",
+            selection,
+            "--opd-kl-coef",
+            "1.0",
+            "--opd-loss-coef",
+            "0.0",
+        ]
+    )
+    args.train_backend = "megatron"
+    with pytest.raises(ValueError, match="student prefill.*full vocabulary"):
+        resolve_policy_vocab_size(args, model_vocab_size=32768)
+
+
+@pytest.mark.parametrize(
+    "limit,overrides",
+    [
+        (32000, {"opd_token_selection": "student_sampled"}),
+        (32000, {"opd_token_selection": "student_topk"}),
+        (32000, {"opd_kl_coef": 0.0, "opd_loss_coef": 1.0}),
+        (32000, {"opd_fkl_entropy_gate": True, "opd_loss_coef": 1.0}),
+        (32000, {"use_opd": False}),
+        (32768, {}),
+        (None, {}),
+    ],
+)
+def test_policy_vocab_keeps_opd_paths_without_mixed_student_probabilities(limit, overrides):
+    args = SimpleNamespace(
+        policy_vocab_size=limit,
+        train_backend="megatron",
+        use_opd=True,
+        opd_type="sglang",
+        opd_token_selection="union",
+        opd_kl_coef=1.0,
+        opd_loss_coef=0.0,
+        opd_fkl_entropy_gate=False,
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    assert resolve_policy_vocab_size(args, model_vocab_size=32768) == limit

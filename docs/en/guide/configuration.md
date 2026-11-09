@@ -701,6 +701,8 @@ For Megatron online RL with native SGLang or Agentic rollout, the optional `--po
 
 The value must be a positive integer no larger than the HF text model's configured vocabulary. It masks the same output rows during sampling and training log-probability, entropy, and Score Centering calculations without changing embedding shapes or Megatron TP padding. Omit it to retain existing behavior. Choose the range from the model's output-token contract, including valid special tokens; tokenizer length alone does not establish that range. This setting does not support offline SFT/DPO/RM or FSDP. Custom generation functions that bypass the native request builder must apply the same restriction themselves.
 
+When the limit is smaller than the model vocabulary, SGLang OPD advantage mode (`--opd-kl-coef != 0`) with `--opd-token-selection teacher_topk` or `union` is rejected: student prefill input log-probabilities still use the full vocabulary, even with sampling logit bias. Use `student_sampled`/`student_topk`, pure loss mode (`--opd-kl-coef 0`), or omit the restriction. EOPD (`--opd-fkl-entropy-gate`) uses sampled-token advantages and is exempt from this check.
+
 ---
 
 ## Debug & Profiling Parameters

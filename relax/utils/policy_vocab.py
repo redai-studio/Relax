@@ -27,6 +27,20 @@ def resolve_policy_vocab_size(args: Namespace, *, model_vocab_size: int | None =
         model_vocab_size = getattr(config, "text_config", config).vocab_size
     if type(limit) is not int or not 0 < limit <= model_vocab_size:
         raise ValueError(f"policy_vocab_size must be an integer in [1, {model_vocab_size}], got {limit!r}")
+    if (
+        limit < model_vocab_size
+        and getattr(args, "use_opd", False)
+        and getattr(args, "opd_type", None) == "sglang"
+        and getattr(args, "opd_kl_coef", 0.0) != 0.0
+        and getattr(args, "opd_token_selection", None) in ("teacher_topk", "union")
+        and not getattr(args, "opd_fkl_entropy_gate", False)
+    ):
+        raise ValueError(
+            "--policy-vocab-size cannot restrict SGLang OPD advantage mode with "
+            "--opd-token-selection teacher_topk or union: student prefill input log-probabilities "
+            "still use the full vocabulary. Use student_sampled/student_topk, pure loss mode "
+            "(--opd-kl-coef 0), or omit the vocabulary restriction."
+        )
     return limit
 
 

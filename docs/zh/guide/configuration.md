@@ -701,6 +701,8 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 
 该值必须是正整数，且不超过 HF 文本模型配置中的词表大小。采样及训练端的 log-probability、entropy、Score Centering 计算会屏蔽相同的输出行，不改变 embedding 形状或 Megatron TP padding。未设置时保持原有行为。请根据模型的输出 token 约定选择范围，并包含有效的特殊 token，不能仅凭 tokenizer 长度推断。该配置不支持离线 SFT/DPO/RM 或 FSDP。绕过原生请求构建器的自定义生成函数需要自行应用同样的限制。
 
+当限制小于模型词表时，SGLang OPD advantage 模式（`--opd-kl-coef != 0`）不允许搭配 `--opd-token-selection teacher_topk` 或 `union`：student prefill 的输入 log-probabilities 即使设置了采样 logit bias，也仍按完整词表归一化。请改用 `student_sampled`/`student_topk`、纯 loss 模式（`--opd-kl-coef 0`），或不限制词表。EOPD（`--opd-fkl-entropy-gate`）使用 sampled-token advantage，不受这项检查限制。
+
 ---
 
 ## 调试与性能分析参数
