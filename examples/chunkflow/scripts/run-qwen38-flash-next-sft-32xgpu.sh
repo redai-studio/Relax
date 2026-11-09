@@ -3,7 +3,7 @@
 # QSA + GDN + PLE, experimental native-prefix text-only SFT. DATA_DIR/train.jsonl contains a messages column.
 # Usage on each node: bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 # New cluster: MASTER_ADDR (head POD_NAME), POD_NAME, HOST_IP; defaults to 4 nodes x 8 GPUs.
-# Existing cluster: RAY_ADDRESS and RAY_JOBS_ADDRESS; run on the submitter only.
+# Existing cluster: auto-detected; run on the submitter only.
 # Preview without Ray or GPUs: DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 
 set -eo pipefail
@@ -32,7 +32,7 @@ export RELAX_QWEN38_PLE_FUSED_CONV=0
 export QWEN38_PLE_CPU_OFFLOAD=1
 
 : "${MODEL_DIR:?Set MODEL_DIR to the directory containing Qwen3.8-Flash-Next}"
-: "${DATA_DIR:?Set DATA_DIR to the directory containing train.jsonl}"
+: "${PROMPT_DATA:=${DATA_DIR:?Set DATA_DIR or PROMPT_DATA}/train.jsonl}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/chunkflow}"
 EXP_NAME="${EXP_NAME:-qwen38-flash-next-text-sft-32xgpu}"
 now=$(date "+%Y%m%d-%H%M%S")
@@ -45,7 +45,7 @@ CKPT_ARGS=(
 
 SFT_ARGS=(
     --loss-type sft
-    --prompt-data "${PROMPT_DATA:-${DATA_DIR}/train.jsonl}"
+    --prompt-data "${PROMPT_DATA}"
     --input-key messages
     --num-rollout "${NUM_STEPS:-100}"
     --global-batch-size 32
@@ -105,20 +105,6 @@ TRACKING_ARGS=(
     --tb-project-name "${PROJECT_NAME}"
     --tb-experiment-name "${EXP_NAME}-${now}"
 )
-
-# Validate a fresh cluster before the standard entrypoint cleans up processes.
-if [ "${DRY_RUN:-0}" != 1 ] && [ -z "${RELAX_ENTRYPOINT_MODE:-}${RAY_ADDRESS:-}${RAY_JOBS_ADDRESS:-}" ]; then
-    : "${MASTER_ADDR:?Set MASTER_ADDR to the head node POD_NAME}"
-    : "${POD_NAME:?Set POD_NAME to the current node hostname}"
-    : "${HOST_IP:?Set HOST_IP to the current node reachable IP}"
-    export WORLD_SIZE="${WORLD_SIZE:-4}"
-    export NUM_GPUS="${NUM_GPUS:-8}"
-    if ! [[ "$WORLD_SIZE" =~ ^[1-9][0-9]*$ && "$NUM_GPUS" =~ ^[1-9][0-9]*$ ]] ||
-        (( WORLD_SIZE * NUM_GPUS != 32 )); then
-        echo "This recipe requires WORLD_SIZE (nodes) * NUM_GPUS (per node) = 32." >&2
-        exit 1
-    fi
-fi
 
 submit_training spmd-multinode \
     --resource '{"sft": [1, 0], "actor": [1, 32]}' \

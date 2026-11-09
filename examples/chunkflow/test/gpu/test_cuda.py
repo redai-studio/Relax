@@ -77,6 +77,7 @@ with module["_megatron_context"]():
     ],
 )
 def test_native_te_matches_cuda_reference(bounds_q, bounds_k, heads, kv_heads, dim):
+    pytest.importorskip("flash_attn")
     _run_native_te_check("_assert_native_te_matches_cuda_reference", bounds_q, bounds_k, heads, kv_heads, dim)
 
 
@@ -385,8 +386,7 @@ def test_te_empty_expert_preserves_accumulated_gradient():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to verify asynchronous metadata copies")
-def test_chunk_metadata_cuda_uses_current_stream_without_host_sync(monkeypatch):
-    monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", "1")
+def test_chunk_metadata_cuda_uses_current_stream_without_host_sync():
     device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream()
     # Warm up allocator/runtime outside the measurement; keep outputs alive through completion.
@@ -402,6 +402,82 @@ def test_chunk_metadata_cuda_uses_current_stream_without_host_sync(monkeypatch):
     for i, output in enumerate(outputs):
         torch.testing.assert_close(output.cpu(), torch.tensor([i, 8192 + i, 8192 + 2 * i], dtype=torch.int32))
     assert warmup.numel() == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires the CUDA PP1 executor and native SFT loss")
+def test_pp1_native_loss_callback_preserves_head_gradients_and_token_count(monkeypatch):
+    from megatron.training import global_vars
+
+    from examples.chunkflow.schedules import chunkflow_forward_backward_no_pipelining
+    from examples.chunkflow.test.cpu.test_unit_batch import _parent
+    from relax.backends.megatron.data import PrepackedBatch, get_batch
+    from relax.backends.megatron.loss import loss_function
+
+    args = SimpleNamespace(
+        chunkflow_chunk_size=128,
+        chunkflow_keep_last_k=1,
+        data_pad_size_multiplier=128,
+        qkv_format="thd",
+        allgather_cp=False,
+        loss_type="sft",
+        sft_chunked_logits=True,
+        sft_logits_chunk_size=32,
+        recompute_loss_function=True,
+        calculate_per_token_loss=True,
+        rollout_temperature=0.7,
+        global_batch_size=3,
+    )
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    with _megatron_context():
+        parent = PrepackedBatch(_parent([301, 11, 13], device="cuda"))
+        model = torch.nn.Sequential(torch.nn.Embedding(384, 16), torch.nn.Linear(16, 384, bias=False)).cuda()
+        model.chunkflow_runtime = ChunkflowRuntime(128)
+        finalized = []
+        model.config = SimpleNamespace(
+            calculate_per_token_loss=True,
+            finalize_model_grads_func=lambda models, count, **kwargs: finalized.append(count.clone()),
+        )
+        targets = torch.cat([torch.cat((tokens[1:], tokens.new_zeros(1))) for tokens in parent["unconcat_tokens"]])
+        logits = model(parent["tokens"]).squeeze(0) / args.rollout_temperature
+        expected = (
+            torch.nn.functional.cross_entropy(logits, targets, reduction="none") * parent["full_loss_masks"][0]
+        ).sum()
+        expected.backward()
+        expected_grads = [parameter.grad.clone() for parameter in model.parameters()]
+        model.zero_grad(set_to_none=True)
+
+        def forward_step(iterator, module):
+            batch = get_batch(iterator, ["tokens"], 128, "thd", False)
+            hidden = module[0](batch["tokens"])
+
+            def head(inputs):
+                return module[1](inputs), None
+
+            head._relax_unfused_head_wgrad = True
+
+            def loss_callback(output):
+                # Fp builds history only; it must not count tokens or compute loss.
+                assert torch.is_grad_enabled()
+                return loss_function(args, batch, 1, output, lm_head_forward=head)
+
+            return hidden, loss_callback
+
+        logs = chunkflow_forward_backward_no_pipelining(
+            forward_step_func=forward_step,
+            data_iterator=SimpleNamespace(get_next=lambda keys: parent),
+            model=model,
+            num_microbatches=1,
+            seq_length=325,
+            micro_batch_size=1,
+            pg_collection=SimpleNamespace(),
+        )
+        expected_count = parent["full_loss_masks"].sum()
+        assert len(finalized) == 1
+        torch.testing.assert_close(finalized[0], expected_count.to(torch.int))
+        torch.testing.assert_close(sum(log["values"][0] for log in logs), expected_count.float())
+        torch.testing.assert_close(sum(log["values"][1] for log in logs), expected.detach())
+        for parameter, gradient in zip(model.parameters(), expected_grads, strict=True):
+            torch.testing.assert_close(parameter.grad, gradient, atol=1e-5, rtol=1e-5)
 
 
 HEAD_DIM = 64

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Dense, text-only SFT. DATA_DIR/train.jsonl contains a messages column.
+# Dense, text-only SFT. Data contains a messages column.
 # Usage: bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 # Preview without Ray or GPUs: DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 
@@ -12,7 +12,7 @@ source "${RELAX_ROOT}/scripts/models/qwen3-4B.sh"
 source "${SCRIPT_DIR}/_common.sh"
 
 : "${MODEL_DIR:?Set MODEL_DIR to the directory containing Qwen3-4B}"
-: "${DATA_DIR:?Set DATA_DIR to the directory containing train.jsonl}"
+: "${PROMPT_DATA:=${DATA_DIR:?Set DATA_DIR or PROMPT_DATA}/train.jsonl}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/chunkflow}"
 EXP_NAME="${EXP_NAME:-qwen3-4b-text-sft-8xgpu}"
 now=$(date "+%Y%m%d-%H%M%S")
@@ -24,14 +24,17 @@ CKPT_ARGS=(
 
 SFT_ARGS=(
     --loss-type sft
-    --prompt-data "${PROMPT_DATA:-${DATA_DIR}/train.jsonl}"
+    --sft-chunked-logits
+    --sft-logits-chunk-size 1024
+    --recompute-loss-function
+    --prompt-data "${PROMPT_DATA}"
     --input-key messages
     --num-rollout "${NUM_STEPS:-100}"
     --global-batch-size 8
     --micro-batch-size 1
-    --seq-length "${SEQ_LENGTH:-8192}"
+    --seq-length "${SEQ_LENGTH:-65536}"
     --use-dynamic-batch-size
-    --max-tokens-per-gpu "${SEQ_LENGTH:-8192}"
+    --max-tokens-per-gpu "${SEQ_LENGTH:-65536}"
     --sft-oversize-strategy skip
 )
 

@@ -16,7 +16,7 @@ source "${SCRIPT_DIR}/_common.sh"
 export RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1
 
 : "${MODEL_DIR:?Set MODEL_DIR to the directory containing Qwen3.6-35B-A3B}"
-: "${DATA_DIR:?Set DATA_DIR to the directory containing train.jsonl}"
+: "${PROMPT_DATA:=${DATA_DIR:?Set DATA_DIR or PROMPT_DATA}/train.jsonl}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/chunkflow}"
 EXP_NAME="${EXP_NAME:-qwen36-35b-a3b-text-sft-8xgpu}"
 now=$(date "+%Y%m%d-%H%M%S")
@@ -28,14 +28,17 @@ CKPT_ARGS=(
 
 SFT_ARGS=(
     --loss-type sft
-    --prompt-data "${PROMPT_DATA:-${DATA_DIR}/train.jsonl}"
+    --sft-chunked-logits
+    --sft-logits-chunk-size 1024
+    --recompute-loss-function
+    --prompt-data "${PROMPT_DATA}"
     --input-key messages
     --num-rollout "${NUM_STEPS:-100}"
     --global-batch-size 8
     --micro-batch-size 1
-    --seq-length "${SEQ_LENGTH:-8192}"
+    --seq-length "${SEQ_LENGTH:-65536}"
     --use-dynamic-batch-size
-    --max-tokens-per-gpu "${SEQ_LENGTH:-8192}"
+    --max-tokens-per-gpu "${SEQ_LENGTH:-65536}"
     --sft-oversize-strategy skip
 )
 

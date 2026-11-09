@@ -13,29 +13,34 @@ submit_training() {
     fi
 
     python3 "${RELAX_ROOT}/examples/chunkflow/setup.py" \
-        --relax-root "${RELAX_ROOT}" \
-        --check
+        --relax-root "${RELAX_ROOT}"
     if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-        if [ -n "${RAY_ADDRESS:-}${RAY_JOBS_ADDRESS:-}" ]; then
-            : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the existing Ray Jobs HTTP URL}"
-            # An explicit cluster must not fall back to local.sh's node cleanup.
-            if ! timeout 5 ray status --address="${RAY_ADDRESS:-auto}"; then
-                echo "Cannot reach the configured Ray cluster; no local cluster was started." >&2
-                return 1
-            fi
+        local ray_status=0
+        timeout 10 ray status --address="${RAY_ADDRESS:-auto}" >/dev/null 2>&1 || ray_status=$?
+        if [ "$ray_status" = 0 ]; then
             entrypoint=ray-job
+            export RELAX_SKIP_CLUSTER_CLEANUP=1
+        elif [ -n "${RAY_ADDRESS:-}${RAY_JOBS_ADDRESS:-}" ] || [ "$ray_status" = 124 ] || pgrep -x raylet >/dev/null; then
+            echo "Cannot reach the existing Ray cluster; no local cluster was started." >&2
+            return 1
         fi
         export RELAX_RUN_SCRIPT_PATH="${SCRIPT_DIR}/${BASH_SOURCE[1]##*/}"
+        if [ "$entrypoint" = spmd-multinode ]; then
+            : "${MASTER_ADDR:?Set MASTER_ADDR to the head node POD_NAME}"
+            : "${POD_NAME:?Set POD_NAME to the current node hostname}"
+            : "${HOST_IP:?Set HOST_IP to the current node reachable IP}"
+            export WORLD_SIZE="${WORLD_SIZE:-4}" NUM_GPUS="${NUM_GPUS:-8}"
+            if ! [[ "$WORLD_SIZE" =~ ^[1-9][0-9]*$ && "$NUM_GPUS" =~ ^[1-9][0-9]*$ ]] ||
+                (( WORLD_SIZE * NUM_GPUS != 32 )); then
+                echo "This recipe requires WORLD_SIZE (nodes) * NUM_GPUS (per node) = 32." >&2
+                return 1
+            fi
+        fi
         if [ "$entrypoint" != local ]; then
             # Standard cluster entrypoints re-enter the recipe with their mode set.
             exec bash "${RELAX_ROOT}/scripts/entrypoint/${entrypoint}.sh" "${RELAX_RUN_SCRIPT_PATH}"
         fi
         source "${RELAX_ROOT}/scripts/entrypoint/${entrypoint}.sh"
-    fi
-    if [[ "${RELAX_ENTRYPOINT_MODE:-}" = local || "${RELAX_ENTRYPOINT_MODE:-}" = spmd-multinode ]]; then
-        export RAY_JOBS_ADDRESS="${RAY_JOBS_ADDRESS:-http://127.0.0.1:8265}"
-    else
-        : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the existing Ray Jobs HTTP URL}"
     fi
     export RAY_NO_WAIT="${RAY_NO_WAIT-}"
     export WORKING_DIR="${WORKING_DIR:-${RELAX_ROOT}}"
@@ -56,7 +61,7 @@ PY
     mkdir -p "${SCRIPT_DIR}/log"
     cd "${RELAX_ROOT}"
     ray job submit ${RAY_NO_WAIT:+--no-wait} \
-        --address="${RAY_JOBS_ADDRESS}" \
+        --address="${RAY_JOBS_ADDRESS:-${RAY_ADDRESS:-auto}}" \
         ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
         --runtime-env-json="${RUNTIME_ENV_JSON}" \
         -- "${train_command[@]}" 2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-${now}.log"

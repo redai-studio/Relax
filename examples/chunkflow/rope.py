@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from relax.utils.logging_utils import get_logger
 
-from .metadata import execution_optimizations_enabled, int32_metadata
+from .metadata import int32_metadata
 
 
 logger = get_logger(__name__)
@@ -28,7 +28,7 @@ def apply_rope_offset(
     for offset, length in zip(offsets, lengths, strict=True):
         padded.append(offset + length)
 
-    if not execution_optimizations_enabled() or getattr(packed_seq_params, "cu_seqlens_q_cpu", None) != absolute:
+    if getattr(packed_seq_params, "cu_seqlens_q_cpu", None) != absolute:
         packed_seq_params.cu_seqlens_q = int32_metadata(absolute, packed_seq_params.cu_seqlens_q.device)
     packed_seq_params.cu_seqlens_kv = packed_seq_params.cu_seqlens_q
     packed_seq_params.cu_seqlens_q_padded = int32_metadata(padded, packed_seq_params.cu_seqlens_q.device)

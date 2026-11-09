@@ -184,7 +184,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
 
     forward_data_store: list = []
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-    discarded: list = []
     fp_step_func = _no_loss_step_func(forward_step_func)
     first_forward = True
 
@@ -256,7 +255,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                         model,
                         1,
                         input_tensor,
-                        discarded if recompute else forward_data_store,
+                        [] if recompute else forward_data_store,
                         config,
                         cp_group_size=cp_size,
                         collect_non_loss_data=False,

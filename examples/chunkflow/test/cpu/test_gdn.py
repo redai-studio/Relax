@@ -14,7 +14,6 @@ from examples.chunkflow.adapters import AttentionAdapter, gdn, register_attentio
 from examples.chunkflow.integration import install, uninstall
 from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
 from examples.chunkflow.scheduler import build_chunks
-from examples.chunkflow.state_store import ChunkState
 from examples.chunkflow.test.cpu.test_integration import restore_rope_patch as restore_rope_patch
 from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
 
@@ -271,36 +270,8 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, paddin
 
 @pytest.mark.parametrize("mode", ["keep", "fr", "selective", "selective_last", "outer"])
 @pytest.mark.parametrize("padding", [0, 3])
-def test_gdn_execution_optimization_matches_original_(kernels, monkeypatch, mode, padding):
-    results = []
-    for enabled in ("0", "1"):
-        monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", enabled)
-        # Each complete install/uninstall restores the shared native kernel.
-        results.append(_alignment(kernels, mode, padding=padding))
-    torch.testing.assert_close(results[1], results[0], rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("padding", [0, 3])
-def test_gdn_execution_optimization_preserves_input_identity_without_padding(monkeypatch, padding):
-    monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", "1")
-    received = []
-
-    def kernel(x, initial_state=None, output_final_state=False, cu_seqlens=None):
-        received.append(x)
-        return x.square(), x[:, -1].square()
-
-    x = torch.randn(1, 4 + padding, 3, requires_grad=True)
-    packed = SimpleNamespace(**{UNIT_ATTR: SimpleNamespace(num_tokens=4)})
-    context = gdn._Context(SimpleNamespace(), packed, previous={}, current=ChunkState({}))
-    token = gdn._ACTIVE.set(context)
-    try:
-        out, _ = gdn._wrap_kernel(kernel, "conv")(x)
-        out.sum().backward()
-    finally:
-        gdn._ACTIVE.reset(token)
-    assert (received[0] is x) == (padding == 0)
-    torch.testing.assert_close(x.grad[:, :4], 2 * x[:, :4], rtol=0, atol=0)
-    assert torch.count_nonzero(x.grad[:, 4:]) == 0
+def test_gdn_recomputation_matches_full_sequence(kernels, mode, padding):
+    _alignment(kernels, mode, padding=padding)
 
 
 @pytest.mark.parametrize("mode,chunk_size", [("keep", 2), ("last", 4)])
@@ -308,7 +279,10 @@ def test_gdn_state_outputs_and_gradients_match_full_sequence(kernels, mode, chun
     _alignment(kernels, mode, chunk_size)
 
 
-def test_gdn_uses_convolution_from_preprocessing_module(kernels, monkeypatch):
+@pytest.mark.parametrize("module_name", ["megatron.core.ssm.gated_delta_net", "megatron.core.ssm.gated_delta_net.gdn"])
+def test_gdn_uses_convolution_from_preprocessing_module(kernels, monkeypatch, module_name):
+    # Exercise both supported native type identities through the built-in registry.
+    monkeypatch.setattr(GatedDeltaNet, "__module__", module_name)
     owner = ModuleType(f"{kernels.__name__}.gdn")
     owner.causal_conv1d = _conv
     exec("def pre_gated_delta_rule(self, **kwargs):\n    return causal_conv1d(**kwargs)", vars(owner))
@@ -377,9 +351,8 @@ def test_gdn_rejects_multiple_dependent_chunks_before_state_access():
     runtime.assert_empty("rejected unit")
 
 
-@pytest.mark.parametrize("enabled", ["0", "1"])
 @pytest.mark.parametrize("padding", [0, 3])
-def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels, monkeypatch, enabled, padding):
+def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels, padding):
     import inspect
     from functools import wraps
 
@@ -390,7 +363,6 @@ def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels, monkeypatch, e
         received.append(inspect.signature(_rule).bind(*args, **kwargs).arguments.get("cu_seqlens_cpu"))
         return _rule(*args, **kwargs)
 
-    monkeypatch.setenv("RELAX_CHUNKFLOW_EXECUTION_OPT", enabled)
     kernels.rule = rule
     model = GatedDeltaNet(kernels)
     install(model, 4)
@@ -404,7 +376,7 @@ def test_gdn_reuses_unit_lengths_and_passes_cpu_metadata(kernels, monkeypatch, e
     assert packed._chunkflow_gdn_lengths is metadata
     assert len(received) == 2 and all(value is metadata[2] for value in received)
     assert metadata[2].tolist() == ([0, 2, 3, total] if padding else [0, 2, 3])
-    assert (metadata[1] is packed.cu_seqlens_q) == (enabled == "1" and padding == 0)
+    assert (metadata[1] is packed.cu_seqlens_q) == (padding == 0)
     torch.testing.assert_close(first, second, rtol=0, atol=0)
     token = gdn._ACTIVE.set(gdn._Context(model, SimpleNamespace(_chunkflow_gdn_lengths=metadata)))
     try:

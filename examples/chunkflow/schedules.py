@@ -69,17 +69,6 @@ def _num_microbatches(num_microbatches) -> int:
     return int(num_microbatches)
 
 
-def _forward_kwargs(batch: dict) -> dict:
-    return {
-        "input_ids": batch["tokens"],
-        "position_ids": batch.get("position_ids"),
-        "attention_mask": None,
-        "labels": None,
-        "packed_seq_params": batch["packed_seq_params"],
-        "loss_mask": batch["full_loss_masks"],
-    }
-
-
 def chunkflow_forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -107,7 +96,6 @@ def chunkflow_forward_backward_no_pipelining(
     from megatron.training.global_vars import get_args
 
     from relax.backends.megatron.data import get_batch
-    from relax.backends.megatron.loss import loss_function
 
     args = get_args()
     chunk_size = int(args.chunkflow_chunk_size)
@@ -148,15 +136,14 @@ def chunkflow_forward_backward_no_pipelining(
 
                 batch = slice_parent_batch(parent, unit, pad_token_id=getattr(args, "pad_token_id", 0) or 0, args=args)
                 batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
+                batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, kind == "Fr")
+                with torch.no_grad() if kind == "Fp" else contextlib.nullcontext():
+                    output, loss_callback = forward_step_func(iter([(batch, {})]), model)
                 if kind == "Fp":
-                    batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, False)
-                    with torch.no_grad():
-                        model(**_forward_kwargs(batch))
+                    del output, loss_callback
                     continue
 
-                batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, kind == "Fr")
-                output = model(**_forward_kwargs(batch))
-                loss, num_tokens, log = loss_function(args, batch, 1, output)
+                loss, num_tokens, log = loss_callback(output)
                 total_num_tokens += num_tokens
                 forward_data_store.append(log)
                 pending[unit_id] = loss

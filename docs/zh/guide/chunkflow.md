@@ -19,14 +19,20 @@ python examples/chunkflow/setup.py --check
 
 移除接入补丁可执行 `python examples/chunkflow/setup.py --reverse`。安装器只管理源码，不安装依赖或启动集群。
 
-## Dense 与 MoE 示例
+## Dense 与 Dense/MoE 同时启用原生 SFT 输出层的 `--sft-chunked-logits --sft-logits-chunk-size 1024 --recompute-loss-function`。这项优化独立于 ChunkFlow，用于降低输出层显存；baseline 对照也应保留相同参数。ChunkFlow 不保证比原生整层重计算更省显存。
+
+MoE 示例
 
 两个示例都使用 8 张 GPU 进行纯文本 SFT，默认 TP=2、CP=1。Qwen3-4B 使用 PP=1、EP=1；Qwen3.6-35B-A3B 使用 PP=4、EP=2、ETP=1，并包含 GDN 状态适配。MoE 脚本设置 `--chunkflow-pipeline 4`，并向 worker 传递 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`，启用实验性的流水线执行器。
 
-先提供训练节点可访问的 `MODEL_DIR` 和 `DATA_DIR`：模型分别位于 `${MODEL_DIR}/Qwen3-4B` 或 `${MODEL_DIR}/Qwen3.6-35B-A3B`；数据为 `${DATA_DIR}/train.jsonl`，每行包含 `messages` 对话列表。数据格式参见 [SFT 训练](./sft-training.md)。
+现有验证环境中，Qwen3.6 的 PP4/EP2 配方与原生整层重计算的短程 loss 接近，但固定权重下的梯度方向存在显著差异。该配方仍属实验性质；训练跑通和 loss 接近不代表 backward 已对齐。
+
+设置训练节点可访问的 `MODEL_DIR`，其中包含 `Qwen3-4B/` 或 `Qwen3.6-35B-A3B/`；用 `PROMPT_DATA` 指定 JSONL 数据文件，每行包含 `messages` 对话列表。不设置 `PROMPT_DATA` 时才使用 `${DATA_DIR}/train.jsonl`。数据格式参见 [SFT 训练](./sft-training.md)。
 
 ```bash
 # 预览参数，不连接 Ray，也不要求 GPU。
+export MODEL_DIR=/path/to/models
+export PROMPT_DATA=/path/to/LongAlign-10k/long.jsonl
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 
@@ -35,11 +41,11 @@ bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-脚本先检查接入补丁，再调用 `scripts/entrypoint/local.sh` 启动 Ray 并向本机 Jobs 服务提交。这个标准入口会清理本机 Python、SGLang 和 Ray 进程，请用于独占训练节点；无需手动执行 `ray start`。
+脚本自动核对固定版本的 Relax 源码并安装接入补丁，再通过 `auto` 发现现有 Ray 集群，使用关闭集群清理的标准 `ray-job.sh` 入口提交。请确保该集群空闲且由本次实验独占。没有现有集群时，标准 `local.sh` 会启动 Ray；该新节点入口会清理本机进程，应在独占训练节点使用。无需手动启动 Ray 或填写 Ray 地址。
 
-已有集群时，先将 `RAY_ADDRESS` 设为 GCS 地址、`RAY_JOBS_ADDRESS` 设为 Jobs HTTP 地址，再执行相同脚本。它会使用标准 `ray-job.sh` 的环境和清理流程；连接失败直接退出，不会回退重启本机 Ray。外部入口已经设置 `RELAX_ENTRYPOINT_MODE` 时直接复用。脚本默认阻塞等待；`RAY_NO_WAIT=1` 可改为非阻塞。默认上传仓库工作目录，以便 driver 和 worker 能导入 example；使用自定义 `WORKING_DIR` 时也须包含打好补丁的 Relax 和完整 example。
+仍可用 `RAY_ADDRESS` 或 `RAY_JOBS_ADDRESS` 显式指定集群。已配置或已发现的集群不可达时会报错退出，不会回退重启本机。请等当前实验结束后再启动下一次实验。外部入口已经设置 `RELAX_ENTRYPOINT_MODE` 时直接复用。脚本默认阻塞等待；`RAY_NO_WAIT=1` 可改为非阻塞。默认上传仓库工作目录，以便 driver 和 worker 能导入 example；使用自定义 `WORKING_DIR` 时也须包含打好补丁的 Relax 和完整 example。
 
-脚本默认 `SEQ_LENGTH=8192`、`CHUNK_SIZE=4096`、`KEEP_LAST_K=1`、`NUM_STEPS=100`，均可用同名环境变量覆盖。三个脚本都从 Hugging Face 初始权重加载，不保存或恢复训练 checkpoint；无需设置 `SAVE_DIR` 或 `SAVE_INTERVAL`，此前导出的这两个变量也不会生效。每次运行的 ClearML task 名和 `examples/chunkflow/scripts/log/` 下的日志带有时间戳。`PROJECT_NAME` 默认 `Relax/sft/chunkflow`，`EXP_NAME` 按模型区分且可覆盖。
+Dense/MoE 脚本默认 `SEQ_LENGTH=65536`、`CHUNK_SIZE=4096`、`KEEP_LAST_K=1`、`NUM_STEPS=100`；QSA 默认 `SEQ_LENGTH=8192`。这些参数均可用同名环境变量覆盖。三个脚本都从 Hugging Face 初始权重加载，不保存或恢复训练 checkpoint；无需设置 `SAVE_DIR` 或 `SAVE_INTERVAL`，此前导出的这两个变量也不会生效。每次运行的 ClearML task 名和 `examples/chunkflow/scripts/log/` 下的日志带有时间戳。`PROJECT_NAME` 默认 `Relax/sft/chunkflow`，`EXP_NAME` 按模型区分且可覆盖。
 
 MoE 示例使用原生 all-to-all 分发，关闭路由辅助损失，并通过 `examples/chunkflow/configs/gdn.yaml` 关闭 GDN 预处理融合。它采用 CPU optimizer offload，需要足够的主机内存。两个示例均不启用 full-layer recompute、VPP、MTP 或多模态输入。
 
@@ -53,9 +59,9 @@ DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 ```
 
-新集群默认 `WORLD_SIZE=4` 个节点、每节点 `NUM_GPUS=8` 张卡，两者乘积必须为 32。所有节点的 `MASTER_ADDR` 都填写主节点可解析的 **`POD_NAME`**，各自的 `POD_NAME` 填本节点名称，`HOST_IP` 填本节点可通信的 IP。标准 `spmd-multinode.sh` 入口通过 `MASTER_ADDR == POD_NAME` 的严格相等判断主节点，自动启动各节点的 Ray，等全部节点加入后仅由主节点提交一次训练。worker 持续运行；只启动主节点会一直等待其他节点。请使用独占节点：该入口会清理本机进程，并要求有权限通过 `sysctl` 设置预留网络端口。
+新集群默认 `WORLD_SIZE=4` 个节点、每节点 `NUM_GPUS=8` 张卡，两者乘积必须为 32。多个节点共享尚未安装补丁的仓库时，先在共享目录运行一次 `python examples/chunkflow/setup.py`，再启动各节点。所有节点的 `MASTER_ADDR` 都填写主节点可解析的 **`POD_NAME`**，各自的 `POD_NAME` 填本节点名称，`HOST_IP` 填本节点可通信的 IP。标准 `spmd-multinode.sh` 入口通过 `MASTER_ADDR == POD_NAME` 的严格相等判断主节点，自动启动各节点的 Ray，等全部节点加入后仅由主节点提交一次训练。worker 持续运行；只启动主节点会一直等待其他节点。请使用独占节点：该入口会清理本机进程，并要求有权限通过 `sysctl` 设置预留网络端口。
 
-已有 32 卡集群时，设置 `RAY_ADDRESS` 和 `RAY_JOBS_ADDRESS`，只在提交节点执行同一脚本；此模式不要求节点变量，也不重新组建集群。预览模式不会初始化任何集群。
+已有 32 卡集群时，只在提交节点执行同一脚本，Ray 会自动发现；此模式不要求节点变量，也不重新组建集群。预览模式不会初始化任何集群。
 
 `configs/qwen38.yaml` 关闭 GDN 预处理融合和 QSA Stage-2 indexer 辅助损失。脚本使用原生 `flex` attention，关闭 Qwen3.8 的融合/社区 selector 覆盖、local-query/replay 补丁及 streamed PLE。`_common.sh` 将这些模型环境变量传给 Ray worker。运行不切块对照时也应保留相同设置。
 
@@ -86,6 +92,8 @@ ChunkFlow 调用模型原有的 Megatron/Transformer Engine Attention，由原�
 连接层负责补上历史 K/V，并使用右下对齐的因果 mask，让当前 query 正确访问前文。Attention 使用新建的实际 packed 序列边界，RoPE 的位置偏移单独保留。模块对象、参数及 checkpoint 键保持不变。原生 autograd 可能为每个 chunk 保存拼接后的历史 K/V，因此从旧的自定义 Attention 反向路径迁移后，需要重新测量显存。
 
 切块由调度器完成，Attention 内部不再二次切块。没有 `chunkflow_unit` 标记的调用直接执行原生 `forward`，保留其输入参数和行为。
+
+两种调度器都会把准备好的 chunk 交给 Relax 原生的前向和 loss 回调，模型参数构造及可选的 SFT 输出层分块仍由 Relax 负责。仅用于建立历史状态的前向不调用 loss 回调，保证每个 chunk 的 token 数和 loss 只统计一次。
 
 ## 配置
 

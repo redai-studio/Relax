@@ -142,7 +142,6 @@ def test_lockstep_dependent_units_fail_closed_until_per_segment_rope_exists():
 
 def test_bridge_chunk_positions_and_padding_match_full_sequence():
     bridge_rope = pytest.importorskip("megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope")
-    from examples.chunkflow.schedules import _forward_kwargs
 
     parent = _parent([301, 301, 11, 13])
     units, _ = _units(parent["total_lengths"], 128)
@@ -172,7 +171,6 @@ def test_bridge_chunk_positions_and_padding_match_full_sequence():
         torch.testing.assert_close(batch["position_ids"][..., :real], expected)
         assert batch["position_ids"].shape == (3, 1, physical)
         assert (batch["position_ids"][..., real:] == 1).all()
-        assert _forward_kwargs(batch)["position_ids"] is batch["position_ids"]
         physical_cu = packed.cu_seqlens_q_padded.tolist()
         assert physical_cu == [*packed.cu_seqlens_q_cpu[:-1], physical]
         assert packed.max_seqlen_q == max(b - a for a, b in zip(physical_cu[:-1], physical_cu[1:]))

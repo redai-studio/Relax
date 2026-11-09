@@ -23,9 +23,14 @@ Use `python examples/chunkflow/setup.py --reverse` to remove the integration pat
 
 Both examples run text-only SFT on eight GPUs with TP=2 and CP=1. Qwen3-4B uses PP=1 and EP=1; Qwen3.6-35B-A3B uses PP=4, EP=2, and ETP=1, including GDN state adaptation. The MoE script sets `--chunkflow-pipeline 4` and forwards `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1` to enable the experimental pipeline executor.
 
-Set `MODEL_DIR` and `DATA_DIR` to paths accessible to the training nodes. Model directories are `${MODEL_DIR}/Qwen3-4B` and `${MODEL_DIR}/Qwen3.6-35B-A3B`. Data is `${DATA_DIR}/train.jsonl`, with a `messages` conversation list in each row; see [SFT Training](./sft-training.md).
+The available validation runtime showed close short-run losses for Qwen3.6 with PP4/EP2, but materially different fixed-weight gradient directions from native full-layer recomputation. This recipe remains experimental; successful training and close loss are not evidence of backward parity.
+
+Set `MODEL_DIR` to the directory containing `Qwen3-4B/` or `Qwen3.6-35B-A3B/`, and `PROMPT_DATA` to the JSONL data file. Each row contains a `messages` conversation list; see [SFT Training](./sft-training.md). If `PROMPT_DATA` is omitted, `DATA_DIR/train.jsonl` is used.
 
 ```bash
+export MODEL_DIR=/path/to/models
+export PROMPT_DATA=/path/to/LongAlign-10k/long.jsonl
+
 # Preview arguments without connecting to Ray or requiring GPUs.
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
@@ -35,11 +40,13 @@ bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-The scripts check the integration patch before using `scripts/entrypoint/local.sh` to start Ray and submit to the local Jobs service. This standard entrypoint clears local Python, SGLang, and Ray processes; use a dedicated training node. No manual `ray start` is needed.
+The scripts validate the pinned Relax sources and install the integration patch automatically. They discover an existing Ray cluster with `auto` and reuse `scripts/entrypoint/ray-job.sh` with cluster cleanup disabled. Ensure that this cluster is idle and dedicated to the experiment. If no cluster exists, the standard `local.sh` starts one. That fresh-node entrypoint clears local processes, so use a dedicated training node. No manual `ray start` or Ray addresses are needed.
 
-For an existing cluster, set `RAY_ADDRESS` to its GCS address and `RAY_JOBS_ADDRESS` to its Jobs HTTP URL, then run the same recipe. It uses the standard `ray-job.sh` environment and cleanup; an unreachable cluster fails without restarting Ray locally. An external entrypoint that already set `RELAX_ENTRYPOINT_MODE` is reused. Submission blocks by default; set `RAY_NO_WAIT=1` for nonblocking submission. Scripts upload the repository working directory by default so both driver and workers can import the example. A custom `WORKING_DIR` must also contain patched Relax and the complete example.
+Explicit `RAY_ADDRESS` or `RAY_JOBS_ADDRESS` values remain optional overrides. An unreachable configured or detected cluster causes an error instead of restarting Ray locally. Start the next experiment after the previous one finishes. An external entrypoint that already set `RELAX_ENTRYPOINT_MODE` is reused. Submission blocks by default; set `RAY_NO_WAIT=1` for nonblocking submission. Scripts upload the repository working directory by default so both driver and workers can import the example. A custom `WORKING_DIR` must also contain patched Relax and the complete example.
 
-Script defaults are `SEQ_LENGTH=8192`, `CHUNK_SIZE=4096`, `KEEP_LAST_K=1`, and `NUM_STEPS=100`; override them with the corresponding environment variables. All three recipes load initial Hugging Face weights and do not save or resume training checkpoints. They do not use `SAVE_DIR` or `SAVE_INTERVAL`, including previously exported values. ClearML task names and logs under `examples/chunkflow/scripts/log/` include a timestamp for each run. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`; each model has a distinct, overridable `EXP_NAME`.
+Dense and MoE defaults are `SEQ_LENGTH=65536`, `CHUNK_SIZE=4096`, `KEEP_LAST_K=1`, and `NUM_STEPS=100`; QSA defaults to `SEQ_LENGTH=8192`. Override them with the corresponding environment variables. All three recipes load initial Hugging Face weights and do not save or resume training checkpoints. They do not use `SAVE_DIR` or `SAVE_INTERVAL`, including previously exported values. ClearML task names and logs under `examples/chunkflow/scripts/log/` include a timestamp for each run. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`; each model has a distinct, overridable `EXP_NAME`.
+
+Dense and MoE also use the native SFT output head with `--sft-chunked-logits --sft-logits-chunk-size 1024 --recompute-loss-function`. This reduces output-head memory independently of ChunkFlow; keep these options enabled in a baseline comparison. ChunkFlow does not guarantee lower memory than native full-layer recomputation.
 
 The MoE example uses native all-to-all dispatch, disables router auxiliary loss, and disables GDN preprocessing fusion through `examples/chunkflow/configs/gdn.yaml`. CPU optimizer offload requires sufficient host memory. Neither example enables full-layer recomputation, VPP, MTP, or multimodal input.
 
@@ -53,9 +60,9 @@ DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 ```
 
-For a new cluster, the recipe defaults to `WORLD_SIZE=4` nodes and `NUM_GPUS=8` per node; their product must be 32. Set `MASTER_ADDR` on every node to the head node's resolvable **`POD_NAME`**, set `POD_NAME` to the current node's hostname, and set `HOST_IP` to its reachable IP. The standard `spmd-multinode.sh` entrypoint identifies the head by the exact equality `MASTER_ADDR == POD_NAME`, starts Ray on each node, and submits once from the head after all nodes join. Workers remain running; starting only the head leaves it waiting for workers. Use dedicated nodes: this entrypoint clears local processes and requires permission to set reserved network ports with `sysctl`.
+For a new cluster, the recipe defaults to `WORLD_SIZE=4` nodes and `NUM_GPUS=8` per node; their product must be 32. If the nodes share an unpatched checkout, run `python examples/chunkflow/setup.py` once before starting them. Set `MASTER_ADDR` on every node to the head node's resolvable **`POD_NAME`**, set `POD_NAME` to the current node's hostname, and set `HOST_IP` to its reachable IP. The standard `spmd-multinode.sh` entrypoint identifies the head by the exact equality `MASTER_ADDR == POD_NAME`, starts Ray on each node, and submits once from the head after all nodes join. Workers remain running; starting only the head leaves it waiting for workers. Use dedicated nodes: this entrypoint clears local processes and requires permission to set reserved network ports with `sysctl`.
 
-For an existing 32-GPU cluster, set `RAY_ADDRESS` and `RAY_JOBS_ADDRESS` and run the same recipe only on the submitter. No node variables or cluster startup are needed in this mode. Preview mode initializes neither kind of cluster.
+For an existing 32-GPU cluster, run the same recipe only on the submitter; Ray is discovered automatically. No node variables or cluster startup are needed in this mode. Preview mode initializes neither kind of cluster.
 
 `configs/qwen38.yaml` disables GDN preprocessing fusion and QSA Stage-2 indexer loss. The script selects native `flex` attention and disables the Qwen3.8 fused/community selector overrides, local-query/replay patches, and streamed PLE. `_common.sh` forwards these model environment settings to Ray workers. Use the same settings when running an unchunked reference.
 
@@ -86,6 +93,8 @@ ChunkFlow calls the model's original Megatron/Transformer Engine attention imple
 The connection layer supplies historical K/V and bottom-right causal masking, so current queries can attend to the correct prefix. It creates fresh physical packed-sequence boundaries for attention and keeps RoPE position offsets separate. Module identities, parameters, and checkpoint keys remain unchanged. Native autograd may retain concatenated historical K/V for each chunk, so measure memory again when migrating from the former custom attention backward.
 
 The scheduler performs chunking; attention does not split the input a second time. Calls without a `chunkflow_unit` marker go directly to the original `forward`, preserving its arguments and behavior.
+
+Both executors pass each prepared chunk to Relax's original forward and loss callbacks. Model arguments and optional SFT output-layer chunking remain owned by Relax. History-only forwards skip the loss callback, so token counts and loss are recorded once per chunk.
 
 ## Configuration
 

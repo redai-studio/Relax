@@ -17,7 +17,7 @@ from examples.chunkflow.adapters import (
     ple,
     resolve_attention_adapter,
 )
-from examples.chunkflow.metadata import execution_optimizations_enabled, int32_metadata
+from examples.chunkflow.metadata import int32_metadata
 from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
 from relax.utils.logging_utils import get_logger
 
@@ -228,7 +228,6 @@ def install(model, chunk_size: int) -> int:
                 cfg.apply_rope_fusion = False
         logger.info("chunkflow: apply_rope_fusion disabled (the offset path needs the unfused RoPE branch)")
     logger.info("chunkflow: installed %s native module adapters, chunk_size=%s", n, chunk_size)
-    logger.info("chunkflow: execution optimization enabled=%s", execution_optimizations_enabled())
     return n
 
 

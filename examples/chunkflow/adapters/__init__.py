@@ -283,11 +283,11 @@ register_attention_adapter(
 )
 
 
-register_attention_adapter(
+for gdn_type in (
+    "megatron.core.ssm.gated_delta_net.GatedDeltaNet",
     "megatron.core.ssm.gated_delta_net.gdn.GatedDeltaNet",
-    None,
-    AttentionAdapter("megatron-native-gdn", gdn.validate, gdn.install),
-)
+):
+    register_attention_adapter(gdn_type, None, AttentionAdapter("megatron-native-gdn", gdn.validate, gdn.install))
 
 register_attention_adapter(
     "megatron.core.transformer.experimental_attention_variant.qsa.QwenSparseSelfAttention",
