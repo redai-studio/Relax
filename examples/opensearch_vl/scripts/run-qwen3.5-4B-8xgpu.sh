@@ -1,0 +1,150 @@
+#!/bin/bash
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Qwen3.5-4B full SFT comparison, complete 32K multimodal tool trajectories, 8 GPUs.
+# MODEL_DIR=/models DATA_DIR=/data SAVE_DIR=/checkpoints bash "$0" relax
+# Modes: relax | evaluate <HF-checkpoint> <base|relax> | compare
+
+set -eo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+RELAX_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+MODE="${1:-relax}"
+PROJECT_NAME="${PROJECT_NAME:-Relax/sft/opensearch-vl}"
+EXP_NAME="${EXP_NAME:-qwen3.5-4b-opensearch-vl-32k-8xgpu}"
+now=$(date "+%Y%m%d-%H%M%S")
+: "${MODEL_DIR:?Set MODEL_DIR to the initial model root}"
+: "${DATA_DIR:?Set DATA_DIR to the prepared dataset root}"
+: "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
+export RAY_NO_WAIT="${RAY_NO_WAIT-}"
+mkdir -p "${SCRIPT_DIR}/log" "${SAVE_DIR}/${EXP_NAME}"
+cd "${RELAX_ROOT}"
+
+case "${MODE}" in
+    evaluate)
+        : "${2:?Supply one explicit HF checkpoint directory}"
+        : "${3:?Supply base or relax as the evaluation label}"
+        case "$3" in base|relax) ;; *) echo "Evaluation label must be base or relax" >&2; exit 2 ;; esac
+        python3 "${SCRIPT_DIR}/../tools/evaluate.py" \
+            --model "$2" --processor "${MODEL_DIR}/Qwen3.5-4B" \
+            --data "${DATA_DIR}/opensearch_vl/32k/test_steps.jsonl" \
+            --output "${SAVE_DIR}/${EXP_NAME}/eval/$3" \
+            2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-eval-$3-${now}.log"
+        exit
+        ;;
+    compare)
+        python3 "${SCRIPT_DIR}/../tools/compare.py" \
+            --base "${SAVE_DIR}/${EXP_NAME}/eval/base/summary.json" \
+            --relax "${SAVE_DIR}/${EXP_NAME}/eval/relax/summary.json" \
+            --output "${SAVE_DIR}/${EXP_NAME}/comparison.json"
+        exit
+        ;;
+    relax) ;;
+    *) echo "Unknown mode: ${MODE}" >&2; exit 2 ;;
+esac
+
+# Do not source the training entrypoint during static checks.
+if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
+    source "${RELAX_ROOT}/scripts/entrypoint/local.sh"
+fi
+source "${RELAX_ROOT}/scripts/models/qwen35-4B.sh"
+# Qwen3.5-4B ties its embedding and output weights. Remove the legacy model flag.
+TIED_MODEL_ARGS=()
+for argument in "${MODEL_ARGS[@]}"; do
+    if [ "${argument}" != --untie-embeddings-and-output-weights ]; then
+        TIED_MODEL_ARGS+=("${argument}")
+    fi
+done
+MODEL_ARGS=("${TIED_MODEL_ARGS[@]}")
+python3 "${SCRIPT_DIR}/../tools/audit_data.py" \
+    --model "${MODEL_DIR}/Qwen3.5-4B" --data-dir "${DATA_DIR}/opensearch_vl/32k" \
+    --output "${SAVE_DIR}/${EXP_NAME}/relax-audit.json"
+
+CKPT_ARGS=(
+    --hf-checkpoint "${MODEL_DIR}/Qwen3.5-4B"
+    --ref-load "${MODEL_DIR}/Qwen3.5-4B"
+    --megatron-to-hf-mode bridge
+    --load "${SAVE_DIR}/${EXP_NAME}/relax"
+    --save "${SAVE_DIR}/${EXP_NAME}/relax"
+    --save-hf "${SAVE_DIR}/${EXP_NAME}/relax-hf"
+    --save-interval 16
+    --max-actor-ckpt-to-keep 2
+    --num-epoch 1
+)
+SFT_ARGS=(
+    --loss-type sft
+    --prompt-data "${DATA_DIR}/opensearch_vl/32k/train.jsonl"
+    --input-key messages
+    --tool-key tools
+    --multimodal-keys '{"image":"images"}'
+    --apply-chat-template-kwargs '{"preserve_thinking":true}'
+    --image-max-token-num 256
+    --image-min-token-num 1
+    --global-batch-size 8
+    --use-dynamic-batch-size
+    --max-tokens-per-gpu 32768
+    --sft-oversize-strategy keep
+    --balance-data
+    --per-rank-fetch
+    --sft-prefetch-num-workers 4
+    --sft-prefetch-buffer-size 32
+    --sft-max-in-flight-steps 2
+)
+EVAL_ARGS=(
+    --eval-prompt-data opensearch_val "${DATA_DIR}/opensearch_vl/32k/val.jsonl"
+    --eval-interval 16
+)
+PERF_ARGS=(
+    --tensor-model-parallel-size 2
+    --sequence-parallel
+    --pipeline-model-parallel-size 1
+    --context-parallel-size 1
+    --expert-model-parallel-size 1
+    --expert-tensor-parallel-size 1
+    --recompute-granularity full
+    --recompute-method uniform
+    --recompute-num-layers 1
+    --calculate-per-token-loss
+    --no-rope-fusion
+    --colocate
+    --cross-entropy-loss-fusion
+    --sft-chunked-logits
+    --sft-logits-chunk-size 256
+    --recompute-loss-function
+)
+OPTIMIZER_ARGS=(
+    --optimizer adam
+    --lr 2e-5
+    --min-lr 0
+    --lr-decay-style cosine
+    --lr-warmup-fraction 0.1
+    --weight-decay 0
+    --adam-beta1 0.9
+    --adam-beta2 0.999
+    --adam-eps 1e-8
+    --clip-grad 1.0
+)
+WANDB_ARGS=(
+    --use-clearml
+    --use-metrics-service
+    --tb-project-name "${PROJECT_NAME}"
+    --tb-experiment-name "${EXP_NAME}-relax-${now}"
+)
+MISC_ARGS=(
+    --seed 42
+    --attention-dropout 0.0
+    --hidden-dropout 0.0
+    --accumulate-allreduce-grads-in-fp32
+    --attention-softmax-in-fp32
+    --attention-backend flash
+    --use-health-check
+)
+
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOBS_ADDRESS:-http://127.0.0.1:8265}" \
+    --submission-id "${EXP_NAME}-relax-${now}" \
+    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
+    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+    -- python3 -m relax.entrypoints.train \
+    --resource '{"sft":[1,0],"actor":[1,8]}' \
+    --num-data-storage-units 1 \
+    "${MODEL_ARGS[@]}" "${CKPT_ARGS[@]}" "${SFT_ARGS[@]}" "${EVAL_ARGS[@]}" \
+    "${PERF_ARGS[@]}" "${OPTIMIZER_ARGS[@]}" "${WANDB_ARGS[@]}" "${MISC_ARGS[@]}" \
+    2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-relax-${now}.log"
