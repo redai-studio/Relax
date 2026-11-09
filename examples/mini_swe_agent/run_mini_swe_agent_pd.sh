@@ -100,9 +100,14 @@ RUN_ID="${RUN_ID:-mini-swe-pd-$(date +%Y%m%d-%H%M%S)}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/mini_swe_agent_pd}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-1000}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-${ROLLOUT_BATCH_SIZE}}"
 # agent_config.yaml leases each task to exactly eight samples.
 N_SAMPLES_PER_PROMPT=8
 [[ "${ROLLOUT_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || { echo "ROLLOUT_BATCH_SIZE must be positive" >&2; exit 1; }
+[[ "${OVER_SAMPLING_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] && \
+   ((OVER_SAMPLING_BATCH_SIZE >= ROLLOUT_BATCH_SIZE)) || {
+   echo "OVER_SAMPLING_BATCH_SIZE must be at least ROLLOUT_BATCH_SIZE" >&2; exit 1;
+}
 GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
 AGENTIC_CONCURRENCY="${AGENTIC_CONCURRENCY:-${ROLLOUT_BATCH_SIZE}}"
 [[ "${AGENTIC_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || { echo "AGENTIC_CONCURRENCY must be positive" >&2; exit 1; }
@@ -180,6 +185,7 @@ ROLLOUT_ARGS=(
    "${DEBUG_DUMP_ARGS[@]}"
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
+   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}"
    --n-samples-per-prompt ${N_SAMPLES_PER_PROMPT}
    --rollout-max-response-len "${MAX_RESPONSE_LEN:-8192}"
    --rollout-max-context-len "${MAX_CONTEXT_LEN:-32768}"
@@ -240,6 +246,9 @@ LOG_ARGS=(
    --tb-project-name "${PROJECT_NAME}"
    --tb-experiment-name "${RUN_ID}"
 )
+if [[ "${ENABLE_CLEARML:-0}" == 1 ]]; then
+   LOG_ARGS+=(--use-clearml)
+fi
 
 MEGATRON_ARGS=(
    --tensor-model-parallel-size 2
@@ -274,6 +283,18 @@ RAY_RESOURCE_ARGS=(
    --num-data-storage-units 1
    --colocate
 )
+case "${MINI_SWE_TRAIN_MODE:-colocate}" in
+   colocate) ;;
+   fully_async)
+      RAY_RESOURCE_ARGS=(
+         --resource '{"actor": [1, 4], "rollout": [1, 4], "advantages": [1, 0]}'
+         --fully-async
+         --max-staleness "${MAX_STALENESS:-0}"
+         --num-data-storage-units 1
+      )
+      ;;
+   *) echo "MINI_SWE_TRAIN_MODE must be colocate or fully_async" >&2; exit 1 ;;
+esac
 
 # agentic rollout: agent exec + parsers ──────────────────────────────────────────────────────────────
 AGENTIC_ARGS=(
@@ -288,8 +309,12 @@ AGENTIC_ARGS=(
    --agentic-reasoning-parser qwen3
 )
 
-ray job submit --no-wait --address "${RAY_JOB_ADDRESS:-http://127.0.0.1:8265}" \
-   --submission-id "${RUN_ID}" --runtime-env-json "${RUNTIME_ENV_JSON}" \
+# Preserve the existing recipe default; new recipes can explicitly select blocking submission.
+RAY_NO_WAIT="${RAY_NO_WAIT-1}"
+ray job submit ${RAY_NO_WAIT:+--no-wait} \
+   --address "${RAY_JOB_ADDRESS:-http://127.0.0.1:8265}" \
+   --submission-id "${RUN_ID}" \
+   --runtime-env-json "${RUNTIME_ENV_JSON}" \
    -- bash "${SCRIPT_DIR}/run_mini_swe_agent_pd.sh" --ray-driver \
    "${RAY_RESOURCE_ARGS[@]}" \
    "${MODEL_ARGS[@]}" \

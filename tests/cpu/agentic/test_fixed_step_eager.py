@@ -4,6 +4,7 @@
 import asyncio
 from argparse import Namespace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -27,11 +28,12 @@ async def eventually(predicate):
             await asyncio.sleep(0.005)
 
 
-def runtime_fixture():
+def runtime_fixture(*, resumable=False, capacity=2, **overrides):
     args = Namespace(
-        agentic_session_capacity_per_node=2,
+        agentic_session_capacity_per_node=capacity,
         agentic_incremental_session_start=True,
-        agentic_fixed_step_eager=True,
+        agentic_fixed_step_eager=not resumable,
+        agentic_eager_session_generation=resumable,
         rollout_global_dataset=False,
         n_samples_per_prompt=2,
         rollout_batch_size=2,
@@ -45,6 +47,8 @@ def runtime_fixture():
         rollout_skip_special_tokens=False,
         sglang_enable_deterministic_inference=False,
     )
+    for name, value in overrides.items():
+        setattr(args, name, value)
     shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
     shard.args = args
     shard._trajectory_recorder = ShardTrajectoryRecorder(args, shard_ordinal=0)
@@ -53,7 +57,8 @@ def runtime_fixture():
     shard._resource_release_receipts = {}
     shard._train_generation_open = False
     shard._standalone_eager_scope = False
-    shard._fixed_step_eager_scope = True
+    shard._fixed_step_eager_scope = not resumable
+    shard._resumable_eager_scope = resumable
     shard._eager_shutdown = False
     shard._rollout_epoch = None
     shard._eager_gate_lock = asyncio.Lock()
@@ -207,3 +212,162 @@ def test_fixed_step_rejects_cross_step_modes():
         args = Namespace(**vars(runtime.args), **{name: True})
         with pytest.raises(ValueError, match="complete synchronous steps"):
             RuntimeDomain(args, "train", runtime._shards, concurrency=3)
+
+
+@pytest.mark.parametrize("fully_async", [False, True])
+async def test_resumable_eager_grant_during_pause_keeps_identity_and_capacity(fully_async):
+    runtime, shard, started, generated = runtime_fixture(
+        resumable=True, fully_async=fully_async, over_sampling_batch_size=3
+    )
+    try:
+        await runtime.resume_generation(0)
+        stream_a = await prepare(runtime, "a")
+        a = shard._groups["a"]
+        for session in a.sessions:
+            await ready(shard, session)
+        finish(shard, a.sessions[0])
+        stream_b = await prepare(runtime, "b")
+        b = shard._groups["b"]
+        identities = tuple(session.session_id for session in b.sessions)
+        assert identities[0] in started and identities[1] not in started
+        await ready(shard, b.sessions[0])
+        assert not b.interrupted  # An unstarted member is not interrupted credit.
+        assert (identities[0], 0) in generated
+        await runtime.pause_generation()
+        finish(shard, a.sessions[1])
+        await eventually(lambda: identities[1] in started)
+        assert runtime.session_capacity_snapshot()["outstanding"] == 2
+        await ready(shard, b.sessions[1])
+        assert not any(sid == identities[1] for sid, _epoch in generated)
+        assert b.interrupted  # All original first IRs now exist; both members are tool-idle.
+        await runtime.resume_generation(1)
+        assert tuple(session.session_id for session in b.sessions) == identities
+        assert all(session.rollout_id == 1 for session in b.sessions)
+        assert all((sid, 1) in generated for sid in identities)
+        assert runtime.session_capacity_snapshot()["outstanding"] == 2
+        result_a = await runtime.collect_group(stream_a)
+        assert len(result_a.sessions) == 2
+        collect_b = asyncio.create_task(runtime.collect_group(stream_b))
+        finish(shard, b.sessions[0])
+        await asyncio.sleep(0.02)
+        assert not collect_b.done()
+        finish(shard, b.sessions[1])
+        assert len((await collect_b).sessions) == 2
+        assert runtime.session_capacity_snapshot()["outstanding"] == 0
+        assert runtime.session_capacity_snapshot()["global_peak"] == 2
+        await runtime.pause_generation()
+    finally:
+        await runtime._stop_shard_observers()
+
+
+@pytest.mark.parametrize("name", ["partial_rollout", "agentic_prelaunch", "use_dynamic_global_batch_size"])
+def test_resumable_eager_rejects_unimplemented_modes(name):
+    with pytest.raises(ValueError, match="incremental synchronous or fully-async"):
+        runtime_fixture(resumable=True, **{name: True})
+
+
+def test_fixed_eager_still_rejects_oversampling():
+    with pytest.raises(ValueError, match="complete synchronous steps"):
+        runtime_fixture(over_sampling_batch_size=3)
+
+
+async def test_prepare_discard_joins_registration_and_drops_ready_surplus():
+    from relax.agentic.pipeline.prepare import PrepareDomain
+
+    runtime, shard, _started, _generated = runtime_fixture(resumable=True, capacity=6)
+    register_entered = asyncio.Event()
+    register_finish = asyncio.Event()
+    original_start = shard.start_group
+
+    async def registered_group(*args, **kwargs):
+        await original_start(*args, **kwargs)
+        if args[1] == "registering":
+            register_entered.set()
+            await register_finish.wait()
+
+    shard.start_group = registered_group
+
+    def start(session, _input, **_kwargs):
+        async def timer(_active):
+            pass
+
+        session.resources = SimpleNamespace(
+            process=SimpleNamespace(set_timeout_active=timer),
+            watcher_task=asyncio.create_task(asyncio.sleep(0)),
+        )
+
+    async def cleanup(session, _outcome, **_kwargs):
+        session.group.resource_released_session_ids.add(session.session_id)
+        session.result_cell.publish(None)
+        session.resources = None
+        session.group.pending_session_specs.pop(session.session_id, None)
+        session.group.sessions.remove(session)
+        shard._session_records.pop(session.session_id, None)
+        shard._notify_state_change(session.group)
+
+    shard._start_session = start
+    shard._finish_session = cleanup
+    preparation = PrepareDomain("train", None, runtime)
+    try:
+        await runtime.resume_generation(0)
+        active = await prepare(runtime, "active")
+        for group_id in ("ready", "registering"):
+            samples = [Sample(index=i, group_index=0, prompt="p") for i in range(2)]
+            preparation._start_prepare(GroupInput(group_id, samples))
+        await register_entered.wait()
+        await eventually(lambda: preparation.ready_group_count == 1)
+        await runtime.pause_generation()
+        discarding = asyncio.create_task(preparation.discard_step())
+        await asyncio.sleep(0.02)
+        assert not discarding.done()  # Registration must settle before its owner is released.
+        register_finish.set()
+        await asyncio.wait_for(discarding, 2)
+        assert tuple(shard._groups) == ("active",)
+        assert preparation.counts == (0, 0)
+        assert runtime.session_capacity_snapshot()["outstanding"] == 2
+        await runtime.drop_group(active)
+        runtime._assert_epoch_drained()
+        assert runtime.session_capacity_snapshot()["outstanding"] == 0
+    finally:
+        register_finish.set()
+        await runtime._stop_shard_observers()
+
+
+async def test_resumable_shutdown_fences_late_registration_and_resume():
+    runtime, shard, _started, _generated = runtime_fixture(resumable=True)
+    dropping, release = asyncio.Event(), asyncio.Event()
+
+    async def drop(group_id, **_kwargs):
+        dropping.set()
+        await release.wait()
+        shard._groups.pop(group_id)
+
+    shard._groups["resident"] = SimpleNamespace(group_id="resident", closing=False)
+    shard.drop_group = drop
+    shard._permit_cleanup_tasks = set()
+    shard._generation_backend = SimpleNamespace(shutdown=AsyncMock())
+    shutdown = asyncio.create_task(shard._shutdown())
+    await asyncio.wait_for(dropping.wait(), 2)
+    try:
+        assert shard._groups["resident"].closing
+        with pytest.raises(RuntimeGroupError, match="resource-accounted train scope"):
+            await shard.start_group("train", "late", (), start_session_ids=(), resumable_eager_session_generation=True)
+        with pytest.raises(RuntimeGroupError, match="new paused rollout"):
+            await shard.resume_generation(1)
+        assert not shard._train_generation_open
+    finally:
+        release.set()
+        await asyncio.wait_for(shutdown, 2)
+    assert not shard._groups
+
+    # A prepare already waiting for a resident permit must observe permanent
+    # closing before reserving physical credits or submitting registration.
+    runtime._resident_group_permits = asyncio.Semaphore(0)
+    pending = asyncio.create_task(runtime.prepare_group(GroupInput("late", [Sample(prompt="p")])))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    runtime._eager_closing = True
+    runtime._resident_group_permits.release()
+    with pytest.raises(RuntimeGroupError, match="Runtime is closing"):
+        await asyncio.wait_for(pending, 2)
+    assert runtime.session_capacity_snapshot()["outstanding"] == 0

@@ -96,18 +96,32 @@ class PrepareDomain:
         prepare_fetch_task = self._prepare_fetch_task
         self._prepare_fetch_task = None
         self._pending_group_inputs.clear()
-        tasks = list(self._warming_prepare_tasks)
+        await self._discard_prepared_tasks(() if prepare_fetch_task is None else (prepare_fetch_task,))
+
+    async def _discard_prepared_tasks(self, extra_tasks: tuple[asyncio.Task, ...] = ()) -> None:
+        tasks = list(extra_tasks)
+        tasks.extend(self._warming_prepare_tasks)
         tasks.extend(self._ready_prepare_tasks)
-        if prepare_fetch_task is not None:
-            tasks.append(prepare_fetch_task)
         for task in tasks:
             task.cancel()
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         self._warming_prepare_tasks.clear()
         self._ready_prepare_tasks.clear()
-        for outcome in outcomes:
+        # A completed Prepare task owns a registered stream even when it was
+        # never leased. Cancelling that already-done task cannot release it.
+        streams = {outcome.group_id: outcome for outcome in outcomes if isinstance(outcome, RuntimeGroupStream)}
+        drops = await asyncio.gather(
+            *(self.runtime_domain.drop_group(stream) for stream in streams.values()), return_exceptions=True
+        )
+        for outcome in (*outcomes, *drops):
             if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
                 raise outcome
+
+    async def discard_step(self) -> None:
+        """Release surplus preparation while retaining unfetched/deferred
+        input."""
+        self.close_step()
+        await self._discard_prepared_tasks()
 
     async def drain_step(self) -> None:
         """Join declined preparation before a fixed-step weight update."""

@@ -347,6 +347,8 @@ class AgenticResidentPipeline:
             await stop_sglang_profile(self.args, rollout_id)
             profile_stopped = True
             rollout_time = time.monotonic() - started_at
+            metrics["perf/rollout_time"] = rollout_time
+            metrics["perf/rollout_accepted_samples"] = len(samples)
             if samples:
                 last_sample = samples[-1]
                 logger.info(
@@ -691,6 +693,8 @@ class AgenticResidentPipeline:
         )
         retain_resident_tail = not context.final_backfill and (self.args.partial_rollout or self.args.fully_async)
         if not retain_resident_tail:
+            if getattr(self.args, "agentic_eager_session_generation", False):
+                await self.prepare_domain.discard_step()
             await finish_before_cancellation(
                 self._cancel_active_group_tasks(
                     rollout_id=context.rollout_id,
@@ -699,6 +703,8 @@ class AgenticResidentPipeline:
                 ),
                 "agentic-groups-discard",
             )
+            if getattr(self.args, "agentic_eager_session_generation", False):
+                self.runtime_domain._assert_epoch_drained()
         elif dynamic_close:
             # Generation is now paused. Harvest Group tasks already complete,
             # append their aligned FIFO prefix, seal the partition, and wait for
@@ -716,6 +722,9 @@ class AgenticResidentPipeline:
                     "session_capacity/confirmed_releases": capacity["confirmed_releases"],
                     "session_capacity/incremental": int(capacity["incremental_session_start"]),
                     "session_capacity/fixed_step_eager": int(getattr(self.args, "agentic_fixed_step_eager", False)),
+                    "session_capacity/resumable_eager": int(
+                        getattr(self.args, "agentic_eager_session_generation", False)
+                    ),
                 }
             )
         return RolloutFnTrainOutput(samples=context.output_groups, metrics=metrics)

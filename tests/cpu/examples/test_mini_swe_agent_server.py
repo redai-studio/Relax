@@ -34,6 +34,27 @@ if str(_EXAMPLE_DIR) not in sys.path:
 agent_server = importlib.import_module("agent_server")
 
 
+@pytest.mark.parametrize("resumable", [False, True])
+def test_resumable_model_read_wait_uses_runtime_deadline(monkeypatch, resumable):
+    monkeypatch.setenv("AGENT_SERVER_RESUMABLE_GENERATION", "1" if resumable else "0")
+    captured = {}
+
+    def completion(**kwargs):
+        captured.update(kwargs)
+        return "response"
+
+    monkeypatch.setattr("litellm.completion", completion)
+    model = agent_server.MyLitellmModel(model_name="openai/test", model_kwargs={"timeout": 7200})
+    assert model._query([{"role": "user", "content": "task"}]) == "response"
+    if resumable:
+        assert captured["timeout"].read is None
+        assert captured["timeout"].connect == captured["timeout"].write == captured["timeout"].pool == 30.0
+    else:
+        assert captured["timeout"] == 7200
+    assert json.loads(model.config.model_dump_json())["model_kwargs"]["timeout"] == 7200
+    assert agent_server.SETUP_AND_REWARD_TIMEOUT_SECONDS == 300
+
+
 def test_tracked_run_preserves_nonzero_exit() -> None:
     result = agent_server._tracked_run(["bash", "-c", "exit 7"], text=True)
     assert result.returncode == 7
