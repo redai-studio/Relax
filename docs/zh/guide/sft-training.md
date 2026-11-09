@@ -24,6 +24,33 @@ SFT 通过 `--loss-type sft` 启用。该模式下，Relax 会启动一个 SFT p
 | [`run-qwen3.5-9B-classification-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh) | SST-2、AG News 或 GoEmotions | `Qwen3.5-9B` | 8 GPU Actor，加 SFT producer | 全参数二分类、多分类或多标签序列分类 SFT。 |
 | [`run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh) | SST-2、AG News 或 GoEmotions | `Qwen3.5-35B-A3B` | 8 GPU Actor，加 SFT producer | LoRA 序列分类 SFT，默认使用 GoEmotions。 |
 
+## YAML 数据配比与分数据集 loss
+
+Megatron 生成式 SFT/CPT 可将 `--prompt-data` 指向 YAML 配比文件。各数据源使用相同的 `--input-key`、`--label-key` 等样本字段配置，例如：
+
+```yaml
+datasets:
+  general:
+    path: /data/general.jsonl
+    weight: 0.7
+  code:
+    path: /data/code.parquet
+    weight: 0.3
+```
+
+YAML 混合数据自动启用按源训练指标，不需要额外参数。每个 optimizer step 上报：
+
+- `train/dataset/general/loss`：该源的监督 token NLL 总和除以有效监督 token 数。
+- `train/dataset/general/tokens`：实际参与主语言模型监督的 token 数。
+- `train/dataset/general/samples`：进入该 step 的实际样本数，包含零监督 token 的样本，排除对齐用 dummy microbatch。
+- `train/dataset/general/token_fraction`、`sample_fraction`：过滤后，该源占当前 step 实际 token 数和样本数的比例。
+
+其他源同理。数据集名称采用 URL 百分号编码，例如 `code/python` 对应 `code%2Fpython`。统计先跨 microbatch、DP 和 CP 累加，再按源计算 loss；当某源整步没有监督 token 时，只上报 counts，省略未定义的 loss。统计复用普通、chunked 或 fused head 已计算的 token loss，不改变训练目标；原有整体 `train/loss` 保留其配置的归一化方式，因此不一定等于分源 token loss 的加权平均。
+
+配比按完整逻辑 epoch 的样本配额生效，不保证逐 step 的固定比例；过滤和跳过样本也会影响实际训练配比，可结合各源 `samples`、`tokens` 观察。这些指标针对主语言模型训练 loss，不包含 MTP 辅助 loss，不改变已有 eval 指标；FSDP、序列分类、DPO/RM 和自定义 dataset 不在此分源统计范围内。续训时应保持 YAML 和数据快照不变。
+
+开启 `--use-clearml --use-metrics-service` 后，ClearML 为每个数据集单独绘制 `train/dataset/loss_domain_<name>`，图中只有一条 `loss` 曲线；token 数、样本数及占比分别放在 `train/dataset/tokens`、`train/dataset/samples`、`train/dataset/token_fraction`、`train/dataset/sample_fraction` 四张对比图中，以数据集名称区分曲线；整体训练 loss 单独放在 `train/loss` 图（series 为 `loss`），其他训练指标在 `train` 图中；CPT 复用同一统计口径。后台预取会在有界窗口内按数据源、文件归组读取，再恢复逻辑样本顺序交给预处理线程；原始行和处理后样本共用配置的预取容量。这样可以减少反复打开文件，保持配比、shuffle 和 checkpoint 游标不变。首次目录枚举、索引构建仍需单独计时。
+
 ## 数据准备
 
 SFT 脚本默认使用 `DATA_DIR=${SCRIPT_DIR}/data`，除非显式覆盖 `DATA_DIR`。对于可复用训练任务，建议把数据放在持久化存储中，并显式设置 `DATA_DIR`。

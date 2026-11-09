@@ -52,6 +52,12 @@ def test_nonfinite_norm_does_not_drop_skip_counters(monkeypatch, bad_norm, queue
             "train/nonfinite_skips_in_process": 2,
             "train/loss": 0.5,
             "train/zero": 0,
+            "train/dataset/general/loss": 0.4,
+            "train/dataset/code%2Fpython/loss": 0.6,
+            "train/dataset/general/tokens": 12,
+            "train/dataset/general/samples": 2,
+            "train/dataset/general/token_fraction": 0.3,
+            "train/dataset/general/sample_fraction": 0.5,
         }
         if queued:
             adapter = object.__new__(MetricsServiceAdapter)
@@ -72,8 +78,14 @@ def test_nonfinite_norm_does_not_drop_skip_counters(monkeypatch, bad_norm, queue
     assert sdk_logger.report_scalar.call_args_list == [
         call(title="train", series="skipped_nonfinite_grad", value=1, iteration=271),
         call(title="train", series="nonfinite_skips_in_process", value=2, iteration=271),
-        call(title="train", series="loss", value=0.5, iteration=271),
+        call(title="train/loss", series="loss", value=0.5, iteration=271),
         call(title="train", series="zero", value=0, iteration=271),
+        call(title="train/dataset/loss_domain_general", series="loss", value=0.4, iteration=271),
+        call(title="train/dataset/loss_domain_code%2Fpython", series="loss", value=0.6, iteration=271),
+        call(title="train/dataset/tokens", series="general", value=12, iteration=271),
+        call(title="train/dataset/samples", series="general", value=2, iteration=271),
+        call(title="train/dataset/token_fraction", series="general", value=0.3, iteration=271),
+        call(title="train/dataset/sample_fraction", series="general", value=0.5, iteration=271),
     ]
     assert metrics["train/grad_norm"] is bad_norm
     assert not service.metrics_buffer.has_metrics_for_step(271)

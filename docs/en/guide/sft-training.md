@@ -24,6 +24,33 @@ The current launch scripts use `ray job submit` and auto-source [`scripts/entryp
 | [`run-qwen3.5-9B-classification-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-9B` | 8 GPU actor plus SFT producer | Full-parameter binary, multiclass, or multilabel sequence-classification SFT. |
 | [`run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-35B-A3B` | 8 GPU actor plus SFT producer | LoRA sequence-classification SFT; defaults to GoEmotions. |
 
+## YAML mixtures and per-dataset loss
+
+Megatron generative SFT/CPT accepts a YAML mixture through `--prompt-data`. Sources share the same sample field configuration, including `--input-key` and `--label-key`:
+
+```yaml
+datasets:
+  general:
+    path: /data/general.jsonl
+    weight: 0.7
+  code:
+    path: /data/code.parquet
+    weight: 0.3
+```
+
+YAML mixtures automatically enable per-source training metrics, without an extra flag. Each optimizer step reports:
+
+- `train/dataset/general/loss`: summed supervised-token NLL divided by the source's effective supervised-token count.
+- `train/dataset/general/tokens`: effective tokens contributing to the main language-model objective.
+- `train/dataset/general/samples`: accepted samples, including fully masked rows and excluding dummy microbatches used for alignment.
+- `train/dataset/general/token_fraction` and `sample_fraction`: this source's share of the step's actual tokens and samples after filtering.
+
+Other sources use the same suffixes. Source names are URL percent-encoded: `code/python` becomes `code%2Fpython`. Statistics are summed across microbatches, DP and CP before source-specific normalization. Sources without supervised tokens report counts but omit undefined loss. Ordinary, chunked and fused-head paths reuse their existing token losses without changing the training objective. The original aggregate `train/loss` retains its configured normalization, so it need not equal the token-weighted average of source losses.
+
+Mixture weights allocate sample quotas over a complete logical epoch, rather than fixed proportions within every step. Filtering can change the accepted proportions; inspect source sample and token counts. These metrics cover the main language-model training loss, exclude MTP auxiliary loss, and leave evaluation metrics unchanged. FSDP, sequence classification, DPO/RM and custom datasets are outside this source-metric scope. Keep the YAML and data snapshot unchanged when resuming.
+
+With `--use-clearml --use-metrics-service`, ClearML gives each dataset a separate `train/dataset/loss_domain_<name>` chart with a single `loss` series. Counts and fractions use four comparison charts: `train/dataset/tokens`, `train/dataset/samples`, `train/dataset/token_fraction`, and `train/dataset/sample_fraction`, with one series per dataset; overall training loss has its own `train/loss` chart with series `loss`, while other training metrics remain under `train`. CPT uses the same source metrics. Background prefetch groups a bounded raw-row window by source and file, then restores logical sample order before preprocessing; raw rows and processed samples share the configured prefetch capacity. This reduces repeated file opens without changing mixture weights, shuffle, or checkpoint cursors. Initial directory enumeration and index construction remain separate costs.
+
 ## Data Preparation
 
 The SFT scripts default to `DATA_DIR=${SCRIPT_DIR}/data` unless you override `DATA_DIR`. For reusable jobs, put datasets on persistent storage and export `DATA_DIR` explicitly.

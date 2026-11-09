@@ -130,6 +130,20 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
             title, series = k.split("/", 1)
 
             if isinstance(v, int | float | np.floating | np.integer):
+                if k == "train/loss":
+                    title, series = "train/loss", "loss"
+                if title == "train" and series.startswith("dataset/"):
+                    source, separator, metric = series[len("dataset/") :].rpartition("/")
+                    if (
+                        separator
+                        and source
+                        and "/" not in source
+                        and metric in {"loss", "tokens", "samples", "token_fraction", "sample_fraction"}
+                    ):
+                        if metric == "loss":
+                            title, series = f"train/dataset/loss_domain_{source}", "loss"
+                        else:
+                            title, series = f"train/dataset/{metric}", source
                 _logger.report_scalar(
                     title=title,
                     series=series,

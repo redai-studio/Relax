@@ -98,6 +98,7 @@ class ProcessedSample:
     # the dropped pixel_values; None keeps the pixel-shipping default mode.
     image_refs_descriptor: dict[str, Any] | None = None
     pre_shifted_labels: torch.Tensor | None = None
+    dataset_id: int | None = None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -672,6 +673,7 @@ class SFTStreamingDataset:
                 chunk_size=prefetch_chunk_size,
                 max_cached=prefetch_max_cached,
                 num_workers=prefetch_num_workers,
+                prepare_fn=self._prepare_rows,
             )
             logger.info(
                 f"SFTStreamingDataset: prefetch enabled "
@@ -1000,7 +1002,15 @@ class SFTStreamingDataset:
             )
         return out, crossed_epoch
 
-    def _process_one_safe(self, idx: int) -> ProcessedSample | None:
+    def _prepare_rows(self, indices: list[int]) -> dict[int, dict[str, Any]]:
+        """Read a bounded window by source/file; keep logical row identity."""
+        try:
+            return dict(self.reader.iter_batch(indices))
+        except Exception as exc:
+            self._record_first_error(exc)
+            raise
+
+    def _process_one_safe(self, idx: int, row: dict[str, Any] | None = None) -> ProcessedSample | None:
         """Wrapper passed to ``PrefetchBuffer`` worker threads.
 
         The buffer's internal ``try/except`` would otherwise drop the exception
@@ -1010,14 +1020,14 @@ class SFTStreamingDataset:
         the asyncio context.
         """
         try:
-            return self._process_one(idx)
+            return self._process_one(idx, row=row)
         except Exception as exc:
             logger.exception(f"SFTStreamingDataset: failed to process sample idx={idx}")
             self._record_first_error(exc)
             return None
 
-    def _process_one(self, idx: int) -> ProcessedSample | None:
-        rendered = self._render_one(idx)
+    def _process_one(self, idx: int, *, row: dict[str, Any] | None = None) -> ProcessedSample | None:
+        rendered = self._render_one(idx, row=row)
         if rendered is None:
             return None
         try:
@@ -1033,10 +1043,11 @@ class SFTStreamingDataset:
             return None
         return self._build_processed(rendered, prompt_ids, mm_inputs)
 
-    def _render_one(self, idx: int) -> "_RenderedSample | None":
+    def _render_one(self, idx: int, *, row: dict[str, Any] | None = None) -> "_RenderedSample | None":
         if self.tokenizer is None:
             raise RuntimeError("SFTStreamingDataset: tokenizer is required for _render_one")
-        row = self.reader[idx]
+        if row is None:
+            row = self.reader[idx]
         try:
             sample = self.get_canonical_sample(idx, row=row)
         except SFTMultimodalContractError as exc:
@@ -1239,6 +1250,7 @@ class SFTStreamingDataset:
             classification_label=rendered.classification_label,
             multimodal_train_inputs=mm_inputs,
             source_idx=rendered.idx,
+            dataset_id=self.reader.dataset_id(rendered.idx) if hasattr(self.reader, "dataset_id") else None,
             image_refs_descriptor=image_refs_descriptor,
         )
 
@@ -1426,6 +1438,10 @@ def pack_samples_for_tq(
         # assistant/function_call token positions.
         "response_lengths": [1] * len(samples) if is_classification else total_lengths,
     }
+    if any(s.dataset_id is not None for s in samples):
+        if not all(s.dataset_id is not None for s in samples):
+            raise ValueError("dataset ids must be present for every sample in a mixture batch")
+        batch["dataset_ids"] = [s.dataset_id for s in samples]
     if is_classification:
         batch["classification_labels"] = [s.classification_label.tolist() for s in samples]
     if has_pre_shifted_labels:

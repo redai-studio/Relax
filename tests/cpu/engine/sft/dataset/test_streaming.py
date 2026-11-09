@@ -186,6 +186,28 @@ def test_get_batch_by_indices_preserves_requested_physical_order(tmp_path):
     assert [sample.source_idx for sample in samples] == [4, 1, 5]
 
 
+def test_yaml_sft_source_ids_survive_reordering_and_tq(tmp_path):
+    for name in ("a", "b"):
+        _write_jsonl(
+            tmp_path / f"{name}.jsonl",
+            [{"messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": name}]}],
+        )
+    mixture = tmp_path / "mixture.yaml"
+    mixture.write_text("datasets:\n  a: a.jsonl\n  b: b.jsonl\n")
+    dataset = SFTStreamingDataset(
+        str(mixture), tokenizer=_FakeTokenizer(), prompt_key="messages", prefetch_max_cached=0
+    )
+    samples = dataset.get_batch_by_indices([1, 0, 1])
+    assert [(s.source_idx, s.dataset_id) for s in samples] == [(1, 1), (0, 0), (1, 1)]
+    td = dict_to_tensordict(pack_samples_for_tq(samples), batch_size=len(samples))
+    assert td["dataset_ids"].dtype == torch.long
+    assert td["dataset_ids"].tolist() == [1, 0, 1]
+    assert pack_samples_for_tq(samples[:1])["dataset_ids"] == [1]
+    samples[0].dataset_id = None
+    with pytest.raises(ValueError, match="every sample"):
+        pack_samples_for_tq(samples)
+
+
 class _FakeTokenizer:
     """Minimal tokenizer with generation-mask chat-template support."""
 

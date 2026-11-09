@@ -18,7 +18,7 @@ def dataset():
     result._prefetch = None
     result._first_error = None
     result._error_lock = threading.Lock()
-    result._process_one = lambda idx: None if idx % 3 == 0 else SimpleNamespace(source_idx=idx)
+    result._process_one = lambda idx, row=None: None if idx % 3 == 0 else SimpleNamespace(source_idx=idx)
     result.shuffle(0)
     return result
 
@@ -89,7 +89,13 @@ def test_resume_with_real_prefetch_and_filtered_epoch_boundaries(tmp_path, step,
 
     args, original, restored = config(tmp_path), dataset(), dataset()
     for value in (original, restored):
-        value._prefetch = PrefetchBuffer(value._process_one, chunk_size=2, max_cached=4, num_workers=2)
+        value._prefetch = PrefetchBuffer(
+            value._process_one,
+            chunk_size=2,
+            max_cached=4,
+            num_workers=2,
+            prepare_fn=lambda indices: dict.fromkeys(indices),
+        )
         value.shuffle(0)
     try:
         for batch in range(step):
