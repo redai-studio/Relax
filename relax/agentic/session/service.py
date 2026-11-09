@@ -3070,7 +3070,10 @@ class AgenticSessionShard:
                     f"agent export failed for {session.session_id}: {type(error).__name__}: {error}"
                 )
                 failure = ("export_failed", "infra", str(outcome))
-        await self._finish_session(session, outcome, failure=failure)
+            # Hand the outcome over before releasing the lock: a drop queued behind
+            # this export must find the finish task that carries the export.
+            finish_task = self._start_finish_task(session, outcome, failure)
+        await asyncio.shield(finish_task)
 
     async def _build_session_export_transport(
         self,
@@ -3255,17 +3258,29 @@ class AgenticSessionShard:
         """Give cleanup, publication, and Group removal one task owner."""
 
         async with session.lock:
-            finish_task = session.finish_task
-            if finish_task is None:
-                session.phase = SessionPhase.FINALIZING
-                if session.observation is not None and session.observation.failure is None and failure is not None:
-                    session.observation.failure = failure
-                finish_task = asyncio.create_task(
-                    self._finish_session_once(session, outcome),
-                    name=f"session-finish:{session.session_id}",
-                )
-                session.finish_task = finish_task
+            finish_task = self._start_finish_task(session, outcome, failure)
         return await asyncio.shield(finish_task)
+
+    def _start_finish_task(
+        self,
+        session: _SessionRecord,
+        outcome: _SessionResultPayload,
+        failure: tuple[str, str, str] | None,
+    ) -> "asyncio.Task[Optional[BaseException]]":
+        """Return the Session's finish task, starting it with this outcome if
+        none exists; the caller holds ``session.lock``."""
+
+        finish_task = session.finish_task
+        if finish_task is None:
+            session.phase = SessionPhase.FINALIZING
+            if session.observation is not None and session.observation.failure is None and failure is not None:
+                session.observation.failure = failure
+            finish_task = asyncio.create_task(
+                self._finish_session_once(session, outcome),
+                name=f"session-finish:{session.session_id}",
+            )
+            session.finish_task = finish_task
+        return finish_task
 
     async def _finish_session_once(
         self,

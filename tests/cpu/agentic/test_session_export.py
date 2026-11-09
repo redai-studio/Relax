@@ -280,6 +280,42 @@ def test_cancelled_finalize_finishes_export_before_propagating():
     assert session.forest is None and not shard._session_records
 
 
+def test_group_drop_during_export_retires_the_export():
+    shard = _shard()
+    gated = _GatedMaterialize(shard)
+    shard._materialize_session_exports = gated
+    session = _session(shard, "s0")
+    recorder = shard._trajectory_recorder
+    recorded, retired = [], []
+    record, record_export_failure = recorder.record, recorder.record_export_failure
+
+    def spy_record(*args, **kwargs):
+        recorded.append(args)
+        return record(*args, **kwargs)
+
+    def spy_failure(exports, **kwargs):
+        retired.append(kwargs.get("reason_code"))
+        return record_export_failure(exports, **kwargs)
+
+    recorder.record, recorder.record_export_failure = spy_record, spy_failure
+
+    async def scenario():
+        session.resources.watcher_task = asyncio.create_task(
+            finish_before_cancellation(shard._finalize_terminal_session(session), "session-finalize:s0")
+        )
+        await _wait_started(gated)
+        drop = asyncio.create_task(shard._drop_group(session.group))
+        await asyncio.sleep(0.01)  # The drop now waits for the Session lock.
+        gated.gate.set()
+        await asyncio.wait_for(drop, 10)
+
+    asyncio.run(scenario())
+    # The recorded export is retired instead of being silently lost.
+    assert isinstance(session.result_cell.payload, service.SessionExportTransport)
+    assert len(recorded) == 1 and retired == ["group_discarded_before_delivery"]
+    assert not shard._groups and not shard._session_records
+
+
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
@@ -291,17 +327,17 @@ def test_worker_errors_keep_their_failure_mapping(error, expected):
     shard = _shard()
     session = _session(shard, "s0")
     failures = []
-    real_finish = shard._finish_session
+    real_start = shard._start_finish_task
 
     def materialize(**kwargs):
         raise error
 
-    async def finish(session, outcome, *, failure=None):
+    def start(session, outcome, failure):
         failures.append((outcome, failure))
-        return await real_finish(session, outcome, failure=failure)
+        return real_start(session, outcome, failure)
 
     shard._materialize_session_exports = materialize
-    shard._finish_session = finish
+    shard._start_finish_task = start
     asyncio.run(shard._finalize_terminal_session(session))
     ((outcome, failure),) = failures
     assert failure[0] == expected
