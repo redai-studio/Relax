@@ -31,6 +31,8 @@ def _validate_flops_configuration(args: Namespace) -> None:
         raise ValueError("FLOPs balancing does not support wholepack")
     if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
         raise ValueError("FLOPs balancing does not support fully-async streaming/drain scheduling")
+    if getattr(args, "advantage_estimator", None) == "m2po":
+        raise ValueError("FLOPs balancing does not support microbatch-dependent M2PO clipping")
     if getattr(args, "loss_type", None) in ("dpo", "rm"):
         raise ValueError("FLOPs balancing does not support preference pairs")
     auxiliary = getattr(args, "moe_aux_loss_coeff", 0.0)
