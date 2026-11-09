@@ -690,6 +690,16 @@ These environment variables are for tuning and troubleshooting; all are optional
 | `--rlsp-server-port` | int | 8234 | RLSP Server HTTP port |
 | `--custom-config-path` | str | None | Custom parameter YAML config file path. Key-value pairs in file override existing parameters |
 
+### Restricting the policy output vocabulary
+
+For Megatron online RL with native SGLang or Agentic rollout, an optional `policy_vocab_size` setting in the YAML passed to `--custom-config-path` restricts output IDs to `[0, policy_vocab_size)`. For example, if the model's intended output range contains 32,000 tokens:
+
+```yaml
+policy_vocab_size: 32000
+```
+
+The value must be a positive integer no larger than the HF text model's configured vocabulary. It masks the same output rows during sampling and training log-probability, entropy, and Score Centering calculations without changing embedding shapes or Megatron TP padding. Omit it to retain existing behavior. Choose the range from the model's output-token contract, including valid special tokens; tokenizer length alone does not establish that range. This setting does not support offline SFT/DPO/RM or FSDP. Custom generation functions that bypass the native request builder must apply the same restriction themselves.
+
 ---
 
 ## Debug & Profiling Parameters

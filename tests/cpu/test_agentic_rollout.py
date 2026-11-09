@@ -700,7 +700,10 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
 
 
 @pytest.mark.parametrize("lifecycle_enabled", [False, True])
-async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypatch, lifecycle_enabled) -> None:
+@pytest.mark.parametrize("policy_limit", [None, 5])
+async def test_generate_preserves_history_routing_and_session_lifecycle(
+    monkeypatch, lifecycle_enabled, policy_limit
+) -> None:
     calls = []
 
     async def fake_post(url, payload, headers=None, fail_fast_no_workers=False):
@@ -712,6 +715,11 @@ async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypa
 
     monkeypatch.setattr(runtime_mod, "post", fake_post)
     adapter = _backend_adapter(lifecycle_enabled=lifecycle_enabled)
+    import relax.utils.policy_vocab as policy_vocab
+
+    monkeypatch.setattr(policy_vocab, "get_hf_config", lambda path: SimpleNamespace(vocab_size=8))
+    adapter._args.policy_vocab_size = policy_limit
+    adapter._args.hf_checkpoint = "model"
     adapter._args.sglang_router_ip = None
     shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
     shard.args = adapter._args
@@ -733,6 +741,8 @@ async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypa
     url, payload, headers, fail_fast = calls[0]
     assert url == "http://10.0.0.1:8000/generate"
     assert payload["input_ids"] == [1, 2, 3] and payload["rid"] == "r"
+    if policy_limit is not None:
+        assert payload["sampling_params"]["logit_bias"] == {"5": -1e30, "6": -1e30, "7": -1e30}
     assert "session_params" not in payload
     if lifecycle_enabled:
         assert payload["session_id"] == "s"

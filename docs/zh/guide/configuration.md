@@ -690,6 +690,16 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 | `--rlsp-server-port` | int | 8234 | RLSP Server HTTP 端口 |
 | `--custom-config-path` | str | None | 自定义参数 YAML 配置文件路径。文件中的 key-value 会覆盖已有参数 |
 
+### 限制策略输出词表
+
+使用 Megatron 在线 RL，并通过原生 SGLang 或 Agentic 路径生成时，可以在 `--custom-config-path` 指向的 YAML 中设置 `policy_vocab_size`，将输出 token ID 限制在 `[0, policy_vocab_size)`。例如，模型约定的有效输出范围包含 32,000 个 token 时：
+
+```yaml
+policy_vocab_size: 32000
+```
+
+该值必须是正整数，且不超过 HF 文本模型配置中的词表大小。采样及训练端的 log-probability、entropy、Score Centering 计算会屏蔽相同的输出行，不改变 embedding 形状或 Megatron TP padding。未设置时保持原有行为。请根据模型的输出 token 约定选择范围，并包含有效的特殊 token，不能仅凭 tokenizer 长度推断。该配置不支持离线 SFT/DPO/RM 或 FSDP。绕过原生请求构建器的自定义生成函数需要自行应用同样的限制。
+
 ---
 
 ## 调试与性能分析参数

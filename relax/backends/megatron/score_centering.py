@@ -12,6 +12,7 @@ from relax.utils.opd.opd_utils import compute_log_probs_on_topk_token_ids
 from relax.utils.training.ppo_utils import calculate_log_probs_and_entropy
 
 from .cp_utils import all_gather_with_cp, slice_log_prob_with_cp
+from .policy_vocab import mask_policy_logits
 
 
 def _mask_vocab_logits(logits: torch.Tensor, args: Namespace) -> torch.Tensor:
@@ -20,11 +21,15 @@ def _mask_vocab_logits(logits: torch.Tensor, args: Namespace) -> torch.Tensor:
     vocab_size = getattr(args, "score_centering_vocab_size", None)
     if vocab_size is None or vocab_size <= 0:
         raise ValueError("Score centering requires the model's unpadded vocabulary size.")
-    tp_rank = mpu.get_tensor_model_parallel_rank()
-    vocab_ids = torch.arange(logits.size(-1), device=logits.device) + tp_rank * logits.size(-1)
-    # A finite floor has zero softmax mass in fp32 and keeps the existing entropy
-    # kernel's p * logits finite on padded entries (0 * -inf would be NaN).
-    return logits.masked_fill(vocab_ids >= vocab_size, torch.finfo(logits.dtype).min)
+    policy_limit = getattr(args, "policy_vocab_size", None)
+    if policy_limit is not None:
+        vocab_size = min(vocab_size, policy_limit)
+    return mask_policy_logits(
+        logits,
+        vocab_size=vocab_size,
+        tp_rank=mpu.get_tensor_model_parallel_rank(),
+        tp_size=mpu.get_tensor_model_parallel_world_size(),
+    )
 
 
 def align_score_centering_candidate_ids(

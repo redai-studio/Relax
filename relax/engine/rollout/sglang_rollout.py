@@ -52,6 +52,7 @@ from relax.utils.opd.opd_multimodal import (
     validate_image_input_ids,
     validate_prompt_token_ids,
 )
+from relax.utils.policy_vocab import configure_policy_vocab_request
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.score_centering import (
@@ -447,6 +448,7 @@ async def generate(
 
     if opd_enabled:
         state.opd_manager.before_rollout(payload)
+    configure_policy_vocab_request(args, payload)
     sc_sampling_mode = configure_score_centering_request(args, payload) if not evaluation else None
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
     # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the

@@ -88,6 +88,7 @@ from relax.utils.opd.opd_utils import (
     consume_opd_train_data,
     has_managed_opd_teacher_manager,
 )
+from relax.utils.policy_vocab import resolve_policy_vocab_size
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
@@ -453,6 +454,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
 
+        text_config = getattr(self.hf_config, "text_config", self.hf_config)
+        policy_vocab_size = resolve_policy_vocab_size(args, model_vocab_size=text_config.vocab_size)
+
         from relax.utils.training.flops_counter import FlopsCounter
 
         self.flops_counter = FlopsCounter(self.hf_config)
@@ -529,8 +533,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
         if self.args.advantage_estimator == "score_centering":
-            text_config = getattr(self.hf_config, "text_config", self.hf_config)
-            self.args.score_centering_vocab_size = text_config.vocab_size
+            self.args.score_centering_vocab_size = policy_vocab_size or text_config.vocab_size
         # Hybrid mode uses the TensorBackuper path: actor handles ref/actor_fwd
         # internally via _switch_model and pushes weights to rollout via
         # UpdateWeightFromTensor instead of DCS.

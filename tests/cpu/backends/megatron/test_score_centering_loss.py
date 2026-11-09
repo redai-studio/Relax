@@ -140,8 +140,8 @@ def _score_inputs():
     return logits, tokens, ids
 
 
-def _dense_scoring(logits, tokens, ids, temperature):
-    logp = (logits[0, 1:7, :5] / temperature).log_softmax(-1)
+def _dense_scoring(logits, tokens, ids, temperature, vocab_size=5):
+    logp = (logits[0, 1:7, :vocab_size] / temperature).log_softmax(-1)
     sample = logp.gather(-1, tokens[2:, None]).squeeze(-1)
     head = logp.gather(-1, ids)
     entropy = -(logp.exp() * logp).sum(-1)
@@ -181,6 +181,49 @@ def test_scoring_uses_real_vocab_once_for_sample_head_and_entropy(monkeypatch):
         response_lengths=[6],
     )
     torch.testing.assert_close(reference["log_probs"][0], expected[0])
+
+
+@pytest.mark.parametrize("estimator", ["grpo", "score_centering"])
+def test_explicit_policy_vocab_controls_probabilities_and_gradients(monkeypatch, estimator):
+    loss, _ = _backend(monkeypatch)
+    args = _args(advantage_estimator=estimator, policy_vocab_size=5, score_centering_vocab_size=8)
+    base, tokens, ids = _score_inputs()
+    logits = base.clone().requires_grad_()
+    oracle = base.clone().requires_grad_()
+    sc = estimator == "score_centering"
+    _, result = loss.get_log_probs_and_entropy(
+        logits,
+        args=args,
+        unconcat_tokens=[tokens],
+        total_lengths=[8],
+        response_lengths=[6],
+        gather_topk_token_ids=[ids] if sc else None,
+        with_entropy=True,
+        with_topk=True,
+        topk_k=2,
+    )
+    expected = _dense_scoring(oracle, tokens, ids, args.rollout_temperature)
+    keys = ("log_probs", "topk_log_probs", "entropy") if sc else ("log_probs", "entropy")
+    references = expected if sc else (expected[0], expected[2])
+    for key, reference in zip(keys, references, strict=True):
+        torch.testing.assert_close(result[key][0], reference)
+    assert (result["topk_token_ids"][0] < 5).all()
+    sum(result[key][0].sum() for key in keys).backward()
+    sum(value.sum() for value in references).backward()
+    torch.testing.assert_close(logits.grad, oracle.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_policy_vocab_rejects_chunked_sft_instead_of_masking_hidden_states(monkeypatch):
+    loss, _ = _backend(monkeypatch)
+    with pytest.raises(ValueError, match="online RL"):
+        loss.get_log_probs_and_entropy(
+            torch.zeros(1, 2, 3),
+            args=_args(loss_type="sft", policy_vocab_size=2),
+            unconcat_tokens=[torch.tensor([0, 1])],
+            total_lengths=[2],
+            response_lengths=[1],
+            lm_head_forward=lambda value: (value, None),
+        )
 
 
 @pytest.mark.parametrize("dynamic", [False, True])
@@ -270,7 +313,8 @@ def _distributed_scoring_worker(rank, init_file, kind):
     try:
         with pytest.MonkeyPatch.context() as monkeypatch:
             is_cp = kind.startswith("cp")
-            loss, cp = _backend(monkeypatch, rank=rank, tp_size=2 if kind == "tp" else 1, cp_size=2 if is_cp else 1)
+            is_tp = kind.startswith("tp")
+            loss, cp = _backend(monkeypatch, rank=rank, tp_size=2 if is_tp else 1, cp_size=2 if is_cp else 1)
             args = _args(allgather_cp=is_cp)
             cp_kwargs = {}
             if kind == "cp_dynamic":
@@ -279,13 +323,24 @@ def _distributed_scoring_worker(rank, init_file, kind):
                 monkeypatch.setattr(loss.mpu, "get_context_parallel_rank", lambda: 1 - rank)
                 monkeypatch.setattr(loss.mpu, "get_context_parallel_world_size", lambda: 4)
             base, tokens, ids = _score_inputs()
+            limit = 5
+            if kind in {"tp_policy", "tp_policy_empty"}:
+                limit = 3 if kind == "tp_policy_empty" else 5
+                tokens, ids = tokens % limit, ids % limit
+                args.policy_vocab_size = limit
+                args.score_centering_vocab_size = 8
+                if kind == "tp_policy":
+                    args.advantage_estimator = "grpo"
+            sc = args.advantage_estimator == "score_centering"
             expected_base = base.clone().requires_grad_()
-            expected = _dense_scoring(expected_base, tokens, ids, args.rollout_temperature)
+            expected = _dense_scoring(expected_base, tokens, ids, args.rollout_temperature, limit)
+            if not sc:
+                expected = expected[0], expected[2]
             response_length = 1 if kind == "cp_empty_rank" else 6
             if response_length == 1:
                 expected = tuple(value[-1:] for value in expected)
                 ids = ids[-1:]
-            if kind == "tp":
+            if is_tp:
                 local = base[..., rank * 4 : (rank + 1) * 4].clone().requires_grad_()
                 local_ids = ids
             else:
@@ -297,11 +352,12 @@ def _distributed_scoring_worker(rank, init_file, kind):
                 unconcat_tokens=[tokens],
                 total_lengths=[8],
                 response_lengths=[response_length],
-                gather_topk_token_ids=[local_ids],
+                gather_topk_token_ids=[local_ids] if sc else None,
                 with_entropy=True,
                 **cp_kwargs,
             )
-            actual = tuple(result[key][0] for key in ("log_probs", "topk_log_probs", "entropy"))
+            keys = ("log_probs", "topk_log_probs", "entropy") if sc else ("log_probs", "entropy")
+            actual = tuple(result[key][0] for key in keys)
             for value, reference in zip(actual, expected, strict=True):
                 if is_cp:
                     reference = cp.slice_log_prob_with_cp(reference, 8, response_length, **cp_kwargs)
@@ -311,7 +367,7 @@ def _distributed_scoring_worker(rank, init_file, kind):
             sum(value.sum() for value in expected).backward()
             expected_grad = (
                 expected_base.grad[..., rank * 4 : (rank + 1) * 4]
-                if kind == "tp"
+                if is_tp
                 else expected_base.grad[:, rank * 4 : (rank + 1) * 4]
             )
             torch.testing.assert_close(local.grad, expected_grad, atol=1e-6, rtol=1e-5)
@@ -322,7 +378,7 @@ def _distributed_scoring_worker(rank, init_file, kind):
 def _distributed_scoring_matrix_worker(rank: int, init_dir: str) -> None:
     # Reuse interpreters; keep fresh process groups and monkeypatch scopes per case.
     torch.set_num_threads(1)
-    for kind in ("tp", "cp", "cp_empty_rank", "cp_dynamic"):
+    for kind in ("tp", "tp_policy", "tp_policy_empty", "cp", "cp_empty_rank", "cp_dynamic"):
         try:
             _distributed_scoring_worker(rank, f"{init_dir}/{kind}", kind)
         except Exception as exc:

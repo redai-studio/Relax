@@ -15,7 +15,7 @@ from relax.algorithms import get_algorithm
 from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
 from relax.algorithms.policy import compute_policy_loss_for
 from relax.algorithms.spec import ALGORITHM_SPECS
-from relax.engine.sft.runtime import is_sft_mode
+from relax.engine.sft.runtime import is_offline_mode, is_sft_mode
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.env import Envs
 from relax.utils.misc import load_function
@@ -53,6 +53,7 @@ from .cp_utils import (
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
+from .policy_vocab import mask_policy_logits
 from .score_centering import (
     align_score_centering_candidate_ids,
     build_score_centering_context,
@@ -411,6 +412,9 @@ def get_log_probs_and_entropy(
         includes "topk_log_probs" key with list of `[R, K]` tensors.
     """
     assert non_loss_data
+    policy_vocab_size = getattr(args, "policy_vocab_size", None)
+    if policy_vocab_size is not None and (is_offline_mode(args) or lm_head_forward is not None):
+        raise ValueError("policy_vocab_size is supported only for online RL policy scoring and sampling")
 
     is_score_centering = (
         getattr(args, "advantage_estimator", None) is not None
@@ -487,6 +491,13 @@ def get_log_probs_and_entropy(
             dynamic_cp_rank=dynamic_cp_rank,
         )
     ):
+        if policy_vocab_size is not None and not is_score_centering:
+            logits_chunk = mask_policy_logits(
+                logits_chunk,
+                vocab_size=policy_vocab_size,
+                tp_rank=mpu.get_tensor_model_parallel_rank(),
+                tp_size=mpu.get_tensor_model_parallel_world_size(),
+            )
         if is_score_centering:
             chunk = get_score_centering_chunk(
                 logits_chunk,
