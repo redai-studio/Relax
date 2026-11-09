@@ -38,6 +38,7 @@ class SessionGroupProgress:
     protected: bool
     resource_released_session_ids: Tuple[str, ...] = ()
     all_first_ir_arrived: bool = False
+    error: RuntimeGroupError | None = None
 
 
 @dataclass(frozen=True)
