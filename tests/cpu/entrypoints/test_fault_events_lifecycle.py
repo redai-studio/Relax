@@ -131,9 +131,6 @@ def train_loader(monkeypatch):
 
         module.threading = SimpleNamespace(Timer=Watchdog)
         module._hard_exit = hard_exit
-        module.quiesce_serve_routers = lambda: []
-        module.shutdown_serve_router_loops = lambda _owners: None
-        module.shutdown_async_loop = lambda: None
         return module, events, timers
 
     yield load
@@ -193,7 +190,7 @@ def test_train_runtime_preserves_success_and_failure_cleanup(train_loader, monke
         if fail_at != "tracking":
             assert events.index("fault_close") < events.index("controller_shutdown")
     timeout = 60 if expected else 1800
-    assert timers == [("start", timeout, (expected or 1,)), ("cancel", timeout, (expected or 1,))]
+    assert timers == [("start", timeout, (expected,)), ("cancel", timeout, (expected,))]
 
 
 def test_train_default_off_does_not_start_runtime(train_loader, monkeypatch):

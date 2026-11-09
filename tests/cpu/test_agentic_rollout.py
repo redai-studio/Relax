@@ -668,7 +668,7 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     expected: bool,
 ) -> None:
     pipeline = object.__new__(AgenticResidentPipeline)
-    pipeline.args = SimpleNamespace(fully_async=fully_async, max_staleness=1)
+    pipeline.args = SimpleNamespace(fully_async=fully_async)
     pipeline.transfer_domain = SimpleNamespace(total_debt=debt, previous_debt=previous_debt)
     pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=tuple(range(interrupted_count)))
 
@@ -680,17 +680,6 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
         get_manager.assert_not_called()
     else:
         get_manager.assert_called_once_with()
-
-
-def test_zero_staleness_keeps_generation_open_until_partition_is_complete() -> None:
-    pipeline = object.__new__(AgenticResidentPipeline)
-    pipeline.args = SimpleNamespace(fully_async=True, max_staleness=0)
-    pipeline.transfer_domain = SimpleNamespace(total_debt=1, previous_debt=0)
-    pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=("tool-idle-group",))
-    context = _StepContext(rollout_id=0, final_backfill=False)
-    assert not pipeline._step_can_close(context)
-    pipeline.transfer_domain.total_debt = 0
-    assert pipeline._step_can_close(context)
 
 
 def test_runtime_gap_counts_current_debt_oversampling_and_resident_tail() -> None:
@@ -1548,7 +1537,6 @@ def _router_recovery_shard():
         router_cb_timeout_duration_secs=0,
     )
     shard._train_generation_open = True
-    shard._eager_gate_lock = asyncio.Lock()
     shard._state_revision = 0
     shard._state_changed = asyncio.Event()
     group = ResidentGroup(rollout_mode="train", group_id="g1", result_cells={}, sessions=[])
