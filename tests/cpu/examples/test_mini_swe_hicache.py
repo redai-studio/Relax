@@ -29,6 +29,8 @@ def submission(tmp_path):
         "run_mini_swe_agent_hicache_blackwell.sh",
     ):
         shutil.copy2(EXAMPLE / name, example / name)
+    (example / "scripts").mkdir()
+    shutil.copy2(EXAMPLE / "scripts/run-qwen35-35B-A3B-8xgpu-hicache-fully-async.sh", example / "scripts")
     models = repo / "scripts/models"
     models.mkdir(parents=True)
     (models / "qwen35-35B-A3B.sh").write_text("MODEL_ARGS=()\n")
@@ -126,6 +128,48 @@ def test_blackwell_submission_preserves_128k_and_complete_group_batch(submission
     runtime = json.loads(last_value("--runtime-env-json"))["env_vars"]
     assert runtime["AGENT_SERVER_MAX_TURNS"] == "100"
     assert runtime["AGENT_SERVER_SUPERVISED_SESSIONS"] == "1"
+
+
+@pytest.mark.parametrize("scheduling", ["group", "incremental"])
+def test_fully_async_submission_uses_disjoint_four_gpu_roles_and_oversampling(submission, scheduling):
+    example, env = submission
+    env.update(GLOBAL_BATCH_SIZE="256", AGENT_SERVER_TRAIN_CONCURRENCY="64", AGENTIC_SCHEDULING=scheduling)
+    env.pop("RAY_NO_WAIT", None)
+    result = subprocess.run(
+        ["bash", str(example / "scripts/run-qwen35-35B-A3B-8xgpu-hicache-fully-async.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    args = json.loads(Path(env["CAPTURE"]).read_text())
+
+    def last_value(flag):
+        return [args[i + 1] for i, item in enumerate(args) if item == flag][-1]
+
+    assert json.loads(last_value("--resource")) == {"actor": [1, 4], "rollout": [1, 4], "advantages": [1, 0]}
+    assert "--fully-async" in args and "--colocate" not in args
+    assert "--no-wait" not in args and "--use-clearml" in args
+    assert last_value("--global-batch-size") == "256"
+    assert last_value("--rollout-batch-size") == "32"
+    assert last_value("--over-sampling-batch-size") == "48"
+    assert last_value("--num-iters-per-train-update") == "8"
+    assert last_value("--num-steps-per-rollout") == "1"
+    assert last_value("--tensor-model-parallel-size") == last_value("--expert-model-parallel-size") == "4"
+    assert last_value("--context-parallel-size") == "1"
+    assert last_value("--seq-length") == last_value("--sglang-context-length") == "131072"
+    assert last_value("--max-tokens-per-gpu") == "131072"
+    assert last_value("--agentic-concurrency") == ("8" if scheduling == "group" else "48")
+    assert ("--agentic-eager-session-generation" in args) == (scheduling == "incremental")
+    assert "--agentic-fixed-step-eager" not in args
+    assert "--save" not in args and "--save-interval" not in args and "--save-hf" not in args
+    runtime = json.loads(last_value("--runtime-env-json"))["env_vars"]
+    assert runtime["AGENT_SERVER_MAX_TURNS"] == "100"
+    assert runtime["AGENT_SERVER_RESUMABLE_GENERATION"] == "1"
+    assert runtime["AGENT_SERVER_SESSION_MEMORY_MIB"] == "8192"
+    model = yaml.safe_load((EXAMPLE / "hicache-cpu-2x-tp2-blackwell.yaml").read_text())["sglang"][0]
+    assert model["num_gpus_per_engine"] == 2
+    assert sum(group["num_gpus"] for group in model["engine_groups"]) == 4
 
 
 @pytest.mark.parametrize(

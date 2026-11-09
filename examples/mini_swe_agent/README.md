@@ -42,6 +42,9 @@ format and the client process exits when the remote run finishes.
 - `pd-2p2d-tp2.yaml`: pure PD engine allocation without hierarchical caching.
 - `run_mini_swe_agent_hicache.sh`: 8-GPU Mini SWE with CPU caching in regular (default) or PD deployment.
 - `hicache-cpu-4x-tp2.yaml` / `pd-hicache-cpu-2p2d-tp2.yaml`: regular and PD CPU cache configurations.
+- `scripts/run-qwen35-35B-A3B-8xgpu-hicache-fully-async.sh`: four training GPUs plus four rollout GPUs,
+  with oversampling and resumable eager Session scheduling.
+- `hicache-cpu-2x-tp2-blackwell.yaml`: two TP2 rollout engines for the fully async recipe.
 - `pd-hicache-cpu-1p1d-dp2-tp2-ep4.yaml`: one prefill and one decode engine with attention DP2 × TP2, EP4, and CPU cache.
 - `agent_server.py`: HTTP service that leases task rows, runs mini-swe-agent,
   controls execution concurrency, scores task output, and returns final results.
@@ -151,6 +154,77 @@ processes:
 
 Keep these values in a single `--agent-env` occurrence. The Relax argument uses a
 list value, so repeating `--agent-env` can drop earlier entries.
+
+## Train with separate training and rollout GPUs
+
+The fully async Blackwell recipe uses TP4/CP1/EP4 for training and two regular
+TP2 HiCache engines on separate GPUs. It defaults to GBS 256, 32 accepted Groups
+of eight members, an oversampling batch of 48 Groups, and 128 physical Session
+slots. Each completed Group stays intact. Eight TransferQueue batches stream
+the partition into training, with one optimizer update per partition.
+
+After preparing the model, data and venv paths above, set `EXP_ROOT` to a new
+directory for this run and launch:
+
+```bash
+bash scripts/entrypoint/ray-job.sh \
+  examples/mini_swe_agent/scripts/run-qwen35-35B-A3B-8xgpu-hicache-fully-async.sh
+```
+
+The recipe uses a 131072-token context, 100 agent turns and 20 training steps.
+It saves rollout evidence but **does not save checkpoints**. ClearML and metrics
+are enabled using the existing credentials; `PROJECT_NAME`, `EXP_NAME` and
+`RUN_ID` customize experiment naming. Submission blocks by default; set
+`RAY_NO_WAIT=1` for an externally monitored run.
+
+`AGENTIC_SCHEDULING=incremental` enables physical per-Session release,
+incremental member startup and `--agentic-eager-session-generation`. A member
+can generate as soon as its first request is ready, before its peers. Unfinished
+Sessions keep their identities, accumulated token/logprob/version history and
+physical credits across rollout boundaries. Credits return only after confirmed
+external resource release. `AGENTIC_SCHEDULING=group` is a whole-Group admission
+control with the same 128-slot physical upper bound; `atomic` uses the capacity
+ledger with whole-Group startup.
+
+`OVER_SAMPLING_BATCH_SIZE` controls logical candidate Groups, independently of
+the physical slot limit. Failed or filtered Groups are replaced using the
+existing rules. Setup/reward test timeout remains 300 seconds and is still a
+failure; a timeout is not converted to reward zero. Synchronous oversampling
+also supports the new eager flag and explicitly cancels and joins surplus work
+before releasing its resources.
+
+This recipe defaults to `AGENT_SERVER_SESSION_MEMORY_MIB=8192`. A private
+cgroup-v1 memory leaf caps the aggregate worker, container, tools and descendants
+of each Session, including detached subprocesses. The supervisor remains outside
+the leaf to verify cleanup. A kernel OOM kill fails the Session and replaces its
+whole Group, even if a tool parent subsequently reports success. Terminal events
+retain the cap, peak, OOM counter and release evidence. Startup fails if the host
+does not provide a writable, hierarchical cgroup-v1 memory controller with swap
+accounting. Other recipes leave this optional limit disabled by default (`0`).
+Budget the cap times physical slots together with training CPU offload and
+HiCache host pools; the cap is not a reservation. Use the same limit in both
+arms of a scheduling comparison.
+
+The default is `MAX_STALENESS=1`. `MAX_STALENESS=0` requires the current partition to be complete before waiting
+for training; it still overlaps streamed training with the rest of that
+partition's rollout. Positive staleness permits interrupted Groups to carry
+partition debt into the next step; older debt is filled first and final backfill
+opens no extra training partition. The resumable eager flag currently rejects
+partial rollout, prelaunch and dynamic global batch size. The older
+`--agentic-fixed-step-eager` retains its strict synchronous, no-oversampling
+contract.
+
+Each TP2 engine has a 4194304-token KV pool and 1332 Mamba states, with CPU
+HiCache ratio 2. These caches share host memory with training offload, the
+TransferQueue and agent containers. Budget their combined peak when adapting
+the recipe to a different machine. The staleness limit applies to physical
+training partitions, not to the weight-version age of every retained token.
+
+The model client's read deadline is disabled only for this resumable recipe,
+so parked requests survive training pauses. Connection/write/pool deadlines and
+the Runtime's active agent budget remain enforced. TIS uses the actual behavior
+logprobs, including retained trajectories; inline old logprobs are valid here
+because dropout is disabled and each partition receives one optimizer update.
 
 ## Train with prefill–decode disaggregation
 

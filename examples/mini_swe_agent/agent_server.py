@@ -25,6 +25,7 @@ from glob import glob
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
+import httpx
 import pyarrow.dataset as ds
 from flask import Flask, jsonify, request
 from litellm.exceptions import ContextWindowExceededError
@@ -34,6 +35,7 @@ from minisweagent.environments.singularity import SingularityEnvironment, Singul
 from minisweagent.exceptions import FormatError, Submitted
 from minisweagent.models.litellm_model import LitellmModel
 from minisweagent.utils.serialize import recursive_merge
+from session_memory import validate_memory_limit
 
 
 if TYPE_CHECKING:
@@ -416,6 +418,7 @@ class SessionRecord:
     release_nonce: str = ""
     resources_released: bool = False
     cleanup_error: str = ""
+    memory_evidence: dict[str, Any] = field(default_factory=dict)
 
     def finish(self, info: dict[str, Any], error: str) -> None:
         if self.cancel_event.is_set():
@@ -708,6 +711,15 @@ class ApptainerInstanceEnvironment(SingularityEnvironment):
 
 
 class MyLitellmModel(LitellmModel):
+    def _query(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+        if os.environ.get("AGENT_SERVER_RESUMABLE_GENERATION") == "1":
+            # A request may remain parked across weight updates. The Runtime
+            # owns its active-time deadline and supervised process cancellation;
+            # an HTTP wall-clock read deadline must not count paused time.
+            # Pass this only at call time so saved model config remains JSON-safe.
+            kwargs["timeout"] = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+        return super()._query(messages, **kwargs)
+
     def _parse_actions(self, response: Any) -> list[dict]:
         try:
             return super()._parse_actions(response)
@@ -857,6 +869,8 @@ class AgentServer:
             raise ValueError("AGENT_SERVER_MAX_TURNS must be positive")
         self.base_config["agent"]["step_limit"] = max_turns
         self._supervised = os.environ.get("AGENT_SERVER_SUPERVISED_SESSIONS", "0") == "1"
+        self._memory_limit_mib = int(os.environ.get("AGENT_SERVER_SESSION_MEMORY_MIB", "0"))
+        validate_memory_limit(self._memory_limit_mib, supervised=self._supervised)
         self._stopping = False
         environment_config = self.base_config["environment"]
         self.apptainer_args = (
@@ -1066,6 +1080,7 @@ class AgentServer:
             "instance_name": _new_instance_name(),
             "server_pid": os.getpid(),
             "release_nonce": record.release_nonce,
+            "memory_limit_mib": getattr(self, "_memory_limit_mib", 0),
         }
         spec_path, report_path = control / "spec.json", control / "release.json"
         spec_path.write_text(json.dumps(spec))
@@ -1103,6 +1118,7 @@ class AgentServer:
                 raise RuntimeError("Supervisor release identity mismatch")
             record.resources_released = report["resources_released"] is True
             record.cleanup_error = report["cleanup_error"]
+            record.memory_evidence = report.get("memory", {})
             info, error = report["info"], report["error"]
             if not record.resources_released:
                 error = (error + "\nSession resources remain unconfirmed: " + record.cleanup_error).strip()
@@ -1131,6 +1147,7 @@ class AgentServer:
                 "exit_code": record.exit_code,
                 "error": record.error,
                 "resources_released": record.resources_released,
+                "memory": record.memory_evidence,
             }
             filename = "session_releases.jsonl" if record.status == "completed" else "agent_server_events.jsonl"
         self._append_event(filename, event)
@@ -1394,7 +1411,8 @@ def session_worker(spec_path: str, result_path: str) -> None:
     server.sifs = {key: Path(value) for key, value in spec["sifs"].items()}
     server._worker_instance_name = spec["instance_name"]
     server._run_session(spec["server_session_id"], record.sample_idx)
-    Path(result_path).write_text(
+    temporary = Path(result_path).with_suffix(".tmp")
+    temporary.write_text(
         json.dumps(
             {
                 "info": {
@@ -1407,6 +1425,7 @@ def session_worker(spec_path: str, result_path: str) -> None:
             }
         )
     )
+    temporary.replace(result_path)
 
 
 if __name__ == "__main__":

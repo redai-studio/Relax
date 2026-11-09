@@ -944,7 +944,8 @@ class RuntimeDomain:
             raise ValueError("Standalone eager generation must be an explicit boolean")
         self._standalone_eager_session_generation = standalone_eager_session_generation
         self._fixed_step_eager = rollout_mode == "train" and getattr(args, "agentic_fixed_step_eager", False)
-        self._eager_enabled = standalone_eager_session_generation or self._fixed_step_eager
+        self._resumable_eager = rollout_mode == "train" and getattr(args, "agentic_eager_session_generation", False)
+        self._eager_enabled = standalone_eager_session_generation or self._fixed_step_eager or self._resumable_eager
         self._rollout_epoch: int | None = None
         self._eager_generation_open = False
         self._eager_closing = False
@@ -962,6 +963,16 @@ class RuntimeDomain:
                 )
         if incremental and per_node is None:
             raise ValueError("Incremental startup requires confirmed Session resource accounting")
+        if self._resumable_eager and (
+            standalone_eager_session_generation
+            or self._fixed_step_eager
+            or incremental is not True
+            or any(
+                getattr(args, name, False)
+                for name in ("partial_rollout", "agentic_prelaunch", "use_dynamic_global_batch_size")
+            )
+        ):
+            raise ValueError("Eager Session generation requires incremental synchronous or fully-async steps")
         if self._fixed_step_eager and (
             standalone_eager_session_generation
             or incremental is not True
@@ -1062,6 +1073,8 @@ class RuntimeDomain:
         Runtime capability.
         """
 
+        if self._eager_enabled and self._eager_closing:
+            raise RuntimeGroupError("Eager Runtime is closing")
         prepare_started_at = time.monotonic()
         prepare_started_at_utc = utc_now()
         group_id = group_input.group_id
@@ -1088,9 +1101,11 @@ class RuntimeDomain:
             raise
         reservation: _GroupShardReservation | None = None
         try:
-            if self._standalone_eager_session_generation and self._eager_closing:
-                raise RuntimeGroupError("Standalone eager Runtime is closing")
+            if self._eager_enabled and self._eager_closing:
+                raise RuntimeGroupError("Eager Runtime is closing")
             reservation = await self._reserve_group_shard(group_id, launch_decision, len(group_input.samples))
+            if self._eager_enabled and self._eager_closing:
+                raise RuntimeGroupError("Eager Runtime is closing")
             if self._fixed_step_eager and (
                 epoch != self._rollout_epoch or not self._eager_generation_open or self._eager_closing
             ):
@@ -1113,6 +1128,8 @@ class RuntimeDomain:
             if self._session_capacity is not None:
                 for spec in session_specs:
                     spec.require_resource_release = True
+            if self._eager_enabled and self._eager_closing:
+                raise RuntimeGroupError("Eager Runtime is closing")
             if self._fixed_step_eager and (
                 epoch != self._rollout_epoch or not self._eager_generation_open or self._eager_closing
             ):
@@ -1162,6 +1179,8 @@ class RuntimeDomain:
                 start_options["standalone_eager_session_generation"] = True
             if self._fixed_step_eager:
                 start_options["fixed_step_eager_epoch"] = epoch
+            if self._resumable_eager:
+                start_options["resumable_eager_session_generation"] = True
             if self._session_capacity is not None and self._session_capacity.incremental:
                 start_options["start_session_ids"] = tuple(
                     sid for sid in session_ids if sid in reservation.session_capacity.allocated_ids
@@ -1277,8 +1296,9 @@ class RuntimeDomain:
             if self._session_capacity.available(reservation.node_id):
                 ids = self._session_capacity.grant(reservation)
                 logger.info(
-                    "Agentic incremental grant group=%s epoch=%s members=%d pending=%d used=%d limit=%d",
+                    "Agentic incremental grant group=%s epoch=%s created_epoch=%s members=%d pending=%d used=%d limit=%d",
                     stream.group_id,
+                    self._rollout_epoch,
                     stream.rollout_epoch,
                     len(ids),
                     len(reservation.pending_ids),
@@ -1379,7 +1399,13 @@ class RuntimeDomain:
 
         try:
             if stream.eager_session_generation:
-                expected_epoch = stream.rollout_epoch if self._fixed_step_eager else 0
+                expected_epoch = (
+                    self._rollout_epoch
+                    if self._resumable_eager
+                    else stream.rollout_epoch
+                    if self._fixed_step_eager
+                    else 0
+                )
                 if (
                     rollout_id != expected_epoch
                     or (self._fixed_step_eager and expected_epoch != self._rollout_epoch)
@@ -1415,6 +1441,12 @@ class RuntimeDomain:
                 or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
             ):
                 raise RuntimeGroupError("Fixed-step eager must open a new drained epoch")
+        if self._resumable_eager and (
+            self._eager_closing
+            or self._eager_generation_open
+            or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
+        ):
+            raise RuntimeGroupError("Resumable eager generation must open a new paused rollout")
         self._start_shard_observers()
         revisions = await asyncio.gather(
             *(shard.handle.resume_generation.remote(rollout_id) for shard in self._shards)
@@ -1815,6 +1847,7 @@ class RuntimeDomain:
         self._shards.clear()
         if first_error is not None:
             raise first_error
+        logger.info("Agentic runtime shutdown complete: session_capacity=%s", capacity)
 
     async def _release_shard_group(self, stream: RuntimeGroupStream) -> None:
         """Release driver refs after Shard export/drop commits."""

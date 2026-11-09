@@ -1423,6 +1423,7 @@ class ResidentGroup:
     timing_events: Dict[str, float] = field(default_factory=dict)
     pending_session_specs: Dict[str, SessionSpec] = field(default_factory=dict)
     eager_session_generation: bool = False
+    resumable_eager_session_generation: bool = False
     rollout_epoch: int | None = None
     leased_rollout_id: int | None = None
     first_ir_seen_session_ids: set[str] = field(default_factory=set)
@@ -1447,8 +1448,12 @@ class ResidentGroup:
 
     @property
     def interrupted(self) -> bool:
-        if self.eager_session_generation:
-            return False  # This fixed-step lane never grants fully-async close credit.
+        if self.eager_session_generation and (
+            not self.resumable_eager_session_generation or not self.all_first_ir_arrived or self.closing
+        ):
+            # Unstarted members have no live IRs; they cannot promise async
+            # completion merely because the Session interrupted predicate is true.
+            return False
         if self.ownership is GroupOwnership.PREPARE or self.first_error() is not None or self.dropped:
             return False
         unfinished = sum(not cell.terminal for cell in self.result_cells.values())
@@ -1536,6 +1541,7 @@ class AgenticSessionShard:
         self._train_generation_open = False
         self._standalone_eager_scope = False
         self._fixed_step_eager_scope = getattr(args, "agentic_fixed_step_eager", False)
+        self._resumable_eager_scope = getattr(args, "agentic_eager_session_generation", False)
         self._rollout_epoch: int | None = None
         self._eager_shutdown = False
         self._eager_gate_lock = asyncio.Lock()
@@ -1638,12 +1644,25 @@ class AgenticSessionShard:
         start_session_ids: Optional[Tuple[str, ...]] = None,
         standalone_eager_session_generation: bool = False,
         fixed_step_eager_epoch: int | None = None,
+        resumable_eager_session_generation: bool = False,
     ) -> None:
         """Register every logical member; start only identities with granted
         credits."""
 
         if type(standalone_eager_session_generation) is not bool:
             raise RuntimeGroupError("Eager startup requires an explicit boolean")
+        if type(resumable_eager_session_generation) is not bool:
+            raise RuntimeGroupError("Resumable eager startup requires an explicit boolean")
+        if resumable_eager_session_generation and (
+            not getattr(self, "_resumable_eager_scope", False)
+            or standalone_eager_session_generation
+            or fixed_step_eager_epoch is not None
+            or rollout_mode != "train"
+            or self._eager_shutdown
+            or start_session_ids is None
+            or not all(spec.require_resource_release for spec in session_specs)
+        ):
+            raise RuntimeGroupError("Resumable eager startup requires its resource-accounted train scope")
         if standalone_eager_session_generation:
             if (
                 rollout_mode != "train"
@@ -1695,7 +1714,12 @@ class AgenticSessionShard:
             sessions=[],
             requires_resource_release=any(spec.require_resource_release for spec in session_specs),
             pending_session_specs={spec.session_id: spec for spec in session_specs},
-            eager_session_generation=standalone_eager_session_generation or fixed_step_eager_epoch is not None,
+            eager_session_generation=(
+                standalone_eager_session_generation
+                or fixed_step_eager_epoch is not None
+                or resumable_eager_session_generation
+            ),
+            resumable_eager_session_generation=resumable_eager_session_generation,
             rollout_epoch=0 if standalone_eager_session_generation else fixed_step_eager_epoch,
         )
         for sample_position, session_spec in enumerate(session_specs):
@@ -1748,8 +1772,10 @@ class AgenticSessionShard:
         eager_runtime = (
             group.eager_session_generation
             and group.ownership is GroupOwnership.RUNTIME
-            and group.leased_rollout_id == group.rollout_epoch
-            and self._group_generation_open(group)
+            and (
+                group.resumable_eager_session_generation
+                or (group.leased_rollout_id == group.rollout_epoch and self._group_generation_open(group))
+            )
         )
         if (
             (group.ownership is not GroupOwnership.PREPARE and not eager_runtime)
@@ -1850,7 +1876,8 @@ class AgenticSessionShard:
                 if group.dropped or group.eager_controlled_drop:
                     return
                 if (
-                    rollout_id != group.rollout_epoch
+                    (not group.resumable_eager_session_generation and rollout_id != group.rollout_epoch)
+                    or (group.resumable_eager_session_generation and rollout_id != self._rollout_epoch)
                     or group.closing
                     or self._eager_shutdown
                     or not self._train_generation_open
@@ -1916,7 +1943,10 @@ class AgenticSessionShard:
                 if (
                     self._groups.get(group.group_id) is not group
                     or group.ownership is not GroupOwnership.RUNTIME
-                    or group.leased_rollout_id != group.rollout_epoch
+                    or (
+                        group.leased_rollout_id
+                        != (session.rollout_id if group.resumable_eager_session_generation else group.rollout_epoch)
+                    )
                     or not self._group_generation_open(group)
                     or session.session_id not in group.first_ir_seen_session_ids
                     or session.phase is not SessionPhase.ACTIVE
@@ -1931,10 +1961,10 @@ class AgenticSessionShard:
                     logger.info(
                         "Agentic eager start group=%s epoch=%s session=%s first_ir=%d/%d",
                         group.group_id,
-                        group.rollout_epoch,
+                        session.rollout_id,
                         session.session_id,
                         len(group.first_ir_seen_session_ids),
-                        len(group.sessions),
+                        len(group.result_cells),
                     )
                 if self._group_generation_open(group) and session.phase is SessionPhase.ACTIVE:
                     self._mark_group_timing(group, "group_generation_open_at")
@@ -1975,11 +2005,15 @@ class AgenticSessionShard:
             group.rollout_mode == "train" for group in self._groups.values()
         ):
             raise RuntimeGroupError("Fixed-step eager pause requires all train groups to be released")
-        self._train_generation_open = False
+        # Serialize closing with first-IR activation so an in-flight timer=True
+        # cannot arrive after pause has committed timer=False.
+        async with self._eager_gate_lock:
+            self._train_generation_open = False
         try:
             await self._interrupt_running_requests()
         finally:
-            await self._set_runtime_timeouts_active(False)
+            async with self._eager_gate_lock:
+                await self._set_runtime_timeouts_active(False)
         self._notify_state_change()
         return self._state_revision
 
@@ -2056,28 +2090,38 @@ class AgenticSessionShard:
             ):
                 raise RuntimeGroupError("Fixed-step eager resume requires a new empty epoch")
             self._rollout_epoch = rollout_id
-        # Keep the gate closed until every resident Session carries this step's
-        # rollout ID. A concurrent OpenAI request therefore cannot start with
-        # the preceding step's ID.
-        for group in tuple(self._groups.values()):
-            if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME:
-                for session in tuple(group.sessions):
-                    async with session.lock:
-                        if session.phase is SessionPhase.ACTIVE:
-                            session.rollout_id = rollout_id
-                            if session.protection_pending_until_resume:
-                                session.protection_pending_until_resume = False
-                                session.protected_until_finalize = True
-                                for ir in session.live_irs:
-                                    ir.kind = RequestKind.PROTECTED
+        # Keep the gate closed until every resident Session, including members
+        # still waiting for physical credits, carries this step's rollout ID.
+        async with self._eager_gate_lock:
+            if getattr(self, "_resumable_eager_scope", False):
+                if (
+                    self._eager_shutdown
+                    or self._train_generation_open
+                    or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
+                ):
+                    raise RuntimeGroupError("Resumable eager generation requires a new paused rollout")
+                self._rollout_epoch = rollout_id
+            for group in tuple(self._groups.values()):
+                if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME:
+                    if group.resumable_eager_session_generation:
+                        group.leased_rollout_id = rollout_id
+                    for session in tuple(group.sessions):
+                        async with session.lock:
+                            if session.phase is SessionPhase.ACTIVE:
+                                session.rollout_id = rollout_id
+                                if session.protection_pending_until_resume:
+                                    session.protection_pending_until_resume = False
+                                    session.protected_until_finalize = True
+                                    for ir in session.live_irs:
+                                        ir.kind = RequestKind.PROTECTED
 
-        runtime_groups = tuple(
-            group
-            for group in self._groups.values()
-            if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME
-        )
-        await asyncio.gather(*(self._set_group_timeout_active(group, True) for group in runtime_groups))
-        self._train_generation_open = True
+            runtime_groups = tuple(
+                group
+                for group in self._groups.values()
+                if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME
+            )
+            await asyncio.gather(*(self._set_group_timeout_active(group, True) for group in runtime_groups))
+            self._train_generation_open = True
         for group in runtime_groups:
             await self._open_group(group)
         self._notify_state_change()
@@ -2356,7 +2400,11 @@ class AgenticSessionShard:
     async def _shutdown(self) -> None:
         """Drop resident groups, then release the Shard-owned backend."""
 
-        if getattr(self, "_standalone_eager_scope", False) or getattr(self, "_fixed_step_eager_scope", False):
+        if (
+            getattr(self, "_standalone_eager_scope", False)
+            or getattr(self, "_fixed_step_eager_scope", False)
+            or getattr(self, "_resumable_eager_scope", False)
+        ):
             async with self._eager_gate_lock:
                 self._eager_shutdown = True
                 self._train_generation_open = False

@@ -15,10 +15,12 @@ from typing import Any, Callable, List, Optional, Tuple, cast
 
 from relax.agentic.pipeline import GroupExport
 from relax.agentic.profile import mark_sample_agentic_event, mark_sample_agentic_event_once
+from relax.utils.logging_utils import get_logger
 from relax.utils.types import Sample
 
 
 TransferBatch = Tuple[int, Tuple[GroupExport, ...], bool]
+logger = get_logger(__name__)
 
 
 async def _transfer_batch_to_data_system(
@@ -54,6 +56,14 @@ async def _transfer_batch_to_data_system(
             partition_id=f"train_{partition_id}",
             custom_meta=custom_meta,
             is_last=is_last,
+        )
+        logger.info(
+            "Agentic transfer committed partition=train_%d groups=%s samples=%d is_last=%s effective_tokens=%d",
+            partition_id,
+            [group[0].group_index for group in batch_samples],
+            len(samples),
+            is_last,
+            sum(sum(mask) for mask in rollout_batch["loss_masks"]),
         )
     finally:
         for sample in samples:
