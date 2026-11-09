@@ -50,6 +50,9 @@ from relax.engine.sft.runtime import (
 )
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
+from relax.utils.agentic_obs import agentic_obs_enabled
+from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
+from relax.utils.agentic_obs.run_hooks import annotate_failure_stage
 from relax.utils.async_utils import run
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.micro_batch_ring import (
@@ -2693,6 +2696,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
                     data_fields.append("teacher_log_probs")
+                if agentic_obs_enabled(self.args):
+                    data_fields.extend(OBSERVATION_DATA_FIELDS)
                 with timer("train_get_data"):
                     sub_batch, batch_meta = self._get_data_from_transfer_queue(
                         "train", rollout_id, data_fields, batch_size, batch_index
@@ -2888,6 +2893,8 @@ class MegatronTrainRayActor(TrainRayActor):
             data_fields.append("multimodal_train_inputs")
         if self.args.use_opd:
             consume_opd_train_data(data_fields, self.args)
+        if agentic_obs_enabled(self.args):
+            data_fields.extend(OBSERVATION_DATA_FIELDS)
         if getattr(self.args, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
             # using token-budget fetches, align num_microbatches across DPs
@@ -2996,6 +3003,7 @@ class MegatronTrainRayActor(TrainRayActor):
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
     @timer
+    @annotate_failure_stage("checkpoint")
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
             return

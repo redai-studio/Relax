@@ -681,6 +681,194 @@ Program-aware admission 可以根据预测的 KV 使用量延迟 backend attempt
 配置 `--save-debug-rollout-data <path-with-{rollout_id}>`，可保存完整 metadata、SessionForest state hash、terminal
 status、turn count、request timing、abort count 与 weight-version 信息。
 
+### Agentic 可观测性 JSONL
+
+设置 `--dump-agentic-obs <directory>` 后，Relax 在生成的 `run_*` 目录下写入
+`manifest.json` 和 JSONL 分片。需要收集所有生产节点的文件，或使用共享输出目录。
+每条 JSONL 都包含 `schema_version` 和 `run_id`；`sample_export_id` 使用十进制字符串，
+`samples[]` 内也遵循同一规则。
+
+| 数据流 | 记录与关联键 |
+| --- | --- |
+| `prompts/*.jsonl` | 原始数据行、`prompt_id`、数据集来源、原始 `input_payload`、可选引用和文本预览。 |
+| `groups/*.jsonl` | Runtime Group 创建信息、`group_id`、`group_index`、`prompt_id`、预期 Session 数、模式和创建时间。 |
+| `sessions/*.jsonl` | `session_id`、`group_id`、`prompt_id`、sample/replicate 索引、预期 Group 大小及合并后的采样默认值。 |
+| `trajectories/*.jsonl` | 导出的 lineage、`sample_export_id`、`session_id`、runtime `group_id`、`sample_index` 和 `exported_at`。同一 Sample 的多个 export 共享 sample index，各有独立 export ID。 |
+| `stages/*.jsonl` | 成对的 stage 边界，包含 `stage_id`、`record_id`、`scope`、`event_seq`、`occurred_at` 和 `is_terminal`。trajectory 阶段描述 reward、filter 和 transfer；rollout/update 事件包含 `group_ids` 和 `groups_finalized`。 |
+| `train/*.jsonl` | 每个真实 policy update 的 DP 分片：`update_id`、`train_generation_id`、`stage_id`、`capture_phase=training_input`、`samples[]`、`dp_rank`、`dp_world_size` 和 `input_complete`。 |
+
+目前训练侧支持 Megatron policy actor。Update ID 为 `actor:<rollout_id>:<step_id>`，
+作用域为 `(run_id, train_generation_id)`；一个 rollout 可以包含多次 update。输入在 micro-batch 被实际消费时、
+packing 和 dynamic CP 切分前采集。Dummy batch 不计入，真实的全零 loss mask 样本仍保留。
+每个样本包含完整 response 空间的 `loss_mask`、长度、有效 token 数，以及按 mask 计算的
+advantage/return 统计。Static CP 下统计为 `null`，dynamic CP 在切分前采集完整序列。
+这里的 mask 是训练输入 mask，尚未应用 loss 内部的 TIS/OPSM 筛选。
+
+DP 分片主键是 `(run_id, train_generation_id, update_id, dp_rank)`，平台按
+`(run_id, train_generation_id, update_id)` 合并。Actor group 初始化时为 worker 参数副本
+分配一个共享代际 ID；重新初始化会换新 ID，不改变训练配置，也不增加 collective。
+输入分片还必须匹配对应 DP 边界的 `stage_id`，避免重放 update 时误用旧执行的输入。
+代际 ID 缺失时表示未知。
+每个 DP owner 向 `stages/actor_<rollout_id>_dp_<rank>.jsonl` 写成对的
+`scope=update_fragment` 边界，包含 `dp_world_size`、`step_id`、`train_generation_id`、`update_sequence`
+以及本地 `optimizer_successful` 结果。训练中不再执行观测专用 collective。
+训练异常写 failed/cancelled，此时 optimizer 结果未知，成员集合不完整。
+
+读取端调用 `relax.utils.agentic_obs.merge_train_updates(stage_records, train_records)`。
+只有全部预期 DP 都有唯一、一致的 start/end，且 optimizer 结果均成功，才判定
+`committed`。证据缺失或冲突表示 `unknown`；训练输入分片缺失则独立地令
+`input_complete=false`。旧格式的 `scope=update` 记录原样保留。
+`optimizer_step` 在每个 actor group 代际内从第一次成功 update 开始计数，起始为 1；跳过的 update
+不递增。各 DP 序号历史出现缺口或冲突后，该计数为 null。
+`groups_finalized=true` 表示成员集合封口，不表示样本成功。
+Runtime `group_id` 与 reward 归一化使用的 `group_index` 含义不同。
+
+自定义转换器应提供与输出行对齐的 CPU int64 `sample_export_ids`。身份缺失或非法时，
+补齐 `-1` ID 和空 group ID，训练数据行保持不变，TQ 观测列仍会提供；下游成员集合和
+输入完整性标记为 false。不会按输入顺序猜测输出身份。
+
+Reward 完成和 transfer 回执均不是终态。提交后 TQ RPC 失败时，使用
+`reason_code=transfer_outcome_unknown` 和 `is_terminal=false`，因为远端写入可能已经成功。
+筛选失败和 Eval 完成是 trajectory 终态。平台按 `record_id` 去重，并在对应 scope 的身份内
+按 `event_seq` 排序，不使用跨分片的文件顺序。
+
+训练主进程在 `stages/run.jsonl` 写入生命周期，使用
+`scope=run, stage=execution`。开始时写 `start`，结束时写一个 `completed`、
+`failed` 或 `cancelled` 终态；两条记录共用 `stage_id`，终态的 `event_seq=2`。
+终态的 `occurred_at` 是训练结束时间，`operation` 表示 `startup`、`training`
+或已确认的 `checkpoint` 失败阶段。`reason_code` 为 `run_failed` 或
+`run_cancelled`，`reason` 保留异常类型及错误信息，取消时记录收到的信号。
+Megatron 在 Checkpoint 错误跨 Ray 传递前标注阶段，包括异步保存的收尾错误；
+没有标注时保留主进程所知的较粗阶段，不根据 traceback 文本猜测阶段或配额错误。
+首个终态生效，清理期间的信号不会覆盖已有的完成或失败结果。
+原有 `scope=run, stage=startup` 记录描述已解析的调度计划，不能当作整个 Run 的结果。
+
+平台消费时应分别维护三个状态：
+
+| 展示项 | 判断依据 |
+| --- | --- |
+| 训练 Run | Run execution 终态；缺失时使用权威 Trial 终态兜底。 |
+| 采集新鲜度 | 采集器最近一次成功采集时间及配置的新鲜度阈值。 |
+| Session | 该 Session 自身的执行事件，与 Run 和采集器状态分别判断。 |
+
+不能长期保留登记时的 `Running`。没有 Run 终态或权威 Trial 结果时，采集过期只能显示
+**状态待确认**，不能据此认定成功、失败或取消。Run 已结束也不能证明各生产端文件已收齐。
+`SIGTERM` 和 `SIGINT` 会在远程清理前记录取消；`SIGKILL`、节点消失或观测目录不可写
+可能只留下 start。进程退出但没有记录结果时，Run 结果同样未知。参数解析发生在 Run start
+之前。Checkpoint 存储可能写满时，应将观测文件放在仍有独立配额的存储位置。
+
+Run 失败后仍保留已完成的训练进度：在 Run 内按 `(train_generation_id, update_id)` 去重统计 committed 更新，
+将这些更新各 DP 输入的 `sample_export_id` 关联到 trajectory 的 `session_id`，再跨更新
+去重，得到实际参与训练的 Session。不能仅凭 Group 关联推断 Session 已被消费。
+DP 分片或 trajectory 未收齐时，应展示已观测到的下界或未知成员集合，不能给出精确的
+Session 总数。这样页面可以同时展示 Checkpoint 失败原因、已提交更新数和已参与训练的 Session。
+
+Dump 采用 best-effort 语义。生产端只构建快照并入队，不等待磁盘。
+Daemon 队列同时限制条目数和字节数，正在写入的任务也计入容量。每次 recorder 或进程
+关闭共用一秒 drain 预算，包含 flush/status；超时或取消后丢弃尚未执行的队列尾部，
+只有正在执行的写入继续持有资源。每个进程最多运行 16 个观测 worker，防止磁盘持续
+阻塞时反复创建 recorder 导致线程无限增长。观测持久化不再屏蔽取消，也不新增训练 collective。
+
+磁盘可写时，生产端 `*.status.json` 提供写入和丢弃计数。输入队列饱和时，独立的有界队列
+仍可保存小型本地 optimizer 事实；整体写盘失败或进程突然退出仍可能丢记录。
+只有收齐全部 DP 输入分片且 `input_complete=true`，才能确认输入集合完整。
+记录缺失、日志文件缺失、export 交付未确认或 JSONL 末尾只有半行均表示**未知**，
+不能据此断言训练仍在等待或已被拒绝。
+Managed 日志在临时目录清理前提取本地最后 1 MiB 快照；`log_ref` 表示后台写入已接纳，
+读取端仍需检查文件是否存在。
+Manifest 使用 `record_format=agentic-observability-full-v3`、schema `3.0.0`；
+v3 读取端需合并 DP 事实，不能继续等待生产端写出的全局 commit 事件。
+
+Eager 和 streaming reader 在自定义 prompt 处理、模板渲染、过滤、打乱和复制之前保存来源身份。
+`source_row_id` 是从零开始的 JSONL 物理行号或 Parquet 行号，切片和多文件数据集也保留原行号。
+`dataset_id` 默认是解析后的源文件路径；metadata 可以提供 `dataset_id`、`dataset_version`
+和 `split`，未知版本保留 `null`。Prompt ID 对来源和原始内容计算摘要：同一行重采样保持相同
+身份，内容相同但来源行不同、或未声明版本的内容发生变化时会产生不同 ID。
+Train 和 Eval split 使用不同身份。
+
+自定义数据源可以通过 `Sample.agentic_prompt_source` 提供这些来源和 payload 字段。
+否则使用 `identity_kind=content_fallback`，按内容计算摘要，dataset/row 字段为 null；无法将
+完全相同的自定义输入区分为不同原始行。平台在 run 内按 ID 对 prompt 和 Group 清单去重；
+每个 driver 实例写入独立的生产端分片。
+
+Group 在取出数据时记录，包括仍在等待准备的 Group。Session 在确认启动后、注册到 Shard 前
+写入清单；真实准备失败也保留对应清单。Group 延后到下一 step 不会产生失败 Session 或额外
+副本。Eval 未启用 group reward 时，每个单 Session runtime Group 的 `expected_group_size=1`，
+算法层 `group_index` 仍可能相同。`sampling_config` 保存合并后的 Session 默认值与覆盖配置；
+终态的 `llm_calls` 保存实际请求的覆盖参数及 context 上限裁剪结果。
+
+每次执行写一个 `start` 和一个具体结果，两行使用相同
+`stage_id`，`occurred_at` 分别是起止时间。`record_id` 用于事件去重；`event_seq` 在同一
+scope 对象内跨阶段递增。`is_terminal` 表示对象生命周期结束，与某个 stage 闭合分别判断。
+
+| scope / stage | start 边界 | 结束结果 |
+| --- | --- | --- |
+| run / execution | 训练主进程开始启动 | 整个训练 Run 的 completed / failed / cancelled |
+| rollout / execution | train 或 Eval 调度批次开始 | 批次收尾后的 completed / failed / cancelled |
+| session / rollout | Driver 开始准备一个已接受的 Session | Shard 清理后的 completed / failed / cancelled |
+| trajectory / reward | 开始 RM 或接收 agent 提供的 reward | completed / failed / cancelled |
+| trajectory / filter | 开始筛选或 custom advantage 决策 | passed / filtered / failed / cancelled |
+| trajectory / transfer | 开始转换并提交训练队列 | queued_for_train / failed / cancelled |
+| update_fragment / train | 当前 DP owner 开始 update | completed / failed / cancelled；读取端推导全局 committed/failed/unknown |
+
+成功入队使用 `status=queued_for_train`。旧版 dump 使用 `completed` 表示同一队列回执，
+读取器可在 `stage=transfer` 时兼容该旧值。两种状态都不能证明 optimizer update 已提交。
+
+`filter.operation` 区分 `dynamic_filter`、`custom_advantage`、`oversampling`、`shutdown`、
+`execution`（group 丢弃决策）、`export_delivery` 和 `eval`（接受评估结果）。这些表示实际的
+筛选决策，瞬时决策允许耗时为零。已提供的 reward 使用 `reward.operation=provided_reward`；
+不含 reward 的 custom advantage 路径不会制造 RM 区间或零分。一次批量入队的各 export
+共享 `transfer_batch_id`。队列回执未知仍为非终结状态，观察器不会自动重试。
+`retry_of_stage_id` 留给显式业务重试；观察器本身不新增重试行为。
+
+**Session 只写 start 和最终 rollout 结果：不包含 progress 字段、phase 字段、请求事件或
+暂停恢复事件。** Driver 唯一写 start；尝试注册到 Shard 后由 Shard 唯一写 end。
+可证明的本地准备失败写配对终态和空调用列表。注册结果未知仅记日志，保留开放的 start，
+等待 Shard 的结果；Driver 不制造 failed 终态。
+
+| 终态字段 | 口径 |
+| --- | --- |
+| `wall_ms` / `active_ms` | Driver 准备开始的墙钟耗时 / 排除暂停的 managed process 活动预算耗时。跨生产端需要时钟同步。 |
+| `llm_calls` / `llm_calls_complete` | 所有已接纳的逻辑请求，包括拒绝、失败、取消和未导出调用；完整性描述 call/attempt 边界是否采齐。 |
+| `request_count` / `attempt_count` | 不同逻辑请求数 / 进入 backend.generate 的次数。内部 HTTP 重试不单独计为 Runtime attempt。 |
+| `generated_tokens` / `token_count_complete` | 返回的 token delta 总和，包括 aborted prefix 和清理期间的结果。生成结果或内部重试无法观察时 token 为 null。 |
+| `export_ids` | 已发布的 export ID，十进制字符串；无 export 时为空。 |
+| `diagnostics` / `log_ref` | 软性清理诊断 / 已入队 agent 日志的相对路径，可为 null，需检查文件是否存在。 |
+
+每个 call 包含 `request_id`、从零开始的 `call_index`、`started_at`、`finished_at`、
+`status`、`parent_state_hash`、`resp_state_hash` 和 `attempts`。每个 Runtime attempt 包含
+从零开始的 `attempt_index`、`rollout_id`、起止时间和状态。partial 中止与恢复共用逻辑请求
+ID，可以跨 rollout；agent 重新提交的请求使用新 ID，不能从内容相似推断重试。
+生成前拒绝的请求使用 `attempts=[]`。达到长度上限是 `finish_reason=length` 的 completed
+call，不是 failed call。
+
+请求失败后 agent 可以恢复，不必导致 Session 失败。终态原因包括 `agent_timeout`、
+`agent_exit_nonzero`、`agent_output_invalid`、`export_validation_failed`、
+`session_prepare_failed`、`session_infra_failed` 和 `session_cleanup_failed`。
+连带停止的未完成 sibling 及显式丢弃使用 cancelled 和 `category=selection`；Session 已完成
+后不会被后续过滤重写。
+
+平台获取 Session timeline 的步骤：
+
+1. 在 `run_id` 内按身份加载 Session、Group、Prompt，收集该 Session 的全部 exports。
+2. 展开所有 DP 分片的 `train.samples`，按 export ID 查实际消费 update；不能仅凭 group
+   关联推断训练消费。
+3. 收集 Session、exports 和实际消费 updates 的事件；按 `record_id` 去重，再按 `stage_id`
+   配对并核对 scope、对象和 stage。内容冲突或多个终态属于数据错误，文件顺序不代表事件顺序。
+4. 只从唯一 Session 终态读取 calls；没有终态时调用列表未知。每个逻辑 call 只画一次，内部
+   绘制 attempts，以 `(session_id, request_id)` 关联 export 的 `agentic_trace.turns`，再按
+   `resp_state_hash` 关联 lineage；未导出调用也保留。
+5. 每条 export 绘制 reward/filter/transfer，每个实际消费 update 只画一次。按
+   `transfer_batch_id` 聚合批量入队，以 attempt 的 rollout ID 关联批次背景；关联时带上
+   Session 的 `rollout_mode`，区分 train 和 Eval。
+6. 只有边界完整且先后正常才计算耗时。缺 end 保留开放区间，快照时间只用于展示，不是实际
+   结束时间；时钟倒置应标记。LLM 调用间隔不能当作工具耗时。只有 committed update 才表示
+   成功训练；只有收齐全部 DP 分片才可声明输入完整。
+
+`--dump-agentic-obs-media` 还会保存按内容寻址的媒体字节。关闭时，prompt/trajectory 中的
+data URI 和原始二进制 payload 替换为摘要/大小引用。日志在 agent 临时目录被移除前复制；
+Shard 突然退出仍可能使最终复制无法完成。`tokens.jsonl` 按当前设计继续留到后续。
+
 ### 常见问题
 
 - **Agent 没有启动或异常退出：** 检查 `--agent-cwd` 和 `--agent-command`，然后查看 `run.log`。Relax 会把 agent
