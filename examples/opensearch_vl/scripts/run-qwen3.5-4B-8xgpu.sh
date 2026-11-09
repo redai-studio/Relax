@@ -151,6 +151,14 @@ OPTIMIZER_ARGS=(
     --clip-grad 1.0
     --use-distributed-optimizer
 )
+if [[ "${OPTIMIZER_OFFLOAD_FRACTION:-0}" != 0 ]]; then
+    OPTIMIZER_ARGS+=(
+        --optimizer-cpu-offload
+        --optimizer-offload-fraction "${OPTIMIZER_OFFLOAD_FRACTION}"
+        --overlap-cpu-optimizer-d2h-h2d
+        --use-precision-aware-optimizer
+    )
+fi
 WANDB_ARGS=(
     --use-clearml
     --use-metrics-service
