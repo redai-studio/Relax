@@ -92,6 +92,20 @@ def test_unsupported_scheduler_configuration_is_rejected(override):
         microbatch_cost.validate_flops_balance(args)
 
 
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        (dict(advantage_estimator="m2po"), "M2PO clipping"),
+    ],
+)
+def test_microbatch_dependent_objectives_are_rejected_only_with_flops(override, message):
+    args = Namespace(balance_by_flops=True, use_dynamic_batch_size=True, **override)
+    with pytest.raises(ValueError, match=message):
+        microbatch_cost.validate_flops_balance(args)
+    args.balance_by_flops = False
+    assert not microbatch_cost.validate_flops_balance(args)
+
+
 def test_unknown_model_and_invalid_cost_fail_at_producer(monkeypatch):
     from relax.utils import misc
     from relax.utils.training import qwen35_cost
