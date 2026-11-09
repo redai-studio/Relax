@@ -291,10 +291,11 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
     pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
-    pip install --no-cache-dir --no-deps transformers==5.16.0 tokenizers==0.23.2 && \
     patch --batch --forward --fuzz=0 -d /sgl-workspace/sglang -p1 < /tmp/sglang-transformers5.patch && \
+    pip install --no-cache-dir setuptools-scm==9.2.2 && \
     SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
-        pip install --no-cache-dir --no-deps -e /sgl-workspace/sglang/python && \
+        pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python && \
+    pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.16.0 tokenizers==0.23.2 && \
     rm /tmp/sglang-transformers5.patch && \
     python -c 'from importlib.metadata import version; \
         assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
