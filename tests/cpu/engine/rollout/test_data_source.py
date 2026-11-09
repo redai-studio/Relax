@@ -17,6 +17,7 @@ from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 
 @pytest.fixture
@@ -77,6 +78,43 @@ class TestEagerDataset:
 
 class TestDataSourceIntegration:
     """Integration tests for data_source.py with StreamingDataset."""
+
+    @pytest.mark.parametrize("failure", ["write", "publish"])
+    def test_failed_snapshot_preserves_previous_sampling_cursor(
+        self, tmp_path, data_source_module, monkeypatch, failure
+    ):
+        source = object.__new__(data_source_module.RolloutDataSource)
+        source.args = Namespace(rollout_global_dataset=True, save=str(tmp_path))
+        source.sample_offset = 8
+        source.epoch_id = 1
+        source.sample_group_index = 8
+        source.sample_index = 16
+        source.metadata = {}
+        source._use_streaming = False
+        source.save(7)
+        path = tmp_path / "dataset/global_dataset_state_dict_7.pt"
+        committed = path.read_bytes()
+        source.sample_offset = 12
+
+        def failed_write(state, stream):
+            stream.write(b"incomplete checkpoint")
+            raise OSError("Interrupted save")
+
+        def failed_publish(*args):
+            raise OSError("Interrupted publish")
+
+        with monkeypatch.context() as patch:
+            if failure == "write":
+                patch.setattr(data_source_module.torch, "save", failed_write)
+            else:
+                patch.setattr(data_source_module.os, "replace", failed_publish)
+            with pytest.raises(OSError, match="Interrupted"):
+                source.save(7)
+        assert path.read_bytes() == committed
+        assert torch.load(path, weights_only=False)["sample_offset"] == 8
+        assert list(path.parent.iterdir()) == [path]
+        source.save(7)
+        assert torch.load(path, weights_only=False)["sample_offset"] == 12
 
     @pytest.fixture
     def jsonl_file(self):
