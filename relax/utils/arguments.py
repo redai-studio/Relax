@@ -5,6 +5,8 @@ import json
 import math
 import os
 import sys
+import time
+import uuid
 import warnings
 from typing import Any
 
@@ -2466,6 +2468,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=("Dump all details of training for post-hoc analysis and visualization."),
             )
             parser.add_argument(
+                "--dump-agentic-obs",
+                type=str,
+                default=None,
+                help=(
+                    "Dump agentic rollout observability to this directory, one wall-clock subdirectory "
+                    "`<dir>/run_YYYYmmdd_HHMMSS/` per run. Holds three JSONL streams joined by "
+                    "sample_export_id: trajectories/ (the exported lineage, written by each SessionShard), "
+                    "stages/ (reward, selection, transfer and optimizer events) "
+                    "and train/ (actual update inputs, response masks and scalars, written by the policy actor). Unset disables "
+                    "every producer. Independent of --dump-details, which dumps whole .pt tensors."
+                ),
+            )
+            parser.add_argument(
+                "--dump-agentic-obs-media",
+                action="store_true",
+                default=False,
+                help=(
+                    "Also write the media bytes referenced by --dump-agentic-obs trajectories to `media/`, "
+                    "content-addressed by sha256. Without it, inline data: URIs are replaced by their digest "
+                    "and the bytes are dropped. Ignored without --dump-agentic-obs."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-result-dir",
                 type=str,
                 default=None,
@@ -4417,6 +4442,19 @@ def slime_validate_args(args):
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
+
+    if getattr(args, "dump_agentic_obs", None):
+        # Derived rather than parsed, and stamped exactly once here on the
+        # driver, then carried inside the pickled args Namespace to every Ray
+        # actor. Deriving it lazily per actor would give the SessionShards, the
+        # rollout driver and the actors different directories, splitting one
+        # run's streams across many roots. The suffix separates launches
+        # started in the same second, even when they share an output root.
+        args.agentic_obs_run_id = f"{time.strftime('run_%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:12]}"
+    elif getattr(args, "dump_agentic_obs_media", False):
+        # The media flag only modifies a dump that is not happening. Say so,
+        # rather than letting the operator wait for images that never appear.
+        logger.warning("--dump-agentic-obs-media is set but --dump-agentic-obs is not; nothing will be written.")
 
     if args.load_debug_rollout_data is not None:
         logger.info(

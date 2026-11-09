@@ -807,6 +807,7 @@ class SGLangEngine(RayActor):
             "ep_join_mode",
             "elastic_ep_backend",
             "speculative_algorithm",
+            "speculative_draft_model_path",
             "moe_runner_backend",
             "moe_a2a_backend",
             "json_model_override_args",
@@ -835,7 +836,11 @@ class SGLangEngine(RayActor):
             and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
         )
         config = get_hf_config(layout["model_path"])
-        text_config = getattr(config, "text_config", None) or config
+        text_config = (
+            getattr(config, "text_config", None)
+            or getattr(getattr(config, "thinker_config", None), "text_config", None)
+            or config
+        )
         if "dtype" in layout:
             from sglang.srt.configs.model_config import _get_and_verify_dtype
 
@@ -852,6 +857,11 @@ class SGLangEngine(RayActor):
             layout["moe_runner_backend"] = "triton"
         layout["num_experts"] = getattr(text_config, "num_experts", None) or getattr(
             text_config, "n_routed_experts", None
+        )
+        layout["num_shared_experts"] = (
+            getattr(text_config, "n_shared_experts", None)
+            or getattr(text_config, "num_shared_experts", None)
+            or int(bool(getattr(text_config, "shared_expert_intermediate_size", 0)))
         )
         for key in ("hidden_size", "moe_intermediate_size", "quantization_config"):
             layout[key] = getattr(text_config, key, None)
@@ -2056,13 +2066,15 @@ def _compute_genrm_server_args(
         kwargs[key] = value
         unused_keys.discard(key)
 
-    # CUDA IPC cannot cross nodes. Resolve the default after GenRM's own topology
-    # and overrides; an explicit None retains SGLang's automatic selection.
+    # CUDA IPC cannot cross nodes, and SGLang rejects it on ROCm. Resolve the default
+    # after GenRM's own topology and overrides; an explicit None retains SGLang's
+    # automatic selection.
     if (
         "mm_feature_transport" in server_arg_fields
         and "mm_feature_transport" not in (args.genrm_engine_config or {})
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
+        and not device_utils.is_rocm
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
@@ -2180,12 +2192,14 @@ def _compute_server_args(
             unused_keys.discard(key)
 
     # Use CUDA IPC only for engines confined to one node; multi-node engines
-    # retain SGLang's auto policy, including CUDA VMM where supported.
+    # retain SGLang's auto policy, including CUDA VMM where supported. SGLang
+    # rejects CUDA IPC on ROCm, so ROCm engines always keep the auto policy.
     if (
         "mm_feature_transport" in server_arg_field_names
         and "mm_feature_transport" not in (sglang_overrides or {})
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
+        and not device_utils.is_rocm
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 

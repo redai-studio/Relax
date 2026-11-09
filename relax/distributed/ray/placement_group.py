@@ -14,6 +14,7 @@ from relax.core.node_group_affinity import (
 )
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils import device as device_utils
+from relax.utils.agentic_obs.startup import record_run_startup
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
@@ -223,6 +224,8 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
             f"num_rollout resolved to {args.num_rollout}; "
             f"num_rollout_per_epoch={num_rollout_per_epoch}, num_epoch={args.num_epoch}"
         )
+
+    record_run_startup(args)
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="snapshot"))

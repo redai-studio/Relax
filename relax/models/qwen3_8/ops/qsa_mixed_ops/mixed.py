@@ -28,15 +28,23 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.
         return q.clone()
     bounds = getattr(indices, "_qsa_bounds", (0, q.shape[0]))
     budget = indices.shape[1] - 4
+    flash_max_len = Envs.RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN
+    explicit_flash_boundary = flash_max_len != -1
+    if not explicit_flash_boundary:
+        flash_max_len = budget + 3
+    if not 0 <= flash_max_len <= budget + 3:
+        raise ValueError("Mixed QSA Flash maximum length exceeds the dense selector budget")
     flex_max_len = Envs.RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN
     if not 0 <= flex_max_len <= 16384:
         raise ValueError("Mixed QSA Flex maximum length must be in [0, 16384]")
+    if explicit_flash_boundary and flex_max_len:
+        raise ValueError("An explicit mixed Flash boundary requires Flex maximum length zero")
     groups = [[], [], []]
     for start, end in zip(bounds, bounds[1:]):
         length = end - start
         if length == 0:
             continue
-        kind = 0 if length <= budget + 3 else (1 if length <= flex_max_len else 2)
+        kind = 0 if length <= flash_max_len else (1 if length <= flex_max_len else 2)
         groups[kind].append((start, end))
     if sum(bool(group) for group in groups) <= 1:
         if groups[2]:

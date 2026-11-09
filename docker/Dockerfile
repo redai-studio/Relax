@@ -230,6 +230,7 @@ COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
+COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
@@ -240,10 +241,11 @@ RUN cd Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
+    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 
@@ -282,6 +284,8 @@ COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
 COPY docker/patch/sglang/v0.5.17-transformers5-compat.patch /tmp/sglang-transformers5.patch
 COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
 COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
+# Apply after all pip installs; this cache specialization requires Frontend 1.27.0 / CuTe DSL 4.6.0.
+COPY docker/patch/cudnn/1.27.0-dsa-sm90-signature-cache.patch /tmp/cudnn-dsa-sm90-signature-cache.patch
 # Resolve late so existing compiled layers remain cached. NIXL packages both
 # backends, but dispatches to cu12 based on Torch; this does not change CUDA.
 # Pin Qwen3.8 HF support without replacing the CUDA/Torch/TE/DeepEP stack.
@@ -304,4 +308,11 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
         assert CONFIG_MAPPING["qwen4_exp"].model_type == "qwen4_exp"; \
         import sglang.srt.configs.qwen3_asr' && \
     python /opt/relax/validate_hybridep_install.py && \
+    CUDNN_SITE="$(python -c 'import importlib.metadata as m; \
+        assert m.version("nvidia-cudnn-frontend") == "1.27.0", "DSA SM90 patch requires cuDNN Frontend 1.27.0"; \
+        assert m.version("nvidia-cutlass-dsl") == "4.6.0", "DSA SM90 patch requires CuTe DSL 4.6.0"; \
+        print(m.distribution("nvidia-cudnn-frontend").locate_file(""))')" && \
+    patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa-sm90-signature-cache.patch && \
+    python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" && \
+    rm /tmp/cudnn-dsa-sm90-signature-cache.patch && \
     python /opt/relax/validate_final_runtime.py --profile cu12

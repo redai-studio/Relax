@@ -17,8 +17,8 @@
 # targeted, RELAX_LORA_SHARE_EXPERT_ADAPTERS=false is injected below (independent
 # per-expert adapters + Bridge EP grad finalization), as in the 8-GPU recipe.
 #
-# Inherit the base script learning rate (1e-5). Pass --lr as a trailing
-# command-line argument to override it.
+# Match the 64-GPU K3 Think recipe's training optimizations and optimizer
+# defaults. Pass trailing command-line arguments to override them.
 #
 # Usage (submit through the existing cluster entrypoint):
 #   bash scripts/entrypoint/ray-job.sh \
@@ -34,6 +34,32 @@ export EXP_NAME="${EXP_NAME:-kimi-k3-full-lora-sft-pokemon-zh-blackwell-280g-gpu
 # Produce an early adapter checkpoint for conversion validation.
 export NUM_STEPS="${NUM_STEPS:-1}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
+export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-32768}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
+export SFT_LOGITS_CHUNK_SIZE="${SFT_LOGITS_CHUNK_SIZE:-1024}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-4}"
+export RAY_USAGE_STATS_ENABLED="${RAY_USAGE_STATS_ENABLED:-0}"
+export NVSHMEM_REMOTE_TRANSPORT="${NVSHMEM_REMOTE_TRANSPORT:-libfabric}"
+
+# Keep these switches in train-env-vars so they reach the GPU workers.
+export TRAIN_ENV_VARS="{\"FLA_TILELANG\":\"${FLA_TILELANG:-0}\",\"PYTORCH_CUDA_ALLOC_CONF\":\"expandable_segments:True\",\"RELAX_KIMI_K3_EXPERT_SPLIT\":\"${RELAX_KIMI_K3_EXPERT_SPLIT:-1}\",\"RELAX_KIMI_K3_FUSED_SITU\":\"${RELAX_KIMI_K3_FUSED_SITU:-1}\",\"RELAX_KIMI_K3_FUSED_ATTN_RES\":\"${RELAX_KIMI_K3_FUSED_ATTN_RES:-1}\"}"
+
+OPTIMIZATION_ARGS=(
+    --attention-backend fused
+    --image-max-token-num 1024
+    --data-pad-size-multiplier 4096
+    --sft-max-in-flight-steps 4
+    --num-data-storage-units 16
+    --lr "${LR:-1e-5}"
+    --lr-warmup-fraction 0.05
+    --weight-decay "${WEIGHT_DECAY:-0.1}"
+    --adam-beta2 0.95
+)
+if [ "${FREEZE_VISION_TOWER:-1}" = 1 ]; then
+    OPTIMIZATION_ARGS+=(--vision-dp-when-tp --freeze-vision-model)
+fi
 
 LORA_ARGS=(
     --lora-rank "${LORA_RANK:-16}"
@@ -69,9 +95,14 @@ import os
 runtime = json.loads(os.environ["RUNTIME_ENV_JSON"])
 env = runtime.setdefault("env_vars", {})
 env["RELAX_LORA_SHARE_EXPERT_ADAPTERS"] = "false"
+worker_env_names = (
+    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+    "RAY_USAGE_STATS_ENABLED", "NVSHMEM_REMOTE_TRANSPORT",
+)
+env.update({name: os.environ[name] for name in worker_env_names})
 propagate = env.get("RELAX_PROPAGATE_ENV_VARS", "").split(",")
 env["RELAX_PROPAGATE_ENV_VARS"] = ",".join(
-    dict.fromkeys(name for name in [*propagate, "RELAX_LORA_SHARE_EXPERT_ADAPTERS"] if name)
+    dict.fromkeys(name for name in [*propagate, "RELAX_LORA_SHARE_EXPERT_ADAPTERS", *worker_env_names] if name)
 )
 print(json.dumps(runtime))
 PY
@@ -79,4 +110,4 @@ PY
     export RUNTIME_ENV_JSON
 fi
 
-exec bash "${SCRIPT_DIR}/run-kimi-k3-pokemon-64xblackwell.sh" "${LORA_ARGS[@]}" "$@"
+exec bash "${SCRIPT_DIR}/run-kimi-k3-pokemon-64xblackwell.sh" "${LORA_ARGS[@]}" "${OPTIMIZATION_ARGS[@]}" "$@"

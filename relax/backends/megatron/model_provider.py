@@ -43,7 +43,7 @@ from relax.utils.megatron_peft_utils import (
     scope_target_modules_to_region,
     summarize_lora_modules,
 )
-from relax.utils.misc import load_function
+from relax.utils.misc import load_function, resolve_is_vl_model
 from relax.utils.training.ppo_utils import (
     ensure_sequence_classification_head_trainable,
     install_critic_value_head_in_provider,
@@ -192,6 +192,9 @@ def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module
     cu_seqlens instead of the pre-split + cp-multiplied form, and by model.py
     to route those through the forward.
     """
+    if getattr(model, "uses_unsplit_forward", False):
+        args.uses_unsplit_forward = True
+        return
     try:
         from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     except ImportError:
@@ -302,6 +305,16 @@ def get_model_provider_func(
 
         ensure_backend(args)
 
+    provider = None
+    if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
+    # Resolve once, after provider selection and before model/data setup. A VL
+    # checkpoint can produce a text-only provider despite its processor files.
+    args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
+
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -336,10 +349,6 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
-
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        provider = bridge.to_megatron_provider(load_weights=False)
         is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
         if is_kimi_k3:
             from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
@@ -361,6 +370,8 @@ def get_model_provider_func(
             "cp_comm_type",
             "cp_partition_mode",
             "sequence_packing_scheduler",
+            "max_seqlen_per_dp_cp_rank",
+            "pad_packed_seq_alignment",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "variable_seq_lengths",
@@ -382,6 +393,13 @@ def get_model_provider_func(
             "recompute_num_layers",
             "recompute_modules",
             "distribute_saved_activations",
+            "fine_grained_activation_offloading",
+            "offload_modules",
+            "min_offloaded_tensor_size",
+            "activation_offload_fraction",
+            "delta_offload_bytes_across_pp_ranks",
+            "delay_offload_until_cuda_graph",
+            "fine_grained_offloading_max_inflight_offloads",
             "moe_router_load_balancing_type",
             "moe_router_dtype",
             "moe_router_fusion",
@@ -464,6 +482,9 @@ def get_model_provider_func(
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
 
+        if callable(getattr(provider, "configure_runtime", None)):
+            provider.configure_runtime(args)
+
         if is_kimi_k3:
             configure_runtime(provider, args)
             # Fake-QAT aligns the training forward with the MXFP4 grid the
@@ -543,22 +564,17 @@ def get_model_provider_func(
                 provider.num_layers_in_first_pipeline_stage = None
                 provider.num_layers_in_last_pipeline_stage = None
 
-        # Fused DSA kernels (FlashMLA forward + cuDNN DSA backward). Deliberately NOT in
-        # bridge_keys: that loop assigns unconditionally, so every bridge-mode model would
-        # get this field set. Only csa.py (DSv4-only) and the dsv4_hybrid branch of
-        # TransformerConfig.__post_init__ read it today, but gating here makes the blast
-        # radius structural rather than an argument about current mcore internals.
-        #
-        # Note the arg polarity: mcore auto-generates only `--no-dsa-kernel-fusion`
-        # (store_false, dest=apply_dsa_kernel_fusion, default True), so args say True
-        # unless the user opts out -- while the TransformerConfig field defaults to False
-        # and DeepSeekV4Bridge sets it False on SM < 10.0. Taking args as authoritative
-        # turns fusion ON for DSv4 by default; without it the CSA layers fall back to the
-        # unfused reference path whose gather backward is quadratic in sequence length
-        # (82GB at 8K tokens). If flash_mla / cuDNN DSA are missing, mcore raises a clear
-        # ValueError naming --no-dsa-kernel-fusion as the escape hatch.
+        # Bridge bypasses MCore's CLI backend resolution. Preserve DSv4's fused default
+        # (FlashMLA forward + cuDNN backward), including newer MCore where the deprecated
+        # fusion flag defaults to None. Let finalize() validate explicit backend/flag conflicts.
         if getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid":
-            want_fusion = bool(getattr(args, "apply_dsa_kernel_fusion", False))
+            want_fusion = getattr(args, "apply_dsa_kernel_fusion", None)
+            if hasattr(provider, "dsa_kernel_backend"):
+                provider.dsa_kernel_backend = getattr(args, "dsa_kernel_backend", None) or (
+                    "cudnn" if want_fusion is None else "none"
+                )
+            else:
+                want_fusion = want_fusion is not False
             if getattr(provider, "apply_dsa_kernel_fusion", False) != want_fusion:
                 logger.info(
                     "Override provider.apply_dsa_kernel_fusion: "

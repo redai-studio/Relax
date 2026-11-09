@@ -650,7 +650,7 @@ _CHAT_TEMPLATE_PATCHERS = (
 
 ### 测试
 
-参考 [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/test_qwen_chat_template_patch.py)，至少覆盖：
+参考 [`test_qwen_chat_template_patch.py`](../../../tests/cpu/engine/sft/dataset/test_qwen_chat_template_patch.py)，至少覆盖：
 
 1. 无关模板严格 no-op。
 2. legacy 模板正确 patch，native 模板保持幂等。
@@ -679,3 +679,34 @@ Gemma4 模板补丁通过环境变量显式启用，需要将这些变量传入�
 - `GEMMA4_SFT_MS_SWIFT_COMPAT=1` 在传给模板的消息中省略工具关联字段，用于显式对齐 ms-swift。
 
 启用模板补丁并导出 HF 模型时，传入 `--save-hf-post-hook-path scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template`，并在导出时保留相同环境变量，使 `chat_template.jinja` 为推理保留训练时的回合边界。导出模板同时保存 ms-swift 的关联字段过滤逻辑，重载后的 tokenizer 无需 Relax 预处理或环境变量即可应用。该 hook 只修改模板，视觉权重由现有导出器处理。
+
+
+### Gemma4 31B 文本 64K SFT
+
+在 worker 环境中显式设置 `RELAX_GEMMA4_FORCE_FLEX_GLOBAL=1`，可为 Gemma4 全局注意力层选择分块 FlexAttention。滑动窗口层继续使用 FlashAttention；不设置该开关时，全局层保留现有 SDPA 路径。packed 样本分别计算注意力。FlexAttention 训练要求 attention dropout 为零，目前仅支持 CP1。
+
+文本启动脚本默认 TP8/PP1/CP1、65,536 tokens，启用分块 logits 及逐块 loss 重计算、完整激活重计算和 optimizer CPU offload。两台各有 8 张 GPU 的节点可设置 `NUM_NODES=2 GPUS_PER_NODE=8`，使用 TP8/DP2。共享 embedding 权重要求保持梯度通信 overlap 关闭。默认 profile 使用 text conversion；图像输入请使用下方独立 profile。
+
+```bash
+RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/messages.jsonl \
+  bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-gemma4-31B-sft-64k-8xgpu.sh
+```
+
+`run-gemma4-31B-multiturn-flex64k.sh` 复用上述脚本，使用 messages 输入并非阻塞提交。两个 profile 默认 `GEMMA4_SFT_THINKING=0`，启用工具回合边界，并使用 Gemma4 post-hook 导出对应模板。`DISABLE_CHECKPOINT_SAVE=1` 关闭模型保存，`OPTIMIZER_CPU_OFFLOAD=0` 关闭 CPU offload。默认跳过超长样本（`SFT_OVERSIZE_STRATEGY=skip`）。
+
+Flex 路径需要支持 FlexAttention 和 BlockMask 的 PyTorch 环境。生产使用前，应在目标环境验证 CUDA 前向／反向一致性、真实 64K 峰值显存和训练稳定性；CPU 参考测试不能证明完整模型的 GPU 数值等价。
+
+### Gemma4 31B packed 图像 SFT
+
+Dense 31B 图像 profile 显式选择 `GEMMA4_SFT_CONVERSION_MODE=vl`，复用文本 profile 的 TP8/PP1/CP1、分块 loss 和仅修改模板的导出 hook。视觉塔和 projector 权重沿用现有 checkpoint／导出路径。checkpoint 需要包含视觉塔和 projector 权重；JSONL 每行提供完整 `messages` 和 `images` 列，每张图对应一个 `<image>` 占位符，也支持消息内联的 `image_url` 部分。
+
+```bash
+RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/image-messages.jsonl \
+  bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-gemma4-31B-multimodal-flex64k.sh
+```
+
+视觉特征在唯一一次 sequence-parallel scatter 前写入 embedding。processor 插入的图像分隔符和展开的图像 tokens 均不参与 loss。注意力遵循 [Transformers 5.16 Gemma4 mask](https://github.com/huggingface/transformers/blob/v5.16.0/src/transformers/models/gemma4/modeling_gemma4.py)：全局层保持因果；当 `use_bidirectional_attention="vision"` 时，滑窗层采用 `(因果 OR 同图像) AND 滑动窗口`。不同 packed 样本之间保持隔离。
+
+适配器支持 CP1、PP1 的图像输入；音频、视频和 MoE VL 接入不在此 profile 范围内。建议保留默认超长策略 `skip`，保证图像 features 与 tokens 对齐。整模 CUDA 数值一致性、TP8 图像训练、64K 显存／稳定性及训练后视觉权重导出仍需在目标环境验证；CPU 适配器测试仅验证接口与梯度链路。

@@ -33,7 +33,7 @@ def install(args: Any, model: list) -> None:
         args.expert_tensor_parallel_size,
     ) == (4, 1, 1, 8, 1)
     world = dist.get_world_size(group=dist.group.WORLD)
-    assert world in (4, 64)
+    assert world >= 4 and world % 4 == 0
     tp = mpu.get_tensor_model_parallel_group()
     local = list(dist.get_process_group_ranks(tp))
     reports = [None] * world

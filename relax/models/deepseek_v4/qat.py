@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class _QATState:
-    original_workspace: Callable[..., Any]
+    original_workspace: Callable[..., Any] | None
     module_name: str
     workspace_calls: int = 0
     optimizer: Any = None
@@ -177,7 +177,8 @@ def install_routed_expert_qat(module: torch.nn.Module, *, module_name: str, comp
         raise RuntimeError(
             f"{module_name}: install MXFP4 QAT before the first forward (workspace cache must be empty)"
         )
-    module._relax_mxfp4_qat = _QATState(module.get_weight_workspace, module_name, compute=compute)
+    original_workspace = getattr(module, "get_weight_workspace", None)
+    module._relax_mxfp4_qat = _QATState(original_workspace, module_name, compute=compute)
     for parameter in module.parameters(recurse=False):
         if parameter.ndim != 2 or parameter.dtype != torch.bfloat16:
             raise TypeError(
@@ -192,7 +193,12 @@ def install_routed_expert_qat(module: torch.nn.Module, *, module_name: str, comp
             training_recipe=TEQuantizationRecipe(), evaluation_recipe=TEQuantizationRecipe()
         )
     elif compute == "fp8":
-        module.get_weight_workspace = MethodType(_mxfp4_weight_workspace, module)
+        if original_workspace is None:
+            from relax.models.deepseek_v4.fp8_weights import _install_weight_quantizers
+
+            _install_weight_quantizers(module, module_name=module_name)
+        else:
+            module.get_weight_workspace = MethodType(_mxfp4_weight_workspace, module)
 
 
 def install_mxfp4_qat(model: torch.nn.Module, *, compute: str = "bf16") -> tuple[str, ...]:
