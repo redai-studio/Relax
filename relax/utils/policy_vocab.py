@@ -10,7 +10,7 @@ from relax.utils.misc import get_hf_config
 
 
 def resolve_policy_vocab_size(args: Namespace, *, model_vocab_size: int | None = None) -> int | None:
-    """Resolve the optional ``policy_vocab_size`` custom YAML setting.
+    """Resolve the optional ``--policy-vocab-size`` output limit.
 
     This is independent of Megatron's embedding/padding size and does not infer
     the valid output range from a tokenizer's length.

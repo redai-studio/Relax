@@ -679,6 +679,7 @@ These environment variables are for tuning and troubleshooting; all are optional
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--train-env-vars` | json | {} | Additional environment variables for training process |
+| `--policy-vocab-size` | int | None | Restrict output token IDs for Megatron online RL sampling and policy scoring |
 | `--train-memory-margin-bytes` | int | 1GB (1024³) | Reserved space for training memory allocation |
 | `--disable-weights-backuper` | flag | - | Disable weight backup to save host memory |
 | `--custom-model-provider-path` | str | None | Custom model provider function path |
@@ -692,10 +693,10 @@ These environment variables are for tuning and troubleshooting; all are optional
 
 ### Restricting the policy output vocabulary
 
-For Megatron online RL with native SGLang or Agentic rollout, an optional `policy_vocab_size` setting in the YAML passed to `--custom-config-path` restricts output IDs to `[0, policy_vocab_size)`. For example, if the model's intended output range contains 32,000 tokens:
+For Megatron online RL with native SGLang or Agentic rollout, the optional `--policy-vocab-size` argument restricts output IDs to `[0, policy_vocab_size)`. For example, if the model's intended output range contains 32,000 tokens, add this argument to the training command:
 
-```yaml
-policy_vocab_size: 32000
+```bash
+--policy-vocab-size 32000
 ```
 
 The value must be a positive integer no larger than the HF text model's configured vocabulary. It masks the same output rows during sampling and training log-probability, entropy, and Score Centering calculations without changing embedding shapes or Megatron TP padding. Omit it to retain existing behavior. Choose the range from the model's output-token contract, including valid special tokens; tokenizer length alone does not establish that range. This setting does not support offline SFT/DPO/RM or FSDP. Custom generation functions that bypass the native request builder must apply the same restriction themselves.
