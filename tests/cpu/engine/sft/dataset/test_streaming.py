@@ -1713,43 +1713,12 @@ def test_html_media_tags_remain_literal_training_text(tmp_path, multimodal_keys)
         ds.stop()
 
 
-def test_assistant_media_tag_with_empty_image_field_remains_text(tmp_path):
-    text = "Write <image> in the example."
-    path = tmp_path / "literal.jsonl"
-    _write_jsonl(
-        path,
-        [
-            {
-                "messages": [{"role": "user", "content": "Show an example."}, {"role": "assistant", "content": text}],
-                "images": [],
-            }
-        ],
-    )
-    ds = SFTStreamingDataset(
-        path=str(path), prompt_key="messages", multimodal_keys={"image": "images"}, prefetch_max_cached=0
-    )
-    try:
-        sample = ds.get_canonical_sample(0)
-        assert sample.messages[1].content == text
-        assert sample.messages[1].learn
-        assert sample.images is None
-    finally:
-        ds.stop()
-
-
 @pytest.mark.parametrize("media_name", ["image", "audio", "video"])
 def test_configured_literal_media_still_requires_payload(tmp_path, media_name):
     path = tmp_path / "missing.jsonl"
     _write_jsonl(
         path,
-        [
-            {
-                "messages": [
-                    {"role": "user", "content": f"<{media_name}>"},
-                    {"role": "assistant", "content": f"The <{media_name}> tag marks a media item."},
-                ]
-            },
-        ],
+        [{"messages": [{"role": "user", "content": f"<{media_name}>"}, {"role": "assistant", "content": "Done"}]}],
     )
     ds = SFTStreamingDataset(
         path=str(path), prompt_key="messages", multimodal_keys={media_name: "media"}, prefetch_max_cached=0

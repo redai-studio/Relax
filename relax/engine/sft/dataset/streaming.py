@@ -38,7 +38,6 @@ from relax.utils.data.kimi_k3 import (
 )
 from relax.utils.data.streaming_dataset import CompositeStreamingReader, IndexManager, PrefetchBuffer, StreamingReader
 from relax.utils.logging_utils import get_logger
-from relax.utils.types import MultimodalTypes
 
 
 logger = get_logger(__name__)
@@ -109,28 +108,6 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
-
-
-def _has_assistant_only_media_tags(
-    row: dict[str, Any], prompt: list[dict[str, Any]], multimodal_keys: dict[str, str] | None
-) -> bool:
-    """Detect media tags quoted by the assistant in text-only rows."""
-    if not multimodal_keys or any(_as_list(row.get(key)) for key in multimodal_keys.values()):
-        return False
-    tags = tuple(media.placeholder for media in MultimodalTypes.all() if media.name in multimodal_keys)
-    if len(tags) != len(multimodal_keys):
-        return False
-
-    found_tag = False
-    for message in prompt:
-        content = message.get("content")
-        if not isinstance(content, str):
-            return False
-        if any(tag in content for tag in tags):
-            if message.get("role") != "assistant":
-                return False
-            found_tag = True
-    return found_tag
 
 
 def _validate_multimodal_contract(
@@ -365,7 +342,6 @@ def _build_canonical_sample_from_row(
     source_name: str,
     task_type: str = "causal_lm",
     conversation_key_map: dict[str, str] | None = None,
-    allow_assistant_literal_media: bool = False,
 ) -> CanonicalSample:
     prompt = row.get(prompt_key)
     if prompt is None:
@@ -402,12 +378,6 @@ def _build_canonical_sample_from_row(
             for message in prompt
         ]
         row = {**row, prompt_key: prompt}
-        if (
-            allow_assistant_literal_media
-            and task_type == "causal_lm"
-            and _has_assistant_only_media_tags(row, prompt, multimodal_keys)
-        ):
-            multimodal_keys = None
         _validate_multimodal_contract(
             row,
             prompt,
@@ -825,7 +795,6 @@ class SFTStreamingDataset:
             require_response=self.require_response,
             source_name=self.source_name,
             task_type=self.task_type,
-            allow_assistant_literal_media=self.training_mode == "sft",
         )
 
     def get_classification_label(self, idx: int, *, row: dict[str, Any] | None = None) -> torch.Tensor | None:

@@ -220,6 +220,7 @@ def test_load_image_surfaces_io_error_after_retries(monkeypatch: pytest.MonkeyPa
     ("failure", "expected"),
     [
         (FileNotFoundError(errno.ENOENT, "missing"), AssertionError),
+        (NotADirectoryError(errno.ENOTDIR, "invalid parent directory"), AssertionError),
         (PermissionError(errno.EACCES, "permission denied"), PermissionError),
         (None, Image.UnidentifiedImageError),
     ],

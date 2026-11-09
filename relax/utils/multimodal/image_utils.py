@@ -211,15 +211,17 @@ def load_image_from_path(image: str, **kwargs: Any) -> Image.Image:
         for attempt in range(_LOCAL_IMAGE_READ_ATTEMPTS):
             image_obj = None
             try:
-                with open(image, "rb") as f:
+                try:
+                    f = open(image, "rb")
+                except (FileNotFoundError, NotADirectoryError) as exc:
+                    raise AssertionError(f"Image path {image} does not exist.") from exc
+                with f:
                     image_obj = Image.open(f)
                     image_obj.load()
                 break
             except OSError as exc:
                 if image_obj is not None:
                     image_obj.close()
-                if isinstance(exc, FileNotFoundError):
-                    raise AssertionError(f"Image path {image} does not exist.") from exc
                 if exc.errno not in _LOCAL_IMAGE_RETRY_ERRNOS or attempt + 1 == _LOCAL_IMAGE_READ_ATTEMPTS:
                     raise
                 delay = _LOCAL_IMAGE_READ_BACKOFF_S * (attempt + 1)
