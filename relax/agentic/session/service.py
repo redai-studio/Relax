@@ -1539,7 +1539,6 @@ class AgenticSessionShard:
         # lifecycle; this table resolves a route token to that direct ref.
         self._session_records: Dict[str, _SessionRecord] = {}
         self._train_generation_open = False
-        self._eager_scope = getattr(args, "agentic_eager_session_generation", False)
         self._rollout_epoch: int | None = None
         self._eager_shutdown = False
         self._eager_gate_lock = asyncio.Lock()
@@ -1641,17 +1640,15 @@ class AgenticSessionShard:
         session_specs: Tuple[SessionSpec, ...],
         *,
         start_session_ids: Optional[Tuple[str, ...]] = None,
-        eager_session_generation: bool = False,
     ) -> None:
         """Register every logical member; start only identities with granted
         credits."""
 
-        if type(eager_session_generation) is not bool:
-            raise RuntimeGroupError("Eager startup requires an explicit boolean")
+        eager_session_generation = (
+            rollout_mode == "train" and getattr(self.args, "agentic_session_capacity_per_node", None) is not None
+        )
         if eager_session_generation and (
-            not getattr(self, "_eager_scope", False)
-            or rollout_mode != "train"
-            or self._eager_shutdown
+            self._eager_shutdown
             or start_session_ids is None
             or not all(spec.require_resource_release for spec in session_specs)
         ):
@@ -2006,7 +2003,7 @@ class AgenticSessionShard:
         # Keep the gate closed until every resident Session, including members
         # still waiting for physical credits, carries this step's rollout ID.
         async with self._eager_gate_lock:
-            if getattr(self, "_eager_scope", False):
+            if getattr(self.args, "agentic_session_capacity_per_node", None) is not None:
                 if (
                     self._eager_shutdown
                     or self._train_generation_open
@@ -2320,7 +2317,7 @@ class AgenticSessionShard:
     async def _shutdown(self) -> None:
         """Drop resident groups, then release the Shard-owned backend."""
 
-        if getattr(self, "_eager_scope", False):
+        if getattr(self.args, "agentic_session_capacity_per_node", None) is not None:
             async with self._eager_gate_lock:
                 self._eager_shutdown = True
                 self._train_generation_open = False

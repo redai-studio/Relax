@@ -36,7 +36,7 @@ class SessionCapacity:
     """One Runtime's atomic reservations; ambiguous owners keep their
     credits."""
 
-    def __init__(self, node_ids: set[str], per_node: int, *, incremental: bool = False) -> None:
+    def __init__(self, node_ids: set[str], per_node: int) -> None:
         if type(per_node) is not int or per_node < 1 or not node_ids or not all(node_ids):
             raise ValueError("Session capacity needs distinct node identities and a positive per-node limit")
         self.per_node = per_node
@@ -45,18 +45,13 @@ class SessionCapacity:
         self.global_peak = 0
         self.confirmed_count = 0
         self.reservations: dict[str, SessionReservation] = {}
-        if type(incremental) is not bool:
-            raise ValueError("Incremental Session startup must be explicitly boolean")
-        self.incremental = incremental
         self.partial_by_node: dict[str, SessionReservation] = {}
 
     def available(self, node_id: str) -> int:
         return self.per_node - self.used[node_id]
 
-    def can_reserve(self, node_id: str, count: int) -> bool:
-        if self.incremental:
-            return node_id not in self.partial_by_node and self.available(node_id) > 0
-        return self.available(node_id) >= count
+    def can_reserve(self, node_id: str) -> bool:
+        return node_id not in self.partial_by_node and self.available(node_id) > 0
 
     def _debit(self, node_id: str, count: int) -> None:
         self.used[node_id] += count
@@ -68,9 +63,9 @@ class SessionCapacity:
             group_id in self.reservations
             or type(count) is not int
             or not 0 < count <= self.per_node
-            or not self.can_reserve(node_id, count)
+            or not self.can_reserve(node_id)
         ):
-            raise ValueError("Group reservation must be new and fit atomically on one host")
+            raise ValueError("Group reservation must be new and fit within one host limit")
         reservation = SessionReservation(group_id, node_id, count)
         reservation.allocated_count = min(count, self.available(node_id))
         self.reservations[group_id] = reservation
@@ -93,8 +88,8 @@ class SessionCapacity:
         """Debit exact identities before asking their owner to start
         processes."""
         self._owned(reservation)
-        if not self.incremental or not reservation.submitted or reservation.closing:
-            raise ValueError("Only a submitted open incremental Group can receive credits")
+        if not reservation.submitted or reservation.closing:
+            raise ValueError("Only a submitted open Group can receive credits")
         if self.partial_by_node.get(reservation.node_id) is not reservation:
             raise ValueError("Only the host's partial Group can receive additional credits")
         ids = reservation.pending_ids[: self.available(reservation.node_id)]
@@ -142,7 +137,6 @@ class SessionCapacity:
         return {
             "per_node_limit": self.per_node,
             "global_limit": self.per_node * len(self.used),
-            "incremental_session_start": self.incremental,
             "used_by_node": dict(self.used),
             "peak_by_node": dict(self.peak),
             "global_peak": self.global_peak,

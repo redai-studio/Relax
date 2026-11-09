@@ -909,25 +909,19 @@ class RuntimeDomain:
         self._admission_coordinator = admission_coordinator
         self._resident_group_permits = asyncio.Semaphore(concurrency)
         per_node = getattr(args, "agentic_session_capacity_per_node", None) if rollout_mode == "train" else None
-        incremental = rollout_mode == "train" and getattr(args, "agentic_incremental_session_start", False)
-        self._eager_enabled = rollout_mode == "train" and getattr(args, "agentic_eager_session_generation", False)
         self._rollout_epoch: int | None = None
         self._eager_generation_open = False
         self._eager_closing = False
-        if incremental and per_node is None:
-            raise ValueError("Incremental startup requires confirmed Session resource accounting")
-        if self._eager_enabled and (
-            incremental is not True
-            or any(
-                getattr(args, name, False)
-                for name in ("partial_rollout", "agentic_prelaunch", "use_dynamic_global_batch_size")
-            )
+        if per_node is not None and any(
+            getattr(args, name, False)
+            for name in ("partial_rollout", "agentic_prelaunch", "use_dynamic_global_batch_size")
         ):
-            raise ValueError("Eager Session generation requires incremental synchronous or fully-async steps")
+            raise ValueError(
+                "Session capacity requires synchronous or fully-async steps; "
+                "partial rollout, prelaunch and dynamic global batch are unsupported"
+            )
         self._session_capacity = (
-            SessionCapacity({shard.node_id for shard in shards}, per_node, incremental=incremental)
-            if per_node is not None
-            else None
+            SessionCapacity({shard.node_id for shard in shards}, per_node) if per_node is not None else None
         )
         # Include Prepare calls that are still building Session specs. Reserve
         # synchronously so concurrent callers cannot all choose an idle node.
@@ -1004,14 +998,14 @@ class RuntimeDomain:
         group_input: GroupInput,
         launch_decision: Optional[asyncio.Future[bool]] = None,
     ) -> Optional[RuntimeGroupStream]:
-        """Start one group on a Shard and wait for its first-IR barrier.
+        """Register a Group and start members with available Session credits.
 
-        Session launch and progress observation share one Shard event stream. A
-        controlled drop before the barrier resolves this operation without a
-        Runtime capability.
+        Capacity-managed train Groups return before all first IRs arrive so
+        ready members can generate. Ordinary Groups wait for their barrier.
+        Session launch and progress observation share one Shard event stream.
         """
 
-        if self._eager_enabled and self._eager_closing:
+        if self._session_capacity is not None and self._eager_closing:
             raise RuntimeGroupError("Eager Runtime is closing")
         prepare_started_at = time.monotonic()
         prepare_started_at_utc = utc_now()
@@ -1032,10 +1026,10 @@ class RuntimeDomain:
             raise
         reservation: _GroupShardReservation | None = None
         try:
-            if self._eager_enabled and self._eager_closing:
+            if self._session_capacity is not None and self._eager_closing:
                 raise RuntimeGroupError("Eager Runtime is closing")
             reservation = await self._reserve_group_shard(group_id, launch_decision, len(group_input.samples))
-            if self._eager_enabled and self._eager_closing:
+            if self._session_capacity is not None and self._eager_closing:
                 raise RuntimeGroupError("Eager Runtime is closing")
             shard = reservation.shard
             self._start_shard_observers()
@@ -1055,7 +1049,7 @@ class RuntimeDomain:
             if self._session_capacity is not None:
                 for spec in session_specs:
                     spec.require_resource_release = True
-            if self._eager_enabled and self._eager_closing:
+            if self._session_capacity is not None and self._eager_closing:
                 raise RuntimeGroupError("Eager Runtime is closing")
             if launch_decision is not None:
                 if not launch_decision.done():
@@ -1073,7 +1067,7 @@ class RuntimeDomain:
                 session_results=tuple(
                     _SessionResultRef(session_spec.session_id, loop.create_future()) for session_spec in session_specs
                 ),
-                eager_session_generation=self._eager_enabled,
+                eager_session_generation=self._session_capacity is not None,
                 rollout_epoch=epoch,
             )
             # The reservation above already excludes duplicate pending Groups.
@@ -1097,8 +1091,8 @@ class RuntimeDomain:
         if reservation.session_capacity is not None:
             reservation.session_capacity.submitted = True
         try:
-            start_options = {"eager_session_generation": True} if self._eager_enabled else {}
-            if self._session_capacity is not None and self._session_capacity.incremental:
+            start_options = {}
+            if self._session_capacity is not None:
                 start_options["start_session_ids"] = tuple(
                     sid for sid in session_ids if sid in reservation.session_capacity.allocated_ids
                 )
@@ -1142,8 +1136,6 @@ class RuntimeDomain:
             stream.preparation_task.add_done_callback(lambda task: self._eager_preparation_done(stream, task))
             return stream
         try:
-            if self._session_capacity is not None and self._session_capacity.incremental:
-                await self._fill_session_capacity(stream, reservation.session_capacity)
             ready_for_lease = await asyncio.shield(stream.first_request_barrier)
             if not ready_for_lease:
                 logger.warning("Dropping group %s because an agent exited before every first IR existed", group_id)
@@ -1257,9 +1249,7 @@ class RuntimeDomain:
                 raise RuntimeGroupError("A complete Group must fit within one host's Session capacity")
             while True:
                 self._state_changed.clear()
-                candidates = [
-                    shard for shard in self._shards if self._session_capacity.can_reserve(shard.node_id, session_count)
-                ]
+                candidates = [shard for shard in self._shards if self._session_capacity.can_reserve(shard.node_id)]
                 if candidates:
                     break
                 for shard in self._shards:
@@ -1333,13 +1323,13 @@ class RuntimeDomain:
     async def resume_generation(self, rollout_id: int) -> None:
         """Release the partial-resume gate for the same requests."""
 
-        if self._eager_enabled and (
+        if self._session_capacity is not None and (
             self._eager_closing
             or self._eager_generation_open
             or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
         ):
             raise RuntimeGroupError("Eager generation must open a new paused rollout")
-        if self._eager_enabled and not getattr(self.args, "fully_async", False):
+        if self._session_capacity is not None and not getattr(self.args, "fully_async", False):
             self._assert_epoch_drained()
         self._start_shard_observers()
         revisions = await asyncio.gather(
@@ -1347,7 +1337,7 @@ class RuntimeDomain:
         )
         await self._wait_for_shard_revisions(revisions)
         self._rollout_epoch = rollout_id
-        self._eager_generation_open = self._eager_enabled
+        self._eager_generation_open = self._session_capacity is not None
 
     async def pause_generation(self) -> None:
         """Seal train IR admission, abort active attempts, and join
@@ -1706,7 +1696,7 @@ class RuntimeDomain:
     async def _shutdown_runtime(self) -> None:
 
         first_error: Optional[BaseException] = None
-        if self._eager_enabled:
+        if self._session_capacity is not None:
             self._eager_closing = True
             streams = tuple(stream for shard in self._shards for stream in shard.group_streams.values())
             for stream in streams:

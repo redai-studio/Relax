@@ -691,7 +691,7 @@ class AgenticResidentPipeline:
         )
         retain_resident_tail = not context.final_backfill and (self.args.partial_rollout or self.args.fully_async)
         if not retain_resident_tail:
-            if getattr(self.args, "agentic_eager_session_generation", False):
+            if getattr(self.args, "agentic_session_capacity_per_node", None) is not None:
                 await self.prepare_domain.discard_step()
             await finish_before_cancellation(
                 self._cancel_active_group_tasks(
@@ -701,7 +701,7 @@ class AgenticResidentPipeline:
                 ),
                 "agentic-groups-discard",
             )
-            if getattr(self.args, "agentic_eager_session_generation", False):
+            if getattr(self.args, "agentic_session_capacity_per_node", None) is not None:
                 self.runtime_domain._assert_epoch_drained()
         elif dynamic_close:
             # Generation is now paused. Harvest Group tasks already complete,
@@ -718,10 +718,6 @@ class AgenticResidentPipeline:
                     "session_capacity/outstanding": capacity["outstanding"],
                     "session_capacity/peak": capacity["global_peak"],
                     "session_capacity/confirmed_releases": capacity["confirmed_releases"],
-                    "session_capacity/incremental": int(capacity["incremental_session_start"]),
-                    "session_capacity/eager_session_generation": int(
-                        getattr(self.args, "agentic_eager_session_generation", False)
-                    ),
                 }
             )
         return RolloutFnTrainOutput(samples=context.output_groups, metrics=metrics)

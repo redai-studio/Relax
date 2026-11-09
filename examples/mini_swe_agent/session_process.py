@@ -18,8 +18,6 @@ import sys
 import time
 from pathlib import Path
 
-from session_memory import SessionMemory
-
 
 def enable_subreaper() -> None:
     libc = ctypes.CDLL(None, use_errno=True)
@@ -117,24 +115,12 @@ def supervise(spec_path: Path, report_path: Path, *, worker_command: list[str] |
         str(spec_path),
         str(result_path),
     ]
-    memory = SessionMemory.create(spec["memory_limit_mib"]) if spec.get("memory_limit_mib", 0) else None
-    memory_evidence: dict = {}
-    try:
-        worker = subprocess.Popen(memory.wrap(command) if memory else command, start_new_session=True)
-    except BaseException:
-        if memory:
-            memory.remove_if_empty()
-        raise
+    worker = subprocess.Popen(command, start_new_session=True)
     sent_term = False
     supervisor_error = ""
-    next_memory_poll = 0.0
     try:
         while worker.poll() is None:
             reap_exited_children(worker.pid)
-            if memory and time.monotonic() >= next_memory_poll:
-                next_memory_poll = time.monotonic() + 0.2
-                if memory.oom_kills():
-                    cancel(0, None)
             if os.getppid() != parent_pid:
                 cancel(0, None)
             if cancelled_at is not None:
@@ -189,26 +175,14 @@ def supervise(spec_path: Path, report_path: Path, *, worker_command: list[str] |
             result["error"] = "Session supervisor cancelled the worker"
         elif supervisor_error:
             result["error"] = supervisor_error
-    memory_released = memory is None
-    if memory:
-        try:
-            memory_evidence = memory.snapshot()
-            memory_released = memory.remove_if_empty()
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        if memory_evidence.get("oom_kills", 0):
-            # A descendant can be killed while its parent writes a success result.
-            # Treat the whole session as failed, preserving group replacement.
-            result["error"] = f"SessionMemoryLimitExceeded: {memory_evidence}"
     report = {
         **result,
         "nonce": spec["release_nonce"],
         "client_session_id": spec["record"]["session_id"],
-        "resources_released": absent and children_reaped and memory_released,
+        "resources_released": absent and children_reaped,
         "children_reaped": children_reaped,
         "instance_absent": absent,
         "cleanup_error": error,
-        "memory": {**memory_evidence, "released": memory_released},
     }
     temporary = report_path.with_suffix(".tmp")
     try:
@@ -218,10 +192,6 @@ def supervise(spec_path: Path, report_path: Path, *, worker_command: list[str] |
         # A deadline or failed result write is not permission to orphan descendants.
         while not children_reaped:
             children_reaped = reap_children(time.monotonic() + 5.0)
-        while memory and not memory_released:
-            memory_released = memory.remove_if_empty()
-            if not memory_released:
-                time.sleep(0.1)
 
 
 if __name__ == "__main__":
