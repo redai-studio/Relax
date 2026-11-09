@@ -46,9 +46,9 @@ class GenerationSegment:
 
     ``token_start`` / ``token_end`` are offsets into the sample response
     (``response`` / ``continuation_train_tokens``) and ``token_end`` is
-    exclusive. A segment holds several spans when the generation was aborted and
-    resumed against a newer policy, and the spans keep the exact token count of
-    each attempt instead of averaging it away.
+    exclusive. A segment holds several spans when the generation was aborted
+    and resumed against a newer policy, and the spans keep the exact token
+    count of each attempt instead of averaging it away.
     """
 
     turn_index: int

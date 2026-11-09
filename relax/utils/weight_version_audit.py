@@ -29,7 +29,8 @@ def parse_weight_version(value: str | None) -> int | None:
 
 
 def trained_token_count(loss_mask: list[int] | None, token_start: int, token_end: int) -> int:
-    """Count response tokens inside ``[token_start, token_end)`` that are trained."""
+    """Count response tokens inside ``[token_start, token_end)`` that are
+    trained."""
     if loss_mask is None:
         return max(token_end - token_start, 0)
     end = min(token_end, len(loss_mask))
@@ -41,8 +42,8 @@ def sample_version_report(sample: Sample) -> dict[str, Any]:
     """Build a per-sample diagnostic report that can be traced back to a turn.
 
     ``segments`` keeps one entry per committed generation span, listing the
-    exact token range of every weight version involved, so a report can point at
-    the session, turn and tokens instead of a summary number.
+    exact token range of every weight version involved, so a report can point
+    at the session, turn and tokens instead of a summary number.
     """
     segments: list[dict[str, Any]] = []
     known_tokens = 0

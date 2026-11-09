@@ -375,7 +375,8 @@ def _sum_counter_dict(left: dict[str, int], right: dict[str, int]) -> dict[str, 
 
 
 def _node_version_spans(node: MsgNode, token_start: int, token_end: int) -> list[VersionSpan]:
-    """Split a response node's token range by the weight version of each attempt.
+    """Split a response node's token range by the weight version of each
+    attempt.
 
     Tokens that no recorded attempt covers (trimmed stop tokens, sanitized
     tokens, or a node recorded before attempt counts existed) stay unknown
