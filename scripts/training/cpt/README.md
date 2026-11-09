@@ -72,21 +72,21 @@ ray job status --address=http://127.0.0.1:8265 "$RUN_NAME"
 ray job logs --address=http://127.0.0.1:8265 "$RUN_NAME"
 ```
 
-ClearML 打开 `PROJECT_NAME` 下对应 `RUN_NAME` 的 Scalars，保持 **Group by = Metric**：
+ClearML 打开 `PROJECT_NAME` 下对应任务，在任务列表的 **Scalars 对比视图**中选择该任务并展开 `train`（单选一个任务也可以）：
 
-| ClearML 图表 title                                | 曲线 series               | 内容                              |
-| ------------------------------------------------- | ------------------------- | --------------------------------- |
-| `train/loss`                                      | `loss`                    | 本 step 的整体训练 loss，独立纵轴 |
-| `train/loss_domain_general`                       | `loss`                    | general 有效监督 token 的平均 NLL |
-| `train/loss_domain_code`                          | `loss`                    | code 有效监督 token 的平均 NLL    |
-| `train/loss_domain_science`                       | `loss`                    | science 有效监督 token 的平均 NLL |
-| `train/dataset/tokens`、`samples`                 | 各数据集名称              | 各源实际 token 数、样本数         |
-| `train/dataset/token_fraction`、`sample_fraction` | 各数据集名称              | 各源实际占比                      |
-| `train`                                           | `grad_norm`、`lr-pg_*` 等 | 其他训练指标                      |
+| SDK title | SDK series / 图名         | 内容                              |
+| --------- | ------------------------- | --------------------------------- |
+| `train`   | `loss`                    | 整体训练 loss                     |
+| `train`   | `loss_domain_general`     | general 有效监督 token 的平均 NLL |
+| `train`   | `loss_domain_code`        | code 有效监督 token 的平均 NLL    |
+| `train`   | `loss_domain_science`     | science 有效监督 token 的平均 NLL |
+| `train`   | `grad_norm`、`lr-pg_*` 等 | 原有训练指标                      |
 
-原始指标 key 仍是 `train/loss` 和 `train/dataset/<name>/<stat>`；只有 ClearML 显示映射按上述规则分图。无需手动双击图例隔离总 loss。跨图量纲不同，各自使用独立纵轴。某源本步没有有效监督 token 时不填零 loss，只上报计数。总 loss 及各源统计均复用训练 forward，不额外遍历数据集。
+所有分源 loss 与原有指标共用 `train` 分类，每个 series 对应一张独立图，图名包含数据集名称；不再创建 `train/loss`、`train/loss_domain_*` 或 `train/dataset/*` 分类。分源 samples、tokens 及占比仍保留为原始训练指标，但不额外绘制到 ClearML。
 
-在新 ClearML 项目中可设置分组、横轴、平滑和图表可见性后点击 **Set as default** 保存项目默认视图；Plotly 图例的临时单曲线隔离不保证随该设置保存。旧验证实验可能仍有 `train/dataset/loss` 等历史图；新实验使用唯一 `RUN_NAME`，不会继承这些历史上报数据。
+原始指标 key 仍是 `train/loss` 和 `train/dataset/<name>/<stat>`；仅 ClearML 展示映射发生变化。某源本步没有有效监督 token 时不填零 loss。总 loss 及各源统计均复用训练 forward，不额外遍历数据集。
+
+旧任务已写入的其他标题不会自动消失；新实验使用唯一 `RUN_NAME`，不会继承历史图表。
 
 ### 默认参数和 checkpoint
 

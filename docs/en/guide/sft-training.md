@@ -49,7 +49,7 @@ Other sources use the same suffixes. Source names are URL percent-encoded: `code
 
 Mixture weights allocate sample quotas over a complete logical epoch, rather than fixed proportions within every step. Filtering can change the accepted proportions; inspect source sample and token counts. These metrics cover the main language-model training loss, exclude MTP auxiliary loss, and leave evaluation metrics unchanged. FSDP, sequence classification, DPO/RM and custom datasets are outside this source-metric scope. Keep the YAML and data snapshot unchanged when resuming.
 
-With `--use-clearml --use-metrics-service`, ClearML groups all per-dataset loss charts under `train`, with the dataset name in each chart title (`train/loss_domain_<name>`) and a single `loss` series. Counts and fractions use four comparison charts: `train/dataset/tokens`, `train/dataset/samples`, `train/dataset/token_fraction`, and `train/dataset/sample_fraction`, with one series per dataset; overall training loss has its own `train/loss` chart with series `loss`, while other training metrics remain under `train`. CPT uses the same source metrics.
+With `--use-clearml --use-metrics-service`, ClearML uses the single SDK title `train`: the aggregate loss has series `loss`, and each dataset has series `loss_domain_<name>`. In the task-list Scalars comparison view, expand `train` to see a separate plot named after each series, alongside the existing training plots. Per-source counts and fractions remain in the canonical training metrics but are not separately reported to ClearML, so they do not create extra plots or categories. CPT uses the same mapping. Historical tasks retain previously reported titles; start a new task to use this layout.
 
 ## Data Preparation
 

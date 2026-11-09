@@ -78,14 +78,10 @@ def test_nonfinite_norm_does_not_drop_skip_counters(monkeypatch, bad_norm, queue
     assert sdk_logger.report_scalar.call_args_list == [
         call(title="train", series="skipped_nonfinite_grad", value=1, iteration=271),
         call(title="train", series="nonfinite_skips_in_process", value=2, iteration=271),
-        call(title="train/loss", series="loss", value=0.5, iteration=271),
+        call(title="train", series="loss", value=0.5, iteration=271),
         call(title="train", series="zero", value=0, iteration=271),
-        call(title="train/loss_domain_general", series="loss", value=0.4, iteration=271),
-        call(title="train/loss_domain_code%2Fpython", series="loss", value=0.6, iteration=271),
-        call(title="train/dataset/tokens", series="general", value=12, iteration=271),
-        call(title="train/dataset/samples", series="general", value=2, iteration=271),
-        call(title="train/dataset/token_fraction", series="general", value=0.3, iteration=271),
-        call(title="train/dataset/sample_fraction", series="general", value=0.5, iteration=271),
+        call(title="train", series="loss_domain_general", value=0.4, iteration=271),
+        call(title="train", series="loss_domain_code%2Fpython", value=0.6, iteration=271),
     ]
     assert metrics["train/grad_norm"] is bad_norm
     assert not service.metrics_buffer.has_metrics_for_step(271)
