@@ -279,15 +279,28 @@ RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2
         --patch /tmp/fla042.patch --manifest /etc/relax-fla042-runtime.json && \
     rm /tmp/fla042.patch
 COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
+COPY docker/patch/sglang/v0.5.17-transformers5-compat.patch /tmp/sglang-transformers5.patch
 COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
 COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
 # Resolve late so existing compiled layers remain cached. NIXL packages both
 # backends, but dispatches to cu12 based on Torch; this does not change CUDA.
+# Pin Qwen3.8 HF support without replacing the CUDA/Torch/TE/DeepEP stack.
 RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt && \
     pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt -r /opt/relax/cu12-runtime-requirements.txt && \
     python /opt/relax/repair_te_wheel_metadata.py /opt/relax/te-wheel-tag.patch && \
     pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
+    pip install --no-cache-dir --no-deps transformers==5.16.0 tokenizers==0.23.2 && \
+    patch --batch --forward --fuzz=0 -d /sgl-workspace/sglang -p1 < /tmp/sglang-transformers5.patch && \
+    SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
+        pip install --no-cache-dir --no-deps -e /sgl-workspace/sglang/python && \
+    rm /tmp/sglang-transformers5.patch && \
+    python -c 'from importlib.metadata import version; \
+        assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
+        assert version("sglang") == "0.5.17"; \
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
+        assert CONFIG_MAPPING["qwen4_exp"].model_type == "qwen4_exp"; \
+        import sglang.srt.configs.qwen3_asr' && \
     python /opt/relax/validate_hybridep_install.py && \
     python /opt/relax/validate_final_runtime.py --profile cu12
