@@ -356,6 +356,24 @@ def _diagnostic(reason: str) -> None:
     get_logger(__name__).info("RL fused log-probs: %s", reason)
 
 
+@lru_cache(maxsize=None)
+def _tp_control_group(group: Any) -> Any:
+    # Only output PP stages participate; other TP groups need not enter creation.
+    return dist.new_group(ranks=dist.get_process_group_ranks(group), backend="gloo", use_local_synchronization=True)
+
+
+def _tp_fallback_reason(reason: str | None, group: Any) -> str | None:
+    if dist.get_world_size(group) == 1:
+        return reason
+    # Eligibility is CPU metadata. Keep its reduction on CPU to avoid object
+    # serialization and CUDA-to-host synchronization on every microbatch.
+    unsupported = torch.tensor(reason is not None, dtype=torch.int32, device="cpu")
+    dist.all_reduce(unsupported, op=dist.ReduceOp.MAX, group=_tp_control_group(group))
+    if unsupported.item():
+        return reason or "unsupported peer TP shard"
+    return None
+
+
 def _head_reason(layer: Any) -> str | None:
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear
     from torch.nn.modules import module as hooks
@@ -483,12 +501,8 @@ def prepare_output_processor(model: torch.nn.Module, args: Any, batch: dict, *, 
         reason = "response without prompt"
     else:
         reason = _head_reason(inner.output_layer)
-    reasons = [reason]
     group = mpu.get_tensor_model_parallel_group()
-    if dist.get_world_size(group) > 1:
-        reasons = [None] * dist.get_world_size(group)
-        dist.all_gather_object(reasons, reason, group=group)
-    reason = next((value for value in reasons if value is not None), None)
+    reason = _tp_fallback_reason(reason, group)
     if reason is not None:
         _diagnostic("fallback to native head precision: " + reason)
         return {}
@@ -524,12 +538,9 @@ def output_processor(*, hidden_states, output_layer, output_weight, input_ids, c
             reason = "head requires an FP32 main_grad buffer"
     # All TP ranks must choose the same branch, including frozen/empty shards.
     group = output_layer.tp_group
-    reasons = [reason]
-    if dist.get_world_size(group) > 1:
-        reasons = [None] * dist.get_world_size(group)
-        dist.all_gather_object(reasons, reason, group=group)
-    if any(reasons):
-        _diagnostic("fallback to native head precision: " + (reason or "unsupported peer TP shard"))
+    reason = _tp_fallback_reason(reason, group)
+    if reason is not None:
+        _diagnostic("fallback to native head precision: " + reason)
         logits, _ = output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=kwargs["runtime_gather_output"]
         )

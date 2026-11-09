@@ -11,6 +11,7 @@ Expected values come from FP64 math or a test-only dense FP32 head.
 import importlib.util
 import os
 import tempfile
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -495,6 +496,80 @@ def actor_args():
     )
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_actor_reference_forward_only_preserves_initial_ci_equality(monkeypatch, enabled):
+    if mpu.get_context_parallel_world_size() > 1 or mpu.get_pipeline_model_parallel_world_size() > 1:
+        pytest.skip("greedy CI fixture requires a complete local sequence and model")
+    from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+    from megatron.core.transformer.module import Float16Module
+    from megatron.training import global_vars
+
+    from relax.backends.megatron import data as data_module
+    from relax.backends.megatron import fused_linear_ce as fused_module
+    from relax.backends.megatron import model as runtime
+    from relax.backends.megatron.data import DataIterator
+    from relax.backends.megatron.loss import get_log_probs_and_entropy
+
+    args = actor_args()
+    args.fused_linear_ce = enabled
+    args.ci_test = True
+    args.use_rollout_entropy = False
+    args.micro_batch_size = args.rollout_batch_size = args.n_samples_per_prompt = 1
+    args.log_multi_turn = False
+    args.qkv_format = "bshd"
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    torch.manual_seed(538)
+    config, bare = make_gpt()
+    bare.output_layer.gradient_accumulation_fusion = False
+    model = Float16Module(config, bare).eval()
+    model.role = "actor"
+    # Native BF16 head, including its actual output rounding. Confident greedy
+    # targets also satisfy CI's existing log-probability range check.
+    with torch.no_grad():
+        bare.output_layer.weight.mul_(100)
+        tokens = torch.tensor([[42]], device="cuda")
+        for _ in range(23):
+            logits = model(input_ids=tokens, position_ids=None, attention_mask=None)[:, -1]
+            logits = gather_from_tensor_model_parallel_region(logits, group=bare.output_layer.tp_group)
+            tokens = torch.cat((tokens, logits.argmax(-1, keepdim=True)), dim=1)
+    data = {
+        "tokens": [tokens[0]],
+        "total_lengths": [24],
+        "response_lengths": [10],
+        "max_seq_lens": [32],
+        "loss_masks": [torch.ones(10, device="cuda", dtype=torch.int)],
+    }
+    hits = []
+    original_processor = fused_module.output_processor
+
+    def record_processor(**kwargs):
+        output = original_processor(**kwargs)
+        hits.append(kwargs["context"].fused)
+        return output
+
+    monkeypatch.setattr(fused_module, "output_processor", record_processor)
+
+    def forward(prefix, consumer=get_log_probs_and_entropy):
+        return runtime.forward_only(consumer, args, [model], [DataIterator(data, 1)], [1], store_prefix=prefix)
+
+    native = forward("teacher_")
+    actor = forward("")
+    reference = forward("ref_")
+    torch.testing.assert_close(actor["log_probs"], reference["ref_log_probs"], rtol=0, atol=1e-8)
+    topk = forward("ref_", partial(get_log_probs_and_entropy, with_topk=True, topk_k=3))
+    torch.testing.assert_close(topk["ref_log_probs"], native["teacher_log_probs"], rtol=0, atol=0)
+    if not enabled:
+        torch.testing.assert_close(actor["log_probs"], native["teacher_log_probs"], rtol=0, atol=0)
+    assert hits == ([True, True] if enabled else [])
+    # Replace only the metrics transport; run the real reducer and CI assertions.
+    monkeypatch.setattr(
+        data_module,
+        "gather_log_data",
+        lambda prefix, _args, _rollout_id, values, *_rest: {f"{prefix}/{key}": val for key, val in values.items()},
+    )
+    data_module.log_rollout_data(0, args, {**data, **actor, **reference})
+
+
 @pytest.mark.parametrize("sp,tied", [(False, False), (False, True), (True, True)])
 @pytest.mark.parametrize("legacy_sft_env", [False, True])
 def test_real_rl_actor_multiple_updates_and_forward_only(monkeypatch, sp, tied, legacy_sft_env):
@@ -962,19 +1037,64 @@ def test_static_cp_coordinates_and_signed_gradients(monkeypatch, layout, empty):
     check_grad(head.weight.grad, expected_dw)
 
 
+def test_tp_control_groups_allow_independent_dp_forward_counts():
+    if mpu.get_tensor_model_parallel_world_size() == 1 or mpu.get_data_parallel_world_size() == 1:
+        pytest.skip("requires distinct TP groups in a TP2/DP2 torchrun")
+    from relax.backends.megatron.fused_linear_ce import _tp_fallback_reason
+
+    group = mpu.get_tensor_model_parallel_group()
+    # Forward-only data partitions can have different microbatch counts. Only
+    # members of this TP group may enter its lazy creation and reductions.
+    for step in range(1 + mpu.get_data_parallel_rank()):
+        reason = "unsupported local shard" if step % 2 == 0 and dist.get_rank(group) == 0 else None
+        result = _tp_fallback_reason(reason, group)
+        assert (result is not None) is (step % 2 == 0)
+        if reason is not None:
+            assert result == reason
+
+
 @pytest.mark.parametrize("invalid", ["bf16_main_grad", "cp_labels"])
-def test_unsupported_output_operands_fall_back_before_projection(invalid):
+def test_unsupported_output_operands_fall_back_before_projection(monkeypatch, invalid):
     pytest.importorskip("fused_weight_gradient_mlp_cuda", reason="native fused main_grad oracle needs MCore extension")
     from relax.backends.megatron.fused_linear_ce import OutputContext, output_processor
 
     _, head = make_head(fusion=True)
-    head.weight.main_grad = torch.zeros_like(
-        head.weight, dtype=torch.bfloat16 if invalid == "bf16_main_grad" else torch.float32
-    )
+    head.weight.main_grad = torch.zeros_like(head.weight, dtype=torch.float32)
     restore_native_head(head)
     h = torch.randn(17, 1, 48, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     tokens = torch.randint(1034, (1, 17), device="cuda")
-    context = OutputContext(0.7, True, labels=tokens[:, :-1] if invalid == "cp_labels" else None)
+
+    def forbidden_objects(*_args, **_kwargs):
+        raise AssertionError("TP eligibility must not serialize Python objects")
+
+    original_item = torch.Tensor.item
+
+    def cpu_item(tensor, *args, **kwargs):
+        if tensor.is_cuda:
+            raise AssertionError("TP eligibility must not synchronize a CUDA scalar to the host")
+        return original_item(tensor, *args, **kwargs)
+
+    processor_kwargs = {
+        "hidden_states": h,
+        "output_layer": head,
+        "output_weight": None,
+        "input_ids": tokens,
+        "runtime_gather_output": None,
+        "scale_logits": lambda z: z,
+    }
+    # Warm up the negotiated path, then change eligibility on only one TP rank.
+    # Caching a local decision would make peers take incompatible branches.
+    with monkeypatch.context() as guard:
+        guard.setattr(dist, "all_gather_object", forbidden_objects)
+        guard.setattr(torch.Tensor, "item", cpu_item)
+        context = OutputContext(0.7, True)
+        with torch.no_grad():
+            output_processor(context=context, **processor_kwargs)
+        assert context.fused
+    rank = dist.get_rank(head.tp_group)
+    if invalid == "bf16_main_grad" and rank == 0:
+        head.weight.main_grad = head.weight.main_grad.bfloat16()
+    context = OutputContext(0.7, True, labels=tokens[:, :-1] if invalid == "cp_labels" and rank == 0 else None)
     expected, _ = head(h)
     actual = output_processor(
         hidden_states=h,
@@ -989,6 +1109,13 @@ def test_unsupported_output_operands_fall_back_before_projection(invalid):
     torch.testing.assert_close(actual, expected.transpose(0, 1).contiguous(), rtol=0, atol=0)
     actual.sum().backward()
     assert torch.isfinite(h.grad).all()
+    head.weight.main_grad = torch.zeros_like(head.weight, dtype=torch.float32)
+    context = OutputContext(0.7, True)
+    with monkeypatch.context() as guard, torch.no_grad():
+        guard.setattr(dist, "all_gather_object", forbidden_objects)
+        guard.setattr(torch.Tensor, "item", cpu_item)
+        output_processor(context=context, **processor_kwargs)
+    assert context.fused
 
 
 @pytest.mark.parametrize("tied", [False, True])

@@ -1055,10 +1055,13 @@ def forward_only(
         }
         if batch.get("padding_mask") is not None:
             forward_kwargs["padding_mask"] = batch["padding_mask"]
-        # Only this exact consumer, on the actor's own weight pass, accepts
-        # fused statistics. Reference/teacher/top-k/value callbacks keep logits.
+        # Actor and its reference-weight pass must use the same head precision.
+        # Teacher/top-k/value callbacks keep logits; role checks stay in prepare.
         rl_output = prepare_output_processor(
-            model, args, batch, consumer="log_probs" if f is get_log_probs_and_entropy and not store_prefix else None
+            model,
+            args,
+            batch,
+            consumer="log_probs" if f is get_log_probs_and_entropy and store_prefix in ("", "ref_") else None,
         )
         forward_kwargs.update(rl_output)
         output_tensor = model(**forward_kwargs)
