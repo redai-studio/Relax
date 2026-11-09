@@ -96,6 +96,7 @@ def test_unsupported_scheduler_configuration_is_rejected(override):
     "override, message",
     [
         (dict(advantage_estimator="m2po"), "M2PO clipping"),
+        (dict(use_opd=True, opd_loss_coef=1.0, opd_kl_coef=0.0), "direct OPD loss"),
     ],
 )
 def test_microbatch_dependent_objectives_are_rejected_only_with_flops(override, message):
@@ -104,6 +105,13 @@ def test_microbatch_dependent_objectives_are_rejected_only_with_flops(override, 
         microbatch_cost.validate_flops_balance(args)
     args.balance_by_flops = False
     assert not microbatch_cost.validate_flops_balance(args)
+
+
+def test_advantage_only_opd_can_use_flops():
+    args = Namespace(
+        balance_by_flops=True, use_dynamic_batch_size=True, use_opd=True, opd_loss_coef=0.0, opd_kl_coef=1.0
+    )
+    assert microbatch_cost.validate_flops_balance(args)
 
 
 def test_unknown_model_and_invalid_cost_fail_at_producer(monkeypatch):
