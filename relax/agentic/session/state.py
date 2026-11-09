@@ -7,7 +7,6 @@ import copy
 import hashlib
 import json
 import math
-import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -399,11 +398,9 @@ def _decode_tokens(
         and tokenizer.clean_up_tokenization_spaces is False
         and type(backend := tokenizer._tokenizer) is Tokenizer
     ):
-        # Rust decode_batch releases the GIL. With parallelism enabled it can
-        # start a Rayon pool, so use single decode unless serial mode is set.
-        if os.environ.get("TOKENIZERS_PARALLELISM", "true").lower() in ("", "0", "false", "f", "off", "no", "n"):
-            return backend.decode_batch([token_ids], skip_special_tokens=False)[0]
-        return backend.decode(token_ids, skip_special_tokens=False)
+        # The native batch entry point releases the GIL even for one sequence,
+        # and respects the tokenizer library's existing parallelism setting.
+        return backend.decode_batch([token_ids], skip_special_tokens=False)[0]
     return decode(token_ids, skip_special_tokens=False)
 
 

@@ -390,7 +390,7 @@ def test_owned_compaction_matches_the_old_snapshot(shared_rollout_tokens: bool) 
     _assert_same(artifact.to_sample().to_dict(), before, "round-trip")
 
 
-@pytest.mark.parametrize("mode", ["default", "serial", "cleanup", "custom"])
+@pytest.mark.parametrize("mode", ["default", "parallel", "serial", "cleanup", "custom"])
 def test_export_decoding_preserves_tokenizer_semantics(monkeypatch, mode) -> None:
     from tokenizers import Tokenizer, models
 
@@ -403,7 +403,16 @@ def test_export_decoding_preserves_tokenizer_semantics(monkeypatch, mode) -> Non
     if mode == "default":
         monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
     else:
-        monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+        monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true" if mode == "parallel" else "false")
+
+    batch_inputs = []
+    decode_batch = Tokenizer.decode_batch
+
+    def track_batch(backend, sequences, *, skip_special_tokens):
+        batch_inputs.append(sequences)
+        return decode_batch(backend, sequences, skip_special_tokens=skip_special_tokens)
+
+    monkeypatch.setattr(Tokenizer, "decode_batch", track_batch)
     if mode == "custom":
         public_decode = tokenizer._decode
         monkeypatch.setattr(tokenizer, "_decode", lambda *a, **kw: "custom:" + public_decode(*a, **kw))
@@ -412,6 +421,7 @@ def test_export_decoding_preserves_tokenizer_semantics(monkeypatch, mode) -> Non
     assert "[SEP]" in expected
     assert _decode_tokens(tokenizer=tokenizer, token_ids=ids) == expected
     assert _decode_tokens(tokenizer=tokenizer, token_ids=[]) == ""
+    assert batch_inputs == ([[ids]] if mode in {"default", "parallel", "serial"} else [])
 
 
 def test_default_artifact_is_a_snapshot() -> None:
