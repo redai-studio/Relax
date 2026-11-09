@@ -16,7 +16,7 @@ from relax.utils.metrics.metric_utils import (
 from relax.utils.misc import group_by
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.types import Sample
-from relax.utils.weight_version_audit import parse_weight_version
+from relax.utils.weight_version_audit import parse_weight_version, trained_token_count
 
 
 def compute_metrics_from_samples(
@@ -91,8 +91,8 @@ def _compute_weight_version_metrics(
     segments_per_sample: list[int] = []
     span_per_sample: list[int] = []
     observed_versions: list[int] = []
-    # (version, token count) pairs, split evenly when a span saw several versions.
-    version_tokens: list[tuple[int, float]] = []
+    # (version, token count) pairs recorded by the producer, never averaged.
+    version_tokens: list[tuple[int, int]] = []
 
     for sample in samples:
         segments = sample.generation_segments
@@ -101,18 +101,26 @@ def _compute_weight_version_metrics(
         sample_unknown = 0
         for segment in segments:
             segment_count += 1
-            versions = [
-                version for version in map(parse_weight_version, segment.weight_versions) if version is not None
-            ]
-            tokens = segment.token_count
-            if not versions:
-                sample_unknown += tokens
-                continue
-            sample_known += tokens
-            observed_versions.extend(versions)
-            span_per_sample.append(max(versions) - min(versions))
-            share = tokens / len(versions)
-            version_tokens.extend((version, share) for version in versions)
+            segment_versions: list[int] = []
+            for span in segment.version_spans:
+                # Only tokens that actually enter training count: partial
+                # rollout masks old on-policy prefixes off, and those must not
+                # inflate the audit.
+                tokens = trained_token_count(sample.loss_mask, span.token_start, span.token_end)
+                if tokens == 0:
+                    # Fully masked off: it never reaches training, so it must
+                    # not influence coverage, span or lag.
+                    continue
+                version = parse_weight_version(span.version)
+                if version is None:
+                    sample_unknown += tokens
+                    continue
+                sample_known += tokens
+                segment_versions.append(version)
+                observed_versions.append(version)
+                version_tokens.append((version, tokens))
+            if segment_versions:
+                span_per_sample.append(max(segment_versions) - min(segment_versions))
         known_tokens += sample_known
         # Response tokens outside any audit segment are unknown as well.
         unsegmented = max(sample.effective_response_length - sample_known - sample_unknown, 0)

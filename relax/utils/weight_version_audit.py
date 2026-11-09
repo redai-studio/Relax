@@ -28,28 +28,58 @@ def parse_weight_version(value: str | None) -> int | None:
         return None
 
 
+def trained_token_count(loss_mask: list[int] | None, token_start: int, token_end: int) -> int:
+    """Count response tokens inside ``[token_start, token_end)`` that are trained."""
+    if loss_mask is None:
+        return max(token_end - token_start, 0)
+    end = min(token_end, len(loss_mask))
+    start = min(max(token_start, 0), end)
+    return int(sum(loss_mask[start:end]))
+
+
 def sample_version_report(sample: Sample) -> dict[str, Any]:
     """Build a per-sample diagnostic report that can be traced back to a turn.
 
-    ``segments`` keeps one entry per committed generation span so a report can
-    point at the exact token range, turn and weight version(s) involved.
+    ``segments`` keeps one entry per committed generation span, listing the
+    exact token range of every weight version involved, so a report can point at
+    the session, turn and tokens instead of a summary number.
     """
     segments: list[dict[str, Any]] = []
     known_tokens = 0
     unknown_tokens = 0
     for segment in sample.generation_segments:
-        versions = [version for version in map(parse_weight_version, segment.weight_versions) if version is not None]
-        if versions:
-            known_tokens += segment.token_count
-        else:
-            unknown_tokens += segment.token_count
+        spans: list[dict[str, Any]] = []
+        segment_versions: list[int] = []
+        segment_known = 0
+        segment_unknown = 0
+        for span in segment.version_spans:
+            tokens = trained_token_count(sample.loss_mask, span.token_start, span.token_end)
+            version = parse_weight_version(span.version)
+            spans.append(
+                {
+                    "version": version,
+                    "token_start": span.token_start,
+                    "token_end": span.token_end,
+                    "tokens": tokens,
+                }
+            )
+            if tokens == 0:
+                continue
+            if version is None:
+                segment_unknown += tokens
+            else:
+                segment_known += tokens
+                segment_versions.append(version)
+        known_tokens += segment_known
+        unknown_tokens += segment_unknown
         segments.append(
             {
                 "turn_index": segment.turn_index,
                 "token_start": segment.token_start,
                 "token_end": segment.token_end,
-                "tokens": segment.token_count,
-                "versions": versions,
+                "tokens": segment_known + segment_unknown,
+                "versions": segment_versions,
+                "spans": spans,
                 "state_hash": segment.state_hash,
             }
         )

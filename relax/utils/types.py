@@ -24,24 +24,62 @@ def get_spec_token_counts(meta_info: dict[str, Any]) -> tuple[int, int]:
 
 
 @dataclass
+class VersionSpan:
+    """A token range produced under one weight version.
+
+    ``version`` is ``None`` when the backend did not report one; such a span is
+    unknown and must never be folded into a known version.
+    """
+
+    version: str | None
+    token_start: int
+    token_end: int
+
+    @property
+    def token_count(self) -> int:
+        return max(self.token_end - self.token_start, 0)
+
+
+@dataclass
 class GenerationSegment:
-    """A committed generation span and the weight version(s) that produced it.
+    """A committed generation span and how its tokens split across versions.
 
     ``token_start`` / ``token_end`` are offsets into the sample response
     (``response`` / ``continuation_train_tokens``) and ``token_end`` is
-    exclusive. A segment holds more than one version when the generation was
-    aborted and resumed against a newer policy.
+    exclusive. A segment holds several spans when the generation was aborted and
+    resumed against a newer policy, and the spans keep the exact token count of
+    each attempt instead of averaging it away.
     """
 
     turn_index: int
     token_start: int
     token_end: int
-    weight_versions: list[str] = field(default_factory=list)
+    version_spans: list[VersionSpan] = field(default_factory=list)
     state_hash: str | None = None
 
     @property
     def token_count(self) -> int:
         return max(self.token_end - self.token_start, 0)
+
+    @property
+    def versions(self) -> list[str]:
+        return [span.version for span in self.version_spans if span.version is not None]
+
+
+def _generation_segment_from_dict(segment: GenerationSegment | dict) -> GenerationSegment:
+    """Rebuild a segment (and its version spans) from its ``to_dict`` form."""
+    if isinstance(segment, GenerationSegment):
+        return segment
+    spans = [
+        span if isinstance(span, VersionSpan) else VersionSpan(**span) for span in segment.get("version_spans") or []
+    ]
+    return GenerationSegment(
+        turn_index=segment["turn_index"],
+        token_start=segment["token_start"],
+        token_end=segment["token_end"],
+        version_spans=spans,
+        state_hash=segment.get("state_hash"),
+    )
 
 
 @dataclass
@@ -202,8 +240,7 @@ class Sample:
         data["spec_info"] = Sample.SpecInfo.from_dict(data.get("spec_info", {}))
         data["prefix_cache_info"] = Sample.PrefixCacheInfo.from_dict(data.get("prefix_cache_info", {}))
         data["generation_segments"] = [
-            segment if isinstance(segment, GenerationSegment) else GenerationSegment(**segment)
-            for segment in data.get("generation_segments") or []
+            _generation_segment_from_dict(segment) for segment in data.get("generation_segments") or []
         ]
 
         field_names = set(Sample.__dataclass_fields__.keys())
@@ -239,8 +276,9 @@ class Sample:
         self.prefix_cache_info.add(meta_info=meta_info)
 
         weight_version = meta_info.get("weight_version")
-        if weight_version is not None:
-            self.weight_versions.append(str(weight_version))
+        version = str(weight_version) if weight_version is not None else None
+        if version is not None:
+            self.weight_versions.append(version)
         if response_delta:
             # Always close a span, even without a version: an unversioned
             # generation must still show up as unknown in the audit instead of
@@ -252,7 +290,7 @@ class Sample:
                     turn_index=len(self.generation_segments),
                     token_start=token_start,
                     token_end=token_end,
-                    weight_versions=[str(weight_version)] if weight_version is not None else [],
+                    version_spans=[VersionSpan(version, token_start, token_end)],
                 )
             )
 
