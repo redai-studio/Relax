@@ -4,7 +4,7 @@
 
 MOPD (Multi-Teacher On-Policy Distillation) 实现多教师在线蒸馏，允许一个学生模型同时从多个异构教师模型中学习。每个教师专注于不同的数据领域（如文本数学、视觉几何），框架按样本的 `data_source` 把它路由到对应教师，请求 token 级 log-probability，实现跨模态、跨领域的知识传递。
 
-教师由 **Relax 托管**：只需通过 `--opd-teacher-routes` 提供 `{data_source: HF 权重路径}`，Relax 会为每个教师自动拉起一个专用 SGLang 服务，运行时注入真实 URL。**无需手动 `sglang.launch_server`、无需管理端口。**
+教师由 **Relax 托管**：只需通过 `--opd-teacher-routes` 提供 `{data_source: HF 权重路径}`，默认每个 Teacher 使用自己的 SGLang 服务。同构 Teacher 可选用一个共享实例。**无需手动 `sglang.launch_server`、无需管理端口。**
 
 本示例场景：
 
@@ -125,7 +125,21 @@ Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确�
 - `mopd/by_teacher/<teacher_id>/responses` 统计本轮登记的 Student 回答，也包括上轮仍待提交的回答。同一回答在本轮重试只算一次。
 - `mopd/by_teacher/<teacher_id>/awaiting_submission` 统计其中尚待提交评分的回答。回答进入 `_teacher_prefill()`、逐条生成被取消或整组跳过评分时移出，重试时重新计入。
 
-> `--resource` 里 `teacher` 的 GPU 数是教师总预算，先在教师间平均分配（要求整除），每个教师再按 `--teacher-num-gpus-per-engine` 拆成若干副本（副本 TP=该值），rollout 时先路由到教师再在其副本间 round-robin。
+> 独占模式下，`--resource` 里 `teacher` 的 GPU 数是教师总预算，先在教师间平均分配（要求整除），每个教师再按 `--teacher-num-gpus-per-engine` 拆成若干副本（副本 TP=该值），rollout 时先路由到教师再在其副本间 round-robin。
+
+### 多个 Teacher 共用一个引擎
+
+在现有 MOPD 命令中使用以下参数。例中 Student rollout 占一张卡，Teacher 占一张卡，训练阶段 Actor 使用两张卡。把路由键换成数据集里实际的 `data_source`，路径换成两个同构、分词器一致的本地 BF16 checkpoint。
+
+```bash
+--colocate --offload --use-opd --opd-type sglang \
+--resource '{"actor":[1,2],"rollout":[1,1],"teacher":[1,1]}' \
+--rollout-num-gpus 1 --rollout-num-gpus-per-engine 1 \
+--opd-shared-teacher --teacher-num-gpus-per-engine 1 --opd-teacher-timeout-s 600 \
+--opd-teacher-routes '{"math":"/models/Teacher1","code":"/models/Teacher2"}'
+```
+
+引擎从第一条路由的 checkpoint 启动。评分就绪的样本按 Teacher 合批；需要换 Teacher 时，先等已派发的评分完成，再就地重载完整 checkpoint。切换失败会中断评分。共享实例采用 TP1、BF16，关闭 Teacher CUDA graph。要增加 Teacher，只需在路由里再填一条，Teacher 仍占一张卡。
 
 ## 奖励路由：`rm_type=mopd`
 
@@ -149,7 +163,7 @@ Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确�
 
 1. 用 `prepare_data.py` 为新领域样本生成带对应 `data_source` 的统一 schema 数据（或用 `--manifest` 接入已有 verl 格式数据）。
 2. 在 `--opd-teacher-routes` 里加一条 `data_source → 权重路径`。
-3. 增大 `--resource` 里 `teacher` 的 GPU 总预算，并**同步缩小 `--rollout-num-gpus`**（或整体扩大 `actor_gpus`），保证 `rollout + teacher == actor` 始终成立——新增教师不能凭空多占卡。
+3. 使用独占模式时，增大 `--resource` 里 `teacher` 的 GPU 总预算，并**同步缩小 `--rollout-num-gpus`**（或整体扩大 `actor_gpus`），保证 `rollout + teacher == actor` 始终成立——新增教师不能凭空多占卡。
 
 ## 参考
 
