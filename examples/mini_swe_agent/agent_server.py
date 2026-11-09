@@ -35,7 +35,6 @@ from minisweagent.environments.singularity import SingularityEnvironment, Singul
 from minisweagent.exceptions import FormatError, Submitted
 from minisweagent.models.litellm_model import LitellmModel
 from minisweagent.utils.serialize import recursive_merge
-from session_memory import validate_memory_limit
 
 
 if TYPE_CHECKING:
@@ -417,7 +416,6 @@ class SessionRecord:
     release_nonce: str = ""
     resources_released: bool = False
     cleanup_error: str = ""
-    memory_evidence: dict[str, Any] = field(default_factory=dict)
 
     def finish(self, info: dict[str, Any], error: str) -> None:
         if self.cancel_event.is_set():
@@ -867,8 +865,6 @@ class AgentServer:
         if max_turns <= 0:
             raise ValueError("AGENT_SERVER_MAX_TURNS must be positive")
         self.base_config["agent"]["step_limit"] = max_turns
-        self._memory_limit_mib = int(os.environ.get("AGENT_SERVER_SESSION_MEMORY_MIB", "0"))
-        validate_memory_limit(self._memory_limit_mib)
         self._stopping = False
         environment_config = self.base_config["environment"]
         self.apptainer_args = (
@@ -1066,7 +1062,6 @@ class AgentServer:
             "instance_name": _new_instance_name(),
             "server_pid": os.getpid(),
             "release_nonce": record.release_nonce,
-            "memory_limit_mib": getattr(self, "_memory_limit_mib", 0),
         }
         spec_path, report_path = control / "spec.json", control / "release.json"
         spec_path.write_text(json.dumps(spec))
@@ -1104,7 +1099,6 @@ class AgentServer:
                 raise RuntimeError("Supervisor release identity mismatch")
             record.resources_released = report["resources_released"] is True
             record.cleanup_error = report["cleanup_error"]
-            record.memory_evidence = report.get("memory", {})
             info, error = report["info"], report["error"]
             if not record.resources_released:
                 error = (error + "\nSession resources remain unconfirmed: " + record.cleanup_error).strip()
@@ -1133,7 +1127,6 @@ class AgentServer:
                 "exit_code": record.exit_code,
                 "error": record.error,
                 "resources_released": record.resources_released,
-                "memory": record.memory_evidence,
             }
             filename = "session_releases.jsonl" if record.status == "completed" else "agent_server_events.jsonl"
         self._append_event(filename, event)
