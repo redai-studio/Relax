@@ -978,15 +978,17 @@ def test_update_membership_masks_and_optimizer_skip(tmp_path, fake_mpu):
     config = resolve_agentic_obs_config(args)
     first, second = _read_jsonl(config.train_scalar_path(8, 0))
     assert first["update_id"] != second["update_id"]
-    assert first["schema_version"] == "3.0.0"
+    assert first["schema_version"] == "4.0.0"
+    assert json.loads(config.manifest_path.read_text())["train_schema_version"] == first["schema_version"]
     assert first["run_id"] == "run_test"
     assert first["capture_phase"] == "training_input"
     assert [row["sample_export_id"] for row in first["samples"]] == [str(2**60 + 1), "2"]
-    assert first["samples"][0]["loss_mask"] == [1, 0, 1, 0]
+    assert first["samples"][0]["loss_mask"] == {"ranges": [[0, 1, 1], [2, 3, 1]]}
     assert first["samples"][0]["effective_tokens"] == 2
     assert first["samples"][0]["advantage_mean"] == pytest.approx(2.0)
     assert first["samples"][0]["advantage_absmax"] == pytest.approx(3.0)
     assert first["samples"][1]["effective_tokens"] == 0
+    assert first["samples"][1]["loss_mask"] == {"ranges": []}
     assert first["samples"][1]["advantage_mean"] == pytest.approx(0.0)
     stages = [r for path in config.stages_dir.glob("actor_*.jsonl") for r in _read_jsonl(path)]
     inputs = [r for path in config.train_debug_dir.glob("*.jsonl") for r in _read_jsonl(path)]
@@ -998,6 +1000,39 @@ def test_update_membership_masks_and_optimizer_skip(tmp_path, fake_mpu):
     assert not committed["groups_finalized"]  # Unassigned rows cannot establish membership.
     assert not committed["input_complete"]
     assert merged["actor:9:0"]["optimizer_step"] == 2
+
+
+def test_train_jsonl_loss_mask_ranges_roundtrip(tmp_path, fake_mpu):
+    from relax.utils.agentic_obs import train_hooks
+
+    fake_mpu()
+    args = _train_args(tmp_path)
+    mask = [0] * 6 + [1] * 16 + [0] * 3 + [2] * 9 + [0] * 8
+    data = _rollout_data(
+        [7],
+        response_lengths=[len(mask)],
+        total_lengths=[len(mask) + 2],
+        loss_masks=[torch.tensor(mask)],
+        advantages=None,
+        returns=None,
+    )
+    _emit_update(args, 1, data)
+    train_hooks.close_train_appenders()
+    config = resolve_agentic_obs_config(args)
+    (record,) = _read_jsonl(config.train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["loss_mask"] == {"ranges": [[6, 22, 1], [25, 34, 2]]}
+    restored = [0] * sample["response_length"]
+    for start, end, value in sample["loss_mask"]["ranges"]:
+        restored[start:end] = [value] * (end - start)
+    assert restored == mask
+    assert sample["effective_tokens"] == sum(mask)
+    assert len(json.dumps(sample["loss_mask"])) < len(json.dumps(mask))
+    legacy = {**record, "schema_version": "3.0.0", "samples": [{**sample, "loss_mask": mask}]}
+    stages = [row for path in config.stages_dir.glob("actor_*.jsonl") for row in _read_jsonl(path)]
+    (summary,) = merge_train_updates(stages, [record])
+    assert summary["status"] == "committed" and summary["input_complete"]
+    assert merge_train_updates(stages, [legacy]) == [summary]
 
 
 def test_update_joins_remote_dp_members_even_when_local_input_is_empty(tmp_path, fake_mpu, monkeypatch):
