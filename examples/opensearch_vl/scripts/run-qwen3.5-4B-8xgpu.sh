@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3.5-4B full SFT comparison, complete 32K multimodal tool trajectories, 8 GPUs.
+# Qwen3.5-4B full SFT comparison, complete multimodal tool trajectories, 8 GPUs.
 # MODEL_DIR=/models DATA_DIR=/data SAVE_DIR=/checkpoints bash "$0" relax
 # Modes: relax | evaluate <HF-checkpoint> <base|relax> | compare
 
@@ -15,6 +15,10 @@ now=$(date "+%Y%m%d-%H%M%S")
 : "${DATA_DIR:?Set DATA_DIR to the prepared dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
+HF_CHECKPOINT="${HF_CHECKPOINT:-${MODEL_DIR}/Qwen3.5-4B}"
+NUM_EPOCHS="${NUM_EPOCHS:-2}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-32768}"
 mkdir -p "${SCRIPT_DIR}/log" "${SAVE_DIR}/${EXP_NAME}"
 cd "${RELAX_ROOT}"
 
@@ -45,7 +49,7 @@ esac
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${RELAX_ROOT}/scripts/entrypoint/local.sh"
 fi
-source "${RELAX_ROOT}/scripts/models/qwen35-4B.sh"
+source "${RELAX_ROOT}/scripts/models/${MODEL_CONFIG:-qwen35-4B}.sh"
 # Qwen3.5-4B ties its embedding and output weights. Remove the legacy model flag.
 TIED_MODEL_ARGS=()
 for argument in "${MODEL_ARGS[@]}"; do
@@ -55,20 +59,27 @@ for argument in "${MODEL_ARGS[@]}"; do
 done
 MODEL_ARGS=("${TIED_MODEL_ARGS[@]}")
 python3 "${SCRIPT_DIR}/../tools/audit_data.py" \
-    --model "${MODEL_DIR}/Qwen3.5-4B" --data-dir "${DATA_DIR}/opensearch_vl/32k" \
+    --model "${HF_CHECKPOINT}" --data-dir "${DATA_DIR}/opensearch_vl/32k" \
+    --max-samples-per-split 8 \
     --output "${SAVE_DIR}/${EXP_NAME}/relax-audit.json"
 
 CKPT_ARGS=(
-    --hf-checkpoint "${MODEL_DIR}/Qwen3.5-4B"
-    --ref-load "${MODEL_DIR}/Qwen3.5-4B"
+    --hf-checkpoint "${HF_CHECKPOINT}"
+    --ref-load "${HF_CHECKPOINT}"
     --megatron-to-hf-mode bridge
-    --load "${SAVE_DIR}/${EXP_NAME}/relax"
-    --save "${SAVE_DIR}/${EXP_NAME}/relax"
-    --save-hf "${SAVE_DIR}/${EXP_NAME}/relax-hf"
-    --save-interval 16
-    --max-actor-ckpt-to-keep 2
-    --num-epoch 1
+    --num-epoch "${NUM_EPOCHS}"
 )
+# Actor always saves the final step. This interval prevents intermediate saves.
+if [[ "${BENCHMARK_ONLY:-0}" != 1 ]]; then
+    CKPT_ARGS+=(
+        --save "${SAVE_DIR}/${EXP_NAME}/relax"
+        --save-hf "${SAVE_DIR}/${EXP_NAME}/final-hf-{rollout_id}"
+        --save-interval 2147483647
+        --max-actor-ckpt-to-keep 1
+    )
+else
+    CKPT_ARGS+=(--num-rollout "${BENCHMARK_STEPS:-8}")
+fi
 SFT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}/opensearch_vl/32k/train.jsonl"
@@ -78,38 +89,46 @@ SFT_ARGS=(
     --apply-chat-template-kwargs '{"preserve_thinking":true}'
     --image-max-token-num 256
     --image-min-token-num 1
-    --global-batch-size 8
+    --global-batch-size "${GLOBAL_BATCH_SIZE}"
     --use-dynamic-batch-size
-    --max-tokens-per-gpu 32768
-    --sft-oversize-strategy keep
+    --seq-length "${MAX_TOKENS_PER_GPU}"
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+    --sft-oversize-strategy skip
     --balance-data
     --per-rank-fetch
-    --sft-prefetch-num-workers 4
-    --sft-prefetch-buffer-size 32
-    --sft-max-in-flight-steps 2
+    --sft-prefetch-num-workers "${SFT_PREFETCH_WORKERS:-8}"
+    --sft-prefetch-buffer-size 128
+    --sft-max-in-flight-steps 4
+    --sft-train-data-prefetch
 )
 EVAL_ARGS=(
     --eval-prompt-data opensearch_val "${DATA_DIR}/opensearch_vl/32k/val.jsonl"
-    --eval-interval 16
+    --eval-interval "${EVAL_INTERVAL:-100}"
 )
+if [[ "${BENCHMARK_ONLY:-0}" == 1 ]]; then EVAL_ARGS=(); fi
 PERF_ARGS=(
-    --tensor-model-parallel-size 2
-    --sequence-parallel
+    --tensor-model-parallel-size "${TP_SIZE:-2}"
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
     --expert-model-parallel-size 1
     --expert-tensor-parallel-size 1
-    --recompute-granularity full
-    --recompute-method uniform
-    --recompute-num-layers 1
     --calculate-per-token-loss
     --no-rope-fusion
     --colocate
     --cross-entropy-loss-fusion
     --sft-chunked-logits
-    --sft-logits-chunk-size 256
+    --sft-logits-chunk-size "${LOGITS_CHUNK_SIZE:-1024}"
     --recompute-loss-function
+    --no-offload-train
 )
+if [[ "${TP_SIZE:-2}" -gt 1 ]]; then PERF_ARGS+=(--sequence-parallel); fi
+if [[ "${RECOMPUTE:-full}" == full ]]; then
+    PERF_ARGS+=(
+        --recompute-granularity full
+        --recompute-method uniform
+        --recompute-num-layers 1
+    )
+fi
 OPTIMIZER_ARGS=(
     --optimizer adam
     --lr 2e-5
@@ -121,6 +140,7 @@ OPTIMIZER_ARGS=(
     --adam-beta2 0.999
     --adam-eps 1e-8
     --clip-grad 1.0
+    --use-distributed-optimizer
 )
 WANDB_ARGS=(
     --use-clearml
@@ -139,7 +159,7 @@ MISC_ARGS=(
 )
 
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOBS_ADDRESS:-http://127.0.0.1:8265}" \
-    --submission-id "${EXP_NAME}-relax-${now}" \
+    --submission-id "${SUBMISSION_ID:-${EXP_NAME}-relax-${now}}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- python3 -m relax.entrypoints.train \

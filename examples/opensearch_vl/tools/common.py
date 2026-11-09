@@ -88,24 +88,24 @@ def step_cases(rows: list[dict]) -> list[dict]:
             prefix = row["messages"][:index]
             image_count = sum(m["content"].count("<image>") for m in prefix)
             calls = extract_calls(message["content"])
-            cases.append({
-                "id": f"{row['id']}:{index}",
-                "messages": prefix,
-                "images": row["images"][:image_count],
-                "tools": row["tools"],
-                "reference": message["content"],
-                "kind": "call" if calls else "answer",
-                "metadata": row["metadata"],
-            })
+            cases.append(
+                {
+                    "id": f"{row['id']}:{index}",
+                    "messages": prefix,
+                    "images": row["images"][:image_count],
+                    "tools": row["tools"],
+                    "reference": message["content"],
+                    "kind": "call" if calls else "answer",
+                    "metadata": row["metadata"],
+                }
+            )
     return cases
 
 
 def chat_messages(messages: list[dict]) -> list[dict]:
     """Replace literal image placeholders with Qwen image tokens."""
     return [
-        {"role": m["role"], "content": m["content"].replace(
-            "<image>", "<|vision_start|><|image_pad|><|vision_end|>"
-        )}
+        {"role": m["role"], "content": m["content"].replace("<image>", "<|vision_start|><|image_pad|><|vision_end|>")}
         for m in messages
     ]
 
@@ -115,6 +115,7 @@ def canonical_sample(row: dict):
 
     return CanonicalSample(
         messages=[CanonicalMessage(**m, learn=m["role"] == "assistant") for m in chat_messages(row["messages"])],
-        tools=row["tools"], images=row["images"],
+        tools=row["tools"],
+        images=row["images"],
         metadata={"source_dataset": "opensearch", "row_index": row["id"]},
     )
