@@ -981,7 +981,7 @@ def test_update_membership_masks_and_optimizer_skip(tmp_path, fake_mpu):
     assert first["run_id"] == "run_test"
     assert first["capture_phase"] == "training_input"
     assert [row["sample_export_id"] for row in first["samples"]] == [str(2**60 + 1), "2"]
-    assert first["samples"][0]["loss_mask"] == [1, 0, 1, 0]
+    assert all("loss_mask" not in sample for sample in first["samples"])
     assert first["samples"][0]["effective_tokens"] == 2
     assert first["samples"][0]["advantage_mean"] == pytest.approx(2.0)
     assert first["samples"][0]["advantage_absmax"] == pytest.approx(3.0)

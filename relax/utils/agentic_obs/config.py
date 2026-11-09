@@ -172,7 +172,7 @@ def build_manifest(args: Namespace, config: AgenticObsConfig, *, cp_size: int | 
         "train_sharding": "join DP facts by (run_id, train_generation_id, update_id); inputs must match local stage_id",
         "optimizer_step": "successful updates within the actor-group generation; null on missing or conflicting sequence history",
         "missing_records": "unknown until all producers have been collected; dumps are best-effort",
-        "loss_mask_space": "response; training input before loss-local filtering",
+        "loss_mask_space": "response; full mask omitted; scalars computed before loss-local filtering",
         "static_cp_scalars": "null",
         "cp_size": cp_size if cp_size is not None else getattr(args, "context_parallel_size", None),
         "dynamic_context_parallel": bool(getattr(args, "dynamic_context_parallel", False)),

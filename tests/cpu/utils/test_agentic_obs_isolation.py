@@ -658,7 +658,8 @@ def test_six_streams_keep_prompt_session_export_and_update_links(args, mpu):
         == rows["train"][0]["samples"][0]["sample_export_id"]
         == str(export_id)
     )
-    assert rows["train"][0]["samples"][0]["loss_mask"] == [1, 0]
+    assert "loss_mask" not in rows["train"][0]["samples"][0]
+    assert rows["train"][0]["samples"][0]["effective_tokens"] == 1
     (update,) = merge_train_updates(rows["stages"], rows["train"])
     assert update["status"] == "committed" and update["input_complete"] and update["group_ids"] == ["g"]
     assert update["started_at"] <= update["occurred_at"]

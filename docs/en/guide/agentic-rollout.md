@@ -721,8 +721,8 @@ The current train producer covers the Megatron policy actor. An update ID is
 `actor:<rollout_id>:<step_id>`, scoped by `(run_id, train_generation_id)`; one rollout
 may contain several updates. Inputs are captured as micro-batches are consumed, before packing or
 dynamic CP splitting. Dummy batches are omitted, but real samples with zero
-loss masks remain. Each sample includes the full response-space `loss_mask`,
-lengths, effective tokens, and masked advantage/return statistics. Static CP
+loss masks remain. Each sample includes lengths, effective tokens, and masked
+advantage/return statistics; the full response-space `loss_mask` is omitted from the dump. Static CP
 statistics are `null`; dynamic CP captures full sequences before splitting.
 The mask is the training input mask, before loss-local TIS/OPSM filtering.
 

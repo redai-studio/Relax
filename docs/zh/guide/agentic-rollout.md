@@ -700,8 +700,8 @@ status、turn count、request timing、abort count 与 weight-version 信息。
 目前训练侧支持 Megatron policy actor。Update ID 为 `actor:<rollout_id>:<step_id>`，
 作用域为 `(run_id, train_generation_id)`；一个 rollout 可以包含多次 update。输入在 micro-batch 被实际消费时、
 packing 和 dynamic CP 切分前采集。Dummy batch 不计入，真实的全零 loss mask 样本仍保留。
-每个样本包含完整 response 空间的 `loss_mask`、长度、有效 token 数，以及按 mask 计算的
-advantage/return 统计。Static CP 下统计为 `null`，dynamic CP 在切分前采集完整序列。
+每个样本包含长度、有效 token 数，以及按 mask 计算的 advantage/return 统计；dump 省略完整
+response 空间的 `loss_mask` 数组。Static CP 下统计为 `null`，dynamic CP 在切分前采集完整序列。
 这里的 mask 是训练输入 mask，尚未应用 loss 内部的 TIS/OPSM 筛选。
 
 DP 分片主键是 `(run_id, train_generation_id, update_id, dp_rank)`，平台按

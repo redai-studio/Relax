@@ -309,7 +309,6 @@ def _write_update(state: _Update) -> None:
                         "effective_tokens": int(sum(mask)),
                         "response_length": response,
                         "total_length": total,
-                        "loss_mask": mask,
                         "advantage_mean": values[3 * index] if snapshot.advantage_available else None,
                         "advantage_absmax": values[3 * index + 1] if snapshot.advantage_available else None,
                         "returns_mean": values[3 * index + 2] if snapshot.returns_available else None,
