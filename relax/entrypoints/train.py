@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import atexit
+import json
 import os
 import signal
 import sys
@@ -20,7 +21,7 @@ try_import_telemetry_hook()
 
 from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
-from relax.distributed.replay_manager import replay_data_manager  # noqa: E402
+from relax.distributed.replay_manager import replay_data_manager, rollout_kinds  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
@@ -149,6 +150,10 @@ def main(args):
             runtime_env = yaml.safe_load(file)
 
         runtime_env = post_process_env(args, runtime_env)
+        replay_data_manager.initialize(kinds=rollout_kinds(args))
+        runtime_env.setdefault("env_vars", {})["RELAX_REPLAY_REGISTRATION"] = json.dumps(
+            replay_data_manager.export_registration()
+        )
         if not ray.is_initialized():
             # this is for local ray cluster
             ray.init(runtime_env=runtime_env)
@@ -161,7 +166,7 @@ def main(args):
             except RuntimeError:
                 pass
 
-        replay_data_manager.start_run()
+        replay_data_manager.initialize(kinds=rollout_kinds(args), owner=True)
 
         if os.environ.get("RELAX_KERNEL_CACHE_DIR"):
             from relax.distributed.ray.kernel_cache import start_kernel_cache_heartbeat_from_env

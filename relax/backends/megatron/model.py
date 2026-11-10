@@ -416,7 +416,7 @@ def setup_model_and_optimizer(
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
     # the actual model modules to remove stale (orphaned) entries.
     if Envs.ENABLE_ROUTING_REPLAY:
-        from relax.distributed.replay_manager.megatron import RoutingReplay
+        from relax.distributed.replay_manager.backend.megatron import RoutingReplay
 
         active_replays = []
         for model_chunk in model:
@@ -1087,11 +1087,11 @@ def train_one_step(
         and gradient norm for logging.
     """
     args = get_args()
-    from relax.distributed.replay_manager.megatron import RoutingReplay
+    from relax.distributed.replay_manager.backend.megatron import RoutingReplay
 
     use_indexer_replay = getattr(args, "use_rollout_indexer_replay", False)
     if use_indexer_replay:
-        from relax.distributed.replay_manager.megatron import IndexerReplay
+        from relax.distributed.replay_manager.backend.megatron import IndexerReplay
 
     # Trajectory-replay capture: open a per-step accumulator (no-op unless
     # capture is enabled and this step is selected).

@@ -4,7 +4,7 @@
 
 import sys
 
-from relax.distributed.replay_manager import megatron as moe
+from relax.distributed.replay_manager.backend import megatron as moe
 
 
 sys.modules[__name__] = moe

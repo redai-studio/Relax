@@ -5,12 +5,11 @@ choices."""
 
 import os
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 from relax.utils.env import Envs
 
-from .data import FIELDS, REFERENCE_FIELD
+from .ref_data import FIELDS, REFERENCE_FIELD
 
 
 @dataclass(frozen=True)
@@ -20,10 +19,9 @@ class ReplayConfig:
 
     delivery: Literal["full", "reference"] = "full"
     compression: Literal["none"] = "none"
-    shm_root: str = "/dev/shm/relax-replay"
     run_id: str = ""
     capacity_bytes: int = 16 << 30
-    chunk_rows: int = 256
+    chunk_rows: int = 1024
     publication_bytes: int = 64 << 20
     materialization_bytes: int = 256 << 20
 
@@ -32,14 +30,15 @@ class ReplayConfig:
             raise ValueError(f"Unsupported replay delivery: {self.delivery}")
         if self.compression != "none":
             raise ValueError("Replay compression is not implemented; use 'none'")
-        if min(self.chunk_rows, self.publication_bytes) <= 0 or self.materialization_bytes < 0:
-            raise ValueError("Replay chunk/publication limits must be positive; materialization budget nonnegative")
+        if min(self.capacity_bytes, self.chunk_rows, self.publication_bytes) <= 0 or self.materialization_bytes < 0:
+            raise ValueError(
+                "Replay capacity/chunk/publication limits must be positive; materialization budget nonnegative"
+            )
 
     @classmethod
     def from_env(cls) -> "ReplayConfig":
         return cls(
             delivery="reference" if references_enabled() else "full",
-            shm_root=Envs.RELAX_REPLAY_SHM_ROOT,
             run_id=Envs.RELAX_REPLAY_RUN_ID,
             capacity_bytes=Envs.RELAX_REPLAY_CAPACITY_MB << 20,
         )
@@ -59,7 +58,7 @@ def references_enabled() -> bool:
 
 
 def reference_environment() -> dict[str, str]:
-    names = ("RELAX_REPLAY_REFERENCES", "RELAX_REPLAY_SHM_ROOT", "RELAX_REPLAY_RUN_ID", "RELAX_REPLAY_CAPACITY_MB")
+    names = ("RELAX_REPLAY_REFERENCES", "RELAX_REPLAY_RUN_ID", "RELAX_REPLAY_CAPACITY_MB")
     return {name: os.environ[name] for name in names if name in os.environ}
 
 
@@ -76,13 +75,12 @@ def replay_fields(fields: list[str]) -> list[str]:
 
 
 if TYPE_CHECKING:
-    from .transport import RoutedReplayStore
+    from .storage import TQReplayStorage
 
 
-@lru_cache(maxsize=1)
-def get_store(config: ReplayConfig) -> "RoutedReplayStore":
-    from .transport import RoutedReplayStore
+def get_store(config: ReplayConfig) -> "TQReplayStorage":
+    from .storage import TQReplayStorage
 
     if config.delivery != "reference":
         raise RuntimeError("Full replay delivery does not use a body store")
-    return RoutedReplayStore(config)
+    return TQReplayStorage(config)

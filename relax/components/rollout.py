@@ -18,6 +18,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.distributed.replay_manager.storage import BODY_PARTITION_PREFIX
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 
@@ -299,14 +300,16 @@ def satisfy_staleness(partition_list: Optional[List[str]], current_rollout_id: i
     """Check if the current rollout remains within the allowed staleness.
 
     Args:
-        partition_list: list of partition ids as strings like 'train_123' or None.
+        partition_list: TQ partition ids, including training batches and replay bodies, or None.
         current_rollout_id: current rollout index.
         max_staleness: maximum allowed staleness.
 
     Returns:
         True if within staleness bounds (or partition_list is empty/None), False otherwise.
     """
-    if not partition_list:  # for None or []
+    # Replay bodies share TQ storage but are not pending training batches.
+    partition_list = [p for p in partition_list or () if not p.startswith(BODY_PARTITION_PREFIX)]
+    if not partition_list:
         return True
 
     def split_partition(partition: str) -> int:

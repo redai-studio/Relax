@@ -491,6 +491,7 @@ async def generate(
         if native_image_opd:
             validate_prompt_token_ids(output, sample.tokens)
 
+        captured_replay_tokens = None
         _t_post_generate_start = monotonic()
         if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
             from relax.engine.router.middleware.radix_tree_middleware import postprocess_sample_with_radix_tree
@@ -533,6 +534,22 @@ async def generate(
                 if any(token in media_token_ids for token in new_response_tokens):
                     raise ValueError("Native image OPD cannot replace sampled media tokens; configure a stop token.")
 
+            if (
+                replay_data_manager.uses_references
+                and not evaluation
+                and replay_producer.kinds
+                and (
+                    state.processor is not None
+                    or any(
+                        hasattr(state.tokenizer, name)
+                        for name in ("image_token_id", "audio_token_id", "video_token_id")
+                    )
+                )
+            ):
+                # These are the captured IDs, before the existing one-for-one
+                # media-token replacements. Keep the original row identities.
+                captured_replay_tokens = sample.tokens + list(new_response_tokens)
+
             while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
                 index = new_response_tokens.index(state.tokenizer.image_token_id)
                 new_response_tokens[index] = state.tokenizer.pad_token_id
@@ -571,6 +588,9 @@ async def generate(
                         )
                     new_response_tokens = sanitized
 
+            if captured_replay_tokens is not None:
+                normalized_replay_tokens = sample.tokens + new_response_tokens
+
             # Update sample with tokens directly - avoiding re-tokenization
             if sc_result is not None and new_response_tokens != sc_tokens_before_sanitization:
                 raise ValueError(
@@ -595,7 +615,11 @@ async def generate(
             if state.opd_manager and not evaluation:
                 state.opd_manager.after_rollout(sample, output)
 
-        replay_producer.accept_response(sample, output["meta_info"], args, evaluation=evaluation)
+        if captured_replay_tokens is not None and sample.tokens != normalized_replay_tokens:
+            raise ValueError("Replay tokens changed after media normalization")
+        replay_producer.accept_response(
+            sample, output["meta_info"], args, evaluation=evaluation, captured_tokens=captured_replay_tokens
+        )
 
         sample.update_from_meta_info(args, output["meta_info"])
         _t_post_generate = monotonic() - _t_post_generate_start

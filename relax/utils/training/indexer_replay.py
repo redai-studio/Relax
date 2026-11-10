@@ -4,7 +4,7 @@
 
 import sys
 
-from relax.distributed.replay_manager import megatron as indexer
+from relax.distributed.replay_manager.backend import megatron as indexer
 
 
 sys.modules[__name__] = indexer

@@ -10,29 +10,40 @@ from copy import copy
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import pybase64
 
-from .core import ReplayManager, replay_data_manager
-from .data import FIELDS, REFERENCE_FIELD, ReplayRef, validate_sample
+from ..core import ReplayManager, replay_data_manager
+from ..producer import Producer
+from ..ref_data import ReplayRef, decode_refs, encode_refs, validate_sample
 
 
 _CAPTURE_FIELDS = {"moe": "routed_experts", "indexer": "indexer_topk"}
 
 
+def _response_references(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Decode either a binary wire envelope or an already decoded manifest.
+
+    Kind validation belongs to the receiver. Cleanup uses all decoded kinds,
+    including unexpected ones, to retain ownership after a parsing failure.
+    """
+    if "replay_manifest" in value:
+        return decode_refs(pybase64.b64decode(value["replay_manifest"], validate=True))
+    ref = ReplayRef.from_dict(value)
+    return {ref.kind: value}
+
+
 @dataclass(frozen=True)
-class Producer:
+class SGLangProducer(Producer):
     """Rollout-facing adapter: request capture, accept references, build TQ
     fields.
 
-    In reference mode SGLang writes bodies directly through the store; TQ only
-    carries references. Full mode preserves the original tensor wire format.
+    In reference mode SGLang publishes layer chunks to the TQ body partition;
+    the sample queue carries manifests. Full mode retains its tensor wire
+    format.
     """
-
-    manager: "ReplayManager"
-    kinds: frozenset[str]
 
     def request_options(self, *, evaluation: bool = False) -> dict[str, bool]:
         self.manager._ensure_open()
@@ -43,15 +54,25 @@ class Producer:
             options["return_indexer_topk"] = True
         return options
 
-    def accept_response(self, sample: Any, meta: dict, args: Any, *, evaluation: bool = False) -> None:
+    def accept_response(
+        self, sample: Any, meta: dict, args: Any, *, evaluation: bool = False, captured_tokens: list[int] | None = None
+    ) -> None:
         self.manager._ensure_open()
         if self.manager.uses_references:
             if evaluation or not self.kinds:
                 return
             refs = {}
+            capture = sample.tokens if captured_tokens is None else captured_tokens
+            if len(capture) != len(sample.tokens):
+                raise ValueError("Replay token normalization must preserve row positions")
             for kind in self.kinds:
                 field = _CAPTURE_FIELDS[kind]
                 value = meta[field]
+                if isinstance(value, dict) and "replay_manifest" in value:
+                    decoded = _response_references(value)
+                    if set(decoded) != {kind}:
+                        raise ValueError("SGLang response contains unexpected replay kinds")
+                    value = meta[field] = decoded[kind]
                 if not isinstance(value, dict):
                     # External/unpatched SGLang keeps its original HTTP payload.
                     # Publish it at ingress; TQ still carries only a reference.
@@ -68,8 +89,15 @@ class Producer:
                             config = get_hf_config(args.hf_checkpoint)
                             topk = getattr(config, "text_config", config).index_topk
                         values = values.reshape(len(sample.tokens) - 1, -1, topk)
-                    value = self._publish_response(values, kind=kind, tokens=sample.tokens)
+                    if hasattr(args, "tq_config"):
+                        self.manager.store().register_local_owner(args.tq_config)
+                    value = self._publish_response(values, kind=kind, tokens=capture)
                     # The enclosing response guard now owns cleanup on failure.
+                    meta[field] = value
+                if capture != sample.tokens:
+                    validate_sample({kind: value}, capture)
+                    mapped = self.manager.store().remap_tokens(ReplayRef.from_dict(value), capture, sample.tokens)
+                    value = mapped.to_dict()
                     meta[field] = value
                 refs[kind] = value
             validate_sample(refs, sample.tokens)
@@ -81,25 +109,6 @@ class Producer:
                 )
             if "indexer" in self.kinds and not evaluation:
                 sample.rollout_indexer_topk = decode_indexer_topk(meta, len(sample.tokens) - 1)
-
-    def _publish_response(self, values: np.ndarray, *, kind: str, tokens: list[int]) -> dict:
-        """Adapt an existing tensor response without changing the producer
-        protocol."""
-        publication = self.manager.store().begin_publication(kind=kind, layers=values.shape[1], topk=values.shape[2])
-        try:
-            for start in range(0, len(values), publication.chunk_rows):
-                stop = min(start + publication.chunk_rows, len(values))
-                publication.append(
-                    stop - start,
-                    lambda layer: np.array(values[start:stop, layer], copy=True, order="C"),
-                )
-            return publication.finish(tokens).to_dict()
-        except BaseException as error:
-            try:
-                publication.abort()
-            except Exception as cleanup:
-                error.add_note(f"Replay ingress cleanup failed: {cleanup!r}")
-            raise
 
     @contextmanager
     def response(self, meta: dict, *, evaluation: bool = False):
@@ -113,22 +122,11 @@ class Producer:
                     value = meta.get(field)
                     if isinstance(value, dict):
                         try:
-                            self.manager.store().discard([ReplayRef.from_dict(value)])
+                            refs = _response_references(value)
+                            self.manager.store().discard([ReplayRef.from_dict(ref) for ref in refs.values()])
                         except Exception as cleanup:
                             error.add_note(f"Replay response cleanup failed: {cleanup!r}")
             raise
-
-    def build_tq_fields(self, samples: Sequence[Any]) -> dict[str, Any]:
-        self.manager._ensure_open()
-        if not samples or (self.manager.uses_references and not self.kinds):
-            return {}
-        fields = frozenset(FIELDS[kind] for kind in self.kinds)
-        result = self.manager.build_tq_fields(samples, required_fields=fields)
-        if self.manager.uses_references:
-            for refs in result[REFERENCE_FIELD]:
-                if not self.kinds.issubset(refs):
-                    raise ValueError("Registered producer is missing replay kinds")
-        return result
 
 
 def decode_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np.ndarray:
@@ -206,6 +204,7 @@ def _abort_request_publication(req: Any) -> None:
     if error is not None:
         raise error
     req._relax_replay_streams = {}
+    req._relax_replay_finish = None
 
 
 def _request_aborted(req: Any) -> bool:
@@ -222,7 +221,14 @@ def _install_abort_patch() -> None:
 
     @wraps(original)
     def abort(self, recv_req, *args, **kwargs):
-        requests = list(self.waiting_queue)
+        pending = getattr(self, "_relax_replay_pending", {})
+        cancelled = [req for req, _ in pending.values() if recv_req.abort_all or req.rid.startswith(recv_req.rid)]
+        # Finished requests have already released KV slots. Remove their output
+        # hold before draining publication; upstream must not free them again.
+        for req in cancelled:
+            pending.pop(id(req))
+            req.finished_output = True
+        requests = list(self.waiting_queue) + cancelled
         if getattr(self, "chunked_req", None) is not None:
             requests.append(self.chunked_req)
         for name in ("running_batch", "last_batch"):
@@ -250,6 +256,11 @@ def _install_abort_patch() -> None:
                 primary.add_note(f"Replay abort cleanup failed: {secondary!r}")
             raise
         cleanup()
+        if cancelled:
+            from sglang.srt.managers.io_struct import AbortReq
+
+            for req in cancelled:
+                self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         return result
 
     abort._relax_replay_cleanup = True
@@ -260,10 +271,17 @@ def _snapshot_layer(buffer: Any, slots: Any, layer: int) -> np.ndarray:
     """Gather bounded stable rows into one owned chunk before yielding
     scheduler.
 
-    Basic slices avoid a hidden all-layer gather or NumPy advanced-index
-    buffer. Background I/O never dereferences a live/recyclable SGLang KV slot.
+    Flattening a contiguous cache is a view: gather only this layer's rows
+    directly into owned output. Strided caches retain the basic-slice path.
+    Background I/O never dereferences a live/recyclable SGLang KV slot.
     """
     output = np.empty((len(slots), buffer.shape[2]), dtype=np.int32)
+    if buffer.flags.c_contiguous:
+        # _advance_publication already validates slots. clip avoids take's
+        # extra output buffer in raise mode; no invalid slot is clamped here.
+        indices = np.asarray(slots, dtype=np.intp) * buffer.shape[1] + layer
+        np.take(buffer.reshape(-1, buffer.shape[2]), indices, axis=0, out=output, mode="clip")
+        return output
     boundaries = np.flatnonzero(np.diff(slots) != 1) + 1
     for start, end in zip(np.r_[0, boundaries], np.r_[boundaries, len(slots)], strict=True):
         src = int(slots[start])
@@ -271,7 +289,9 @@ def _snapshot_layer(buffer: Any, slots: Any, layer: int) -> np.ndarray:
     return output
 
 
-def _advance_publication(processor: Any, req: Any, target: int, capturers: dict[str, Any], *, final: bool) -> dict:
+def _advance_publication(
+    processor: Any, req: Any, target: int, capturers: dict[str, Any], *, final: bool, asynchronous: bool = False
+) -> dict:
     """Publish newly stable whole chunks; seal the remaining tail only at
     finish."""
     generation = getattr(req, "retraction_count", 0)
@@ -294,7 +314,7 @@ def _advance_publication(processor: Any, req: Any, target: int, capturers: dict[
             if buffer.device.type != "cpu" or str(buffer.dtype) != "torch.int32" or buffer.ndim != 3:
                 raise RuntimeError("Replay streaming requires completed int32 CPU capture storage")
             if kind not in streams:
-                streams[kind] = replay_data_manager.store().begin_publication(
+                streams[kind] = replay_data_manager.register_producer([kind]).begin(
                     kind=kind,
                     layers=buffer.shape[1],
                     topk=buffer.shape[2],
@@ -309,19 +329,24 @@ def _advance_publication(processor: Any, req: Any, target: int, capturers: dict[
                 flush = getattr(capturer, "_flush_pending_scatter", None)
                 if flush is not None:
                     flush()
+                first = publication.rows
+                # Transfer the lightweight stable slot range once. Body copies
+                # remain chunked and admitted by the writer before KV reuse.
+                slots = processor.req_to_token_pool.req_to_token[req.req_pool_idx][first:end].cpu().numpy()
+                if len(slots) != end - first or np.any(slots < 0) or np.any(slots >= len(buffer)):
+                    raise ValueError("Replay capture slot range is invalid")
+                cache = buffer.numpy()
             while publication.rows < end:
                 start = publication.rows
                 stop = min(start + publication.chunk_rows, end)
-                # Only lightweight slot indices cross D2H here; the capture body
-                # already crossed at SGLang's own result-copy boundary.
-                slots = processor.req_to_token_pool.req_to_token[req.req_pool_idx][start:stop].cpu().numpy()
-                if len(slots) != stop - start or np.any(slots < 0) or np.any(slots >= len(buffer)):
-                    raise ValueError("Replay capture slot range is invalid")
-                publication.append(stop - start, lambda layer: _snapshot_layer(buffer.numpy(), slots, layer))
+                chunk_slots = slots[start - first : stop - first]
+                publication.append(stop - start, lambda layer: _snapshot_layer(cache, chunk_slots, layer))
         if not final:
             return {}
         output_ids = req.output_ids_through_stop if hasattr(req, "output_ids_through_stop") else req.output_ids
         tokens = list(req.origin_input_ids) + list(output_ids)
+        if asynchronous:
+            return {kind: publication.finish_async(tokens) for kind, publication in streams.items()}
         refs = {kind: publication.finish(tokens).to_dict() for kind, publication in streams.items()}
         return refs
     except BaseException as primary:
@@ -332,21 +357,33 @@ def _advance_publication(processor: Any, req: Any, target: int, capturers: dict[
         raise
 
 
-def install_scheduler_patch() -> None:
+def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: frozenset[str] | None = None) -> None:
     """Intercept completed batch copies and finished responses in SGLang only.
 
     The intermediate layer owns publication. SGLang still owns capture, token
     acceptance, cache slots and scheduling; TQ receives only sealed references.
     """
+    global replay_data_manager
+    selected = replay_data_manager if manager is None else manager
+    selected_kinds = frozenset(_CAPTURE_FIELDS) if kinds is None else kinds
+    if not selected_kinds.issubset(_CAPTURE_FIELDS):
+        raise ValueError("The SGLang capture adapter does not implement the requested replay kind")
     module, classname, prefix = _scheduler_contract()
     upstream = importlib.import_module(module)
     cls = getattr(upstream, classname)
     if getattr(cls, "_relax_replay_references", False):
+        if getattr(cls, "_relax_replay_manager", None) is not selected:
+            raise RuntimeError("SGLang replay hooks are already bound to another manager")
+        if getattr(cls, "_relax_replay_kinds", selected_kinds) != selected_kinds:
+            raise RuntimeError("SGLang replay hooks are already bound to another kind selection")
         return
+    replay_data_manager = selected
+    cls._relax_replay_manager = selected
+    cls._relax_replay_kinds = selected_kinds
     capturers = {
         kind: getattr(upstream, name)
         for kind, name in (("moe", "get_global_experts_capturer"), ("indexer", "get_global_indexer_capturer"))
-        if hasattr(upstream, name)
+        if kind in selected_kinds and hasattr(upstream, name)
     }
     collectors = {kind: getattr(cls, prefix + "maybe_collect_" + _CAPTURE_FIELDS[kind]) for kind in capturers}
 
@@ -371,7 +408,11 @@ def install_scheduler_patch() -> None:
         rank = getattr(parallel, "attn_tp_rank", parallel.tp_rank)
         return rank == 0 and getattr(parallel, "attn_cp_rank", 0) == 0 and getattr(parallel, "pp_rank", 0) == 0
 
+    asynchronous = _install_response_patch(owner)
+
     def collect(self, req):
+        if getattr(req, "_relax_replay_finish", None) is not None:
+            return
         if getattr(req, "_relax_replay_published", False) or getattr(req, "_relax_replay_native_collected", False):
             return
         kinds = {kind for kind, field in _CAPTURE_FIELDS.items() if getattr(req, "return_" + field, False)}
@@ -393,7 +434,17 @@ def install_scheduler_patch() -> None:
             req._relax_replay_native_collected = True
             return
         output_ids = req.output_ids_through_stop if hasattr(req, "output_ids_through_stop") else req.output_ids
-        refs = _advance_publication(self, req, len(req.origin_input_ids) + len(output_ids) - 1, capturers, final=True)
+        refs = _advance_publication(
+            self,
+            req,
+            len(req.origin_input_ids) + len(output_ids) - 1,
+            capturers,
+            final=True,
+            asynchronous=asynchronous,
+        )
+        if asynchronous:
+            req._relax_replay_finish = refs
+            return
         for kind, ref in refs.items():
             setattr(req, _CAPTURE_FIELDS[kind], ref)
         # Ownership now belongs to the response/rollout handoff, not the live Req.
@@ -455,6 +506,115 @@ def install_scheduler_patch() -> None:
     cls._relax_replay_references = True
 
 
+def _install_response_patch(owner: Any) -> bool:
+    """Send completed references from the scheduler thread, never the
+    writer."""
+    from sglang.srt.managers.scheduler import Scheduler
+
+    if getattr(Scheduler, "_relax_replay_async_output", False):
+        return True
+    original_output = Scheduler.stream_output
+    original_input = Scheduler.process_input_requests
+    original_idle = Scheduler.maybe_sleep_on_idle
+
+    def drain(self, *, wait: bool = False):
+        pending = getattr(self, "_relax_replay_pending", {})
+        for key, (req, _) in list(pending.items()):
+            if req._relax_replay_finish is None:
+                pending.pop(key)
+        if wait and pending:
+            req, _ = next(iter(pending.values()))
+            # Bounded response metadata: only apply this backpressure when the
+            # engine's outstanding-request limit has already been reached.
+            for future in req._relax_replay_finish.values():
+                try:
+                    future.result()
+                except Exception:
+                    pass  # Drain every kind, then propagate below after cleanup.
+        completed = []
+        for key, (req, return_logprob) in list(pending.items()):
+            futures = req._relax_replay_finish
+            if futures is None:
+                pending.pop(key)
+                continue
+            if not all(future.done() for future in futures.values()):
+                continue
+            try:
+                refs = {kind: future.result().to_dict() for kind, future in futures.items()}
+            except BaseException as primary:
+                pending.pop(key)
+                try:
+                    _abort_request_publication(req)
+                except Exception as cleanup:
+                    primary.add_note(f"Replay publication cleanup failed: {cleanup!r}")
+                raise
+            completed.append((key, req, return_logprob, refs))
+        # Resolve every ready Future before handing off any request. If another
+        # kind/request fails, unsent publications remain owned by the queue.
+        ready = {False: [], True: []}
+        for key, req, return_logprob, refs in completed:
+            for kind, ref in refs.items():
+                setattr(req, _CAPTURE_FIELDS[kind], ref)
+            req._relax_replay_streams = {}
+            req._relax_replay_finish = None
+            req._relax_replay_published = True
+            pending.pop(key)
+            ready[bool(return_logprob)].append(req)
+        for return_logprob, reqs in ready.items():
+            if reqs:
+                original_output(self, reqs, return_logprob)
+
+    @wraps(original_output)
+    def output(self, reqs, return_logprob, skip_req=None):
+        if not owner(self):
+            return original_output(self, reqs, return_logprob, skip_req)
+        pending = getattr(self, "_relax_replay_pending", None)
+        if pending is None:
+            pending = self._relax_replay_pending = {}
+        immediate = []
+        for req in reqs:
+            if req is not skip_req and getattr(req, "_relax_replay_finish", None) is not None:
+                if id(req) not in pending:
+                    if len(pending) >= self.max_running_requests:
+                        drain(self, wait=True)
+                    pending[id(req)] = (req, return_logprob)
+            else:
+                immediate.append(req)
+        if immediate:
+            original_output(self, immediate, return_logprob, skip_req)
+        drain(self)
+
+    @wraps(original_input)
+    def process_input(self, *args, **kwargs):
+        # This runs even for empty input / recv_skipper iterations. Process
+        # cancellations before releasing any newly completed response.
+        result = original_input(self, *args, **kwargs)
+        drain(self)
+        return result
+
+    @wraps(original_idle)
+    def idle(self, *args, **kwargs):
+        if getattr(self, "_relax_replay_pending", None):
+            # The fixed SGLang idle poll otherwise waits up to one second for
+            # external input; writer completion does not wake that socket.
+            import time
+
+            time.sleep(0.001)
+            return None
+        return original_idle(self, *args, **kwargs)
+
+    Scheduler.stream_output = output
+    Scheduler.process_input_requests = process_input
+    Scheduler.maybe_sleep_on_idle = idle
+    Scheduler._relax_replay_async_output = True
+    return True
+
+
+def _wire_ref(value: dict) -> dict[str, str]:
+    ref = ReplayRef.from_dict(value)
+    return {"replay_manifest": pybase64.b64encode(encode_refs({ref.kind: value})).decode("ascii")}
+
+
 def _encode_responses(values: Any, encode: Any) -> Any:
     """Keep reference metadata and encode native payloads in their original
     order."""
@@ -465,9 +625,9 @@ def _encode_responses(values: Any, encode: Any) -> Any:
             ReplayRef.from_dict(value)
     native = [value for value in values if not isinstance(value, dict)]
     if not native:
-        return values
+        return [_wire_ref(value) for value in values]
     encoded = iter(encode(native))
-    return [value if isinstance(value, dict) else next(encoded) for value in values]
+    return [_wire_ref(value) if isinstance(value, dict) else next(encoded) for value in values]
 
 
 def install_detokenizer_patch() -> None:
@@ -512,7 +672,19 @@ def run_reference_scheduler(*args, **kwargs):
         from relax.backends.sglang.routing_replay_patch import apply_patch
 
         apply_patch()
-    install_scheduler_patch()
+    import ray
+
+    if not ray.is_initialized():
+        if not Envs.RELAX_REPLAY_RAY_ADDRESS:
+            raise RuntimeError("Scheduler needs its parent replay Ray address; refusing automatic cluster discovery")
+        ray.init(address=Envs.RELAX_REPLAY_RAY_ADDRESS, namespace="relax-replay", log_to_driver=False)
+    import json
+    import os
+
+    registration = os.environ.get("RELAX_REPLAY_REGISTRATION")
+    if registration is None:
+        raise RuntimeError("Scheduler requires its parent's replay registration")
+    replay_data_manager.initialize_worker(json.loads(registration), engine="sglang")
     from sglang.srt.managers.scheduler import run_scheduler_process
 
     return run_scheduler_process(*args, **kwargs)
@@ -526,9 +698,21 @@ def run_reference_detokenizer(*args, **kwargs):
 
 
 def validate_configuration(args: Any, server_args: dict) -> None:
-    from .config import rollout_kinds
+    from ..config import rollout_kinds
 
     kinds = rollout_kinds(args)
+    if server_args.get("pp_size", 1) > 1:
+        raise RuntimeError(
+            "SGLang reference publication needs a PP stage-aggregation adapter; "
+            "the current fixed-version hook cannot assume PP0 owns every layer"
+        )
     # Algorithm compatibility stays in Relax's existing replay-flag validation.
     # This adapter checks only the installed publication API, never training modes.
     _validate_capture_api(kinds)
+
+
+def apply_sglang_patch(manager: ReplayManager | None = None, *, kinds: frozenset[str] | None = None) -> None:
+    """Install the supported scheduler hooks once in the scheduler process."""
+    selected = replay_data_manager if manager is None else manager
+    if selected.uses_references:
+        install_scheduler_patch(selected, kinds=kinds)

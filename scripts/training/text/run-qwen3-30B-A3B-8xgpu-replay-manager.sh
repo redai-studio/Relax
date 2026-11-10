@@ -41,7 +41,6 @@ workers = runtime.setdefault("env_vars", {})
 for name in (
     "RELAX_REPLAY_REFERENCES",
     "RELAX_REPLAY_RUN_ID",
-    "RELAX_REPLAY_SHM_ROOT",
     "RELAX_REPLAY_CAPACITY_MB",
     "NCCL_NVLS_ENABLE",
 ):

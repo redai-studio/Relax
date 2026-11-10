@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json
 import logging
 import os
 import random
@@ -31,7 +32,7 @@ from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
-from relax.distributed.replay_manager.megatron import RoutingReplay, reference_execution
+from relax.distributed.replay_manager.backend.megatron import RoutingReplay, reference_execution
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
@@ -402,6 +403,11 @@ class MegatronTrainRayActor(TrainRayActor):
         init(args)
         tq.init(args.tq_config)
         self.data_system_client = tq.get_client()
+        replay_registration = os.environ.get("RELAX_REPLAY_REGISTRATION")
+        if replay_registration is not None:
+            replay_data_manager.initialize_worker(json.loads(replay_registration), engine="megatron")
+        else:
+            replay_data_manager.initialize(kinds=rollout_kinds(args), engine="megatron")
         self._sft_train_prefetch_executor: ThreadPoolExecutor | None = None
         self._sft_train_prefetch: Future[tuple[list, float]] | None = None
         self._sft_train_prefetch_rollout_id: int | None = None
@@ -903,7 +909,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self, data_iterator, num_microbatches, rollout_data, *, delivery_manager=None, region=None, cache=None
     ):
         if "rollout_replay_refs" in rollout_data:
-            from relax.distributed.replay_manager.megatron import fill_reference_replay
+            from relax.distributed.replay_manager.backend.megatron import fill_reference_replay
 
             fill_reference_replay(
                 self,
@@ -1042,7 +1048,7 @@ class MegatronTrainRayActor(TrainRayActor):
     ):
         """Pack SGLang's logical C4 IDs into Megatron's local CP/PP layout."""
         if "rollout_replay_refs" in rollout_data:
-            from relax.distributed.replay_manager.megatron import fill_reference_replay
+            from relax.distributed.replay_manager.backend.megatron import fill_reference_replay
 
             fill_reference_replay(
                 self,
@@ -1969,7 +1975,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         use_indexer_replay = getattr(self.args, "use_rollout_indexer_replay", False)
         if use_indexer_replay:
-            from relax.distributed.replay_manager.megatron import IndexerReplay
+            from relax.distributed.replay_manager.backend.megatron import IndexerReplay
 
         # PPO colocate: ``values`` and ``loss_masks`` reach us via TransferQueue
         # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline

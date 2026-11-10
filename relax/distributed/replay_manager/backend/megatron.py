@@ -4,9 +4,8 @@
 decisions."""
 
 import os
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
 
@@ -15,21 +14,19 @@ import torch
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 
-from .config import references_enabled
-from .core import ConsumerConsumptionError, ConsumerPhase, ReplayManager, ReplayRegion, replay_data_manager
-from .data import (
-    FIELDS,
-    REFERENCE_FIELD,
+from ..config import references_enabled
+from ..consumer import (
+    Consumer,
     ConsumerBatchLayout,
     ConsumerChannelKey,
     ConsumerLayerBinding,
     ConsumerModelLayout,
+    ConsumerReadSession,
     ConsumerRecord,
-    ReplayRef,
-    validate_sample,
+    ConsumerTensorCache,
 )
-from .layout import ConsumerLayerReader, ConsumerTensorCache, consumer_batch_layout
-from .store import ConsumerReadSession
+from ..core import ConsumerConsumptionError, ConsumerPhase, ReplayManager, ReplayRegion, replay_data_manager
+from ..ref_data import REFERENCE_FIELD, ReplayRef, TokenHandle
 
 
 P = ParamSpec("P")
@@ -38,58 +35,9 @@ ROUTING_REPLAY = None
 _VALID_STAGES = {"fallthrough", "replay_forward", "replay_backward"}
 
 
-@dataclass(frozen=True)
-class Consumer:
-    """Adapt an already selected TQ batch and bind lazy model-side readers.
-
-    Full payloads retain their existing path. References stay lightweight until
-    the model consumes a laid-out layer; TrainActor never opens body storage.
-    """
-
-    manager: "ReplayManager"
-    kinds: frozenset[str]
-
-    def fields(self, fields: Sequence[str]) -> list[str]:
-        self.manager._ensure_open()
-        requested = list(fields) + [FIELDS[kind] for kind in sorted(self.kinds)]
-        return self.manager.config.fields(requested)
-
-    def allows_per_rank_fetch(self, fields: Sequence[str]) -> bool:
-        return not set(FIELDS.values()).intersection(self.fields(fields))
-
-    def accept_batch(self, batch: dict[str, Any] | None, *, data_fields: Sequence[str], region: ReplayRegion) -> None:
-        """Validate a postprocessed batch; queue selection stays with the
-        caller.
-
-        Reference decoding happens at the existing CPU postprocess boundary.
-        This check neither reads tensor bodies nor acquires reader holds.
-        """
-        self.manager._ensure_open()
-        if region.manager is not self.manager:
-            raise ValueError("Replay region belongs to another manager")
-        fields = self.fields(data_fields)
-        if batch is not None and REFERENCE_FIELD in fields and REFERENCE_FIELD not in batch:
-            raise ValueError("TQ response is missing requested replay references")
-        region.validate(batch)
-
-    def receive_references(self, batch: dict[str, Any]) -> None:
-        self.manager._ensure_open()
-        if REFERENCE_FIELD not in batch:
-            return
-        refs = self.manager.receive(REFERENCE_FIELD, batch[REFERENCE_FIELD], device="cpu")
-        for ref, tokens in zip(refs, batch["tokens"], strict=True):
-            # Called before the existing token H2D boundary, never on GPU.
-            if hasattr(tokens, "device") and tokens.device.type != "cpu":
-                raise ValueError("Replay identity validation requires CPU tokens")
-            validate_sample(ref, tokens.tolist() if hasattr(tokens, "tolist") else list(tokens))
-        batch[REFERENCE_FIELD] = refs
-
-    def receive_tensors(self, batch: dict[str, Any], *, device: Any) -> None:
-        self.manager._ensure_open()
-        for kind in ("moe", "indexer"):
-            field = FIELDS[kind]
-            if field in batch and (kind == "moe" or kind in self.kinds):
-                batch[field] = self.manager.receive(field, batch[field], device=device)
+class MegatronConsumer(Consumer):
+    """Relax Actor preparation; the shared Consumer owns only receive/read
+    semantics."""
 
     def prepare(
         self,
@@ -123,6 +71,66 @@ class Consumer:
                 region=region,
                 cache=cache,
             )
+
+
+def pack_token_rows(
+    args: Any,
+    rows: list[torch.Tensor],
+    lengths: list[int],
+    pad: Callable[[torch.Tensor, int], torch.Tensor],
+    *,
+    sequence_parallel: bool,
+) -> torch.Tensor:
+    """The existing token layout, independent of what each row contains."""
+    from megatron.core import mpu
+
+    from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_with_cp
+
+    tp = mpu.get_tensor_model_parallel_world_size()
+    cp = mpu.get_context_parallel_world_size()
+    padded = maybe_padded_total_lengths(lengths, args.qkv_format, getattr(args, "is_vl_model", False))
+    if padded is not None:
+        rows = [pad(value, padded[i] - value.shape[0]) for i, value in enumerate(rows)]
+        packed = torch.cat([slice_with_cp(value, pad) for value in rows], dim=0)
+    else:
+        rows = [pad(value, 1) for value in rows]
+        alignment = tp * args.data_pad_size_multiplier
+        if args.allgather_cp and cp > 1:
+            packed = torch.cat(rows, dim=0)
+            count = (-packed.shape[0]) % (cp * alignment)
+            if count:
+                packed = pad(packed, count)
+            packed = packed.chunk(cp, dim=0)[mpu.get_context_parallel_rank()]
+        else:
+            packed = torch.cat([slice_with_cp(value, pad) for value in rows], dim=0)
+            count = (-packed.shape[0]) % alignment
+            if count:
+                packed = pad(packed, count)
+    if sequence_parallel:
+        assert packed.shape[0] % tp == 0
+        packed = packed.chunk(tp, dim=0)[mpu.get_tensor_model_parallel_rank()]
+    return packed
+
+
+def consumer_batch_layout(
+    args: Any,
+    refs: list[ReplayRef],
+    lengths: list[int],
+    *,
+    sequence_parallel: bool,
+) -> ConsumerBatchLayout:
+    if any(m.rows != length - 1 for m, length in zip(refs, lengths, strict=True)):
+        raise ValueError("Replay reference row count differs from training tokens")
+    rows = [torch.from_numpy(TokenHandle.expand(ref)) for ref in refs]
+
+    def pad(value: torch.Tensor, count: int) -> torch.Tensor:
+        # Each padding operation restarts its offset, exactly as the original
+        # MoE padding formula does. Do not replace this with a global offset.
+        padding = torch.from_numpy(TokenHandle.padding(count))
+        return torch.cat((value, padding), dim=0)
+
+    coordinates = pack_token_rows(args, rows, lengths, pad, sequence_parallel=sequence_parallel).numpy()
+    return ConsumerBatchLayout.from_coordinates(TokenHandle.coordinates(coordinates, refs))
 
 
 def _local_layer_ranges(actor: Any) -> Iterator[tuple[Any, range]]:
@@ -191,24 +199,9 @@ def _bind_microbatch(
     num_experts: int,
     cache: ConsumerTensorCache | None = None,
 ) -> None:
-    for binding in layout.bindings:
-        source = ConsumerLayerReader(
-            reader,
-            batch_layout,
-            layer=binding.capture_layer,
-            kind=layout.kind,
-            device=device,
-            num_experts=num_experts,
-            cache=cache,
-        )
-        try:
-            binding.manager.bind(binding.channel, ConsumerRecord(layout.kind, microbatch, source))
-        except BaseException as primary_error:
-            try:
-                source.release()
-            except Exception as cleanup_error:
-                raise primary_error from cleanup_error
-            raise
+    from ..consumer import ConsumerReadTask, bind_read_task
+
+    bind_read_task(ConsumerReadTask(layout, batch_layout, microbatch, device, num_experts), reader, cache)
 
 
 def fill_reference_replay(

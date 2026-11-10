@@ -350,7 +350,7 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
         return
 
     if Envs.RELAX_REPLAY_REFERENCES and server_args.disaggregation_mode in (None, "null"):
-        from relax.distributed.replay_manager.sglang import run_reference_detokenizer, run_reference_scheduler
+        from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
 
         launch_server(
             server_args,
@@ -580,17 +580,19 @@ class SGLangEngine(RayActor):
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
         if Envs.RELAX_REPLAY_REFERENCES:
-            from relax.distributed.replay_manager.sglang import validate_configuration
+            from relax.distributed.replay_manager.backend.sglang import validate_configuration
 
             if not (getattr(self.args, "rollout_external", False) or init_external_kwargs) and server_args_dict.get(
                 "disaggregation_mode", "null"
             ) in (None, "null"):
-                from relax.distributed.replay_manager import replay_data_manager
+                from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
 
                 validate_configuration(self.args, server_args_dict)
-                # Register the node while still inside the Ray parent. The CUDA
-                # scheduler child publishes locally without starting a Ray client.
-                replay_data_manager.store().register_local_owner()
+                # Register resolved TQ endpoints before spawning scheduler processes.
+                # Children construct their own clients; no sockets cross spawn.
+                replay_data_manager.initialize(kinds=rollout_kinds(self.args), connection=self.args.tq_config)
+                os.environ["RELAX_REPLAY_REGISTRATION"] = json.dumps(replay_data_manager.export_registration())
+                os.environ["RELAX_REPLAY_RAY_ADDRESS"] = ray.get_runtime_context().gcs_address
             else:
                 logger.info("SGLang retains its native HTTP payload; Replay publishes references at rollout ingress")
 
