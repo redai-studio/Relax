@@ -217,7 +217,7 @@ PYDRY
 fi
 
 cd "${RELAX}"
-mkdir -p "${SAVE_DIR}/logs"
+mkdir -p "${SCRIPT_DIR}/log"
 RAY_JOB_ADDRESS_ARGS=()
 if [[ -n "${RAY_JOBS_ADDRESS:-}" ]]; then
     RAY_JOB_ADDRESS_ARGS=(--address "${RAY_JOBS_ADDRESS}")
@@ -227,4 +227,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} "${RAY_JOB_ADDRESS_ARGS[@]}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- python3 -m relax.entrypoints.train "${TRAIN_ARGS[@]}" \
-    2>&1 | tee "${SAVE_DIR}/logs/${SUBMISSION_ID}.submit.log"
+    2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-${now}.log"
