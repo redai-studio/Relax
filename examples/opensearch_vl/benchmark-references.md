@@ -17,6 +17,8 @@
 | GPT-5            |      61.6 | 9.8 |
 | Gemini-2.5-Pro   |      63.0 | 8.0 |
 
+论文第5节与附录Table 4明确使用 **Qwen3-VL-8B-Instruct、Qwen3-VL-30B-A3B-Instruct、Qwen3-VL-32B-Instruct**；表格省略了Instruct后缀。[官方固定版本模型配置](https://github.com/shawn0728/OpenSearch-VL/blob/1ac26e2c35a3e813e022813c88888db457d88f7d/opensearch_vl/opensearch_infer/config.py#L176-L198)也指向这些权重。Instruct可以按提示生成推理文本或`<think>`段，这与单独的Thinking权重版本是两件事；“Direct Reasoning”表示无工具，不能据此推断权重为Thinking。
+
 此外，[Qwen3.5-4B 官方模型卡](https://huggingface.co/Qwen/Qwen3.5-4B#vision-language) 给出的 SimpleVQA 是 **43.4%**；同表 Qwen3.5-9B 为 51.2%。该表没有 VDR 分数，也没有足以对齐本例题集、裁判和生成预算的完整说明，因此不能用 43.4% 替代本机基座实测。
 
 ## 带工具：Agentic Workflow
@@ -51,7 +53,7 @@
 
 ## 如何比较本项目结果
 
-当前协议为无工具、温度 0、thinking 开启、32K 输入输出总预算、每题一次生成，使用配置指定的裁判模型并保存其实际型号。参考答案只给裁判；超限、无答案和异常题均计入分母，另报排除 SFT train 重叠题后的分数。
+当前协议为无工具、温度 0、32K 输入输出总预算、每题一次生成；Qwen3.5/3.6保留原生thinking，Qwen3-VL-8B-Instruct使用原生模板且无thinking开关。使用配置指定的裁判模型并保存其实际型号。参考答案只给裁判；超限、无答案和异常题均计入分母，另报排除 SFT train 重叠题后的分数。
 
 公开分数用于判断大致量级。严格判断 SFT 的收益，需要同一权重来源、题目 ID、图片处理、提示、生成设置、裁判及去重口径下的基座和训练后两组实测；不能把公开基座分数与本项目 SFT 分数相减，或将无工具结果与上方 agent 分数混排。当前比较脚本还会检查 workers、QPS 和 evaluator source hash，历史协议不同的结果不能直接自动合并。
 
