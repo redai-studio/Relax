@@ -122,8 +122,11 @@ def install_worker() -> None:
     if getattr(WeightUpdater, "_relax_prepared_transport", False):
         raise RuntimeError("Prepared transport wrapper is already installed")
     original = WeightUpdater.update_weights_from_tensor
+    prepared_state = None
+    prepared_owner = None
 
     def wrapped(self, named_tensors, load_format=None):
+        nonlocal prepared_state, prepared_owner
         if load_format != AUDIT_LOADER:
             return original(self, named_tensors, load_format=load_format)
         if len(named_tensors) != 1:
@@ -148,20 +151,28 @@ def install_worker() -> None:
             raise ValueError("Transport experiment requires a paused owned run")
         group = self._model_update_group[control["group_name"]]
         if command == "prepare_transfer":
-            if hasattr(self, "_relax_prepared_state"):
+            if prepared_state is not None:
                 raise RuntimeError("Prepared scratch is already allocated")
-            self._relax_prepared_state = prepare(control["plan"], self.device)
+            # SGLang's WeightUpdater is a frozen slots dataclass. Keep scratch
+            # in this worker-local wrapper rather than mutating its instance.
+            prepared_state = prepare(control["plan"], self.device)
+            prepared_owner = self
         elif command == "run_transfer":
+            if prepared_state is None or prepared_owner is not self:
+                raise RuntimeError("Prepared scratch belongs to another updater or is not allocated")
             if type(control.get("round")) is not int or not 0 <= control["round"] < 4:
                 raise ValueError("Invalid prepared transfer round")
-            report = replay(self._relax_prepared_state, group)
+            report = replay(prepared_state, group)
             report.update(identity=runtime_identity(), command=command, round=control["round"])
             atomic_write(
                 directory / control["member"] / f"prepared-{control['round']}.json",
                 json.dumps(report, indent=2).encode(),
             )
         else:
-            del self._relax_prepared_state
+            if prepared_state is None or prepared_owner is not self:
+                raise RuntimeError("Prepared scratch belongs to another updater or is not allocated")
+            prepared_state = None
+            prepared_owner = None
             WeightUpdater.update_weights_from_tensor = original
             del WeightUpdater._relax_prepared_transport
         return True, "Prepared transport control completed"
