@@ -4,6 +4,7 @@
 
 - [数据准备](data-preparation.md)：原始七域数据、ZIP 图片读取、切分与真实 Processor 审计。
 - [训练后模型评测](evaluation.md) / [English](evaluation.en.md)：SimpleVQA 英文 test 和 VDR testmini 的工具 Agent 评测。
+- [评测方案对比与工具准备](evaluation-setup.md)：其他GitHub项目的协议区别、工具依赖来源与准备方式。
 - [Qwen3.5-4B 验证记录与阻塞项](results/qwen3.5-4b.md)：区分历史训练产物、上传验证版本和正式 benchmark。
 
 ## 训练入口

@@ -4,6 +4,8 @@
 
 Configure all tool services before running a full benchmark. QS and MaaS credentials alone do not provide search, image search, or OCR. The runner rejects missing configuration. A bounded run that explicitly allows missing tools is a smoke test.
 
+These requirements describe the complete OpenSearch-VL agent, rather than requirements of the datasets themselves. See [evaluation approaches and tool setup](evaluation-setup.en.md) for direct-answer and smaller search-agent alternatives and preparation steps.
+
 ## Evaluation protocol
 
 Compare the initial Qwen3.5-4B model with the Relax SFT model:
