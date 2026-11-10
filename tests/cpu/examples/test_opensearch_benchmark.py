@@ -59,6 +59,8 @@ def test_http_runner_keeps_history_within_32k(monkeypatch, benchmark, input_toke
         with pytest.raises(ValueError):
             runner.infer(history, "system")
         assert runner.error == "context_limit"
+        if finish_reason == "length":
+            assert runner.last_response == "<response>answer</response>"
     else:
         runner.infer(history, "system")
     if input_tokens < 32768:
@@ -153,3 +155,129 @@ def test_relax_evaluation_rejects_upload_validation_model(monkeypatch, benchmark
     with pytest.raises(ValueError, match="not an upload-validation model"):
         benchmark.main()
     assert not (tmp_path / "result").exists()
+
+
+@pytest.mark.parametrize(
+    "text,answer",
+    [
+        ("red", "red"),
+        ("<think>private reasoning</think>red", "red"),
+        ("private reasoning</think><response>red</response>", "red"),
+    ],
+)
+def test_direct_answer_excludes_reasoning(benchmark, text, answer):
+    assert benchmark.direct_answer(text) == answer
+
+
+@pytest.mark.parametrize("text", ["<think>unfinished", '<tool_call>{"name":"search"}</tool_call>'])
+def test_direct_answer_rejects_unfinished_reasoning_or_tool_call(benchmark, text):
+    with pytest.raises(ValueError):
+        benchmark.direct_answer(text)
+
+
+def test_direct_workflow_sends_one_question_without_reference_or_tools(benchmark):
+    import json
+
+    calls = []
+
+    def infer(contents, system_instruction):
+        calls.append((contents, system_instruction))
+        return {"candidates": [{"content": {"parts": [{"text": "red"}]}}]}
+
+    case = {"id": "one", "question": "What color?", "images": [b"image bytes"], "answer": "HIDDEN_REFERENCE"}
+    trajectory = benchmark.direct_trajectory(case, SimpleNamespace(infer=infer))
+    assert len(calls) == 1
+    assert len(calls[0][0]) == 1
+    assert calls[0][0][0]["role"] == "user"
+    assert calls[0][0][0]["parts"][0]["text"] == case["question"]
+    assert "HIDDEN_REFERENCE" not in json.dumps(calls)
+    assert "<tools>" not in json.dumps(calls)
+    assert len(trajectory["turns"]) == 1
+
+
+def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, benchmark, tmp_path):
+    import json
+
+    class Runner:
+        def __init__(self, *_args):
+            self.template_sha256 = "template"
+            self.requests, self.error, self.last_response = [], None, None
+
+        def infer(self, contents, **_kwargs):
+            if contents[0]["parts"][0]["text"] == "fail":
+                raise ConnectionError("model unavailable")
+            return {"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}
+
+    def unexpected_tools(*_args):
+        pytest.fail("Direct workflow must not inspect or connect tools")
+
+    monkeypatch.setattr(benchmark, "missing_tools", unexpected_tools)
+    monkeypatch.setattr(benchmark, "connect_tools", unexpected_tools)
+    monkeypatch.setattr(benchmark, "HTTPRunner", Runner)
+    monkeypatch.setattr(benchmark.subprocess, "check_output", lambda *_args, **_kwargs: benchmark.UPSTREAM_REVISION)
+    monkeypatch.setattr(
+        benchmark,
+        "read_cases",
+        lambda *_args: [
+            {"id": question, "question": question, "answer": "reference", "images": []}
+            for question in ["pass", "fail"]
+        ],
+    )
+    upstream = ModuleType("eval_with_gpt4o")
+    upstream.JUDGE_PROMPT = "{question} {correct_answer} {response}"
+    upstream.parse_judge_response = lambda _text: {"acc": 1}
+    monkeypatch.setitem(sys.modules, "eval_with_gpt4o", upstream)
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **_kwargs: SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="correct: yes"))], model="judge"
+                )
+            )
+        )
+    )
+    openai = ModuleType("openai")
+    openai.OpenAI = lambda **_kwargs: client
+    monkeypatch.setitem(sys.modules, "openai", openai)
+    for name, value in {
+        "AGENT_MODEL": "baseline",
+        "AGENT_BASE_URL": "http://127.0.0.1:1/v1",
+        "JUDGE_API_KEY": "test",
+        "JUDGE_BASE_URL": "http://127.0.0.1:2/v1",
+        "JUDGE_MODEL": "judge",
+        "OPENSEARCH_ROOT": str(tmp_path),
+    }.items():
+        monkeypatch.setenv(name, value)
+    provenance = tmp_path / "model.json"
+    provenance.write_text(json.dumps({"served_model_name": "baseline", "hashes_verified": True}))
+    monkeypatch.setenv("AGENT_PROVENANCE_FILE", str(provenance))
+    data = tmp_path / "data.parquet"
+    data.write_bytes(b"dataset")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--workflow",
+            "direct",
+            "--workers",
+            "2",
+            "--dataset",
+            "vdr",
+            "--label",
+            "base",
+            "--data",
+            str(data),
+            "--processor",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "result"),
+            "--max-cases",
+            "2",
+        ],
+    )
+    benchmark.main()
+    result = json.loads((tmp_path / "result/summary.json").read_text())
+    assert result["expected_cases"] == 2 and result["failures"] == 1
+    assert result["pass_at_1"] == 0.5
+    assert result["tool_errors"] == 0 and result["protocol"]["tool_cache"] is None

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Compare complete base and Relax runs under the same tool-agent protocol."""
+"""Compare complete base and Relax runs under the same evaluation protocol."""
 
 import argparse
 import json

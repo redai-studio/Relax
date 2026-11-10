@@ -2,9 +2,9 @@
 
 [English](evaluation.en.md)
 
-正式评测需要先配置全部工具服务。仅设置 QS 和 MaaS 密钥不足以运行本文的工具评测；入口会列出缺失项。显式限制题数并允许缺失工具的运行只用于联调，不计作完整 benchmark。
+当前默认采用 **Direct Answer：关闭全部工具，模型直接看图回答，由MaaS判分**。不需要搜索、图搜、OCR、图片上传或超分服务。
 
-这里的工具要求对应完整OpenSearch-VL Agent，不是数据集本身的硬性要求。其他项目的直接问答、简化搜索Agent以及逐项准备方式见[评测方案对比与工具准备](evaluation-setup.md)。
+工具Agent保留为可选模式，区别与服务准备方式见[评测方案对比与工具准备](evaluation-setup.md)。
 
 ## 评什么
 
@@ -15,13 +15,15 @@
 | SimpleVQA          | test 中全部英文题 | Pass@1 |
 | VDR-Bench-testmini | 全部 500 题       | Pass@1 |
 
-[原 benchmark](https://arxiv.org/html/2605.05185v1#S5) 的流程是：图片和问题 → 模型自主调用工具 → 最终答案 → GPT-4o 按 VDR rubric 判断语义正确性。本例复用其工具 dispatcher、system prompt 和裁判 prompt，通过 API 接入待评模型。每题一次，准确率为答对题数 / 总题数。
+每题仅一次模型生成，温度0，保留thinking，输入和输出合计最多32K；不提供工具定义或历史轨迹，不执行工具。复用OpenSearch/VDR裁判prompt，通过MaaS判断最终答案的语义正确性，Pass@1为答对题数/全部题数。参考答案只给裁判。超限、无答案、错误工具调用和异常题均保留在分母，另报与SFT train去重后的分数。
 
-两组固定温度 0、32K 总上下文、最多 50 回合，共用工具缓存与同一个裁判模型。保留完整历史；超限、无答案和异常题计入分母。另报与 SFT train 去重后的分数。参考答案只给裁判。
+模型服务容量允许时，可设置 `BENCHMARK_WORKERS=4` 并发生成答案；裁判始终串行并遵守1 QPS。初始/SFT两组使用相同设置，结果记录评测代码分支、commit与源码hash。
+
+这是公开题目上的无工具问答评测，不是训练轨迹PPL或给定标准工具结果的下一步预测。
 
 ## 准备
 
-先完成[数据准备](data-preparation.md)，生成完整七域训练集及去重索引，再配置工具环境：
+先完成[数据准备](data-preparation.md)，生成完整七域训练集及去重索引，再配置模型和裁判接口：
 
 ```bash
 git clone https://github.com/shawn0728/OpenSearch-VL.git /path/to/OpenSearch-VL
@@ -31,19 +33,15 @@ cp examples/opensearch_vl/configs/benchmark.env.example /path/to/benchmark.env
 source /path/to/benchmark.env
 ```
 
-| 配置                                                              | 用途                                                            |
-| ----------------------------------------------------------------- | --------------------------------------------------------------- |
-| `OPENSEARCH_ROOT`                                                 | 上述工具代码目录                                                |
-| `AGENT_BASE_URL / AGENT_MODEL`                                    | 待评模型的 OpenAI 兼容接口                                      |
-| `SERPER_API_KEY / JINA_API_KEY / QWEN_API_BASE / QWEN_MODEL_NAME` | 文本搜索、网页读取与摘要                                        |
-| `SERPAPI_URL / SERPAPI_API_KEY`                                   | Google Lens 图搜接口                                            |
-| `IMAGE_UPLOAD_URL`                                                | multipart `file` 上传，返回外部可访问的 `{"url":"https://..."}` |
-| `LAYOUT_PARSING_API_URL / SR_MODEL_PATH`                          | PP-StructureV3 接口、超分权重                                   |
-| `JUDGE_BASE_URL / JUDGE_MODEL / JUDGE_API_KEY`                    | MaaS 裁判模型，使用 `JUDGE_MODEL` 明确指定                      |
+| 配置                                           | 用途                                       |
+| ---------------------------------------------- | ------------------------------------------ |
+| `OPENSEARCH_ROOT`                              | 上述工具代码目录                           |
+| `AGENT_BASE_URL / AGENT_MODEL`                 | 待评模型的 OpenAI 兼容接口                 |
+| `JUDGE_BASE_URL / JUDGE_MODEL / JUDGE_API_KEY` | MaaS 裁判模型，使用 `JUDGE_MODEL` 明确指定 |
 
 MaaS 裁判配置：`JUDGE_BASE_URL` 填接口地址去掉 `/chat/completions` 的部分，`JUDGE_MODEL` 填实际可调用的模型名称，`JUDGE_API_KEY_HEADER=api-key`，密钥填入本地环境的 `JUDGE_API_KEY`。保留原评分 prompt，结果记录实际裁判型号；这是内部裁判分数，与论文分数分开报告。
 
-工具环境需具备 Pillow、requests、HF processor、带 `dnn_superres` 的 OpenCV。模型服务保留 thinking 和原始 `<tool_call>` 文本，不启用会消费该文本的工具解析器。
+客户端需具备Pillow、HF processor、PyArrow、OpenAI SDK和httpx。当前MaaS域名限制1 QPS，运行器顺序调用裁判且关闭自动重试；结果记录实际裁判模型。
 
 ## 评测数据与去重
 
@@ -67,7 +65,7 @@ hf_hub_download("Osilly/Vision-DeepResearch-Eval", repo_type="dataset",
 
 ## 运行
 
-原 Qwen 模板会丢弃历史 thinking，不能仅传入 `preserve_thinking=true`。先生成与训练一致的模板，本地计数与模型服务共用该文件：
+本地计数和模型服务使用相同模板，以核对包含图片展开的实际输入token数。生成模板后供两边共用：
 
 ```bash
 export HF_CHECKPOINT="${MODEL_DIR}/Qwen3.5-4B"
@@ -85,7 +83,8 @@ PY
 在 GPU 节点部署初始模型；沿用数据准备中的 `MODEL_DIR / DATA_DIR / SAVE_DIR`：
 
 ```bash
-export EXP_NAME=qwen3.5-4b-opensearch-vl-32k-8xgpu
+export EXP_NAME=qwen3.5-4b-opensearch-vl-direct
+export BENCHMARK_WORKFLOW=direct
 python3 -m sglang.launch_server \
   --model-path "${MODEL_DIR}/Qwen3.5-4B" \
   --host 127.0.0.1 --port 30000 --tp 2 --context-length 32768 \
@@ -118,7 +117,23 @@ bash "$SCRIPT" compare
 ## 看结果
 
 - 总表：`${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json`，包含训练前后 Pass@1、差值和去重集合分数。
-- 逐题记录：`benchmark/<base|relax>/<simplevqa|vdr>/trajectories.jsonl`，包含工具轨迹、最终答案和裁判判词。
+- 逐题记录：`benchmark/<base|relax>/<simplevqa|vdr>/trajectories.jsonl`，包含问题、完整模型输出、最终答案、token用量和裁判判词。
 - 汇总：同目录 `summary.json`，包含题数、失败数、工具错误和截断次数。命令异常退出时先排错，不能只统计成功题。
 
 结果另存于实验记录，注明实际裁判型号、模型版本和训练来源；不要将联调结果写成完整 benchmark 分数。
+
+## 与论文分数比较
+
+[论文Table 2](https://arxiv.org/html/2605.05185v1#S5.T2)的Direct Reasoning参考分数（%）：
+
+| 模型             | SimpleVQA | VDR |
+| ---------------- | --------- | --- |
+| Qwen3-VL-8B      | 47.1      | 2.8 |
+| Qwen3-VL-30B-A3B | 53.2      | 3.8 |
+| Qwen3-VL-32B     | 58.0      | 4.1 |
+
+这些分数可作背景参考，不能与当前结果宣称严格同口径：论文使用GPT-4o裁判，本例使用实际配置的MaaS模型；题集范围及生成预算也需对齐。当前实验的主要比较是同一设置下初始模型与SFT模型的差值。Agentic Workflow和Table 3中的SFT工具评测应另列。
+
+## 可选的完整工具Agent
+
+显式设置 `BENCHMARK_WORKFLOW=agent` 才会启用工具环境；需配置[工具准备文档](evaluation-setup.md)中的全部服务，共用工具缓存，最多50回合。为它使用独立的 `EXP_NAME` 和结果目录。比较脚本会拒绝不同workflow、提示或裁判配置的结果混比。

@@ -2,9 +2,7 @@
 
 [中文](evaluation.md)
 
-Configure all tool services before running a full benchmark. QS and MaaS credentials alone do not provide search, image search, or OCR. The runner rejects missing configuration. A bounded run that explicitly allows missing tools is a smoke test.
-
-These requirements describe the complete OpenSearch-VL agent, rather than requirements of the datasets themselves. See [evaluation approaches and tool setup](evaluation-setup.en.md) for direct-answer and smaller search-agent alternatives and preparation steps.
+The default is **Direct Answer: no tools, one visual answer per question, graded through MaaS**. Search, image search, OCR, image upload and super-resolution services are unnecessary. The complete agent remains optional; see [approaches and setup](evaluation-setup.en.md).
 
 ## Evaluation protocol
 
@@ -15,11 +13,13 @@ Compare the initial Qwen3.5-4B model with the Relax SFT model:
 | SimpleVQA          | All 1,013 English test questions | Pass@1 |
 | VDR-Bench-testmini | All 500 questions                | Pass@1 |
 
-The [original benchmark](https://arxiv.org/html/2605.05185v1#S5) lets the model call tools and produce a final answer, which GPT-4o grades using the VDR rubric. This recipe reuses its dispatcher, system prompt and judge prompt, with an OpenAI-compatible API for the evaluated model. Run each question once; accuracy is correct answers divided by all questions.
+Generate once per question at temperature 0 with thinking enabled and a 32K total input/output context. Supply no tool definitions or reference trajectories and execute no tools. Reuse the OpenSearch/VDR judge prompt through MaaS; Pass@1 is correct answers divided by all questions. Only the judge receives reference answers. Overflow, missing answers, attempted tool calls and errors remain in the denominator. Also report a score excluding overlap with SFT train.
 
-Use temperature 0, a 32K total context budget and at most 50 turns for both models. Keep the complete history, a shared tool cache and the same judge model. Context overflow, missing answers and failed cases remain in the denominator. Report a second score after removing overlap with SFT train. Only the judge receives reference answers. A MaaS judge produces an internal judge score, reported separately from the paper's GPT-4o score.
+If the model server has capacity, set `BENCHMARK_WORKERS=4` for concurrent generation. Judging remains sequential at no more than 1 QPS. Match settings across initial/SFT runs; results record evaluator branch, commit and source hash.
 
-## Tool environment
+This evaluates answers to public questions, rather than trajectory PPL or next-step prediction conditioned on reference observations.
+
+## Model and judge configuration
 
 ```bash
 git clone https://github.com/shawn0728/OpenSearch-VL.git /path/to/OpenSearch-VL
@@ -29,20 +29,16 @@ cp examples/opensearch_vl/configs/benchmark.env.example /path/to/benchmark.env
 source /path/to/benchmark.env
 ```
 
-| Configuration                                                     | Purpose                                                            |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `OPENSEARCH_ROOT`                                                 | Pinned tool checkout                                               |
-| `AGENT_BASE_URL / AGENT_MODEL`                                    | Evaluated model's OpenAI-compatible API                            |
-| `AGENT_PROVENANCE_FILE`                                           | Verified model identity and training provenance                    |
-| `SERPER_API_KEY / JINA_API_KEY / QWEN_API_BASE / QWEN_MODEL_NAME` | Text search, page reading and fixed summarization service          |
-| `SERPAPI_URL / SERPAPI_API_KEY`                                   | Google Lens image-search API                                       |
-| `IMAGE_UPLOAD_URL`                                                | Multipart `file` upload returning a public `{"url":"https://..."}` |
-| `LAYOUT_PARSING_API_URL / SR_MODEL_PATH`                          | PP-StructureV3 endpoint and super-resolution weights               |
-| `JUDGE_BASE_URL / JUDGE_MODEL / JUDGE_API_KEY`                    | Explicitly selected MaaS judge                                     |
+| Configuration                                  | Purpose                                         |
+| ---------------------------------------------- | ----------------------------------------------- |
+| `OPENSEARCH_ROOT`                              | Pinned tool checkout                            |
+| `AGENT_BASE_URL / AGENT_MODEL`                 | Evaluated model's OpenAI-compatible API         |
+| `AGENT_PROVENANCE_FILE`                        | Verified model identity and training provenance |
+| `JUDGE_BASE_URL / JUDGE_MODEL / JUDGE_API_KEY` | Explicitly selected MaaS judge                  |
 
 Set the judge base URL to the endpoint without `/chat/completions`; use `JUDGE_API_KEY_HEADER=api-key`. Keep keys outside Git. The judge transport limits requests to 1 QPS. Record its actual model name and retain the original grading prompt.
 
-Install Pillow, requests, the HF processor and OpenCV with `dnn_superres`. Preserve thinking and raw `<tool_call>` output in the model server; do not enable a parser that consumes those tags.
+The client needs Pillow, the HF processor, PyArrow, the OpenAI SDK and httpx. The supplied MaaS domain allows 1 QPS. Judge requests are sequential with automatic retries disabled; results identify the actual judge.
 
 ## Datasets and overlap
 
@@ -66,7 +62,7 @@ Set `BENCHMARK_DATA_ROOT` to that directory. The loader selects SimpleVQA rows w
 
 ## Run
 
-The original Qwen template drops historical thinking. Generate the training-compatible template and use it for both token counting and serving:
+Generate a shared template for local token counting and serving so image-expanded prompt token counts agree:
 
 ```bash
 export HF_CHECKPOINT="${MODEL_DIR}/Qwen3.5-4B"
@@ -80,7 +76,8 @@ processor = AutoProcessor.from_pretrained(os.environ["HF_CHECKPOINT"], local_fil
 Path(os.environ["BENCHMARK_CHAT_TEMPLATE"]).write_text(preserve_history_template(processor))
 PY
 
-export EXP_NAME=qwen3.5-4b-opensearch-vl-32k-8xgpu
+export EXP_NAME=qwen3.5-4b-opensearch-vl-direct
+export BENCHMARK_WORKFLOW=direct
 python3 -m sglang.launch_server \
   --model-path "${MODEL_DIR}/Qwen3.5-4B" \
   --host 127.0.0.1 --port 30000 --tp 2 --context-length 32768 \
@@ -109,7 +106,23 @@ bash "$SCRIPT" compare
 ## Outputs
 
 - `${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json`: base and Relax Pass@1, differences and deduplicated scores.
-- `benchmark/<base|relax>/<simplevqa|vdr>/trajectories.jsonl`: full tool trajectories, final answers and judge verdicts.
+- `benchmark/<base|relax>/<simplevqa|vdr>/trajectories.jsonl`: questions, complete model output, final answers, token usage and judge verdicts.
 - `summary.json` in each run directory: case counts, failures, tool errors and truncations. Diagnose abnormal exits; do not count only successful cases.
 
 Keep measured results in experiment records with the actual judge, model version and training provenance. Do not report smoke tests as full benchmark results.
+
+## Paper comparisons
+
+[Table 2](https://arxiv.org/html/2605.05185v1#S5.T2) reports the following Direct Reasoning reference scores (%):
+
+| Model            | SimpleVQA | VDR |
+| ---------------- | --------- | --- |
+| Qwen3-VL-8B      | 47.1      | 2.8 |
+| Qwen3-VL-30B-A3B | 53.2      | 3.8 |
+| Qwen3-VL-32B     | 58.0      | 4.1 |
+
+Treat these as context, rather than a matched reproduction: the paper uses GPT-4o and this run uses the configured MaaS judge; subsets and generation budgets also need alignment. The primary comparison is initial versus SFT weights under identical settings. Report Agentic Workflow and Table 3's tool-enabled SFT evaluations separately.
+
+## Optional complete tool agent
+
+Set `BENCHMARK_WORKFLOW=agent` explicitly to enable tools. Configure all services in the [setup guide](evaluation-setup.en.md), share the cache and allow at most 50 turns. Use a separate `EXP_NAME` and output directory. Comparison rejects different workflows, prompts or judge configurations.

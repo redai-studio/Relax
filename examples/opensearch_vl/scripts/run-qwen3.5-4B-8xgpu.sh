@@ -37,6 +37,7 @@ case "${MODE}" in
         if [[ "${BENCHMARK_MAX_CASES:-0}" != 0 ]]; then benchmark_args+=(--max-cases "${BENCHMARK_MAX_CASES}"); fi
         if [[ "${BENCHMARK_ALLOW_MISSING_TOOLS:-0}" == 1 ]]; then benchmark_args+=(--allow-missing-tools); fi
         python3 "${SCRIPT_DIR}/../tools/benchmark.py" \
+            --workflow "${BENCHMARK_WORKFLOW:-direct}" --workers "${BENCHMARK_WORKERS:-1}" \
             --dataset "$2" --label "$3" --data "${benchmark_data}" --processor "${HF_CHECKPOINT}" \
             --output "${SAVE_DIR}/${EXP_NAME}/benchmark/$3/$2" \
             --tool-cache "${BENCHMARK_CACHE_DIR:-${SAVE_DIR}/${EXP_NAME}/benchmark/tool-cache}" \

@@ -2,7 +2,7 @@
 
 [English](evaluation-setup.en.md) · [评测运行方式](evaluation.md)
 
-SimpleVQA 和 VDR 的数据文件不绑定某个工具服务。准备成本取决于采用直接问答、搜索 Agent，还是复现某篇论文的完整工具环境。当前 `benchmark ... base/relax` 两种标签都运行 OpenSearch-VL 工具 Agent；`base` 表示初始权重，不表示关闭工具。
+SimpleVQA 和 VDR 的数据文件不绑定某个工具服务。准备成本取决于采用直接问答、搜索 Agent，还是复现某篇论文的完整工具环境。当前 `benchmark ... base/relax` 默认运行无工具direct模式；`base/relax`区分初始与SFT权重。显式选择 `BENCHMARK_WORKFLOW=agent` 才启用工具。
 
 ## GitHub 中的实现有什么区别
 
@@ -20,11 +20,11 @@ VDR仓库的[结果表](https://github.com/Osilly/Vision-DeepResearch/tree/1f13e
 
 ## 如何选择准备范围
 
-若先检查SFT是否损伤基础问答，可以增加一组初始/SFT的无工具直接问答对照：图片和问题 → 固定提示生成答案 → 同一裁判。这组实验无需等待搜索、图片上传、OCR、超分，结果单独报告。当前脚本尚未实现这个模式，不应使用缺配工具的smoke结果替代它。
+若先检查SFT是否损伤基础问答，可以增加一组初始/SFT的无工具直接问答对照：图片和问题 → 固定提示生成答案 → 同一裁判。这组实验无需等待搜索、图片上传、OCR、超分，结果单独报告。当前默认direct模式已实现这组评测，不需要工具服务。
 
 若评估训练得到的工具使用能力，则需要可工作的工具环境。可以采用较少工具的搜索Agent，也可以继续本文已选定的OpenSearch-VL协议。删减工具、替换搜索供应商或更换摘要模型都需要形成独立的实验配置，并在初始与SFT两组共用。
 
-当前正式协议仍为[评测文档](evaluation.md)中的完整OpenSearch-VL环境；以下给出它的准备方式，不改变已选协议。
+当前选定协议为[评测文档](evaluation.md)中的无工具直接问答。以下准备方式仅用于可选的完整OpenSearch-VL工具环境。
 
 ## 现有工具逐项怎么准备
 

@@ -2,7 +2,7 @@
 
 [中文](evaluation-setup.md) · [Running evaluation](evaluation.en.md)
 
-SimpleVQA and VDR data files do not prescribe a service stack. Setup depends on whether the experiment uses direct answers, a search agent, or a paper's complete tool environment. Both current `benchmark ... base/relax` labels run the OpenSearch-VL agent. `base` selects initial weights; it does not disable tools.
+SimpleVQA and VDR data files do not prescribe a service stack. Setup depends on whether the experiment uses direct answers, a search agent, or a paper's complete tool environment. Both `benchmark ... base/relax` labels default to direct answers without tools; labels select initial or SFT weights. Set `BENCHMARK_WORKFLOW=agent` explicitly to enable tools.
 
 ## What public implementations do
 
@@ -20,11 +20,11 @@ VDR's [results](https://github.com/Osilly/Vision-DeepResearch/tree/1f13ea7261de0
 
 ## Choosing an experiment
 
-A direct-answer comparison can check whether SFT changes basic VQA: image and question → fixed answer prompt → shared judge. It needs no search, upload, OCR or super-resolution services. The current script does not implement this mode. Missing-tool smoke runs are not direct-answer evaluations.
+A direct-answer comparison can check whether SFT changes basic VQA: image and question → fixed answer prompt → shared judge. It needs no search, upload, OCR or super-resolution services. The default direct workflow implements this comparison without tool services.
 
 Tool-use evaluation requires working tools. A smaller search-agent environment is possible, as is the complete OpenSearch-VL setup. Removing tools or changing providers or the summarizer defines a separate configuration that both initial and SFT models must share.
 
-The selected main protocol remains the complete environment in the [evaluation guide](evaluation.en.md). The preparation below does not change it.
+The selected protocol is direct answering in the [evaluation guide](evaluation.en.md). The preparation below is only for the optional complete tool environment.
 
 ## Preparing the current environment
 

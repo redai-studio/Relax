@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Run the pinned OpenSearch tool agent against an OpenAI-compatible model."""
+"""Evaluate direct visual answers or the pinned OpenSearch tool agent."""
 
 import argparse
 import base64
@@ -12,13 +12,19 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock, local
 
 from common import normalized_text, write_json
 
 
 UPSTREAM_REVISION = "1ac26e2c35a3e813e022813c88888db457d88f7d"
+DIRECT_SYSTEM_PROMPT = (
+    "Answer the question using the provided image(s) and your own knowledge. "
+    "No tools or external resources are available. Give a concise final answer."
+)
 
 
 def sha256(value: bytes) -> str:
@@ -91,6 +97,25 @@ def preserve_history_template(processor) -> str:
     return patched.template
 
 
+def direct_answer(text: str) -> str:
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    if "<think>" in text:
+        raise ValueError("Unfinished reasoning contains no final answer")
+    if "<tool_call>" in text:
+        raise ValueError("Tool calls are not answers in the direct workflow")
+    final = re.search(r"<response>(.*?)</response>", text, re.DOTALL)
+    return (final[1] if final else text).strip()
+
+
+def direct_trajectory(case: dict, runner) -> dict:
+    parts = [{"text": case["question"]}]
+    parts.extend({"inline_data": {"data": base64.b64encode(payload).decode()}} for payload in case["images"])
+    response = runner.infer([{"role": "user", "parts": parts}], system_instruction=DIRECT_SYSTEM_PROMPT)
+    text = "".join(part.get("text", "") for part in response["candidates"][0]["content"]["parts"])
+    return {"data_id": case["id"], "prompt": case["question"], "turns": [{"turn": 0, "response_text": text}]}
+
+
 class HTTPRunner:
     def __init__(self, processor_path: Path, client, model: str) -> None:
         from transformers import AutoProcessor
@@ -100,6 +125,7 @@ class HTTPRunner:
         self.client, self.model = client, model
         self.requests: list[dict] = []
         self.error: str | None = None
+        self.last_response: str | None = None
 
     def infer(self, contents, system_instruction=None, cfg=None) -> dict:
         from PIL import Image
@@ -160,6 +186,7 @@ class HTTPRunner:
         reasoning = getattr(choice.message, "reasoning_content", None)
         if reasoning:
             text = "<think>" + reasoning + "</think>" + text
+        self.last_response = text
         self.requests.append(
             {
                 "input_tokens": tokens,
@@ -262,17 +289,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=["simplevqa", "vdr"], required=True)
     parser.add_argument("--label", choices=["base", "relax"], required=True)
+    parser.add_argument("--workflow", choices=["direct", "agent"], default="direct")
+    parser.add_argument(
+        "--workers", type=int, default=1, help="Concurrent direct-answer requests; judge stays sequential"
+    )
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--processor", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--tool-cache", type=Path, required=True)
+    parser.add_argument("--tool-cache", type=Path, help="Shared cache for agent workflow only")
     parser.add_argument("--overlap-index", type=Path)
     parser.add_argument("--max-cases", type=int, default=0, help="Nonzero values are smoke tests, not full benchmarks")
     parser.add_argument("--allow-missing-tools", action="store_true", help="Smoke tests only")
     args = parser.parse_args()
     if args.max_cases < 0 or (args.allow_missing_tools and not args.max_cases):
         parser.error("Missing tool configuration is permitted only in an explicitly bounded smoke test")
-    missing = missing_tools()
+    if args.workflow == "agent" and not args.tool_cache:
+        parser.error("The agent workflow requires --tool-cache")
+    if args.workers < 1 or (args.workflow == "agent" and args.workers != 1):
+        parser.error("Use positive workers; agent workflow runs sequentially")
+    missing = missing_tools() if args.workflow == "agent" else []
     if missing and not args.allow_missing_tools:
         parser.error("Configure tools before a formal benchmark: " + ", ".join(missing))
     if not args.max_cases and not args.overlap_index:
@@ -293,16 +328,21 @@ def main() -> None:
     import requests
     from eval_with_gpt4o import JUDGE_PROMPT, parse_judge_response
     from openai import OpenAI
-    from opensearch_infer import config, cos_upload, tools
-    from opensearch_infer.pipeline import process_single_case
-    from opensearch_infer.prompts import SYSTEM_PROMPT
-    from opensearch_infer.runners import InferenceConfig
 
     from relax.utils.logging_utils import get_logger
 
     logger = get_logger(__name__)
-    config.MAX_TURNS = 50
-    tool_configuration_sha256 = connect_tools(args.tool_cache, tools, cos_upload)
+    tool_configuration_sha256 = None
+    system_prompt = DIRECT_SYSTEM_PROMPT
+    if args.workflow == "agent":
+        from opensearch_infer import config, cos_upload, tools
+        from opensearch_infer.pipeline import process_single_case
+        from opensearch_infer.prompts import SYSTEM_PROMPT
+        from opensearch_infer.runners import InferenceConfig
+
+        config.MAX_TURNS = 50
+        system_prompt = SYSTEM_PROMPT
+        tool_configuration_sha256 = connect_tools(args.tool_cache, tools, cos_upload)
 
     def visual_lookup(image_url):
         response = requests.get(
@@ -317,7 +357,7 @@ def main() -> None:
         api_key=os.environ.get("AGENT_API_KEY", "EMPTY"),
         base_url=os.environ["AGENT_BASE_URL"],
         max_retries=0,
-        http_client=httpx.Client(trust_env=False, timeout=300),
+        http_client=httpx.Client(trust_env=False, timeout=3600 if args.workflow == "direct" else 300),
     )
     judge = OpenAI(
         api_key=os.environ["JUDGE_API_KEY"],
@@ -335,33 +375,58 @@ def main() -> None:
     images = set(overlap["images"]) if overlap else set()
     protocol = {
         "dataset": args.dataset,
+        "workflow": args.workflow,
+        "workers": args.workers,
         "upstream_revision": revision,
         "temperature": 0,
         "context_length": 32768,
-        "max_turns": 50,
+        "max_turns": 1 if args.workflow == "direct" else 50,
+        "enable_thinking": True,
         "judge_model": os.environ["JUDGE_MODEL"],
-        "tool_cache": str(args.tool_cache.resolve()),
+        "tool_cache": str(args.tool_cache.resolve()) if args.workflow == "agent" else None,
         "tool_configuration_sha256": tool_configuration_sha256,
-        "system_prompt_sha256": sha256(SYSTEM_PROMPT.encode()),
+        "system_prompt_sha256": sha256(system_prompt.encode()),
         "chat_template_sha256": runner.template_sha256,
         "judge_prompt_sha256": sha256(JUDGE_PROMPT.encode()),
         "data_sha256": sha256(args.data.read_bytes()),
         "smoke": bool(args.max_cases),
         "missing_tools": missing,
         "overlap_index_sha256": sha256(args.overlap_index.read_bytes()) if args.overlap_index else None,
+        "evaluator_sha256": sha256(Path(__file__).read_bytes()),
+    }
+    repository = Path(__file__).resolve().parents[3]
+    evaluator = {
+        "git_branch": subprocess.check_output(
+            ["git", "-C", str(repository), "branch", "--show-current"], text=True
+        ).strip(),
+        "git_commit": subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip(),
+        "source_sha256": protocol["evaluator_sha256"],
     }
     args.output.mkdir(parents=True, exist_ok=False)
     write_json(args.output / "protocol.json", protocol)
     records, last_judge = [], 0.0
-    with (args.output / "trajectories.jsonl").open("w") as sink:
-        for index, case in enumerate(cases):
-            runner.requests, runner.error = [], None
-            record = {"id": case["id"], "correct": False, "overlaps_sft_train": None, "tool_errors": 0}
-            if overlap:
-                record["overlaps_sft_train"] = question_hash(case["question"]) in questions or any(
-                    image_hash(image) in images for image in case["images"]
-                )
-            try:
+    judge_lock, worker_state = Lock(), local()
+
+    def evaluate_case(item: tuple[int, dict]) -> dict:
+        nonlocal last_judge
+        index, case = item
+        if args.workers == 1:
+            case_runner = runner
+        else:
+            if not hasattr(worker_state, "runner"):
+                worker_state.runner = HTTPRunner(args.processor, agent, os.environ["AGENT_MODEL"])
+            case_runner = worker_state.runner
+        case_runner.requests, case_runner.error = [], None
+        case_runner.last_response = None
+        record = {"id": case["id"], "correct": False, "overlaps_sft_train": None, "tool_errors": 0}
+        if overlap:
+            record["overlaps_sft_train"] = question_hash(case["question"]) in questions or any(
+                image_hash(image) in images for image in case["images"]
+            )
+        try:
+            if args.workflow == "direct":
+                trajectory = direct_trajectory(case, case_runner)
+            else:
                 row = {
                     "data_id": case["id"],
                     "prompt": [{"role": "user", "content": case["question"]}],
@@ -369,23 +434,28 @@ def main() -> None:
                 }
                 trajectory = process_single_case(
                     row,
-                    runner,
+                    case_runner,
                     str(args.output / "cases"),
                     index,
                     dataset_type="test",
                     visual_lookup=visual_lookup,
                     inference_cfg=InferenceConfig(temperature=0, enable_thinking=True),
                 )
-                record["trajectory"] = trajectory
-                record["tool_errors"] = sum(
-                    "Tool execution error" in turn.get("tool_output", "") for turn in trajectory["turns"]
-                )
-                text = trajectory["turns"][-1].get("response_text", "") if trajectory["turns"] else ""
+            record["trajectory"] = trajectory
+            record["tool_errors"] = sum(
+                "Tool execution error" in turn.get("tool_output", "") for turn in trajectory["turns"]
+            )
+            text = trajectory["turns"][-1].get("response_text", "") if trajectory["turns"] else ""
+            if args.workflow == "direct":
+                answer = direct_answer(text)
+            else:
                 final = re.search(r"<response>(.*?)</response>", text, re.DOTALL)
-                if runner.error or not final:
-                    record["error"] = runner.error or "no_final_answer"
-                else:
-                    record["final_answer"] = final[1].strip()
+                answer = final[1].strip() if final else ""
+            if case_runner.error or not answer:
+                record["error"] = case_runner.error or "no_final_answer"
+            else:
+                record["final_answer"] = answer
+                with judge_lock:
                     time.sleep(max(0, 1.05 - (time.monotonic() - last_judge)))
                     last_judge = time.monotonic()
                     verdict = judge.chat.completions.create(
@@ -403,29 +473,42 @@ def main() -> None:
                             }
                         ],
                     )
-                    raw = verdict.choices[0].message.content or ""
-                    if not re.search(r"correct:\s*(yes|no)", raw, re.IGNORECASE):
-                        raise ValueError("Judge did not produce the required correctness verdict")
-                    record["judge"] = parse_judge_response(raw)
-                    record["correct"] = bool(record["judge"]["acc"])
-            except Exception as error:
-                record["error"] = type(error).__name__
-            record["requests"] = runner.requests
+                raw = verdict.choices[0].message.content or ""
+                record["raw_judge"] = raw
+                record["judge_model"] = verdict.model
+                if not re.search(r"correct:\s*(yes|no)", raw, re.IGNORECASE):
+                    raise ValueError("Judge did not produce the required correctness verdict")
+                record["judge"] = parse_judge_response(raw)
+                record["correct"] = bool(record["judge"]["acc"])
+        except Exception as error:
+            record["error"] = type(error).__name__
+            if case_runner.error:
+                record["error"] = case_runner.error
+            if case_runner.last_response is not None:
+                record["raw_model_output"] = case_runner.last_response
+        record["requests"] = case_runner.requests
+        logger.info(
+            "Case %s/%s id=%s correct=%s error=%s",
+            index + 1,
+            len(cases),
+            case["id"],
+            record["correct"],
+            record.get("error"),
+        )
+        return record
+
+    with (args.output / "trajectories.jsonl").open("w") as sink, ThreadPoolExecutor(args.workers) as executor:
+        pending = [executor.submit(evaluate_case, item) for item in enumerate(cases)]
+        for future in as_completed(pending):
+            record = future.result()
             records.append(record)
             sink.write(json.dumps(record, ensure_ascii=False) + "\n")
             sink.flush()
-            logger.info(
-                "Case %s/%s id=%s correct=%s error=%s",
-                index + 1,
-                len(cases),
-                case["id"],
-                record["correct"],
-                record.get("error"),
-            )
     clean = [row for row in records if row["overlaps_sft_train"] is False]
     summary = {
         "protocol": protocol,
         "model": os.environ["AGENT_MODEL"],
+        "judge_models": sorted({row["judge_model"] for row in records if "judge_model" in row}),
         "expected_cases": len(cases),
         "correct": sum(row["correct"] for row in records),
         "pass_at_1": sum(row["correct"] for row in records) / len(cases),
@@ -437,6 +520,7 @@ def main() -> None:
     }
     summary["model_source"] = provenance
     summary["label"] = args.label
+    summary["evaluator"] = evaluator
     write_json(args.output / "summary.json", summary)
     logger.info("Benchmark summary: %s", json.dumps(summary, ensure_ascii=False))
 
