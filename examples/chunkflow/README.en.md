@@ -89,13 +89,14 @@ python3 examples/chunkflow/setup.py
 
 Do not duplicate settings already present in the recipe:
 
-| Setting                                        | Reason                                                                                       |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `--context-parallel-size 1`                    | Cross-chunk state management does not currently support CP splitting                         |
-| `--calculate-per-token-loss`                   | Count tokens without changing sample weights through chunking                                |
-| `--no-rope-fusion`                             | Use the RoPE path that supports chunk position offsets                                       |
-| `--attention-dropout 0.0 --hidden-dropout 0.0` | Current adapters require zero dropout to avoid random-mask issues during chunking and replay |
-| Megatron recomputation compatibility           | Disable full-layer / selective `core_attn`                                                   |
+| Setting                                        | Reason                                                                                                                   |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `--context-parallel-size 1`                    | Cross-chunk state management does not currently support CP splitting                                                     |
+| `--calculate-per-token-loss`                   | Count tokens without changing sample weights through chunking                                                            |
+| `--no-rope-fusion`                             | Use the RoPE path that supports chunk position offsets                                                                   |
+| `--attention-dropout 0.0 --hidden-dropout 0.0` | Current adapters require zero dropout to avoid random-mask issues during chunking and replay                             |
+| Megatron recomputation compatibility           | Disable full-layer / selective `core_attn`                                                                               |
+| Expert parallelism (EP)                        | All ranks in each EP group must share the same chunk execution plan; mismatches fail collectively before model execution |
 
 ### Key parameters
 

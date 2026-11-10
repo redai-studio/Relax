@@ -206,3 +206,18 @@ def merge_model_plans(plans: Sequence[ModelPlan], pp_size: int) -> ModelPlan:
         frozenset(recompute),
         tuple(min(delay + pp_size - s - 1, len(forward)) for s in range(pp_size)),
     )
+
+
+def validate_schedule(signature: tuple, *, group, scope: tuple[int, ...] = ()) -> None:
+    """Reject divergent schedules collectively before any model/P2P calls."""
+    import torch.distributed as dist
+
+    schedules = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(schedules, (scope, signature), group=group)
+    expected = {}
+    for ranks, candidate in schedules:
+        if candidate != expected.setdefault(ranks, candidate):
+            raise RuntimeError(
+                "ChunkFlow requires matching parent windows and F/Fr/B plans within each expert-parallel group; "
+                "the current DP shards produce different schedules"
+            )

@@ -101,8 +101,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
 
     from megatron.training.global_vars import get_args
 
-    from examples.chunkflow.schedules import _BATCH_KEYS, _num_microbatches, _plan
-    from relax.backends.megatron.data import get_batch
+    from examples.chunkflow.schedules import _check_ep_schedule, _next_parent, _num_microbatches, _plan
 
     args = get_args()
     chunk_size = int(args.chunkflow_chunk_size)
@@ -187,25 +186,15 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
     fp_step_func = _no_loss_step_func(forward_step_func)
     first_forward = True
 
-    def next_parent() -> dict:
-        get_next = getattr(data_iterator, "get_next", None)
-        raw = get_next(_BATCH_KEYS) if get_next is not None else next(data_iterator)[0]
-        return get_batch(
-            iter([(raw, {})]),
-            _BATCH_KEYS,
-            args.data_pad_size_multiplier,
-            args.qkv_format,
-            args.allgather_cp,
-        )
-
     with no_sync_func():
         num_parents = _num_microbatches(num_microbatches)
         parent_window = parent_window or max(1, num_parents)
+        _check_ep_schedule((num_parents, parent_window), args, layout=True)
         for mb_start in range(0, num_parents, parent_window):
             by_id, owners, plans = {}, {}, []
             group_offset = chunk_offset = 0
             for mb_idx in range(mb_start, min(mb_start + parent_window, num_parents)):
-                parent = next_parent()
+                parent = _next_parent(data_iterator, args)
                 chunks, units = _plan(parent, chunk_size, policy)
                 plan = make_model_plan(units, chunks, keep_last_k, p2p_communicator.total_stages)
                 plans.append(plan)
@@ -223,6 +212,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 group_offset += len(groups)
                 chunk_offset += len(chunks)
             plan = merge_model_plans(plans, p2p_communicator.total_stages)
+            _check_ep_schedule((plan.forward, plan.backward, tuple(sorted(plan.recompute)), plan.warmups), args)
             fwd_seq, bwd_seq, need_fr = plan.forward, plan.backward, plan.recompute
             W, n = plan.warmups[p2p_communicator.current_stage], len(fwd_seq)
             unit_shapes = {

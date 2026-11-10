@@ -10,15 +10,18 @@ from typing import Iterator, List, Optional, Union
 
 import torch
 from megatron.core import parallel_state
+from megatron.core.pipeline_parallel.schedules import backward_step
+from megatron.core.utils import get_model_config
 
 from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
 from examples.chunkflow.scheduler import build_chunks
 from examples.chunkflow.unit_batch import slice_parent_batch
-from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
+from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops, validate_schedule
 
 
 _BATCH_KEYS = (
     "tokens",
+    "multimodal_train_inputs",
     "pre_shifted_labels",
     "packed_seq_params",
     "total_lengths",
@@ -32,6 +35,40 @@ _BATCH_KEYS = (
     "rollout_log_probs",
     "max_seq_lens",
 )
+
+
+def _next_parent(data_iterator, args) -> dict:
+    from relax.backends.megatron.data import get_batch
+
+    get_next = getattr(data_iterator, "get_next", None)
+    raw = get_next(_BATCH_KEYS) if get_next is not None else next(data_iterator)[0]
+    if any(raw.get("multimodal_train_inputs") or ()):
+        raise NotImplementedError("ChunkFlow currently supports text-only batches")
+    return get_batch(
+        iter([(raw, {})]),
+        _BATCH_KEYS,
+        args.data_pad_size_multiplier,
+        args.qkv_format,
+        args.allgather_cp,
+    )
+
+
+def _check_ep_schedule(signature: tuple, args, *, layout: bool = False) -> None:
+    tp_size = getattr(args, "tensor_model_parallel_size", 1)
+    etp_size = getattr(args, "expert_tensor_parallel_size", None) or tp_size
+    if getattr(args, "expert_model_parallel_size", 1) <= 1 and etp_size <= tp_size:
+        return
+    from relax.utils.distributed_utils import get_gloo_group
+
+    # The training-wide CPU group propagates failures to every PP/DP peer.
+    scope = (
+        ()
+        if layout
+        else tuple(
+            torch.distributed.get_process_group_ranks(parallel_state.get_expert_tensor_and_model_parallel_group())
+        )
+    )
+    validate_schedule(signature, group=get_gloo_group(), scope=scope)
 
 
 def get_schedule(args: Namespace, pp_size: int) -> Callable:
@@ -86,8 +123,6 @@ def chunkflow_forward_backward_no_pipelining(
 
     from megatron.training.global_vars import get_args
 
-    from relax.backends.megatron.data import get_batch
-
     args = get_args()
     chunk_size = int(args.chunkflow_chunk_size)
     policy = getattr(args, "chunkflow_pack_policy", "staggered")
@@ -95,24 +130,19 @@ def chunkflow_forward_backward_no_pipelining(
     keep_last_k = getattr(args, "chunkflow_keep_last_k", 0) or 1 << 30
     runtime = require_runtime(model)
 
-    config = model.config if hasattr(model, "config") else None
+    config = get_model_config(model)
     no_sync_func = getattr(config, "no_sync_func", None) or contextlib.nullcontext
 
     forward_data_store: list = []
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
+    _check_ep_schedule((num_mb, 1), args, layout=True)
     with no_sync_func():
         for _ in range(num_mb):
-            parent_batch = data_iterator.get_next(_BATCH_KEYS)
-            parent = get_batch(
-                iter([(parent_batch, {})]),
-                _BATCH_KEYS,
-                args.data_pad_size_multiplier,
-                args.qkv_format,
-                args.allgather_cp,
-            )
+            parent = _next_parent(data_iterator, args)
             chunks, units = _plan(parent, chunk_size, policy)
             ops = gen_unit_ops(units, chunks, keep_last_k)
+            _check_ep_schedule(tuple(ops), args)
 
             pending: dict[int, torch.Tensor] = {}
             for kind, unit_id in ops:
@@ -120,7 +150,7 @@ def chunkflow_forward_backward_no_pipelining(
                 if kind == "B":
                     loss = pending.pop(unit_id)
                     if not forward_only:
-                        loss.backward()
+                        backward_step(None, loss, None, config)
                     for group in completed_groups(unit):
                         runtime.release_group(group)
                     continue

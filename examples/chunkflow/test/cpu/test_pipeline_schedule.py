@@ -411,3 +411,139 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     assert config.batch_p2p_comm is True
     for key, expected in (("sf", stage != 3), ("rf", stage != 0), ("sb", stage != 0), ("rb", stage != 3)):
         assert comm.positions[key] == (len(forward_shapes) if expected else 0)
+
+
+@pytest.mark.parametrize("keep_last_k", [0, 1])
+@pytest.mark.parametrize("loss_scale", [1.0, 8.0])
+def test_single_stage_prepacked_step_preserves_scaled_gradients(monkeypatch, keep_last_k, loss_scale):
+    pytest.importorskip("megatron.core")
+    import torch
+    from megatron.core.pipeline_parallel.schedules import backward_step
+    from megatron.training import global_vars
+
+    from examples.chunkflow import schedules
+    from examples.chunkflow.runtime import ChunkflowRuntime
+    from relax.backends.megatron.data import PrepackedBatch
+
+    args = SimpleNamespace(
+        chunkflow_chunk_size=128,
+        chunkflow_keep_last_k=keep_last_k,
+        data_pad_size_multiplier=128,
+        qkv_format="thd",
+        allgather_cp=False,
+    )
+    config = SimpleNamespace(
+        no_sync_func=None,
+        finalize_model_grads_func=None,
+        grad_scale_func=lambda loss: loss * loss_scale,
+        timers=None,
+        deallocate_pipeline_outputs=False,
+    )
+    tokens = torch.arange(256).view(1, -1)
+    parent = PrepackedBatch(
+        tokens=tokens,
+        full_loss_masks=torch.ones_like(tokens),
+        total_lengths=[256],
+        packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=[0, 256]),
+    )
+    weight = torch.nn.Parameter(torch.tensor(0.25))
+    reference = torch.nn.Parameter(weight.detach().clone())
+    model = SimpleNamespace(config=config, chunkflow_runtime=ChunkflowRuntime(128))
+    backward_step(None, (reference * tokens.float()).square().sum(), None, config)
+
+    def forward(iterator, model):
+        batch, _ = next(iterator)
+        output = (weight * batch["tokens"].float()).square()
+        return output, lambda output: (output.sum(), torch.tensor(output.numel()), {})
+
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.setattr(schedules, "get_model_config", lambda model: model.config)
+    zeros = torch.zeros
+    monkeypatch.setattr(torch, "zeros", lambda *a, **kw: zeros(*a, **dict(kw, device="cpu")))
+    # The async prepack iterator exposes __next__, not DataIterator.get_next.
+    assert schedules._next_parent(iter([(parent, {})]), args) is parent
+    schedules.chunkflow_forward_backward_no_pipelining(
+        forward_step_func=forward,
+        data_iterator=iter([(parent, {})]),
+        model=model,
+        num_microbatches=1,
+        seq_length=256,
+        micro_batch_size=1,
+    )
+    torch.testing.assert_close(weight.grad, reference.grad)
+    # Optimizer unscale must leave the ordinary full-batch gradient and update.
+    expected = 2 * reference.detach() * tokens.float().square().sum()
+    torch.testing.assert_close(weight.grad / loss_scale, expected)
+    torch.testing.assert_close(weight.detach() - 1e-6 * weight.grad / loss_scale, reference.detach() - 1e-6 * expected)
+
+
+def test_parent_reader_rejects_multimodal_data_iterator_before_packing():
+    pytest.importorskip("megatron.core")
+    import torch
+
+    from examples.chunkflow.schedules import _next_parent
+    from relax.backends.megatron.data import DataIterator
+
+    iterator = DataIterator(
+        {"tokens": [torch.arange(4)], "multimodal_train_inputs": [{"pixel_values": torch.ones(1)}]},
+        micro_batch_size=1,
+    )
+    with pytest.raises(NotImplementedError, match="text-only"):
+        _next_parent(iterator, SimpleNamespace())
+
+
+def _validate_expert_plans_worker(rank, init_file):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from examples.chunkflow.units import validate_schedule
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=4, timeout=timedelta(seconds=25)
+    )
+    group = dist.group.WORLD
+    scope = (0, 1) if rank < 2 else (2, 3)
+
+    def signature(lengths, k=0):
+        chunks = build_chunks(lengths, chunk_size=4096)
+        units = build_micro_batches(chunks)
+        plan = make_model_plan(units, chunks, k or 1 << 30, 2)
+        return plan.forward, plan.backward, tuple(sorted(plan.recompute)), plan.warmups
+
+    try:
+        # Different token counts are legal when the collective order is identical.
+        validate_schedule(signature([4097] if rank % 2 else [8192]), group=group, scope=scope)
+        cases = [
+            (signature([2048] if rank == 0 else [8192]), scope),
+            (signature([4096, 4096] if rank == 0 else [8192]), scope),
+            (signature([8192], k=1 if rank == 0 else 0), scope),
+            ((1 if rank == 0 else 2, 1), ()),
+            ((2, 1 if rank == 0 else 2), ()),
+        ]
+        for candidate, candidate_scope in cases:
+            with pytest.raises(RuntimeError, match="different schedules"):
+                validate_schedule(candidate, group=group, scope=candidate_scope)
+        # Even peers in the unaffected EP scope must have raised and reached here.
+        validate_schedule(("finished",), group=group)
+    finally:
+        dist.destroy_process_group(group)
+
+
+def test_expert_schedule_mismatch_fails_on_all_pipeline_stages(tmp_path):
+    import time
+
+    import torch.multiprocessing as mp
+
+    workers = mp.spawn(_validate_expert_plans_worker, args=(str(tmp_path / "gloo"),), nprocs=4, join=False)
+    deadline = time.monotonic() + 45
+    try:
+        while time.monotonic() < deadline:
+            if workers.join(timeout=1):
+                return
+        pytest.fail("collective schedule validation hung")
+    finally:
+        for worker in workers.processes:
+            if worker.is_alive():
+                worker.terminate()
+            worker.join(timeout=5)
