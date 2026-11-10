@@ -1,16 +1,16 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Full 48-layer multimodal SFT: 5 x 8 H20, TP4/PP5/DP2/EP4, MTP1, 64K packing.
+# Full 48-layer multimodal SFT: 4 x 8 H20, TP4/PP4/DP2/EP4, MTP1, 16K packing.
 # Export MODEL_DIR (HF checkpoint), DATA_DIR (JSONL or train.jsonl directory), SAVE_DIR, then:
-# bash scripts/entrypoint/spmd-multinode.sh examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-40xh20.sh
-# Existing Ray head: bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-40xh20.sh
-# Default: 10 updates from HF, without saving/resuming training checkpoints.
+# bash scripts/entrypoint/spmd-multinode.sh examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xh20.sh
+# Existing Ray head: bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xh20.sh
+# Default: 100 updates from HF, without saving/resuming training checkpoints.
 # DRY_RUN=1 previews arguments without Ray/GPU setup or output writes.
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RELAX_ROOT="$(cd -- "${RELAX_DIR:-${SCRIPT_DIR}/../../../..}" && pwd)"
-TARGET_SCRIPT="${RELAX_ROOT}/examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-40xh20.sh"
+TARGET_SCRIPT="${RELAX_ROOT}/examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xh20.sh"
 if [[ ! "${BASH_SOURCE[0]}" -ef "${TARGET_SCRIPT}" ]]; then
     exec bash "${TARGET_SCRIPT}" "$@"
 fi
@@ -43,7 +43,7 @@ PYADMIT
 fi
 source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa}"
-EXP_NAME="${EXP_NAME:-qwen38-qsa-40xh20}"
+EXP_NAME="${EXP_NAME:-qwen38-qsa-32xh20}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
@@ -92,7 +92,7 @@ CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}"
     --ref-load "${MODEL_DIR}"
     --megatron-to-hf-mode bridge
-    --num-rollout "${NUM_STEPS:-10}"
+    --num-rollout "${NUM_STEPS:-100}"
 )
 
 PROMPT_DATA="${DATA_DIR}"
@@ -107,12 +107,12 @@ SFT_ARGS=(
     --sft-invalid-multimodal-strategy error
     --sft-oversize-strategy skip
     --calculate-per-token-loss
-    --rollout-max-context-len "${SEQ_LENGTH:-65536}"
-    --global-batch-size "${GBS:-1024}"
+    --rollout-max-context-len "${SEQ_LENGTH:-16384}"
+    --global-batch-size "${GBS:-32}"
     --micro-batch-size 1
-    --seq-length "${SEQ_LENGTH:-65536}"
+    --seq-length "${SEQ_LENGTH:-16384}"
     --use-dynamic-batch-size
-    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-65536}"
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-16384}"
     --data-pad-size-multiplier 4096
     --per-rank-fetch
     --sft-prefetch-num-workers 16
@@ -131,11 +131,11 @@ SFT_ARGS=(
 
 PERF_ARGS=(
     --tensor-model-parallel-size 4
-    --pipeline-model-parallel-size 5
+    --pipeline-model-parallel-size 4
     --context-parallel-size 1
     --expert-model-parallel-size 4
     --expert-tensor-parallel-size 1
-    --pipeline-model-parallel-layout 'Et*8|t*11|t*11|t*12|t*6mL'
+    --pipeline-model-parallel-layout 'Et*13|t*13|t*13|t*9mL'
     --sequence-parallel
     --moe-token-dispatcher-type flex
     --moe-flex-dispatcher-backend deepep
@@ -203,8 +203,8 @@ PYENV
 )
 
 TRAIN_ARGS=(
-    --resource '{"sft":[1,0],"actor":[1,40]}'
-    --actor-num-nodes 5
+    --resource '{"sft":[1,0],"actor":[1,32]}'
+    --actor-num-nodes 4
     --actor-num-gpus-per-node 8
     --sft-max-in-flight-steps 2
     --num-data-storage-units 2
