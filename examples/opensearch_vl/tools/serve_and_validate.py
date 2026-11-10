@@ -5,6 +5,7 @@ HTTP."""
 
 import argparse
 import base64
+import json
 import subprocess
 import sys
 import time
@@ -27,6 +28,7 @@ def main() -> None:
     from transformers import AutoProcessor
 
     from relax.engine.sft.dataset.chat_template import render_to_text
+    from relax.utils.logging_utils import get_logger
 
     args.output.mkdir(parents=True, exist_ok=False)
     processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
@@ -103,7 +105,9 @@ def main() -> None:
             if not records:
                 raise ValueError("No held-out service cases")
             write_json(args.output / "predictions.json", records)
-            write_json(args.output / "summary.json", summarize(records))
+            summary = summarize(records)
+            write_json(args.output / "summary.json", summary)
+            get_logger(__name__).info("Service validation completed: %s", json.dumps(summary, ensure_ascii=False))
         finally:
             process.terminate()
             try:
