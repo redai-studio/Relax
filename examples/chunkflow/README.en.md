@@ -35,39 +35,36 @@ Data: 5,000 synthetic Chinese SFT samples. Length distribution: 70% at 0–2K, 2
 | Baseline      |          16.2 s |         17.5 s |        13.8% |            1.00× |              1.00× |
 | **ChunkFlow** |      **17.0 s** |     **18.4 s** |    **13.1%** |       **0.950×** |         **0.950×** |
 
-**Memory reference**: LongAlign / 64K / chunk4096 / GBS8 / K0 + native selective `gdn moe`; peak allocated memory drops from **56.38 GiB → 37.79 GiB**, saving **32.97%**.
-
-Speedups follow the experiment summary: above 1 means faster, below 1 means slower.
+**Memory reference**: LongAlign / 64K / chunk4096 / GBS8 / K0; peak allocated memory drops from **56.38 GiB → 37.79 GiB**, saving **32.97%**.
 
 ______________________________________________________________________
 
 ## When to enable
 
-| Scenario                                              | Recommendation                                                                           |
-| ----------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Long-context Dense, small batches, pipeline idle time | Benchmark it; training speedups have been observed                                       |
-| Long-context MoE with memory pressure                 | Try it if additional compute time is acceptable                                          |
-| Short sequences, ample memory, throughput first       | Leave off unless a matched comparison shows a benefit                                    |
-| QSA / PLE models                                      | Experimental: prefix replay repeats computation; savings and speedups are not guaranteed |
+| Scenario                                              | Recommendation                                        |
+| ----------------------------------------------------- | ----------------------------------------------------- |
+| Long-context Dense, small batches, pipeline idle time | Benchmark it; training speedups have been observed    |
+| Long-context MoE with memory pressure                 | Try it if additional compute time is acceptable       |
+| Short sequences, ample memory, throughput first       | Leave off unless a matched comparison shows a benefit |
 
 ______________________________________________________________________
 
 ## Quick start
 
-**Version dependency**: based on Relax [d548769b](https://github.com/redai-studio/Relax/commit/d548769b77f12e445e464f99d4332290a3e5bd3d) and its matching training image; see [relax.version](relax.version) for the pinned revision. Recipes automatically apply the integration patch; they install no dependencies and save no checkpoints.
+**Version dependency**: based on Relax [d548769b](https://github.com/redai-studio/Relax/commit/d548769b77f12e445e464f99d4332290a3e5bd3d) and its matching training image; see [relax.version](relax.version) for the pinned revision.
 
 ```bash
 export MODEL_DIR=/path/to/model
 export PROMPT_DATA=/path/to/data
 ```
 
-**Dense · Qwen3-4B**　Defaults: 64K / chunk4096 / K0
+**Dense · Qwen3-4B**　64K / chunk4096 / K0
 
 ```bash
 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 ```
 
-**MoE · Qwen3.6-35B-A3B**　64K / chunk4096; K0 below disables ChunkFlow recomputation
+**MoE · Qwen3.6-35B-A3B**　64K / chunk4096 / K0
 
 ```bash
 KEEP_LAST_K=0 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
@@ -75,15 +72,13 @@ KEEP_LAST_K=0 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 
 ### Integrate an existing recipe
 
-Integrate with a compatible Megatron recipe, keeping its model, data, and launch method.
-
-**① Install the integration patch** (once, from the repository root)
+**① Install the integration patch**
 
 ```bash
 python3 examples/chunkflow/setup.py
 ```
 
-**② Add the ChunkFlow arguments** (append to the training command; do not run separately)
+**② Add the ChunkFlow arguments**
 
 ```bash
 --use-chunkflow \
@@ -91,8 +86,6 @@ python3 examples/chunkflow/setup.py
 --chunkflow-keep-last-k 0 \
 --no-rope-fusion
 ```
-
-`K=0` retains all activations without recomputation; `K=1` keeps only the last chunk per group and recomputes earlier chunks before backward.
 
 Do not duplicate settings already present in the recipe:
 
@@ -102,15 +95,12 @@ Do not duplicate settings already present in the recipe:
 | `--calculate-per-token-loss`                   | Count tokens without changing sample weights through chunking                                |
 | `--no-rope-fusion`                             | Use the RoPE path that supports chunk position offsets                                       |
 | `--attention-dropout 0.0 --hidden-dropout 0.0` | Current adapters require zero dropout to avoid random-mask issues during chunking and replay |
-| Pipeline parallelism (PP)                      | Automatically uses Megatron’s PP size; no extra argument or environment variable             |
-| Native recomputation                           | Disable full-layer / selective `core_attn`; keep the GDN/QSA recipe settings                 |
+| Megatron recomputation compatibility           | Disable full-layer / selective `core_attn`; keep the GDN/QSA recipe settings                 |
 
 ### Key parameters
 
-| Argument                  | Starting point  | Adjustment                                                                                                                                |
-| ------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `--chunkflow-chunk-size`  | `4096`          | Must be below actual sample length to split it; smaller chunks increase chunk count and call overhead                                     |
-| `--chunkflow-keep-last-k` | `0`             | `0` disables recomputation; `1` retains only the last chunk's activations and recomputes earlier chunks before backward; keep `0` for QSA |
-| `--seq-length`            | Match your data | Sample length limit, not chunk size; samples above the limit are skipped                                                                  |
-
-For a baseline, remove only `--use-chunkflow` and keep other arguments and data identical.
+| Argument                  | Starting point  | Adjustment                                                                                                              |
+| ------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `--chunkflow-chunk-size`  | `4096`          | Must be below actual sample length to split it; smaller chunks increase chunk count and call overhead                   |
+| `--chunkflow-keep-last-k` | `0`             | `0` disables recomputation; `1` retains only the last chunk's activations and recomputes earlier chunks before backward |
+| `--seq-length`            | Match your data | Sample length limit, not chunk size; samples above the limit are skipped                                                |

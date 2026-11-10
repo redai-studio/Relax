@@ -50,12 +50,8 @@ NativeExecutor = Callable[[Callable[..., torch.Tensor], DenseAttentionCall], tor
 
 @dataclass(frozen=True)
 class AttentionAdapter:
-    """A layer adapter with read-only validation and reversible installation.
-
-    Installers must undo their own mutations if they raise. The returned undo
-    restores the layer. Full-layer adapters can manage indexers or other state;
-    they need not use the dense KV helper below.
-    """
+    """Validate without mutation; install reversibly and roll back on
+    failure."""
 
     name: str
     validate: Callable[[nn.Module], None]

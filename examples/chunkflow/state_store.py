@@ -45,7 +45,7 @@ def _accumulate_gradient(leaf: torch.Tensor) -> None:
     grad = leaf.grad
     dtype = torch.float32 if grad.dtype in (torch.float16, torch.bfloat16) else grad.dtype
     if leaf._chunkflow_grad_sum is None:
-        leaf._chunkflow_grad_sum = grad.to(dtype).clone()
+        leaf._chunkflow_grad_sum = grad.to(dtype=dtype, copy=True)
     else:
         leaf._chunkflow_grad_sum.add_(grad)
     leaf.grad = None
@@ -83,8 +83,8 @@ class StateStore:
         self._chunks[chunk_id] = state
 
     def lookup(self, upto_chunk_id: int) -> list[ChunkState]:
-        missing = [i for i in range(upto_chunk_id + 1) if i not in self._chunks]
-        if missing:
+        if upto_chunk_id >= len(self._chunks):
+            missing = list(range(len(self._chunks), upto_chunk_id + 1))
             raise StateStoreError(
                 f"lookup(upto_chunk_id={upto_chunk_id}) requested missing/freed chunk id(s) {missing}"
             )

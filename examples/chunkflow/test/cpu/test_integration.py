@@ -18,6 +18,7 @@ from examples.chunkflow.integration import (
 )
 from examples.chunkflow.runtime import ChunkflowRuntime, require_runtime
 from examples.chunkflow.scheduler import build_chunks
+from examples.chunkflow.state_store import ChunkState, StateStore, StateStoreError
 from examples.chunkflow.units import build_micro_batches
 
 
@@ -91,6 +92,23 @@ def test_schedule_reuses_runtime_installed_below_model_wrappers():
     wrapped = Wrapper(Wrapper(bare))
     assert require_runtime(wrapped) is runtime
     assert not hasattr(wrapped, "chunkflow_runtime")
+
+
+def test_state_store_preserves_history_order_and_rejects_missing_chunks():
+    store = StateStore()
+    assert store.lookup(-1) == []
+    with pytest.raises(StateStoreError):
+        store.lookup(0)
+    first, second = ChunkState({}), ChunkState({})
+    store.put(0, first)
+    with pytest.raises(StateStoreError):
+        store.put(2, second)
+    store.put(1, second)
+    assert store.lookup(0)[0] is first
+    history = store.lookup(1)
+    assert history[0] is first and history[1] is second
+    with pytest.raises(StateStoreError, match=r"\[2, 3\]"):
+        store.lookup(3)
 
 
 class _FakeAttn(torch.nn.Module):
