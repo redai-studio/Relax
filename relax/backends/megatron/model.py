@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import torch
@@ -1681,6 +1682,16 @@ def train_one_step(
         or getattr(args, "memory_weight_sync_config", None)
         or getattr(args, "_dws_optimizer_observer", False)
     ):
+        optimizer_updated = bool(update_successful)
+        if getattr(args, "_dws_optimizer_observer", False):
+            args._dws_optimizer_result = dict(
+                rollout=rollout_id,
+                step=step_id,
+                updated=optimizer_updated,
+                zero_tokens=zero_token_step,
+                observed_host_monotonic_s=monotonic(),
+                scope="Host optimizer result after LR scheduling; before reduced loss metrics and actor preparation; no added GPU fence",
+            )
         logger.info(
             "%s sync optimizer result: rollout=%d step=%d updated=%s zero_tokens=%s",
             "Disk"
@@ -1690,7 +1701,7 @@ def train_one_step(
             else "NCCL",
             rollout_id,
             step_id,
-            bool(update_successful),
+            optimizer_updated,
             zero_token_step,
         )
 

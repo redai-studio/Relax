@@ -936,6 +936,11 @@ class SGLangEngine(RayActor):
         for _ in range(2):
             response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
             response.raise_for_status()
+            counter = getattr(self, "_dws_http_metrics", None)
+            if counter is not None:
+                from task_delta_weight_sync.sync_metrics import record_http
+
+                record_http(counter, "server_info", response)
             info = response.json()
             # /server_info can time out fetching scheduler state while still
             # returning HTTP 200. Retry once before rejecting an unknown auto layout.
@@ -1867,6 +1872,11 @@ class SGLangEngine(RayActor):
             f"http://{self.server_host}:{self.server_port}/pause_generation", json={}, timeout=timeout
         )
         response.raise_for_status()
+        counter = getattr(self, "_dws_http_metrics", None)
+        if counter is not None:
+            from task_delta_weight_sync.sync_metrics import record_http
+
+            record_http(counter, "pause_generation", response)
         return response
 
     def continue_generation(self, timeout: float | None = None):
@@ -1874,6 +1884,11 @@ class SGLangEngine(RayActor):
             f"http://{self.server_host}:{self.server_port}/continue_generation", json={}, timeout=timeout
         )
         response.raise_for_status()
+        counter = getattr(self, "_dws_http_metrics", None)
+        if counter is not None:
+            from task_delta_weight_sync.sync_metrics import record_http
+
+            record_http(counter, "continue_generation", response)
         return response
 
     def begin_weight_update(self):

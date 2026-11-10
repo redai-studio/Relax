@@ -67,6 +67,7 @@ def host_memory_budget(proc: Path = Path("/proc")) -> dict:
             if kind == "cgroup" and limit is not None and limit >= 1 << 60:
                 limit = None  # Linux v1 PAGE_COUNTER_MAX, not a usable quota.
             remaining = None if limit is None else max(0, limit - current)
+            peak_path = directory / ("memory.peak" if kind == "cgroup2" else "memory.max_usage_in_bytes")
             constraints.append(
                 dict(
                     path=str(directory),
@@ -75,6 +76,8 @@ def host_memory_budget(proc: Path = Path("/proc")) -> dict:
                     limit_bytes=limit,
                     current_bytes=current,
                     remaining_bytes=remaining,
+                    peak_bytes=int(peak_path.read_text().strip()) if peak_path.exists() else None,
+                    peak_scope="Visible cgroup lifetime high-water mark; may include other processes; never reset",
                 )
             )
             if remaining is not None:
@@ -87,6 +90,8 @@ def host_memory_budget(proc: Path = Path("/proc")) -> dict:
     return dict(
         effective_available_bytes=available,
         node_available_bytes=int(fields["MemAvailable"].split()[0]) * 1024,
+        node_total_bytes=int(fields["MemTotal"].split()[0]) * 1024 if "MemTotal" in fields else None,
+        node_scope="Point-in-time MemAvailable, not a node peak or task-attributed usage",
         cgroups=constraints,
     )
 

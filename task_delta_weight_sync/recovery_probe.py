@@ -339,9 +339,16 @@ def install(args: Any) -> None:
 
             fresh = local_action(build_fresh)
             deferred = tuple(_DeferredEngine(engine) for engine in engines)
-            raw_update(fresh, _DeferredManager(deferred, lock), full_only=True)
+            fresh_result = raw_update(fresh, _DeferredManager(deferred, lock), full_only=True)
             root_action(lambda: audit("compare", "fresh-full-recovery"))
             compared = root_action(lambda: inspect_reports("fresh-full-recovery", compare=True))
+
+            def check_schemas():
+                from task_delta_weight_sync.sync_metrics import validate_stream_receipts
+
+                return validate_stream_receipts(fresh_result, compared)
+
+            fresh_schema_check = root_action(check_schemas)
             local_action(close_fresh)
             fresh_closed = True
 
@@ -361,6 +368,9 @@ def install(args: Any) -> None:
                             old_retry_rejected=True,
                             quarantined=quarantined,
                             compared=compared,
+                            fresh_result=fresh_result,
+                            fresh_schema_check=fresh_schema_check,
+                            fresh_result_scope="FULL installation with test-deferred resume/probe; correctness evidence only",
                             failure=error,
                             limitation="Forced FULL after complement; test-only deferred resume; excluded from performance",
                         ),

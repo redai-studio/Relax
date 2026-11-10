@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from task_delta_weight_sync import prepared_nccl, recovery_probe
-from task_delta_weight_sync.prepared_nccl import plan_capacity, wire_bucket
+from task_delta_weight_sync.prepared_nccl import plan_capacity, wire_bucket, wire_metadata, wire_schema_digest
 from task_delta_weight_sync.sharded_gpu_audit import AUDIT_LOADER
 
 
@@ -28,6 +28,17 @@ def test_prepared_plan_keeps_native_order_dtype_and_bytes_with_bounded_reuse():
     capacities, totals = plan_capacity([bucket, bucket])
     assert capacities == {"bfloat16": 9, "float32": 2}
     assert totals == {"bfloat16": 36, "float32": 16}
+
+
+def test_native_wire_schema_covers_names_shapes_and_bucket_boundaries_beyond_rle():
+    first = [("a", torch.empty(2, 3)), ("b", torch.empty(4))]
+    reshaped = [("a", torch.empty(3, 2)), first[1]]
+    renamed = [("c", first[0][1]), first[1]]
+    assert wire_bucket(first) == wire_bucket(reshaped) == wire_bucket(renamed)
+    digest = wire_schema_digest([wire_metadata(first)])
+    assert digest != wire_schema_digest([wire_metadata(reshaped)])
+    assert digest != wire_schema_digest([wire_metadata(renamed)])
+    assert digest != wire_schema_digest([wire_metadata(first[:1]), wire_metadata(first[1:])])
 
 
 @pytest.mark.parametrize(

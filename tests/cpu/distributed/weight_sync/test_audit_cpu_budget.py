@@ -57,9 +57,14 @@ def test_effective_memory_uses_tighter_parent_even_when_leaf_is_unlimited(tmp_pa
     (mount / usage_name).write_text("90000")
     (mount / "worker" / limit_name).write_text(str((1 << 63) - 4096) if kind == "cgroup" else "max")
     (mount / "worker" / usage_name).write_text("1000")
+    peak_name = "memory.max_usage_in_bytes" if kind == "cgroup" else "memory.peak"
+    (mount / peak_name).write_text("95000")
+    (mount / "worker" / peak_name).write_text("2000")
     result = host_memory_budget(proc)
     assert result["effective_available_bytes"] == 10000
     assert len(result["cgroups"]) == 2
+    assert [row["peak_bytes"] for row in result["cgroups"]] == [2000, 95000]
+    assert (mount / peak_name).read_text() == "95000"  # Shared lifetime counters must never be reset.
     budget = AuditCpuBudget(
         tmp_path / "leases",
         "worker",

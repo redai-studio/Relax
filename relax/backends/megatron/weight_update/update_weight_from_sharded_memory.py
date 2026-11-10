@@ -148,6 +148,7 @@ class UpdateWeightFromShardedMemory:
             raise RuntimeError(plan[0]["error"])
         members, nonce = plan[0]["members"], plan[0]["nonce"]
         layout = DirectExpertLayout.from_receiver(plan[0]["layout"])
+        planned_at = monotonic()
         self.members = tuple(members)
         if world != 8:
             raise ValueError("Owner-local Qwen3.5 synchronization requires exactly eight source ranks")
@@ -221,6 +222,7 @@ class UpdateWeightFromShardedMemory:
         captured_at = monotonic()
         error = None
         descriptors = {}
+        stream_metadata = {}
         expected_members = {}
         try:
             if (
@@ -256,6 +258,14 @@ class UpdateWeightFromShardedMemory:
                     group_update=nonce,
                 )
                 descriptors[stream] = descriptor
+                stream_metadata[stream] = dict(
+                    schema=self.encoders[key].pending_schema,
+                    group_update=nonce,
+                    update=descriptor["update"],
+                    members=sorted(fixed),
+                    version=version,
+                    base=version - 1,
+                )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         self._gate(error)
@@ -269,9 +279,11 @@ class UpdateWeightFromShardedMemory:
                 combined = {key: value for item in all_descriptors for key, value in item.items()}
                 if len(combined) != world * 2 + 1:
                     raise ValueError("Incomplete owner stream descriptor set")
+                lock_started = monotonic()
                 while not ray.get(lock.acquire.remote(), timeout=remaining()):
                     sleep(min(0.05, remaining()))
                 acquired = True
+                locked_at = monotonic()
                 ray.get(
                     [engine.pause_generation.remote(timeout=remaining()) for engine in engines], timeout=remaining()
                 )
@@ -301,6 +313,7 @@ class UpdateWeightFromShardedMemory:
                             )
                         )
                     controls.append(per_tp)
+                dispatched_at = monotonic()
                 loaded = ray.get(
                     [
                         engine.install_sharded_memory_update.remote(control, remaining())
@@ -310,10 +323,21 @@ class UpdateWeightFromShardedMemory:
                 )
                 if any(not isinstance(item, dict) or item.get("success") is not True for item in loaded):
                     raise RuntimeError(f"Incomplete sharded engine install: {loaded}")
-                result[0] = dict(receivers=loaded, receiver_calls_s=monotonic() - paused_at)
+                installed_at = monotonic()
+                result[0] = dict(
+                    receivers=loaded,
+                    receiver_calls_s=installed_at - paused_at,
+                    stream_union_s=lock_started - published_at,
+                    lock_wait_s=locked_at - lock_started,
+                    pause_s=paused_at - locked_at,
+                    receiver_control_prepare_s=dispatched_at - paused_at,
+                    install_calls_s=installed_at - dispatched_at,
+                )
             except Exception as exc:
                 result[0] = dict(error=f"{type(exc).__name__}: {exc}")
+        broadcast_started = monotonic()
         dist.broadcast_object_list(result, src=0, group=group)
+        broadcasted_at = monotonic()
         error = result[0].get("error")
         if error is None:
             try:
@@ -322,8 +346,10 @@ class UpdateWeightFromShardedMemory:
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
         completion_error = None
+        lock_release_s = 0.0
         try:
             self._gate(error)
+            ack_prepared_at = monotonic()
             error = None
             try:
                 for encoder in self.encoders.values():
@@ -336,6 +362,7 @@ class UpdateWeightFromShardedMemory:
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
             self._gate(error)
+            committed_at = monotonic()
             if rank == 0:
                 ready = [None]
                 try:
@@ -351,6 +378,7 @@ class UpdateWeightFromShardedMemory:
                     ready[0] = dict(
                         sync_to_ready_s=ready_at - started,
                         sync_with_probe_s=monotonic() - started,
+                        resume_s=ready_at - committed_at,
                         probe_s=monotonic() - ready_at,
                     )
                 except Exception as exc:
@@ -364,28 +392,53 @@ class UpdateWeightFromShardedMemory:
             completion_error = f"{type(exc).__name__}: {exc}"
         finally:
             if rank == 0 and acquired:
+                release_started = monotonic()
                 try:
                     ray.get(lock.release.remote(), timeout=10)
                 except Exception as exc:
                     completion_error = f"Group lock release failed: {type(exc).__name__}: {exc}"
+                lock_release_s = monotonic() - release_started
+        completion_gate_started = monotonic()
         self._gate(completion_error)
+        completion_gate_s = monotonic() - completion_gate_started
         totals = [None] * world
         groups = {}
         for key, buckets in local.items():
             for bucket in buckets:
                 label = ("expert" if key.startswith("expert:") else "nonexpert") + ":" + bucket.dtype
                 item = groups.setdefault(
-                    label, dict(elements=0, changed=0, payload_bytes=0, full_buckets=0, sparse_buckets=0)
+                    label,
+                    dict(
+                        elements=0,
+                        changed=0,
+                        payload_bytes=0,
+                        full_buckets=0,
+                        sparse_buckets=0,
+                        zero_changed_buckets=0,
+                        full_fallback_buckets=0,
+                    ),
                 )
                 item["elements"] += bucket.elements
                 item["changed"] += bucket.changed
                 item["payload_bytes"] += len(bucket.payload)
                 item[bucket.encoding + "_buckets"] += 1
+                item["zero_changed_buckets"] += int(bucket.changed == 0)
+                item["full_fallback_buckets"] += int(bucket.encoding == "full" and not full)
         if self.config.full_only:
             for item in groups.values():
                 item["changed"] = None
+                item["zero_changed_buckets"] = None
+                item["full_fallback_buckets"] = None
         local_stats = dict(
             groups=groups,
+            streams=stream_metadata,
+            layout_and_membership_s=planned_at - started,
+            capture_body_s=captured_at - planned_at,
+            install_result_broadcast_s=broadcasted_at - broadcast_started,
+            ack_wait_and_prepare_s=ack_prepared_at - broadcasted_at,
+            commit_and_gate_s=committed_at - ack_prepared_at,
+            lock_release_s=lock_release_s,
+            completion_gate_s=completion_gate_s,
             elements=sum(b.elements for values in local.values() for b in values),
             changed=None if self.config.full_only else sum(b.changed for values in local.values() for b in values),
             payload_bytes=sum(len(b.payload) for values in local.values() for b in values),
@@ -404,6 +457,7 @@ class UpdateWeightFromShardedMemory:
         )
         dist.all_gather_object(totals, local_stats, group=group)
         metrics = dict(
+            stream=self.config.stream,
             version=version,
             full=full,
             members=len(members),

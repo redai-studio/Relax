@@ -113,6 +113,11 @@ def test_sharded_real_tcp_applies_every_expert_and_preserves_fp32_bits():
             control, sources, expected = _publish(stack, encoders, "group", version)
             result = receiver.apply_group(control, _receive)
             assert result["streams"] == 3 and receiver.version == version and not receiver.poisoned
+            assert result["stream"] == "group" and result["group_update"] == f"update-{version}"
+            assert result["schemas"] == {
+                item["stream"]: encoder.pending_schema
+                for item, (encoder, _) in zip(control["streams"], sources, strict=True)
+            }
             for name, value in expected.items():
                 assert torch.equal(model.get_parameter(name).view(torch.uint8), value.view(torch.uint8))
             for encoder, source in sources:

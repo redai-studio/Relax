@@ -143,6 +143,9 @@ class ShardedMemoryReceiver:
         self._remember_storage()
         self.version, self.root, self.poisoned = version, root, False
         self.last_metrics = dict(
+            stream=root,
+            group_update=group_update,
+            schemas=dict(self.schemas),
             version=version,
             streams=len(streams),
             hf_bytes=self.hf_bytes,

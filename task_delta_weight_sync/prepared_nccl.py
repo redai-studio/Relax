@@ -5,12 +5,23 @@ installation."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 from pathlib import Path
 from time import monotonic
 from typing import Any
+
+
+def wire_metadata(named: list) -> list:
+    """Freeze dispatched names, dtype and shape without retaining tensors."""
+    return [(name, str(tensor.dtype), list(tensor.shape)) for name, tensor in named]
+
+
+def wire_schema_digest(buckets: list) -> str:
+    """Hash ordered semantic metadata, including native bucket boundaries."""
+    return hashlib.sha256(json.dumps(buckets, separators=(",", ":")).encode()).hexdigest()
 
 
 def wire_bucket(named: list) -> list:
@@ -250,5 +261,8 @@ def run(self: Any, directory: Path) -> None:
     ray.get([engine.disk_weight_generation_probe.remote(30) for engine in engines], timeout=40)
     atomic_write(
         directory / "prepared-nccl-verified.json",
-        json.dumps(dict(status="VERIFIED", plan=plan, rounds=reports), indent=2).encode(),
+        json.dumps(
+            dict(status="VERIFIED", plan=plan, named_tensor_schema_sha256=self._ab_wire_schema, rounds=reports),
+            indent=2,
+        ).encode(),
     )

@@ -31,8 +31,13 @@ def install(args: Any) -> None:
     from relax.utils.distributed_utils import get_gloo_group
     from relax.utils.logging_utils import get_logger
     from task_delta_weight_sync.native_call import guarded_native_call
-    from task_delta_weight_sync.prepared_nccl import wire_bucket
-    from task_delta_weight_sync.sync_metrics import allocator_metrics, receiver_metrics
+    from task_delta_weight_sync.prepared_nccl import wire_bucket, wire_metadata, wire_schema_digest
+    from task_delta_weight_sync.sync_metrics import (
+        allocator_metrics,
+        optimizer_boundary,
+        receiver_metrics,
+        validate_stream_receipts,
+    )
 
     config = MemorySyncConfig.load(args.memory_weight_sync_config)
     if config.layout != "qwen35_owner_local" or config.full_only:
@@ -43,6 +48,8 @@ def install(args: Any) -> None:
     group, logger = get_gloo_group(), get_logger(__name__)
     rank = dist.get_rank(group)
     measure_allocators = os.environ.get("DWS_COLLECT_METRICS") == "1"
+    args._dws_optimizer_observer = True
+    args._dws_optimizer_result = None
     root = Path(os.environ["TENSORBOARD_DIR"]).resolve().parents[1]
     measurements, audit_root = root / "paired-measurements", root / "audit"
     native_module = importlib.import_module("relax.backends.megatron.weight_update.update_weight_from_distributed")
@@ -79,6 +86,7 @@ def install(args: Any) -> None:
                 host_enqueue_s=monotonic() - host_started,
                 bytes=sum(t.numel() * t.element_size() for _, t in named),
                 wire_plan=wire_bucket(named),
+                wire_metadata=wire_metadata(named),
             )
         )
         return refs
@@ -98,9 +106,11 @@ def install(args: Any) -> None:
 
     def paused_action(self, command: str, update_id: str, phase: str, *, stay_paused: bool = False):
         def act():
-            deadline = monotonic() + config.sync_timeout_s
+            action_started = monotonic()
+            deadline = action_started + config.sync_timeout_s
             lock = self._ab_lock
             acquired = False
+            timings = dict(command=command, phase=phase, resume_s=0.0)
 
             def remaining():
                 value = deadline - monotonic()
@@ -112,9 +122,12 @@ def install(args: Any) -> None:
                 while not ray.get(lock.acquire.remote(), timeout=remaining()):
                     sleep(min(0.05, remaining()))
                 acquired = True
+                locked_at = monotonic()
                 ray.get(
                     [e.pause_generation.remote(timeout=remaining()) for e in self._ab_engines], timeout=remaining()
                 )
+                paused_at = monotonic()
+                timings.update(lock_wait_s=locked_at - action_started, pause_s=paused_at - locked_at)
                 control = dict(
                     command=command,
                     update_id=update_id,
@@ -126,6 +139,8 @@ def install(args: Any) -> None:
                 replies = ray.get(
                     [e.run_memory_audit.remote(control, remaining()) for e in self._ab_engines], timeout=remaining()
                 )
+                audited_at = monotonic()
+                timings["worker_action_and_receipts_s"] = audited_at - paused_at
                 if any(item.get("success") is not True for item in replies):
                     raise RuntimeError(f"Incomplete TP audit: {replies}")
                 if command != "fence":
@@ -143,13 +158,22 @@ def install(args: Any) -> None:
                                 ):
                                     raise RuntimeError("Incomplete raw GPU parameter comparison")
                 if not stay_paused:
+                    validated_at = monotonic()
+                    timings["receipt_validation_s"] = validated_at - audited_at
                     ray.get(
                         [e.continue_generation.remote(timeout=remaining()) for e in self._ab_engines],
                         timeout=remaining(),
                     )
+                    timings["resume_s"] = monotonic() - validated_at
+                else:
+                    timings["receipt_validation_s"] = monotonic() - audited_at
             finally:
                 if acquired:
+                    release_started = monotonic()
                     ray.get(lock.release.remote(), timeout=10)
+                    timings["lock_release_s"] = monotonic() - release_started
+                timings["total_s"] = monotonic() - action_started
+            return timings
 
         return root_action(self, act)
 
@@ -204,7 +228,7 @@ def install(args: Any) -> None:
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         self._gate(error)
-        paused_action(self, "prepare", "initialization", "prepare")
+        self._ab_setup_audit = paused_action(self, "prepare", "initialization", "prepare")
         root_action(
             self,
             lambda: atomic_write(measurements / "runtime.json", json.dumps(runtime_identity(), indent=2).encode()),
@@ -229,6 +253,7 @@ def install(args: Any) -> None:
         ready = {}
 
         def finish():
+            fence_started = monotonic()
             control = dict(
                 command="fence",
                 update_id=update_id,
@@ -241,15 +266,20 @@ def install(args: Any) -> None:
                 [e.run_memory_audit.remote(control, config.sync_timeout_s) for e in self._ab_engines],
                 timeout=config.sync_timeout_s,
             )
+            fenced_at = monotonic()
             ray.get(
                 [e.continue_generation.remote(timeout=config.sync_timeout_s) for e in self._ab_engines],
                 timeout=config.sync_timeout_s,
             )
             ready["sync_to_ready_s"] = monotonic() - started
+            ready["fence_s"] = fenced_at - fence_started
+            ready["resume_s"] = monotonic() - fenced_at
+            probe_started = monotonic()
             ray.get(
                 [e.disk_weight_generation_probe.remote(config.sync_timeout_s) for e in self._ab_engines],
                 timeout=config.sync_timeout_s,
             )
+            ready["probe_s"] = monotonic() - probe_started
 
         root_action(self, finish)
         elapsed = monotonic() - started
@@ -268,6 +298,8 @@ def install(args: Any) -> None:
             payload = sum(item["bytes"] for item in rows)
             return dict(
                 arm="nccl",
+                version=self._ab_native.weight_version,
+                wire_schema_sha256=wire_schema_digest([event["wire_metadata"] for event in events]),
                 sync_call_s=elapsed,
                 native_return_s=returned - started,
                 native_supervision="ordinary native implementation in its original CUDA stream, plus independent Gloo polling at 20ms intervals",
@@ -298,21 +330,29 @@ def install(args: Any) -> None:
 
     def begin_observation(self, update_id, arm):
         if not measure_allocators:
-            return
-        root_action(
+            return None
+        observed_at = monotonic()
+        receivers = root_action(
             self,
             lambda: receiver_metrics(self._ab_engines, audit_root, update_id, f"{arm}-metrics-start", start=True),
         )
         error = None
+        local = None
         try:
-            allocator_metrics(reset=True)
+            local = allocator_metrics(reset=True)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         self._gate(error)
+        sources = [None] * dist.get_world_size(group)
+        dist.all_gather_object(sources, local, group=group)
+        if rank == 0:
+            return dict(receivers, source_ranks=sources, total_s=monotonic() - observed_at)
+        return None
 
     def end_observation(self, report, update_id, arm):
         if not measure_allocators:
-            return
+            return None
+        observed_at = monotonic()
         error, local = None, None
         try:
             local = allocator_metrics(reset=False)
@@ -327,6 +367,9 @@ def install(args: Any) -> None:
                 self._ab_engines, audit_root, update_id, f"{arm}-metrics-end", start=False
             )
             report["observations"]["source_ranks"] = sources
+            if arm != "nccl":
+                report["wire_schema_check"] = validate_stream_receipts(report, report["observations"]["workers"])
+            report["observations"]["total_s"] = monotonic() - observed_at
 
         root_action(self, collect)
 
@@ -338,16 +381,19 @@ def install(args: Any) -> None:
                 initialize(self, manager)
             self._ab_step += 1
             update_id = f"optimizer-{self._ab_step:06d}"
-            begin_observation(self, update_id, "delta_tcp")
+            observations_start = {}
+            observations_start["delta_tcp"] = begin_observation(self, update_id, "delta_tcp")
             started = monotonic()
             delta = original(self, manager)
-            delta = tcp_metrics(delta, monotonic() - started, "delta_tcp")
+            delta_completed_at = monotonic()
+            delta = tcp_metrics(delta, delta_completed_at - started, "delta_tcp")
+            delta["optimizer_boundary"] = optimizer_boundary(args, total_started, delta_completed_at)
             end_observation(self, delta, update_id, "delta_tcp")
-            paused_action(self, "capture", update_id, "delta-before-full")
+            audit_timings = dict(capture=paused_action(self, "capture", update_id, "delta-before-full"))
             controls = ("nccl", "full_tcp") if self._ab_step % 2 else ("full_tcp", "nccl")
             results = dict(delta_tcp=delta)
             for arm in controls:
-                begin_observation(self, update_id, arm)
+                observations_start[arm] = begin_observation(self, update_id, arm)
                 if arm == "nccl":
                     results[arm] = timed_native(self, update_id)
                 else:
@@ -355,20 +401,42 @@ def install(args: Any) -> None:
                     value = original(self, manager, full_only=True)
                     results[arm] = tcp_metrics(value, monotonic() - started, arm)
                 end_observation(self, results.get(arm), update_id, arm)
-                paused_action(self, "compare", update_id, f"{arm}-compare")
+                audit_timings[arm + "_compare"] = paused_action(self, "compare", update_id, f"{arm}-compare")
             oracle_started = monotonic()
-            paused_action(self, "complement", update_id, "complement-before-reference", stay_paused=True)
+            audit_timings["complement"] = paused_action(
+                self, "complement", update_id, "complement-before-reference", stay_paused=True
+            )
             events.clear()
+            reference_started = monotonic()
             native_call(self, update_id, "independent-full")
-            paused_action(self, "compare", update_id, "independent-full-reference")
+            extra_full_updater_return_s = monotonic() - reference_started
+            audit_timings["independent_reference_fence"] = paused_action(
+                self, "fence", update_id, "independent-full-fence", stay_paused=True
+            )
+            extra_full_gpu_complete_s = monotonic() - reference_started
+            audit_timings["independent_reference_compare"] = paused_action(
+                self, "compare", update_id, "independent-full-reference"
+            )
             # Only the above successful all-worker reference compare resumes.
             oracle_s = monotonic() - oracle_started
+            reference_schema = wire_schema_digest([event["wire_metadata"] for event in events]) if rank == 0 else None
+            self._gate(
+                "The independent native FULL changed its tensor metadata"
+                if rank == 0 and reference_schema != results["nccl"]["wire_schema_sha256"]
+                else None
+            )
             report = dict(
                 optimizer_update=self._ab_step,
                 initialization=self._ab_step == 0,
                 status="VERIFIED",
                 full_control_order=list(controls),
                 arms=results,
+                observations_start=observations_start,
+                audit_timings=audit_timings,
+                initial_audit_prepare=self._ab_setup_audit if self._ab_step == 0 else None,
+                extra_full_updater_return_s=extra_full_updater_return_s,
+                extra_full_gpu_complete_s=extra_full_gpu_complete_s,
+                extra_full_wire_schema_sha256=reference_schema,
                 extra_reference_s=oracle_s,
                 total_with_audit_s=monotonic() - total_started,
                 extra_reference_source_tensor_bytes=sum(event["bytes"] for event in events),
@@ -385,6 +453,7 @@ def install(args: Any) -> None:
             )
             if rank == 0:
                 self._ab_wire_plan = [event["wire_plan"] for event in events]
+                self._ab_wire_schema = reference_schema
                 logger.info(
                     "Matched sharded sync verified: update=%d delta=%.6f full_tcp=%.6f nccl=%.6f",
                     self._ab_step,

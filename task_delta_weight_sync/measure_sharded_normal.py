@@ -23,7 +23,13 @@ def install(args: Any) -> None:
     from relax.utils.distributed_utils import get_gloo_group
     from relax.utils.logging_utils import get_logger
     from task_delta_weight_sync.native_call import guarded_native_call
-    from task_delta_weight_sync.sync_metrics import allocator_metrics, receiver_metrics
+    from task_delta_weight_sync.prepared_nccl import wire_metadata, wire_schema_digest
+    from task_delta_weight_sync.sync_metrics import (
+        allocator_metrics,
+        optimizer_boundary,
+        receiver_metrics,
+        validate_stream_receipts,
+    )
 
     memory = bool(getattr(args, "memory_weight_sync_config", None))
     if memory:
@@ -58,6 +64,7 @@ def install(args: Any) -> None:
         error = f"{type(exc).__name__}: {exc}"
     gate(error)
     args._dws_optimizer_observer = True
+    args._dws_optimizer_result = None
     if not memory:
         supervision = dist.new_group(
             ranks=dist.get_process_group_ranks(group), backend="gloo", timeout=timedelta(seconds=60)
@@ -66,6 +73,7 @@ def install(args: Any) -> None:
 
         def bucket(self, named, *call_args, **kwargs):
             self._normal_source_bytes += sum(t.numel() * t.element_size() for _, t in named)
+            self._normal_wire_metadata.append(wire_metadata(named))
             return original_bucket(self, named, *call_args, **kwargs)
 
         cls._update_bucket_weights_from_distributed = bucket
@@ -85,6 +93,7 @@ def install(args: Any) -> None:
         return errors
 
     def update(self, *call_args, **kwargs):
+        entered_at = monotonic()
         if not memory:
             error = None
             if rank == 0:
@@ -98,9 +107,14 @@ def install(args: Any) -> None:
                     quarantine(self)
                 raise
         self._normal_source_bytes = 0
+        self._normal_wire_metadata = []
         self._normal_step = getattr(self, "_normal_step", -1) + 1
         metric_started = monotonic()
         metric_id = f"optimizer-{self._normal_step:06d}"
+        metric_receivers_start = None
+        source_start = None
+        source_starts = None
+        metric_arm = "memory" if memory else "nccl"
         error = None
         if observe:
             try:
@@ -114,8 +128,10 @@ def install(args: Any) -> None:
                     else:
                         engines = self.rollout_engines
                     self._normal_metric_engines = tuple(engines)
-                    receiver_metrics(engines, root, metric_id, "metrics-start", start=True)
-                allocator_metrics(reset=True)
+                    metric_receivers_start = receiver_metrics(
+                        engines, root, metric_id, f"{metric_arm}-metrics-start", start=True
+                    )
+                source_start = allocator_metrics(reset=True)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
             try:
@@ -124,6 +140,8 @@ def install(args: Any) -> None:
                 if rank == 0:
                     quarantine(self)
                 raise
+            source_starts = [None] * dist.get_world_size(group)
+            dist.all_gather_object(source_starts, source_start, group=group)
         metric_setup_s = monotonic() - metric_started
         started = monotonic()
         value = (
@@ -148,6 +166,7 @@ def install(args: Any) -> None:
                     report["logical_payload_bytes"] = 4 * expert + 8 * nonexpert
                 else:
                     engines = self.rollout_engines
+                    fence_started = monotonic()
                     control = dict(
                         command="fence",
                         phase="ordinary-fence",
@@ -157,6 +176,7 @@ def install(args: Any) -> None:
                         node_budget_bytes=384 << 30,
                     )
                     ray.get([engine.run_memory_audit.remote(control, 120) for engine in engines], timeout=130)
+                    fenced_at = monotonic()
                     ray.get([engine.continue_generation.remote(timeout=120) for engine in engines], timeout=130)
                     ready = monotonic()
                     ray.get([engine.disk_weight_generation_probe.remote(120) for engine in engines], timeout=130)
@@ -170,15 +190,19 @@ def install(args: Any) -> None:
                         version=self.weight_version,
                         sync_to_ready_s=ready - started,
                         sync_with_probe_s=monotonic() - started,
+                        fence_s=fenced_at - fence_started,
+                        resume_s=ready - fenced_at,
                         probe_s=monotonic() - ready,
                         changed=None,
                         changed_scope="No extra diff on the native FULL control",
                     )
+                completed_at = monotonic()
                 report.update(
                     optimizer_update=self._normal_step,
                     initialization=self._normal_step == 0,
                     updater_return_s=returned - started,
-                    completion_return_s=monotonic() - started,
+                    completion_return_s=completed_at - started,
+                    optimizer_boundary=optimizer_boundary(args, entered_at, completed_at),
                     native_return_scope=None
                     if memory
                     else "resume_generation=False; continue/fence/probe included in common completion timings",
@@ -186,6 +210,8 @@ def install(args: Any) -> None:
                     payload_scope="Logical shard/member deliveries; not NIC traffic",
                     memory_peak_scope="Process lifetime allocator high-water marks; not per-arm incremental peaks",
                 )
+                if not memory:
+                    report["wire_schema_sha256"] = wire_schema_digest(self._normal_wire_metadata)
             except Exception as exc:
                 errors = quarantine(self)
                 error = f"{type(exc).__name__}: {exc}; quarantine_errors={errors}"
@@ -209,9 +235,14 @@ def install(args: Any) -> None:
             if rank == 0:
                 try:
                     report["observations"] = receiver_metrics(
-                        self._normal_metric_engines, root, metric_id, "metrics-end", start=False
+                        self._normal_metric_engines, root, metric_id, f"{metric_arm}-metrics-end", start=False
                     )
                     report["observations"]["source_ranks"] = sources
+                    report["observations_start"] = dict(metric_receivers_start, source_ranks=source_starts)
+                    if memory:
+                        report["wire_schema_check"] = validate_stream_receipts(
+                            report, report["observations"]["workers"]
+                        )
                     report["metrics_setup_s"] = metric_setup_s
                     report["metrics_collection_s"] = monotonic() - metric_started
                     report["memory_peak_scope"] = "Per-arm GPU reset; lifetime host peaks explicitly labeled"
