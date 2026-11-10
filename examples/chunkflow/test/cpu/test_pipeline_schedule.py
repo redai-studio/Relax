@@ -4,13 +4,55 @@
 
 from __future__ import annotations
 
+import ast
+import os
+import sys
+from argparse import ArgumentParser
 from collections import defaultdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from examples.chunkflow.arguments import add_arguments, validate_args
 from examples.chunkflow.scheduler import build_chunks
 from examples.chunkflow.units import build_micro_batches, make_model_plan
+
+
+@pytest.mark.parametrize("pp_size", [1, 2, 4])
+def test_schedule_uses_actual_pp_without_duplicate_option(monkeypatch, pp_size):
+    # Load the real selector without importing the GPU-only Megatron dependency graph.
+    path = Path(__file__).resolve().parents[2] / "schedules.py"
+    tree = ast.parse(path.read_text())
+    selector = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "get_schedule")
+    single, pipeline = object(), object()
+    namespace = {
+        "__package__": "examples.chunkflow",
+        "os": os,
+        "chunkflow_forward_backward_no_pipelining": single,
+    }
+    module = ast.Module(body=ast.parse("from __future__ import annotations").body + [selector], type_ignores=[])
+    exec(compile(module, str(path), "exec"), namespace)
+    monkeypatch.setitem(
+        sys.modules,
+        "examples.chunkflow.pipeline_schedules",
+        SimpleNamespace(chunkflow_forward_backward_pipelining_without_interleaving=pipeline),
+    )
+    parser = add_arguments(ArgumentParser())
+    parser.add_argument("--pipeline-model-parallel-size", type=int, default=1)
+    args = parser.parse_args(
+        ["--use-chunkflow", "--chunkflow-chunk-size", "4096", "--pipeline-model-parallel-size", str(pp_size)]
+    )
+    args.calculate_per_token_loss = True
+    validate_args(args)
+    monkeypatch.delenv("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", raising=False)
+    if pp_size == 1:
+        assert namespace["get_schedule"](args, pp_size) is single
+    else:
+        with pytest.raises(NotImplementedError, match="RELAX_CHUNKFLOW_PIPELINE_UNTESTED"):
+            namespace["get_schedule"](args, pp_size)
+        monkeypatch.setenv("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "1")
+        assert namespace["get_schedule"](args, pp_size) is pipeline
 
 
 def _channel(stage, action):

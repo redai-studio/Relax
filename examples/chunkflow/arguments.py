@@ -44,16 +44,6 @@ def add_arguments(parser: ArgumentParser) -> ArgumentParser:
             "recomputed before their backward. 0 (default) keeps every chunk."
         ),
     )
-    parser.add_argument(
-        "--chunkflow-pipeline",
-        type=int,
-        default=0,
-        help=(
-            "Enable the pipelined chunkflow schedule. 0 (default) runs the PP=1 executor; a value equal "
-            "to --pipeline-model-parallel-size runs the pipeline executor, driving chunks through the "
-            "stages. Requires RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1 for PP > 1."
-        ),
-    )
     return parser
 
 
@@ -89,10 +79,4 @@ def validate_args(args: Namespace) -> None:
     if getattr(args, "chunkflow_keep_last_k", 0) < 0:
         raise ValueError(
             f"--chunkflow-keep-last-k must be >= 0 (0 keeps every chunk), got {args.chunkflow_keep_last_k}"
-        )
-    pipeline = getattr(args, "chunkflow_pipeline", 0)
-    if pipeline and pipeline != getattr(args, "pipeline_model_parallel_size", 1):
-        raise ValueError(
-            f"--chunkflow-pipeline ({pipeline}) must equal --pipeline-model-parallel-size "
-            f"({args.pipeline_model_parallel_size}) so the chunk plan and the pipeline agree."
         )

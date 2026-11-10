@@ -38,10 +38,6 @@ _BATCH_KEYS = (
 def get_schedule(args: Namespace, pp_size: int) -> Callable:
     if pp_size <= 1:
         return chunkflow_forward_backward_no_pipelining
-    if getattr(args, "chunkflow_pipeline", 0) != pp_size:
-        raise NotImplementedError(
-            f"chunkflow at --pipeline-model-parallel-size {pp_size} needs --chunkflow-pipeline {pp_size}."
-        )
     if os.environ.get("RELAX_CHUNKFLOW_PIPELINE_UNTESTED") != "1":
         raise NotImplementedError(
             "chunkflow's experimental pipeline executor requires RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1."

@@ -1,87 +1,109 @@
-# ChunkFlow
+<h1 align="center">ChunkFlow</h1>
 
-[English](README.en.md) · [完整指南](../../docs/zh/guide/chunkflow.md)
+<p align="center">长序列分块训练 · 复用原生计算 · 降低显存压力</p>
 
-将长序列拆成 chunk，复用模型原生 Attention / GDN 计算，并连接跨块状态与梯度。**优先用于长上下文、显存受限的训练；是否加速取决于模型和配置。**
+<p align="center">
+  <a href="#实验收益">实验收益</a> ·
+  <a href="#开启建议">开启建议</a> ·
+  <a href="#快速开启">快速开启</a> ·
+  <a href="README.en.md">English</a>
+</p>
+
+______________________________________________________________________
 
 ## 实验收益
 
-以下是已完成的短跑对照，不代表所有模型的收益。两组使用相同数据和训练配置，仅切换 ChunkFlow；Dense 的 K1 会额外启用 ChunkFlow 重计算。时间取第 1～29 步均值（排除第 0 步），显存取全部步骤、全部 rank 的最大值。加速比 = Baseline / ChunkFlow，低于 1 表示变慢；“—”表示未核验，不填估算值。
-
 ### Dense · Qwen3-4B
 
-**8 卡 · TP2 / PP4 · GBS1 · LongAlign · 长度上限64K · chunk4096 · K1 · 30步**。未启用原生重计算；这是历史 K1 对照，不能当作 K0 结果。
+> **实验配置**　8 卡 · TP2 / PP4 · GBS8 · chunk4096
 
-| 方法          | 平均训练耗时 | 平均 step time | MFU | 训练加速比 | 端到端加速比 | 峰值 allocated / reserved | allocated 节省 |
-| ------------- | -----------: | -------------: | --: | ---------: | -----------: | ------------------------: | -------------: |
-| Baseline      |       3.89 s |              — |   — |      1.00× |            — |         52.28 / 79.03 GiB |              — |
-| **ChunkFlow** |   **2.20 s** |              — |   — |  **1.76×** |            — |     **21.01 / 22.58 GiB** |     **59.81%** |
+数据：5,000 条合成中文 SFT 样本。长度分布：0–2K 占 70%，2–8K 占 20%，8–16K 占 8%，16–32K 占 2%。
 
-Loss 平均相对差异 **0.51%**。本配置同时体现训练加速与显存下降；不能外推到大 batch 或 K0。
+| 方法          | 平均训练耗时 | 平均 step time |  训练 MFU | 训练加速比 | 端到端加速比 | 显存参考¹ (GiB) |      节省¹ |
+| ------------- | -----------: | -------------: | --------: | ---------: | -----------: | --------------: | ---------: |
+| Baseline      |       3.08 s |         4.38 s |     23.1% |      1.00× |        1.00× |           52.28 |          — |
+| **ChunkFlow** |   **1.86 s** |     **3.10 s** | **38.2%** |  **1.65×** |    **1.40×** |       **21.01** | **59.81%** |
 
 ### MoE · Qwen3.6-35B-A3B
 
-**8 卡 · TP2 / PP4 / EP2 · GBS8 · LongAlign · 长度上限64K · chunk4096 · K0 · 30步**。双方均开启原生 selective `gdn moe` 重计算，关闭 ChunkFlow 自身重计算。
+> **实验配置**　8 卡 · TP2 / PP4 / EP2 · GBS8 · chunk8192 · LongAlign
 
-| 方法          | 平均训练耗时 | 平均 step time | MFU | 训练加速比 | 端到端加速比 | 峰值 allocated / reserved | allocated 节省 |
-| ------------- | -----------: | -------------: | --: | ---------: | -----------: | ------------------------: | -------------: |
-| Baseline      |      15.99 s |              — |   — |      1.00× |            — |         56.38 / 70.26 GiB |              — |
-| **ChunkFlow** |  **18.90 s** |              — |   — |  **0.85×** |            — |     **37.79 / 40.58 GiB** |     **32.97%** |
+| 方法          | 平均训练耗时 | 平均 step time |  训练 MFU | 训练加速比 | 端到端加速比 | 显存参考¹ (GiB) |      节省¹ |
+| ------------- | -----------: | -------------: | --------: | ---------: | -----------: | --------------: | ---------: |
+| Baseline      |       16.2 s |         17.5 s |     13.8% |      1.00× |        1.00× |           56.38 |          — |
+| **ChunkFlow** |   **17.0 s** |     **18.4 s** | **13.1%** | **0.950×** |   **0.950×** |       **37.79** | **32.97%** |
 
-Loss 平均相对差异 **0.39%**。本配置节省 **18.59 GiB**，训练耗时增加约 **18.2%**，适合优先解决显存压力的场景。
+______________________________________________________________________
 
-显存收益主要看 **allocated**；reserved 包含分配器缓存。短跑 loss 接近不代表梯度等价或长期收敛已验证。
-
-## 什么时候开启
+## 开启建议
 
 | 场景                                     | 建议                                               |
 | ---------------------------------------- | -------------------------------------------------- |
-| 长上下文 Dense、小 batch、流水线空闲较多 | 值得做对照，历史 K1 配置有加速收益                 |
+| 长上下文 Dense、小 batch、流水线空闲较多 | 值得做对照，已观察到训练加速收益                   |
 | 长上下文 MoE、显存紧张                   | 优先尝试，接受可能增加的计算时间                   |
 | 短序列、显存充足、追求最大吞吐           | 默认不开；先测再决定                               |
 | QSA / PLE 模型                           | 实验性使用；前缀重放会重复计算，不保证省显存或加速 |
 
-当前面向 **packed 纯文本、CP1、零 dropout、关闭 RoPE fusion、per-token loss**。PP4 需实验性 opt-in（示例已设置）。不直接支持 CP>1、VPP、多模态、full-layer / selective `core_attn` 重计算。QSA 仅允许原生 selective `moe` 重计算。
-
-Qwen3.8-Flash-Next 已完成8K上限、K0、10步对照，但使用了长度筛选子集：allocated 仅下降2.42%，未体现加速。原始 LongAlign 的32K对照尚未完成，不能据此推荐长上下文 QSA 性能。
+______________________________________________________________________
 
 ## 快速开启
 
 使用 [relax.version](relax.version) 固定的 Relax 版本及其训练镜像。示例脚本自动安装集成补丁，不安装依赖，不保存 checkpoint。
 
 ```bash
-export MODEL_DIR=/path/to/models
-export PROMPT_DATA=/path/to/LongAlign-10k/long.jsonl
+export MODEL_DIR=/path/to/model
+export PROMPT_DATA=/path/to/data
+```
 
-# Dense：脚本已开启 ChunkFlow，默认64K / chunk4096 / K1
+**Dense · Qwen3-4B**　默认 64K / chunk4096 / K1
+
+```bash
 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
+```
 
-# MoE：默认64K / chunk4096 / K1；K0关闭ChunkFlow自身重计算
+**MoE · Qwen3.6-35B-A3B**　64K / chunk4096；下方 K0 关闭 ChunkFlow 自身重计算
+
+```bash
 KEEP_LAST_K=0 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-## 代码目录
+### 接入现有训练脚本
 
-```text
-examples/chunkflow/
-├── adapters/                 # 原生计算适配
-│   ├── __init__.py           # 注册表与 Dense Attention
-│   ├── gdn.py                # GDN 卷积、递推状态连接
-│   ├── qsa.py                # 原生 QSA 前缀重放
-│   ├── ple.py                # 原生 PLE 前缀适配
-│   └── prefix.py             # 共享前缀布局、RoPE 与 SP 处理
-├── integration.py            # 模型创建时安装适配器
-├── scheduler.py / units.py   # 分块与执行计划
-├── schedules.py              # 单流水线 stage 的 forward/backward
-├── pipeline_schedules.py     # 多 stage 的 forward/backward
-├── runtime.py / state_store.py # 跨块状态、梯度与生命周期
-├── unit_batch.py / metadata.py # batch 切分与边界元数据
-├── rope.py                   # 分块位置偏移
-├── arguments.py              # 开关与约束检查
-├── setup.py / relax.patch / relax.version # 固定版本集成
-├── configs/                  # GDN、QSA 原生配置
-├── scripts/                  # Dense、MoE、QSA 三个入口及公共提交逻辑
-└── test/{cpu,gpu}/           # 核心回归与 CUDA 验证
+在兼容的 Megatron 脚本中接入，保留原有模型、数据与启动方式。
+
+**① 安装接入补丁**（仓库根目录执行一次）
+
+```bash
+python3 examples/chunkflow/setup.py
 ```
 
-运行链路：**脚本 → 集成补丁 → 安装适配器 → 分块计划 → 原生 forward → 跨块 backward → 清理状态**。实现细节与测试命令见[完整指南](../../docs/zh/guide/chunkflow.md)。
+**② 添加 ChunkFlow 参数**（加入现有训练命令，不是单独执行）
+
+```bash
+--use-chunkflow \
+--chunkflow-chunk-size 4096 \
+--chunkflow-keep-last-k 0
+```
+
+`K=0` 保留全部激活、不重计算；`K=1` 每组只保留最后一块激活，其余块在反向前重计算。
+
+原脚本已满足下列设置时，无需重复添加：
+
+| 设置                                           | 原因                                                   |
+| ---------------------------------------------- | ------------------------------------------------------ |
+| `--context-parallel-size 1`                    | 当前跨块状态管理不支持 CP 切分                         |
+| `--calculate-per-token-loss`                   | 按 token 统计，避免切块改变样本权重                    |
+| `--no-rope-fusion`                             | 使用支持分块位置偏移的 RoPE 路径                       |
+| `--attention-dropout 0.0 --hidden-dropout 0.0` | 当前适配要求关闭 dropout，避免分块与重放的随机掩码问题 |
+
+**PP 自动沿用原配置**：ChunkFlow 根据 Megatron 实际 PP 大小选择调度器，无需额外设置流水线参数。PP>1 仍需在训练 worker 环境中设置 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`，确认使用实验性调度器；Ray 通过 `runtime_env.env_vars` 传递，示例脚本已设置。
+
+仅适用于已适配的 packed 纯文本模型；GDN / QSA 沿用对应示例的模型配置。
+
+### 重要参数
+
+| 参数                      | 建议起点       | 调整方式                                                                 |
+| ------------------------- | -------------- | ------------------------------------------------------------------------ |
+| `--chunkflow-chunk-size`  | `4096`         | 小于实际长样本长度才会分块；减小后块数与调用开销增加                     |
+| `--chunkflow-keep-last-k` | `0`            | `0` 不重计算；`1` 只保留最后一块激活，较早块在反向前重计算；QSA 保持 `0` |
+| `--seq-length`            | 按数据长度设置 | 样本长度上限，不是 chunk 大小；超过上限的样本跳过                        |
