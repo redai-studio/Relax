@@ -89,14 +89,14 @@ python3 examples/chunkflow/setup.py
 
 原脚本已满足下列设置时，无需重复添加：
 
-| 设置                                           | 原因                                                   |
-| ---------------------------------------------- | ------------------------------------------------------ |
-| `--context-parallel-size 1`                    | 当前跨块状态管理不支持 CP 切分                         |
-| `--calculate-per-token-loss`                   | 按 token 统计，避免切块改变样本权重                    |
-| `--no-rope-fusion`                             | 使用支持分块位置偏移的 RoPE 路径                       |
-| `--attention-dropout 0.0 --hidden-dropout 0.0` | 当前适配要求关闭 dropout，避免分块与重放的随机掩码问题 |
-
-PP 自动沿用原配置；PP>1 时须向训练 worker 传递 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`（Ray 使用 `runtime_env.env_vars`，示例已配置）。不支持原生 full-layer 或 selective `core_attn` 重计算；GDN/QSA 保留对应示例的模型设置。
+| 设置                                           | 原因                                                                                                                      |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `--context-parallel-size 1`                    | 当前跨块状态管理不支持 CP 切分                                                                                            |
+| `--calculate-per-token-loss`                   | 按 token 统计，避免切块改变样本权重                                                                                       |
+| `--no-rope-fusion`                             | 使用支持分块位置偏移的 RoPE 路径                                                                                          |
+| `--attention-dropout 0.0 --hidden-dropout 0.0` | 当前适配要求关闭 dropout，避免分块与重放的随机掩码问题                                                                    |
+| 流水线并行（PP）                               | 自动沿用原配置；PP>1 需通过 Ray `runtime_env.env_vars` 向 worker 设置 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`（示例已设置） |
+| 原生重计算                                     | 禁用 full-layer / selective `core_attn`；GDN/QSA 沿用对应示例设置                                                         |
 
 ### 重要参数
 

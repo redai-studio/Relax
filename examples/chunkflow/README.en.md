@@ -96,16 +96,14 @@ python3 examples/chunkflow/setup.py
 
 Do not duplicate settings already present in the recipe:
 
-| Setting                                        | Reason                                                                                       |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `--context-parallel-size 1`                    | Cross-chunk state management does not currently support CP splitting                         |
-| `--calculate-per-token-loss`                   | Count tokens without changing sample weights through chunking                                |
-| `--no-rope-fusion`                             | Use the RoPE path that supports chunk position offsets                                       |
-| `--attention-dropout 0.0 --hidden-dropout 0.0` | Current adapters require zero dropout to avoid random-mask issues during chunking and replay |
-
-**PP follows the existing configuration automatically**: ChunkFlow selects its executor from Megatron’s actual PP size. No separate pipeline argument is needed. For PP>1, training workers still require `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1` to opt into the experimental executor; pass it through Ray’s `runtime_env.env_vars`. Example recipes already set it.
-
-Use adapted packed-text models only; retain the corresponding recipe's model settings for GDN / QSA.
+| Setting                                        | Reason                                                                                                                                       |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--context-parallel-size 1`                    | Cross-chunk state management does not currently support CP splitting                                                                         |
+| `--calculate-per-token-loss`                   | Count tokens without changing sample weights through chunking                                                                                |
+| `--no-rope-fusion`                             | Use the RoPE path that supports chunk position offsets                                                                                       |
+| `--attention-dropout 0.0 --hidden-dropout 0.0` | Current adapters require zero dropout to avoid random-mask issues during chunking and replay                                                 |
+| Pipeline parallelism (PP)                      | Reuses the existing PP size; PP>1 requires `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1` in workers via Ray `runtime_env.env_vars` (set by examples) |
+| Native recomputation                           | Disable full-layer / selective `core_attn`; keep the GDN/QSA recipe settings                                                                 |
 
 ### Key parameters
 
@@ -115,4 +113,4 @@ Use adapted packed-text models only; retain the corresponding recipe's model set
 | `--chunkflow-keep-last-k` | `0`             | `0` disables recomputation; `1` retains only the last chunk's activations and recomputes earlier chunks before backward; keep `0` for QSA |
 | `--seq-length`            | Match your data | Sample length limit, not chunk size; samples above the limit are skipped                                                                  |
 
-For a baseline, remove only `--use-chunkflow` and keep other arguments and data identical. Do not enable native full-layer or selective `core_attn` recomputation alongside ChunkFlow.
+For a baseline, remove only `--use-chunkflow` and keep other arguments and data identical.
