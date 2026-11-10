@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.training.flops_counter import FlopsCounter
-from relax.utils.training.gemma4_flops import _causal_pairs, estimate_gemma4_flops, gemma4_linear_components
+from relax.utils.training.gemma4_flops import _causal_pairs, estimate_gemma4_flops, gemma4_active_weights
 
 
 def _config(name="26b"):
@@ -40,7 +40,7 @@ def test_26b_official_useful_flops(length, expected):
     config = _config()
     # Independently audited GEMM weights: active experts + shared MLP +
     # router + mixed local/global QKO(V) + one vocabulary output projection.
-    assert sum(active for _, active in gemma4_linear_components(config).values()) == 3_821_830_144
+    assert gemma4_active_weights(config) == 3_821_830_144
     assert estimate_gemma4_flops(config, length, [length], 1.0) == pytest.approx(expected)
 
 
@@ -56,7 +56,6 @@ def test_window_includes_current_token_and_resets_between_packed_sequences():
 def test_dense_31b_does_not_activate_experts_from_residual_config_fields():
     config = _config("31b")
     config["text_config"].update(num_experts=128, top_k_experts=8, moe_intermediate_size=704)
-    assert "routed_experts" not in gemma4_linear_components(config)
     assert estimate_gemma4_flops(config, 4096, [4096], 1) == pytest.approx(788.923315912704)
 
 
@@ -66,8 +65,8 @@ def test_global_k_eq_v_does_not_remove_sliding_v_projection():
     untied["text_config"]["attention_k_eq_v"] = False
     # Fix the global KV head override so this test isolates tying V.
     untied["text_config"]["per_layer_config"] = {str(i): {"num_key_value_heads": 2} for i in range(5, 30, 6)}
-    tied_n = gemma4_linear_components(config)["attention"][0]
-    untied_n = gemma4_linear_components(untied)["attention"][0]
+    tied_n = gemma4_active_weights(config)
+    untied_n = gemma4_active_weights(untied)
     assert untied_n - tied_n == 5 * 2816 * 2 * 512
 
 
@@ -137,7 +136,7 @@ def test_hf_zero_padded_layer_override_indices(namespace):
     text["attention_k_eq_v"] = False
     text["per_layer_config"] = {f"{i:02d}": {"head_dim": 512, "num_key_value_heads": 2} for i in range(5, 30, 6)}
     config = _namespace(text) if namespace else text
-    assert gemma4_linear_components(config)["attention"][0] == 1_124_597_760
+    assert gemma4_active_weights(config) == 3_836_248_064
 
 
 @pytest.mark.parametrize(

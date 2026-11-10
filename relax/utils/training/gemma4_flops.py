@@ -66,36 +66,23 @@ def gemma4_text_spec(config: Any) -> tuple[Any, list[tuple[int, int, bool]]]:
     return text, shapes
 
 
-def gemma4_linear_components(config: Any) -> dict[str, tuple[int, int]]:
-    """Return (total, token-active) GEMM weight counts, including output head.
-
-    The output head is counted once even when tied to the input embedding;
-    parameter profiling must deduplicate that weight separately.
-    """
+def gemma4_active_weights(config: Any) -> int:
+    """Count active GEMM weights; include the output head once."""
     text, shapes = gemma4_text_spec(config)
     hidden, heads = _get(text, "hidden_size"), _get(text, "num_attention_heads")
     layers, intermediate = len(shapes), _get(text, "intermediate_size")
     vocab = _get(text, "vocab_size")
     if not all(value and value > 0 for value in (hidden, heads, intermediate, vocab)):
         raise ValueError("Missing required Gemma4 text shapes")
-    attention = sum(hidden * dim * (2 * heads + kv * (1 if tied else 2)) for dim, kv, tied in shapes)
-    mlp = layers * 3 * hidden * intermediate
-    result = {"attention": (attention, attention), "output_head": (hidden * vocab, hidden * vocab)}
+    weights = sum(hidden * dim * (2 * heads + kv * (1 if tied else 2)) for dim, kv, tied in shapes)
+    weights += layers * 3 * hidden * intermediate + hidden * vocab
     if _get(text, "enable_moe_block", False):
         experts, top_k = _get(text, "num_experts"), _get(text, "top_k_experts")
         width = _get(text, "moe_intermediate_size")
         if not all(value and value > 0 for value in (experts, top_k, width)) or top_k > experts:
             raise ValueError("Missing or invalid Gemma4 MoE shapes")
-        expert = layers * 3 * hidden * width
-        router = layers * hidden * experts
-        result.update(
-            shared_experts=(mlp, mlp),
-            routed_experts=(expert * experts, expert * top_k),
-            routers=(router, router),
-        )
-    else:
-        result["dense_mlp"] = (mlp, mlp)
-    return result
+        weights += layers * hidden * (3 * width * top_k + experts)
+    return weights
 
 
 def _causal_pairs(length: int, window: int | None = None) -> int:
@@ -148,7 +135,7 @@ def estimate_gemma4_flops(
         return float("nan")
     try:
         text, shapes = gemma4_text_spec(config)
-        weights = sum(active for _, active in gemma4_linear_components(config).values())
+        weights = gemma4_active_weights(config)
         types = _get(text, "layer_types")
         window = _get(text, "sliding_window")
         if "sliding_attention" in types and (not window or window <= 0):

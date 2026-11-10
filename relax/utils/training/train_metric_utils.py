@@ -44,9 +44,6 @@ def log_perf_data_raw(
 
     if timer_instance.seq_lens:
         log_dict["perf/actor_train_tokens"] = sum(timer_instance.seq_lens)
-        # MetricsService has no process group; carry the training GPU count
-        # with the global token total rather than inferring it on the reporter.
-        log_dict["perf/actor_train_world_size"] = world_size
 
     per_gpu_tflops: float | None = None
     if ("perf/actor_train_time" in log_dict) and (flops_counter is not None):

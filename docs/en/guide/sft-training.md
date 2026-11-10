@@ -384,6 +384,8 @@ When historical reasoning is compressed, those reasoning tokens are absent from 
 
 Values other than a JSON boolean or `null`, such as `"false"`, raise `ValueError`. A Qwen-like template with a duplicated, conflicting, or unrecognized history gate raises `RuntimeError` instead of being patched heuristically. The SFT log reports `source=qwen_history_thinking (patched|native)` and the resolved `preserve_thinking` value for verification.
 
+Newer Qwen3.8 templates mark assistant turns with native `{% generation %}` tags. Relax removes them for SFT rendering, so tokens and loss masks match the earlier Qwen3.8 template.
+
 ### Evaluation and Predict
 
 PPL evaluation is controlled by:
