@@ -344,10 +344,21 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
 
 
 @pytest.mark.parametrize(
-    "existing", [None, [], ["custom.loader"], ["relax.backends.sglang.weight_loader.load_expert_slices"]]
+    "existing,colocate,fusion",
+    [
+        (None, True, False),
+        ([], True, False),
+        (["custom.loader"], True, False),
+        (["relax.backends.sglang.weight_loader.load_expert_slices"], True, False),
+        (["custom.loader"], True, True),
+        (["custom.loader"], False, True),
+    ],
 )
-def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sglang_engine_module, existing):
+def test_expert_slice_loader_registration_preserves_user_loaders(
+    monkeypatch, sglang_engine_module, existing, colocate, fusion
+):
     module = sglang_engine_module
+    monkeypatch.setattr(module.Envs, "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", fusion, raising=False)
     monkeypatch.setattr(module, "ServerArgs", make_dataclass("ServerArgs", [("custom_weight_loader", list, None)]))
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda value: value)
     args = SimpleNamespace(
@@ -361,6 +372,7 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
         sglang_ep_size=1,
         use_rollout_routing_replay=False,
         fp16=False,
+        colocate=colocate,
     )
     result, _ = module._compute_server_args(
         args,
@@ -372,7 +384,16 @@ def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sg
         base_gpu_id=0,
         sglang_overrides={"custom_weight_loader": existing},
     )
-    expected = list(dict.fromkeys([*(existing or []), "relax.backends.sglang.weight_loader.load_expert_slices"]))
+    expected = list(
+        dict.fromkeys(
+            [
+                *(existing or []),
+                "relax.backends.sglang.weight_loader.load_expert_slices",
+            ]
+        )
+    )
+    if colocate and fusion:
+        expected.append("relax.backends.sglang.weight_loader.fence_native_weights")
     assert result["custom_weight_loader"] == expected
     assert result["custom_weight_loader"] is not existing
 

@@ -129,6 +129,17 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+# Enable colocate weight-sync optimizations in the Ray job environment.
+RUNTIME_ENV_JSON=$(python3 -c '
+import json, os
+d = json.loads(os.environ["RUNTIME_ENV_JSON"])
+d.setdefault("env_vars", {}).update({
+    "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP": "1",
+})
+print(json.dumps(d))
+')
+export RUNTIME_ENV_JSON
+
 mkdir -p log
 
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
