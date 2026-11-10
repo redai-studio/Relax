@@ -3390,7 +3390,13 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
     @timer
-    def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
+    def update_weights_fully_async(
+        self,
+        rollout_id,
+        rollout_only=False,
+        actor_fwd_only=False,
+        expected_rollout_actor_ids: list[str] | None = None,
+    ) -> None:
         """Fully async version of update_weights, which will be called by actor
         train engine after it train update.
 
@@ -3420,6 +3426,21 @@ class MegatronTrainRayActor(TrainRayActor):
             synced_actor_ids = run(
                 self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only)
             )
+            if expected_rollout_actor_ids is not None:
+                group = get_gloo_group()
+                sync_error = [None]
+                if dist.get_rank(group=group) == 0:
+                    expected = set(expected_rollout_actor_ids)
+                    synced = set(synced_actor_ids)
+                    if not expected or expected != synced:
+                        sync_error[0] = (
+                            "Replacement Rollout weight synchronization is incomplete: "
+                            f"missing={sorted(expected - synced)}, unexpected={sorted(synced - expected)}; "
+                            "require global restart"
+                        )
+                dist.broadcast_object_list(sync_error, src=0, group=group)
+                if sync_error[0] is not None:
+                    raise RuntimeError(sync_error[0])
             if not actor_fwd_only and dist.get_rank(group=get_gloo_group()) == 0 and synced_actor_ids:
                 try:
                     ray.get(

@@ -4,7 +4,7 @@
 
 from contextlib import contextmanager, nullcontext
 from types import MethodType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 import torch
@@ -74,6 +74,55 @@ def test_sender_rank_uses_broadcast_sync_decision(backend, can_sync, error):
             worker._begin_inference_sync()
     state.begin_sync.remote.assert_not_called()
     backend.dist.broadcast_object_list.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "expected,synced,rank",
+    [
+        (["A", "B"], ["A", "B"], 0),
+        (["A", "B"], ["A"], 0),
+        (["A", "B"], ["A", "B", "C"], 0),
+        ([], [], 0),
+        (None, ["A"], 0),
+        (["A", "B"], ["A"], 1),
+    ],
+)
+def test_replacement_weights_require_every_receiver_before_publication(backend, monkeypatch, expected, synced, rank):
+    worker = _actor(backend)
+    worker._weight_sync_lock = SimpleNamespace(
+        acquire=SimpleNamespace(remote=Mock(return_value=True)), release=SimpleNamespace(remote=Mock())
+    )
+    worker.checkpoint_engine_client = SimpleNamespace(
+        update_weights_for_rollout=AsyncMock(return_value=synced if rank == 0 else [])
+    )
+    worker.rollout_manager = SimpleNamespace(register_recovered_engines=SimpleNamespace(remote=Mock()))
+    worker.args.rollout_http_timeout = 10
+    backend.dist.get_rank.return_value = rank
+    monkeypatch.setattr(backend, "print_memory", Mock())
+    incomplete = expected is not None and (not expected or set(expected) != set(synced))
+    if rank != 0:
+        backend.dist.broadcast_object_list.side_effect = lambda payload, **kwargs: payload.__setitem__(
+            0, "Replacement Rollout weight synchronization is incomplete: missing=['B']"
+        )
+
+    def synchronize():
+        backend.MegatronTrainRayActor.update_weights_fully_async(
+            worker, 0, rollout_only=True, expected_rollout_actor_ids=expected
+        )
+
+    if incomplete:
+        with pytest.raises(RuntimeError, match="Replacement Rollout weight synchronization is incomplete"):
+            synchronize()
+        worker.rollout_manager.register_recovered_engines.remote.assert_not_called()
+    else:
+        synchronize()
+        worker.rollout_manager.register_recovered_engines.remote.assert_called_once_with(synced)
+    if rank == 0:
+        worker._weight_sync_lock.release.remote.assert_called_once()
+    if expected is None:
+        backend.dist.broadcast_object_list.assert_not_called()
+    else:
+        backend.dist.broadcast_object_list.assert_called_once_with([ANY], src=0, group="gloo")
 
 
 @pytest.mark.parametrize("mode", ["normal", "paused", "sender_error"])

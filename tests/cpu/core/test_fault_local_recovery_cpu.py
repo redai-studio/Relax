@@ -186,6 +186,11 @@ def make_controller(runtime, services, trace, *, count=1, max_global_restart=3, 
     controller.serve_dict = services
     controller._fault_events = runtime
     controller._fault_recovery = None
+    controller._inference_recovery = None
+    controller._inference_recovery_timeout = 2.0
+    controller._local_recovery_thread = None
+    controller._training_wait_done = threading.Event()
+    controller._training_wait_done.set()
     controller._restart_consumed_event = threading.Event()
     controller._restart_consumed_event.set()
     controller._restart_lock = threading.RLock()

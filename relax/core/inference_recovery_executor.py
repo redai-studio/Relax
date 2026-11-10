@@ -127,12 +127,14 @@ class InferenceRecoveryExecutor:
         if not ray.get(state.begin_sync.remote(maintenance=True)):
             raise RuntimeError("Cannot reserve replacement weight synchronization")
         if self.config.fully_async or getattr(self.config, "hybrid", False):
+            sync_options = dict(rollout_only=str(role) == "rollout", actor_fwd_only=str(role) == "actor_fwd")
+            if str(role) == "rollout":
+                engines, *_ = await manager.get_rollout_engines_and_lock.remote()
+                if not engines or any(engine is None for engine in engines):
+                    raise RuntimeError("Replacement Rollout engines are incomplete; require global restart")
+                sync_options["expected_rollout_actor_ids"] = [engine._actor_id.hex() for engine in engines]
             await actor.handle.reset_inference_transport.remote(str(role))
-            sends = [
-                actor.handle.update_weights_fully_async.remote(
-                    rollout_only=str(role) == "rollout", actor_fwd_only=str(role) == "actor_fwd"
-                )
-            ]
+            sends = [actor.handle.update_weights_fully_async.remote(**sync_options)]
             if str(role) == "actor_fwd":
                 sends.append(failed.handle.recv_weight_fully_async.remote())
             await asyncio.gather(*sends)

@@ -166,18 +166,18 @@ class Actor(Base):
         rollout_only: bool = False,
         actor_fwd_only: bool = False,
         recovery_token: dict | None = None,
+        expected_rollout_actor_ids: Optional[list[str]] = None,
     ) -> None:
         from relax.utils.fault_events.receipts import emit_receipt
 
+        sync_options = dict(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        if expected_rollout_actor_ids is not None:
+            sync_options["expected_rollout_actor_ids"] = expected_rollout_actor_ids
         try:
             if self._recovery.state is not None:
-                wait_all(
-                    self.actor_model.async_inference_call(
-                        "update_weights_fully_async", self.step, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
-                    )
-                )
+                wait_all(self.actor_model.async_inference_call("update_weights_fully_async", self.step, **sync_options))
             else:
-                self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+                self.actor_model.update_weights_fully_async(0, **sync_options)
         except Exception:
             emit_receipt(self, recovery_token, "actor_send", "failed")
             raise

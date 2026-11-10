@@ -104,7 +104,7 @@ def test_default_global_restart_reinitializes_after_legacy_manager_death(monkeyp
 
     controller_module.ray.shutdown.assert_called_once_with()
     controller_module.ray.init.assert_called_once_with(runtime_env=controller.runtime_env)
-    initialize.assert_called_once_with(controller.config, controller.runtime_env)
+    initialize.assert_called_once_with(controller.config, controller.runtime_env, fault_events=None)
 
 
 def test_global_restart_count_limit_remains_terminal(monkeypatch):
@@ -309,7 +309,7 @@ def test_original_in_place_restart_keeps_other_service_responses(monkeypatch):
 
     controller.restart_serve("sft")
 
-    service.restart.assert_called_once_with()
+    service.restart.assert_called_once_with(fault_observer=None)
     response.cancel.assert_not_called()
     assert controller._pending_task_refs == [response]
     assert controller._restart_mode == "local"
@@ -496,9 +496,11 @@ def test_old_global_owner_does_not_publish_completion_into_next_cycle(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("global_takeover", [False, True])
+@pytest.mark.parametrize("global_takeover,sync_failure", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("role,hybrid", [("actor_fwd", False), ("rollout", False), ("rollout", True)])
-async def test_activation_publishes_and_registers_only_current_recovery(monkeypatch, global_takeover, role, hybrid):
+async def test_activation_publishes_and_registers_only_current_recovery(
+    monkeypatch, global_takeover, sync_failure, role, hybrid
+):
     controller = _controller_shell()
     controller.config = SimpleNamespace(fully_async=True, hybrid=hybrid)
     controller._health_manager = SimpleNamespace(mark_healthy=Mock())
@@ -528,7 +530,10 @@ async def test_activation_publishes_and_registers_only_current_recovery(monkeypa
         handle=SimpleNamespace(recv_weight_fully_async=SimpleNamespace(remote=AsyncMock())),
         run=Mock(return_value=replacement),
     )
-    rollout_manager = object()
+    engines = [SimpleNamespace(_actor_id=SimpleNamespace(hex=Mock(return_value=actor_id))) for actor_id in ("A", "B")]
+    rollout_manager = SimpleNamespace(
+        get_rollout_engines_and_lock=SimpleNamespace(remote=AsyncMock(return_value=(engines, None, 0, [], [])))
+    )
     rollout = SimpleNamespace(
         set_step=AsyncMock(),
         get_rollout_manager=AsyncMock(return_value=rollout_manager),
@@ -557,11 +562,20 @@ async def test_activation_publishes_and_registers_only_current_recovery(monkeypa
         controller._inference_recovery_timeout,
         lambda: controller._check_inference_recovery(state),
     )
-    generation = await executor._synchronize(role, step=3)
     sender = controller.serve_dict["actor"].handle
+    if sync_failure:
+        sender.update_weights_fully_async.remote.side_effect = RuntimeError("Replacement weight sync incomplete")
+        with pytest.raises(RuntimeError, match="Replacement weight sync incomplete"):
+            await executor._synchronize(role, step=3)
+        state.end_sync.remote.assert_not_called()
+        state.resume.remote.assert_not_called()
+        failed.run.assert_not_called()
+        return
+    generation = await executor._synchronize(role, step=3)
     sender.reset_inference_transport.remote.assert_awaited_once_with(role)
+    sync_options = {"expected_rollout_actor_ids": ["A", "B"]} if role == "rollout" else {}
     sender.update_weights_fully_async.remote.assert_awaited_once_with(
-        rollout_only=role == "rollout", actor_fwd_only=role == "actor_fwd"
+        rollout_only=role == "rollout", actor_fwd_only=role == "actor_fwd", **sync_options
     )
     recovery = InferenceRecoveryResult(
         step=3, attempt=1, generation=generation, started=controller_module.time.monotonic()
