@@ -57,7 +57,7 @@ def _args_for(name, **overrides):
             "true_on_policy_mode": False,
             "debug_rollout_only": False,
             "debug_train_only": False,
-            "loss_type": None,
+            "loss_type": "policy_loss",
             **overrides,
         }
     )

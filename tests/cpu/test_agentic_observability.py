@@ -86,6 +86,7 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "dump_agentic_obs_media": False,
         "reward_key": None,
         "use_rollout_routing_replay": False,
+        "advantage_estimator": "grpo",
     }
     args.update(overrides)
     return Namespace(**args)

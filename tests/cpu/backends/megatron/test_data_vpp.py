@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from relax.utils.data.data import get_first_fit_partitions
+from tests.helpers.relax_args import make_args
 
 
 def _load_data_module(monkeypatch):
@@ -97,7 +98,12 @@ def test_vpp_microbatch_rounding_uses_ceil_multiple(monkeypatch):
 @pytest.mark.parametrize("cp_rank, expected_rows", [(0, [6, 7]), (1, [0, 1, 2, 3, 4, 5])])
 def test_dynamic_cp_microbatch_slices_score_centering_heads_with_sampled_probs(monkeypatch, cp_rank, expected_rows):
     data_module = _load_data_module(monkeypatch)
-    args = Namespace(dynamic_context_parallel=True, max_tokens_per_gpu=6)
+    args = Namespace(
+        dynamic_context_parallel=True,
+        max_tokens_per_gpu=6,
+        # get_batch reads uses_unsplit_forward via get_args() after Task 13.
+        uses_unsplit_forward=False,
+    )
     monkeypatch.setattr(data_module, "get_args", lambda: args)
     monkeypatch.setattr(data_module, "dynamic_cp_split_data", lambda batch, budget: 2)
     monkeypatch.setattr(data_module, "PackedSeqParams", types.SimpleNamespace)
@@ -271,7 +277,7 @@ def test_log_rollout_data_creates_collective_stats_on_training_device(monkeypatc
     monkeypatch.setattr(data_module, "gather_log_data", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(data_module, "maybe_padded_total_lengths", lambda *_args, **_kwargs: None)
 
-    args = Namespace(
+    args = make_args(
         qkv_format="thd",
         is_vl_model=False,
         uses_unsplit_forward=False,
@@ -334,11 +340,13 @@ def test_get_data_iterator_uses_rollout_mini_boundaries_with_balance_data(monkey
     monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(data_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
 
-    args = Namespace(
+    args = make_args(
         balance_data=True,
         global_batch_size=32,
         micro_batch_size=4,
         use_dynamic_batch_size=False,
+        is_vl_model=False,
+        uses_unsplit_forward=False,
     )
     rollout_data = {
         "total_lengths": list(range(32)),
@@ -371,11 +379,13 @@ def test_get_data_iterator_balance_data_without_boundaries_uses_regular_steps(mo
     monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(data_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
 
-    args = Namespace(
+    args = make_args(
         balance_data=True,
         global_batch_size=16,
         micro_batch_size=4,
         use_dynamic_batch_size=False,
+        is_vl_model=False,
+        uses_unsplit_forward=False,
     )
     rollout_data = {"total_lengths": list(range(16))}
 
@@ -409,6 +419,8 @@ def test_sft_multimodal_metrics_include_text_samples(monkeypatch, cp_size, text_
         n_samples_per_prompt=1,
         ci_test=False,
         log_multi_turn=False,
+        is_vl_model=False,
+        uses_unsplit_forward=False,
     )
     batch = {
         "total_lengths": [10, 100, 80],

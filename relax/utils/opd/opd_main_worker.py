@@ -391,7 +391,7 @@ class TopkWorker:
 def restore_opd_topk_rollout_fields(rollout_data: dict, args, device) -> None:
     import torch
 
-    token_selection = getattr(args, "opd_token_selection", None)
+    token_selection = args.opd_token_selection
     opd_top_k = int(getattr(args, "opd_log_prob_top_k", 0) or 0)
     if opd_top_k <= 0 or token_selection not in ("student_topk", "teacher_topk", "union"):
         return

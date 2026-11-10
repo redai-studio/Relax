@@ -341,7 +341,7 @@ def get_model_provider_func(
             _install_cp_probe(model)
             return model
 
-        if is_lora_enabled(args) and getattr(args, "task_type", "causal_lm") == "seq_cls":
+        if is_lora_enabled(args) and args.task_type == "seq_cls":
             wrapped_model_provider = wrap_model_provider_with_lora(wrapped_model_provider, args)
         return wrapped_model_provider
 
@@ -897,7 +897,7 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
 
 def validate_mtp_only_trainable_params(args: argparse.Namespace, model: Sequence[torch.nn.Module]) -> None:
     """Fail fast when MTP-only mode exposes any non-MTP trainable parameter."""
-    if not getattr(args, "mtp_only_training", False):
+    if not args.mtp_only_training:
         return
 
     trainable = [

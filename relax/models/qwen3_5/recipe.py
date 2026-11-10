@@ -73,7 +73,7 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
     from relax.utils.env import Envs
 
     _check_args(args)
-    _TEXT_ONLY_CPT = getattr(args, "sft_training_mode", None) == "cpt"
+    _TEXT_ONLY_CPT = args.sft_training_mode == "cpt"
     assert args.max_tokens_per_gpu == 262144
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     assert dp_size > 0 and dp_size % (args.expert_model_parallel_size // args.tensor_model_parallel_size) == 0

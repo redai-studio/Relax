@@ -80,6 +80,8 @@ def test_indexer_replay_dynamic_sample_field_round_trips_when_enabled():
 def test_indexer_replay_field_is_absent_when_flag_is_false_or_missing():
     base_args = dict(
         advantage_estimator="grpo",
+        fully_async=False,
+        hybrid=False,
         loss_type="policy_loss",
         multimodal_keys=None,
         use_opd=False,
