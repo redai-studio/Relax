@@ -126,15 +126,7 @@ class Actor(Base):
         self.rollout_manager = rollout_manager
         self.actor_model.set_rollout_manager(self.rollout_manager)
 
-        # Call update_weights when weight_updater exists (sync colocate or hybrid mode).
-        # In pure fully_async mode weight_updater is not created and weights are synced via DCS.
-        # Offline training skips the init-time weight sync. SFT syncs weights to SGLang
-        # right before periodic predict (gated in `train_actor`); between
-        # predicts SGLang stays fully offloaded. Sync-at-init would leave
-        # SGLang with `weights` resumed but no follow-up offload, causing
-        # the first predict-step `onload_weights` to crash on a non-idempotent
-        # `set.remove`. NCCL group setup is lazy — `connect_rollout_engines`
-        # fires on the first real `update_weights` instead.
+        # The backend owns sync and offload lifecycles. SFT syncs before predict.
         if (not self.config.fully_async or self.config.hybrid) and not is_offline_mode(self.config):
             self.actor_model.update_weights()
 

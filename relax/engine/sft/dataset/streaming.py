@@ -98,6 +98,7 @@ class ProcessedSample:
     # the dropped pixel_values; None keeps the pixel-shipping default mode.
     image_refs_descriptor: dict[str, Any] | None = None
     pre_shifted_labels: torch.Tensor | None = None
+    dataset_id: int | None = None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -185,6 +186,8 @@ def _normalize_tools(value: Any) -> list[dict] | None:
     if value is None:
         return None
     if isinstance(value, str):
+        if not value or value.isspace():
+            return None
         value = json.loads(value)
     elif hasattr(value, "tolist"):
         value = value.tolist()
@@ -1101,6 +1104,15 @@ class SFTStreamingDataset:
                     apply_chat_template_kwargs=self.apply_chat_template_kwargs,
                     last_turn_only=self.loss_last_turn_only,
                 )
+                if _gemma4_media_token_wrappers(self.tokenizer, self._pad_token_ids):
+                    # Packed image groups are rebuilt from input IDs on the
+                    # actor. Per-row [1, T] token types cannot be concatenated
+                    # as encoder inputs across different-length samples.
+                    processor_kwargs = {
+                        "return_mm_token_type_ids": False,
+                        "return_tensors": "pt",
+                        "add_special_tokens": False,
+                    }
         return _RenderedSample(
             idx=idx,
             sample=sample,
@@ -1168,6 +1180,7 @@ class SFTStreamingDataset:
                 short_mask=rendered.short_mask,
                 expanded_ids=tokens,
                 pad_token_ids=self._pad_token_ids,
+                media_token_wrappers=_gemma4_media_token_wrappers(self.tokenizer, self._pad_token_ids),
             )
         untruncated_tokens = tokens
         if self.task_type == "seq_cls":
@@ -1229,6 +1242,7 @@ class SFTStreamingDataset:
             classification_label=rendered.classification_label,
             multimodal_train_inputs=mm_inputs,
             source_idx=rendered.idx,
+            dataset_id=self.reader.dataset_id(rendered.idx) if hasattr(self.reader, "dataset_id") else None,
             image_refs_descriptor=image_refs_descriptor,
         )
 
@@ -1305,12 +1319,27 @@ def _to_long_tensor(ids: Any) -> torch.Tensor:
     return t.long()
 
 
+def _gemma4_media_token_wrappers(tokenizer: Any, pad_token_ids: frozenset[int]) -> dict[int, tuple[int, int]]:
+    template = getattr(tokenizer, "chat_template", "") or ""
+    if "<|turn>" not in template or not hasattr(tokenizer, "convert_tokens_to_ids"):
+        return {}
+    image_id = tokenizer.convert_tokens_to_ids("<|image|>")
+    start_id = tokenizer.convert_tokens_to_ids("<|image>")
+    end_id = tokenizer.convert_tokens_to_ids("<image|>")
+    if image_id not in pad_token_ids or any(
+        token_id is None or token_id == getattr(tokenizer, "unk_token_id", None) for token_id in (start_id, end_id)
+    ):
+        return {}
+    return {image_id: (start_id, end_id)}
+
+
 def _expand_loss_mask_via_alignment(
     *,
     short_ids: torch.Tensor,
     short_mask: torch.Tensor,
     expanded_ids: torch.Tensor,
     pad_token_ids: frozenset[int],
+    media_token_wrappers: dict[int, tuple[int, int]] | None = None,
 ) -> torch.Tensor:
     if short_ids.dim() != 1 or short_mask.dim() != 1 or expanded_ids.dim() != 1:
         raise ValueError("Inputs must be 1D tensors")
@@ -1327,6 +1356,17 @@ def _expand_loss_mask_via_alignment(
     while i < n_short and j < n_long:
         s_tok = s[i]
         e_tok = e[j]
+        wrapper = (media_token_wrappers or {}).get(s_tok)
+        if wrapper is not None and e_tok == wrapper[0]:
+            j += 1
+            media_start = j
+            while j < n_long and e[j] == s_tok:
+                j += 1
+            if j == media_start or j >= n_long or e[j] != wrapper[1]:
+                raise ValueError("SFT media alignment requires a nonempty image run and matching end token")
+            j += 1
+            i += 1
+            continue
         if s_tok == e_tok and s_tok not in pad_token_ids:
             out[j] = m[i]
             i += 1
@@ -1390,6 +1430,10 @@ def pack_samples_for_tq(
         # assistant/function_call token positions.
         "response_lengths": [1] * len(samples) if is_classification else total_lengths,
     }
+    if any(s.dataset_id is not None for s in samples):
+        if not all(s.dataset_id is not None for s in samples):
+            raise ValueError("dataset ids must be present for every sample in a mixture batch")
+        batch["dataset_ids"] = [s.dataset_id for s in samples]
     if is_classification:
         batch["classification_labels"] = [s.classification_label.tolist() for s in samples]
     if has_pre_shifted_labels:

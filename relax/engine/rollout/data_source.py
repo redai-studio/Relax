@@ -2,10 +2,12 @@
 
 import abc
 import os
+import tempfile
 from pathlib import Path
 
 import torch
 
+from relax.utils.agentic_obs.config import agentic_obs_enabled
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import load_processor, load_tokenizer
 from relax.utils.logging_utils import get_logger
@@ -103,6 +105,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             custom_prompt_func=custom_prompt_func,
             teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
             teacher_multimodal_keys=teacher_mm_keys,
+            record_source=agentic_obs_enabled(args),
         )
     else:
         logger.info("Using traditional Dataset (eager loading)")
@@ -125,6 +128,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             custom_prompt_func=custom_prompt_func,
             teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
             teacher_multimodal_keys=teacher_mm_keys,
+            record_source=agentic_obs_enabled(args),
         )
 
 
@@ -259,7 +263,17 @@ class RolloutDataSource(DataSource):
 
         path = os.path.join(self.args.save, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
+        # Publish only a complete snapshot, including when replacing an earlier
+        # save of the same rollout after recovery.
+        fd, temporary = tempfile.mkstemp(prefix=".dataset-", suffix=".tmp", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                torch.save(state_dict, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:

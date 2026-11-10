@@ -25,7 +25,6 @@ class ContextRecorder:
     generation."""
 
     def __init__(self) -> None:
-        # ponytail: forward-only Codex exec; rollback/branching needs lineage tracking.
         self.contexts: list[dict[str, Any]] = []
         self.error: str | None = None
 

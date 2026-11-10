@@ -86,6 +86,7 @@ def test_driver_offsets_skip_second_scan_and_preserve_rows(tmp_path, monkeypatch
     rows = [expected[i] for i in range(len(expected))]
     args = _args(path)
     cache = resolve_sft_num_rollout(args)
+    assert args._sft_dataset_names == (("a", "b") if mode == "mixture" else ())
     assert cache and len(cache) == len(published)
     assert not hasattr(args, "_sft_line_offsets_cache")
     assert args.num_rollout == len(rows) // 2

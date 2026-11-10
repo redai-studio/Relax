@@ -44,6 +44,8 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # The example's installer tests read its pinned Relax commit.
+          fetch-depth: 0
 
       - name: Prepare local test image
         id: image
@@ -87,7 +89,7 @@ jobs:
         timeout-minutes: 31
         run: |
           docker exec "$CI_CONTAINER_NAME" timeout --kill-after=30s 30m bash -euo pipefail -c '
-            python -m pytest tests/cpu -v -ra --tb=short --durations=50 \
+            python -m pytest tests/cpu examples/chunkflow/test/cpu -v -ra --tb=short --durations=50 \
               --junitxml=/artifacts/junit.xml 2>&1 | tee /artifacts/pytest.log
           '
 
@@ -196,7 +198,7 @@ jobs:
         timeout-minutes: 20
         run: |
           docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
-            python -m pytest tests/ --ignore=tests/cpu \
+            python -m pytest tests/ examples/chunkflow/test/gpu --ignore=tests/cpu \
               -v -ra --tb=short --durations=50 --junitxml=/artifacts/junit.xml \
               2>&1 | tee /artifacts/pytest.log
           '
