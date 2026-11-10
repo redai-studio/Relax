@@ -9,38 +9,19 @@
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-RELAX_ROOT="$(cd -- "${RELAX_DIR:-${SCRIPT_DIR}/../../../..}" && pwd)"
-TARGET_SCRIPT="${RELAX_ROOT}/examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xh20.sh"
-if [[ ! "${BASH_SOURCE[0]}" -ef "${TARGET_SCRIPT}" ]]; then
-    exec bash "${TARGET_SCRIPT}" "$@"
-fi
+RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
 export RELAX="${RELAX_ROOT}"
 if [[ "${DRY_RUN:-0}" != 1 && -z "${MEGATRON:-}" ]]; then
     MEGATRON=$(python3 -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("megatron.core").origin).resolve().parents[2])')
 fi
 export MEGATRON="${MEGATRON:-/root/Megatron-LM}"
-export PYTHONPATH="${RELAX}:${MEGATRON}${PYTHONPATH:+:${PYTHONPATH}}"
 : "${MODEL_DIR:?Set MODEL_DIR to the HF model directory}"
 : "${DATA_DIR:?Set DATA_DIR to the JSONL file or directory}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent run output directory}"
-export RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-${RAY_JOBS_ADDRESS:-http://127.0.0.1:8265}}"
-export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
-    python3 - "${RAY_DASHBOARD_ADDRESS}" <<'PYADMIT'
-import sys
-from ray.job_submission import JobSubmissionClient
-active = [job.submission_id for job in JobSubmissionClient(sys.argv[1]).list_jobs()
-          if str(job.status) in ("PENDING", "RUNNING") and "relax.entrypoints.train" in job.entrypoint]
-if active:
-    raise SystemExit(f"Active Relax training jobs: {active}")
-PYADMIT
-    if [[ -n "${RELAX_KERNEL_CACHE_DIR:-}" ]]; then
-        # Source mode needs the concrete examples/ script for the cache profile.
-        source "${RELAX_ROOT}/scripts/entrypoint/kernel-cache.sh"
-        RELAX_ENTRYPOINT_MODE=ray-job relax_kernel_cache_configure "${TARGET_SCRIPT}" "$@"
-    fi
-    source "${RELAX_ROOT}/scripts/entrypoint/ray-job.sh"
+    exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$@"
 fi
+export PYTHONPATH="${RELAX}:${MEGATRON}${PYTHONPATH:+:${PYTHONPATH}}"
 source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa}"
 EXP_NAME="${EXP_NAME:-qwen38-qsa-32xh20}"
@@ -71,10 +52,6 @@ ENV_ARGS=(
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
     TOKENIZERS_PARALLELISM=false
     RAY_OVERRIDE_JOB_RUNTIME_ENV=1
-    OMP_NUM_THREADS=24 MKL_NUM_THREADS=24 OPENBLAS_NUM_THREADS=24
-    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
-    SGLANG_HEALTH_CHECK_TIMEOUT=180
-    INDEXER_ROPE_NEOX_STYLE=0
     RELAX_QWEN38_QSA_FUSED_ATTENTION=triton_v2
     RELAX_QWEN38_QSA_FUSED_SELECTOR=1
     RELAX_QWEN38_QSA_SPARSE_BLOCKMASK=1
@@ -87,6 +64,32 @@ ENV_ARGS=(
     RELAX_QWEN38_QSA_COMMUNITY_BACKEND=
 )
 export "${ENV_ARGS[@]}"
+TRAIN_ENV_JSON=$(python3 - "${ENV_ARGS[@]}" <<'PYENV'
+import json
+import os
+import sys
+env = dict(item.split("=", 1) for item in sys.argv[1:])
+runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
+env["LD_LIBRARY_PATH"] = runtime.get("env_vars", {}).get("LD_LIBRARY_PATH", env["LD_LIBRARY_PATH"])
+print(json.dumps(env))
+PYENV
+)
+
+# Preserve the standard entrypoint's library paths, cache settings and hooks.
+export RUNTIME_ENV_JSON
+RUNTIME_ENV_JSON=$(python3 - "${TRAIN_ENV_JSON}" <<'PYRUNTIME'
+import json
+import os
+import sys
+runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
+env = runtime.setdefault("env_vars", {})
+env.update(json.loads(sys.argv[1]))
+propagated = [*env.get("RELAX_PROPAGATE_ENV_VARS", "").split(","),
+              *os.environ.get("RELAX_PROPAGATE_ENV_VARS", "").split(","), *env]
+env["RELAX_PROPAGATE_ENV_VARS"] = ",".join(dict.fromkeys(name for name in propagated if name))
+print(json.dumps(runtime))
+PYRUNTIME
+)
 
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}"
@@ -129,7 +132,7 @@ SFT_ARGS=(
     --sft-image-preprocess-on-rank
 )
 
-PERF_ARGS=(
+PARALLEL_ARGS=(
     --tensor-model-parallel-size 4
     --pipeline-model-parallel-size 4
     --context-parallel-size 1
@@ -148,6 +151,9 @@ PERF_ARGS=(
     --recompute-method uniform
     --recompute-num-layers 1
     --no-offload-train
+)
+
+MISC_ARGS=(
     --seed "${SEED:-1234}"
     --rollout-seed "${SEED:-1234}"
     --bf16
@@ -157,6 +163,7 @@ PERF_ARGS=(
     --attention-backend flash
     --accumulate-allreduce-grads-in-fp32
     --use-health-check
+    --train-env-vars "${TRAIN_ENV_JSON}"
 )
 
 OPTIMIZER_ARGS=(
@@ -184,24 +191,6 @@ TRACKING_ARGS=(
     --tb-experiment-name "${EXP_NAME}-${now}"
 )
 
-# Merge once with the standard entrypoint, retaining its library paths and hooks.
-export RUNTIME_ENV_JSON
-RUNTIME_ENV_JSON=$(python3 - "${ENV_ARGS[@]}" <<'PYENV'
-import json
-import os
-import sys
-runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
-env = runtime.setdefault("env_vars", {})
-overrides = dict(item.split("=", 1) for item in sys.argv[1:])
-overrides["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", overrides["LD_LIBRARY_PATH"])
-env.update(overrides)
-propagated = [*env.get("RELAX_PROPAGATE_ENV_VARS", "").split(","),
-              *os.environ.get("RELAX_PROPAGATE_ENV_VARS", "").split(","), *env]
-env["RELAX_PROPAGATE_ENV_VARS"] = ",".join(dict.fromkeys(name for name in propagated if name))
-print(json.dumps(runtime))
-PYENV
-)
-
 TRAIN_ARGS=(
     --resource '{"sft":[1,0],"actor":[1,32]}'
     --actor-num-nodes 4
@@ -211,8 +200,9 @@ TRAIN_ARGS=(
     "${MODEL_ARGS[@]}"
     "${CKPT_ARGS[@]}"
     "${SFT_ARGS[@]}"
-    "${PERF_ARGS[@]}"
+    "${PARALLEL_ARGS[@]}"
     "${OPTIMIZER_ARGS[@]}"
+    "${MISC_ARGS[@]}"
     "${TRACKING_ARGS[@]}"
     "$@"
 )
@@ -228,7 +218,11 @@ fi
 
 cd "${RELAX}"
 mkdir -p "${SAVE_DIR}/logs"
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD_ADDRESS}" \
+RAY_JOB_ADDRESS_ARGS=()
+if [[ -n "${RAY_JOBS_ADDRESS:-}" ]]; then
+    RAY_JOB_ADDRESS_ARGS=(--address "${RAY_JOBS_ADDRESS}")
+fi
+ray job submit ${RAY_NO_WAIT:+--no-wait} "${RAY_JOB_ADDRESS_ARGS[@]}" \
     --submission-id "${SUBMISSION_ID}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
