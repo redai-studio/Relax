@@ -1395,13 +1395,20 @@ class MegatronTrainRayActor(TrainRayActor):
             # monitoring stay paused forever. Short call -> keep the timeout;
             # swallow its own errors independently.
             if end_update_weight:
-                try:
-                    response = requests.get(
-                        f"{rollout_serve_url}/end_update_weight", timeout=self.args.rollout_http_timeout
-                    )
-                    response.raise_for_status()
-                except Exception as e:
-                    logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
+                self._end_rollout_weight_update(rollout_id)
+
+    def _end_rollout_weight_update(self, rollout_id: int) -> None:
+        """Release the rollout handshake even when no new policy was
+        published."""
+        if getattr(self, "rollout_manager", None) is None or dist.get_rank(group=dist.group.WORLD) != 0:
+            return
+        try:
+            response = requests.get(
+                f"{get_serve_url('rollout')}/end_update_weight", timeout=self.args.rollout_http_timeout
+            )
+            response.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
 
     def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         """Backward-compatible name kept for existing internal call sites."""
@@ -2798,6 +2805,9 @@ class MegatronTrainRayActor(TrainRayActor):
             self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
+        if actor_fwd_only:
+            self._end_rollout_weight_update(rollout_id)
+            return
         self._run_step_evaluation(
             evaluation_step_for_rollout(self.args, rollout_id),
             end_update_weight=True,

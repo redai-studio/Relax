@@ -992,6 +992,28 @@ class DeviceDirectBackend(CommBackend):
     ) -> int | None:
         """Keep every TP rank in Bridge's shard collectives; only src sends."""
 
+        # PP stages iterate different local parameters. Coordinate only ranks
+        # that share this stage, including DP/CP replicas outside the src TP group.
+        control_group = self._megatron.mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        source_rank = dist.get_global_rank(control_group, 0)
+
+        def send_from_source(action: Callable[[], None]) -> None:
+            error = None
+            status = [None]
+            if self._is_pp_src_rank:
+                try:
+                    action()
+                except Exception as exc:
+                    error = exc
+                    status[0] = f"{type(exc).__name__}: {exc}"
+            # The next shard export contains a TP collective. Every stage rank
+            # must learn whether sending succeeded before advancing its iterator.
+            dist.broadcast_object_list(status, src=source_rank, group=control_group)
+            if status[0] is not None:
+                if error is not None:
+                    raise error
+                raise RuntimeError(f"PLE update {name} failed on source rank {source_rank}: {status[0]}")
+
         def flush_rollout_bucket() -> None:
             if not converted_named_tensors or actor_fwd_only:
                 return
@@ -1002,28 +1024,35 @@ class DeviceDirectBackend(CommBackend):
                 self._update_bucket_weights_from_distributed(ready, pbar=pbar)
             converted_named_tensors[:] = pending
 
-        if self._is_pp_src_rank:
+        def flush_previous_weights() -> None:
             if origin_named_tensors and not rollout_only:
                 self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
             origin_named_tensors.clear()
             flush_rollout_bucket()
 
+        send_from_source(flush_previous_weights)
+
         if not rollout_only:
             # actor_fwd/ref still consume full Megatron weights. Do not retain
             # that separate payload while streaming the HF shards to rollout.
             gathered = self._megatron.all_gather_param(self.args, name, local_rows)
-            if self._is_pp_src_rank:
-                self._update_bucket_weights_from_distributed_for_actor_fwd_ref([(name, gathered)])
-            del gathered
+            try:
+                send_from_source(
+                    lambda: self._update_bucket_weights_from_distributed_for_actor_fwd_ref([(name, gathered)])
+                )
+            finally:
+                del gathered
+
+        def send_shard(converted: tuple[str, torch.Tensor]) -> None:
+            converted_named_tensors.append(converted)
+            flush_rollout_bucket()
 
         if not actor_fwd_only and not self._lora_skip_rollout_base:
             # PLE mappings expect TP-local rows and perform an all-reduce per
             # HF shard. Neither gather the full table nor filter non-src ranks.
             with closing(self._bridge_converter.iter_ple_shards(name, local_rows)) as shards:
                 for converted in shards:
-                    if self._is_pp_src_rank:
-                        converted_named_tensors.append(converted)
-                        flush_rollout_bucket()
+                    send_from_source(lambda converted=converted: send_shard(converted))
                     del converted
 
         if self._is_pp_src_rank:

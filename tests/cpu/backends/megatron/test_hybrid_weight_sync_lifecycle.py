@@ -168,7 +168,10 @@ def test_hybrid_training_restores_offload_before_first_parallel_query(hybrid_act
 
 
 @pytest.mark.parametrize("save_checkpoint", [False, True])
-def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(hybrid_actor, monkeypatch, save_checkpoint):
+@pytest.mark.parametrize("handshake_ok", [False, True])
+def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
+    hybrid_actor, monkeypatch, save_checkpoint, handshake_ok
+):
     actor, state = hybrid_actor
     vars(actor.args).update(
         use_rollout_routing_replay=False,
@@ -181,6 +184,7 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(hybrid_actor
         save="checkpoint" if save_checkpoint else None,
         rotate_ckpt=False,
         save_interval=1,
+        rollout_http_timeout=17,
     )
     actor._active_model_tag = "actor"
     actor._weights_backup_on_device = True
@@ -192,8 +196,13 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(hybrid_actor
     actor._get_data_from_transfer_queue = lambda *_a: ({"total_lengths": [2, 3]}, None)
     actor._hybrid_forward_subbatch = Mock()
     actor._wait_for_previous_eval = Mock()
-    actor._check_services_health = lambda: (True, False)
+    actor._check_services_health = lambda: (True, not handshake_ok)
     actor._run_step_evaluation = Mock()
+    actor.rollout_manager = object()
+    cleanup = Mock(return_value=SimpleNamespace(raise_for_status=lambda: None))
+    monkeypatch.setattr(actor_module.requests, "get", cleanup)
+    monkeypatch.setattr(actor_module, "get_serve_url", lambda role: "http://rollout")
+    monkeypatch.setattr(actor_module.dist, "get_rank", lambda *args, **kwargs: 0)
 
     def checkpoint(*_a, **_kw):
         assert state.awake and state.tp_group is not None
@@ -239,6 +248,12 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(hybrid_actor
     for step in range(2):
         actor.train_hybrid(step)
         assert not state.awake and state.tp_group is None
-    assert state.events.count("push") == 2
+    assert state.events.count("push") == (2 if handshake_ok else 0)
     assert state.events.count("checkpoint") == (2 if save_checkpoint else 0)
-    assert actor._advance_keep_old_actor_queue.call_count == 2
+    assert actor._advance_keep_old_actor_queue.call_count == (2 if handshake_ok else 0)
+    assert actor._run_step_evaluation.call_count == (2 if handshake_ok else 0)
+    assert actor_module.tracking_utils.flush_metrics.call_count == 2
+    if not handshake_ok:
+        assert cleanup.call_count == 2
+        assert all(call.args == ("http://rollout/end_update_weight",) for call in cleanup.call_args_list)
+        assert all(call.kwargs == {"timeout": 17} for call in cleanup.call_args_list)

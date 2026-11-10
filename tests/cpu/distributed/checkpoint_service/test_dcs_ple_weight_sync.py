@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as multiprocessing
 
+from relax.distributed.checkpoint_service.backends import device_direct
 from relax.distributed.checkpoint_service.backends.device_direct import DeviceDirectBackend
 from relax.models.deepseek_v4.weight_sync import split_fused_weight_pairs
 
@@ -25,13 +26,18 @@ from relax.models.deepseek_v4.weight_sync import split_fused_weight_pairs
 PLE_NAME = "module.module.decoder.layers.0.per_layer_embedding.ple_embedding.ngram_embedding.weight"
 
 
-def _backend(converter, gather, send_hf, send_raw, *, source=True, skip_base=False):
+def _backend(converter, gather, send_hf, send_raw, *, source=True, skip_base=False, control_group=None):
     backend = DeviceDirectBackend.__new__(DeviceDirectBackend)
     backend.args = Namespace(update_weight_buffer_size=8)
     backend._is_pp_src_rank = source
     backend._use_bridge = True
     backend._bridge_converter = converter
-    backend._megatron = SimpleNamespace(all_gather_param=gather)
+    backend._megatron = SimpleNamespace(
+        all_gather_param=gather,
+        mpu=SimpleNamespace(
+            get_tensor_and_data_parallel_group=lambda **kw: control_group or dist.group.WORLD,
+        ),
+    )
     backend._lora_enabled = False
     backend._lora_merge_mode = False
     backend._lora_skip_rollout_base = skip_base
@@ -144,11 +150,11 @@ def _collective_worker(rank: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
-def test_dcs_ple_all_tp_ranks_stream_updated_shards_and_preserve_raw_consumers(tmp_path):
+def _run_workers(worker, tmp_path, nprocs):
     context = multiprocessing.start_processes(
-        _collective_worker,
+        worker,
         args=((tmp_path / "gloo").as_uri(),),
-        nprocs=2,
+        nprocs=nprocs,
         join=False,
         start_method="spawn",
     )
@@ -168,7 +174,17 @@ def test_dcs_ple_all_tp_ranks_stream_updated_shards_and_preserve_raw_consumers(t
                 process.join(timeout=5)
 
 
-def test_dcs_ple_keeps_pending_fused_weights_across_shards():
+def test_dcs_ple_all_tp_ranks_stream_updated_shards_and_preserve_raw_consumers(tmp_path):
+    _run_workers(_collective_worker, tmp_path, 2)
+
+
+@pytest.fixture
+def single_rank_control(monkeypatch):
+    monkeypatch.setattr(device_direct.dist, "get_global_rank", lambda group, rank: 0)
+    monkeypatch.setattr(device_direct.dist, "broadcast_object_list", lambda *args, **kwargs: None)
+
+
+def test_dcs_ple_keeps_pending_fused_weights_across_shards(single_rank_control):
     pending = ("model.layers.0.mlp.experts.w1_weight", torch.ones(2))
     sent = []
 
@@ -193,7 +209,7 @@ def test_dcs_ple_keeps_pending_fused_weights_across_shards():
     assert sent == ["hf.ple.shard_0.weight", "hf.ple.shard_1.weight"]
 
 
-def test_dcs_ple_closes_export_iterator_when_receiver_fails():
+def test_dcs_ple_closes_export_iterator_when_receiver_fails(single_rank_control):
     state = SimpleNamespace(pp_group=object())
     original_group = state.pp_group
 
@@ -212,3 +228,78 @@ def test_dcs_ple_closes_export_iterator_when_receiver_fails():
     with pytest.raises(RuntimeError, match="receiver failed"):
         backend._update_weight_from_distributed(PLE_NAME, torch.ones(2), [], [], 0, True)
     assert state.pp_group is original_group
+
+
+def _failure_worker(rank: int, rendezvous: str) -> None:
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=8))
+    try:
+        groups = [
+            dist.new_group(ranks=ranks, backend="gloo", timeout=timedelta(seconds=8)) for ranks in ([0, 1], [2, 3])
+        ]
+        tp_group = groups[rank // 2]
+        # Four ranks are necessary to test DP peers outside the source TP group
+        # and a PP-local source whose global rank is not zero. Other PP stages
+        # need not own a PLE table or enter the same per-shard control sequence.
+        for layout in ["tp2_dp2", "pp2_tp2"]:
+            source = 0 if layout == "tp2_dp2" else 2
+            control = dist.group.WORLD if layout == "tp2_dp2" else groups[1]
+            for phase in ["preflush", "raw", "shard"]:
+                if layout == "pp2_tp2" and rank < 2:
+                    dist.barrier(group=dist.group.WORLD)
+                    continue
+                assert (rank == source) == (dist.get_rank(control) == 0)
+                table = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+                local_rows = table[(rank % 2) * 6 : (rank % 2 + 1) * 6].clone()
+                state = SimpleNamespace(exported=[], closed=False)
+
+                def shards(name, param):
+                    try:
+                        for index in range(3):
+                            state.exported.append(index)
+                            shard = torch.zeros(4, 2)
+                            start = index * 4
+                            lo, hi = max(start, rank % 2 * 6), min(start + 4, (rank % 2 + 1) * 6)
+                            if hi > lo:
+                                shard[lo - start : hi - start] = param[lo - rank % 2 * 6 : hi - rank % 2 * 6]
+                            dist.all_reduce(shard, group=tp_group)
+                            yield f"hf.ple.shard_{index}.weight", shard
+                    finally:
+                        state.closed = True
+
+                def gather(args, name, param):
+                    assert phase == "raw"
+                    parts = [torch.empty_like(param) for _ in range(2)]
+                    dist.all_gather(parts, param, group=tp_group)
+                    return torch.cat(parts)
+
+                def fail_send(*args, **kwargs):
+                    assert rank == source
+                    raise ValueError(f"injected {phase} receiver failure")
+
+                backend = _backend(
+                    SimpleNamespace(iter_ple_shards=shards),
+                    gather,
+                    fail_send,
+                    fail_send,
+                    source=rank == source,
+                    control_group=control,
+                )
+                converted = [("before", torch.ones(2))] if phase == "preflush" else []
+                # The peer must receive the source's error before requesting a
+                # second shard, rather than failing on Gloo's 8-second timeout.
+                with pytest.raises((ValueError, RuntimeError), match=f"injected {phase} receiver failure") as error:
+                    backend._update_weight_from_distributed(
+                        PLE_NAME, local_rows, converted, [], 0, rollout_only=phase != "raw"
+                    )
+                if rank == source:
+                    assert type(error.value) is ValueError
+                assert state.exported == ([0] if phase == "shard" else [])
+                assert state.closed == (phase == "shard")
+                dist.barrier(group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_dcs_ple_send_failures_reach_all_stage_ranks_before_next_collective(tmp_path):
+    _run_workers(_failure_worker, tmp_path, 4)
