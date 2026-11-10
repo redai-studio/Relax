@@ -7,6 +7,7 @@ import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 
 from relax.backends.sglang.shard_p2p_weight_loader import expert_shapes
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 from .tp_shard_source import OrdinaryTPSource
@@ -74,7 +75,14 @@ class CombinedShardSource:
 
     def replica_record(self, weights) -> dict:
         tensors, _, _ = self.ordinary._views(weights, selected_only=False)
-        hashes = snapshot_digests(tensors) if len(self.ordinary.replica_ranks) > 1 else {}
+        # DP/CP parameter synchronization is the training contract. Cold native
+        # parity still checks every actual receiver against its original source;
+        # hashing all source replicas is an additional content diagnostic.
+        hashes = (
+            snapshot_digests(tensors)
+            if Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK and len(self.ordinary.replica_ranks) > 1
+            else {}
+        )
         return dict(
             expert=self.expert.replica_record(weights) if self.expert is not None else None,
             global_rank=dist.get_global_rank(self.group, self.rank),

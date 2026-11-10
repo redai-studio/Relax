@@ -513,6 +513,43 @@ def test_expert_consumer_qualifies_without_enabling_backup_overlap(module, monke
     assert not module.Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
 
 
+@pytest.mark.parametrize("check_content", [False, True])
+def test_ordinary_replica_content_audit_preserves_layout_and_expert_checks(module, monkeypatch, check_content):
+    from relax.backends.megatron.weight_update.combined_shard_source import CombinedShardSource
+
+    monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "1" if check_content else "0")
+    monkeypatch.setattr(module.dist, "get_global_rank", lambda group, rank: rank)
+    source = object.__new__(CombinedShardSource)
+    source.group, source.rank = "gloo", 0
+    source.expert = Mock()
+    source.ordinary = SimpleNamespace(replica_ranks=(0, 1), _views=Mock())
+    weights = {"weight": torch.ones(2, dtype=torch.bfloat16)}
+    source.ordinary._views.return_value = (weights, [], {})
+    cpu_copy = torch.Tensor.cpu
+    copies = []
+
+    def copy(tensor):
+        copies.append(tensor)
+        return cpu_copy(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", copy)
+    record = source.replica_record(weights)
+    assert bool(record["hashes"]) is check_content and len(copies) == int(check_content)
+    source.ordinary._views.assert_called_once_with(weights, selected_only=False)
+    source.expert.replica_record.assert_called_once_with(weights)
+    peer = dict(record, global_rank=1)
+    source.validate_replicas([record, peer])
+    source.expert.validate_replicas.assert_called_once_with([record["expert"], peer["expert"]])
+    if check_content:
+        with pytest.raises(ValueError, match="replica weights differ"):
+            source.validate_replicas([record, dict(peer, hashes={"weight": "different"})])
+    with pytest.raises(ValueError, match="replica weights differ"):
+        source.validate_replicas([record, dict(peer, replicas=(1, 0))])
+    source.ordinary._views.side_effect = ValueError("source layout changed")
+    with pytest.raises(ValueError, match="source layout changed"):
+        source.replica_record(weights)
+
+
 def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_active_capability_loss(
     module, monkeypatch
 ):
