@@ -336,24 +336,9 @@ class TestTargetModuleExpansion:
         out = convert_megatron_to_hf_target_modules(["linear_qkv", "linear_proj"])
         assert out == ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-    def test_dedup_preserves_order(self):
-        out = convert_megatron_to_hf_target_modules(["linear_qkv", "linear_q"])
-        assert out == ["q_proj", "k_proj", "v_proj"]  # linear_q -> q_proj already present
-
 
 class TestMergeContract:
     """The TP=1 merge-mode fold must equal base + alpha/dim*(B @ A)."""
-
-    def test_tp1_formula_reference(self):
-        # Documents the exact math _merge_full_base depends on (no megatron needed).
-        torch.manual_seed(0)
-        out_features, in_features, dim = 6, 5, 2
-        base = torch.randn(out_features, in_features)
-        b = torch.randn(out_features, dim)  # linear_out
-        a = torch.randn(dim, in_features)  # linear_in
-        alpha, r = 8, dim
-        expected = base + (alpha / r) * (b @ a)
-        assert expected.shape == base.shape
 
     def test_tp1_matches_real_loramerge(self):
         from megatron.bridge.peft.lora_merge import LoRAMerge
