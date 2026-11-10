@@ -2998,6 +2998,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         from relax.backends.fsdp.arguments import add_generative_arguments
 
         parser = add_generative_arguments(parser)
+        # Keep FSDPTurbo YAML/JSON raw for Ray serialization; the train actor loads it lazily.
+        parser.add_argument(
+            "--turbo-config",
+            type=str,
+            default=None,
+            help=(
+                "FSDPTurbo config for --train-backend fsdp_turbo: path to a FSDPTurbo "
+                "YAML file (e.g. configs/turbo_config/qwen3_5_moe_35b.yaml) or inline "
+                "JSON describing the parallel / memory / quantization plan."
+            ),
+        )
         reset_arg(
             parser,
             "--custom-config-path",
@@ -3030,7 +3041,9 @@ def _pre_parse_mode():
     Phase 2 parsing.
     """
     temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
+    temp_parser.add_argument(
+        "--train-backend", type=str, choices=["megatron", "fsdp", "fsdp_turbo"], default="megatron"
+    )
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
@@ -3120,6 +3133,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
             pre.debug_rollout_only
             or pre.skip_hf_validate
             or image_sft
+            or pre.train_backend == "fsdp_turbo"
             or (model_source is not None and is_s3_uri(model_source.uri))
         ),
     )
@@ -3151,7 +3165,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # gets a per-model-family default from its adapter. Resolve the Megatron
     # fallback here so every downstream Megatron consumer keeps seeing a concrete
     # list, and leave it None for fsdp so the actor can defer to the adapter.
-    if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
+    if getattr(args, "lora_target_modules", None) is None and args.train_backend not in ("fsdp", "fsdp_turbo"):
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
     slime_validate_args(args)
@@ -3160,6 +3174,12 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         from relax.backends.fsdp.arguments import validate_generative_config
 
         validate_generative_config(args)
+    elif args.train_backend == "fsdp_turbo":
+        # debug_rollout_only has no actor or backend config to validate.
+        if not args.debug_rollout_only:
+            from relax.backends.fsdp_turbo.turbo_config_utils import validate_fsdp_turbo_args
+
+            validate_fsdp_turbo_args(args)
     elif not args.debug_rollout_only:
         args = megatron_validate_args(args)
 
@@ -4476,7 +4496,14 @@ def slime_validate_args(args):
         # path knows how to (a) cap per-GPU tokens (CP-aware) and (b) build
         # balanced micro-batches. Static --micro-batch-size cannot do either,
         # so we require --use-dynamic-batch-size.
-        if not args.use_dynamic_batch_size and not is_i2i_sft(args):
+        # fsdp_turbo micro-batches internally using --max-tokens-per-gpu; Megatron's dynamic-batch flag does not apply.
+        if getattr(args, "train_backend", "megatron") == "fsdp_turbo":
+            if args.max_tokens_per_gpu is None:
+                raise ValueError(
+                    "--loss-type sft on fsdp_turbo requires --max-tokens-per-gpu "
+                    "(the actor packs micro-batches under this token budget)."
+                )
+        elif not args.use_dynamic_batch_size and not is_i2i_sft(args):
             raise ValueError(
                 f"--loss-type {args.loss_type} requires --use-dynamic-batch-size (with --max-tokens-per-gpu). "
                 "Offline training relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "

@@ -166,6 +166,19 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --index-url https://pypi.org/simple ray==2.55.1 protobuf==6.33.6 fastokens==0.3.1
 
+# FSDPTurbo: official upstream main pinned to 8f2bada2058615266f3b84039e3d12ca8a199d18
+# (includes Ascend/FSDPTurbo PR160: the DeepSeek-V4 model implementation) + the
+# Relax adaptation patch (broadcast device fix, mtp_only_labels, label-less MTP
+# skip, position_ids fallback, packed-weight grouped_matmul fallback,
+# conv1d head tiling, vocab-parallel input device alignment, GDN stock-FLA
+# submodule import + kwargs filtering for the mindspeed-patched backend).
+RUN git clone https://gitcode.com/Ascend/FSDPTurbo.git /root/FSDPTurbo && \
+    cd /root/FSDPTurbo && \
+    git checkout 8f2bada2058615266f3b84039e3d12ca8a199d18 && \
+    patch -p1 < /root/Relax/docker/npu_patch/fsdpturbo.patch && \
+    pip install -e . --no-deps && \
+    pip install transformers==5.16.1
+
 # Clean caches.
 RUN pip cache purge && \
     rm -rf /tmp/*
