@@ -52,6 +52,9 @@ class _WorkerWeightGuard:
         self.lease = NativeWeightLease()
         self.models: tuple = ()
         self.operation_sequence = 0
+        self.remote_owner = None
+        self.current_control = None
+        self.native_reload = None
 
     def refresh(self) -> None:
         import torch
@@ -66,6 +69,8 @@ class _WorkerWeightGuard:
         for model in models:
             model._relax_native_weight_lease = self.lease
             model._relax_native_weight_guard = self
+        if self.models and self.models != models:
+            self.native_reload = None
         self.models = models
 
 
@@ -140,7 +145,7 @@ def _guard_native_weights(manager: Any, operation: str) -> _WorkerWeightGuard:
     return guard
 
 
-def install_native_weight_guard(manager_type: type | None = None) -> None:
+def install_native_weight_guard(manager_type: type | None = None, *, remote: bool = False) -> None:
     """Install before SGLang builds its worker dispatcher, never in Ray alone.
 
     The same guard covers all native weight mutations, including the owning
@@ -165,6 +170,8 @@ def install_native_weight_guard(manager_type: type | None = None) -> None:
     if not updates <= set(originals):
         raise NotImplementedError("Unsupported SGLang native weight mutation interface")
     if all(getattr(method, "_relax_native_weight_guard", False) for method in originals.values()):
+        if any(getattr(method, "_relax_remote_weight_guard", False) != remote for method in originals.values()):
+            raise RuntimeError("SGLang allocation guard protocol changed")
         return
     if any(getattr(method, "_relax_native_weight_guard", False) for method in originals.values()):
         raise RuntimeError("SGLang native weight guards were partially installed")
@@ -200,4 +207,12 @@ def install_native_weight_guard(manager_type: type | None = None) -> None:
         return guarded
 
     for name, method in originals.items():
-        setattr(manager_type, name, wrapped(name, method))
+        if remote:
+            from .p2p_weight_lease import wrap_remote_weight_operation
+
+            guarded = wrap_remote_weight_operation(name, method)
+            guarded._relax_native_weight_guard = True
+            guarded._relax_remote_weight_guard = True
+        else:
+            guarded = wrapped(name, method)
+        setattr(manager_type, name, guarded)

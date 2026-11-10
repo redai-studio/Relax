@@ -355,6 +355,9 @@ class Envs(metaclass=_EnvsMeta):
     # Overlap the Actor CPU backup with sending weights to SGLang.
     RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP = EnvProperty("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", bool, False)
     # Debug only: compare the first Colocate expert direct update with a full native update.
+    RELAX_WEIGHT_SYNC_SHARED_DIR = EnvProperty("RELAX_WEIGHT_SYNC_SHARED_DIR", str, "")
+    RELAX_P2P_AUDIT_DIR = EnvProperty("RELAX_P2P_AUDIT_DIR", str, "")
+    RELAX_P2P_HOST_PROFILE = EnvProperty("RELAX_P2P_HOST_PROFILE", bool, False)
     RELAX_P2P_WEIGHT_CONSISTENCY_CHECK = EnvProperty("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", bool, False)
 
     # ------------- Routing Replay -------------

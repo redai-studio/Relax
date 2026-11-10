@@ -317,10 +317,14 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 
 
 def _needs_native_weight_guard(server_args: ServerArgs) -> bool:
+    from relax.distributed.checkpoint_service.backends.shard_p2p.remote.common import REMOTE_SHARD_LOADER
+
     from .weight_loader import EXPERT_IPC_LOADER, TP_IPC_LOADER
 
     return bool(
-        {EXPERT_IPC_LOADER, TP_IPC_LOADER}.intersection(getattr(server_args, "custom_weight_loader", None) or [])
+        {EXPERT_IPC_LOADER, TP_IPC_LOADER, REMOTE_SHARD_LOADER}.intersection(
+            getattr(server_args, "custom_weight_loader", None) or []
+        )
     )
 
 
@@ -334,12 +338,14 @@ def _patched_run_scheduler_process(*args, **kwargs):
     if server_args is None:
         raise RuntimeError("SGLang scheduler entry is missing its server arguments")
     if _needs_native_weight_guard(server_args):
-        from .weight_sync_guard import install_native_weight_guard
-
         # Every direct loader requires quarantine after an uncertain copy or
         # fence. Without the actual worker guard, later native offload could
         # remap storage that a failed IPC reader still holds.
-        install_native_weight_guard()
+        from relax.distributed.checkpoint_service.backends.shard_p2p.remote.common import REMOTE_SHARD_LOADER
+
+        from .weight_sync_guard import install_native_weight_guard
+
+        install_native_weight_guard(remote=REMOTE_SHARD_LOADER in (server_args.custom_weight_loader or []))
 
     from sglang.srt.managers.scheduler import run_scheduler_process
 
@@ -609,6 +615,69 @@ class SGLangEngine(RayActor):
             self.register_dcs()
         return {"url": self.get_url(), **self.get_pid_and_node_id()}
 
+    def _remote_weight_capabilities(self) -> dict:
+        """Challenge every actual scheduler before advertising remote
+        support."""
+        if not getattr(self.args, "use_shard_p2p_weight_sync", False) or self.args.rollout_external:
+            return {}
+        import json
+        import tempfile
+        import uuid
+        from pathlib import Path
+
+        import torch
+
+        from relax.distributed.checkpoint_service.backends.shard_p2p.remote.common import (
+            NATIVE_LEASE_PROTOCOL,
+            REMOTE_SHARD_LOADER,
+            serialize_control,
+        )
+
+        if not Envs.RELAX_WEIGHT_SYNC_SHARED_DIR:
+            return {}
+        directory = Path(tempfile.mkdtemp(prefix="weight-capability-", dir=Envs.RELAX_WEIGHT_SYNC_SHARED_DIR))
+        challenge = uuid.uuid4().hex
+        tp_size = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
+        command = dict(
+            op="capability", engine=str(self.rank), version=0, directory=str(directory), challenge=challenge
+        )
+        empty = torch.empty(0)
+        payload = dict(
+            serialized_named_tensors=[serialize_control(command, empty) for _ in range(tp_size)],
+            load_format=REMOTE_SHARD_LOADER,
+            flush_cache=False,
+            disable_draft_model=True,
+        )
+        result = self._make_request("update_weights_from_tensor", payload, timeout=120)
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise RuntimeError("Actual scheduler rejected the allocation capability challenge")
+        rows = [json.loads((directory / f"{rank}.json").read_text()) for rank in range(tp_size)]
+        if (
+            any(
+                row.get("engine") != str(self.rank)
+                or row.get("challenge") != challenge
+                or row.get("tp_rank") != rank
+                or row.get("tp_size") != tp_size
+                or row.get("native_weight_lease_protocol") != NATIVE_LEASE_PROTOCOL
+                for rank, row in enumerate(rows)
+            )
+            or len({row["weight_update_session"] for row in rows}) != 1
+        ):
+            raise RuntimeError("Actual schedulers disagree on remote weight capabilities")
+        # Preserve original scheduler predicates for both activation and fallback.
+        diagnostics = dict(
+            shard_capability_directory=str(directory), shard_capability_checks=[row["capability"] for row in rows]
+        )
+        logger.info("Native shard receiver capability: engine=%s tp=%s %s", self.rank, tp_size, diagnostics)
+        if not all(row.get("supported") is True for row in rows):
+            return diagnostics
+        return dict(
+            weight_update_session=rows[0]["weight_update_session"],
+            native_weight_lease_protocol=NATIVE_LEASE_PROTOCOL,
+            scheduler_identities=[(row["hostname"], row["pid"], row["tp_rank"]) for row in rows],
+            **diagnostics,
+        )
+
     def register_dcs(self):
         if self.node_rank == 0 and self.args.fully_async:
             # Resolve effective num_gpus_per_engine for this engine
@@ -624,6 +693,7 @@ class SGLangEngine(RayActor):
                     metadata={
                         "num_gpus_per_engine": effective_num_gpus,
                         "actor_id": ray.get_runtime_context().get_actor_id(),
+                        **self._remote_weight_capabilities(),
                     },
                 )
             )
@@ -2255,6 +2325,11 @@ def _compute_server_args(
                 for loader in (EXPERT_IPC_LOADER, TP_IPC_LOADER):
                     if loader not in loaders:
                         loaders.append(loader)
+        if getattr(args, "fully_async", False) and getattr(args, "use_shard_p2p_weight_sync", False):
+            from relax.distributed.checkpoint_service.backends.shard_p2p.remote.common import REMOTE_SHARD_LOADER
+
+            if REMOTE_SHARD_LOADER not in loaders:
+                loaders.append(REMOTE_SHARD_LOADER)
         kwargs["custom_weight_loader"] = loaders
 
     if (

@@ -302,6 +302,9 @@ class DeviceDirectBackend(CommBackend):
                     info.get("port") if isinstance(info, dict) else None,
                     meta.get("num_gpus_per_engine"),
                     meta.get("actor_id"),
+                    meta.get("weight_update_session"),
+                    meta.get("native_weight_lease_protocol"),
+                    tuple(tuple(row) for row in meta.get("scheduler_identities", [])),
                 )
             )
         return frozenset(sig)
@@ -704,6 +707,56 @@ class DeviceDirectBackend(CommBackend):
         Sequence: pause rollout generation, flush caches, gather and broadcast
         model parameters (non-expert then expert), then resume generation.
         """
+        from .shard_p2p.remote.common import enabled as p2p_enabled
+
+        if (
+            p2p_enabled(self.args)
+            and self.weight_version == 0
+            and not actor_fwd_only
+            and not getattr(self, "_p2p_reference", False)
+        ):
+            from .shard_p2p.remote.moe_qualification import qualify_before_native_reference
+
+            self._p2p_selected = qualify_before_native_reference(self, get_gloo_group())
+            self._p2p_requested = p2p_enabled(self.args)
+            if p2p_enabled(self.args) and not self._p2p_selected:
+                logger.info("Using native Gather/broadcast for the configured topology or receiver capabilities")
+
+        if (
+            p2p_enabled(self.args)
+            and not actor_fwd_only
+            and not getattr(self, "_p2p_reference", False)
+            and not getattr(self, "_p2p_requested", False)
+        ):
+            raise RuntimeError("P2P must be selected before the initial rollout synchronization")
+
+        if (
+            p2p_enabled(self.args)
+            and getattr(self, "_p2p_selected", False)
+            and not actor_fwd_only
+            and not getattr(self, "_p2p_reference", False)
+        ):
+            if not hasattr(self, "_p2p_sender"):
+                if self.weight_version != 0:
+                    raise RuntimeError("P2P must be selected before the initial rollout synchronization")
+                # Establish an exact same-snapshot native-loader reference once.
+                # P2P prepare captures it before any writes; subsequent syncs use only P2P.
+                from .shard_p2p.remote.loader_probe import NativeExportCatalog
+
+                catalog = NativeExportCatalog(self.weight_version + 1)
+                self._native_export_catalog = catalog
+                self._p2p_reference = True
+                try:
+                    self.update_weights_for_rollout(rollout_only, actor_fwd_only)
+                    catalog.complete(self.weight_version)
+                finally:
+                    self._p2p_reference = False
+                    self._native_export_catalog = None
+                from .shard_p2p.remote.moe import MoeP2P
+
+                self._p2p_sender = MoeP2P(self, reference_catalog=catalog)
+            self._p2p_sender.update()
+            return
         self.weight_version += 1
 
         if self._use_bridge:
@@ -1193,6 +1246,9 @@ class DeviceDirectBackend(CommBackend):
         updates complete.
         """
 
+        catalog = getattr(self, "_native_export_catalog", None)
+        if catalog is not None:
+            catalog.record(self.weight_version, converted_named_tensors)
         while not ray.get(self.lock.acquire.remote()):
             time.sleep(0.1)
         completed = False
