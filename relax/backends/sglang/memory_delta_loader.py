@@ -169,7 +169,10 @@ def apply_sparse(model: Any, routes: list[CopyRoute], metadata: dict, payload: b
         for route in routes:
             parameter = parameters[route.parameter]
             left, right = np.searchsorted(
-                positions_cpu, [route.source_start, route.source_start + route.elements]
+                positions_cpu,
+                # Python integer keys promote the entire int32 search array to
+                # int64 on each route. Preserve its dtype for binary searches.
+                np.asarray([route.source_start, route.source_start + route.elements], dtype=positions_cpu.dtype),
             ).tolist()
             if left != right:
                 indices = positions[left:right].to(torch.int64) - route.source_start + route.target_start
