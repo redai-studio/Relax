@@ -52,6 +52,21 @@ def runtime_identity() -> dict:
             )
             if name in os.environ
         },
+        "transport_environment": {
+            name: os.environ.get(name)
+            for name in (
+                "NCCL_NET",
+                "NCCL_IB_DISABLE",
+                "NCCL_NET_PLUGIN",
+                "NCCL_SOCKET_IFNAME",
+                "NCCL_SOCKET_NTHREADS",
+                "NCCL_NSOCKS_PERTHREAD",
+                "NCCL_P2P_DISABLE",
+                "NCCL_SHM_DISABLE",
+                "NCCL_DEBUG",
+                "NCCL_DEBUG_SUBSYS",
+            )
+        },
     }
     torch = sys.modules.get("torch")
     if torch is not None and torch.cuda.is_initialized():

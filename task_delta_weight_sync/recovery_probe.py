@@ -17,6 +17,18 @@ class InjectedRecoveryFailure(RuntimeError):
     pass
 
 
+def pause_schedulers(engines: Any) -> None:
+    """Pause actual scheduler execution, rather than only aborting requests."""
+    import ray
+
+    # SGLang's empty pause request defaults to mode=abort. That pauses the
+    # tokenizer but deliberately never sends a pause command to schedulers.
+    ray.get(
+        [engine._make_request.remote("pause_generation", {"mode": "in_place"}, timeout=30) for engine in engines],
+        timeout=40,
+    )
+
+
 def scheduler_state() -> dict:
     """Inspect the real scheduler frame executing this test-only request."""
     frame = inspect.currentframe()
@@ -278,9 +290,7 @@ def install(args: Any) -> None:
                 failure_path=directory / f"prepared-native-failure-rank-{rank}.json",
                 quarantine=(lambda: UpdateWeightFromMemory._close_generation(self, manager)) if rank == 0 else None,
             )
-            root_action(
-                lambda: ray.get([engine.pause_generation.remote(timeout=30) for engine in engines], timeout=40)
-            )
+            root_action(lambda: pause_schedulers(engines))
             root_action(lambda: audit("arm_failure", "failure-armed"))
             root_action(lambda: audit("complement", "failure-complement"))
             versions = (self.version, {key: encoder.version for key, encoder in self.encoders.items()})

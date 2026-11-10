@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Isolated synchronous RL validation: Qwen3.5-35B-A3B: eight training GPUs and four TP2 engines on separate nodes.
 # Launch through scripts/entrypoint/ray-job.sh with MODEL_DIR, DATA_DIR, SAVE_DIR.
-# Native NCCL validation first; sharded TCP/delta requires its separately validated implementation.
+# Compare against NCCL's Socket transport; sharded TCP/delta needs separate validation.
 # No ordinary training/optimizer checkpoint is saved in this bounded validation.
 
 set -euo pipefail
@@ -49,6 +49,10 @@ overrides = {
     # Trial allocations cannot rely on NVLS multicast support merely
     # because nvidia-smi reports NVLink connectivity.
     "NCCL_NVLS_ENABLE": "0",
+    # The acceptance control is NCCL over TCP. Keep intra-node P2P/SHM enabled.
+    "NCCL_NET": "Socket",
+    "NCCL_IB_DISABLE": "1",
+    "NCCL_DEBUG_SUBSYS": "INIT,NET",
     "WANDB_DIR": str(root / "logs"), "CLEARML_CACHE_DIR": str(root / "cache" / "clearml"),
     "ETTR_LOG_FILE": str(root / "logs" / "ettr.jsonl"),
     "ETTR_TRACE_LOG_DIR": str(root / "logs" / "ettr"),
@@ -168,7 +172,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} \
    --actor-num-gpus-per-node 8 \
    --rollout-num-gpus 8 \
    --num-gpus-per-node 8 \
-   --train-env-vars '{"NCCL_NVLS_ENABLE":"0"}' \
+   --train-env-vars '{"NCCL_NVLS_ENABLE":"0","NCCL_DEBUG":"INFO"}' \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    "${MODEL_ARGS[@]}" \

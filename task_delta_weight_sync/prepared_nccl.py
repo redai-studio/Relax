@@ -178,12 +178,13 @@ def run(self: Any, directory: Path) -> None:
 
     from relax.distributed.weight_sync.provenance import runtime_identity
     from relax.distributed.weight_sync.store import atomic_write
+    from task_delta_weight_sync.recovery_probe import pause_schedulers
 
     engines, native, plan = self._ab_engines, self._ab_native, self._ab_wire_plan
     _, totals = plan_capacity(plan)
     if sum(totals.values()) != 70214365792:
         raise ValueError("Prepared replay differs from the actual 35B native tensor stream")
-    ray.get([engine.pause_generation.remote(timeout=30) for engine in engines], timeout=40)
+    pause_schedulers(engines)
 
     def dispatch(command, round_no=None):
         control = dict(
