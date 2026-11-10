@@ -137,17 +137,16 @@ jobs:
 
       - name: Verify async actor gradients
         if: matrix.case == 'Qwen3.5-4B-4xgpu-async'
-        env:
-          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
         run: |
-          python3 - "$ARTIFACT_DIR/training.log" <<'PY'
+          docker exec -i "$CI_CONTAINER_NAME" python3 - /artifacts/training.log <<'PY'
           import math
           import re
           import sys
 
+          ansi_color = re.compile(r"\x1b\[[0-9;]*m")
           metric = re.compile(r"\bstep \d+: \{[^\n]*'train/grad_norm':\s*([^,\s}]+)")
           with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
-              norms = [float(match[1]) for line in log if (match := metric.search(line))]
+              norms = [float(match[1]) for line in log if (match := metric.search(ansi_color.sub("", line)))]
           nonzero = [norm for norm in norms if math.isfinite(norm) and norm > 0]
           if not nonzero:
               sys.exit(f"Expected a finite, nonzero actor gradient norm; found {len(norms)} actor step metrics")
