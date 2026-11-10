@@ -65,10 +65,24 @@ def validate_args(args: Namespace) -> None:
             "splits the very sequence chunkflow caches in its per-layer StateStore. "
             "Remove one of the two."
         )
+    if getattr(args, "num_distributed_optimizer_instances", 1) != 1:
+        raise ValueError(
+            "--use-chunkflow requires --num-distributed-optimizer-instances 1 for gradient synchronization"
+        )
     if not getattr(args, "calculate_per_token_loss", False):
         raise ValueError(
             "--use-chunkflow requires --calculate-per-token-loss: sample-mean loss would treat "
             "each chunk as a separate sample and change the training objective."
+        )
+    from relax.algorithms import ALGORITHM_SPECS
+
+    algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
+    if getattr(args, "use_opsm", False) or (
+        algorithm is not None and (algorithm.kl_level == "sequence" or algorithm.needs_full_log_probs)
+    ):
+        raise ValueError(
+            "--use-chunkflow does not support sequence-level objectives (GSPO/OPSM): "
+            "chunk-local log probabilities cannot replace a full-response reduction."
         )
     if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
         raise ValueError(

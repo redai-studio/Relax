@@ -10,7 +10,7 @@ from typing import Iterator, List, Optional, Union
 
 import torch
 from megatron.core import parallel_state
-from megatron.core.pipeline_parallel.schedules import backward_step
+from megatron.core.pipeline_parallel.schedules import backward_step, check_first_val_step, forward_step
 from megatron.core.utils import get_model_config
 
 from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, require_runtime
@@ -97,6 +97,22 @@ def _num_microbatches(num_microbatches) -> int:
     return int(num_microbatches)
 
 
+def _no_loss_step_func(forward_step_func):
+    def step(data_iterator, model):
+        output, _ = forward_step_func(data_iterator, model)
+        return output, None
+
+    return step
+
+
+def _start_grad_sync(model, config) -> None:
+    # All chunk backwards run under no_sync, so DDP hooks cannot launch reduction.
+    if getattr(config, "grad_sync_func", None) is not None:
+        config.grad_sync_func(model.parameters())
+    elif getattr(getattr(model, "ddp_config", None), "overlap_grad_reduce", False):
+        model.start_grad_sync()
+
+
 def chunkflow_forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -111,7 +127,7 @@ def chunkflow_forward_backward_no_pipelining(
     first_val_step: Optional[bool] = None,
     **kwargs,
 ):
-    del seq_length, micro_batch_size, decoder_seq_length, collect_non_loss_data, first_val_step
+    del seq_length, micro_batch_size, decoder_seq_length, collect_non_loss_data
     if isinstance(model, list):
         assert len(model) == 1, "chunkflow schedule requires a single model chunk"
         model = model[0]
@@ -135,10 +151,12 @@ def chunkflow_forward_backward_no_pipelining(
 
     forward_data_store: list = []
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    fp_step_func = _no_loss_step_func(forward_step_func)
+    first_forward = True
 
     _check_ep_schedule((num_mb, 1), args, layout=True)
     with no_sync_func():
-        for _ in range(num_mb):
+        for mb_idx in range(num_mb):
             parent = _next_parent(data_iterator, args)
             chunks, units = _plan(parent, chunk_size, policy)
             ops = gen_unit_ops(units, chunks, keep_last_k)
@@ -159,18 +177,31 @@ def chunkflow_forward_backward_no_pipelining(
                 batch["packed_seq_params"].__setattr__(UNIT_ATTR, unit)
                 batch["packed_seq_params"].__setattr__(RECOMPUTE_ATTR, kind == "Fr")
                 with torch.no_grad() if kind == "Fp" else contextlib.nullcontext():
-                    output, loss_callback = forward_step_func(iter([(batch, {})]), model)
+                    loss, num_tokens = forward_step(
+                        fp_step_func if kind == "Fp" else forward_step_func,
+                        iter([(batch, {})]),
+                        model,
+                        1,
+                        None,
+                        [] if kind == "Fp" else forward_data_store,
+                        config,
+                        cp_group_size=1,
+                        is_first_microbatch=check_first_val_step(first_val_step, forward_only, first_forward),
+                        current_microbatch=mb_idx,
+                        is_last_stage=True,
+                    )
+                first_forward = False
                 if kind == "Fp":
-                    del output, loss_callback
+                    del loss
                     continue
 
-                loss, num_tokens, log = loss_callback(output)
                 total_num_tokens += num_tokens
-                forward_data_store.append(log)
                 pending[unit_id] = loss
 
             runtime.assert_empty("chunkflow PP=1 micro-batch")
 
+    if not forward_only:
+        _start_grad_sync(model, config)
     if getattr(config, "finalize_model_grads_func", None) is not None and not forward_only:
         from megatron.core.pipeline_parallel.schedules import ProcessGroupCollection
 

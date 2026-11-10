@@ -419,6 +419,8 @@ def test_single_stage_prepacked_step_preserves_scaled_gradients(monkeypatch, kee
     pytest.importorskip("megatron.core")
     import torch
     from megatron.core.pipeline_parallel.schedules import backward_step
+    from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+    from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.training import global_vars
 
     from examples.chunkflow import schedules
@@ -432,13 +434,10 @@ def test_single_stage_prepacked_step_preserves_scaled_gradients(monkeypatch, kee
         qkv_format="thd",
         allgather_cp=False,
     )
-    config = SimpleNamespace(
-        no_sync_func=None,
-        finalize_model_grads_func=None,
-        grad_scale_func=lambda loss: loss * loss_scale,
-        timers=None,
-        deallocate_pipeline_outputs=False,
+    config = TransformerConfig(
+        num_layers=1, hidden_size=4, num_attention_heads=1, calculate_per_token_loss=True, num_moe_experts=2
     )
+    config.grad_scale_func = lambda loss: loss * loss_scale
     tokens = torch.arange(256).view(1, -1)
     parent = PrepackedBatch(
         tokens=tokens,
@@ -447,14 +446,20 @@ def test_single_stage_prepacked_step_preserves_scaled_gradients(monkeypatch, kee
         packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=[0, 256]),
     )
     weight = torch.nn.Parameter(torch.tensor(0.25))
+    aux_weight = torch.nn.Parameter(torch.tensor(0.5))
     reference = torch.nn.Parameter(weight.detach().clone())
-    model = SimpleNamespace(config=config, chunkflow_runtime=ChunkflowRuntime(128))
+    model = torch.nn.Module()
+    model.config = config
+    model.chunkflow_runtime = ChunkflowRuntime(128)
+    model.set_input_tensor = lambda tensors: None
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
     backward_step(None, (reference * tokens.float()).square().sum(), None, config)
 
     def forward(iterator, model):
         batch, _ = next(iterator)
         output = (weight * batch["tokens"].float()).square()
-        return output, lambda output: (output.sum(), torch.tensor(output.numel()), {})
+        output = MoEAuxLossAutoScaler.apply(output, aux_weight * 3 * output.numel())
+        return output, lambda output: (output.sum(), torch.tensor(output.numel()), {"tokens": output.numel()})
 
     monkeypatch.setattr(global_vars, "get_args", lambda: args)
     monkeypatch.setattr(schedules, "get_model_config", lambda model: model.config)
@@ -462,7 +467,7 @@ def test_single_stage_prepacked_step_preserves_scaled_gradients(monkeypatch, kee
     monkeypatch.setattr(torch, "zeros", lambda *a, **kw: zeros(*a, **dict(kw, device="cpu")))
     # The async prepack iterator exposes __next__, not DataIterator.get_next.
     assert schedules._next_parent(iter([(parent, {})]), args) is parent
-    schedules.chunkflow_forward_backward_no_pipelining(
+    logs = schedules.chunkflow_forward_backward_no_pipelining(
         forward_step_func=forward,
         data_iterator=iter([(parent, {})]),
         model=model,
@@ -471,6 +476,8 @@ def test_single_stage_prepacked_step_preserves_scaled_gradients(monkeypatch, kee
         micro_batch_size=1,
     )
     torch.testing.assert_close(weight.grad, reference.grad)
+    torch.testing.assert_close(aux_weight.grad / loss_scale, torch.tensor(3.0 * tokens.numel()))
+    assert sum(log["tokens"] for log in logs) == tokens.numel()
     # Optimizer unscale must leave the ordinary full-batch gradient and update.
     expected = 2 * reference.detach() * tokens.float().square().sum()
     torch.testing.assert_close(weight.grad / loss_scale, expected)

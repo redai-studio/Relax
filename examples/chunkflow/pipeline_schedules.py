@@ -56,18 +56,6 @@ def _check_tensor_shapes(tensors, expected) -> None:
         raise RuntimeError(f"ChunkFlow planned P2P shapes {expected} do not match tensor shapes {shapes}")
 
 
-def _no_loss_step_func(forward_step_func):
-
-    def no_loss(output_tensor):
-        return output_tensor.reshape(-1)[0] * 0.0, torch.tensor(0, dtype=torch.int), {}
-
-    def step(data_iterator, model):
-        output_tensor, _ = forward_step_func(data_iterator, model)
-        return output_tensor, no_loss
-
-    return step
-
-
 def chunkflow_forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -101,7 +89,14 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
 
     from megatron.training.global_vars import get_args
 
-    from examples.chunkflow.schedules import _check_ep_schedule, _next_parent, _num_microbatches, _plan
+    from examples.chunkflow.schedules import (
+        _check_ep_schedule,
+        _next_parent,
+        _no_loss_step_func,
+        _num_microbatches,
+        _plan,
+        _start_grad_sync,
+    )
 
     args = get_args()
     chunk_size = int(args.chunkflow_chunk_size)
@@ -357,8 +352,7 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 )
             runtime.assert_empty(f"chunkflow PP={p2p_communicator.total_stages} parent window {mb_start}")
 
-    if config.grad_sync_func is not None:
-        config.grad_sync_func(model.parameters())
+    _start_grad_sync(model, config)
 
     if config.finalize_model_grads_func is not None:
         finish_embedding_wgrad_compute(config, embedding_module, is_last, tp_group)

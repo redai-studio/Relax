@@ -132,6 +132,49 @@ def _assert_native_te_matches_cuda_reference(bounds_q, bounds_k, heads, kv_heads
         assert (actual.float() - wanted.float()).norm() / wanted.float().norm() < 0.03
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="native DDP gradient buffers require CUDA/NCCL")
+def test_native_ddp_sync_after_chunk_backwards():
+    _run_native_te_check("_assert_native_ddp_sync_after_chunk_backwards")
+
+
+def _assert_native_ddp_sync_after_chunk_backwards():
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.tensor_parallel.layers import set_defaults_if_not_set_tensor_model_parallel_attributes
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    from examples.chunkflow.schedules import _start_grad_sync
+
+    # Initialize native hook counts before testing the post-warmup no_sync path.
+    for distributed_optimizer, overlap, aligned in (
+        (False, False, False),
+        (False, True, False),
+        (True, True, False),
+        (True, True, True),
+    ):
+        config = TransformerConfig(num_layers=1, hidden_size=4, num_attention_heads=1)
+        linear = torch.nn.Linear(4, 4, bias=False, device="cuda")
+        for parameter in linear.parameters():
+            set_defaults_if_not_set_tensor_model_parallel_attributes(parameter)
+        model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(
+                use_distributed_optimizer=distributed_optimizer, overlap_grad_reduce=overlap
+            ),
+            linear,
+        )
+        config.grad_sync_func = model.start_grad_sync if aligned else None
+        model(torch.ones((2, 4), device="cuda")).sum().backward()
+        model.finish_grad_sync()
+        for step in (1, 2):
+            model.zero_grad_buffer()
+            with model.no_sync():
+                for chunk in (1, 3):
+                    model(torch.full((2, 4), float(step * chunk), device="cuda")).sum().backward()
+            _start_grad_sync(model, config)
+            model.finish_grad_sync()
+            torch.testing.assert_close(linear.weight.main_grad, torch.full_like(linear.weight, 8 * step))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and differentiable FLA state kernels")
 @pytest.mark.parametrize("mode", ["fr", "last", "selective", "selective_last"])
 def test_gdn_fla_state_outputs_and_gradients_match_full_sequence(kernels, mode):
@@ -420,6 +463,7 @@ def test_chunk_metadata_cuda_uses_current_stream_without_host_sync():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires the CUDA PP1 executor and native SFT loss")
 def test_pp1_native_loss_callback_preserves_head_gradients_and_token_count(monkeypatch):
+    from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.training import global_vars
 
     from examples.chunkflow.schedules import chunkflow_forward_backward_no_pipelining
@@ -446,11 +490,12 @@ def test_pp1_native_loss_callback_preserves_head_gradients_and_token_count(monke
         parent = PrepackedBatch(_parent([301, 11, 13], device="cuda"))
         model = torch.nn.Sequential(torch.nn.Embedding(384, 16), torch.nn.Linear(16, 384, bias=False)).cuda()
         model.chunkflow_runtime = ChunkflowRuntime(128)
+        model.set_input_tensor = lambda tensors: None
         finalized = []
-        model.config = SimpleNamespace(
-            calculate_per_token_loss=True,
-            finalize_model_grads_func=lambda models, count, **kwargs: finalized.append(count.clone()),
+        model.config = TransformerConfig(
+            num_layers=1, hidden_size=16, num_attention_heads=1, calculate_per_token_loss=True
         )
+        model.config.finalize_model_grads_func = lambda models, count, **kwargs: finalized.append(count.clone())
         targets = torch.cat([torch.cat((tokens[1:], tokens.new_zeros(1))) for tokens in parent["unconcat_tokens"]])
         logits = model(parent["tokens"]).squeeze(0) / args.rollout_temperature
         expected = (
