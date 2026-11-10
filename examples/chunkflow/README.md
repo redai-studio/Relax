@@ -95,7 +95,7 @@ python3 examples/chunkflow/setup.py
 | `--calculate-per-token-loss`                   | 按 token 统计，避免切块改变样本权重                               |
 | `--no-rope-fusion`                             | 使用支持分块位置偏移的 RoPE 路径                                  |
 | `--attention-dropout 0.0 --hidden-dropout 0.0` | 当前适配要求关闭 dropout，避免分块与重放的随机掩码问题            |
-| Megatron 重计算兼容性                          | 禁用 full-layer / selective `core_attn`；GDN/QSA 沿用对应示例设置 |
+| Megatron 重计算兼容性                          | 禁用 full-layer / selective `core_attn`|
 
 ### 重要参数
 
