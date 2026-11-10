@@ -55,6 +55,8 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
 def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     monkeypatch, sglang_engine_module, routing_replay, parent_alive
 ):
+    from relax.backends.sglang import control_polling_patch
+
     module = sglang_engine_module
     events = []
     http_server = ModuleType("sglang.srt.entrypoints.http_server")
@@ -73,16 +75,24 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
 
     monkeypatch.setattr(module.os, "getppid", getppid)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
-    server_args = SimpleNamespace()
+    interval = 0.01 if routing_replay else 1.0
+    monkeypatch.setattr(module.Envs, "SGLANG_CONTROL_POLL_INTERVAL", interval, raising=False)
+    patch_poll = Mock(side_effect=lambda *_args, **_kwargs: events.append("poll"))
+    monkeypatch.setattr(control_polling_patch, "patch_control_poll_interval", patch_poll)
+    server_args = SimpleNamespace(tokenizer_worker_num=1)
     module._launch_server_with_patches(server_args, 123)
 
     if parent_alive:
-        assert events == ["guard", "parent_check", "launch"]
+        assert events == (["poll"] if routing_replay else []) + ["guard", "parent_check", "launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
         http_server.launch_server.assert_called_once_with(server_args, **kwargs)
     else:
         assert events == ["guard", "parent_check"]
         http_server.launch_server.assert_not_called()
+    if interval != 1.0:
+        patch_poll.assert_called_once_with(interval, tokenizer_worker_num=1)
+    else:
+        patch_poll.assert_not_called()
 
 
 @pytest.fixture
