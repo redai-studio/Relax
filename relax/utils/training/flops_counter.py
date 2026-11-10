@@ -21,6 +21,7 @@ _DEVICE_FLOPS = {
     "B200": 2.25e15,  # gitleaks:allow
     "GB300": 2.5e15,  # gitleaks:allow
     "B300": 2.25e15,  # gitleaks:allow
+    "H20G": 2.25e15,  # Blackwell Ultra compatibility name; must not match H20.
     "MI300X": 1307e12,
     "MI350X": 2300e12,
     "MI355X": 2500e12,
