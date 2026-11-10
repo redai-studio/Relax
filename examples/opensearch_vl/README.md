@@ -66,6 +66,6 @@ JSON、JSONL、逐题轨迹、日志、数据、缓存和权重保存在仓库�
 
 ## SwanLab
 
-可在运行环境安装 `swanlab==0.7.16` 并完成认证，然后设置 `ENABLE_SWANLAB=1`、`SWANLAB_MODE=cloud`、`SWANLAB_PROJ_NAME`、`SWANLAB_WORKSPACE` 和 `SWANLAB_LOG_DIR`。训练保留 ClearML，并通过 TensorBoard 同步标量。认证文件留在运行环境。
+可在运行环境安装 `swanlab==0.10.4` 并完成认证，然后设置 `ENABLE_SWANLAB=1`、`SWANLAB_MODE=online`、`SWANLAB_PROJ_NAME`、`SWANLAB_WORKSPACE` 和 `SWANLAB_LOG_DIR`。训练保留 ClearML，并通过 TensorBoard 同步标量。认证文件留在运行环境。
 
-同步 hook 关闭自动环境、依赖、硬件及终端日志采集，只同步标量和指定来源字段。实验文档分别记录训练与评测链接；实际裁判型号与协议也需写入文档。
+同步 hook 关闭自动Git、环境、依赖、硬件及终端日志采集，只同步标量和指定来源字段。实验文档分别记录训练与评测链接；实际裁判型号与协议也需写入文档。

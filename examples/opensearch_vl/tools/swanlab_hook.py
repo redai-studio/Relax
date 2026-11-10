@@ -6,20 +6,42 @@ writer."""
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 def privacy_settings():
     import swanlab
 
     return swanlab.Settings(
-        metadata_collect=False,
-        collect_hardware=False,
-        collect_runtime=False,
-        hardware_monitor=False,
-        requirements_collect=False,
-        conda_collect=False,
-        log_proxy_type="none",
+        interactive=False,
+        on_online_error="raise",
+        probe=swanlab.Settings.Probe(
+            hardware=False,
+            runtime=False,
+            requirements=False,
+            conda=False,
+            git=False,
+            swanlab=False,
+            monitor=False,
+        ),
+        terminal=swanlab.Settings.Terminal(proxy_type="none"),
     )
+
+
+def check_receipts(directory: Path, experiment_prefix: str) -> None:
+    expected_path = f"/@{os.environ['SWANLAB_WORKSPACE']}/{os.environ['SWANLAB_PROJ_NAME']}/runs/"
+    for path in directory.glob("*.json"):
+        if not path.name.startswith(experiment_prefix):
+            continue
+        url = urlsplit(json.loads(path.read_text())["url"])
+        if (
+            url.scheme in ("https", "http")
+            and url.netloc
+            and url.path.startswith(expected_path)
+            and len(url.path) > len(expected_path)
+        ):
+            return
+    raise RuntimeError(f"SwanLab cloud training receipt missing for {experiment_prefix}")
 
 
 def install() -> None:
@@ -44,8 +66,18 @@ def install() -> None:
         )
         directory = Path(os.environ["SWANLAB_LOG_DIR"])
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / (os.environ["SWANLAB_EXP_NAME"] + ".json")).write_text(
-            json.dumps({"url": swanlab.get_run().public.cloud.experiment_url})
-        )
+        url = swanlab.get_run().url
+        if not url:
+            raise RuntimeError("SwanLab cloud run URL missing")
+        (directory / (os.environ["SWANLAB_EXP_NAME"] + ".json")).write_text(json.dumps({"url": url}))
 
     SummaryWriter.__init__ = initialize
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check-receipts", required=True, help="Training experiment name prefix")
+    args = parser.parse_args()
+    check_receipts(Path(os.environ["SWANLAB_LOG_DIR"]), args.check_receipts)
