@@ -126,9 +126,7 @@ class InferenceRecoveryExecutor:
                 await actor.set_barriers(rollout=RolloutOffloadBarrier(manager, logger=logger))
         if not ray.get(state.begin_sync.remote(maintenance=True)):
             raise RuntimeError("Cannot reserve replacement weight synchronization")
-        if getattr(self.config, "hybrid", False):
-            await actor.handle.recovery_update_weights_hybrid.remote()
-        elif self.config.fully_async:
+        if self.config.fully_async or getattr(self.config, "hybrid", False):
             await actor.handle.reset_inference_transport.remote(str(role))
             sends = [
                 actor.handle.update_weights_fully_async.remote(

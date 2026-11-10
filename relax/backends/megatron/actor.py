@@ -3135,35 +3135,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.onload_kv.remote())
             ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
-    def recovery_update_weights_hybrid(self) -> None:
-        """Reconnect the tensor updater and push the current Actor snapshot."""
-        if (
-            self.role != "actor"
-            or self._inference_recovery is None
-            or not self.args.hybrid
-            or self.args.offload_train
-            or self.args.offload_rollout
-            or not isinstance(self.weight_updater, UpdateWeightFromTensor)
-        ):
-            raise RuntimeError("Hybrid recovery requires the resident Actor and its tensor updater")
-        updater = self.weight_updater
-        if updater.lora_enabled and updater.lora_adapter_mode:
-            raise NotImplementedError("Hybrid recovery does not support LoRA adapter mode")
-        weights = self.weights_backuper.get("actor")
-        if not weights:
-            raise RuntimeError("Hybrid recovery requires the current Actor snapshot")
-        engines, lock, _, counts, offsets = ray.get(self.rollout_manager.get_rollout_engines_and_lock.remote())
-        if updater._model_update_groups is not None:
-            dist.destroy_process_group(updater._model_update_groups)
-            updater._model_update_groups = None
-        updater._ipc_engine = None
-        updater.connect_rollout_engines(engines, lock, engine_gpu_counts=counts, engine_gpu_offsets=offsets)
-        with self._train_state_offloader.disable_during_update():
-            updater.update_weights()
-        dist.barrier(group=get_gloo_group())
-        if dist.get_rank(group=get_gloo_group()) == 0:
-            ray.get(self.rollout_manager.clear_num_new_engines.remote())
-
     @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
