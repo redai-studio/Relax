@@ -3,9 +3,7 @@
 """Regress the Gemma4 dense fallback error using pinned official configs."""
 
 import copy
-import json
 import math
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +13,32 @@ from relax.utils.training.gemma4_flops import _causal_pairs, estimate_gemma4_flo
 
 
 def _config(name="26b"):
-    return json.loads((Path(__file__).parent / "fixtures" / f"gemma4_{name}_config.json").read_text())
+    # Official text shapes: google/gemma-4-{26B-A4B,31B}-it.
+    # Revisions: 4d7ae4984b7db7de8f8457170b3f1a419ee76d52 / 842da3794eaa0b77d5f08bae87a17459d91ff475.
+    moe = name == "26b"
+    hidden, layers, heads, kv, global_kv, intermediate = (
+        (2816, 30, 16, 8, 2, 2112) if moe else (5376, 60, 32, 16, 4, 21504)
+    )
+    text = dict(
+        model_type="gemma4_text",
+        hidden_size=hidden,
+        vocab_size=262144,
+        num_hidden_layers=layers,
+        num_attention_heads=heads,
+        num_key_value_heads=kv,
+        num_global_key_value_heads=global_kv,
+        head_dim=256,
+        global_head_dim=512,
+        intermediate_size=intermediate,
+        enable_moe_block=moe,
+        attention_k_eq_v=True,
+        layer_types=["sliding_attention"] * 5 + ["full_attention"],
+        sliding_window=1024,
+    )
+    text["layer_types"] *= layers // 6
+    if moe:
+        text.update(num_experts=128, top_k_experts=8, moe_intermediate_size=704)
+    return {"model_type": "gemma4", "text_config": text}
 
 
 def _namespace(value):
