@@ -553,6 +553,15 @@ diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimi
 index 4192b0bb7..3a6fb539d 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -418,7 +418,7 @@
+ 
+                 # fp32 params.
+                 elif model_param.type() == 'torch.cuda.FloatTensor':
+-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
++                    shard_model_param = model_param.detach().view(-1)[param_range.start : param_range.end]
+                     model_fp32_params_this_group.append(model_param)
+                     shard_fp32_params_this_group.append(shard_model_param)
+                     tensor_parallel.copy_tensor_model_parallel_attributes(
 @@ -680,6 +680,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                  # TE FusedAdam will not accumulate step for empty param groups, so we need to
                  # align the step across param groups.
