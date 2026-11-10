@@ -375,6 +375,8 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_REPLAY_CAPTURE_ROLLOUTS = EnvProperty("RELAX_REPLAY_CAPTURE_ROLLOUTS", str, None)
 
     # ------------- SGLang Speculative Decoding & External Packages -----------
+    # Seconds between health/abort-pause checks; 1.0 keeps the native interval.
+    SGLANG_CONTROL_POLL_INTERVAL = EnvProperty("SGLANG_CONTROL_POLL_INTERVAL", float, 0.01)
     SGLANG_ENABLE_SPEC_V2 = EnvProperty("SGLANG_ENABLE_SPEC_V2", str, "")
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvProperty("SGLANG_EXTERNAL_MODEL_PACKAGE", str, None)
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvProperty("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", str, None)
