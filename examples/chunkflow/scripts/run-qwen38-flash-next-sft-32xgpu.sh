@@ -30,6 +30,7 @@ export RELAX_QWEN38_PLE_STREAMED=0
 export RELAX_QWEN38_PLE_FUSED_CONV=0
 # Preserve the checkpoint's large PLE tables on host memory, frozen for SFT.
 export QWEN38_PLE_CPU_OFFLOAD=1
+export RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1
 
 : "${MODEL_DIR:?Set MODEL_DIR to the directory containing Qwen3.8-Flash-Next}"
 : "${PROMPT_DATA:=${DATA_DIR:?Set DATA_DIR or PROMPT_DATA}/train.jsonl}"
@@ -44,11 +45,12 @@ CKPT_ARGS=(
 )
 
 SFT_ARGS=(
+    --seed 1234
     --loss-type sft
     --prompt-data "${PROMPT_DATA}"
     --input-key messages
     --num-rollout "${NUM_STEPS:-100}"
-    --global-batch-size 32
+    --global-batch-size 4
     --micro-batch-size 1
     --seq-length "${SEQ_LENGTH:-8192}"
     --use-dynamic-batch-size
@@ -60,14 +62,17 @@ CHUNKFLOW_ARGS=(
     --use-chunkflow
     --chunkflow-chunk-size "${CHUNK_SIZE:-4096}"
     --chunkflow-pack-policy staggered
-    --chunkflow-keep-last-k "${KEEP_LAST_K:-1}"
+    --chunkflow-keep-last-k "${KEEP_LAST_K:-0}"
+    --chunkflow-pipeline 4
     --custom-config-path examples/chunkflow/configs/qwen38.yaml
 )
 
 PERF_ARGS=(
+    --recompute-granularity selective
+    --recompute-modules moe
     --tensor-model-parallel-size 2
     --sequence-parallel
-    --pipeline-model-parallel-size 1
+    --pipeline-model-parallel-size 4
     --context-parallel-size 1
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1

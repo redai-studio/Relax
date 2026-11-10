@@ -23,7 +23,9 @@ python examples/chunkflow/setup.py --check
 
 MoE 示例
 
-两个示例都使用 8 张 GPU 进行纯文本 SFT，默认 TP=2、CP=1。Qwen3-4B 使用 PP=1、EP=1；Qwen3.6-35B-A3B 使用 PP=4、EP=2、ETP=1，并包含 GDN 状态适配。MoE 脚本设置 `--chunkflow-pipeline 4`，并向 worker 传递 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`，启用实验性的流水线执行器。
+两个示例都使用 8 张 GPU 进行纯文本 SFT，默认 TP=2、CP=1。Qwen3-4B 使用 PP=4、EP=1，global batch size 为 1；Qwen3.6-35B-A3B 使用 PP=4、EP=2、ETP=1，并包含 GDN 状态适配。两个脚本均设置 `--chunkflow-pipeline 4`，并向 worker 传递 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`，启用实验性的流水线执行器。
+
+进行 baseline 对比时，只从同一脚本中移除 `--use-chunkflow`。模型、数据、随机种子、并行布局、batch size、序列长度、精度和重计算配置均保持一致。若任一侧显存不足，应同时降低两侧的序列长度再对比。
 
 现有验证环境中，Qwen3.6 的 PP4/EP2 配方与原生整层重计算的短程 loss 接近，但固定权重下的梯度方向存在显著差异。该配方仍属实验性质；训练跑通和 loss 接近不代表 backward 已对齐。
 
@@ -51,7 +53,7 @@ MoE 示例使用原生 all-to-all 分发，关闭路由辅助损失，并通过 
 
 ## Qwen3.8-Flash-Next（QSA + GDN + PLE）
 
-实验性的 32 卡脚本使用 `${MODEL_DIR}/Qwen3.8-Flash-Next` 和相同格式的 `train.jsonl`，配置为 TP2/PP1/CP1、EP8/ETP1，并启用 sequence parallel。脚本保留 checkpoint 的 PLE 和 hyper-connection 结构，冻结 PLE 参数及硬选块的 indexer；PLE 大表使用原生 CPU offload，优化器也卸载到 CPU，主机内存需要同时容纳两者。32 卡是启动配置，不代表任意 32 卡机器都能装下模型。
+实验性的 32 卡脚本使用 `${MODEL_DIR}/Qwen3.8-Flash-Next` 和相同格式的 `train.jsonl`，配置为 TP2/PP4/CP1、EP8/ETP1、global batch size 4、原生 selective MoE 重计算，并启用 sequence parallel。脚本保留 checkpoint 的 PLE 和 hyper-connection 结构，冻结 PLE 参数及硬选块的 indexer；PLE 大表使用原生 CPU offload，优化器也卸载到 CPU，主机内存需要同时容纳两者。32 卡是启动配置，不代表任意 32 卡机器都能装下模型。
 
 ```bash
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
@@ -69,7 +71,9 @@ bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
 
 每次重放的参数梯度由原生 autograd 计算。历史 hidden states 的梯度累计到 `ChunkState`，在较早 chunk 执行 backward 时接回上游；`Fr` 复用这些缓存叶子。前缀重放会重复计算，也可能保留较多激活，而 selector 仍使用完整 parent 布局。这是兼容性实现，长上下文训练前需要实际测量开销。
 
-该适配器要求固定版本的原生 QSA 类、bitset 后端（`flex`，或小规模对照用的 `dense_masked`）、PP1/CP1、packed 纯文本、零 dropout，以及由 ChunkFlow 管理重计算。不支持 `id_sparse`、Stage-2 辅助损失、推理缓存、外部 mask/bias 和上述方法覆盖优化。CPU 数值测试使用仓库补丁中的原生 selector/attention 与 PLE 方法，并用小型对象替代构造依赖；它们不能代替 CUDA kernel、多卡通信或完整 Flash-Next 训练验证。
+32 卡 baseline 与 ChunkFlow 均已在 8K 上限、K0、原生稀疏 QSA 下完成 10 步。该验证使用 256 条长度筛选的 LongAlign 样本（渲染后 5,192～8,180 token），loss 平均相对差异为 0.57%，峰值 allocated 显存分别为 51.21 和 49.97 GiB，未证明加速。随后使用原始数据的 32K 实验因资源中断，尚未完成验证。启动脚本不筛选输入数据，超过配置长度上限的样本按现有策略跳过。
+
+该适配器要求固定版本的原生 QSA 类、bitset 后端（`flex`，或小规模对照用的 `dense_masked`）、CP1、packed 纯文本、零 dropout，原生 Megatron 重计算仅允许 selective `moe`。脚本使用实验性 PP4，默认 `KEEP_LAST_K=0`，关闭 ChunkFlow 自身重计算。不支持 `id_sparse`、Stage-2 辅助损失、推理缓存、外部 mask/bias 和上述方法覆盖优化。CPU 数值测试使用仓库补丁中的原生 selector/attention 与 PLE 方法，并用小型对象替代构造依赖；它们不能代替 CUDA kernel、多卡通信或完整 Flash-Next 训练验证。
 
 ## 接入其他训练脚本
 
@@ -116,7 +120,7 @@ PP 大于 1 使用实验性的非交错流水线执行器，还须设置 `RELAX_
 - 启动时会检查 `--calculate-per-token-loss`：将各 chunk 当成独立样本求均值会改变训练目标。ChunkFlow 也会拒绝同时启用 `--fully-async` 和 `--use-dynamic-batch-size`，因为固定执行计划无法消费 micro-batch 数量未知的流式迭代器；请关闭这两个选项之一。
 - 使用 dropout=0 并关闭 RoPE fusion。显式 MRoPE 位置路径目前仅支持纯文本 batch。
 - Attention 重计算使用 `--chunkflow-keep-last-k`。Megatron full-layer recompute 和 selective `core_attn` 重计算会在没有 ChunkFlow 重放标记的情况下重复写入缓存，因此会被拒绝。
-- 滑动窗口、非 vanilla softmax、QK clipping/logit 统计、外部 Attention mask/bias 和 Qwen3.5 optimized recipe 需要单独适配。QSA 和 PLE 使用上文受限的原生前缀适配器，即使启用了实验流水线也必须保持 PP1。
+- 滑动窗口、非 vanilla softmax、QK clipping/logit 统计、外部 Attention mask/bias 和 Qwen3.5 optimized recipe 需要单独适配。QSA 和 PLE 使用上文受限的原生前缀适配器，其前缀状态保留在各自的流水线 stage 内。PP4 已在长度筛选的 LongAlign 子集上通过 8K 上限、10 步对照；这不代表长上下文性能或梯度等价性已验证。
 - GDN 整层适配器精确匹配 Megatron `GatedDeltaNet`；子类需要显式注册。它需要支持初始/末状态梯度的算子及 Megatron `_forward_compute` 接口；须关闭预处理融合，不支持 deterministic 模式或 full-layer recompute。
 - MoE 辅助损失、容量限制和丢弃 token 的配置需单独验证，不能假设切块前后等价。
 - PP=1 暂不更新上游 PackingMetrics，性能对比应使用实际 step 耗时。

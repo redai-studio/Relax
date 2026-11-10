@@ -1,108 +1,100 @@
-# ChunkFlow example
+# ChunkFlow
 
 [中文](README.zh-CN.md) · [Full guide](../../docs/en/guide/chunkflow.md)
 
-ChunkFlow schedules sequence chunks through Megatron models and connects their history and gradients. Attention and GDN computation use the model's native implementations. This directory owns the implementation, argument definitions, integration patch, launch scripts, and tests.
+Split long sequences into chunks, reuse native Attention / GDN computation, and connect cross-chunk states and gradients. **Start with long-context, memory-constrained training; speedups depend on the model and configuration.**
 
-## Relax version
+## Measured benefits
 
-The supported source baseline is **`d548769b77f12e445e464f99d4332290a3e5bd3d`**, recorded in `relax.version`. Use that revision's training environment, including Megatron/Bridge, TE, and FLA. Python 3.10 or newer is required by Relax.
+These completed short runs are configuration-specific. Each pair shares data and training settings, differing only in the ChunkFlow switch and tracking name; Dense K1 additionally activates ChunkFlow recomputation. Times average steps 1–29, excluding step 0. Memory is the maximum across all steps and ranks. Speedup = Baseline / ChunkFlow; below 1 means slower. “—” means unverified, not an estimate.
 
-For a separate checkout at the pinned revision, copy this complete directory to its `examples/chunkflow/`. From the repository root:
+### Dense · Qwen3-4B
 
-```bash
-python examples/chunkflow/setup.py
-python examples/chunkflow/setup.py --check
-```
+**8 GPUs · TP2 / PP4 · GBS1 · LongAlign · 64K limit · chunk4096 · K1 · 30 steps**. No native recomputation. This historical K1 comparison does not establish K0 performance.
 
-The installer checks the pinned Relax sources and applies `relax.patch` to three core files. It accepts this example's descendant checkout when the core still matches the baseline, rejects incompatible edits, and can be rerun. Remove the patch with `python examples/chunkflow/setup.py --reverse`. No dependencies are installed automatically.
+| Method        | Mean train time | Mean step time | MFU | Training speedup | End-to-end speedup | Peak allocated / reserved | Allocated saving |
+| ------------- | --------------: | -------------: | --: | ---------------: | -----------------: | ------------------------: | ---------------: |
+| Baseline      |          3.89 s |              — |   — |            1.00× |                  — |         52.28 / 79.03 GiB |                — |
+| **ChunkFlow** |      **2.20 s** |              — |   — |        **1.76×** |                  — |     **21.01 / 22.58 GiB** |       **59.81%** |
 
-## Train Dense or MoE
+Mean relative loss difference: **0.51%**. This configuration improves time and memory; do not extrapolate to larger batches or K0.
 
-Provide these paths on the training nodes:
+### MoE · Qwen3.6-35B-A3B
 
-| Variable      | Contents                                                  |
-| ------------- | --------------------------------------------------------- |
-| `MODEL_DIR`   | `Qwen3-4B/` or `Qwen3.6-35B-A3B/` Hugging Face checkpoint |
-| `PROMPT_DATA` | JSONL data file, each row containing a `messages` list    |
+**8 GPUs · TP2 / PP4 / EP2 · GBS8 · LongAlign · 64K limit · chunk4096 · K0 · 30 steps**. Both arms use native selective `gdn moe` recomputation; ChunkFlow recomputation is off.
 
-For example, one data row is:
+| Method        | Mean train time | Mean step time | MFU | Training speedup | End-to-end speedup | Peak allocated / reserved | Allocated saving |
+| ------------- | --------------: | -------------: | --: | ---------------: | -----------------: | ------------------------: | ---------------: |
+| Baseline      |         15.99 s |              — |   — |            1.00× |                  — |         56.38 / 70.26 GiB |                — |
+| **ChunkFlow** |     **18.90 s** |              — |   — |        **0.85×** |                  — |     **37.79 / 40.58 GiB** |       **32.97%** |
 
-```json
-{"messages": [{"role": "user", "content": "What is 1 + 1?"}, {"role": "assistant", "content": "2"}]}
-```
+Mean relative loss difference: **0.39%**. This configuration saves **18.59 GiB**, at approximately **18.2%** more training time: a memory tradeoff, not a speedup.
 
-Use longer conversations to exercise multiple chunks. Both recipes are text-only SFT with eight GPUs, zero dropout, and ChunkFlow activation recomputation. The Dense recipe uses TP2/PP1/CP1. The MoE recipe uses TP2/PP4/CP1, EP2/ETP1, native all-to-all dispatch, no router auxiliary loss, and unfused GDN preprocessing. It also uses CPU optimizer offload. The MoE script sets `--chunkflow-pipeline 4` and forwards `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1` to enable the experimental pipeline executor.
+Use **allocated** for the primary memory comparison; reserved includes allocator caching. Close short-run losses do not establish gradient parity or long-term convergence.
 
-The available validation runtime showed close short-run losses for Qwen3.6 with PP4/EP2, but materially different fixed-weight gradient directions from native full-layer recomputation. This recipe remains experimental; successful training and close loss are not evidence of backward parity.
+## When to enable
 
-ChunkFlow requires `--calculate-per-token-loss` to keep normalization independent of chunk boundaries. It rejects `--fully-async` combined with `--use-dynamic-batch-size`, because its fixed execution plan cannot consume an unknown number of streaming micro-batches. The supplied recipes use per-token loss and synchronous training.
+| Scenario                                              | Recommendation                                                                           |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Long-context Dense, small batches, pipeline idle time | Benchmark it; the historical K1 configuration benefited                                  |
+| Long-context MoE with memory pressure                 | Try it if additional compute time is acceptable                                          |
+| Short sequences, ample memory, throughput first       | Leave off unless a matched comparison shows a benefit                                    |
+| QSA / PLE models                                      | Experimental: prefix replay repeats computation; savings and speedups are not guaranteed |
 
-After exporting `MODEL_DIR` and `PROMPT_DATA`, preview without Ray or GPUs:
+The current path requires **packed text, CP1, zero dropout, disabled RoPE fusion, and per-token loss**. PP4 requires experimental opt-in, already set by the recipes. CP>1, VPP, multimodal inputs, full-layer and selective `core_attn` recomputation are not directly supported. QSA only allows native selective `moe` recomputation.
+
+Qwen3.8-Flash-Next completed a 10-step, 8K-limit K0 comparison on a length-filtered subset: allocated memory decreased only 2.42%, with no observed speedup. The 32K comparison on original LongAlign remains incomplete; it does not establish long-context QSA performance.
+
+## Quick start
+
+Use the Relax revision in [relax.version](relax.version) and its training image. Recipes automatically apply the integration patch; they install no dependencies and save no checkpoints.
 
 ```bash
 export MODEL_DIR=/path/to/models
 export PROMPT_DATA=/path/to/LongAlign-10k/long.jsonl
-DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
-DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
-```
 
-On a dedicated eight-GPU node, choose one recipe and run it directly:
-
-```bash
+# Dense: ChunkFlow enabled; defaults to 64K / chunk4096 / K1
 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
-bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+
+# MoE: defaults to 64K / chunk4096 / K1; K0 disables ChunkFlow recomputation
+KEEP_LAST_K=0 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-The scripts validate the pinned Relax sources and install the integration patch automatically. They discover an existing Ray cluster with `auto` and reuse `scripts/entrypoint/ray-job.sh` with cluster cleanup disabled. Ensure that this cluster is idle and dedicated to the experiment. If no cluster exists, the standard `local.sh` starts one. That fresh-node entrypoint clears local processes, so use a dedicated training node. No manual `ray start` or Ray addresses are needed.
+Choose one recipe per run. Existing Ray clusters are discovered automatically; no address is needed. An eight-GPU node can launch directly. Input is JSONL with a `messages` column. Samples exceeding `SEQ_LENGTH` are skipped, without a prefiltered dataset or truncation. The MoE command does not enable native recomputation: to reproduce its table, add `--recompute-granularity selective` and `--recompute-modules gdn moe` to both arms.
 
-Explicit `RAY_ADDRESS` or `RAY_JOBS_ADDRESS` values remain optional overrides. An unreachable configured or detected cluster causes an error instead of restarting Ray locally. Start the next experiment after the previous one finishes. An external entrypoint that already set `RELAX_ENTRYPOINT_MODE` is reused. Submission blocks unless `RAY_NO_WAIT=1` is set. The repository is uploaded as the working directory by default, including this example and the applied patch.
+| Setting            | Purpose                                                                                               |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| `SEQ_LENGTH=65536` | Sequence limit, not a forced padded length                                                            |
+| `CHUNK_SIZE=4096`  | Tokens per chunk; smaller than actual long samples                                                    |
+| `KEEP_LAST_K=0`    | Retain all chunk activations; `1` retains only the last and recomputes earlier chunks before backward |
+| `NUM_STEPS=10`     | Short comparison                                                                                      |
 
-Override `CHUNK_SIZE` (4096), `KEEP_LAST_K` (1), `SEQ_LENGTH` (65536 for Dense/MoE; 8192 for QSA), or `NUM_STEPS` (100) through environment variables. `KEEP_LAST_K=0` retains every chunk's activation graph. Model and training options are visible in each recipe; `_common.sh` handles standard entrypoint selection and submission.
+For an existing compatible recipe, run `python3 examples/chunkflow/setup.py`, then add `--use-chunkflow --chunkflow-chunk-size 4096 --chunkflow-keep-last-k 0`. PP4 also needs `--chunkflow-pipeline 4` and `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`. The model and loss constraints above still apply. For a baseline, remove only `--use-chunkflow`; keep all other arguments and inputs identical.
 
-Dense and MoE also use the native SFT output head with `--sft-chunked-logits --sft-logits-chunk-size 1024 --recompute-loss-function`. This reduces output-head memory independently of ChunkFlow; keep these options enabled in a baseline comparison. ChunkFlow does not guarantee lower memory than native full-layer recomputation.
+The 32-GPU QSA entrypoint is `scripts/run-qwen38-flash-next-sft-32xgpu.sh`, defaulting to 8K / PP4 / EP8 / GBS4 / K0 with native MoE recomputation. Run once on an existing cluster's submitter; see the [full guide](../../docs/en/guide/chunkflow.md) for new-cluster setup.
 
-All three recipes accept `PROMPT_DATA` directly; `DATA_DIR` is optional when it is provided. For LongAlign, point it to `LongAlign-10k/long.jsonl`. Choose `SEQ_LENGTH` for the tokenized conversations. Samples exceeding that limit are skipped; the dataset's stored length may differ from the model tokenizer's count.
+## Code layout
 
-All three recipes load initial Hugging Face weights and do not save or resume training checkpoints. They do not use `SAVE_DIR` or `SAVE_INTERVAL`, including previously exported values. `PROJECT_NAME` defaults to `Relax/sft/chunkflow`; `EXP_NAME` identifies the experiment. ClearML task names and logs under `scripts/log/` include a timestamp for each run.
-
-## Qwen3.8-Flash-Next (QSA + GDN + PLE)
-
-The experimental 32-GPU recipe uses `${MODEL_DIR}/Qwen3.8-Flash-Next`, the same `train.jsonl` format, TP2/PP1/CP1, EP8/ETP1, and sequence parallelism. It keeps the checkpoint's PLE and hyper-connection architecture. PLE parameters and the hard-selection indexer are frozen; PLE tables use native CPU offload, and the optimizer also offloads to CPU. Plan host memory for both. The GPU count is a launch configuration, not a guarantee that the model fits any 32-GPU machine.
-
-```bash
-DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
-# Run on every node after setting the directories and node variables below.
-bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+```text
+examples/chunkflow/
+├── adapters/                 # Native computation adapters
+│   ├── __init__.py           # Registry and Dense Attention
+│   ├── gdn.py                # GDN convolution and recurrent state
+│   ├── qsa.py                # Native QSA prefix replay
+│   ├── ple.py                # Native PLE prefix adaptation
+│   └── prefix.py             # Shared prefix layout, RoPE and SP
+├── integration.py            # Install adapters during model creation
+├── scheduler.py / units.py   # Chunk and execution plans
+├── schedules.py              # Single-stage forward/backward
+├── pipeline_schedules.py     # Multi-stage forward/backward
+├── runtime.py / state_store.py # State, gradients and lifetime
+├── unit_batch.py / metadata.py # Batch splitting and boundaries
+├── rope.py                   # Chunk position offsets
+├── arguments.py              # Flags and validation
+├── setup.py / relax.patch / relax.version # Pinned integration
+├── configs/                  # Native GDN and QSA settings
+├── scripts/                  # Dense, MoE, QSA and shared submission
+└── test/{cpu,gpu}/           # Core regressions and CUDA validation
 ```
 
-For a new cluster, the recipe defaults to `WORLD_SIZE=4` nodes and `NUM_GPUS=8` per node; their product must be 32. If the nodes share an unpatched checkout, run `python examples/chunkflow/setup.py` once before starting them. Set `MASTER_ADDR` on every node to the head node's resolvable **`POD_NAME`**, set `POD_NAME` to the current node's hostname, and set `HOST_IP` to its reachable IP. The standard `spmd-multinode.sh` entrypoint identifies the head by the exact equality `MASTER_ADDR == POD_NAME`, starts Ray on each node, and submits once from the head after all nodes join. Workers remain running; starting only the head leaves it waiting for workers. Use dedicated nodes: this entrypoint clears local processes and requires permission to set reserved network ports with `sysctl`.
-
-For an existing 32-GPU cluster, run the same recipe only on the submitter; Ray is discovered automatically. No node variables or cluster startup are needed in this mode. Preview mode initializes neither kind of cluster.
-
-`configs/qwen38.yaml` disables GDN preprocessing fusion and QSA Stage-2 indexer loss. The script selects native `flex` attention and disables the Qwen3.8 fused/community selector overrides, local-query/replay patches, and streamed PLE. `_common.sh` forwards these model environment settings to Ray workers. Use the same settings when running an unchunked reference.
-
-`adapters/qsa.py` replays each layer's complete hidden-state prefix through native `QwenSparseSelfAttention`. Native projection, pooling, TopK, masking, and attention remain responsible for computation; the adapter returns only the current chunk's outputs. Selection temporarily restores the original parent pack's row count, document count, and candidate width before calling native TopK. Preserving only visible candidates can change tie selection. `adapters/ple.py` similarly supplies the original prefix token IDs and hidden states to native PLE hashing, gating, and causal convolution. `adapters/prefix.py` shares physical-boundary, padding, RoPE, and SP layout handling. Their history caches use separate namespaces so PLE and QSA at the same layer do not overwrite one another.
-
-Native autograd computes each replay's parameter gradients. Historical hidden-state gradients accumulate in `ChunkState` and reconnect when earlier chunks run backward; `Fr` reuses those cached leaves. Prefix replay repeats computation and can retain substantial activations, while the selector still uses the full parent layout. Treat this as a compatibility implementation and measure its cost before adopting it for long-context training.
-
-This adapter requires the pinned native QSA classes, a bitset backend (`flex`, or `dense_masked` for small references), PP1/CP1, packed text input, zero dropout, and ChunkFlow-owned recomputation. It rejects `id_sparse`, Stage-2 auxiliary loss, inference caches, external masks/biases, and the optimized method overrides above. The CPU numerical tests load the shipped native selector/attention and PLE methods with small construction stubs; they do not validate CUDA kernels, distributed collectives, or a full Flash-Next training run.
-
-## Code and tests
-
-| Files                                                       | Responsibility                                     |
-| ----------------------------------------------------------- | -------------------------------------------------- |
-| `scheduler.py`, `units.py`                                  | Chunk and execution plans                          |
-| `unit_batch.py`, `rope.py`, `metadata.py`                   | Inputs, original positions, packed boundaries      |
-| `integration.py`, `adapters/__init__.py`, `adapters/gdn.py` | Model installation and native computation adapters |
-| `adapters/qsa.py`, `adapters/ple.py`, `adapters/prefix.py`  | Native QSA/PLE prefix replay                       |
-| `runtime.py`, `state_store.py`                              | Cross-chunk state, gradients, cleanup              |
-| `schedules.py`, `pipeline_schedules.py`                     | Forward/backward execution                         |
-| `arguments.py`, `setup.py`, `relax.patch`                   | Configuration and pinned integration               |
-
-```bash
-CUDA_VISIBLE_DEVICES="" python -m pytest examples/chunkflow/test/cpu -q
-python -m pytest examples/chunkflow/test/gpu -q
-```
-
-CPU tests may require Megatron imports; GPU tests require CUDA and the native backends. Skips are not a numerical-validation result. PP>1 is experimental and requires explicit opt-in. CP>1, VPP, multimodal inputs, and full-layer recomputation are outside the supplied recipes; consult the full guide for adapter-specific limits.
+Execution: **recipe → integration patch → adapter installation → chunk plan → native forward → cross-chunk backward → state cleanup**. Implementation details and test commands are in the [full guide](../../docs/en/guide/chunkflow.md).

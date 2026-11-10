@@ -1,6 +1,7 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Dense, text-only SFT. Data contains a messages column.
+# Dense, text-only SFT with experimental TP2 / PP4 and global batch size 1.
+# Data contains a messages column; small batches expose pipeline bubbles.
 # Usage: bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 # Preview without Ray or GPUs: DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 
@@ -10,6 +11,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 source "${RELAX_ROOT}/scripts/models/qwen3-4B.sh"
 source "${SCRIPT_DIR}/_common.sh"
+
+export RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1
 
 : "${MODEL_DIR:?Set MODEL_DIR to the directory containing Qwen3-4B}"
 : "${PROMPT_DATA:=${DATA_DIR:?Set DATA_DIR or PROMPT_DATA}/train.jsonl}"
@@ -30,7 +33,7 @@ SFT_ARGS=(
     --prompt-data "${PROMPT_DATA}"
     --input-key messages
     --num-rollout "${NUM_STEPS:-100}"
-    --global-batch-size 8
+    --global-batch-size 1
     --micro-batch-size 1
     --seq-length "${SEQ_LENGTH:-65536}"
     --use-dynamic-batch-size
@@ -43,12 +46,13 @@ CHUNKFLOW_ARGS=(
     --chunkflow-chunk-size "${CHUNK_SIZE:-4096}"
     --chunkflow-pack-policy staggered
     --chunkflow-keep-last-k "${KEEP_LAST_K:-1}"
+    --chunkflow-pipeline 4
 )
 
 PERF_ARGS=(
     --tensor-model-parallel-size 2
     --sequence-parallel
-    --pipeline-model-parallel-size 1
+    --pipeline-model-parallel-size 4
     --context-parallel-size 1
     --expert-model-parallel-size 1
     --expert-tensor-parallel-size 1

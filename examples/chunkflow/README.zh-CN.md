@@ -1,108 +1,100 @@
-# ChunkFlow 示例
+# ChunkFlow
 
 [English](README.md) · [完整指南](../../docs/zh/guide/chunkflow.md)
 
-ChunkFlow 将长序列切块后送入 Megatron 模型，安排前后向，并连接各块之间的历史状态和梯度。Attention 与 GDN 计算调用模型原生实现。本目录包含全部实现、参数定义、接入补丁、启动脚本和测试。
+将长序列拆成 chunk，复用模型原生 Attention / GDN 计算，并连接跨块状态与梯度。**优先用于长上下文、显存受限的训练；是否加速取决于模型和配置。**
 
-## Relax 版本
+## 实验收益
 
-固定源码基线为 **`d548769b77f12e445e464f99d4332290a3e5bd3d`**，记录在 `relax.version` 中。使用该版本对应的训练环境，包括 Megatron/Bridge、TE 和 FLA；Relax 要求 Python 3.10 及以上。
+以下是已完成的短跑对照，不代表所有模型的收益。两组使用相同数据和训练配置，仅切换 ChunkFlow；Dense 的 K1 会额外启用 ChunkFlow 重计算。时间取第 1～29 步均值（排除第 0 步），显存取全部步骤、全部 rank 的最大值。加速比 = Baseline / ChunkFlow，低于 1 表示变慢；“—”表示未核验，不填估算值。
 
-在单独检出固定版本的 Relax 中，将本目录完整复制到其 `examples/chunkflow/`。从仓库根目录执行：
+### Dense · Qwen3-4B
 
-```bash
-python examples/chunkflow/setup.py
-python examples/chunkflow/setup.py --check
-```
+**8 卡 · TP2 / PP4 · GBS1 · LongAlign · 长度上限64K · chunk4096 · K1 · 30步**。未启用原生重计算；这是历史 K1 对照，不能当作 K0 结果。
 
-安装器核对固定版本源码后，将 `relax.patch` 应用到三个核心文件。包含本示例的后续 checkout 也可以使用，但 Relax 核心须仍与基线一致。安装可重复执行，不兼容修改会被拒绝。执行 `python examples/chunkflow/setup.py --reverse` 可移除接入补丁；安装器不会自动安装依赖。
+| 方法          | 平均训练耗时 | 平均 step time | MFU | 训练加速比 | 端到端加速比 | 峰值 allocated / reserved | allocated 节省 |
+| ------------- | -----------: | -------------: | --: | ---------: | -----------: | ------------------------: | -------------: |
+| Baseline      |       3.89 s |              — |   — |      1.00× |            — |         52.28 / 79.03 GiB |              — |
+| **ChunkFlow** |   **2.20 s** |              — |   — |  **1.76×** |            — |     **21.01 / 22.58 GiB** |     **59.81%** |
 
-## Dense 与 MoE 训练
+Loss 平均相对差异 **0.51%**。本配置同时体现训练加速与显存下降；不能外推到大 batch 或 K0。
 
-提供训练节点可访问的模型目录和数据文件路径：
+### MoE · Qwen3.6-35B-A3B
 
-| 环境变量      | 目录内容                                                   |
-| ------------- | ---------------------------------------------------------- |
-| `MODEL_DIR`   | Hugging Face checkpoint：`Qwen3-4B/` 或 `Qwen3.6-35B-A3B/` |
-| `PROMPT_DATA` | JSONL 数据文件，每行包含 `messages` 列表                   |
+**8 卡 · TP2 / PP4 / EP2 · GBS8 · LongAlign · 长度上限64K · chunk4096 · K0 · 30步**。双方均开启原生 selective `gdn moe` 重计算，关闭 ChunkFlow 自身重计算。
 
-数据行示例：
+| 方法          | 平均训练耗时 | 平均 step time | MFU | 训练加速比 | 端到端加速比 | 峰值 allocated / reserved | allocated 节省 |
+| ------------- | -----------: | -------------: | --: | ---------: | -----------: | ------------------------: | -------------: |
+| Baseline      |      15.99 s |              — |   — |      1.00× |            — |         56.38 / 70.26 GiB |              — |
+| **ChunkFlow** |  **18.90 s** |              — |   — |  **0.85×** |            — |     **37.79 / 40.58 GiB** |     **32.97%** |
 
-```json
-{"messages": [{"role": "user", "content": "What is 1 + 1?"}, {"role": "assistant", "content": "2"}]}
-```
+Loss 平均相对差异 **0.39%**。本配置节省 **18.59 GiB**，训练耗时增加约 **18.2%**，适合优先解决显存压力的场景。
 
-使用较长对话才能覆盖多个 chunk。两个脚本均为八卡纯文本 SFT，采用零 dropout 和 ChunkFlow 激活重计算。Dense 脚本使用 TP2/PP1/CP1；MoE 脚本使用 TP2/PP4/CP1、EP2/ETP1、原生 all-to-all 分发，关闭路由辅助损失与 GDN 预处理融合，并使用 CPU optimizer offload。MoE 脚本设置 `--chunkflow-pipeline 4`，并向 worker 传递 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`，启用实验性的流水线执行器。
+显存收益主要看 **allocated**；reserved 包含分配器缓存。短跑 loss 接近不代表梯度等价或长期收敛已验证。
 
-现有验证环境中，Qwen3.6 的 PP4/EP2 配方与原生整层重计算的短程 loss 接近，但固定权重下的梯度方向存在显著差异。该配方仍属实验性质；训练跑通和 loss 接近不代表 backward 已对齐。
+## 什么时候开启
 
-ChunkFlow 要求启用 `--calculate-per-token-loss`，使归一化不受切块边界影响。它会拒绝同时启用 `--fully-async` 和 `--use-dynamic-batch-size`，因为固定执行计划无法消费数量未知的流式 micro-batch。示例脚本已经使用 per-token loss 和同步训练。
+| 场景                                     | 建议                                               |
+| ---------------------------------------- | -------------------------------------------------- |
+| 长上下文 Dense、小 batch、流水线空闲较多 | 值得做对照，历史 K1 配置有加速收益                 |
+| 长上下文 MoE、显存紧张                   | 优先尝试，接受可能增加的计算时间                   |
+| 短序列、显存充足、追求最大吞吐           | 默认不开；先测再决定                               |
+| QSA / PLE 模型                           | 实验性使用；前缀重放会重复计算，不保证省显存或加速 |
 
-设置上述目录变量后，可以不连接 Ray、不使用 GPU 地预览参数：
+当前面向 **packed 纯文本、CP1、零 dropout、关闭 RoPE fusion、per-token loss**。PP4 需实验性 opt-in（示例已设置）。不直接支持 CP>1、VPP、多模态、full-layer / selective `core_attn` 重计算。QSA 仅允许原生 selective `moe` 重计算。
+
+Qwen3.8-Flash-Next 已完成8K上限、K0、10步对照，但使用了长度筛选子集：allocated 仅下降2.42%，未体现加速。原始 LongAlign 的32K对照尚未完成，不能据此推荐长上下文 QSA 性能。
+
+## 快速开启
+
+使用 [relax.version](relax.version) 固定的 Relax 版本及其训练镜像。示例脚本自动安装集成补丁，不安装依赖，不保存 checkpoint。
 
 ```bash
 export MODEL_DIR=/path/to/models
 export PROMPT_DATA=/path/to/LongAlign-10k/long.jsonl
-DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
-DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
-```
 
-在独占的八卡节点上，选择一个脚本直接执行：
-
-```bash
+# Dense：脚本已开启 ChunkFlow，默认64K / chunk4096 / K1
 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
-bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+
+# MoE：默认64K / chunk4096 / K1；K0关闭ChunkFlow自身重计算
+KEEP_LAST_K=0 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
-脚本自动核对固定版本的 Relax 源码并安装接入补丁，再通过 `auto` 发现现有 Ray 集群，使用关闭集群清理的标准 `ray-job.sh` 入口提交。请确保该集群空闲且由本次实验独占。没有现有集群时，标准 `local.sh` 会启动 Ray；该新节点入口会清理本机进程，应在独占训练节点使用。无需手动启动 Ray 或填写 Ray 地址。
+每次选择一个脚本。已有 Ray 集群会自动发现，无需设置地址；8卡单机可直接启动。数据为包含 `messages` 列的 JSONL，超过 `SEQ_LENGTH` 的样本按现有策略跳过，不预筛选或截断。MoE 启动示例不额外开启原生重计算；复现上表还需在双方脚本中加入 `--recompute-granularity selective` 和 `--recompute-modules gdn moe`。
 
-仍可用 `RAY_ADDRESS` 或 `RAY_JOBS_ADDRESS` 显式指定集群。已配置或已发现的集群不可达时会报错退出，不会回退重启本机。请等当前实验结束后再启动下一次实验。外部入口已经设置 `RELAX_ENTRYPOINT_MODE` 时直接复用。默认阻塞等待，设置 `RAY_NO_WAIT=1` 可非阻塞提交。脚本默认上传仓库工作目录，包含本示例与已经应用的补丁。
+| 参数               | 用途                                             |
+| ------------------ | ------------------------------------------------ |
+| `SEQ_LENGTH=65536` | 序列长度上限，不强制填满                         |
+| `CHUNK_SIZE=4096`  | 每块 token 数；应小于实际长样本长度              |
+| `KEEP_LAST_K=0`    | 保留全部块激活；`1` 仅保留末块，其余反向前重计算 |
+| `NUM_STEPS=10`     | 短跑对照                                         |
 
-可用环境变量覆盖 `CHUNK_SIZE`（4096）、`KEEP_LAST_K`（1）、`SEQ_LENGTH`（Dense/MoE 为 65536，QSA 为 8192）或 `NUM_STEPS`（100）。`KEEP_LAST_K=0` 保留全部块的激活计算图。每个脚本直接列出模型和训练参数，`_common.sh` 负责选择标准入口和提交任务。
+已有兼容脚本：先运行 `python3 examples/chunkflow/setup.py`，再加入 `--use-chunkflow --chunkflow-chunk-size 4096 --chunkflow-keep-last-k 0`；PP4 另需 `--chunkflow-pipeline 4` 和 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`。仍须满足上述模型与损失约束。做 baseline 时只移除 `--use-chunkflow`，其余参数及输入保持一致。
 
-Dense/MoE 同时启用原生 SFT 输出层的 `--sft-chunked-logits --sft-logits-chunk-size 1024 --recompute-loss-function`。这项优化独立于 ChunkFlow，用于降低输出层显存；baseline 对照也应保留相同参数。ChunkFlow 不保证比原生整层重计算更省显存。
+32卡 QSA 脚本为 `scripts/run-qwen38-flash-next-sft-32xgpu.sh`，默认8K / PP4 / EP8 / GBS4 / K0、原生 MoE 重计算；已有集群只在提交节点运行，新集群配置见[完整指南](../../docs/zh/guide/chunkflow.md)。
 
-三个脚本都可直接使用 `PROMPT_DATA` 指定数据文件，此时无需 `DATA_DIR`。不设置 `PROMPT_DATA` 时才使用 `${DATA_DIR}/train.jsonl`。LongAlign 可直接指向 `LongAlign-10k/long.jsonl`，并按分词后的对话长度选择 `SEQ_LENGTH`。超过上限的样本会被跳过；数据集记录的长度可能与模型 tokenizer 的统计不同。
+## 代码目录
 
-三个脚本都从 Hugging Face 初始权重加载，不保存或恢复训练 checkpoint。无需设置 `SAVE_DIR` 或 `SAVE_INTERVAL`，此前导出的这两个变量也不会生效。`PROJECT_NAME` 默认为 `Relax/sft/chunkflow`，`EXP_NAME` 标识实验；每次运行的 ClearML task 名和 `scripts/log/` 日志带有时间戳。
-
-## Qwen3.8-Flash-Next（QSA + GDN + PLE）
-
-实验性的 32 卡脚本使用 `${MODEL_DIR}/Qwen3.8-Flash-Next` 和相同格式的 `train.jsonl`，配置为 TP2/PP1/CP1、EP8/ETP1，并启用 sequence parallel。脚本保留 checkpoint 的 PLE 和 hyper-connection 结构，冻结 PLE 参数及硬选块的 indexer；PLE 大表使用原生 CPU offload，优化器也卸载到 CPU，主机内存需要同时容纳两者。32 卡是启动配置，不代表任意 32 卡机器都能装下模型。
-
-```bash
-DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
-# 设置目录和下述节点变量后，在每个节点执行。
-bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
+```text
+examples/chunkflow/
+├── adapters/                 # 原生计算适配
+│   ├── __init__.py           # 注册表与 Dense Attention
+│   ├── gdn.py                # GDN 卷积、递推状态连接
+│   ├── qsa.py                # 原生 QSA 前缀重放
+│   ├── ple.py                # 原生 PLE 前缀适配
+│   └── prefix.py             # 共享前缀布局、RoPE 与 SP 处理
+├── integration.py            # 模型创建时安装适配器
+├── scheduler.py / units.py   # 分块与执行计划
+├── schedules.py              # 单流水线 stage 的 forward/backward
+├── pipeline_schedules.py     # 多 stage 的 forward/backward
+├── runtime.py / state_store.py # 跨块状态、梯度与生命周期
+├── unit_batch.py / metadata.py # batch 切分与边界元数据
+├── rope.py                   # 分块位置偏移
+├── arguments.py              # 开关与约束检查
+├── setup.py / relax.patch / relax.version # 固定版本集成
+├── configs/                  # GDN、QSA 原生配置
+├── scripts/                  # Dense、MoE、QSA 三个入口及公共提交逻辑
+└── test/{cpu,gpu}/           # 核心回归与 CUDA 验证
 ```
 
-新集群默认 `WORLD_SIZE=4` 个节点、每节点 `NUM_GPUS=8` 张卡，两者乘积必须为 32。多个节点共享尚未安装补丁的仓库时，先在共享目录运行一次 `python examples/chunkflow/setup.py`，再启动各节点。所有节点的 `MASTER_ADDR` 都填写主节点可解析的 **`POD_NAME`**，各自的 `POD_NAME` 填本节点名称，`HOST_IP` 填本节点可通信的 IP。标准 `spmd-multinode.sh` 入口通过 `MASTER_ADDR == POD_NAME` 的严格相等判断主节点，自动启动各节点的 Ray，等全部节点加入后仅由主节点提交一次训练。worker 持续运行；只启动主节点会一直等待其他节点。请使用独占节点：该入口会清理本机进程，并要求有权限通过 `sysctl` 设置预留网络端口。
-
-已有 32 卡集群时，只在提交节点执行同一脚本，Ray 会自动发现；此模式不要求节点变量，也不重新组建集群。预览模式不会初始化任何集群。
-
-`configs/qwen38.yaml` 关闭 GDN 预处理融合和 QSA Stage-2 indexer 辅助损失。脚本使用原生 `flex` attention，关闭 Qwen3.8 的融合/社区 selector 覆盖、local-query/replay 补丁及 streamed PLE。`_common.sh` 将这些模型环境变量传给 Ray worker。运行不切块对照时也应保留相同设置。
-
-`adapters/qsa.py` 把每层完整的 hidden-state 前缀交给原生 `QwenSparseSelfAttention`，投影、池化、TopK、mask 和 attention 都由原生实现计算，适配器只取当前 chunk 的输出。选块前会恢复原 parent pack 的行数、文档数和候选宽度，再调用原生 TopK；如果只保留当前可见候选，并列分数可能选出不同的块。`adapters/ple.py` 将完整前缀的 token ID 和 hidden states 交给原生 PLE，继续使用它的 n-gram 哈希、门控和因果卷积。`adapters/prefix.py` 共用实际边界、padding、RoPE 和 SP 布局处理；PLE 与 QSA 使用不同的缓存命名空间，同一层的历史不会相互覆盖。
-
-每次重放的参数梯度由原生 autograd 计算。历史 hidden states 的梯度累计到 `ChunkState`，在较早 chunk 执行 backward 时接回上游；`Fr` 复用这些缓存叶子。前缀重放会重复计算，也可能保留较多激活，而 selector 仍使用完整 parent 布局。这是兼容性实现，长上下文训练前需要实际测量开销。
-
-该适配器要求固定版本的原生 QSA 类、bitset 后端（`flex`，或小规模对照用的 `dense_masked`）、PP1/CP1、packed 纯文本、零 dropout，以及由 ChunkFlow 管理重计算。不支持 `id_sparse`、Stage-2 辅助损失、推理缓存、外部 mask/bias 和上述方法覆盖优化。CPU 数值测试使用仓库补丁中的原生 selector/attention 与 PLE 方法，并用小型对象替代构造依赖；它们不能代替 CUDA kernel、多卡通信或完整 Flash-Next 训练验证。
-
-## 代码与测试
-
-| 文件                                                        | 职责                         |
-| ----------------------------------------------------------- | ---------------------------- |
-| `scheduler.py`、`units.py`                                  | 切块与执行计划               |
-| `unit_batch.py`、`rope.py`、`metadata.py`                   | 输入、原始位置和 packed 边界 |
-| `integration.py`、`adapters/__init__.py`、`adapters/gdn.py` | 模型安装与原生计算适配       |
-| `adapters/qsa.py`、`adapters/ple.py`、`adapters/prefix.py`  | 原生 QSA/PLE 前缀重放        |
-| `runtime.py`、`state_store.py`                              | 跨块状态、梯度与清理         |
-| `schedules.py`、`pipeline_schedules.py`                     | 前后向执行                   |
-| `arguments.py`、`setup.py`、`relax.patch`                   | 配置与固定版本接入           |
-
-```bash
-CUDA_VISIBLE_DEVICES="" python -m pytest examples/chunkflow/test/cpu -q
-python -m pytest examples/chunkflow/test/gpu -q
-```
-
-部分 CPU 用例需要 Megatron Python 依赖，GPU 用例需要 CUDA 和原生计算后端。跳过用例不代表数值验证通过。PP>1 是需要显式启用的实验路径。示例脚本不包含 CP>1、VPP、多模态输入或 full-layer recompute；适配器具体限制见完整指南。
+运行链路：**脚本 → 集成补丁 → 安装适配器 → 分块计划 → 原生 forward → 跨块 backward → 清理状态**。实现细节与测试命令见[完整指南](../../docs/zh/guide/chunkflow.md)。

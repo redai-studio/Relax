@@ -24,13 +24,15 @@ PARENT_CU_ATTR = "chunkflow_parent_physical_cu"
 
 def validate(module: Any) -> None:
     config = module.config
-    for field in ("context_parallel_size", "pipeline_model_parallel_size"):
-        if getattr(config, field, 1) != 1:
-            raise NotImplementedError(f"ChunkFlow native prefix replay requires {field}=1")
-    if getattr(config, "recompute_granularity", None) is not None or getattr(
-        module, "checkpoint_core_attention", False
-    ):
-        raise NotImplementedError("Use ChunkFlow keep_last_k instead of Megatron recomputation for prefix replay")
+    # PP keeps each layer's complete prefix on its owning stage; CP splits it.
+    if getattr(config, "context_parallel_size", 1) != 1:
+        raise NotImplementedError("ChunkFlow native prefix replay requires context_parallel_size=1")
+    granularity = getattr(config, "recompute_granularity", None)
+    # Native MoE checkpointing stays inside the MLP and never replays QSA/PLE
+    # after their per-unit context has been released.
+    moe_only = granularity == "selective" and set(getattr(config, "recompute_modules", None) or []) == {"moe"}
+    if (granularity is not None and not moe_only) or getattr(module, "checkpoint_core_attention", False):
+        raise NotImplementedError("Native prefix replay only supports selective MoE recomputation")
     if getattr(config, "hidden_dropout", 0) or getattr(config, "attention_dropout", 0):
         raise NotImplementedError("ChunkFlow native prefix replay requires zero dropout")
 

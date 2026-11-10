@@ -21,7 +21,9 @@ Use `python examples/chunkflow/setup.py --reverse` to remove the integration pat
 
 ## Dense and MoE examples
 
-Both examples run text-only SFT on eight GPUs with TP=2 and CP=1. Qwen3-4B uses PP=1 and EP=1; Qwen3.6-35B-A3B uses PP=4, EP=2, and ETP=1, including GDN state adaptation. The MoE script sets `--chunkflow-pipeline 4` and forwards `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1` to enable the experimental pipeline executor.
+Both examples run text-only SFT on eight GPUs with TP=2 and CP=1. Qwen3-4B uses PP=4, EP=1, and global batch size 1; Qwen3.6-35B-A3B uses PP=4, EP=2, and ETP=1, including GDN state adaptation. Both scripts set `--chunkflow-pipeline 4` and forward `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1` to enable the experimental pipeline executor.
+
+For a baseline comparison, remove only `--use-chunkflow` from the same recipe. Keep the model, data, seed, parallel layout, batch size, sequence length, precision, and recomputation settings identical. If either run runs out of memory, reduce the sequence length for both runs before comparing them.
 
 The available validation runtime showed close short-run losses for Qwen3.6 with PP4/EP2, but materially different fixed-weight gradient directions from native full-layer recomputation. This recipe remains experimental; successful training and close loss are not evidence of backward parity.
 
@@ -52,7 +54,7 @@ The MoE example uses native all-to-all dispatch, disables router auxiliary loss,
 
 ## Qwen3.8-Flash-Next (QSA + GDN + PLE)
 
-The experimental 32-GPU recipe uses `${MODEL_DIR}/Qwen3.8-Flash-Next`, the same `train.jsonl` format, TP2/PP1/CP1, EP8/ETP1, and sequence parallelism. It keeps the checkpoint's PLE and hyper-connection architecture. PLE parameters and the hard-selection indexer are frozen; PLE tables use native CPU offload, and the optimizer also offloads to CPU. Plan host memory for both. The GPU count is a launch configuration, not a guarantee that the model fits any 32-GPU machine.
+The experimental 32-GPU recipe uses `${MODEL_DIR}/Qwen3.8-Flash-Next`, the same `train.jsonl` format, TP2/PP4/CP1, EP8/ETP1, global batch size 4, native selective MoE recomputation, and sequence parallelism. It keeps the checkpoint's PLE and hyper-connection architecture. PLE parameters and the hard-selection indexer are frozen; PLE tables use native CPU offload, and the optimizer also offloads to CPU. Plan host memory for both. The GPU count is a launch configuration, not a guarantee that the model fits any 32-GPU machine.
 
 ```bash
 DRY_RUN=1 bash examples/chunkflow/scripts/run-qwen38-flash-next-sft-32xgpu.sh
@@ -70,7 +72,9 @@ For an existing 32-GPU cluster, run the same recipe only on the submitter; Ray i
 
 Native autograd computes each replay's parameter gradients. Historical hidden-state gradients accumulate in `ChunkState` and reconnect when earlier chunks run backward; `Fr` reuses those cached leaves. Prefix replay repeats computation and can retain substantial activations, while the selector still uses the full parent layout. Treat this as a compatibility implementation and measure its cost before adopting it for long-context training.
 
-This adapter requires the pinned native QSA classes, a bitset backend (`flex`, or `dense_masked` for small references), PP1/CP1, packed text input, zero dropout, and ChunkFlow-owned recomputation. It rejects `id_sparse`, Stage-2 auxiliary loss, inference caches, external masks/biases, and the optimized method overrides above. The CPU numerical tests load the shipped native selector/attention and PLE methods with small construction stubs; they do not validate CUDA kernels, distributed collectives, or a full Flash-Next training run.
+The 32-GPU baseline and ChunkFlow each completed 10 steps at an 8K limit with K0 and native sparse QSA. This check used 256 length-filtered LongAlign samples (5,192–8,180 rendered tokens). Mean relative loss difference was 0.57%; peak allocated memory was 51.21 vs 49.97 GiB. It does not establish a speedup. The subsequent 32K run on the original dataset was interrupted by resource loss and remains unvalidated. The recipe does not filter input data; samples above the configured limit are skipped.
+
+This adapter requires the pinned native QSA classes, a bitset backend (`flex`, or `dense_masked` for small references), CP1, packed text input, zero dropout, and no native Megatron recomputation except selective `moe` checkpointing. The recipe uses experimental PP4 and defaults to `KEEP_LAST_K=0` (no ChunkFlow recomputation). It rejects `id_sparse`, Stage-2 auxiliary loss, inference caches, external masks/biases, and the optimized method overrides above. The CPU numerical tests load the shipped native selector/attention and PLE methods with small construction stubs; they do not validate CUDA kernels, distributed collectives, or a full Flash-Next training run.
 
 ## Using other training scripts
 
@@ -117,7 +121,7 @@ PP greater than 1 uses an experimental non-interleaved pipeline executor and als
 - `--calculate-per-token-loss` is enforced at startup: averaging each chunk as a separate sample changes the training objective. ChunkFlow also rejects `--fully-async` together with `--use-dynamic-batch-size`; its fixed plan cannot consume a streaming iterator with an unknown micro-batch count. Disable one of those two options.
 - Use zero dropout and disable RoPE fusion. The explicit MRoPE position path currently supports text-only batches.
 - Use `--chunkflow-keep-last-k` for attention recomputation. Megatron full-layer recomputation and selective `core_attn` recomputation are rejected because they replay cache writes without the ChunkFlow replay marker.
-- Sliding windows, non-vanilla softmax, QK clipping/logit statistics, external attention masks/biases, and the Qwen3.5 optimized recipe need separate adapters. QSA and PLE use the restricted native-prefix adapters described above; they require PP1 even when the experimental pipeline is enabled.
+- Sliding windows, non-vanilla softmax, QK clipping/logit statistics, external attention masks/biases, and the Qwen3.5 optimized recipe need separate adapters. QSA and PLE use the restricted native-prefix adapters described above; their prefix state remains local to each pipeline stage. A 10-step PP4 comparison passed at an 8K limit on a length-filtered LongAlign subset; this does not establish long-context performance or gradient parity.
 - The full-layer GDN adapter matches Megatron's exact `GatedDeltaNet` class; subclasses require explicit registration. It requires kernels that propagate gradients through initial and final states and Megatron's `_forward_compute` interface. Disable preprocessing fusion; deterministic mode and full-layer recomputation are unsupported.
 - MoE auxiliary losses, capacity limits, and token-dropping configurations need separate validation. Do not assume they remain equivalent after chunking.
 - PP=1 does not currently update upstream PackingMetrics. Use actual step time for performance comparisons.

@@ -405,3 +405,21 @@ def test_kv_cache_fp32_accumulates_across_backward_without_changing_values(dtype
     torch.testing.assert_close(
         old_live.grad, torch.full_like(old_live, 256 if dtype == torch.bfloat16 else 258), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("local_number,missing", [(2, False), (1, True)])
+def test_install_checks_only_local_pipeline_ple_layers(local_number, missing):
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Module()
+    layer = _FakeAttn()
+    layer.layer_number = local_number
+    layer.config.ple_layer_ids = [1]
+    model.decoder.layers = torch.nn.ModuleList([layer])
+    if missing:
+        with pytest.raises(NotImplementedError, match="local layer 1"):
+            install(model, 4)
+        assert not hasattr(model, "chunkflow_runtime")
+        assert "forward" not in layer.core_attention.__dict__
+    else:
+        assert install(model, 4) == 1
+        assert uninstall(model) == 1

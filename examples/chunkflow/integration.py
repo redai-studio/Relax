@@ -170,7 +170,15 @@ def install(model, chunk_size: int) -> int:
         for module in backbone.modules()
         if (layer := getattr(module, "per_layer_embedding", None)) is not None
     }
-    if not ple_layers and any(
+    local_layers = getattr(getattr(backbone, "decoder", None), "layers", None)
+    if local_layers is not None:
+        for layer in local_layers:
+            expected = getattr(getattr(layer, "config", None), "ple_layer_ids", None) or []
+            if layer.layer_number in expected and getattr(layer, "per_layer_embedding", None) is None:
+                raise NotImplementedError(
+                    f"ChunkFlow requires native per_layer_embedding on local layer {layer.layer_number}"
+                )
+    elif not ple_layers and any(
         getattr(getattr(module, "config", None), "ple_layer_ids", None) for module in backbone.modules()
     ):
         raise NotImplementedError("ChunkFlow PLE configuration requires native per_layer_embedding modules")
