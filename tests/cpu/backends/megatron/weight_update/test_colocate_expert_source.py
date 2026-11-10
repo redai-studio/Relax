@@ -231,6 +231,35 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
 
     cuda_initialized = torch.cuda.is_initialized()
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
+    # A teacher-side Actor has no student engine, but still joins every native
+    # packing-error collective. Reuse these two processes to catch a hang on
+    # both the successful path and a student-side packing failure.
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater._ipc_engine = object() if rank == 0 else None
+    updater._ipc_allocator_version = updater.weight_version = 1
+    updater._ipc_bucket_allocator = object()
+    updater._ipc_gather_src, updater._ipc_gather_group = 0, dist.group.WORLD
+    updater._route_experts = updater.use_distribute = False
+    updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = True
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(module, "get_gloo_group", lambda: dist.group.WORLD)
+        for fail in (False, True):
+
+            def pack(values, *, pack_error_group, **kwargs):
+                with module._check_packing_errors_across_ranks(pack_error_group):
+                    if fail:
+                        raise ValueError("student packing failed")
+                return [], None
+
+            patch.setattr(module, "_send_to_colocated_engine", pack)
+            if fail:
+                with pytest.raises(RuntimeError, match="student packing failed"):
+                    updater._send_hf_params([])
+            else:
+                assert updater._send_hf_params([]) == ([], None)
+            alive = torch.tensor(1)
+            dist.all_reduce(alive)
+            assert alive.item() == 2
     # Exercise the real cold collective: one unsupported owner makes all
     # owners keep canonical bindings for this session.
     from relax.distributed.checkpoint_service.backends.shard_p2p import synchronizer as sync
@@ -504,6 +533,9 @@ def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_act
     assert not updater._colocate_tp_ipc_enabled and not updater._colocate_expert_ipc_enabled
 
     updater._ordinary_tp_receiver_support = True
+    # MOPD's four TP1 student engines use only half the eight Actor GPUs.
+    updater.rollout_engines = [object() for _ in range(4)]
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group: 8)
     updater._configure_colocate_expert_ipc(["node"])
     assert updater._colocate_tp_ipc_enabled
     source = object.__new__(CombinedShardSource)

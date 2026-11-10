@@ -43,14 +43,13 @@ def validate_actor_weight_retention(
     actor_gpus = resource.get("actor", (0, 0))[1]
     rollout_gpus = resource.get("rollout", (0, 0))[1]
     engine_size = getattr(args, "rollout_num_gpus_per_engine", None)
-    if not actor_gpus or actor_gpus != rollout_gpus:
-        return "requires equal Actor and rollout GPU counts"
-    if type(engine_size) is not int or engine_size <= 0 or actor_gpus % engine_size:
-        return "requires whole rollout engines covering the Actor world"
+    if not actor_gpus or not 0 < rollout_gpus <= actor_gpus:
+        return "requires rollout GPUs within the Actor world"
+    if type(engine_size) is not int or engine_size <= 0 or rollout_gpus % engine_size:
+        return "requires whole rollout engines within the Actor world"
 
     # Current integration gaps; keep the original path until these are connected.
     from relax.utils.megatron_peft_utils import is_lora_adapter_mode, is_lora_enabled
-    from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
 
     if getattr(args, "megatron_to_hf_mode", None) != "bridge":
         return "raw export uses different snapshot keys from the retained-weight getter"
@@ -58,8 +57,6 @@ def validate_actor_weight_retention(
         args, "colocate_expert_weight_routing", False
     ):
         return "adapter and expert-routing protocols resume generation before Actor weight release"
-    if is_managed_opd_teacher_enabled(args):
-        return "managed teacher onload is not connected to the retained-weight lifecycle"
     if getattr(args, "rollout_external", False):
         return "external rollout is outside the managed offload and completion protocol"
     if (
@@ -115,9 +112,8 @@ def validate_sglang_weight_sync_support(
 ) -> str | None:
     """Check local IPC placement and completion support for Actor retention.
 
-    Require colocated engines covering every Actor GPU and a completion hook
-    that waits for CUDA reads. Return None if supported, else a fallback
-    reason.
+    Require colocated engines within the Actor world and a completion hook that
+    waits for CUDA reads. Return None if supported, else a fallback reason.
     """
     world = len(actor_nodes)
     # Required: every Actor participates in the same packing/ACK collectives,
@@ -129,11 +125,12 @@ def validate_sglang_weight_sync_support(
         or len(engine_nodes) != len(counts)
         or len(offsets) != len(counts)
         or any(type(count) is not int or count <= 0 for count in counts)
-        or sum(counts) != world
+        or not counts
+        or sum(counts) > world
     ):
-        return "requires IPC engines covering the Actor world"
+        return "requires IPC engines within the Actor world"
     # Current gap: the completion RPC still sends engine_size entries per engine.
-    if any(count != engine_size for count in counts) or list(offsets) != list(range(0, world, engine_size)):
+    if any(count != engine_size for count in counts) or list(offsets) != list(range(0, sum(counts), engine_size)):
         return "completion fences require contiguous engines with the configured GPU count"
     if any(
         not node or any(actor != node for actor in actor_nodes[offset : offset + count])
@@ -181,13 +178,14 @@ def run_with_distributed_error_check(action, group):
     return result
 
 
-def run_rank0_rpc_calls(calls, group) -> None:
+def run_rank0_rpc_calls(calls, group, *, append_handles=None) -> None:
     """Submit and wait for Ray RPCs on group rank 0; all ranks check errors.
 
     Every rank must call this. Each callable submits one RPC and returns its
     ObjectRef. On failure, rank 0 waits for all already submitted RPCs before
     propagating the error to peers. The caller owns buffer retention and CUDA
-    completion checks.
+    completion checks. append_handles can submit additional RPCs into the same
+    list, so their handles are also drained if submission or completion fails.
     """
     import ray
     import torch.distributed as dist
@@ -199,6 +197,8 @@ def run_rank0_rpc_calls(calls, group) -> None:
         try:
             for call in calls:
                 refs.append(call())
+            if append_handles is not None:
+                append_handles(refs)
             ray.get(refs)
         except Exception:
             # A failed RPC does not imply the other receivers finished reading.
@@ -231,8 +231,8 @@ def validate_native_colocate_devices(actors: list[dict], engines: list[list[dict
     if not actors or not engines or not engines[0]:
         raise ValueError("Colocated device coverage requires complete worker inventories")
     width = len(engines[0])
-    if len(actors) != len(engines) * width or any(len(engine) != width for engine in engines):
-        raise ValueError("Colocated device coverage differs from the Actor world")
+    if len(engines) * width > len(actors) or any(len(engine) != width for engine in engines):
+        raise ValueError("Colocated device coverage exceeds the Actor world or has unequal engines")
     for endpoint in [*actors, *(endpoint for engine in engines for endpoint in engine)]:
         validate_worker_identity(endpoint)
 
@@ -241,7 +241,7 @@ def validate_native_colocate_devices(actors: list[dict], engines: list[list[dict
 
     actor_devices = [physical(endpoint) for endpoint in actors]
     receiver_devices = [physical(endpoint) for engine in engines for endpoint in engine]
-    if len(set(actor_devices)) != len(actors) or len(set(receiver_devices)) != len(actors):
+    if len(set(actor_devices)) != len(actors) or len(set(receiver_devices)) != len(receiver_devices):
         raise ValueError("Colocated device coverage reuses a physical GPU")
     for index, engine in enumerate(engines):
         block = actors[index * width : (index + 1) * width]
