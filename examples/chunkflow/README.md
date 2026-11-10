@@ -60,7 +60,7 @@ export PROMPT_DATA=/path/to/data
 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 ```
 
-**MoE · Qwen3.6-35B-A3B**　64K / K0
+**MoE · Qwen3.6-35B-A3B**　64K / chunk4096 / K0
 
 ```bash
 KEEP_LAST_K=0 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
