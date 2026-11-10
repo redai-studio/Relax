@@ -81,7 +81,17 @@ def missing_tools() -> list[str]:
     return missing
 
 
+def inference_chat_kwargs(processor) -> dict[str, bool]:
+    template = processor.chat_template
+    if type(processor).__name__ == "Qwen3VLProcessor" and isinstance(template, str):
+        if not any(marker in template for marker in ("<think>", "enable_thinking", "reasoning_content")):
+            return {}
+    return {"enable_thinking": True, "preserve_thinking": True}
+
+
 def preserve_history_template(processor) -> str:
+    if not inference_chat_kwargs(processor):
+        return processor.chat_template
     from relax.engine.sft.dataset.qwen_chat_template_patch import try_patch_qwen_chat_template
     from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 
@@ -122,6 +132,7 @@ class HTTPRunner:
 
         self.processor = AutoProcessor.from_pretrained(processor_path, local_files_only=True)
         self.template_sha256 = sha256(preserve_history_template(self.processor).encode())
+        self.chat_template_kwargs = inference_chat_kwargs(self.processor)
         self.client, self.model = client, model
         self.requests: list[dict] = []
         self.error: str | None = None
@@ -160,8 +171,7 @@ class HTTPRunner:
             return_dict=True,
             return_tensors="pt",
             add_generation_prompt=True,
-            enable_thinking=True,
-            preserve_thinking=True,
+            **self.chat_template_kwargs,
         )
         tokens = int(inputs["input_ids"].shape[-1])
         # Reserve one terminal token; SGLang rejects a request at the exact context boundary.
@@ -174,7 +184,7 @@ class HTTPRunner:
             messages=messages,
             temperature=0,
             max_tokens=remaining,
-            extra_body={"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}},
+            extra_body={"chat_template_kwargs": self.chat_template_kwargs},
         )
         if response.usage is not None and response.usage.prompt_tokens != tokens:
             self.error = "token_budget_mismatch"
@@ -384,7 +394,8 @@ def main() -> None:
         "temperature": 0,
         "context_length": 32768,
         "max_turns": 1 if args.workflow == "direct" else 50,
-        "enable_thinking": True,
+        "enable_thinking": runner.chat_template_kwargs.get("enable_thinking", False),
+        "chat_template_kwargs": runner.chat_template_kwargs,
         "judge_model": os.environ["JUDGE_MODEL"],
         "judge_qps": args.judge_qps,
         "tool_cache": str(args.tool_cache.resolve()) if args.workflow == "agent" else None,
@@ -402,7 +413,8 @@ def main() -> None:
     evaluator = {
         "git_branch": subprocess.check_output(
             ["git", "-C", str(repository), "branch", "--show-current"], text=True
-        ).strip(),
+        ).strip()
+        or os.environ.get("RELAX_GIT_REF", ""),
         "git_commit": subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip(),
         "source_sha256": protocol["evaluator_sha256"],
     }

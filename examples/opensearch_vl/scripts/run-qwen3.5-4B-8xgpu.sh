@@ -147,7 +147,7 @@ if [[ "${BENCHMARK_ONLY:-0}" == 1 ]]; then EVAL_ARGS=(); fi
 PERF_ARGS=(
     --tensor-model-parallel-size "${TP_SIZE:-2}"
     --pipeline-model-parallel-size "${PP_SIZE:-1}"
-    --context-parallel-size 1
+    --context-parallel-size "${CP_SIZE:-1}"
     --expert-model-parallel-size 1
     --expert-tensor-parallel-size 1
     --calculate-per-token-loss

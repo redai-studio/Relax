@@ -26,7 +26,10 @@ def benchmark(monkeypatch):
 @pytest.mark.parametrize(
     "input_tokens,finish_reason,raises", [(32760, "stop", False), (32768, "stop", True), (32760, "length", True)]
 )
-def test_http_runner_keeps_history_within_32k(monkeypatch, benchmark, input_tokens, finish_reason, raises):
+@pytest.mark.parametrize("chat_kwargs", [{"enable_thinking": True, "preserve_thinking": True}, {}])
+def test_http_runner_keeps_history_within_32k(
+    monkeypatch, benchmark, input_tokens, finish_reason, raises, chat_kwargs
+):
     upstream = ModuleType("opensearch_infer.messages")
     upstream.to_qwen3vl_messages = lambda contents: list(contents)
     monkeypatch.setitem(sys.modules, "opensearch_infer.messages", upstream)
@@ -50,6 +53,7 @@ def test_http_runner_keeps_history_within_32k(monkeypatch, benchmark, input_toke
     )
     runner.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     runner.model, runner.requests, runner.error = "baseline", [], None
+    runner.chat_template_kwargs = chat_kwargs
     history = [
         {"role": "user", "parts": [{"text": "original question"}]},
         {"role": "model", "parts": [{"text": "<tool_call>earlier call</tool_call>"}]},
@@ -65,6 +69,7 @@ def test_http_runner_keeps_history_within_32k(monkeypatch, benchmark, input_toke
         runner.infer(history, "system")
     if input_tokens < 32768:
         assert captured[0]["max_tokens"] == 7
+        assert captured[0]["extra_body"]["chat_template_kwargs"] == chat_kwargs
         assert len(captured[0]["messages"]) == 4
         assert captured[0]["messages"][1]["content"][0]["text"] == "original question"
         assert captured[0]["messages"][-1]["content"][0]["text"] == "entire earlier observation"
@@ -211,6 +216,7 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(
     class Runner:
         def __init__(self, *_args):
             self.template_sha256 = "template"
+            self.chat_template_kwargs = {"enable_thinking": True, "preserve_thinking": True}
             self.requests, self.error, self.last_response = [], None, None
 
         def infer(self, contents, **_kwargs):
@@ -358,3 +364,29 @@ def test_comparison_needs_only_full_simplevqa_results(monkeypatch, tmp_path, inv
         result = json.loads(output.read_text())
         assert set(result) == {"simplevqa"}
         assert result["simplevqa"]["pass_at_1_difference"] == pytest.approx(0.1)
+
+
+def test_qwen3_vl_instruct_keeps_native_history_without_thinking_flags(benchmark):
+    from jinja2 import Environment
+
+    template = "{% for message in messages %}{{ message.content }}{% endfor %}"
+    processor = type("Qwen3VLProcessor", (), {})()
+    processor.chat_template = template
+    processor.tokenizer = SimpleNamespace(chat_template=template)
+    assert benchmark.inference_chat_kwargs(processor) == {}
+    actual = benchmark.preserve_history_template(processor)
+    history = "<think>original reasoning</think><tool_call>original call</tool_call>"
+    assert Environment().from_string(actual).render(messages=[{"content": history}]) == history
+    assert processor.tokenizer.chat_template == template
+
+
+@pytest.mark.parametrize(
+    "processor_type,template", [("UnknownProcessor", "{{ content }}"), ("Qwen3VLProcessor", "<think>")]
+)
+def test_unsupported_reasoning_templates_still_fail(benchmark, processor_type, template):
+    processor = type(processor_type, (), {})()
+    processor.chat_template = template
+    processor.tokenizer = SimpleNamespace(chat_template=template)
+    assert benchmark.inference_chat_kwargs(processor)["enable_thinking"] is True
+    with pytest.raises(ValueError, match="supported Qwen history template"):
+        benchmark.preserve_history_template(processor)

@@ -6,13 +6,14 @@
 
 每次正式基准测试保留一行，按模型分组、时间倒序；空白表示尚无结果。分数为 Pass@1（%，原始 / 去重），失败题保留在分母。去重题集由本次实际 SFT train 决定，不同去重集合不能直接排名。
 
-| 模型        | 阶段 / 预算     | 状态       | 启动时间 UTC        | 训练 commit    |  SimpleVQA EN | SwanLab                                                                                                                                                                           | 实验文档                                      |
-| ----------- | --------------- | ---------- | ------------------- | -------------- | ------------: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| Qwen3.5-4B  | Base            | 完成       | 2026-11-10 08:33:48 |                | 45.11 / 46.38 | [评测](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/5210g8ibu4eo0y0zzg6ft)                                                                                           | [详情](results/qwen3.5-4b.md#baseline)        |
-| Qwen3.5-4B  | SFT / 100 steps | 完成       | 2026-11-10 07:04:49 | `28f866220dc3` | 42.74 / 43.93 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/ejccsn9ib17s2swcq6z40) · [评测](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/emr9mnx3q7y5z6e6z3pfi) | [详情](results/qwen3.5-4b.md#sft100-20261110) |
-| Qwen3.6-27B | SFT / 2 epochs  | 训练未完成 |                     | `1c621a84ae89` |               |                                                                                                                                                                                   | [详情](results/qwen3.6-27b.md)                |
+| 模型                 | 阶段 / 预算     | 状态       | 启动时间 UTC        | 训练 commit    |  SimpleVQA EN | SwanLab                                                                                                                                                                           | 实验文档                                      |
+| -------------------- | --------------- | ---------- | ------------------- | -------------- | ------------: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| Qwen3-VL-8B-Instruct | SFT / 2 epochs  | 准备中     |                     |                |               |                                                                                                                                                                                   | [详情](results/qwen3-vl-8b.md)                |
+| Qwen3.5-4B           | Base            | 完成       | 2026-11-10 08:33:48 |                | 45.11 / 46.38 | [评测](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/5210g8ibu4eo0y0zzg6ft)                                                                                           | [详情](results/qwen3.5-4b.md#baseline)        |
+| Qwen3.5-4B           | SFT / 100 steps | 完成       | 2026-11-10 07:04:49 | `28f866220dc3` | 42.74 / 43.93 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/ejccsn9ib17s2swcq6z40) · [评测](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/emr9mnx3q7y5z6e6z3pfi) | [详情](results/qwen3.5-4b.md#sft100-20261110) |
+| Qwen3.6-27B          | SFT / 2 epochs  | 训练未完成 |                     | `1c621a84ae89` |               |                                                                                                                                                                                   | [详情](results/qwen3.6-27b.md)                |
 
-当前分数均为 Direct Answer、temperature=0、thinking 开启、32K 总上下文。完整生成配置、裁判和评测 commit 见模型文档。SimpleVQA全量对比中，100步SFT比Base低2.37个百分点。评测代码仅裁判重试及帮助文字有差异，已人工审计并保留各自源码SHA，见模型文档；100步是短程实验。[公开参考基准](benchmark-references.md)中的工具模式及其他裁判分数另列。
+当前分数均为 Direct Answer、temperature=0、4B的thinking开启、32K总上下文。完整生成配置、裁判和评测 commit 见模型文档。SimpleVQA全量对比中，100步SFT比Base低2.37个百分点。评测代码仅裁判重试及帮助文字有差异，已人工审计并保留各自源码SHA，见模型文档；100步是短程实验。[公开参考基准](benchmark-references.md)中的工具模式及其他裁判分数另列。
 
 已有VDR分数保留在模型历史文档中；后续实验、数据下载和默认比较均只要求SimpleVQA。
 
@@ -24,6 +25,7 @@
 | [evaluation.md](evaluation.md)                                       | 数据版本、Direct Answer 协议、裁判配置、运行与结果比较 |
 | [evaluation-setup.md](evaluation-setup.md)                           | 可选工具环境和其他评测实现的区别                       |
 | [benchmark-references.md](benchmark-references.md)                   | 公开 Direct Reasoning、Agentic、纯 SFT 参考分数        |
+| [scripts/run-qwen3-vl-8B-8xgpu.sh](scripts/run-qwen3-vl-8B-8xgpu.sh) | Qwen3-VL-8B-Instruct的训练与SimpleVQA入口              |
 | [scripts/run-qwen3.5-4B-8xgpu.sh](scripts/run-qwen3.5-4B-8xgpu.sh)   | Qwen3.5-4B 的训练、基准评测与比较入口                  |
 | [scripts/run-qwen3.6-27B-8xgpu.sh](scripts/run-qwen3.6-27B-8xgpu.sh) | Qwen3.6-27B 模型配置及共用入口                         |
 | [configs/benchmark.env.example](configs/benchmark.env.example)       | 模型、裁判与可选工具的配置占位符                       |

@@ -12,7 +12,7 @@
 | --------- | ----------------- | ------ |
 | SimpleVQA | test 中全部英文题 | Pass@1 |
 
-每题仅一次模型生成，温度0，保留thinking，输入和输出合计最多32K；不提供工具定义或历史轨迹，不执行工具。复用OpenSearch/VDR裁判prompt，通过裁判接口判断最终答案的语义正确性，Pass@1为答对题数/全部题数。参考答案只给裁判。超限、无答案、错误工具调用和异常题均保留在分母，另报与SFT train去重后的分数。
+每题仅一次模型生成，温度0，按模型原生模板保留thinking（Qwen3-VL-8B-Instruct没有该开关），输入和输出合计最多32K；不提供工具定义或历史轨迹，不执行工具。复用OpenSearch/VDR裁判prompt，通过裁判接口判断最终答案的语义正确性，Pass@1为答对题数/全部题数。参考答案只给裁判。超限、无答案、错误工具调用和异常题均保留在分母，另报与SFT train去重后的分数。
 
 模型服务容量允许时，可设置 `BENCHMARK_WORKERS=4` 并发生成答案；裁判可并行调用；`JUDGE_QPS`控制请求发起速率，默认1 QPS，设为0表示不限速。初始/SFT两组使用相同设置，结果记录评测代码分支、commit与源码hash。
 
@@ -58,6 +58,8 @@ hf_hub_download("m-a-p/SimpleVQA", repo_type="dataset",
 `AGENT_PROVENANCE_FILE` 指向保存在运行产物目录的模型来源 JSON，记录模型名称与 revision、`served_model_name`、完整训练 branch/commit、`kind`、实际训练预算和 `hashes_verified=true`。验证模型文件与可信校验清单一致后再设置此标记。本地最终导出应检查权重索引和分片、计算文件 SHA256，并记录 `origin=local-final-export`。`relax` 标签只接受 `kind=trained-final`；基座与短程训练分别记录。该文件及逐题结果不提交到 Git。
 
 ## 运行
+
+Qwen3-VL-8B-Instruct使用原生模板，不强行添加thinking开关；Qwen3.5/3.6仍要求保留完整thinking历史的补丁成功。结果记录实际chat模板参数。
 
 本地计数和模型服务使用相同模板，以核对包含图片展开的实际输入token数。生成模板后供两边共用：
 
