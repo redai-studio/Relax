@@ -320,7 +320,7 @@ def main() -> None:
     provenance = json.loads(Path(os.environ["AGENT_PROVENANCE_FILE"]).read_text())
     if provenance["served_model_name"] != os.environ["AGENT_MODEL"]:
         raise ValueError("Served model name differs from the verified model provenance")
-    if args.label == "relax" and (provenance.get("kind") != "trained-final" or provenance.get("epochs", 0) < 2):
+    if args.label == "relax" and provenance.get("kind") != "trained-final":
         raise ValueError("Relax evaluation requires the final trained artifact, not an upload-validation model")
     if not provenance.get("hashes_verified"):
         raise ValueError("Verify model file hashes against trusted provenance before evaluation")

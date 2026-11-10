@@ -104,6 +104,7 @@ CKPT_ARGS=(
     --megatron-to-hf-mode bridge
     --num-epoch "${NUM_EPOCHS}"
 )
+if [[ -n "${TRAIN_STEPS:-}" ]]; then CKPT_ARGS+=(--num-rollout "${TRAIN_STEPS}"); fi
 # Actor always saves the final step. This interval prevents intermediate saves.
 if [[ "${BENCHMARK_ONLY:-0}" != 1 ]]; then
     CKPT_ARGS+=(

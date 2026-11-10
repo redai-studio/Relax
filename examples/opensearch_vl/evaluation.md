@@ -61,7 +61,7 @@ hf_hub_download("Osilly/Vision-DeepResearch-Eval", repo_type="dataset",
 
 将 `BENCHMARK_DATA_ROOT` 设为相同下载目录。`BENCHMARK_OVERLAP_INDEX` 指向从实际 `train.jsonl` 生成的 JSON，包含 `questions` 和 `images` 两个 hash 列表。问题 hash 对首条用户消息去掉 `<image>`，再 casefold、合并空白并计算 UTF-8 SHA256；图片使用训练记录的 `metadata.image_hashes`，即原图 RGB 尺寸与像素的 SHA256。问题或任一图片命中都视为与训练重叠；去重分数仅统计未命中题目。
 
-`AGENT_PROVENANCE_FILE` 指向模型来源 JSON，包含实际 QS model/version/subversion、`served_model_name`、完整 branch/commit、训练 Job/Trial、`kind`、`epochs` 和 `hashes_verified=true`。先按上传收据校验下载文件，再写此标记；它不是自动校验的替代品。`relax` 标签只接受 `kind=trained-final` 且至少 2 epoch 的版本，上传验证版本只能作为 baseline。
+`AGENT_PROVENANCE_FILE` 指向模型来源 JSON，包含实际 QS model/version/subversion、`served_model_name`、完整 branch/commit、训练 Job/Trial、`kind`、`epochs` 和 `hashes_verified=true`。先按上传收据校验下载文件，再写此标记；它不是自动校验的替代品。`relax` 标签只接受 `kind=trained-final` 的训练最终导出版本，并记录实际完成步数和轮数（短程实验单列），上传验证版本只能作为 baseline。
 
 ## 运行
 

@@ -8,6 +8,20 @@ import os
 from pathlib import Path
 
 
+def privacy_settings():
+    import swanlab
+
+    return swanlab.Settings(
+        metadata_collect=False,
+        collect_hardware=False,
+        collect_runtime=False,
+        hardware_monitor=False,
+        requirements_collect=False,
+        conda_collect=False,
+        log_proxy_type="none",
+    )
+
+
 def install() -> None:
     from relax.utils.logging_utils import install_asyncio_noise_filter
 
@@ -15,6 +29,7 @@ def install() -> None:
     import swanlab
     from torch.utils.tensorboard import SummaryWriter
 
+    swanlab.merge_settings(privacy_settings())
     swanlab.sync_tensorboard_torch(types=["scalar"])
     original_init = SummaryWriter.__init__
 
