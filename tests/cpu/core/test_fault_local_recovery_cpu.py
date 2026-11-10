@@ -171,6 +171,7 @@ def make_controller(runtime, services, trace, *, count=1, max_global_restart=3, 
     namespace = {
         "logger": logger,
         "threading": threading,
+        "time": time,
         "ROLES": Roles,
         "GENRM_ROLE": "genrm",
         "ALGOS": {"cpu": {}},
@@ -538,7 +539,7 @@ def test_actual_global_teardown_retires_old_receiver_even_when_reinit_fails(runt
         recovery_load_path=lambda config: None,
         tq=SimpleNamespace(close=lambda: trace.append("tq_close")),
         shutdown_async_loop=lambda: trace.append("loop_shutdown"),
-        time=SimpleNamespace(sleep=lambda seconds: trace.append(("sleep", seconds))),
+        time=SimpleNamespace(sleep=lambda seconds: trace.append(("sleep", seconds)), monotonic=time.monotonic),
     )
     router = ModuleType("relax.distributed.ray.rollout")
     router.stop_launched_routers = lambda: 0
