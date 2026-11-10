@@ -71,21 +71,20 @@ KEEP_LAST_K=0 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 
 在兼容的 Megatron 脚本中接入，保留原有模型、数据与启动方式。
 
-**① 安装接入补丁**（仓库根目录执行一次）
+**① 安装接入补丁**
 
 ```bash
 python3 examples/chunkflow/setup.py
 ```
 
-**② 添加 ChunkFlow 参数**（加入现有训练命令，不是单独执行）
+**② 添加 ChunkFlow 参数**
 
 ```bash
 --use-chunkflow \
 --chunkflow-chunk-size 4096 \
---chunkflow-keep-last-k 0
+--chunkflow-keep-last-k 0 \
+--no-rope-fusion
 ```
-
-`K=0` 保留全部激活、不重计算；`K=1` 每组只保留最后一块激活，其余块在反向前重计算。
 
 原脚本已满足下列设置时，无需重复添加：
 
@@ -95,10 +94,6 @@ python3 examples/chunkflow/setup.py
 | `--calculate-per-token-loss`                   | 按 token 统计，避免切块改变样本权重                    |
 | `--no-rope-fusion`                             | 使用支持分块位置偏移的 RoPE 路径                       |
 | `--attention-dropout 0.0 --hidden-dropout 0.0` | 当前适配要求关闭 dropout，避免分块与重放的随机掩码问题 |
-
-**PP 自动沿用原配置**：ChunkFlow 根据 Megatron 实际 PP 大小选择调度器，无需额外设置流水线参数。PP>1 仍需在训练 worker 环境中设置 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`，确认使用实验性调度器；Ray 通过 `runtime_env.env_vars` 传递，示例脚本已设置。
-
-仅适用于已适配的 packed 纯文本模型；GDN / QSA 沿用对应示例的模型配置。
 
 ### 重要参数
 

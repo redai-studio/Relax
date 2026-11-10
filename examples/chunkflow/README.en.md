@@ -86,7 +86,8 @@ python3 examples/chunkflow/setup.py
 ```bash
 --use-chunkflow \
 --chunkflow-chunk-size 4096 \
---chunkflow-keep-last-k 0
+--chunkflow-keep-last-k 0 \
+--no-rope-fusion
 ```
 
 `K=0` retains all activations without recomputation; `K=1` keeps only the last chunk per group and recomputes earlier chunks before backward.
