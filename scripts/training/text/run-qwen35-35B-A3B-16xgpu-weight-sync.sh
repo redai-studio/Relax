@@ -16,6 +16,8 @@ source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
 : "${DATA_DIR:?Set DATA_DIR to the root containing dapo-math-17k}"
 : "${SAVE_DIR:?Set SAVE_DIR to the task-owned run directory}"
 : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the verified Jobs HTTP endpoint}"
+: "${WEIGHT_SYNC_CUDA_ARCHS:?Set WEIGHT_SYNC_CUDA_ARCHS after verifying the allocated GPUs}"
+export WEIGHT_SYNC_CUDA_ARCHS
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/rl/delta-weight-sync}"
 EXP_NAME="${EXP_NAME:-qwen35-35b-a3b-dapo-16xgpu-weight-sync}"
@@ -32,6 +34,7 @@ env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 env.pop("working_dir", None)
 root = Path(os.environ["SAVE_DIR"]).resolve()
 overrides = {
+    "TORCH_CUDA_ARCH_LIST": os.environ["WEIGHT_SYNC_CUDA_ARCHS"],
     "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(root / "tmp"),
     "XDG_CACHE_HOME": str(root / "cache"), "HF_HOME": str(root / "cache" / "hf"),
     "TRITON_CACHE_DIR": str(root / "cache" / "triton"),
@@ -132,6 +135,7 @@ SGLANG_ARGS=(
    --sglang-moe-runner-backend triton
    --sglang-disable-shared-experts-fusion
    --sglang-disable-cuda-graph
+   --sglang-enforce-disable-flashinfer-allreduce-fusion
 )
 LOG_ARGS=(
    --use-metrics-service
