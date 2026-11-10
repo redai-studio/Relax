@@ -19,23 +19,25 @@ ______________________________________________________________________
 
 Data: 5,000 synthetic Chinese SFT samples. Length distribution: 70% at 0–2K, 20% at 2–8K, 8% at 8–16K, and 2% at 16–32K.
 
-| Method        | Mean train time | Mean step time | Training MFU | Training speedup | End-to-end speedup | Memory ref.¹ (GiB) |     Saved¹ |
-| ------------- | --------------: | -------------: | -----------: | ---------------: | -----------------: | -----------------: | ---------: |
-| Baseline      |          3.08 s |         4.38 s |        23.1% |            1.00× |              1.00× |              52.28 |          — |
-| **ChunkFlow** |      **1.86 s** |     **3.10 s** |    **38.2%** |        **1.65×** |          **1.40×** |          **21.01** | **59.81%** |
+| Method        | Mean train time | Mean step time | Training MFU | Training speedup | End-to-end speedup |
+| ------------- | --------------: | -------------: | -----------: | ---------------: | -----------------: |
+| Baseline      |          3.08 s |         4.38 s |        23.1% |            1.00× |              1.00× |
+| **ChunkFlow** |      **1.86 s** |     **3.10 s** |    **38.2%** |        **1.65×** |          **1.40×** |
+
+**Memory reference**: LongAlign / 64K / chunk4096 / GBS1 / K1; peak allocated memory drops from **52.28 GiB → 21.01 GiB**, saving **59.81%**.
 
 ### MoE · Qwen3.6-35B-A3B
 
 > **Configuration**　8 GPUs · TP2 / PP4 / EP2 · GBS8 · chunk8192 · LongAlign
 
-| Method        | Mean train time | Mean step time | Training MFU | Training speedup | End-to-end speedup | Memory ref.¹ (GiB) |     Saved¹ |
-| ------------- | --------------: | -------------: | -----------: | ---------------: | -----------------: | -----------------: | ---------: |
-| Baseline      |          16.2 s |         17.5 s |        13.8% |            1.00× |              1.00× |              56.38 |          — |
-| **ChunkFlow** |      **17.0 s** |     **18.4 s** |    **13.1%** |       **0.950×** |         **0.950×** |          **37.79** | **32.97%** |
+| Method        | Mean train time | Mean step time | Training MFU | Training speedup | End-to-end speedup |
+| ------------- | --------------: | -------------: | -----------: | ---------------: | -----------------: |
+| Baseline      |          16.2 s |         17.5 s |        13.8% |            1.00× |              1.00× |
+| **ChunkFlow** |      **17.0 s** |     **18.4 s** |    **13.1%** |       **0.950×** |         **0.950×** |
+
+**Memory reference**: LongAlign / 64K / chunk4096 / GBS8 / K0 + native selective `gdn moe`; peak allocated memory drops from **56.38 GiB → 37.79 GiB**, saving **32.97%**.
 
 Speedups follow the experiment summary: above 1 means faster, below 1 means slower.
-
-¹ Memory reference: LongAlign, 64K, chunk4096; Dense uses GBS1 / K1, MoE uses GBS8 / K0 with native selective `gdn moe`.
 
 ______________________________________________________________________
 
