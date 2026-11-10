@@ -74,6 +74,11 @@ def validate_args(args: Namespace) -> None:
             "--use-chunkflow requires --calculate-per-token-loss: sample-mean loss would treat "
             "each chunk as a separate sample and change the training objective."
         )
+    if getattr(args, "enable_mtp_training", False):
+        raise ValueError(
+            "--use-chunkflow does not support --enable-mtp-training: "
+            "chunk-local MTP labels omit supervision across chunk boundaries."
+        )
     from relax.algorithms import ALGORITHM_SPECS
 
     algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))

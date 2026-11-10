@@ -44,6 +44,9 @@ ROOT = Path(__file__).resolve().parents[4]
         ({"use_chunkflow": False, "advantage_estimator": "gspo", "use_opsm": True}, None),
         ({"use_chunkflow": False, "advantage_estimator": "m2po"}, None),
         ({"num_distributed_optimizer_instances": 2}, "--num-distributed-optimizer-instances 1"),
+        ({"enable_mtp_training": True, "mtp_num_layers": 1}, "--enable-mtp-training"),
+        ({"mtp_num_layers": 1}, None),
+        ({"use_chunkflow": False, "enable_mtp_training": True, "mtp_num_layers": 1}, None),
     ],
 )
 def test_validation_rejects_unsupported_loss_and_streaming_contracts(options, error):
