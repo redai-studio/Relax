@@ -45,7 +45,7 @@ CHUNKFLOW_ARGS=(
     --use-chunkflow
     --chunkflow-chunk-size "${CHUNK_SIZE:-4096}"
     --chunkflow-pack-policy staggered
-    --chunkflow-keep-last-k "${KEEP_LAST_K:-1}"
+    --chunkflow-keep-last-k "${KEEP_LAST_K:-0}"
 )
 
 PERF_ARGS=(

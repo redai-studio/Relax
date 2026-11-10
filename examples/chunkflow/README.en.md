@@ -59,7 +59,7 @@ export MODEL_DIR=/path/to/model
 export PROMPT_DATA=/path/to/data
 ```
 
-**Dense · Qwen3-4B**　Defaults: 64K / chunk4096 / K1
+**Dense · Qwen3-4B**　Defaults: 64K / chunk4096 / K0
 
 ```bash
 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
