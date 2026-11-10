@@ -12,6 +12,8 @@ from relax.distributed.checkpoint_service.backends.shard_p2p.remote.compat impor
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
 @pytest.mark.parametrize("optional_fields", [False, True])
 def test_replica_context_uses_target_coordinates_and_restores_them(monkeypatch, tp, optional_fields):
+    import sglang.srt as srt
+
     original = dict(tp_rank=19, tp_size=32, world_group=object())
     current = dict(original)
     fields = {
@@ -54,11 +56,11 @@ def test_replica_context_uses_target_coordinates_and_restores_them(monkeypatch, 
             current.clear()
             current.update(previous)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.runtime_context",
-        SimpleNamespace(_PARALLEL_FIELDS=frozenset(fields), get_parallel=lambda: SimpleNamespace(override=override)),
+    runtime_context = SimpleNamespace(
+        _PARALLEL_FIELDS=frozenset(fields), get_parallel=lambda: SimpleNamespace(override=override)
     )
+    monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", runtime_context)
+    monkeypatch.setattr(srt, "runtime_context", runtime_context, raising=False)
     legacy = SimpleNamespace(
         **dict.fromkeys(
             ("_WORLD", "_TP", "_PP", "_ATTN_TP", "_ATTN_CP", "_DCP", "_MOE_TP", "_MOE_EP", "_MOE_DP"), object()
