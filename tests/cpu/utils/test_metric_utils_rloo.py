@@ -131,3 +131,32 @@ def test_eval_logger_disables_training_rloo_diagnostics(monkeypatch):
     rollout_module._log_eval_rollout_data(0, args, data)
 
     assert calls == [{"include_rloo_diagnostics": False}]
+
+
+@pytest.mark.parametrize("rewards", [[0.0, 1.0], []])
+def test_eval_logger_reports_partial_coverage_and_dataset_group_size(monkeypatch, rewards):
+    import relax.distributed.ray.rollout as rollout_module
+
+    monkeypatch.setattr(rollout_module, "save_eval_summary_jsonl", lambda *_a: None)
+    monkeypatch.setattr(rollout_module, "compute_rollout_step", lambda *_a: 0)
+    monkeypatch.setattr(rollout_module.tracking_utils, "log", lambda *_a, **_kw: None)
+    monkeypatch.setattr(rollout_module.tracking_utils, "flush_metrics", lambda *_a: None)
+    args = SimpleNamespace(custom_eval_rollout_log_function_path=None, log_passrate=True, n_samples_per_eval_prompt=4)
+    data = {
+        "audit": {
+            "rewards": rewards,
+            "group_size": 2,
+            "num_prompts": 2,
+            "num_valid_prompts": 1 if rewards else 0,
+        }
+    }
+    metrics = rollout_module._log_eval_rollout_data(0, args, data)
+    assert metrics["eval/audit/coverage"] == (0.5 if rewards else 0)
+    assert metrics["eval/audit/num_dropped_prompts"] == (1 if rewards else 2)
+    assert metrics["eval/audit/partial"] == 1
+    if rewards:
+        assert metrics["eval/audit-pass@1"] == 0.5
+        assert metrics["eval/audit-pass@2"] == 1
+        assert "eval/audit-pass@4" not in metrics
+    else:
+        assert "eval/audit" not in metrics
