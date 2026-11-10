@@ -3,9 +3,13 @@
 """Native wire operation accounting without allocating full model replicas."""
 
 import json
+import multiprocessing
 import sys
 import weakref
 from dataclasses import dataclass
+from datetime import timedelta
+from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +18,77 @@ import torch
 from task_delta_weight_sync import prepared_nccl, recovery_probe
 from task_delta_weight_sync.prepared_nccl import plan_capacity, wire_bucket, wire_metadata, wire_schema_digest
 from task_delta_weight_sync.sharded_gpu_audit import AUDIT_LOADER
+
+
+def _custom_rank(rank: int, directory: str) -> None:
+    import torch.distributed as dist
+
+    from relax.utils.distributed_utils import init_process_group
+
+    root = Path(directory)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{root / f'tp-{rank}'}",
+        rank=0,
+        world_size=1,
+        timeout=timedelta(seconds=10),
+    )
+    custom = None
+    try:
+        custom = init_process_group(
+            "gloo",
+            init_method=f"file://{root / 'update'}",
+            rank=rank,
+            world_size=2,
+            group_name="prepared-custom-rank",
+            timeout=timedelta(seconds=10),
+        )
+        value = torch.tensor([rank + 1])
+        dist.all_reduce(value, group=custom)
+        (root / f"rank-{rank}.json").write_text(
+            json.dumps(
+                dict(
+                    actual=prepared_nccl.communicator_identity(custom),
+                    translated_rank=dist.get_rank(custom),
+                    default_rank=dist.get_rank(dist.group.WORLD),
+                    reduced=value.tolist(),
+                )
+            )
+        )
+    finally:
+        if custom is not None:
+            dist.destroy_process_group(custom)
+        dist.destroy_process_group()
+
+
+def test_prepared_receipts_use_actual_custom_group_rank_outside_local_tp_world(tmp_path):
+    # Two independent one-rank TP worlds reproduce SGLang's global-rank
+    # namespace mismatch. A fake group cannot expose Torch's translation.
+    # This is CPU Gloo only, bounded to two processes and a 30-second deadline.
+    context = multiprocessing.get_context("spawn")
+    processes = [context.Process(target=_custom_rank, args=(rank, str(tmp_path))) for rank in range(2)]
+    deadline = monotonic() + 30
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=max(0, deadline - monotonic()))
+        assert [process.exitcode for process in processes] == [0, 0]
+        reports = [json.loads((tmp_path / f"rank-{rank}.json").read_text()) for rank in range(2)]
+        assert [r["actual"] for r in reports] == [
+            dict(group_rank=0, group_world_size=2),
+            dict(group_rank=1, group_world_size=2),
+        ]
+        assert all(r["default_rank"] == r["translated_rank"] == 0 and r["reduced"] == [3] for r in reports)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            if process.pid is not None:
+                process.join(timeout=2)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=2)
 
 
 def test_prepared_plan_keeps_native_order_dtype_and_bytes_with_bounded_reuse():

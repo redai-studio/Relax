@@ -24,6 +24,14 @@ def wire_schema_digest(buckets: list) -> str:
     return hashlib.sha256(json.dumps(buckets, separators=(",", ":")).encode()).hexdigest()
 
 
+def communicator_identity(group: Any) -> dict:
+    """Read the actual communicator, independently of the local TP world."""
+    # SGLang creates an out-of-band update group whose ranks are not the
+    # default TP world's ranks. dist.get_rank(group) translates that default
+    # rank through pg_group_ranks and can report TP0/1 for every engine.
+    return dict(group_rank=group.rank(), group_world_size=group.size())
+
+
 def wire_bucket(named: list) -> list:
     """Run-length encode the actual tensor order, without retaining weights."""
     runs = []
@@ -110,8 +118,7 @@ def replay(state: dict, group: Any) -> dict:
     return dict(
         cuda_event_s=start.elapsed_time(end) / 1000,
         local_wall_s=monotonic() - started,
-        group_rank=dist.get_rank(group),
-        group_world_size=dist.get_world_size(group),
+        **communicator_identity(group),
         buckets=len(state["views"]),
         collectives=sum(map(len, state["views"])),
         dtype_bytes=state["dtype_bytes"],
