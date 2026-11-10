@@ -53,6 +53,7 @@ from relax.utils.training.ppo_utils import (
 
 from .arguments import _validate_linear_cp_mode
 from .conditional_branch_sync import install_conditional_branch_sync
+from .fsdp_hyper_connection_patch import patch_gated_residual_norms_for_fsdp
 
 
 logger = get_logger(__name__)
@@ -923,6 +924,7 @@ def get_bridge_distributed_model(
         for model_chunk in model_chunks:
             post_process = bool(getattr(model_chunk, "post_process", False))
             _configure_bridge_model(model_chunk, args, role, post_process)
+            patch_gated_residual_norms_for_fsdp(model_chunk)
             freeze_model_params(model_chunk, args)
             ensure_sequence_classification_head_trainable(model_chunk, args, role, post_process)
             install_conditional_branch_sync(args, model_chunk)

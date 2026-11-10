@@ -1011,13 +1011,16 @@ def test_bridge_fsdp_configures_every_chunk_before_distributed_wrap(monkeypatch)
     chunks = [_TaskHeadModel(post_process=False), _TaskHeadModel(post_process=True)]
     module, provider = _load_model_provider(monkeypatch, provider=_FakeProvider(chunks))
     probes = []
+    norm_patches = []
     monkeypatch.setattr(module, "_install_cp_probe", lambda models: probes.append(models))
+    monkeypatch.setattr(module, "patch_gated_residual_norms_for_fsdp", lambda model: norm_patches.append(model))
     args = _bridge_args(task_type="seq_cls", num_labels=3, mtp_detach_paths=[], freeze_params_name_list=[r".*"])
 
     model = module.get_bridge_distributed_model(args)
 
     assert model is chunks
     assert probes == [chunks]
+    assert norm_patches == chunks
     assert len(provider.pre_wrap_hooks) == 1
     assert chunks[0].output_layer.out_features == 8
     assert chunks[1].output_layer.out_features == 3
