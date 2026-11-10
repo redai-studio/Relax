@@ -117,20 +117,9 @@ class Dataset(BaseDataset):
 
 
 def get_first_fit_partitions(total_lengths: list[int], max_tokens_per_gpu: int) -> list[list[int]]:
-    """Pack indices in input order; oversized samples get their own bin."""
-    batches: list[int] = []
-    partitions: list[list[int]] = []
-    for index, length in enumerate(total_lengths):
-        for i in range(len(batches)):
-            if batches[i] + length <= max_tokens_per_gpu:
-                batches[i] += length
-                partitions[i].append(index)
-                break
-        else:
-            batches.append(length)
-            partitions.append([index])
+    from relax.utils.data.packing import get_first_fit_partitions as pack
 
-    return partitions
+    return pack(total_lengths, max_tokens_per_gpu)
 
 
 def get_minimum_num_micro_batch_size(total_lengths: list[int], max_tokens_per_gpu: int) -> int:

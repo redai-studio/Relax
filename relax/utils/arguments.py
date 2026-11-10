@@ -1575,6 +1575,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             # mbs for the training, will be ignored if `use_dynamic_batch_size` is set.
             reset_arg(parser, "--micro-batch-size", type=int, default=1)
             parser.add_argument(
+                "--balance-by-flops",
+                action="store_true",
+                default=False,
+                help=(
+                    "Opt in to FLOPs-aware DP assignment and capacity-safe dynamic microbatches for text SFT. "
+                    "Requires the ordinary SFT path (use --sft-max-in-flight-steps 1 if async prepack is selected)."
+                ),
+            )
+            parser.add_argument(
                 "--balance-data",
                 action="store_true",
                 default=False,
@@ -4762,6 +4771,10 @@ def slime_validate_args(args):
 
     apply_custom_config_overrides(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
+    from relax.utils.data.flops_config import validate_flops_balancing
+
+    # Prepack is derived later; check it after final pipeline selection as well.
+    validate_flops_balancing(args, check_prepack=False)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
 
