@@ -94,7 +94,7 @@ CRITICAL: 以下规则不可违反。
 - 禁止通配导入、硬编码密钥/路径/端点
 - 禁止跳过 pre-commit hooks
 - 禁止猜测集群配置或重建 CUDA/驱动栈
-- 调试时直接修改 `scripts/training/` 下的训练脚本来调整参数，再通过 `scripts/entrypoint/ray-job.sh` 提交
+- 调试时直接修改 `scripts/training/` 下的训练脚本来调整参数，启动入口遵循下方 Configuration & Launching 规则
 - 禁止做与目标无关的代码改动，如 code format 等
 - 集成测试需要多节点 GPU 硬件——必须显式说明跳过原因
 - 修改前先读相关文件；提交前跑 `pre-commit run --all-files`
@@ -151,6 +151,8 @@ make docs-dev                       # 启动 VitePress 文档开发服务器
 ## Configuration & Launching
 
 训练入口为 `python relax/entrypoints/train.py [args]`，通过 `relax/utils/arguments.py` 的命令行参数配置（扩展 Megatron-LM 解析器）。
+
+单机启动训练时先检查本地 Ray 是否运行，未运行则直接 `bash <训练脚本路径>`（多数脚本会自动 source `scripts/entrypoint/local.sh`，缺少该逻辑时先 source 此入口），不要仅凭 `HOST_IP` / `MASTER_ADDR` 环境变量推断已有远程集群或要求用户提供 Ray 地址，只有明确使用已有集群时才走 `ray-job.sh`。
 
 ## Domain experts & skills
 
