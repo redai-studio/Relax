@@ -58,7 +58,7 @@ hf_hub_download("Osilly/Vision-DeepResearch-Eval", repo_type="dataset",
 
 Set `BENCHMARK_DATA_ROOT` to that directory. The loader selects SimpleVQA rows with `language == "EN"`. Set `BENCHMARK_OVERLAP_INDEX` to a JSON object built from the actual `train.jsonl`, with `questions` and `images` hash lists. Question hashes remove `<image>` from the first user message, casefold, collapse whitespace and SHA256 the UTF-8 text. Image hashes are the training rows' `metadata.image_hashes`: SHA256 of the original RGB size string followed by RGB bytes. A question or any image match marks overlap; the deduplicated score uses only nonmatching cases.
 
-`AGENT_PROVENANCE_FILE` records QS model/version/subversion, `served_model_name`, full branch/commit, training Job/Trial, `kind`, `epochs` and `hashes_verified=true`. Verify downloaded files against their upload receipt before recording this flag. The `relax` label requires `kind=trained-final` and at least two epochs; upload-validation versions can only serve as baselines.
+`AGENT_PROVENANCE_FILE` records QS model/version/subversion, `served_model_name`, full branch/commit, training Job/Trial, `kind`, `epochs` and `hashes_verified=true`. Verify downloaded files against their upload receipt before recording this flag. For a local final export, validate its weight index and shards, compute file hashes, and record `origin=local-final-export`; no upload receipt is needed. The `relax` label requires `kind=trained-final` and records the actual completed steps/epochs. Report short runs separately; upload-validation versions can only serve as baselines.
 
 ## Run
 
