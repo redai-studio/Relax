@@ -267,12 +267,13 @@ jobs:
             export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:${LD_LIBRARY_PATH:-}
             npu-smi info
             python3 -c "import torch, torch_npu; assert torch.npu.device_count() == 4, torch.npu.device_count()"
-            # MindSpeed parses sys.argv at import time, so pass pytest options in-process.
-            PYTHONPATH="${MEGATRON_BRIDGE_SRC:-/root/Megatron-Bridge/src}${PYTHONPATH:+:$PYTHONPATH}" \
-              python3 -c "import pytest, torch_npu; raise SystemExit(pytest.main([
+            # Match the NPU launcher import paths and keep pytest options out of sys.argv.
+            npu_test_pythonpath="${MEGATRON_BRIDGE_SRC:-/root/Megatron-Bridge/src}:${MINDSPEED:-/root/MindSpeed}:${MEGATRON:-/root/Megatron-LM}${PYTHONPATH:+:$PYTHONPATH}"
+            PYTHONPATH="$npu_test_pythonpath" \
+              python3 -c "import pytest, torch_npu, relax.backends.megatron; raise SystemExit(pytest.main([
                   \"-q\",
                   \"tests/backends/megatron/test_ce_alog_precision.py::test_gdn_a_log_preserves_fp32_checkpoint_through_bf16_wrapper[npu]\",
-              ]))"
+              ]))" 2>&1 | tee /artifacts/gdn-precision.log
             unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
             unset RAY_NO_WAIT RAY_ADDRESS RELAX_ENTRYPOINT_MODE
             export no_proxy="*" NO_PROXY="*"
