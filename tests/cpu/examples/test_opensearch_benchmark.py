@@ -326,7 +326,7 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(
         assert len(judge_calls) == 3
 
 
-@pytest.mark.parametrize("invalid", [None, "protocol", "partial", "smoke"])
+@pytest.mark.parametrize("invalid", [None, "protocol", "resume", "partial", "smoke"])
 def test_comparison_needs_only_full_simplevqa_results(monkeypatch, tmp_path, invalid):
     import json
 
@@ -346,6 +346,8 @@ def test_comparison_needs_only_full_simplevqa_results(monkeypatch, tmp_path, inv
         if label == "relax":
             if invalid == "protocol":
                 summary["protocol"]["evaluator_sha256"] = "different-source"
+            elif invalid == "resume":
+                summary["protocol"]["resume_evaluator_sha256s"] = ["different-source"]
             elif invalid == "partial":
                 summary["expected_cases"] = 100
             elif invalid == "smoke":
@@ -390,3 +392,206 @@ def test_unsupported_reasoning_templates_still_fail(benchmark, processor_type, t
     assert benchmark.inference_chat_kwargs(processor)["enable_thinking"] is True
     with pytest.raises(ValueError, match="supported Qwen history template"):
         benchmark.preserve_history_template(processor)
+
+
+@pytest.fixture
+def unfinished_benchmark(monkeypatch, benchmark, tmp_path):
+    import json
+
+    calls, verdicts = [], []
+    cases = [{"id": str(index), "question": str(index), "answer": "reference", "images": []} for index in range(1013)]
+
+    class Runner:
+        def __init__(self, *_args):
+            self.template_sha256, self.chat_template_kwargs = "native-template", {}
+            self.requests, self.error, self.last_response = [], None, None
+
+        def infer(self, contents, **_kwargs):
+            question = contents[0]["parts"][0]["text"]
+            calls.append(question)
+            if question == "0":
+                self.error = "context_limit"
+                raise ValueError("Context exhausted")
+            return {"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}
+
+    def judge_request(**kwargs):
+        verdicts.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="correct: yes"))], model="judge"
+        )
+
+    upstream = tmp_path / "upstream"
+    monkeypatch.setattr(benchmark, "HTTPRunner", Runner)
+    monkeypatch.setattr(benchmark, "read_cases", lambda *_args: cases)
+    monkeypatch.setattr(benchmark.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        benchmark.subprocess,
+        "check_output",
+        lambda command, **_kwargs: (
+            benchmark.UPSTREAM_REVISION if command[2] == str(upstream) else "current-evaluator-commit"
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(
+            OpenAI=lambda **_kwargs: SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=judge_request))
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "eval_with_gpt4o",
+        SimpleNamespace(
+            JUDGE_PROMPT="{question} {correct_answer} {response}", parse_judge_response=lambda _text: {"acc": 1}
+        ),
+    )
+    provenance = tmp_path / "model-provenance.json"
+    provenance.write_text(
+        json.dumps(
+            {
+                "kind": "base",
+                "served_model_name": "baseline",
+                "hashes_verified": True,
+                "model_id": 5859,
+                "version": 1,
+                "sub_version": 1761219912,
+                "files_sha256": {"config.json": "trusted-model-hash"},
+            }
+        )
+    )
+    for key, value in {
+        "OPENSEARCH_ROOT": str(upstream),
+        "AGENT_MODEL": "baseline",
+        "AGENT_BASE_URL": "http://127.0.0.1:1/v1",
+        "AGENT_PROVENANCE_FILE": str(provenance),
+        "JUDGE_MODEL": "judge",
+        "JUDGE_BASE_URL": "http://127.0.0.1:2/v1",
+        "JUDGE_API_KEY": "fixture",
+    }.items():
+        monkeypatch.setenv(key, value)
+    data, overlap, output = tmp_path / "dataset.parquet", tmp_path / "overlap.json", tmp_path / "output"
+    data.write_bytes(b"complete-dataset")
+    overlap.write_text('{"questions":[],"images":[]}')
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--dataset",
+            "simplevqa",
+            "--label",
+            "base",
+            "--data",
+            str(data),
+            "--processor",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--overlap-index",
+            str(overlap),
+            "--judge-qps",
+            "0",
+        ],
+    )
+    benchmark.main()
+    assert json.loads((output / "model-provenance.json").read_text()) == json.loads(provenance.read_text())
+    (output / "summary.json").unlink()
+    records = output / "trajectories.jsonl"
+    records.write_text(
+        "".join(
+            line
+            for line in records.read_text().splitlines(keepends=True)
+            if json.loads(line)["id"] not in {"1011", "1012"}
+        )
+    )
+    protocol = json.loads((output / "protocol.json").read_text())
+    protocol["evaluator_sha256"] = "previous-source-hash"
+    (output / "protocol.json").write_text(json.dumps(protocol))
+    (output / "evaluator.json").write_text(
+        json.dumps(
+            {"git_branch": "original", "git_commit": "original-commit", "source_sha256": "previous-source-hash"}
+        )
+    )
+    calls.clear()
+    verdicts.clear()
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--resume"])
+    return SimpleNamespace(output=output, data=data, provenance=provenance, calls=calls, verdicts=verdicts)
+
+
+def test_resume_appends_without_repeating_completed_cases_and_keeps_full_denominator(benchmark, unfinished_benchmark):
+    import json
+
+    run = unfinished_benchmark
+    original = {
+        name: (run.output / name).read_bytes() for name in ("protocol.json", "evaluator.json", "model-provenance.json")
+    }
+    prefix = (run.output / "trajectories.jsonl").read_bytes()
+    benchmark.main()
+    assert sorted(run.calls) == ["1011", "1012"] and len(run.verdicts) == 2
+    assert (run.output / "trajectories.jsonl").read_bytes().startswith(prefix)
+    for name, payload in original.items():
+        assert (run.output / name).read_bytes() == payload
+    records = [json.loads(line) for line in (run.output / "trajectories.jsonl").read_text().splitlines()]
+    assert len(records) == len({record["id"] for record in records}) == 1013
+    summary = json.loads((run.output / "summary.json").read_text())
+    assert summary["expected_cases"] == summary["deduplicated_cases"] == 1013
+    assert summary["correct"] == 1012 and summary["failures"] == summary["truncations"] == 1
+    assert summary["pass_at_1"] == pytest.approx(1012 / 1013)
+    assert summary["protocol"]["evaluator_sha256"] == "previous-source-hash"
+    assert summary["protocol"]["resume_evaluator_sha256s"] == [benchmark.sha256((TOOLS / "benchmark.py").read_bytes())]
+    assert summary["evaluator"]["git_commit"] == "original-commit"
+    source = json.loads((run.output / "resume-source.json").read_text())
+    assert source["attempts"][0]["completed_cases"] == 1011
+    assert source["attempts"][0]["protocol_differences"] == ["evaluator_sha256"]
+    assert source["attempts"][0]["evaluator"]["git_commit"] == "current-evaluator-commit"
+    assert source["attempts"][0]["evaluator"]["source_sha256"] == benchmark.sha256(
+        (TOOLS / "benchmark.py").read_bytes()
+    )
+    with pytest.raises(ValueError, match="unfinished"):
+        benchmark.main()
+    assert len(run.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "damage", ["model", "data", "judge", "protocol", "duplicate", "unknown", "partial", "incomplete"]
+)
+def test_resume_rejects_mismatched_or_invalid_saved_runs(monkeypatch, benchmark, unfinished_benchmark, damage):
+    import json
+
+    run = unfinished_benchmark
+    trajectories = run.output / "trajectories.jsonl"
+    if damage == "model":
+        source = json.loads(run.provenance.read_text())
+        source["files_sha256"]["config.json"] = "different-model"
+        run.provenance.write_text(json.dumps(source))
+    elif damage == "data":
+        run.data.write_bytes(b"different-dataset")
+    elif damage == "judge":
+        monkeypatch.setenv("JUDGE_MODEL", "different-judge")
+    elif damage == "protocol":
+        protocol = json.loads((run.output / "protocol.json").read_text())
+        protocol["temperature"] = 1
+        (run.output / "protocol.json").write_text(json.dumps(protocol))
+    else:
+        rows = trajectories.read_text().splitlines(keepends=True)
+        if damage == "duplicate":
+            rows.append(rows[0])
+        elif damage == "partial":
+            rows.append('{"id":')
+        else:
+            record = json.loads(rows[0])
+            if damage == "unknown":
+                record["id"] = "unknown-case"
+            else:
+                record.pop("correct")
+            rows[0] = json.dumps(record) + "\n"
+        trajectories.write_text("".join(rows))
+    original = trajectories.read_bytes()
+    with pytest.raises(ValueError):
+        benchmark.main()
+    assert not run.calls and not run.verdicts
+    assert trajectories.read_bytes() == original
+    assert not (run.output / "summary.json").exists()
+    assert not (run.output / "resume-source.json").exists()

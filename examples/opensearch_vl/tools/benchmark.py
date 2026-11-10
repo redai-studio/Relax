@@ -307,6 +307,7 @@ def main() -> None:
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--processor", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--resume", action="store_true", help="Append remaining cases to an unfinished matching run")
     parser.add_argument("--tool-cache", type=Path, help="Shared cache for agent workflow only")
     parser.add_argument("--overlap-index", type=Path)
     parser.add_argument("--max-cases", type=int, default=0, help="Nonzero values are smoke tests, not full benchmarks")
@@ -418,9 +419,67 @@ def main() -> None:
         "git_commit": subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip(),
         "source_sha256": protocol["evaluator_sha256"],
     }
-    args.output.mkdir(parents=True, exist_ok=False)
-    write_json(args.output / "protocol.json", protocol)
-    records, last_judge = [], 0.0
+    records, completed, resume_source = [], set(), None
+    if args.resume:
+        if not args.output.is_dir() or (args.output / "summary.json").exists():
+            raise ValueError("Resume requires an existing unfinished benchmark directory")
+        original_protocol = json.loads((args.output / "protocol.json").read_text())
+        if {key: value for key, value in original_protocol.items() if key != "evaluator_sha256"} != {
+            key: value for key, value in protocol.items() if key != "evaluator_sha256"
+        }:
+            raise ValueError("Resume protocol differs from the original benchmark")
+        original_source = json.loads((args.output / "model-provenance.json").read_text())
+        if (
+            original_source != provenance
+            or original_source.get("kind") != {"base": "base", "relax": "trained-final"}[args.label]
+        ):
+            raise ValueError("Resume model source or evaluation label differs from the original benchmark")
+        with (args.output / "trajectories.jsonl").open() as stream:
+            records = [json.loads(line) for line in stream]
+        case_ids = {case["id"] for case in cases}
+        for record in records:
+            identifier = record.get("id")
+            if identifier not in case_ids or identifier in completed:
+                raise ValueError(f"Duplicate or unknown completed case ID: {identifier}")
+            if (
+                not isinstance(record.get("correct"), bool)
+                or not isinstance(record.get("tool_errors"), int)
+                or "overlaps_sft_train" not in record
+            ):
+                raise ValueError(f"Incomplete saved case: {identifier}")
+            completed.add(identifier)
+        original_evaluator_path = args.output / "evaluator.json"
+        original_evaluator = (
+            json.loads(original_evaluator_path.read_text())
+            if original_evaluator_path.exists()
+            else {"git_branch": None, "git_commit": None, "source_sha256": original_protocol["evaluator_sha256"]}
+        )
+        if original_evaluator["source_sha256"] != original_protocol["evaluator_sha256"]:
+            raise ValueError("Original evaluator metadata differs from the saved protocol")
+        resume_path = args.output / "resume-source.json"
+        resume_source = (
+            json.loads(resume_path.read_text())
+            if resume_path.exists()
+            else {"original_evaluator": original_evaluator, "attempts": []}
+        )
+        resume_source["attempts"].append(
+            {
+                "evaluator": evaluator,
+                "completed_cases": len(completed),
+                "protocol_differences": ["evaluator_sha256"]
+                if protocol["evaluator_sha256"] != original_protocol["evaluator_sha256"]
+                else [],
+            }
+        )
+        write_json(resume_path, resume_source)
+        protocol, evaluator = original_protocol, original_evaluator
+        logger.info("Resuming benchmark with %s/%s cases already recorded", len(completed), len(cases))
+    else:
+        args.output.mkdir(parents=True, exist_ok=False)
+        write_json(args.output / "protocol.json", protocol)
+        write_json(args.output / "model-provenance.json", provenance)
+        write_json(args.output / "evaluator.json", evaluator)
+    last_judge = 0.0
     judge_lock, worker_state = Lock(), local()
 
     def evaluate_case(item: tuple[int, dict]) -> dict:
@@ -514,8 +573,11 @@ def main() -> None:
         )
         return record
 
-    with (args.output / "trajectories.jsonl").open("w") as sink, ThreadPoolExecutor(args.workers) as executor:
-        pending = [executor.submit(evaluate_case, item) for item in enumerate(cases)]
+    trajectories = args.output / "trajectories.jsonl"
+    with trajectories.open("a" if args.resume else "w") as sink, ThreadPoolExecutor(args.workers) as executor:
+        if records and not trajectories.read_bytes().endswith(b"\n"):
+            sink.write("\n")
+        pending = [executor.submit(evaluate_case, item) for item in enumerate(cases) if item[1]["id"] not in completed]
         for future in as_completed(pending):
             record = future.result()
             records.append(record)
@@ -538,6 +600,11 @@ def main() -> None:
     summary["model_source"] = provenance
     summary["label"] = args.label
     summary["evaluator"] = evaluator
+    if resume_source is not None:
+        summary["resume_source"] = resume_source
+        resume_hashes = sorted({attempt["evaluator"]["source_sha256"] for attempt in resume_source["attempts"]})
+        if any(value != protocol["evaluator_sha256"] for value in resume_hashes):
+            summary["protocol"] = {**protocol, "resume_evaluator_sha256s": resume_hashes}
     write_json(args.output / "summary.json", summary)
     logger.info("Benchmark summary: %s", json.dumps(summary, ensure_ascii=False))
 

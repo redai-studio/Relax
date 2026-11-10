@@ -108,6 +108,8 @@ bash "$SCRIPT" compare
 
 ## 看结果
 
+评测中断后，可用相同的 `benchmark.py` 参数、原输出目录及 `--resume` 继续。恢复会校验模型来源和评测协议，保留已有逐题记录并只追加缺失题目；已记录的错误题也不会重新生成。已完成的汇总不接受恢复。若恢复时评测源码发生变化，会另外保存 `resume-source.json`，并在汇总协议中记录恢复源码hash；不同源码集合仍需审计，不能绕过比较脚本的严格校验。
+
 - 总表：`${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json`，包含SimpleVQA训练前后Pass@1、差值和去重集合分数；不读取或要求VDR结果。
 - 逐题记录：`benchmark/<base|relax>/simplevqa/trajectories.jsonl`，包含问题、完整模型输出、最终答案、token用量和裁判判词。
 - 汇总：同目录 `summary.json`，包含题数、失败数、工具错误和截断次数。命令异常退出时先排错，不能只统计成功题。
