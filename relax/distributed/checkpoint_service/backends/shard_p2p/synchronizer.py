@@ -155,7 +155,7 @@ class ShardP2PSynchronizer:
                         engine.update_weights_from_tensor.remote(
                             serialized_named_tensors=serialized,
                             load_format=self.control_loader
-                            if pair[0]["op"] in ("prepare", "seed")
+                            if pair[0]["op"] in ("describe_tp", "prepare", "seed")
                             else self.update_loader,
                             flush_cache=False,
                         )
@@ -183,6 +183,12 @@ class ShardP2PSynchronizer:
         """Build the first direct plan inside an active weight update."""
         self._audit_expert_replicas(weights)
         self.source.reset()
+        if hasattr(self.source, "prepare_targets"):
+            self.source.prepare_targets(self, weights, version=version)
+        self.disabled = bool(getattr(self.source, "empty", False))
+        if self.disabled:
+            self.needs_seed = False
+            return
         sources, plans = self._phase(lambda: self.source.local_plan(weights))
         raw = [None] * self.geometry["source_world_size"]
         local_raw = self.source.raw_recipe_available
@@ -214,13 +220,18 @@ class ShardP2PSynchronizer:
         self._actor_endpoints = self._gather(self._phase(lambda: self._actor_endpoint(weights)))
         dist.broadcast_object_list(layers, src=0, group=self.group)
         self.geometry = layers[0]
+        geometries = (
+            self.source.geometries(self.geometry)
+            if hasattr(self.source, "geometries")
+            else [self.geometry] * self.tp_size
+        )
 
         def collect():
             if self.rank != 0:
                 return None
-            layouts = self.source.target_layouts(self.geometry)
             result = []
             for tp_rank in range(self.tp_size):
+                layouts = self.source.target_layouts(geometries[tp_rank])
                 writes = []
                 for rank, owner in enumerate(gathered):
                     if any(
@@ -248,7 +259,6 @@ class ShardP2PSynchronizer:
             nonlocal delivery_builders
             if self.rank != 0:
                 return None
-            geometries = [self.geometry] * self.tp_size
             self._plan_hashes = [
                 fingerprint(dict(geometry=geometry, writes=plan))
                 for geometry, plan in zip(geometries, prepared_writes, strict=True)
@@ -366,6 +376,17 @@ class ShardP2PSynchronizer:
         self._needed_keys_by_slot = tuple(needed[0][self.rank])
 
     def update(self, weights: Mapping[str, torch.Tensor], *, version: int) -> None:
+        if getattr(self, "disabled", False):
+
+            def complete_native():
+                if self.needs_seed or self._pending is not None:
+                    raise RuntimeError("Native fallback requires a complete seed")
+                if self.completed_version is not None and version != self.completed_version + 1:
+                    raise ValueError("Native fallback version did not advance once")
+                self.completed_version = version
+
+            self._phase(complete_native)
+            return
         try:
             self.start(weights, version=version)
             self.finish(version=version)

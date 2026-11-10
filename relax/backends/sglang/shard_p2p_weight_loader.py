@@ -58,9 +58,37 @@ def infer_expert_layers(writes: list[dict], geometry: dict) -> list[int]:
     return layers
 
 
+def target_shapes(geometry: dict) -> dict:
+    """Union native expert and ordinary targets in the same IPC plan."""
+    shapes = expert_shapes(geometry) if geometry.get("expert_enabled", True) else {}
+    ordinary = geometry.get("ordinary_targets", {})
+    if not isinstance(ordinary, dict) or set(ordinary) & set(shapes):
+        raise ValueError("Invalid or overlapping ordinary target inventory")
+    for name, shape in ordinary.items():
+        if not isinstance(name, str) or not shape or any(type(size) is not int or size <= 0 for size in shape):
+            raise ValueError("Invalid ordinary target shape")
+    return dict(shapes, **{name: tuple(shape) for name, shape in ordinary.items()})
+
+
+def _parameters(model: torch.nn.Module, geometry: dict) -> dict:
+    shapes = target_shapes(geometry)
+    return {
+        name: value
+        for name, value in model.named_parameters()
+        if name in shapes or geometry.get("expert_enabled", True) and _NATIVE_EXPERT.fullmatch(name)
+    }
+
+
+def refresh_native_metadata(model: torch.nn.Module, geometry: dict) -> None:
+    """Preserve a cold-qualified native lazy-cache invalidation after
+    writes."""
+    if geometry.get("native_refresh", False):
+        model.load_weights([])
+
+
 def validate_expert_targets(writes: list[dict], parameters: dict, geometry: dict) -> None:
     """Adapt native expert names and shapes to the shared storage contract."""
-    validate_targets(writes, parameters, expert_shapes(geometry), source_world_size=geometry["source_world_size"])
+    validate_targets(writes, parameters, target_shapes(geometry), source_world_size=geometry["source_world_size"])
 
 
 def _digests(parameters: dict[str, torch.Tensor]) -> dict[str, str]:
@@ -85,7 +113,7 @@ def _prepare_delivery(model: torch.nn.Module, command: dict, tp_rank: int) -> di
         or any(not isinstance(command.get(key), str) or not command[key] for key in ("session", "nonce"))
     ):
         raise ValueError("Invalid expert delivery identity")
-    parameters = {name: value for name, value in model.named_parameters() if _NATIVE_EXPERT.fullmatch(name)}
+    parameters = _parameters(model, command["geometry"])
     validate_expert_targets(command["writes"], parameters, command["geometry"])
     devices = {value.device for value in parameters.values()}
     if len(devices) != 1:
@@ -95,7 +123,7 @@ def _prepare_delivery(model: torch.nn.Module, command: dict, tp_rank: int) -> di
         command["geometry"],
         command["sources"],
         worker_identity(uuid4().hex, next(iter(devices))),
-        layouts={name: dict(nbytes=prod(shape) * 2) for name, shape in expert_shapes(command["geometry"]).items()},
+        layouts={name: dict(nbytes=prod(shape) * 2) for name, shape in target_shapes(command["geometry"]).items()},
     )
     if binding["logical_plan_hash"] != command["plan_hash"]:
         raise ValueError("Expert delivery logical checksum differs")
@@ -149,7 +177,7 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
         raise ValueError("Invalid expert IPC target or transfer identity")
     state = getattr(model, "_relax_expert_ipc", None)
     geometry = command.get("geometry", {}) if command["op"] == "seed" else state["geometry"] if state else {}
-    parameters = {name: parameter for name, parameter in model.named_parameters() if _NATIVE_EXPERT.fullmatch(name)}
+    parameters = _parameters(model, geometry)
     if command["op"] == "seed":
         if state is not None and (
             state["failed"]
@@ -189,7 +217,7 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
                 parameters,
                 writes,
                 geometry,
-                target_shapes=expert_shapes(geometry),
+                target_shapes=target_shapes(geometry),
                 owner_rotation=command["engine"] * geometry["tp_size"] + tp_rank,
                 write_ids=frozenset(binding["delivery"]["routes"]["cuda_ipc"]) if binding is not None else None,
             )
@@ -259,7 +287,7 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
             state["writes"],
             bindings,
             state["geometry"],
-            target_shapes=expert_shapes(state["geometry"]),
+            target_shapes=target_shapes(state["geometry"]),
             batched=state["batched"],
             owner_rotation=state["engine"] * geometry["tp_size"] + tp_rank,
             write_ids=frozenset(state["delivery"]["routes"]["cuda_ipc"]) if "delivery" in state else None,
@@ -293,6 +321,7 @@ def apply_command(model: torch.nn.Module, command: dict, tp_rank: int) -> None:
                 command["version"],
                 *compiled_plan.template_statistics,
             )
+    refresh_native_metadata(model, state["geometry"])
     state.pop("reference", None)
     state.update(version=command["version"], nonce=command["nonce"], failed=False, seed_pending=False)
 
@@ -315,7 +344,7 @@ def _decode_command(model: torch.nn.Module, weights: Sequence[tuple[str, torch.T
     command = json.loads(weights[0][0])
     geometry = (
         command.get("geometry", {})
-        if command["op"] in ("prepare", "seed")
+        if command["op"] in ("describe_tp", "prepare", "seed")
         else getattr(model, "_relax_expert_ipc", {}).get("geometry", {})
     )
     if geometry.get("tp_size") != args.tp_size:
@@ -363,7 +392,7 @@ def _control_tp(
         command = _decode_command(model, weights, args)
         if (
             command.get("tp_rank") != tp_rank
-            or command.get("op") not in ("prepare", "seed", "apply")
+            or command.get("op") not in ("describe_tp", "prepare", "seed", "apply")
             or command.get("op") == "seed"
             and "delivery" not in command
             or "tp" in command
@@ -375,7 +404,10 @@ def _control_tp(
         if command["op"] == "seed":
             header += _copy_mode(command)
             header += (command.get("audit_native", False),)
-        if command["op"] == "prepare":
+        if command["op"] == "describe_tp":
+            if command.get("description_hash") != fingerprint(command["description"]):
+                raise ValueError("Ordinary TP description checksum differs")
+        elif command["op"] == "prepare":
             delivery = _prepare_delivery(model, command, tp_rank)
         elif command["op"] == "seed":
             _accept_delivery(model, command)
@@ -384,7 +416,24 @@ def _control_tp(
     agree(error, header)
     error = None
     try:
-        if command["op"] == "prepare":
+        if command["op"] == "describe_tp":
+            from .tp_shard_layout import describe_tp_targets
+
+            try:
+                reply = describe_tp_targets(model, command["description"], tp_rank)
+            except NotImplementedError as exc:
+                logger.info("Ordinary TP native fallback: %s", exc)
+                reply = dict(
+                    description_hash=command["description_hash"],
+                    tp_rank=tp_rank,
+                    selected_hf=[],
+                    components=[],
+                    target_shapes={},
+                    target_hf={},
+                    writes=[],
+                    native_refresh=False,
+                )
+        elif command["op"] == "prepare":
             reply = dict(
                 identity=delivery["identity"],
                 receiver=delivery["delivery"]["receiver"],
@@ -395,11 +444,13 @@ def _control_tp(
         else:
             apply_command(model, command, tp_rank)
     except Exception as exc:
+        logger.exception("Shard IPC receiver command failed: %s", command["op"])
         error = str(exc)
     agree(error)
-    if command["op"] == "prepare":
+    if command["op"] in ("describe_tp", "prepare"):
         replies = [None] * dist.get_world_size(group)
         dist.all_gather_object(replies, reply, group=group)
         # The scheduler guard forwards this one-shot reply through SGLang's
         # existing success/message response, after the native RPC completes.
-        model._relax_weight_sync_reply = json.dumps({"shard_p2p_receivers": replies}, separators=(",", ":"))
+        key = "shard_p2p_tp_targets" if command["op"] == "describe_tp" else "shard_p2p_receivers"
+        model._relax_weight_sync_reply = json.dumps({key: replies}, separators=(",", ":"))
