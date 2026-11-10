@@ -1228,6 +1228,7 @@ def _prepare_mtp_training_window(
     args: Namespace,
     data_iterator: Sequence[DataIterator | Iterator],
     num_microbatches: int,
+    model: Sequence[DDP],
 ) -> tuple[Sequence[DataIterator | Iterator], int]:
     """Collect one streaming window so native MTP scaling sees its true
     size."""
@@ -1237,6 +1238,14 @@ def _prepare_mtp_training_window(
         and isinstance(data_iterator[0], StreamingTQIterator)
     ):
         return data_iterator, num_microbatches
+
+    config = get_model_config(model[0])
+    if getattr(config, "fine_grained_activation_offloading", False):
+        # Preserve the streaming restriction before switching to a fixed list.
+        raise ValueError(
+            "Streaming schedules do not support fine-grained activation offloading with variable microbatch counts. "
+            "Disable --fine-grained-activation-offloading or --use-dynamic-batch-size."
+        )
 
     # Keep the original stream for rollout logging and wait metrics. Its
     # aligned dummy batches must retain their original positions and masks.
@@ -1318,7 +1327,7 @@ def train_one_step(
 
     # Fetch only after optimizer-state offload and gradient cleanup, before
     # the native schedule needs the fixed accumulation count.
-    data_iterator, num_microbatches = _prepare_mtp_training_window(args, data_iterator, num_microbatches)
+    data_iterator, num_microbatches = _prepare_mtp_training_window(args, data_iterator, num_microbatches, model)
 
     main_loss_has_tokens = False
     packing_metrics = PackingMetrics()

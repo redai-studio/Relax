@@ -154,7 +154,7 @@ def test_streaming_mtp_windows_keep_pg_gradients_and_average_auxiliary_gradients
     def native_step(args, rollout_id, step_id, iterators, model, optimizer, scheduler, count, global_samples):
         stream = streams[step_id]
         assert stream.offset == 0, "Preparation must stay inside train_one_step, after optimizer offload"
-        iterators, count = namespace["_prepare_mtp_training_window"](args, iterators, count)
+        iterators, count = namespace["_prepare_mtp_training_window"](args, iterators, count, model)
         assert stream.offset == len(stream.mbs), "The current window must be collected before scheduling"
         assert all(future.offset == 0 for future in streams[step_id + 1 :]), "The next window was collected too early"
         assert count == len(stream.mbs)
@@ -206,7 +206,7 @@ def test_streaming_without_microbatch_mtp_normalization_stays_lazy(monkeypatch, 
     stream = _Stream([1, 2, 3], [])
 
     def streaming_step(args, rollout_id, step_id, iterators, model, optimizer, scheduler, count, global_samples):
-        iterators, count = namespace["_prepare_mtp_training_window"](args, iterators, count)
+        iterators, count = namespace["_prepare_mtp_training_window"](args, iterators, count, model)
         assert iterators == [stream]
         assert stream.offset == 0
         assert count == 1
@@ -219,7 +219,7 @@ def test_streaming_without_microbatch_mtp_normalization_stays_lazy(monkeypatch, 
 
 def test_streaming_mtp_rejects_an_empty_window_before_scheduling(monkeypatch):
     def unexpected_step(args, rollout_id, step_id, iterators, model, optimizer, scheduler, count, global_samples):
-        namespace["_prepare_mtp_training_window"](args, iterators, count)
+        namespace["_prepare_mtp_training_window"](args, iterators, count, model)
         pytest.fail("An empty MTP window reached the optimizer schedule")
 
     run, namespace, _, _ = _train_loop(monkeypatch, unexpected_step)
@@ -229,13 +229,33 @@ def test_streaming_mtp_rejects_an_empty_window_before_scheduling(monkeypatch):
 
 def test_fixed_mtp_iterator_is_not_collected_or_scaled_twice(monkeypatch):
     _, namespace, _, _ = _train_loop(monkeypatch, None)
+    namespace["get_model_config"] = lambda _: SimpleNamespace(fine_grained_activation_offloading=True)
     source = _Stream([1, None, 3], [])
     fixed = namespace["MicroBatchListIterator"](source.mbs, loss_scale=source.loss_scale)
     iterators = [fixed]
-    prepared, count = namespace["_prepare_mtp_training_window"](namespace["get_args"](), iterators, 3)
+    prepared, count = namespace["_prepare_mtp_training_window"](namespace["get_args"](), iterators, 3, [object()])
     assert prepared is iterators
     assert count == 3 and fixed.offset == 0
     assert [batch["__loss_scale__"] for batch, _ in fixed] == [0.25, 0.25, 0.25]
+
+
+def test_streaming_mtp_rejects_activation_offload_before_consuming_data(monkeypatch):
+    def prepare_window(args, rollout_id, step_id, iterators, model, optimizer, scheduler, count, global_samples):
+        namespace["_prepare_mtp_training_window"](args, iterators, count, model)
+        return {}, 0.0
+
+    run, namespace, _, _ = _train_loop(monkeypatch, prepare_window)
+    # The actual model config is authoritative even when the CLI flag differs.
+    namespace["get_args"]().fine_grained_activation_offloading = False
+    namespace["get_model_config"] = lambda _: SimpleNamespace(fine_grained_activation_offloading=True)
+    for count in (2, 4):
+        stream = _Stream(range(1, count + 1), [])
+        with pytest.raises(
+            ValueError, match="Disable --fine-grained-activation-offloading or --use-dynamic-batch-size"
+        ):
+            run([stream], [1])
+        assert stream.offset == 0
+        assert stream.events == []
 
 
 def test_streaming_mtp_collects_after_optimizer_offload_zero_grad_and_hook(monkeypatch):
