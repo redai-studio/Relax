@@ -39,6 +39,7 @@ def receiver(backend="triton", **overrides):
 @pytest.mark.parametrize("failure", ["none", "layout", "query", "source", "peer"])
 def test_bf16_routing_negotiates_before_enabling_and_restores_fallback(monkeypatch, failure):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater.args = SimpleNamespace(num_experts=4)
     updater._route_experts = updater._auto_expert_routing = False
     updater.rollout_engines = [Mock()]
@@ -99,6 +100,7 @@ def test_bridge_sync_collective_closure_includes_tp_and_etp(monkeypatch):
 @pytest.mark.parametrize("quantization", [None, {"quant_method": "fp8"}, {"format": "mxfp4-pack-quantized"}])
 def test_communicator_plan_is_independent_of_quantization_and_releases_on_remote_reconnect(monkeypatch, quantization):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater.args = SimpleNamespace(offload_train=True, colocate=True, num_experts=8, megatron_to_hf_mode="bridge")
     updater.use_distribute = updater.lora_enabled = updater._sync_groups_configured = False
     updater.quantization_config = quantization
@@ -137,6 +139,7 @@ def test_communicator_plan_is_independent_of_quantization_and_releases_on_remote
 @pytest.mark.parametrize("backend", ["triton", "deep_gemm", "flashinfer_cutlass"])
 def test_negotiation_agrees_before_selecting_or_falling_back(monkeypatch, failure, backend):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater.args = SimpleNamespace(colocate=True)
     updater.use_distribute = updater._route_experts = updater.lora_enabled = False
     updater.quantization_config = None
@@ -196,6 +199,7 @@ def test_negotiation_agrees_before_selecting_or_falling_back(monkeypatch, failur
 )
 def test_negotiation_preserves_full_engine_placement_for_expert_parallelism(monkeypatch, topology):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater.args = SimpleNamespace(colocate=True)
     updater.use_distribute = updater._route_experts = updater.lora_enabled = False
     updater.quantization_config = None
@@ -217,6 +221,7 @@ def test_negotiation_preserves_full_engine_placement_for_expert_parallelism(monk
 @pytest.mark.parametrize("rank", [0, 3])
 def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, rank):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater.args = SimpleNamespace(rollout_num_gpus_per_engine=2)
     updater._route_experts = False
     updater._ipc_placement = updater._ipc_gather_group = updater._ipc_gather_src = updater._ipc_engine = None
@@ -290,6 +295,7 @@ def test_packed_projection_memory_budget_uses_metadata_only(monkeypatch, geometr
 
 def test_ordinary_wait_drains_all_readers_without_adding_collectives(monkeypatch):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater._route_experts = False
     calls = []
 
@@ -316,6 +322,7 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
         pass
 
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.shard_p2p_requested = False
     updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
     updater.quantization_config = None
     updater.weight_version = 0

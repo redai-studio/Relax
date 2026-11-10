@@ -399,6 +399,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 router.replicated_bytes,
             )
 
+    def get_non_expert_hf_weight_chunks(self, megatron_local_weights):
+        """Keep native dense conversion without entering expert collectives."""
+        yield from _chunk_with_mla_pairing(
+            self._iter_hf_params(megatron_local_weights, include_experts=False),
+            chunk_size=self.args.update_weight_buffer_size,
+        )
+
     def get_hf_weight_chunks(self, megatron_local_weights):
         if self._bf16_expert_buckets is not None:
             if self._packed_expert_sync:

@@ -80,7 +80,8 @@ class UpdateWeightFromTensor:
         # enabled: all Actor ranks and SGLang receivers passed the checks.
         # active: this update reads retained GPU weights instead of a CPU backup.
         # OVERLAP_WEIGHT_BACKUP separately controls CPU-backup/send overlap.
-        self.actor_weight_retention_requested = False
+        self.shard_p2p_requested = bool(getattr(args, "use_shard_p2p_weight_sync", False))
+        self.actor_weight_retention_requested = self.shard_p2p_requested
         self.actor_weight_retention_enabled = False
         self.actor_weight_retention_active = False
         self.actor_weight_retention_fallback_reason = "Actor GPU weight retention has not been validated"
@@ -126,6 +127,8 @@ class UpdateWeightFromTensor:
         )
 
         self._direct_expert_layout: DirectExpertLayout | None = None
+        self._expert_ipc_receiver_support = False
+        self._colocate_expert_ipc_enabled = False
 
         self._ipc_gather_group = None
         self._ipc_placement = None
@@ -151,6 +154,9 @@ class UpdateWeightFromTensor:
         if getattr(self, "_auto_expert_routing", False):
             self._hf_weight_iterator.configure_expert_routing(None)
             self._route_experts = self._auto_expert_routing = False
+        expert_ipc = getattr(self, "_colocate_expert_ipc", None)
+        if expert_ipc is not None:
+            expert_ipc.invalidate_receivers(rollout_engines)
         if self._route_experts and (engine_gpu_counts is None or engine_gpu_offsets is None):
             raise ValueError("Expert routing requires explicit engine GPU counts and offsets")
 
@@ -179,6 +185,7 @@ class UpdateWeightFromTensor:
             mode = (
                 requested,
                 Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP,
+                self.shard_p2p_requested,
             )
             reason = (
                 getattr(self, "actor_weight_retention_fallback_reason", None)
@@ -192,10 +199,12 @@ class UpdateWeightFromTensor:
             from .utils import agree_actor_weight_retention
 
             records = [
-                info[1:] if isinstance(info, tuple) else ((False, False), "disabled by configuration", False)
+                info[1:] if isinstance(info, tuple) else ((False,) * 3, "disabled by configuration", False)
                 for info in infos
             ]
-            qualified = agree_actor_weight_retention(reason, get_gloo_group(), requested=requested, records=records)
+            qualified = agree_actor_weight_retention(
+                reason, get_gloo_group(), requested=requested, records=records, shard_p2p=self.shard_p2p_requested
+            )
         else:
             qualified = False
         gathered_actor_node_ids = [info[0] if isinstance(info, tuple) else info for info in infos]
@@ -293,6 +302,7 @@ class UpdateWeightFromTensor:
             self._expert_routing_placement = placement
 
         self._configure_direct_experts(colocate_gpu_counts)
+        self._configure_colocate_expert_ipc(gathered_actor_node_ids)
 
         # Create IPC Gloo gather groups (only on first call; partitioning is
         # fixed across reconnects).
@@ -491,6 +501,90 @@ class UpdateWeightFromTensor:
 
     @torch.no_grad()
     def update_weights(self) -> None:
+        if self.shard_p2p_requested and getattr(self, "actor_weight_retention_enabled", False):
+            self._agree_expert_dispatch()
+        if self._has_retained_actor_weights() and getattr(self, "_colocate_expert_ipc_enabled", False):
+            from .shard_p2p_source import create_shard_p2p_synchronizer
+
+            if not hasattr(self, "_colocate_expert_ipc"):
+                self._colocate_expert_ipc = create_shard_p2p_synchronizer(self)
+            helper = self._colocate_expert_ipc
+            try:
+                helper._phase(lambda: None)
+                if helper.needs_seed and Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK:
+                    self._update_weights_native()
+                    self._routed_engine_call(self.rollout_engines, "begin_weight_update")
+                    weights = self.weights_getter()
+                    helper.prepare(weights, version=self.weight_version, audit_native=True)
+                    helper.update(weights, version=self.weight_version)
+                    self._routed_engine_call(self.rollout_engines, "end_weight_update")
+                    self._routed_engine_call(
+                        self.rollout_engines,
+                        "update_weights_from_tensor",
+                        serialized_named_tensors=[MultiprocessingSerializer.serialize([], output_str=True)]
+                        * self.args.rollout_num_gpus_per_engine,
+                        load_format=NATIVE_SYNC_FENCE_LOADER,
+                        flush_cache=False,
+                    )
+                else:
+                    self._update_weights_native(expert_ipc=helper)
+            except Exception:
+                helper.failed = True
+                raise
+            return
+        self._update_weights_native()
+
+    def _configure_colocate_expert_ipc(self, actor_nodes: Sequence[str]) -> None:
+        """Select the expert consumer without changing CPU-backup overlap."""
+        self._colocate_expert_ipc_enabled = False
+        if not self.shard_p2p_requested:
+            return
+        layout = self._direct_expert_layout
+        ready = bool(
+            self.actor_weight_retention_enabled
+            and self._expert_ipc_receiver_support
+            and bool(actor_nodes)
+            and all(actor_nodes)
+            and len(set(actor_nodes)) == 1
+            and layout is not None
+            and (layout.ep_size, layout.moe_dp_size) == (1, 1)
+            and all(
+                getattr(self.args, name, None) == 1
+                for name in ("pipeline_model_parallel_size", "context_parallel_size", "expert_tensor_parallel_size")
+            )
+        )
+        decision = torch.tensor([int(ready)], dtype=torch.int32, device="cpu")
+        dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=get_gloo_group())
+        self._colocate_expert_ipc_enabled = bool(decision.item())
+        if dist.get_rank(get_gloo_group()) == 0:
+            logger.info(
+                "ShardP2P weight sync requested=%s effective=%s; coverage=experts-only; "
+                "fallback=%s; non-expert weights use native export",
+                self.shard_p2p_requested,
+                self._colocate_expert_ipc_enabled,
+                "none"
+                if self._colocate_expert_ipc_enabled
+                else "requires retained source weights, supported receiver and single-node PP1/CP1/ETP1 layout",
+            )
+
+    def _agree_expert_dispatch(self) -> None:
+        """Agree on the consumer incarnation before choosing cold or warm
+        sync."""
+        helper = getattr(self, "_colocate_expert_ipc", None)
+        state = (
+            self._has_retained_actor_weights(),
+            bool(getattr(self, "_colocate_expert_ipc_enabled", False)),
+            helper is not None,
+            bool(getattr(helper, "needs_seed", True)),
+            bool(Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK),
+            bool(getattr(helper, "failed", False)),
+        )
+        states = [None] * dist.get_world_size(get_gloo_group())
+        dist.all_gather_object(states, state, group=get_gloo_group())
+        if any(item != state for item in states) or state[-1]:
+            raise RuntimeError(f"Expert dispatch disagreed or failed: {states}")
+
+    def _update_weights_native(self, *, expert_ipc=None) -> None:
         """version++, flush caches, process buckets with pipelining.
 
         Pipelining: overlap chunk N's IPC transfer with chunk N+1's HF
@@ -576,9 +670,15 @@ class UpdateWeightFromTensor:
         prev_long_lived_tensors = None
         current_refs: list[ObjectRef] = []
         long_lived_tensors = None
+        hf_named_tensors = None
         try:
             with export_ctx:
-                for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                iterator = (
+                    self._hf_weight_iterator.get_non_expert_hf_weight_chunks
+                    if expert_ipc is not None
+                    else self._hf_weight_iterator.get_hf_weight_chunks
+                )
+                for hf_named_tensors in iterator(megatron_local_weights):
                     dispatch_errors = []
                     current_refs, long_lived_tensors = self._send_hf_params(
                         hf_named_tensors, dispatch_errors=dispatch_errors
@@ -605,6 +705,11 @@ class UpdateWeightFromTensor:
                     device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
                 self._wait_for_ipc(prev_refs)
                 prev_refs = []
+                if expert_ipc is not None:
+                    prev_long_lived_tensors = long_lived_tensors = hf_named_tensors = None
+                    if expert_ipc.needs_seed:
+                        expert_ipc.prepare(megatron_local_weights, version=self.weight_version, audit_native=False)
+                    expert_ipc.update(megatron_local_weights, version=self.weight_version)
         finally:
             # Conversion or ACK failures must not release storage while an
             # already submitted receiver is still reading it. No additional
@@ -693,6 +798,14 @@ class UpdateWeightFromTensor:
                 status[0] = ([], f"receiver capability query failed: {error}")
         dist.broadcast_object_list(status, src=0, group=group)
         receivers, reason = status[0]
+        self._expert_ipc_receiver_support = False
+        if self.shard_p2p_requested:
+            from relax.backends.sglang.weight_loader import EXPERT_IPC_LOADER, TP_IPC_LOADER
+
+            self._expert_ipc_receiver_support = bool(receivers) and all(
+                {EXPERT_IPC_LOADER, TP_IPC_LOADER} <= set(receiver.get("custom_weight_loader") or [])
+                for receiver in receivers
+            )
         reason = reason or validate_sglang_weight_sync_support(
             actor_nodes, engine_nodes, counts, offsets, receivers, self.args.rollout_num_gpus_per_engine
         )
@@ -703,6 +816,7 @@ class UpdateWeightFromTensor:
             group,
             requested=self.actor_weight_retention_requested,
             active=self.actor_weight_retention_enabled or self.actor_weight_retention_active,
+            shard_p2p=self.shard_p2p_requested,
         )
         self.actor_weight_retention_enabled = enabled
         if dist.get_rank(group) == 0:

@@ -344,18 +344,19 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
 
 
 @pytest.mark.parametrize(
-    "existing,colocate,fusion",
+    "existing,colocate,fusion,expert_ipc",
     [
-        (None, True, False),
-        ([], True, False),
-        (["custom.loader"], True, False),
-        (["relax.backends.sglang.weight_loader.load_expert_slices"], True, False),
-        (["custom.loader"], True, True),
-        (["custom.loader"], False, True),
+        (None, True, False, False),
+        ([], True, False, False),
+        (["custom.loader"], True, False, False),
+        (["relax.backends.sglang.weight_loader.load_expert_slices"], True, False, False),
+        (["custom.loader"], True, True, False),
+        (["custom.loader"], False, True, False),
+        (["custom.loader"], True, False, True),
     ],
 )
 def test_expert_slice_loader_registration_preserves_user_loaders(
-    monkeypatch, sglang_engine_module, existing, colocate, fusion
+    monkeypatch, sglang_engine_module, existing, colocate, fusion, expert_ipc
 ):
     module = sglang_engine_module
     monkeypatch.setattr(module.Envs, "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", fusion, raising=False)
@@ -373,6 +374,7 @@ def test_expert_slice_loader_registration_preserves_user_loaders(
         use_rollout_routing_replay=False,
         fp16=False,
         colocate=colocate,
+        use_shard_p2p_weight_sync=expert_ipc,
     )
     result, _ = module._compute_server_args(
         args,
@@ -392,8 +394,15 @@ def test_expert_slice_loader_registration_preserves_user_loaders(
             ]
         )
     )
-    if colocate and fusion:
+    if colocate and (fusion or expert_ipc):
         expected.append("relax.backends.sglang.weight_loader.fence_native_weights")
+        if expert_ipc:
+            expected.extend(
+                [
+                    "relax.backends.sglang.shard_p2p_weight_loader.control",
+                    "relax.backends.sglang.shard_p2p_weight_loader.control_tp",
+                ]
+            )
     assert result["custom_weight_loader"] == expected
     assert result["custom_weight_loader"] is not existing
 

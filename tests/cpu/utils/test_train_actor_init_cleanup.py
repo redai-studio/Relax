@@ -63,10 +63,11 @@ def offload_launch(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "torch_memory_saver", tms)
     monkeypatch.delenv("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", raising=False)
 
-    def launch(enabled, matching_world, selective, optimizer="adam"):
+    def launch(enabled, matching_world, selective, optimizer="adam", expert=False):
         config = dict(
             train_backend="megatron",
             colocate=True,
+            use_shard_p2p_weight_sync=expert,
             offload_train=True,
             offload_rollout=True,
             enable_weights_backuper=True,
@@ -80,6 +81,8 @@ def offload_launch(monkeypatch, tmp_path):
         )
         args = SimpleNamespace(**config)
         env = {"RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP": "1"} if enabled else {}
+        if expert:
+            env.update(RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP=str(int(enabled)))
         group = RayTrainGroup(args, 1, (object(), [0], [0]), role="actor", runtime_env={"env_vars": env})
         return group, args, actor, captured, log
 
@@ -87,29 +90,34 @@ def offload_launch(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "enabled,matching_world,selective,optimizer",
+    "enabled,matching_world,selective,optimizer,expert",
     [
-        (False, True, False, "adam"),
-        (True, True, False, "adam"),
-        (True, False, False, "adam"),
-        (True, False, True, "adam"),
-        (True, True, False, "sgd"),
-        (True, True, False, "muon"),
+        (False, True, False, "adam", False),
+        (True, True, False, "adam", False),
+        (True, False, False, "adam", False),
+        (True, False, True, "adam", False),
+        (True, True, False, "sgd", False),
+        (True, True, False, "muon", False),
+        (False, True, False, "adam", True),
+        (False, False, False, "adam", True),
     ],
 )
 def test_overlap_selects_offload_only_when_enabled_and_supported(
-    monkeypatch, offload_launch, enabled, matching_world, selective, optimizer
+    monkeypatch, offload_launch, enabled, matching_world, selective, optimizer, expert
 ):
     launch, hook = offload_launch
     preload = "/user/first.so /user/last.so"
     monkeypatch.setenv("LD_PRELOAD", preload if selective else f"{preload}:{hook}")
-    group, args, actor, env, log = launch(enabled, matching_world, selective, optimizer)
+    group, args, actor, env, log = launch(enabled, matching_world, selective, optimizer, expert=expert)
     group.async_init(args, "actor")
     sent = actor.init.remote.call_args.args[0]
-    selected = enabled and matching_world and optimizer == "adam"
+    selected = (enabled or expert) and matching_world and optimizer == "adam"
     assert sent.selective_offload == (selected or selective)
     assert (sent is args) == (not selected)
     assert args.selective_offload == selective
+    if expert:
+        assert sent.use_shard_p2p_weight_sync is True
+        assert env["RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP"] == str(int(enabled))
     if selected:
         assert env["LD_PRELOAD"] == preload
         assert env["TMS_INIT_ENABLE"] == env["TMS_INIT_ENABLE_CPU_BACKUP"] == "0"
