@@ -105,15 +105,15 @@ CKPT_ARGS=(
     --num-epoch "${NUM_EPOCHS}"
 )
 if [[ -n "${TRAIN_STEPS:-}" ]]; then CKPT_ARGS+=(--num-rollout "${TRAIN_STEPS}"); fi
-# Actor always saves the final step. This interval prevents intermediate saves.
+# Preserve a resumable recovery point and retain only the latest checkpoint.
 if [[ "${BENCHMARK_ONLY:-0}" != 1 ]]; then
     CKPT_ARGS+=(
+        --load "${SAVE_DIR}/${EXP_NAME}/relax"
         --save "${SAVE_DIR}/${EXP_NAME}/relax"
         --save-hf "${SAVE_DIR}/${EXP_NAME}/final-hf-{rollout_id}"
-        --save-interval 2147483647
+        --save-hf-post-hook-path examples.opensearch_vl.tools.checkpoint_retention.keep_latest_hf
+        --save-interval "${SAVE_INTERVAL:-200}"
         --max-actor-ckpt-to-keep 1
-        --no-save-optim
-        --no-save-rng
     )
 else
     CKPT_ARGS+=(--num-rollout "${BENCHMARK_STEPS:-8}")
