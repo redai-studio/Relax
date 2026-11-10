@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""SwanLab remains lazy, private, and required despite platform fault containment."""
+"""SwanLab remains lazy, private, and required despite platform fault
+containment."""
 
 import importlib.util
 import json
@@ -28,7 +29,7 @@ def hook(monkeypatch, tmp_path):
         "SWANLAB_WORKSPACE": "redai-studio",
         "SWANLAB_EXP_NAME": "trial-tune-none-relax-timestamp",
         "RELAX_GIT_COMMIT": "commit",
-        "QS_TOKEN": "secret-fixture",
+        "UNRELATED_SECRET": "secret-fixture",
     }.items():
         monkeypatch.setenv(key, str(value))
     return module
