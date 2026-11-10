@@ -95,7 +95,7 @@ Do not duplicate settings already present in the recipe:
 | `--calculate-per-token-loss`                   | Count tokens without changing sample weights through chunking                                |
 | `--no-rope-fusion`                             | Use the RoPE path that supports chunk position offsets                                       |
 | `--attention-dropout 0.0 --hidden-dropout 0.0` | Current adapters require zero dropout to avoid random-mask issues during chunking and replay |
-| Megatron recomputation compatibility           | Disable full-layer / selective `core_attn`; keep the GDN/QSA recipe settings                 |
+| Megatron recomputation compatibility           | Disable full-layer / selective `core_attn`                                                   |
 
 ### Key parameters
 
