@@ -100,6 +100,18 @@ verl 核对版本为 `63913d1d5fef4d028658c330f397c0bd2a909213`，MCore 主线�
 
 参考：[MCore issue #5384](https://github.com/NVIDIA/Megatron-LM/issues/5384)、[MCore PR #5386](https://github.com/NVIDIA/Megatron-LM/pull/5386)、[verl GLM-5.2 配方](https://github.com/verl-project/verl/blob/63913d1d5fef4d028658c330f397c0bd2a909213/examples/ascend_extras/grpo_trainer/run_glm5_2_megatron.sh)、[vLLM PR #49555](https://github.com/vllm-project/vllm/pull/49555)、[RTP-LLM PR #1615](https://github.com/alibaba/rtp-llm/pull/1615)。
 
+### 3.4 Relax TQ host-RDMA：PR #256 已合入并包含在当前分支
+
+[PR #256](https://github.com/redai-studio/Relax/pull/256)（`feat/enable-tq-rdma`）于 2026-10-21 合入，合并提交为 `50da7ad05`。已通过 Git 祖先检查确认当前 `github/replay-manager` 包含该提交，无须再次移植其 Controller、worker attach 或资源清理逻辑。
+
+该 PR 接入 TransferQueue 的 MooncakeStore/host-RDMA，默认 `--tq-rdma-mode=off`；`auto` 在满足回退条件并完成清理后使用 SimpleStorage，`required` 要求 RDMA 可用。它复用外部管理的 Mooncake master，并处理有界初始化、全节点 attach、统一配置、correctness contract 与 owner/worker 清理。当前固定 `use_gdr=false`，不提供 GPU-to-GPU 直传。
+
+Replay 的 `register_local_owner()` 和 `tq_client_factory()` 已传递并使用所选 TQ backend，因此 reference body 可沿用 MooncakeStore 配置。现有本地 replay smoke 验证的是 SimpleStorage；尚未独立验证 replay 在 RDMA 上的完整发布、读取与回收，也没有该路径的性能数据。
+
+配套 [PR #278](https://github.com/redai-studio/Relax/pull/278) 是旧版 Mooncake loss-guard 运行时补丁，调研时已关闭且未合入。当前方案要求 pinned TransferQueue 自带 correctness contract，不应重新引入该旧补丁。
+
+操作与验证参考 [TransferQueue host-RDMA 文档](./transfer_queue_rdma.md) 和 [跨节点 benchmark](../../scripts/benchmarks/tq_cross_node_bench.py)。其 C0/C1/C2 分别为 SimpleStorage、仅作 benchmark 对照的 Mooncake/TCP、Mooncake/host-RDMA。需要区分 attach 成功与真实线路证明：正式 RDMA 验收应同时提供 byte-exact、指定 HCA/port 的 wire proof、版本信息与资源清理结果。本轮仅核对代码和 PR 材料，未复跑真机 RDMA benchmark。
+
 ## 4. 当前 Relax 与 Miles 的差异
 
 | 维度 | Relax 当前 reference 路径 | Miles 所查实现 |
@@ -219,6 +231,14 @@ Manifest/adapter 必须明确模型类型、ratio、top-k、capture layer 映射
 默认 1024 行、topk=2048 的单层 chunk 为 8 MiB。当前读取整个命中 chunk，再裁出有效行；长连续 CP 切片的浪费通常集中在边界。缩小 chunk 会增加对象和 RPC 数量，不能只追求最小过读字节。
 
 当前支持的 DSV4 路径为 TP1。未来 QSA/TP 扩展中，indexer selection 未必按 TP 切 query 行，可能出现各 rank 独立读取同一份数据；这与 chunk 边界过读不同。现各进程独立 client/cache，不存在自动的节点级共享。先完成局部优化；若实测证明重复读取是主要瓶颈，再考虑现有 backend 内的 owner 读取与组内分发，不先新增节点缓存服务。
+
+### 7.5 沿用 TQ RDMA，并补足 replay 容量预算
+
+Host RDMA 对跨节点大 payload 有潜在收益，但不会消除原 indexer 计算、布局处理、metadata RPC、chunk 过读或最终 H2D。同节点或小请求场景的收益需要实测，不能由 backend 名称推断。当前 host 路径仍涉及接收 buffer 分配、注册和数据组装，不是自动的零拷贝消费。
+
+当前 `relax/utils/tq/config.py` 的 `estimate_payload_bytes()` 只估算文本与多模态样本字段，没有计入独立 replay body。启用该组合前，需要把实际 capture stream 数、top-k、query 行数、在途 batch 和保留生命周期纳入 Mooncake segment 容量预算；小 manifest 不能代表小存储占用。Replay 的逻辑 capacity、Mooncake 的实际 segment 和在途 buffer 是不同预算，需同时验证。
+
+优先方案是保留 PR #256 的现有接线，结合提前消费和有界预取验证。先测 SimpleStorage 与 host-RDMA 的同布局 replay A/B，再决定是否需要调整注册 buffer 复用或更低层的读取接口；不另建独立 Mooncake 服务或 RDMA 传输框架。
 
 ## 8. 算子对齐与 replay 的取舍
 
