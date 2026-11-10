@@ -88,6 +88,7 @@ class MemorySource:
         self._connections: set[socket.socket] = set()
         self._closed = False
         self.last_errors: list[str] = []
+        self.last_control_bytes = 0
         owner = self
 
         class Handler(socketserver.BaseRequestHandler):
@@ -151,12 +152,22 @@ class MemorySource:
             manifest["group_update"] = group_update
         manifest["update"] = hashlib.sha256(_json(manifest)).hexdigest()
         token = secrets.token_hex(32)
+        # Application framing only; exclude TCP/IP, HTTP and Ray overhead.
+        control_bytes = sum(
+            16
+            + len(_json(dict(token=token, update=manifest["update"], member=member)))
+            + len(_json(manifest))
+            + len(_json(dict(ack=manifest["update"])))
+            + len(_json(dict(ok=True)))
+            for member in members
+        )
         with self._lock:
             if self._closed or self._pending is not None:
                 raise RuntimeError("A memory delivery is already outstanding")
             self._pending = manifest | {"token": token}
             self._buckets, self._members = tuple(buckets), set(members)
             self._acks, self._active, self.last_errors = set(), set(), []
+            self.last_control_bytes = control_bytes
         host, port = self._server.server_address
         return dict(host=host, port=port, token=token, update=manifest["update"])
 

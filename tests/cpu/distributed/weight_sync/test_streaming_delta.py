@@ -98,6 +98,33 @@ def test_transposed_capture_has_one_owned_clone_and_no_reshape_copy():
     assert budget.used_bytes == 0
 
 
+def test_full_control_encodes_without_comparing_old_values(monkeypatch):
+    encoder = StreamingDeltaEncoder(SnapshotBudget(4096), bucket_bytes=128)
+    with pytest.raises(ValueError, match="FULL encoding"):
+        encoder.begin(compare_changes=False)
+    encoder.begin()
+    encoder.add("x", torch.zeros(16, dtype=torch.bfloat16))
+    encoder.finish()
+    encoder.prepare_commit({"a"}, {"a"})
+    encoder.commit()
+
+    def unexpected_comparison(*args, **kwargs):
+        raise AssertionError("FULL transport control must not find changed positions")
+
+    monkeypatch.setattr(torch, "nonzero", unexpected_comparison)
+    encoder.begin(full=True, compare_changes=False)
+    target = torch.ones(16, dtype=torch.bfloat16)
+    encoder.add("x", target)
+    bucket = encoder.finish()[0]
+    assert bucket.encoding == "full"
+    assert bucket.payload == target.view(torch.uint8).numpy().tobytes()
+    # changed denotes sent elements in this mode, not a measured diff count.
+    assert bucket.changed == bucket.elements == 16
+    encoder.prepare_commit({"a"}, {"a"})
+    encoder.commit()
+    encoder.close()
+
+
 def test_streaming_capture_freezes_reused_buffers_before_iterator_advances():
     budget = SnapshotBudget(4096)
     encoder = StreamingDeltaEncoder(budget, bucket_bytes=8)

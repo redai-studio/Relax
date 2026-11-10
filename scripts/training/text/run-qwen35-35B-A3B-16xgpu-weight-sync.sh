@@ -137,6 +137,9 @@ SGLANG_ARGS=(
    --sglang-disable-cuda-graph
    --sglang-enforce-disable-flashinfer-allreduce-fusion
 )
+if [ "${CUSTOM_MEGATRON_INIT_PATH:-}" = "task_delta_weight_sync.measure_sharded.install" ]; then
+    SGLANG_ARGS+=(--sglang-custom-weight-loader task_delta_weight_sync.sharded_gpu_audit.load_audit)
+fi
 LOG_ARGS=(
    --use-metrics-service
    --tb-project-name "${PROJECT_NAME}"
@@ -151,6 +154,9 @@ MISC_ARGS=(
 )
 if [ -n "${CUSTOM_MEGATRON_INIT_PATH:-}" ]; then
     MISC_ARGS+=(--custom-megatron-init-path "${CUSTOM_MEGATRON_INIT_PATH}")
+fi
+if [ -n "${MEMORY_SYNC_CONFIG:-}" ]; then
+    MISC_ARGS+=(--memory-weight-sync-config "${MEMORY_SYNC_CONFIG}")
 fi
 ray job submit ${RAY_NO_WAIT:+--no-wait} \
    --address="${RAY_JOBS_ADDRESS}" \

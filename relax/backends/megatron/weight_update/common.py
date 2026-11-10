@@ -3,7 +3,7 @@
 import inspect
 import re
 from argparse import Namespace
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -113,6 +113,63 @@ def all_gather_params_async(
         split_sizes=gdn_split_sizes or {},
         async_op=True,
     )
+
+
+def all_gather_params_gated(
+    param_infos_and_params: list[tuple[ParamInfo, torch.Tensor]],
+    *,
+    error_gate: Callable[[str | None], None],
+    gdn_split_sizes: Mapping[str, tuple[int, ...]] | None = None,
+) -> list[torch.Tensor]:
+    """Gate local preparation before any TP collective, and restoration after.
+
+    A transport/process failure still follows the process group's timeout and
+    invalidates the update. A local allocation or metadata failure must not
+    send peers into a data collective while this rank enters an error gate.
+    """
+    tasks, plans, results = [], [], []
+    error = None
+    try:
+        for info, param in param_infos_and_params:
+            name = info.name.replace(".to_wrap.", ".")
+            if "expert_bias" in name:
+                tasks.append((name, param, None, None))
+                continue
+            if not hasattr(param, "tensor_model_parallel"):
+                multimodal = any(part in name for part in (".audio_model.", ".vision_model.", ".video_model."))
+                if not multimodal and isinstance(param, torch.nn.Parameter):
+                    raise ValueError(f"{name} lacks TP metadata")
+                tasks.append((name, param, None, None))
+                continue
+            if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
+                tasks.append((name, param.data, None, None))
+                continue
+            if ".experts." in name:
+                raise ValueError("Gated nonexpert gathering received a routed expert")
+            if "linear_fc1" not in name and getattr(param, "partition_stride", 1) != 1:
+                raise ValueError(f"Unsupported partition stride for {name}")
+            group = mpu.get_tensor_model_parallel_group()
+            size = dist.get_world_size(group)
+            partitions = [torch.empty_like(param.data) for _ in range(size)]
+            plans.append((partitions, param.data, group))
+            tasks.append((name, None, partitions, param.partition_dim))
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    error_gate(error)
+    error = None
+    try:
+        handles = [dist.all_gather(parts, param, group=group, async_op=True) for parts, param, group in plans]
+        for handle in handles:
+            handle.wait()
+        splits = gdn_split_sizes or {}
+        results = [
+            direct if parts is None else _restore_tp_weight(name, parts, dim, splits.get(name))
+            for name, direct, parts, dim in tasks
+        ]
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    error_gate(error)
+    return results
 
 
 def named_params_and_buffers(

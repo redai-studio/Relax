@@ -17,6 +17,15 @@ logger = get_logger(__name__)
 
 
 class UpdateWeightFromMemory:
+    def __new__(cls, args, model, weights_getter, *, model_name, quantization_config):
+        if MemorySyncConfig.load(args.memory_weight_sync_config).layout == "qwen35_owner_local":
+            from .update_weight_from_sharded_memory import UpdateWeightFromShardedMemory
+
+            return UpdateWeightFromShardedMemory(
+                args, model, weights_getter, model_name=model_name, quantization_config=quantization_config
+            )
+        return super().__new__(cls)
+
     def __init__(self, args, model, weights_getter, *, model_name, quantization_config) -> None:
         if quantization_config:
             raise ValueError("Memory delta requires unquantized BF16 weights")

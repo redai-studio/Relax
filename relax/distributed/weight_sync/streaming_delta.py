@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import contextmanager
+from time import monotonic
 from typing import Any, Iterator
 
 from .memory_delta import MemoryBucket
@@ -71,16 +72,22 @@ class StreamingDeltaEncoder:
         self._current_bytes = 0
         self._seen: set[str] = set()
         self._full = False
+        self._compare = True
         self._finished = False
         self._next_baseline: list | None = None
+        self.clone_enqueue_s = self.pack_diff_to_host_s = 0.0
 
-    def begin(self, *, full: bool = False) -> None:
+    def begin(self, *, full: bool = False, compare_changes: bool = True) -> None:
         if self._pending is not None:
             raise RuntimeError("A shard capture is already outstanding")
+        if not compare_changes and not full:
+            raise ValueError("Skipping the comparison requires FULL encoding")
         self._pending = []
         self._pending_snapshots = []
         self._seen = set()
         self._full, self._finished = full, False
+        self._compare = compare_changes
+        self.clone_enqueue_s = self.pack_diff_to_host_s = 0.0
 
     def add(self, name: str, tensor: Any) -> None:
         import torch
@@ -101,6 +108,7 @@ class StreamingDeltaEncoder:
             self._current_bytes + size > self.bucket_bytes or self._current[0][1].dtype != tensor.dtype
         ):
             self._flush()
+        started = monotonic()
         self.budget.reserve(size)
         try:
             frozen = tensor.detach().clone(memory_format=torch.contiguous_format)
@@ -110,12 +118,14 @@ class StreamingDeltaEncoder:
         self._current.append((name, frozen))
         self._current_bytes += size
         self._seen.add(name)
+        self.clone_enqueue_s += monotonic() - started
 
     def _flush(self) -> None:
         import torch
 
         if not self._current:
             return
+        started = monotonic()
         names = tuple((name, tuple(t.shape)) for name, t in self._current)
         dtype = self._current[0][1].dtype
         dtype_name = str(dtype).removeprefix("torch.")
@@ -135,7 +145,7 @@ class StreamingDeltaEncoder:
             count, width = snapshot.numel(), snapshot.element_size()
             if count >= 2**31:
                 raise ValueError("A shard bucket must fit signed int32 positions")
-            if previous is None:
+            if previous is None or not self._compare:
                 changed, encoding = count, "full"
                 payload = snapshot.view(torch.uint8).cpu().numpy().tobytes()
             else:
@@ -163,6 +173,7 @@ class StreamingDeltaEncoder:
         except Exception:
             self.budget.release(size)
             raise
+        self.pack_diff_to_host_s += monotonic() - started
 
     def finish(self) -> list[MemoryBucket]:
         if self._pending is None or self._finished:

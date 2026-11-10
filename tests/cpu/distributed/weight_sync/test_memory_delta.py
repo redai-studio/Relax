@@ -483,3 +483,38 @@ def test_memory_configuration_rejects_unsupported_execution_modes(tmp_path):
     path.write_text(json.dumps(dict(stream="test", bucket_bytes=True)))
     with pytest.raises(ValueError):
         MemorySyncConfig.load(path)
+
+
+def test_owner_local_configuration_keeps_dense_guards_and_requires_exact_topology(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from relax.distributed.weight_sync.config import validate_memory_weight_sync_args
+
+    path = tmp_path / "memory.json"
+    path.write_text(json.dumps(dict(stream="moe-test", layout="qwen35_owner_local")))
+    base = dict(
+        memory_weight_sync_config=str(path),
+        sglang_disable_cuda_graph=True,
+        megatron_to_hf_mode="bridge",
+        num_experts=256,
+        num_layers=40,
+        hidden_size=2048,
+        expert_tensor_parallel_size=1,
+        expert_model_parallel_size=8,
+        tensor_model_parallel_size=4,
+        rollout_num_gpus_per_engine=2,
+        sglang_moe_runner_backend="triton",
+        sglang_disable_shared_experts_fusion=True,
+    )
+    validate_memory_weight_sync_args(SimpleNamespace(**base))
+    for override in (
+        dict(expert_tensor_parallel_size=2),
+        dict(sglang_disable_shared_experts_fusion=False),
+        dict(rollout_num_gpus_per_engine=4),
+    ):
+        with pytest.raises(ValueError, match="explicit Qwen3.5"):
+            validate_memory_weight_sync_args(SimpleNamespace(**(base | override)))
+    path.write_text(json.dumps(dict(stream="dense")))
+    with pytest.raises(ValueError, match="Dense models only"):
+        validate_memory_weight_sync_args(SimpleNamespace(**base))

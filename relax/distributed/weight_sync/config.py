@@ -86,7 +86,7 @@ def validate_disk_weight_sync_args(args) -> None:
     _validate_sync_execution(args, "Disk")
 
 
-def _validate_sync_execution(args, label: str) -> None:
+def _validate_sync_execution(args, label: str, *, sharded: bool = False) -> None:
     unsupported = [
         name
         for name in (
@@ -113,11 +113,11 @@ def _validate_sync_execution(args, label: str) -> None:
         raise WeightSyncError(f"{label} weight sync does not support: {', '.join(unsupported)}")
     if getattr(args, "lora_rank", 0) > 0 or getattr(args, "save_hf_dtype", "bf16") != "bf16":
         raise WeightSyncError(f"{label} weight sync requires full-parameter, nonquantized HF export")
-    if getattr(args, "num_experts", None):
+    if getattr(args, "num_experts", None) and not sharded:
         raise WeightSyncError(f"{label} weight sync currently supports Dense models only")
     if not getattr(args, "sglang_disable_cuda_graph", False):
         raise WeightSyncError(f"{label} weight sync currently requires --sglang-disable-cuda-graph")
-    if any(
+    if not sharded and any(
         getattr(args, name, 1) != 1 for name in ("sglang_pp_size", "sglang_dp_size", "rollout_num_gpus_per_engine")
     ):
         raise WeightSyncError(f"The {label.lower()} MVP currently requires single-GPU TP/PP/DP=1 inference engines")
@@ -128,12 +128,14 @@ def _validate_sync_execution(args, label: str) -> None:
 @dataclass(frozen=True)
 class MemorySyncConfig:
     stream: str
+    layout: str = "dense"
     bucket_bytes: int = 512 << 20
     gpu_budget_bytes: int = 16 << 30
     host_budget_bytes: int = 8 << 30
     sync_timeout_s: int = 120
     anchor_interval: int = 20
     full_only: bool = False
+    receiver_gpu_budget_bytes: int = 12 << 30
 
     @classmethod
     def load(cls, path: str | Path) -> "MemorySyncConfig":
@@ -143,10 +145,19 @@ class MemorySyncConfig:
         if not isinstance(data.get("stream"), str) or not data["stream"]:
             raise WeightSyncError("Memory weight sync requires a nonempty stream")
         config = cls(**data)
-        for name in ("bucket_bytes", "gpu_budget_bytes", "host_budget_bytes", "sync_timeout_s", "anchor_interval"):
+        for name in (
+            "bucket_bytes",
+            "gpu_budget_bytes",
+            "host_budget_bytes",
+            "sync_timeout_s",
+            "anchor_interval",
+            "receiver_gpu_budget_bytes",
+        ):
             integer(getattr(config, name), 1)
         if type(config.full_only) is not bool:
             raise WeightSyncError("full_only must be a boolean")
+        if config.layout not in ("dense", "qwen35_owner_local"):
+            raise WeightSyncError("Unsupported memory shard layout")
         return config
 
 
@@ -156,8 +167,33 @@ def validate_memory_weight_sync_args(args) -> None:
         return
     if getattr(args, "disk_weight_sync_config", None):
         raise WeightSyncError("Select one weight sync configuration")
-    MemorySyncConfig.load(path)
-    _validate_sync_execution(args, "Memory")
+    config = MemorySyncConfig.load(path)
+    sharded = config.layout == "qwen35_owner_local"
+    _validate_sync_execution(args, "Memory", sharded=sharded)
+    if sharded:
+        if (
+            getattr(args, "megatron_to_hf_mode", None) != "bridge"
+            or getattr(args, "num_experts", None) != 256
+            or getattr(args, "num_layers", None) != 40
+            or getattr(args, "hidden_size", None) != 2048
+            or getattr(args, "expert_tensor_parallel_size", 1) != 1
+            or getattr(args, "expert_model_parallel_size", 1) != 8
+            or getattr(args, "tensor_model_parallel_size", 1) != 4
+            or any(
+                getattr(args, name, 1) != 1
+                for name in (
+                    "pipeline_model_parallel_size",
+                    "context_parallel_size",
+                    "sglang_pp_size",
+                    "sglang_dp_size",
+                )
+            )
+            or getattr(args, "rollout_num_gpus_per_engine", 1) != 2
+            or getattr(args, "sglang_moe_runner_backend", None) != "triton"
+            or not getattr(args, "sglang_disable_shared_experts_fusion", False)
+        ):
+            raise WeightSyncError("Owner-local memory sync requires the explicit Qwen3.5 TP4/EP8 to TP2 layout")
+        return
     if any(
         getattr(args, name, 1) != 1
         for name in ("tensor_model_parallel_size", "pipeline_model_parallel_size", "context_parallel_size")

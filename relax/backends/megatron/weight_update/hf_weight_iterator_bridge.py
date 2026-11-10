@@ -320,6 +320,48 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                         f"expected {sorted(expected_projections)}"
                     )
 
+    def iter_gated_nonexpert_tensors(self, megatron_local_weights, *, error_gate):
+        """PP1 nonexpert conversion with gates around local failure boundaries.
+
+        Local source/allocator failures precede TP collectives; conversion and
+        output-capture failures cannot leave a peer entering the next bucket.
+        This explicit path leaves the default iterator unchanged.
+        """
+        from .common import all_gather_params_gated
+
+        if mpu.get_pipeline_model_parallel_world_size() != 1 or self.lora_merge_mode or self.lora_adapter_mode:
+            raise ValueError("Gated nonexpert conversion requires PP1 without LoRA")
+        rank = dist.get_rank(group=dist.group.WORLD)
+        device = device_utils.make_current_torch_device()
+        for infos in self._non_expert_buckets:
+            error, params = None, None
+            try:
+                for info in infos:
+                    if info.src_rank != rank or info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                        raise ValueError("Gated Qwen3.5 nonexperts must have a local PP1 owner")
+                    source = megatron_local_weights[self._vanilla_key_map[info.name]]
+                    if source.dtype != info.dtype or tuple(source.shape) != tuple(info.shape):
+                        raise ValueError(f"Nonexpert source metadata changed: {info.name}")
+                params = _load_to_gpu(infos, megatron_local_weights, self._vanilla_key_map, device, rank)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            error_gate(error)
+            gathered = all_gather_params_gated(
+                list(zip(infos, params, strict=True)),
+                error_gate=error_gate,
+                gdn_split_sizes=self._gdn_split_sizes,
+            )
+            for info, param in zip(infos, gathered, strict=True):
+                error, converted = None, None
+                try:
+                    converted = self._bridge_converter.convert(info.name, param)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                error_gate(error)
+                yield from converted
+                del converted
+            del params, gathered
+
     def configure_expert_routing(
         self,
         layout: ExpertLayout | None,
