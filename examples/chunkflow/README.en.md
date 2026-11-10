@@ -52,7 +52,7 @@ ______________________________________________________________________
 
 ## Quick start
 
-Use the Relax revision in [relax.version](relax.version) and its training image. Recipes automatically apply the integration patch; they install no dependencies and save no checkpoints.
+**Version dependency**: based on Relax [d548769b](https://github.com/redai-studio/Relax/commit/d548769b77f12e445e464f99d4332290a3e5bd3d) and its matching training image; see [relax.version](relax.version) for the pinned revision. Recipes automatically apply the integration patch; they install no dependencies and save no checkpoints.
 
 ```bash
 export MODEL_DIR=/path/to/model

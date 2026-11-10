@@ -47,7 +47,7 @@ ______________________________________________________________________
 
 ## 快速开启
 
-使用 [relax.version](relax.version) 固定的 Relax 版本及其训练镜像。示例脚本自动安装集成补丁，不安装依赖，不保存 checkpoint。
+**版本依赖**：基于 Relax [d548769b](https://github.com/redai-studio/Relax/commit/d548769b77f12e445e464f99d4332290a3e5bd3d) 及其配套训练镜像，固定版本见 [relax.version](relax.version)。
 
 ```bash
 export MODEL_DIR=/path/to/model
