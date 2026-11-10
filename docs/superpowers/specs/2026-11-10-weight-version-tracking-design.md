@@ -152,6 +152,10 @@ class WeightVersionSpan:
 - 遵循 Relax 仓库规则：版权头、`get_logger`、显式类型注解、最小变更、pre-commit；`.claude/rules` SSOT（span 单一数据源）；新增测试按「先评估增量价值」原则限定在上表场景。
 - schema bump 3.1.0 additive；旧字段 `weight_versions` 保留，向后兼容。
 
+### 10.1 TQ 序列化风险与 fallback 的判定标准
+
+实现第 4 步时先跑一个探针：构造带 `weight_version_spans` 的 Sample 过 TransferQueue 序列化往返，断言字段存活。失败则启用 fallback（train 流只写 `consumed_weight_version`，lag 计算移入 version_audit.py 离线 join）。判定以探针结果为准，不在设计层预设。
+
 ## 10. 实现顺序（供后续计划参考）
 
 1. `WeightVersionSpan` 类型 + `InflightRequest`/`MsgNode`/`Sample`/`LineageNode` 扩展（纯数据结构，先写单测）
