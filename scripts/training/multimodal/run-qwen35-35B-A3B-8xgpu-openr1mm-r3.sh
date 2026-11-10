@@ -119,6 +119,9 @@ WANDB_ARGS=(
 )
 
 MISC_ARGS=(
+   # Retain training communicators independently of weight-backup overlap.
+   --selective-offload
+   --train-env-vars '{"RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS":"1","NCCL_BUFFSIZE":"1048576","NCCL_MAX_CTAS":"8","NCCL_NVLS_ENABLE":"0"}'
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
    --hidden-dropout 0.0

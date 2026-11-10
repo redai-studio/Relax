@@ -381,6 +381,8 @@ class Envs(metaclass=_EnvsMeta):
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvProperty("SGLANG_EXTERNAL_MM_MODEL_ARCH", str, None)
 
     # ------------- Distributed Runtime -------------
+    # Keep Actor training communicators across per-step selective offload.
+    RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS = EnvProperty("RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS", bool, False)
     LOCAL_RANK = EnvProperty("LOCAL_RANK", int, 0)
     RANK = EnvProperty("RANK", int, 0)
     SLURM_JOB_NUM_NODES = EnvProperty("SLURM_JOB_NUM_NODES", int, 1)

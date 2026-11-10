@@ -520,6 +520,13 @@ class MegatronTrainRayActor(TrainRayActor):
         self._train_state_offloader = MegatronTrainStateOffloader(self.model, self.optimizer, args)
         # Set after training; blocks sleep until weight sync and CPU backup finish.
         self._actor_weights_pending_sync = False
+        self._keep_train_process_groups = False
+        if role == "actor":
+            from .train_process_groups import configure_train_process_group_retention
+
+            self._keep_train_process_groups = configure_train_process_group_retention(
+                args, self._train_state_offloader, get_gloo_group()
+            )
 
         start_rollout_id = loaded_rollout_id + 1
 
@@ -833,7 +840,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights_backuper.backup("actor", on_device=getattr(self, "_weights_backup_on_device", False))
 
     @timer
-    def sleep(self) -> None:
+    def sleep(self, *, keep_process_groups: bool = False) -> None:
         assert self.args.offload_train
         if getattr(self, "_actor_weights_pending_sync", False):
             raise RuntimeError("Cannot sleep while weight sync owns the training parameters")
@@ -853,7 +860,8 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
-        destroy_process_groups()
+        if not (keep_process_groups and getattr(self, "_keep_train_process_groups", False)):
+            destroy_process_groups()
 
         self._train_state_offloader.offload()
 
@@ -2348,7 +2356,7 @@ class MegatronTrainRayActor(TrainRayActor):
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
             if self.args.offload_train and not getattr(self, "_actor_weights_pending_sync", False):
-                self.sleep()
+                self.sleep(keep_process_groups=getattr(self, "_keep_train_process_groups", False))
             if has_rollout:
                 self.update_weights()
                 if colocate_transition_started is not None and dist.get_rank(group=get_gloo_group()) == 0:
@@ -3221,7 +3229,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self._advance_keep_old_actor_queue()
         if reconnect_rollout_engines:
             self.sleep()
-        elif self.args.offload_train:
+        elif self.args.offload_train and not getattr(self, "_keep_train_process_groups", False):
             destroy_process_groups()
 
         if self.args.offload_rollout:
