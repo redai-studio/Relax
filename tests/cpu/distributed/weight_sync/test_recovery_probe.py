@@ -64,7 +64,9 @@ def test_successful_peer_records_current_install_nonce_without_swallowing_errors
         "sglang.srt.model_executor.model_runner_components.weight_updater",
         SimpleNamespace(WeightUpdater=Updater),
     )
-    monkeypatch.setattr(recovery_probe, "scheduler_state", lambda: dict(paused=True))
+    monkeypatch.setattr(
+        recovery_probe, "scheduler_state", lambda: dict(paused=True, fully_idle=True, running_requests=0)
+    )
     model = torch.nn.Linear(2, 2)
     receiver = SimpleNamespace(poisoned=False, version=3, _apply_bucket=lambda: None)
 
@@ -84,3 +86,23 @@ def test_successful_peer_records_current_install_nonce_without_swallowing_errors
     assert worker_control(model, control)["receiver_version"] == 4
     assert model(torch.ones(1, 2)).shape == (1, 2)
     assert Updater().update_weights_from_tensor() == (True, "ordinary")
+
+
+def test_fault_is_not_armed_with_a_retained_overlap_batch(tmp_path, monkeypatch):
+    import torch
+
+    from task_delta_weight_sync import recovery_probe
+
+    monkeypatch.setattr(
+        recovery_probe, "scheduler_state", lambda: dict(paused=True, fully_idle=False, running_requests=1)
+    )
+    model = torch.nn.Linear(2, 2)
+    receiver = SimpleNamespace(_apply_bucket=lambda: None)
+    model._relax_sharded_memory_receiver = receiver
+    original_bucket = receiver._apply_bucket
+    control = dict(command="arm_failure", member="engine1:tp:0", directory=str(tmp_path), inject=False)
+    with pytest.raises(RuntimeError, match="paused and drained"):
+        worker_control(model, control)
+    assert receiver._apply_bucket is original_bucket
+    assert not hasattr(model, "_relax_recovery_probe")
+    assert model(torch.ones(1, 2)).shape == (1, 2)

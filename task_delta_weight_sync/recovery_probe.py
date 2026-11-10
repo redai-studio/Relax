@@ -18,13 +18,16 @@ class InjectedRecoveryFailure(RuntimeError):
 
 
 def pause_schedulers(engines: Any) -> None:
-    """Pause actual scheduler execution, rather than only aborting requests."""
+    """Drain overlap batches and pause actual scheduler execution."""
     import ray
 
     # SGLang's empty pause request defaults to mode=abort. That pauses the
     # tokenizer but deliberately never sends a pause command to schedulers.
+    # In-place pause can leave an overlap batch behind and prevent the
+    # following FULL update from flushing its cache. Retraction drains that
+    # batch before fault injection while keeping the scheduler paused.
     ray.get(
-        [engine._make_request.remote("pause_generation", {"mode": "in_place"}, timeout=30) for engine in engines],
+        [engine._make_request.remote("pause_generation", {"mode": "retract"}, timeout=30) for engine in engines],
         timeout=40,
     )
 
@@ -36,7 +39,11 @@ def scheduler_state() -> dict:
         while frame is not None:
             candidate = frame.f_locals.get("self")
             if hasattr(candidate, "_engine_paused") and hasattr(candidate, "tp_worker"):
-                return dict(paused=bool(candidate._engine_paused))
+                return dict(
+                    paused=bool(candidate._engine_paused),
+                    fully_idle=bool(candidate.is_fully_idle(ignore_waiting=candidate._engine_paused)),
+                    running_requests=len(candidate.running_batch.reqs),
+                )
             frame = frame.f_back
     finally:
         del frame
@@ -62,6 +69,9 @@ def worker_control(model: Any, control: dict) -> dict:
     directory = Path(control["directory"]) / "failure-probe"
     member = control["member"]
     if control["command"] == "arm_failure":
+        scheduler = scheduler_state()
+        if not scheduler["paused"] or not scheduler["fully_idle"] or scheduler["running_requests"]:
+            raise RuntimeError("Fault injection requires a paused and drained scheduler")
         from sglang.srt.model_executor.model_runner_components.weight_updater import WeightUpdater
 
         if getattr(model, "_relax_recovery_probe", None) is not None:
@@ -263,7 +273,8 @@ def install(args: Any) -> None:
                             report["compared_bytes"] == inventory["snapshot_bytes"] and report["mismatched_bytes"] == 0
                         )
                     else:
-                        assert report["paused"] and report["forward_attempts"] == 0
+                        assert report["paused"] and report["fully_idle"] and report["running_requests"] == 0
+                        assert report["forward_attempts"] == 0
                         if engine._actor_id.hex() == target:
                             assert (
                                 report["triggered"] and report["applied_buckets"] > 0 and report["receiver_poisoned"]
