@@ -38,7 +38,7 @@ jobs:
       matrix:
         include:
           - case: Qwen3.5-4B-4xgpu-async
-            script: scripts/training/text/run-qwen35-4B-4x-async.sh
+            script: scripts/training/text/run-qwen35-4B-4xgpu-async.sh
             gpus: 4
           - case: Qwen3.5-4B-2xgpu-vl
             script: scripts/training/multimodal/run-qwen35-4B-2xgpu.sh
@@ -85,7 +85,7 @@ jobs:
           HOST_UV_CACHE_DIR="$HOME/.cache/uv"
           mkdir -p "$HOST_UV_CACHE_DIR" "$ARTIFACT_DIR"
 
-          # Runners provision ~/model/Qwen3.5-4B and the case's dataset in ~/data.
+          # Each runner provisions the cases' model and dataset files in ~/model and ~/data.
           # Keep Ray processes, network, IPC and /tmp private to this container.
           docker create --pull never --rm --init \
             --name "$CI_CONTAINER_NAME" \
@@ -125,7 +125,7 @@ jobs:
             --system --break-system-packages -r requirements.txt \
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
-      - name: Run Qwen3.5-4B integration test
+      - name: Run integration test
         timeout-minutes: 10
         run: |
           docker exec --env TRAINING_SCRIPT "$CI_CONTAINER_NAME" bash -euo pipefail -c '
@@ -134,6 +134,25 @@ jobs:
             export no_proxy="*" NO_PROXY="*"
             bash "$TRAINING_SCRIPT" 2>&1 | tee /artifacts/training.log
           '
+
+      - name: Verify async actor gradients
+        if: matrix.case == 'Qwen3.5-4B-4xgpu-async'
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
+        run: |
+          python3 - "$ARTIFACT_DIR/training.log" <<'PY'
+          import math
+          import re
+          import sys
+
+          metric = re.compile(r"\bstep \d+: \{[^\n]*'train/grad_norm':\s*([^,\s}]+)")
+          with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
+              norms = [float(match[1]) for line in log if (match := metric.search(line))]
+          nonzero = [norm for norm in norms if math.isfinite(norm) and norm > 0]
+          if not nonzero:
+              sys.exit(f"Expected a finite, nonzero actor gradient norm; found {len(norms)} actor step metrics")
+          print(f"Finite, nonzero actor gradients in {len(nonzero)}/{len(norms)} steps (max norm {max(nonzero):g})")
+          PY
 
       - name: Collect Ray logs
         if: always()
@@ -168,7 +187,7 @@ jobs:
     timeout-minutes: 185
     env:
       CI_CONTAINER_NAME: relax-npu-integration-${{ github.run_id }}-${{ github.run_attempt }}
-      TRAINING_SCRIPT: scripts/training/text/run-qwen35-4B-4x-async.sh
+      TRAINING_SCRIPT: scripts/training/text/run-qwen35-4B-4xnpu-async.sh
       ARTIFACT_NAME: integration-Qwen3.5-4B-4xnpu-async-${{ github.run_id }}-${{ github.run_attempt }}
       CLEARML_TAGS: branch=${{ github.head_ref || github.ref_name }},commit=${{ github.sha }}
     steps:
@@ -238,7 +257,7 @@ jobs:
             cp -a --no-preserve=ownership /source/. /workspace/Relax/
           '
 
-      - name: Run Qwen3.5-4B integration test
+      - name: Run integration test
         timeout-minutes: 15
         run: |
           docker exec --env TRAINING_SCRIPT "$CI_CONTAINER_NAME" bash -eo pipefail -c '
@@ -251,7 +270,7 @@ jobs:
             unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
             unset RAY_NO_WAIT RAY_ADDRESS RELAX_ENTRYPOINT_MODE
             export no_proxy="*" NO_PROXY="*"
-            bash "$TRAINING_SCRIPT" npu 2>&1 | tee /artifacts/training.log
+            bash "$TRAINING_SCRIPT" 2>&1 | tee /artifacts/training.log
           '
 
       - name: Collect Ray logs

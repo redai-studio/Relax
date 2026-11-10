@@ -2,8 +2,8 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.5-4B fully async GRPO smoke test on 4 GPUs or 4 logical NPUs.
-# Set MODEL_DIR and DATA_DIR, then run this script with [gpu|npu] (default: gpu).
+# Qwen3.5-4B fully async GRPO smoke test on 4 logical NPUs.
+# Set MODEL_DIR and DATA_DIR, then run this script with bash.
 
 set -eo pipefail
 
@@ -17,58 +17,19 @@ for input in "${CHECKPOINT}/config.json" "${PROMPT_SET}"; do
    fi
 done
 
-BACKEND="${1:-gpu}"
-BACKEND_ARGS=()
-case "$BACKEND" in
-   gpu)
-      export NUM_GPUS="${NUM_GPUS:-4}"
-      ENTRYPOINT=local.sh
-      ROLLOUT_BATCH_SIZE=4
-      BACKEND_ARGS=(
-         --warm-hf-checkpoint-page-cache
-         --use-streaming-dataset
-         --streaming-buffer-size 10000
-         --use-dynamic-batch-size
-      )
-      ;;
-   npu)
-      export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}"
-      export HCCL_NPU_SOCKET_PORT_RANGE="62000-62050"
-      export HCCL_HOST_SOCKET_PORT_RANGE="62100-62200"
-      export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-      ENTRYPOINT=local-npu.sh
-      ROLLOUT_BATCH_SIZE=2
-      BACKEND_ARGS=(
-         # Match the Qwen3.5 Ascend recipes: GDN uses unpacked batches.
-         --qkv-format bshd
-         --micro-batch-size 1
-         --no-gradient-accumulation-fusion
-         --use-flash-attn
-         --distributed-timeout-minutes 60
-         --sglang-device npu
-         --sglang-attention-backend ascend
-         --sglang-disable-radix-cache
-         --sglang-chunked-prefill-size 8192
-         --sglang-max-prefill-tokens 8192
-         --sglang-cuda-graph-bs 4 8 16 32 64 96 128
-         --sglang-enable-dp-attention
-         --sglang-enable-dp-lm-head
-      )
-      ;;
-   *)
-      printf 'Usage: %s [gpu|npu]\n' "$0" >&2
-      exit 2
-      ;;
-esac
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}"
+export HCCL_NPU_SOCKET_PORT_RANGE="62000-62050"
+export HCCL_HOST_SOCKET_PORT_RANGE="62100-62200"
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 if [[ -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
-   source "${SCRIPT_DIR}/../../entrypoint/${ENTRYPOINT}"
+   source "${SCRIPT_DIR}/../../entrypoint/local-npu.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen35-4B.sh"
 
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/dev/dapo-math}"
-EXP_NAME="${EXP_NAME:-qwen35-4b-grpo-4x${BACKEND}-async}"
+EXP_NAME="${EXP_NAME:-qwen35-4b-grpo-4xnpu-async}"
 now=$(date "+%Y%m%d-%H%M%S")
 
 CKPT_ARGS=(
@@ -86,7 +47,7 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    --num-rollout "${NUM_ROLLOUT:-4}"
-   --rollout-batch-size "$ROLLOUT_BATCH_SIZE"
+   --rollout-batch-size 2
    --n-samples-per-prompt 8
    --rollout-max-response-len 2048
    --rollout-temperature 0.8
@@ -94,6 +55,14 @@ ROLLOUT_ARGS=(
    --use-fault-tolerance
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.8
+   --sglang-device npu
+   --sglang-attention-backend ascend
+   --sglang-disable-radix-cache
+   --sglang-chunked-prefill-size 8192
+   --sglang-max-prefill-tokens 8192
+   --sglang-cuda-graph-bs 4 8 16 32 64 96 128
+   --sglang-enable-dp-attention
+   --sglang-enable-dp-lm-head
 )
 
 TRAIN_ARGS=(
@@ -105,6 +74,12 @@ TRAIN_ARGS=(
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
+   # Match the Qwen3.5 Ascend recipes: GDN uses unpacked batches.
+   --qkv-format bshd
+   --micro-batch-size 1
+   --no-gradient-accumulation-fusion
+   --use-flash-attn
+   --distributed-timeout-minutes 60
    --max-tokens-per-gpu 9216
    --no-rope-fusion
    --attention-dropout 0.0
@@ -163,5 +138,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} \
    "${TRAIN_ARGS[@]}" \
    "${GRPO_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
-   "${METRICS_ARGS[@]}" \
-   "${BACKEND_ARGS[@]}" 2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-${now}.log"
+   "${METRICS_ARGS[@]}" 2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-${now}.log"
