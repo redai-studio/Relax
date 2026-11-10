@@ -852,14 +852,14 @@ class PrefetchBuffer:
                             prepared.pop(idx, None)
                             self._pos += 1
                             continue
+                        if self._prepare_fn is not None and idx not in prepared:
+                            break
                         if idx in self._fallback_fetched_indices:
                             prepared.pop(idx, None)
                             self._fallback_fetched_indices.discard(idx)
                             self._prefetch_stale_drops += 1
                             self._pos += 1
                             continue
-                        if self._prepare_fn is not None and idx not in prepared:
-                            break
                         try:
                             future = (
                                 pool.submit(process, idx, prepared[idx])
@@ -890,13 +890,13 @@ class PrefetchBuffer:
 
                 # Publish completed processing even while the next raw read
                 # is in flight; slow I/O must not hold ready samples hostage.
-                done, _ = wait(waiting, timeout=0.1, return_when=FIRST_COMPLETED)
+                done = wait(waiting, timeout=0.1, return_when=FIRST_COMPLETED)[0]
+                done.discard(preparation)
+                waiting.clear()
                 with self._cache_updated:
                     if stop_event is not self._stop or stop_event.is_set():
                         return
                     for future in done:
-                        if future is preparation:
-                            continue
                         idx = pending.pop(future)
                         started_at.pop(idx, None)
                         if future in expired:

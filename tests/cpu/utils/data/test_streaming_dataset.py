@@ -622,13 +622,28 @@ class TestPrefetchBuffer:
         finally:
             buffer.stop()
 
-    def test_prepared_rows_are_released_before_refilling_the_window(self):
+    @pytest.mark.parametrize("fallback", [False, True])
+    def test_prepared_rows_are_released_before_refilling_the_window(self, fallback, monkeypatch):
         from weakref import WeakSet
 
         from relax.utils.data.streaming_dataset import PrefetchBuffer
 
         live = WeakSet()
         windows = []
+        ready = threading.Event()
+        release = threading.Event()
+        fallback_done = threading.Event()
+        background_checked = threading.Event()
+        import relax.utils.data.streaming_dataset as module
+
+        original_wait = module.wait
+
+        def observed_wait(*args, **kwargs):
+            if fallback_done.is_set():
+                background_checked.set()
+            return original_wait(*args, **kwargs)
+
+        monkeypatch.setattr(module, "wait", observed_wait)
 
         class Row:
             pass
@@ -639,16 +654,29 @@ class TestPrefetchBuffer:
             rows = {idx: Row() for idx in indices}
             live.update(rows.values())
             windows.append(indices)
+            if len(windows) == 1:
+                ready.set()
+                assert release.wait(2)
             return rows
 
-        buffer = PrefetchBuffer(lambda idx, row: idx, chunk_size=2, max_cached=4, num_workers=1, prepare_fn=prepare)
+        buffer = PrefetchBuffer(
+            lambda idx, row=None: idx, chunk_size=2, max_cached=4, num_workers=1, prepare_fn=prepare
+        )
         buffer.set_index_order(list(range(12)))
         try:
-            for idx in range(12):
+            if fallback:
+                assert ready.wait(2)
+                for idx in range(4):
+                    assert buffer.get(idx) == idx
+                fallback_done.set()
+                assert background_checked.wait(2)
+            release.set()
+            for idx in range(4 if fallback else 0, 12):
                 assert buffer.wait_for(idx, timeout=2)
                 assert buffer.get_cached(idx) == (True, idx)
             assert windows[0] == [0, 1, 2, 3]
         finally:
+            release.set()
             buffer.stop()
 
     def test_slow_next_preparation_does_not_hold_completed_samples(self):
