@@ -651,6 +651,38 @@ class TestPrefetchBuffer:
         finally:
             buffer.stop()
 
+    def test_slow_next_preparation_does_not_hold_completed_samples(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        preparing = threading.Event()
+        release = threading.Event()
+
+        def prepare(indices):
+            if indices[0] >= 4:
+                preparing.set()
+                assert release.wait(3)
+            return dict.fromkeys(indices)
+
+        def process(idx, row):
+            if idx == 2:
+                assert preparing.wait(2)
+            return idx
+
+        buffer = PrefetchBuffer(process, chunk_size=2, max_cached=4, num_workers=2, prepare_fn=prepare)
+        buffer.set_index_order(list(range(8)))
+        try:
+            for idx in range(2):
+                assert buffer.wait_for(idx, timeout=2)
+                assert buffer.get_cached(idx) == (True, idx)
+            assert preparing.wait(2)
+            # Raw I/O for the next window must not hold completed work from
+            # the previous one.
+            assert buffer.wait_for(2, timeout=0.5)
+            assert buffer.get_cached(2) == (True, 2)
+        finally:
+            release.set()
+            buffer.stop()
+
     def test_preparation_timeout_finishes_generation_and_wakes_waiters(self):
         from relax.utils.data.streaming_dataset import PrefetchBuffer
 

@@ -774,6 +774,10 @@ class PrefetchBuffer:
         expired: set[Future] = set()
         consecutive_failures = 0
         pool: ThreadPoolExecutor | None = None
+        read_pool: ThreadPoolExecutor | None = None
+        preparation: Future | None = None
+        to_prepare: list[int] = []
+        prepare_started = 0.0
         prepared: dict[int, Any] = {}
         prepare_pos = 0
         processed_limit = (
@@ -798,12 +802,26 @@ class PrefetchBuffer:
 
         try:
             pool = ThreadPoolExecutor(max_workers=self._num_workers, thread_name_prefix="pf")
+            if self._prepare_fn is not None:
+                read_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pf-read")
             while not stop_event.is_set():
+                if preparation is not None:
+                    if preparation.done():
+                        rows = preparation.result()
+                        if set(rows) != set(to_prepare):
+                            raise ValueError("Prepared prefetch rows must match the requested indices")
+                        prepared = rows
+                        # Drop the Future's result before reserving another
+                        # window, so it cannot retain an already consumed one.
+                        preparation = None
+                        rows = None
+                    elif time.monotonic() - prepare_started >= self._PROCESS_TIMEOUT_SECONDS:
+                        raise TimeoutError("Prefetch batch preparation timed out")
                 # Reserve the next read window without advancing the consumer's
                 # cursor. A smaller processed queue leaves space to amortize I/O
                 # across more than one rolling worker window.
-                to_prepare: list[int] = []
-                if self._prepare_fn is not None and not prepared:
+                if self._prepare_fn is not None and not prepared and preparation is None:
+                    to_prepare = []
                     with self._lock:
                         if stop_event is not self._stop or stop_event.is_set():
                             return
@@ -815,18 +833,9 @@ class PrefetchBuffer:
                                 to_prepare.append(idx)
                                 occupied.add(idx)
                     if to_prepare:
-                        preparation = pool.submit(self._prepare_fn, to_prepare)
+                        assert read_pool is not None
+                        preparation = read_pool.submit(self._prepare_fn, to_prepare)
                         prepare_started = time.monotonic()
-                        while not preparation.done():
-                            if stop_event.is_set():
-                                return
-                            if time.monotonic() - prepare_started >= self._PROCESS_TIMEOUT_SECONDS:
-                                raise TimeoutError("Prefetch batch preparation timed out")
-                            wait((preparation,), timeout=0.1)
-                        rows = preparation.result()
-                        if set(rows) != set(to_prepare):
-                            raise ValueError("Prepared prefetch rows must match the requested indices")
-                        prepared = rows
                 with self._cache_updated:
                     if stop_event is not self._stop or stop_event.is_set():
                         return
@@ -872,15 +881,22 @@ class PrefetchBuffer:
                         return
                     self._space_available.clear()
 
-                if not pending:
+                waiting = [*pending]
+                if preparation is not None:
+                    waiting.append(preparation)
+                if not waiting:
                     self._space_available.wait(timeout=0.1)
                     continue
 
-                done, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                # Publish completed processing even while the next raw read
+                # is in flight; slow I/O must not hold ready samples hostage.
+                done, _ = wait(waiting, timeout=0.1, return_when=FIRST_COMPLETED)
                 with self._cache_updated:
                     if stop_event is not self._stop or stop_event.is_set():
                         return
                     for future in done:
+                        if future is preparation:
+                            continue
                         idx = pending.pop(future)
                         started_at.pop(idx, None)
                         if future in expired:
@@ -911,6 +927,8 @@ class PrefetchBuffer:
             # Running calls cannot be killed; they never publish into a new epoch.
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
+            if read_pool is not None:
+                read_pool.shutdown(wait=False, cancel_futures=True)
             with self._cache_updated:
                 if stop_event is self._stop:
                     self._finished = True
