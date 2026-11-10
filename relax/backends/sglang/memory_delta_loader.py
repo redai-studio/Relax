@@ -14,6 +14,34 @@ from dataclasses import dataclass
 from typing import Any
 
 
+MEMORY_LOADER = "relax.backends.sglang.memory_delta_loader.load_memory_weights"
+
+
+def load_memory_weights(model: Any, weights: list[tuple[str, Any]]) -> None:
+    """SGLang custom loader: serialized tensors carry only a TCP descriptor."""
+    import json
+
+    from relax.distributed.weight_sync.memory_transport import receive_memory_update
+
+    weights = list(weights)
+    if len(weights) != 1 or weights[0][1].numel() != 0 or len(weights[0][0]) > 65536:
+        raise ValueError("Memory loader expects one empty control tensor")
+    control = json.loads(weights[0][0])
+    receiver = getattr(model, "_relax_memory_receiver", None)
+    if receiver is None:
+        receiver = MemoryModelReceiver(model, host_budget_bytes=control["host_budget_bytes"])
+        model._relax_memory_receiver = receiver
+    elif receiver.host_budget_bytes != control["host_budget_bytes"]:
+        raise ValueError("Memory host budget changed during a stream")
+    receive_memory_update(
+        control["descriptor"],
+        control["member"],
+        receiver.apply,
+        timeout_s=control["timeout_s"],
+        host_budget_bytes=receiver.host_budget_bytes,
+    )
+
+
 @dataclass(frozen=True)
 class CopyRoute:
     parameter: str

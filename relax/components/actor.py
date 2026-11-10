@@ -112,8 +112,10 @@ class Actor(Base):
 
     async def set_rollout_manager(self, rollout_manager: Any) -> None:
         """Set the rollout manager and initialize weights."""
-        if getattr(self.config, "disk_weight_sync_config", None):
-            # Disk export, delivery and checked installation can take minutes.
+        if getattr(self.config, "disk_weight_sync_config", None) or getattr(
+            self.config, "memory_weight_sync_config", None
+        ):
+            # Initial capture, delivery and checked installation can be slow.
             # Keep Serve's user event loop available to its health probe, while
             # still awaiting completion (and propagating installation errors).
             await asyncio.to_thread(self._set_rollout_manager_blocking, rollout_manager)

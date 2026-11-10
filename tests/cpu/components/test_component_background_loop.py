@@ -12,14 +12,15 @@ from relax.components.background_loop import BackgroundLoopRunner
 
 
 @pytest.mark.parametrize("fails", [False, True])
-async def test_actor_disk_initialization_keeps_event_loop_live_and_awaits_installation(fails, monkeypatch):
+@pytest.mark.parametrize("config_field", ["disk_weight_sync_config", "memory_weight_sync_config"])
+async def test_actor_sync_initialization_keeps_event_loop_live_and_awaits_installation(
+    fails, config_field, monkeypatch
+):
     monkeypatch.setattr("relax.utils.tq.lifecycle.detach_tq_client", Mock())
     deployment = importlib.import_module("relax.components.actor").Actor.func_or_class
     cls = next(cls for cls in deployment.__mro__ if "run" in cls.__dict__)
     actor = object.__new__(cls)
-    actor.config = Namespace(
-        disk_weight_sync_config="sync.json", fully_async=False, hybrid=False, loss_type="policy_loss"
-    )
+    actor.config = Namespace(**{config_field: "sync.json"}, fully_async=False, hybrid=False, loss_type="policy_loss")
     actor.actor_model = Mock()
     entered, release = threading.Event(), threading.Event()
     error = RuntimeError("installation failed")

@@ -83,6 +83,10 @@ def validate_disk_weight_sync_args(args) -> None:
     config = WeightSyncConfig.load(path)
     if config.mode != "delta":
         raise WeightSyncError("--disk-weight-sync-config requires mode=delta (full_only selects the FULL control)")
+    _validate_sync_execution(args, "Disk")
+
+
+def _validate_sync_execution(args, label: str) -> None:
     unsupported = [
         name
         for name in (
@@ -106,16 +110,56 @@ def validate_disk_weight_sync_args(args) -> None:
         if getattr(args, name, False)
     ]
     if unsupported:
-        raise WeightSyncError(f"Disk weight sync does not support: {', '.join(unsupported)}")
+        raise WeightSyncError(f"{label} weight sync does not support: {', '.join(unsupported)}")
     if getattr(args, "lora_rank", 0) > 0 or getattr(args, "save_hf_dtype", "bf16") != "bf16":
-        raise WeightSyncError("Disk weight sync requires full-parameter, nonquantized HF export")
+        raise WeightSyncError(f"{label} weight sync requires full-parameter, nonquantized HF export")
     if getattr(args, "num_experts", None):
-        raise WeightSyncError("Disk weight sync currently supports Dense models only")
+        raise WeightSyncError(f"{label} weight sync currently supports Dense models only")
     if not getattr(args, "sglang_disable_cuda_graph", False):
-        raise WeightSyncError("Disk weight sync currently requires --sglang-disable-cuda-graph")
+        raise WeightSyncError(f"{label} weight sync currently requires --sglang-disable-cuda-graph")
     if any(
         getattr(args, name, 1) != 1 for name in ("sglang_pp_size", "sglang_dp_size", "rollout_num_gpus_per_engine")
     ):
-        raise WeightSyncError("The disk MVP currently requires single-GPU TP/PP/DP=1 inference engines")
+        raise WeightSyncError(f"The {label.lower()} MVP currently requires single-GPU TP/PP/DP=1 inference engines")
     if getattr(args, "train_backend", "megatron") != "megatron":
-        raise WeightSyncError("Disk weight sync requires the Megatron backend")
+        raise WeightSyncError(f"{label} weight sync requires the Megatron backend")
+
+
+@dataclass(frozen=True)
+class MemorySyncConfig:
+    stream: str
+    bucket_bytes: int = 512 << 20
+    gpu_budget_bytes: int = 16 << 30
+    host_budget_bytes: int = 8 << 30
+    sync_timeout_s: int = 120
+    anchor_interval: int = 20
+    full_only: bool = False
+
+    @classmethod
+    def load(cls, path: str | Path) -> "MemorySyncConfig":
+        data = parse_json(Path(path).read_bytes())
+        if not isinstance(data, dict) or set(data) - {f.name for f in fields(cls)}:
+            raise WeightSyncError("Unknown or invalid memory weight sync settings")
+        if not isinstance(data.get("stream"), str) or not data["stream"]:
+            raise WeightSyncError("Memory weight sync requires a nonempty stream")
+        config = cls(**data)
+        for name in ("bucket_bytes", "gpu_budget_bytes", "host_budget_bytes", "sync_timeout_s", "anchor_interval"):
+            integer(getattr(config, name), 1)
+        if type(config.full_only) is not bool:
+            raise WeightSyncError("full_only must be a boolean")
+        return config
+
+
+def validate_memory_weight_sync_args(args) -> None:
+    path = getattr(args, "memory_weight_sync_config", None)
+    if path is None:
+        return
+    if getattr(args, "disk_weight_sync_config", None):
+        raise WeightSyncError("Select one weight sync configuration")
+    MemorySyncConfig.load(path)
+    _validate_sync_execution(args, "Memory")
+    if any(
+        getattr(args, name, 1) != 1
+        for name in ("tensor_model_parallel_size", "pipeline_model_parallel_size", "context_parallel_size")
+    ):
+        raise WeightSyncError("Memory sync currently requires training TP/PP/CP=1")

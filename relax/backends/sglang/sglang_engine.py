@@ -783,6 +783,45 @@ class SGLangEngine(RayActor):
 
         return prepare(config_path, published, reference)
 
+    def install_memory_update(self, descriptor: dict, member: str, timeout: float, host_budget_bytes: int) -> dict:
+        import torch
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+
+        started = time.monotonic()
+        deadline = started + timeout
+
+        def request(endpoint: str, payload: dict) -> dict:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Memory worker installation deadline exceeded")
+            response = self._make_request(endpoint, payload, timeout=remaining)
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise RuntimeError(f"SGLang {endpoint} failed: {response}")
+            return response
+
+        if _sglang_has_weight_update_session():
+            request("begin_weight_update", {})
+        control = json.dumps(
+            dict(descriptor=descriptor, member=member, timeout_s=timeout, host_budget_bytes=host_budget_bytes)
+        )
+        serialized = MultiprocessingSerializer.serialize([(control, torch.empty(0))], output_str=True)
+        request(
+            "update_weights_from_tensor",
+            dict(serialized_named_tensors=[serialized], load_format=MEMORY_LOADER, flush_cache=True),
+        )
+        if _sglang_has_weight_update_session():
+            request("end_weight_update", {})
+        request("update_weight_version", dict(new_version=descriptor["update"], abort_all_requests=False))
+        return dict(
+            success=True,
+            engine=self.rank,
+            node_id=ray.get_runtime_context().get_node_id(),
+            install_s=time.monotonic() - started,
+            update=descriptor["update"],
+        )
+
     def install_disk_checkpoint(self, target: dict, published: dict, timeout: float) -> dict:
         from .disk_weight_sync import install
 
@@ -2240,6 +2279,13 @@ def _compute_server_args(
 
             if DUMP_LOADER not in loaders:
                 loaders.append(DUMP_LOADER)
+        if getattr(args, "memory_weight_sync_config", None):
+            from relax.backends.sglang.disk_weight_dump import DUMP_LOADER
+            from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+
+            for loader in (MEMORY_LOADER, DUMP_LOADER):
+                if loader not in loaders:
+                    loaders.append(loader)
         kwargs["custom_weight_loader"] = loaders
 
     if (

@@ -431,3 +431,55 @@ def test_source_close_releases_connections_waiting_for_ack():
             release.set()
         with pytest.raises((ConnectionError, OSError)):
             future.result(timeout=2)
+
+
+def test_custom_loader_uses_control_tensor_and_real_tcp():
+    import json
+
+    from relax.backends.sglang.memory_delta_loader import load_memory_weights
+
+    source = MemorySource("127.0.0.1", timeout_s=2)
+    encoder = MemoryDeltaEncoder()
+    model = PackedModel()
+    try:
+        descriptor = source.publish(
+            encoder.prepare(weights()),
+            stream="s",
+            version=0,
+            base=-1,
+            schema=encoder.pending_schema,
+            members={"a"},
+            reset=True,
+        )
+        control = json.dumps(dict(descriptor=descriptor, member="a", timeout_s=2, host_budget_bytes=4096))
+        load_memory_weights(model, [(control, torch.empty(0))])
+        assert model._relax_memory_receiver.version == 0
+        encoder.commit(source.wait(1), {"a"})
+        source.finish()
+        with pytest.raises(ValueError, match="empty control"):
+            load_memory_weights(model, [(control, torch.zeros(1))])
+    finally:
+        source.close()
+
+
+def test_memory_configuration_rejects_unsupported_execution_modes(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from relax.distributed.weight_sync.config import MemorySyncConfig, validate_memory_weight_sync_args
+
+    path = tmp_path / "memory.json"
+    path.write_text(json.dumps(dict(stream="test")))
+    assert MemorySyncConfig.load(path).stream == "test"
+    base = dict(memory_weight_sync_config=str(path), sglang_disable_cuda_graph=True)
+    validate_memory_weight_sync_args(SimpleNamespace(**base))
+    for override, message in [
+        (dict(colocate=True), "does not support"),
+        (dict(tensor_model_parallel_size=2), "training TP/PP/CP"),
+        (dict(disk_weight_sync_config="disk.json"), "Select one"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            validate_memory_weight_sync_args(SimpleNamespace(**(base | override)))
+    path.write_text(json.dumps(dict(stream="test", bucket_bytes=True)))
+    with pytest.raises(ValueError):
+        MemorySyncConfig.load(path)

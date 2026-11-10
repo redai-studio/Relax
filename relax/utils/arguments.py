@@ -1936,6 +1936,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Opt-in JSON configuration for synchronous disk checkpoint publication and installation.",
             )
             parser.add_argument(
+                "--memory-weight-sync-config",
+                type=str,
+                default=None,
+                help="Opt-in JSON configuration for synchronous TCP memory delta weight updates.",
+            )
+            parser.add_argument(
                 "--save-hf",
                 type=str,
                 default=None,
@@ -4134,9 +4140,10 @@ def slime_validate_args(args):
     _validate_agentic_rollout_args(args)
     validate_save_hf_fp8_args(args)
     validate_save_hf_post_hook_args(args)
-    from relax.distributed.weight_sync.config import validate_disk_weight_sync_args
+    from relax.distributed.weight_sync.config import validate_disk_weight_sync_args, validate_memory_weight_sync_args
 
     validate_disk_weight_sync_args(args)
+    validate_memory_weight_sync_args(args)
 
     if not is_offline and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(
