@@ -97,6 +97,9 @@ class MemorySource:
         class Server(socketserver.ThreadingTCPServer):
             daemon_threads = True
             allow_reuse_address = False
+            # All fixed members connect together; the default backlog of five
+            # can force a SYN retry even for eight single-GPU receivers.
+            request_queue_size = 128
 
         self._server = Server((bind_host, 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
