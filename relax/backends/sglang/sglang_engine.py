@@ -620,6 +620,11 @@ class SGLangEngine(RayActor):
         support."""
         if not getattr(self.args, "use_shard_p2p_weight_sync", False) or self.args.rollout_external:
             return {}
+        from .p2p_weight_lease import native_worker_dispatch_supported
+
+        if not native_worker_dispatch_supported():
+            logger.warning("Remote shard P2P requires the checked native worker dispatch; using native weight sync")
+            return {}
         import json
         import tempfile
         import uuid

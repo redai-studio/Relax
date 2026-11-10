@@ -56,7 +56,7 @@ def _legacy_groups(values: dict) -> Iterator[None]:
 
     state = import_module("sglang.srt.distributed.parallel_state")
     attention = import_module("sglang.srt.layers.dp_attention")
-    if getattr(state, "_ENABLE_PDMUX_P_TP", False):
+    if getattr(state, "_ENABLE_PDMUX_P_TP", False) or getattr(state, "_PDMUX_PREFILL_TP_GROUP", None) is not None:
         raise NotImplementedError("Layout-only replicas do not support PD-multiplexed tensor parallel groups")
     groups = {
         "_WORLD": "world",
@@ -96,7 +96,13 @@ def _validate_parallelism(layout: tuple[int, int]) -> None:
 def ParallelismContext(layout: tuple[int, int]) -> Iterator[None]:
     rank, size = layout
     _validate_parallelism(layout)
-    from sglang.srt.runtime_context import _PARALLEL_FIELDS, get_parallel
+    from sglang.srt import runtime_context
+
+    get_parallel = runtime_context.get_parallel
+    parallel_fields = getattr(runtime_context, "_PARALLEL_FIELDS", None)
+    if parallel_fields is None:
+        fields_factory = getattr(runtime_context, "_parallel_fields", None)
+        parallel_fields = fields_factory() if callable(fields_factory) else None
 
     values = dict(
         world_rank=rank,
@@ -154,17 +160,17 @@ def ParallelismContext(layout: tuple[int, int]) -> Iterator[None]:
         "dcp_enabled",
     }
     if (
-        not isinstance(_PARALLEL_FIELDS, (set, frozenset))
-        or (set(values) - optional) - _PARALLEL_FIELDS
-        or not {"world_rank", "launch_world_rank"} & _PARALLEL_FIELDS
-        or not {"world_size", "launch_world_size"} & _PARALLEL_FIELDS
+        not isinstance(parallel_fields, (set, frozenset))
+        or (set(values) - optional) - parallel_fields
+        or not {"world_rank", "launch_world_rank"} & parallel_fields
+        or not {"world_size", "launch_world_size"} & parallel_fields
     ):
         raise NotImplementedError("SGLang runtime context cannot represent the complete target layout")
     # Some installed models still import the legacy getters directly. Both
     # views must describe the same layout; neither may use a trainer group.
     with (
         _LAYOUT_LOCK,
-        get_parallel().override(**{name: value for name, value in values.items() if name in _PARALLEL_FIELDS}),
+        get_parallel().override(**{name: value for name, value in values.items() if name in parallel_fields}),
         _legacy_groups(values),
     ):
         yield

@@ -327,6 +327,15 @@ def _native_worker(rank, rendezvous, directory):
 
 
 def test_actual_native_worker_and_two_rank_failures_do_not_strand_scheduler_barrier(tmp_path):
+    if not protocol.native_worker_dispatch_supported():
+        from relax.backends.sglang.sglang_engine import SGLangEngine
+
+        engine = SimpleNamespace(
+            args=SimpleNamespace(use_shard_p2p_weight_sync=True, rollout_external=False),
+            _make_request=lambda *args, **kwargs: pytest.fail("Unsupported native dispatch sent a control RPC"),
+        )
+        assert SGLangEngine._remote_weight_capabilities(engine) == {}
+        return
     mp.spawn(_native_worker, args=(f"file://{tmp_path}/rdzv", str(tmp_path)), nprocs=2, join=True)
     rows = [json.loads(path.read_text()) for path in tmp_path.glob("rank-*.json")]
     assert len(rows) == 2 and rows[0] == rows[1] and len(rows[0]) == 10

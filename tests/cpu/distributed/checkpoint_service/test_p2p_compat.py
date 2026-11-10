@@ -119,7 +119,9 @@ def test_actual_sglang_context_accepts_layout_only_target_groups(monkeypatch, tp
         "get_moe_dp_group": "moe_dp",
     }
     saved = {name: value for name, value in vars(parallel_state).items() if name.startswith("_") and name.isupper()}
-    saved_attention = (dp_attention._ATTN_DP_RANK, dp_attention._ATTN_DP_SIZE)
+    saved_attention = tuple(
+        getattr(dp_attention, name) for name in ("_ATTN_DP_RANK", "_ATTN_DP_SIZE") if hasattr(dp_attention, name)
+    )
     for rank in range(tp):
         with ParallelismContext((rank, tp)):
             parallel = get_parallel()
@@ -133,14 +135,25 @@ def test_actual_sglang_context_accepts_layout_only_target_groups(monkeypatch, tp
             with pytest.raises(RuntimeError, match="cannot use group operation"):
                 parallel.tp_group.all_reduce
         assert all(getattr(parallel_state, name) is value for name, value in saved.items())
-        assert (dp_attention._ATTN_DP_RANK, dp_attention._ATTN_DP_SIZE) == saved_attention
+        assert (
+            tuple(
+                getattr(dp_attention, name)
+                for name in ("_ATTN_DP_RANK", "_ATTN_DP_SIZE")
+                if hasattr(dp_attention, name)
+            )
+            == saved_attention
+        )
 
 
 def test_layout_context_refuses_pd_multiplexed_groups(monkeypatch):
     pytest.importorskip("sglang")
     from sglang.srt.distributed import parallel_state
 
-    monkeypatch.setattr(parallel_state, "_ENABLE_PDMUX_P_TP", True)
+    if hasattr(parallel_state, "_ENABLE_PDMUX_P_TP"):
+        monkeypatch.setattr(parallel_state, "_ENABLE_PDMUX_P_TP", True)
+    else:
+        assert hasattr(parallel_state, "_PDMUX_PREFILL_TP_GROUP")
+        monkeypatch.setattr(parallel_state, "_PDMUX_PREFILL_TP_GROUP", object())
     saved = parallel_state._TP
     with pytest.raises(NotImplementedError, match="PD-multiplexed"):
         with ParallelismContext((0, 2)):

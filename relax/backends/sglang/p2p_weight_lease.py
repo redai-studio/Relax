@@ -286,6 +286,16 @@ def _p2p_native_request(
                 del worker.update_weights_from_tensor
 
 
+def native_worker_dispatch_supported() -> bool:
+    """Require the worker hook that closes errors before the scheduler
+    barrier."""
+    from sglang.srt.managers.tp_worker import BaseTpWorker
+
+    return callable(getattr(BaseTpWorker, "update_weights_from_tensor", None)) and callable(
+        getattr(BaseTpWorker, "_deserialize_own_rank", None)
+    )
+
+
 def _guard_p2p_native_weights(manager: Any, operation: str, request: Any = None) -> _WorkerWeightGuard:
     import torch.distributed as dist
 
