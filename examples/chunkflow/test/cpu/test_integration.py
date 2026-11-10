@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -278,6 +278,38 @@ def test_keeps_native_moe_parameters_and_methods():
     assert (moe.router.forward, *(expert.forward for expert in moe.experts)) == methods
     assert vars(moe.token_dispatcher) == dispatch
     assert uninstall(model) == 1
+
+
+@pytest.mark.parametrize(
+    "mode,coeff,hash_layer,rejected",
+    [
+        ("aux_loss", 0.01, False, True),
+        ("seq_aux_loss", 0.01, False, True),
+        ("global_aux_loss", 0.01, False, True),
+        (["aux_loss", "seq_aux_loss"], [0.0, 0.01], False, True),
+        ("aux_loss", 0.0, False, False),
+        ("none", 0.01, False, False),
+        ("aux_loss", 0.01, True, False),
+    ],
+)
+def test_install_checks_native_router_objective_before_mutation(mode, coeff, hash_layer, rejected):
+    pytest.importorskip("megatron.core")
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    router = torch.nn.Module()
+    router.routing_type, router.is_hash_layer = mode, hash_layer
+    router.config = SimpleNamespace(moe_aux_loss_coeff=coeff, moe_z_loss_coeff=0.01)
+    router.get_aux_loss_coeff = MethodType(TopKRouter.get_aux_loss_coeff, router)
+    model = torch.nn.ModuleList([_FakeAttn(), router])
+    original = model[0].core_attention.forward
+    if rejected:
+        with pytest.raises(NotImplementedError, match="load-balancing auxiliary loss"):
+            install(model, 4)
+        assert not hasattr(model, "chunkflow_runtime")
+        assert model[0].core_attention.forward == original
+    else:
+        assert install(model, 4) == 1
+        assert uninstall(model) == 1
 
 
 @pytest.mark.parametrize("original_cache_disabled", [False, True])

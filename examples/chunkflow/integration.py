@@ -165,6 +165,14 @@ def install(model, chunk_size: int) -> int:
 
     # Validate the complete text subtree before replacing even its first layer.
     backbone = _adaptation_root(model)
+    for module in backbone.modules():
+        get_aux_coeff = getattr(module, "get_aux_loss_coeff", None)
+        if callable(get_aux_coeff) and not getattr(module, "is_hash_layer", False):
+            if any(get_aux_coeff(mode) > 0 for mode in ("aux_loss", "seq_aux_loss", "global_aux_loss")):
+                raise NotImplementedError(
+                    "ChunkFlow requires zero MoE load-balancing auxiliary loss: "
+                    "chunk-local routing statistics change the full-batch objective."
+                )
     ple_layers = {
         id(layer): layer
         for module in backbone.modules()

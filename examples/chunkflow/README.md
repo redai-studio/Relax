@@ -98,6 +98,7 @@ python3 examples/chunkflow/setup.py
 | Megatron 重计算兼容性                          | 禁用 full-layer / selective `core_attn`                              |
 | 训练目标                                       | 暂不支持 GSPO / OPSM / M2PO 等依赖完整序列或 batch 统计的目标        |
 | MTP 训练                                       | 暂不支持跨 chunk 的多 token 预测；请关闭 `--enable-mtp-training`     |
+| MoE 负载均衡辅助损失                           | 使用 `none` 或零系数；暂不支持跨 chunk 的路由统计                    |
 | 分布式优化器                                   | `--num-distributed-optimizer-instances 1`（默认）                    |
 | 专家并行（EP）                                 | 同一 EP 组须有一致的分块执行计划；不一致时全组提前报错，避免通信挂起 |
 
