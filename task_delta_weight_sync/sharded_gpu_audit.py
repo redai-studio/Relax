@@ -366,9 +366,12 @@ def load_audit(model: Any, weights: Any) -> None:
         "failure_state",
         "disarm_failure",
         "install_transfer",
+        "allocator_reset",
+        "allocator_metrics",
     }:
         raise ValueError("Unknown GPU audit command")
-    if control.get("paused") is not True or any(
+    observing = command in {"allocator_reset", "allocator_metrics"}
+    if (control.get("paused") is not True and not observing) or any(
         not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,180}", value) is None
         for value in (member, update_id, control["phase"])
     ):
@@ -393,7 +396,11 @@ def load_audit(model: Any, weights: Any) -> None:
     if receiver is not None and hasattr(receiver, "last_metrics"):
         report["last_tcp_receiver_stages"] = receiver.last_metrics
     try:
-        if command == "fence":
+        if observing:
+            from task_delta_weight_sync.sync_metrics import allocator_metrics
+
+            report.update(allocator_metrics(model, reset=command == "allocator_reset"))
+        elif command == "fence":
             _fence({parameter.device for parameter in model.parameters()})
             return  # No audit filesystem IO inside a measured completion fence.
         elif command in {"arm_failure", "failure_state", "disarm_failure"}:

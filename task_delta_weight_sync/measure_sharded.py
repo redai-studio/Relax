@@ -32,6 +32,7 @@ def install(args: Any) -> None:
     from relax.utils.logging_utils import get_logger
     from task_delta_weight_sync.native_call import guarded_native_call
     from task_delta_weight_sync.prepared_nccl import wire_bucket
+    from task_delta_weight_sync.sync_metrics import allocator_metrics, receiver_metrics
 
     config = MemorySyncConfig.load(args.memory_weight_sync_config)
     if config.layout != "qwen35_owner_local" or config.full_only:
@@ -41,6 +42,7 @@ def install(args: Any) -> None:
         return
     group, logger = get_gloo_group(), get_logger(__name__)
     rank = dist.get_rank(group)
+    measure_allocators = os.environ.get("DWS_COLLECT_METRICS") == "1"
     root = Path(os.environ["TENSORBOARD_DIR"]).resolve().parents[1]
     measurements, audit_root = root / "paired-measurements", root / "audit"
     native_module = importlib.import_module("relax.backends.megatron.weight_update.update_weight_from_distributed")
@@ -294,6 +296,40 @@ def install(args: Any) -> None:
             payload_scope="expert TP shards to four engines; full nonexpert HF to eight TP workers; not NIC traffic",
         )
 
+    def begin_observation(self, update_id, arm):
+        if not measure_allocators:
+            return
+        root_action(
+            self,
+            lambda: receiver_metrics(self._ab_engines, audit_root, update_id, f"{arm}-metrics-start", start=True),
+        )
+        error = None
+        try:
+            allocator_metrics(reset=True)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        self._gate(error)
+
+    def end_observation(self, report, update_id, arm):
+        if not measure_allocators:
+            return
+        error, local = None, None
+        try:
+            local = allocator_metrics(reset=False)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        self._gate(error)
+        sources = [None] * dist.get_world_size(group)
+        dist.all_gather_object(sources, local, group=group)
+
+        def collect():
+            report["observations"] = receiver_metrics(
+                self._ab_engines, audit_root, update_id, f"{arm}-metrics-end", start=False
+            )
+            report["observations"]["source_ranks"] = sources
+
+        root_action(self, collect)
+
     def paired(self, manager):
         total_started = monotonic()
         try:
@@ -302,19 +338,23 @@ def install(args: Any) -> None:
                 initialize(self, manager)
             self._ab_step += 1
             update_id = f"optimizer-{self._ab_step:06d}"
+            begin_observation(self, update_id, "delta_tcp")
             started = monotonic()
             delta = original(self, manager)
             delta = tcp_metrics(delta, monotonic() - started, "delta_tcp")
+            end_observation(self, delta, update_id, "delta_tcp")
             paused_action(self, "capture", update_id, "delta-before-full")
             controls = ("nccl", "full_tcp") if self._ab_step % 2 else ("full_tcp", "nccl")
             results = dict(delta_tcp=delta)
             for arm in controls:
+                begin_observation(self, update_id, arm)
                 if arm == "nccl":
                     results[arm] = timed_native(self, update_id)
                 else:
                     started = monotonic()
                     value = original(self, manager, full_only=True)
                     results[arm] = tcp_metrics(value, monotonic() - started, arm)
+                end_observation(self, results.get(arm), update_id, arm)
                 paused_action(self, "compare", update_id, f"{arm}-compare")
             oracle_started = monotonic()
             paused_action(self, "complement", update_id, "complement-before-reference", stay_paused=True)

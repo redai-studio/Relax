@@ -23,6 +23,7 @@ def install(args: Any) -> None:
     from relax.utils.distributed_utils import get_gloo_group
     from relax.utils.logging_utils import get_logger
     from task_delta_weight_sync.native_call import guarded_native_call
+    from task_delta_weight_sync.sync_metrics import allocator_metrics, receiver_metrics
 
     memory = bool(getattr(args, "memory_weight_sync_config", None))
     if memory:
@@ -41,6 +42,7 @@ def install(args: Any) -> None:
         cls = UpdateWeightFromDistributed
     group, logger = get_gloo_group(), get_logger(__name__)
     rank = dist.get_rank(group)
+    observe = os.environ.get("DWS_COLLECT_METRICS") == "1"
     root = Path(os.environ["TENSORBOARD_DIR"]).resolve().parents[1] / "sync-measurements"
 
     def gate(error):
@@ -71,7 +73,7 @@ def install(args: Any) -> None:
 
     def quarantine(self):
         errors = []
-        engines = self.engines if memory else self.rollout_engines
+        engines = (self.engines or getattr(self, "_normal_metric_engines", ())) if memory else self.rollout_engines
         for engine in engines:
             try:
                 ray.get(engine.pause_generation.remote(timeout=5), timeout=10)
@@ -89,9 +91,40 @@ def install(args: Any) -> None:
                 identities = [engine._actor_id.hex() for engine in self.rollout_engines]
                 if len(identities) != 4 or len(set(identities)) != 4 or list(self._engine_gpu_counts or []) != [2] * 4:
                     error = "Ordinary native comparison requires four distinct TP2 engines"
-            gate(error)
+            try:
+                gate(error)
+            except Exception:
+                if rank == 0:
+                    quarantine(self)
+                raise
         self._normal_source_bytes = 0
         self._normal_step = getattr(self, "_normal_step", -1) + 1
+        metric_started = monotonic()
+        metric_id = f"optimizer-{self._normal_step:06d}"
+        error = None
+        if observe:
+            try:
+                if rank == 0:
+                    if memory:
+                        manager = call_args[0] if call_args else kwargs["rollout_manager"]
+                        engines, _, _, counts, _ = ray.get(manager.get_rollout_engines_and_lock.remote(), timeout=60)
+                        self._normal_metric_engines = tuple(engines)
+                        if list(counts) != [2] * 4 or len({e._actor_id.hex() for e in engines}) != 4:
+                            raise ValueError("Ordinary measurements require four distinct TP2 engines")
+                    else:
+                        engines = self.rollout_engines
+                    self._normal_metric_engines = tuple(engines)
+                    receiver_metrics(engines, root, metric_id, "metrics-start", start=True)
+                allocator_metrics(reset=True)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            try:
+                gate(error)
+            except Exception:
+                if rank == 0:
+                    quarantine(self)
+                raise
+        metric_setup_s = monotonic() - metric_started
         started = monotonic()
         value = (
             original(self, *call_args, **kwargs)
@@ -157,7 +190,35 @@ def install(args: Any) -> None:
                 errors = quarantine(self)
                 error = f"{type(exc).__name__}: {exc}; quarantine_errors={errors}"
         gate(error)
-        if not memory:
+        if observe:
+            metric_started = monotonic()
+            error, local = None, None
+            try:
+                local = allocator_metrics(reset=False)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            try:
+                gate(error)
+            except Exception:
+                if rank == 0:
+                    quarantine(self)
+                raise
+            sources = [None] * dist.get_world_size(group)
+            dist.all_gather_object(sources, local, group=group)
+            error = None
+            if rank == 0:
+                try:
+                    report["observations"] = receiver_metrics(
+                        self._normal_metric_engines, root, metric_id, "metrics-end", start=False
+                    )
+                    report["observations"]["source_ranks"] = sources
+                    report["metrics_setup_s"] = metric_setup_s
+                    report["metrics_collection_s"] = monotonic() - metric_started
+                    report["memory_peak_scope"] = "Per-arm GPU reset; lifetime host peaks explicitly labeled"
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}; quarantine_errors={quarantine(self)}"
+            gate(error)
+        elif not memory:
             local_memory = dict(
                 rank=rank,
                 cuda_allocated_bytes=torch.cuda.memory_allocated(),

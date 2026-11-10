@@ -181,8 +181,8 @@ def install(args: Any) -> None:
     from task_delta_weight_sync import measure_sharded
 
     cls = UpdateWeightFromShardedMemory
-    if args.num_rollout != 1:
-        raise ValueError("Recovery probe is an isolated one-optimizer-update experiment")
+    if type(args.num_rollout) is not int or not 1 <= args.num_rollout <= 20:
+        raise ValueError("Recovery probe requires a bounded 1..20-update experiment")
     raw_update = cls.update_weights
     measure_sharded.install(args)
     paired_update = cls.update_weights
@@ -191,12 +191,12 @@ def install(args: Any) -> None:
 
     def experiment(self, manager):
         result = paired_update(self, manager)
-        if self._ab_step != 1:
+        if self._ab_step != args.num_rollout:
             return result
         engines, lock = self._ab_engines, self._ab_lock
         target = engines[0]._actor_id.hex()
         other_members = [f"{engine._actor_id.hex()}:tp:{tp}" for engine in engines[1:] for tp in range(2)]
-        update_id = "optimizer-000001"
+        update_id = f"optimizer-{self._ab_step:06d}"
         fresh = None
         fresh_closed = False
 
@@ -354,6 +354,7 @@ def install(args: Any) -> None:
                     json.dumps(
                         dict(
                             status="VERIFIED",
+                            optimizer_update=self._ab_step,
                             seconds=monotonic() - started,
                             failed_stream=self.config.stream,
                             recovered_stream=fresh.config.stream,

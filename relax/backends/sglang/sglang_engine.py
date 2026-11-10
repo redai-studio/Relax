@@ -721,6 +721,11 @@ class SGLangEngine(RayActor):
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
             raise
+        counter = getattr(self, "_dws_http_metrics", None)
+        if counter is not None:
+            from task_delta_weight_sync.sync_metrics import record_http
+
+            record_http(counter, endpoint, response)
         return response.json()
 
     def health_generate(self, timeout: float = 5.0) -> bool:
@@ -878,8 +883,18 @@ class SGLangEngine(RayActor):
 
         from task_delta_weight_sync.sharded_gpu_audit import AUDIT_LOADER
 
-        if control.get("paused") is not True:
+        command = control.get("command")
+        measuring = command in {"measure_start", "measure_end"}
+        if control.get("paused") is not True and not measuring:
             raise ValueError("Pause the engine group before GPU auditing")
+        collected = None
+        if measuring:
+            if command == "measure_start" and getattr(self, "_dws_http_metrics", None) is not None:
+                raise RuntimeError("Synchronization measurement already active")
+            if command == "measure_end":
+                collected = self._dws_http_metrics
+                del self._dws_http_metrics  # Exclude the observation RPC itself.
+            control = dict(control, command="allocator_reset" if command == "measure_start" else "allocator_metrics")
         serialized = []
         for tp in range(2):
             item = dict(control, member=f"{ray.get_runtime_context().get_actor_id()}:tp:{tp}", tp_rank=tp)
@@ -893,7 +908,9 @@ class SGLangEngine(RayActor):
         )
         if not isinstance(result, dict) or result.get("success") is not True:
             raise RuntimeError(f"SGLang audit failed: {result}")
-        return dict(success=True, engine=self.rank, command=control["command"])
+        if measuring and command == "measure_start":
+            self._dws_http_metrics = {}  # Exclude setup and allocator reset RPCs.
+        return dict(success=True, engine=self.rank, command=command, http=collected)
 
     def install_disk_checkpoint(self, target: dict, published: dict, timeout: float) -> dict:
         from .disk_weight_sync import install

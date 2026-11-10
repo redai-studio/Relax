@@ -53,6 +53,7 @@ overrides = {
     "NCCL_NET": "Socket",
     "NCCL_IB_DISABLE": "1",
     "NCCL_DEBUG_SUBSYS": "INIT,NET",
+    "DWS_COLLECT_METRICS": "1",
     "WANDB_DIR": str(root / "logs"), "CLEARML_CACHE_DIR": str(root / "cache" / "clearml"),
     "ETTR_LOG_FILE": str(root / "logs" / "ettr.jsonl"),
     "ETTR_TRACE_LOG_DIR": str(root / "logs" / "ettr"),
