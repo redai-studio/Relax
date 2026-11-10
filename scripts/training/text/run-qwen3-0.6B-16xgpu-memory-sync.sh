@@ -44,6 +44,8 @@ overrides = {
     # because nvidia-smi reports NVLink connectivity.
     "NCCL_NVLS_ENABLE": "0",
     "WANDB_DIR": str(root / "logs"), "CLEARML_CACHE_DIR": str(root / "cache" / "clearml"),
+    "ETTR_LOG_FILE": str(root / "logs" / "ettr.jsonl"),
+    "ETTR_TRACE_LOG_DIR": str(root / "logs" / "ettr"),
     "TENSORBOARD_DIR": str(root / "logs" / "tensorboard"),
     "FLASHINFER_WORKSPACE_BASE": str(root / "cache" / "flashinfer-workspace"),
     "SGLANG_CACHE_DIR": str(root / "cache" / "sglang"),
