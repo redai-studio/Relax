@@ -743,13 +743,30 @@ def get_serve_url(route_prefix: str = "") -> str:
     return serve_url
 
 
+def checkpoint_resume_step(path: str, ckpt_step: Optional[int] = None) -> int:
+    """Return the next rollout ID from the committed native checkpoint
+    tracker."""
+    root = Path(path)
+    tracker = (root / "latest_checkpointed_iteration.txt").read_text().strip()
+    if not tracker.isdecimal():
+        raise ValueError(f"Resuming training requires a numeric checkpoint tracker: {root}")
+    iteration = ckpt_step if ckpt_step is not None and ckpt_step > 0 else int(tracker)
+    if not (root / f"iter_{iteration:07d}").is_dir():
+        raise ValueError(f"Committed checkpoint directory is missing: {root}/iter_{iteration:07d}")
+    return iteration + 1
+
+
 def recovery_load_path(args: Namespace) -> Optional[str]:
     """Determine the checkpoint path to load for recovery, if applicable."""
     if args.save is not None and os.path.exists(os.path.join(args.save, "latest_checkpointed_iteration.txt")):
         args.no_load_optim = args.no_save_optim
         args.no_load_rng = args.no_save_rng
         args.finetune = False
-        args.start_rollout_id = None
+        args.start_rollout_id = (
+            checkpoint_resume_step(args.save, getattr(args, "ckpt_step", None))
+            if getattr(args, "train_backend", "megatron") == "megatron"
+            else None
+        )
         args.load = args.save
 
 

@@ -107,14 +107,26 @@ CKPT_ARGS=(
 if [[ -n "${TRAIN_STEPS:-}" ]]; then CKPT_ARGS+=(--num-rollout "${TRAIN_STEPS}"); fi
 # Preserve a resumable recovery point and retain only the latest checkpoint.
 if [[ "${BENCHMARK_ONLY:-0}" != 1 ]]; then
+    checkpoint_load="${RESUME_CHECKPOINT:-${SAVE_DIR}/${EXP_NAME}/relax}"
     CKPT_ARGS+=(
-        --load "${SAVE_DIR}/${EXP_NAME}/relax"
+        --load "${checkpoint_load}"
         --save "${SAVE_DIR}/${EXP_NAME}/relax"
         --save-hf "${SAVE_DIR}/${EXP_NAME}/final-hf-{rollout_id}"
         --save-hf-post-hook-path examples.opensearch_vl.tools.checkpoint_retention.keep_latest_hf
         --save-interval "${SAVE_INTERVAL:-200}"
         --max-actor-ckpt-to-keep 1
     )
+    if [[ -n "${RESUME_CHECKPOINT:-}" || -f "${checkpoint_load}/latest_checkpointed_iteration.txt" ]]; then
+        resume_step=$(python3 - "${checkpoint_load}" <<'PY'
+import sys
+
+from relax.utils.utils import checkpoint_resume_step
+
+print(checkpoint_resume_step(sys.argv[1]))
+PY
+)
+        CKPT_ARGS+=(--start-rollout-id "${resume_step}")
+    fi
 else
     CKPT_ARGS+=(--num-rollout "${BENCHMARK_STEPS:-8}")
 fi
