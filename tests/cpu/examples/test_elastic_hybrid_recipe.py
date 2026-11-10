@@ -29,8 +29,14 @@ def test_elastic_recipe_submits_expected_training_mode(tmp_path, mode):
         NUM_ROLLOUT="100",
         CE_ENABLE_AFFINITY="0",
     )
-    env.pop("RELAX_ELASTIC_TRAIN_MODE", None)
-    script = ROOT / f"scripts/training/text/run-qwen35-9B-elastic-rollout-{mode}.sh"
+    env.pop("PROJECT_NAME", None)
+    recipe = f"run-qwen35-9B-elastic-rollout-{mode}.sh"
+    script = tmp_path / recipe
+    script.write_text((ROOT / "scripts/training/text" / recipe).read_text())
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    policy = "qwen35-9b-elastic-autoscaler.yaml"
+    (configs / policy).write_text((ROOT / "scripts/training/text/configs" / policy).read_text())
     result = subprocess.run(["bash", str(script)], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     argv = json.loads(result.stdout.splitlines()[-1])
@@ -43,10 +49,12 @@ def test_elastic_recipe_submits_expected_training_mode(tmp_path, mode):
     assert ("--hybrid" in command) == (mode == "hybrid")
     assert ("--fully-async" in command) == (mode == "async")
     assert ("--ref-actor-config" in command) == (mode == "async")
+    assert command[command.index("--tb-project-name") + 1] == f"Relax/CE/run-qwen35-9B-elastic-rollout-{mode}"
+    assert command[command.index("--tb-experiment-name") + 1].startswith(f"qwen35-9B-elastic-{mode}-")
     assert command[command.index("--num-rollout") + 1] == "100"
     assert "--no-enable-affinity" in command
     autoscaler = Path(command[command.index("--autoscaler-config") + 1])
-    assert autoscaler == ROOT / "scripts/training/text/configs/qwen35-9b-elastic-autoscaler.yaml"
+    assert autoscaler == configs / policy
     assert autoscaler.is_file()
     runtime_arg = next(arg for arg in argv if arg.startswith("--runtime-env-json="))
     runtime = json.loads(runtime_arg.split("=", 1)[1])
