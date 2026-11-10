@@ -16,12 +16,24 @@ PATCH = Path(__file__).resolve().parents[3] / "docker/patch/transformer_engine/2
 
 @pytest.fixture(scope="module")
 def padding_code():
-    # This single-hunk patch replaces only the padding body. Test those exact
-    # added statements: CI may use an older TE than the target Docker image.
-    # Reading the installed module would test stale code (or find no block).
+    # Select the padding file and hunk; other TE changes must not become
+    # executable padding statements. CI may have an older installed TE.
     lines = PATCH.read_text().splitlines(keepends=True)
-    assert sum(line.startswith("@@ ") for line in lines) == 1
-    added_code = dedent("".join(line[1:] for line in lines if line.startswith("+") and not line.startswith("+++")))
+    target = "transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py"
+    file_name, hunks, current = None, [], None
+    for line in lines:
+        if line.startswith("+++ b/"):
+            file_name = line[len("+++ b/") :].strip()
+            current = None
+        elif line.startswith("@@ "):
+            current = [] if file_name == target else None
+            if current is not None:
+                hunks.append(current)
+        elif current is not None and line.startswith("+"):
+            current.append(line[1:])
+    padding_hunks = [hunk for hunk in hunks if any("q_pad_mask =" in line for line in hunk)]
+    assert len(padding_hunks) == 1, "Expected one TE padding replacement hunk"
+    added_code = dedent("".join(padding_hunks[0]))
     assert added_code.strip(), "TE padding patch has no replacement code"
     return compile(added_code, str(PATCH), "exec")
 

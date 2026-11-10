@@ -54,4 +54,7 @@ class KimiK3VLModelProvider(KimiK3ModelProvider):
     def provide_language_model(
         self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
     ) -> GPTModel:
+        from .training_ops import configure_training_ops
+
+        configure_training_ops()
         return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)

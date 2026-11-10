@@ -24,9 +24,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import torch
 
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.sft.runtime import is_i2i_sft
 from relax.models import flow_grpo
 from relax.models.generative import GenerativeModelAdapter
+from relax.models.generative_sft import GenerativeSFTAdapter
 from relax.utils.logging_utils import get_logger
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.utils import load_function
 
 
@@ -92,7 +95,7 @@ class WeightSyncError(RuntimeError):
     INVALID.
 
     Raised by :meth:`FSDPTrainRayActor._run_weight_transaction` when any engine
-    drops a bucket, the commit fails, or the post-commit checksum mismatches.
+    rejects a bucket, the streamed counts mismatch, or the commit fails.
     :meth:`update_weights` catches it to trigger engine recovery + whole-round
     retry (fault tolerance) or to fail the job (design doc 10.3). No engine-side
     ``begin/abort`` staging is used — that is a planned SGLang-patch follow-up.
@@ -340,9 +343,13 @@ class FSDPTrainRayActor(TrainRayActor):
 
             init_tracking(args, primary=False)
 
-        self.adapter: GenerativeModelAdapter = self._load_adapter(args)
+        if is_i2i_sft(args):
+            from relax.backends.fsdp.sft import seed_training
+
+            seed_training(args.seed)
+        self.adapter = self._load_adapter(args)
         self.bundle = self._load_train_model_waved(args)
-        self.model = getattr(self.bundle, args.fsdp_trainable_attr, self.bundle)
+        self.model = self.bundle if is_i2i_sft(args) else getattr(self.bundle, args.fsdp_trainable_attr, self.bundle)
 
         # LoRA must be injected here: after the base weights are materialized
         # (``load_train_model`` returns the bundle already frozen down to the
@@ -365,6 +372,8 @@ class FSDPTrainRayActor(TrainRayActor):
                 task_type=self._lora_task_type(),
             )
 
+        if is_i2i_sft(args):
+            self.adapter.prepare_for_sharding(self.model)
         self._assert_trainable_boundary()
 
         from relax.backends.fsdp.runtime import fsdp2_wrap
@@ -378,15 +387,16 @@ class FSDPTrainRayActor(TrainRayActor):
             activation_checkpointing=getattr(args, "fsdp_activation_checkpointing", False),
             master_dtype=getattr(args, "fsdp_master_dtype", None),
         )
-        if self._trainable_mode == "lora":
+        if self._trainable_mode == "lora" and not is_i2i_sft(args):
             from relax.backends.fsdp.lora import build_lora_sync_plan
 
             # Built once, after sharding: the plan holds parameter OBJECTS, whose
             # .data the optimizer and the offload/onload helpers mutate in place.
             self._lora_plan = build_lora_sync_plan(self.model)
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.model.parameters() if p.requires_grad], **_adamw_kwargs(args)
-        )
+        optimizer_kwargs = _adamw_kwargs(args)
+        if is_i2i_sft(args) and self._trainable_mode == "full":
+            optimizer_kwargs["foreach"] = False
+        self.optimizer = torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad], **optimizer_kwargs)
         # Step-driven LR schedule (see :func:`lr_at_step`). Counts OPTIMIZER steps,
         # not rollouts, and round-trips through the checkpoint so a resumed run does
         # not restart warmup from zero.
@@ -401,6 +411,12 @@ class FSDPTrainRayActor(TrainRayActor):
         self._last_sync_tensors = 0
         self._last_sync_bytes = 0
         self._data_system_client = None  # lazy TransferQueue client for reading train partitions
+        if is_i2i_sft(args):
+            from relax.backends.fsdp.sft import FSDPSFTTrainer
+
+            self._get_parallel_config()
+            self.sft = FSDPSFTTrainer(self)
+            return self.sft.step
         self._base_model_sha256 = self._hash_base_model(args)
         self._assert_sync_plan_aligned()
         # Publish the parallel config so TrainRayActor.set_rollout_manager (called
@@ -438,7 +454,7 @@ class FSDPTrainRayActor(TrainRayActor):
     # -- construction helpers -------------------------------------------------
 
     @staticmethod
-    def _load_adapter(args) -> GenerativeModelAdapter:
+    def _load_adapter(args) -> GenerativeModelAdapter | GenerativeSFTAdapter:
         adapter_cls = load_function(args.model_adapter_path)
         return adapter_cls()
 
@@ -793,6 +809,8 @@ class FSDPTrainRayActor(TrainRayActor):
         step moves the weights. The heavy diffusion replay is delegated to
         :func:`flow_grpo_update`.
         """
+        if is_i2i_sft(self.args):
+            return self.sft.train(rollout_id)
         from relax.utils.timer import Timer, timer
 
         # Bracket the whole step so log_perf_data_raw emits perf/step_time
@@ -1400,7 +1418,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
             onload_error = None
             try:
-                ray.get(self.rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
+                if self._rank == 0:
+                    ray.get(self.rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
@@ -1485,7 +1504,8 @@ class FSDPTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
             onload_error = None
             try:
-                ray.get(self.rollout_manager.onload.remote())
+                if self._rank == 0:
+                    ray.get(self.rollout_manager.onload.remote())
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
@@ -1497,6 +1517,8 @@ class FSDPTrainRayActor(TrainRayActor):
             phase_lap("engine_full_onload")
 
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+        if is_i2i_sft(self.args):
+            return self.sft.save()
 
         from relax.backends.fsdp import checkpoint as ckpt
 
@@ -1802,7 +1824,7 @@ class FSDPTrainRayActor(TrainRayActor):
         per bucket keeps every rank's source tensors alive until the engine has
         opened them. ``tp==1`` degenerates to one blob per single-GPU engine.
 
-        Any engine drop / commit failure / checksum mismatch raises
+        Any engine RPC / streamed-count / commit failure raises
         :class:`WeightSyncError` so the caller can abort the version. Disk update is
         used only for resume, never here.
         """
@@ -1995,9 +2017,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
             # Validate the streamed snapshot against the manifest BEFORE committing —
             # every rank streams the identical full set, so every rank checks the
-            # same counts and raises uniformly. A mismatch means a truncated /
-            # mis-ordered / mis-named stream; fail the version rather than commit a
-            # partial weight set (design doc 10.2).
+            # same counts and raises uniformly. This detects a truncated stream;
+            # it does not compare the contents of engine replicas.
             count_error = None
             if sent_count != manifest.tensor_count or sent_bytes != manifest.total_bytes:
                 count_error = (
@@ -2011,11 +2032,11 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
             # Broadcasts rank 0's outcome and doubles as the barrier, so a
-            # failed verify/commit raises everywhere instead of hanging the
+            # failed commit raises everywhere instead of hanging the
             # other ranks on a barrier rank 0 already unwound past.
             self._rank0_then_agree(
-                lambda: self._verify_and_commit_engines(engines, manifest),
-                what=f"weight v{version} verify/commit",
+                lambda: self._commit_engines(engines, manifest),
+                what=f"weight v{version} commit",
             )
             self._synced_versions += 1
         except WeightSyncError:
@@ -2023,65 +2044,18 @@ class FSDPTrainRayActor(TrainRayActor):
         except Exception as exc:  # any transport / engine RPC failure invalidates the version
             raise WeightSyncError(version, str(exc)) from exc
 
-    def _verify_and_commit_engines(self, engines, manifest) -> None:
-        """Verify every engine replica before committing the policy version."""
+    def _commit_engines(self, engines, manifest) -> None:
+        """Commit the version after all bucket and manifest checks pass."""
         import ray
 
         version = manifest.policy_version
-        try:
-            checksums = ray.get(
-                [engine.get_weights_checksum.remote([self.args.fsdp_trainable_attr]) for engine in engines]
-            )
-        except Exception as exc:
-            raise WeightSyncError(version, f"checksum RPC failed: {exc}") from exc
-        reference = None
-        for index, checksum in enumerate(checksums):
-            if not isinstance(checksum, dict) or checksum.get("success") is False:
-                raise WeightSyncError(version, f"engine {index} returned an invalid checksum response: {checksum!r}")
-            try:
-                engine_count = int(checksum["tensor_count"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise WeightSyncError(
-                    version,
-                    f"engine {index} checksum response has no valid tensor_count: {checksum!r}",
-                ) from exc
-            if engine_count != manifest.tensor_count:
-                raise WeightSyncError(
-                    version,
-                    f"engine {index} has {engine_count} tensors != manifest {manifest.tensor_count}",
-                )
-            comparable = {
-                key: value for key, value in checksum.items() if key not in ("success", "message", "tensor_count")
-            }
-            if not comparable:
-                raise WeightSyncError(version, f"engine {index} checksum response contains no digest: {checksum!r}")
-            invalid_digests = {
-                key: value
-                for key, value in comparable.items()
-                if not isinstance(value, str)
-                or len(value) != 64
-                or any(char not in "0123456789abcdefABCDEF" for char in value)
-            }
-            if invalid_digests:
-                raise WeightSyncError(
-                    version,
-                    f"engine {index} checksum response contains invalid digests: {invalid_digests!r}",
-                )
-            if reference is None:
-                reference = comparable
-            elif comparable != reference:
-                raise WeightSyncError(
-                    version,
-                    f"engine {index} checksum differs from engine 0: {comparable!r} != {reference!r}",
-                )
-
         manifest_digest = manifest.sha256()
         try:
             commit_results = ray.get(
                 [engine.commit_weight_version.remote(version, manifest_digest) for engine in engines]
             )
         except Exception as exc:
-            raise WeightSyncError(version, f"commit RPC failed after verification: {exc}") from exc
+            raise WeightSyncError(version, f"commit RPC failed: {exc}") from exc
         for index, result in enumerate(commit_results):
             if (
                 not isinstance(result, dict)
@@ -2090,8 +2064,7 @@ class FSDPTrainRayActor(TrainRayActor):
             ):
                 raise WeightSyncError(version, f"engine {index} failed to commit the version: {result!r}")
         logger.info(
-            f"weight v{version} committed on {len(engines)} engine(s); "
-            f"weight_manifest_sha256={manifest_digest} checksum={reference}"
+            f"weight v{version} committed on {len(engines)} engine(s); weight_manifest_sha256={manifest_digest}"
         )
 
     def _run_adapter_transaction(self, manifest, engines) -> None:
@@ -2206,15 +2179,35 @@ class FSDPTrainRayActor(TrainRayActor):
         except Exception as exc:
             raise WeightSyncError(version, str(exc)) from exc
 
-    def _tq_client(self):
-        """Lazily create this actor's TransferQueue client (mirrors megatron
-        actor)."""
-        if self._data_system_client is None:
-            import transfer_queue as tq
+    def __del__(self) -> None:
+        # Best-effort detach on graceful teardown; ray.kill / fate-sharing
+        # kills skip destructors, in which case the Mooncake master TTL
+        # reclaims the segment.
+        if getattr(self, "_data_system_client", None) is None:
+            return
+        try:
+            detach_tq_client()
+            self._data_system_client = None
+        except Exception:  # destructor must never raise (interpreter shutdown)
+            return
 
-            if getattr(self.args, "tq_config", None) is not None:
-                tq.init(self.args.tq_config)
-            self._data_system_client = tq.get_client()
+    def _tq_client(self):
+        """Lazily attach this actor's TransferQueue client (mirrors megatron
+        actor).
+
+        A configured job goes through the bounded lifecycle helper so the
+        attach cannot poll the controller forever and the Mooncake runtime
+        contract is validated before use; a missing ``tq_config`` keeps
+        upstream's behavior of reusing the client this process already holds.
+        """
+        if self._data_system_client is None:
+            conf = getattr(self.args, "tq_config", None)
+            if conf is None:
+                import transfer_queue as tq
+
+                self._data_system_client = tq.get_client()
+            else:
+                self._data_system_client = attach_tq_client(conf, role="fsdp_actor")
         return self._data_system_client
 
     def _load_train_batches(self, rollout_id: int, rollout_data_ref) -> List[Dict[str, Any]]:
@@ -2315,6 +2308,8 @@ class FSDPTrainRayActor(TrainRayActor):
             "total_lengths",
             "skip_optimizer_step",
         ]
+        if is_i2i_sft(self.args):
+            data_fields = ["sample_id"]
         deadline = time.time() + float(getattr(self.args, "rollout_request_timeout", 3600.0))
         while time.time() < deadline:
             meta = client.get_meta(

@@ -6,7 +6,7 @@ A practical guide to maximizing training throughput in Relax. All parameters men
 
 ## Kimi K3 TFLOPS and MFU
 
-`perf/actor_train_tflops` estimates useful model FLOPs per GPU per second. `perf/mfu/actor_train` divides this rate by the device's BF16 dense peak (2250 TFLOPS for B300) and reports a fraction, so 0.4 means 40%. It uses the actor training time, not the total rollout/save wall time. Optimizer and offload time inside training reduce the rate.
+`perf/actor_train_tflops` estimates useful model FLOPs per GPU per second. `perf/mfu/actor_train` divides this rate by the device's BF16 dense peak (2250 TFLOPS for the 280G Blackwell configuration) and reports a fraction, so 0.4 means 40%. It uses the actor training time, not the total rollout/save wall time. Optimizer and offload time inside training reduce the rate.
 
 K3 counts KDA projections, convolutions and state contractions; MLA low-rank/output-gate projections and causal attention; active latent MoE experts, router and shared experts; the vocabulary output; and MoonViT-V2 plus PatchMergerMLPV2. It uses actual per-sample lengths and original image `(T,H,W)` grids: the vision encoder attends over all frames before temporal pooling. Training GPU count is applied once after gathering sample metadata across DP without CP replicas.
 

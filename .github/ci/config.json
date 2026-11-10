@@ -8,18 +8,6 @@
       "workflow": "ci.yml",
       "job": "Pre-commit Checks"
     },
-    "ci/cpu-310": {
-      "workflow": "ci.yml",
-      "job": "Tests (Python 3.10)"
-    },
-    "ci/cpu-311": {
-      "workflow": "ci.yml",
-      "job": "Tests (Python 3.11)"
-    },
-    "ci/cpu-312": {
-      "workflow": "ci.yml",
-      "job": "Tests (Python 3.12)"
-    },
     "gpu-unit": {
       "workflow": "unittest.yml"
     },

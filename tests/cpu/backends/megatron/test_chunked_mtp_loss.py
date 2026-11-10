@@ -1,0 +1,547 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Unit tests for the chunked-MTP-loss patch
+(models/common/chunked_mtp_loss.py).
+
+The patch computes each MTP prediction depth's head + cross-entropy in sequence
+chunks so the full ``[S, V/TP]`` per-depth logits never materialize (fixes the
+tail-stage OOM). Because ``compute_language_model_loss`` reduces per token, chunking
+the sequence and concatenating the per-token ``[b, chunk]`` losses must reconstruct
+the full ``[b, s]`` loss BIT-FOR-BIT.
+
+These tests drive the patched ``process_mtp_loss`` against the ORIGINAL upstream one
+with mocked head (a plain Linear) + stub per-token CE, and assert the per-depth loss
+tensor fed to ``MTPLossAutoScaler.apply`` is identical. Pure CPU, no distributed init.
+"""
+
+from __future__ import annotations
+
+import types
+from collections.abc import Iterator
+
+import pytest
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+try:
+    from megatron.core.transformer import multi_token_prediction as _mtp_mod
+
+    from relax.models.common import chunked_mtp_loss as _patch
+except Exception as exc:  # pragma: no cover
+    pytest.skip(f"megatron/relax unavailable: {exc}", allow_module_level=True)
+
+
+def _native_process_mtp_loss(*args, **kwargs):
+    previous = _patch._chunked_mtp_enabled
+    _patch._chunked_mtp_enabled = lambda: False
+    try:
+        return _mtp_mod.process_mtp_loss(*args, **kwargs)
+    finally:
+        _patch._chunked_mtp_enabled = previous
+
+
+S, B, H, V, LAYERS = 16, 2, 8, 32, 2
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _single_threaded_cpu() -> Iterator[None]:
+    """Run bitwise CPU comparisons with one thread, then restore the previous
+    setting."""
+    previous_num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous_num_threads)
+
+
+class _FakeHead(nn.Module):
+    """Stand-in for ColumnParallelLinear output_layer.
+
+    forward returns (logits, None) matching the (logits, bias) contract. The
+    patch calls ``type(output_layer).forward(output_layer, x, weight=,
+    runtime_gather_output=)``, so this must accept those kwargs.
+    """
+
+    def __init__(self, hidden, vocab):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(vocab, hidden, dtype=torch.float32))
+
+    def forward(self, input_, weight=None, runtime_gather_output=None):
+        w = weight if weight is not None else self.weight
+        return input_ @ w.t(), None  # [.., vocab]
+
+
+def _stub_clml(labels, logits):
+    """Per-token CE: labels [b, s], logits [s, b, V] -> loss [b, s]."""
+    s, b, v = logits.shape
+    lg = logits.transpose(0, 1).reshape(b * s, v)
+    lb = labels.reshape(b * s)
+    return F.cross_entropy(lg, lb, reduction="none").reshape(b, s)
+
+
+def _make_config(calculate_per_token_loss=False, fuse_linear=False):
+    return types.SimpleNamespace(
+        mtp_num_layers=LAYERS,
+        mtp_loss_scaling_factor=0.3,
+        calculate_per_token_loss=calculate_per_token_loss,
+        cross_entropy_loss_fusion=fuse_linear,
+        cross_entropy_fusion_impl="linear" if fuse_linear else "native",
+        mtp_detach_heads=False,
+        mtp_detach_lm_head=True,
+    )
+
+
+def _run_and_capture(fn, *, head, config, monkeypatch, chunk_size=None, scale_logits_fn=None, is_training=False):
+    """Run a process_mtp_loss impl, spying on MTPLossAutoScaler.apply to
+    capture the per-depth loss tensors it would send to backward.
+
+    Returns (returned_hidden, [losses]).
+    """
+    torch.manual_seed(0)
+    hidden = torch.randn(S * (1 + LAYERS), B, H, dtype=torch.float32)
+    labels = torch.randint(0, V, (B, S))
+    loss_mask = (torch.rand(B, S) > 0.3).to(torch.float32)
+
+    captured = []
+
+    class _SpyAutoScaler:
+        @staticmethod
+        def apply(hs, loss):
+            captured.append(loss.detach().clone())
+            return hs
+
+    # Patch MTPLossAutoScaler in BOTH the source module and the patch module's binding.
+    monkeypatch.setattr(_mtp_mod, "MTPLossAutoScaler", _SpyAutoScaler)
+    monkeypatch.setattr(_patch, "MTPLossAutoScaler", _SpyAutoScaler, raising=False)
+    if chunk_size is not None:
+        monkeypatch.setattr(_patch, "_resolve_chunk_size", lambda: chunk_size)
+    # force gate ON for the patched fn (no get_args() in-process)
+    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: True)
+
+    ret = fn(
+        hidden,
+        labels,
+        loss_mask,
+        head,
+        None,
+        None,
+        is_training,
+        _stub_clml,
+        config,
+        cp_group=None,
+        packed_seq_params=None,
+        scale_logits_fn=scale_logits_fn,
+    )
+    return ret, captured
+
+
+@pytest.mark.parametrize("chunk_size", [S, 2, 3, 7])
+def test_chunked_mtp_matches_original(chunk_size, monkeypatch):
+    """Chunked head+CE == full head+CE, bit-identical (fp32), for every chunk
+    size."""
+    head = _FakeHead(H, V)
+    cfg = _make_config()
+
+    # original (unchunked): the captured upstream impl. Force chunk irrelevant.
+    _, ref = _run_and_capture(_native_process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch)
+    # patched (chunked) at this chunk size.
+    _, got = _run_and_capture(
+        _patch.process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, chunk_size=chunk_size
+    )
+
+    assert len(got) == len(ref) == LAYERS
+    for d, (g, r) in enumerate(zip(got, ref)):
+        assert torch.equal(g, r), f"depth {d} chunk={chunk_size}: max|Δ|={(g - r).abs().max()}"
+
+
+def test_scale_logits_fn_per_chunk(monkeypatch):
+    """A per-token scalar scale_logits_fn is chunk-invariant."""
+    head = _FakeHead(H, V)
+    cfg = _make_config()
+    sfn = lambda x: 0.5 * x  # noqa: E731
+    _, ref = _run_and_capture(
+        _native_process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, scale_logits_fn=sfn
+    )
+    _, got = _run_and_capture(
+        _patch.process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, chunk_size=3, scale_logits_fn=sfn
+    )
+    for g, r in zip(got, ref):
+        assert torch.equal(g, r)
+
+
+def test_calculate_per_token_loss_branch(monkeypatch):
+    """The per-token-loss normalization branch is preserved under chunking."""
+    head = _FakeHead(H, V)
+    cfg = _make_config(calculate_per_token_loss=True)
+    _, ref = _run_and_capture(_native_process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch)
+    _, got = _run_and_capture(_patch.process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, chunk_size=3)
+    for g, r in zip(got, ref):
+        assert torch.equal(g, r)
+
+
+def test_is_training_logging_matches(monkeypatch):
+    """is_training path: both the per-depth GRADIENT tensor
+    (MTPLossAutoScaler.apply) AND the LOGGED per-depth loss
+    (save_loss_to_tracker's first arg) must match upstream.
+
+    Spies on save_loss_to_tracker so a divergence in mtp_loss_for_log (e.g.
+    dropping the mtp_loss_scale factor from the log-only value) is caught — the
+    gradient path alone would still match and hide it (regression: chunked
+    patch logged the UNSCALED loss).
+    """
+    head = _FakeHead(H, V)
+    cfg = _make_config()
+
+    logged = {"ref": [], "got": []}
+
+    def _spy_tracker(dst):
+        return staticmethod(lambda loss, *a, **k: dst.append(loss.detach().clone()))
+
+    monkeypatch.setattr(_mtp_mod.parallel_state, "get_data_parallel_group", lambda **k: None)
+    monkeypatch.setattr(_patch.parallel_state, "get_data_parallel_group", lambda **k: None, raising=False)
+
+    monkeypatch.setattr(_mtp_mod.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["ref"]))
+    monkeypatch.setattr(
+        _patch.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["ref"]), raising=False
+    )
+    _, ref = _run_and_capture(
+        _native_process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, is_training=True
+    )
+    monkeypatch.setattr(_mtp_mod.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["got"]))
+    monkeypatch.setattr(
+        _patch.MTPLossLoggingHelper, "save_loss_to_tracker", _spy_tracker(logged["got"]), raising=False
+    )
+    _, got = _run_and_capture(
+        _patch.process_mtp_loss, head=head, config=cfg, monkeypatch=monkeypatch, chunk_size=3, is_training=True
+    )
+    for g, r in zip(got, ref):
+        assert torch.equal(g, r), "gradient (MTPLossAutoScaler.apply) tensor mismatch"
+    assert len(logged["got"]) == len(logged["ref"]) == LAYERS
+    for d, (g, r) in enumerate(zip(logged["got"], logged["ref"])):
+        assert torch.equal(g, r), f"logged mtp_loss_for_log mismatch at depth {d}: {g} vs {r}"
+
+
+def test_token_aware_tracker_api_receives_scaled_sum_and_count(monkeypatch):
+    """New Megatron tracker APIs receive the raw scaled sum and token count."""
+    seen = {}
+
+    def tracker(loss_sum, num_tokens, layer_number, num_layers, **kwargs):
+        seen.update(
+            loss_sum=loss_sum,
+            num_tokens=num_tokens,
+            layer_number=layer_number,
+            num_layers=num_layers,
+            kwargs=kwargs,
+        )
+
+    monkeypatch.setattr(
+        _patch,
+        "_MTP_TRACKER_PARAMETERS",
+        {"loss_sum", "num_tokens", "layer_number", "num_layers", "correct", "total"},
+    )
+    monkeypatch.setattr(_patch.MTPLossLoggingHelper, "save_loss_to_tracker", staticmethod(tracker))
+    monkeypatch.setattr(_patch.parallel_state, "get_data_parallel_group", lambda **_kwargs: None)
+    config = _make_config()
+    loss = torch.tensor([[1.0, 2.0]])
+    num_tokens = torch.tensor(2.0)
+    correct = torch.tensor(1.0)
+    total = torch.tensor(2.0)
+
+    _patch._save_mtp_loss_to_tracker(loss, num_tokens, 0, config, correct, total)
+
+    expected_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+    assert torch.equal(seen["loss_sum"], expected_scale * loss.sum())
+    assert seen["num_tokens"] is num_tokens
+    assert seen["layer_number"] == 0
+    assert seen["num_layers"] == config.mtp_num_layers
+    assert seen["kwargs"]["correct"] is correct
+    assert seen["kwargs"]["total"] is total
+
+
+@pytest.mark.parametrize("enabled,fused", [(False, False), (True, True), (True, False)])
+def test_static_dispatch_retains_native_fallback(monkeypatch, enabled, fused):
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(_mtp_mod.process_mtp_loss))
+    tree = ast.parse(source)
+    function = tree.body[0]
+    branch = next(
+        (
+            node
+            for node in function.body
+            if isinstance(node, ast.If) and "_chunked_mtp_enabled" in ast.unparse(node.test)
+        ),
+        None,
+    )
+    if branch is None:
+        pytest.skip("Requires image-built static chunked MTP dispatch")
+    # Execute the real dispatch condition with independent results for each path.
+    branch = ast.If(test=branch.test, body=[ast.Return(ast.Constant("chunked"))], orelse=[])
+    function = ast.FunctionDef(
+        name="dispatch",
+        args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+        body=[branch, ast.Return(ast.Constant("native"))],
+        decorator_list=[],
+    )
+    scope = {"_chunked_mtp_enabled": lambda: enabled, "config": _make_config(fuse_linear=fused)}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "dispatch", "exec"), scope)
+    assert scope["dispatch"]() == ("chunked" if enabled and not fused else "native")
+
+
+@pytest.mark.parametrize("batched_roll", [False, True])
+def test_chunked_mtp_roll_preserves_depth_labels_mask_and_context(monkeypatch, batched_roll):
+    """Both roll APIs must produce the same successive MTP targets and
+    masks."""
+    cp_group, packed_seq_params, context = types.SimpleNamespace(size=lambda: 1), object(), object()
+    calls = []
+
+    def roll_one(tensor, shifts, dims):
+        rolled = torch.roll(tensor, shifts=shifts, dims=dims)
+        rolled.select(dims, shifts).zero_()
+        return rolled
+
+    def batched(tensors, *, shifts, dims, cp_group, packed_seq_params, **kwargs):
+        calls.append((cp_group, packed_seq_params, kwargs))
+        return [roll_one(tensor, shifts, dims) for tensor in tensors]
+
+    def legacy(tensor, *, shifts, dims, cp_group, packed_seq_params):
+        calls.append((cp_group, packed_seq_params, {}))
+        rolled = roll_one(tensor, shifts, dims)
+        return rolled, rolled.sum()
+
+    monkeypatch.setattr(_patch, "roll_tensor", batched if batched_roll else legacy)
+    monkeypatch.setattr(_patch, "_ROLL_TENSOR_PARAMETERS", {"tensors" if batched_roll else "tensor"})
+    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: True)
+    monkeypatch.setattr(_patch, "_resolve_chunk_size", lambda: 2)
+    labels = torch.tensor([[1, 2, 3, 4, 5]])
+    mask = torch.tensor([[1, 0, 1, 1, 1]])
+    seen_labels = []
+    seen_masks = []
+
+    def head_ce(hidden, labels, *args, **kwargs):
+        seen_labels.append(labels.clone())
+        return torch.ones_like(labels), None, None
+
+    monkeypatch.setattr(_patch, "_chunked_head_ce", head_ce)
+    monkeypatch.setattr(
+        _patch,
+        "MTPLossAutoScaler",
+        types.SimpleNamespace(apply=lambda hs, loss: seen_masks.append(loss.detach().clone()) or hs),
+    )
+    cfg = _make_config()
+    _patch.process_mtp_loss(
+        torch.zeros(5 * (1 + LAYERS), 1, H),
+        labels,
+        mask,
+        _FakeHead(H, V),
+        None,
+        None,
+        False,
+        _stub_clml,
+        cfg,
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        sequence_roll_context=context,
+    )
+    for depth in range(LAYERS):
+        shifted = depth + 1
+        expected_labels = torch.cat([labels[:, shifted:], torch.zeros(1, shifted, dtype=labels.dtype)], dim=1)
+        expected_mask = torch.cat([mask[:, shifted:], torch.zeros(1, shifted, dtype=mask.dtype)], dim=1)
+        assert torch.equal(seen_labels[depth], expected_labels)
+        torch.testing.assert_close(
+            seen_masks[depth], cfg.mtp_loss_scaling_factor / LAYERS * expected_mask / expected_mask.sum()
+        )
+    assert len(calls) == LAYERS * (1 if batched_roll else 2)
+    for depth, (called_cp, called_packed, kwargs) in enumerate(calls):
+        assert called_cp is cp_group
+        assert called_packed is packed_seq_params
+        if batched_roll:
+            assert kwargs == {
+                "roll_context": context,
+                "sequence_fields": ["labels", "loss_mask"],
+                "roll_depth": depth,
+            }
+    assert torch.equal(labels, torch.tensor([[1, 2, 3, 4, 5]]))
+    assert torch.equal(mask, torch.tensor([[1, 0, 1, 1, 1]]))
+
+
+@pytest.mark.parametrize("detach_lm_head", [False, True, None])
+@pytest.mark.parametrize("shared_weight", [False, True])
+def test_chunked_mtp_detach_lm_head_preserves_hidden_gradients(monkeypatch, detach_lm_head, shared_weight):
+    """MTP must train its hidden states while respecting Relax's LM-head detach
+    path."""
+    cfg = _make_config()
+    if detach_lm_head is None:
+        del cfg.mtp_detach_lm_head
+    else:
+        cfg.mtp_detach_lm_head = detach_lm_head
+    head = _FakeHead(H, V)
+    weight = nn.Parameter(head.weight.detach().clone()) if shared_weight else None
+    hidden = torch.randn(S * (1 + LAYERS), B, H, requires_grad=True)
+    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: True)
+    monkeypatch.setattr(_patch, "_resolve_chunk_size", lambda: 3)
+    monkeypatch.setattr(_patch, "MTPLossAutoScaler", types.SimpleNamespace(apply=lambda hs, loss: hs + loss.sum()))
+    result = _patch.process_mtp_loss(
+        hidden,
+        torch.randint(0, V, (B, S)),
+        None,
+        head,
+        weight,
+        None,
+        False,
+        _stub_clml,
+        cfg,
+    )
+    result.sum().backward()
+    effective_weight = weight if shared_weight else head.weight
+    assert (effective_weight.grad is None) is (detach_lm_head is not False)
+    assert hidden.grad is not None
+    assert torch.count_nonzero(hidden.grad[S:]) > 0
+    if shared_weight:
+        assert head.weight.grad is None
+
+
+@pytest.mark.parametrize("is_training, collect", [(False, True), (True, False), (True, True)])
+def test_chunked_mtp_acceptance_obeys_logging_gate(monkeypatch, is_training, collect):
+    """Skip vocabulary argmax work except on training steps selected for
+    logging."""
+    calls = []
+    logged = []
+
+    def counts(logits, labels, loss_mask, *args):
+        calls.append(labels.shape[1])
+        total = loss_mask.sum()
+        return total, total
+
+    monkeypatch.setattr(_patch, "_COMPUTE_MTP_ACCEPTANCE_COUNTS", counts)
+    monkeypatch.setattr(_patch.MTPLossLoggingHelper, "should_collect_acceptance", lambda: collect, raising=False)
+    monkeypatch.setattr(
+        _patch,
+        "_save_mtp_loss_to_tracker",
+        lambda loss, num_tokens, layer, cfg, correct, total, **kwargs: logged.append((correct, total)),
+    )
+    _run_and_capture(
+        _patch.process_mtp_loss,
+        head=_FakeHead(H, V),
+        config=_make_config(),
+        monkeypatch=monkeypatch,
+        chunk_size=3,
+        is_training=is_training,
+    )
+    assert bool(calls) is (is_training and collect)
+    if is_training:
+        assert len(logged) == LAYERS
+        for correct, total in logged:
+            assert (correct is not None) is collect
+            assert (total is not None) is collect
+            if collect:
+                assert torch.equal(correct, total)
+
+
+def test_sequence_parallel_gathers_hidden_once(monkeypatch):
+    """With sequence_parallel=True on the head, the patch must gather the SP-
+    scattered hidden to the full sequence ONCE (so chunk boundaries align with
+    the full-sequence labels), run the head with SP disabled per chunk, then
+    restore the flag — mirroring relax model.py _bypass_output_layer.
+
+    Regression for the on-cluster IndexError ('shapes [2048], [1024]'): before
+    the fix the patch chunked the SP-scattered input and let the
+    ColumnParallelLinear all-gather each chunk (×TP), so logits seq (chunk×TP)
+    no longer matched the label slice (chunk). Here the head's own forward
+    would NOT gather (it's a plain matmul), so we assert the behavioral
+    contract: (1) gather_from_sequence_parallel_region is invoked exactly once
+    per depth, (2) sequence_parallel is False during the head calls, (3) it is
+    restored to True afterwards, and (4) the per-depth loss equals the
+    unchunked reference.
+    """
+    torch.manual_seed(0)
+    head = _FakeHead(H, V)
+    head.sequence_parallel = True
+    head.tp_group = object()  # truthy sentinel so tp_group resolution skips parallel_state
+
+    cfg = _make_config()
+    full_hidden = torch.randn(S * (1 + LAYERS), B, H, dtype=torch.float32)
+    labels = torch.randint(0, V, (B, S))
+    loss_mask = (torch.rand(B, S) > 0.3).to(torch.float32)
+
+    # Reference: unchunked upstream on the FULL hidden with SP off (no gather, matmul only).
+    ref_head = _FakeHead(H, V)
+    ref_head.load_state_dict(head.state_dict())
+    captured_ref = []
+    monkeypatch.setattr(
+        _mtp_mod,
+        "MTPLossAutoScaler",
+        types.SimpleNamespace(apply=staticmethod(lambda hs, loss: captured_ref.append(loss.detach().clone()) or hs)),
+    )
+    _native_process_mtp_loss(
+        full_hidden,
+        labels,
+        loss_mask,
+        ref_head,
+        None,
+        None,
+        False,
+        _stub_clml,
+        cfg,
+    )
+
+    # Stub the SP gather as identity (the test feeds full-seq hidden directly) and count calls
+    # + observe the sequence_parallel flag at head-call time.
+    gather_calls = {"n": 0}
+    sp_during_head = []
+
+    def _fake_gather(x, tensor_parallel_output_grad=False, group=None):
+        gather_calls["n"] += 1
+        return x
+
+    monkeypatch.setattr(
+        "megatron.core.tensor_parallel.mappings.gather_from_sequence_parallel_region", _fake_gather, raising=True
+    )
+
+    orig_fake_forward = _FakeHead.forward
+
+    def _spy_forward(self, input_, weight=None, runtime_gather_output=None):
+        sp_during_head.append(self.sequence_parallel)
+        return orig_fake_forward(self, input_, weight=weight, runtime_gather_output=runtime_gather_output)
+
+    monkeypatch.setattr(_FakeHead, "forward", _spy_forward)
+
+    captured_got = []
+    monkeypatch.setattr(
+        _mtp_mod,
+        "MTPLossAutoScaler",
+        types.SimpleNamespace(apply=staticmethod(lambda hs, loss: captured_got.append(loss.detach().clone()) or hs)),
+    )
+    monkeypatch.setattr(_patch, "MTPLossAutoScaler", _mtp_mod.MTPLossAutoScaler, raising=False)
+    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: True)
+    monkeypatch.setattr(_patch, "_resolve_chunk_size", lambda: 3)
+    _patch.process_mtp_loss(
+        full_hidden,
+        labels,
+        loss_mask,
+        head,
+        None,
+        None,
+        False,
+        _stub_clml,
+        cfg,
+    )
+
+    assert gather_calls["n"] == LAYERS, f"expected one SP gather per depth, got {gather_calls['n']}"
+    assert sp_during_head and all(sp is False for sp in sp_during_head), "head must run with sequence_parallel=False"
+    assert head.sequence_parallel is True, "sequence_parallel must be restored to True after chunking"
+    assert len(captured_got) == len(captured_ref) == LAYERS
+    for d, (g, r) in enumerate(zip(captured_got, captured_ref)):
+        assert torch.equal(g, r), f"SP depth {d}: chunked != unchunked (max|Δ|={(g - r).abs().max()})"
+
+
+def test_static_mcore_bindings_are_not_replaced():
+    from megatron.core.models.gpt import gpt_model as gpt_mod
+
+    assert _mtp_mod.process_mtp_loss is not _patch.process_mtp_loss
+    assert gpt_mod.process_mtp_loss is _mtp_mod.process_mtp_loss

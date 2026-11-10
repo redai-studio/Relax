@@ -5,6 +5,8 @@ import json
 import math
 import os
 import sys
+import time
+import uuid
 import warnings
 from typing import Any
 
@@ -42,7 +44,7 @@ logger = get_logger(__name__)
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps'
+    'TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps'
 )
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
@@ -80,6 +82,21 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _fault_events_port(value: str) -> int:
+    parsed = int(value)
+    if not 0 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("expected a port from 0 to 65535")
+    return parsed
+
+
+def _nonnegative_finite_float(value: str) -> float:
+    """argparse type for bounded auxiliary-loss coefficients."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a finite non-negative float, got {value!r}")
     return parsed
 
 
@@ -187,6 +204,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hybrid-weights-backuper-on-gpu",
+                action="store_true",
+                default=False,
+                help=(
+                    "Only takes effect with --hybrid. Keeps the 'actor' "
+                    "TensorBackuper snapshot used for the DCS actor->rollout weight push "
+                    "on-device instead of host-pinned memory, trading a permanent extra "
+                    "device-resident copy of the model (full size at TP=1, sharded by TP degree "
+                    "otherwise) for skipping the D2H backup copy + H2D push-time copy "
+                    "(relax/distributed/checkpoint_service/backends/device_direct.py's "
+                    "_named_params_and_buffers). Off by default: raises peak GPU memory, so only "
+                    "enable if headroom is confirmed for the model being trained."
+                ),
+            )
+            parser.add_argument(
                 "--checkpoint-engine-backend",
                 type=str,
                 default=device_utils.get_dist_backend(),
@@ -243,6 +275,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1,
                 help="Fully async pipeline num of iters every global batch.",
+            )
+            # ── RDMA transport (MooncakeStore backend) ──────────────────────────
+            # The default selects the existing SimpleStorage data path. These
+            # expose *intent* only; Mooncake internals (endpoint,
+            # buffer, segment, timeout, master strategy) are handled via internal
+            # defaults / deployment environment, not CLI flags.
+            parser.add_argument(
+                "--tq-rdma-mode",
+                choices=["off", "auto", "required"],
+                default="off",
+                help=(
+                    "TransferQueue data-plane transport. 'off' (default) uses "
+                    "SimpleStorage/ZMQ with bounded worker attach and cleanup. "
+                    "'auto' attempts MooncakeStore over host RDMA and falls back "
+                    "to SimpleStorage when it is unavailable (with a WARNING). "
+                    "'required' fails fast instead of falling back."
+                ),
+            )
+            parser.add_argument(
+                "--tq-rdma-device",
+                type=str,
+                default="",
+                help=(
+                    "RDMA device name for MooncakeStore (e.g. mlx5_bond_0). Empty "
+                    "(default) lets Mooncake auto-select. On multi-NIC hosts the "
+                    "auto-selected device may fail cross-node; specify explicitly if "
+                    "needed."
+                ),
             )
             return parser
 
@@ -331,6 +391,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="thd",
                 help="The qkv layout for Megatron backend.",
             )
+            qsa_coeff_option = "--qsa-indexer-loss-coeff"
+            if qsa_coeff_option in parser._option_string_actions:
+                # Megatron registers TransformerConfig fields on newer revisions.
+                qsa_coeff_action = parser._option_string_actions[qsa_coeff_option]
+                qsa_coeff_action.type = _nonnegative_finite_float
+                qsa_coeff_action.default = 0.0
+            else:
+                parser.add_argument(
+                    qsa_coeff_option,
+                    type=_nonnegative_finite_float,
+                    default=0.0,
+                    help="QSA Stage-2 indexer KL coefficient; positive values require the opt-in selected-ID sparse backend.",
+                )
             parser.add_argument(
                 "--true-on-policy-mode",
                 action="store_true",
@@ -518,11 +591,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "logits. Default off — legacy external-loss SFT path materializes full logits "
                 "and runs CE externally. Set --sft-chunked-logits to opt in. MTP head calls "
                 "continue to use the real output_layer before the main head is deferred. "
-                "Incompatible when embeddings are tied "
-                "(--untie-embeddings-and-output-weights not set: output_layer is built with "
-                "skip_weight_param_allocation=True so output_layer.weight is None and the "
-                "chunked path's lm_head matmul has nothing to multiply against; tied models "
-                "are small enough that the chunked path's memory win is marginal anyway).",
+                "Tied embeddings reuse the explicit shared weight passed to the main output layer. "
+                "Chunked recomputation with tied embeddings does not support overlapping "
+                "gradient reduction.",
             )
             parser.add_argument(
                 "--only-train-params-name-list",
@@ -640,6 +711,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-wholepack",
+                action="store_true",
+                help="Enable the reviewed 64-GPU Qwen3.5 wholepack scheduling policy explicitly.",
+            )
+            parser.add_argument(
+                "--sft-packing-strategy",
+                choices=["balanced", "binpack"],
+                default="balanced",
+                help="Dynamic SFT microbatch packing algorithm; binpack preserves the archived SFT recipe.",
+            )
+            parser.add_argument(
                 "--sft-max-in-flight-steps",
                 type=int,
                 default=None,
@@ -689,19 +771,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=["sft", "cpt"],
                 default="sft",
                 help=(
-                    "Use cpt for text-only continued pretraining: raw text plus tokenizer EOS, "
+                    "Use cpt for continued pretraining: raw text plus tokenizer EOS, "
                     "no chat template, and a CPT loss mask (see --sft-cpt-template). Requires --loss-type sft. "
                     "Read text from --input-key (or text/messages when the default input key is absent)."
                 ),
             )
             parser.add_argument(
                 "--sft-cpt-template",
-                choices=["raw", "qwen3_5"],
+                choices=["raw", "qwen3_5", "multimodal"],
                 default="raw",
                 help=(
                     "CPT text preprocessing. raw preserves text and supervises all tokens; "
                     "qwen3_5 matches ms-swift Qwen3.5 generation preprocessing and "
-                    "all+ignore_empty_think masks. Requires --sft-training-mode cpt."
+                    "all+ignore_empty_think masks; multimodal preserves the chat/processor layout and supervises text tokens. Requires --sft-training-mode cpt."
                 ),
             )
             parser.add_argument(
@@ -1101,6 +1183,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to enable the global health check system. "
                 "When enabled, the Controller's HealthManager monitors all services "
                 "and triggers automatic restarts (in-place or global) on failure.",
+            )
+            parser.add_argument(
+                "--fault-events-enabled",
+                action="store_true",
+                default=False,
+                help="Record bounded in-memory fault events in the driver. Requires --use-health-check.",
+            )
+            parser.add_argument(
+                "--fault-events-port",
+                type=_fault_events_port,
+                default=0,
+                help="Loopback fault event query port (0-65535); 0 selects an available port.",
             )
             parser.add_argument(
                 "--max-global-restart",
@@ -2389,6 +2483,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=("Dump all details of training for post-hoc analysis and visualization."),
             )
             parser.add_argument(
+                "--dump-agentic-obs",
+                type=str,
+                default=None,
+                help=(
+                    "Dump agentic rollout observability to this directory, one wall-clock subdirectory "
+                    "`<dir>/run_YYYYmmdd_HHMMSS/` per run. Holds three JSONL streams joined by "
+                    "sample_export_id: trajectories/ (the exported lineage, written by each SessionShard), "
+                    "stages/ (reward, selection, transfer and optimizer events) "
+                    "and train/ (actual update inputs, response masks and scalars, written by the policy actor). Unset disables "
+                    "every producer. Independent of --dump-details, which dumps whole .pt tensors."
+                ),
+            )
+            parser.add_argument(
+                "--dump-agentic-obs-media",
+                action="store_true",
+                default=False,
+                help=(
+                    "Also write the media bytes referenced by --dump-agentic-obs trajectories to `media/`, "
+                    "content-addressed by sha256. Without it, inline data: URIs are replaced by their digest "
+                    "and the bytes are dropped. Ignored without --dump-agentic-obs."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-result-dir",
                 type=str,
                 default=None,
@@ -2413,6 +2530,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Number of rollout steps after which to dump the memory snapshot. "
                 "For example, --memory-snapshot-num-steps 3 dumps after step 2 (0-indexed).",
+            )
+            parser.add_argument(
+                "--profile-output-dir",
+                type=str,
+                default="traces",
+                help="Root directory for profiler outputs. Experiment name and trace type are appended.",
             )
             parser.add_argument(
                 "--profile-target",
@@ -2927,6 +3050,8 @@ def _pre_parse_mode():
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
     temp_parser.add_argument("--skip-hf-validate", action="store_true", default=False)
+    temp_parser.add_argument("--loss-type", default=None)
+    temp_parser.add_argument("--generation-task", default=None)
     temp_args, _ = temp_parser.parse_known_args()
     return temp_args
 
@@ -2984,7 +3109,10 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
     pre = _pre_parse_mode()
-    skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
+    from relax.engine.sft.runtime import is_i2i_sft
+
+    image_sft = is_i2i_sft(pre)
+    skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None or image_sft
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
     # Skipped when sglang servers are not needed.
@@ -3006,13 +3134,15 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         skip_hf_validate=(
             pre.debug_rollout_only
             or pre.skip_hf_validate
+            or image_sft
             or (model_source is not None and is_s3_uri(model_source.uri))
         ),
     )
 
     # Merge pre-parsed args into the main namespace
     for key, value in vars(pre).items():
-        setattr(args, key, value)
+        if key not in ("loss_type", "generation_task"):
+            setattr(args, key, value)
 
     # Merge sglang args into the main namespace
     if sglang_ns is not None:
@@ -3050,7 +3180,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
 
     configure_sft_data_pipeline(args)
 
-    if not args.debug_train_only:
+    if not skip_sglang:
         sglang_validate_args(args)
 
     if getattr(args, "colocate_expert_weight_routing", False) and (
@@ -3267,9 +3397,12 @@ def _validate_cpt_args(args) -> None:
         "--custom-dataset-class": getattr(args, "custom_dataset_class_path", None),
         "--sft-oversize-strategy custom": getattr(args, "sft_oversize_strategy", None) == "custom",
     }
+    if getattr(args, "sft_cpt_template", "raw") == "multimodal":
+        for name in ("--multimodal-keys", "--conversation-key-map", "--apply-chat-template-kwargs"):
+            incompatible.pop(name)
     enabled = [name for name, value in incompatible.items() if value]
     if enabled:
-        raise ValueError(f"Text-only CPT does not support: {', '.join(enabled)}.")
+        raise ValueError(f"Selected CPT template does not support: {', '.join(enabled)}.")
 
 
 def _normalize_sft_max_in_flight_steps(args, is_offline: bool) -> None:
@@ -3930,6 +4063,8 @@ def slime_validate_args(args):
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
+    from relax.engine.sft.runtime import is_i2i_sft
+
     if args.loss_type in ("sft_loss", "sft-loss"):
         warnings.warn(
             f"--loss-type {args.loss_type} is deprecated; use --loss-type sft instead. "
@@ -3974,7 +4109,7 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
-    if getattr(args, "lora_rank", 0) > 0:
+    if getattr(args, "lora_rank", 0) > 0 and not is_i2i_sft(args):
         if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
             raise ValueError(
                 "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
@@ -4099,38 +4234,45 @@ def slime_validate_args(args):
 
     validate_opd_args(args, is_offline=is_offline, log=logger)
 
-    if args.megatron_to_hf_mode == "bridge":
-        if (
-            args.load is not None
-            and os.path.exists(args.load)
-            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            # If is a Megatron checkpoint, won't use bridge to load hf weight.
-            pass
-        else:
-            if args.load is None:
-                args.load = args.ref_load or args.hf_checkpoint
-                if is_dpo_mode(args):
-                    args.finetune = True
-                    args.no_load_optim = True
-                    args.no_load_rng = True
-                    if getattr(args, "ref_ckpt_step", None) is not None:
-                        args.ckpt_step = args.ref_ckpt_step
-            # If is a HF checkpoint, set start_rollout_id to 0 here.
+    if is_i2i_sft(args):
+        # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.
+        if args.train_backend != "fsdp":
+            raise ValueError("Image SFT requires --train-backend fsdp")
+        if args.start_rollout_id is None:
             args.start_rollout_id = 0
     else:
-        if (
-            args.load is None
-            or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            args.no_load_optim = True
-            args.no_load_rng = True
-            args.finetune = True
-            args.load = args.ref_load
-            if args.ref_ckpt_step is not None:
-                args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
+        if args.megatron_to_hf_mode == "bridge":
+            if (
+                args.load is not None
+                and os.path.exists(args.load)
+                and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+            ):
+                # If is a Megatron checkpoint, won't use bridge to load hf weight.
+                pass
+            else:
+                if args.load is None:
+                    args.load = args.ref_load or args.hf_checkpoint
+                    if is_dpo_mode(args):
+                        args.finetune = True
+                        args.no_load_optim = True
+                        args.no_load_rng = True
+                        if getattr(args, "ref_ckpt_step", None) is not None:
+                            args.ckpt_step = args.ref_ckpt_step
+                # If is a HF checkpoint, set start_rollout_id to 0 here.
+                args.start_rollout_id = 0
+        else:
+            if (
+                args.load is None
+                or not os.path.exists(args.load)
+                or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+            ):
+                args.no_load_optim = True
+                args.no_load_rng = True
+                args.finetune = True
+                args.load = args.ref_load
+                if args.ref_ckpt_step is not None:
+                    args.ckpt_step = args.ref_ckpt_step
+                args.start_rollout_id = 0
 
     if args.eval_interval is not None:
         if is_offline:
@@ -4316,6 +4458,19 @@ def slime_validate_args(args):
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
 
+    if getattr(args, "dump_agentic_obs", None):
+        # Derived rather than parsed, and stamped exactly once here on the
+        # driver, then carried inside the pickled args Namespace to every Ray
+        # actor. Deriving it lazily per actor would give the SessionShards, the
+        # rollout driver and the actors different directories, splitting one
+        # run's streams across many roots. The suffix separates launches
+        # started in the same second, even when they share an output root.
+        args.agentic_obs_run_id = f"{time.strftime('run_%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:12]}"
+    elif getattr(args, "dump_agentic_obs_media", False):
+        # The media flag only modifies a dump that is not happening. Say so,
+        # rather than letting the operator wait for images that never appear.
+        logger.warning("--dump-agentic-obs-media is set but --dump-agentic-obs is not; nothing will be written.")
+
     if args.load_debug_rollout_data is not None:
         logger.info(
             f"load_debug_rollout_data {args.load_debug_rollout_data} is set, "
@@ -4336,7 +4491,7 @@ def slime_validate_args(args):
         # path knows how to (a) cap per-GPU tokens (CP-aware) and (b) build
         # balanced micro-batches. Static --micro-batch-size cannot do either,
         # so we require --use-dynamic-batch-size.
-        if not args.use_dynamic_batch_size:
+        if not args.use_dynamic_batch_size and not is_i2i_sft(args):
             raise ValueError(
                 f"--loss-type {args.loss_type} requires --use-dynamic-batch-size (with --max-tokens-per-gpu). "
                 "Offline training relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "
@@ -4344,7 +4499,7 @@ def slime_validate_args(args):
             )
         # The controller installs SeqlenBalancedSampler for offline training, so keep the
         # Megatron data path in DP-balanced mode as well.
-        if not args.balance_data:
+        if not args.balance_data and not is_i2i_sft(args):
             logger.info("--loss-type %s: auto-enabling --balance-data for DP-balanced batching.", args.loss_type)
             args.balance_data = True
         from relax.engine.sft.runtime import validate_preference_args
@@ -4423,8 +4578,8 @@ def slime_validate_args(args):
             args.train_memory_margin_bytes = 0
 
     # Resolve --hybrid into the underlying execution flags so downstream
-    # machinery (StreamDataLoader broadcast_pp, UpdateWeightFromTensor
-    # selection, sglang_engine DCS gating) keeps a single semantic axis.
+    # machinery (StreamDataLoader broadcast_pp and SGLang DCS registration)
+    # keeps a single semantic axis.
     # `args.hybrid` remains the canonical switch for hybrid-specific
     # branches (registry, controller dispatch, train_hybrid call site).
     if args.hybrid:
@@ -4434,6 +4589,13 @@ def slime_validate_args(args):
             "hybrid mode: actor/reference/actor_fwd/advantages will share GPUs "
             "via offload/onload role switching, while rollout uses separate GPUs."
         )
+        if not args.enable_weights_backuper:
+            raise ValueError(
+                "Hybrid training requires the weights backuper for DCS synchronization: with "
+                "--disable-weights-backuper the DCS push would read detached live tensors that "
+                "carry no Megatron TP attributes, so all_gather_param would silently treat TP "
+                "shards as replicated weights. Remove --disable-weights-backuper."
+            )
     elif args.fully_async and args.colocate:
         raise ValueError(
             "--fully-async and --colocate cannot be combined directly. "
@@ -4600,27 +4762,13 @@ def slime_validate_args(args):
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
-    # --sft-chunked-logits incompatibilities. Both are flagged here so
+    # --sft-chunked-logits incompatibilities are flagged here so
     # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
-    # Both are hard asserts — the user must remove --sft-chunked-logits
+    # This is a hard assert — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
     if getattr(args, "sft_chunked_logits", False):
-        # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
-        #    Output_layer is built with skip_weight_param_allocation=True →
-        #    output_layer.weight is None → chunked path's lm_head matmul
-        #    crashes on NoneType. The chunked memory win is marginal on the
-        #    small models that ship with tied embeddings anyway, so the user
-        #    should just drop the flag.
-        assert getattr(args, "untie_embeddings_and_output_weights", False), (
-            "--sft-chunked-logits is incompatible with tied embeddings "
-            "(HF config.tie_word_embeddings=true → "
-            "--untie-embeddings-and-output-weights not set; output_layer.weight "
-            "is None and the chunked path's lm_head matmul has nothing to "
-            "multiply against). Remove --sft-chunked-logits; the chunked "
-            "memory win is marginal on tied-weight models."
-        )
-        # 2) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        # Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked
         #    silently degrades to the full-logits path.

@@ -1,0 +1,46 @@
+diff --git a/transfer_queue/sampler/seqlen_balanced_sampler.py b/transfer_queue/sampler/seqlen_balanced_sampler.py
+index 20c904d..85e9358 100644
+--- a/transfer_queue/sampler/seqlen_balanced_sampler.py
++++ b/transfer_queue/sampler/seqlen_balanced_sampler.py
+@@ -71,6 +71,7 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
+         task_name: str = "",
+         partition_id: str = "",
+         *args: Any,
++        assignment_transform=None,
+         **kwargs: Any,
+     ) -> tuple[list[int], list[int]]:
+         """Sample indices for a specific DP rank with seqlen balancing.
+@@ -166,6 +167,20 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
+                 balanced_partitions = get_seqlen_balanced_partitions(total_lengths, self.dp_size, equal_size=False)
+                 partitions = [[grpo_sampled[i] for i in part_indices] for part_indices in balanced_partitions]
+ 
++        # Transform before publishing any per-rank result. The sampler owns
++        # assignment/state consistency; callers never manipulate its caches.
++        if assignment_transform is not None:
++            if self.n_samples_per_prompt != 1:
++                raise ValueError("assignment_transform currently requires n_samples_per_prompt=1")
++            proposed = [list(ids) for ids in assignment_transform([list(ids) for ids in partitions])]
++            original_ids = [idx for ids in partitions for idx in ids]
++            proposed_ids = [idx for ids in proposed for idx in ids]
++            if len(proposed) != self.dp_size or sorted(proposed_ids) != sorted(original_ids):
++                raise ValueError("assignment_transform must preserve all identities and DP rank count")
++            if len(set(proposed_ids)) != len(proposed_ids):
++                raise ValueError("assignment_transform must not duplicate identities")
++            partitions = proposed
++
+         # Cache the result
+         self._balanced_cache[cache_key] = partitions
+ 
+@@ -204,8 +219,11 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
+ 
+     def load_checkpoint(self, state: dict) -> None:
+         """Restore sampler state including the balanced cache."""
++        assignments = state["_balanced_cache"]
++        if any(len(groups) != self.dp_size for groups in assignments.values()):
++            raise ValueError("checkpoint DP geometry mismatch")
+         super().load_checkpoint(state)
+-        self._balanced_cache = state["_balanced_cache"]
++        self._balanced_cache = assignments
+ 
+ 
+ # Copied from https://github.com/volcengine/verl/blob/468adf22c43b744348051fccd7a5d830c6c3c36a/verl/utils/seqlen_balancing.py

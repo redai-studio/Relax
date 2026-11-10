@@ -1,0 +1,565 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Blocking P2P simulation and dependency checks for the PP schedule."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from types import SimpleNamespace
+
+import pytest
+
+from examples.chunkflow.scheduler import build_chunks
+from examples.chunkflow.units import build_micro_batches, make_model_plan
+
+
+def _channel(stage, action):
+    if action == "sf":
+        return (stage, stage + 1, "fwd")
+    if action == "rf":
+        return (stage - 1, stage, "fwd")
+    if action == "sb":
+        return (stage - 1, stage, "bwd")
+    return (stage, stage + 1, "bwd")
+
+
+def _simulate(calls_by_stage):
+    pp = len(calls_by_stage)
+    pos = defaultdict(lambda: {"send": 0, "recv": 0})
+    per_call = []
+    for stage, calls in enumerate(calls_by_stage):
+        stage_calls = []
+        for recvs, sends in calls:
+            phases = []
+            for _part in ("shape", "data"):
+                msgs = []
+                for a in recvs:
+                    ch = _channel(stage, a)
+                    msgs.append((ch, "recv", pos[ch]["recv"]))
+                    pos[ch]["recv"] += 1
+                for a in sends:
+                    ch = _channel(stage, a)
+                    msgs.append((ch, "send", pos[ch]["send"]))
+                    pos[ch]["send"] += 1
+                phases.append(msgs)
+            stage_calls.append(phases)
+        per_call.append(stage_calls)
+
+    sends_posted = defaultdict(int)
+    recvs_posted = defaultdict(int)
+    ptr = [(0, 0) for _ in range(pp)]
+    posted = [None] * pp
+
+    def enter(stage):
+        c, p = ptr[stage]
+        if c >= len(per_call[stage]):
+            posted[stage] = None
+            return
+        posted[stage] = [list(per_call[stage][c][p]), 0]
+        for ch, kind, _p in posted[stage][0]:
+            (sends_posted if kind == "send" else recvs_posted)[ch] += 1
+
+    for stage in range(pp):
+        enter(stage)
+
+    guard = 0
+    while True:
+        guard += 1
+        assert guard < 10_000_000, "iteration limit"
+        progress = False
+        for stage in range(pp):
+            if posted[stage] is None:
+                continue
+            msgs, done = posted[stage]
+            still = []
+            for ch, kind, p in msgs:
+                if (recvs_posted if kind == "send" else sends_posted)[ch] > p:
+                    done += 1
+                else:
+                    still.append((ch, kind, p))
+            if done != posted[stage][1]:
+                posted[stage] = [still, done]
+                progress = True
+            if not still:
+                c, p = ptr[stage]
+                ptr[stage] = (c, p + 1) if p + 1 < len(per_call[stage][c]) else (c + 1, 0)
+                enter(stage)
+                progress = True
+        if all(ptr[s][0] >= len(per_call[s]) for s in range(pp)):
+            return
+        assert progress, f"p2p deadlock: stalled at {[(s, ptr[s]) for s in range(pp) if posted[s]]}"
+
+
+def _calls(W, n, is_first, is_last):
+    calls = []
+    for _ in range(W):
+        calls.append((["rf"] if not is_first else [], []))
+        calls.append(([], ["sf"]) if not is_last else ([], []))
+    n_steady = n - W
+    if n_steady > 0:
+        calls.append((["rf"] if not is_first else [], []))
+    for i in range(n_steady):
+        calls.append((["rb"] if not is_last else [], ["sf"] if not is_last else []))
+        calls.append((["rf"] if (not is_first and i < n_steady - 1) else [], ["sb"] if not is_first else []))
+    for _ in range(W):
+        calls.append((["rb"] if not is_last else [], []))
+        calls.append(([], ["sb"]) if not is_first else ([], []))
+    return calls
+
+
+def _schedule(lengths, pp, policy, k, stage):
+    chunks = build_chunks(lengths, chunk_size=512)
+    units = build_micro_batches(chunks, policy)
+    plan = make_model_plan(units, chunks, k or 1 << 30, pp)
+    return chunks, units, (plan.forward, plan.backward, plan.recompute, plan.warmups[stage])
+
+
+@pytest.mark.parametrize(
+    "lengths,pp,policy,k",
+    [
+        ([96, 96, 96, 96], 4, "staggered", 0),
+        ([2600], 4, "staggered", 0),
+        ([2600], 4, "staggered", 1),
+        ([2048, 700, 300, 1500], 4, "staggered", 0),
+        ([2048, 700, 300, 1500], 4, "staggered", 1),
+        ([2000, 1800, 2100, 1900], 3, "staggered", 2),
+        ([2048, 700, 300, 1500], 2, "lockstep", 1),
+    ],
+)
+def test_pipeline_plan_is_complete_dependency_valid_and_deadlock_free(lengths, pp, policy, k):
+    calls = []
+    for stage in range(pp):
+        chunks, units, (fwd, bwd, need_fr, warmup) = _schedule(lengths, pp, policy, k, stage)
+        n = len(fwd)
+        assert sorted(fwd) == sorted(bwd) == sorted(u.unit_id for u in units)
+        assert set(need_fr) <= set(bwd)
+        assert bool(need_fr) == (k > 0)
+        assert 0 <= warmup <= n
+        calls.append(_calls(warmup, n, stage == 0, stage == pp - 1))
+        by_id = {u.unit_id: u for u in units}
+        for i, uid in enumerate(bwd):
+            done = set(fwd[: min(warmup + i + 1, n)])
+            assert uid in done, f"backward {uid} before its forward"
+            for group in by_id[uid].groups:
+                assert all(u.unit_id in done for u in units if group in u.groups), (
+                    f"backward {uid} before group {group} full"
+                )
+        fwd_pos = {uid: i for i, uid in enumerate(fwd)}
+        bwd_pos = {uid: i for i, uid in enumerate(bwd)}
+        unit_of = {c.chunk_id: u.unit_id for u in units for c in u.chunks}
+        groups = defaultdict(list)
+        for chunk in chunks:
+            if chunk.is_dependent:
+                groups[chunk.group].append(chunk)
+        for members in groups.values():
+            members.sort(key=lambda chunk: chunk.group_idx)
+            forward_positions = [fwd_pos[unit_of[c.chunk_id]] for c in members]
+            backward_positions = [bwd_pos[unit_of[c.chunk_id]] for c in reversed(members)]
+            assert forward_positions == sorted(forward_positions)
+            assert backward_positions == sorted(backward_positions)
+    _simulate(calls)
+
+
+@pytest.mark.parametrize("padding", [0, 180])
+def test_plan_preserves_real_samples_and_excludes_alignment_padding(padding):
+    pytest.importorskip("megatron.core")
+    import torch
+
+    from examples.chunkflow.schedules import _plan
+    from examples.chunkflow.unit_batch import slice_parent_batch
+
+    cu = [0, 1100, 1612]
+    if padding:
+        cu.append(cu[-1] + padding)
+    tokens = torch.arange(cu[-1]).view(1, -1)
+    mask = torch.zeros_like(tokens)
+    mask[0, 1090:1099] = 1
+    parent = dict(
+        tokens=tokens,
+        full_loss_masks=mask,
+        total_lengths=[1100, 512],
+        packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=cu),
+    )
+    chunks, units = _plan(parent, 512, "staggered")
+    assert len(units) == 4
+    assert sum(c.num_tokens for c in chunks) == 1612
+    assert sorted((s.seq_id, s.prefix, s.length) for c in chunks for s in c.segments) == [
+        (0, 0, 512),
+        (0, 512, 512),
+        (0, 1024, 76),
+        (1, 0, 512),
+    ]
+    batches = [slice_parent_batch(parent, unit, pad_token_id=0) for unit in units]
+    targets = torch.cat([b["unconcat_tokens"][0][1:][b["loss_masks"][0].bool()] for b in batches])
+    torch.testing.assert_close(targets, torch.arange(1091, 1100))
+    for source_lengths in (None, [1099, 513]):
+        parent["total_lengths"] = source_lengths
+        unverified, _ = _plan(parent, 512, "staggered")
+        assert sum(c.num_tokens for c in unverified) == cu[-1]
+
+
+@pytest.mark.parametrize("parent_window", [None, 1, 2])
+@pytest.mark.parametrize("stage", range(4))
+@pytest.mark.parametrize("keep_last_k", [0, 1])
+def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, keep_last_k, parent_window):
+    pytest.importorskip("megatron.core")
+    import torch
+    from megatron.training import global_vars
+
+    from examples.chunkflow import pipeline_schedules as executor
+    from examples.chunkflow.runtime import UNIT_ATTR, ChunkflowRuntime
+    from examples.chunkflow.schedules import _plan
+    from relax.backends.megatron.data import PrepackedBatch
+
+    if parent_window is None:
+        monkeypatch.delenv("RELAX_CHUNKFLOW_PARENT_WINDOW", raising=False)
+    else:
+        monkeypatch.setenv("RELAX_CHUNKFLOW_PARENT_WINDOW", str(parent_window))
+    config = SimpleNamespace(
+        variable_seq_lengths=True,
+        batch_p2p_comm=True,
+        sequence_parallel=True,
+        hidden_size=4,
+        overlap_p2p_comm=False,
+        no_sync_func=None,
+        deallocate_pipeline_outputs=True,
+        grad_sync_func=None,
+        finalize_model_grads_func=None,
+    )
+    args = SimpleNamespace(
+        chunkflow_chunk_size=256,
+        chunkflow_pack_policy="staggered",
+        chunkflow_keep_last_k=keep_last_k,
+        data_pad_size_multiplier=128,
+        qkv_format="thd",
+        allgather_cp=False,
+        uses_unsplit_forward=False,
+        loss_type="sft",
+        calculate_per_token_loss=True,
+    )
+    parents, forward_shapes, backward_shapes = [], [], []
+    first_lengths = [600, 350, 200, 129, 1]
+    for lengths in (first_lengths, [513, 128, 33], [128], [129], [700]):
+        cu = [0]
+        for length in lengths:
+            cu.append(cu[-1] + length)
+        real_rows = cu[-1]
+        if pad := (-real_rows) % 256:
+            cu.append(real_rows + pad)
+        tokens = (torch.arange(cu[-1]) + len(parents) * 10000).view(1, -1)
+        mask = torch.ones_like(tokens)
+        mask[0, real_rows:] = 0
+        parent = PrepackedBatch(
+            tokens=tokens,
+            full_loss_masks=mask,
+            total_lengths=lengths,
+            packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=cu),
+            replay_micro_batch_index=len(parents),
+        )
+        parents.append(parent)
+        chunks, units = _plan(parent, 256, "staggered")
+        plan = make_model_plan(units, chunks, keep_last_k or 1 << 30, 4)
+        fwd, bwd = plan.forward, plan.backward
+        shapes = {u.unit_id: ((u.num_tokens + 127) // 128 * 64, 1, 4) for u in units}
+        forward_shapes.extend(shapes[uid] for uid in fwd)
+        backward_shapes.extend(shapes[uid] for uid in bwd)
+    assert len(set(forward_shapes)) > 1
+
+    class Communicator:
+        total_stages, current_stage = 4, stage
+        is_pp_first_stage, is_pp_last_stage = stage == 0, stage == 3
+        pp_group = SimpleNamespace(size=lambda: 4, rank=lambda: stage)
+
+        def __init__(self):
+            self.config = config
+            self.positions = defaultdict(int)
+
+        def receive(self, shapes, order, key):
+            assert self.config.variable_seq_lengths is False
+            assert self.config.batch_p2p_comm is False
+            expected = order[self.positions[key]]
+            self.positions[key] += 1
+            assert shapes == [expected]
+            return [torch.ones(expected)]
+
+        def send(self, tensors, order, key):
+            assert self.config.variable_seq_lengths is False
+            assert self.config.batch_p2p_comm is False
+            tensors = tensors if isinstance(tensors, list) else [tensors]
+            assert [tuple(t.shape) for t in tensors] == [order[self.positions[key]]]
+            self.positions[key] += 1
+
+        def recv_forward(self, shapes, first):
+            return None if first else self.receive(shapes, forward_shapes, "rf")
+
+        def recv_backward(self, shapes, last):
+            return None if last else self.receive(shapes, backward_shapes, "rb")
+
+        def send_forward(self, tensors, last):
+            if not last:
+                self.send(tensors, forward_shapes, "sf")
+
+        def send_backward(self, tensors, first):
+            if not first:
+                self.send(tensors, backward_shapes, "sb")
+
+        def send_forward_recv_backward(self, tensors, shapes, last):
+            self.send_forward(tensors, last)
+            return self.recv_backward(shapes, last)
+
+        def send_backward_recv_forward(self, tensors, shapes, first):
+            self.send_backward(tensors, first)
+            return self.recv_forward(shapes, first)
+
+    groups, released, first_flags, seen_tokens = {}, [], [], defaultdict(list)
+
+    def forward(_callback, iterator, *_args, **_kwargs):
+        batch, _ = next(iterator)
+        unit = getattr(batch["packed_seq_params"], UNIT_ATTR)
+        mb = _kwargs["current_microbatch"]
+        first_flags.append(_kwargs["is_first_microbatch"])
+        assert (batch["tokens"][0, : unit.num_tokens] // 10000 == mb).all()
+        offset = 0
+        for chunk in unit.chunks:
+            owner_mb = int(batch["tokens"][0, offset] // 10000)
+            if chunk.is_dependent:
+                owner = groups.setdefault(chunk.group, owner_mb)
+                assert owner == owner_mb, "two parents share a live dependency group"
+                model.chunkflow_runtime.store(1, chunk.group)
+            if not getattr(batch["packed_seq_params"], "chunkflow_recompute", False):
+                seen_tokens[owner_mb].append(chunk.num_tokens)
+            offset += chunk.num_tokens
+        shape = ((unit.num_tokens + 127) // 128 * 64, 1, 4)
+        if stage == 3 and not torch.is_grad_enabled():
+            # Packed B=1 logits remain a view even after transpose().contiguous().
+            return torch.ones(shape).transpose(0, 1).contiguous(), torch.tensor(0)
+        return torch.ones(()) if stage == 3 else torch.ones(shape), torch.tensor(1)
+
+    real_zeros = torch.zeros
+    monkeypatch.setattr(torch, "zeros", lambda *a, **kw: real_zeros(*a, **dict(kw, device="cpu")))
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.setattr(executor, "get_model_config", lambda _: config)
+    monkeypatch.setattr(executor, "forward_step", forward)
+    monkeypatch.setattr(executor, "check_first_val_step", lambda *a: a[-1])
+    monkeypatch.setattr(
+        executor,
+        "backward_step",
+        lambda inputs, *_: None if inputs is None else [torch.ones_like(t) for t in inputs],
+    )
+    model = SimpleNamespace(chunkflow_runtime=ChunkflowRuntime(256))
+    real_release = model.chunkflow_runtime.release_group
+
+    def release(group):
+        released.append(groups.pop(group))
+        assert real_release(group) == 1
+
+    monkeypatch.setattr(model.chunkflow_runtime, "release_group", release)
+    comm = Communicator()
+    executor.chunkflow_forward_backward_pipelining_without_interleaving(
+        forward_step_func=None,
+        data_iterator=iter((p, {}) for p in parents),
+        model=model,
+        num_microbatches=len(parents),
+        seq_length=32768,
+        decoder_seq_length=32768,
+        micro_batch_size=1,
+        p2p_communicator=comm,
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1), tp=SimpleNamespace(size=lambda: 2)),
+    )
+    assert first_flags.count(True) == 1
+    assert not groups
+    assert sorted(released) == [0, 0, 1, 4]
+    assert {mb: sum(values) for mb, values in seen_tokens.items()} == {
+        i: sum(p["total_lengths"]) for i, p in enumerate(parents)
+    }
+    assert config.variable_seq_lengths is True and comm.config is config
+    assert config.batch_p2p_comm is True
+    for key, expected in (("sf", stage != 3), ("rf", stage != 0), ("sb", stage != 0), ("rb", stage != 3)):
+        assert comm.positions[key] == (len(forward_shapes) if expected else 0)
+
+
+@pytest.mark.parametrize("keep_last_k", [0, 1])
+@pytest.mark.parametrize("loss_scale", [1.0, 8.0])
+def test_single_stage_prepacked_step_preserves_scaled_gradients(monkeypatch, keep_last_k, loss_scale):
+    pytest.importorskip("megatron.core")
+    import torch
+    from megatron.core.pipeline_parallel.schedules import backward_step
+    from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.training import global_vars
+
+    from examples.chunkflow import schedules
+    from examples.chunkflow.runtime import ChunkflowRuntime
+    from relax.backends.megatron.data import PrepackedBatch
+
+    args = SimpleNamespace(
+        chunkflow_chunk_size=128,
+        chunkflow_keep_last_k=keep_last_k,
+        data_pad_size_multiplier=128,
+        qkv_format="thd",
+        allgather_cp=False,
+    )
+    config = TransformerConfig(
+        num_layers=1, hidden_size=4, num_attention_heads=1, calculate_per_token_loss=True, num_moe_experts=2
+    )
+    config.grad_scale_func = lambda loss: loss * loss_scale
+    tokens = torch.arange(256).view(1, -1)
+    parent = PrepackedBatch(
+        tokens=tokens,
+        full_loss_masks=torch.ones_like(tokens),
+        total_lengths=[256],
+        packed_seq_params=SimpleNamespace(cu_seqlens_q_cpu=[0, 256]),
+    )
+    weight = torch.nn.Parameter(torch.tensor(0.25))
+    aux_weight = torch.nn.Parameter(torch.tensor(0.5))
+    reference = torch.nn.Parameter(weight.detach().clone())
+    model = torch.nn.Module()
+    model.config = config
+    model.chunkflow_runtime = ChunkflowRuntime(128)
+    model.set_input_tensor = lambda tensors: None
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
+    backward_step(None, (reference * tokens.float()).square().sum(), None, config)
+
+    def forward(iterator, model):
+        batch, _ = next(iterator)
+        output = (weight * batch["tokens"].float()).square()
+        output = MoEAuxLossAutoScaler.apply(output, aux_weight * 3 * output.numel())
+        return output, lambda output: (output.sum(), torch.tensor(output.numel()), {"tokens": output.numel()})
+
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.setattr(schedules, "get_model_config", lambda model: model.config)
+    zeros = torch.zeros
+    monkeypatch.setattr(torch, "zeros", lambda *a, **kw: zeros(*a, **dict(kw, device="cpu")))
+    # The async prepack iterator exposes __next__, not DataIterator.get_next.
+    assert schedules._next_parent(iter([(parent, {})]), args) is parent
+    logs = schedules.chunkflow_forward_backward_no_pipelining(
+        forward_step_func=forward,
+        data_iterator=iter([(parent, {})]),
+        model=model,
+        num_microbatches=1,
+        seq_length=256,
+        micro_batch_size=1,
+    )
+    torch.testing.assert_close(weight.grad, reference.grad)
+    torch.testing.assert_close(aux_weight.grad / loss_scale, torch.tensor(3.0 * tokens.numel()))
+    assert sum(log["tokens"] for log in logs) == tokens.numel()
+    # Optimizer unscale must leave the ordinary full-batch gradient and update.
+    expected = 2 * reference.detach() * tokens.float().square().sum()
+    torch.testing.assert_close(weight.grad / loss_scale, expected)
+    torch.testing.assert_close(weight.detach() - 1e-6 * weight.grad / loss_scale, reference.detach() - 1e-6 * expected)
+
+
+def test_parent_reader_rejects_multimodal_data_iterator_before_packing():
+    pytest.importorskip("megatron.core")
+    import torch
+
+    from examples.chunkflow.schedules import _next_parent
+    from relax.backends.megatron.data import DataIterator
+
+    iterator = DataIterator(
+        {"tokens": [torch.arange(4)], "multimodal_train_inputs": [{"pixel_values": torch.ones(1)}]},
+        micro_batch_size=1,
+    )
+    with pytest.raises(NotImplementedError, match="text-only"):
+        _next_parent(iterator, SimpleNamespace())
+
+
+@pytest.mark.parametrize("layout", [False, True])
+def test_expert_wrapper_rejects_non_nested_tensor_parallel_plans(monkeypatch, layout):
+    pytest.importorskip("megatron.core")
+    import torch.distributed as dist
+
+    from examples.chunkflow import schedules
+    from relax.utils import distributed_utils
+
+    generator = schedules.parallel_state.RankGenerator
+    common = dict(ep=1, pp=1, cp=1, order="tp-cp-ep-dp-pp")
+    dense = generator(tp=3, dp=2, **common).get_ranks("tp")
+    experts = generator(tp=2, dp=3, **common).get_ranks("tp")
+    assert dense == [[0, 1, 2], [3, 4, 5]] and [2, 3] in experts
+
+    records = []
+    for rank in range(6):
+        chunks, units = schedules._plan(
+            {"packed_seq_params": SimpleNamespace(cu_seqlens_q_cpu=[0, 384 if rank < 3 else 768])},
+            384,
+            "staggered",
+        )
+        scope = tuple(next(group for group in experts if rank in group))
+        ops = tuple(schedules.gen_unit_ops(units, chunks, 1 << 30))
+        records.append(((), (1 if rank < 3 else 2, 1)) if layout else (scope, ops))
+
+    world = object()
+
+    def gather(output, value, *, group):
+        assert group is world
+        assert value == records[rank]
+        output[:] = records
+
+    monkeypatch.setattr(distributed_utils, "get_gloo_group", lambda: world)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 6)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: group)
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    args = SimpleNamespace(tensor_model_parallel_size=3, expert_tensor_parallel_size=2, expert_model_parallel_size=1)
+    for rank, (_, signature) in enumerate(records):
+        scope = tuple(next(group for group in experts if rank in group))
+        monkeypatch.setattr(schedules.parallel_state, "get_expert_tensor_and_model_parallel_group", lambda: scope)
+        with pytest.raises(RuntimeError, match="different schedules"):
+            schedules._check_ep_schedule(signature, args, layout=layout)
+
+
+def _validate_expert_plans_worker(rank, init_file):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from examples.chunkflow.units import validate_schedule
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=4, timeout=timedelta(seconds=25)
+    )
+    group = dist.group.WORLD
+    scope = (0, 1) if rank < 2 else (2, 3)
+
+    def signature(lengths, k=0):
+        chunks = build_chunks(lengths, chunk_size=4096)
+        units = build_micro_batches(chunks)
+        plan = make_model_plan(units, chunks, k or 1 << 30, 2)
+        return plan.forward, plan.backward, tuple(sorted(plan.recompute)), plan.warmups
+
+    try:
+        # Different token counts are legal when the collective order is identical.
+        validate_schedule(signature([4097] if rank % 2 else [8192]), group=group, scope=scope)
+        cases = [
+            (signature([2048] if rank == 0 else [8192]), scope),
+            (signature([4096, 4096] if rank == 0 else [8192]), scope),
+            (signature([8192], k=1 if rank == 0 else 0), scope),
+            ((1 if rank == 0 else 2, 1), ()),
+            ((2, 1 if rank == 0 else 2), ()),
+        ]
+        for candidate, candidate_scope in cases:
+            with pytest.raises(RuntimeError, match="different schedules"):
+                validate_schedule(candidate, group=group, scope=candidate_scope)
+        # Even peers in the unaffected EP scope must have raised and reached here.
+        validate_schedule(("finished",), group=group)
+    finally:
+        dist.destroy_process_group(group)
+
+
+def test_expert_schedule_mismatch_fails_on_all_pipeline_stages(tmp_path):
+    import time
+
+    import torch.multiprocessing as mp
+
+    workers = mp.spawn(_validate_expert_plans_worker, args=(str(tmp_path / "gloo"),), nprocs=4, join=False)
+    deadline = time.monotonic() + 45
+    try:
+        while time.monotonic() < deadline:
+            if workers.join(timeout=1):
+                return
+        pytest.fail("collective schedule validation hung")
+    finally:
+        for worker in workers.processes:
+            if worker.is_alive():
+                worker.terminate()
+            worker.join(timeout=5)

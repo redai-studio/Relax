@@ -2,8 +2,8 @@
 """Real layout and GDN forward/backward regression for context parallelism.
 
 Checks exact THD/SBHD layout round trips and BF16 CP=1/CP=2 GDN parity in one
-two-GPU spawn. FLA kernels use a fixed candidate configuration to avoid
-autotune benchmarks. Run with: pytest
+two-GPU spawn shared by both CP modes. FLA kernels use a fixed candidate
+configuration to avoid autotune benchmarks. Run with: pytest
 tests/backends/megatron/test_gdn_cp_gpu.py
 """
 
@@ -172,9 +172,7 @@ def _use_one_fla_config():
     triton.autotune = single_config
 
 
-def _worker_gdn_cp(rank, init_method, tested_mode):
-    torch.cuda.set_device(rank)
-    _use_one_fla_config()  # Install before Megatron/FLA imports create kernels.
+def _check_gdn_cp_mode(rank: int, init_method: str, tested_mode: str) -> None:
     import torch.distributed as dist
     from megatron.core import parallel_state
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -258,12 +256,19 @@ def _worker_gdn_cp(rank, init_method, tested_mode):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("mode", ["chunkwise", "all_gather"])
-def test_gdn_cp_layout_and_gradients(tmp_path, mode):
+def _worker_gdn_cp(rank: int, init_dir: str) -> None:
+    torch.cuda.set_device(rank)
+    _use_one_fla_config()  # Install once before Megatron/FLA imports create kernels.
+    # Run native chunkwise first: all_gather installs a persistent forward patch.
+    # Reuse imports/JIT kernels, but rebuild groups, models and references per mode.
+    for mode in ("chunkwise", "all_gather"):
+        try:
+            _check_gdn_cp_mode(rank, f"file://{init_dir}/{mode}", mode)
+        except Exception as exc:
+            raise RuntimeError(f"GDN CP mode={mode}, rank={rank}") from exc
+
+
+def test_gdn_cp_layout_and_gradients(tmp_path):
     """Check exact layouts and CP=2 output/input/parameter gradients against
     CP=1."""
-    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-
-    if mode == "all_gather" and not hasattr(GatedDeltaNet, "_resolve_thd_cu_seqlens"):
-        pytest.skip("installed MCore lacks all_gather support; rebuild with the current Relax Megatron patch")
-    mp.spawn(_worker_gdn_cp, args=(f"file://{tmp_path / 'gdn_cp_init'}", mode), nprocs=2, join=True)
+    mp.spawn(_worker_gdn_cp, args=(str(tmp_path),), nprocs=2, join=True)

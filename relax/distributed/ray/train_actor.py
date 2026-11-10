@@ -3,6 +3,7 @@
 import abc
 import os
 import random
+import threading
 from datetime import timedelta
 
 import ray
@@ -78,6 +79,15 @@ class TrainRayActor(RayActor):
 
         numa_local_rank = Envs.RANK % args.num_gpus_per_node
         device_utils.set_numa_affinity(numa_local_rank)
+
+    def termination_probe(self) -> None:
+        """Never return normally; used to confirm force-killed actor exit.
+
+        The driver queues this behind ``init`` before calling ``ray.kill``. Its
+        ObjectRef must become terminal with ``RayActorError``; a successful
+        return would mean the actor survived cleanup and is unsafe to reuse.
+        """
+        threading.Event().wait()
 
     def clear_memory(self):
         print_memory("before TrainRayActor.clear_memory")

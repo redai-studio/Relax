@@ -10,6 +10,7 @@ here, not in the storage service. No files or mmap are used.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from contextlib import contextmanager
@@ -138,6 +139,11 @@ def tq_client_factory(connection: Any, *, body_partition: str) -> Any:
     )
 
     class ReplayTQClient(TransferQueueClient):
+        async def async_clear_samples(self, metadata: Any) -> None:
+            if connection.backend.storage_backend != "SimpleStorage":
+                return await super().async_clear_samples(metadata)
+            await _clear_simple_storage_samples(self, metadata)
+
         async def async_get_data(self, metadata: Any) -> Any:
             # Keep TQ's validation/empty-result behavior and unusual topology
             # fallback. The override is bound by TQ's synchronous constructor.
@@ -175,6 +181,28 @@ def tq_client_factory(connection: Any, *, body_partition: str) -> Any:
         client.close()
         raise
     return client
+
+
+async def _clear_simple_storage_samples(client: Any, metadata: Any) -> None:
+    """Keep key metadata until every storage unit acknowledges body deletion.
+
+    The pinned TQ SimpleStorage clear_data logs unit errors without raising.
+    Drain every unit before propagating failure so a retry cannot race an
+    outstanding request on the same client sockets.
+    """
+    manager = client.storage_manager
+    routing = manager._group_by_hash(metadata.global_indexes)
+    results = await asyncio.gather(
+        *(
+            manager._clear_single_storage_unit(group.global_indexes, target_storage_unit=unit)
+            for unit, group in routing.items()
+        ),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    await client._clear_meta_in_controller(metadata)
 
 
 class TQBodyBackend:
@@ -502,6 +530,16 @@ class TQReplayStorage:
         # Never infer remote process death from a local PID. Uncertain writes
         # remain visible for recovery instead of being deleted by a timeout.
         return len(self.invoke("snapshot")["objects"])
+
+    def abandon_run(self) -> None:
+        """Drop failed-job metadata before its owning TQ is destroyed."""
+        if self._writer is not None:
+            self._writer.close()
+        if self._registry_handle is not None:
+            _ray().kill(self._registry_handle, no_restart=True)
+        self._backend.close()
+        self._registry_handle = None
+        self._driver = None
 
     def close_run(self) -> None:
         if self._writer is not None:

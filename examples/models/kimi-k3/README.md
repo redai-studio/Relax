@@ -8,6 +8,92 @@ Relax provides full-parameter and LoRA SFT for Kimi K3, with image inputs, packi
 
 Use a training image built with the pinned Megatron/Bridge, FLA and NVRx dependencies in `docker/Dockerfile` or `docker/Dockerfile.cu13`. Model and dataset directories must be readable from every training node. These recipes are reference configurations; validate memory use and numerical behavior on the target cluster before a long run.
 
+## Open-Data Reproduction Results
+
+The following Kimi K3 runs use HellaSwag, multimodal-open-r1-8k-verified (OpenR1-MM), Pokémon captions and LLaVA-OneVision v1.5 Instruct. Measurements below were collected on 128×280G Blackwell GPUs for full-parameter SFT/GRPO and 64×280G Blackwell GPUs for LoRA. They describe those experiment configurations; current recipe defaults may differ. Curves show raw steps with smoothing 0.25 and the unsmoothed trace in the background.
+
+| Dataset                       | Experiment                      | Observed result                                                                                                   |
+| ----------------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| HellaSwag                     | Raw context/target SFT          | Training loss settles around 1.4 over 100 steps; validation loss decreases to about 1.93.                         |
+| OpenR1-MM                     | Full-parameter multimodal SFT   | Exported MXFP4 checkpoint improves pass@k on a 256-example held-out split; detailed scoring below.                |
+| Pokémon captions (Chinese)    | Language-backbone LoRA          | Training loss decreases through step 198.                                                                         |
+| LLaVA-OneVision v1.5 Instruct | Long-context SFT, frozen vision | Recorded through step 680; packed sequences around 110k tokens and step time around 60 s, with occasional spikes. |
+| OpenR1-MM                     | Multimodal GRPO                 | Rollout reward increases; train/rollout logprob differences remain small and decrease during the illustrated run. |
+
+### HellaSwag SFT
+
+The raw-text recipe supervises the target ending from the original context. These are language-model loss measurements, not HellaSwag multiple-choice accuracy. The recorded training step time was approximately 40 s on 128×280G Blackwell.
+
+|                      Training loss                      |                        Validation loss                         |
+| :-----------------------------------------------------: | :------------------------------------------------------------: |
+| ![HellaSwag training loss](./assets/hellaswag-loss.png) | ![HellaSwag validation loss](./assets/hellaswag-eval-loss.png) |
+
+Recipe: [`run-kimi-k3-hellaswag-128xblackwell-rawtext.sh`](./scripts/run-kimi-k3-hellaswag-128xblackwell-rawtext.sh).
+
+### OpenR1-MM SFT and Evaluation
+
+The SFT experiment uses 7424 training examples and 256 held-out evaluation examples from multimodal-open-r1-8k-verified. Evaluation compares the original Kimi K3 weights with SFT checkpoint **iter86 after export to native MXFP4 HF weights**.
+
+| Scoring rule                               | Model            |     pass@1 |     pass@4 |     pass@8 |    pass@16 |
+| ------------------------------------------ | ---------------- | ---------: | ---------: | ---------: | ---------: |
+| Original OpenR1-MM reward: format + answer | Original Kimi K3 |      7.50% |     11.92% |     14.98% |     20.00% |
+| Original OpenR1-MM reward: format + answer | SFT iter86       | **66.25%** | **77.64%** | **84.00%** | **90.00%** |
+| Final-answer scorer v2                     | Original Kimi K3 |     43.44% |     49.31% |     52.29% |     55.00% |
+| Final-answer scorer v2                     | SFT iter86       | **56.25%** | **64.84%** | **70.10%** | **75.00%** |
+
+These are two separate scoring implementations; their scores are not nested and should only be compared within the same rule. This is a held-out split of the SFT dataset, not an independent benchmark suite. The recorded summary does not specify all decoding settings, so these values should not be treated as a fully specified evaluation protocol. The current [`eval_openr1mm.py`](../../../scripts/tools/eval_openr1mm.py) provides a final-answer evaluator; its defaults do not establish the historical settings.
+
+|                         Representative SFT training-loss curve                         |
+| :------------------------------------------------------------------------------------: |
+| ![OpenR1-MM SFT training loss, first recorded segment](./assets/openr1mm-sft-loss.png) |
+
+The curve shows one recorded training segment, rather than the full trajectory to iter86. The context-capacity experiments on 128×280G Blackwell reported:
+
+| Global batch size | Context | Vision tower | Outcome                             |
+| ----------------: | ------: | ------------ | ----------------------------------- |
+|               256 |     64k | Trainable    | Stable training in the recorded run |
+|               256 |     96k | Trainable    | OOM at step 16                      |
+|               256 |     96k | Frozen       | Stable training in the recorded run |
+|               512 |    128k | Frozen       | Stable training in the recorded run |
+
+Recipe: [`run-kimi-k3-openr1mm-128xblackwell.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell.sh).
+
+### Pokémon LoRA
+
+The 64×280G Blackwell LoRA run uses the Chinese Pokémon GPT-4o captions preparation (`pokemon_gpt4o_zh.parquet`). This run demonstrates LoRA optimization on image-caption data; no held-out accuracy was reported.
+
+|                         Training loss                         |                           Gradient norm                            |
+| :-----------------------------------------------------------: | :----------------------------------------------------------------: |
+| ![Pokémon LoRA training loss](./assets/pokemon-lora-loss.png) | ![Pokémon LoRA gradient norm](./assets/pokemon-lora-grad-norm.png) |
+
+Recipe: [`run-kimi-k3-pokemon-lora-64xblackwell.sh`](./scripts/run-kimi-k3-pokemon-lora-64xblackwell.sh).
+
+### LLaVA-OneVision Long-Context SFT
+
+The 128×280G Blackwell run uses frozen vision, global batch size 512 and CP8. Its training log spans steps 0–680, with packed sequences typically around 110k tokens under a 128k context budget. Loss trends downward and most steps take approximately 60 s; initialization and occasional spikes take longer. The run had a large gradient-norm spike later attributed to an FLA KDA issue; FLA 0.5.2 was reported to fix it. No downstream accuracy score was reported for this run.
+
+|                      Training loss                      |                      Step time (s)                       |                              Packed tokens                              |
+| :-----------------------------------------------------: | :------------------------------------------------------: | :---------------------------------------------------------------------: |
+| ![OneVision training loss](./assets/onevision-loss.png) | ![OneVision step time](./assets/onevision-step-time.png) | ![OneVision packed sequence tokens](./assets/onevision-pack-tokens.png) |
+
+Recipe: [`run-kimi-k3-llava-onevision-128xblackwell.sh`](./scripts/run-kimi-k3-llava-onevision-128xblackwell.sh).
+
+### OpenR1-MM GRPO
+
+The full-parameter multimodal GRPO run uses 128×280G Blackwell. In the illustrated run (steps 0–60), rollout reward rises from roughly 0.16 to 0.44, mismatch KL stays around 0.002–0.003, and mean absolute train/rollout logprob difference stays around 0.03. These are training diagnostics, not held-out pass@k results.
+
+|                           Rollout reward                            |                       Train/rollout mismatch KL                       |                              Absolute logprob difference                               |
+| :-----------------------------------------------------------------: | :-------------------------------------------------------------------: | :------------------------------------------------------------------------------------: |
+| ![OpenR1-MM GRPO rollout reward](./assets/openr1mm-grpo-reward.png) | ![OpenR1-MM GRPO mismatch KL](./assets/openr1mm-grpo-mismatch-kl.png) | ![OpenR1-MM GRPO absolute logprob difference](./assets/openr1mm-grpo-logprob-diff.png) |
+
+The recorded optimization results reduced representative iteration time from about **1100 s to 770 s** (30%) and weight synchronization from about **270 s to 80 s** (70%). These are approximate measurements from separate runs, not controlled throughput benchmarks. The timing comparison below includes a short optimized run recorded through step 8; startup and sequence-length variation affect the curves. Blue is the September 29 optimized run; yellow is the September 28 comparison run.
+
+|                                        Before optimization                                        |                                    Later timing runs                                    |
+| :-----------------------------------------------------------------------------------------------: | :-------------------------------------------------------------------------------------: |
+| ![OpenR1-MM GRPO iteration time before optimization](./assets/openr1mm-grpo-step-time-before.png) | ![OpenR1-MM GRPO later iteration-time comparison](./assets/openr1mm-grpo-step-time.png) |
+
+Recipe: [`run-kimi-k3-openr1mm-128xblackwell-grpo.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh).
+
 ## Training
 
 Run commands from the repository root on an existing Ray cluster. `MODEL_DIR` points directly to the original HF model directory; `DATA_DIR` points to the prepared dataset directory. Existing `HF_CHECKPOINT`, `HELLASWAG_DATA_DIR`, `OPENR1MM_DATA_DIR`, `POKEMON_DATA_DIR` and `LLAVA_DATA_DIR` overrides remain supported.
@@ -17,23 +103,25 @@ export MODEL_DIR=/shared/models/Kimi-K3
 export DATA_DIR=/shared/data/openr1mm
 export SAVE_DIR=/shared/checkpoints
 export EXP_NAME=kimi-k3-openr1mm-full
-DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300.sh
+DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh
 bash scripts/entrypoint/ray-job.sh \
-  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300.sh
+  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh
 ```
 
-| Recipe filename                             |     GPUs | Input                                              |
-| ------------------------------------------- | -------: | -------------------------------------------------- |
-| `run-kimi-k3-hellaswag-128xb300.sh`         | 128 B300 | `train.jsonl`, `validation.jsonl`                  |
-| `run-kimi-k3-hellaswag-128xb300-rawtext.sh` | 128 B300 | Same files; raw context/target baseline comparison |
-| `run-kimi-k3-openr1mm-128xb300.sh`          | 128 B300 | `train.parquet`                                    |
-| `run-kimi-k3-llava-onevision-128xb300.sh`   | 128 B300 | `train/` JSONL shards and `READY.json`             |
-| `run-kimi-k3-pokemon-64xb300.sh`            |  64 B300 | `pokemon_gpt4o_zh.parquet`                         |
-| `run-kimi-k3-pokemon-128xb300.sh`           | 128 B300 | Same Parquet file                                  |
-| `run-kimi-k3-pokemon-192xgpu-b300.sh`       | 192 B300 | Same Parquet file                                  |
-| `run-kimi-k3-pokemon-lora-64xb300.sh`       |  64 B300 | Same Parquet file; language-backbone LoRA          |
+| Recipe filename                                  |               GPUs | Input                                              |
+| ------------------------------------------------ | -----------------: | -------------------------------------------------- |
+| `run-kimi-k3-hellaswag-128xblackwell.sh`         | 128×280G Blackwell | `train.jsonl`, `validation.jsonl`                  |
+| `run-kimi-k3-hellaswag-128xblackwell-rawtext.sh` | 128×280G Blackwell | Same files; raw context/target baseline comparison |
+| `run-kimi-k3-openr1mm-128xblackwell.sh`          | 128×280G Blackwell | `train.parquet`                                    |
+| `run-kimi-k3-llava-onevision-128xblackwell.sh`   | 128×280G Blackwell | `train/` JSONL shards and `READY.json`             |
+| `run-kimi-k3-pokemon-64xblackwell.sh`            |  64×280G Blackwell | `pokemon_gpt4o_zh.parquet`                         |
+| `run-kimi-k3-pokemon-128xblackwell.sh`           | 128×280G Blackwell | Same Parquet file                                  |
+| `run-kimi-k3-pokemon-192xgpu-blackwell.sh`       | 192×280G Blackwell | Same Parquet file                                  |
+| `run-kimi-k3-pokemon-lora-64xblackwell.sh`       |  64×280G Blackwell | Same Parquet file; language-backbone LoRA          |
 
 `SAVE_DIR` enables saving to the stable `${SAVE_DIR}/${EXP_NAME}` directory and loading from the same directory. Without it, recipes do not save checkpoints. OpenR1-MM and OneVision save **model weights only** by default; optimizer and scheduler state are not preserved. `SAVE_OPTIMIZER=1` enables full-state saving, which needs substantially more host memory and storage. A model-only checkpoint is not an exact training resume.
+
+The default SFT experiment names now use architecture and memory profiles. To continue an existing experiment after upgrading, keep `SAVE_DIR` unchanged and explicitly set `EXP_NAME` to the original experiment name. Using the new default changes the checkpoint directory and can restart training from the HF weights instead of resuming the existing checkpoint.
 
 OpenR1-MM and OneVision default to frozen vision; set `FREEZE_VISION_TOWER=0` for joint vision training and revalidate memory use. `FLA_TILELANG=0` is passed to training actors by default; an explicit environment override is supported. ClearML uses the existing runtime configuration. Ray submission waits for completion and streams logs by default; set `RAY_NO_WAIT=1` to submit in the background, where submission success does not establish training success.
 
@@ -96,10 +184,10 @@ Kimi K3 supports colocated GRPO with native MXFP4 rollout weights. Training keep
 
 The SGLang v0.5.17 patch shipped in this repository must be installed on **every rollout node**. Its reload hooks preserve captured runtime storage while refreshing MXFP4 repacks, fused decode buffers, MLA projections and AttnRes caches. The router supports worker removal and re-registration without applying stale requests or health checks to a replacement worker. PP weight conversion broadcasts cleaned configuration copies and avoids repeating TP/EP collectives after weights have already been gathered.
 
-| Recipe                                                                  | Layout                                     | Purpose                                                              |
-| ----------------------------------------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------- |
-| `scripts/training/text/run-kimi-k3-5l-8xgpu-grpo.sh`                    | Training TP2/EP4/ETP1, rollout TP8; 8 GPUs | Reduced 5-layer/128-expert checkpoint, text-only DAPO math smoke run |
-| `examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh` | Training TP4/PP4/CP2/EP32/ETP1; 128 B300   | Full-parameter multimodal OpenR1-MM GRPO, including vision           |
+| Recipe                                                                       | Layout                                             | Purpose                                                              |
+| ---------------------------------------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------- |
+| `scripts/training/text/run-kimi-k3-5l-8xgpu-grpo.sh`                         | Training TP2/EP4/ETP1, rollout TP8; 8 GPUs         | Reduced 5-layer/128-expert checkpoint, text-only DAPO math smoke run |
+| `examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh` | Training TP4/PP4/CP2/EP32/ETP1; 128×280G Blackwell | Full-parameter multimodal OpenR1-MM GRPO, including vision           |
 
 The full recipe uses PP layer counts 21/24/24/24, eight 16-GPU rollout engines with attention TP8/DP2 and MoE EP16, CPU optimizer offload (default fraction 0.9), dummy rollout initialization followed by a full weight push, and no reference model. It clears inherited allocator settings, limits compiler threads and keeps Ray Serve probes responsive during weight synchronization. Defaults are 200 training rollouts and a model-only save every 200 rollouts, retaining one checkpoint. It initializes from HF unless `LOAD_DIR` is set. Model-only checkpoints do **not** restore optimizer state.
 
@@ -110,9 +198,9 @@ export SAVE_DIR=/shared/checkpoints
 export EXP_NAME=kimi-k3-openr1mm-grpo
 export HF_CHECKPOINT="${MODEL_DIR}"
 export PROMPT_SET="${DATA_DIR}/train.parquet"
-DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh
+DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh
 bash scripts/entrypoint/ray-job.sh \
-  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh
+  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh
 ```
 
 The full recipe defaults to `${MODEL_DIR}/Kimi-K3` for model weights and `${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet` for data with `prompt`, `label` and `image` fields. The example above sets `HF_CHECKPOINT` and `PROMPT_SET` explicitly to reuse the SFT directory layout. The reduced recipe expects `dapo-math-17k.jsonl` under `DATA_DIR` and the reduced checkpoint directly under `MODEL_DIR`. Its entropy coefficient 0.01 keeps gradients nonzero when the unretrained smoke checkpoint receives zero rewards; it is not a quality baseline. Optional `SAVE_DIR` enables full-state saves and resume for this reduced recipe. Experiment names and checkpoint paths are stable; timestamps appear only in log/task names. ClearML uses existing runtime configuration.

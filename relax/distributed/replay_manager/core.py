@@ -155,6 +155,8 @@ class ReplayManager:
         self._store_factory = store_factory
         self._store_instance: TQReplayStorage | None = None
         self._owns_run = False
+        self._run_stopped = False
+        self._finalization_error: Exception | None = None
         self._kinds = _builtin_kinds()
         self._enabled_kinds = None
         self._installed_engines: dict[str, frozenset[str]] = {}
@@ -231,13 +233,47 @@ class ReplayManager:
         if self.uses_references:
             self.store().start_run()
             self._owns_run = True
+            self._run_stopped = False
 
     def finish_run(self) -> None:
         """Called by standard normal/error shutdown, never by an in-job
         restart."""
+        if self._finalization_error is not None:
+            raise RuntimeError("Replay finalization previously failed") from self._finalization_error
         if self._owns_run:
-            self.store().close_run()
-            self._owns_run = False
+            try:
+                self.store().close_run()
+            except Exception as error:
+                self._finalization_error = error
+                try:
+                    self.store().abandon_run()
+                except Exception as cleanup:
+                    error.add_note(f"Replay registry cleanup failed: {cleanup!r}")
+                raise
+            finally:
+                self._owns_run = False
+                self._run_stopped = True
+
+    def prepare_restart(self, runtime_env: dict[str, Any]) -> None:
+        """Discard the failed generation with TQ and isolate replayed rollout.
+
+        Global recovery rolls training back to a checkpoint and destroys TQ;
+        its references and dead-worker leases must not survive into the new
+        run. Call start_run only after reconnecting Ray.
+        """
+        if not self.uses_references:
+            return
+        import os
+
+        self._run_stopped = True
+        if self._owns_run:
+            self.store().abandon_run()
+        self._owns_run = False
+        self._store_instance = None
+        self._finalization_error = None
+        self.config = replace(self.config, run_id=new_data_id())
+        os.environ["RELAX_REPLAY_RUN_ID"] = self.config.run_id
+        runtime_env.setdefault("env_vars", {})["RELAX_REPLAY_RUN_ID"] = self.config.run_id
 
     @property
     def uses_references(self) -> bool:
@@ -401,7 +437,9 @@ class ReplayManager:
 
         if field not in frozenset(FIELDS.values()):
             raise KeyError(field)
-        dtype = torch.long if field == "rollout_routed_experts" else torch.int32
+        if field == "rollout_routed_experts":
+            device = "cpu"
+        dtype = torch.int32
         return [
             torch.as_tensor(value.data if isinstance(value, NonTensorData) else value, dtype=dtype, device=device)
             for value in values
@@ -861,7 +899,7 @@ def install_tq_cleanup_hook() -> None:
         # Retirement removes the partition hold, never an active reader lease.
         from .storage import BODY_PARTITION_PREFIX
 
-        if not partition_id.startswith(BODY_PARTITION_PREFIX):
+        if not partition_id.startswith(BODY_PARTITION_PREFIX) and not replay_data_manager._run_stopped:
             replay_data_manager.region(partition_id).retire()
         return result
 

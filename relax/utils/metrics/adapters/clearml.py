@@ -94,6 +94,12 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
             reuse_last_task_id=False,
             auto_connect_frameworks={"tensorboard": False, "pytorch": False},
         )
+        try:
+            from relax.utils.agentic_obs.tracking import record_clearml_task
+
+            record_clearml_task(args, self._task)
+        except Exception as error:
+            logger.warning("agentic_obs: ClearML task binding unavailable: %s", error)
         self._connect_git_metadata(args)
         logger.info(
             f"Saving clearml log to project: {self.project_name}, experiment: {self.experiment_name}, tags: {self.tags}"
@@ -124,6 +130,18 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
             title, series = k.split("/", 1)
 
             if isinstance(v, int | float | np.floating | np.integer):
+                if title == "train" and series.startswith("dataset/"):
+                    source, separator, metric = series[len("dataset/") :].rpartition("/")
+                    if (
+                        separator
+                        and source
+                        and "/" not in source
+                        and metric in {"loss", "tokens", "samples", "token_fraction", "sample_fraction"}
+                    ):
+                        if metric == "loss":
+                            series = f"loss/{source}"
+                        else:
+                            continue
                 _logger.report_scalar(
                     title=title,
                     series=series,

@@ -260,7 +260,8 @@ def _install_abort_patch() -> None:
             from sglang.srt.managers.io_struct import AbortReq
 
             for req in cancelled:
-                self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+                channels = getattr(self, "ipc_channels", self)
+                channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         return result
 
     abort._relax_replay_cleanup = True
@@ -332,7 +333,8 @@ def _advance_publication(
                 first = publication.rows
                 # Transfer the lightweight stable slot range once. Body copies
                 # remain chunked and admitted by the writer before KV reuse.
-                slots = processor.req_to_token_pool.req_to_token[req.req_pool_idx][first:end].cpu().numpy()
+                kv = getattr(req, "kv", req)
+                slots = processor.req_to_token_pool.req_to_token[kv.req_pool_idx][first:end].cpu().numpy()
                 if len(slots) != end - first or np.any(slots < 0) or np.any(slots >= len(buffer)):
                     raise ValueError("Replay capture slot range is invalid")
                 cache = buffer.numpy()
@@ -513,7 +515,24 @@ def _install_response_patch(owner: Any) -> bool:
 
     if getattr(Scheduler, "_relax_replay_async_output", False):
         return True
-    original_output = Scheduler.stream_output
+    if hasattr(Scheduler, "stream_output"):
+        original_output = Scheduler.stream_output
+    else:
+        original_streamer_class = Scheduler.get_output_streamer_class
+
+        def original_output(self, reqs, return_logprob, skip_req=None):
+            return original_streamer_class(self).stream_output(self.output_streamer, reqs, return_logprob, skip_req)
+
+        def replay_streamer_class(scheduler):
+            base = original_streamer_class(scheduler)
+
+            class ReplayOutputStreamer(base):
+                def stream_output(self, reqs, return_logprob, skip_req=None):
+                    return output(scheduler, reqs, return_logprob, skip_req)
+
+            return ReplayOutputStreamer
+
+        Scheduler.get_output_streamer_class = replay_streamer_class
     original_input = Scheduler.process_input_requests
     original_idle = Scheduler.maybe_sleep_on_idle
 
@@ -603,7 +622,8 @@ def _install_response_patch(owner: Any) -> bool:
             return None
         return original_idle(self, *args, **kwargs)
 
-    Scheduler.stream_output = output
+    if hasattr(Scheduler, "stream_output"):
+        Scheduler.stream_output = output
     Scheduler.process_input_requests = process_input
     Scheduler.maybe_sleep_on_idle = idle
     Scheduler._relax_replay_async_output = True

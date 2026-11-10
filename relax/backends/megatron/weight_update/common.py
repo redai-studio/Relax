@@ -3,7 +3,7 @@
 import inspect
 import re
 from argparse import Namespace
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -17,188 +17,102 @@ from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
 
-def all_gather_param(args, name: str, param: torch.Tensor) -> torch.Tensor:
-    """All-gather TP-sharded param to full tensor.
+def gdn_component_sizes(config, tp_size: int, name: str) -> tuple[int, ...] | None:
+    """Component-major GDN layout; unrelated parameters use ordinary TP
+    metadata."""
+    if not any(key in name for key in ("self_attention.conv1d.weight", "self_attention.in_proj.weight")):
+        return None
+    config = getattr(config, "text_config", None) or config
+    if not all(
+        hasattr(config, key)
+        for key in ("linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim")
+    ):
+        return None
+    if config.linear_num_key_heads % tp_size or config.linear_num_value_heads % tp_size:
+        raise ValueError("GDN head counts must be divisible by TP size")
+    qk = config.linear_key_head_dim * (config.linear_num_key_heads // tp_size)
+    value = config.linear_value_head_dim * (config.linear_num_value_heads // tp_size)
+    heads = config.linear_num_value_heads // tp_size
+    return (qk, qk, value) if "conv1d" in name else (qk, qk, value, value, heads, heads)
 
-    expert_bias→param, non-TP/duplicated→param.data. Uses expert-TP for
-    ".experts.", else regular-TP. linear_fc1 rechunked (GLU), linear_fc2 dim
-    fix.
-    """
-    name = name.replace(".to_wrap.", ".")
 
-    if "expert_bias" in name:
-        return param
-
-    if ".audio_model." in name or ".vision_model." in name or ".video_model." in name:
-        if not hasattr(param, "tensor_model_parallel"):
-            # NOTE: qwen3.5 vision_model is a megatron module
-            return param
-
-    if not hasattr(param, "tensor_model_parallel"):
-        assert not isinstance(param, torch.nn.Parameter), f"{name} does not have tensor_model_parallel attribute"
-        # Ordinary persistent buffers are replicated. A buffer carrying
-        # Megatron TP metadata continues through the regular gather path.
-        return param
-
-    if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
-        return param.data
-
-    if ".experts." in name:
-        tp_size = mpu.get_expert_tensor_parallel_world_size()
-        tp_group = mpu.get_expert_tensor_parallel_group()
-    else:
-        tp_size = mpu.get_tensor_model_parallel_world_size()
-        tp_group = mpu.get_tensor_model_parallel_group()
-
-    # NOTE(wuhuan): qwen3.5 GDN
-    if "self_attention.conv1d.weight" in name:
-        config = get_hf_config(args.hf_checkpoint).text_config
-        qk_dim = config.linear_key_head_dim * config.linear_num_key_heads
-        v_dim = config.linear_value_head_dim * config.linear_num_value_heads
-        qk_dim = qk_dim // tp_size
-        v_dim = v_dim // tp_size
-        q_shard_idx = torch.arange(qk_dim)
-        k_shard_idx = torch.arange(qk_dim) + qk_dim
-        v_shard_idx = torch.arange(v_dim) + qk_dim * 2
-
-        q = param[q_shard_idx]
-        k = param[k_shard_idx]
-        v = param[v_shard_idx]
-
-        # Gather each component across TP ranks
-        full_weights = []
-        for c in [q, k, v]:
-            if tp_size == 1:
-                full_weight = c
-            else:
-                gathered = [torch.empty_like(c.data) for _ in range(tp_size)]
-                dist.all_gather(gathered, c.data, group=tp_group)
-                full_weight = torch.cat(gathered, dim=0)
-            full_weights.append(full_weight)
-        return torch.cat(full_weights, dim=0)
-
-    # NOTE(wuhuan): qwen3.5 GDN
-    if "self_attention.in_proj.weight" in name:
-        config = get_hf_config(args.hf_checkpoint).text_config
-        qk_head_dim = config.linear_key_head_dim
-        v_head_dim = config.linear_value_head_dim
-        num_qk_heads_local_tp = config.linear_num_key_heads // tp_size
-        num_v_heads_local_tp = config.linear_num_value_heads // tp_size
-        qk_dim_local_tp = qk_head_dim * num_qk_heads_local_tp
-        v_dim_local_tp = v_head_dim * num_v_heads_local_tp
-
-        full_weights = []
-        for c in torch.split(
-            param,
-            [
-                qk_dim_local_tp,
-                qk_dim_local_tp,
-                v_dim_local_tp,
-                v_dim_local_tp,
-                num_v_heads_local_tp,
-                num_v_heads_local_tp,
-            ],
-            dim=0,
-        ):
-            gathered = [torch.empty_like(c.data) for _ in range(tp_size)]
-            dist.all_gather(gathered, c.data, group=tp_group)
-            full_weights.append(torch.cat(gathered, dim=0))
-        return torch.cat(full_weights, dim=0)
-
-    param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
-    dist.all_gather(param_partitions, param.data, group=tp_group)
-    partition_dim = param.partition_dim
-    # NOTE: Megatron-LM (megatron/core/transformer/mlp.py) now explicitly sets partition_stride=2
-    # for GLU/SwiGLU linear_fc1 layers to indicate interleaved [gate, up] TP layout.
-    # The rechunk logic below (chunk(2) + reorder) already handles this correctly,
-    # so we only assert stride==1 for non-GLU parameters.
-    if "linear_fc1" not in name:
-        assert param.partition_stride == 1, f"{param.partition_stride=} != 1 is not supported"
-    # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
-    # TODO: check only GLU is used.
+def _restore_tp_weight(name, partitions, partition_dim, split_sizes=None):
+    if split_sizes is not None:
+        assert partition_dim == 0, "GDN components must be sharded along rows"
+        components = [part.split(split_sizes, dim=0) for part in partitions]
+        return torch.cat([parts[index] for index in range(len(split_sizes)) for parts in components], dim=0)
     if "linear_fc1.weight" in name and "vision_model" not in name:
-        param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
-        param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
-        # TODO:Temporary workaround for NPU to set partition_dim to 0
+        components = [part.chunk(2, dim=0) for part in partitions]
+        partitions = [part[0] for part in components] + [part[1] for part in components]
         if is_npu_available:
             partition_dim = 0
-    # this is bug in megatron's grouped moe.
-    if "linear_fc2.weight" in name and "vision_model" not in name:
-        if partition_dim == 0:
-            partition_dim = 1
+    if "linear_fc2.weight" in name and "vision_model" not in name and partition_dim == 0:
+        partition_dim = 1
+    return torch.cat(partitions, dim=partition_dim)
 
-    param = torch.cat(param_partitions, dim=partition_dim)
-    return param
+
+def _gather_tp_weights(named_params, *, split_sizes, async_op):
+    tasks, handles = [], []
+    for name, param in named_params:
+        name = name.replace(".to_wrap.", ".")
+        if "expert_bias" in name:
+            tasks.append((name, param, None, None))
+            continue
+        if not hasattr(param, "tensor_model_parallel"):
+            multimodal = any(part in name for part in (".audio_model.", ".vision_model.", ".video_model."))
+            assert multimodal or not isinstance(param, torch.nn.Parameter), f"{name} lacks TP metadata"
+            tasks.append((name, param, None, None))
+            continue
+        if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
+            tasks.append((name, param.data, None, None))
+            continue
+        if ".experts." in name:
+            size, group = mpu.get_expert_tensor_parallel_world_size(), mpu.get_expert_tensor_parallel_group()
+        else:
+            size, group = mpu.get_tensor_model_parallel_world_size(), mpu.get_tensor_model_parallel_group()
+        if "linear_fc1" not in name:
+            assert getattr(param, "partition_stride", 1) == 1, f"Unsupported partition stride for {name}"
+        partitions = [torch.empty_like(param.data) for _ in range(size)]
+        handle = dist.all_gather(partitions, param.data, group=group, async_op=async_op)
+        if handle is not None:
+            handles.append(handle)
+        tasks.append((name, None, partitions, param.partition_dim))
+    # All async collectives launch before any wait. Results remain in input order.
+    for handle in handles:
+        handle.wait()
+    return [
+        direct if partitions is None else _restore_tp_weight(name, partitions, dim, split_sizes.get(name))
+        for name, direct, partitions, dim in tasks
+    ]
+
+
+def all_gather_param(args, name: str, param: torch.Tensor) -> torch.Tensor:
+    """Gather one parameter using the same layout rules as batched export."""
+    name = name.replace(".to_wrap.", ".")
+    split_sizes = {}
+    if (
+        getattr(param, "tensor_model_parallel", False)
+        and getattr(param, "parallel_mode", None) != "duplicated"
+        and any(key in name for key in ("self_attention.conv1d.weight", "self_attention.in_proj.weight"))
+    ):
+        split_sizes[name] = gdn_component_sizes(
+            get_hf_config(args.hf_checkpoint), mpu.get_tensor_model_parallel_world_size(), name
+        )
+    return _gather_tp_weights([(name, param)], split_sizes=split_sizes, async_op=False)[0]
 
 
 def all_gather_params_async(
     param_infos_and_params: list[tuple[ParamInfo, torch.Tensor]],
+    *,
+    gdn_split_sizes: Mapping[str, tuple[int, ...]] | None = None,
 ) -> list[torch.Tensor]:
-    """Parallel TP all-gather for multiple params.
-
-    Loop 1: for each TP param, allocate buffers +
-    dist.all_gather(async_op=True) on expert-TP/regular-TP group (skip
-    expert_bias/non-TP/duplicated). Loop 2: wait all NCCL handles (enables
-    overlap). Loop 3: concat partitions + apply GLU rechunk/MoE dim fix.
-    """
-    # Phase 1: Start all async all_gather operations
-    gather_tasks = []
-    handles = []
-
-    for info, param in param_infos_and_params:
-        # Prepare async all_gather. Strip the LoRA ``.to_wrap.`` infix so name-based
-        # dispatch matches the plain non-LoRA name (see all_gather_param). No-op otherwise.
-        name = info.name.replace(".to_wrap.", ".")
-        if "expert_bias" in name:
-            gather_tasks.append((info, param, None, None, None))
-            handles.append(None)
-        elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
-            gather_tasks.append((info, param.data, None, None, None))
-            handles.append(None)
-        else:
-            # Start async all_gather
-            if ".experts." in name:
-                tp_size = mpu.get_expert_tensor_parallel_world_size()
-                tp_group = mpu.get_expert_tensor_parallel_group()
-            else:
-                tp_size = mpu.get_tensor_model_parallel_world_size()
-                tp_group = mpu.get_tensor_model_parallel_group()
-
-            param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
-            handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
-            handles.append(handle)
-
-    # Phase 2: Wait for ALL async operations to complete at once
-    # This ensures maximum parallelism by not blocking on individual operations
-    for handle in handles:
-        if handle is not None:
-            handle.wait()
-
-    # Phase 3: Process all results after all communications are done
-    gathered_params = []
-    for info, direct_param, handle, param_partitions, partition_dim in gather_tasks:
-        if handle is None:
-            # No all_gather needed
-            param = direct_param
-        else:
-            # Process the gathered partitions (same logic as original all_gather_param)
-            assert partition_dim is not None, "partition_dim must be set for TP-sharded params"
-            name = info.name.replace(".to_wrap.", ".")
-            # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
-            # TODO: check only GLU is used.
-            if "linear_fc1.weight" in name and "vision_model" not in name:
-                param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
-                param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
-            # this is bug in megatron's grouped moe.
-            if "linear_fc2.weight" in name and "vision_model" not in name:
-                if partition_dim == 0:
-                    partition_dim = 1
-            param = torch.cat(param_partitions, dim=partition_dim)
-
-        gathered_params.append(param)
-
-    return gathered_params
+    """Launch every parameter gather before waiting, then restore shared TP
+    layouts."""
+    return _gather_tp_weights(
+        [(info.name, param) for info, param in param_infos_and_params],
+        split_sizes=gdn_split_sizes or {},
+        async_op=True,
+    )
 
 
 def named_params_and_buffers(
@@ -314,7 +228,11 @@ def _named_params_and_buffers_global(
 
                 # MTP layer indices start from 0
                 middle_path, layer_idx, rest = match.groups()
-                expert_pattern = r"transformer_layer.mlp.experts\.(.+)\.weight(\d+)"
+                # GPT MTP uses transformer_layer; hybrid MTP (e.g. Qwen3.8)
+                # nests its transformer layer inside mtp_model_layer.layers.
+                expert_pattern = (
+                    r"((?:transformer_layer|mtp_model_layer\.layers\.\d+)\.mlp\.experts\..+)\.weight(\d+)$"
+                )
                 match = re.match(expert_pattern, rest)
                 if not match:
                     yield name, param
@@ -327,7 +245,7 @@ def _named_params_and_buffers_global(
                 else:
                     middle_path += "."
                 yield (
-                    f"module.module.{middle_path}mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.weight{expert_idx}",
+                    f"module.module.{middle_path}mtp.layers.{layer_idx}.{rest}.weight{expert_idx}",
                     param,
                 )
                 continue

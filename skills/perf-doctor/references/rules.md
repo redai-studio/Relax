@@ -90,7 +90,7 @@
 ### R-P06 — TP 跨节点
 - **Category:** performance (critical)
 - **Severity:** critical
-- **Trigger:** `--tensor-model-parallel-size > 8`（H20/H100 单节点 8 卡）或 TP × 节点内其他并行 > 单节点 GPU 数
+- **Trigger:** `--tensor-model-parallel-size > 8`（H20 / H800 单节点 8 卡）或 TP × 节点内其他并行 > 单节点 GPU 数
 - **Why:** TP 每层都 all-reduce，跨 NVLink boundary 后走 IB，带宽下降一个数量级；几乎一定显著掉 MFU
 - **Fix:** TP <= 8，多出来的并行放到 PP / EP / DP
 - **Skip when:** 几乎不存在合理 skip 场景；若用户明确说在做跨节点 TP 调研可降级 warn

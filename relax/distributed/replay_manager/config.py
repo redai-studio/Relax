@@ -70,6 +70,22 @@ def rollout_kinds(args: Any) -> frozenset[str]:
     )
 
 
+def validate_reference_training(args: Any) -> None:
+    """Reject deployment paths whose reference consumers are not wired."""
+    if not references_enabled() or not rollout_kinds(args):
+        return
+    if (
+        getattr(args, "train_backend", None) != "megatron"
+        or not getattr(args, "colocate", False)
+        or getattr(args, "fully_async", False)
+        or getattr(args, "hybrid", False)
+    ):
+        raise ValueError(
+            "Reference replay currently requires colocated Megatron training; "
+            "hybrid and fully-async reference consumption are not implemented"
+        )
+
+
 def replay_fields(fields: list[str]) -> list[str]:
     return ReplayConfig.from_env().fields(fields)
 

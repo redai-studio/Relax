@@ -1,0 +1,37 @@
+diff --git a/fla/ops/common/chunk_o.py b/fla/ops/common/chunk_o.py
+--- a/fla/ops/common/chunk_o.py
++++ b/fla/ops/common/chunk_o.py
+@@ -4,6 +4,8 @@
+ # LICENSE file in the root directory of this source tree.
+ # For a list of all contributors, visit:
+ #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
++
++import os
+ 
+ import torch
+ import triton
+@@ -21,6 +23,15 @@
+     check_shared_mem,
+ )
+ 
++def _relax_bool_env(name):
++    value = os.environ.get(name, "0").strip().lower()
++    if value in {"1", "t", "true", "y", "yes", "on"}:
++        return True
++    if value in {"0", "f", "false", "n", "no", "off"}:
++        return False
++    raise ValueError(f"Invalid boolean for {name}: {value!r}")
++
++
+ BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
+ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+ 
+@@ -31,7 +42,7 @@
+     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+ })
+ @fla_cache_autotune(
+-    configs=[
++    configs=[triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3)] if _relax_bool_env('RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG') else [
+         triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
+         triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
+         triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
