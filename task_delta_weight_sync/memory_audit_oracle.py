@@ -9,7 +9,6 @@ overwrite the tested models before their delivered-state dumps are saved.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from time import monotonic
@@ -19,7 +18,7 @@ from typing import Any
 def check_version(actor: Any, receipt_path: str, output: str) -> dict:
     from relax.distributed.weight_sync.store import atomic_write
     from relax.distributed.weight_sync.tensor_diff import compare
-    from task_delta_weight_sync.memory_audit import snapshot_engine
+    from task_delta_weight_sync.memory_audit import file_sha256, snapshot_engine
 
     receipt = json.loads(Path(receipt_path).read_text())
     if receipt["status"] != "CAPTURED_NOT_COMPARED" or len(receipt["captured"]) != 8:
@@ -39,8 +38,7 @@ def check_version(actor: Any, receipt_path: str, output: str) -> dict:
         path = export / name
         if not path.resolve().is_relative_to(export.resolve()):
             raise ValueError("HF manifest path escapes the exported checkpoint")
-        with path.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        digest = file_sha256(path)
         if path.stat().st_size != expected["bytes"] or digest != expected["sha256"]:
             raise ValueError(f"Independent HF file changed: {name}")
     engine = actor.engine

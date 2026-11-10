@@ -17,6 +17,15 @@ from time import monotonic, sleep
 from typing import Any
 
 
+def file_sha256(path: Path) -> str:
+    """Bounded-memory hashing, including Python 3.10 benchmark environments."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def snapshot_engine(engine: Any, destination: str, expected_update: str) -> dict:
     import ray
     import requests
@@ -204,9 +213,9 @@ def install(args: Any) -> None:
                 files = {}
                 for path in sorted(export.rglob("*")):
                     if path.is_file():
-                        with path.open("rb") as stream:
-                            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                        files[str(path.relative_to(export))] = dict(bytes=path.stat().st_size, sha256=digest)
+                        files[str(path.relative_to(export))] = dict(
+                            bytes=path.stat().st_size, sha256=file_sha256(path)
+                        )
                 if not any(name.endswith(".safetensors") for name in files):
                     raise RuntimeError("Independent HF export has no weight shards")
                 receipt = report[0] | dict(
