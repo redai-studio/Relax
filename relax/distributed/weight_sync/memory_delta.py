@@ -19,16 +19,20 @@ class MemoryBucket:
     encoding: str
     payload: bytes
     snapshot: Any
+    dtype: str = "bfloat16"
 
     def metadata(self) -> dict:
-        return {
+        metadata = {
             "names": self.names,
             "elements": self.elements,
             "changed": self.changed,
             "encoding": self.encoding,
+            "dtype": self.dtype,
             "bytes": len(self.payload),
             "sha256": hashlib.sha256(self.payload).hexdigest(),
         }
+        _validate_bucket_structure(metadata, self.payload, max_bytes=len(self.payload))
+        return metadata
 
 
 class MemoryDeltaEncoder:
@@ -133,6 +137,12 @@ class MemoryDeltaEncoder:
 def validate_bucket(metadata: dict, payload: bytes, *, max_bytes: int) -> None:
     """Validate the complete byte frame before exposing it to the GPU
     loader."""
+    _validate_bucket_structure(metadata, payload, max_bytes=max_bytes)
+    if hashlib.sha256(payload).hexdigest() != metadata.get("sha256"):
+        raise ValueError("Memory bucket checksum mismatch")
+
+
+def _validate_bucket_structure(metadata: dict, payload: bytes, *, max_bytes: int) -> None:
     import math
 
     for key in ("elements", "changed", "bytes"):
@@ -142,11 +152,12 @@ def validate_bucket(metadata: dict, payload: bytes, *, max_bytes: int) -> None:
     if not 0 < count < 2**31 or changed > count:
         raise ValueError("Invalid memory bucket element count")
     encoding = metadata.get("encoding")
-    size = count * 2 if encoding == "full" else changed * 6 if encoding == "sparse" else -1
+    width = {"bfloat16": 2, "float32": 4}.get(metadata.get("dtype", "bfloat16"))
+    if width is None:
+        raise ValueError("Unsupported memory bucket dtype")
+    size = count * width if encoding == "full" else changed * (4 + width) if encoding == "sparse" else -1
     if size != len(payload) or size != metadata["bytes"] or size > max_bytes:
         raise ValueError("Invalid memory bucket payload size")
-    if hashlib.sha256(payload).hexdigest() != metadata.get("sha256"):
-        raise ValueError("Memory bucket checksum mismatch")
     names, total = set(), 0
     for name, shape in metadata["names"]:
         if not isinstance(name, str) or not name or name in names:

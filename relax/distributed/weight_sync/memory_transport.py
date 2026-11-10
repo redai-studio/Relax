@@ -115,6 +115,7 @@ class MemorySource:
         schema: str,
         members: set[str],
         reset: bool = False,
+        group_update: str | None = None,
     ) -> dict:
         if not members or any(not isinstance(m, str) or not m for m in members):
             raise ValueError("A memory update requires fixed inference members")
@@ -124,10 +125,30 @@ class MemorySource:
             raise ValueError("Memory update exceeds its host budget")
         if reset and any(b.encoding != "full" for b in buckets):
             raise ValueError("A memory reset requires every bucket in FULL form")
+        if any(type(b.payload) is not bytes for b in buckets):
+            raise ValueError("Memory payloads must be immutable bytes")
+        # A caller may rebind fields on its pending GPU bucket after publish.
+        # Retain independent metadata and only its exact immutable CPU bytes.
+        buckets = [
+            MemoryBucket(
+                tuple((name, tuple(shape)) for name, shape in b.names),
+                b.elements,
+                b.changed,
+                b.encoding,
+                b.payload,
+                None,
+                b.dtype,
+            )
+            for b in buckets
+        ]
+        # metadata() checks structure and hashes these local payloads once.
+        # Network receivers independently verify the complete immutable frame.
         metadata = [b.metadata() for b in buckets]
-        for item, bucket in zip(metadata, buckets):
-            validate_bucket(item, bucket.payload, max_bytes=self.host_budget_bytes)
         manifest = dict(stream=stream, version=version, base=base, schema=schema, reset=reset, buckets=metadata)
+        if group_update is not None:
+            if not isinstance(group_update, str) or not group_update:
+                raise ValueError("Invalid memory group update identity")
+            manifest["group_update"] = group_update
         manifest["update"] = hashlib.sha256(_json(manifest)).hexdigest()
         token = secrets.token_hex(32)
         with self._lock:

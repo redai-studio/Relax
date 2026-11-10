@@ -41,8 +41,9 @@ def load_memory_weights(model: Any, weights: list[tuple[str, Any]]) -> None:
     def apply(manifest: dict, payloads: list[bytes]) -> None:
         arrived = monotonic()
         stages["receive_validate_s"] = arrived - started
-        receiver.apply(manifest, payloads)
-        # Includes the receiver's second validation and completed GPU writes.
+        # receive_memory_update validates every immutable frame before calling
+        # us; keep sequence, layout and GPU checks without hashing it twice.
+        receiver._apply_validated(manifest, payloads)
         stages["validate_apply_s"] = monotonic() - arrived
 
     manifest = receive_memory_update(
@@ -230,9 +231,18 @@ class MemoryModelReceiver:
         self.routes: list[list[CopyRoute]] = []
 
     def apply(self, manifest: dict, payloads: list[bytes]) -> None:
-        import torch
-
         from relax.distributed.weight_sync.memory_delta import validate_bucket
+
+        metadata = manifest["buckets"]
+        if len(metadata) != len(payloads) or sum(map(len, payloads)) > self.host_budget_bytes:
+            raise ValueError("Invalid memory update payload count or host budget")
+        for item, payload in zip(metadata, payloads):
+            validate_bucket(item, payload, max_bytes=self.host_budget_bytes)
+        self._apply_validated(manifest, payloads)
+
+    def _apply_validated(self, manifest: dict, payloads: list[bytes]) -> None:
+        """Apply frames already checked by apply() or the TCP receive loop."""
+        import torch
 
         # Derived persistent buffers would need their own source/update rules.
         # Rotary/cache buffers marked nonpersistent are outside model weights.
@@ -245,8 +255,8 @@ class MemoryModelReceiver:
         metadata = manifest["buckets"]
         if len(metadata) != len(payloads) or sum(map(len, payloads)) > self.host_budget_bytes:
             raise ValueError("Invalid memory update payload count or host budget")
-        for item, payload in zip(metadata, payloads):
-            validate_bucket(item, payload, max_bytes=self.host_budget_bytes)
+        if any(item.get("dtype", "bfloat16") != "bfloat16" for item in metadata):
+            raise ValueError("The Dense memory loader requires BF16 frames")
         reset = manifest.get("reset") is True
         if type(manifest.get("version")) is not int or type(manifest.get("base")) is not int:
             raise ValueError("Invalid memory version")
