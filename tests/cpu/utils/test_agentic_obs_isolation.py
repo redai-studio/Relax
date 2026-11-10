@@ -685,7 +685,8 @@ def test_custom_converter_identity_failure_keeps_business_rows(ids):
     exec("from __future__ import annotations\n" + ast.unparse(function), scope)
     samples = [NS(sample_export_id=7, agentic_group_id="a"), NS(sample_export_id=8, agentic_group_id="b")]
     result = scope["convert_samples_to_train_data"](
-        Namespace(custom_convert_samples_to_train_data_path="custom"), samples
+        Namespace(custom_convert_samples_to_train_data_path="custom", advantage_estimator="grpo"),
+        samples,
     )
     assert result is converted and result["total_lengths"] == [2, 3] and result["sample_indices"] == [5, 6]
     assert result["sample_export_ids"] == ([8, 7] if ids == [8, 7] else [-1, -1])

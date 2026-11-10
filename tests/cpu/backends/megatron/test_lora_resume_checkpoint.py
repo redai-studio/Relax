@@ -27,6 +27,8 @@ class _AdapterModel(torch.nn.Module):
 def _runtime_args():
     return SimpleNamespace(
         hf_checkpoint="/models/base",
+        # load_checkpoint → is_rm_mode() reads loss_type directly.
+        loss_type="policy_loss",
         lora_rank=8,
         lora_alpha=16,
         lora_dropout=0.05,
