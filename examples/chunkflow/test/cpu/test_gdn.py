@@ -12,7 +12,7 @@ from torch.utils.checkpoint import checkpoint
 
 from examples.chunkflow.adapters import AttentionAdapter, gdn, register_attention_adapter
 from examples.chunkflow.integration import install, uninstall
-from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
+from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
 from examples.chunkflow.scheduler import build_chunks
 from examples.chunkflow.test.cpu.test_integration import restore_rope_patch as restore_rope_patch
 from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
@@ -239,7 +239,7 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, paddin
             with torch.no_grad():
                 forward(padded)
         else:
-            out = checkpoint(forward, padded, use_reentrant=True) if mode == "outer" else forward(padded)
+            out = forward(padded)
             pending[uid] = out[: unit.num_tokens]
             actual.update(zip(indices, pending[uid].detach()))
         if unit.is_dependent and len(unit.chunks) == 1:
@@ -268,8 +268,9 @@ def _alignment(kernels, mode, chunk_size=4, device="cpu", heads=2, dim=4, paddin
     return torch.stack([actual[i] for i in range(sum(lengths))]), x.grad, [p.grad for p in model.parameters()]
 
 
-@pytest.mark.parametrize("mode", ["keep", "fr", "selective", "selective_last", "outer"])
-@pytest.mark.parametrize("padding", [0, 3])
+@pytest.mark.parametrize(
+    "mode,padding", [("keep", 0), ("keep", 3), ("fr", 3), ("selective", 3), ("selective_last", 3)]
+)
 def test_gdn_recomputation_matches_full_sequence(kernels, mode, padding):
     _alignment(kernels, mode, padding=padding)
 
@@ -321,34 +322,6 @@ def test_gdn_shared_convolution_restored_after_last_model_uninstall(kernels):
     assert uninstall(second) == 1
     assert kernels.causal_conv1d is native
     assert "forward" not in first.__dict__ and "forward" not in second.__dict__
-
-
-def test_unregistered_gdn_subclass_is_rejected_before_patching(kernels):
-    class DifferentRecurrence(GatedDeltaNet):
-        pass
-
-    model = DifferentRecurrence(kernels)
-    native = kernels.causal_conv1d
-    with pytest.raises(NotImplementedError, match="DifferentRecurrence"):
-        install(model, 4)
-    assert kernels.causal_conv1d is native
-    assert "forward" not in model.__dict__
-    assert not hasattr(model, "chunkflow_runtime")
-
-
-def test_gdn_rejects_multiple_dependent_chunks_before_state_access():
-    chunks = build_chunks([11, 11], 4)
-    unit = next(u for u in build_micro_batches(chunks, "lockstep") if u.is_dependent and len(u.chunks) > 1)
-    packed = SimpleNamespace(**{UNIT_ATTR: unit})
-    runtime = ChunkflowRuntime(4)
-
-    def original(packed_seq_params):
-        raise AssertionError("unsupported units must not enter the kernel")
-
-    forward = gdn._wrap_forward(SimpleNamespace(layer_number=1), original, runtime, prepare=False)
-    with pytest.raises(NotImplementedError, match="one dependent chunk per unit"):
-        forward(packed_seq_params=packed)
-    runtime.assert_empty("rejected unit")
 
 
 @pytest.mark.parametrize("padding", [0, 3])

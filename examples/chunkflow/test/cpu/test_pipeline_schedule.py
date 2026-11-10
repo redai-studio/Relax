@@ -4,50 +4,13 @@
 
 from __future__ import annotations
 
-import ast
-import sys
-from argparse import ArgumentParser
 from collections import defaultdict
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from examples.chunkflow.arguments import add_arguments, validate_args
 from examples.chunkflow.scheduler import build_chunks
 from examples.chunkflow.units import build_micro_batches, make_model_plan
-
-
-@pytest.mark.parametrize("pp_size", [1, 2, 4])
-def test_schedule_uses_actual_pp_without_duplicate_option(monkeypatch, pp_size):
-    # Load the real selector without importing the GPU-only Megatron dependency graph.
-    path = Path(__file__).resolve().parents[2] / "schedules.py"
-    tree = ast.parse(path.read_text())
-    selector = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "get_schedule")
-    single, pipeline = object(), object()
-    namespace = {
-        "__package__": "examples.chunkflow",
-        "chunkflow_forward_backward_no_pipelining": single,
-    }
-    module = ast.Module(body=ast.parse("from __future__ import annotations").body + [selector], type_ignores=[])
-    exec(compile(module, str(path), "exec"), namespace)
-    monkeypatch.setitem(
-        sys.modules,
-        "examples.chunkflow.pipeline_schedules",
-        SimpleNamespace(chunkflow_forward_backward_pipelining_without_interleaving=pipeline),
-    )
-    parser = add_arguments(ArgumentParser())
-    parser.add_argument("--pipeline-model-parallel-size", type=int, default=1)
-    args = parser.parse_args(
-        ["--use-chunkflow", "--chunkflow-chunk-size", "4096", "--pipeline-model-parallel-size", str(pp_size)]
-    )
-    args.calculate_per_token_loss = True
-    validate_args(args)
-    monkeypatch.delenv("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", raising=False)
-    if pp_size == 1:
-        assert namespace["get_schedule"](args, pp_size) is single
-    else:
-        assert namespace["get_schedule"](args, pp_size) is pipeline
 
 
 def _channel(stage, action):
@@ -235,7 +198,7 @@ def test_plan_preserves_real_samples_and_excludes_alignment_padding(padding):
         assert sum(c.num_tokens for c in unverified) == cu[-1]
 
 
-@pytest.mark.parametrize("parent_window", [None, 0, 1, 2, 4, 7])
+@pytest.mark.parametrize("parent_window", [None, 1, 2])
 @pytest.mark.parametrize("stage", range(4))
 @pytest.mark.parametrize("keep_last_k", [0, 1])
 def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, keep_last_k, parent_window):

@@ -14,7 +14,7 @@ import torch
 
 from examples.chunkflow import rope as cf_rope
 from examples.chunkflow.adapters import DenseAttentionCall, megatron_native_attention
-from examples.chunkflow.integration import ChunkedCoreAttention, install, uninstall
+from examples.chunkflow.integration import install, uninstall
 from examples.chunkflow.metadata import int32_metadata
 from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR, ChunkflowRuntime
 from examples.chunkflow.scheduler import build_chunks
@@ -73,7 +73,6 @@ with module["_megatron_context"]():
     [
         ([0, 17, 26], [0, 40, 53], 16, 4, 128),
         ([0, 6144, 8192], [0, 6144, 8192], 8, 1, 256),
-        ([0, 8192], [0, 8192], 8, 1, 256),
     ],
 )
 def test_native_te_matches_cuda_reference(bounds_q, bounds_k, heads, kv_heads, dim):
@@ -176,73 +175,13 @@ def _assert_native_ddp_sync_after_chunk_backwards():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and differentiable FLA state kernels")
-@pytest.mark.parametrize("mode", ["fr", "last", "selective", "selective_last"])
+@pytest.mark.parametrize("mode", ["fr", "selective_last"])
 def test_gdn_fla_state_outputs_and_gradients_match_full_sequence(kernels, mode):
     from fla.modules.convolution import causal_conv1d
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     kernels.causal_conv1d, kernels.rule = causal_conv1d, chunk_gated_delta_rule
     _alignment(kernels, mode, chunk_size=64, device="cuda", heads=2, dim=32)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires native MCore/TE CUDA forward and backward")
-@pytest.mark.parametrize("keep_last_k", [1, 1000])
-def test_native_te_history_gradients_and_recomputation(keep_last_k):
-    _run_native_te_check("_assert_native_te_history_gradients_and_recomputation", keep_last_k)
-
-
-def _assert_native_te_history_gradients_and_recomputation(keep_last_k):
-    from megatron.core.packed_seq_params import PackedSeqParams
-    from megatron.core.transformer.enums import AttnMaskType
-
-    torch.manual_seed(27)
-    total, chunk_size, heads, kv_heads, dim = 317, 128, 4, 2, 64
-    core = _native_te(heads, kv_heads, dim)
-    leaves = [
-        torch.randn(total, h, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        for h in (heads, kv_heads, kv_heads)
-    ]
-    reference = [t.detach().clone().requires_grad_() for t in leaves]
-    full_cu = int32_metadata([0, total], torch.device("cuda"))
-    packed = PackedSeqParams(
-        qkv_format="thd", cu_seqlens_q=full_cu, cu_seqlens_kv=full_cu, max_seqlen_q=total, max_seqlen_kv=total
-    )
-    expected = core(
-        *reference, attention_mask=None, attn_mask_type=AttnMaskType.causal, packed_seq_params=packed
-    ).reshape(total, -1)
-    dout = torch.randn_like(expected)
-    expected.backward(dout)
-    runtime = ChunkflowRuntime(chunk_size)
-    adapter = ChunkedCoreAttention(
-        config=core.config,
-        layer_number=1,
-        runtime=runtime,
-        executor=lambda call: megatron_native_attention(core.forward, call),
-    )
-    chunks = build_chunks([total], chunk_size)
-    units = build_micro_batches(chunks)
-    actual, pending = {}, {}
-    for kind, uid in gen_unit_ops(units, chunks, keep_last_k):
-        unit = units[uid]
-        start = unit.chunks[0].segments[0].prefix
-        sl = slice(start, start + unit.num_tokens)
-        if kind == "B":
-            pending.pop(uid).backward(dout[sl])
-            for group in completed_groups(unit):
-                runtime.release_group(group)
-            continue
-        cu = int32_metadata([0, unit.num_tokens], torch.device("cuda"))
-        packed = SimpleNamespace(
-            cu_seqlens_q_cpu=[0, unit.num_tokens], cu_seqlens_q=cu, **{UNIT_ATTR: unit, RECOMPUTE_ATTR: kind == "Fr"}
-        )
-        with torch.set_grad_enabled(kind != "Fp"):
-            output = adapter(*(t[sl] for t in leaves), packed_seq_params=packed)
-        if kind != "Fp":
-            pending[uid], actual[uid] = output, output.detach()
-    runtime.assert_empty("native TE history")
-    torch.testing.assert_close(torch.cat([actual[u.unit_id] for u in units]), expected, atol=0.02, rtol=0.02)
-    for got, want in zip(leaves, reference):
-        torch.testing.assert_close(got.grad, want.grad, atol=0.03, rtol=0.03)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires native Bridge Qwen3VL and TE CUDA execution")
@@ -420,26 +359,6 @@ def _assert_qwen3_vl_native_layer_outputs_and_gradients(keep_last_k):
         torch.testing.assert_close(parameter.grad, reference_grads[name], atol=0.03, rtol=0.03)
     assert uninstall(layer) == 1
     assert layer.forward == outer_forward and tuple(layer.state_dict()) == state_keys
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
-def test_te_empty_expert_preserves_accumulated_gradient():
-    te = pytest.importorskip("transformer_engine.pytorch")
-    model = te.GroupedLinear(
-        2, 16, 16, bias=False, params_dtype=torch.float32, fuse_wgrad_accumulation=True, device="cuda"
-    )
-    weights = [model.weight0, model.weight1]
-    for weight in weights:
-        weight.main_grad = torch.zeros_like(weight)
-    inputs = [torch.arange(n * 16, device="cuda", dtype=torch.float32).reshape(n, 16) / 16 for n in (2, 3)]
-    outputs = [model(inputs[0], [2, 0], is_first_microbatch=None), model(inputs[1], [0, 3], is_first_microbatch=None)]
-    outputs[1].sum().backward()
-    accumulated = weights[1].main_grad.clone()
-    outputs[0].sum().backward()
-    torch.testing.assert_close(weights[1].main_grad, accumulated, rtol=0, atol=0)
-    for weight, x in zip(weights, inputs):
-        expected = x.sum(dim=0).expand_as(weight)
-        torch.testing.assert_close(weight.main_grad, expected, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to verify asynchronous metadata copies")

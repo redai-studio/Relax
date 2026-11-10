@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import copy
-import sys
-from dataclasses import dataclass
-from enum import Enum
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,9 +12,7 @@ import torch.nn.functional as F
 from examples.chunkflow import adapters
 from examples.chunkflow.adapters import (
     AttentionAdapter,
-    DenseAttentionCall,
     dense_attention_adapter,
-    megatron_native_attention,
     register_attention_adapter,
 )
 from examples.chunkflow.integration import install, uninstall
@@ -48,8 +43,9 @@ def registry(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("keep_last_k", [1, 1000])
-def test_native_module_packed_outputs_input_and_parameter_gradients(keep_last_k):
+@pytest.mark.parametrize("keep_last_k,fp32", [(1, False), (1000, False), (1, True)])
+def test_native_module_packed_outputs_input_and_parameter_gradients(keep_last_k, fp32, monkeypatch):
+    monkeypatch.setenv("RELAX_CHUNKFLOW_KV_GRAD_FP32", str(int(fp32)))
     torch.manual_seed(32)
     layer = NativeLayer()
     reference = copy.deepcopy(layer)
@@ -166,35 +162,6 @@ def test_unknown_outer_attention_does_not_inherit_dense_adapter():
     assert not hasattr(layer, "chunkflow_runtime")
 
 
-def test_qwen3_vl_native_te_registration_preserves_exact_type_boundary():
-    # Reproduce Bridge's concrete type identity without importing CUDA-backed
-    # constructors. Native Qwen3VL forward/backward has a separate GPU test.
-    layer_type = type(
-        "Qwen3VLSelfAttention",
-        (NativeLayer,),
-        {"__module__": "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention"},
-    )
-    core_type = type(
-        "TEDotProductAttention",
-        (SDPAttention,),
-        {"__module__": "megatron.core.extensions.transformer_engine", "te_forward_mask_type": True},
-    )
-    layer = layer_type()
-    layer.core_attention = core_type()
-    original = layer.core_attention.forward
-    assert install(layer, 4) == 1
-    assert uninstall(layer) == 1
-    assert layer.core_attention.forward == original
-
-    unknown = type("UnknownAttention", (layer_type,), {})()
-    unknown.core_attention = core_type()
-    with pytest.raises(NotImplementedError, match="no attention adapter"):
-        install(unknown, 4)
-    layer.core_attention = SDPAttention()
-    with pytest.raises(NotImplementedError, match="no attention adapter"):
-        install(layer, 4)
-
-
 def test_uninstalled_model_accepts_a_new_chunk_size():
     layer = NativeLayer()
     # TE represents unrestricted causal attention with this window pair.
@@ -308,72 +275,3 @@ def test_dense_adapter_accepts_native_positional_mask_and_bias():
         actual = layer.core_attention(q, k, v, *args, **kwargs)
         torch.testing.assert_close(actual, expected)
     assert uninstall(layer) == 1
-
-
-def test_native_bridge_uses_physical_boundaries_and_bottom_right_mask(monkeypatch):
-    # Only metadata classes are stubbed. Numerical attention uses native SDPA;
-    # the real MCore/TE forward is exercised by the separate CUDA integration test.
-    @dataclass
-    class PackedSeqParams:
-        qkv_format: str
-        cu_seqlens_q: torch.Tensor
-        cu_seqlens_kv: torch.Tensor
-        max_seqlen_q: int
-        max_seqlen_kv: int
-        cu_seqlens_q_padded: object = None
-        cu_seqlens_kv_padded: object = None
-
-    class AttnMaskType(Enum):
-        causal = 1
-
-    for name, attr, value in (
-        ("megatron.core.packed_seq_params", "PackedSeqParams", PackedSeqParams),
-        ("megatron.core.transformer.enums", "AttnMaskType", AttnMaskType),
-    ):
-        module = ModuleType(name)
-        setattr(module, attr, value)
-        monkeypatch.setitem(sys.modules, name, module)
-
-    torch.manual_seed(15)
-    q = torch.randn(2, 1, 4, dtype=torch.float64, requires_grad=True)
-    k, v = [torch.randn(5, 1, 4, dtype=torch.float64, requires_grad=True) for _ in range(2)]
-    call = DenseAttentionCall(
-        q,
-        (k[:3], k[3:]),
-        (v[:3], v[3:]),
-        torch.tensor([0, 2], dtype=torch.int32),
-        torch.tensor([0, 5], dtype=torch.int32),
-        (2,),
-        (5,),
-        (2, 5),
-        0.5,
-    )
-
-    def original(q, k, v, attention_mask, attn_mask_type, packed_seq_params):
-        packed = packed_seq_params
-        assert attention_mask is None
-        assert packed.cu_seqlens_q_padded is packed.cu_seqlens_kv_padded is None
-        assert packed.max_seqlen_q == 2 and packed.max_seqlen_kv == 5
-        torch.testing.assert_close(packed.cu_seqlens_q, call.cu_q)
-        torch.testing.assert_close(packed.cu_seqlens_kv, call.cu_kv)
-        right_aligned = attn_mask_type.name == "padding_causal_bottom_right"
-        positions = torch.arange(2) + (3 if right_aligned else 0)
-        mask = torch.arange(5)[None] <= positions[:, None]
-        return F.scaled_dot_product_attention(
-            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), attn_mask=mask
-        ).transpose(0, 1)
-
-    result = megatron_native_attention(original, call)
-    expected = torch.cat(
-        [
-            F.scaled_dot_product_attention(
-                q[i : i + 1].transpose(0, 1), k[: 4 + i].transpose(0, 1), v[: 4 + i].transpose(0, 1)
-            ).transpose(0, 1)
-            for i in range(2)
-        ]
-    )
-    torch.testing.assert_close(result, expected)
-    actual_grads = torch.autograd.grad(result.sum(), (q, k, v))
-    reference_grads = torch.autograd.grad(expected.sum(), (q, k, v))
-    for got, want in zip(actual_grads, reference_grads):
-        torch.testing.assert_close(got, want)

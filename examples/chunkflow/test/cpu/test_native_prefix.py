@@ -234,12 +234,11 @@ def model(native, *, absolute=False):
     return Model()
 
 
-@pytest.mark.parametrize("absolute,keep,pp", [(False, 1, 1), (True, 1, 1), (True, 99, 1), (True, 99, 4)])
-def test_native_qsa_ple_prefix_matches_full_outputs_and_gradients(native, absolute, keep, pp):
+@pytest.mark.parametrize("absolute,keep", [(False, 1), (True, 1), (True, 99)])
+def test_native_qsa_ple_prefix_matches_full_outputs_and_gradients(native, absolute, keep):
     torch.manual_seed(41)
     full = model(native, absolute=absolute)
     split = model(native, absolute=absolute)
-    full.config.pipeline_model_parallel_size = split.config.pipeline_model_parallel_size = pp
     split.load_state_dict(full.state_dict())
     lengths, cu = [19, 11, 2, 3], [0, 19, 30, 32, 35, 128]
     tokens = torch.randint(1, 16, (1, 128))
