@@ -1,46 +1,69 @@
-# OpenSearch-VL：SFT 与评测
+# OpenSearch-VL Benchmark
 
-本例使用完整的图文工具轨迹训练 Qwen3.5-4B / Qwen3.6-27B。数据准备不按长度过滤；训练在 32K token 上限下跳过超长样本，训练两轮，只在最后保存并导出模型，开启 ClearML。
+统一记录不同模型在 OpenSearch-VL 数据上的 SFT 与评测效果。每个模型有独立启动脚本和实验文档，共用数据处理、评测协议与指标定义。当前只评测SimpleVQA，采用无工具Direct Answer；带工具 Agentic 结果单独报告。
 
-- [数据准备](data-preparation.md)：原始七域数据、ZIP 图片读取、切分与真实 Processor 审计。
-- [训练后模型评测](evaluation.md) / [English](evaluation.en.md)：SimpleVQA英文test和VDR testmini的无工具问答与MaaS判分；工具Agent为可选模式。
-- [评测方案对比与工具准备](evaluation-setup.md)：其他GitHub项目的协议区别、工具依赖来源与准备方式。
-- [Qwen3.5-4B 验证记录与阻塞项](results/qwen3.5-4b.md)：区分历史训练产物、上传验证版本和正式 benchmark。
+## 评测结果汇总
 
-## 训练入口
+每次正式基准测试保留一行，按模型分组、时间倒序；空白表示尚无结果。分数为 Pass@1（%，原始 / 去重），失败题保留在分母。去重题集由本次实际 SFT train 决定，不同去重集合不能直接排名。
 
-环境需已有匹配的 PyTorch、Megatron、SGLang、Ray 和 ClearML 配置；以下路径由运行环境提供，不将内网地址或密钥写进仓库：
+| 模型        | 阶段 / 预算     | 状态       | 启动时间 UTC        | 训练 commit    |  SimpleVQA EN | SwanLab                                                                                                                                                                           | 实验文档                                      |
+| ----------- | --------------- | ---------- | ------------------- | -------------- | ------------: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| Qwen3.5-4B  | Base            | 完成       | 2026-11-10 08:33:48 |                | 45.11 / 46.38 | [评测](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/5210g8ibu4eo0y0zzg6ft)                                                                                           | [详情](results/qwen3.5-4b.md#baseline)        |
+| Qwen3.5-4B  | SFT / 100 steps | 完成       | 2026-11-10 07:04:49 | `28f866220dc3` | 42.74 / 43.93 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/ejccsn9ib17s2swcq6z40) · [评测](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/emr9mnx3q7y5z6e6z3pfi) | [详情](results/qwen3.5-4b.md#sft100-20261110) |
+| Qwen3.6-27B | SFT / 2 epochs  | 训练未完成 |                     | `1c621a84ae89` |               |                                                                                                                                                                                   | [详情](results/qwen3.6-27b.md)                |
+
+当前分数均为 Direct Answer、temperature=0、thinking 开启、32K 总上下文。完整生成配置、裁判和评测 commit 见模型文档。SimpleVQA全量对比中，100步SFT比Base低2.37个百分点。评测代码仅裁判重试及帮助文字有差异，已人工审计并保留各自源码SHA，见模型文档；100步是短程实验。[公开参考基准](benchmark-references.md)中的工具模式及其他裁判分数另列。
+
+已有VDR分数保留在模型历史文档中；后续实验、数据下载和默认比较均只要求SimpleVQA。
+
+## 目录与入口
+
+| 路径                                                                 | 用途                                                   |
+| -------------------------------------------------------------------- | ------------------------------------------------------ |
+| [data-preparation.md](data-preparation.md)                           | 七域数据、图片处理、固定切分及真实 Processor 审计      |
+| [evaluation.md](evaluation.md)                                       | 数据版本、Direct Answer 协议、裁判配置、运行与结果比较 |
+| [evaluation-setup.md](evaluation-setup.md)                           | 可选工具环境和其他评测实现的区别                       |
+| [benchmark-references.md](benchmark-references.md)                   | 公开 Direct Reasoning、Agentic、纯 SFT 参考分数        |
+| [scripts/run-qwen3.5-4B-8xgpu.sh](scripts/run-qwen3.5-4B-8xgpu.sh)   | Qwen3.5-4B 的训练、基准评测与比较入口                  |
+| [scripts/run-qwen3.6-27B-8xgpu.sh](scripts/run-qwen3.6-27B-8xgpu.sh) | Qwen3.6-27B 模型配置及共用入口                         |
+| [configs/benchmark.env.example](configs/benchmark.env.example)       | 模型、裁判与可选工具的配置占位符                       |
+| [results/](results/)                                                 | 每模型一个 Markdown 文档，新实验插在旧实验之前         |
+| [templates/model-results.md](templates/model-results.md)             | 新模型文档与每次实验的记录模板                         |
+| [tools/](tools/)                                                     | 数据准备/审计、评测、比较、服务验证和 SwanLab 同步实现 |
+
+## 训练
+
+先按数据准备文档生成七域完整训练集。预处理不按长度过滤，训练在 32K 上限下跳过超长样本；默认训练 2 epochs，只在最后保存 native/HF 权重，不保存 optimizer/RNG。
+
+在已经配置好的 8 GPU Ray 环境，从仓库根目录运行：
 
 ```bash
 export MODEL_DIR=/path/to/models
 export HF_CHECKPOINT="${MODEL_DIR}/Qwen3.5-4B"
 export DATA_DIR=/path/to/data
-export EXP_DIR=/path/to/experiments
-export SAVE_DIR="${EXP_DIR}/opensearchvl/my-run/outputs"
+export SAVE_DIR=/path/to/experiment-artifacts
 export PROJECT_NAME=Relax/sft/opensearch-vl
-export EXP_NAME=qwen3.5-4b-opensearch-vl-32k-8xgpu
+export EXP_NAME=qwen3.5-4b-opensearch-vl-my-run
 export NUM_EPOCHS=2
 export GLOBAL_BATCH_SIZE=32
 export MAX_TOKENS_PER_GPU=32768
 bash scripts/entrypoint/ray-job.sh examples/opensearch_vl/scripts/run-qwen3.5-4B-8xgpu.sh relax
 ```
 
-在已配置的 8 GPU Ray 环境运行，提交默认阻塞等待。27B 改用 `run-qwen3.6-27B-8xgpu.sh` 和对应 HF 目录。TP/PP、整层重算及 optimizer CPU offload 由 `TP_SIZE / PP_SIZE / RECOMPUTE / OPTIMIZER_OFFLOAD_FRACTION` 调整，按实际显存和稳定吞吐选择，不能直接套用其他卡型的结果。
+短程实验可另设 `TRAIN_STEPS=100`；步数和 epoch 预算取先到者，必须记录实际完成量。27B 换用对应脚本与 HF 目录；TP/PP、重算、CPU optimizer offload 按实际显存和吞吐选择。
 
-正式训练每 100 步做验证集 loss/PPL；这与 SimpleVQA/VDR 工具评测是不同环节。`BENCHMARK_ONLY=1` 是训练性能测试，默认只跑 8 步、不保存模型，也不是任务准确率评测。
+脚本模式为 `relax`、`benchmark simplevqa <base|relax>`、`evaluate <HF目录> <base|relax>` 和 `compare`。`benchmark` 是公开数据集问答评测，`evaluate` 是留出轨迹决策评测；训练期间每 100 步的验证 loss/PPL 另行记录。`BENCHMARK_ONLY=1` 仅测试训练性能，默认 8 步、不保存权重。
 
-## 最终产物
+## 评测与实验记录
 
-训练脚本最后保存 Megatron 权重 `${SAVE_DIR}/${EXP_NAME}/relax`，并导出 `${SAVE_DIR}/${EXP_NAME}/final-hf-<step>`；不保存 optimizer/RNG，也不在中途保存 checkpoint。
+最终 HF 导出默认在 `${SAVE_DIR}/${EXP_NAME}/final-hf-<step>`。直接用该目录启动模型服务，再按评测文档运行SimpleVQA；无需先发布权重。每题一次生成、固定提示和裁判，保留失败题，并记录实际数据与模型来源。
 
-公共训练脚本自身不执行 QS 上传。QS 启动器会在后面串联最终目录改名、`model_tools` 上传、文件完整性/训练关联校验和服务验证；这些内部下载/上传启动配置留在 Git 外，由 `relax-ce` 的 `qs-opensearch-sft` skill 管理。成功后才清理 `${EXP_DIR}/opensearchvl/` 下本任务的临时目录，收据与评测日志保留在独立 results 目录。
+每个模型只维护一个 `results/<model>.md`。实验开始时在前方插入新记录，填写 run ID、启动时间、分支、训练/评测 commit 和 SwanLab 链接；结束后在同一节补齐题数、分数、失败情况与产物引用，同时更新上方总表。未确认的字段留空，未完成或限题测试不填正式分数。
 
-评测必须核对实际模型版本：`kind=upload-validation, epochs=0` 只说明上传链路验证成功，不能作为 Relax SFT 模型。正式版本应记录 `kind=trained-final`、完整 branch/commit、训练 Job/Trial，以及最终训练轮数。
+JSON、JSONL、逐题轨迹、日志、数据、缓存和权重保存在仓库外的 `SAVE_DIR`，不提交到 Git。配置示例只用占位符；文档中的产物引用使用可公开分享的位置，无法分享时留空。
 
-## SwanLab 指标同步
+## SwanLab
 
-QS 启动命令安装 `swanlab==0.7.16`，将认证文件安全复制到容器的 `~/.swanlab/.netrc`（权限600），再设置 `ENABLE_SWANLAB=1`。认证文件不放入代码库。训练同时保留 ClearML，并通过 TensorBoard 标量同步到 SwanLab。
+可在运行环境安装 `swanlab==0.7.16` 并完成认证，然后设置 `ENABLE_SWANLAB=1`、`SWANLAB_MODE=cloud`、`SWANLAB_PROJ_NAME`、`SWANLAB_WORKSPACE` 和 `SWANLAB_LOG_DIR`。训练保留 ClearML，并通过 TensorBoard 同步标量。认证文件留在运行环境。
 
-`SWANLAB_PROJ_NAME` 设置不含 `/` 的项目名；该固定SDK版本使用 `SWANLAB_MODE=cloud`。设置 `SWANLAB_LOG_DIR` 保存日志和看板链接，`SWANLAB_WORKSPACE` 选择目标workspace。运行器关闭自动环境、依赖、硬件及终端日志采集，只同步标量和明确设置的配置。Ray worker hook 在创建指标服务的 TensorBoard writer 时初始化 SwanLab，记录完整分支、commit、训练Job和Trial。其他worker不会主动创建实验。
-
-训练后可直接用本地最终HF导出运行无工具评测，无需上传模型。模型来源需标为 `kind=trained-final, origin=local-final-export`，验证权重索引、分片和文件hash，记录实际训练轮数、分支、commit、Job/Trial；MaaS配置通过私有文件或环境输入。评测结果写入持久结果目录后，仅清理本任务的数据和缓存，保留未上传的最终HF权重。
+同步 hook 关闭自动环境、依赖、硬件及终端日志采集，只同步标量和指定来源字段。实验文档分别记录训练与评测链接；实际裁判型号与协议也需写入文档。

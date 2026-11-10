@@ -1,21 +1,18 @@
 # 训练后模型评测
 
-[English](evaluation.en.md)
-
-当前默认采用 **Direct Answer：关闭全部工具，模型直接看图回答，由MaaS判分**。不需要搜索、图搜、OCR、图片上传或超分服务。
+当前默认采用 **Direct Answer：关闭全部工具，模型直接看图回答，由裁判模型判分**。不需要搜索、图搜、OCR、图片上传或超分服务。
 
 工具Agent保留为可选模式，区别与服务准备方式见[评测方案对比与工具准备](evaluation-setup.md)。
 
 ## 评什么
 
-对比**初始 Qwen3.5-4B**与**Relax SFT 模型**：
+对每个模型分别对比**初始权重**与**Relax SFT 权重**。模型脚本和实验历史见[汇总](README.md)：
 
-| 数据集             | 范围              | 指标   |
-| ------------------ | ----------------- | ------ |
-| SimpleVQA          | test 中全部英文题 | Pass@1 |
-| VDR-Bench-testmini | 全部 500 题       | Pass@1 |
+| 数据集    | 范围              | 指标   |
+| --------- | ----------------- | ------ |
+| SimpleVQA | test 中全部英文题 | Pass@1 |
 
-每题仅一次模型生成，温度0，保留thinking，输入和输出合计最多32K；不提供工具定义或历史轨迹，不执行工具。复用OpenSearch/VDR裁判prompt，通过MaaS判断最终答案的语义正确性，Pass@1为答对题数/全部题数。参考答案只给裁判。超限、无答案、错误工具调用和异常题均保留在分母，另报与SFT train去重后的分数。
+每题仅一次模型生成，温度0，保留thinking，输入和输出合计最多32K；不提供工具定义或历史轨迹，不执行工具。复用OpenSearch/VDR裁判prompt，通过裁判接口判断最终答案的语义正确性，Pass@1为答对题数/全部题数。参考答案只给裁判。超限、无答案、错误工具调用和异常题均保留在分母，另报与SFT train去重后的分数。
 
 模型服务容量允许时，可设置 `BENCHMARK_WORKERS=4` 并发生成答案；裁判可并行调用；`JUDGE_QPS`控制请求发起速率，默认1 QPS，设为0表示不限速。初始/SFT两组使用相同设置，结果记录评测代码分支、commit与源码hash。
 
@@ -33,19 +30,19 @@ cp examples/opensearch_vl/configs/benchmark.env.example /path/to/benchmark.env
 source /path/to/benchmark.env
 ```
 
-| 配置                                           | 用途                                       |
-| ---------------------------------------------- | ------------------------------------------ |
-| `OPENSEARCH_ROOT`                              | 上述工具代码目录                           |
-| `AGENT_BASE_URL / AGENT_MODEL`                 | 待评模型的 OpenAI 兼容接口                 |
-| `JUDGE_BASE_URL / JUDGE_MODEL / JUDGE_API_KEY` | MaaS 裁判模型，使用 `JUDGE_MODEL` 明确指定 |
+| 配置                                           | 用途                                  |
+| ---------------------------------------------- | ------------------------------------- |
+| `OPENSEARCH_ROOT`                              | 上述工具代码目录                      |
+| `AGENT_BASE_URL / AGENT_MODEL`                 | 待评模型的 OpenAI 兼容接口            |
+| `JUDGE_BASE_URL / JUDGE_MODEL / JUDGE_API_KEY` | 裁判模型，使用 `JUDGE_MODEL` 明确指定 |
 
-MaaS 裁判配置：`JUDGE_BASE_URL` 填接口地址去掉 `/chat/completions` 的部分，`JUDGE_MODEL` 填实际可调用的模型名称，`JUDGE_API_KEY_HEADER=api-key`，密钥填入本地环境的 `JUDGE_API_KEY`。保留原评分 prompt，结果记录实际裁判型号；这是内部裁判分数，与论文分数分开报告。
+裁判配置：`JUDGE_BASE_URL` 填接口地址去掉 `/chat/completions` 的部分，`JUDGE_MODEL` 填实际可调用的模型名称，`JUDGE_API_KEY_HEADER=api-key`，密钥填入本地环境的 `JUDGE_API_KEY`。保留原评分 prompt，结果记录实际裁判型号；更换论文所用裁判后，结果应与论文分数分开报告。
 
-客户端需具备Pillow、HF processor、PyArrow、OpenAI SDK和httpx。当前MaaS域名限制1 QPS，运行器对请求发起限速、允许裁判请求并行且关闭自动重试；结果记录实际裁判模型。
+客户端需具备Pillow、HF processor、PyArrow、OpenAI SDK和httpx。按服务实际限制设置 `JUDGE_QPS`；设为0表示不在客户端限速。裁判瞬时HTTP/连接故障最多重试2次，复用同一次生成的答案；最终失败仍保留记录和分母。结果记录实际裁判模型。
 
 ## 评测数据与去重
 
-下载固定版本，SimpleVQA 仅读取 `language == "EN"` 的 1,013 题，VDR 读取全部 500 题：
+当前仅评测 SimpleVQA 全部1,013道英文题；训练后自动评测、基座评测与默认比较均不要求VDR。下载固定版本，运行时读取 `language == "EN"`：
 
 ```python
 from huggingface_hub import hf_hub_download
@@ -54,14 +51,11 @@ benchmark_data_root = "/path/to/benchmark-datasets"
 hf_hub_download("m-a-p/SimpleVQA", repo_type="dataset",
     revision="037cf89fb6f1212691756b66d1ecde6c2ce89e54", filename="test.parquet",
     local_dir=f"{benchmark_data_root}/simplevqa")
-hf_hub_download("Osilly/Vision-DeepResearch-Eval", repo_type="dataset",
-    revision="deeaf45779a3bbd407d8f0ccb9b4831fc78e81c9", filename="data/testmini500_v1.parquet",
-    local_dir=f"{benchmark_data_root}/vdr")
 ```
 
 将 `BENCHMARK_DATA_ROOT` 设为相同下载目录。`BENCHMARK_OVERLAP_INDEX` 指向从实际 `train.jsonl` 生成的 JSON，包含 `questions` 和 `images` 两个 hash 列表。问题 hash 对首条用户消息去掉 `<image>`，再 casefold、合并空白并计算 UTF-8 SHA256；图片使用训练记录的 `metadata.image_hashes`，即原图 RGB 尺寸与像素的 SHA256。问题或任一图片命中都视为与训练重叠；去重分数仅统计未命中题目。
 
-`AGENT_PROVENANCE_FILE` 指向模型来源 JSON，包含实际 QS model/version/subversion、`served_model_name`、完整 branch/commit、训练 Job/Trial、`kind`、`epochs` 和 `hashes_verified=true`。从模型库下载时，先按上传收据校验文件，再写此标记；本地最终导出则检查权重索引和分片、计算文件hash，并记录 `origin=local-final-export`，无需上传回执。此标记不是自动校验的替代品。`relax` 标签只接受 `kind=trained-final` 的训练最终导出版本，并记录实际完成步数和轮数（短程实验单列），上传验证版本只能作为 baseline。
+`AGENT_PROVENANCE_FILE` 指向保存在运行产物目录的模型来源 JSON，记录模型名称与 revision、`served_model_name`、完整训练 branch/commit、`kind`、实际训练预算和 `hashes_verified=true`。验证模型文件与可信校验清单一致后再设置此标记。本地最终导出应检查权重索引和分片、计算文件 SHA256，并记录 `origin=local-final-export`。`relax` 标签只接受 `kind=trained-final`；基座与短程训练分别记录。该文件及逐题结果不提交到 Git。
 
 ## 运行
 
@@ -98,31 +92,29 @@ export AGENT_BASE_URL=http://127.0.0.1:30000/v1
 export AGENT_MODEL=Qwen3.5-4B
 SCRIPT=examples/opensearch_vl/scripts/run-qwen3.5-4B-8xgpu.sh
 bash "$SCRIPT" benchmark simplevqa base
-bash "$SCRIPT" benchmark vdr base
 ```
 
-停止初始模型服务，将 `--model-path` 换成选定的 Relax HF 模型目录，重启服务。当前训练脚本导出至 `${SAVE_DIR}/${EXP_NAME}/final-hf-<step>`；自动上传流程会将目录改名，加入完整分支、commit 和训练 Job/Trial。若临时目录已经清理，先从 QS 模型库下载对应的正式训练版本，再使用下载后的 HF 目录。
-
-确认所选版本的 `relax-artifact.json` 中 `kind=trained-final`，并记录实际 branch、commit、Job/Trial 和模型版本；`kind=upload-validation` 的版本仅用于验证上传流程，不作为训练后模型评测。
+初始模型评测完成后，停止对应服务，将 `--model-path` 换成选定的 Relax HF 目录并重新生成其共用模板。训练脚本默认导出至 `${SAVE_DIR}/${EXP_NAME}/final-hf-<step>`，可以直接用于推理。更新 `AGENT_PROVENANCE_FILE` 为该模型已经校验的来源文件；保持数据、图片处理、提示、生成预算、裁判和去重方式一致。
 
 再执行：
 
 ```bash
 export AGENT_MODEL=your-served-relax-model-name
 bash "$SCRIPT" benchmark simplevqa relax
-bash "$SCRIPT" benchmark vdr relax
 bash "$SCRIPT" compare
 ```
 
 ## 看结果
 
-- 总表：`${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json`，包含训练前后 Pass@1、差值和去重集合分数。
-- 逐题记录：`benchmark/<base|relax>/<simplevqa|vdr>/trajectories.jsonl`，包含问题、完整模型输出、最终答案、token用量和裁判判词。
+- 总表：`${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json`，包含SimpleVQA训练前后Pass@1、差值和去重集合分数；不读取或要求VDR结果。
+- 逐题记录：`benchmark/<base|relax>/simplevqa/trajectories.jsonl`，包含问题、完整模型输出、最终答案、token用量和裁判判词。
 - 汇总：同目录 `summary.json`，包含题数、失败数、工具错误和截断次数。命令异常退出时先排错，不能只统计成功题。
 
-结果另存于实验记录，注明实际裁判型号、模型版本和训练来源；不要将联调结果写成完整 benchmark 分数。
+最终分数填写到 `results/<model>.md` 的本次实验段，最新实验插在前方，并同步[汇总表](README.md#评测结果汇总)。逐题 JSONL、summary 和模型来源文件留在仓库外的产物目录。记录实际裁判型号、模型版本和训练来源；未完成或限题测试不填完整分数。
 
 ## 与论文分数比较
+
+完整参考见[公开基准](benchmark-references.md)：保留 Table 2 的带工具对照、Table 3 的纯 SFT 消融，并补充无工具分数及 Qwen3.5-4B 官方 SimpleVQA 43.4%。Table 3 的纯 SFT 仍使用工具。
 
 [论文Table 2](https://arxiv.org/html/2605.05185v1#S5.T2)的Direct Reasoning参考分数（%）：
 
@@ -132,7 +124,7 @@ bash "$SCRIPT" compare
 | Qwen3-VL-30B-A3B | 53.2      | 3.8 |
 | Qwen3-VL-32B     | 58.0      | 4.1 |
 
-这些分数可作背景参考，不能与当前结果宣称严格同口径：论文使用GPT-4o裁判，本例使用实际配置的MaaS模型；题集范围及生成预算也需对齐。当前实验的主要比较是同一设置下初始模型与SFT模型的差值。Agentic Workflow和Table 3中的SFT工具评测应另列。
+这些分数可作背景参考，不能与当前结果宣称严格同口径：论文使用GPT-4o裁判，本例使用实际配置的裁判模型；题集范围及生成预算也需对齐。当前实验的主要比较是同一设置下初始模型与SFT模型的差值。Agentic Workflow和Table 3中的SFT工具评测应另列。
 
 ## 可选的完整工具Agent
 

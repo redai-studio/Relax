@@ -1,0 +1,15 @@
+# Generated artifacts belong outside the source tree.
+artifacts/
+data/
+models/
+cache/
+*.json
+*.jsonl
+*.parquet
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.tar
+*.zip
+configs/*.env

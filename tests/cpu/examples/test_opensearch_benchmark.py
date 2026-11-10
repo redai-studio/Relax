@@ -318,3 +318,43 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(
     assert len(inference_calls) == 2
     if judge_failure:
         assert len(judge_calls) == 3
+
+
+@pytest.mark.parametrize("invalid", [None, "protocol", "partial", "smoke"])
+def test_comparison_needs_only_full_simplevqa_results(monkeypatch, tmp_path, invalid):
+    import json
+
+    monkeypatch.syspath_prepend(str(TOOLS))
+    spec = importlib.util.spec_from_file_location("opensearch_comparison", TOOLS / "compare_benchmark.py")
+    comparison = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(comparison)
+    for label, score in [("base", 0.4), ("relax", 0.5)]:
+        summary = {
+            "protocol": {"smoke": False, "evaluator_sha256": "same-source"},
+            "expected_cases": 1013,
+            "model_source": {"kind": "base" if label == "base" else "trained-final"},
+            "deduplicated_cases": 981,
+            "pass_at_1": score,
+            "deduplicated_pass_at_1": score,
+        }
+        if label == "relax":
+            if invalid == "protocol":
+                summary["protocol"]["evaluator_sha256"] = "different-source"
+            elif invalid == "partial":
+                summary["expected_cases"] = 100
+            elif invalid == "smoke":
+                summary["protocol"]["smoke"] = True
+        directory = tmp_path / label / "simplevqa"
+        directory.mkdir(parents=True)
+        (directory / "summary.json").write_text(json.dumps(summary))
+    output = tmp_path / "comparison.json"
+    monkeypatch.setattr(sys, "argv", ["compare", "--root", str(tmp_path), "--output", str(output)])
+    if invalid:
+        with pytest.raises(ValueError):
+            comparison.main()
+        assert not output.exists()
+    else:
+        comparison.main()
+        result = json.loads(output.read_text())
+        assert set(result) == {"simplevqa"}
+        assert result["simplevqa"]["pass_at_1_difference"] == pytest.approx(0.1)

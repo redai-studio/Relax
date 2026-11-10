@@ -1,8 +1,8 @@
 # 评测方案对比与工具准备
 
-[English](evaluation-setup.en.md) · [评测运行方式](evaluation.md)
+[评测运行方式](evaluation.md)
 
-SimpleVQA 和 VDR 的数据文件不绑定某个工具服务。准备成本取决于采用直接问答、搜索 Agent，还是复现某篇论文的完整工具环境。当前 `benchmark ... base/relax` 默认运行无工具direct模式；`base/relax`区分初始与SFT权重。显式选择 `BENCHMARK_WORKFLOW=agent` 才启用工具。
+当前只评测SimpleVQA；数据文件本身不绑定某个工具服务。准备成本取决于采用直接问答、搜索 Agent，还是复现某篇论文的完整工具环境。当前 `benchmark ... base/relax` 默认运行无工具direct模式；`base/relax`区分初始与SFT权重。显式选择 `BENCHMARK_WORKFLOW=agent` 才启用工具。
 
 ## GitHub 中的实现有什么区别
 
@@ -12,11 +12,11 @@ SimpleVQA 和 VDR 的数据文件不绑定某个工具服务。准备成本取�
 | [lmms-eval SimpleVQA](https://github.com/EvolvingLMMs-Lab/lmms-eval/tree/main/lmms_eval/tasks/simplevqa)                                                                           | 单次生成短答案，归一化后 exact match                                      | 模型与数据；该实现默认最多生成32 tokens，不是本文的 Agent 协议                        |
 | [Vision-DeepResearch 官方评测](https://github.com/Osilly/Vision-DeepResearch/blob/1f13ea7261de0ec8e9961d3ef2c9c33fcd6d27b1/rllm/eval/README.md)                                    | 多轮 Agent，使用搜索、访问网页、Python 和裁剪后图搜；摘要与裁判可共享服务 | 搜索/网页读取权限、图片托管、摘要模型和裁判；该入口没有要求独立OCR或超分服务          |
 | [WebWatcher](https://github.com/Alibaba-NLP/DeepResearch/blob/main/WebAgent/WebWatcher/README.md)                                                                                  | 先运行工具推理，再运行裁判脚本                                            | 文搜/图搜、Jina、图片存储、摘要模型、裁判；README中的一条eval命令以这些服务就绪为前提 |
-| [OpenSearch-VL](https://github.com/shawn0728/OpenSearch-VL/tree/1ac26e2c35a3e813e022813c88888db457d88f7d/opensearch_vl)                                                            | 本例复用的多轮工具环境，包含OCR、搜索、裁剪和图像增强                     | 当前缺项表对应这一套完整环境                                                          |
+| [OpenSearch-VL](https://github.com/shawn0728/OpenSearch-VL/tree/1ac26e2c35a3e813e022813c88888db457d88f7d/opensearch_vl)                                                            | 本例复用的多轮工具环境，包含OCR、搜索、裁剪和图像增强                     | 包含OCR和图像增强工具，按下表准备                                                     |
 
-SimpleVQA 官方的[裁判](https://github.com/SimpleVQA/SimpleVQA/blob/b94d1f3d05d7f488afcdcf95bfcd69bcb279111e/llm_as_a_vqa_judger.py)和[汇总脚本](https://github.com/SimpleVQA/SimpleVQA/blob/b94d1f3d05d7f488afcdcf95bfcd69bcb279111e/simpleVQA_eval.py)区分正确、错误、未尝试，并计算回答条件下的准确率和F1。lmms-eval的exact match、本文的MaaS语义判分也不是同一个指标，不能只按数据集名字比较数字。
+SimpleVQA 官方的[裁判](https://github.com/SimpleVQA/SimpleVQA/blob/b94d1f3d05d7f488afcdcf95bfcd69bcb279111e/llm_as_a_vqa_judger.py)和[汇总脚本](https://github.com/SimpleVQA/SimpleVQA/blob/b94d1f3d05d7f488afcdcf95bfcd69bcb279111e/simpleVQA_eval.py)区分正确、错误、未尝试，并计算回答条件下的准确率和F1。lmms-eval的exact match、本文的裁判语义判分也不是同一个指标，不能只按数据集名字比较数字。
 
-VDR仓库的[结果表](https://github.com/Osilly/Vision-DeepResearch/tree/1f13ea7261de0ec8e9961d3ef2c9c33fcd6d27b1#performance)同时列出Direct Answer和Agent Workflow，说明无工具对照本身是有效实验。其评测示例使用 `simplevqa_300.parquet` 和500题VDR；本例选定的是SimpleVQA全部1013道英文题和500题VDR。题目范围、工具、裁判、温度、上下文和失败口径都应单独记录。
+VDR仓库的[结果表](https://github.com/Osilly/Vision-DeepResearch/tree/1f13ea7261de0ec8e9961d3ef2c9c33fcd6d27b1#performance)同时列出Direct Answer和Agent Workflow，说明无工具对照本身是有效实验。其评测示例使用 `simplevqa_300.parquet` 和500题VDR；本例当前只选SimpleVQA全部1013道英文题，已有500题VDR结果仅作历史记录。题目范围、工具、裁判、温度、上下文和失败口径都应单独记录。
 
 ## 如何选择准备范围
 
@@ -33,8 +33,8 @@ VDR仓库的[结果表](https://github.com/Osilly/Vision-DeepResearch/tree/1f13e
 | 文本搜索      | 申请或复用[Serper](https://serper.dev/)账号的搜索权限，配置 `SERPER_API_KEY`；也可使用上游已有 `API_HOST / API_USER / API_KEY` 网关                                        | 实际搜索返回非空 `organic`，包含标题、链接和摘要                                                   |
 | 网页读取      | 配置[Jina Reader](https://docs.jina.ai/)与 `JINA_API_KEY`；已有兼容网关也可复用                                                                                            | 已知公开网页能返回正文，而不是验证页、空文本或搜索摘要                                             |
 | 反向图搜      | 配置[SerpApi Google Lens](https://serpapi.com/google-lens-api)，`SERPAPI_URL=https://serpapi.com/search.json`，提供 `SERPAPI_API_KEY`                                      | 当前适配器发送GET，参数为 `engine=google_lens / url / api_key`；检查JSON中的业务错误和实际匹配内容 |
-| 网页/图搜摘要 | 提供固定的 `QWEN_API_BASE / QWEN_MODEL_NAME`                                                                                                                               | 原始OpenSearch适配器只发送Content-Type，不发送MaaS鉴权头；填入MaaS URL本身不能完成接入             |
-| 图片托管      | 复用已有COS配置，提供 `IMAGE_UPLOAD_URL` 对应的本地上传桥                                                                                                                  | multipart字段为 `file`，返回 `{"url":"https://..."}`；图片需能由外部搜索服务获取                   |
+| 网页/图搜摘要 | 提供固定的 `QWEN_API_BASE / QWEN_MODEL_NAME`                                                                                                                               | 核对服务需要的鉴权与请求/响应协议，不能只替换URL                                                   |
+| 图片托管      | 选择图片存储，提供 `IMAGE_UPLOAD_URL` 对应的上传桥                                                                                                                         | multipart字段为 `file`，返回 `{"url":"https://..."}`；图片需能由外部搜索服务获取                   |
 | OCR与版面解析 | 复用或独立部署[PP-StructureV3](https://paddlepaddle.github.io/PaddleX/latest/en/pipeline_usage/tutorials/ocr_pipelines/PP-StructureV3.html)，配置 `LAYOUT_PARSING_API_URL` | 核对请求和响应字段，真实文本图片应提取出可读文字                                                   |
 | 超分          | OpenCV contrib的 `dnn_superres` 加EDSR对应倍率权重，配置 `SR_MODEL_PATH`                                                                                                   | 加载权重并检查实际输出尺寸；上游的succeeded字符串不能证明超分成功                                  |
 
@@ -42,17 +42,15 @@ VDR仓库的[结果表](https://github.com/Osilly/Vision-DeepResearch/tree/1f13e
 
 Jina Reader允许匿名访问，官方[限流表](https://jina.ai/en-US/api-dashboard/rate-limit/)列出的匿名额度为20 RPM，免费key为500 RPM；实际额度以账号和当前服务为准。匿名访问适合小规模验证。当前完整入口把 `JINA_API_KEY` 列为必填，是本例的前置检查策略；若启用匿名方案，需要同时修改检查和全局限流，而不能只删掉这一项。网页读取失败时，上游可能退回搜索snippet，不能把这种降级当成正文提取正常。
 
-### 摘要可以复用MaaS，仍需一个适配层
+### 使用固定的摘要模型
 
-OpenSearch当前的两种摘要请求都是文本，因此可以尝试复用已有MaaS，而无需额外下载摘要模型。接入层需要补齐MaaS鉴权、核对上游非标准请求字段，并保留原摘要prompt。摘要模型必须固定，不能随待评的初始/SFT模型切换；更换模型也要记录为实验配置变化。
+基座和SFT两组使用相同摘要模型与prompt。按所选服务核对鉴权和非标准请求字段；若摘要和裁判共享限流额度，两类请求都应经过同一个限流器。当前runner只限制裁判调用。摘要失败时上游可能直接截取原文，因此需要确认实际发生了模型调用。
 
-若摘要和裁判使用同一个限流为1 QPS的MaaS域名，应让两类请求经过同一个限流器。当前runner只约束裁判调用；它不会自动限制上游摘要HTTP请求。摘要失败时上游可能直接截取原文，因此接入检查必须确认实际发生了模型调用。
+### 提供可公开访问的图片URL
 
-### 图片上传可以复用现有COS
+上游 `cos_upload.py` 需要外部 `upload.py` 插件。本例也支持 `IMAGE_UPLOAD_URL` 对应的HTTP上传桥：接收multipart字段 `file`，上传到运行者选择的对象存储，返回 `{"url":"https://..."}`。对象使用内容hash和run ID命名，保留到两组评测与缓存复用结束后再清理。
 
-上游的 `cos_upload.py` 需要外部 `upload.py` 插件，公开仓库没有提供当前环境可用的实现。本例已提供HTTP上传接口适配，尚需在Git外实现这个小服务：接收图片 → 使用已有coscmd配置上传 → 返回可访问URL。对象应使用内容hash和运行标识命名，放到 `/wuhuan2/lib/relax/` 下本实验的独立目录；保留到两组评测与缓存复用结束后再清理。
-
-这里的外部可访问URL供搜索供应商取图；模型服务能接收base64图片，并不能替代图搜的取图链路。配置文件、内网地址、密钥及上传桥部署参数均放在Git外。
+搜索供应商必须能取得该URL。模型服务支持base64图片并不能代替图搜的取图链路。凭据与部署配置留在Git外。
 
 ### OCR应使用匹配的服务协议
 
@@ -93,4 +91,4 @@ assert result.shape == (64, 64, 3)
 
 若采用统一供应商，应先实现并验证请求、响应和错误语义的适配，再记录为新的工具配置。省下的是账号和服务管理成本，搜索、图片托管、摘要与裁判这些逻辑步骤仍然存在。
 
-实际准备顺序建议是：确定实验协议 → 开通搜索权限 → 接通COS与图搜 → 接通固定摘要与全局限流 → 验证OCR和真实超分 → 小样本完整Agent运行 → 估算调用量、费用和耗时 → 固定配置运行完整两组。仅填写环境变量不足以证明工具已经就绪。
+实际准备顺序建议是：确定实验协议 → 开通搜索权限 → 接通图片托管与图搜 → 接通固定摘要与全局限流 → 验证OCR和真实超分 → 小样本完整Agent运行 → 估算调用量、费用和耗时 → 固定配置运行完整两组。仅填写环境变量不足以证明工具已经就绪。

@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     results = {}
-    for dataset, expected in [("simplevqa", 1013), ("vdr", 500)]:
+    for dataset, expected in [("simplevqa", 1013)]:
         runs = {
             label: json.loads((args.root / label / dataset / "summary.json").read_text())
             for label in ["base", "relax"]
