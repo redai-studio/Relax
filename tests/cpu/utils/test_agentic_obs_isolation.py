@@ -183,6 +183,16 @@ def args(tmp_path):
         agentic_obs_run_id="run",
         agentic_obs_train_generation_id="generation",
         reward_key=None,
+        # rollout sampling params read directly by session_sampling_config.
+        rollout_temperature=1.0,
+        rollout_top_p=1.0,
+        rollout_top_k=-1,
+        rollout_max_response_len=None,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=False,
+        eval_reward_key=None,
+        sglang_enable_deterministic_inference=False,
     )
 
 
@@ -931,3 +941,33 @@ def test_unused_appender_does_not_create_status(tmp_path):
     appender = AsyncJsonlAppender(path)
     appender.close()
     assert not path.exists() and not path.with_suffix(".status.json").exists()
+
+
+def test_session_sampling_config_preserves_falsy_explicit_values() -> None:
+    """None is dropped, but explicit False / 0 / empty-list must survive.
+
+    Regression guard: the filter in session_sampling_config is `value is not
+    None`; a future change to a truthiness check would silently drop False and
+    empty-list overrides, changing sampling semantics.
+    """
+    from relax.agentic.inventory import session_sampling_config
+
+    args = Namespace(
+        rollout_temperature=0.0,
+        rollout_top_p=1.0,
+        rollout_top_k=0,  # explicit greedy top-1, not a missing value
+        rollout_max_response_len=None,  # unset -> must be dropped
+        rollout_stop=[],  # explicit empty list -> must be kept
+        rollout_stop_token_ids=[],
+        rollout_skip_special_tokens=False,  # explicit False -> must be kept
+        sglang_enable_deterministic_inference=False,
+    )
+    cfg = session_sampling_config(args, None, position=0)
+
+    assert cfg["temperature"] == 0.0  # explicit float 0 kept
+    assert cfg["top_k"] == 0
+    assert cfg["skip_special_tokens"] is False
+    assert cfg["stop"] == []
+    assert cfg["stop_token_ids"] == []
+    assert "max_new_tokens" not in cfg
+
