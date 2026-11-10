@@ -6,8 +6,20 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
+import torch
+from torch import nn
 
-from task_delta_weight_sync.sync_metrics import record_http
+from task_delta_weight_sync.sync_metrics import parameter_sizes, record_http
+
+
+def test_native_parameter_denominator_preserves_fp32_vision_and_tied_objects():
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.empty(3, dtype=torch.bfloat16))
+    model.visual = nn.Linear(2, 1, bias=False, dtype=torch.float32)
+    model.tied = model.weight
+    sizes = parameter_sizes(model)
+    assert sizes["named_parameters"] == 2 and sizes["named_parameter_bytes"] == 14
+    assert sizes["parameter_groups"]["vision:torch.float32"] == dict(parameters=1, elements=2, bytes=8)
 
 
 def test_control_metrics_count_actual_http_bodies_once_per_engine_request():

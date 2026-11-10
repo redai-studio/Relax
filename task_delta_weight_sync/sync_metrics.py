@@ -5,8 +5,28 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
+
+
+def parameter_sizes(model: Any) -> dict:
+    """Read native parameter geometry and dtype sizes without tensor values."""
+    groups = {}
+    count = 0
+    for name, parameter in model.named_parameters():
+        count += 1
+        key = ("vision" if "visual" in name else "other") + ":" + str(parameter.dtype)
+        row = groups.setdefault(key, dict(parameters=0, elements=0, bytes=0))
+        row["parameters"] += 1
+        row["elements"] += parameter.numel()
+        row["bytes"] += parameter.numel() * parameter.element_size()
+    return dict(
+        named_parameters=count,
+        named_parameter_bytes=sum(row["bytes"] for row in groups.values()),
+        parameter_groups=groups,
+        parameter_size_scope="Native named parameters with duplicate-object removal; raw storage coverage independently audited",
+    )
 
 
 def record_http(counter: dict, endpoint: str, response: Any) -> None:
@@ -43,6 +63,9 @@ def allocator_metrics(model: Any = None, *, reset: bool) -> dict:
         torch.cuda.reset_peak_memory_stats(device)
     status = Path("/proc/self/status").read_text().splitlines()
     rss = next(int(line.split()[1]) * 1024 for line in status if line.startswith("VmRSS:"))
+    compiler = sys.modules.get("torch._dynamo.utils")
+    timers = getattr(compiler, "compilation_time_metrics", {})
+    compiler_times = {name: dict(calls=len(values), seconds=sum(values)) for name, values in list(timers.items())}
     return dict(
         identity=runtime_identity(),
         cuda_allocated_bytes=torch.cuda.memory_allocated(device),
@@ -53,6 +76,9 @@ def allocator_metrics(model: Any = None, *, reset: bool) -> dict:
         host_lifetime_max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
         gpu_peak_scope="Since this arm's explicit reset; includes already resident allocations",
         host_peak_scope="Process lifetime high-water mark, including initialization",
+        torch_compiler_cumulative=compiler_times,
+        compiler_scope="Cumulative PyTorch dynamo_timed CPU compiler timers; nested keys overlap and must not be summed; other libraries' JIT is not covered",
+        **(parameter_sizes(model) if model is not None else {}),
     )
 
 
