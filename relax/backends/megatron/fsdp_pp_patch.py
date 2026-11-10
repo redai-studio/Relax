@@ -392,7 +392,7 @@ def patch_embedding_grad_reshard_for_pp() -> None:
         if weight is None and skip_if_none:
             return
 
-        grad_attr = fmg._get_main_grad_attr(weight)
+        grad_attr = "decoupled_grad" if hasattr(weight, "decoupled_grad") else fmg._get_main_grad_attr(weight)
         dtensor_grad = getattr(weight, grad_attr)
         if dtensor_grad is None:
             if skip_if_none:
@@ -440,17 +440,13 @@ def check_fsdp_pp_checkpoint_support(args, role: str = "actor") -> None:
 
     :func:`patch_checkpoint_layer_numbering_for_pp` fixes the general PP>1 case
     (stage-local ``decoder.layers.0...`` collisions across pipeline stages, see its
-    docstring). Two narrower combinations are not covered by that fix and are refused
+    docstring). Virtual pipeline parallelism is not covered by that fix and is refused
     here instead of silently mis-numbering:
 
     - Virtual pipeline parallelism (multiple model chunks per rank): the patched
       ``preprocess_fsdp_dtensor_state_dict`` only ever receives ``model[0]``, so a
       second-or-later VPP chunk on the same rank would get the *first* chunk's layer
       offset.
-    - MTP (``mtp_num_layers``): Megatron's own checkpoint code has no MTP-aware key
-      rewriting anywhere in the ``fsdp_dtensor`` path, and the PP fix here explicitly
-      excludes ``mtp.layers.*`` keys (mirroring upstream's own ``get_global_unique_param_name``
-      exclusion) rather than guessing at a rewrite for a path nothing else validates.
 
     The check applies when the role will save a checkpoint or resume a native Megatron
     checkpoint. HuggingFace initialization is unaffected because it does not use the
@@ -480,14 +476,6 @@ def check_fsdp_pp_checkpoint_support(args, role: str = "actor") -> None:
             "(--num-virtual-stages-per-pipeline-rank / --virtual-pipeline-model-parallel-size) "
             "is not supported: the global-layer-numbering patch only handles one model chunk "
             "per rank. Drop VPP, or disable native Megatron checkpoint load/save for a smoke test."
-        )
-    if getattr(args, "mtp_num_layers", None):
-        raise RuntimeError(
-            "[Relax] --ckpt-format fsdp_dtensor with --use-megatron-fsdp, "
-            "--pipeline-model-parallel-size > 1, and MTP (--mtp-num-layers) is not supported: "
-            "Megatron's fsdp_dtensor checkpoint path has no MTP-aware key rewriting, and the "
-            "PP global-layer-numbering patch deliberately excludes mtp.layers.* keys. Drop MTP, "
-            "or disable native Megatron checkpoint load/save for a smoke test."
         )
 
 
@@ -528,11 +516,9 @@ def _rename_layers_to_global(state_dict: dict, offset: int) -> None:
     rename with no separate "reverse on load" step needed — the loaded *values* are
     already sitting in the right place regardless of which key currently points at them.
 
-    ``mtp.layers.*`` keys are left untouched (Megatron's own
-    ``get_global_unique_param_name`` excludes them the same way; MTP is refused
-    upstream by :func:`check_fsdp_pp_checkpoint_support`, this is defense in depth).
-    A no-op when ``offset == 0`` (PP stage 0, or effectively PP==1), so this patch
-    cannot perturb any already-working single-stage checkpoint.
+    MTP has its own layer numbering. Megatron requires all MTP layers on one
+    stage, so its MTP offset is zero even when the decoder offset is not. Preserve
+    both ``mtp.layers.<index>`` and nested ``mtp_model_layer.layers.<index>`` keys.
     """
     if offset == 0:
         return
@@ -601,8 +587,12 @@ def patch_checkpoint_layer_numbering_for_pp() -> None:
     the way through Megatron's own preprocessing, and only get renamed at the very end,
     after that original body has already run and returned).
 
-    Scope: single model chunk per rank (no VPP), no MTP — both refused at startup by
-    :func:`check_fsdp_pp_checkpoint_support` rather than silently mishandled here.
+    MTP retains its independent layer numbering (all MTP layers are on one stage).
+    MTP optimizer parameter-group metadata uses the same keys as its tensor state;
+    retain the existing metadata layout for non-MTP checkpoint compatibility.
+    Keep the original outer dicts local-named for Megatron's load-time snapshots;
+    share their values so DCP writes tensors and group metadata back into them.
+    Scope: single model chunk per rank (VPP is refused at startup).
 
     Idempotent. Pointless (and not installed) at PP == 1 — gated behind the same
     ``pipeline_model_parallel_size > 1`` condition as the other PP patches.
@@ -619,9 +609,16 @@ def patch_checkpoint_layer_numbering_for_pp() -> None:
     def _patched_preprocess(args, raw_state_dict, model):
         state_dict = _orig_preprocess(args, raw_state_dict, model)
         offset = _pp_global_layer_offset(model.config)
+        state_dict["model"] = state_dict["model"].copy()
         _rename_layers_to_global(state_dict["model"], offset)
-        if "optimizer" in state_dict and "state" in state_dict["optimizer"]:
-            _rename_layers_to_global(state_dict["optimizer"]["state"], offset)
+        if "optimizer" in state_dict:
+            state_dict["optimizer"] = state_dict["optimizer"].copy()
+            fields = ("state", "param_to_group_meta") if getattr(args, "mtp_num_layers", None) else ("state",)
+            for field in fields:
+                if field in state_dict["optimizer"]:
+                    values = state_dict["optimizer"][field].copy()
+                    _rename_layers_to_global(values, offset)
+                    state_dict["optimizer"][field] = values
         return state_dict
 
     setattr(_patched_preprocess, _PP_CKPT_MARKER, True)

@@ -2,9 +2,8 @@
 
 """Unit tests for the Megatron-FSDP + PP patches (``fsdp_pp_patch``).
 
-Only the pure-arithmetic / pure-dict helpers are covered here — the ones the
-monkeypatches delegate their actual decisions to. They need neither GPUs,
-``torch.distributed``, nor Megatron, so they run in plain CI.
+Cover the mesh helpers and checkpoint key mapping, including a CPU DCP/Adam
+round trip. No GPU, distributed process group, or Megatron runtime is required.
 """
 
 import ast
@@ -14,7 +13,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 
+from relax.backends.megatron import fsdp_pp_patch
 from relax.backends.megatron.fsdp_pp_patch import (
     _rename_layers_to_global,
     check_fsdp_pp_checkpoint_support,
@@ -197,11 +198,10 @@ def test_rename_layers_to_global_shifts_keys_but_keeps_the_same_tensor_objects()
 
 
 def test_rename_layers_to_global_skips_mtp_and_unnumbered_keys():
-    """``mtp.layers.*`` is excluded (mirroring upstream's own
-    ``get_global_unique_param_name``), and keys with no layer index are
-    inert."""
+    """MTP and its nested HybridStack retain independent layer numbering."""
     state = {
         "mtp.layers.0.weight": "mtp",
+        "language_model.mtp.layers.0.mtp_model_layer.layers.0.mlp.weight": "hybrid_mtp",
         "embedding.word_embeddings.weight": "emb",
         "decoder.layers.2.weight": "dec",
     }
@@ -210,6 +210,7 @@ def test_rename_layers_to_global_skips_mtp_and_unnumbered_keys():
 
     assert set(state) == {
         "mtp.layers.0.weight",
+        "language_model.mtp.layers.0.mtp_model_layer.layers.0.mlp.weight",
         "embedding.word_embeddings.weight",
         "decoder.layers.6.weight",
     }
@@ -235,15 +236,16 @@ def _ckpt_args(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_check_fsdp_pp_checkpoint_support_allows_the_covered_combination():
-    check_fsdp_pp_checkpoint_support(_ckpt_args())
+@pytest.mark.parametrize("mtp_num_layers", [None, 1])
+def test_check_fsdp_pp_checkpoint_support_allows_the_covered_combination(mtp_num_layers):
+    check_fsdp_pp_checkpoint_support(_ckpt_args(mtp_num_layers=mtp_num_layers))
 
 
 @pytest.mark.parametrize(
     "override,expected",
     [
         ({"virtual_pipeline_model_parallel_size": 2}, "virtual pipeline"),
-        ({"mtp_num_layers": 1}, "MTP"),
+        ({"virtual_pipeline_model_parallel_size": 2, "mtp_num_layers": 1}, "virtual pipeline"),
     ],
 )
 def test_check_fsdp_pp_checkpoint_support_refuses_uncovered_combinations(override, expected):
@@ -266,3 +268,85 @@ def test_check_fsdp_pp_checkpoint_support_short_circuits_on_each_gate(gate):
     """Each early-return gate is exercised against an otherwise-fatal VPP
     config, so the test fails if that gate ever stops firing."""
     check_fsdp_pp_checkpoint_support(_ckpt_args(virtual_pipeline_model_parallel_size=2, **gate))
+
+
+def test_mtp_checkpoint_restores_weights_adam_and_group_metadata(tmp_path, monkeypatch):
+    """Real CPU DCP/Adam round trip with MCore's shallow-snapshot load
+    protocol.
+
+    Assemble two PP stages in one process to expose duplicate checkpoint keys
+    without adding a distributed fixture. The CPU adapter omits only MCore's
+    GPU tensor-layout transforms; the actual Relax preprocessing hook is used.
+    """
+    checkpointing = SimpleNamespace(preprocess_fsdp_dtensor_state_dict=lambda args, state, model: state.copy())
+    monkeypatch.setitem(sys.modules, "megatron.training.checkpointing", checkpointing)
+    monkeypatch.setattr(fsdp_pp_patch, "_pp_global_layer_offset", lambda config: config.offset)
+    fsdp_pp_patch.patch_checkpoint_layer_numbering_for_pp()
+    args = _ckpt_args(mtp_num_layers=1)
+
+    def make_stage(stage, *, loading=False):
+        names = ["language_model.decoder.layers.0.weight"]
+        if stage == 1:
+            names += ["language_model.mtp.layers.0.mtp_model_layer.layers.0.weight"]
+        params = {name: torch.nn.Parameter(torch.arange(3.0) + stage + i) for i, name in enumerate(names)}
+        adam = torch.optim.AdamW(params.values(), lr=0.01 * (stage + 1), weight_decay=0.1 * (stage + 1))
+        for param in params.values():
+            param.grad = torch.full_like(param, 0.25 * (stage + 1))
+        adam.step()
+        group_meta = {key: value for key, value in adam.param_groups[0].items() if key != "params"}
+        raw = {
+            "model": {name: param.detach() for name, param in params.items()},
+            "optimizer": {
+                "state": {f"module.{name}": adam.state[param] for name, param in params.items()},
+                "param_to_group_meta": {f"module.{name}": group_meta for name in params},
+            },
+        }
+        if loading:
+            for param in params.values():
+                param.data.zero_()
+                for value in adam.state[param].values():
+                    value.zero_()
+            group_meta.update(lr=0.9, weight_decay=0.9)
+        snapshots = {"model": raw["model"].copy(), "optimizer": raw["optimizer"].copy()}
+        processed = checkpointing.preprocess_fsdp_dtensor_state_dict(
+            args, raw, SimpleNamespace(config=SimpleNamespace(offset=stage * 26))
+        )
+        return params, adam, snapshots, processed
+
+    saved = [make_stage(stage) for stage in range(2)]
+    combined = {"model": {}, "optimizer": {"state": {}, "param_to_group_meta": {}}}
+    for _, _, _, processed in saved:
+        for target, source in [
+            (combined["model"], processed["model"]),
+            *[(combined["optimizer"][key], value) for key, value in processed["optimizer"].items()],
+        ]:
+            assert target.keys().isdisjoint(source), "PP stages must not overwrite each other's state"
+            target.update(source)
+    dcp.save(combined, checkpoint_id=tmp_path)
+
+    for stage, (expected_params, expected_adam, expected_raw, _) in enumerate(saved):
+        params, adam, raw, processed = make_stage(stage, loading=True)
+        dcp.load(processed, checkpoint_id=tmp_path)
+        # MCore restores the pre-preprocessing snapshots before model/optimizer load.
+        processed.update(raw)
+        assert processed["model"].keys() == expected_raw["model"].keys()
+        for name, param in params.items():
+            torch.testing.assert_close(param, expected_params[name], rtol=0, atol=0)
+            state_key = f"module.{name}"
+            for field, value in processed["optimizer"]["state"][state_key].items():
+                torch.testing.assert_close(value, expected_adam.state[expected_params[name]][field], rtol=0, atol=0)
+            metadata = processed["optimizer"]["param_to_group_meta"][state_key]
+            assert metadata == expected_raw["optimizer"]["param_to_group_meta"][state_key]
+        adam.param_groups[0].update(metadata)
+        # Loaded moments, step, LR and weight decay must reproduce the next update.
+        for optimizer, parameters in ((adam, params), (expected_adam, expected_params)):
+            for param in parameters.values():
+                param.grad = torch.full_like(param, 0.75)
+            optimizer.step()
+        for name, param in params.items():
+            torch.testing.assert_close(param, expected_params[name], rtol=0, atol=0)
+
+    # Existing non-MTP checkpoint metadata keeps its on-disk naming convention.
+    args.mtp_num_layers = None
+    _, _, raw, processed = make_stage(1)
+    assert processed["optimizer"]["param_to_group_meta"] is raw["optimizer"]["param_to_group_meta"]
