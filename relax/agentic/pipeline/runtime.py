@@ -1306,9 +1306,7 @@ class RuntimeDomain:
     async def debug_state(self) -> dict[str, Any]:
         """Project Shard refs into one debug dictionary."""
 
-        shard_snapshots = tuple(
-            await asyncio.gather(*(shard.handle.debug_state.remote(sample_limit=8) for shard in self._shards))
-        )
+        shard_snapshots = tuple(await asyncio.gather(*(shard.handle.debug_state.remote() for shard in self._shards)))
         return {
             "shards": shard_snapshots,
             "group_count": sum(snapshot["group_count"] for snapshot in shard_snapshots),
@@ -1428,8 +1426,30 @@ async def _take_session_results(
     session_ids = tuple(result.session_id for result in results)
     try:
         session_results = await stream.shard.handle.take_session_results.remote(stream.group_id, session_ids)
-        for result, session_result in zip(results, session_results, strict=True):
-            _resolve_session_export(stream, result, session_result)
+        result_pairs = tuple(zip(results, session_results, strict=True))
+        group_error = next(
+            (
+                session_result
+                for _result, session_result in result_pairs
+                if isinstance(session_result, RuntimeGroupError)
+            ),
+            None,
+        )
+        export_error: Exception | None = None
+        for result, session_result in result_pairs:
+            try:
+                _resolve_session_export(result, session_result)
+            except Exception as error:
+                result.completion.set_exception(error)
+                if export_error is None:
+                    export_error = error
+        if not stream.first_request_barrier.done():
+            if group_error is not None:
+                stream.first_request_barrier.set_exception(group_error)
+            elif export_error is not None:
+                stream.first_request_barrier.set_exception(export_error)
+            elif any(session_result is None for _result, session_result in result_pairs):
+                stream.first_request_barrier.set_result(False)
     except Exception as error:
         for result in results:
             completion = result.completion
@@ -1440,7 +1460,6 @@ async def _take_session_results(
 
 
 def _resolve_session_export(
-    stream: RuntimeGroupStream,
     result: _SessionResultRef,
     session_result: SessionExportTransport | RuntimeGroupError | None,
 ) -> None:
@@ -1451,13 +1470,9 @@ def _resolve_session_export(
         return
     if isinstance(session_result, RuntimeGroupError):
         completion.set_exception(session_result)
-        if not stream.first_request_barrier.done():
-            stream.first_request_barrier.set_exception(session_result)
         return
     if session_result is None:
         completion.set_result(None)
-        if not stream.first_request_barrier.done():
-            stream.first_request_barrier.set_result(False)
         return
     exports = []
     for export_payload in session_result.exports:

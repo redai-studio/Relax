@@ -97,6 +97,8 @@ def test_yaml_mixture_applies_weights_to_text_and_messages(tmp_path):
 
     assert dataset.reader.names == ["text", "messages"]
     assert dataset.reader.quotas == [3, 1]
+    assert [sample.dataset_id for sample in samples] == [0, 0, 0, 1]
+    assert pack_samples_for_tq(samples)["dataset_ids"] == [0, 0, 0, 1]
     assert [chr(sample.tokens[0]) for sample in samples] == ["a", "a", "a", "b"]
     batch = list(dataset.reader.iter_batch([3, 2, 0, 1]))
     assert [idx for idx, _ in batch] == [3, 2, 0, 1]
@@ -106,6 +108,14 @@ def test_yaml_mixture_applies_weights_to_text_and_messages(tmp_path):
         "a",
         "a",
     ]
+
+
+def test_yaml_mixture_rejects_ambiguous_dataset_names(tmp_path):
+    (tmp_path / "text.jsonl").write_text('{"text": "value"}\n')
+    config = tmp_path / "mixture.yaml"
+    config.write_text("datasets:\n  1: text.jsonl\n  '1': text.jsonl\n")
+    with pytest.raises(ValueError, match="unique as strings"):
+        SFTStreamingDataset(str(config), prefetch_max_cached=0)
 
 
 def test_yaml_mixture_rejects_partial_weights(tmp_path):

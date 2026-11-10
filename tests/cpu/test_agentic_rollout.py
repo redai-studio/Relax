@@ -34,6 +34,7 @@ from relax.agentic.pipeline.runtime import (
     _build_session_specs,
 )
 from relax.agentic.pipeline.transfer import TransferBatch, TransferDomain
+from relax.agentic.session import service as service_mod
 from relax.agentic.session.admission import (
     AdmissionAction,
     AdmissionReason,
@@ -64,6 +65,7 @@ _existing_rollout_module = sys.modules.get(_rollout_module_name)
 if _existing_rollout_module is None:
     _rollout_module_stub = ModuleType(_rollout_module_name)
     _rollout_module_stub._log_rollout_data = MagicMock()
+    _rollout_module_stub.get_local_rollout_manager = lambda: SimpleNamespace(training_weight_updating=False)
     sys.modules[_rollout_module_name] = _rollout_module_stub
 try:
     from relax.agentic.rollout import AgenticResidentPipeline, _StepContext  # noqa: E402
@@ -434,6 +436,34 @@ async def _wait_until(predicate) -> None:
     raise AssertionError("condition did not become true")
 
 
+def _runtime_result_stream(*session_ids: str):
+    loop = asyncio.get_running_loop()
+    results = tuple(runtime_mod._SessionResultRef(session_id, loop.create_future()) for session_id in session_ids)
+    take_session_results = AsyncMock()
+    shard = SimpleNamespace(handle=SimpleNamespace(take_session_results=SimpleNamespace(remote=take_session_results)))
+    barrier = loop.create_future()
+    stream = runtime_mod.RuntimeGroupStream("group", shard, barrier, results)
+    return stream, results, take_session_results
+
+
+@pytest.mark.parametrize("drop_first", [False, True])
+async def test_take_session_results_prioritizes_error_over_controlled_drop(drop_first) -> None:
+    stream, results, take_session_results = _runtime_result_stream("session-0", "session-1")
+    group_error = RuntimeGroupError("prepare failed")
+    take_session_results.return_value = (None, group_error) if drop_first else (group_error, None)
+
+    await runtime_mod._take_session_results(stream, results)
+
+    with pytest.raises(RuntimeGroupError, match="prepare failed"):
+        stream.first_request_barrier.result()
+    for result, outcome in zip(results, take_session_results.return_value, strict=True):
+        if outcome is None:
+            assert result.completion.result() is None
+        else:
+            with pytest.raises(RuntimeGroupError, match="prepare failed"):
+                result.completion.result()
+
+
 def test_session_forest_build_sample_and_session_spec() -> None:
     forest, initial_obs = _forest_with_initial_obs(
         session_id="sess-build",
@@ -609,19 +639,29 @@ def test_partial_resume_request_kind(
 
 
 @pytest.mark.parametrize(
-    ("fully_async", "final_backfill", "debt", "previous_debt", "interrupted_count", "expected"),
+    (
+        "fully_async",
+        "final_backfill",
+        "training_weight_updating",
+        "debt",
+        "previous_debt",
+        "interrupted_count",
+        "expected",
+    ),
     [
-        (False, False, 0, 0, 0, True),
-        (False, False, 2, 0, 2, False),
-        (True, False, 2, 0, 2, True),
-        (True, False, 2, 1, 2, False),
-        (True, False, 3, 0, 2, False),
-        (True, True, 2, 0, 2, False),
+        (False, False, False, 0, 0, 0, True),
+        (False, False, True, 2, 0, 2, False),
+        (True, False, False, 2, 0, 2, False),
+        (True, False, True, 2, 0, 2, True),
+        (True, False, True, 2, 1, 2, False),
+        (True, False, True, 3, 0, 2, False),
+        (True, True, True, 2, 0, 2, False),
     ],
 )
 def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     fully_async: bool,
     final_backfill: bool,
+    training_weight_updating: bool,
     debt: int,
     previous_debt: int,
     interrupted_count: int,
@@ -632,7 +672,14 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     pipeline.transfer_domain = SimpleNamespace(total_debt=debt, previous_debt=previous_debt)
     pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=tuple(range(interrupted_count)))
 
-    assert pipeline._step_can_close(_StepContext(rollout_id=3, final_backfill=final_backfill)) is expected
+    manager = SimpleNamespace(training_weight_updating=training_weight_updating)
+    with patch("relax.agentic.rollout.get_local_rollout_manager", return_value=manager) as get_manager:
+        assert pipeline._step_can_close(_StepContext(rollout_id=3, final_backfill=final_backfill)) is expected
+
+    if debt == 0 or not fully_async or final_backfill:
+        get_manager.assert_not_called()
+    else:
+        get_manager.assert_called_once_with()
 
 
 def test_runtime_gap_counts_current_debt_oversampling_and_resident_tail() -> None:
@@ -997,6 +1044,74 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
     assert shard._lifecycle_close_failure_count == 0
 
 
+def _lease_group_fixture():
+    shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
+    result_cells = {f"session-{index}": _SessionResultCell() for index in range(2)}
+    group = ResidentGroup(rollout_mode="train", group_id="group-1", result_cells=result_cells, sessions=[])
+    for session_id, result_cell in result_cells.items():
+        session = _SessionRecord(
+            group=group,
+            session_id=session_id,
+            session_sampling_params={},
+            result_cell=result_cell,
+        )
+        session.live_irs.add(object())
+        group.sessions.append(session)
+    shard._groups = {group.group_id: group}
+    shard._train_generation_open = False
+    shard._set_group_timeout_active = AsyncMock()
+    shard._open_group = AsyncMock()
+    return shard, group
+
+
+async def test_lease_group_publishes_runtime_ownership_without_waiting_for_session_locks() -> None:
+    shard, group = _lease_group_fixture()
+    for session in group.sessions:
+        await session.lock.acquire()
+    try:
+        await asyncio.wait_for(shard.lease_group(group.group_id, 7), timeout=0.1)
+    finally:
+        for session in group.sessions:
+            session.lock.release()
+
+    assert group.ownership is GroupOwnership.RUNTIME
+    assert [session.rollout_id for session in group.sessions] == [7, 7]
+    shard._set_group_timeout_active.assert_awaited_once()
+    shard._open_group.assert_awaited_once_with(group)
+
+
+@pytest.mark.parametrize("drop_state", ["published", "inflight"])
+async def test_lease_group_tolerates_controlled_prepare_drop(drop_state: str) -> None:
+    shard, group = _lease_group_fixture()
+    if drop_state == "published":
+        group.result_cells["session-0"].publish(None)
+    else:
+        group.drop_task = asyncio.create_task(asyncio.sleep(0))
+
+    await shard.lease_group(group.group_id, 7)
+
+    if group.drop_task is not None:
+        await group.drop_task
+    assert group.ownership is GroupOwnership.PREPARE
+    assert [session.rollout_id for session in group.sessions] == [0, 0]
+    shard._set_group_timeout_active.assert_not_awaited()
+    shard._open_group.assert_not_awaited()
+
+
+async def test_lease_group_preserves_prepare_error_priority_over_drop() -> None:
+    shard, group = _lease_group_fixture()
+    group.result_cells["session-0"].publish(RuntimeGroupError("prepare failed"))
+    group.drop_task = asyncio.create_task(asyncio.sleep(0))
+
+    with pytest.raises(RuntimeGroupError, match="prepare failed"):
+        await shard.lease_group(group.group_id, 7)
+
+    await group.drop_task
+    assert group.ownership is GroupOwnership.PREPARE
+    shard._set_group_timeout_active.assert_not_awaited()
+    shard._open_group.assert_not_awaited()
+
+
 def test_compute_reservation_tokens_uses_expanded_prompt_and_remaining_decode() -> None:
     assert compute_reservation_tokens(prompt_tokens=100, remaining_completion_tokens=50) == 150
     assert compute_reservation_tokens(prompt_tokens=-1, remaining_completion_tokens=-1) == 0
@@ -1238,6 +1353,89 @@ async def test_admission_coordinator_cancellation_removes_waiter_or_granted_leas
         {"ticket_id": "cancelled-before-acquire", "reservation_tokens": 1},
     )
     assert cancelled_before_acquire["reason"] == AdmissionReason.CANCELLED.value
+
+
+def _ray_task_cancellation(*, wrapped: bool) -> BaseException:
+    cancellation = service_mod.ray.exceptions.TaskCancelledError(error_message="cancelled")
+    if not wrapped:
+        return cancellation
+    return service_mod.ray.exceptions.RayTaskError("acquire", "traceback", cancellation)
+
+
+async def test_request_permit_active_cancel_releases_without_tombstone() -> None:
+    coordinator_cls = AdmissionCoordinator.__ray_metadata__.modified_class
+    coordinator = object.__new__(coordinator_cls)
+    coordinator._request_permits = asyncio.Semaphore(0)
+    coordinator._active_request_permits = {"permit-1"}
+    coordinator._cancelled_request_permits = {}
+
+    await coordinator_cls.cancel_request_permit(coordinator, "permit-1")
+
+    assert "permit-1" not in coordinator._active_request_permits
+    assert "permit-1" not in coordinator._cancelled_request_permits
+    await asyncio.wait_for(coordinator._request_permits.acquire(), timeout=0.1)
+
+
+def _request_permit_shard(acquire: AsyncMock):
+    shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
+    shard._sglang_request_limiter = SimpleNamespace(
+        acquire_request_permit=SimpleNamespace(remote=acquire),
+        cancel_request_permit=SimpleNamespace(remote=AsyncMock()),
+        release_request_permit=SimpleNamespace(remote=AsyncMock()),
+    )
+    shard._permit_cleanup_tasks = set()
+    return shard
+
+
+@pytest.mark.parametrize("outcome", ["false", "direct", "wrapped"])
+async def test_request_permit_normalizes_acquire_cancellation(outcome: str) -> None:
+    acquire = (
+        AsyncMock(return_value=False)
+        if outcome == "false"
+        else AsyncMock(side_effect=_ray_task_cancellation(wrapped=outcome == "wrapped"))
+    )
+    shard = _request_permit_shard(acquire)
+
+    with pytest.raises(asyncio.CancelledError):
+        async with shard._sglang_request_permit():
+            raise AssertionError("cancelled permit cannot enter backend execution")
+
+    shard._sglang_request_limiter.cancel_request_permit.remote.assert_not_awaited()
+    shard._sglang_request_limiter.release_request_permit.remote.assert_not_awaited()
+
+
+async def test_request_permit_compensation_accepts_ray_cancellation() -> None:
+    acquire = AsyncMock(side_effect=_ray_task_cancellation(wrapped=True))
+    shard = _request_permit_shard(AsyncMock())
+
+    await shard._release_sglang_request_permit_after_cancel(acquire(), "permit-1")
+
+    shard._sglang_request_limiter.cancel_request_permit.remote.assert_not_awaited()
+    shard._sglang_request_limiter.release_request_permit.remote.assert_not_awaited()
+
+
+async def test_chat_api_maps_ray_task_cancellation_to_disconnect() -> None:
+    service = SimpleNamespace()
+    shard = SimpleNamespace(chat=SimpleNamespace(remote=AsyncMock(side_effect=_ray_task_cancellation(wrapped=True))))
+    normalized = {
+        "messages": [],
+        "tools": [],
+        "chat_template_kwargs": {},
+        "max_completion_tokens": None,
+        "stop": None,
+        "seed": None,
+        "logprobs": False,
+    }
+
+    response = await service_mod.AgenticChatAPIService.func_or_class._complete_generation(
+        service,
+        shard=shard,
+        session_id="session-1",
+        normalized=normalized,
+    )
+
+    assert response["_http_status"] == 499
+    assert response["error"]["code"] == "client_disconnect"
 
 
 async def test_admission_coordinator_ages_waiters_without_leasing_capacity() -> None:
@@ -1691,6 +1889,23 @@ async def test_agentic_503_is_pre_dispatch_before_permit_cleanup_finishes():
     assert task.done() and list(session.queued_irs) == [ir]
     assert ir.backend_started is False
     abort_request.assert_not_awaited()
+
+
+async def test_pause_abort_propagates_ordinary_error_after_finalization() -> None:
+    shard, _group, session, ir = _router_recovery_shard()
+    runner_done = asyncio.Event()
+
+    async def abort_request(_request_id: str) -> None:
+        session.phase = service_mod.SessionPhase.FINALIZING
+        runner_done.set()
+        raise RuntimeError("abort failed")
+
+    shard._generation_backend = SimpleNamespace(abort_request=AsyncMock(side_effect=abort_request))
+    ir.backend_started = True
+    ir.runner_task = asyncio.create_task(runner_done.wait())
+
+    with pytest.raises(RuntimeError, match="abort failed"):
+        await shard._interrupt_running_requests()
 
 
 @pytest.mark.asyncio
