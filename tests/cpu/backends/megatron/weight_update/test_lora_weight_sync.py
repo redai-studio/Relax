@@ -85,7 +85,7 @@ class TestLoRADeltaExtraction:
             "lora_b": torch.ones(10, 10) * 2.0,
         }
 
-        delta, _ = extract_lora_delta(state2, old_lora_state=state1, threshold=1e-6)
+        delta, _ = extract_lora_delta(state2, old_lora_state=state1)
 
         assert "lora_a" in delta
         assert "lora_b" not in delta
