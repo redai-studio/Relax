@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.5-4B full SFT comparison, complete multimodal tool trajectories, 8 GPUs.
 # MODEL_DIR=/models DATA_DIR=/data SAVE_DIR=/checkpoints bash "$0" relax
-# Modes: relax | evaluate <HF-checkpoint> <base|relax> | compare
+# Modes: relax | evaluate <HF-checkpoint> <base|relax> | benchmark <simplevqa|vdr> <base|relax> | compare
 
 set -eo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -23,6 +23,26 @@ mkdir -p "${SCRIPT_DIR}/log" "${SAVE_DIR}/${EXP_NAME}"
 cd "${RELAX_ROOT}"
 
 case "${MODE}" in
+    benchmark)
+        : "${2:?Supply simplevqa or vdr}"
+        : "${3:?Supply base or relax}"
+        : "${BENCHMARK_DATA_ROOT:?Set the downloaded benchmark dataset root}"
+        : "${BENCHMARK_OVERLAP_INDEX:?Set the SFT train overlap index}"
+        case "$2" in
+            simplevqa) benchmark_data="${BENCHMARK_DATA_ROOT}/simplevqa/test.parquet" ;;
+            vdr) benchmark_data="${BENCHMARK_DATA_ROOT}/vdr/data/testmini500_v1.parquet" ;;
+            *) echo "Benchmark must be simplevqa or vdr" >&2; exit 2 ;;
+        esac
+        benchmark_args=()
+        if [[ "${BENCHMARK_MAX_CASES:-0}" != 0 ]]; then benchmark_args+=(--max-cases "${BENCHMARK_MAX_CASES}"); fi
+        if [[ "${BENCHMARK_ALLOW_MISSING_TOOLS:-0}" == 1 ]]; then benchmark_args+=(--allow-missing-tools); fi
+        python3 "${SCRIPT_DIR}/../tools/benchmark.py" \
+            --dataset "$2" --label "$3" --data "${benchmark_data}" --processor "${HF_CHECKPOINT}" \
+            --output "${SAVE_DIR}/${EXP_NAME}/benchmark/$3/$2" \
+            --tool-cache "${BENCHMARK_CACHE_DIR:-${SAVE_DIR}/${EXP_NAME}/benchmark/tool-cache}" \
+            --overlap-index "${BENCHMARK_OVERLAP_INDEX}" "${benchmark_args[@]}"
+        exit
+        ;;
     evaluate)
         : "${2:?Supply one explicit HF checkpoint directory}"
         : "${3:?Supply base or relax as the evaluation label}"
@@ -35,6 +55,12 @@ case "${MODE}" in
         exit
         ;;
     compare)
+        if [[ -d "${SAVE_DIR}/${EXP_NAME}/benchmark" ]]; then
+            python3 "${SCRIPT_DIR}/../tools/compare_benchmark.py" \
+                --root "${SAVE_DIR}/${EXP_NAME}/benchmark" \
+                --output "${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json"
+            exit
+        fi
         python3 "${SCRIPT_DIR}/../tools/compare.py" \
             --base "${SAVE_DIR}/${EXP_NAME}/eval/base/summary.json" \
             --relax "${SAVE_DIR}/${EXP_NAME}/eval/relax/summary.json" \

@@ -1,9 +1,8 @@
 # 训练后模型评测
 
-> 接入状态：本文定义目标评测协议。当前分支尚未实现下述 `benchmark` 子命令和
-> `configs/benchmark.env.example`，现有 `compare` 只比较留出决策评测，不能用于生成本文的 benchmark 总表。
-> 下列运行命令需待 benchmark 接入后使用。英文版 `evaluation.en.md`、数据准备说明
-> `data-preparation.md` 和验证记录 `results/qwen3.5-4b.md` 也待补齐。
+[English](evaluation.en.md)
+
+正式评测需要先配置全部工具服务。仅设置 QS 和 MaaS 密钥不足以运行本文的工具评测；入口会列出缺失项。显式限制题数并允许缺失工具的运行只用于联调，不计作完整 benchmark。
 
 ## 评什么
 
@@ -20,7 +19,7 @@
 
 ## 准备
 
-先完成数据准备，再配置工具环境：
+先完成[数据准备](data-preparation.md)，生成完整七域训练集及去重索引，再配置工具环境：
 
 ```bash
 git clone https://github.com/shawn0728/OpenSearch-VL.git /path/to/OpenSearch-VL
@@ -38,13 +37,48 @@ source /path/to/benchmark.env
 | `SERPAPI_URL / SERPAPI_API_KEY`                                   | Google Lens 图搜接口                                            |
 | `IMAGE_UPLOAD_URL`                                                | multipart `file` 上传，返回外部可访问的 `{"url":"https://..."}` |
 | `LAYOUT_PARSING_API_URL / SR_MODEL_PATH`                          | PP-StructureV3 接口、超分权重                                   |
-| `JUDGE_BASE_URL / JUDGE_MODEL / JUDGE_API_KEY`                    | MaaS 裁判模型（默认 `glm-5.3-flash`）                           |
+| `JUDGE_BASE_URL / JUDGE_MODEL / JUDGE_API_KEY`                    | MaaS 裁判模型，使用 `JUDGE_MODEL` 明确指定                      |
 
-MaaS 裁判配置：`JUDGE_BASE_URL` 填接口地址去掉 `/chat/completions` 的部分，`JUDGE_MODEL=glm-5.3-flash`，`JUDGE_API_KEY_HEADER=api-key`，密钥填入本地环境的 `JUDGE_API_KEY`。保留原评分 prompt，结果记录实际裁判型号；这是内部裁判分数，与论文分数分开报告。
+MaaS 裁判配置：`JUDGE_BASE_URL` 填接口地址去掉 `/chat/completions` 的部分，`JUDGE_MODEL` 填实际可调用的模型名称，`JUDGE_API_KEY_HEADER=api-key`，密钥填入本地环境的 `JUDGE_API_KEY`。保留原评分 prompt，结果记录实际裁判型号；这是内部裁判分数，与论文分数分开报告。
 
 工具环境需具备 Pillow、requests、HF processor、带 `dnn_superres` 的 OpenCV。模型服务保留 thinking 和原始 `<tool_call>` 文本，不启用会消费该文本的工具解析器。
 
+## 评测数据与去重
+
+下载固定版本，SimpleVQA 仅读取 `language == "EN"` 的 1,013 题，VDR 读取全部 500 题：
+
+```python
+from huggingface_hub import hf_hub_download
+
+benchmark_data_root = "/path/to/benchmark-datasets"
+hf_hub_download("m-a-p/SimpleVQA", repo_type="dataset",
+    revision="037cf89fb6f1212691756b66d1ecde6c2ce89e54", filename="test.parquet",
+    local_dir=f"{benchmark_data_root}/simplevqa")
+hf_hub_download("Osilly/Vision-DeepResearch-Eval", repo_type="dataset",
+    revision="deeaf45779a3bbd407d8f0ccb9b4831fc78e81c9", filename="data/testmini500_v1.parquet",
+    local_dir=f"{benchmark_data_root}/vdr")
+```
+
+将 `BENCHMARK_DATA_ROOT` 设为相同下载目录。`BENCHMARK_OVERLAP_INDEX` 指向从实际 `train.jsonl` 生成的 JSON，包含 `questions` 和 `images` 两个 hash 列表。问题 hash 对首条用户消息去掉 `<image>`，再 casefold、合并空白并计算 UTF-8 SHA256；图片使用训练记录的 `metadata.image_hashes`，即原图 RGB 尺寸与像素的 SHA256。问题或任一图片命中都视为与训练重叠；去重分数仅统计未命中题目。
+
+`AGENT_PROVENANCE_FILE` 指向模型来源 JSON，包含实际 QS model/version/subversion、`served_model_name`、完整 branch/commit、训练 Job/Trial、`kind`、`epochs` 和 `hashes_verified=true`。先按上传收据校验下载文件，再写此标记；它不是自动校验的替代品。`relax` 标签只接受 `kind=trained-final` 且至少 2 epoch 的版本，上传验证版本只能作为 baseline。
+
 ## 运行
+
+原 Qwen 模板会丢弃历史 thinking，不能仅传入 `preserve_thinking=true`。先生成与训练一致的模板，本地计数与模型服务共用该文件：
+
+```bash
+export HF_CHECKPOINT="${MODEL_DIR}/Qwen3.5-4B"
+export BENCHMARK_CHAT_TEMPLATE=/path/to/preserve-thinking.jinja
+PYTHONPATH=examples/opensearch_vl/tools:. python3 - <<'PY'
+import os
+from pathlib import Path
+from transformers import AutoProcessor
+from benchmark import preserve_history_template
+processor = AutoProcessor.from_pretrained(os.environ["HF_CHECKPOINT"], local_files_only=True)
+Path(os.environ["BENCHMARK_CHAT_TEMPLATE"]).write_text(preserve_history_template(processor))
+PY
+```
 
 在 GPU 节点部署初始模型；沿用数据准备中的 `MODEL_DIR / DATA_DIR / SAVE_DIR`：
 
@@ -52,7 +86,8 @@ MaaS 裁判配置：`JUDGE_BASE_URL` 填接口地址去掉 `/chat/completions` �
 export EXP_NAME=qwen3.5-4b-opensearch-vl-32k-8xgpu
 python3 -m sglang.launch_server \
   --model-path "${MODEL_DIR}/Qwen3.5-4B" \
-  --host 127.0.0.1 --port 30000 --tp 2 --context-length 32768
+  --host 127.0.0.1 --port 30000 --tp 2 --context-length 32768 \
+  --chat-template "${BENCHMARK_CHAT_TEMPLATE}" --served-model-name Qwen3.5-4B
 ```
 
 另一个终端加载环境后执行：
@@ -84,4 +119,4 @@ bash "$SCRIPT" compare
 - 逐题记录：`benchmark/<base|relax>/<simplevqa|vdr>/trajectories.jsonl`，包含工具轨迹、最终答案和裁判判词。
 - 汇总：同目录 `summary.json`，包含题数、失败数、工具错误和截断次数。命令异常退出时先排错，不能只统计成功题。
 
-将实测结果填入后续的 Qwen3.5-4B 验证记录 `results/qwen3.5-4b.md`。
+结果另存于实验记录，注明实际裁判型号、模型版本和训练来源；不要将联调结果写成完整 benchmark 分数。
