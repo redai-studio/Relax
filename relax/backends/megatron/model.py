@@ -1328,6 +1328,7 @@ def train_one_step(
                     "response_lengths",
                     "loss_masks",
                     "classification_labels",
+                    "dataset_ids",
                     "log_probs",
                     "ref_log_probs",
                     "preference_branch_pair_ids",

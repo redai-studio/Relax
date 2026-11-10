@@ -37,6 +37,7 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.engine.rollout import on_policy_distillation as opd
 from relax.utils.agentic_obs.records import utc_now
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
@@ -884,6 +885,7 @@ class RuntimeDomain:
     ) -> None:
         self.args = args
         self.rollout_mode = rollout_mode
+        self.teacher_routing_enabled = rollout_mode == "train" and opd.is_teacher_routing_enabled(args)
         self._shards = shards
         self.concurrency = concurrency
         self._admission_coordinator = admission_coordinator
@@ -963,8 +965,11 @@ class RuntimeDomain:
         group_id = group_input.group_id
         shard = self._shards[zlib.crc32(group_id.encode("utf-8")) % len(self._shards)]
         session_ids = tuple(f"{shard.actor_name}.session-{uuid.uuid4().hex}" for _ in group_input.samples)
-        self._inventory.record_group(group_id, group_input.samples)
         try:
+            if self.teacher_routing_enabled:
+                for sample in group_input.samples:
+                    opd.bind_teacher(self.args, sample)
+            self._inventory.record_group(group_id, group_input.samples)
             await self._resident_group_permits.acquire()
         except BaseException as error:
             self._inventory.record_group(group_id, group_input.samples, session_ids, started_at=prepare_started_at_utc)

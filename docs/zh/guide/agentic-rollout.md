@@ -700,9 +700,12 @@ status、turn count、request timing、abort count 与 weight-version 信息。
 目前训练侧支持 Megatron policy actor。Update ID 为 `actor:<rollout_id>:<step_id>`，
 作用域为 `(run_id, train_generation_id)`；一个 rollout 可以包含多次 update。输入在 micro-batch 被实际消费时、
 packing 和 dynamic CP 切分前采集。Dummy batch 不计入，真实的全零 loss mask 样本仍保留。
-每个样本包含完整 response 空间的 `loss_mask`、长度、有效 token 数，以及按 mask 计算的
-advantage/return 统计。Static CP 下统计为 `null`，dynamic CP 在切分前采集完整序列。
-这里的 mask 是训练输入 mask，尚未应用 loss 内部的 TIS/OPSM 筛选。
+每个样本包含长度、有效 token 数，以及按 mask 计算的 advantage/return 统计。
+Train schema `4.0.0` 将 `loss_mask.ranges` 保存为 response 空间中从零开始的
+左闭右开区间 `[start, end, value]`。按 `response_length` 还原完整长度，区间外填零。
+例如 `[1, 1, 0, 1]` 写成 `{"ranges": [[0, 2, 1], [3, 4, 1]]}`。
+Train schema `3.0.0` 的 `loss_mask` 是逐 token 数组。Static CP 下统计为 `null`，
+dynamic CP 在切分前采集完整序列。这里记录的是 loss 内部 TIS/OPSM 筛选前的输入 mask。
 
 DP 分片主键是 `(run_id, train_generation_id, update_id, dp_rank)`，平台按
 `(run_id, train_generation_id, update_id)` 合并。Actor group 初始化时为 worker 参数副本
@@ -776,8 +779,8 @@ Daemon 队列同时限制条目数和字节数，正在写入的任务也计入�
 不能据此断言训练仍在等待或已被拒绝。
 Managed 日志在临时目录清理前提取本地最后 1 MiB 快照；`log_ref` 表示后台写入已接纳，
 读取端仍需检查文件是否存在。
-Manifest 使用 `record_format=agentic-observability-full-v3`、schema `3.0.0`；
-v3 读取端需合并 DP 事实，不能继续等待生产端写出的全局 commit 事件。
+Manifest 使用 `record_format=agentic-observability-full-v3`、schema `3.0.0`。
+`train_schema_version` 标明 train 数据流的版本。读取端通过合并 DP 事实判断 update 结果。
 
 Eager 和 streaming reader 在自定义 prompt 处理、模板渲染、过滤、打乱和复制之前保存来源身份。
 `source_row_id` 是从零开始的 JSONL 物理行号或 Parquet 行号，切片和多文件数据集也保留原行号。

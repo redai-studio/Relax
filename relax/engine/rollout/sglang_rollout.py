@@ -707,25 +707,26 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
-    # For samples with existing response, check if they're complete
-    if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
+    if sample.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
         return sample
 
     state = GenerateState(args)
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args, evaluation=evaluation)
+    if teacher_routing_enabled and not args.group_rm:
+        state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
 
-    # Resolve the generate function and run it under the right permit scope
-    # (session-level lock by default; per-request permits for opt-in functions).
     generated = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
-
-    # Group rewards and Teacher scoring run in generate_and_rm_group.
+    # Group reward and Teacher scoring run in generate_and_rm_group.
     if args.group_rm:
         return generated
 
     results = generated if isinstance(generated, list) else [generated]
     if any(result.status == Sample.Status.ABORTED for result in results):
+        if teacher_routing_enabled:
+            state.opd_manager.response_stats.finish(sample.response_key)
         return generated
 
     # Custom generation may already have assigned rewards to some outputs.
@@ -799,6 +800,15 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args, evaluation=evaluation)
+    if teacher_routing_enabled:
+        for sample in group:
+            opd.bind_teacher(args, sample)
+
+    if teacher_routing_enabled and args.group_rm:
+        for sample in group:
+            state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
+
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
@@ -815,9 +825,10 @@ async def generate_and_rm_group(
     group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
     if not args.group_rm:
         return group
-    if state.aborted and not evaluation:
-        return group
-    if group_aborted:
+    if (state.aborted and not evaluation) or group_aborted:
+        if teacher_routing_enabled:
+            for sample in group:
+                state.opd_manager.response_stats.finish(sample.response_key)
         return group
 
     rewards = await batched_async_rm(args, group)
@@ -930,6 +941,9 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args)
+    if teacher_routing_enabled:
+        state.opd_manager.response_stats.new_window()
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1302,6 +1316,8 @@ async def generate_rollout_async(
 
     global CURRENT_ROLLOUT_BATCH
     filter_metrics = metric_gatherer.collect()
+    if teacher_routing_enabled:
+        filter_metrics.update(state.opd_manager.response_stats.metrics())
     if CURRENT_ROLLOUT_BATCH:
         save_debug_rollout_data(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer

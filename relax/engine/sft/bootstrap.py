@@ -72,6 +72,7 @@ def resolve_sft_num_rollout(config: Namespace) -> dict | None:
         return
 
     line_offsets_cache = {}
+    config._sft_dataset_names = ()
     # Lazy import: pulling streaming dataset at module load would drag heavy
     # multimodal deps into every controller import.
     if is_preference_mode(config):
@@ -85,6 +86,8 @@ def resolve_sft_num_rollout(config: Namespace) -> dict | None:
         from relax.engine.sft.dataset.streaming import _build_reader
 
         sizing_dataset = _build_reader(config.prompt_data, pre_make_index=True, line_offsets_cache=line_offsets_cache)
+        if getattr(config, "task_type", "causal_lm") == "causal_lm":
+            config._sft_dataset_names = tuple(getattr(sizing_dataset, "names", ()))
 
     # Sized-only construction: no tokenizer/processor needed because we never
     # call get_batch — we just need len() to derive num_rollout.
