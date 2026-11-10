@@ -38,6 +38,7 @@ case "${MODE}" in
         if [[ "${BENCHMARK_ALLOW_MISSING_TOOLS:-0}" == 1 ]]; then benchmark_args+=(--allow-missing-tools); fi
         python3 "${SCRIPT_DIR}/../tools/benchmark.py" \
             --workflow "${BENCHMARK_WORKFLOW:-direct}" --workers "${BENCHMARK_WORKERS:-1}" \
+            --judge-qps "${JUDGE_QPS:-1}" \
             --dataset "$2" --label "$3" --data "${benchmark_data}" --processor "${HF_CHECKPOINT}" \
             --output "${SAVE_DIR}/${EXP_NAME}/benchmark/$3/$2" \
             --tool-cache "${BENCHMARK_CACHE_DIR:-${SAVE_DIR}/${EXP_NAME}/benchmark/tool-cache}" \
@@ -192,6 +193,21 @@ WANDB_ARGS=(
     --tb-project-name "${PROJECT_NAME}"
     --tb-experiment-name "${EXP_NAME}-relax-${now}"
 )
+if [[ "${ENABLE_SWANLAB:-0}" == 1 ]]; then
+    WANDB_ARGS+=(--use-tensorboard)
+    export SWANLAB_PROJ_NAME="${SWANLAB_PROJ_NAME:-Relax-sft-opensearch-vl}"
+    export SWANLAB_EXP_NAME="${EXP_NAME}-relax-${now}"
+    export RUNTIME_ENV_JSON="$(python3 - <<'PY'
+import json
+import os
+
+runtime = json.loads(os.environ['RUNTIME_ENV_JSON'])
+runtime['worker_process_setup_hook'] = 'examples.opensearch_vl.tools.swanlab_hook.install'
+runtime['env_vars'].update({key: value for key, value in os.environ.items() if key.startswith('SWANLAB_')})
+print(json.dumps(runtime))
+PY
+)"
+fi
 MISC_ARGS=(
     --seed 42
     --attention-dropout 0.0

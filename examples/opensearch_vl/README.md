@@ -36,3 +36,11 @@ bash scripts/entrypoint/ray-job.sh examples/opensearch_vl/scripts/run-qwen3.5-4B
 公共训练脚本自身不执行 QS 上传。QS 启动器会在后面串联最终目录改名、`model_tools` 上传、文件完整性/训练关联校验和服务验证；这些内部下载/上传启动配置留在 Git 外，由 `relax-ce` 的 `qs-opensearch-sft` skill 管理。成功后才清理 `${EXP_DIR}/opensearchvl/` 下本任务的临时目录，收据与评测日志保留在独立 results 目录。
 
 评测必须核对实际模型版本：`kind=upload-validation, epochs=0` 只说明上传链路验证成功，不能作为 Relax SFT 模型。正式版本应记录 `kind=trained-final`、完整 branch/commit、训练 Job/Trial，以及最终训练轮数。
+
+## SwanLab 指标同步
+
+QS 启动命令安装 `swanlab==0.7.16`，将认证文件安全复制到容器的 `~/.swanlab/.netrc`（权限600），再设置 `ENABLE_SWANLAB=1`。认证文件不放入代码库。训练同时保留 ClearML，并通过 TensorBoard 标量同步到 SwanLab。
+
+`SWANLAB_PROJ_NAME` 设置不含 `/` 的项目名；该固定SDK版本使用 `SWANLAB_MODE=cloud`。设置 `SWANLAB_LOG_DIR` 保存日志和看板链接。Ray worker hook 在创建指标服务的 TensorBoard writer 时初始化 SwanLab，记录完整分支、commit、训练Job和Trial。其他worker不会主动创建实验。
+
+训练后可直接用本地最终HF导出运行无工具评测，无需上传模型。模型来源需标为 `kind=trained-final, origin=local-final-export`，验证权重索引、分片和文件hash，记录实际训练轮数、分支、commit、Job/Trial；MaaS配置通过私有文件或环境输入。评测结果写入持久结果目录后，仅清理本任务的数据和缓存，保留未上传的最终HF权重。
