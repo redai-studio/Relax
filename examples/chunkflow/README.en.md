@@ -96,14 +96,14 @@ python3 examples/chunkflow/setup.py
 
 Do not duplicate settings already present in the recipe:
 
-| Setting                                        | Reason                                                                                                                                       |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--context-parallel-size 1`                    | Cross-chunk state management does not currently support CP splitting                                                                         |
-| `--calculate-per-token-loss`                   | Count tokens without changing sample weights through chunking                                                                                |
-| `--no-rope-fusion`                             | Use the RoPE path that supports chunk position offsets                                                                                       |
-| `--attention-dropout 0.0 --hidden-dropout 0.0` | Current adapters require zero dropout to avoid random-mask issues during chunking and replay                                                 |
-| Pipeline parallelism (PP)                      | Reuses the existing PP size; PP>1 requires `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1` in workers via Ray `runtime_env.env_vars` (set by examples) |
-| Native recomputation                           | Disable full-layer / selective `core_attn`; keep the GDN/QSA recipe settings                                                                 |
+| Setting                                        | Reason                                                                                       |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `--context-parallel-size 1`                    | Cross-chunk state management does not currently support CP splitting                         |
+| `--calculate-per-token-loss`                   | Count tokens without changing sample weights through chunking                                |
+| `--no-rope-fusion`                             | Use the RoPE path that supports chunk position offsets                                       |
+| `--attention-dropout 0.0 --hidden-dropout 0.0` | Current adapters require zero dropout to avoid random-mask issues during chunking and replay |
+| Pipeline parallelism (PP)                      | Automatically uses Megatron’s PP size; no extra argument or environment variable             |
+| Native recomputation                           | Disable full-layer / selective `core_attn`; keep the GDN/QSA recipe settings                 |
 
 ### Key parameters
 

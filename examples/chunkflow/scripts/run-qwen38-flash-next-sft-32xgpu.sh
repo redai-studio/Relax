@@ -30,8 +30,6 @@ export RELAX_QWEN38_PLE_STREAMED=0
 export RELAX_QWEN38_PLE_FUSED_CONV=0
 # Preserve the checkpoint's large PLE tables on host memory, frozen for SFT.
 export QWEN38_PLE_CPU_OFFLOAD=1
-export RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1
-
 : "${MODEL_DIR:?Set MODEL_DIR to the directory containing Qwen3.8-Flash-Next}"
 : "${PROMPT_DATA:=${DATA_DIR:?Set DATA_DIR or PROMPT_DATA}/train.jsonl}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/chunkflow}"

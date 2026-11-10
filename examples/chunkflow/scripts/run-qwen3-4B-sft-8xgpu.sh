@@ -12,8 +12,6 @@ RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 source "${RELAX_ROOT}/scripts/models/qwen3-4B.sh"
 source "${SCRIPT_DIR}/_common.sh"
 
-export RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1
-
 : "${MODEL_DIR:?Set MODEL_DIR to the directory containing Qwen3-4B}"
 : "${PROMPT_DATA:=${DATA_DIR:?Set DATA_DIR or PROMPT_DATA}/train.jsonl}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/chunkflow}"

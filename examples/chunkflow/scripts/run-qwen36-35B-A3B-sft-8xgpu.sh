@@ -13,8 +13,6 @@ source "${SCRIPT_DIR}/_common.sh"
 
 # Reuse the original eight-GPU pipeline layout; _common.sh forwards this
 # explicit opt-in to Ray workers.
-export RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1
-
 : "${MODEL_DIR:?Set MODEL_DIR to the directory containing Qwen3.6-35B-A3B}"
 : "${PROMPT_DATA:=${DATA_DIR:?Set DATA_DIR or PROMPT_DATA}/train.jsonl}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/chunkflow}"

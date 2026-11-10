@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import contextlib
-import os
 from argparse import Namespace
 from collections.abc import Callable
 from typing import Iterator, List, Optional, Union
@@ -38,10 +37,6 @@ _BATCH_KEYS = (
 def get_schedule(args: Namespace, pp_size: int) -> Callable:
     if pp_size <= 1:
         return chunkflow_forward_backward_no_pipelining
-    if os.environ.get("RELAX_CHUNKFLOW_PIPELINE_UNTESTED") != "1":
-        raise NotImplementedError(
-            "chunkflow's experimental pipeline executor requires RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1."
-        )
     from .pipeline_schedules import chunkflow_forward_backward_pipelining_without_interleaving
 
     return chunkflow_forward_backward_pipelining_without_interleaving

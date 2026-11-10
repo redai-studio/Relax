@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import ast
-import os
 import sys
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -28,7 +27,6 @@ def test_schedule_uses_actual_pp_without_duplicate_option(monkeypatch, pp_size):
     single, pipeline = object(), object()
     namespace = {
         "__package__": "examples.chunkflow",
-        "os": os,
         "chunkflow_forward_backward_no_pipelining": single,
     }
     module = ast.Module(body=ast.parse("from __future__ import annotations").body + [selector], type_ignores=[])
@@ -49,9 +47,6 @@ def test_schedule_uses_actual_pp_without_duplicate_option(monkeypatch, pp_size):
     if pp_size == 1:
         assert namespace["get_schedule"](args, pp_size) is single
     else:
-        with pytest.raises(NotImplementedError, match="RELAX_CHUNKFLOW_PIPELINE_UNTESTED"):
-            namespace["get_schedule"](args, pp_size)
-        monkeypatch.setenv("RELAX_CHUNKFLOW_PIPELINE_UNTESTED", "1")
         assert namespace["get_schedule"](args, pp_size) is pipeline
 
 
