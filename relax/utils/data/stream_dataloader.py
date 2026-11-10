@@ -1126,7 +1126,11 @@ def get_data_from_transfer_queue(
                     from relax.utils.agentic_obs.records import decode_group_ids
 
                     new_rollout_data[k] = decode_group_ids(v)
-                elif "lengths" in k or "reward" in k or k in ("sample_index_mask_sums", "sample_export_ids"):
+                elif (
+                    "lengths" in k
+                    or "reward" in k
+                    or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids"}
+                ):
                     new_rollout_data[k] = _tensor_to_python_values(v)
                 elif k in MULTIMODAL_PAYLOAD_FIELDS:
                     # Only reached on the per_rank_fetch path (the broadcast path

@@ -143,7 +143,7 @@ def build_manifest(args: Namespace, config: AgenticObsConfig, *, cp_size: int | 
     closed" from "never computed" will misreport it.
     """
 
-    from relax.utils.agentic_obs.records import SCHEMA_VERSION
+    from relax.utils.agentic_obs.records import SCHEMA_VERSION, TRAIN_SCHEMA_VERSION
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -169,6 +169,7 @@ def build_manifest(args: Namespace, config: AgenticObsConfig, *, cp_size: int | 
         "session_active_time": "managed process active-time budget, excluding generation gates",
         "session_logs": "logs/*.log; bounded final 1 MiB of combined stdout/stderr; queued reference; missing files mean unknown persistence",
         "train_scope": "megatron_policy_actor",
+        "train_schema_version": TRAIN_SCHEMA_VERSION,
         "train_sharding": "join DP facts by (run_id, train_generation_id, update_id); inputs must match local stage_id",
         "optimizer_step": "successful updates within the actor-group generation; null on missing or conflicting sequence history",
         "missing_records": "unknown until all producers have been collected; dumps are best-effort",

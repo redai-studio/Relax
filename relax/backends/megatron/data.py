@@ -1601,6 +1601,7 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "dataset_ids",
                 "sample_index_mask_sums",
                 # An opaque join key, not a measurement: averaging it would put a
                 # meaningless ~1e18 scalar on the metrics dashboard.
