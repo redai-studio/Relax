@@ -27,7 +27,7 @@ def _atomic_json(path: Path, value: dict) -> None:
     os.replace(temporary, path)
 
 
-def dump_model(model: torch.nn.Module, directory: Path, tp_rank: int) -> dict:
+def dump_model(model: torch.nn.Module, directory: Path, tp_rank: int, *, packed: bool = False) -> dict:
     """Save every state_dict entry, preserving dtype and documenting
     aliases/exclusions."""
     if not directory.is_absolute():
@@ -66,12 +66,17 @@ def dump_model(model: torch.nn.Module, directory: Path, tp_rank: int) -> dict:
     weight_map: dict[str, str] = {}
     entries = []
     total_bytes = 0
+    packed_tensors = {}
     for index, (name, tensor) in enumerate(state.items()):
-        filename = f"tensor-{index:08d}.safetensors"
+        filename = "model.safetensors" if packed else f"tensor-{index:08d}.safetensors"
         destination = rank_dir / filename
-        # save_file writes a single CPU tensor, so peak host materialization is one tensor.
+        # The default streams one tensor. Opt-in small-model audits retain the
+        # CPU copies for one file, avoiding per-parameter shared-FS metadata I/O.
         cpu_tensor = tensor.detach().to(device="cpu", copy=True).contiguous()
-        save_file({name: cpu_tensor}, destination)
+        if packed:
+            packed_tensors[name] = cpu_tensor
+        else:
+            save_file({name: cpu_tensor}, destination)
         byte_count = tensor.numel() * tensor.element_size()
         total_bytes += byte_count
         weight_map[name] = filename
@@ -85,6 +90,8 @@ def dump_model(model: torch.nn.Module, directory: Path, tp_rank: int) -> dict:
                 "bytes": byte_count,
             }
         )
+    if packed:
+        save_file(packed_tensors, rank_dir / "model.safetensors")
     coverage = {
         "tp_rank": tp_rank,
         "tensor_count": len(entries),
@@ -111,7 +118,14 @@ def dump_weights(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torc
     controls = list(named_tensors)
     if len(controls) != 1 or controls[0][1].numel() != 0:
         raise ValueError("Dump loader requires one zero-length control tensor")
-    directory = Path(controls[0][0])
+    control = controls[0][0]
+    packed = False
+    if control.startswith("{"):
+        options = json.loads(control)
+        if set(options) != {"directory", "packed"} or type(options["packed"]) is not bool:
+            raise ValueError("Invalid packed dump control")
+        control, packed = options["directory"], options["packed"]
+    directory = Path(control)
     from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
-    dump_model(model, directory, get_tensor_model_parallel_rank())
+    dump_model(model, directory, get_tensor_model_parallel_rank(), packed=packed)
