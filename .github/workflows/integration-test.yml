@@ -267,6 +267,8 @@ jobs:
             export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:${LD_LIBRARY_PATH:-}
             npu-smi info
             python3 -c "import torch, torch_npu; assert torch.npu.device_count() == 4, torch.npu.device_count()"
+            PYTHONPATH="${MEGATRON_BRIDGE_SRC:-/root/Megatron-Bridge/src}${PYTHONPATH:+:$PYTHONPATH}" \
+              python3 -m pytest -q "tests/backends/megatron/test_ce_alog_precision.py::test_gdn_a_log_preserves_fp32_checkpoint_through_bf16_wrapper[npu]"
             unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
             unset RAY_NO_WAIT RAY_ADDRESS RELAX_ENTRYPOINT_MODE
             export no_proxy="*" NO_PROXY="*"
