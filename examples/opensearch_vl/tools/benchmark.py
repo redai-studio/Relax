@@ -293,9 +293,7 @@ def main() -> None:
     parser.add_argument(
         "--judge-qps", type=float, default=1, help="Judge request start rate; zero disables rate limiting"
     )
-    parser.add_argument(
-        "--workers", type=int, default=1, help="Concurrent direct-answer requests; judge stays sequential"
-    )
+    parser.add_argument("--workers", type=int, default=1, help="Concurrent direct-answer requests and judge requests")
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--processor", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -367,7 +365,7 @@ def main() -> None:
     judge = OpenAI(
         api_key=os.environ["JUDGE_API_KEY"],
         base_url=os.environ["JUDGE_BASE_URL"],
-        max_retries=0,
+        max_retries=2,
         default_headers={os.environ.get("JUDGE_API_KEY_HEADER", "api-key"): os.environ["JUDGE_API_KEY"]},
         http_client=httpx.Client(trust_env=False, timeout=180),
     )

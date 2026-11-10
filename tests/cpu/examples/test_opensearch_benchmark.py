@@ -195,12 +195,18 @@ def test_direct_workflow_sends_one_question_without_reference_or_tools(benchmark
     assert len(trajectory["turns"]) == 1
 
 
-@pytest.mark.parametrize("model_failure", [False, True])
-def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, benchmark, tmp_path, model_failure):
+@pytest.mark.parametrize("model_failure,judge_failure", [(False, False), (True, False), (False, True)])
+def test_direct_main_requires_no_tools_and_retains_failed_cases(
+    monkeypatch, benchmark, tmp_path, model_failure, judge_failure
+):
     import json
     from threading import Barrier
 
+    import httpx
+    from openai import OpenAI
+
     barrier = Barrier(2)
+    inference_calls, judge_calls = [], []
 
     class Runner:
         def __init__(self, *_args):
@@ -208,6 +214,7 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, ben
             self.requests, self.error, self.last_response = [], None, None
 
         def infer(self, contents, **_kwargs):
+            inference_calls.append(contents)
             if model_failure and contents[0]["parts"][0]["text"] == "fail":
                 raise ConnectionError("model unavailable")
             return {"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}
@@ -240,9 +247,30 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, ben
         )
 
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=judge_request)))
-    openai = ModuleType("openai")
-    openai.OpenAI = lambda **_kwargs: client
-    monkeypatch.setitem(sys.modules, "openai", openai)
+
+    def transport(request):
+        judge_calls.append(request)
+        if len(judge_calls) == 1:
+            return httpx.Response(500, json={"error": {"message": "temporary judge failure"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "verdict",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "judge",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "correct: yes"}}],
+            },
+        )
+
+    def make_client(**kwargs):
+        if judge_failure and kwargs["base_url"].endswith(":2/v1"):
+            kwargs["http_client"].close()
+            kwargs["http_client"] = httpx.Client(transport=httpx.MockTransport(transport))
+            return OpenAI(**kwargs)
+        return client
+
+    monkeypatch.setattr(sys.modules["openai"], "OpenAI", make_client)
     for name, value in {
         "AGENT_MODEL": "baseline",
         "AGENT_BASE_URL": "http://127.0.0.1:1/v1",
@@ -287,3 +315,6 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, ben
     assert result["expected_cases"] == 2 and result["failures"] == int(model_failure)
     assert result["pass_at_1"] == (0.5 if model_failure else 1.0)
     assert result["tool_errors"] == 0 and result["protocol"]["tool_cache"] is None
+    assert len(inference_calls) == 2
+    if judge_failure:
+        assert len(judge_calls) == 3
