@@ -70,6 +70,7 @@ def test_log_perf_data_raw_reports_baseline_per_card_throughput(monkeypatch):
     logged_metrics = _collect_perf_metrics(monkeypatch, 100.0)
 
     assert logged_metrics["perf/actor_train_tok_per_s"] == 150.0
+    assert logged_metrics["perf/actor_train_world_size"] == 2
     assert logged_metrics["perf/actor_train_tok_per_s_per_card"] == 75.0
     assert logged_metrics["perf/step_token_per_s_per_card"] == 50.0
     assert logged_metrics["perf/step_resp_token_per_s_per_card"] == 25.0
