@@ -130,6 +130,129 @@ async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) ->
     assert sample.reward == 1.0
 
 
+@pytest.mark.parametrize("cancel", [False, True], ids=["across_steps", "cancel"])
+async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> None:
+    from relax.utils.opd.opd_main_worker import LogprobResponse
+
+    args = _runtime_args(
+        rollout_global_dataset=True,
+        use_opd=True,
+        opd_type="sglang",
+        opd_token_selection="student_sampled",
+        opd_teacher_key="domain",
+        opd_teacher_routes_map={"A": ["http://a"], "B": ["http://b"]},
+        opd_teacher_timeout_s=10,
+        rollout_batch_size=1,
+        over_sampling_batch_size=2,
+        n_samples_per_prompt=2 if cancel else 1,
+        partial_rollout=True,
+        group_rm=True,
+        num_rollout=2,
+        agentic_prelaunch=False,
+        use_dynamic_global_batch_size=False,
+        debug_rollout_only=False,
+        save_debug_rollout_data=None,
+    )
+    shard = runtime_mod._SessionShardBinding("shard", MagicMock())
+    runtime = RuntimeDomain(args, "train", [shard], 2)
+    monkeypatch.setattr(runtime, "_start_shard_observers", lambda: None)
+    shard.handle.pause_generation.remote = AsyncMock(return_value=0)
+    shard.handle.trim_memory.remote = AsyncMock()
+    shard.handle.release_group.remote = AsyncMock()
+    prepare = PrepareDomain("train", None, runtime)
+    monkeypatch.setattr(prepare, "fill", lambda demand: None)  # Use the groups prepared below.
+    reward = RewardDomain(args, "train", None)
+    monkeypatch.setattr(reward, "score_group", AsyncMock())
+    pipeline = AgenticResidentPipeline(args, prepare, runtime, reward, TransferDomain(args=args), None)
+    monkeypatch.setattr("relax.agentic.rollout._transfer_batch_to_data_system", AsyncMock())
+    monkeypatch.setattr("relax.agentic.rollout._log_rollout_data", MagicMock())
+    specs = {}
+
+    def counts(metrics, teacher):
+        prefix = f"mopd/by_teacher/{teacher}/"
+        return metrics[prefix + "responses"], metrics[prefix + "awaiting_submission"]
+
+    async def start_group(mode, teacher, session_specs):
+        assert all(spec.metadata["teacher_id"] == teacher for spec in session_specs)
+        specs[teacher] = session_specs[0]
+        shard.group_streams[teacher].first_request_barrier.set_result(True)
+
+    def export(teacher, answers):
+        spec = specs[teacher]
+        forest, prompt = _forest_with_initial_obs(
+            session_id=spec.session_id,
+            index=spec.index,
+            metadata=spec.metadata,
+            messages=spec.input_payload["messages"],
+            train_token_delta=_chars("q"),
+            rollout_token_delta=_chars("q"),
+        )
+        rows = []
+        for answer, fields in answers:
+            leaf = forest.append_resp(
+                parent_state_hash=prompt.state_hash,
+                rollout_id=0,
+                abort_count=0,
+                messages_delta=[{"role": "assistant", "content": answer}],
+                token_delta=_chars(answer),
+                logprob_delta=[-1.0],
+                export_metadata_patch=fields,
+            )
+            row = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
+            rows.append(SampleExport(answer, row))
+        shard.group_streams[teacher].session_results[0].completion.set_result(SessionExport(tuple(rows)))
+
+    async def resume_generation(rollout_id):
+        if rollout_id == 1:
+            export("B", [("z", {})])
+        return 0
+
+    async def lease_group(teacher, rollout_id):
+        size = args.n_samples_per_prompt
+        assert counts(pipeline.snapshot()["teacher_responses"], teacher) == (size, size)
+        if teacher == "A" and not cancel:
+            export("A", [("x", {"turn_index": 0}), ("y", {"outcome": "won"})])
+
+    async def post(session, url, payload, row, tag, expected_ids):
+        teacher = row.metadata["teacher_id"]
+        assert url == f"http://{teacher.lower()}"
+        assert counts(pipeline.snapshot()["teacher_responses"], teacher) == (1, 0)
+        score = {"x": -0.25, "y": -0.75, "z": -0.5}[row.response]
+        token_logprobs = [[None, row.tokens[0]], [score, row.tokens[1]]]
+        return LogprobResponse({"meta_info": {"input_token_logprobs": token_logprobs}})
+
+    shard.handle.start_group.remote = start_group
+    shard.handle.lease_group.remote = AsyncMock(side_effect=lease_group)
+    shard.handle.resume_generation.remote = resume_generation
+    monkeypatch.setattr(pipeline._opd_manager, "_post_logprob", post)
+    groups = {"A": [0, None]} if cancel else {"A": [0], "B": [1]}
+    for teacher, indices in groups.items():
+        samples = [Sample(index=i, prompt="q", metadata={"data_source": "math", "domain": teacher}) for i in indices]
+        prepare._start_prepare(GroupInput(teacher, samples))
+    await asyncio.gather(*prepare._warming_prepare_tasks)
+    assert counts(pipeline.snapshot()["teacher_responses"], "A") == (0, 0)
+
+    if cancel:
+        await pipeline._lease_prepared_groups(_StepContext(rollout_id=0, final_backfill=False))
+        shard.handle.lease_group.remote.assert_awaited_once_with("A", 0)
+        await pipeline._cancel_active_group_tasks()
+        assert counts(pipeline.snapshot()["teacher_responses"], "A") == (2, 0)
+        return
+
+    first = await asyncio.wait_for(pipeline.run_step(0), timeout=5)
+    assert counts(first.metrics, "A") == (1, 0)
+    assert counts(first.metrics, "B") == (1, 1)
+    x, y = first.samples[0]
+    assert x.session_id == y.session_id == specs["A"].session_id
+    assert x.metadata["turn_index"] == 0 and y.metadata["outcome"] == "won"
+    assert [x.teacher_log_probs, y.teacher_log_probs] == [[-0.25], [-0.75]]
+
+    second = await asyncio.wait_for(pipeline.run_step(1), timeout=5)
+    assert counts(second.metrics, "A") == (0, 0)
+    assert counts(second.metrics, "B") == (1, 0)
+    assert second.samples[0][0].teacher_log_probs == [-0.5]
+
+
 async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> None:
     calls: list[list[Sample]] = []
 

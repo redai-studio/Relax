@@ -591,6 +591,8 @@ def rollout_module(monkeypatch):
     logging_module._log_rollout_data = lambda *args, **kwargs: None
     logging_module.get_local_rollout_manager = lambda: SimpleNamespace(training_weight_updating=False)
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", logging_module)
+    # Reimporting also replaces the rollout attribute on the parent package.
+    monkeypatch.setattr(sys.modules["relax.agentic"], "rollout", None, raising=False)
     monkeypatch.delitem(sys.modules, "relax.agentic.rollout", raising=False)
     module = importlib.import_module("relax.agentic.rollout")
     yield module
@@ -624,7 +626,7 @@ async def _lease_observed_group(pipeline, module, stream, reward_domain, collect
     pipeline._changed = asyncio.Event()
     pipeline._opd_manager = None
     pipeline.reward_domain = reward_domain
-    pipeline.prepare_domain.take_ready = lambda count: [stream]
+    pipeline.prepare_domain.take_ready = lambda count: [(stream, None, ())]
     pipeline.runtime_domain.lease_group = AsyncMock()
     pipeline.runtime_domain.drop_group = AsyncMock()
     pipeline.runtime_domain.collect_group = collect_group
