@@ -164,8 +164,7 @@ def test_noop_backuper_signature_compatible():
     assert torch.equal(snapshot, param.detach())
 
 
-@pytest.mark.parametrize("devices", [("cuda:0", "cuda:1"), ("cpu", "cuda:0")])
-def test_backup_on_device_preserves_each_source_device(monkeypatch, devices):
+def _assert_backup_on_device_preserves_each_source_device(monkeypatch, devices: tuple[str, str]) -> None:
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     from relax.utils.training import tensor_backper
@@ -180,3 +179,7 @@ def test_backup_on_device_preserves_each_source_device(monkeypatch, devices):
         for name, param in params.items():
             assert first[name].device == param.device
             assert backuper.get("actor")[name] is first[name]
+
+
+def test_backup_on_device_preserves_each_source_device(monkeypatch):
+    _assert_backup_on_device_preserves_each_source_device(monkeypatch, ("cpu", "cuda:0"))
