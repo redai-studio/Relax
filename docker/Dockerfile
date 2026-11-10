@@ -161,13 +161,16 @@ ARG ENABLE_SGLANG_PATCH=1
 ARG HYBRID_EP_COMMIT
 ENV RELAX_HYBRID_EP_COMMIT=${HYBRID_EP_COMMIT}
 
-ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
+ARG MEGATRON_BRIDGE_COMMIT=5531d7bde48dc7872267be2ed838be8c12ef8fdb
+ARG MEGATRON_CORE_COMMIT=ac100f773f9d8fac918ce3e64698be4ed84fa428
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
 
 RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && \
     cd /root/Megatron-Bridge/ && git checkout ${MEGATRON_BRIDGE_COMMIT} && \
-    git submodule update --init --recursive && ./scripts/switch_mcore.sh dev && \
+    git submodule update --init --depth 1 -- 3rdparty/Megatron-LM && \
+    git -C 3rdparty/Megatron-LM fetch --depth 1 --no-tags origin "${MEGATRON_CORE_COMMIT}" && \
+    git -C 3rdparty/Megatron-LM checkout --detach "${MEGATRON_CORE_COMMIT}" && \
     mkdir /root/Megatron-LM &&\
     cp -r /root/Megatron-Bridge/src/megatron /root/Megatron-LM/ && \
     rsync -avP /root/Megatron-Bridge/3rdparty/Megatron-LM/megatron/ /root/Megatron-LM/megatron/ && \
@@ -233,12 +236,12 @@ COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
 COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
 COPY docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
-    patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
+    patch --batch --forward --fuzz=0 -p1 < megatron.patch && \
     if grep -R -n '^<<<<<<< ' .; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
+    patch --batch --forward --fuzz=0 -p1 < sync-save-bounded-staging.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \

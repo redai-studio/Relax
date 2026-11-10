@@ -2,7 +2,7 @@
 """Exercise the static RoPE patch on pinned Bridge functions without CUDA.
 
 Set QWEN_BRIDGE_ROPE_SOURCE to rope.py from Bridge
-6862ee170a2569607e8ebc5dde91f119779093ca.
+5531d7bde48dc7872267be2ed838be8c12ef8fdb.
 """
 
 import ast

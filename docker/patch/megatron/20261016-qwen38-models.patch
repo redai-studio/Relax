@@ -19,14 +19,13 @@ diff --git a/megatron/bridge/models/__init__.py b/megatron/bridge/models/__init_
      "Qwen35TokenClassificationModelProvider",
      "Qwen35VLModelProvider",
 diff --git a/megatron/bridge/models/conversion/auto_bridge.py b/megatron/bridge/models/conversion/auto_bridge.py
+index 44f980093..bca27a7c2 100644
 --- a/megatron/bridge/models/conversion/auto_bridge.py
 +++ b/megatron/bridge/models/conversion/auto_bridge.py
-@@ -166,6 +166,19 @@
-         return False
-     with open(config_path) as f:
+@@ -169,6 +169,19 @@ def _saved_config_disables_mtp(path: str | Path) -> bool:
          return _config_disables_mtp(json.load(f))
-+
-+
+ 
+ 
 +def _ple_fp8_source_scale_keys(source: SafeTensorsStateSource) -> tuple[str, ...]:
 +    """Return exact PLE scale keys consumed when FP8 host rows are dequantized."""
 +    keys = source.get_all_keys()
@@ -38,10 +37,12 @@ diff --git a/megatron/bridge/models/conversion/auto_bridge.py b/megatron/bridge/
 +        if any(key != scale and key.startswith(scale) for key in keys):
 +            raise ValueError(f"PLE scale key prefix collision: {scale}")
 +    return scales
- 
- 
++
++
  def _mtp_source_key_prefixes(source: Any, *configs: Any) -> tuple[str, ...]:
-@@ -1287,7 +1300,8 @@
+     """Source-checkpoint key prefixes for MTP/nextn tensors that must be ignored
+     when exporting a model built without an MTP head.
+@@ -1341,7 +1354,8 @@ class AutoBridge(Generic[MegatronModelT]):
                  or _model_omits_mtp(model_config)
              )
              ignored_source_key_prefixes = (
@@ -1739,9 +1740,10 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
          sequence_parallel_override = False
  
 diff --git a/megatron/core/models/hybrid/hybrid_block.py b/megatron/core/models/hybrid/hybrid_block.py
+index c886f6fe2..a5738fec9 100644
 --- a/megatron/core/models/hybrid/hybrid_block.py
 +++ b/megatron/core/models/hybrid/hybrid_block.py
-@@ -43,7 +43,7 @@
+@@ -44,7 +44,7 @@ from megatron.core.transformer.module import (
  )
  from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
  from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -1750,7 +1752,7 @@ diff --git a/megatron/core/models/hybrid/hybrid_block.py b/megatron/core/models/
  from megatron.core.transformer.utils import (
      ensure_metadata_has_dp_cp_group,
      make_sharded_tensors_for_checkpoint,
-@@ -950,7 +950,8 @@
+@@ -1135,7 +1135,8 @@ class HybridStack(MegatronModule):
                      raise ValueError("unexpected layer_type")
              if self.is_mtp_layer and self.mtp_layer_number is not None:
                  self._set_mtp_layer_number_for_moe_metrics(layer, self.mtp_layer_number)
@@ -1761,6 +1763,7 @@ diff --git a/megatron/core/models/hybrid/hybrid_block.py b/megatron/core/models/
              self.layers.append(layer)
  
 diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/core/pipeline_parallel/p2p_communication.py
+index a31f99de4..f097fdb8a 100644
 --- a/megatron/core/pipeline_parallel/p2p_communication.py
 +++ b/megatron/core/pipeline_parallel/p2p_communication.py
 @@ -1,6 +1,7 @@
@@ -1771,7 +1774,7 @@ diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/cor
  from typing import List, Optional, Tuple, Union
  
  import torch
-@@ -223,7 +224,19 @@
+@@ -223,7 +224,19 @@ class P2PCommunicator:
                  tensor_send_next.size(), device=torch.cuda.current_device(), dtype=torch.int64
              )
  
@@ -1792,7 +1795,7 @@ diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/cor
              torch.distributed.ring_exchange(
                  tensor_send_prev=send_prev_shape_tensor,
                  tensor_recv_prev=recv_prev_shape_tensor,
-@@ -308,6 +321,9 @@
+@@ -308,6 +321,9 @@ class P2PCommunicator:
          """
  
          config = self.config
@@ -1802,7 +1805,7 @@ diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/cor
          tensor_recv_prev_func = None
          tensor_recv_next_func = None
  
-@@ -368,7 +384,7 @@
+@@ -371,7 +387,7 @@ class P2PCommunicator:
              # batch_isend_irecv cannot pair same-peer bidirectional ops correctly (see
              # #1450). Force _p2p_ops which handles this via WORLD split + even/odd order.
              p2p_func = _p2p_ops
@@ -1811,7 +1814,7 @@ diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/cor
              assert wait_on_reqs
              p2p_func = _batched_p2p_ops
          else:
-@@ -414,6 +430,7 @@
+@@ -417,6 +433,7 @@ class P2PCommunicator:
  
          if (
              config.batch_p2p_comm
@@ -1820,9 +1823,10 @@ diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/cor
              and not torch.cuda.is_current_stream_capturing()
          ):
 diff --git a/megatron/core/pipeline_parallel/schedules.py b/megatron/core/pipeline_parallel/schedules.py
+index cf44390d3..9cb04a412 100644
 --- a/megatron/core/pipeline_parallel/schedules.py
 +++ b/megatron/core/pipeline_parallel/schedules.py
-@@ -277,7 +277,10 @@
+@@ -277,7 +277,10 @@ def _get_experimental_attention_variant_loss_scale_func(config):
      if loss_scale_func is not None:
          return loss_scale_func
  
@@ -1835,9 +1839,10 @@ diff --git a/megatron/core/pipeline_parallel/schedules.py b/megatron/core/pipeli
              DSAIndexerLossAutoScaler,
          )
 diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gated_delta_net/common.py
+index 5d486d409..dfae503f6 100644
 --- a/megatron/core/ssm/gated_delta_net/common.py
 +++ b/megatron/core/ssm/gated_delta_net/common.py
-@@ -192,6 +192,19 @@
+@@ -198,6 +198,19 @@ class _GDNBase(MegatronModule):
          self.hidden_size = config.hidden_size
          self.act_fn = config.activation_func
          self.activation = self.act_fn.__name__
@@ -1857,7 +1862,7 @@ diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gat
          self.conv_kernel_dim = config.linear_conv_kernel_dim
          self.key_head_dim = config.linear_key_head_dim
          self.value_head_dim = config.linear_value_head_dim
-@@ -394,7 +407,7 @@
+@@ -400,7 +413,7 @@ class _GDNBase(MegatronModule):
          y = self.out_norm(x)
          # Output gate
          gate = gate.reshape(-1, gate.shape[-1])
@@ -4104,9 +4109,10 @@ new file mode 100644
 +    )
 +    return reduced * loss_coeff
 diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
+index 6e207f5c7..10dc93e92 100644
 --- a/megatron/core/transformer/hyper_connection.py
 +++ b/megatron/core/transformer/hyper_connection.py
-@@ -904,6 +904,241 @@
+@@ -912,6 +912,241 @@ class HyperConnectionModule(MegatronModule):
          return output
  
  
@@ -5280,9 +5286,10 @@ new file mode 100644
 +        )
 +    return output
 diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/transformer/transformer_block.py
+index fb8e786e5..42a8c8d73 100755
 --- a/megatron/core/transformer/transformer_block.py
 +++ b/megatron/core/transformer/transformer_block.py
-@@ -397,7 +397,7 @@
+@@ -397,7 +397,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                  hidden_size=self.config.hidden_size,
                  eps=self.config.layernorm_epsilon,
              )
@@ -5291,7 +5298,7 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
                  hc_mult = self.config.num_residual_streams
                  hc_dim = self.config.hidden_size * hc_mult
                  self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-@@ -522,14 +522,15 @@
+@@ -522,14 +522,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                  mhc_multistream = hidden_states
              # DSv4 introduced the new output contraction for mHC.
              # [s, b, n*C] -> [s, b, C]
@@ -5316,9 +5323,10 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
          # Final layer norm.
          if self.final_layernorm is not None:
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 0a80aef17..5c2136140 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
-@@ -464,6 +464,79 @@
+@@ -518,6 +518,79 @@ class TransformerConfig(ModelParallelConfig):
      This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
      the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
  
@@ -5398,11 +5406,10 @@ diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/tra
      ####################
      # initialization
      ####################
-@@ -1299,6 +1369,18 @@
- 
+@@ -1356,6 +1429,18 @@ class TransformerConfig(ModelParallelConfig):
      num_residual_streams: int = 4
      """Number of residual streams (n in paper)."""
-+
+ 
 +    mhc_variant: Literal["mhc", "gated_residual"] = "mhc"
 +    """Hyper-connection formulation used by the layer specs when ``enable_hyper_connections`` is
 +    set. ``mhc`` is the Manifold-Constrained Hyper-Connection of DeepSeek-V4
@@ -5414,10 +5421,11 @@ diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/tra
 +    mhc_gated_residual_rank: Optional[int] = None
 +    """Bottleneck rank of the gated-residual input mixer (``hc_lowrank`` in the Qwen4-Exp HF
 +    config). Required when ``mhc_variant == "gated_residual"``."""
- 
++
      mhc_sinkhorn_iterations: int = 20
      """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
-@@ -2745,7 +2827,80 @@
+ 
+@@ -2849,7 +2934,80 @@ class TransformerConfig(ModelParallelConfig):
          # itself requires is checked further down, under
          # mhc_recompute_attn_cuda_graph_split.
  
@@ -5499,11 +5507,10 @@ diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/tra
              warnings.warn(
                  "HyperConnections are enabled but 'mhc' is not in "
                  "recompute_modules with selective recompute. Consider adding 'mhc' to "
-@@ -2891,6 +3046,17 @@
-                 )
+@@ -2996,6 +3154,17 @@ class TransformerConfig(ModelParallelConfig):
              elif detected_vpp_size > 1:
                  self.virtual_pipeline_model_parallel_size = detected_vpp_size
-+
+ 
 +            if (
 +                self.enable_hyper_connections
 +                and self.mhc_variant == "gated_residual"
@@ -5514,13 +5521,15 @@ diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/tra
 +                    "enable_hyper_connections with pipeline_model_parallel_size > 1 does not "
 +                    "support virtual_pipeline_model_parallel_size."
 +                )
- 
++
              # Check whether the layout is valid.
+             mtp_was_standalone = self.mtp_standalone
              self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
 diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
+index f9fd7e82c..80cabea08 100644
 --- a/megatron/core/transformer/transformer_layer.py
 +++ b/megatron/core/transformer/transformer_layer.py
-@@ -276,6 +276,9 @@
+@@ -276,6 +276,9 @@ class TransformerLayerSubmodules:
              in the `sharded_state_dict` method.
      """
  
@@ -5530,7 +5539,7 @@ diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/tran
      input_layernorm: LayerNormBuilder = IdentityOp
      self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
      self_attention: Union[ModuleSpec, type] = IdentityOp
-@@ -2012,6 +2015,7 @@
+@@ -2078,6 +2081,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
          pp_layer_offset: Optional[int] = None,
          is_mtp_layer: bool = False,
          name: str | None = None,
@@ -5538,22 +5547,21 @@ diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/tran
      ):
          super().__init__(
              config=config,
-@@ -2020,8 +2024,9 @@
+@@ -2086,8 +2090,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
              hidden_dropout=hidden_dropout,
              pg_collection=pg_collection,
              vp_stage=vp_stage,
-+            is_mtp_layer=is_mtp_layer,
+-            pp_layer_offset=pp_layer_offset,
+             is_mtp_layer=is_mtp_layer,
 +            add_layer_offset=add_layer_offset,
-             pp_layer_offset=pp_layer_offset,
--            is_mtp_layer=is_mtp_layer,
++            pp_layer_offset=pp_layer_offset,
              name=name,
          )
  
-@@ -2049,6 +2054,14 @@
-         self.mlp_hyper_connection = build_module(
+@@ -2116,6 +2121,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
              submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
          )
-+
+ 
 +        # Optional per-layer embedding (Qwen4-Exp PLE) added to the n-stream residual before
 +        # the self-attention hyper connection reads it.
 +        self.per_layer_embedding = build_module(
@@ -5561,21 +5569,22 @@ diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/tran
 +        )
 +        if isinstance(self.per_layer_embedding, IdentityOp):
 +            self.per_layer_embedding = None
- 
++
          self._validate_mhc_recompute_attn_cuda_graph_split()
  
-@@ -2315,6 +2328,11 @@
-     ):
+     def _uses_mhc_recompute_attn_cuda_graph_split(self) -> bool:
+@@ -2372,6 +2385,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
          """Forward attention with hyper connection pre/post processing on self-attention."""
          inference_context = deprecate_inference_params(inference_context, inference_params)
-+
+ 
 +        if self.per_layer_embedding is not None:
 +            nvtx_range_push(suffix="per_layer_embedding")
 +            hidden_states = hidden_states + self.per_layer_embedding(hidden_states)
 +            nvtx_range_pop(suffix="per_layer_embedding")
- 
++
          nvtx_range_push(suffix="self_attention_hyper_connection")
          hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (
+             self.self_attention_hyper_connection(
 diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_delta_net/gdn.py
 --- a/megatron/core/ssm/gated_delta_net/gdn.py
 +++ b/megatron/core/ssm/gated_delta_net/gdn.py
@@ -5623,9 +5632,13 @@ diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transfor
 +HYBRIDEP_TOKEN_ALIGNMENT = 128
 
 diff --git a/megatron/core/transformer/moe/token_dispatcher.py b/megatron/core/transformer/moe/token_dispatcher.py
+index 7bd8f4837..13a89c4a1 100644
 --- a/megatron/core/transformer/moe/token_dispatcher.py
 +++ b/megatron/core/transformer/moe/token_dispatcher.py
-@@ -1141,3 +1141,9 @@
+@@ -1138,9 +1138,15 @@ class _HybridEPManager(_DispatchManager):
+         if self.config.moe_hybridep_pad_variable_tokens:
+             # Use the actual tp_ep max so all ranks in the MoE communication
+             # group pass the same token count to HybridEP.
 -            max_num_tokens_across_ep = torch.tensor(
 -                [num_tokens], device=routing_map.device, dtype=torch.long
 -            )
@@ -5638,3 +5651,6 @@ diff --git a/megatron/core/transformer/moe/token_dispatcher.py b/megatron/core/t
 +                max_num_tokens_across_ep = torch.tensor(
 +                    [num_tokens], device=routing_map.device, dtype=torch.long
 +                )
+             torch.distributed.all_reduce(
+                 max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
+             )

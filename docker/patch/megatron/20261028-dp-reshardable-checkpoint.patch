@@ -1,6 +1,8 @@
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index 6c644662a..28000ddf8 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
-@@ -1951,6 +1951,32 @@
+@@ -1957,6 +1957,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
          data_parallel_world_size = self.data_parallel_group.size()
  
          state = self.get_parameter_state_dp_reshardable()
@@ -33,7 +35,7 @@
          # per_bucket_numel metadata is saved separately for each TPxPP domain.
          for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
              key = (
-@@ -1984,10 +2010,34 @@
+@@ -1990,10 +2016,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
  
                      # The global ckpt tensors must be fully covered.
                      # We add extra empty padding if necessary
@@ -69,7 +71,7 @@
                      for i in range(-1, len(bucket_state)):
                          if i == len(bucket_state) - 1:
                              # Potential padding at the end
-@@ -1999,16 +2049,13 @@
+@@ -2005,16 +2055,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                              cur_param_end = 0
                          else:
                              cur_param_end = bucket_state[i]['gbuf_local_end']
@@ -89,7 +91,7 @@
                                  )
                                  for k, v in bucket_state[i].items()
                                  if isinstance(v, torch.Tensor)
-@@ -2016,7 +2063,7 @@
+@@ -2022,7 +2069,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                              all_pad_tensors[i + 1] = {
                                  **pad_tensors,
                                  'gbuf_local_start': cur_param_end,

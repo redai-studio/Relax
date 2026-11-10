@@ -207,9 +207,10 @@ diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/opti
                  log_single_rank(
                      logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
 diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/transformer/transformer_block.py
+index 42a8c8d73..3d3f76b75 100755
 --- a/megatron/core/transformer/transformer_block.py
 +++ b/megatron/core/transformer/transformer_block.py
-@@ -579,21 +579,7 @@
+@@ -579,21 +579,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
      def _get_layer(self, layer_number: int):
          return self.layers[layer_number]
  
@@ -232,7 +233,7 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
          """Forward method with activation checkpointing.
  
          Args:
-@@ -608,153 +594,69 @@
+@@ -608,154 +594,70 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
              If extract_layer_indices is empty: hidden_states tensor
              If extract_layer_indices is non-empty: (hidden_states, intermediate_hidden_states) tuple
          """
@@ -267,8 +268,7 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
 -                    if is_dual_rope
 -                    else rotary_pos_emb_global
 -                )
--
-+
+ 
 +            def custom_forward(hidden_states, attention_mask, context, context_mask, rotary_pos_emb_local, rotary_pos_emb_global, padding_mask=None):
 +                rotary_pos_emb = (rotary_pos_emb_local, rotary_pos_emb_global) if is_dual_rope else rotary_pos_emb_global
                  for index in range(start, end):
@@ -404,14 +404,16 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
 -
 +            return (hidden_states, intermediate_hidden_states)
          return hidden_states
-+
  
++
      def set_input_tensor(self, input_tensor: Tensor):
          """Set input tensor to be used instead of forward()'s input.
+ 
 diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
+index bc42ab7e0..c2cb86ead 100644
 --- a/megatron/core/transformer/attention.py
 +++ b/megatron/core/transformer/attention.py
-@@ -1949,166 +1949,89 @@
+@@ -1957,166 +1957,89 @@ class SelfAttention(Attention):
                  "TP",
              )
  
@@ -609,11 +611,10 @@ diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/
 +            return (query, key, value, gate)
          if head_wise_gate:
 -            return query, key, value, head_wise_gate_states
--
--        return query, key, value
 +            return (query, key, value, head_wise_gate_states)
 +        return (query, key, value)
-+
+ 
+-        return query, key, value
  
      def backward_dw(self) -> None:
          """Execute weight update operations"""
@@ -630,9 +631,10 @@ diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/tra
              else:
                  output = self.cached_output
 diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 6334b1a27..6a6f0eaea 100644
 --- a/megatron/training/training.py
 +++ b/megatron/training/training.py
-@@ -2554,6 +2554,12 @@
+@@ -3056,6 +3056,12 @@ def get_model(
          config = get_model_config(model[0])
  
          ddp_config = get_megatron_ddp_config(args)
@@ -646,17 +648,18 @@ diff --git a/megatron/training/training.py b/megatron/training/training.py
              # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
              ddp_config.bucket_size = resolve_ddp_bucket_size(
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 5c2136140..36d8f2448 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
-@@ -64,6 +64,8 @@
-     The initialization function has an argument for each parameter,
+@@ -68,6 +68,8 @@ class TransformerConfig(ModelParallelConfig):
      including those in ModelParallelConfig.
      """
-+
-+    _relax_qwen35_optimized: bool = False
  
++    _relax_qwen35_optimized: bool = False
++
      ####################
      # model architecture
+     ####################
 diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transformer/moe/fused_a2a.py
 --- a/megatron/core/transformer/moe/fused_a2a.py
 +++ b/megatron/core/transformer/moe/fused_a2a.py
@@ -698,9 +701,10 @@ diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transfor
      num_bytes = ElasticBuffer.get_buffer_size_hint(
          group, num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden, num_topk=num_topk
 diff --git a/megatron/core/transformer/moe/token_dispatcher.py b/megatron/core/transformer/moe/token_dispatcher.py
+index 13a89c4a1..0aac4a6e7 100644
 --- a/megatron/core/transformer/moe/token_dispatcher.py
 +++ b/megatron/core/transformer/moe/token_dispatcher.py
-@@ -1968,7 +1968,12 @@
+@@ -1968,7 +1968,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
              self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
          elif self.config.moe_flex_dispatcher_backend == "deepepv2":
              assert self.tp_size * self.ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"

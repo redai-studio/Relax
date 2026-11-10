@@ -1,8 +1,10 @@
 Backport the optimizer changes from NVIDIA/Megatron-LM#5077 (32a03b77c560).
 
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index 28000ddf8..3b45352fb 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
-@@ -1311,6 +1311,8 @@ def get_parameter_state_dp_zero(
+@@ -1397,6 +1397,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
              for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                  buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                  # Create coalesced tensors for all state related to parameters in this buffer.
@@ -11,7 +13,7 @@ Backport the optimizer changes from NVIDIA/Megatron-LM#5077 (32a03b77c560).
                  world_tensors = {}
                  if data_parallel_rank == 0 or return_on_all_ranks:
                      world_tensors = {
-@@ -1761,10 +1763,21 @@ def sharded_param_state_fully_reshardable(
+@@ -1855,10 +1857,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                  # Note: for NVFP4, param_index_map uses unpacked (full numel)
                  # offsets, which is correct here since optimizer states
                  # (fp32_param, exp_avg, exp_avg_sq) are in unpacked space.
@@ -34,7 +36,7 @@ Backport the optimizer changes from NVIDIA/Megatron-LM#5077 (32a03b77c560).
                  ) in buffer.param_index_map.items():
                      try:
                          sharded_metadata = param_to_sharded_metadata[model_param]
-@@ -1780,32 +1793,29 @@ def sharded_param_state_fully_reshardable(
+@@ -1874,6 +1887,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                      # Note: replica_id is exactly the same as in the model param
                      replica_id = sharded_metadata.replica_id
  
@@ -48,7 +50,7 @@ Backport the optimizer changes from NVIDIA/Megatron-LM#5077 (32a03b77c560).
                      tensors = {}
                      for state_key in world_tensor_keys:
                          if state_key == 'step' or state_key == 'numel_unpadded':
-                             # The optimizer state of STEP is handled
+@@ -1881,25 +1901,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                              # specifically and is read from param_groups.
                              # Numel unpadded is not needed.
                              continue

@@ -90,7 +90,7 @@ If you only need the base policy and have no downstream speculative-decoding pla
 ### Prerequisites
 
 - The HF checkpoint must already contain MTP weights, i.e. `config.json` has `num_nextn_predict_layers >= 1`. Today this covers **Qwen3.5**, **Qwen3-next**, **MiMo-7B-RL**, **DeepSeek-V3 / V3.1**, and **GLM-4.7-MoE**.
-- The Megatron backend (this is the only training backend in Relax). MTP requires the Megatron MTP patch shipped at [`docker/patch/megatron/20260506-85bced0ae.patch`](../../../docker/patch/megatron/20260506-85bced0ae.patch); the official Relax image applies it automatically.
+- The Megatron backend (this is the only training backend in Relax). MTP requires the Megatron MTP patch shipped at [`docker/patch/latest/megatron.patch`](../../../docker/patch/latest/megatron.patch). The CUDA and ROCm images apply it automatically.
 - Combined 1F1B pipeline schedule must be off — it is incompatible with MTP and is asserted out at [`relax/backends/megatron/model.py:493`](../../../relax/backends/megatron/model.py).
 
 ### Flags

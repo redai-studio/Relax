@@ -353,9 +353,7 @@ def test_fake_qat_mxfp4_matches_real_bridge_implementation(monkeypatch, shape, m
         for node in ast.walk(functions[name])
         if isinstance(node, ast.Compare)
     ):
-        pytest.skip(
-            "Requires Bridge uint8 E8M0 support (Dockerfile.cu13 pin 6862ee170a2569607e8ebc5dde91f119779093ca)"
-        )
+        pytest.skip("Requires Bridge uint8 E8M0 support")
     spec = importlib.util.spec_from_file_location("_test_real_bridge_quantization", path)
     bridge_utils = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bridge_utils)

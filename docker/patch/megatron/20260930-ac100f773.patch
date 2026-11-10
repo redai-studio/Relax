@@ -1,17 +1,8 @@
 diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge/models/conversion/model_bridge.py
-index a7e4a70..b7118ca 100644
+index c4ac32532..fd04d382f 100644
 --- a/megatron/bridge/models/conversion/model_bridge.py
 +++ b/megatron/bridge/models/conversion/model_bridge.py
-@@ -1430,7 +1430,7 @@ class MegatronModelBridge(
-         _hf_import_cache: Dict[str, torch.Tensor] = {}
-         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
-             # None means megatron module not on current rank, skip if this task is not going to happen
--            if task.megatron_module is None:
-+            if task is None or task.megatron_module is None:
-                 continue
-             # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
-             hf_param_key = str(task.mapping.hf_param)
-@@ -1602,7 +1602,7 @@ class MegatronModelBridge(
+@@ -1644,7 +1644,7 @@ class MegatronModelBridge(
  
          for task in conversion_tasks:
              # None means megatron module not on current rank, skip if this task is not going to happen
@@ -20,8 +11,8 @@ index a7e4a70..b7118ca 100644
                  continue
              hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
              converted_weights = self._convert_loaded_hf_weight(task, hf_weights)
-@@ -1709,6 +1709,8 @@ class MegatronModelBridge(
-         _grouped_buffers: Dict[str, Dict[int, torch.Tensor]] = {}
+@@ -1761,6 +1761,8 @@ class MegatronModelBridge(
+         _grouped_sources: Optional[Dict[str, List[str]]] = {} if with_megatron_names else None
  
          for task in self._with_progress_tracking(megatron_to_hf_tasks, "Converting to HuggingFace", show_progress):
 +            if task is None:
@@ -428,10 +419,10 @@ index ac36d40..490ebed 100644
  
  
 diff --git a/megatron/core/fusions/fused_mla_yarn_rope_apply.py b/megatron/core/fusions/fused_mla_yarn_rope_apply.py
-index 121dd85..411473b 100644
+index a541c2a6c..204badd3f 100644
 --- a/megatron/core/fusions/fused_mla_yarn_rope_apply.py
 +++ b/megatron/core/fusions/fused_mla_yarn_rope_apply.py
-@@ -913,6 +913,7 @@ def _mla_rope_fwd_kv_split_kernel(
+@@ -1048,6 +1048,7 @@ def _mla_rope_fwd_kv_split_kernel(
      SIN,
      emb_dim: tl.constexpr,
      k_dim: tl.constexpr,
@@ -439,7 +430,7 @@ index 121dd85..411473b 100644
      v_dim: tl.constexpr,
      head_num: tl.constexpr,
      batch_size,
-@@ -962,21 +963,27 @@ def _mla_rope_fwd_kv_split_kernel(
+@@ -1097,21 +1098,27 @@ def _mla_rope_fwd_kv_split_kernel(
      cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
      sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
  
@@ -480,7 +471,7 @@ index 121dd85..411473b 100644
  
      EMB = K_POS_EMB + pid_m * stride_emb_seq
      # x1 = t[..., 0::2], x2 = t[..., 1::2]
-@@ -988,24 +995,26 @@ def _mla_rope_fwd_kv_split_kernel(
+@@ -1123,24 +1130,26 @@ def _mla_rope_fwd_kv_split_kernel(
      x_left = x_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
      x_right = x_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
  
@@ -513,7 +504,7 @@ index 121dd85..411473b 100644
  
  
  @triton.autotune(
-@@ -1031,6 +1040,7 @@ def _mla_rope_bwd_kv_split_kernel(
+@@ -1166,6 +1175,7 @@ def _mla_rope_bwd_kv_split_kernel(
      SIN,
      emb_dim: tl.constexpr,
      k_dim: tl.constexpr,
@@ -521,7 +512,7 @@ index 121dd85..411473b 100644
      v_dim: tl.constexpr,
      head_num: tl.constexpr,
      batch_size,
-@@ -1072,27 +1082,32 @@ def _mla_rope_bwd_kv_split_kernel(
+@@ -1207,27 +1217,32 @@ def _mla_rope_bwd_kv_split_kernel(
      else:
          token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
  
@@ -570,7 +561,7 @@ index 121dd85..411473b 100644
              mask = x_off < head_num * stride_dk_nheads
              if REMOVE_INTERLEAVING:
                  x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
-@@ -1179,6 +1194,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
+@@ -1314,6 +1329,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
  
          o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
          o_value = kv.new_empty(total_seqlen, nheads, v_dim)
@@ -578,7 +569,7 @@ index 121dd85..411473b 100644
  
          grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
          _mla_rope_fwd_kv_split_kernel[grid](
-@@ -1190,6 +1206,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
+@@ -1325,6 +1341,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
              sin,
              emb_dim,
              k_dim,
@@ -586,7 +577,7 @@ index 121dd85..411473b 100644
              v_dim,
              nheads,
              batch_size,
-@@ -1249,6 +1266,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
+@@ -1384,6 +1401,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
  
          d_kv = dk.new_empty(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
          d_emb = dk.new_empty(total_seqlen, 1, ctx.emb_dim)
@@ -594,7 +585,7 @@ index 121dd85..411473b 100644
  
          grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
          _mla_rope_bwd_kv_split_kernel[grid](
-@@ -1260,6 +1278,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
+@@ -1395,6 +1413,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
              sin,
              ctx.emb_dim,
              ctx.k_dim,
@@ -873,7 +864,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
      def _register_load_state_dict_hooks(self):
          def pre_load_state_dict_hook(self, state_dict):
 diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
-index ea16883..6df7026 100644
+index 97cb9a87b..6c644662a 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
 @@ -470,7 +470,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
@@ -896,15 +887,6 @@ index ea16883..6df7026 100644
  
          # Grad scaler state.
          if self.grad_scaler:
-@@ -2039,6 +2043,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
-                                 # separately via param_groups, not as part of the gradient buffer.
-                                 tensors[key] = LocalNonpersistentObject(tensors[key])
-                                 continue
-+                            if key == 'step':
-+                                continue
-                             assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
-                                 tensors[key].shape,
-                                 gbuf_local_start,
 diff --git a/megatron/core/parallel_state.py b/megatron/core/parallel_state.py
 index 7023488..25b07e2 100644
 --- a/megatron/core/parallel_state.py
@@ -918,7 +900,7 @@ index 7023488..25b07e2 100644
  from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
  
 diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/core/pipeline_parallel/p2p_communication.py
-index a365767..18d9d2f 100644
+index 0fb4cf4da..a31f99de4 100644
 --- a/megatron/core/pipeline_parallel/p2p_communication.py
 +++ b/megatron/core/pipeline_parallel/p2p_communication.py
 @@ -232,34 +232,26 @@ class P2PCommunicator:
@@ -975,7 +957,7 @@ index a365767..18d9d2f 100644
              torch.cuda.synchronize()
  
          recv_prev_shape = [0, 0, 0]
-@@ -371,6 +363,11 @@ class P2PCommunicator:
+@@ -374,6 +366,11 @@ class P2PCommunicator:
                  return []
  
              p2p_func = _ring_exchange_wrapper
@@ -987,7 +969,7 @@ index a365767..18d9d2f 100644
          elif config.batch_p2p_comm:
              assert wait_on_reqs
              p2p_func = _batched_p2p_ops
-@@ -381,10 +378,12 @@ class P2PCommunicator:
+@@ -384,10 +381,12 @@ class P2PCommunicator:
          next_rank = self.next_rank
          prev_rank = self.prev_rank
  
@@ -1023,13 +1005,13 @@ index d046c3e..59ac05e 100644
              ("megatron.core.safe_globals", "safe_load_from_bytes"),
              ("numpy._core.multiarray", "_reconstruct"),
 diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gated_delta_net/common.py
-index b3b829b..8e21e01 100644
+index fdc7f2908..5d486d409 100644
 --- a/megatron/core/ssm/gated_delta_net/common.py
 +++ b/megatron/core/ssm/gated_delta_net/common.py
-@@ -485,6 +485,65 @@
+@@ -501,6 +501,65 @@ class _GDNBase(MegatronModule):
          """
          raise NotImplementedError
-
+ 
 +    def _resolve_thd_cu_seqlens(self, packed_seq_params, seq_len_global, cp_size):
 +        """Resolve and validate this micro-batch's global THD boundaries, once.
 +
@@ -1092,7 +1074,7 @@ index b3b829b..8e21e01 100644
      def _resolve_cu_seqlens(
          self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
      ) -> torch.Tensor:
-@@ -706,7 +765,7 @@ def get_parameter_local_cp(
+@@ -722,7 +781,7 @@ def get_parameter_local_cp(
      slices = [slice(None)] * param.dim()
      dim_size = param.size(dim=dim)
      slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
@@ -1202,23 +1184,23 @@ index 8a76c8e..8f54840 100644
          _unset_checkpointing()
          return (None, None) + grads
 diff --git a/megatron/core/transformer/experimental_attention_variant/csa.py b/megatron/core/transformer/experimental_attention_variant/csa.py
-index 59a5fef..62d9a0c 100644
+index 1c8356056..414149973 100644
 --- a/megatron/core/transformer/experimental_attention_variant/csa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/csa.py
-@@ -2980,7 +2980,8 @@ class CompressedSparseAttention(MegatronModule):
-                         self.config,
-                     )
-                 q_indexer_cp = rotate_activation(q_indexer_cp)
+@@ -3404,7 +3404,8 @@ class CompressedSparseAttention(MegatronModule):
+                             self.config,
+                         )
+                     q_indexer_cp = rotate_activation(q_indexer_cp)
 -                weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
 +                with get_fp8_disabled_context(indexer.config):
 +                    weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
                  weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
                  nvtx_range_pop("dsv4_cp_indexer_q_weights")
  
-@@ -3054,6 +3055,14 @@ class CompressedSparseAttention(MegatronModule):
-                         logical_indexer_layout=indexer_layout,
+@@ -3581,6 +3582,14 @@ class CompressedSparseAttention(MegatronModule):
+                             logical_indexer_layout=indexer_layout,
+                         )
                      )
-                 )
 +                if getattr(self.config, "relax_use_indexer_replay", False):
 +                    from relax.utils.training.indexer_replay import maybe_replay_indexer_topk
 +                    compressed_topk = maybe_replay_indexer_topk(
@@ -1229,12 +1211,12 @@ index 59a5fef..62d9a0c 100644
 +                    compact_indexer_predict = None
                  nvtx_range_pop("dsv4_cp_indexer_topk")
  
-                 nvtx_range_push("dsv4_cp_attention_kv_all_gather_wait")
+                 nvtx_range_pop("indexer_total")
 diff --git a/megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py b/megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py
-index 5bccd28..fac7a61 100644
+index 9fbe5311d..45bcb753a 100644
 --- a/megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py
 +++ b/megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py
-@@ -255,7 +255,6 @@ def prepare_cp_compressor_input(
+@@ -260,7 +260,6 @@ def prepare_cp_compressor_input(
      )
  
  
@@ -1243,10 +1225,10 @@ index 5bccd28..fac7a61 100644
      cu_seqlens_q: torch.Tensor,
      cu_seqlens_compressed: torch.Tensor,
 diff --git a/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py b/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
-index 1be7733..ab01220 100644
+index 69cd7b0f7..f54408375 100644
 --- a/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
 +++ b/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
-@@ -3016,7 +3016,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
+@@ -3261,7 +3261,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
          bwd_loss_coeff = loss_coeff * total_q / loss_divisor
          unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
  
@@ -1258,10 +1240,10 @@ index 1be7733..ab01220 100644
              if q_padding_mask is not None:
                  indexer_topk_idxs_for_loss = indexer_topk_idxs.masked_fill(
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
-index 4ce5ebf..d39ca64 100644
+index b67b9167f..62e31f949 100644
 --- a/megatron/core/transformer/moe/moe_utils.py
 +++ b/megatron/core/transformer/moe/moe_utils.py
-@@ -864,6 +864,9 @@ def topk_routing_with_score_function(
+@@ -865,6 +865,9 @@ def topk_routing_with_score_function(
                  scores, topk, num_groups, group_topk, _compute_topk
              )
  
@@ -1271,7 +1253,7 @@ index 4ce5ebf..d39ca64 100644
      # Precision notes:
      # - Logits are converted to fp32 for score functions.
      # - All the intermediate calculations are in fp32.
-@@ -1495,7 +1498,16 @@
+@@ -1478,7 +1481,16 @@ class RouterGatingLinearFunction(torch.autograd.Function):
          inp_shape = inp.shape
          inp = inp.view(-1, inp_shape[-1])
  
@@ -1289,7 +1271,7 @@ index 4ce5ebf..d39ca64 100644
              # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
              # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
              # small bias vector before passing it to TE.
-@@ -1534,7 +1544,16 @@
+@@ -1517,7 +1529,16 @@ class RouterGatingLinearFunction(torch.autograd.Function):
          inp = inp.view(-1, inp_shape[-1])
          grad_output = grad_output.view(-1, grad_shape[-1])
  
@@ -1403,10 +1385,10 @@ index e8291a0..ce4058b 100644
          for iteration in range(self.config.mtp_num_layers):
              layer_idx = 0 if self.mtp_use_repeated_layer else iteration
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index 35a6d87..d24c299 100644
+index d50b03b1c..0a80aef17 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
-@@ -226,6 +226,10 @@ class TransformerConfig(ModelParallelConfig):
+@@ -229,6 +229,10 @@ class TransformerConfig(ModelParallelConfig):
      """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
      is quick_gelu or weighted SwiGLU (MoE only)."""
  
@@ -1417,7 +1399,7 @@ index 35a6d87..d24c299 100644
      num_moe_experts: Optional[int] = None
      """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
      for no MoE."""
-@@ -295,6 +299,9 @@ class TransformerConfig(ModelParallelConfig):
+@@ -298,6 +302,9 @@ class TransformerConfig(ModelParallelConfig):
      num_query_groups >= tp, and under fp8/fp4 a per-partition
      linear_qkv_out_dim aligned to 16/32."""
  
@@ -1427,27 +1409,26 @@ index 35a6d87..d24c299 100644
      test_mode: bool = False
      """Whether to run real-time tests."""
  
-@@ -1851,11 +1858,13 @@
+@@ -1955,11 +1962,13 @@ class TransformerConfig(ModelParallelConfig):
                  f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                  f"linear_num_key_heads ({self.linear_num_key_heads})."
              )
 -            if (
--                self.experimental_attention_variant == "kda" or self.context_parallel_size > 1
+-                self.experimental_attention_variant == "kda" or has_context_parallelism
 -            ) and self.linear_cp_mode not in ("headwise", "chunkwise"):
--                raise ValueError(
--                    f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
 +            linear_cp_modes = ("headwise", "chunkwise")
 +            if self.experimental_attention_variant == "gdn":
 +                # Relax's all-gather fallback also keeps all TP-local heads.
 +                linear_cp_modes += ("all_gather",)
 +            if self.linear_cp_mode not in linear_cp_modes:
-+                raise ValueError(
+                 raise ValueError(
+-                    f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
 +                    f"linear_cp_mode must be one of {linear_cp_modes!r}, "
                      f"got {self.linear_cp_mode!r}."
                  )
              if self.gdn_conv_pad_alignment is not None:
 diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
-index 100ed76..aa0088e 100644
+index df14516a1..f9fd7e82c 100644
 --- a/megatron/core/transformer/transformer_layer.py
 +++ b/megatron/core/transformer/transformer_layer.py
 @@ -280,6 +280,7 @@ class TransformerLayerSubmodules:
@@ -1466,7 +1447,7 @@ index 100ed76..aa0088e 100644
  
      # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
      sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
-@@ -398,6 +400,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+@@ -400,6 +402,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
          # [Module 3: BiasDropoutFusion]
          self.self_attn_bda = build_module(submodules.self_attn_bda)
  
@@ -1480,7 +1461,7 @@ index 100ed76..aa0088e 100644
          # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
          self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
              config=self.config,
-@@ -474,6 +483,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+@@ -476,6 +485,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
  
          self.is_moe_layer = isinstance(self.mlp, MoELayer)
  
@@ -1494,7 +1475,7 @@ index 100ed76..aa0088e 100644
          # Cache whether these optional layernorms are materialized. The split hybrid mHC
          # recompute and fine-grained activation-offloading paths share these predicates.
          self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
-@@ -799,6 +815,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+@@ -801,6 +817,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                  attention_output_with_bias[0]
              )
  
@@ -1505,7 +1486,7 @@ index 100ed76..aa0088e 100644
          # TODO: could we move `bias_dropout_add_exec_handler` itself
          # inside the module provided in the `bias_dropout_add_spec` module?
          nvtx_range_push(suffix="self_attn_bda")
-@@ -1065,6 +1085,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+@@ -1067,6 +1087,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
              )
              mlp_output_with_bias = (mlp_output, mlp_bias)
  
@@ -1517,10 +1498,10 @@ index 100ed76..aa0088e 100644
          return mlp_output_with_bias, residual
  
 diff --git a/megatron/training/training.py b/megatron/training/training.py
-index 8503a66..82f5640 100644
+index c0a3e0cb4..6334b1a27 100644
 --- a/megatron/training/training.py
 +++ b/megatron/training/training.py
-@@ -227,7 +227,9 @@ except ImportError:
+@@ -229,7 +229,9 @@ except ImportError:
  try:
      from torch_memory_saver import torch_memory_saver
  
@@ -1531,9 +1512,159 @@ index 8503a66..82f5640 100644
      HAVE_TORCH_MEMORY_SAVER = True
  except ImportError:
      HAVE_TORCH_MEMORY_SAVER = False
+diff --git a/megatron/core/distributed/param_and_grad_buffer.py b/megatron/core/distributed/param_and_grad_buffer.py
+--- a/megatron/core/distributed/param_and_grad_buffer.py
++++ b/megatron/core/distributed/param_and_grad_buffer.py
+@@ -1330,19 +1330,13 @@
+                             device=torch.cuda.current_device(),
+                             requires_grad=False,
+                         )
+-                with grad_mem_alloc_context():
+-                    self.grad_data = torch.zeros(
+-                        self.numel,
+-                        dtype=self.grad_dtype,
+-                        device=torch.cuda.current_device(),
+-                        requires_grad=False,
+-                    )
+ 
+         self.grad_data_size = 0
+         self.param_data_size = 0
+         self.param_data_cpu = None
+ 
+-        # Finally, map param.data and param.main_grad fields to buffers.
++        # Remap parameters before allocating a separate gradient buffer so the old
++        # parameter storage can be released without overlapping both new buffers.
+         def _create_bucket(bucket_id, bucket_params, bucket_params_with_extra_main_grads):
+             """
+             Look up precomputed bucket indices and create a new bucket.
+@@ -1374,9 +1368,6 @@
+                 bucket_params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+             )
+ 
+-        bucket_params = []
+-        bucket_params_with_extra_main_grads = []
+-        cur_bucket_id = 0
+         for param, param_name in params_with_names[::-1]:
+             # Get parameter indices computed in previous loop.
+             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
+@@ -1507,6 +1498,21 @@
+                                     "storage into DDP param_data."
+                                 )
+ 
++        if self.grad_data is None:
++            with mem_alloc_context(), grad_mem_alloc_context():
++                self.grad_data = torch.zeros(
++                    self.numel,
++                    dtype=self.grad_dtype,
++                    device=torch.cuda.current_device(),
++                    requires_grad=False,
++                )
++
++        # Map gradients and construct buckets after all parameter storage is remapped.
++        bucket_params = []
++        bucket_params_with_extra_main_grads = []
++        cur_bucket_id = 0
++        for param, param_name in params_with_names[::-1]:
++            param_start_index, param_end_index, bucket_id = self.param_index_map[param]
+             # Grad buffer always uses full-numel offsets from param_index_map.
+             param.main_grad = self._get(
+                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
+diff --git a/megatron/core/optimizer/clip_grads.py b/megatron/core/optimizer/clip_grads.py
+--- a/megatron/core/optimizer/clip_grads.py
++++ b/megatron/core/optimizer/clip_grads.py
+@@ -113,12 +113,17 @@
+             # Use apex's multi-tensor applier for efficiency reasons.
+             # Multi-tensor applier takes a function and a list of list
+             # and performs the operation on that list all in one kernel.
+-            grad_norm, _ = multi_tensor_applier(
+-                l2_norm_impl, dummy_overflow_buf, [grads_for_norm], False  # no per-parameter norm
+-            )
+-            # Since we will be summing across data parallel groups,
+-            # we need the pow(norm-type).
+-            total_norm = grad_norm**norm_type
++            # Fused kernels dispatch on the first tensor's dtype. Precision-aware
++            # optimizers can expose both BF16 and FP32 gradients, so split the calls.
++            grads_by_dtype = {}
++            for grad in grads_for_norm:
++                grads_by_dtype.setdefault(grad.dtype, []).append(grad)
++            for dtype_grads in grads_by_dtype.values():
++                grad_norm, _ = multi_tensor_applier(
++                    l2_norm_impl, dummy_overflow_buf, [dtype_grads], False
++                )
++                # Sum squared norms before the single distributed reduction.
++                total_norm += grad_norm**norm_type
+         else:
+             for grad in grads_for_norm:
+                 grad_norm = torch.norm(grad, norm_type)
+@@ -175,6 +180,11 @@
+                 params.append(param)
+                 grads.append(to_local_if_dtensor(param.grad).detach())
+ 
++    # Fused scaling kernels also require each tensor list to have one dtype.
++    grads_by_dtype = {}
++    for grad in grads:
++        grads_by_dtype.setdefault(grad.dtype, []).append(grad)
++
+     # Scale.
+     clip_coeff = max_norm / (total_norm + 1.0e-6)
+     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+@@ -183,13 +193,18 @@
+         assert (
+             multi_tensor_scale_tensor_impl is not None
+         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
+-        multi_tensor_applier(
+-            multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+-        )
++        for dtype_grads in grads_by_dtype.values():
++            multi_tensor_applier(
++                multi_tensor_scale_tensor_impl,
++                dummy_overflow_buf,
++                [dtype_grads, dtype_grads],
++                clip_coeff,
++            )
+     elif clip_coeff < 1.0:
+-        multi_tensor_applier(
+-            multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+-        )
++        for dtype_grads in grads_by_dtype.values():
++            multi_tensor_applier(
++                multi_tensor_scale_impl, dummy_overflow_buf, [dtype_grads, dtype_grads], clip_coeff
++            )
+ 
+ 
+ def count_zeros_fp32(
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -136,6 +136,8 @@
+ 
+ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+     """Copy optimizer-relevant metadata when creating param views/copies."""
++    if hasattr(source, 'allreduce'):
++        destination.allreduce = source.allreduce
+     if hasattr(source, 'shared'):
+         destination.shared = source.shared
+     if hasattr(source, GRAD_NORM_GROUP_ATTR):
+diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+--- a/megatron/core/tensor_parallel/layers.py
++++ b/megatron/core/tensor_parallel/layers.py
+@@ -98,7 +98,10 @@
+     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
+         return True
+     # allreduce=False marks parameters reduced over expert DP, so filter their duplicates over ETP.
+-    if not getattr(param, "allreduce", True) and expert_tp_group is not None:
++    if not getattr(param, "allreduce", True):
++        if expert_tp_group is None:
++            # Legacy callers pass ordinary TP, which must not filter expert shards.
++            return True
+         tp_group = expert_tp_group
+     # Prefer provided tp_group when available (new explicit path).
+     if tp_group is not None:
+diff --git a/megatron/bridge/models/kimi/kimi_k3_layers.py b/megatron/bridge/models/kimi/kimi_k3_layers.py
+index 8b5b0b866..e67337559 100644
 --- a/megatron/bridge/models/kimi/kimi_k3_layers.py
 +++ b/megatron/bridge/models/kimi/kimi_k3_layers.py
-@@ -23,6 +23,8 @@
+@@ -23,6 +23,8 @@ import copy
  import torch
  from einops import rearrange
  from fla.modules import FusedRMSNormGated, ShortConvolution
@@ -1542,7 +1673,7 @@ index 8503a66..82f5640 100644
  from megatron.core.dist_checkpointing.mapping import ShardedStateDict
  from megatron.core.extensions.transformer_engine import (
      TEColumnParallelLinear,
-@@ -33,6 +35,13 @@
+@@ -33,6 +35,13 @@ from megatron.core.extensions.transformer_engine import (
  from megatron.core.inference.contexts import BaseInferenceContext
  from megatron.core.packed_seq_params import PackedSeqParams
  from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1556,7 +1687,7 @@ index 8503a66..82f5640 100644
  from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
  from megatron.core.tensor_parallel.mappings import (
      copy_to_tensor_model_parallel_region,
-@@ -123,8 +132,6 @@
+@@ -123,8 +132,6 @@ class KimiK3Attention(MegatronModule):
  
          self.layer_idx = layer_number - 1
          self.is_kda = layer_number in config.kimi_kda_layers
@@ -1565,7 +1696,7 @@ index 8503a66..82f5640 100644
          if self.is_kda:
              self._init_kda(config)
          else:
-@@ -169,6 +176,8 @@
+@@ -169,6 +176,8 @@ class KimiK3Attention(MegatronModule):
          )
  
      def _init_kda(self, config) -> None:
@@ -1574,7 +1705,7 @@ index 8503a66..82f5640 100644
          hidden_size = config.hidden_size
          device = torch.cuda.current_device()
          dtype = config.params_dtype
-@@ -176,6 +185,14 @@
+@@ -176,6 +185,14 @@ class KimiK3Attention(MegatronModule):
          if self.num_heads % self.tp_size:
              raise ValueError(f"KDA heads {self.num_heads} must be divisible by TP size {self.tp_size}")
          self.local_num_heads = self.num_heads // self.tp_size
@@ -1589,7 +1720,7 @@ index 8503a66..82f5640 100644
          self.head_dim = config.kimi_linear_head_dim
          self.projection_size = self.num_heads * self.head_dim
          self.local_projection_size = self.local_num_heads * self.head_dim
-@@ -285,6 +302,13 @@
+@@ -285,6 +302,13 @@ class KimiK3Attention(MegatronModule):
          hidden_states: torch.Tensor,
          packed_seq_params: PackedSeqParams | None,
      ) -> torch.Tensor:
@@ -1603,11 +1734,10 @@ index 8503a66..82f5640 100644
          x = hidden_states.transpose(0, 1)
          cu_seqlens = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
          if packed_seq_params is not None and cu_seqlens is None:
-@@ -318,6 +342,170 @@
-         output = self.o_norm(output.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim))
+@@ -319,6 +343,170 @@ class KimiK3Attention(MegatronModule):
          output = output.view(*gate.shape).flatten(-2)
          return _linear(self.o_proj, output.to(hidden_states.dtype)).transpose(0, 1)
-+
+ 
 +    def _forward_kda_context_parallel(
 +        self,
 +        hidden_states: torch.Tensor,
@@ -1771,21 +1901,24 @@ index 8503a66..82f5640 100644
 +        if back_to_input is not None:
 +            output = back_to_input.convert(output, seq_dim=0, sequence_parallel=False)
 +        return output
- 
++
      def _forward_mla(
          self,
+         hidden_states: torch.Tensor,
+diff --git a/megatron/bridge/models/kimi/kimi_k3_ops.py b/megatron/bridge/models/kimi/kimi_k3_ops.py
+index 9ba0116bf..80d510dfd 100644
 --- a/megatron/bridge/models/kimi/kimi_k3_ops.py
 +++ b/megatron/bridge/models/kimi/kimi_k3_ops.py
-@@ -13,6 +13,8 @@
- # limitations under the License.
+@@ -14,6 +14,8 @@
  
  """Numerical operators used by the Kimi K3 language backbone."""
-+
-+from typing import Any
  
++from typing import Any
++
  import torch
  from torch import nn
-@@ -47,6 +49,7 @@
+ 
+@@ -47,6 +49,7 @@ def kda(
      lower_bound: float,
      *,
      cu_seqlens: torch.Tensor | None = None,
@@ -1793,7 +1926,7 @@ index 8503a66..82f5640 100644
  ) -> torch.Tensor:
      """Run Kimi Delta Attention while preserving packed-sequence boundaries."""
      from fla.ops.kda import chunk_kda
-@@ -68,6 +71,7 @@
+@@ -68,6 +71,7 @@ def kda(
          lower_bound=lower_bound,
          transpose_state_layout=True,
          cu_seqlens=cu_seqlens,
@@ -1801,151 +1934,3 @@ index 8503a66..82f5640 100644
      )
      return output
  
-diff --git a/megatron/core/distributed/param_and_grad_buffer.py b/megatron/core/distributed/param_and_grad_buffer.py
---- a/megatron/core/distributed/param_and_grad_buffer.py
-+++ b/megatron/core/distributed/param_and_grad_buffer.py
-@@ -1330,19 +1330,13 @@
-                             device=torch.cuda.current_device(),
-                             requires_grad=False,
-                         )
--                with grad_mem_alloc_context():
--                    self.grad_data = torch.zeros(
--                        self.numel,
--                        dtype=self.grad_dtype,
--                        device=torch.cuda.current_device(),
--                        requires_grad=False,
--                    )
- 
-         self.grad_data_size = 0
-         self.param_data_size = 0
-         self.param_data_cpu = None
- 
--        # Finally, map param.data and param.main_grad fields to buffers.
-+        # Remap parameters before allocating a separate gradient buffer so the old
-+        # parameter storage can be released without overlapping both new buffers.
-         def _create_bucket(bucket_id, bucket_params, bucket_params_with_extra_main_grads):
-             """
-             Look up precomputed bucket indices and create a new bucket.
-@@ -1374,9 +1368,6 @@
-                 bucket_params_with_extra_main_grads=bucket_params_with_extra_main_grads,
-             )
- 
--        bucket_params = []
--        bucket_params_with_extra_main_grads = []
--        cur_bucket_id = 0
-         for param, param_name in params_with_names[::-1]:
-             # Get parameter indices computed in previous loop.
-             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
-@@ -1507,6 +1498,21 @@
-                                     "storage into DDP param_data."
-                                 )
- 
-+        if self.grad_data is None:
-+            with mem_alloc_context(), grad_mem_alloc_context():
-+                self.grad_data = torch.zeros(
-+                    self.numel,
-+                    dtype=self.grad_dtype,
-+                    device=torch.cuda.current_device(),
-+                    requires_grad=False,
-+                )
-+
-+        # Map gradients and construct buckets after all parameter storage is remapped.
-+        bucket_params = []
-+        bucket_params_with_extra_main_grads = []
-+        cur_bucket_id = 0
-+        for param, param_name in params_with_names[::-1]:
-+            param_start_index, param_end_index, bucket_id = self.param_index_map[param]
-             # Grad buffer always uses full-numel offsets from param_index_map.
-             param.main_grad = self._get(
-                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
-diff --git a/megatron/core/optimizer/clip_grads.py b/megatron/core/optimizer/clip_grads.py
---- a/megatron/core/optimizer/clip_grads.py
-+++ b/megatron/core/optimizer/clip_grads.py
-@@ -113,12 +113,17 @@
-             # Use apex's multi-tensor applier for efficiency reasons.
-             # Multi-tensor applier takes a function and a list of list
-             # and performs the operation on that list all in one kernel.
--            grad_norm, _ = multi_tensor_applier(
--                l2_norm_impl, dummy_overflow_buf, [grads_for_norm], False  # no per-parameter norm
--            )
--            # Since we will be summing across data parallel groups,
--            # we need the pow(norm-type).
--            total_norm = grad_norm**norm_type
-+            # Fused kernels dispatch on the first tensor's dtype. Precision-aware
-+            # optimizers can expose both BF16 and FP32 gradients, so split the calls.
-+            grads_by_dtype = {}
-+            for grad in grads_for_norm:
-+                grads_by_dtype.setdefault(grad.dtype, []).append(grad)
-+            for dtype_grads in grads_by_dtype.values():
-+                grad_norm, _ = multi_tensor_applier(
-+                    l2_norm_impl, dummy_overflow_buf, [dtype_grads], False
-+                )
-+                # Sum squared norms before the single distributed reduction.
-+                total_norm += grad_norm**norm_type
-         else:
-             for grad in grads_for_norm:
-                 grad_norm = torch.norm(grad, norm_type)
-@@ -175,6 +180,11 @@
-                 params.append(param)
-                 grads.append(to_local_if_dtensor(param.grad).detach())
- 
-+    # Fused scaling kernels also require each tensor list to have one dtype.
-+    grads_by_dtype = {}
-+    for grad in grads:
-+        grads_by_dtype.setdefault(grad.dtype, []).append(grad)
-+
-     # Scale.
-     clip_coeff = max_norm / (total_norm + 1.0e-6)
-     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
-@@ -183,13 +193,18 @@
-         assert (
-             multi_tensor_scale_tensor_impl is not None
-         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
--        multi_tensor_applier(
--            multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
--        )
-+        for dtype_grads in grads_by_dtype.values():
-+            multi_tensor_applier(
-+                multi_tensor_scale_tensor_impl,
-+                dummy_overflow_buf,
-+                [dtype_grads, dtype_grads],
-+                clip_coeff,
-+            )
-     elif clip_coeff < 1.0:
--        multi_tensor_applier(
--            multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
--        )
-+        for dtype_grads in grads_by_dtype.values():
-+            multi_tensor_applier(
-+                multi_tensor_scale_impl, dummy_overflow_buf, [dtype_grads, dtype_grads], clip_coeff
-+            )
- 
- 
- def count_zeros_fp32(
-diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
---- a/megatron/core/optimizer/optimizer.py
-+++ b/megatron/core/optimizer/optimizer.py
-@@ -136,6 +136,8 @@
- 
- def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
-     """Copy optimizer-relevant metadata when creating param views/copies."""
-+    if hasattr(source, 'allreduce'):
-+        destination.allreduce = source.allreduce
-     if hasattr(source, 'shared'):
-         destination.shared = source.shared
-     if hasattr(source, GRAD_NORM_GROUP_ATTR):
-diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
---- a/megatron/core/tensor_parallel/layers.py
-+++ b/megatron/core/tensor_parallel/layers.py
-@@ -98,7 +98,10 @@
-     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
-         return True
-     # allreduce=False marks parameters reduced over expert DP, so filter their duplicates over ETP.
--    if not getattr(param, "allreduce", True) and expert_tp_group is not None:
-+    if not getattr(param, "allreduce", True):
-+        if expert_tp_group is None:
-+            # Legacy callers pass ordinary TP, which must not filter expert shards.
-+            return True
-         tp_group = expert_tp_group
-     # Prefer provided tp_group when available (new explicit path).
-     if tp_group is not None:

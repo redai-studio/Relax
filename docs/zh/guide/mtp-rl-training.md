@@ -89,7 +89,7 @@ base、detach 联合训练和 no-detach 联合训练可以直接比较。两阶�
 ### 前置条件
 
 - HF checkpoint 必须已经包含 MTP 权重,即 `config.json` 中 `num_nextn_predict_layers >= 1`。目前覆盖 **Qwen3.5**、**Qwen3-next**、**MiMo-7B-RL**、**DeepSeek-V3 / V3.1**、**GLM-4.7-MoE**。
-- 使用 Megatron 后端(也是 Relax 唯一的训练后端)。MTP 依赖 [`docker/patch/megatron/20260506-85bced0ae.patch`](../../../docker/patch/megatron/20260506-85bced0ae.patch) 中的 Megatron MTP 补丁;Relax 官方镜像已自动应用。
+- 使用 Megatron 后端(也是 Relax 唯一的训练后端)。MTP 依赖 [`docker/patch/latest/megatron.patch`](../../../docker/patch/latest/megatron.patch) 中的 Megatron MTP 补丁。CUDA 和 ROCm 镜像已自动应用。
 - 不能开启 combined 1F1B 流水线调度——与 MTP 不兼容,在 [`relax/backends/megatron/model.py:493`](../../../relax/backends/megatron/model.py) 处会被断言挡掉。
 
 ### 参数

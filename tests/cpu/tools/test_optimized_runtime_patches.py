@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[3]
 @pytest.mark.parametrize(
     "patch",
     [
-        "megatron/20260915-4a4de8657.patch",
+        "latest/megatron.patch",
         "megatron/20261016-qwen38-models.patch",
         "megatron/20261020-qwen35-optimized.patch",
         "megatron/20261020-model-operators.patch",
