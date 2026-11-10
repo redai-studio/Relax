@@ -154,6 +154,7 @@ class UpdateWeightFromMemory:
                 raise TimeoutError("Memory group installation deadline exceeded")
             return value
 
+        resolve_started = monotonic()
         engines, lock, *_ = ray.get(rollout_manager.get_rollout_engines_and_lock.remote(), timeout=remaining())
         engines = tuple(engines)
         previous_engines = self.engines
@@ -164,6 +165,7 @@ class UpdateWeightFromMemory:
         if self.members is not None and members != self.members:
             raise RuntimeError("Inference membership changed; restart with a new memory stream")
         self.members = members
+        resolved_at = monotonic()
         if self.source is None:
             self.source = MemorySource(
                 ray.util.get_node_ip_address(),
@@ -179,11 +181,13 @@ class UpdateWeightFromMemory:
             members=members,
             reset=self.encoder.version == -1,
         )
+        published_at = monotonic()
         while not ray.get(lock.acquire.remote(), timeout=remaining()):
             sleep(min(0.05, remaining()))
         paused = monotonic()
         try:
             ray.get([e.pause_generation.remote(timeout=remaining()) for e in engines], timeout=remaining())
+            pause_returned = monotonic()
             loaded = ray.get(
                 [
                     e.install_memory_update.remote(
@@ -196,6 +200,7 @@ class UpdateWeightFromMemory:
                 ],
                 timeout=remaining(),
             )
+            receivers_returned = monotonic()
             if any(not isinstance(item, dict) or item.get("success") is not True for item in loaded):
                 raise RuntimeError(f"Inference member failed memory update: {loaded}")
             self.encoder.commit(self.source.wait(remaining()), members)
@@ -214,6 +219,12 @@ class UpdateWeightFromMemory:
                 generation_pause_s=ready_at - paused,
                 source_host=descriptor["host"],
                 receivers=loaded,
+                resolve_group_s=resolved_at - resolve_started,
+                publish_s=published_at - resolved_at,
+                lock_s=paused - published_at,
+                pause_calls_s=pause_returned - paused,
+                receiver_calls_s=receivers_returned - pause_returned,
+                commit_s=loaded_at - receivers_returned,
             )
         finally:
             ray.get(lock.release.remote(), timeout=10)

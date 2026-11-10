@@ -791,12 +791,15 @@ class SGLangEngine(RayActor):
 
         started = time.monotonic()
         deadline = started + timeout
+        request_s: dict[str, float] = {}
 
         def request(endpoint: str, payload: dict) -> dict:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Memory worker installation deadline exceeded")
+            request_started = time.monotonic()
             response = self._make_request(endpoint, payload, timeout=remaining)
+            request_s[endpoint] = time.monotonic() - request_started
             if not isinstance(response, dict) or response.get("success") is not True:
                 raise RuntimeError(f"SGLang {endpoint} failed: {response}")
             return response
@@ -820,6 +823,7 @@ class SGLangEngine(RayActor):
             node_id=ray.get_runtime_context().get_node_id(),
             install_s=time.monotonic() - started,
             update=descriptor["update"],
+            request_s=request_s,
         )
 
     def install_disk_checkpoint(self, target: dict, published: dict, timeout: float) -> dict:

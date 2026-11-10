@@ -20,8 +20,10 @@ MEMORY_LOADER = "relax.backends.sglang.memory_delta_loader.load_memory_weights"
 def load_memory_weights(model: Any, weights: list[tuple[str, Any]]) -> None:
     """SGLang custom loader: serialized tensors carry only a TCP descriptor."""
     import json
+    from time import monotonic
 
     from relax.distributed.weight_sync.memory_transport import receive_memory_update
+    from relax.utils.logging_utils import get_logger
 
     weights = list(weights)
     if len(weights) != 1 or weights[0][1].numel() != 0 or len(weights[0][0]) > 65536:
@@ -33,12 +35,27 @@ def load_memory_weights(model: Any, weights: list[tuple[str, Any]]) -> None:
         model._relax_memory_receiver = receiver
     elif receiver.host_budget_bytes != control["host_budget_bytes"]:
         raise ValueError("Memory host budget changed during a stream")
-    receive_memory_update(
+    started = monotonic()
+    stages: dict[str, float] = {}
+
+    def apply(manifest: dict, payloads: list[bytes]) -> None:
+        arrived = monotonic()
+        stages["receive_validate_s"] = arrived - started
+        receiver.apply(manifest, payloads)
+        # Includes the receiver's second validation and completed GPU writes.
+        stages["validate_apply_s"] = monotonic() - arrived
+
+    manifest = receive_memory_update(
         control["descriptor"],
         control["member"],
-        receiver.apply,
+        apply,
         timeout_s=control["timeout_s"],
         host_budget_bytes=receiver.host_budget_bytes,
+    )
+    stages["ack_s"] = monotonic() - started - sum(stages.values())
+    get_logger(__name__).info(
+        "Memory receiver timing: %s",
+        dict(stream=manifest["stream"], version=manifest["version"], member=control["member"], **stages),
     )
 
 
