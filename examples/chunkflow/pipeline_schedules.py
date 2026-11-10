@@ -15,9 +15,7 @@ from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.schedules import (
     backward_step,
     check_first_val_step,
-    clear_embedding_activation_buffer,
     deallocate_output_tensor,
-    finish_embedding_wgrad_compute,
     forward_step,
     get_tensor_shapes,
 )
@@ -145,10 +143,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
         if not getattr(runtime, "_planned_p2p_logged", False):
             logger.info("chunkflow: planned P2P shapes enabled; individual P2P skips shape exchange and batched sync")
             runtime._planned_p2p_logged = True
-
-    embedding_module = None
-    if config.finalize_model_grads_func is not None:
-        embedding_module = clear_embedding_activation_buffer(config, model, is_last)
 
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -353,9 +347,6 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                     f"{len(fp_inputs)} unrecomputed unit(s) -- schedule bug"
                 )
             runtime.assert_empty(f"chunkflow PP={p2p_communicator.total_stages} parent window {mb_start}")
-
-    if config.finalize_model_grads_func is not None:
-        finish_embedding_wgrad_compute(config, embedding_module, is_last, tp_group)
 
     _start_grad_sync(model, config)
 

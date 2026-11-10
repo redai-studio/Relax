@@ -186,6 +186,17 @@ def test_install_preserves_module_and_uninstall_restores_forward():
     assert model[0].config.apply_rope_fusion is True
 
 
+def test_install_rejects_deferred_weight_gradients_before_mutation():
+    model = torch.nn.Sequential(_FakeAttn(), _FakeAttn())
+    model[1].config.defer_embedding_wgrad_compute = True
+    model[1].config.wgrad_deferral_limit = 0
+    originals = [layer.core_attention.forward for layer in model]
+    with pytest.raises(NotImplementedError, match="defer_embedding_wgrad_compute"):
+        install(model, 4)
+    assert not hasattr(model, "chunkflow_runtime")
+    assert [layer.core_attention.forward for layer in model] == originals
+
+
 def _qwen3_vl_container():
     # CPU coverage of the explicit container contract; the GPU test constructs
     # the real Bridge model, including its native vision and GDN/MoE branches.

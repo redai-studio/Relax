@@ -99,6 +99,7 @@ Do not duplicate settings already present in the recipe:
 | Expert parallelism (EP)                        | All ranks in each EP group must share the same chunk execution plan; mismatches fail collectively before model execution |
 | RL policy loss                                 | GSPO / OPSM / M2PO objectives requiring full-sequence or batch statistics are not supported; this does not restrict SFT  |
 | MTP training                                   | Cross-chunk multi-token prediction is not supported; disable `--enable-mtp-training`                                     |
+| Deferred head weight gradients                 | Disable `defer_embedding_wgrad_compute`; native FIFO buffers do not support chunk backward ordering                      |
 | MoE load-balancing auxiliary loss              | Use `none` or zero coefficients; cross-chunk routing statistics are not supported                                        |
 | Distributed optimizer                          | Keep `--num-distributed-optimizer-instances 1` (default)                                                                 |
 

@@ -89,18 +89,19 @@ python3 examples/chunkflow/setup.py
 
 原脚本已满足下列设置时，无需重复添加：
 
-| 设置                                           | 原因                                                                 |
-| ---------------------------------------------- | -------------------------------------------------------------------- |
-| `--context-parallel-size 1`                    | 当前跨块状态管理不支持 CP 切分                                       |
-| `--calculate-per-token-loss`                   | 按 token 统计，避免切块改变样本权重                                  |
-| `--no-rope-fusion`                             | 使用支持分块位置偏移的 RoPE 路径                                     |
-| `--attention-dropout 0.0 --hidden-dropout 0.0` | 当前适配要求关闭 dropout，避免分块与重放的随机掩码问题               |
-| Megatron 重计算兼容性                          | 禁用 full-layer / selective `core_attn`                              |
-| RL 策略损失                                    | 暂不支持 GSPO / OPSM / M2PO 等完整序列或 batch 统计目标；不限制 SFT  |
-| MTP 训练                                       | 暂不支持跨 chunk 的多 token 预测；请关闭 `--enable-mtp-training`     |
-| MoE 负载均衡辅助损失                           | 使用 `none` 或零系数；暂不支持跨 chunk 的路由统计                    |
-| 分布式优化器                                   | `--num-distributed-optimizer-instances 1`（默认）                    |
-| 专家并行（EP）                                 | 同一 EP 组须有一致的分块执行计划；不一致时全组提前报错，避免通信挂起 |
+| 设置                                           | 原因                                                                   |
+| ---------------------------------------------- | ---------------------------------------------------------------------- |
+| `--context-parallel-size 1`                    | 当前跨块状态管理不支持 CP 切分                                         |
+| `--calculate-per-token-loss`                   | 按 token 统计，避免切块改变样本权重                                    |
+| `--no-rope-fusion`                             | 使用支持分块位置偏移的 RoPE 路径                                       |
+| `--attention-dropout 0.0 --hidden-dropout 0.0` | 当前适配要求关闭 dropout，避免分块与重放的随机掩码问题                 |
+| Megatron 重计算兼容性                          | 禁用 full-layer / selective `core_attn`                                |
+| RL 策略损失                                    | 暂不支持 GSPO / OPSM / M2PO 等完整序列或 batch 统计目标；不限制 SFT    |
+| MTP 训练                                       | 暂不支持跨 chunk 的多 token 预测；请关闭 `--enable-mtp-training`       |
+| 延迟 head 权重梯度                             | 关闭 `defer_embedding_wgrad_compute`，原生 FIFO 缓存不兼容分块反向顺序 |
+| MoE 负载均衡辅助损失                           | 使用 `none` 或零系数；暂不支持跨 chunk 的路由统计                      |
+| 分布式优化器                                   | `--num-distributed-optimizer-instances 1`（默认）                      |
+| 专家并行（EP）                                 | 同一 EP 组须有一致的分块执行计划；不一致时全组提前报错，避免通信挂起   |
 
 ### 重要参数
 
