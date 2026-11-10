@@ -18,6 +18,7 @@ class FakeEngine:
     def __init__(self):
         self.probes = 0
         self.disk_weight_generation_probe = SimpleNamespace(remote=lambda timeout: self.probe)
+        self.update_weights_from_distributed = SimpleNamespace(remote=lambda **kwargs: lambda: None)
 
     def probe(self):
         self.probes += 1
@@ -32,6 +33,11 @@ class FakeUpdater:
         self.updated = False
 
     def _update_bucket_weights_from_distributed(self, named):
+        if getattr(type(self), "_dws_collective_profiled", False) and dist.get_rank(dist.group.WORLD) == 0:
+            import importlib
+
+            module = importlib.import_module("relax.backends.megatron.weight_update.update_weight_from_distributed")
+            module.update_weights_from_distributed("test", dist.group.WORLD, 0, self.rollout_engines, named)
         named.clear()
 
     def update_weights(self):
@@ -57,10 +63,13 @@ def _measurement_rank(rank, rendezvous, directory):
     os.environ["TENSORBOARD_DIR"] = str(Path(directory) / "logs/tensorboard")
     write = store.atomic_write
     fail_write = True
+    profile_failure = None
 
     def result_write(path, data):
         if rank == 0 and fail_write and path.name == "000000.json":
             raise OSError("injected metrics write failure")
+        if profile_failure == "write" and b'"collective_buckets"' in data:
+            raise OSError("injected profile write failure")
         return write(path, data)
 
     identity = provenance.runtime_identity
@@ -101,6 +110,46 @@ def _measurement_rank(rank, rendezvous, directory):
                     metrics = json.loads((Path(directory) / "sync-measurements/000000.json").read_text())
                     assert metrics["payload_bytes"] == 4 and metrics["elements"] == 2
                     assert metrics["members"] == 8 and metrics["version"] == 0
+
+                from task_delta_weight_sync.measure_nccl import install as install_profile
+
+                order = []
+
+                class Event:
+                    def record(self):
+                        order.append("record")
+
+                    def synchronize(self):
+                        assert all(engine.probes == 1 for engine in updater.rollout_engines)
+                        assert order[:3] == ["record", "wait", "record"]
+                        order.append("synchronize")
+
+                    def elapsed_time(self, end):
+                        if profile_failure == "elapsed":
+                            raise RuntimeError("injected event failure")
+                        return 2.5
+
+                module.dist = SimpleNamespace(
+                    broadcast=lambda *args, **kwargs: SimpleNamespace(wait=lambda: order.append("wait"))
+                )
+                with patch.object(torch.cuda, "Event", side_effect=lambda **kwargs: Event()):
+                    install_profile(args)
+                    for profile_failure in ("elapsed", "write", None):
+                        dist.barrier(group=dist.group.WORLD)
+                        order.clear()
+                        updater = FakeUpdater()
+                        before = updater.weight.view(torch.uint8).numpy().tobytes()
+                        if profile_failure:
+                            with pytest.raises(RuntimeError, match="Collective timing collection failed.*injected"):
+                                updater.update_weights()
+                        else:
+                            assert updater.update_weights() == "ordinary-result"
+                            if rank == 0:
+                                metrics = json.loads((Path(directory) / "sync-measurements/000000.json").read_text())
+                                assert metrics["sender_collective_stream_s"] == 0.0025
+                                assert metrics["collective_buckets"][0]["bytes"] == metrics["payload_bytes"] == 4
+                                assert order == ["record", "wait", "record", "synchronize"]
+                        assert updater.weight.view(torch.uint8).numpy().tobytes() == before
     finally:
         dist.destroy_process_group()
 
