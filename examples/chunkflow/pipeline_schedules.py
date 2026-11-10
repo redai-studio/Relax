@@ -306,7 +306,8 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                     fp_inputs[fwd_seq[i]] = fwd_input
                 if not is_last:
                     p2p_communicator.send_forward(output_tensor, is_last)
-                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                if not is_last or num_tokens is not None:
+                    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
             n_steady = n - W
             input_tensor = None
@@ -323,7 +324,8 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 output_tensor_grad = p2p_communicator.send_forward_recv_backward(
                     output_tensor, unit_shapes[bwd_seq[i]][1], is_last
                 )
-                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                if not is_last or num_tokens is not None:
+                    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
                 input_tensor_grad, fr_num_tokens = backward(bwd_seq[i], output_tensor_grad)
                 if fr_num_tokens is not None:
                     total_num_tokens += fr_num_tokens
@@ -352,10 +354,12 @@ def chunkflow_forward_backward_pipelining_without_interleaving(
                 )
             runtime.assert_empty(f"chunkflow PP={p2p_communicator.total_stages} parent window {mb_start}")
 
+    if config.finalize_model_grads_func is not None:
+        finish_embedding_wgrad_compute(config, embedding_module, is_last, tp_group)
+
     _start_grad_sync(model, config)
 
     if config.finalize_model_grads_func is not None:
-        finish_embedding_wgrad_compute(config, embedding_module, is_last, tp_group)
         config.finalize_model_grads_func(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,

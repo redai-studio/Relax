@@ -259,9 +259,10 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         hidden_size=4,
         overlap_p2p_comm=False,
         no_sync_func=None,
-        deallocate_pipeline_outputs=False,
+        deallocate_pipeline_outputs=True,
         grad_sync_func=None,
-        finalize_model_grads_func=None,
+        calculate_per_token_loss=True,
+        finalize_model_grads_func=lambda *a, **kw: None,
     )
     args = SimpleNamespace(
         chunkflow_chunk_size=256,
@@ -367,6 +368,9 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
                 seen_tokens[owner_mb].append(chunk.num_tokens)
             offset += chunk.num_tokens
         shape = ((unit.num_tokens + 127) // 128 * 64, 1, 4)
+        if stage == 3 and not torch.is_grad_enabled():
+            # Packed B=1 logits remain a view even after transpose().contiguous().
+            return torch.ones(shape).transpose(0, 1).contiguous(), torch.tensor(0)
         return torch.ones(()) if stage == 3 else torch.ones(shape), torch.tensor(1)
 
     real_zeros = torch.zeros
@@ -374,14 +378,20 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
     monkeypatch.setattr(global_vars, "get_args", lambda: args)
     monkeypatch.setattr(executor, "get_model_config", lambda _: config)
     monkeypatch.setattr(executor, "forward_step", forward)
-    monkeypatch.setattr(executor, "deallocate_output_tensor", lambda *a: None)
+    gradient, synchronized = torch.zeros(()), []
+    monkeypatch.setattr(executor, "clear_embedding_activation_buffer", lambda *a: None)
+    monkeypatch.setattr(executor, "finish_embedding_wgrad_compute", lambda *a: gradient.add_(7 if stage == 3 else 0))
     monkeypatch.setattr(executor, "check_first_val_step", lambda *a: a[-1])
     monkeypatch.setattr(
         executor,
         "backward_step",
         lambda inputs, *_: None if inputs is None else [torch.ones_like(t) for t in inputs],
     )
-    model = SimpleNamespace(chunkflow_runtime=ChunkflowRuntime(256))
+    model = SimpleNamespace(
+        chunkflow_runtime=ChunkflowRuntime(256),
+        ddp_config=SimpleNamespace(overlap_grad_reduce=True),
+        start_grad_sync=lambda: synchronized.append(gradient.clone()),
+    )
     real_release = model.chunkflow_runtime.release_group
 
     def release(group):
@@ -402,6 +412,8 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1), tp=SimpleNamespace(size=lambda: 2)),
     )
     assert first_flags.count(True) == 1
+    assert len(synchronized) == 1
+    torch.testing.assert_close(synchronized[0], torch.tensor(7.0 if stage == 3 else 0.0))
     assert not groups
     assert sorted(released) == [0, 0, 1, 4]
     assert {mb: sum(values) for mb, values in seen_tokens.items()} == {

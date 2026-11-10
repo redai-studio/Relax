@@ -96,7 +96,7 @@ python3 examples/chunkflow/setup.py
 | `--no-rope-fusion`                             | 使用支持分块位置偏移的 RoPE 路径                                     |
 | `--attention-dropout 0.0 --hidden-dropout 0.0` | 当前适配要求关闭 dropout，避免分块与重放的随机掩码问题               |
 | Megatron 重计算兼容性                          | 禁用 full-layer / selective `core_attn`                              |
-| 训练目标                                       | 暂不支持 GSPO / OPSM 等依赖完整序列归约的目标                        |
+| 训练目标                                       | 暂不支持 GSPO / OPSM / M2PO 等依赖完整序列或 batch 统计的目标        |
 | 分布式优化器                                   | `--num-distributed-optimizer-instances 1`（默认）                    |
 | 专家并行（EP）                                 | 同一 EP 组须有一致的分块执行计划；不一致时全组提前报错，避免通信挂起 |
 

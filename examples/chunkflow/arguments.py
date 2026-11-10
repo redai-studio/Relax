@@ -78,11 +78,12 @@ def validate_args(args: Namespace) -> None:
 
     algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
     if getattr(args, "use_opsm", False) or (
-        algorithm is not None and (algorithm.kl_level == "sequence" or algorithm.needs_full_log_probs)
+        algorithm is not None
+        and (algorithm.kl_level == "sequence" or algorithm.needs_full_log_probs or algorithm.policy_loss_fn == "m2po")
     ):
         raise ValueError(
-            "--use-chunkflow does not support sequence-level objectives (GSPO/OPSM): "
-            "chunk-local log probabilities cannot replace a full-response reduction."
+            "--use-chunkflow does not support sequence/batch-level objectives (GSPO/OPSM/M2PO): "
+            "chunk-local statistics cannot replace full-response or batch reductions."
         )
     if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
         raise ValueError(
