@@ -1437,7 +1437,7 @@ def install_sequence_classification_head_in_provider(
     models stash their vocabulary head under an unregistered attribute so HF
     CausalLM loading can temporarily restore it.
     """
-    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+    if args.task_type != "seq_cls" or role != "actor" or not post_process:
         return
 
     owner = _find_output_layer_owner(model)
@@ -1466,7 +1466,7 @@ def ensure_sequence_classification_head_trainable(
     post_process: bool,
 ) -> None:
     """Undo PEFT/freeze wrappers that would otherwise freeze the task head."""
-    if getattr(args, "task_type", "causal_lm") != "seq_cls" or role != "actor" or not post_process:
+    if args.task_type != "seq_cls" or role != "actor" or not post_process:
         return
     owner = _find_output_layer_owner(model)
     if owner is None:

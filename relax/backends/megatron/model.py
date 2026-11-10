@@ -331,10 +331,8 @@ def _mtp_metric_scales(args: Namespace, num_microbatches: int, *, token_tracker:
     already averages tokens across microbatches. Legacy trackers expose sums of
     microbatch means and do not have a uniform loss-scaling contract.
     """
-    objective_scale = (
-        1.0 if token_tracker and getattr(args, "calculate_per_token_loss", False) else 1 / num_microbatches
-    )
-    factor = getattr(args, "mtp_loss_scaling_factor", 0.0)
+    objective_scale = 1.0 if token_tracker and args.calculate_per_token_loss else 1 / num_microbatches
+    factor = args.mtp_loss_scaling_factor
     raw_scale = objective_scale * args.mtp_num_layers / factor if token_tracker and factor else None
     return objective_scale, raw_scale
 
@@ -436,7 +434,7 @@ def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) 
     """Build Megatron optimizer overrides, including the optional MS-Swift-
     style ViT LR group."""
     if Envs.RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS:
-        if getattr(args, "vit_lr", None) is not None:
+        if args.vit_lr is not None:
             raise ValueError("RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS is incompatible with --vit-lr")
         # The standard Megatron groups set wd_mult=0 for biases and 1-D
         # parameters. The strict AutoModel parity baseline used a single AdamW
@@ -444,7 +442,7 @@ def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) 
         return {}
 
     config_overrides = get_standard_config_overrides(config)
-    vit_lr = getattr(args, "vit_lr", None)
+    vit_lr = args.vit_lr
     if vit_lr is None:
         return config_overrides
 
@@ -479,7 +477,7 @@ def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) 
 def _validate_vit_lr_trainable_params(args: Namespace, model: list[DDP]) -> None:
     """Fail fast when ``--vit-lr`` does not match a trainable parameter on any
     rank."""
-    if getattr(args, "vit_lr", None) is None:
+    if args.vit_lr is None:
         return
 
     global_match_count = sum(
@@ -503,7 +501,7 @@ def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> 
     buckets."""
     if not (
         getattr(args, "loss_type", None) == "sft"
-        and getattr(args, "sft_chunked_logits", False)
+        and args.sft_chunked_logits
         and getattr(args, "recompute_loss_function", False)
         and getattr(args, "overlap_grad_reduce", False)
     ):
@@ -981,7 +979,7 @@ def forward_only(
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
 
         # Get the batch.
-        is_vl_model = getattr(args, "is_vl_model", False)
+        is_vl_model = args.is_vl_model
         batch = get_batch(
             data_iterator,
             [
@@ -1011,7 +1009,7 @@ def forward_only(
         # takes the image_grid_thw=None branch.
         mm_kwargs = batch.get("multimodal_train_inputs") or {}
         has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
-        needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
+        needs_unsplit = is_vl_model or has_mm_inputs or args.uses_unsplit_forward
 
         # Bridge Qwen3VLModel.forward (VL or text-only Qwen3.6) does CP+SP
         # splitting internally, so pass unsplit tokens.
@@ -1351,8 +1349,8 @@ def train_one_step(
         """
 
         nonlocal main_loss_has_tokens
-        is_vl_model = getattr(args, "is_vl_model", False)
-        mtp_only = getattr(args, "mtp_only_training", False)
+        is_vl_model = args.is_vl_model
+        mtp_only = args.mtp_only_training
         # Get the batch.
         with timer(f"get_data_batch_{uuid.uuid4().hex[:8]}", keep=False):
             _opd_keys: list[str] = []
@@ -1429,7 +1427,7 @@ def train_one_step(
                 )
         else:
             has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
-            needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
+            needs_unsplit = is_vl_model or has_mm_inputs or args.uses_unsplit_forward
             use_unsplit = needs_unsplit and "unsplit_tokens" in batch
 
             forward_kwargs = {
@@ -1486,13 +1484,11 @@ def train_one_step(
                 fused_linear = (
                     head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
                 )
-                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False) and not fused_linear
-                mtp_output_layer_calls = (
-                    0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
-                )
+                chunked_mtp_on = mtp_enabled and args.sft_chunked_logits and not fused_linear
+                mtp_output_layer_calls = 0 if chunked_mtp_on else (int(args.mtp_num_layers or 0) if mtp_enabled else 0)
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
-                if getattr(args, "sft_chunked_logits", False) and (args.fp16 or args.bf16):
+                if args.sft_chunked_logits and (args.fp16 or args.bf16):
                     forward_kwargs["fp32_output"] = False
                 with _bypass_output_layer(
                     model,
@@ -1545,7 +1541,7 @@ def train_one_step(
     # Forward pass.
     use_streaming = (
         getattr(args, "use_dynamic_batch_size", False)
-        and getattr(args, "fully_async", False)
+        and args.fully_async
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
@@ -1708,7 +1704,7 @@ def train_one_step(
 
         loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
         values = values.tolist()
-        is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+        is_sequence_classification = args.task_type == "seq_cls"
         num_samples_or_tokens = (
             values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
         )
@@ -2120,7 +2116,7 @@ def save(
         args.head_type = REWARD_MODEL_HEAD_TYPE
     elif role == "critic":
         args.head_type = "critic_value_terminal_v1"
-    elif getattr(args, "task_type", "causal_lm") == "seq_cls":
+    elif args.task_type == "seq_cls":
         args.head_type = "sequence_classification_v1"
     else:
         args.head_type = "causal_lm_v1"
@@ -2368,7 +2364,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
             reference_expects_vision,
         )
 
-        model_has_mtp = bool(getattr(args, "mtp_num_layers", 0))
+        model_has_mtp = bool(args.mtp_num_layers)
         allow_missing_mtp_keys = reference_expects_mtp(export_reference) and not model_has_mtp
         # Short-circuits: a reference without vision weights can never be missing them.
         vision_absent_from_model = reference_expects_vision(export_reference) and not hasattr(
@@ -2473,7 +2469,7 @@ def initialize_model_and_optimizer(
     classification_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
     if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
@@ -2498,7 +2494,7 @@ def initialize_model_and_optimizer(
         assert loaded_reward_head_param_ids == reward_head_param_ids, (
             "reward-model head parameter identities changed during checkpoint loading"
         )
-    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+    if role == "actor" and args.task_type == "seq_cls":
         release_sequence_classification_lm_heads(model)
         loaded_classification_head_param_ids = validate_sequence_classification_head_registration(
             model, optimizer, args

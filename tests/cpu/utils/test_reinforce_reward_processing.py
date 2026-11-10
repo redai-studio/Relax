@@ -36,6 +36,7 @@ def _args(**overrides):
         rewards_normalization=True,
         n_samples_per_prompt=2,
         grpo_std_normalization=True,
+        custom_convert_samples_to_train_data_path=None,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

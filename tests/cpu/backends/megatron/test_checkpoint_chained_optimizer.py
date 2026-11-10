@@ -143,8 +143,14 @@ def test_checkpoint_chained_optimizer_resumes_adam_and_scheduler(
             assert any(key.startswith(prefix) for key in keys)
         # This optimizer-only fixture saves no RNG snapshot and explicitly
         # resets RNG; full-resume RNG validation has separate coverage.
+        # load_checkpoint → is_rm_mode() reads loss_type directly.
         args = Namespace(
-            load=str(tmp_path), ckpt_format="torch_dist", no_load_optim=False, no_load_rng=True, finetune=False
+            load=str(tmp_path),
+            loss_type="policy_loss",
+            ckpt_format="torch_dist",
+            no_load_optim=False,
+            no_load_rng=True,
+            finetune=False,
         )
         assert checkpoint_metadata._checkpoint_has_optimizer_state(path, args)
         (tmp_path / "latest_checkpointed_iteration.txt").write_text("3")
