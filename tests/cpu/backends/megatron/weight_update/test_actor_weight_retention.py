@@ -146,6 +146,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
             return dict(device="cuda", tp_size=1, custom_weight_loader=[])
 
         updater = actor.weight_updater
+        updater.shard_p2p_requested = False
         updater.actor_weight_retention_requested = True
         updater.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
         updater.quantization_config, updater.lora_enabled, updater._route_experts = None, False, False

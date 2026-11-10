@@ -620,6 +620,68 @@ class BridgeConverter:
         finally:
             mapping.pp_group = pp_group
 
+    def local_expert_views(
+        self, name: str, param: torch.Tensor, *, allow_etp: bool = False
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Qualify Bridge's live expert views and optional ETP shard
+        contract."""
+        self.init_tasks()
+        global_name, task = self._lookup_task(_normalize_global_name(name))
+        etp_size = mpu.get_expert_tensor_parallel_world_size()
+        if (
+            self._quantization_config
+            or param.dtype != torch.bfloat16
+            or not param.is_contiguous()
+            or task is None
+            or not getattr(task.mapping, "is_expert", False)
+            or not hasattr(task.mapping, "local_hf_params")
+            or type(etp_size) is not int
+            or etp_size <= 0
+            or (etp_size != 1 and not allow_etp)
+        ):
+            raise ValueError(f"No qualified local expert view mapping for {name}")
+        views = task.mapping.local_hf_params(
+            param, global_param_name=global_name, megatron_module=task.megatron_module
+        )
+        if not views or any(
+            view.weight.dtype != torch.bfloat16
+            or view.weight.ndim != 2
+            or not view.weight.is_contiguous()
+            or view.weight.device != param.device
+            or view.weight.untyped_storage().data_ptr() != param.untyped_storage().data_ptr()
+            or view.weight.storage_offset() < param.storage_offset()
+            or view.weight.storage_offset() + view.weight.numel() > param.storage_offset() + param.numel()
+            or (etp_size == 1 and tuple(view.global_weight_shape) != tuple(view.weight.shape))
+            for view in views
+        ):
+            raise ValueError(f"Expert mapping does not expose complete canonical storage views: {name}")
+        if etp_size > 1:
+            etp_rank = mpu.get_expert_tensor_parallel_rank()
+            if (
+                type(etp_rank) is not int
+                or not 0 <= etp_rank < etp_size
+                or task.mapping.tp_size != etp_size
+                or task.mapping.tp_rank != etp_rank
+            ):
+                raise ValueError("Bridge expert tensor-parallel coordinate differs from the actual Actor")
+            for view in views:
+                match = re.fullmatch(
+                    r"model\.(?:language_model\.)?layers\.\d+\.mlp\.experts\.\d+\.(gate|up|down)_proj\.weight",
+                    view.name,
+                )
+                axis = 1 if match is not None and match[1] == "down" else 0
+                expected_shape = list(view.weight.shape)
+                expected_shape[axis] *= etp_size
+                if (
+                    match is None
+                    or view.shard_group != "etp"
+                    or type(view.shard_dim) is not int
+                    or view.shard_dim != axis
+                    or tuple(view.global_weight_shape) != tuple(expected_shape)
+                ):
+                    raise ValueError(f"Bridge does not describe the canonical expert ETP interval: {view.name}")
+        return [(view.name, view.weight.detach()) for view in views]
+
     def convert(self, name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         """Convert a single TP/EP-gathered parameter to HF format.
 
