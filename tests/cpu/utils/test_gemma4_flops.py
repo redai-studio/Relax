@@ -179,3 +179,49 @@ def test_modality_arrays_do_not_require_a_boolean_tensor_conversion():
             raise RuntimeError("ambiguous tensor truth value")
 
     assert math.isnan(estimate_gemma4_flops(_config(), 4096, [4096], 1, image_grid_thw=Grid()))
+
+
+@pytest.mark.parametrize("image_field", ["pixel_values", "image_position_ids"])
+@pytest.mark.parametrize("layout", ["dict", "list"])
+def test_actual_gemma4_image_payload_omits_mfu_but_keeps_tps(monkeypatch, image_field, layout):
+    import torch
+
+    from relax.utils.training import flops_counter, train_metric_utils
+    from relax.utils.utils import _extract_image_grids, _has_image_inputs
+
+    metadata = {image_field: torch.zeros(1, 2, 3)}
+    if layout == "list":
+        metadata = [None, {}, metadata]
+    # Gemma4 has image payloads without Qwen-style image grids.
+    assert _extract_image_grids(metadata) == []
+    assert _has_image_inputs(metadata)
+    timer = SimpleNamespace(
+        seq_lens=[4096],
+        response_lens=[1024],
+        images_seqlens=[],
+        image_grid_thw=[],
+        audio_seqlens=[],
+        has_image_inputs=_has_image_inputs(metadata),
+        log_dict=lambda: {"actor_train": 2.0, "log_probs": 1.0, "train": 2.0},
+        reset=lambda: None,
+    )
+    metrics = {}
+    monkeypatch.setattr(flops_counter, "get_device_peak_flops", lambda unit: 989.0)
+    monkeypatch.setattr(train_metric_utils, "Timer", lambda: timer)
+    monkeypatch.setattr(train_metric_utils.tracking_utils, "log", lambda *args, **kwargs: metrics.update(args[1]))
+    counter = FlopsCounter(_namespace(_config()))
+    args = SimpleNamespace(wandb_always_use_train_step=False)
+    train_metric_utils.log_perf_data_raw(0, args, True, counter, world_size=8)
+    assert "perf/mfu/actor_train" not in metrics
+    assert "perf/mfu/actor_infer" not in metrics
+    assert "perf/actor_train_tflops" not in metrics
+    assert metrics["perf/actor_train_tok_per_s_per_card"] == 256
+
+    # The next pure-text step reports MFU again.
+    timer.has_image_inputs = _has_image_inputs([None, {"pixel_values": torch.empty(0)}])
+    assert not timer.has_image_inputs
+    metrics.clear()
+    train_metric_utils.log_perf_data_raw(1, args, True, counter, world_size=8)
+    assert metrics["perf/mfu/actor_train"] > 0
+    assert metrics["perf/mfu/actor_infer"] > 0
+    assert metrics["perf/actor_train_tok_per_s_per_card"] == 256

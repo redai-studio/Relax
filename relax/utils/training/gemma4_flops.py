@@ -111,6 +111,7 @@ def estimate_gemma4_flops(
     """Return global training TFLOPS/s; unsupported paths return NaN."""
     if (
         dense_multiplier != 6
+        or kwargs.get("has_image_inputs", False)
         or kwargs.get("lora_rank", 0)
         or kwargs.get("freeze_language_model", False)
         or kwargs.get("freeze_params_name_list")
