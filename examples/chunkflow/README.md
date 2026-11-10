@@ -33,6 +33,8 @@ ______________________________________________________________________
 | Baseline      |       16.2 s |         17.5 s |     13.8% |      1.00× |        1.00× |           56.38 |          — |
 | **ChunkFlow** |   **17.0 s** |     **18.4 s** | **13.1%** | **0.950×** |   **0.950×** |       **37.79** | **32.97%** |
 
+¹ 显存为历史峰值 allocated 参考：LongAlign、64K、chunk4096；Dense 使用 GBS1/K1，MoE 使用 GBS8/K0 + 原生 selective `gdn moe`，与上方耗时配置不同。
+
 ______________________________________________________________________
 
 ## 开启建议
@@ -63,7 +65,7 @@ bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 **MoE · Qwen3.6-35B-A3B**　64K / chunk4096 / K0
 
 ```bash
-bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
+KEEP_LAST_K=0 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
 ```
 
 ### 接入现有训练脚本
@@ -91,6 +93,8 @@ python3 examples/chunkflow/setup.py
 | `--calculate-per-token-loss`                   | 按 token 统计，避免切块改变样本权重                    |
 | `--no-rope-fusion`                             | 使用支持分块位置偏移的 RoPE 路径                       |
 | `--attention-dropout 0.0 --hidden-dropout 0.0` | 当前适配要求关闭 dropout，避免分块与重放的随机掩码问题 |
+
+PP 自动沿用原配置；PP>1 时须向训练 worker 传递 `RELAX_CHUNKFLOW_PIPELINE_UNTESTED=1`（Ray 使用 `runtime_env.env_vars`，示例已配置）。不支持原生 full-layer 或 selective `core_attn` 重计算；GDN/QSA 保留对应示例的模型设置。
 
 ### 重要参数
 

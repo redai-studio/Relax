@@ -51,8 +51,19 @@ def test_validation_rejects_unsupported_loss_and_streaming_contracts(options, er
 
 def _load_functions(path, names, namespace):
     tree = ast.parse((ROOT / path).read_text())
-    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    assert {node.name for node in functions} == set(names)
+    definitions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert set(names) <= definitions.keys()
+    # Include native helpers extracted by upstream refactors as well as the
+    # entry points, without importing the module's GPU-only dependencies.
+    selected = set(names)
+    pending = list(names)
+    while pending:
+        node = definitions[pending.pop()]
+        dependencies = {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
+        new = (dependencies & definitions.keys()) - selected
+        selected.update(new)
+        pending.extend(new)
+    functions = [node for name, node in definitions.items() if name in selected]
     future = ast.parse("from __future__ import annotations").body
     exec(compile(ast.Module(body=future + functions, type_ignores=[]), path, "exec"), namespace)
 
