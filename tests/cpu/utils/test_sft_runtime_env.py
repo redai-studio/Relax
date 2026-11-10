@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -116,3 +117,17 @@ def test_nonfinite_delivery_policy_reaches_training_workers(monkeypatch):
     env = post_process_env(_make_args(), {"env_vars": {"OMP_NUM_THREADS": "24"}})["env_vars"]
     assert env["RELAX_SKIP_NONFINITE_GRAD"] == "1"
     assert env["OMP_NUM_THREADS"] == "24"
+
+
+@pytest.mark.parametrize("env", [{}, {"env_vars": None}, {"env_vars": {"CUSTOM_SETTING": "kept"}}])
+@pytest.mark.parametrize("use_megatron_fsdp", [False, True])
+def test_post_process_env_initializes_fsdp_env_after_normalization(monkeypatch, env, use_megatron_fsdp):
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+    args = _make_args()
+    args.use_megatron_fsdp = use_megatron_fsdp
+    configured = dict(env.get("env_vars") or {})
+
+    runtime_env = post_process_env(args, deepcopy(env))
+
+    assert runtime_env["env_vars"].get("CUDA_DEVICE_MAX_CONNECTIONS") == ("32" if use_megatron_fsdp else None)
+    assert all(runtime_env["env_vars"][key] == value for key, value in configured.items())

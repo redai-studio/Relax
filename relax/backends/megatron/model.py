@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from __future__ import annotations
+
 import dataclasses
 import itertools
 import json
@@ -74,6 +76,7 @@ from .conditional_branch_sync import disable_frozen_conditional_branch_sync
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
+    get_bridge_distributed_model,
     get_model_provider_func,
     validate_mtp_only_trainable_params,
     wrap_model_provider_with_freeze,
@@ -91,6 +94,26 @@ def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None
     device_module.empty_cache()
     logger.info("Gradient finalization cache release: before=%s after=%s", memory_before, available_memory())
     finalize_model_grads(*args, **kwargs)
+
+
+def _get_distributed_wrapper_classes() -> tuple[type[torch.nn.Module], ...]:
+    classes: list[type[torch.nn.Module]] = [DDP]
+    try:
+        from megatron.core.distributed.fsdp import mcore_fsdp_adapter
+
+        # Newer Megatron uses the legacy name for a factory; isinstance needs
+        # the concrete V1/V2 classes, while older releases export a class.
+        for name in ("FullyShardedDataParallel", "FullyShardedDataParallelV1", "FullyShardedDataParallelV2"):
+            wrapper_class = getattr(mcore_fsdp_adapter, name, None)
+            if isinstance(wrapper_class, type) and wrapper_class not in classes:
+                classes.append(wrapper_class)
+    except ImportError:
+        pass
+    return tuple(classes)
+
+
+def _is_distributed_wrapper(model_chunk: torch.nn.Module) -> bool:
+    return isinstance(model_chunk, _get_distributed_wrapper_classes())
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -559,11 +582,14 @@ def setup_model_and_optimizer(
     assert args.load is not None or args.pretrained_checkpoint is not None
     skip_nonfinite = configure_nonfinite_guard(args)
 
-    model = get_model(
-        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
-        ModelType.encoder_or_decoder,
-        wrap_with_ddp=role in ["actor", "critic"],
-    )
+    if getattr(args, "use_megatron_fsdp", False):
+        model = get_bridge_distributed_model(args, role, wrap_with_ddp=role in ["actor", "critic"])
+    else:
+        model = get_model(
+            wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
+            ModelType.encoder_or_decoder,
+            wrap_with_ddp=role in ["actor", "critic"],
+        )
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
@@ -857,6 +883,13 @@ def _patch_gdn_for_dynamic_cp(linear_cp_mode: str | None = None) -> None:
     GatedDeltaNet._dcp_patched = True
 
 
+_NO_FORWARD_PRE_HOOK_MSG = (
+    "forward pre-hooks are a Megatron DDP feature; {cls} does not implement them. "
+    "Megatron-FSDP overlaps its own parameter gather inside MegatronFSDP.forward, so these "
+    "calls must stay gated behind should_disable_forward_pre_hook()."
+)
+
+
 def enable_forward_pre_hook(model_chunks: Sequence[DDP]) -> None:
     """Enable forward pre-hooks for provided DDP-wrapped model chunks.
 
@@ -864,7 +897,7 @@ def enable_forward_pre_hook(model_chunks: Sequence[DDP]) -> None:
         model_chunks (Sequence[DDP]): Sequence of DDP modules to enable hooks on.
     """
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        assert isinstance(model_chunk, DDP), _NO_FORWARD_PRE_HOOK_MSG.format(cls=type(model_chunk).__name__)
         model_chunk.enable_forward_pre_hook()
 
 
@@ -876,7 +909,7 @@ def disable_forward_pre_hook(model_chunks: Sequence[DDP], param_sync: bool = Tru
         param_sync (bool): Whether to synchronize parameters when disabling.
     """
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        assert isinstance(model_chunk, DDP), _NO_FORWARD_PRE_HOOK_MSG.format(cls=type(model_chunk).__name__)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
@@ -903,7 +936,7 @@ def force_param_sync(model_chunks: Sequence[DDP]) -> None:
     """Synchronize distributed-optimizer parameters without changing hook
     state."""
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        assert _is_distributed_wrapper(model_chunk)
         model_chunk.start_param_sync(force_sync=True)
 
 
@@ -1738,8 +1771,28 @@ def train_one_step(
 
 
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
-    """Block forward pre-hook for certain configurations."""
-    return args.use_distributed_optimizer and args.overlap_param_gather
+    """Block forward pre-hook for certain configurations.
+
+    Mirrors Megatron's own gate (``megatron/training/training.py`` and
+    ``megatron/bridge/training/train.py``), which excludes Megatron-FSDP for two
+    reasons:
+
+    - ``enable_forward_pre_hook`` / ``disable_forward_pre_hook`` exist only on
+      Megatron's ``DistributedDataParallel``; the FSDP adapter never implements
+      or aliases them, so reaching this path raises ``AttributeError``.
+    - Even if it did, the hooks would be meaningless: Megatron-FSDP overlaps its
+      own parameter all-gather inside ``MegatronFSDP.forward``, and its
+      ``start_param_sync`` puts params back into the *raw* (unsharded) state that
+      the weight-export path deliberately normalizes away
+      (``_ensure_fsdp_params_distributed``).
+
+    Megatron forces ``use_distributed_optimizer=True`` under ``--use-megatron-fsdp``,
+    so without the FSDP term any run adding ``--overlap-param-gather`` would enter
+    this path.
+    """
+    return (
+        not getattr(args, "use_megatron_fsdp", False) and args.use_distributed_optimizer and args.overlap_param_gather
+    )
 
 
 def train(
@@ -1784,7 +1837,7 @@ def train(
     # train() is invoked once per rollout in Relax (vs. once per run upstream),
     # so guard the sync-func setup to be idempotent — re-assigning would trip
     # Megatron's "no_sync_func must be None" assert on rollout 1+.
-    if isinstance(model[0], DDP) and args.overlap_grad_reduce and config.no_sync_func is None:
+    if _is_distributed_wrapper(model[0]) and args.overlap_grad_reduce and config.no_sync_func is None:
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]

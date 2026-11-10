@@ -13,8 +13,10 @@ from relax.utils.training import ppo_utils
 class _FakeProvider:
     def __init__(self, model=None):
         self.calls = []
+        self.distributed_calls = []
         self.finalized = False
         self.model = model or torch.nn.Module()
+        self.pre_wrap_hooks = []
         self.attention_backend = None
         self.tensor_model_parallel_size = 1
         self.sequence_parallel = False
@@ -30,6 +32,8 @@ class _FakeProvider:
         self.bf16 = False
         self.params_dtype = None
         self.vision_dp_when_cp = False
+        self.qsa_indexer_loss_coeff = 0.0
+        self.deallocate_pipeline_outputs = True
 
     def finalize(self):
         self.finalized = True
@@ -43,6 +47,17 @@ class _FakeProvider:
             }
         )
         return self.model
+
+    def register_pre_wrap_hook(self, hook):
+        self.pre_wrap_hooks.append(hook)
+
+    def provide_distributed_model(self, **kwargs):
+        self.distributed_calls.append(kwargs)
+        # Megatron-Bridge hands pre-wrap hooks the list of model chunks, not a bare module.
+        model_chunks = self.model if isinstance(self.model, list) else [self.model]
+        for hook in self.pre_wrap_hooks:
+            model_chunks = hook(model_chunks)
+        return model_chunks
 
 
 def _install_fake_megatron(monkeypatch, provider=None):
@@ -64,8 +79,13 @@ def _install_fake_megatron(monkeypatch, provider=None):
     arguments = types.ModuleType("megatron.training.arguments")
     tokenizer_package = types.ModuleType("megatron.training.tokenizer")
     tokenizer = types.ModuleType("megatron.training.tokenizer.tokenizer")
+    training_training = types.ModuleType("megatron.training.training")
     bridge = types.ModuleType("megatron.bridge")
     misc = types.ModuleType("relax.utils.misc")
+    bridge_training = types.ModuleType("megatron.bridge.training")
+    bridge_training_utils = types.ModuleType("megatron.bridge.training.utils")
+    bridge_config_utils = types.ModuleType("megatron.bridge.training.utils.config_utils")
+    ray = types.ModuleType("ray")
 
     class _FakeGPTModel:
         pass
@@ -106,6 +126,9 @@ def _install_fake_megatron(monkeypatch, provider=None):
     bridge.AutoBridge = _FakeAutoBridge
     misc.load_function = lambda path: None
     misc.resolve_is_vl_model = resolve_is_vl_model
+    # Stub the real megatron.training.training.get_megatron_ddp_config: it reads a long tail
+    # of Megatron-parser-only args off the namespace, which these fake args don't carry.
+    training_training.get_megatron_ddp_config = lambda args: {"fake_ddp_config_for": args.megatron_to_hf_mode}
 
     modules = {
         "megatron": megatron,
@@ -124,8 +147,13 @@ def _install_fake_megatron(monkeypatch, provider=None):
         "megatron.training.arguments": arguments,
         "megatron.training.tokenizer": tokenizer_package,
         "megatron.training.tokenizer.tokenizer": tokenizer,
+        "megatron.training.training": training_training,
         "megatron.bridge": bridge,
         "relax.utils.misc": misc,
+        "megatron.bridge.training": bridge_training,
+        "megatron.bridge.training.utils": bridge_training_utils,
+        "megatron.bridge.training.utils.config_utils": bridge_config_utils,
+        "ray": ray,
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
@@ -185,6 +213,10 @@ def _bridge_args(**overrides):
         "fp16": False,
         "bf16": True,
         "save": None,
+        "use_distributed_optimizer": True,
+        "use_megatron_fsdp": False,
+        "only_train_params_name_list": None,
+        "freeze_params_name_list": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -225,7 +257,7 @@ def test_dsv4_bridge_resolves_dsa_backend_before_finalize(
     )
 
 
-@pytest.mark.parametrize("path", ["bridge", "custom", "raw"])
+@pytest.mark.parametrize("path", ["bridge", "fsdp", "custom", "raw"])
 @pytest.mark.parametrize("processor", [False, True])
 @pytest.mark.parametrize("declared", [None, False, True])
 def test_model_routing_is_resolved_before_model_construction(monkeypatch, tmp_path, path, processor, declared):
@@ -241,8 +273,11 @@ def test_model_routing_is_resolved_before_model_construction(monkeypatch, tmp_pa
         is_vl_model=not processor,
         uses_unsplit_forward=True,
     )
-    module.get_model_provider_func(args)
-    expected = declared if path == "bridge" and declared is not None else processor
+    if path == "fsdp":
+        module.get_bridge_distributed_model(args)
+    else:
+        module.get_model_provider_func(args)
+    expected = declared if path in ("bridge", "fsdp") and declared is not None else processor
     assert args.is_vl_model is expected
     assert args.uses_unsplit_forward is True
     assert provider.calls == []
@@ -752,28 +787,33 @@ def test_raw_provider_uses_supplied_config_and_process_groups(monkeypatch, expli
         ("gdn_conv_pad_alignment", 8192),
     ],
 )
-def test_bridge_forwards_blackwell_runtime_configuration(monkeypatch, name, value):
+@pytest.mark.parametrize("distributed", [False, True], ids=["ddp", "mfsdp"])
+def test_bridge_forwards_blackwell_runtime_configuration(monkeypatch, name, value, distributed):
     provider = _FakeProvider()
     setattr(provider, name, None)
     module, provider = _load_model_provider(monkeypatch, provider)
-    module.get_model_provider_func(_bridge_args(**{name: value}))(pre_process=True, post_process=True)
+    if distributed:
+        module.get_bridge_distributed_model(_bridge_args(**{name: value}))
+    else:
+        module.get_model_provider_func(_bridge_args(**{name: value}))(pre_process=True, post_process=True)
     assert getattr(provider, name) == value
 
 
 @pytest.mark.parametrize("max_tokens,alignment", [(65536, 8), (4096, 16)])
-def test_bridge_provider_receives_packed_sequence_limits(monkeypatch, max_tokens, alignment):
+@pytest.mark.parametrize("distributed", [False, True], ids=["ddp", "mfsdp"])
+def test_bridge_provider_receives_packed_sequence_limits(monkeypatch, max_tokens, alignment, distributed):
     provider = _FakeProvider()
     provider.max_seqlen_per_dp_cp_rank = 2048
     provider.pad_packed_seq_alignment = 1
     module, provider = _load_model_provider(monkeypatch, provider=provider)
-    module.get_model_provider_func(
-        _bridge_args(max_seqlen_per_dp_cp_rank=max_tokens, pad_packed_seq_alignment=alignment)
-    )
+    build = module.get_bridge_distributed_model if distributed else module.get_model_provider_func
+    build(_bridge_args(max_seqlen_per_dp_cp_rank=max_tokens, pad_packed_seq_alignment=alignment))
     assert provider.max_seqlen_per_dp_cp_rank == max_tokens
     assert provider.pad_packed_seq_alignment == alignment
 
 
-def test_bridge_provider_preserves_native_offload_policy(monkeypatch):
+@pytest.mark.parametrize("distributed", [False, True], ids=["ddp", "mfsdp"])
+def test_bridge_provider_preserves_native_offload_policy(monkeypatch, distributed):
     policy = {
         "fine_grained_activation_offloading": True,
         "offload_modules": ["moe_act", "core_attn"],
@@ -787,6 +827,309 @@ def test_bridge_provider_preserves_native_offload_policy(monkeypatch):
     for name in policy:
         setattr(provider, name, None)
     module, provider = _load_model_provider(monkeypatch, provider)
-    module.get_model_provider_func(_bridge_args(**policy), role="actor")
+    build = module.get_bridge_distributed_model if distributed else module.get_model_provider_func
+    build(_bridge_args(**policy), role="actor")
     assert provider.finalized
     assert {name: getattr(provider, name) for name in policy} == policy
+
+
+def test_bridge_distributed_model_uses_megatron_fsdp(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    model = module.get_bridge_distributed_model(_bridge_args(use_megatron_fsdp=True), role="actor")
+
+    assert len(model) == 1
+    assert len(provider.pre_wrap_hooks) == 1
+    assert provider.distributed_calls == [
+        {
+            "wrap_with_ddp": True,
+            "ddp_config": {"fake_ddp_config_for": "bridge"},
+            "fp16": False,
+            "bf16": True,
+            "use_megatron_fsdp": True,
+            "overlap_param_gather_with_optimizer_step": False,
+            "data_parallel_random_init": False,
+            "use_cpu_initialization": False,
+            "init_model_with_meta_device": False,
+        }
+    ]
+
+
+def test_bridge_distributed_model_disables_pipeline_output_dealloc_under_pp(monkeypatch):
+    """#20: megatron_fsdp wraps every FSDP-unit module's forward output in a
+    `t.view_as(t)` (see megatron_fsdp.py::create_custom_backward_hook), so the
+    activation crossing a PP boundary is always a view. The pipelined schedules'
+    `deallocate_output_tensor()` asserts the opposite ("counter-productive to free
+    a view of another tensor") and crashes at PP>1. GPTModelProvider defaults
+    `deallocate_pipeline_outputs=True`, so get_bridge_distributed_model must turn
+    it off whenever PP>1 is in play (PP==1 never calls deallocate_output_tensor at
+    all, so it's left alone there)."""
+    module, provider = _load_model_provider(monkeypatch)
+
+    module.get_bridge_distributed_model(
+        _bridge_args(use_megatron_fsdp=True, pipeline_model_parallel_size=4), role="actor"
+    )
+
+    assert provider.deallocate_pipeline_outputs is False
+
+
+def test_bridge_distributed_model_leaves_pipeline_output_dealloc_alone_at_pp1(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    module.get_bridge_distributed_model(
+        _bridge_args(use_megatron_fsdp=True, pipeline_model_parallel_size=1), role="actor"
+    )
+
+    assert provider.deallocate_pipeline_outputs is True
+
+
+@pytest.mark.parametrize("distributed", [False, True], ids=["ddp", "mfsdp"])
+@pytest.mark.parametrize("precision", ["fp16", "bf16", "provider_default"])
+def test_bridge_provider_configures_overrides_before_finalize(monkeypatch, distributed, precision):
+    module, provider = _load_model_provider(monkeypatch)
+    provider.masked_softmax_fusion = False
+    provider.recompute_modules = ["default"]
+    provider.moe_router_bias_update_rate = 0.001
+    provider.dynamic_context_parallel = True
+    provider.params_dtype = torch.float32
+    provider.unrelated_setting = "provider default"
+    runtime_overrides = {
+        "fp8": "hybrid",
+        "fp8_recipe": "blockwise",
+        "fp8_quantizer_factory": "custom.quantizer",
+        "pipeline_model_parallel_layout": "Et|t|t|tL",
+        "cp_partition_mode": "zigzag",
+        "sequence_packing_scheduler": "dynamic",
+        "mtp_use_repeated_layer": True,
+        "linear_cp_mode": "all_gather",
+        "activation_func_clamp_shared_expert": 7.0,
+    }
+    for key in runtime_overrides:
+        setattr(provider, key, None)
+    snapshots = []
+    dumps = []
+    monkeypatch.setattr(provider, "finalize", lambda: snapshots.append(vars(provider).copy()))
+    monkeypatch.setattr(module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(module, "_dump_provider_config", lambda p, path: dumps.append((p, path)))
+    args = _bridge_args(
+        masked_softmax_fusion=True,
+        recompute_modules=["core_attn", "moe"],
+        moe_router_bias_update_rate=0.02,
+        dynamic_context_parallel=True,
+        decoder_first_pipeline_num_layers=3,
+        decoder_last_pipeline_num_layers=1,
+        gradient_accumulation_fusion=False,
+        fp16=precision == "fp16",
+        bf16=precision == "bf16",
+        save="fake-save",
+        unrelated_setting="must not override",
+        **runtime_overrides,
+    )
+
+    if distributed:
+        module.get_bridge_distributed_model(args)
+    else:
+        module.get_model_provider_func(args)
+
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert {key: snapshot[key] for key in runtime_overrides} == runtime_overrides
+    assert snapshot["masked_softmax_fusion"] is True
+    assert snapshot["recompute_modules"] == ["core_attn", "moe"]
+    assert snapshot["moe_router_bias_update_rate"] == 0.02
+    assert snapshot["dynamic_context_parallel"] is False
+    assert args.dynamic_context_parallel is True
+    assert snapshot["num_layers_in_first_pipeline_stage"] == 3
+    assert snapshot["num_layers_in_last_pipeline_stage"] == 1
+    assert snapshot["gradient_accumulation_fusion"] is False
+    assert snapshot["virtual_pipeline_model_parallel_size"] == 2
+    assert snapshot["unrelated_setting"] == "provider default"
+    assert (
+        snapshot["params_dtype"]
+        == {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "provider_default": torch.float32,
+        }[precision]
+    )
+    assert snapshot["fp16"] is (precision == "fp16")
+    assert snapshot["bf16"] is (precision == "bf16")
+    assert dumps == [(provider, "fake-save")]
+
+
+class _TaskHeadModel(torch.nn.Module):
+    def __init__(self, post_process=True):
+        super().__init__()
+        self.post_process = post_process
+        self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+        self.decoder = torch.nn.Linear(4, 4)
+        self.decoder.config = SimpleNamespace()
+        self.output_layer = torch.nn.Linear(4, 8)
+
+
+@pytest.mark.parametrize("distributed", [False, True], ids=["ddp", "mfsdp"])
+@pytest.mark.parametrize("role", ["actor", "critic", "reference"])
+@pytest.mark.parametrize("post_process", [False, True])
+def test_bridge_task_heads_and_detach_paths_match_across_wrappers(monkeypatch, distributed, role, post_process):
+    model = _TaskHeadModel(post_process=post_process)
+    lm_head = model.output_layer
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(model))
+    args = _bridge_args(
+        task_type="seq_cls" if role == "actor" else "causal_lm",
+        num_labels=3,
+        mtp_detach_paths=["embedding", "lm-head"],
+        freeze_params_name_list=[r".*"] if role == "actor" else None,
+    )
+
+    if distributed:
+        assert module.get_bridge_distributed_model(args, role=role) == [model]
+    else:
+        provide = module.wrap_model_provider_with_freeze(module.get_model_provider_func(args, role=role), args)
+        # Positional arguments must retain the same pre/post-process interpretation.
+        assert provide(True, post_process, 1) is model
+
+    for config in (model.config, model.decoder.config):
+        assert config.mtp_detach_embedding is True
+        assert config.mtp_detach_backbone is False
+        assert config.mtp_detach_lm_head is True
+    if post_process and role in ("actor", "critic"):
+        assert isinstance(model.output_layer, ppo_utils.LinearForLastLayer)
+        assert model.output_layer.out_features == (3 if role == "actor" else 1)
+        stash = (
+            ppo_utils._RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR if role == "actor" else ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR
+        )
+        assert getattr(model, stash) is lm_head
+        assert all(param is not lm_head.weight for param in model.parameters())
+        assert all(param.requires_grad for param in model.output_layer.parameters())
+    else:
+        assert model.output_layer is lm_head
+    if role == "actor":
+        assert all(not param.requires_grad for param in model.decoder.parameters())
+
+
+def test_bridge_fsdp_configures_every_chunk_before_distributed_wrap(monkeypatch):
+    chunks = [_TaskHeadModel(post_process=False), _TaskHeadModel(post_process=True)]
+    module, provider = _load_model_provider(monkeypatch, provider=_FakeProvider(chunks))
+    probes = []
+    monkeypatch.setattr(module, "_install_cp_probe", lambda models: probes.append(models))
+    args = _bridge_args(task_type="seq_cls", num_labels=3, mtp_detach_paths=[], freeze_params_name_list=[r".*"])
+
+    model = module.get_bridge_distributed_model(args)
+
+    assert model is chunks
+    assert probes == [chunks]
+    assert len(provider.pre_wrap_hooks) == 1
+    assert chunks[0].output_layer.out_features == 8
+    assert chunks[1].output_layer.out_features == 3
+    assert not chunks[0].output_layer.weight.requires_grad
+    assert chunks[1].output_layer.weight.requires_grad
+    for chunk in chunks:
+        assert chunk.config.mtp_detach_embedding is False
+        assert chunk.config.mtp_detach_backbone is False
+        assert chunk.config.mtp_detach_lm_head is False
+
+
+def test_bridge_ddp_preserves_task_head_lora_freeze_order(monkeypatch):
+    model = _TaskHeadModel()
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(model))
+    calls = []
+
+    def apply_peft(model, training):
+        assert training is True
+        assert model.output_layer.out_features == 3
+        assert model.config.mtp_detach_backbone is False
+        calls.append(model)
+        model.requires_grad_(False)
+        model.register_parameter("adapter", torch.nn.Parameter(torch.ones(4)))
+        return model
+
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: apply_peft)
+    args = _bridge_args(
+        task_type="seq_cls",
+        num_labels=3,
+        mtp_detach_paths=[],
+        lora_rank=4,
+        only_train_params_name_list=[r"^adapter$"],
+    )
+    provide = module.wrap_model_provider_with_freeze(module.get_model_provider_func(args), args)
+
+    assert provide(post_process=True) is model
+    assert calls == [model]
+    assert {name for name, param in model.named_parameters() if param.requires_grad} == {
+        "adapter",
+        "output_layer.weight",
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"megatron_to_hf_mode": "raw"}, "bridge"),
+        ({"custom_model_provider_path": "custom.provider"}, "custom-model-provider-path"),
+        ({"lora_rank": 4}, "LoRA"),
+    ],
+)
+def test_bridge_fsdp_rejects_ignored_options_before_provider_creation(monkeypatch, overrides, match):
+    module, provider = _load_model_provider(monkeypatch)
+
+    with pytest.raises(ValueError, match=match):
+        module.get_bridge_distributed_model(_bridge_args(**overrides))
+
+    assert not provider.finalized
+    assert provider.pre_wrap_hooks == []
+    assert provider.distributed_calls == []
+
+
+def test_custom_provider_still_takes_precedence_in_ordinary_path(monkeypatch):
+    model = _TaskHeadModel()
+    module, provider = _load_model_provider(monkeypatch)
+    calls = []
+
+    def custom(pre_process, post_process, vp_stage):
+        calls.append((pre_process, post_process, vp_stage))
+        return model
+
+    monkeypatch.setattr(module, "load_function", lambda path: custom)
+    args = _bridge_args(custom_model_provider_path="custom.provider", mtp_detach_paths=[])
+
+    assert module.get_model_provider_func(args)(pre_process=False, post_process=False, vp_stage=2) is model
+    assert calls == [(False, False, 2)]
+    assert model.config.mtp_detach_backbone is False
+    assert not provider.finalized
+
+
+@pytest.mark.parametrize("distributed", [False, True], ids=["ddp", "mfsdp"])
+def test_bridge_preserves_gdn_precision_and_reward_head_before_wrapping(monkeypatch, distributed):
+    class GatedDeltaNet(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.A_log = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+            self.A_log.tensor_model_parallel = True
+
+    model = _TaskHeadModel()
+    model.self_attention = GatedDeltaNet()
+    model.uses_unsplit_forward = True
+    original_a_log = model.self_attention.A_log
+    lm_head = model.output_layer
+    module, provider = _load_model_provider(monkeypatch, provider=_FakeProvider(model))
+    monkeypatch.setitem(sys.modules, "megatron.core.ssm.gated_delta_net", SimpleNamespace(GatedDeltaNet=GatedDeltaNet))
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.transformer.module",
+        SimpleNamespace(mark_keep_in_fp32=lambda param: setattr(param, "keep_in_fp32", True)),
+    )
+    args = _bridge_args(loss_type="rm", mtp_detach_paths=[])
+    if distributed:
+        assert module.get_bridge_distributed_model(args) == [model]
+    else:
+        assert module.get_model_provider_func(args)(post_process=True) is model
+
+    assert model.self_attention.A_log is original_a_log
+    assert original_a_log.dtype == torch.float32
+    assert original_a_log.tensor_model_parallel and original_a_log.keep_in_fp32
+    assert isinstance(model.output_layer, ppo_utils.LinearForLastLayer)
+    assert model.output_layer.out_features == 1
+    assert getattr(model, ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR) is lm_head
+    assert all(param is not lm_head.weight for param in model.parameters())
+    assert args.uses_unsplit_forward is True
+    assert args._relax_qwen35_optimized is False

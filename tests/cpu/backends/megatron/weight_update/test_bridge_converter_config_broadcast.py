@@ -28,12 +28,22 @@ class _Task:
     megatron_module: object = None
 
 
-def test_config_broadcast_removes_runtime_state_and_preserves_local_config(monkeypatch):
+@dataclass
+class _ProviderConfig:
+    hidden_size: int
+    num_attention_heads: int
+
+
+@pytest.mark.parametrize("config_type", [SimpleNamespace, _ProviderConfig])
+def test_config_broadcast_removes_runtime_state_and_preserves_local_config(monkeypatch, config_type):
     state = _RuntimeState()
     groups = ProcessGroupCollection(tp=state)
-    config = SimpleNamespace(
-        hidden_size=7168, num_attention_heads=96, _pg_collection=groups, grad_scale_func=state.scale_loss
-    )
+    config = config_type(hidden_size=7168, num_attention_heads=96)
+    hook = lambda chunks: chunks
+    config._pg_collection = groups
+    config.grad_scale_func = state.scale_loss
+    config._pre_wrap_hooks = [hook]
+    config.opaque_state = state
     remote_config = SimpleNamespace(hidden_size=1152, num_attention_heads=16)
     converter = bridge_converter.BridgeConverter.__new__(bridge_converter.BridgeConverter)
     converter._configs_broadcast_done = False
@@ -51,6 +61,8 @@ def test_config_broadcast_removes_runtime_state_and_preserves_local_config(monke
         assert wire["language_model"].num_attention_heads == 96
         assert wire["language_model"]._pg_collection is None
         assert wire["language_model"].grad_scale_func is None
+        assert wire["language_model"]._pre_wrap_hooks == [None]
+        assert wire["language_model"].opaque_state is None
         object_list[:] = [wire, {"vision_model": remote_config}]
 
     monkeypatch.setattr(bridge_converter.dist, "all_gather_object", gather)
@@ -60,6 +72,8 @@ def test_config_broadcast_removes_runtime_state_and_preserves_local_config(monke
     assert converter._config_map["language_model"] is config
     assert config._pg_collection is groups
     assert config.grad_scale_func.__self__ is state
+    assert config._pre_wrap_hooks == [hook]
+    assert config.opaque_state is state
     assert converter._bridge_task_map["vision_model.weight"].megatron_module.config is remote_config
 
 

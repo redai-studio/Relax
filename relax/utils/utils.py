@@ -475,6 +475,9 @@ def post_process_env(args, env):
     if "env_vars" not in env or not isinstance(env["env_vars"], dict):
         env["env_vars"] = {}
 
+    if getattr(args, "use_megatron_fsdp", False):
+        env["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] = "32"
+
     # Dynamic-batch streaming ends via the producer's is_last signal, not a
     # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
     # The non-dynamic path still pre-allocates the exact count for its .all() check.

@@ -139,6 +139,14 @@ from .data import (
     prepack_sft_micro_batch_cpu,
     record_tensors_on_stream,
 )
+from .fsdp_pp_patch import (
+    check_fsdp_pp_checkpoint_support,
+    patch_bridge_shared_embedding_broadcast_for_pp,
+    patch_checkpoint_layer_numbering_for_pp,
+    patch_dtensor_meta_check_for_pp,
+    patch_embedding_grad_reshard_for_pp,
+    patch_fsdp_mesh_for_pp,
+)
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import flush_resident_sft_param_sync, forward_only, initialize_model_and_optimizer, save, train
@@ -362,6 +370,62 @@ class _SFTPrepackedDeviceIterator:
         self._next_ready_event = None
 
 
+def _patch_clip_grad_for_fsdp_empty_grads() -> None:
+    """Guard ``clip_grad_by_total_norm_fp32`` against empty gradient lists
+    (FSDP + MoE).
+
+    Under Megatron-FSDP with expert-parallel MoE, expert params are sharded over the
+    expert-data-parallel group, so on some ranks *no* local parameter carries a
+    gradient shard. Upstream then passes an empty ``[[], []]`` to TE's
+    ``multi_tensor_scale_tensor`` (selected because ``--use-precision-aware-optimizer``
+    makes ``clip_coeff`` a Tensor), whose CUDA kernel dereferences the empty metadata
+    → native segfault (see debug doc #13).
+
+    This wraps the upstream function: filter parameters to those with a non-empty local
+    grad shard, and no-op when none remain (nothing to clip). Delegating to the original
+    keeps the scale logic in one place (no upstream drift). Idempotent; safe for non-FSDP
+    (the filter is a no-op when every param has a full grad). Installed as a Relax-side
+    monkeypatch so it survives Megatron reinstalls (the prior in-tree edit did not).
+    """
+    from megatron.core.optimizer import clip_grads
+    from megatron.core.optimizer import optimizer as mcore_optimizer
+    from megatron.core.utils import to_local_if_dtensor
+
+    if getattr(clip_grads.clip_grad_by_total_norm_fp32, "_relax_empty_grad_guard", False):
+        return
+
+    _orig = clip_grads.clip_grad_by_total_norm_fp32
+
+    def _has_nonempty_local_grad(param, use_decoupled_grad: bool) -> bool:
+        if use_decoupled_grad:
+            grad = getattr(param, "decoupled_grad", None)
+        else:
+            grad = param.grad
+        if grad is None:
+            return False
+        return to_local_if_dtensor(grad).numel() > 0
+
+    def _patched(parameters, max_norm, total_norm, use_decoupled_grad: bool = False):
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        else:
+            parameters = list(parameters)
+        filtered = [p for p in parameters if _has_nonempty_local_grad(p, use_decoupled_grad)]
+        if not filtered:
+            # No local grad shards on this rank — nothing to clip; skip the TE
+            # multi-tensor kernel that segfaults on empty metadata.
+            return
+        return _orig(filtered, max_norm, total_norm, use_decoupled_grad=use_decoupled_grad)
+
+    _patched._relax_empty_grad_guard = True
+    clip_grads.clip_grad_by_total_norm_fp32 = _patched
+    # optimizer.py did `from .clip_grads import clip_grad_by_total_norm_fp32`, binding the
+    # name in its own module namespace — patch that reference too, else its call site
+    # (MegatronOptimizer.clip_grad_norm) keeps the unguarded original.
+    mcore_optimizer.clip_grad_by_total_norm_fp32 = _patched
+    logger.info("Installed Relax clip_grad empty-grad guard for Megatron-FSDP (#13).")
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @property
     def _per_step_rollout(self) -> bool:
@@ -402,12 +466,24 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
         with_opd_teacher: bool = False,
     ) -> int | None:
+        if role == "reference" or role == "actor_fwd":
+            process_args(args, role)
         monkey_patch_torch_dist(args)
+        if getattr(args, "use_megatron_fsdp", False):
+            _patch_clip_grad_for_fsdp_empty_grads()
+            check_fsdp_pp_checkpoint_support(args, role)
+            if getattr(args, "pipeline_model_parallel_size", 1) > 1:
+                # PP=1 needs no patch: upstream's full-world mesh is already correct.
+                # Runs before init(args) below, so dist/mpu are not up yet — the shim
+                # reads them lazily when the mesh builders actually run.
+                patch_fsdp_mesh_for_pp()
+                patch_dtensor_meta_check_for_pp()
+                patch_bridge_shared_embedding_broadcast_for_pp()
+                patch_embedding_grad_reshard_for_pp()
+                patch_checkpoint_layer_numbering_for_pp()
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
         patch_checkpoint_write()
-        if role == "reference" or role == "actor_fwd":
-            process_args(args, role)
         super().init(args, role, with_ref, with_opd_teacher)
 
         # Materialize an S3 checkpoint on this node before Megatron init(args)
