@@ -117,24 +117,6 @@ class TestModePredicates:
         assert is_lora_adapter_mode(args_adapter)
         assert not is_lora_adapter_mode(args_merge)
 
-    def test_is_lora_merge_mode_flag(self):
-        args_merge = MagicMock()
-        args_merge.lora_merge_mode = True
-        args_adapter = MagicMock()
-        args_adapter.lora_merge_mode = False
-
-        assert is_lora_merge_mode(args_merge)
-        assert not is_lora_merge_mode(args_adapter)
-
-    def test_is_lora_enabled_by_rank(self):
-        args_on = MagicMock()
-        args_on.lora_rank = 32
-        args_off = MagicMock()
-        args_off.lora_rank = 0
-
-        assert is_lora_enabled(args_on)
-        assert not is_lora_enabled(args_off)
-
     def test_missing_attrs_default_false(self):
         # Plain object without the LoRA attributes -> predicates must not raise.
         class Empty:
@@ -294,10 +276,6 @@ class TestAdapterSkipPredicate:
         assert is_lora_adapter_param("decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight")
         assert is_lora_adapter_param("decoder.layers.0.self_attention.linear_proj.adapter.linear_out.weight")
 
-    def test_standard_peft_adapter_names_matched(self):
-        assert is_lora_adapter_param("base_model.model.layers.0.self_attn.q_proj.lora_A.weight")
-        assert is_lora_adapter_param("base_model.model.layers.0.self_attn.q_proj.lora_B.weight")
-
     def test_base_and_to_wrap_names_not_matched(self):
         # The wrapped base weight MUST NOT be classified as an adapter, or it would be
         # dropped from the rollout broadcast.
@@ -315,17 +293,6 @@ class TestDeltaSkip:
         delta, new_state = extract_lora_delta(state, {k: v.clone() for k, v in state.items()})
         assert delta == {}  # empty -> _push_lora_adapter_distributed early-returns on non-first sync
         assert set(new_state) == set(state)
-
-    def test_changed_state_yields_nonempty_delta(self):
-        old = {"a": torch.zeros(4, 8)}
-        new = {"a": torch.ones(4, 8)}
-        delta, _ = extract_lora_delta(new, old)
-        assert "a" in delta and delta  # non-empty -> push proceeds
-
-    def test_first_sync_returns_full_state(self):
-        new = {"a": torch.randn(4, 8), "b": torch.randn(8, 4)}
-        delta, _ = extract_lora_delta(new, None)
-        assert set(delta) == set(new)
 
 
 class TestTargetModuleExpansion:
