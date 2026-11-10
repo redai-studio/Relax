@@ -54,13 +54,13 @@ export MODEL_DIR=/path/to/model
 export PROMPT_DATA=/path/to/data
 ```
 
-**Dense · Qwen3-4B**　默认 64K / chunk4096 / K0
+**Dense · Qwen3-4B**　64K / chunk4096 / K0
 
 ```bash
 bash examples/chunkflow/scripts/run-qwen3-4B-sft-8xgpu.sh
 ```
 
-**MoE · Qwen3.6-35B-A3B**　64K / chunk4096；下方 K0 关闭 ChunkFlow 自身重计算
+**MoE · Qwen3.6-35B-A3B**　64K / K0
 
 ```bash
 KEEP_LAST_K=0 bash examples/chunkflow/scripts/run-qwen36-35B-A3B-sft-8xgpu.sh
@@ -97,5 +97,5 @@ python3 examples/chunkflow/setup.py
 | 参数                      | 建议起点       | 调整方式                                                                 |
 | ------------------------- | -------------- | ------------------------------------------------------------------------ |
 | `--chunkflow-chunk-size`  | `4096`         | 小于实际长样本长度才会分块；减小后块数与调用开销增加                     |
-| `--chunkflow-keep-last-k` | `0`            | `0` 不重计算；`1` 只保留最后一块激活，较早块在反向前重计算；QSA 保持 `0` |
+| `--chunkflow-keep-last-k` | `0`            | `0` 不重计算；`1` 只保留最后一块激活，较早块在反向前重计算 |
 | `--seq-length`            | 按数据长度设置 | 样本长度上限，不是 chunk 大小；超过上限的样本跳过                        |
