@@ -33,7 +33,9 @@ class TinyMoE(torch.nn.Module):
 
 
 def _receive(descriptor, member, apply):
-    return receive_memory_update(descriptor, member, apply, timeout_s=2, host_budget_bytes=1 << 20)
+    return receive_memory_update(
+        descriptor, member, apply, timeout_s=2, host_budget_bytes=1 << 20, private_buffers=True
+    )
 
 
 def _publish(stack, encoders, root, version, *, wrong_nonce_owner=None, missing_expert=False):

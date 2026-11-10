@@ -32,6 +32,12 @@ def _json(value: Any) -> bytes:
 
 
 def _read(sock: socket.socket, size: int, deadline: float) -> bytes:
+    return bytes(_read_buffer(sock, size, deadline))
+
+
+def _read_buffer(sock: socket.socket, size: int, deadline: float) -> bytearray:
+    """Return one receiver-owned payload allocation; never reuse it in
+    place."""
     chunks = bytearray(size)
     view = memoryview(chunks)
     offset = 0
@@ -44,7 +50,7 @@ def _read(sock: socket.socket, size: int, deadline: float) -> bytes:
         if not received:
             raise ConnectionError("Truncated memory transfer")
         offset += received
-    return bytes(chunks)
+    return chunks
 
 
 def _header(sock: socket.socket, deadline: float) -> dict:
@@ -271,11 +277,17 @@ def receive_memory_update(
     *,
     timeout_s: float = 600,
     host_budget_bytes: int = 8 << 30,
+    private_buffers: bool = False,
+    timings: dict | None = None,
 ) -> dict:
     """Stage and validate all frames before apply; ACK only after it
     returns."""
     deadline = monotonic() + timeout_s
+    connected = monotonic()
     with socket.create_connection((descriptor["host"], descriptor["port"]), timeout=timeout_s) as sock:
+        if timings is not None:
+            timings["connect_s"] = timings.get("connect_s", 0) + monotonic() - connected
+        started = monotonic()
         _send_header(sock, {"token": descriptor["token"], "update": descriptor["update"], "member": member}, deadline)
         manifest = _header(sock, deadline)
         identity = manifest.get("update")
@@ -285,17 +297,28 @@ def receive_memory_update(
         metadata = manifest.get("buckets")
         if not isinstance(metadata, list) or not metadata:
             raise ValueError("Memory manifest requires buckets")
+        if timings is not None:
+            timings["metadata_s"] = timings.get("metadata_s", 0) + monotonic() - started
         payloads, total = [], 0
         for item in metadata:
             size = item.get("bytes")
             if type(size) is not int or size < 0 or size > host_budget_bytes - total:
                 raise ValueError("Memory update exceeds its host budget")
             total += size
-            payload = _read(sock, size, deadline)
+            started = monotonic()
+            payload = _read_buffer(sock, size, deadline) if private_buffers else _read(sock, size, deadline)
+            if timings is not None:
+                timings["payload_read_s"] = timings.get("payload_read_s", 0) + monotonic() - started
+            started = monotonic()
             validate_bucket(item, payload, max_bytes=host_budget_bytes)
+            if timings is not None:
+                timings["validate_s"] = timings.get("validate_s", 0) + monotonic() - started
             payloads.append(payload)
         apply(manifest, payloads)
+        started = monotonic()
         _send_header(sock, {"ack": identity}, deadline)
         if _header(sock, deadline) != {"ok": True}:
             raise RuntimeError("Source did not confirm the memory ACK")
+        if timings is not None:
+            timings["ack_roundtrip_s"] = timings.get("ack_roundtrip_s", 0) + monotonic() - started
         return manifest

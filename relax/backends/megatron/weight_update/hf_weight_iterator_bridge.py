@@ -241,7 +241,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         return True
 
     def iter_owner_local_expert_tensors(
-        self, megatron_local_weights: Mapping[str, torch.Tensor]
+        self, megatron_local_weights: Mapping[str, torch.Tensor], *, grouped: bool = False
     ) -> Iterator[tuple[int, int, str, torch.Tensor]]:
         """Yield canonical HF expert tensors converted by their Megatron owner.
 
@@ -270,7 +270,16 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
         rank = dist.get_rank(group=dist.group.WORLD)
         device = device_utils.make_current_torch_device()
-        for bucket in self._expert_buckets:
+        buckets = self._expert_buckets
+        if grouped:
+            from .expert_gather import bucket_expert_projections
+
+            buckets = bucket_expert_projections(
+                [info for bucket in buckets for info in bucket],
+                self.args.num_experts,
+                dist.get_process_group_ranks(mpu.get_expert_model_parallel_group()),
+            )
+        for bucket in buckets:
             for info in bucket:
                 match = _OWNER_LOCAL_EXPERT_PARAM.fullmatch(info.name)
                 if match is None:

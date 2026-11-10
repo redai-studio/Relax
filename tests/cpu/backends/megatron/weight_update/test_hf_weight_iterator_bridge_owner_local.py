@@ -80,6 +80,50 @@ def test_owner_local_expert_iterator_converts_only_owned_experts_without_collect
     assert [tensor.dtype for _, _, _, tensor in actual] == [torch.bfloat16] * 3
 
 
+def test_grouped_owner_iterator_uses_numeric_expert_order_and_complete_projection_metadata(monkeypatch):
+    infos = []
+    for fc in (1, 2):
+        for expert in range(24):
+            shape = torch.Size((4, 3) if fc == 1 else (3, 2))
+            infos.append(
+                ParamInfo(
+                    name=f"decoder.layers.0.mlp.experts.linear_fc{fc}.weight{expert}",
+                    dtype=torch.bfloat16,
+                    shape=shape,
+                    attrs={},
+                    size=shape.numel() * 2,
+                    src_rank=expert // 12,
+                )
+            )
+    infos.sort(key=lambda info: info.name)
+    calls = []
+
+    def convert(name, tensor):
+        calls.append(name)
+        expert = int(name.rsplit("weight", 1)[1])
+        prefix = f"model.layers.0.mlp.experts.{expert}"
+        if "fc1" in name:
+            return [(prefix + ".gate_proj.weight", tensor[:2]), (prefix + ".up_proj.weight", tensor[2:])]
+        return [(prefix + ".down_proj.weight", tensor)]
+
+    iterator = _iterator(infos, convert)
+    iterator.args.num_experts = 24
+    iterator._vanilla_key_map = {info.name: info.name for info in infos if info.src_rank == 0}
+    weights = {info.name: torch.zeros(info.shape, dtype=info.dtype) for info in infos if info.src_rank == 0}
+    monkeypatch.setattr(bridge_iterator.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge_iterator.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge_iterator.mpu, "get_expert_tensor_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge_iterator.mpu, "get_expert_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(bridge_iterator.mpu, "get_expert_model_parallel_group", lambda: object())
+    monkeypatch.setattr(bridge_iterator.dist, "get_rank", lambda *, group: 0)
+    monkeypatch.setattr(bridge_iterator.dist, "get_process_group_ranks", lambda group: [0, 1])
+    monkeypatch.setattr(bridge_iterator.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    list(iterator.iter_owner_local_expert_tensors(weights, grouped=True))
+    assert calls == [
+        f"decoder.layers.0.mlp.experts.linear_fc{fc}.weight{expert}" for fc in (1, 2) for expert in range(12)
+    ]
+
+
 @pytest.mark.parametrize(
     ("pp_size", "vpp_size", "etp_size", "ep_size"),
     [(2, 1, 1, 2), (1, 2, 1, 2), (1, 1, 2, 2), (1, 1, 1, 1)],

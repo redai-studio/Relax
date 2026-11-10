@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import re
 import secrets
+from contextlib import closing
 from dataclasses import replace
 from time import monotonic, sleep
 from typing import Any
@@ -17,7 +17,6 @@ from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
-_EXPERT = re.compile(r"^(.*\.layers\.\d+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
 class UpdateWeightFromShardedMemory:
@@ -113,6 +112,7 @@ class UpdateWeightFromShardedMemory:
         from relax.utils.distributed_utils import get_gloo_group
 
         from .expert_layout import DirectExpertLayout, expert_slice_chunk
+        from .owner_expert_blocks import iter_owner_expert_blocks
 
         group = get_gloo_group()
         rank, world = dist.get_rank(group), dist.get_world_size(group)
@@ -182,32 +182,18 @@ class UpdateWeightFromShardedMemory:
         local: dict[str, list] = {}
         error = None
         try:
-            pending = {}
             with torch.no_grad():
-                for owner, expert, name, tensor in self.iterator.iter_owner_local_expert_tensors(weights):
-                    match = _EXPERT.fullmatch(name)
-                    if owner != rank or match is None or int(match[2]) != expert:
-                        raise ValueError("Unexpected local expert identity")
-                    prefix, _, projection = match.groups()
-                    if projection == "down_proj":
-                        packed, target = tensor.unsqueeze(0), "down_proj"
-                    else:
-                        key = (prefix, expert)
-                        pair = pending.setdefault(key, {})
-                        if projection in pair:
-                            raise ValueError("Duplicate canonical expert projection")
-                        pair[projection] = tensor
-                        if set(pair) != {"gate_proj", "up_proj"}:
-                            continue
-                        packed = torch.cat((pair["gate_proj"], pair["up_proj"]), dim=0).unsqueeze(0)
-                        del pending[key]
-                        target = "gate_up_proj"
-                    for tp in range(2):
-                        chunk = expert_slice_chunk([(f"{prefix}.{target}[{expert}:{expert + 1}]", packed)], layout, tp)
-                        for descriptor, shard in chunk:
-                            self.encoders[f"expert:{tp}"].add(descriptor, shard)
-                if pending:
-                    raise ValueError("Incomplete local gate/up expert pair")
+                with closing(self.iterator.iter_owner_local_expert_tensors(weights, grouped=True)) as named:
+                    with closing(iter_owner_expert_blocks(named, layout, rank, world, self.budget)) as blocks:
+                        for name, packed in blocks:
+                            for tp in range(2):
+                                chunk = expert_slice_chunk([(name, packed)], layout, tp)
+                                if chunk is None or len(chunk) != 1:
+                                    raise ValueError("Owner block did not map to one contiguous native TP slice")
+                                descriptor, shard = chunk[0]
+                                self.encoders[f"expert:{tp}"].add(descriptor, shard)
+                                del chunk, shard
+                            del packed
                 for tp in range(2):
                     key = f"expert:{tp}"
                     local[key] = self.encoders[key].finish()

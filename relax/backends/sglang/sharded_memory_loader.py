@@ -176,7 +176,15 @@ class ShardedMemoryReceiver:
         scratch = len(payload) + metadata["changed"] * 8
         if self.hf_bytes + scratch > self.gpu_budget_bytes:
             raise ValueError("Receiver staging exceeds its GPU budget")
-        raw = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(device) if payload else None
+        # The transport owns private bytearrays until this stream's GPU fence
+        # and ACK; immutable callers still get an independent writable copy.
+        raw = (
+            torch.frombuffer(payload if isinstance(payload, bytearray) else bytearray(payload), dtype=torch.uint8).to(
+                device
+            )
+            if payload
+            else None
+        )
         sparse = metadata["encoding"] == "sparse"
         changed = metadata["changed"]
         words = torch.int16 if width == 2 else torch.int32
@@ -289,9 +297,19 @@ def load_sharded_memory_weights(model: Any, weights: list[tuple[str, Any]]) -> N
     elif receiver.gpu_budget_bytes != control["gpu_budget_bytes"]:
         raise ValueError("Receiver GPU budget changed")
 
+    timings = {}
+
     def receive(descriptor: dict, member: str, apply: Any) -> None:
         receive_memory_update(
-            descriptor, member, apply, timeout_s=control["timeout_s"], host_budget_bytes=control["host_budget_bytes"]
+            descriptor,
+            member,
+            apply,
+            timeout_s=control["timeout_s"],
+            host_budget_bytes=control["host_budget_bytes"],
+            private_buffers=True,
+            timings=timings,
         )
 
     receiver.apply_group(control, receive)
+    receiver.last_metrics["tcp_stages"] = timings
+    logger.info("Sharded TCP receive phases: %s", json.dumps(timings, sort_keys=True))
