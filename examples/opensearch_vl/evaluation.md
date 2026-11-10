@@ -17,7 +17,7 @@
 
 每题仅一次模型生成，温度0，保留thinking，输入和输出合计最多32K；不提供工具定义或历史轨迹，不执行工具。复用OpenSearch/VDR裁判prompt，通过MaaS判断最终答案的语义正确性，Pass@1为答对题数/全部题数。参考答案只给裁判。超限、无答案、错误工具调用和异常题均保留在分母，另报与SFT train去重后的分数。
 
-模型服务容量允许时，可设置 `BENCHMARK_WORKERS=4` 并发生成答案；裁判始终串行并遵守1 QPS。初始/SFT两组使用相同设置，结果记录评测代码分支、commit与源码hash。
+模型服务容量允许时，可设置 `BENCHMARK_WORKERS=4` 并发生成答案；裁判可并行调用；`JUDGE_QPS`控制请求发起速率，默认1 QPS，设为0表示不限速。初始/SFT两组使用相同设置，结果记录评测代码分支、commit与源码hash。
 
 这是公开题目上的无工具问答评测，不是训练轨迹PPL或给定标准工具结果的下一步预测。
 
@@ -41,7 +41,7 @@ source /path/to/benchmark.env
 
 MaaS 裁判配置：`JUDGE_BASE_URL` 填接口地址去掉 `/chat/completions` 的部分，`JUDGE_MODEL` 填实际可调用的模型名称，`JUDGE_API_KEY_HEADER=api-key`，密钥填入本地环境的 `JUDGE_API_KEY`。保留原评分 prompt，结果记录实际裁判型号；这是内部裁判分数，与论文分数分开报告。
 
-客户端需具备Pillow、HF processor、PyArrow、OpenAI SDK和httpx。当前MaaS域名限制1 QPS，运行器顺序调用裁判且关闭自动重试；结果记录实际裁判模型。
+客户端需具备Pillow、HF processor、PyArrow、OpenAI SDK和httpx。当前MaaS域名限制1 QPS，运行器对请求发起限速、允许裁判请求并行且关闭自动重试；结果记录实际裁判模型。
 
 ## 评测数据与去重
 

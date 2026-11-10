@@ -291,6 +291,9 @@ def main() -> None:
     parser.add_argument("--label", choices=["base", "relax"], required=True)
     parser.add_argument("--workflow", choices=["direct", "agent"], default="direct")
     parser.add_argument(
+        "--judge-qps", type=float, default=1, help="Judge request start rate; zero disables rate limiting"
+    )
+    parser.add_argument(
         "--workers", type=int, default=1, help="Concurrent direct-answer requests; judge stays sequential"
     )
     parser.add_argument("--data", type=Path, required=True)
@@ -301,6 +304,8 @@ def main() -> None:
     parser.add_argument("--max-cases", type=int, default=0, help="Nonzero values are smoke tests, not full benchmarks")
     parser.add_argument("--allow-missing-tools", action="store_true", help="Smoke tests only")
     args = parser.parse_args()
+    if args.judge_qps < 0:
+        parser.error("--judge-qps must be nonnegative")
     if args.max_cases < 0 or (args.allow_missing_tools and not args.max_cases):
         parser.error("Missing tool configuration is permitted only in an explicitly bounded smoke test")
     if args.workflow == "agent" and not args.tool_cache:
@@ -318,7 +323,7 @@ def main() -> None:
     if args.label == "relax" and (provenance.get("kind") != "trained-final" or provenance.get("epochs", 0) < 2):
         raise ValueError("Relax evaluation requires the final trained artifact, not an upload-validation model")
     if not provenance.get("hashes_verified"):
-        raise ValueError("Verify the downloaded model against its upload receipt before evaluation")
+        raise ValueError("Verify model file hashes against trusted provenance before evaluation")
     root = Path(os.environ["OPENSEARCH_ROOT"])
     revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if revision != UPSTREAM_REVISION:
@@ -383,6 +388,7 @@ def main() -> None:
         "max_turns": 1 if args.workflow == "direct" else 50,
         "enable_thinking": True,
         "judge_model": os.environ["JUDGE_MODEL"],
+        "judge_qps": args.judge_qps,
         "tool_cache": str(args.tool_cache.resolve()) if args.workflow == "agent" else None,
         "tool_configuration_sha256": tool_configuration_sha256,
         "system_prompt_sha256": sha256(system_prompt.encode()),
@@ -456,23 +462,24 @@ def main() -> None:
             else:
                 record["final_answer"] = answer
                 with judge_lock:
-                    time.sleep(max(0, 1.05 - (time.monotonic() - last_judge)))
+                    interval = 1.05 / args.judge_qps if args.judge_qps else 0
+                    time.sleep(max(0, interval - (time.monotonic() - last_judge)))
                     last_judge = time.monotonic()
-                    verdict = judge.chat.completions.create(
-                        model=os.environ["JUDGE_MODEL"],
-                        temperature=0,
-                        max_tokens=2048,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": JUDGE_PROMPT.format(
-                                    question=case["question"],
-                                    correct_answer=case["answer"],
-                                    response=record["final_answer"],
-                                ),
-                            }
-                        ],
-                    )
+                verdict = judge.chat.completions.create(
+                    model=os.environ["JUDGE_MODEL"],
+                    temperature=0,
+                    max_tokens=2048,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": JUDGE_PROMPT.format(
+                                question=case["question"],
+                                correct_answer=case["answer"],
+                                response=record["final_answer"],
+                            ),
+                        }
+                    ],
+                )
                 raw = verdict.choices[0].message.content or ""
                 record["raw_judge"] = raw
                 record["judge_model"] = verdict.model

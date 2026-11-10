@@ -15,7 +15,7 @@ Compare the initial Qwen3.5-4B model with the Relax SFT model:
 
 Generate once per question at temperature 0 with thinking enabled and a 32K total input/output context. Supply no tool definitions or reference trajectories and execute no tools. Reuse the OpenSearch/VDR judge prompt through MaaS; Pass@1 is correct answers divided by all questions. Only the judge receives reference answers. Overflow, missing answers, attempted tool calls and errors remain in the denominator. Also report a score excluding overlap with SFT train.
 
-If the model server has capacity, set `BENCHMARK_WORKERS=4` for concurrent generation. Judging remains sequential at no more than 1 QPS. Match settings across initial/SFT runs; results record evaluator branch, commit and source hash.
+If the model server has capacity, set `BENCHMARK_WORKERS=4` for concurrent generation. Judge requests can overlap; `JUDGE_QPS` limits their start rate (default 1 QPS; 0 disables rate limiting). Match settings across initial/SFT runs; results record evaluator branch, commit and source hash.
 
 This evaluates answers to public questions, rather than trajectory PPL or next-step prediction conditioned on reference observations.
 
@@ -38,7 +38,7 @@ source /path/to/benchmark.env
 
 Set the judge base URL to the endpoint without `/chat/completions`; use `JUDGE_API_KEY_HEADER=api-key`. Keep keys outside Git. The judge transport limits requests to 1 QPS. Record its actual model name and retain the original grading prompt.
 
-The client needs Pillow, the HF processor, PyArrow, the OpenAI SDK and httpx. The supplied MaaS domain allows 1 QPS. Judge requests are sequential with automatic retries disabled; results identify the actual judge.
+The client needs Pillow, the HF processor, PyArrow, the OpenAI SDK and httpx. The supplied MaaS domain allows 1 QPS. Judge requests can overlap, with rate-limited starts and automatic retries disabled; results identify the actual judge.
 
 ## Datasets and overlap
 

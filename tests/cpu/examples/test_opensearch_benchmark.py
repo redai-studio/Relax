@@ -195,8 +195,12 @@ def test_direct_workflow_sends_one_question_without_reference_or_tools(benchmark
     assert len(trajectory["turns"]) == 1
 
 
-def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, benchmark, tmp_path):
+@pytest.mark.parametrize("model_failure", [False, True])
+def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, benchmark, tmp_path, model_failure):
     import json
+    from threading import Barrier
+
+    barrier = Barrier(2)
 
     class Runner:
         def __init__(self, *_args):
@@ -204,7 +208,7 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, ben
             self.requests, self.error, self.last_response = [], None, None
 
         def infer(self, contents, **_kwargs):
-            if contents[0]["parts"][0]["text"] == "fail":
+            if model_failure and contents[0]["parts"][0]["text"] == "fail":
                 raise ConnectionError("model unavailable")
             return {"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}
 
@@ -227,15 +231,15 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, ben
     upstream.JUDGE_PROMPT = "{question} {correct_answer} {response}"
     upstream.parse_judge_response = lambda _text: {"acc": 1}
     monkeypatch.setitem(sys.modules, "eval_with_gpt4o", upstream)
-    client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(
-                create=lambda **_kwargs: SimpleNamespace(
-                    choices=[SimpleNamespace(message=SimpleNamespace(content="correct: yes"))], model="judge"
-                )
-            )
+
+    def judge_request(**_kwargs):
+        if not model_failure:
+            barrier.wait(timeout=5)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="correct: yes"))], model="judge"
         )
-    )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=judge_request)))
     openai = ModuleType("openai")
     openai.OpenAI = lambda **_kwargs: client
     monkeypatch.setitem(sys.modules, "openai", openai)
@@ -262,6 +266,8 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, ben
             "direct",
             "--workers",
             "2",
+            "--judge-qps",
+            "0",
             "--dataset",
             "vdr",
             "--label",
@@ -278,6 +284,6 @@ def test_direct_main_requires_no_tools_and_retains_failed_cases(monkeypatch, ben
     )
     benchmark.main()
     result = json.loads((tmp_path / "result/summary.json").read_text())
-    assert result["expected_cases"] == 2 and result["failures"] == 1
-    assert result["pass_at_1"] == 0.5
+    assert result["expected_cases"] == 2 and result["failures"] == int(model_failure)
+    assert result["pass_at_1"] == (0.5 if model_failure else 1.0)
     assert result["tool_errors"] == 0 and result["protocol"]["tool_cache"] is None
