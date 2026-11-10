@@ -130,6 +130,9 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    --attention-backend flash
 )
+if [ -n "${CUSTOM_MEGATRON_INIT_PATH:-}" ]; then
+    MISC_ARGS+=(--custom-megatron-init-path "${CUSTOM_MEGATRON_INIT_PATH}")
+fi
 ray job submit ${RAY_NO_WAIT:+--no-wait} \
    --address="${RAY_JOBS_ADDRESS}" \
    --submission-id="${SUBMISSION_ID:-${EXP_NAME}-${now}}" \
