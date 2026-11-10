@@ -131,9 +131,6 @@ class Actor(Base):
     def recovery_update_weights_colocate(self) -> None:
         wait_all(self.actor_model.async_inference_call("recovery_update_weights_colocate"))
 
-    def recovery_update_weights_hybrid(self) -> None:
-        wait_all(self.actor_model.async_inference_call("recovery_update_weights_hybrid"))
-
     def reset_inference_transport(self, role: str) -> None:
         wait_all(self.actor_model.async_inference_call("reset_inference_transport", role))
 
