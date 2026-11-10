@@ -258,10 +258,10 @@ def _parse_teacher_routes(
         raise ValueError("--opd-teacher-routes must be a non-empty JSON object.")
 
     if shared:
-        if gpus_per_replica is not None and gpus_per_replica != total_gpus:
+        if gpus_per_replica is not None and (gpus_per_replica < 1 or total_gpus % gpus_per_replica):
             raise ValueError(
-                "--opd-shared-teacher runs one engine: --teacher-num-gpus-per-engine "
-                f"({gpus_per_replica}) must equal the Teacher GPU budget ({total_gpus})."
+                f"Teacher GPU budget ({total_gpus}) must be divisible by a positive "
+                f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
             )
         return {key: {"checkpoint_path": path} for key, path in routes.items()}
 
@@ -296,8 +296,7 @@ def _parse_teacher_routes(
 
 
 def _shared_checkpoints(specs: dict[str, dict[str, Any]]) -> dict[str, str]:
-    """Check architecture and text vocabulary size before sharing one
-    engine."""
+    """Check architecture and text vocabulary size across checkpoints."""
     routes = {}
     reference = None
     for teacher, spec in specs.items():
@@ -327,15 +326,24 @@ def _start_shared_teacher(args: Any, routes: dict[str, str], pg: Any, runtime_en
     teacher_args = copy.copy(args)
     teacher_args.teacher_hf_checkpoint = next(iter(routes.values()))
     teacher_args.teacher_sglang_disable_cuda_graph = True
-    gpus_per_engine = args.resource["teacher"][1]
+    total_gpus = args.resource["teacher"][1]
+    gpus_per_engine = args.teacher_num_gpus_per_engine
+    if gpus_per_engine is None:
+        gpus_per_engine, replicas = total_gpus, 1
+    else:
+        replicas = total_gpus // gpus_per_engine
     options = with_control_plane_affinity(args, {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env})
     physical = owner = None
     try:
-        physical = TeacherManager.options(**options).remote(teacher_args, 1, gpus_per_engine, pg=pg, shared_pg=True)
-        (url,) = ray.get(physical.get_urls.remote())
-        owner = SharedTeacherManager.options(**options).remote(args, physical, url, routes)
+        physical = TeacherManager.options(**options).remote(
+            teacher_args, replicas, gpus_per_engine, pg=pg, shared_pg=True
+        )
+        urls = ray.get(physical.get_urls.remote())
+        if len(urls) != replicas:
+            raise RuntimeError(f"Expected {replicas} shared Teacher replicas, got {len(urls)} endpoints")
+        owner = SharedTeacherManager.options(**options).remote(args, physical, urls, routes)
         ray.get(owner.initialize.remote())
-        if getattr(args, "offload_rollout", False):
+        if args.offload_rollout:
             ray.get(owner.offload.remote())
     except BaseException:
         try:
@@ -351,9 +359,13 @@ def _start_shared_teacher(args: Any, routes: dict[str, str], pg: Any, runtime_en
             remove_placement_group(pg[0])
         raise
 
-    args.opd_teacher_routes_map = {teacher: [url] for teacher in routes}
+    args.opd_teacher_routes_map = dict.fromkeys(routes, urls)
     logger.info(
-        "Shared Teacher ready: GPUs=%s, active=%s, routes=%s", gpus_per_engine, next(iter(routes)), list(routes)
+        "Shared Teacher ready: replicas=%s, GPUs per replica=%s, active=%s, routes=%s",
+        replicas,
+        gpus_per_engine,
+        next(iter(routes)),
+        list(routes),
     )
     return pg, [owner]
 
@@ -379,7 +391,7 @@ def _start_managed_multi_teacher(
     import ray
 
     _, total_teacher_gpus = args.resource["teacher"]
-    teacher_tp = getattr(args, "teacher_num_gpus_per_engine", None)
+    teacher_tp = args.teacher_num_gpus_per_engine
     shared = getattr(args, "opd_shared_teacher", False)
     if shared:
         draft_path = getattr(
@@ -662,7 +674,7 @@ def add_opd_arguments(parser: Any) -> Any:
             "When unset, defaults to the total teacher GPU count from --resource "
             "(single replica using all teacher GPUs). Set this lower to run multiple "
             "replicas, e.g. teacher GPUs=8 + --teacher-num-gpus-per-engine=4 -> "
-            "2 replicas, each TP=4. With --opd-shared-teacher, the single engine uses the full budget."
+            "2 replicas, each TP=4. With --opd-shared-teacher, all replicas switch checkpoints together."
         ),
     )
     parser.set_defaults(opd_teacher_routes_map=None)
@@ -688,8 +700,9 @@ def add_opd_arguments(parser: Any) -> Any:
         "--opd-shared-teacher",
         action="store_true",
         help=(
-            "Use the full Teacher GPU budget for one SGLang engine. Checkpoints must come from the same base model "
-            "and differ only in weights. The engine reuses its model configuration, tokenizer and processor. "
+            "Serve all routes with one group of SGLang replicas that switch checkpoints together. "
+            "Checkpoints must share a base model and differ only in weights; each replica reuses "
+            "its model configuration, tokenizer and processor. "
             "A separate speculative draft checkpoint cannot be switched."
         ),
     )
@@ -856,7 +869,7 @@ def add_opd_arguments(parser: Any) -> Any:
 def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -> None:
     shared = getattr(args, "opd_shared_teacher", False)
     if shared:
-        if is_offline or not is_managed_opd_teacher_colocate(args) or not getattr(args, "opd_teacher_routes", None):
+        if is_offline or not is_managed_opd_teacher_colocate(args) or not args.opd_teacher_routes:
             raise ValueError("--opd-shared-teacher requires colocated SGLang OPD with --opd-teacher-routes.")
 
     if is_offline:
@@ -1001,7 +1014,7 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
             routes_map = _parse_teacher_routes(
                 opd_teacher_routes,
                 args.resource["teacher"][1],
-                getattr(args, "teacher_num_gpus_per_engine", None),
+                args.teacher_num_gpus_per_engine,
                 shared=shared,
             )
             log.info(

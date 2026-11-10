@@ -2,8 +2,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
 # Qwen3.5-2B distills from the math, code and instruction-following experts in
-# https://huggingface.co/collections/XINLI1997/dn-mopd. All three share one TP1
-# Teacher. Student rollout uses the other GPU; Student training uses both (TP2).
+# https://huggingface.co/collections/XINLI1997/dn-mopd. By default, Student rollout
+# and Teacher scoring use one GPU each. Teacher replicas switch checkpoints together.
+# Student training uses all GPUs (TP2).
 # Run on a dedicated single-node Ray cluster with RAY_ADDRESS set to its GCS.
 #
 # From the Relax checkout, with MODEL_DIR and DATA_DIR set:
@@ -37,6 +38,9 @@ fi
 source "$RELAX/scripts/models/qwen35-2B.sh"
 
 NUM_ROLLOUT="${NUM_ROLLOUT:-2}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-1}"
+TEACHER_GPUS="${TEACHER_GPUS:-1}"
+ACTOR_GPUS=$((ROLLOUT_GPUS + TEACHER_GPUS))
 
 CKPT_ARGS=(
     --hf-checkpoint "${STUDENT}"
@@ -124,13 +128,13 @@ SGLANG_ARGS=(
     --sglang-enable-weights-cpu-backup
 )
 
-RESOURCE_JSON='{"actor":[1,2],"rollout":[1,1],"teacher":[1,1]}'
+RESOURCE_JSON="{\"actor\":[1,${ACTOR_GPUS}],\"rollout\":[1,${ROLLOUT_GPUS}],\"teacher\":[1,${TEACHER_GPUS}]}"
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
 python3 -m relax.entrypoints.train \
     --resource "${RESOURCE_JSON}" \
-    --num-gpus-per-node 2 \
-    --rollout-num-gpus 1 \
+    --num-gpus-per-node "${ACTOR_GPUS}" \
+    --rollout-num-gpus "${ROLLOUT_GPUS}" \
     --max-staleness 0 \
     --num-data-storage-units 1 \
     --colocate \
@@ -144,4 +148,4 @@ python3 -m relax.entrypoints.train \
     "${PERF_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
-    "${MISC_ARGS[@]}" 2>&1 | tee "mopd-qwen35-2b-2xgpu-shared-${now}.log"
+    "${MISC_ARGS[@]}" 2>&1 | tee "mopd-qwen35-2b-${ACTOR_GPUS}xgpu-shared-${now}.log"

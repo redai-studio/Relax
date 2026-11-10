@@ -3,6 +3,7 @@
 
 import asyncio
 from enum import Enum
+from itertools import cycle
 from pathlib import Path
 from time import monotonic
 
@@ -208,9 +209,11 @@ class TeacherManager(MultiEngineManager):
                 addr_and_ports[rank] = dict(self._engine_addr_and_ports[rank])
                 continue
             unallocated_replicas.setdefault(rank // self.nodes_per_engine, []).append((rank, engine))
+        port_cursors = {}
         for replica, engines in unallocated_replicas.items():
-            base_port = find_available_port(15000)
-            per_engine_addr_and_ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
+            # All replicas are allocated before any engine binds its ports.
+            base_port = max(port_cursors.values()) if port_cursors else find_available_port(15000)
+            per_engine_addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
                 args=self._teacher_args,
                 rollout_engines=engines,
                 worker_type="regular",
@@ -236,12 +239,12 @@ class _TeacherState(str, Enum):
 
 @ray.remote
 class SharedTeacherManager:
-    """Own admission and checkpoint changes for one physical Teacher engine."""
+    """Score requests on replicas that switch Teacher checkpoints together."""
 
-    def __init__(self, args, manager, url: str, routes: dict[str, str]) -> None:
+    def __init__(self, args, manager, urls: list[str], routes: dict[str, str]) -> None:
         self.manager = manager
-        self.url = url
-        self.base_url = url.removesuffix("/generate")
+        self.urls = urls
+        self._score_urls = cycle(urls)
         self.routes = routes
         self.current_teacher = next(iter(routes))
         self._timeout = float(args.opd_teacher_timeout_s)
@@ -268,15 +271,17 @@ class SharedTeacherManager:
                 connector=aiohttp.TCPConnector(limit=self._limit), timeout=aiohttp.ClientTimeout(total=self._timeout)
             )
             try:
-                async with self._session.get(self.base_url + "/model_info") as response:
-                    response.raise_for_status()
-                    info = await response.json()
-                path = info.get("model_path")
                 expected = self.routes[self.current_teacher]
-                if not path or Path(path).resolve() != Path(expected).resolve():
-                    raise RuntimeError(
-                        f"Shared Teacher {self.current_teacher!r} expected checkpoint {expected!r}, got {path!r}"
-                    )
+                for url in self.urls:
+                    async with self._session.get(url.removesuffix("/generate") + "/model_info") as response:
+                        response.raise_for_status()
+                        info = await response.json()
+                    path = info.get("model_path")
+                    if not path or Path(path).resolve() != Path(expected).resolve():
+                        raise RuntimeError(
+                            f"Shared Teacher {self.current_teacher!r} at {url} expected checkpoint {expected!r}, "
+                            f"got {path!r}"
+                        )
                 self._state = _TeacherState.READY
             except BaseException:
                 self._state = _TeacherState.FAILED
@@ -322,18 +327,25 @@ class SharedTeacherManager:
     async def _load(self, teacher: str) -> None:
         started = monotonic()
         payload = {"model_path": self.routes[teacher], "weight_version": teacher, "flush_cache": True}
-        async with self._session.post(self.base_url + "/update_weights_from_disk", json=payload) as response:
-            response.raise_for_status()
-            result = await response.json()
-        if result.get("success") is not True:
-            raise RuntimeError(f"Shared Teacher checkpoint update failed for {teacher!r}: {result.get('message')}")
+
+        async def reload_replica(url: str) -> None:
+            async with self._session.post(
+                url.removesuffix("/generate") + "/update_weights_from_disk", json=payload
+            ) as response:
+                response.raise_for_status()
+
+        # A failed replica can return while another one is still writing weights.
+        results = await asyncio.gather(*(reload_replica(url) for url in self.urls), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
         logger.info("Shared Teacher reload %s -> %s took %.2fs", self.current_teacher, teacher, monotonic() - started)
         self.current_teacher = teacher
 
     async def _generate(self, payload: dict) -> dict:
         from relax.engine.rollout.on_policy_distillation import _aiohttp_json_post_kwargs
 
-        async with self._session.post(self.url, **_aiohttp_json_post_kwargs(payload)) as response:
+        async with self._session.post(next(self._score_urls), **_aiohttp_json_post_kwargs(payload)) as response:
             response.raise_for_status()
             return await response.json()
 

@@ -275,6 +275,17 @@ def test_multinode_teacher_allocates_each_replicas_node_addresses_together(monke
         assert call.kwargs["rank_offset"] == replica * 2
 
 
+def test_same_node_teacher_replicas_use_disjoint_port_blocks(monkeypatch):
+    teacher_manager, manager = _make_teacher_manager(monkeypatch, num_replicas=2, gpus_per_replica=1)
+
+    def allocate(*, rank_offset, base_port, **kwargs):
+        return {rank_offset: {"host": "192.0.2.1", "port": base_port}}, {0: base_port + 32}
+
+    monkeypatch.setattr(teacher_manager, "_allocate_rollout_engine_addr_and_ports_normal", allocate)
+    endpoints = manager._allocate_engine_addr_and_ports(new_engines=[(0, object()), (1, object())])
+    assert [endpoints[i]["port"] for i in (0, 1)] == [15000, 15032]
+
+
 def test_single_node_dedicated_teachers_allocate_their_own_hosts(monkeypatch):
     def fake_allocate(*, rollout_engines, rank_offset, base_port, **kwargs):
         return (

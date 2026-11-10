@@ -4,7 +4,7 @@
 
 MOPD (Multi-Teacher On-Policy Distillation) 实现多教师在线蒸馏，允许一个学生模型同时从多个异构教师模型中学习。每个教师专注于不同的数据领域（如文本数学、视觉几何），框架按样本的 `data_source` 把它路由到对应教师，请求 token 级 log-probability，实现跨模态、跨领域的知识传递。
 
-教师由 **Relax 托管**：只需通过 `--opd-teacher-routes` 提供 `{data_source: HF 权重路径}`，默认每个 Teacher 使用自己的 SGLang 服务。同构 Teacher 可选用一个共享实例。**无需手动 `sglang.launch_server`、无需管理端口。**
+教师由 **Relax 托管**：只需通过 `--opd-teacher-routes` 提供 `{data_source: HF 权重路径}`，默认每个 Teacher 使用自己的 SGLang 服务。同一基座的 Teacher 可共用一组 SGLang 副本，整组同步切换权重。**无需手动 `sglang.launch_server`、无需管理端口。**
 
 本示例场景：
 
@@ -127,7 +127,7 @@ Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确�
 
 > 独占模式下，`--resource` 里 `teacher` 的 GPU 数是教师总预算，先在教师间平均分配（要求整除），每个教师再按 `--teacher-num-gpus-per-engine` 拆成若干副本（副本 TP=该值），rollout 时先路由到教师再在其副本间 round-robin。
 
-### 多个 Teacher 共用一个引擎
+### 多个 Teacher 共用一组 SGLang 副本
 
 在现有 MOPD 命令中使用以下参数。例中 Student rollout 占一张卡，Teacher 占一张卡，训练阶段 Actor 使用两张卡。把路由键换成数据集里实际的 `data_source`，路径换成两个同构、分词器一致的本地 BF16 checkpoint。
 
@@ -139,7 +139,13 @@ Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确�
 --opd-teacher-routes '{"math":"/models/Teacher1","code":"/models/Teacher2"}'
 ```
 
-引擎从第一条路由的 checkpoint 启动。评分就绪的样本按 Teacher 合批；需要换 Teacher 时，先等已派发的评分完成，再就地重载完整 checkpoint。切换失败会中断评分。共享实例采用 TP1、BF16，关闭 Teacher CUDA graph。要增加 Teacher，只需在路由里再填一条，Teacher 仍占一张卡。
+整组从第一条路由的 checkpoint 启动。每条回答只交给一个副本评分。切换 Teacher 时，先等已派发的评分全部完成，再让所有副本并行重载目标权重。全部成功才派发下一批，任一副本失败则整组停止评分。
+
+下面用同一份 Qwen3.5-2B recipe 跑单机八卡。Student 用六个 TP1 副本生成，两个 TP1 Teacher 副本同时给当前领域打分。训练阶段 Student 使用全部八张卡。
+
+```bash
+ROLLOUT_GPUS=6 TEACHER_GPUS=2 bash examples/on_policy_distillation/mopd/run-mopd-qwen35-2b-2xgpu-shared.sh
+```
 
 ## 奖励路由：`rm_type=mopd`
 

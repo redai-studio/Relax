@@ -221,11 +221,11 @@ def test_multi_teacher_rejects_invalid_route_budgets(routes: object, total: int,
         opd_utils._parse_teacher_routes(json.dumps(routes), total, tp)
 
 
-@pytest.mark.parametrize(("total", "tp"), [(2, 1), (1, 2)])
+@pytest.mark.parametrize(("total", "tp"), [(3, 2), (2, 0)])
 def test_shared_teacher_rejects_invalid_engine_budget(total: int, tp: int) -> None:
     from relax.utils.opd import opd_utils
 
-    with pytest.raises(ValueError, match="must equal the Teacher GPU budget"):
+    with pytest.raises(ValueError, match="must be divisible"):
         opd_utils._parse_teacher_routes('{"a":"/a"}', total, tp, shared=True)
 
 
@@ -241,7 +241,9 @@ def test_shared_teacher_cli_validates_physical_budget_independently_of_routes():
     args.resource = {"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]}
     opd_utils.validate_opd_args(args, is_offline=False)
     args.teacher_num_gpus_per_engine = 2
-    with pytest.raises(ValueError, match="must equal the Teacher GPU budget"):
+    opd_utils.validate_opd_args(args, is_offline=False)
+    args.teacher_num_gpus_per_engine = 3
+    with pytest.raises(ValueError, match="must be divisible"):
         opd_utils.validate_opd_args(args, is_offline=False)
 
 
@@ -258,9 +260,19 @@ def test_shared_teacher_rejects_separate_draft_checkpoint():
 
 
 @pytest.mark.parametrize(
-    ("budget", "teacher_tp", "failure"), [(1, None, False), (2, 2, False), (4, None, False), (2, 2, True)]
+    ("budget", "teacher_tp", "replicas", "failure"),
+    [
+        (1, None, 1, None),
+        (2, 2, 1, None),
+        (4, None, 1, None),
+        (2, 1, 2, None),
+        (2, 1, 2, "initialization failed"),
+        (2, 1, 2, "missing replica"),
+    ],
 )
-def test_shared_teacher_allocates_one_engine_and_owns_its_lifecycle(monkeypatch, budget, teacher_tp, failure) -> None:
+def test_shared_teacher_allocates_replicas_and_owns_their_lifecycle(
+    monkeypatch, budget, teacher_tp, replicas, failure
+):
     import ray
 
     from relax.utils.opd import opd_utils
@@ -273,7 +285,8 @@ def test_shared_teacher_allocates_one_engine_and_owns_its_lifecycle(monkeypatch,
     module.SharedTeacherManager = MagicMock()
     module.SharedTeacherManager.options.return_value.remote.return_value = owner
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    gpu_ids = list(range(2 * budget))
+    rollout_gpus = 6
+    gpu_ids = list(range(rollout_gpus + budget))
     pg = ("pg", gpu_ids, gpu_ids)
     create = MagicMock(return_value=pg)
     remove = MagicMock()
@@ -282,25 +295,31 @@ def test_shared_teacher_allocates_one_engine_and_owns_its_lifecycle(monkeypatch,
     monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", remove)
     monkeypatch.setattr(ray, "kill", kill)
     monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
-    url = "http://engine/generate"
-    physical.get_urls.remote.return_value = [url]
+    urls = [f"http://engine-{i}/generate" for i in range(replicas)]
+    physical.get_urls.remote.return_value = urls[:-1] if failure == "missing replica" else urls
     routes = {key: f"/checkpoints/{key}" for key in ("a", "b", "c")}
     monkeypatch.setattr(opd_utils, "_shared_checkpoints", lambda specs: routes)
     args = _base_args(
         opd_shared_teacher=True,
         offload_rollout=True,
         opd_teacher_routes=json.dumps(routes),
-        rollout_num_gpus=budget,
+        rollout_num_gpus=rollout_gpus,
         teacher_num_gpus_per_engine=teacher_tp,
         teacher_sglang_dtype="float16",
-        resource={"actor": [1, 2 * budget], "rollout": [1, budget], "teacher": [1, budget]},
+        resource={"actor": [1, rollout_gpus + budget], "rollout": [1, rollout_gpus], "teacher": [1, budget]},
     )
     if failure:
-        owner.initialize.remote.side_effect = RuntimeError("initialization failed")
-        with pytest.raises(RuntimeError, match="initialization failed"):
+        if failure == "initialization failed":
+            owner.initialize.remote.side_effect = RuntimeError(failure)
+        expected = "got 1 endpoints" if failure == "missing replica" else failure
+        with pytest.raises(RuntimeError, match=expected):
             opd_utils.maybe_start_managed_opd_teacher(args)
         physical.shutdown.remote.assert_called_once()
-        assert [call.args for call in kill.call_args_list] == [(owner,), (physical,)]
+        if failure == "missing replica":
+            module.SharedTeacherManager.options.assert_not_called()
+            kill.assert_called_once_with(physical)
+        else:
+            assert [call.args for call in kill.call_args_list] == [(owner,), (physical,)]
         remove.assert_called_once_with(pg[0])
         return
 
@@ -308,14 +327,14 @@ def test_shared_teacher_allocates_one_engine_and_owns_its_lifecycle(monkeypatch,
     create.assert_called_once()
     spawn = module.TeacherManager.options.return_value.remote
     spawn.assert_called_once()
-    engine_args, replicas, tp = spawn.call_args.args
-    assert (engine_args.teacher_hf_checkpoint, replicas, tp) == (routes["a"], 1, budget)
+    engine_args, count, tp = spawn.call_args.args
+    assert (engine_args.teacher_hf_checkpoint, count, tp) == (routes["a"], replicas, teacher_tp or budget)
     assert engine_args.teacher_sglang_dtype == "float16"
     assert spawn.call_args.kwargs == {"pg": pg, "shared_pg": True}
-    module.SharedTeacherManager.options.return_value.remote.assert_called_once_with(args, physical, url, routes)
+    module.SharedTeacherManager.options.return_value.remote.assert_called_once_with(args, physical, urls, routes)
     owner.initialize.remote.assert_called_once()
     owner.offload.remote.assert_called_once()
-    assert args.opd_teacher_routes_map == {key: [url] for key in routes}
+    assert args.opd_teacher_routes_map == {key: urls for key in routes}
 
 
 def test_only_rollout_configuration_receives_shared_teacher_handle(monkeypatch):
