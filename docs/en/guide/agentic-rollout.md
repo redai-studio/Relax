@@ -721,10 +721,14 @@ The current train producer covers the Megatron policy actor. An update ID is
 `actor:<rollout_id>:<step_id>`, scoped by `(run_id, train_generation_id)`; one rollout
 may contain several updates. Inputs are captured as micro-batches are consumed, before packing or
 dynamic CP splitting. Dummy batches are omitted, but real samples with zero
-loss masks remain. Each sample includes the full response-space `loss_mask`,
-lengths, effective tokens, and masked advantage/return statistics. Static CP
-statistics are `null`; dynamic CP captures full sequences before splitting.
-The mask is the training input mask, before loss-local TIS/OPSM filtering.
+loss masks remain. Each sample includes lengths, effective tokens, and masked
+advantage/return statistics. Train records with schema `4.0.0` encode
+`loss_mask.ranges` as zero-based, half-open `[start, end, value]` intervals over
+the response. Fill uncovered positions with zero up to `response_length`.
+For example, `[1, 1, 0, 1]` becomes `{"ranges": [[0, 2, 1], [3, 4, 1]]}`.
+Train records with schema `3.0.0` store `loss_mask` as a per-token array.
+Static CP statistics are `null`; dynamic CP captures full sequences before
+splitting. The mask describes training input before loss-local TIS/OPSM filtering.
 
 Identify each DP fragment by `(run_id, train_generation_id, update_id, dp_rank)`
 and join by `(run_id, train_generation_id, update_id)`. The actor-group initializer
@@ -815,8 +819,9 @@ Missing records, missing log files, unacknowledged export delivery, and partial 
 tails mean **unknown**, never proof of a pending or rejected training update.
 Managed logs snapshot the final 1 MiB locally before temporary-directory cleanup;
 `log_ref` names an accepted background write, so readers must check file availability.
-The manifest uses `record_format=agentic-observability-full-v3` and schema `3.0.0`;
-v3 readers merge DP facts instead of expecting a producer-side global commit event.
+The manifest uses `record_format=agentic-observability-full-v3` and schema `3.0.0`.
+Its `train_schema_version` identifies the train stream's schema. Readers merge
+DP facts to determine the update outcome.
 
 Eager and streaming readers preserve source identity before custom prompt processing,
 templating, filtering, shuffling, or replication. `source_row_id` is the zero-based
