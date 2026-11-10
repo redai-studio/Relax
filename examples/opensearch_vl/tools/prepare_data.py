@@ -31,21 +31,26 @@ from common import (
 )
 
 
-def unpack_images(directory: Path) -> None:
+@lru_cache(maxsize=8)
+def image_bundle(directory: Path) -> zipfile.ZipFile | None:
     archive = directory / "images.zip"
-    with zipfile.ZipFile(archive) as bundle:
-        for entry in bundle.infolist():
-            target = (directory / entry.filename).resolve()
-            if not target.is_relative_to(directory.resolve()):
-                raise ValueError(f"Unsafe archive path: {entry.filename}")
-        bundle.extractall(directory)
+    return zipfile.ZipFile(archive) if archive.is_file() else None
+
+
+@lru_cache(maxsize=16)
+def image_output_dir(output: Path) -> Path:
+    directory = output / "images"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 
 @lru_cache(maxsize=16384)
-def prepare_image(path: Path, output: Path) -> tuple[str, str]:
+def prepare_image(path: Path, output: Path, directory: Path) -> tuple[str, str]:
     from PIL import Image
 
-    with Image.open(path) as source:
+    bundle = image_bundle(directory)
+    stream = bundle.open(path.relative_to(directory.resolve()).as_posix()) if bundle is not None else path.open("rb")
+    with stream, Image.open(stream) as source:
         image = source.convert("RGB")
         pixel_hash = hashlib.sha256(str(image.size).encode() + image.tobytes()).hexdigest()
         # Match the original recipe's 262144-pixel cap, with Qwen3.5's 32px grid.
@@ -58,8 +63,7 @@ def prepare_image(path: Path, output: Path) -> tuple[str, str]:
             w, h = max(32, math.floor(width / scale / 32) * 32), max(32, math.floor(height / scale / 32) * 32)
         if image.size != (w, h):
             image = image.resize((w, h), Image.Resampling.BICUBIC)
-        target = output / "images" / f"{pixel_hash}.png"
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target = image_output_dir(output) / f"{pixel_hash}.png"
         if not target.exists():
             temporary = target.with_suffix(f".{os.getpid()}.tmp")
             image.save(temporary, format="PNG")
@@ -89,7 +93,7 @@ def normalize(row: dict, directory: Path, output: Path, domain: str) -> dict:
         path = (directory / value).resolve()
         if not path.is_relative_to(directory.resolve()):
             raise ValueError(f"Image outside its source domain: {value}")
-        prepared, image_hash = prepare_image(path, output)
+        prepared, image_hash = prepare_image(path, output, directory)
         paths.append(prepared)
         hashes.append(image_hash)
     identity = digest([messages, hashes, tools])
@@ -200,8 +204,6 @@ def main() -> None:
     with ProcessPoolExecutor(max_workers=args.workers, mp_context=multiprocessing.get_context("spawn")) as pool:
         for domain in args.domains:
             directory = args.source / domain
-            if not (directory / "images").is_dir():
-                unpack_images(directory)
             raw = json.loads((directory / SOURCE_FILES[domain]).read_text())
             counters["source_rows"] += len(raw)
             tasks = ((index, source, directory, args.output, domain) for index, source in enumerate(raw))

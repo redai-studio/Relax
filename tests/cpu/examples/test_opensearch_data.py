@@ -7,6 +7,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -56,7 +57,8 @@ def test_split_keeps_all_rows_and_shared_image_question_groups(prepare):
     assert splits == prepare.select_splits(rows, [0, 8, 8], 42)
 
 
-def test_prepare_cli_retains_long_rows_without_a_model(tmp_path, prepare):
+@pytest.mark.parametrize("archived", [False, True])
+def test_prepare_cli_retains_long_rows_without_a_model(tmp_path, prepare, archived):
     source = tmp_path / "source"
     domain = source / "fvqa"
     (domain / "images").mkdir(parents=True)
@@ -80,6 +82,12 @@ def test_prepare_cli_retains_long_rows_without_a_model(tmp_path, prepare):
             }
         )
     (domain / prepare.SOURCE_FILES["fvqa"]).write_text(json.dumps(rows))
+    if archived:
+        with zipfile.ZipFile(domain / "images.zip", "w") as bundle:
+            for path in (domain / "images").iterdir():
+                bundle.write(path, path.relative_to(domain))
+                path.unlink()
+        (domain / "images").rmdir()
     (source / "source-revision.json").write_text(json.dumps({"revision": prepare.DATA_REVISION}))
     output = tmp_path / "prepared"
     subprocess.run(
@@ -116,3 +124,23 @@ def test_prepare_cli_retains_long_rows_without_a_model(tmp_path, prepare):
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["max_length"] is None and manifest["rejected_count"] == 0
     assert len(list((output / "images").glob("*.png"))) == 24
+    assert (domain / "images").exists() is not archived
+
+
+def test_zip_and_file_images_have_identical_normalized_pixels(tmp_path, prepare):
+    domain = tmp_path / "fvqa"
+    (domain / "images").mkdir(parents=True)
+    path = domain / "images" / "sample.png"
+    Image.new("RGB", (1024, 768), (17, 33, 71)).save(path)
+    extracted, extracted_hash = prepare.prepare_image(path, tmp_path / "extracted", domain)
+    with zipfile.ZipFile(domain / "images.zip", "w") as bundle:
+        bundle.write(path, "images/sample.png")
+        bundle.writestr("../must-not-extract", b"unused")
+    path.unlink()
+    path.parent.rmdir()
+    prepare.image_bundle.cache_clear()
+    archived, archived_hash = prepare.prepare_image(path, tmp_path / "archived", domain)
+    assert archived_hash == extracted_hash
+    with Image.open(extracted) as expected, Image.open(archived) as actual:
+        assert actual.size == expected.size and actual.tobytes() == expected.tobytes()
+    assert not (tmp_path / "must-not-extract").exists()
