@@ -518,6 +518,13 @@ class MegatronTrainRayActor(TrainRayActor):
         # (VMM pause) or manual selective CPU offload based on TMS availability;
         # both implementations live in the offloader. No-op when offload_train is off.
         self._train_state_offloader = MegatronTrainStateOffloader(self.model, self.optimizer, args)
+        self._keep_train_process_groups = False
+        if role == "actor":
+            from .train_process_groups import configure_train_process_group_retention
+
+            self._keep_train_process_groups = configure_train_process_group_retention(
+                args, self._train_state_offloader, get_gloo_group()
+            )
 
         start_rollout_id = loaded_rollout_id + 1
 
@@ -836,7 +843,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights_backuper.backup("actor")
 
     @timer
-    def sleep(self) -> None:
+    def sleep(self, *, keep_process_groups: bool = False) -> None:
         assert self.args.offload_train
         self._flush_resident_sft_parameters()
 
@@ -854,7 +861,8 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
-        destroy_process_groups()
+        if not (keep_process_groups and getattr(self, "_keep_train_process_groups", False)):
+            destroy_process_groups()
 
         self._train_state_offloader.offload()
 
@@ -2289,7 +2297,7 @@ class MegatronTrainRayActor(TrainRayActor):
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
             if self.args.offload_train:
-                self.sleep()
+                self.sleep(keep_process_groups=getattr(self, "_keep_train_process_groups", False))
             if has_rollout:
                 self.update_weights()
         with timer("train_metrics_flush"):
@@ -3081,7 +3089,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("old_actor")
         if reconnect_rollout_engines:
             self.sleep()
-        elif self.args.offload_train:
+        elif self.args.offload_train and not getattr(self, "_keep_train_process_groups", False):
             destroy_process_groups()
 
         if self.args.offload_rollout:
