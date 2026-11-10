@@ -227,7 +227,7 @@ MISC_ARGS=(
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32
     --attention-softmax-in-fp32
-    --attention-backend flash
+    --attention-backend auto
     --use-health-check
 )
 
