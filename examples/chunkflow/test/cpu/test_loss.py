@@ -47,11 +47,20 @@ ROOT = Path(__file__).resolve().parents[4]
         ({"enable_mtp_training": True, "mtp_num_layers": 1}, "--enable-mtp-training"),
         ({"mtp_num_layers": 1}, None),
         ({"use_chunkflow": False, "enable_mtp_training": True, "mtp_num_layers": 1}, None),
+        ({"loss_type": "sft", "advantage_estimator": "gspo"}, None),
+        ({"loss_type": "sft", "advantage_estimator": "m2po"}, None),
+        ({"loss_type": "sft", "use_opsm": True}, None),
     ],
 )
 def test_validation_rejects_unsupported_loss_and_streaming_contracts(options, error):
     args = SimpleNamespace(
-        **{"use_chunkflow": True, "chunkflow_chunk_size": 128, "calculate_per_token_loss": True, **options}
+        **{
+            "use_chunkflow": True,
+            "chunkflow_chunk_size": 128,
+            "calculate_per_token_loss": True,
+            "loss_type": "policy_loss",
+            **options,
+        }
     )
     if error is None:
         validate_args(args)

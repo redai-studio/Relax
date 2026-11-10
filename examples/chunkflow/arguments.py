@@ -82,9 +82,16 @@ def validate_args(args: Namespace) -> None:
     from relax.algorithms import ALGORITHM_SPECS
 
     algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
-    if getattr(args, "use_opsm", False) or (
-        algorithm is not None
-        and (algorithm.kl_level == "sequence" or algorithm.needs_full_log_probs or algorithm.policy_loss_fn == "m2po")
+    if getattr(args, "loss_type", None) == "policy_loss" and (
+        getattr(args, "use_opsm", False)
+        or (
+            algorithm is not None
+            and (
+                algorithm.kl_level == "sequence"
+                or algorithm.needs_full_log_probs
+                or algorithm.policy_loss_fn == "m2po"
+            )
+        )
     ):
         raise ValueError(
             "--use-chunkflow does not support sequence/batch-level objectives (GSPO/OPSM/M2PO): "

@@ -511,6 +511,50 @@ def test_parent_reader_rejects_multimodal_data_iterator_before_packing():
         _next_parent(iterator, SimpleNamespace())
 
 
+@pytest.mark.parametrize("layout", [False, True])
+def test_expert_wrapper_rejects_non_nested_tensor_parallel_plans(monkeypatch, layout):
+    pytest.importorskip("megatron.core")
+    import torch.distributed as dist
+
+    from examples.chunkflow import schedules
+    from relax.utils import distributed_utils
+
+    generator = schedules.parallel_state.RankGenerator
+    common = dict(ep=1, pp=1, cp=1, order="tp-cp-ep-dp-pp")
+    dense = generator(tp=3, dp=2, **common).get_ranks("tp")
+    experts = generator(tp=2, dp=3, **common).get_ranks("tp")
+    assert dense == [[0, 1, 2], [3, 4, 5]] and [2, 3] in experts
+
+    records = []
+    for rank in range(6):
+        chunks, units = schedules._plan(
+            {"packed_seq_params": SimpleNamespace(cu_seqlens_q_cpu=[0, 384 if rank < 3 else 768])},
+            384,
+            "staggered",
+        )
+        scope = tuple(next(group for group in experts if rank in group))
+        ops = tuple(schedules.gen_unit_ops(units, chunks, 1 << 30))
+        records.append(((), (1 if rank < 3 else 2, 1)) if layout else (scope, ops))
+
+    world = object()
+
+    def gather(output, value, *, group):
+        assert group is world
+        assert value == records[rank]
+        output[:] = records
+
+    monkeypatch.setattr(distributed_utils, "get_gloo_group", lambda: world)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 6)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: group)
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    args = SimpleNamespace(tensor_model_parallel_size=3, expert_tensor_parallel_size=2, expert_model_parallel_size=1)
+    for rank, (_, signature) in enumerate(records):
+        scope = tuple(next(group for group in experts if rank in group))
+        monkeypatch.setattr(schedules.parallel_state, "get_expert_tensor_and_model_parallel_group", lambda: scope)
+        with pytest.raises(RuntimeError, match="different schedules"):
+            schedules._check_ep_schedule(signature, args, layout=layout)
+
+
 def _validate_expert_plans_worker(rank, init_file):
     from datetime import timedelta
 

@@ -97,7 +97,7 @@ Do not duplicate settings already present in the recipe:
 | `--attention-dropout 0.0 --hidden-dropout 0.0` | Current adapters require zero dropout to avoid random-mask issues during chunking and replay                             |
 | Megatron recomputation compatibility           | Disable full-layer / selective `core_attn`                                                                               |
 | Expert parallelism (EP)                        | All ranks in each EP group must share the same chunk execution plan; mismatches fail collectively before model execution |
-| Training objective                             | GSPO / OPSM / M2PO and other objectives requiring full-sequence or batch statistics are not supported                    |
+| RL policy loss                                 | GSPO / OPSM / M2PO objectives requiring full-sequence or batch statistics are not supported; this does not restrict SFT  |
 | MTP training                                   | Cross-chunk multi-token prediction is not supported; disable `--enable-mtp-training`                                     |
 | MoE load-balancing auxiliary loss              | Use `none` or zero coefficients; cross-chunk routing statistics are not supported                                        |
 | Distributed optimizer                          | Keep `--num-distributed-optimizer-instances 1` (default)                                                                 |

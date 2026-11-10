@@ -56,7 +56,7 @@ def _next_parent(data_iterator, args) -> dict:
 def _check_ep_schedule(signature: tuple, args, *, layout: bool = False) -> None:
     tp_size = getattr(args, "tensor_model_parallel_size", 1)
     etp_size = getattr(args, "expert_tensor_parallel_size", None) or tp_size
-    if getattr(args, "expert_model_parallel_size", 1) <= 1 and etp_size <= tp_size:
+    if getattr(args, "expert_model_parallel_size", 1) <= 1 and etp_size <= 1:
         return
     from relax.utils.distributed_utils import get_gloo_group
 
