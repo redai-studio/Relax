@@ -37,11 +37,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - case: Qwen3-4B-4xgpu-async
-            script: scripts/training/text/run-qwen3-4B-4xgpu-async.sh
+          - case: Qwen3.5-4B-4xgpu-async
+            script: scripts/training/text/run-qwen35-4B-4x-async.sh
             gpus: 4
-          - case: Qwen3-VL-4B-2xgpu
-            script: scripts/training/multimodal/run-qwen3-vl-4B-2xgpu.sh
+          - case: Qwen3.5-4B-2xgpu-vl
+            script: scripts/training/multimodal/run-qwen35-4B-2xgpu.sh
             gpus: 2
     env:
       CI_CONTAINER_NAME: relax-integration-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
@@ -85,7 +85,7 @@ jobs:
           HOST_UV_CACHE_DIR="$HOME/.cache/uv"
           mkdir -p "$HOST_UV_CACHE_DIR" "$ARTIFACT_DIR"
 
-          # Each runner provisions the cases' model and dataset files in ~/model and ~/data.
+          # Runners provision ~/model/Qwen3.5-4B and the case's dataset in ~/data.
           # Keep Ray processes, network, IPC and /tmp private to this container.
           docker create --pull never --rm --init \
             --name "$CI_CONTAINER_NAME" \
@@ -125,7 +125,7 @@ jobs:
             --system --break-system-packages -r requirements.txt \
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
-      - name: Run integration test
+      - name: Run Qwen3.5-4B integration test
         timeout-minutes: 10
         run: |
           docker exec --env TRAINING_SCRIPT "$CI_CONTAINER_NAME" bash -euo pipefail -c '
@@ -163,13 +163,13 @@ jobs:
     needs: bypass
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
-    name: Qwen3-4B-4xnpu-async
+    name: Qwen3.5-4B-4xnpu-async
     runs-on: [self-hosted, linux, ARM64, 910c, npu]
     timeout-minutes: 185
     env:
       CI_CONTAINER_NAME: relax-npu-integration-${{ github.run_id }}-${{ github.run_attempt }}
-      TRAINING_SCRIPT: scripts/training/text/run-qwen3-4B-4xgpu-async-npu.sh
-      ARTIFACT_NAME: integration-Qwen3-4B-4xnpu-async-${{ github.run_id }}-${{ github.run_attempt }}
+      TRAINING_SCRIPT: scripts/training/text/run-qwen35-4B-4x-async.sh
+      ARTIFACT_NAME: integration-Qwen3.5-4B-4xnpu-async-${{ github.run_id }}-${{ github.run_attempt }}
       CLEARML_TAGS: branch=${{ github.head_ref || github.ref_name }},commit=${{ github.sha }}
     steps:
       - name: Checkout
@@ -238,7 +238,7 @@ jobs:
             cp -a --no-preserve=ownership /source/. /workspace/Relax/
           '
 
-      - name: Run integration test
+      - name: Run Qwen3.5-4B integration test
         timeout-minutes: 15
         run: |
           docker exec --env TRAINING_SCRIPT "$CI_CONTAINER_NAME" bash -eo pipefail -c '
@@ -251,7 +251,7 @@ jobs:
             unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
             unset RAY_NO_WAIT RAY_ADDRESS RELAX_ENTRYPOINT_MODE
             export no_proxy="*" NO_PROXY="*"
-            bash "$TRAINING_SCRIPT" 2>&1 | tee /artifacts/training.log
+            bash "$TRAINING_SCRIPT" npu 2>&1 | tee /artifacts/training.log
           '
 
       - name: Collect Ray logs
