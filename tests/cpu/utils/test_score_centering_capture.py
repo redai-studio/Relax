@@ -15,6 +15,7 @@ import numpy as np
 import pybase64
 import pytest
 
+from relax.utils.policy_vocab import configure_policy_vocab_request, resolve_policy_vocab_size
 from relax.utils.score_centering import (
     append_score_centering_candidates,
     configure_score_centering_request,
@@ -292,8 +293,41 @@ def test_score_centering_capture_resolves_real_model_vocab_once(monkeypatch):
     assert calls == ["model"]
 
 
+@pytest.mark.parametrize("limit", [0, -1, True, 9, 1.5])
+def test_policy_vocab_rejects_invalid_output_range(limit):
+    with pytest.raises(ValueError, match="policy_vocab_size"):
+        resolve_policy_vocab_size(_args(policy_vocab_size=limit), model_vocab_size=8)
+
+
+@pytest.mark.parametrize("mode", [{"loss_type": "sft"}, {"train_backend": "fsdp"}])
+def test_policy_vocab_rejects_unsupported_training_paths(mode):
+    with pytest.raises(ValueError, match="online RL|Megatron"):
+        resolve_policy_vocab_size(_args(policy_vocab_size=5, **mode), model_vocab_size=8)
+
+
+def test_policy_vocab_request_preserves_caller_and_legal_biases(monkeypatch):
+    import relax.utils.policy_vocab as policy_vocab
+
+    monkeypatch.setattr(policy_vocab, "get_hf_config", lambda path: SimpleNamespace(vocab_size=8))
+    sampling = {"temperature": 0.7, "logit_bias": {"1": 0.5, "7": 10}}
+    original = copy.deepcopy(sampling)
+    payload = {"sampling_params": sampling}
+    args = _args(hf_checkpoint="model", policy_vocab_size=5)
+    configure_policy_vocab_request(args, payload)
+    assert payload["sampling_params"] == {
+        "temperature": 0.7,
+        "logit_bias": {"1": 0.5, "5": -1e30, "6": -1e30, "7": -1e30},
+    }
+    assert sampling == original
+    assert resolve_score_centering_vocab_size(args) == args.score_centering_vocab_size == 5
+    untouched = {"sampling_params": sampling}
+    configure_policy_vocab_request(_args(), untouched)
+    assert untouched["sampling_params"] is sampling
+
+
 @pytest.mark.parametrize("packed", [False, True])
-def test_score_centering_native_generation_appends_resume_without_rescoring(monkeypatch, packed):
+@pytest.mark.parametrize("policy_limit", [None, 5])
+def test_score_centering_native_generation_appends_resume_without_rescoring(monkeypatch, packed, policy_limit):
     """Run the real generate function with only its HTTP/processor boundary
     mocked."""
     source = Path(__file__).parents[3] / "relax/engine/rollout/sglang_rollout.py"
@@ -305,6 +339,9 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
     )
     tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [0])
     state = SimpleNamespace(tokenizer=tokenizer, processor=None, opd_manager=None)
+    import relax.utils.policy_vocab as policy_vocab
+
+    monkeypatch.setattr(policy_vocab, "get_hf_config", lambda path: SimpleNamespace(vocab_size=8))
     calls = []
 
     async def post_generation(args, state, url, payload, headers, evaluation):
@@ -319,6 +356,7 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         "monotonic": monotonic,
         "_post_generation": post_generation,
         "configure_score_centering_request": configure_score_centering_request,
+        "configure_policy_vocab_request": configure_policy_vocab_request,
         "parse_score_centering_response": parse_score_centering_response,
         "append_score_centering_candidates": append_score_centering_candidates,
         "resolve_score_centering_vocab_size": resolve_score_centering_vocab_size,
@@ -333,6 +371,8 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         sglang_router_policy="round_robin",
         partial_rollout=True,
         mask_offpolicy_in_partial_rollout=True,
+        hf_checkpoint="model",
+        policy_vocab_size=policy_limit,
     )
     sample = Sample(prompt="prompt")
     asyncio.run(namespace["generate"](args, sample, {"max_new_tokens": 8, "temperature": 0.7}))
@@ -340,6 +380,8 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
     first_head = sample.rollout_topk_log_probs.copy()
     asyncio.run(namespace["generate"](args, sample, {"max_new_tokens": 8, "temperature": 0.7}))
     assert calls[0]["top_logprobs_num"] == 2
+    if policy_limit is not None:
+        assert calls[0]["sampling_params"]["logit_bias"] == {"5": -1e30, "6": -1e30, "7": -1e30}
     assert calls[1]["input_ids"] == [0, 4, 2]
     assert sample.tokens == [0, 4, 2, 4, 2] and sample.loss_mask == [0, 0, 1, 1]
     np.testing.assert_array_equal(sample.rollout_topk_log_probs[:2], first_head)

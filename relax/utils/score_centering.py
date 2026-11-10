@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pybase64
 
+from relax.utils.policy_vocab import resolve_policy_vocab_size
 from relax.utils.types import Sample
 
 
@@ -33,6 +34,10 @@ def resolve_score_centering_vocab_size(args: Any) -> int:
         args.score_centering_vocab_size = vocab_size
     if vocab_size <= 0:
         raise ValueError("Score Centering requires a positive model vocabulary size")
+    policy_limit = resolve_policy_vocab_size(args, model_vocab_size=vocab_size)
+    if policy_limit is not None:
+        vocab_size = policy_limit
+        args.score_centering_vocab_size = vocab_size
     return int(vocab_size)
 
 

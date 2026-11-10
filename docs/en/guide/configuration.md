@@ -681,6 +681,7 @@ These environment variables are for tuning and troubleshooting; all are optional
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--train-env-vars` | json | {} | Additional environment variables for training process |
+| `--policy-vocab-size` | int | None | Restrict output token IDs for Megatron online RL sampling and policy scoring |
 | `--train-memory-margin-bytes` | int | 1GB (1024³) | Reserved space for training memory allocation |
 | `--disable-weights-backuper` | flag | - | Disable weight backup to save host memory |
 | `--custom-model-provider-path` | str | None | Custom model provider function path |
@@ -691,6 +692,18 @@ These environment variables are for tuning and troubleshooting; all are optional
 | `--only-load-weight` | flag | False | Reference model and actor fwd only load weights |
 | `--rlsp-server-port` | int | 8234 | RLSP Server HTTP port |
 | `--custom-config-path` | str | None | Custom parameter YAML config file path. Key-value pairs in file override existing parameters |
+
+### Restricting the policy output vocabulary
+
+For Megatron online RL with native SGLang or Agentic rollout, the optional `--policy-vocab-size` argument restricts output IDs to `[0, policy_vocab_size)`. For example, if the model's intended output range contains 32,000 tokens, add this argument to the training command:
+
+```bash
+--policy-vocab-size 32000
+```
+
+The value must be a positive integer no larger than the HF text model's configured vocabulary. It masks the same output rows during sampling and training log-probability, entropy, and Score Centering calculations without changing embedding shapes or Megatron TP padding. Omit it to retain existing behavior. Choose the range from the model's output-token contract, including valid special tokens; tokenizer length alone does not establish that range. This setting does not support offline SFT/DPO/RM or FSDP. Custom generation functions that bypass the native request builder must apply the same restriction themselves.
+
+When the limit is smaller than the model vocabulary, SGLang OPD advantage mode (`--opd-kl-coef != 0`) with `--opd-token-selection teacher_topk` or `union` is rejected: student prefill input log-probabilities still use the full vocabulary, even with sampling logit bias. Use `student_sampled`/`student_topk`, pure loss mode (`--opd-kl-coef 0`), or omit the restriction. EOPD (`--opd-fkl-entropy-gate`) uses sampled-token advantages and is exempt from this check.
 
 ---
 

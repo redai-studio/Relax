@@ -681,6 +681,7 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--train-env-vars` | json | {} | 训练进程的额外环境变量 |
+| `--policy-vocab-size` | int | None | 限制 Megatron 在线 RL 采样和策略评分使用的输出 token ID |
 | `--train-memory-margin-bytes` | int | 1GB (1024³) | 训练内存分配的预留空间 |
 | `--disable-weights-backuper` | flag | - | 禁用权重备份以节省主机内存 |
 | `--custom-model-provider-path` | str | None | 自定义模型 provider 函数路径 |
@@ -691,6 +692,18 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 | `--only-load-weight` | flag | False | 参考模型和 actor fwd 仅加载权重 |
 | `--rlsp-server-port` | int | 8234 | RLSP Server HTTP 端口 |
 | `--custom-config-path` | str | None | 自定义参数 YAML 配置文件路径。文件中的 key-value 会覆盖已有参数 |
+
+### 限制策略输出词表
+
+使用 Megatron 在线 RL，并通过原生 SGLang 或 Agentic 路径生成时，可以用 `--policy-vocab-size` 参数将输出 token ID 限制在 `[0, policy_vocab_size)`。例如，模型约定的有效输出范围包含 32,000 个 token 时，在训练命令中添加：
+
+```bash
+--policy-vocab-size 32000
+```
+
+该值必须是正整数，且不超过 HF 文本模型配置中的词表大小。采样及训练端的 log-probability、entropy、Score Centering 计算会屏蔽相同的输出行，不改变 embedding 形状或 Megatron TP padding。未设置时保持原有行为。请根据模型的输出 token 约定选择范围，并包含有效的特殊 token，不能仅凭 tokenizer 长度推断。该配置不支持离线 SFT/DPO/RM 或 FSDP。绕过原生请求构建器的自定义生成函数需要自行应用同样的限制。
+
+当限制小于模型词表时，SGLang OPD advantage 模式（`--opd-kl-coef != 0`）不允许搭配 `--opd-token-selection teacher_topk` 或 `union`：student prefill 的输入 log-probabilities 即使设置了采样 logit bias，也仍按完整词表归一化。请改用 `student_sampled`/`student_topk`、纯 loss 模式（`--opd-kl-coef 0`），或不限制词表。EOPD（`--opd-fkl-entropy-gate`）使用 sampled-token advantage，不受这项检查限制。
 
 ---
 

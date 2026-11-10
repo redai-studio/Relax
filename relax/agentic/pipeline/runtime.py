@@ -41,6 +41,7 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
+from relax.utils.policy_vocab import configure_policy_vocab_request
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.score_centering import (
     configure_score_centering_request,
@@ -606,6 +607,7 @@ class SGLangBackendAdapter:
             "rid": request_id,
             "return_logprob": return_logprob,
         }
+        configure_policy_vocab_request(self._args, payload)
         sc_sampling_mode = (
             configure_score_centering_request(self._args, payload)
             if return_logprob and collect_score_centering

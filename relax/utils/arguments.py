@@ -370,6 +370,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_train_arguments(parser):
             # --train-backend is parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(
+                "--policy-vocab-size",
+                type=_positive_int,
+                default=None,
+                help=(
+                    "Restrict sampling and policy scoring to output token IDs [0, size) for Megatron online RL. "
+                    "Must not exceed the HF text model vocabulary; leaves embedding shapes and TP padding unchanged. "
+                    "Unset by default to retain the model's output vocabulary."
+                ),
+            )
+            parser.add_argument(
                 "--qkv-format",
                 type=str,
                 choices=["thd", "bshd"],
