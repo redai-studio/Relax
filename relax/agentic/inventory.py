@@ -53,17 +53,19 @@ def _prompt_preview(prompt: Any) -> str:
 
 def session_sampling_config(args: Namespace, overrides: dict[str, Any] | None, position: int) -> dict[str, Any]:
     params = {
-        "temperature": getattr(args, "rollout_temperature", None),
-        "top_p": getattr(args, "rollout_top_p", None),
-        "top_k": getattr(args, "rollout_top_k", None),
-        "max_new_tokens": getattr(args, "rollout_max_response_len", None),
-        "stop": getattr(args, "rollout_stop", None),
-        "stop_token_ids": getattr(args, "rollout_stop_token_ids", None),
-        "skip_special_tokens": getattr(args, "rollout_skip_special_tokens", None),
+        "temperature": args.rollout_temperature,
+        "top_p": args.rollout_top_p,
+        "top_k": args.rollout_top_k,
+        "max_new_tokens": args.rollout_max_response_len,
+        "stop": args.rollout_stop,
+        "stop_token_ids": args.rollout_stop_token_ids,
+        "skip_special_tokens": args.rollout_skip_special_tokens,
         "no_stop_trim": True,
         "spaces_between_special_tokens": False,
     }
-    if getattr(args, "sglang_enable_deterministic_inference", False):
+    # --sglang-* attrs only exist when sglang args were parsed (not skip_sglang).
+    # This function is rollout-path only, so they are always present here.
+    if args.sglang_enable_deterministic_inference:
         params["sampling_seed"] = args.rollout_seed + position
     if overrides is not None:
         params.update(overrides)
