@@ -77,13 +77,15 @@ with module["_megatron_context"]():
     ],
 )
 def test_native_te_matches_cuda_reference(bounds_q, bounds_k, heads, kv_heads, dim):
-    pytest.importorskip("flash_attn")
+    if bounds_q != bounds_k:
+        pytest.importorskip("flash_attn")
     _run_native_te_check("_assert_native_te_matches_cuda_reference", bounds_q, bounds_k, heads, kv_heads, dim)
 
 
 def _assert_native_te_matches_cuda_reference(bounds_q, bounds_k, heads, kv_heads, dim):
-    flash_attn = pytest.importorskip("flash_attn")
-    flash_attn_varlen_func = flash_attn.flash_attn_varlen_func
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.enums import AttnMaskType
+
     core = _native_te(heads, kv_heads, dim)
     max_q = max(b - a for a, b in zip(bounds_q[:-1], bounds_q[1:]))
     max_k = max(b - a for a, b in zip(bounds_k[:-1], bounds_k[1:]))
@@ -109,8 +111,20 @@ def _assert_native_te_matches_cuda_reference(bounds_q, bounds_k, heads, kv_heads
         dim**-0.5,
     )
     result = megatron_native_attention(core.forward, call).reshape_as(q)
-    expected = flash_attn_varlen_func(qr, kr, vr, cu_q, cu_k, max_q, max_k, causal=True)
-    dout = torch.randn_like(result)
+    if bounds_q == bounds_k:
+        # Long BF16 gradients compare the adapter with unadapted native TE,
+        # rather than requiring different FlashAttention versions to agree.
+        packed = PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu_q, cu_seqlens_kv=cu_k, max_seqlen_q=max_q, max_seqlen_kv=max_k
+        )
+        expected = core(
+            qr, kr, vr, attention_mask=None, attn_mask_type=AttnMaskType.causal, packed_seq_params=packed
+        ).reshape_as(q)
+    else:
+        # Keep an independent oracle for unequal-length bottom-right masking.
+        flash_attn = pytest.importorskip("flash_attn")
+        expected = flash_attn.flash_attn_varlen_func(qr, kr, vr, cu_q, cu_k, max_q, max_k, causal=True)
+    dout = torch.randn(result.shape, device=result.device, dtype=result.dtype, generator=generator)
     result.backward(dout)
     expected.backward(dout)
     for actual, wanted in ((result, expected), (q.grad, qr.grad), (k.grad, kr.grad), (v.grad, vr.grad)):
