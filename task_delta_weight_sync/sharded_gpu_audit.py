@@ -348,14 +348,25 @@ def load_audit(model: Any, weights: Any) -> None:
 
     from relax.distributed.weight_sync.provenance import runtime_identity
     from relax.distributed.weight_sync.store import atomic_write
-    from task_delta_weight_sync.audit_cpu_budget import AuditCpuBudget
+    from task_delta_weight_sync.audit_cpu_budget import AuditCpuBudget, host_memory_budget
 
     weights = list(weights)
     if len(weights) != 1 or weights[0][1].numel() != 0 or len(weights[0][0]) > 65536:
         raise ValueError("Audit controls require one bounded empty tensor")
     control = json.loads(weights[0][0])
     command, member, update_id = control["command"], control["member"], control["update_id"]
-    if command not in {"prepare", "capture", "compare", "complement", "fence", "close"}:
+    if command not in {
+        "prepare",
+        "capture",
+        "compare",
+        "complement",
+        "fence",
+        "close",
+        "arm_failure",
+        "failure_state",
+        "disarm_failure",
+        "install_transfer",
+    }:
         raise ValueError("Unknown GPU audit command")
     if control.get("paused") is not True or any(
         not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,180}", value) is None
@@ -385,9 +396,18 @@ def load_audit(model: Any, weights: Any) -> None:
         if command == "fence":
             _fence({parameter.device for parameter in model.parameters()})
             return  # No audit filesystem IO inside a measured completion fence.
+        elif command in {"arm_failure", "failure_state", "disarm_failure"}:
+            from task_delta_weight_sync.recovery_probe import worker_control
+
+            report.update(worker_control(model, control))
+        elif command == "install_transfer":
+            from task_delta_weight_sync.prepared_nccl import install_worker
+
+            install_worker()
         elif command == "prepare":
             if snapshot is not None:
                 raise ValueError("GPU audit snapshot is already prepared")
+            atomic_write(destination / "host-memory.json", json.dumps(host_memory_budget(), indent=2).encode())
             budget = AuditCpuBudget(directory, member, limit_bytes=control["node_budget_bytes"])
             snapshot = AuditSnapshot(
                 model,

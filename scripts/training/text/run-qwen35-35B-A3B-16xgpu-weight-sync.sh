@@ -137,7 +137,7 @@ SGLANG_ARGS=(
    --sglang-disable-cuda-graph
    --sglang-enforce-disable-flashinfer-allreduce-fusion
 )
-if [ "${CUSTOM_MEGATRON_INIT_PATH:-}" = "task_delta_weight_sync.measure_sharded.install" ]; then
+if [[ "${CUSTOM_MEGATRON_INIT_PATH:-}" = "task_delta_weight_sync.measure_sharded.install" || "${CUSTOM_MEGATRON_INIT_PATH:-}" = "task_delta_weight_sync.recovery_probe.install" ]]; then
     SGLANG_ARGS+=(--sglang-custom-weight-loader task_delta_weight_sync.sharded_gpu_audit.load_audit)
 fi
 LOG_ARGS=(

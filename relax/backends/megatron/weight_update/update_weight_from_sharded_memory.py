@@ -384,7 +384,22 @@ class UpdateWeightFromShardedMemory:
                     completion_error = f"Group lock release failed: {type(exc).__name__}: {exc}"
         self._gate(completion_error)
         totals = [None] * world
+        groups = {}
+        for key, buckets in local.items():
+            for bucket in buckets:
+                label = ("expert" if key.startswith("expert:") else "nonexpert") + ":" + bucket.dtype
+                item = groups.setdefault(
+                    label, dict(elements=0, changed=0, payload_bytes=0, full_buckets=0, sparse_buckets=0)
+                )
+                item["elements"] += bucket.elements
+                item["changed"] += bucket.changed
+                item["payload_bytes"] += len(bucket.payload)
+                item[bucket.encoding + "_buckets"] += 1
+        if self.config.full_only:
+            for item in groups.values():
+                item["changed"] = None
         local_stats = dict(
+            groups=groups,
             elements=sum(b.elements for values in local.values() for b in values),
             changed=None if self.config.full_only else sum(b.changed for values in local.values() for b in values),
             payload_bytes=sum(len(b.payload) for values in local.values() for b in values),

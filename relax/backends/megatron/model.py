@@ -1622,9 +1622,10 @@ def train_one_step(
         else:
             grad_norm = float("nan")
 
-    if getattr(args, "disk_weight_sync_config", None):
+    if getattr(args, "disk_weight_sync_config", None) or getattr(args, "memory_weight_sync_config", None):
         logger.info(
-            "Disk sync optimizer result: rollout=%d step=%d updated=%s zero_tokens=%s",
+            "%s sync optimizer result: rollout=%d step=%d updated=%s zero_tokens=%s",
+            "Disk" if getattr(args, "disk_weight_sync_config", None) else "Memory",
             rollout_id,
             step_id,
             bool(update_successful),

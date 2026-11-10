@@ -31,6 +31,7 @@ def install(args: Any) -> None:
     from relax.utils.distributed_utils import get_gloo_group
     from relax.utils.logging_utils import get_logger
     from task_delta_weight_sync.native_call import guarded_native_call
+    from task_delta_weight_sync.prepared_nccl import wire_bucket
 
     config = MemorySyncConfig.load(args.memory_weight_sync_config)
     if config.layout != "qwen35_owner_local" or config.full_only:
@@ -75,6 +76,7 @@ def install(args: Any) -> None:
                 end=end,
                 host_enqueue_s=monotonic() - host_started,
                 bytes=sum(t.numel() * t.element_size() for _, t in named),
+                wire_plan=wire_bucket(named),
             )
         )
         return refs
@@ -191,6 +193,15 @@ def install(args: Any) -> None:
             timeout=timedelta(seconds=min(config.sync_timeout_s, 60)),
         )
         self._ab_step = -1
+        error = None
+        try:
+            atomic_write(
+                measurements / "source-runtime" / f"rank-{rank}.json",
+                json.dumps(runtime_identity(), indent=2).encode(),
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        self._gate(error)
         paused_action(self, "prepare", "initialization", "prepare")
         root_action(
             self,
@@ -333,6 +344,7 @@ def install(args: Any) -> None:
                 ),
             )
             if rank == 0:
+                self._ab_wire_plan = [event["wire_plan"] for event in events]
                 logger.info(
                     "Matched sharded sync verified: update=%d delta=%.6f full_tcp=%.6f nccl=%.6f",
                     self._ab_step,
