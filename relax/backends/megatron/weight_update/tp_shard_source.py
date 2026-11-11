@@ -118,7 +118,7 @@ class OrdinaryTPSource:
                     raise ValueError("Ordinary TP source no longer matches its live inventory")
                 for key, attr in info.attrs.items():
                     setattr(value, key, attr)
-                global_name, task = converter._lookup_task(_normalize_global_name(info.name))
+                _, task = converter._lookup_task(_normalize_global_name(info.name))
                 if task is None:
                     continue
                 try:
@@ -143,7 +143,7 @@ class OrdinaryTPSource:
         tensors, regions, groups = self._views(weights, selected_only=False)
         if self.replica_rank != 0:
             tensors, regions, groups = {}, [], {}
-        flat, views = group_storage_views(tensors)
+        _, views = group_storage_views(tensors)
         self._catalogue_slots = {name: item["source"] for name, item in views.items()}
         for region in regions:
             region["source"] = "ordinary:" + views[region["source"]]["source"]
@@ -152,12 +152,9 @@ class OrdinaryTPSource:
             global_rank=dist.get_global_rank(self.group, self.rank),
             replica_ranks=list(self.replica_ranks),
             replica_rank=self.replica_rank,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
             regions=regions,
             groups=groups,
             native_specs=self.native_specs,
-            sources={"ordinary:" + key: [str(value.dtype), list(value.shape)] for key, value in flat.items()},
         )
 
     def bind(self, weights: Mapping[str, torch.Tensor], *, seed: bool = False) -> dict:

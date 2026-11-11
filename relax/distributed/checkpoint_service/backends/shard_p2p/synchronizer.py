@@ -179,12 +179,47 @@ class ShardP2PSynchronizer:
             self.engines = engines
         self.needs_seed = True
 
+    def _prepare_targets(self, weights: Mapping[str, torch.Tensor], version: int) -> None:
+        """Negotiate ordinary TP layouts before building the shared IPC
+        plan."""
+        source = self.source
+        records = self._gather(self._phase(lambda: source.target_catalogue(weights)))
+        description = self._phase(lambda: source.target_description(records))
+
+        def commands():
+            if self.rank != 0:
+                return None
+            digest = fingerprint(description)
+            return [
+                [
+                    dict(
+                        op="describe_tp",
+                        session=self.session,
+                        engine=engine,
+                        tp_rank=tp,
+                        version=version,
+                        nonce=uuid4().hex,
+                        geometry=self.geometry,
+                        description=description,
+                        description_hash=digest,
+                    )
+                    for tp in range(self.tp_size)
+                ]
+                for engine in range(self.engine_count)
+            ]
+
+        requests = self._phase(commands)
+        responses = self._fanout(requests)
+        selection = [self._phase(lambda: source.select_targets(description, requests, responses))]
+        dist.broadcast_object_list(selection, src=0, group=self.group)
+        self._phase(lambda: source.apply_targets(selection[0], weights))
+
     def prepare(self, weights: Mapping[str, torch.Tensor], *, version: int, audit_native: bool) -> None:
         """Build the first direct plan inside an active weight update."""
         self._audit_expert_replicas(weights)
         self.source.reset()
-        if hasattr(self.source, "prepare_targets"):
-            self.source.prepare_targets(self, weights, version=version)
+        if getattr(self.source, "has_ordinary", False):
+            self._prepare_targets(weights, version)
         self.disabled = bool(getattr(self.source, "empty", False))
         if self.disabled:
             self.needs_seed = False

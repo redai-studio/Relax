@@ -318,8 +318,9 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
         return [dict(success=True, message=json.dumps(dict(shard_p2p_tp_targets=[reply])))]
 
     cold._fanout = describe
+    cold.source = combined
     with pytest.raises(RuntimeError, match="ordinary source binding failed"):
-        combined.prepare_targets(cold, {}, version=1)
+        cold._prepare_targets({}, 1)
     assert cold.failed
     value = torch.tensor(1)
     dist.all_reduce(value)

@@ -1,20 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Ordinary TP and expert adapters sharing one versioned IPC transaction."""
 
-import hashlib
 import json
 from math import prod
-from uuid import uuid4
 
-import torch
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 
 from relax.backends.sglang.shard_p2p_weight_loader import expert_shapes
-from relax.distributed.checkpoint_service.backends.shard_p2p.plan import fingerprint
 from relax.utils.logging_utils import get_logger
 
 from .tp_shard_source import OrdinaryTPSource
+from .utils import snapshot_digests
 
 
 logger = get_logger(__name__)
@@ -78,10 +75,7 @@ class CombinedShardSource:
 
     def replica_record(self, weights) -> dict:
         tensors, _, _ = self.ordinary._views(weights, selected_only=False)
-        hashes = {}
-        if len(self.ordinary.replica_ranks) > 1:
-            for name, value in tensors.items():
-                hashes[name] = hashlib.sha256(value.detach().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()
+        hashes = snapshot_digests(tensors) if len(self.ordinary.replica_ranks) > 1 else {}
         return dict(
             expert=self.expert.replica_record(weights) if self.expert is not None else None,
             global_rank=dist.get_global_rank(self.group, self.rank),
@@ -100,123 +94,95 @@ class CombinedShardSource:
             ):
                 raise ValueError("Ordinary TP DP/CP replica weights differ")
 
-    def prepare_targets(self, sync, weights, *, version: int) -> None:
-        records = sync._gather(sync._phase(lambda: self.ordinary.catalogue(weights)))
+    def target_catalogue(self, weights) -> dict:
+        return self.ordinary.catalogue(weights)
 
-        def commands():
-            if self.rank != 0:
-                return None
-            specs = {}
-            by_global = {record["global_rank"]: record for record in records}
-            if len(by_global) != len(records):
-                raise ValueError("Duplicate ordinary TP source owner")
-            for rank, record in enumerate(records):
-                if record["rank"] != rank or record["replica_ranks"][record["replica_rank"]] != record["global_rank"]:
-                    raise ValueError("Ordinary TP source ownership disagrees")
-                for position, peer in enumerate(record["replica_ranks"]):
-                    other = by_global[peer]
-                    if other["replica_ranks"] != record["replica_ranks"] or other["replica_rank"] != position:
-                        raise ValueError("Ordinary TP replica groups disagree")
-                for name, spec in record["native_specs"].items():
-                    if name in specs and specs[name] != spec:
-                        raise ValueError("Native HF schema differs across Actor stages")
-                    specs[name] = spec
-            description = dict(records=records, native_specs=specs, source_world_size=len(records))
-            digest = fingerprint(description)
-            return [
-                [
-                    dict(
-                        op="describe_tp",
-                        session=sync.session,
-                        engine=engine,
-                        tp_rank=tp,
-                        version=version,
-                        nonce=uuid4().hex,
-                        geometry=sync.geometry,
-                        description=description,
-                        description_hash=digest,
-                    )
-                    for tp in range(self._tp_size)
-                ]
-                for engine in range(sync.engine_count)
-            ]
+    def target_description(self, records) -> dict | None:
+        if self.rank != 0:
+            return None
+        specs = {}
+        by_global = {record["global_rank"]: record for record in records}
+        if len(by_global) != len(records):
+            raise ValueError("Duplicate ordinary TP source owner")
+        for rank, record in enumerate(records):
+            if record["rank"] != rank or record["replica_ranks"][record["replica_rank"]] != record["global_rank"]:
+                raise ValueError("Ordinary TP source ownership disagrees")
+            for position, peer in enumerate(record["replica_ranks"]):
+                other = by_global[peer]
+                if other["replica_ranks"] != record["replica_ranks"] or other["replica_rank"] != position:
+                    raise ValueError("Ordinary TP replica groups disagree")
+            for name, spec in record["native_specs"].items():
+                if name in specs and specs[name] != spec:
+                    raise ValueError("Native HF schema differs across Actor stages")
+                specs[name] = spec
+        return dict(records=records, native_specs=specs, source_world_size=len(records))
 
-        commands = sync._phase(commands)
-        responses = sync._fanout(commands)
+    def select_targets(self, description, commands, responses) -> dict | None:
+        if self.rank != 0:
+            return None
+        records = description["records"]
+        replies = []
+        for pair, response in zip(commands, responses, strict=True):
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise ValueError("Missing ordinary TP layout response")
+            values = json.loads(response["message"])["shard_p2p_tp_targets"]
+            if len(values) != self._tp_size:
+                raise ValueError("Incomplete ordinary TP target inventory")
+            for command, reply in zip(pair, values, strict=True):
+                if reply["description_hash"] != command["description_hash"] or reply["tp_rank"] != command["tp_rank"]:
+                    raise ValueError("Misrouted ordinary TP layout reply")
+            replies.append(values)
+        if any(pair != replies[0] for pair in replies[1:]):
+            raise ValueError("Inference engines disagree on ordinary TP geometry")
+        selected = set.intersection(*(set(reply["selected_hf"]) for reply in replies[0]))
+        groups = [group for reply in replies[0] for group in reply["components"]]
+        groups += [names for record in records for names in record["groups"].values()]
+        previous = None
+        while previous != selected:
+            previous = set(selected)
+            for names in groups:
+                if not set(names) <= selected:
+                    selected.difference_update(names)
+        layouts, plans = [], [[] for _ in records]
+        for tp, reply in enumerate(replies[0]):
+            targets = {
+                name: shape
+                for name, shape in reply["target_shapes"].items()
+                if set(reply["target_hf"][name]) <= selected
+            }
+            layouts.append(targets)
+            for rank in range(len(records)):
+                plans[rank].append(
+                    [
+                        write
+                        for write in reply["writes"]
+                        if write["source_rank"] == rank and write["param"] in targets and write["hf"] in selected
+                    ]
+                )
+        names = [[name for name, hfs in record["groups"].items() if set(hfs) <= selected] for record in records]
+        logger.info(
+            "SHARD_P2P_TP selected_hf=%d logical_bytes=%d receiver_bytes=%d effective=%s",
+            len(selected),
+            sum(prod(description["native_specs"][name]["shape"]) * 2 for name in selected),
+            sum(prod(shape) * 2 for layout in layouts for shape in layout.values()) * len(replies),
+            bool(selected),
+        )
+        return dict(
+            layouts=layouts,
+            plans=plans,
+            names=names,
+            selected_hf=sorted(selected),
+            refresh=[bool(reply.get("native_refresh", False)) for reply in replies[0]],
+        )
 
-        def accept():
-            if self.rank != 0:
-                return None
-            replies = []
-            for pair, response in zip(commands, responses, strict=True):
-                if not isinstance(response, dict) or response.get("success") is not True:
-                    raise ValueError("Missing ordinary TP layout response")
-                values = json.loads(response["message"])["shard_p2p_tp_targets"]
-                if len(values) != self._tp_size:
-                    raise ValueError("Incomplete ordinary TP target inventory")
-                for command, reply in zip(pair, values, strict=True):
-                    if (
-                        reply["description_hash"] != command["description_hash"]
-                        or reply["tp_rank"] != command["tp_rank"]
-                    ):
-                        raise ValueError("Misrouted ordinary TP layout reply")
-                replies.append(values)
-            if any(pair != replies[0] for pair in replies[1:]):
-                raise ValueError("Inference engines disagree on ordinary TP geometry")
-            selected = set.intersection(*(set(reply["selected_hf"]) for reply in replies[0]))
-            groups = [group for reply in replies[0] for group in reply["components"]]
-            groups += [names for record in records for names in record["groups"].values()]
-            previous = None
-            while previous != selected:
-                previous = set(selected)
-                for names in groups:
-                    if not set(names) <= selected:
-                        selected.difference_update(names)
-            layouts, plans = [], [[] for _ in records]
-            for tp, reply in enumerate(replies[0]):
-                targets = {
-                    name: shape
-                    for name, shape in reply["target_shapes"].items()
-                    if set(reply["target_hf"][name]) <= selected
-                }
-                layouts.append(targets)
-                for rank in range(len(records)):
-                    plans[rank].append(
-                        [
-                            write
-                            for write in reply["writes"]
-                            if write["source_rank"] == rank and write["param"] in targets and write["hf"] in selected
-                        ]
-                    )
-            names = [[name for name, hfs in record["groups"].items() if set(hfs) <= selected] for record in records]
-            source_bytes = sum(
-                prod(commands[0][0]["description"]["native_specs"][name]["shape"]) * 2 for name in selected
-            )
-            logger.info(
-                "SHARD_P2P_TP selected_hf=%d logical_bytes=%d receiver_bytes=%d effective=%s",
-                len(selected),
-                source_bytes,
-                sum(prod(shape) * 2 for layout in layouts for shape in layout.values()) * len(replies),
-                bool(selected),
-            )
-            return dict(
-                layouts=layouts,
-                plans=plans,
-                names=names,
-                selected_hf=sorted(selected),
-                refresh=[bool(reply.get("native_refresh", False)) for reply in replies[0]],
-            )
-
-        result = [sync._phase(accept)]
-        dist.broadcast_object_list(result, src=0, group=self.group)
-        result = result[0]
+    def apply_targets(self, result, weights) -> None:
         self.ordinary.selected = frozenset(result["names"][self.rank])
         self.native_skip_names = frozenset(name for names in result["names"] for name in names)
         self._plans = result["plans"][self.rank]
         self._target_shapes = result["layouts"]
         self._native_refresh = result["refresh"]
         self.empty = not result["selected_hf"] and not self.has_experts
-        sync._phase(lambda: self.ordinary.bind(weights, seed=True))
+        self.ordinary.bind(weights, seed=True)
 
     def local_plan(self, weights, *, sources_only: bool = False):
         sources = self.ordinary.bind(weights)
