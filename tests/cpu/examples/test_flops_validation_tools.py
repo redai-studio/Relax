@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from examples.flops_balancing.compare_step_captures import compare_captures
+from examples.flops_balancing.record_run import hash_model_weight_shards
 from examples.flops_balancing.summarize_runs import read_window, summarize
 from relax.utils.training.optimizer_step_capture import OptimizerStepCapture, capture_rollout_inputs
 from tests.cpu.utils.test_optimizer_step_capture import _OptimizerContract
@@ -137,6 +138,7 @@ def _runs(tmp_path):
                 source_sha256="source",
                 workload_sha256="workload",
                 model_revision="model",
+                model_weight_sha256={"model.safetensors": "same weights"},
                 data_revision="data",
                 native_source_sha256="native source",
                 transfer_queue_source_sha256="patched TQ source",
@@ -154,9 +156,32 @@ def test_repeated_run_summary_checks_20_percent_boundary(tmp_path):
     assert report["modes"]["D"]["reaches_20_percent"]
 
 
+def test_weight_shard_recording_hashes_contents_and_requires_every_shard(tmp_path):
+    index = {"weight_map": {"a": "part-2.safetensors", "b": "part-1.safetensors", "c": "part-1.safetensors"}}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+    for filename in ("part-1.safetensors", "part-2.safetensors"):
+        (tmp_path / filename).write_bytes(filename.encode())
+    first = hash_model_weight_shards(tmp_path)
+    assert set(first) == {"model.safetensors.index.json", "part-1.safetensors", "part-2.safetensors"}
+    (tmp_path / "part-2.safetensors").write_bytes(b"different")
+    assert hash_model_weight_shards(tmp_path) != first
+    (tmp_path / "part-1.safetensors").unlink()
+    with pytest.raises(ValueError, match="weight shards"):
+        hash_model_weight_shards(tmp_path)
+
+
 @pytest.mark.parametrize(
     "change",
-    ["different_config", "different_environment", "different_tokens", "capture", "diagnostic", "failure", "same_run"],
+    [
+        "different_config",
+        "different_environment",
+        "different_weights",
+        "different_tokens",
+        "capture",
+        "diagnostic",
+        "failure",
+        "same_run",
+    ],
 )
 def test_repeated_run_summary_rejects_unfair_or_incomplete_comparisons(tmp_path, change):
     directories = _runs(tmp_path)
@@ -167,6 +192,8 @@ def test_repeated_run_summary_rejects_unfair_or_incomplete_comparisons(tmp_path,
         metadata["invariant_command"] = ["changed token budget"]
     elif change == "different_environment":
         metadata["launch_environment"]["OMP_NUM_THREADS"] = "2"
+    elif change == "different_weights":
+        metadata["model_weight_sha256"]["model.safetensors"] = "different weights"
     elif change == "capture":
         metadata["capture"] = True
     elif change == "diagnostic":

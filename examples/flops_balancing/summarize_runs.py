@@ -90,6 +90,7 @@ def summarize(directories: list[Path], *, warmup: int, steps: int, minimum_runs:
                 "source_sha256",
                 "workload_sha256",
                 "model_revision",
+                "model_weight_sha256",
                 "data_revision",
                 "native_source_sha256",
                 "transfer_queue_source_sha256",

@@ -16,6 +16,18 @@ import torch
 from examples.flops_balancing.prepare_workload import sha256_file
 
 
+def hash_model_weight_shards(checkpoint: Path) -> dict[str, str]:
+    index_path = checkpoint / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    filenames = sorted(set(index["weight_map"].values()))
+    if not filenames or any(not (checkpoint / filename).is_file() for filename in filenames):
+        raise ValueError("All pinned model weight shards must be downloaded before GPU training")
+    return {
+        index_path.name: sha256_file(index_path),
+        **{filename: sha256_file(checkpoint / filename) for filename in filenames},
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", type=Path, required=True)
@@ -32,10 +44,9 @@ def main() -> None:
     for filename, digest in manifest["tokenizer_files"].items():
         if sha256_file(args.checkpoint / filename) != digest:
             raise ValueError(f"Model configuration/tokenizer changed: {filename}")
+    weight_shards = None
     if not args.dry_run:
-        index = json.loads((args.checkpoint / "model.safetensors.index.json").read_text())
-        if any(not (args.checkpoint / filename).is_file() for filename in set(index["weight_map"].values())):
-            raise ValueError("All pinned model weight shards must be downloaded before GPU training")
+        weight_shards = hash_model_weight_shards(args.checkpoint)
     if not args.command or args.command[0] != "--":
         parser.error("Separate the recorded training command with --")
     command = args.command[1:]
@@ -52,6 +63,7 @@ def main() -> None:
         [
             *root.joinpath("relax").rglob("*.py"),
             *root.joinpath("scripts/models").glob("*.sh"),
+            *root.joinpath("scripts/training/sft").glob("*flops-task16.sh"),
             *root.joinpath("examples/flops_balancing").glob("*.py"),
         ]
     ):
@@ -98,6 +110,7 @@ def main() -> None:
         source_sha256=source.hexdigest(),
         workload_sha256=sha256_file(args.workload / "manifest.json"),
         model_revision=manifest["model_revision"],
+        model_weight_sha256=weight_shards,
         data_revision=manifest["source_revision"],
         git_head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         native_source_sha256=native_digest.hexdigest() if native_files else None,
