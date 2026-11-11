@@ -45,6 +45,8 @@ from relax.utils.agentic_obs.writers import close_observation_writers
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.types import Sample
 
+from tests.cpu.agentic_obs_args import make_agentic_obs_args
+
 
 class _FakeTokenizer:
     def encode(self, text, add_special_tokens=False):
@@ -79,27 +81,13 @@ def _read_stage_ends(path: Path) -> list[dict]:
 
 
 def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
-    args = {
-        "dump_agentic_obs": str(tmp_path),
-        "agentic_obs_run_id": "run_test",
-        "agentic_obs_train_generation_id": "generation",
-        "dump_agentic_obs_media": False,
-        "reward_key": None,
-        "use_rollout_routing_replay": False,
-        # rollout sampling params read directly by session_sampling_config;
-        # declare them here so tests only override what differs.
-        "rollout_temperature": 1.0,
-        "rollout_top_p": 1.0,
-        "rollout_top_k": -1,
-        "rollout_max_response_len": None,
-        "rollout_stop": None,
-        "rollout_stop_token_ids": None,
-        "rollout_skip_special_tokens": False,
-        "eval_reward_key": None,
-        "sglang_enable_deterministic_inference": False,
-    }
-    args.update(overrides)
-    return Namespace(**args)
+    # Factory defaults live in one dict so callers can still override them via
+    # **overrides ({**defaults, **overrides}: caller wins).
+    return make_agentic_obs_args(
+        tmp_path,
+        run_id="run_test",
+        **{"use_rollout_routing_replay": False, **overrides},
+    )
 
 
 def _two_turn_forest() -> tuple[SessionForest, str]:
@@ -453,31 +441,21 @@ def _rollout_data(export_ids: list[int], **overrides: Any) -> dict[str, Any]:
 
 
 def _train_args(tmp_path: Path, **overrides: Any) -> Namespace:
-    args = {
-        "dump_agentic_obs": str(tmp_path),
-        "agentic_obs_run_id": "run_test",
-        "agentic_obs_train_generation_id": "generation",
-        "dump_agentic_obs_media": False,
-        "dynamic_context_parallel": False,
-        "context_parallel_size": 1,
-        "n_samples_per_prompt": 1,
-        "rollout_batch_size": 1,
-        "advantage_estimator": "grpo",
-        "agentic_custom_advantage_path": None,
-        "reward_key": None,
-        # rollout sampling params read directly by session_sampling_config.
-        "rollout_temperature": 1.0,
-        "rollout_top_p": 1.0,
-        "rollout_top_k": -1,
-        "rollout_max_response_len": None,
-        "rollout_stop": None,
-        "rollout_stop_token_ids": None,
-        "rollout_skip_special_tokens": False,
-        "eval_reward_key": None,
-        "sglang_enable_deterministic_inference": False,
-    }
-    args.update(overrides)
-    return Namespace(**args)
+    # Factory defaults live in one dict so callers can still override them via
+    # **overrides ({**defaults, **overrides}: caller wins).
+    return make_agentic_obs_args(
+        tmp_path,
+        run_id="run_test",
+        **{
+            "dynamic_context_parallel": False,
+            "context_parallel_size": 1,
+            "n_samples_per_prompt": 1,
+            "rollout_batch_size": 1,
+            "advantage_estimator": "grpo",
+            "agentic_custom_advantage_path": None,
+            **overrides,
+        },
+    )
 
 
 def _emit_update(args, rollout_id, data, step_id=0, successful=True):
