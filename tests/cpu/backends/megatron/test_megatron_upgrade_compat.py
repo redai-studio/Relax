@@ -139,6 +139,7 @@ def gpt_postprocess():
         {"_postprocess"},
         {
             "InferenceMode": types.SimpleNamespace(is_active=lambda: state["inference"]),
+            "InferenceCudaGraphScope": types.SimpleNamespace(block="block"),
             "roll_tensor": roll,
             "resolve_cp_group": lambda static_group, packed: cp_group,
             "prepare_mtp_sequence_roll_context": prepare,
@@ -147,7 +148,7 @@ def gpt_postprocess():
         class_name="GPTModel",
     )
     model = types.SimpleNamespace(
-        config=types.SimpleNamespace(mtp_num_layers=2, use_mup=False),
+        config=types.SimpleNamespace(mtp_num_layers=2, use_mup=False, inference_cuda_graph_scope="none"),
         post_process=True,
         share_embeddings_and_output_weights=False,
         pg_collection=types.SimpleNamespace(cp=object()),
@@ -229,6 +230,11 @@ def test_megatron_upgrade_gpt_without_mtp_targets_skips_auxiliary_work(gpt_postp
     fixture.state["inference"] = inference
     fixture.kwargs["runtime_gather_output"] = inference
     fixture.model.training = not inference
+    context = types.SimpleNamespace(
+        is_dynamic_batching=lambda: True, num_speculative_tokens=1, mtp_decoder_hidden_states=None
+    )
+    if inference:
+        fixture.kwargs["inference_context"] = context
     result = fixture.fn(fixture.model, **fixture.kwargs)
 
     for operation in ("roll", "prepare", "prefetch", "mtp", "loss"):
@@ -236,6 +242,6 @@ def test_megatron_upgrade_gpt_without_mtp_targets_skips_auxiliary_work(gpt_postp
     assert len(fixture.calls["output"]) == 1
     assert result is fixture.kwargs["hidden_states"]
     if inference:
-        assert fixture.model._decoder_hidden_states_cache is fixture.kwargs["hidden_states"]
+        assert context.mtp_decoder_hidden_states is fixture.kwargs["hidden_states"]
     else:
-        assert not hasattr(fixture.model, "_decoder_hidden_states_cache")
+        assert context.mtp_decoder_hidden_states is None

@@ -74,7 +74,7 @@ def test_optimized_patch_replays_without_fuzz(variable, patch, tmp_path):
         if variable == "MODEL_OPERATORS_SOURCE":
             _check_model_helper_signatures(path)
     if variable == "OPTIMIZED_MCORE_SOURCE":
-        mtp = (tmp_path / "megatron/core/transformer/multi_token_prediction.py").read_text()
+        mtp = (Path(source) / "megatron/core/transformer/multi_token_prediction.py").read_text()
         tree = ast.parse(mtp)
         call = next(
             n
@@ -85,7 +85,7 @@ def test_optimized_patch_replays_without_fuzz(variable, patch, tmp_path):
         assert "cumulative_mtp_input_mask" in mtp
         _exercise_fused_expert_contract((tmp_path / "megatron/core/transformer/moe/experts.py").read_text())
         _exercise_lazy_deepep_contract((tmp_path / "megatron/core/transformer/moe/fused_a2a.py").read_text())
-        backward = tmp_path / "megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py"
+        backward = ROOT / "relax/backends/megatron/kernels/linear_cross_entropy.py"
         output_tile = next(
             node
             for node in ast.walk(ast.parse(backward.read_text()))
@@ -273,7 +273,14 @@ def _exercise_lazy_deepep_contract(source):
         or (isinstance(node, ast.If) and "find_spec" in ast.unparse(node.test))
         or (isinstance(node, ast.FunctionDef) and node.name == "get_elastic_buffer")
     ]
-    scope = {"__builtins__": {**vars(builtins), "__import__": import_backend}, "_elastic_buffer": None}
+    scope = {
+        "__builtins__": {**vars(builtins), "__import__": import_backend},
+        "_elastic_buffer": None,
+        "torch": SimpleNamespace(
+            zeros=lambda *args, **kwargs: object(),
+            distributed=SimpleNamespace(all_reduce=lambda tensor, group: None),
+        ),
+    }
     exec("from __future__ import annotations\n" + ast.unparse(ast.Module(body=nodes, type_ignores=[])), scope)
     assert scope["HAVE_DEEP_EP_V2"] and imported == []
     group = object()
@@ -312,7 +319,7 @@ def _exercise_fused_expert_contract(source):
             return value
 
     scope["off_interface"] = lambda enabled, value, name: Offload(value)
-    exec(compile(ast.Module(body=[method], type_ignores=[]), "experts.py", "exec"), scope)
+    exec("from __future__ import annotations\n" + ast.unparse(method), scope)
     config = SimpleNamespace(
         fp8=False,
         fp4=False,
@@ -333,7 +340,9 @@ def _exercise_fused_expert_contract(source):
         calls.append(True)
         return value * 2
 
-    module = SimpleNamespace(config=config, _use_grouped_tensor=False, _fused_ops=(fused,))
+    module = SimpleNamespace(
+        config=config, _use_grouped_tensor=False, _fused_ops=(fused,), linear_fc2=SimpleNamespace(use_bias=False)
+    )
     result = scope["_fused_forward"](module, hidden, counts, probs)
     result.sum().backward()
     torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 2))

@@ -1,7 +1,8 @@
 diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py
+index fb268a0..fbe5970 100644
 --- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py
 +++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py
-@@ -186,7 +186,11 @@
+@@ -186,7 +186,11 @@ class Qwen3VLSelfAttention(SelfAttention):
              context_layer = out.view(out.size(0), out.size(1), -1)
              if gate is not None:
                  context_layer = self._apply_output_gate(context_layer, gate)
@@ -14,7 +15,7 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py b/me
              return output, bias
  
          if in_decode_mode and self.config.enable_cuda_graph and inference_context.is_static_batching():
-@@ -290,7 +294,7 @@
+@@ -290,7 +294,7 @@ class Qwen3VLSelfAttention(SelfAttention):
          else:
              if inference_context is None or inference_context.is_static_batching():
                  # Static batching attention kernel.
@@ -23,7 +24,7 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py b/me
                      query,
                      key,
                      value,
-@@ -337,7 +341,11 @@
+@@ -337,7 +341,11 @@ class Qwen3VLSelfAttention(SelfAttention):
          # =================
  
          nvtx_range_push(suffix="linear_proj")
@@ -37,6 +38,7 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py b/me
  
          return output, bias
 diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
+index a323cb4..f57e2f0 100644
 --- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
 +++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
 @@ -13,13 +13,14 @@
@@ -55,22 +57,22 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py b/megatro
      get_pos_emb_on_this_cp_rank,
  )
  from megatron.core.packed_seq_params import PackedSeqParams
-@@ -30,6 +31,14 @@
- 
- from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import Qwen3VLTransformerConfig
+@@ -32,6 +33,14 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import
  from megatron.bridge.training.utils.packed_seq_utils import get_packed_seq_q_cu_seqlens
-+
-+
+ 
+ 
 +def _apply_rotary_pos_emb_bshd(*args, **kwargs):
 +    recipe = sys.modules.get("relax.models.qwen3_5.recipe")
 +    if recipe is not None and recipe.active():
 +        from relax.models.qwen3_5.rotary_embedding import apply_rotary
 +        return apply_rotary(_native_apply_rotary_pos_emb_bshd, *args, **kwargs)
 +    return _native_apply_rotary_pos_emb_bshd(*args, **kwargs)
- 
- 
++
++
  def _get_flat_packed_ranges(
-@@ -253,6 +262,14 @@
+     input_ids: torch.Tensor,
+     packed_seq_params: PackedSeqParams | None,
+@@ -253,6 +262,14 @@ def _build_llm_rope_positions(
      video_index: int,
  ) -> tuple[torch.Tensor, int, int]:
      """Build Qwen3-VL MRoPE positions for one logical sample."""
@@ -86,12 +88,14 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py b/megatro
      vision_tokens = sample_input_ids[vision_start_indices + 1]
      image_nums = int((vision_tokens == image_token_id).sum().item())
 diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
+index 74855d7..5a6862a 100644
 --- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
 +++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
-@@ -519,7 +519,33 @@
+@@ -518,9 +518,35 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+         # args for deepstack
          visual_pos_masks: Optional[torch.Tensor] = None,
          deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
-     ):
++    ):
 +        from relax.utils.env import Envs
 +        if any(getattr(layer, "_relax_qsa_attention_retained", False) for layer in self.layers):
 +            from relax.models.qwen3_8.qsa_bridge_recompute import qsa_bridge_checkpointed_forward
@@ -113,16 +117,17 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block
 +        # args for deepstack
 +        visual_pos_masks: Optional[torch.Tensor] = None,
 +        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
-+    ):
+     ):
          """Forward method with activation checkpointing."""
-+
+ 
 +        checkpoint_mask = None
 +        if getattr(self.config, "_relax_qwen35_optimized", False):
 +            checkpoint_mask = tuple(getattr(packed_seq_params, "_qwen_recompute_mask"))
- 
++
          def custom(start: int, end: int):
              # Pipeline schedules may prepare a later microbatch before this checkpoint
-@@ -637,7 +663,9 @@
+             # replays. Keep each layer's PLE inputs with its own checkpoint closure.
+@@ -637,7 +663,9 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                  if self.config.fp8 and not hidden_states.requires_grad:
                      recompute_skip_num_layers += 1
                  if (
@@ -134,9 +139,10 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block
                  ):
                      hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
 diff --git a/megatron/core/distributed/finalize_model_grads.py b/megatron/core/distributed/finalize_model_grads.py
+index af268d1..ccbb3e5 100644
 --- a/megatron/core/distributed/finalize_model_grads.py
 +++ b/megatron/core/distributed/finalize_model_grads.py
-@@ -429,65 +429,8 @@
+@@ -467,65 +467,8 @@ def _allreduce_non_tensor_model_parallel_grads(
      gradients from modules with average_gradients_across_tp_domain=True
      across tensor-model-parallel ranks.
      """
@@ -204,67 +210,134 @@ diff --git a/megatron/core/distributed/finalize_model_grads.py b/megatron/core/d
  
  
  """
-diff --git a/megatron/core/fusions/linear_cross_entropy/blackwell/entry.py b/megatron/core/fusions/linear_cross_entropy/blackwell/entry.py
---- a/megatron/core/fusions/linear_cross_entropy/blackwell/entry.py
-+++ b/megatron/core/fusions/linear_cross_entropy/blackwell/entry.py
-@@ -2,6 +2,7 @@
- 
- import logging
- import os
-+import sys
- import typing
- from dataclasses import dataclass, field
- from functools import lru_cache
-@@ -36,6 +37,16 @@
-             default=int(os.environ.get("LCE_FWD_VOCAB_SPLIT_SIZE", 512 * 6))
-         )
- 
-+    def _qwen35_recipe_active():
-+        recipe = sys.modules.get("relax.models.qwen3_5.recipe")
-+        return recipe is not None and recipe.active()
+diff --git a/megatron/core/fusions/fused_linear_cross_entropy.py b/megatron/core/fusions/fused_linear_cross_entropy.py
+new file mode 100644
+index 0000000..4570f5d
+--- /dev/null
++++ b/megatron/core/fusions/fused_linear_cross_entropy.py
+@@ -0,0 +1,36 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++"""Bridge the combined output head to Relax's Blackwell linear CE kernel."""
 +
-+    def _backward_vocab_split():
-+        if _qwen35_recipe_active():
-+            from relax.models.qwen3_5.loss_config import VOCAB_PER_SPLIT
-+            return VOCAB_PER_SPLIT
-+        return int(os.environ.get("LCE_BWD_VOCAB_SPLIT_SIZE", 512 * 6))
++from typing import Literal, Optional
 +
-     @dataclass
-     class BwdConfig:
-         """
-@@ -44,7 +55,7 @@
++import torch
++
++
++def linear_cross_entropy(
++    hidden: torch.Tensor,
++    weight: torch.Tensor,
++    labels: torch.Tensor,
++    tp_group: Optional[torch.distributed.ProcessGroup] = None,
++    reduction: Literal["none", "sum", "mean"] = "mean",
++    ignore_index: int = -100,
++    sequence_parallel: bool = False,
++) -> torch.Tensor:
++    """Compute loss over a vocabulary shard, gathering SP rows if needed."""
++    from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
++
++    from relax.backends.megatron.kernels.linear_cross_entropy import linear_cross_entropy as kernel
++
++    if sequence_parallel:
++        hidden = gather_from_sequence_parallel_region(
++            hidden, tensor_parallel_output_grad=False, group=tp_group
++        )
++    if ignore_index != -100:
++        labels = labels.masked_fill(labels == ignore_index, -100)
++    losses, _ = kernel(hidden, weight, labels, tp_group, accumulate=False, return_logits=False)
++    if reduction == "none":
++        return losses
++    if reduction == "sum":
++        return losses.sum()
++    if reduction == "mean":
++        return losses.sum() / labels.ne(-100).sum()
++    raise ValueError(f"Unsupported reduction {reduction!r}")
+diff --git a/megatron/core/model_parallel_config.py b/megatron/core/model_parallel_config.py
+index 2c7b26d..15fe470 100644
+--- a/megatron/core/model_parallel_config.py
++++ b/megatron/core/model_parallel_config.py
+@@ -357,7 +357,7 @@ class ModelParallelConfig:
+        Defaults to False.
+     """
  
-         _bwd_kernel: typing.Dict[str, cute.kernel] = field(default_factory=dict)
-         _vocab_per_split: int = field(
--            default=int(os.environ.get("LCE_BWD_VOCAB_SPLIT_SIZE", 512 * 6))
-+            default_factory=_backward_vocab_split
+-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
++    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
+     """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
+        from Transformer Engine library is used. Defaults to 'native'.
+     """
+diff --git a/megatron/core/models/backends.py b/megatron/core/models/backends.py
+index a35b473..5a1852a 100644
+--- a/megatron/core/models/backends.py
++++ b/megatron/core/models/backends.py
+@@ -78,14 +78,14 @@ def select_cross_entropy(
+     Shared by every provider: the choice depends on the config, not on which backend supplies
+     the rest of the model, which is how it behaved before this was a provider decision.
+     """
+-    if cross_entropy_fusion_impl not in ("native", "te"):
++    if cross_entropy_fusion_impl not in ("native", "te", "linear"):
+         raise ValueError(
+             f"unknown cross_entropy_fusion_impl={cross_entropy_fusion_impl!r}. "
+             "Valid choices: native, te"
          )
-         _backward_method: utils.BackwardMethodEnum = field(
-             default=utils.BackwardMethodEnum.kDlogitsSplitN
-@@ -157,9 +168,15 @@
-                 _logprobs.zero_()
-         assert _max.is_contiguous() and _accu.is_contiguous() and _logprobs.is_contiguous()
+     if not cross_entropy_loss_fusion:
+         return unfused_cross_entropy
+-    if cross_entropy_fusion_impl == "native":
++    if cross_entropy_fusion_impl in ("native", "linear"):
+         return _fused_ce
  
--        triton_kernels.get_num_valid_tokens[(1,)](
--            num_tokens, ignore_index, labels_view, labels_view.stride(0), num_valid_tokens
--        )
-+        if _qwen35_recipe_active():
-+            triton_kernels.get_num_valid_tokens.fn[(1,)](
-+                num_tokens, ignore_index, labels_view, labels_view.stride(0), num_valid_tokens,
-+                BLOCK_SIZE_M=2048, num_warps=32, num_stages=3,
-+            )
-+        else:
-+            triton_kernels.get_num_valid_tokens[(1,)](
-+                num_tokens, ignore_index, labels_view, labels_view.stride(0), num_valid_tokens
-+            )
+     # Full-iteration CUDA graphs capture the loss too, which TE only supports from 2.7.0.
+diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
+index 554add8..a402172 100644
+--- a/megatron/core/models/gpt/gpt_model.py
++++ b/megatron/core/models/gpt/gpt_model.py
+@@ -31,6 +31,7 @@ from megatron.core.quantization.utils import get_quant_config_or_none
+ from megatron.core.tensor_observation import observe_tensor
+ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+ from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
++from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
+ from megatron.core.transformer.module import GraphableMegatronModule
+ from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
+ from megatron.core.transformer.multi_token_prediction import (
+@@ -322,6 +323,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
+                 if is_mxfp8_output_proj_active(config)
+                 else tensor_parallel.ColumnParallelLinear
+             )
++            if config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear":
++                if is_mxfp8_output_proj_active(config):
++                    raise ValueError("Fused linear CE requires a BF16 output projection")
++                output_layer_cls = LinearCrossEntropyModule
+             self.output_layer = output_layer_cls(
+                 config.hidden_size,
+                 self.vocab_size,
+@@ -918,6 +923,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
+                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                     input_ids=input_ids,
+                     mtp_input_mask=mtp_input_mask,
++                    sequence_roll_context=sequence_roll_context,
++                    runtime_gather_output=runtime_gather_output,
+                     metric_avg_group=(
+                         getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+                         or self.pg_collection.dp_cp
+@@ -945,6 +952,14 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
+                 config=self.config,
+             )
  
-         # need to compile the kernel for the first time
-         hidden_packed = from_dlpack(
++        if labels is not None and isinstance(self.output_layer, LinearCrossEntropyModule):
++            return self.output_layer(
++                hidden_states,
++                weight=output_weight,
++                output_cross_entropy_loss=True,
++                labels=labels,
++            )
++
+         if (
+             in_inference_mode
+             and inference_context is not None
 diff --git a/megatron/core/models/hybrid/hybrid_block.py b/megatron/core/models/hybrid/hybrid_block.py
-index a5738fec9..1d7dadd35 100644
+index 0e07923..2e6edf4 100644
 --- a/megatron/core/models/hybrid/hybrid_block.py
 +++ b/megatron/core/models/hybrid/hybrid_block.py
-@@ -1386,7 +1386,12 @@ class HybridStack(MegatronModule):
+@@ -690,7 +690,12 @@ class HybridStack(MegatronModule):
  
          with outer_fp8_context:
              if self.config.recompute_granularity == 'full' and self.training:
@@ -279,9 +352,10 @@ index a5738fec9..1d7dadd35 100644
                      hidden_states=hidden_states,
                      attention_mask=attention_mask,
 diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+index e1a0b88..d3fa704 100644
 --- a/megatron/core/optimizer/optimizer.py
 +++ b/megatron/core/optimizer/optimizer.py
-@@ -2034,7 +2034,7 @@
+@@ -1983,7 +1983,7 @@ class ChainedOptimizer(MegatronOptimizer):
          grad_norm = self.get_grad_norm()
          _relax_threshold_norm = grad_norm
          if getattr(self, "_relax_qwen35_optimized", False):
@@ -290,65 +364,15 @@ diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/opti
  
              _relax_threshold_norm = finite_norm(grad_norm)
          should_skip_update = False
-diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_delta_net/gdn.py
---- a/megatron/core/ssm/gated_delta_net/gdn.py
-+++ b/megatron/core/ssm/gated_delta_net/gdn.py
-@@ -308,7 +308,11 @@
-         """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
-         # Input projection
-         nvtx_range_push(suffix="in_proj")
--        qkvzba, _ = self.in_proj(hidden_states)
-+        if getattr(self.config, "_relax_qwen35_optimized", False):
-+            from relax.models.qwen3_5.projection_hooks import run_projection
-+            qkvzba, _ = run_projection(self.in_proj, hidden_states, self.in_proj)
-+        else:
-+            qkvzba, _ = self.in_proj(hidden_states)
-         nvtx_range_pop(suffix="in_proj")
- 
-         qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
-@@ -388,7 +392,10 @@
-             nvtx_range_pop(suffix="pre_gated_delta_rule")
- 
-         nvtx_range_push(suffix="gated_delta_rule")
--        core_attn_out, _ = self.gated_delta_rule(
-+        rule = self.gated_delta_rule
-+        if getattr(self.config, "_relax_qwen35_optimized", False):
-+            from relax.models.qwen3_5.gdn_backend import rule
-+        core_attn_out, _ = rule(
-             **kernel_inputs,
-             initial_state=None,
-             output_final_state=False,
-@@ -430,7 +437,11 @@
- 
-         # Output projection
-         nvtx_range_push(suffix="out_proj")
--        out, out_bias = self.out_proj(norm_out)
-+        if getattr(self.config, "_relax_qwen35_optimized", False):
-+            from relax.models.qwen3_5.projection_hooks import run_projection
-+            out, out_bias = run_projection(self.out_proj, norm_out, self.out_proj)
-+        else:
-+            out, out_bias = self.out_proj(norm_out)
-         nvtx_range_pop(suffix="out_proj")
- 
-         if self.recompute_norm_out and self.training:
-@@ -476,6 +487,10 @@
-     ):
-         """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
- 
-+        if getattr(self.config, "_relax_qwen35_optimized", False):
-+            from relax.models.qwen3_5.gdn_preprocessing import pre
-+            return pre(self, qkvzba, batch, seq_len, cp_size_headwise,
-+                       cp_group_headwise, cu_seqlens_q, chunkwise_cp_context, packed_seq_params)
-         qkvzba = qkvzba.transpose(0, 1)
-         qkv, gate, beta, alpha = torch.split(
-             qkvzba, self._get_feat_dim_split(cp_size_headwise), dim=-1
 diff --git a/megatron/core/tensor_parallel/random.py b/megatron/core/tensor_parallel/random.py
+index cd0dcd9..34c66c9 100644
 --- a/megatron/core/tensor_parallel/random.py
 +++ b/megatron/core/tensor_parallel/random.py
-@@ -674,6 +674,20 @@
+@@ -686,6 +686,20 @@ class CheckpointFunction(torch.autograd.Function):
+         run_function: Callable[[Unpack[_Ts]], _R],
          distribute_saved_activations: bool,
          *args: Unpack[_Ts],
-     ) -> _R:
++    ) -> _R:
 +        from relax.utils.env import Envs
 +        if Envs.RELAX_QWEN38_QSA_RECOMPUTE_REPLAY:
 +            from relax.models.qwen3_8.qsa_cp import _checkpoint_forward
@@ -362,15 +386,23 @@ diff --git a/megatron/core/tensor_parallel/random.py b/megatron/core/tensor_para
 +        run_function: Callable[[Unpack[_Ts]], _R],
 +        distribute_saved_activations: bool,
 +        *args: Unpack[_Ts],
-+    ) -> _R:
+     ) -> _R:
          """Forward pass."""
          _set_checkpointing()
- 
 diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
-index c2cb86ead..3c002bfb0 100644
+index b5aff47..4b846b9 100644
 --- a/megatron/core/transformer/attention.py
 +++ b/megatron/core/transformer/attention.py
-@@ -592,6 +592,11 @@ class Attention(MegatronModule, ABC):
+@@ -10,6 +10,8 @@ from typing import Callable, Optional, Protocol, Tuple, Union
+ import torch
+ from torch import Tensor
+ 
++from megatron.core.dist_checkpointing import ShardedTensor
++from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedStateDict, ShardedTensorFactory
+ from megatron.core import tensor_parallel
+ from megatron.core.extensions.transformer_engine import HAVE_TE
+ from megatron.core.inference.contexts import BaseInferenceContext
+@@ -509,6 +511,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
          **extra_kwargs,
      ):
          """Run the configured core attention module."""
@@ -382,20 +414,36 @@ index c2cb86ead..3c002bfb0 100644
          return apply_module(self.core_attention)(
              query,
              key,
-@@ -1542,7 +1547,11 @@ class Attention(MegatronModule, ABC):
+@@ -1454,6 +1461,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
+                 self.config.fused_single_qkv_rope and split_qkv
+             ), "fused_single_qkv_rope requested but not available/supported for the config."
+ 
++        head_wise_gate_enabled = self.config.head_wise_attn_gate and self.attention_type != "cross"
++        if head_wise_gate_enabled and not split_qkv:
++            raise ValueError("head_wise_attn_gate requires split QKV")
++        qkv_kwargs = {"head_wise_gate": True} if head_wise_gate_enabled else {}
++
+         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+         with qkv_linear_manager as hidden_states:
+             qkv_output = self.get_query_key_value_tensors(
+@@ -1461,12 +1473,16 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
+                 key_value_states,
+                 split_qkv=split_qkv,
+                 output_gate=self.config.attention_output_gate,
++                **qkv_kwargs,
              )
-             out = output.transpose(0, 1).contiguous()
-             context_layer = out.view(out.size(0), out.size(1), -1)
--            output, bias = apply_module(self.linear_proj)(context_layer)
-+            if getattr(self.config, "_relax_qwen35_optimized", False):
-+                from relax.models.qwen3_5.projection_hooks import run_projection
-+                output, bias = run_projection(self.linear_proj, context_layer, apply_module(self.linear_proj))
-+            else:
-+                output, bias = apply_module(self.linear_proj)(context_layer)
-             if back_to_input_converter is not None:
-                 output = back_to_input_converter.convert(
-                     output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
-@@ -1667,7 +1676,7 @@ class Attention(MegatronModule, ABC):
+         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
+         attn_mask_type = self.attn_mask_type
+         block_table = None
+         gate = None
++        head_wise_gate = None
++        if head_wise_gate_enabled:
++            *qkv_output, head_wise_gate = qkv_output
+         if split_qkv:
+             if self.config.attention_output_gate:
+                 query, key, value, gate = qkv_output
+@@ -1637,7 +1653,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
              if inference_context is None or inference_context.is_static_batching():
                  # Static batching attention kernel.
                  with core_attn_manager as query:
@@ -404,7 +452,24 @@ index c2cb86ead..3c002bfb0 100644
                          query,
                          key,
                          value,
-@@ -1736,7 +1745,11 @@ class Attention(MegatronModule, ABC):
+@@ -1684,6 +1700,16 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
+             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+         nvtx_range_pop(suffix="core_attention")
+ 
++        if head_wise_gate is not None:
++            nvtx_range_push(suffix="head_wise_attn_gate")
++            gate_states = head_wise_gate.view(*head_wise_gate.shape[:2], -1, 1)
++            core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)
++            core_attn_out = core_attn_out * torch.sigmoid(gate_states.float()).to(
++                core_attn_out.dtype
++            )
++            core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)
++            nvtx_range_pop(suffix="head_wise_attn_gate")
++
+         # Output gate
+         if gate is not None:
+             nvtx_range_push(suffix="output_gate")
+@@ -1697,7 +1723,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
          nvtx_range_push(suffix="linear_proj")
          attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
          with attn_proj_manager as core_attn_out:
@@ -417,9 +482,9 @@ index c2cb86ead..3c002bfb0 100644
          output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
          nvtx_range_pop(suffix="linear_proj")
  
-@@ -1748,8 +1761,14 @@ class Attention(MegatronModule, ABC):
-         self.pg_collection.cp = _orig_cp_group
-         return output, bias
+@@ -1708,8 +1738,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
+         """Run core attention followed by the output projection."""
+         return self.forward_post_core_attn(self.forward_pre_attn_and_core_attn(*args, **kwargs))
  
 -    @jit_fuser
      def _apply_output_gate(self, x, gate):
@@ -433,10 +498,44 @@ index c2cb86ead..3c002bfb0 100644
          x_dtype = x.dtype
          gate = gate.contiguous()
          gate = gate.view(*x.shape)
-@@ -1958,6 +1977,14 @@ class SelfAttention(Attention):
+@@ -1768,6 +1804,19 @@ class SelfAttention(Attention):
+         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
+         if self.config.attention_output_gate:
+             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
++        if self.config.head_wise_attn_gate:
++            # Defensive runtime guards against config-validation bypass; same
++            # invariants enforced earlier in TransformerConfig.__post_init__.
++            tp_world_size = get_pg_size(self.pg_collection.tp)
++            assert self.config.num_query_groups >= tp_world_size, (
++                f"head_wise_attn_gate requires num_query_groups "
++                f"({self.config.num_query_groups}) >= tp world_size ({tp_world_size})"
++            )
++            assert self.config.num_attention_heads % tp_world_size == 0, (
++                f"head_wise_attn_gate requires num_attention_heads "
++                f"({self.config.num_attention_heads}) % tp world_size ({tp_world_size}) == 0"
++            )
++            self.linear_qkv_out_dim += self.config.num_attention_heads
+         self.linear_qkv = submodules.linear_qkv(
+             self.config.hidden_size,
+             self.linear_qkv_out_dim,
+@@ -1900,31 +1949,31 @@ class SelfAttention(Attention):
+                 "TP",
              )
  
-     def get_query_key_value_tensors(self, hidden_states: Tensor, key_value_states: Tensor | None=None, output_gate: bool=False, head_wise_gate: bool=False, split_qkv: bool=True) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, list[int]]:
+-    def get_query_key_value_tensors(
+-        self,
+-        hidden_states: Tensor,
+-        key_value_states: Tensor | None = None,
+-        output_gate: bool = False,
+-        head_wise_gate: bool = False,
+-        split_qkv: bool = True,
+-    ) -> (
+-        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
+-        | tuple[Tensor, Tensor, Tensor, Tensor]
+-        | tuple[Tensor, Tensor, Tensor]
+-        | tuple[Tensor, list[int]]
+-    ):
++    def get_query_key_value_tensors(self, hidden_states: Tensor, key_value_states: Tensor | None=None, output_gate: bool=False, head_wise_gate: bool=False, split_qkv: bool=True) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, list[int]]:
 +        from relax.utils.env import Envs
 +        if Envs.RELAX_QWEN38_QSA_ROUTED_QKV:
 +            from relax.models.qwen3_8.qsa_routed_qkv import forward
@@ -447,9 +546,8 @@ index c2cb86ead..3c002bfb0 100644
 +    def _relax_native_get_query_key_value_tensors(self, hidden_states: Tensor, key_value_states: Tensor | None=None, output_gate: bool=False, head_wise_gate: bool=False, split_qkv: bool=True) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, list[int]]:
          """
          Derives `query`, `key` and `value` tensors from `hidden_states`.
-         If `output_gate` is True, also returns a per-head head_dim gate.
-@@ -1965,12 +1992,16 @@ class SelfAttention(Attention):
-         If `split_qkv=False`, returns the unsplit mixed_qkv tensor.
+         If `output_gate` is True, then also derives `gate` tensor.
+         If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
          """
          if getattr(self, '_qwen_qkv_fused', False):
 -            from relax.backends.megatron.megatron_patch.qwen3_5.qkv_transform import _supported as _qwen_extract_supported
@@ -468,13 +566,100 @@ index c2cb86ead..3c002bfb0 100644
          if getattr(self, '_qwen_qkv_fused', False) and _qwen_extract_supported(self, mixed_qkv, key_value_states, output_gate, head_wise_gate, split_qkv):
              query, key, value, gate = _qwen_extract(mixed_qkv, self._qwen_kv_pair_group)
              if self.q_layernorm is not None:
+@@ -2112,6 +2161,84 @@ class SelfAttention(Attention):
+         return weight_updated
+ 
+ 
++    def sharded_state_dict(
++        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
++    ) -> ShardedStateDict:
++        """Wrap linear_qkv.{weight,bias} with a factory that reshards QKV and
++        gate sub-blocks independently, analogous to apply_swiglu_sharded_factory."""
++        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
++        if self.config.head_wise_attn_gate:
++            qkv_size = self.query_projection_size + 2 * self.kv_projection_size
++            gate_size = self.config.num_attention_heads
++            for sub_name in ("weight", "bias"):
++                key = f"{prefix}linear_qkv.{sub_name}"
++                if key in sharded_state_dict:
++                    sharded_state_dict[key] = apply_head_wise_attn_gate_sharded_factory(
++                        sharded_state_dict[key], sharded_offsets, qkv_size, gate_size
++                    )
++        return sharded_state_dict
++
++
++# pylint: disable=missing-function-docstring
++def apply_head_wise_attn_gate_sharded_factory(
++    original_sh_ten, sharded_offsets, qkv_size: int, gate_size: int
++):
++    """Split linear_qkv.{weight,bias} into QKV and gate sub-tensors with
++    distinct keys so each is resharded independently along axis 0 across TP.
++    Default {"weight": 0} sharding would otherwise re-balance the QKV/gate
++    boundary on TP change and turn V/K rows into gate rows (silent miscompute).
++    Same pattern as apply_swiglu_sharded_factory, but with unequal sub-block
++    sizes (QKV >> gate)."""
++    shard_axis = 0
++    prepend_axis_num = len(sharded_offsets)
++    local_axis_size = original_sh_ten.local_shape[shard_axis]
++    axis_frag = original_sh_ten.axis_fragmentations[shard_axis + prepend_axis_num]
++
++    qkv_local_size, qkv_rem = divmod(qkv_size, axis_frag)
++    gate_local_size, gate_rem = divmod(gate_size, axis_frag)
++    assert qkv_rem == 0 and gate_rem == 0, (
++        f"head_wise_attn_gate dist-ckpt requires QKV ({qkv_size}) and gate "
++        f"({gate_size}) divisible by TP world_size ({axis_frag})."
++    )
++    assert local_axis_size == qkv_local_size + gate_local_size
++    rank_offset = original_sh_ten.global_offset[shard_axis + prepend_axis_num] // local_axis_size
++
++    @torch.no_grad()
++    def sh_ten_build_fn(
++        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
++    ):
++        tensor_qkv, tensor_gate = torch.split(t, [qkv_local_size, gate_local_size], dim=shard_axis)
++        offset_qkv = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
++        offset_gate = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
++        return [
++            ShardedTensor.from_rank_offsets(
++                f"{key}._qkv",
++                tensor_qkv,
++                *sharded_offsets,
++                offset_qkv,
++                replica_id=replica_id,
++                prepend_axis_num=prepend_axis_num,
++            ),
++            ShardedTensor.from_rank_offsets(
++                f"{key}._gate",
++                tensor_gate,
++                *sharded_offsets,
++                offset_gate,
++                replica_id=replica_id,
++                prepend_axis_num=prepend_axis_num,
++            ),
++        ]
++
++    return ShardedTensorFactory(
++        original_sh_ten.key,
++        original_sh_ten.data,
++        sh_ten_build_fn,
++        torch.cat,
++        original_sh_ten.replica_id,
++        flattened_range=original_sh_ten.flattened_range,
++    )
++
++
+ class CrossAttention(Attention):
+     """Cross-attention layer class
+ 
 diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/megatron/core/transformer/experimental_attention_variant/qsa.py
+index 80539e4..29d1050 100644
 --- a/megatron/core/transformer/experimental_attention_variant/qsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/qsa.py
-@@ -184,6 +184,20 @@
+@@ -183,6 +183,20 @@ def _sequence_layout(
+     packed_seq_params: Optional[PackedSeqParams],
      device,
      stage2_max_doc_len: Optional[int] = None,
- ) -> Tuple[Tensor, Tensor, int]:
++) -> Tuple[Tensor, Tensor, int]:
 +    from relax.utils.env import Envs
 +    if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
 +        from relax.models.qwen3_8.qsa_cpu_layout import _sequence_layout
@@ -488,15 +673,13 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
 +    packed_seq_params: Optional[PackedSeqParams],
 +    device,
 +    stage2_max_doc_len: Optional[int] = None,
-+) -> Tuple[Tensor, Tensor, int]:
+ ) -> Tuple[Tensor, Tensor, int]:
      """Document ids and in-document positions for every token.
  
-     Returns ``(doc_ids [b, s], positions [b, s], max_doc_len)`` as int32 tensors.
-@@ -318,6 +332,16 @@
-         return torch.cat([rotated.view_as(x_rot), x_pass], dim=-1)
+@@ -319,6 +333,16 @@ class QSAIndexer(MegatronModule):
  
      def _pool_keys(
-+        self, raw_keys: Tensor, doc_ids: Tensor, positions: Tensor, max_doc_len: int
+         self, raw_keys: Tensor, doc_ids: Tensor, positions: Tensor, max_doc_len: int
 +    ) -> Tuple[Tensor, Tensor, Tensor]:
 +        from relax.utils.env import Envs
 +        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or Envs.RELAX_QWEN38_QSA_FIXED_POOL:
@@ -506,21 +689,14 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
 +        return self._relax_native_pool_keys(raw_keys, doc_ids, positions, max_doc_len)
 +
 +    def _relax_native_pool_keys(
-         self, raw_keys: Tensor, doc_ids: Tensor, positions: Tensor, max_doc_len: int
++        self, raw_keys: Tensor, doc_ids: Tensor, positions: Tensor, max_doc_len: int
      ) -> Tuple[Tensor, Tensor, Tensor]:
          """Mean-pool complete blocks of ``compress_ratio`` consecutive tokens per document.
-@@ -422,6 +446,23 @@
  
-     @torch.no_grad()
-     def _select_blocks(
-+        self,
-+        q: Tensor,
-+        pooled_keys: Tensor,
-+        block_valid: Tensor,
-+        doc_ids: Tensor,
-+        positions: Tensor,
-+        uniform_doc_len: Optional[int] = None,
-+        output_format: str = "bits",
+@@ -430,6 +454,23 @@ class QSAIndexer(MegatronModule):
+         positions: Tensor,
+         uniform_doc_len: Optional[int] = None,
+         output_format: str = "bits",
 +    ) -> Tuple[Tensor, bool]:
 +        from relax.utils.env import Envs
 +        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or Envs.RELAX_QWEN38_QSA_FUSED_SELECTOR:
@@ -530,18 +706,21 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
 +        return self._relax_native_select_blocks(q, pooled_keys, block_valid, doc_ids, positions, uniform_doc_len, output_format)
 +
 +    def _relax_native_select_blocks(
-         self,
-         q: Tensor,
-         pooled_keys: Tensor,
-@@ -565,6 +606,21 @@
- 
-     # ------------------------------------------------------------------ forward
-     def forward(
 +        self,
-+        hidden_states: Tensor,
-+        rotary_pos_emb: Optional[Tensor],
-+        packed_seq_params: Optional[PackedSeqParams] = None,
++        q: Tensor,
++        pooled_keys: Tensor,
++        block_valid: Tensor,
++        doc_ids: Tensor,
++        positions: Tensor,
++        uniform_doc_len: Optional[int] = None,
 +        output_format: str = "bits",
+     ) -> Tuple[Tensor, bool]:
+         """Top-k complete blocks per query.
+ 
+@@ -570,6 +611,21 @@ class QSAIndexer(MegatronModule):
+         rotary_pos_emb: Optional[Tensor],
+         packed_seq_params: Optional[PackedSeqParams] = None,
+         output_format: str = "bits",
 +    ) -> QSASelection:
 +        from relax.utils.env import Envs
 +        import os
@@ -552,10 +731,15 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
 +        return self._relax_native_forward(hidden_states, rotary_pos_emb, packed_seq_params, output_format)
 +
 +    def _relax_native_forward(
-         self,
-         hidden_states: Tensor,
-         rotary_pos_emb: Optional[Tensor],
-@@ -824,7 +880,15 @@
++        self,
++        hidden_states: Tensor,
++        rotary_pos_emb: Optional[Tensor],
++        packed_seq_params: Optional[PackedSeqParams] = None,
++        output_format: str = "bits",
+     ) -> QSASelection:
+         """Compute the block selection.
+ 
+@@ -824,7 +880,15 @@ class QSACoreAttention(torch.nn.Module):
              **kwargs,
          )
          self._selection: Optional[QSASelection] = None
@@ -572,10 +756,11 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
  
      def set_selection(self, selection: Optional[QSASelection]) -> None:
          """Register the block selection consumed by the next forward call."""
-@@ -945,6 +1009,16 @@
+@@ -944,6 +1008,16 @@ class QSACoreAttention(torch.nn.Module):
+ 
      def _id_sparse_forward(
          self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
-     ) -> Tensor:
++    ) -> Tensor:
 +        from relax.utils.env import Envs
 +        if Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND:
 +            from relax.models.qwen3_8.qsa_community import _community_id_sparse_forward
@@ -585,15 +770,13 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
 +
 +    def _relax_native_id_sparse_forward(
 +        self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
-+    ) -> Tensor:
+     ) -> Tensor:
          """Run the experimental selected-ID kernel on the current full-sequence order."""
          from megatron.core.transformer.experimental_attention_variant.qsa_id_sparse import (
-             qsa_sparse_attention_id,
-@@ -976,6 +1050,16 @@
-         return out.permute(2, 0, 1, 3).reshape(s, b, hq * d)
+@@ -977,6 +1051,16 @@ class QSACoreAttention(torch.nn.Module):
  
      def _flex_forward(
-+        self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
+         self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
 +    ) -> Tensor:
 +        from relax.utils.env import Envs
 +        if Envs.RELAX_QWEN38_QSA_SPARSE_BLOCKMASK or Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION:
@@ -603,13 +786,15 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
 +        return self._relax_native_flex_forward(query, key, value, selection, is_thd)
 +
 +    def _relax_native_flex_forward(
-         self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
++        self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
      ) -> Tensor:
          if not HAVE_FLEX_ATTENTION:
-@@ -1112,6 +1196,27 @@
+             raise RuntimeError("QSA sparse attention requires torch.nn.attention.flex_attention")
+@@ -1111,6 +1195,27 @@ class QSACoreAttention(torch.nn.Module):
+         qsa_selection: Optional[QSASelection] = None,
          qsa_index_query: Optional[Tensor] = None,
          qsa_compressed_key: Optional[Tensor] = None,
-     ) -> Tensor:
++    ) -> Tensor:
 +        from relax.utils.env import Envs
 +        if Envs.RELAX_QWEN38_QSA_LOCAL_QUERY:
 +            from relax.models.qwen3_8.qsa_cp import _core_forward
@@ -630,15 +815,14 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
 +        qsa_selection: Optional[QSASelection] = None,
 +        qsa_index_query: Optional[Tensor] = None,
 +        qsa_compressed_key: Optional[Tensor] = None,
-+    ) -> Tensor:
+     ) -> Tensor:
          """Attention over the selected tokens.
  
-         ``query``/``key``/``value`` are ``[s, b, h, d]`` (sbhd) or ``[t, h, d]`` (thd); the output
 diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
-index 10dc93e92..1b640cde8 100644
+index f409eaf..0a148cc 100644
 --- a/megatron/core/transformer/hyper_connection.py
 +++ b/megatron/core/transformer/hyper_connection.py
-@@ -1020,6 +1020,11 @@ class GatedResidualHyperConnection(MegatronModule):
+@@ -966,6 +966,11 @@ class GatedResidualHyperConnection(MegatronModule):
                  setattr(param, 'sequence_parallel', True)
  
      def _mix(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
@@ -650,7 +834,7 @@ index 10dc93e92..1b640cde8 100644
          s, b, nC = hidden_states.shape
          n, C = self.n, self.hidden_size
          xn = gated_residual_group_rmsnorm(hidden_states, self.hc_norm.weight, n, self.norm_eps)
-@@ -1062,6 +1067,12 @@ class GatedResidualHyperConnection(MegatronModule):
+@@ -1008,6 +1013,12 @@ class GatedResidualHyperConnection(MegatronModule):
      def _inject(
          residual: Tensor, inject: Tensor, x: Tensor, bias: Optional[Tensor], n: int
      ) -> Tensor:
@@ -663,10 +847,93 @@ index 10dc93e92..1b640cde8 100644
          s, b, nC = residual.shape
          out = x.float()
          if bias is not None:
+diff --git a/megatron/core/transformer/linear_cross_entropy.py b/megatron/core/transformer/linear_cross_entropy.py
+new file mode 100644
+index 0000000..e7afe32
+--- /dev/null
++++ b/megatron/core/transformer/linear_cross_entropy.py
+@@ -0,0 +1,76 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++
++from typing import Literal, Optional, Tuple, Union
++
++import torch
++
++from megatron.core import tensor_parallel
++from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
++
++
++class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
++    """
++    A module that combines a ColumnParallelLinear layer with fused
++    linear + cross-entropy loss computation over a tensor-parallel vocabulary.
++    """
++
++    def forward(
++        self,
++        input_: torch.Tensor,
++        weight: Optional[torch.Tensor] = None,
++        runtime_gather_output: Optional[bool] = None,
++        output_cross_entropy_loss: bool = False,
++        labels: Optional[torch.Tensor] = None,
++        reduction: Literal["none", "sum", "mean"] = "none",
++        ignore_index: int = -100,
++    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
++        """Run either the plain ColumnParallelLinear or fused linear+cross-entropy."""
++        if output_cross_entropy_loss:
++            assert labels is not None, "labels cannot be None when outputting cross-entropy loss."
++            return self._compute_linear_and_cross_entropy_loss(
++                hidden=input_,
++                weight=weight if weight is not None else self.weight,
++                labels=labels,
++                reduction=reduction,
++                ignore_index=ignore_index,
++            )
++
++        # Fall back to standard ColumnParallelLinear forward.
++        # ColumnParallelLinear.forward returns (output, bias) or just output
++        # depending on configuration, so keep the return type as Tensor.
++        return super().forward(input_, weight, runtime_gather_output)
++
++    def _compute_linear_and_cross_entropy_loss(
++        self,
++        hidden: torch.Tensor,
++        weight: torch.Tensor,
++        labels: Optional[torch.Tensor] = None,
++        reduction: Literal["none", "sum", "mean"] = "none",
++        ignore_index: int = -100,
++    ) -> torch.Tensor:
++        """Compute fused linear + cross-entropy over tensor-parallel vocab."""
++        assert self.config.cross_entropy_loss_fusion, "Cross-entropy loss fusion must be enabled."
++        assert self.config.cross_entropy_fusion_impl == "linear", (
++            "Cross-entropy loss fusion implementation must be 'linear' to use "
++            "_compute_linear_and_cross_entropy_loss."
++        )
++        assert weight is not None, "weight cannot be None when using fused linear cross entropy."
++        assert labels is not None, "labels cannot be None when using fused linear cross entropy."
++
++        # [b s] => [s b]
++        labels = labels.transpose(0, 1).contiguous()
++        loss = linear_cross_entropy(
++            hidden,
++            weight,
++            labels,
++            sequence_parallel=self.sequence_parallel,
++            reduction=reduction,
++            ignore_index=ignore_index,
++            tp_group=self.tp_group,
++        )
++        # If reduction != "none" this will be a scalar; for "none" it should
++        # match [s, b] and can be reshaped back to [b, s].
++        if reduction == "none":
++            loss = loss.view_as(labels).transpose(0, 1).contiguous()
++
++        return loss
 diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transformer/moe/experts.py
+index 0988ad0..ed0bd7a 100644
 --- a/megatron/core/transformer/moe/experts.py
 +++ b/megatron/core/transformer/moe/experts.py
-@@ -500,6 +500,13 @@
+@@ -581,6 +581,13 @@ class TEGroupedMLP(MegatronModule):
          # Container for fusible ops
          ops = te.pytorch.ops.Sequential()
  
@@ -680,7 +947,7 @@ diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transforme
          # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
          fc1_single_grouped_weight = self.linear_fc1.single_grouped_weight
          fc1_weight_dtype = (
-@@ -524,7 +531,7 @@
+@@ -605,7 +612,7 @@ class TEGroupedMLP(MegatronModule):
  
          # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
          # Using meta avoids allocating duplicate weights for the fused wrapper.
@@ -689,31 +956,31 @@ diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transforme
              self.linear_fc1.num_gemms,
              self.linear_fc1.in_features,
              self.linear_fc1.out_features,
-@@ -576,12 +583,12 @@
-                 "activation_recompute_in_mlp"
-                 in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
-             ):
--                op = te.pytorch.ops.ScaledSwiGLU(
-+                op = scaled_swiglu(
-                     glu_interleave_size=glu_interleave,
-                     activation_recompute_in_mlp=activation_recompute_in_mlp,
-                 )
-             else:
--                op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
-+                op = scaled_swiglu(glu_interleave_size=glu_interleave)
+@@ -655,12 +662,12 @@ class TEGroupedMLP(MegatronModule):
+                     "activation_recompute_in_mlp"
+                     in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
+                 ):
+-                    op = te.pytorch.ops.ScaledSwiGLU(
++                    op = scaled_swiglu(
+                         glu_interleave_size=glu_interleave,
+                         activation_recompute_in_mlp=activation_recompute_in_mlp,
+                     )
+                 else:
+-                    op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
++                    op = scaled_swiglu(glu_interleave_size=glu_interleave)
          elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
              clamp = self.config.activation_func_clamp_value
              if clamp is not None:
-@@ -632,7 +639,7 @@
-         ops.append(op)
+@@ -712,7 +719,7 @@ class TEGroupedMLP(MegatronModule):
  
          # FC2
+         fc2_bias_kwargs = {"scale_bias": True} if self.linear_fc2.use_bias else {}
 -        op = te.pytorch.ops.GroupedLinear(
 +        op = grouped_linear(
              self.linear_fc2.num_gemms,
              self.linear_fc2.in_features,
              self.linear_fc2.out_features,
-@@ -825,7 +832,15 @@
+@@ -929,7 +936,15 @@ class TEGroupedMLP(MegatronModule):
          x = x.view(shape)
          return x
  
@@ -730,28 +997,72 @@ diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transforme
          self,
          permuted_local_hidden_states: torch.Tensor,
          tokens_per_expert: torch.Tensor,
+diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transformer/moe/fused_a2a.py
+index af9c7d2..beac58f 100644
+--- a/megatron/core/transformer/moe/fused_a2a.py
++++ b/megatron/core/transformer/moe/fused_a2a.py
+@@ -9,7 +9,7 @@ from typing import Callable, Optional
+ from megatron.core.utils import internal_api
+ 
+ try:
+-    from deep_ep.utils import EventHandle, EventOverlap
++    from _relax_hybrid_ep.utils import EventHandle, EventOverlap
+ except ImportError:
+     try:
+         from deep_ep import EventHandle, EventOverlap
+@@ -18,7 +18,7 @@ except ImportError:
+         EventOverlap = None
+ 
+ try:
+-    from deep_ep import Buffer
++    from _relax_hybrid_ep import Buffer
+ 
+     HAVE_DEEP_EP = True
+ except ImportError:
+@@ -518,13 +518,13 @@ def _has_parameter(function: Callable, parameter: str) -> bool:
+ 
+ 
+ try:
+-    from deep_ep import HybridEPBuffer
++    from _relax_hybrid_ep import HybridEPBuffer
+ 
+     HAVE_HYBRIDEP = True
+     # HybridEP accepts dense [num_tokens, topk] expert ids (topk_idx) when its config carries a
+     # topk field; older builds only take the bool [num_tokens, num_experts] routing map.
+     try:
+-        import hybrid_ep_cpp
++        from _relax_hybrid_ep import hybrid_ep_cpp
+ 
+         HAVE_HYBRIDEP_DENSE_ROUTING = hasattr(hybrid_ep_cpp.HybridEpConfigInstance(), "topk")
+     except (ImportError, AttributeError, TypeError, ValueError):
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
-index 62e31f949..6d6ebdc3a 100644
+index e9659ee..04c8f38 100644
 --- a/megatron/core/transformer/moe/moe_utils.py
 +++ b/megatron/core/transformer/moe/moe_utils.py
-@@ -853,7 +853,12 @@ def topk_routing_with_score_function(
+@@ -910,12 +910,12 @@ def topk_routing_with_score_function(
              )
          else:
              # Sorting top-k turned off during inference
--            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
+-            return torch.topk(
+-                scores,
+-                k=topk,
+-                dim=1,
+-                sorted=torch.is_grad_enabled() or is_batch_invariant_mode_enabled(),
+-            )
 +            from relax.utils.env import Envs
-+            sort_topk = torch.is_grad_enabled()
++            sort_topk = torch.is_grad_enabled() or is_batch_invariant_mode_enabled()
 +            if Envs.RELAX_QWEN38_ROUTER_SORTED_REPLAY:
 +                from relax.models.qwen3_8.ops.router_sorted_replay import use_sorted_topk
-+                sort_topk = sort_topk or use_sorted_topk(logits, topk, use_pre_softmax, num_groups, group_topk, scaling_factor, score_function, expert_bias, fused, router_replay, dense_output, qb_histogram, qb_bin_bounds, topk_indices)
++                sort_topk = sort_topk or use_sorted_topk(logits, topk, use_pre_softmax, num_groups, group_topk, scaling_factor, score_function, expert_bias, fused, router_replay, dense_output, topk_indices=topk_indices)
 +            return torch.topk(scores, k=topk, dim=1, sorted=sort_topk)
  
      def compute_topk(scores, topk, num_groups=None, group_topk=None):
          # Default behavior if no replay is active
 diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/transformer/moe/shared_experts.py
+index 38ce977..39066f3 100644
 --- a/megatron/core/transformer/moe/shared_experts.py
 +++ b/megatron/core/transformer/moe/shared_experts.py
-@@ -234,8 +234,14 @@
+@@ -230,8 +230,14 @@ class SharedExpertMLP(MLP):
              sharded_state_dict.update(sub_sd)
          return sharded_state_dict
  
@@ -766,7 +1077,7 @@ diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/tra
          self.stream.wait_stream(torch.cuda.current_stream())
  
      @overlap_state_check(SharedExpertState.IDLE, SharedExpertState.PRE_FORWARD_COMM_DONE)
-@@ -382,7 +388,11 @@
+@@ -384,7 +390,11 @@ class SharedExpertMLP(MLP):
          with torch.cuda.stream(self.stream):
              if self.use_shared_expert_gate:
                  assert self.gate_score is not None
@@ -780,10 +1091,10 @@ diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/tra
              else:
                  output = self.cached_output
 diff --git a/megatron/core/transformer/moe/token_dispatcher.py b/megatron/core/transformer/moe/token_dispatcher.py
-index 0aac4a6e7..a304335fd 100644
+index c15b125..eb5fb6d 100644
 --- a/megatron/core/transformer/moe/token_dispatcher.py
 +++ b/megatron/core/transformer/moe/token_dispatcher.py
-@@ -1970,7 +1970,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
+@@ -2065,7 +2065,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
              assert self.tp_size * self.ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"
              manager_class = _DeepepV2Manager
              if getattr(self.config, "_relax_qwen35_optimized", False):
@@ -792,26 +1103,11 @@ index 0aac4a6e7..a304335fd 100644
  
                  manager_class = ExpandedManager
              self._comm_manager = manager_class(
-diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
---- a/megatron/core/transformer/multi_token_prediction.py
-+++ b/megatron/core/transformer/multi_token_prediction.py
-@@ -1733,8 +1733,11 @@
-     Returns:
-         Tensor: Updated hidden states after MTP loss processing (first chunk only).
-     """
-+    from relax.models.common.chunked_mtp_loss import _chunked_mtp_enabled, process_mtp_loss as chunked_mtp_loss
-+    if _chunked_mtp_enabled() and not (config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"):
-+        return chunked_mtp_loss(hidden_states, labels, loss_mask, output_layer, output_weight, runtime_gather_output, is_training, compute_language_model_loss, config, cp_group=cp_group, tp_group=tp_group, packed_seq_params=packed_seq_params, scale_logits_fn=scale_logits_fn, input_ids=input_ids, sequence_roll_context=sequence_roll_context, mtp_input_mask=mtp_input_mask)
-     if getattr(config, '_relax_qwen35_optimized', False):
--        from relax.backends.megatron.megatron_patch.qwen3_5.mtp_loss import selected_mtp_head as _relax_selected_mtp_head
-+        from relax.models.qwen3_5.mtp_loss import selected_mtp_head as _relax_selected_mtp_head
-     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
-     hidden_states = hidden_states_list[0]
-     derived_labels_from_input_ids = labels is None
 diff --git a/megatron/core/transformer/per_layer_embedding.py b/megatron/core/transformer/per_layer_embedding.py
+index f0d83bb..5cfe4bc 100644
 --- a/megatron/core/transformer/per_layer_embedding.py
 +++ b/megatron/core/transformer/per_layer_embedding.py
-@@ -517,6 +517,14 @@
+@@ -519,6 +519,14 @@ class PerLayerEmbedding(MegatronModule):
      # ------------------------------------------------------------------ forward
      def forward(self, hidden_states: Tensor) -> Tensor:
          """[s_local, b, n*C] streams -> [s_local, b, n*C] PLE update (to be added by the layer)."""
@@ -826,11 +1122,53 @@ diff --git a/megatron/core/transformer/per_layer_embedding.py b/megatron/core/tr
          if self._ngram_ids is None:
              raise RuntimeError("PerLayerEmbedding.prepare() must be called before forward().")
          from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp, split_tensor_cp
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 18dbbc0..9a8bf33 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -310,6 +310,18 @@ class TransformerConfig(ModelParallelConfig):
+     """Whether to log the max attention logit across whole model. Decoupled from qk_clip,
+     defualts to False. Setting qk_clip will automatically log the max logit"""
+ 
++    head_wise_attn_gate: bool = False
++    """Apply a per-head scalar output gate (Step-3.5-Flash g_proj):
++    num_attention_heads scalar gates fused as the trailing rows of
++    linear_qkv; sigmoid scales each head uniformly across head_dim.
++    Contrast with `attention_output_gate` (full head_dim gate, inline
++    per-group); the two are mutually exclusive. Self-attention only.
++    dist-ckpt TP resharding is handled by a ShardedTensorFactory in
++    SelfAttention.sharded_state_dict. Requires (validated in
++    __post_init__): num_attention_heads % tp == 0,
++    num_query_groups >= tp, and under fp8/fp4 a per-partition
++    linear_qkv_out_dim aligned to 16/32."""
++
+     attention_output_gate: bool = False
+     """Whether to apply output gate to the attention layers."""
+ 
+@@ -337,7 +349,7 @@ class TransformerConfig(ModelParallelConfig):
+     # attention variant
+     ####################
+     experimental_attention_variant: Optional[
+-        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
++        Literal['gdn', 'gdn2', 'kda', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
+     ] = None
+     """Type of attention variant to use. Supports gdn, gdn2, dsa, and dsv4_hybrid.
+     gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
+@@ -1253,9 +1265,7 @@ class TransformerConfig(ModelParallelConfig):
+ 
+     gdn_conv_pad_alignment: Optional[int] = None
+ 
+-    linear_attention_beta_in_fp32: bool = True
+ 
+-    linear_attention_output_gate_activation: Optional[Literal["silu", "sigmoid"]] = None
+ 
+     linear_cp_mode: Literal["headwise", "chunkwise", "all_gather"] = "headwise"
+     """Context-parallel algorithm for recurrent and linear-attention layers."""
 diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
-index 80cabea08..c8299f390 100644
+index e1ededa..e8f85ae 100644
 --- a/megatron/core/transformer/transformer_layer.py
 +++ b/megatron/core/transformer/transformer_layer.py
-@@ -884,6 +884,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+@@ -1141,6 +1141,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
  
      @copy_signature(_forward_attention)
      def forward(self, *args, **kwargs):
@@ -844,53 +1182,10 @@ index 80cabea08..c8299f390 100644
          """
          Perform a forward pass through the transformer layer.
  
-@@ -1104,6 +1111,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
-         padding_mask: Tensor | None = None,
-         input_ids: Optional[Tensor] = None,
-         packed_seq_params: Optional[PackedSeqParams] = None,
-+    ) -> Tensor | list[Tensor | None]:
-+        if getattr(self, "_relax_qsa_attention_retained", False):
-+            from relax.models.qwen3_8.qsa_attention_recompute import retained_mlp
-+
-+            return retained_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params, native_forward=TransformerLayer._relax_native_forward_mlp)
-+        return TransformerLayer._relax_native_forward_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params)
-+
-+    def _relax_native_forward_mlp(
-+        self,
-+        hidden_states: Tensor,
-+        inference_context: BaseInferenceContext | None = None,
-+        padding_mask: Tensor | None = None,
-+        input_ids: Optional[Tensor] = None,
-+        packed_seq_params: Optional[PackedSeqParams] = None,
-     ) -> Tensor | list[Tensor | None]:
-         """
-         Perform a forward pass through the feed-forward layer.
-@@ -2481,6 +2502,21 @@ class HyperConnectionTransformerLayer(TransformerLayer):
-         input_ids=None,
-         packed_seq_params: Optional[PackedSeqParams] = None,
-         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
-+    ):
-+        if getattr(self, "_relax_qsa_attention_retained", False):
-+            from relax.models.qwen3_8.qsa_attention_recompute import retained_mlp
-+
-+            return retained_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params, mhc_recompute_manager, native_forward=HyperConnectionTransformerLayer._relax_native_forward_mlp)
-+        return HyperConnectionTransformerLayer._relax_native_forward_mlp(self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params, mhc_recompute_manager)
-+
-+    def _relax_native_forward_mlp(
-+        self,
-+        hidden_states,
-+        inference_context=None,
-+        padding_mask=None,
-+        input_ids=None,
-+        packed_seq_params: Optional[PackedSeqParams] = None,
-+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
-     ):
-         """Forward MLP with hyper connection pre/post processing."""
-         is_last_in_recompute_block = bool(
-@@ -3258,6 +3294,20 @@ class MoETransformerLayer(TransformerLayer):
+@@ -2852,6 +2859,20 @@ class MoETransformerLayer(TransformerLayer):
          padding_mask=None,
-         input_ids=None,
          packed_seq_params=None,
+         input_ids=None,
 +    ):
 +        if getattr(self, "_relax_qsa_attention_retained", False):
 +            from relax.models.qwen3_8.qsa_attention_recompute import retained_mlp
@@ -908,41 +1203,415 @@ index 80cabea08..c8299f390 100644
      ):
          """
          Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
-diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transformer/moe/fused_a2a.py
---- a/megatron/core/transformer/moe/fused_a2a.py
-+++ b/megatron/core/transformer/moe/fused_a2a.py
-@@ -9,7 +9,7 @@
- from megatron.core.utils import internal_api
-
- try:
--    from deep_ep.utils import EventHandle, EventOverlap
-+    from _relax_hybrid_ep.utils import EventHandle, EventOverlap
- except ImportError:
-     try:
-         from deep_ep import EventHandle, EventOverlap
-@@ -18,7 +18,7 @@
-         EventOverlap = None
-
- try:
--    from deep_ep import Buffer
-+    from _relax_hybrid_ep import Buffer
-
-     HAVE_DEEP_EP = True
- except ImportError:
-@@ -510,14 +510,14 @@
-
-
- try:
--    from deep_ep import HybridEPBuffer
-+    from _relax_hybrid_ep import HybridEPBuffer
-
-     HAVE_HYBRIDEP = True
-     HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING = _has_parameter(
-         HybridEPBuffer.dispatch_with_permute, "dense_routing"
-     )
-     try:
--        import hybrid_ep_cpp
-+        from _relax_hybrid_ep import hybrid_ep_cpp
-
-         HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING = hasattr(
-             hybrid_ep_cpp.HybridEpConfigInstance(), "topk"
+diff --git a/megatron/core/utils.py b/megatron/core/utils.py
+index 4d47cb2..8cc1236 100644
+--- a/megatron/core/utils.py
++++ b/megatron/core/utils.py
+@@ -1363,8 +1363,8 @@ def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
+ 
+ 
+ def get_data_parallel_group_if_dtensor(
+-    tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "ProcessGroup" = None
+-) -> Optional["ProcessGroup"]:
++    tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "torch.distributed.ProcessGroup" = None
++) -> Optional["torch.distributed.ProcessGroup"]:
+     """Gets the data parallel group of the given tensor if it is a DTensor."""
+     if HAVE_DTENSOR and isinstance(tensor, DTensor):
+         current_group = tensor.device_mesh.get_group()
+@@ -2881,6 +2881,16 @@ def _nvtx_range_get_func_path():
+     return f"{module.__name__}.{caller_func}"
+ 
+ 
++@contextmanager
++def nvtx_range(msg=None, suffix=None):
++    """Create an NVTX range controlled by Core's profiling configuration."""
++    nvtx_range_push(msg, suffix)
++    try:
++        yield
++    finally:
++        nvtx_range_pop(msg, suffix)
++
++
+ def nvtx_range_push(msg=None, suffix=None) -> None:
+     """Push NVTX range onto stack. If msg is not provided, use the calling function's path.
+ 
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
+index 5a6862a..6f172f8 100644
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
+@@ -303,9 +303,9 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
+ 
+         # Hyper connections (e.g. Qwen4-Exp gated residual): expand the single stream to
+         # n streams at the block start, mirroring megatron.core TransformerBlock.forward.
+-        if self.config.enable_hyper_connections and self.pre_process:
++        if self.config.enable_mhc_connections and self.pre_process:
+             hidden_states = HyperConnectionModule.input_expand(
+-                hidden_states, self.num_residual_streams
++                hidden_states, self.mhc_num_residual_streams
+             )  # [s, b, C] -> [s, b, n*C]
+ 
+         if self.config.sequence_parallel:
+@@ -768,9 +768,9 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+ 
+         # Hyper connections (e.g. Qwen4-Exp gated residual): expand the single stream to
+         # n streams at the block start, mirroring megatron.core TransformerBlock.forward.
+-        if self.config.enable_hyper_connections and self.pre_process:
++        if self.config.enable_mhc_connections and self.pre_process:
+             hidden_states = HyperConnectionModule.input_expand(
+-                hidden_states, self.num_residual_streams
++                hidden_states, self.mhc_num_residual_streams
+             )  # [s, b, C] -> [s, b, n*C]
+ 
+         if self.config.sequence_parallel:
+@@ -847,7 +847,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+ 
+         # MTP's gated-residual branch consumes the full residual-stream tensor;
+         # the main LM head still consumes the contracted output below.
+-        if self.config.mtp_num_layers and self.post_process and self.config.enable_hyper_connections:
++        if self.config.mtp_num_layers and self.post_process and self.config.enable_mhc_connections:
+             self._mtp_multistream = hidden_states
+ 
+         # Final layer norm.
+diff --git a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py b/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
+index 50fa9b0..4994bed 100644
+--- a/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
++++ b/megatron/core/models/gpt/experimental_attention_variant_module_specs.py
+@@ -271,7 +271,7 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
+ 
+     # Hyper connections: the gated-residual variant (Qwen4-Exp) normalizes the sub-layer input
+     # itself, so no (fused) input/pre-MLP layer norms are built.
+-    use_hyper_connections = config.enable_hyper_connections
++    use_hyper_connections = config.enable_mhc_connections
+     gated_residual = use_hyper_connections and config.mhc_variant == "gated_residual"
+ 
+     # Get attention patterns and specs
+@@ -442,7 +442,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
+ 
+     # Get GPT decoder block spec
+     rms_norm = config.normalization == "RMSNorm"
+-    if config.enable_hyper_connections and config.mhc_variant == "gated_residual":
++    if config.enable_mhc_connections and config.mhc_variant == "gated_residual":
+         # Learned contraction of the residual streams replaces the final layer norm.
+         final_layer_norm = GatedResidualOutputMixer
+     else:
+diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
+index a402172..e8a4157 100644
+--- a/megatron/core/models/gpt/gpt_model.py
++++ b/megatron/core/models/gpt/gpt_model.py
+@@ -687,7 +687,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
+ 
+         # Pass input_ids to decoder for hash-based MoE routing
+         decoder_extra_block_kwargs = extra_block_kwargs or {}
+-        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
++        if self.config.moe_num_hash_layers > 0 and input_ids is not None:
+             decoder_extra_block_kwargs['input_ids'] = input_ids
+ 
+         # Run decoder.
+@@ -887,6 +887,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
+                 padding_mask=padding_mask,
+                 embedding=self.embedding,
+                 mtp_input_mask=mtp_input_mask,
++                sequence_roll_context=sequence_roll_context,
+                 **(extra_block_kwargs or {}),
+             )
+ 
+@@ -917,7 +918,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
+                     is_training=self.training,
+                     compute_language_model_loss=self.compute_language_model_loss,
+                     config=self.config,
+-                    cp_group=self.pg_collection.cp,
++                    cp_group=mtp_cp_group,
+                     tp_group=self.tp_group,
+                     packed_seq_params=packed_seq_params,
+                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+@@ -927,7 +928,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
+                     runtime_gather_output=runtime_gather_output,
+                     metric_avg_group=(
+                         getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+-                        or self.pg_collection.dp_cp
++                        or getattr(self.pg_collection, 'dp_cp', None)
+                     ),
+                 )
+         sequence_parallel_override = False
+diff --git a/megatron/core/models/hybrid/hybrid_model.py b/megatron/core/models/hybrid/hybrid_model.py
+index bd9304b..4eb2b31 100644
+--- a/megatron/core/models/hybrid/hybrid_model.py
++++ b/megatron/core/models/hybrid/hybrid_model.py
+@@ -801,6 +801,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
+                     loss_mask=mtp_inputs.loss_mask,
+                     output_layer=self.output_layer,
+                     output_weight=output_weight,
++                    runtime_gather_output=runtime_gather_output,
+                     is_training=self.training,
+                     compute_language_model_loss=self.compute_language_model_loss,
+                     config=self.config,
+diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_delta_net/gdn.py
+index 316343d..4ddec17 100644
+--- a/megatron/core/ssm/gated_delta_net/gdn.py
++++ b/megatron/core/ssm/gated_delta_net/gdn.py
+@@ -164,7 +164,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
+ 
+     def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+         """Normalize and gate the recurrence output, validating every fused call."""
+-        if self.config.gdn_gated_output_norm_fusion and self.config.linear_attention_output_gate_activation == "silu":
++        if self.config.gdn_gated_output_norm_fusion and self.config.linear_attention_output_gate_activation in (None, "silu"):
+             from megatron.core.fusions.fused_gated_norm import fused_gated_norm, validate_gated_norm
+ 
+             validate_gated_norm(self, x, gate)
+diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
+index 0a148cc..9c0e0aa 100644
+--- a/megatron/core/transformer/hyper_connection.py
++++ b/megatron/core/transformer/hyper_connection.py
+@@ -888,7 +888,7 @@ class GatedResidualMTPHiddenNorm(MegatronModule):
+     def __init__(self, config: TransformerConfig, hidden_size: int, eps: float):
+         super().__init__(config)
+         assert hidden_size == config.hidden_size
+-        self.num_streams = config.num_residual_streams
++        self.num_streams = config.mhc_num_residual_streams
+         self.hidden_size = hidden_size
+         self.eps = eps
+         self.weight = nn.Parameter(
+@@ -934,7 +934,7 @@ class GatedResidualHyperConnection(MegatronModule):
+         super().__init__(config)
+         self.config = config
+         self.layer_number = layer_number
+-        self.n = config.num_residual_streams
++        self.n = config.mhc_num_residual_streams
+         self.hidden_size = config.hidden_size
+         self.rank = config.mhc_gated_residual_rank
+         self.use_combine = use_combine
+diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
+index a3d2e97..791ebc8 100755
+--- a/megatron/core/transformer/multi_token_prediction.py
++++ b/megatron/core/transformer/multi_token_prediction.py
+@@ -2268,7 +2268,7 @@ def get_mtp_normalization_counts(num_tokens, original_num_tokens, cp_group=None)
+     return counts[0], counts[1], cp_size
+ 
+ 
+-def process_mtp_loss(hidden_states: Tensor, labels: Optional[Tensor], loss_mask: Optional[Tensor], output_layer: Callable, output_weight: Optional[Tensor], is_training: bool, compute_language_model_loss: Callable, config: TransformerConfig, cp_group: Optional[torch.distributed.ProcessGroup]=None, tp_group: Optional[torch.distributed.ProcessGroup]=None, packed_seq_params: Optional[PackedSeqParams]=None, scale_logits_fn: Optional[Callable[[Tensor], Tensor]]=None, input_ids: Optional[Tensor]=None, sequence_roll_context: Optional[MTPSequenceRollContext]=None, mtp_input_mask: Optional[Tensor]=None, runtime_gather_output: Optional[bool]=None, metric_avg_group: Optional[torch.distributed.ProcessGroup]=None, main_hidden_states: Optional[Tensor]=None) -> Tensor:
++def process_mtp_loss(hidden_states: Tensor, labels: Optional[Tensor], loss_mask: Optional[Tensor], output_layer: Callable, output_weight: Optional[Tensor], runtime_gather_output: Optional[bool], is_training: bool, compute_language_model_loss: Callable, config: TransformerConfig, cp_group: Optional[torch.distributed.ProcessGroup]=None, tp_group: Optional[torch.distributed.ProcessGroup]=None, packed_seq_params: Optional[PackedSeqParams]=None, scale_logits_fn: Optional[Callable[[Tensor], Tensor]]=None, input_ids: Optional[Tensor]=None, sequence_roll_context: Optional[MTPSequenceRollContext]=None, mtp_input_mask: Optional[Tensor]=None, metric_avg_group: Optional[torch.distributed.ProcessGroup]=None, main_hidden_states: Optional[Tensor]=None) -> Tensor:
+     """Process Multi-Token Prediction (MTP) loss computation.
+ 
+     This is a standalone function that handles MTP loss computation. It's used on the
+@@ -2627,6 +2627,8 @@ class MultiTokenPredictionLayer(MegatronModule):
+         packed_seq_params: Optional[PackedSeqParams] = None,
+         padding_mask: Optional[torch.Tensor] = None,
+         mtp_input_mask: Optional[torch.Tensor] = None,
++        sequence_roll_context: Optional[MTPSequenceRollContext] = None,
++        roll_depth: int = 0,
+     ):
+         """
+         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
+@@ -2660,7 +2662,54 @@ class MultiTokenPredictionLayer(MegatronModule):
+                 tensor_parallel_output_grad=False,
+                 group=self.tp_group,
+             ).transpose(0, 1)
+-        if self.config.attention_cp_layout == "contiguous":
++        if sequence_roll_context is not None:
++            cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
++
++            tensors_to_roll = [input_ids]
++            fill_values = [0]
++            sequence_fields = ["input_ids"]
++            roll_position_ids = getattr(embedding, 'add_position_embedding', True)
++            if roll_position_ids:
++                tensors_to_roll.append(position_ids)
++                fill_values.append(0)
++                sequence_fields.append("position_ids")
++            if padding_mask is not None:
++                tensors_to_roll.append(padding_mask)
++                fill_values.append(True)
++                sequence_fields.append("padding_mask")
++
++            if mtp_input_mask is not None:
++                if mtp_input_mask.dtype != torch.bool:
++                    raise ValueError("MTP conditioning mask must be boolean")
++                if mtp_input_mask.shape != input_ids.shape or mtp_input_mask.device != input_ids.device:
++                    raise ValueError("MTP conditioning mask must match input_ids shape and device")
++                tensors_to_roll.append(mtp_input_mask)
++                fill_values.append(False)
++                sequence_fields.append("mtp_input_mask")
++
++            rolled_tensors = roll_tensor(
++                tensors_to_roll,
++                shifts=-1,
++                dims=-1,
++                cp_group=cp_group,
++                packed_seq_params=packed_seq_params,
++                fill_values=fill_values,
++                roll_context=sequence_roll_context,
++                sequence_fields=sequence_fields,
++                roll_depth=roll_depth,
++            )
++            input_ids = rolled_tensors[0]
++            next_rolled_tensor = 1
++            if roll_position_ids:
++                position_ids = rolled_tensors[next_rolled_tensor]
++                next_rolled_tensor += 1
++            if padding_mask is not None:
++                padding_mask = rolled_tensors[next_rolled_tensor]
++                next_rolled_tensor += 1
++            if mtp_input_mask is not None:
++                mtp_input_mask = rolled_tensors[next_rolled_tensor]
++
++        elif self.config.attention_cp_layout == "contiguous":
+             input_ids, position_ids, padding_mask, mtp_input_mask = roll_contiguous_fields(
+                 (input_ids, position_ids, padding_mask, mtp_input_mask),
+                 self.cp_group,
+@@ -3163,6 +3212,8 @@ class MultiTokenPredictionLayer(MegatronModule):
+         mtp_input_mask: Optional[Tensor] = None,
+         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
+         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
++        sequence_roll_context: Optional[MTPSequenceRollContext] = None,
++        roll_depth: int = 0,
+     ):
+         """
+         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
+@@ -3205,6 +3256,8 @@ class MultiTokenPredictionLayer(MegatronModule):
+                 hidden_states=hidden_states,
+                 packed_seq_params=packed_seq_params,
+                 mtp_input_mask=mtp_input_mask,
++                sequence_roll_context=sequence_roll_context,
++                roll_depth=roll_depth,
+             )
+         else:
+             decoder_input, hidden_states = self._get_precomputed_embeddings(
+@@ -3690,6 +3743,7 @@ class MultiTokenPredictionBlock(MegatronModule):
+         mhc_multistream: Optional[Tensor] = None,
+         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
+         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
++        sequence_roll_context: Optional[MTPSequenceRollContext] = None,
+     ) -> Tensor:
+         """
+         Perform the forward pass through all of the MTP modules.
+@@ -3838,6 +3892,8 @@ class MultiTokenPredictionBlock(MegatronModule):
+                 embedding=embedding,
+                 decoder_input=decoder_input,
+                 mtp_input_mask=mtp_input_mask,
++                sequence_roll_context=sequence_roll_context,
++                roll_depth=offset + iteration,
+                 **(extra_block_kwargs or {}),
+             )
+ 
+diff --git a/megatron/core/transformer/per_layer_embedding.py b/megatron/core/transformer/per_layer_embedding.py
+index 5cfe4bc..6963dd3 100644
+--- a/megatron/core/transformer/per_layer_embedding.py
++++ b/megatron/core/transformer/per_layer_embedding.py
+@@ -384,7 +384,7 @@ class PerLayerEmbedding(MegatronModule):
+             layer_number in config.ple_layer_ids
+         ), f"layer {layer_number} is not a PLE layer ({config.ple_layer_ids})"
+         self.ple_layer_index = list(config.ple_layer_ids).index(layer_number)
+-        self.n = config.num_residual_streams
++        self.n = config.mhc_num_residual_streams
+         self.hidden_size = config.hidden_size
+         self.norm_eps = config.layernorm_epsilon
+         self.embed_dim = config.ple_embed_dim or config.hidden_size
+diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/transformer/transformer_block.py
+index c75a994..8d34120 100755
+--- a/megatron/core/transformer/transformer_block.py
++++ b/megatron/core/transformer/transformer_block.py
+@@ -418,7 +418,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                 eps=self.config.layernorm_epsilon,
+             )
+             if self.config.enable_mhc_connections and not getattr(self.final_layernorm, "contracts_mhc_streams", False):
+-                hc_mult = self.config.num_residual_streams
++                hc_mult = self.config.mhc_num_residual_streams
+                 hc_dim = self.config.hidden_size * hc_mult
+                 self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                 self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+@@ -549,7 +549,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                     self.hc_head_fn,
+                     self.hc_head_base,
+                     self.hc_head_scale,
+-                    self.config.num_residual_streams,
++                    self.config.mhc_num_residual_streams,
+                     self.config.layernorm_epsilon,
+                 )
+ 
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 9a8bf33..172ef99 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -446,6 +446,12 @@ class TransformerConfig(ModelParallelConfig):
+     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
+ 
++    kda_safe_gate: bool = False
++    """Whether the KDA kernel should use bounded gate values."""
++
++    kda_lower_bound: Optional[float] = None
++    """Optional lower bound for KDA's bounded gate values."""
++
+     gdn_kernel_backend: Literal["transformer_engine", "fla", "torch"] = "fla"
+     """Kernel backend for Gated DeltaNet. The selected backend is required to be available;
+     there is no automatic fallback. ``torch`` selects the PyTorch-native reference
+@@ -1914,6 +1920,8 @@ class TransformerConfig(ModelParallelConfig):
+             )
+ 
+         if is_gated_delta_net_variant(self.experimental_attention_variant):
++            if self.deterministic_mode and self.gdn_kernel_backend == "fla":
++                self.gdn_kernel_backend = "torch"
+             if self.deterministic_mode and self.gdn_kernel_backend != "torch":
+                 raise ValueError(
+                     "deterministic_mode=True requires gdn_kernel_backend='torch' for "
+@@ -2485,6 +2493,7 @@ class TransformerConfig(ModelParallelConfig):
+                     "mlp",
+                     "moe",
+                     "shared_experts",
++                    "gdn",
+                     "gdn_norm_out",
+                     "gdp_in_proj",
+                     "gdp_qkv",
+@@ -2509,6 +2518,12 @@ class TransformerConfig(ModelParallelConfig):
+                     "multi_latent_attention."
+                 )
+ 
++            if "gdn" in self.recompute_modules:
++                if self.experimental_attention_variant not in ("gdn", "kda", "gated_delta_net"):
++                    raise ValueError("gdn recomputation requires a GDN or KDA layer")
++                if "gdn_norm_out" in self.recompute_modules:
++                    raise ValueError("gdn and gdn_norm_out recomputation are mutually exclusive")
++
+             if "gdn_norm_out" in self.recompute_modules and (
+                 not is_gated_delta_net_variant(self.experimental_attention_variant)
+             ):
+diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
+index e8f85ae..ad7a0d7 100644
+--- a/megatron/core/transformer/transformer_layer.py
++++ b/megatron/core/transformer/transformer_layer.py
+@@ -1376,6 +1376,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
+         packed_seq_params=None,
+         input_ids: Optional[Tensor] = None,
+         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
++    ) -> Tensor | list[Tensor | None]:
++        if getattr(self, "_relax_qsa_attention_retained", False):
++            from relax.models.qwen3_8.qsa_attention_recompute import retained_mlp
++
++            return retained_mlp(
++                self, hidden_states, inference_context, padding_mask, input_ids, packed_seq_params,
++                native_forward=TransformerLayer._relax_native_forward_mlp,
++            )
++        return TransformerLayer._relax_native_forward_mlp(
++            self, hidden_states, inference_context, padding_mask, packed_seq_params, input_ids,
++            residual_stream_recompute_context,
++        )
++
++    def _relax_native_forward_mlp(
++        self,
++        hidden_states: Tensor,
++        inference_context: BaseInferenceContext | None = None,
++        padding_mask: Tensor | None = None,
++        packed_seq_params=None,
++        input_ids: Optional[Tensor] = None,
++        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+     ) -> Tensor | list[Tensor | None]:
+         """
+         Perform a forward pass through the feed-forward layer.
+@@ -2461,6 +2482,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
+             nvtx_range_push(suffix="per_layer_embedding")
+             hidden_states = hidden_states + self.per_layer_embedding(hidden_states)
+             nvtx_range_pop(suffix="per_layer_embedding")
++            residual = hidden_states
+ 
+         nvtx_range_push(suffix="self_attention_hyper_connection")
+         hidden_states, h_res, h_post = self.self_attention_hyper_connection(

@@ -11,6 +11,7 @@ from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
@@ -558,6 +559,13 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
     skip_nonfinite = configure_nonfinite_guard(args)
+
+    from megatron.training import global_vars
+
+    if hasattr(global_vars, "set_run_config") and not global_vars.is_run_config_initialized():
+        from megatron.training.argument_utils import pretrain_cfg_container_from_args
+
+        global_vars.set_run_config(pretrain_cfg_container_from_args(args))
 
     model = get_model(
         wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
@@ -2458,7 +2466,7 @@ def initialize_model_and_optimizer(
             DDP-wrapped model chunks, optimizer, scheduler, and iteration index.
     """
 
-    if torch.version.hip:
+    if torch.version.hip and find_spec("megatron.core.dist_checkpointing.strategies.filesystem_async") is not None:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
 
         from relax.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync

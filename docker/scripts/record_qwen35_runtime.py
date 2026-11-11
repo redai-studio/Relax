@@ -127,8 +127,8 @@ def main() -> None:
         "megatron/core/transformer/transformer_block.py",
         "megatron/core/transformer/transformer_config.py",
         "megatron/training/training.py",
-        "megatron/core/fusions/linear_cross_entropy/blackwell/fwd_mainloop.py",
-        "megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py",
+        "megatron/core/fusions/fused_linear_cross_entropy.py",
+        "megatron/core/transformer/linear_cross_entropy.py",
     )
     operator_patch = Path("/root/Megatron-LM/20261020-model-operators.patch")
     protected_sources = sorted(

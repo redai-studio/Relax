@@ -172,7 +172,7 @@ def test_chunked_cp_requires_the_native_normalization_patch(monkeypatch):
     from relax.models.common import chunked_mtp_loss
 
     monkeypatch.delattr(native, "get_mtp_normalization_counts", raising=False)
-    with pytest.raises(RuntimeError, match="mtp-cp-normalization.patch"):
+    with pytest.raises(RuntimeError, match="Megatron patches for CP normalization"):
         chunked_mtp_loss._normalization_counts(torch.tensor(1), torch.tensor(2), SimpleNamespace(size=lambda: 2))
     counts = chunked_mtp_loss._normalization_counts(torch.tensor(1), torch.tensor(2), None)
     assert tuple(int(value) for value in counts) == (1, 2, 1)

@@ -208,7 +208,13 @@ def patch_checkpoint_write():
 
     This function is idempotent — calling it multiple times is safe.
     """
-    from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+    try:
+        from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+    except ModuleNotFoundError as exc:
+        if exc.name != "megatron.core.dist_checkpointing.strategies.filesystem_async":
+            raise
+        # Core 0.20 uses PyTorch DCP for synchronous saves and NVRx for async.
+        return
 
     global _patched
     # NOTE(wuhuan): the latest Megatron-LM of 20260506 use write_preloaded_data_multithread instead of

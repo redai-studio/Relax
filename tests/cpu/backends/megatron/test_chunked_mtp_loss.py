@@ -288,7 +288,11 @@ def test_static_dispatch_retains_native_fallback(monkeypatch, enabled, fused):
         body=[branch, ast.Return(ast.Constant("native"))],
         decorator_list=[],
     )
-    scope = {"_chunked_mtp_enabled": lambda: enabled, "config": _make_config(fuse_linear=fused)}
+    scope = {
+        "_chunked_mtp_enabled": lambda: enabled,
+        "config": _make_config(fuse_linear=fused),
+        "main_hidden_states": None,
+    }
     exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "dispatch", "exec"), scope)
     assert scope["dispatch"]() == ("chunked" if enabled and not fused else "native")
 

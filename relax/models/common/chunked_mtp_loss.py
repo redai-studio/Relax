@@ -30,7 +30,7 @@ def _normalization_counts(num_tokens, original_num_tokens, cp_group):
     if helper is not None:
         return helper(num_tokens, original_num_tokens, cp_group)
     if cp_group is not None and cp_group.size() > 1:
-        raise RuntimeError("MTP with CP requires docker/patch/megatron/mtp-cp-normalization.patch")
+        raise RuntimeError("MTP with CP requires Relax's Megatron patches for CP normalization")
     return num_tokens, original_num_tokens, 1
 
 

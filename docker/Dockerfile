@@ -161,8 +161,8 @@ ARG ENABLE_SGLANG_PATCH=1
 ARG HYBRID_EP_COMMIT
 ENV RELAX_HYBRID_EP_COMMIT=${HYBRID_EP_COMMIT}
 
-ARG MEGATRON_BRIDGE_COMMIT=5531d7bde48dc7872267be2ed838be8c12ef8fdb
-ARG MEGATRON_CORE_COMMIT=ac100f773f9d8fac918ce3e64698be4ed84fa428
+ARG MEGATRON_BRIDGE_COMMIT=04ce2b3efd6f2e387fc244e9f37afd0a1f7952fb
+ARG MEGATRON_CORE_COMMIT=685fb8bd970185e9ac3283fe32a5d6667bf4b268
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
 
@@ -229,28 +229,22 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
 
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
-COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
-COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
-COPY docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < megatron.patch && \
     if grep -R -n '^<<<<<<< ' .; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    patch --batch --forward --fuzz=0 -p1 < sync-save-bounded-staging.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
-    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
-    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch fully-reshardable-checkpoint-padding.patch && \
+    rm megatron.patch 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 

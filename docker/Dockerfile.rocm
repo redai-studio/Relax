@@ -61,8 +61,8 @@ SHELL ["/bin/bash", "-ceuxo", "pipefail"]
 ARG GPU_ARCH
 ARG WHEELS_REPO_URL=https://github.com/XinyuJiangCMU/miles-wheels-rocm/releases/download
 ARG MOONCAKE_VERSION=0.3.12.post1
-ARG MEGATRON_BRIDGE_COMMIT=5531d7bde48dc7872267be2ed838be8c12ef8fdb
-ARG MEGATRON_CORE_COMMIT=ac100f773f9d8fac918ce3e64698be4ed84fa428
+ARG MEGATRON_BRIDGE_COMMIT=04ce2b3efd6f2e387fc244e9f37afd0a1f7952fb
+ARG MEGATRON_CORE_COMMIT=685fb8bd970185e9ac3283fe32a5d6667bf4b268
 
 ENV GPU_ARCH=${GPU_ARCH} \
     PYTORCH_ROCM_ARCH=${GPU_ARCH} \
@@ -165,28 +165,20 @@ RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatro
 
 # Same Megatron patch sequence and checks as Dockerfile.cu13.
 COPY docker/patch/latest/megatron.patch \
-    docker/patch/megatron/sync-save-bounded-staging.patch \
-    docker/patch/megatron/kimi-packed-sequence-api.patch \
     docker/patch/megatron/20261016-qwen38-models.patch \
     docker/patch/megatron/20261020-qwen35-optimized.patch \
     docker/patch/megatron/20261020-model-operators.patch \
-    docker/patch/megatron/mtp-cp-normalization.patch \
-    docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch \
-    docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/
+    docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch /root/Megatron-LM/
 RUN cd /root/Megatron-LM && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
     patch --batch --forward --fuzz=0 -p1 < megatron.patch && \
-    patch --batch --forward --fuzz=0 -p1 < sync-save-bounded-staging.patch && \
-    patch --batch --forward --fuzz=0 -p1 < kimi-packed-sequence-api.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
     sha256sum 20261016-qwen38-models.patch > /etc/relax-qwen38-model-patch.sha256 && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
-    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
-    echo '87e20b1aac3094b6be498c8a9a4ac6f8099b6422e21f1118bea2606c83c7d6a9  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
+    echo '8d2133f2002b2e6b7aead40e22f4b613ba6578dd7e8a0619f92ab03e3e96ae9b  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
     patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \
-    echo '5db4026f238aa2086800765796f463e9d50a30674b7337536045c31ad537e7e0  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
-    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
+    echo 'ddc8ad0d08e2256f01f42d2b4210518de48422bf008567c8bb624e1b4766b925  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
     python -m compileall -q megatron && \

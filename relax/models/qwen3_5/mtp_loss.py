@@ -55,7 +55,7 @@ def selected_mtp_head(
 def install_ce_launches():
     """Validate the statically selected launch; configuration is owned by
     MCore."""
-    from megatron.core.fusions.linear_cross_entropy.blackwell import entry
+    from .linear_cross_entropy import get_bwd_config
 
-    bwd = entry._get_bwd_config()
+    bwd = get_bwd_config()
     assert not bwd._bwd_kernel and bwd._vocab_per_split == 16384

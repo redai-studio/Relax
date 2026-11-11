@@ -1,8 +1,8 @@
 diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
-index 6c644662a..28000ddf8 100644
+index 28f724a..48e323d 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
-@@ -1957,6 +1957,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+@@ -2015,6 +2015,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
          data_parallel_world_size = self.data_parallel_group.size()
  
          state = self.get_parameter_state_dp_reshardable()
@@ -35,7 +35,7 @@ index 6c644662a..28000ddf8 100644
          # per_bucket_numel metadata is saved separately for each TPxPP domain.
          for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
              key = (
-@@ -1990,10 +2016,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+@@ -2048,7 +2074,27 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
  
                      # The global ckpt tensors must be fully covered.
                      # We add extra empty padding if necessary
@@ -64,39 +64,12 @@ index 6c644662a..28000ddf8 100644
  
                      # Insert padding between parameter tensors to ensure full coverage as needed.
                      all_pad_tensors = {}
-+                    local_unpadded_end = max(0, min(
-+                        gbuf_local_numel,
-+                        gbuf_world_numel_unpadded - data_parallel_rank * gbuf_local_numel,
-+                    ))
-                     for i in range(-1, len(bucket_state)):
-                         if i == len(bucket_state) - 1:
-                             # Potential padding at the end
-@@ -2005,16 +2055,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
-                             cur_param_end = 0
-                         else:
-                             cur_param_end = bucket_state[i]['gbuf_local_end']
--                        world_param_end = data_parallel_rank * gbuf_local_numel + cur_param_end
-+                        padding_end = min(next_param_start, local_unpadded_end)
-                         # Insert padding if there is a gap between next param,
-                         # but not exceeding unpadded gbuf size
--                        if (
--                            next_param_start != cur_param_end
--                            and world_param_end < gbuf_world_numel_unpadded
--                        ):
-+                        if padding_end > cur_param_end:
-                             pad_tensors = {
-                                 k: torch.empty(
--                                    next_param_start - cur_param_end, dtype=v.dtype, device=v.device
-+                                    padding_end - cur_param_end, dtype=v.dtype, device=v.device
+@@ -2083,7 +2129,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                                     next_param_start - cur_param_end, dtype=v.dtype, device=v.device
                                  )
                                  for k, v in bucket_state[i].items()
-                                 if isinstance(v, torch.Tensor)
-@@ -2022,7 +2069,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+-                                if isinstance(v, torch.Tensor)
++                                if isinstance(v, torch.Tensor) and k != 'step'
+                             }
                              all_pad_tensors[i + 1] = {
                                  **pad_tensors,
-                                 'gbuf_local_start': cur_param_end,
--                                'gbuf_local_end': next_param_start,
-+                                'gbuf_local_end': padding_end,
-                                 'padding': True,
-                             }
- 
