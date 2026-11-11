@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Policy provenance for rows consumed by fully asynchronous Agentic training."""
+"""Policy provenance for rows consumed by fully asynchronous Agentic
+training."""
 
 import json
 from argparse import Namespace
@@ -54,7 +55,8 @@ def encode_policy_audit(sample: Sample, loss_mask: list[int]) -> str:
 def audit_consumed_rows(
     rows: list[str], published_versions: dict[str, int]
 ) -> tuple[list[dict[str, Any]], dict[str, float], dict[str, int]]:
-    """Produce row diagnostics and DP-reducible means with their denominators."""
+    """Produce row diagnostics and DP-reducible means with their
+    denominators."""
     reports = []
     totals = dict(
         generation_version_span=0,
