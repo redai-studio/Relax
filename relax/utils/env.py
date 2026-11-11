@@ -225,6 +225,11 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_QWEN38_HC_FUSED_COMBINE = EnvProperty("RELAX_QWEN38_HC_FUSED_COMBINE", bool, False)
     RELAX_QWEN38_PLE_FUSED_CONV = EnvProperty("RELAX_QWEN38_PLE_FUSED_CONV", bool, False)
     RELAX_SFT_FUSED_LINEAR_CE = EnvProperty("RELAX_SFT_FUSED_LINEAR_CE", bool, False)
+    # Opt-in BF16 chunked-SFT roundoff control: process-wide cuBLASLt with
+    # reduced-precision/split-K reductions disabled (body and head matmuls),
+    # plus FP32 TP SUM for native/fused heads. This does not promise bitwise
+    # equality or convergence parity. Requires the Torch split-K controls.
+    RELAX_SFT_STABLE_GRADIENTS = EnvProperty("RELAX_SFT_STABLE_GRADIENTS", bool, False)
     # Independent opt-ins for K3 training operator benchmarks and deployment.
     RELAX_KIMI_K3_EXPERT_SPLIT = EnvProperty("RELAX_KIMI_K3_EXPERT_SPLIT", bool, False)
     RELAX_KIMI_K3_FUSED_SITU = EnvProperty("RELAX_KIMI_K3_FUSED_SITU", bool, False)

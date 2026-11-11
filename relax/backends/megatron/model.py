@@ -78,6 +78,12 @@ from .model_provider import (
     validate_mtp_only_trainable_params,
     wrap_model_provider_with_freeze,
 )
+from .sft_precision import (
+    configure_sft_stable_gradients,
+    fused_head_precision_kwargs,
+    native_head_precision,
+    set_sft_stable_head,
+)
 
 
 logger = get_logger(__name__)
@@ -200,6 +206,8 @@ def _bypass_output_layer(
         if input_.dtype != w.dtype:
             input_ = input_.to(w.dtype)
         if labels is not None:
+            if getattr(output_layer, "_relax_sft_stable_gradients", False):
+                raise ValueError("SFT stable gradients does not support the MCore labels-based fused head")
             from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
 
             return linear_cross_entropy(
@@ -226,25 +234,28 @@ def _bypass_output_layer(
                 output_layer._relax_chunked_head_wgrad_logged = True
         output_layer.sequence_parallel = False
         try:
-            return original_forward(input_, weight=call_weight, runtime_gather_output=runtime_gather_output)
+            with native_head_precision(output_layer, input_, w, runtime_gather_output) as mapped:
+                return original_forward(mapped, weight=call_weight, runtime_gather_output=runtime_gather_output)
         finally:
             output_layer.sequence_parallel = prev_sp
             if unfused_head_wgrad:
                 output_layer.gradient_accumulation_fusion = prev_fusion
 
     def _fused_ce(input_: torch.Tensor, labels: torch.Tensor, temperature: float) -> torch.Tensor | None:
-        from .fused_linear_ce import linear_cross_entropy, supported
+        from . import fused_linear_ce
 
         weight = deferred_weight if deferred_weight is not None else output_layer.weight
-        if not supported(output_layer, input_, weight):
+        precision_kwargs = fused_head_precision_kwargs(output_layer, fused_linear_ce, weight)
+        if precision_kwargs is None or not fused_linear_ce.supported(output_layer, input_, weight):
             return None
-        loss, _ = linear_cross_entropy(
+        loss, _ = fused_linear_ce.linear_cross_entropy(
             input_,
             weight,
             labels,
             tp_group,
             temperature=temperature,
             accumulate=output_layer.gradient_accumulation_fusion,
+            **precision_kwargs,
         )
         return loss
 
@@ -557,6 +568,7 @@ def setup_model_and_optimizer(
     """
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
+    stable_gradients = configure_sft_stable_gradients(args)
     skip_nonfinite = configure_nonfinite_guard(args)
 
     model = get_model(
@@ -564,6 +576,8 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
+    for model_chunk in model:
+        set_sft_stable_head(_find_lm_output_layer(model_chunk), stable_gradients)
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
