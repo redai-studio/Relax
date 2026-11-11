@@ -22,6 +22,10 @@ from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
+# Callers can retain native heads when an older fused backend lacks this policy.
+SUPPORTS_FP32_TP_DGRAD = True
+
+
 @lru_cache(maxsize=2)
 def _log_enabled(metric_logits: bool) -> None:
     get_logger(__name__).info(
@@ -98,7 +102,7 @@ def supported(
 
 class _LinearCE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, labels, tp_group, inverse_temperature, accumulate, return_logits):
+    def forward(ctx, hidden, weight, labels, tp_group, inverse_temperature, accumulate, return_logits, tp_dgrad_fp32):
         from megatron.core.utils import ensure_params_ready
 
         from .fused_linear_ce_ops import linear_ce_forward
@@ -137,6 +141,7 @@ class _LinearCE(torch.autograd.Function):
         ctx.tp_group, ctx.tp_size = tp_group, size
         ctx.inverse_temperature, ctx.accumulate = inverse_temperature, accumulate
         ctx.hidden_shape, ctx.hidden_dtype = hidden.shape, hidden.dtype
+        ctx.tp_dgrad_fp32 = tp_dgrad_fp32
         logits = result.get("D") if return_logits else None
         if logits is not None:
             ctx.mark_non_differentiable(logits)
@@ -146,7 +151,7 @@ class _LinearCE(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, grad_loss, _grad_logits):
         if grad_loss is None:
-            return (None,) * 7
+            return (None,) * 8
         from .fused_linear_ce_ops import linear_ce_backward
 
         x, weight, labels, local_target, lse = ctx.saved_tensors
@@ -169,7 +174,13 @@ class _LinearCE(torch.autograd.Function):
             if ctx.tp_size > 1:
                 # SP was gathered with tensor_parallel_output_grad=False. Sum
                 # vocabulary contributions here; the gather backward only splits.
+                if ctx.tp_dgrad_fp32:
+                    dx = dx.float()
                 dist.all_reduce(dx, op=dist.ReduceOp.SUM, group=ctx.tp_group)
+                # Match native BF16 head input casting before propagating to
+                # a possibly FP32 bridge hidden state.
+                if ctx.tp_dgrad_fp32:
+                    dx = dx.to(x.dtype)
             dx = dx.reshape(ctx.hidden_shape).to(ctx.hidden_dtype)
         dw = None
         if ctx.needs_input_grad[1]:
@@ -189,7 +200,7 @@ class _LinearCE(torch.autograd.Function):
                     parameter.grad_added_to_main_grad = True
             else:
                 dw = (dlogits.T @ x).to(weight.dtype)
-        return dx, dw, None, None, None, None, None
+        return dx, dw, None, None, None, None, None, None
 
 
 def linear_cross_entropy(
@@ -201,9 +212,15 @@ def linear_cross_entropy(
     temperature: float = 1.0,
     accumulate: bool = False,
     return_logits: bool = False,
+    tp_dgrad_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Return unreduced losses in hidden row order; SP gathering is the
-    caller's job."""
+    caller's job.
+
+    ``tp_dgrad_fp32`` promotes Quack's BF16 local dgrad for the TP SUM, then
+    rounds back to the GEMM input dtype. The Blackwell backport already
+    computes and reduces dgrad in FP32.
+    """
     # The backport uses Blackwell TCGEN05/TMEM instructions. Hopper instead
     # reuses the Quack epilogues below, which have an SM90 GEMM backend.
     hopper = hidden.is_cuda and torch.cuda.get_device_capability(hidden.device)[0] == 9
@@ -219,6 +236,8 @@ def linear_cross_entropy(
         raise ValueError("Linear CE expects at least one row")
     if accumulate and weight.requires_grad and not hasattr(weight, "main_grad"):
         raise ValueError("Fused gradient accumulation requires the original head Parameter.main_grad")
-    result = _LinearCE.apply(hidden, weight, labels, tp_group, 1.0 / temperature, accumulate, return_logits)
+    result = _LinearCE.apply(
+        hidden, weight, labels, tp_group, 1.0 / temperature, accumulate, return_logits, tp_dgrad_fp32
+    )
     _log_enabled(return_logits)
     return result
