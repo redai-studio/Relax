@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pytest
@@ -500,15 +502,13 @@ def _megatron_context():
     own_parallel = not parallel_state.is_initialized()
     rng_tracker = get_cuda_rng_tracker()
     rng_states = rng_tracker.get_states()
-    with pytest.MonkeyPatch.context() as patcher:
+    with pytest.MonkeyPatch.context() as patcher, TemporaryDirectory() as directory:
         patcher.setattr(cf_rope, "_ORIGINAL_GET_ROTARY_SEQ_LEN", cf_rope._ORIGINAL_GET_ROTARY_SEQ_LEN)
         patcher.setattr(RotaryEmbedding, "get_rotary_seq_len", RotaryEmbedding.get_rotary_seq_len)
-        if own_dist:
-            patcher.setenv("MASTER_ADDR", os.environ.get("MASTER_ADDR", "127.0.0.1"))
-            patcher.setenv("MASTER_PORT", os.environ.get("MASTER_PORT", "29593"))
         try:
             if own_dist:
-                dist.init_process_group("nccl", rank=0, world_size=1)
+                rendezvous = (Path(directory) / "rendezvous").as_uri()
+                dist.init_process_group("nccl", init_method=rendezvous, rank=0, world_size=1)
             if own_parallel:
                 parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
             # TE enters Megatron's named RNG stream even with dropout=0.

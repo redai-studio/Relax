@@ -16,8 +16,6 @@ asserted too.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 
@@ -26,22 +24,19 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA r
 
 
 @pytest.fixture()
-def dist_env():
+def dist_env(tmp_path):
     """Single-rank NCCL process group, torn down after the test."""
     import torch.distributed as dist
 
-    created = False
-    if not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29617")
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        dist.init_process_group("nccl")
-        created = True
-    torch.cuda.set_device(0)
-    yield
+    created = not dist.is_initialized()
     if created:
-        dist.destroy_process_group()
+        dist.init_process_group("nccl", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1)
+    try:
+        torch.cuda.set_device(0)
+        yield
+    finally:
+        if created:
+            dist.destroy_process_group()
 
 
 class _Block(torch.nn.Module):
