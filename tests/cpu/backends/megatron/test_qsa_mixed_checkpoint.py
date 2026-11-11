@@ -35,6 +35,7 @@ def _load(monkeypatch, name, path):
 
 @pytest.fixture
 def checkpoint_modules(monkeypatch):
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "grouped")
     # This patch adds the entire pinned qsa.py. Execute the unmodified production
     # dataclass and two methods, with only external backend services substituted.
     patch = (ROOT / "docker/patch/megatron/20261016-qwen38-models.patch").read_text()
@@ -55,6 +56,7 @@ def checkpoint_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, QSA_MODULE, module)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<pinned-qsa-checkpoint>", "exec"), module.__dict__)
     metadata = _load(monkeypatch, MIXED + ".selection", ROOT / "relax/models/qwen3_8/ops/qsa_mixed_ops/selection.py")
+    _load(monkeypatch, MIXED + ".geometry", ROOT / "relax/models/qwen3_8/ops/qsa_mixed_ops/geometry.py")
     mixed = _load(monkeypatch, MIXED, ROOT / "relax/models/qwen3_8/ops/qsa_mixed_ops/__init__.py")
     return module, metadata, mixed
 

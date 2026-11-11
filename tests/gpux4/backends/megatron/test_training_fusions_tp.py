@@ -52,7 +52,7 @@ def _worker(rank: int, rendezvous: str) -> None:
             weight.grad.float(), reference_weight.grad.chunk(2)[rank].float(), atol=0.004, rtol=0.04
         )
 
-        source = Path(__file__).resolve().parents[3] / "relax/models/qwen3_8/ops/ple_fused_conv.py"
+        source = Path(__file__).resolve().parents[4] / "relax/models/qwen3_8/ops/ple_fused_conv.py"
         spec = importlib.util.spec_from_file_location("ple_tp_test", source)
         patch = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(patch)

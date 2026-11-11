@@ -19,6 +19,7 @@ relax/                   核心框架
 └── utils/               基础设施 — 工具函数、指标监控、多模态处理
 tests/                   模块测试与集成回归测试
 ├── cpu/                 无 GPU 环境执行的测试，内部保留模块层级
+├── gpux4/               需要 2-4 张 GPU 的测试
 ├── backends/megatron/   Megatron 后端测试（权重转换等）
 ├── backends/sglang/     SGLang 后端测试
 ├── components/          RL 服务组件测试
@@ -148,7 +149,7 @@ make docs-dev                       # 启动 VitePress 文档开发服务器
 
 - 测试按实际运行需求归类：纯 CPU 测试放入 `tests/cpu/<module>/`，需要真实 GPU 的测试保留在对应的 `tests/<module>/`。CPU/GPU 混合文件应拆开，不在 workflow 维护文件清单或逐用例排除。
 - CPU 分类必须检查间接调用和 fixture 的设备依赖，包括 CUDA tensor 搬运、设备探测和可见设备环境变量；不能仅凭测试名称或使用 mock 判断，也不能为迁入 CPU 而新增 skip/mock 掩盖真实 GPU 依赖。
-- CPU 套件须支持隐藏 GPU 后执行 `pytest tests/cpu`；GPU 套件由 `pytest tests/ --ignore=tests/cpu` 执行。依赖不全导致的 skip 不算回归通过，应明确验证限制。
+- CPU 套件须支持隐藏 GPU 后执行 `pytest tests/cpu`。单卡 CI 运行 `pytest tests/ --ignore=tests/cpu --ignore=tests/gpux4`，多卡 CI 运行 `pytest tests/gpux4`。依赖不全导致的 skip 不算回归通过，应明确验证限制。
 
 ## Distributed Code Rules
 

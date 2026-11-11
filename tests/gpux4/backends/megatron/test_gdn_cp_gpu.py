@@ -4,7 +4,7 @@
 Checks exact THD/SBHD layout round trips and BF16 CP=1/CP=2 GDN parity in one
 two-GPU spawn shared by both CP modes. FLA kernels use a fixed candidate
 configuration to avoid autotune benchmarks. Run with: pytest
-tests/backends/megatron/test_gdn_cp_gpu.py
+tests/gpux4/backends/megatron/test_gdn_cp_gpu.py
 """
 
 from __future__ import annotations
