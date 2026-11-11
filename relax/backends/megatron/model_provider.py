@@ -62,17 +62,14 @@ def configure_gdn_a_log_fp32(model: torch.nn.Module) -> None:
     """Preserve GDN A_log precision before Float16Module, DDP and HF
     loading."""
     for module in model.modules():
+        # MCore and MindSpeed-Bridge both expose A_log on their GDN layers.
         if not any(cls.__name__ == "GatedDeltaNet" for cls in type(module).__mro__):
             continue
-        # Import only for GDN models; other architectures need no GDN dependencies.
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
         from megatron.core.transformer.module import mark_keep_in_fp32
 
-        if isinstance(module, GatedDeltaNet):
-            # Keep Parameter identity and TP metadata. This also preserves the
-            # constructor's RNG sequence and works for meta-device construction.
-            module.A_log.data = module.A_log.data.float()
-            mark_keep_in_fp32(module.A_log)
+        # Preserve Parameter identity and TP metadata before mixed precision wrapping.
+        module.A_log.data = module.A_log.data.float()
+        mark_keep_in_fp32(module.A_log)
 
 
 def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
