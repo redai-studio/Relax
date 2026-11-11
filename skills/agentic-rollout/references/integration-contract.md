@@ -1,7 +1,7 @@
 # Integration contract
 
 Contents: [runtime path](#choose-the-runtime-path), [environment](#agent-environment),
-[dataset](#dataset-mapping), [request/parser](#model-request-contract), [export](#export-contract),
+[recipe](#assemble-a-recipe), [resources](#resource-ownership), [dataset](#dataset-mapping), [request/parser](#model-request-contract), [export](#export-contract),
 [multimodal](#multimodal-boundary), [validation](#integration-validation).
 
 ## Choose the runtime path
@@ -16,6 +16,21 @@ Use resident Agentic rollout for an external agent application that owns its mod
 
 `--use-agentic-rollout` unconditionally selects Agentic train and Eval generation functions. A configured
 `--custom-generate-function-path` is ignored; use the legacy path instead when Relax-side custom code must own the loop.
+
+## Assemble a recipe
+
+Start from the closest working model/mode recipe. Local tools: `examples/search_r1/run_search_r1.sh`; images:
+`examples/deepeyes_agentic/run_deepeyes_agentic.sh`; remote sandbox and fully async 4+4 PD/HiCache:
+`examples/mini_swe_agent/run_mini_swe_agent_pd_blackwell.sh`. Reuse applicable settings, not machine-specific paths,
+capacity, or parallelism without checking the target environment.
+
+Keep the integration in the agent entry point, dataset mapping, resource adapter, and launch recipe. Wire the existing
+model/tool loop to the injected API and complete-history contract, choose reward/export behavior, then configure
+concurrency and eligible-node dependencies. Shared environment/retrieval servers belong outside per-Session commands.
+The recipe should contain normal CLI configuration rather than experiment hooks or a separate rollout implementation.
+
+For local launch, inspect local Ray first and follow the repository's `AGENTS.md` entrypoint rule. Use `ray-job.sh`
+when submitting to an existing cluster. Integration or documentation work alone does not authorize a GPU experiment.
 
 ## Agent environment
 
@@ -33,6 +48,34 @@ Relax provides:
 
 The adapter must preserve the agent's normal task lifecycle, write terminal output atomically, and exit after cleanup.
 The command runs through `/bin/bash -lc`; inspect login-profile behavior if it may replace injected environment values.
+
+## Resource ownership
+
+`--agent-resource-owner-path` defaults to `relax.agentic.runner.resources.ProcessGroupResourceOwner`, which covers the
+launcher's process group without an application receipt. It does not cover remote jobs, containers managed elsewhere,
+or descendants that escape the process group. Use `ReceiptResourceOwner` from the same module, or a custom
+`SessionResourceOwner`, for that scope. Do not infer ownership from a recipe name.
+
+External adapters receive `RELAX_REQUIRE_RESOURCE_RELEASE=1`, `RELAX_RESOURCE_RELEASE_PATH`, and
+`RELAX_RESOURCE_RELEASE_NONCE`. On normal completion, failure, and cancellation, stop/join the actual external work
+before atomically writing exactly this terminal payload, then exit:
+
+```text
+{"schema": 1, "session_id": <RELAX_SESSION_ID>, "nonce": <RELAX_RESOURCE_RELEASE_NONCE>, "status": "released"}
+```
+
+The nonce binds one launch, not a reusable task slot. No response, a cancel ACK without physical cleanup, or a missing,
+invalid, or old receipt must not become a successful release. Task success/reward is independent of physical release.
+See the runnable receipt helper in `docs/en/guide/agentic-rollout.md#resource-ownership-and-release`.
+
+Custom owners receive a `ResourceLease` before command launch. Their `launch_environment()`, `confirm_release()`, and
+`diagnostics()` hooks are bounded synchronous local operations; confirmation is idempotent and returns a matching
+`ResourceReleaseReceipt` or `None`. Do not start resources in a constructor or perform remote cleanup in verification.
+The agent's cancellation path owns remote cleanup; the launcher joins the local process group before confirmation.
+
+Enable `--agentic-session-capacity-per-node` only after this scope is correct. The framework returns individual slots
+on confirmed release and retains uncertain owners for retry. The adapter remains necessary even when logical Groups
+fail, are filtered, or survive a step boundary.
 
 ## Dataset mapping
 
@@ -152,7 +195,8 @@ Before experiment preflight, verify:
    protocol-specific finish reasons;
 7. implicit or explicit export resolves to committed state;
 8. export count and advantage match `agentic-training-contract.md`;
-9. agent, tool, sandbox, and external resources clean up.
+9. agent, tool, sandbox, and external resources clean up on completion and cancellation; release proof matches the
+   current launch and an uncertain outcome does not refund capacity.
 
 Source anchors: `docs/en/guide/agentic-rollout.md`, `relax/agentic/runner/ipc.py`,
 `relax/agentic/session/service.py`, `relax/agentic/session/state.py`, `relax/agentic/pipeline/reward.py`, and
