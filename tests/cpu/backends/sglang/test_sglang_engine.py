@@ -163,6 +163,63 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
     response.raise_for_status.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("algorithm", "draft_model_path", "draft_revision", "external_draft", "selector"),
+    [
+        ("NEXTN", None, None, None, "all"),
+        ("NEXTN", "/policy", None, None, "all"),
+        ("NEXTN", "/policy", "other-revision", None, None),
+        ("NEXTN", "/separate-draft", None, None, None),
+        ("NEXTN", None, None, "/policy", "all"),
+        ("NEXTN", None, None, "/separate-draft", None),
+        ("EAGLE", None, None, None, None),
+        (None, None, None, None, None),
+    ],
+)
+def test_distributed_update_selects_same_checkpoint_nextn_runners(
+    monkeypatch, sglang_engine_module, algorithm, draft_model_path, draft_revision, external_draft, selector
+):
+    module = sglang_engine_module
+    args = SimpleNamespace(rollout_external=external_draft is not None, sglang_router_ip=None, sglang_router_port=None)
+    engine = module.SGLangEngine(args, rank=0)
+    server_args = {
+        "node_rank": 0,
+        "host": "127.0.0.1",
+        "port": 5000,
+        "model_path": "/policy",
+        "speculative_algorithm": algorithm,
+        "speculative_draft_model_path": draft_model_path,
+        "speculative_draft_model_revision": draft_revision,
+    }
+    monkeypatch.setattr(module, "_compute_server_args", Mock(return_value=(server_args, [])))
+    monkeypatch.setattr(engine, "_init_normal", Mock())
+    monkeypatch.setattr(engine, "get_pid_and_node_id", Mock(return_value={}), raising=False)
+    if external_draft is not None:
+        actual = {**server_args, "speculative_algorithm": "EAGLE", "speculative_draft_model_path": external_draft}
+        monkeypatch.setattr(module, "_wait_server_healthy", Mock())
+        monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=actual))))
+    engine.init(
+        "127.0.0.1:6000", 5000, 6001, host="127.0.0.1", skip_dcs_registration=True, skip_router_registration=True
+    )
+
+    request = Mock(return_value={"success": True})
+    monkeypatch.setattr(engine, "_make_request", request)
+    engine.update_weights_from_distributed(
+        ["mtp.layers.0.o_proj.weight_scale_inv"], ["torch.float32"], [[1, 1]], "rollout", weight_version="7"
+    )
+    payload = {
+        "names": ["mtp.layers.0.o_proj.weight_scale_inv"],
+        "dtypes": ["float32"],
+        "shapes": [[1, 1]],
+        "group_name": "rollout",
+        "flush_cache": False,
+        "weight_version": "7",
+    }
+    if selector is not None:
+        payload["selector"] = selector
+    request.assert_called_once_with("update_weights_from_distributed", payload)
+
+
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):
     engine = object.__new__(sglang_engine_module.SGLangEngine)
     request = Mock(return_value={"success": True})
