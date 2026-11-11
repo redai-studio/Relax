@@ -67,11 +67,16 @@ def summarize(directories: list[Path], *, warmup: int, steps: int, minimum_runs:
     groups: dict[str, list[dict[str, Any]]] = {}
     invariant = None
     coverage = None
+    job_ids: set[str] = set()
     if len({path.resolve() for path in directories}) != len(directories):
         raise ValueError("The same run directory cannot count as independent repetitions")
     for directory in directories:
         metadata = json.loads((directory / "run.json").read_text())
         status = json.loads((directory / "status.json").read_text())
+        job_id = status.get("job_id")
+        if not isinstance(job_id, str) or not job_id or job_id in job_ids:
+            raise ValueError("Independent runs require distinct nonempty Ray job IDs")
+        job_ids.add(job_id)
         if (
             status["status"] != "SUCCEEDED"
             or metadata["capture"]

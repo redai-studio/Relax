@@ -177,7 +177,7 @@ def _runs(tmp_path):
                 gpu_topology={"links_and_numa": "GPU0 NV2 GPU1", "gpu_identity": "uuid-0, bus-0"},
             )
             (directory / "run.json").write_text(json.dumps(metadata))
-            (directory / "status.json").write_text(json.dumps({"status": "SUCCEEDED"}))
+            (directory / "status.json").write_text(json.dumps({"status": "SUCCEEDED", "job_id": f"{mode}-{repeat}"}))
             (directory / "training.log").write_text(_log([(seconds, 120)]))
             directories.append(directory)
     return directories
@@ -215,6 +215,7 @@ def test_weight_shard_recording_hashes_contents_and_requires_every_shard(tmp_pat
         "diagnostic",
         "failure",
         "same_run",
+        "same_job",
     ],
 )
 def test_repeated_run_summary_rejects_unfair_or_incomplete_comparisons(tmp_path, change):
@@ -240,6 +241,8 @@ def test_repeated_run_summary_rejects_unfair_or_incomplete_comparisons(tmp_path,
         (directory / "status.json").write_text(json.dumps({"status": "FAILED"}))
     elif change == "same_run":
         directories[-1] = directories[-2]
+    elif change == "same_job":
+        (directory / "status.json").write_text(json.dumps({"status": "SUCCEEDED", "job_id": "D-1"}))
     else:
         (directory / "training.log").write_text(_log([(1, 100)]))
     path.write_text(json.dumps(metadata))
