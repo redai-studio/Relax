@@ -28,23 +28,31 @@ sufficient to identify this development baseline.
 
 ## Build the candidate image
 
-Build from the repository root, using an existing Relax GPU runtime as the base.
-It must already contain compatible Torch, Transformer Engine, SGLang, attention
-and GDN dependencies. A plain CUDA image is insufficient. The Dockerfile replaces
-the inherited Megatron source with the clean snapshots above and installs Lens;
-it does not replay the regular image's Megatron patches or rebuild CUDA kernels.
+The candidate uses the existing `docker/Dockerfile` and its `relax` target, so
+the normal CI image pipeline can build this branch without a custom Dockerfile
+or additional build flags. The default build selects the clean paired Megatron
+snapshots above, omits the regular Megatron patches, and installs Lens. The
+existing train-stage and CUDA runtime build process still applies.
 
 ```bash
 docker build \
-    -f docker/Dockerfile.megatron-otel \
-    --build-arg BASE_IMAGE=<existing-relax-gpu-runtime> \
+    -f docker/Dockerfile \
+    --target relax \
     -t relax:megatron-otel-qwen35 .
 ```
 
-The resulting checkout is `/opt/relax-otel`. Dependency source identities are
+Existing CI overrides such as `BASE_IMAGE` and a cached `TRAIN_IMAGE` keep their
+normal meaning. The Megatron/Lens selection is in the final `relax` stage and
+does not require rebuilding a cached train stage.
+
+The resulting checkout is `/root/Relax`. Dependency source identities are
 recorded in `/opt/relax/megatron-otel-versions.txt`. Keep the build's Relax commit,
 base image and output digest alongside this file. Build-time imports do not
 establish that GPU training works.
+
+Image builds and GPU smoke execution are performed by the operator. The default
+Dockerfile change itself has only been checked locally; no image build or GPU
+run has been accepted for this revision.
 
 ## Prepare assets
 
