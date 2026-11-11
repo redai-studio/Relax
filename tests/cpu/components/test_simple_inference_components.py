@@ -94,17 +94,20 @@ def test_actor_commits_next_step_and_clears_partition_before_leaving_operation(h
 
 def test_actor_failure_pauses_before_leaving_and_is_not_swallowed_by_health_check():
     events = []
+    report_ack = Mock()
     actor = component_methods(
         "actor.py",
         "Actor",
         ["_background_run", "_run_training_step"],
         suppress=suppress,
+        ray=SimpleNamespace(get=report_ack),
         build_async_train_data_fields=lambda config: ["advantages"],
     )
     actor.config = SimpleNamespace(num_rollout=1, fully_async=True, use_health_check=True)
     actor.step = 0
     actor._lock = threading.RLock()
     actor._stop_event = threading.Event()
+    actor._stop_event.wait = Mock()
     actor._logger = Mock()
     actor._recovery = Gate(events)
     actor._execute_training = Mock(side_effect=ValueError("training-failed"))
@@ -115,6 +118,8 @@ def test_actor_failure_pauses_before_leaving_and_is_not_swallowed_by_health_chec
         actor._background_run()
 
     assert events == ["admit", ("failure", "training-failed"), "leave"]
+    report_ack.assert_called_once()
+    actor._stop_event.wait.assert_called_once_with()
     assert actor.step == 0
     actor.data_system_client.async_clear_partition.assert_not_called()
 

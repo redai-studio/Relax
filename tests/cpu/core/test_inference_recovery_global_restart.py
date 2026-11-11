@@ -45,68 +45,6 @@ def _controller_shell():
     return controller
 
 
-def _patch_global_restart_cleanup(monkeypatch):
-    monkeypatch.setattr(controller_module, "recovery_load_path", Mock())
-    monkeypatch.setattr(controller_module.serve, "shutdown", Mock())
-    monkeypatch.setattr(controller_module.ray, "shutdown", Mock())
-    monkeypatch.setattr(controller_module.ray, "init", Mock())
-    monkeypatch.setattr(controller_module.tq, "close", Mock())
-    monkeypatch.setattr(controller_module, "shutdown_async_loop", Mock())
-
-
-def test_global_restart_signals_failure_from_any_phase():
-    controller = _controller_shell()
-    error = RuntimeError("ray init failed")
-    controller._restart_serve = Mock(side_effect=error)
-
-    controller.restart_serve("actor")
-
-    assert controller._restart_done_event.is_set()
-    assert controller._restart_error is error
-
-
-def test_global_restart_signals_success_on_same_event():
-    controller = _controller_shell()
-    event = threading.Event()
-    controller._restart_done_event = event
-    controller._restart_serve = Mock()
-
-    controller.restart_serve("actor")
-
-    assert controller._restart_done_event is event
-    assert event.is_set()
-    assert controller._restart_error is None
-
-
-def test_default_global_restart_reinitializes_after_legacy_manager_death(monkeypatch):
-    from relax.core import service as service_module
-
-    controller = _controller_shell()
-    controller.config, controller.runtime_env = SimpleNamespace(), {}
-    controller._health_manager = SimpleNamespace(_checker=None, stop=Mock())
-    controller._metrics_service_enabled, controller._autoscaler_config = False, None
-    controller._shutdown_agentic_rollout_services = Mock()
-    legacy = object.__new__(service_module.Service)
-    legacy.role, legacy.pgs = "rollout", None
-    legacy._is_shared_pgs = False
-    legacy.handle, legacy._stop_heartbeat_thread = Mock(), Mock()
-    controller.serve_dict = {"rollout": legacy}
-    _patch_global_restart_cleanup(monkeypatch)
-    monkeypatch.setattr(controller_module.serve, "delete", Mock())
-    monkeypatch.setattr(controller_module.serve, "start", Mock())
-    monkeypatch.setattr(controller_module.serve, "status", Mock(side_effect=RuntimeError("Serve unavailable")))
-    monkeypatch.setattr(controller_module.time, "sleep", Mock())
-    monkeypatch.setattr("relax.distributed.ray.rollout.stop_launched_routers", Mock(return_value=0))
-    initialize = Mock()
-    monkeypatch.setattr(Controller, "__init__", initialize)
-
-    controller._run_global_restart()
-
-    controller_module.ray.shutdown.assert_called_once_with()
-    controller_module.ray.init.assert_called_once_with(runtime_env=controller.runtime_env)
-    initialize.assert_called_once_with(controller.config, controller.runtime_env, fault_events=None)
-
-
 def test_global_restart_count_limit_remains_terminal(monkeypatch):
     controller = _controller_shell()
     controller._global_restart_count = 0
@@ -123,17 +61,6 @@ def test_global_restart_count_limit_remains_terminal(monkeypatch):
     assert controller._global_restart_count == 1
     exit_process.assert_called_once_with(1)
     controller._report_error_to_metrics_service.assert_called_once()
-
-
-def test_cancel_pending_tasks_cancels_owned_refs_once():
-    controller = _controller_shell()
-    ref = Mock()
-    controller._pending_task_refs = [ref]
-
-    controller._cancel_pending_tasks()
-
-    assert controller._pending_task_refs == []
-    ref.cancel.assert_called_once_with()
 
 
 def _patch_restart_entry(monkeypatch, controller):

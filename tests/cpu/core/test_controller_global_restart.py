@@ -142,6 +142,9 @@ def test_global_restart_cleans_both_router_owners(
 
     def reinit(self, config, runtime_env, fault_events=None, fault_recovery=None):
         events.append("reinit")
+        assert config is controller.config
+        assert runtime_env is controller.runtime_env
+        assert fault_events is None
         assert config.sglang_router_ip == expected_router_ip
         assert config.sglang_router_port == (3000 if expected_router_ip else None)
 
@@ -157,5 +160,6 @@ def test_global_restart_cleans_both_router_owners(
         assert events.index("dispose manager") < events.index(f"delete {controller_module.ROLES.rollout}")
     stop_driver.assert_called_once_with()
     assert events.index("stop driver router") < events.index("ray shutdown") < events.index("reinit")
+    controller_module.ray.init.assert_called_once_with(runtime_env=controller.runtime_env)
     assert controller._restart_error is None
     assert controller._restart_done_event.is_set()
