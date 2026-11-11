@@ -1200,29 +1200,15 @@ class MegatronTrainRayActor(TrainRayActor):
         indexer_topk = None
         for vp_stage, model in enumerate(self.model):
             config = model.module.config
-            ratios_value = getattr(config, "csa_compress_ratios", None)
-            if ratios_value is None or not hasattr(config, "dsa_indexer_topk"):
-                raise RuntimeError("Rollout indexer replay requires a DeepSeek-V4 hybrid Megatron model")
-            indexer_loss_coeff = getattr(config, "dsa_indexer_loss_coeff", 0.0) or 0.0
-            if indexer_loss_coeff != 0.0:
-                raise RuntimeError(
-                    "Rollout indexer replay requires dsa_indexer_loss_coeff=0, "
-                    f"got {indexer_loss_coeff} from the Megatron model config"
-                )
-            ratios = list(ratios_value)
-            if len(ratios) < config.num_layers:
-                raise RuntimeError(
-                    f"DSV4 csa_compress_ratios has {len(ratios)} entries for {config.num_layers} layers"
-                )
-            c4_ordinal = 0
-            for layer_id, ratio in enumerate(ratios[: config.num_layers]):
-                if ratio == 4:
-                    layer_to_ordinal[layer_id] = c4_ordinal
-                    c4_ordinal += 1
+            from relax.distributed.replay_manager.validation import indexer_capture_layout
 
-            model_topk = int(config.dsa_indexer_topk)
+            model_topk, capture_layers = indexer_capture_layout(config)
+            model_ordinals = {layer: ordinal for ordinal, layer in enumerate(capture_layers)}
+            if layer_to_ordinal and layer_to_ordinal != model_ordinals:
+                raise RuntimeError("Inconsistent indexer capture layer maps")
+            layer_to_ordinal = model_ordinals
             if indexer_topk is not None and indexer_topk != model_topk:
-                raise RuntimeError(f"Inconsistent DSV4 indexer top-k widths: {indexer_topk} vs {model_topk}")
+                raise RuntimeError(f"Inconsistent indexer top-k widths: {indexer_topk} vs {model_topk}")
             indexer_topk = model_topk
 
             num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)

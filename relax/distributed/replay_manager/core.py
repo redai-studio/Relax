@@ -612,11 +612,12 @@ class ReplayInventory:
             item["topk"],
             item["chunk_rows"],
             token_identity,
+            item.get("codec", "int32"),
         )
         self.seal(ref)
         return ref
 
-    def begin(self, record: str, kind: str, layers: int, topk: int, chunk_rows: int) -> None:
+    def begin(self, record: str, kind: str, layers: int, topk: int, chunk_rows: int, codec: str = "int32") -> None:
         if self.state["closed"] or self.state.get("closing"):
             raise RuntimeError("Replay run is closed")
         if record in self.state["objects"]:
@@ -637,12 +638,15 @@ class ReplayInventory:
             readers=[],
             blocks={},
             kind=kind,
+            codec=codec,
             layers=layers,
             topk=topk,
             chunk_rows=chunk_rows,
         )
 
-    def reserve_layers(self, record: str, chunk: int, layers: tuple[int, ...], count: int) -> None:
+    def reserve_layers(
+        self, record: str, chunk: int, layers: tuple[int, ...], count: int, encoded_bytes: int | None = None
+    ) -> None:
         item = self.state["objects"][record]
         if not item["writing"] or self.state.get("closing"):
             raise RuntimeError("Replay publication is not writable")
@@ -658,6 +662,10 @@ class ReplayInventory:
         if any(key in item["blocks"] for key in keys):
             raise ValueError("Replay blocks are write-once")
         size = count * item["topk"] * 4 * len(keys)
+        if item.get("codec", "int32") != "int32":
+            if encoded_bytes is None or not 0 < encoded_bytes <= size:
+                raise ValueError("Invalid encoded replay reservation")
+            size = encoded_bytes
         used = sum(obj["bytes"] for obj in self.state["objects"].values())
         if used + size > self.capacity_bytes:
             raise BufferError("Replay store capacity exhausted during publication")

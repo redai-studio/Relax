@@ -31,6 +31,7 @@ from relax.models.keye_vl2.topk import dsa_topk_indices
 from relax.models.keye_vl2.vision import build_vision, image_features
 
 from .ops import expert_forward, paged_decode, paged_scores, rope
+from .replay import install_indexer_capturer
 
 
 try:
@@ -174,6 +175,7 @@ class KeyeAttention(Qwen3MoeAttention):
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 min(req_to_token.shape[1], get_model().context_length or req_to_token.shape[1]),
+                layer_id=layer_id,
             )
             output, _ = self.o_proj(output)
             return output
@@ -182,6 +184,9 @@ class KeyeAttention(Qwen3MoeAttention):
             req_to_token = req_to_token[forward_batch.req_pool_indices]
         else:
             raise ValueError("Keye reference rollout supports extend/decode only")
+        from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+
+        capturer = get_global_indexer_capturer()
         for batch_index, (length, query_length) in enumerate(zip(lengths, query_lengths)):
             length = int(length)  # CPU metadata, never a GPU synchronization.
             slots = req_to_token[batch_index, :length].long()
@@ -195,6 +200,8 @@ class KeyeAttention(Qwen3MoeAttention):
                 scores.masked_fill_(~causal, torch.finfo(scores.dtype).min)
                 selected = dsa_topk_indices(scores)
                 selected_slots, counts = compact_indices(selected, causal.gather(1, selected))
+                if capturer is not None:
+                    capturer.capture_compacted(layer_id, selected_slots, counts, row_offset=start)
                 result = sparse_attention(q[start:end], all_k, all_v, selected_slots, counts)
                 outputs.append(result.reshape(end - start, -1))
             offset += query_length
@@ -267,6 +274,8 @@ class KeyeVL2MoeForConditionalGeneration(Qwen3MoeForCausalLM):
         if quant_config is not None:
             raise ValueError("Keye reference rollout requires BF16 weights")
         torch.backends.cuda.preferred_blas_library("cublaslt")
+        if getattr(config, "model_type", None) == "KeyeVL2":
+            install_indexer_capturer()
         super().__init__(config, quant_config, prefix)
         self.lm_head.quant_method = KeyeLinearMethod()
         self.model.__class__ = KeyeLanguageModel

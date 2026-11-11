@@ -213,6 +213,7 @@ class TQBodyBackend:
         self.partition = BODY_PARTITION_PREFIX + run
         self._factory = client_factory
         self._client = None
+        self._gdr_reader = None
         self._pid = os.getpid()
         self._lock = RLock()
 
@@ -263,6 +264,9 @@ class TQBodyBackend:
 
     def close(self) -> None:
         with self._lock:
+            if self._gdr_reader is not None:
+                self._gdr_reader.close()
+                self._gdr_reader = None
             if self._client is not None:
                 self._client.close()  # Local sockets only. Never tq.close().
                 self._client = None
@@ -350,6 +354,7 @@ class TQReplayStorage:
         self._pid = os.getpid()
         self._backend = TQBodyBackend(self.run, client_factory or self._make_client)
         self._pending_releases = []
+        self._device_reads = None
 
     def _registry(self) -> Any:
         if self._registry_handle is None:
@@ -405,7 +410,7 @@ class TQReplayStorage:
     def write_blocks(self, record: str, chunk: int, layers: tuple[int, ...], values: tuple[Any, ...]) -> None:
         if not layers or len(layers) != len(values) or any(value.shape != values[0].shape for value in values):
             raise ValueError("Replay batch requires equally shaped layer blocks")
-        self.invoke("reserve_layers", record, chunk, layers, len(values[0]))
+        self.invoke("reserve_layers", record, chunk, layers, len(values[0]), sum(value.nbytes for value in values))
         self._backend.write_many([f"{record}:{chunk}:{layer}" for layer in layers], values)
         try:
             self.invoke("written_layers", record, chunk, layers)
@@ -413,6 +418,35 @@ class TQReplayStorage:
             # Only metadata acknowledgement is idempotent; never retry an
             # ambiguous payload put. Unacknowledged blocks remain inventoried.
             self.invoke("written_layers", record, chunk, layers)
+
+    def _prepare_device_reads(self, device: Any) -> bool:
+        import torch
+
+        if self._inventory is not None or torch.device(device).type != "cuda":
+            return False
+        if self._device_reads is None:
+            from ._gdr import GdrBodyReader, reader_connection
+
+            connection, self._device_reads = reader_connection(self.invoke("get_connection"))
+            if self._device_reads:
+                from transfer_queue.storage.managers import mooncake_manager  # noqa: F401
+
+                self._backend._gdr_reader = GdrBodyReader(
+                    lambda: tq_client_factory(connection, body_partition=self._backend.partition),
+                    partition=self._backend.partition,
+                )
+        return bool(self._device_reads)
+
+    def encoded_batch_limit(self, *, device: Any) -> int:
+        """Bound heterogeneous GPU reads; CPU TensorDict bodies stay
+        singleton."""
+        return 32 << 20 if self._prepare_device_reads(device) else 0
+
+    def read_encoded(self, keys: list[str], *, device: Any) -> list[Any]:
+        """Keep CPU backends unchanged; RDMA bodies arrive directly on GPU."""
+        if self._prepare_device_reads(device):
+            return self._backend._gdr_reader.read(keys)
+        return self._backend.read(keys)
 
     def remap_tokens(self, ref: ReplayRef, captured: list[int], training: list[int]) -> ReplayRef:
         return self.invoke("remap_tokens", ref, captured, training)
@@ -538,6 +572,7 @@ class TQReplayStorage:
         if self._registry_handle is not None:
             _ray().kill(self._registry_handle, no_restart=True)
         self._backend.close()
+        self._device_reads = None
         self._registry_handle = None
         self._driver = None
 
@@ -561,3 +596,4 @@ class TQReplayStorage:
             _ray().kill(self._registry(), no_restart=True)
             self._driver = None
         self._backend.close()
+        self._device_reads = None

@@ -137,3 +137,58 @@ def test_causal_prefix_matches_full_matrix_outputs_and_auxiliary_gradients():
     assert inputs[3].grad is None
     for (_, parameter), (_, rp) in zip(attention.named_parameters(), reference.named_parameters()):
         torch.testing.assert_close(parameter.grad, rp.grad, atol=2e-5, rtol=0.08)
+
+
+def test_recorded_rows_skip_index_scores_but_missing_last_row_keeps_exact_fallback(monkeypatch):
+    import relax.models.keye_vl2.attention as module
+    from relax.distributed.replay_manager.backend.megatron import IndexerReplay
+    from relax.models.keye_vl2.replay import capture_rows
+
+    torch.manual_seed(97)
+    length = 2113
+    attention = _attention()
+    attention.sa_indexer.requires_grad_(False)
+    packed = SimpleNamespace(cu_seqlens_q_cpu=[0, length], num_valid_tokens=length)
+    inputs = _inputs(length)
+    captured = []
+    topk = module.dsa_topk_indices
+
+    def record(scores):
+        selected = topk(scores)
+        start = sum(len(chunk) for chunk in captured)
+        positions = torch.arange(start, start + len(selected), device="cuda")
+        captured.append(capture_rows(selected, selected <= positions[:, None]))
+        return selected
+
+    monkeypatch.setattr(module, "dsa_topk_indices", record)
+    expected = attention(*inputs[:3], hidden_states=inputs[3], packed_seq_params=packed)
+    choices = torch.cat(captured)
+    choices[-1] = -1
+    choices._relax_indexer_missing_rows = (length - 1,)
+    valid = torch.arange(length, device="cuda") < length - 1
+    monkeypatch.setattr(module, "dsa_topk_indices", topk)
+    scored_rows = []
+    scores = module.indexer_scores
+
+    def count_scores(query, key, weights):
+        scored_rows.append(len(query))
+        return scores(query, key, weights)
+
+    monkeypatch.setattr(module, "indexer_scores", count_scores)
+    replay_inputs = [x.detach().clone().requires_grad_() for x in inputs]
+    IndexerReplay.begin_step([1])
+    IndexerReplay.record(1, choices, valid)
+    IndexerReplay.set_stage("replay_forward")
+    attention.config.relax_use_indexer_replay = True
+    try:
+        actual = attention(*replay_inputs[:3], hidden_states=replay_inputs[3], packed_seq_params=packed)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        weight = torch.randn_like(actual) / length
+        (expected * weight).float().sum().backward()
+        (actual * weight).float().sum().backward()
+        for reference, replayed in zip(inputs[:3], replay_inputs[:3]):
+            torch.testing.assert_close(replayed.grad, reference.grad, atol=2e-5, rtol=0.08)
+        assert scored_rows == [1]
+        IndexerReplay.finish_step(expect_backward=False)
+    finally:
+        IndexerReplay.clear()

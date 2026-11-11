@@ -4,6 +4,8 @@
 
 代码基线为内部 `github/replay-manager` 分支的 `0336755c0ca2788a767c23a5fa5d473895eaa945`。该提交合并了 PR #486 与当时的 `github/main`，并修复 reference 生命周期和 SGLang 接口适配；原 GitHub PR 分支未修改。本文新增的性能优化仍是设计，尚未实施。
 
+MoE 数据通路的后续实施和单机对照结果见 [Qwen3.5-35B-A3B reference R3 实验记录](./experiments/2026-11-11-qwen35-moe-r3/README.md)。该实验仅覆盖非 DSA 的预取与 TQ 热路径优化，不代表本文 DSA/QSA 方案已完成。
+
 ## 1. 目标与范围
 
 目标是让 Relax 的 DSA/QSA rollout-to-train replay 具有很低的端到端开销：中间环节只处理元数据和布局，模型消费点直接使用录制选择，尽可能跳过原 indexer 的打分、top-k 以及仅为选路服务的计算和通信。

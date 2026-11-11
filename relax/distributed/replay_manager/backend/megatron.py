@@ -28,6 +28,7 @@ from ..consumer import (
 )
 from ..core import ConsumerConsumptionError, ConsumerPhase, ReplayManager, ReplayRegion, replay_data_manager
 from ..ref_data import REFERENCE_FIELD, ReplayRef, TokenHandle
+from ..validation import indexer_capture_layout
 
 
 P = ParamSpec("P")
@@ -83,7 +84,7 @@ def log_reference_replay_metrics(cache: ConsumerTensorCache, args: Any, rollout_
     existing training performance report, not a cross-rank maximum.
     """
     ahead = cache._read_ahead
-    if not ahead.read_calls:
+    if not ahead.read_calls and not cache.decoded_rows:
         return
     from megatron.core import mpu
 
@@ -91,10 +92,22 @@ def log_reference_replay_metrics(cache: ConsumerTensorCache, args: Any, rollout_
     from relax.utils.metrics.metric_utils import compute_rollout_step
     from relax.utils.timer import Timer
 
-    Timer().add("replay_read_cpu", ahead.read_seconds)
+    Timer().add("replay_read_cpu", ahead.read_seconds + cache.encoded_fetch_seconds)
     Timer().add("replay_consumer_wait", ahead.demand_wait_seconds)
     Timer().add("replay_prefetch_read", ahead.prefetch_read_seconds)
     metrics = {
+        "replay/encoded_rdma_bytes": cache.encoded_rdma_bytes,
+        "replay/gdr_staging_d2d_bytes": cache.encoded_rdma_bytes,
+        "replay/gdr_read_calls": cache.gdr_read_calls,
+        "replay/encoded_fetch_seconds": cache.encoded_fetch_seconds,
+        "replay/encoded_read_batches": cache.encoded_read_batches,
+        "replay/encoded_read_bodies": cache.encoded_read_bodies,
+        "replay/encoded_batch_peak_bytes": cache.encoded_batch_peak_bytes,
+        "replay/gpu_cache_peak_bytes": cache.gpu_peak_bytes,
+        "replay/encoded_read_bytes": cache.encoded_read_bytes,
+        "replay/encoded_h2d_bytes": cache.encoded_h2d_bytes,
+        "replay/decoded_rows": cache.decoded_rows,
+        "replay/logical_decoded_bytes": cache.logical_decoded_bytes,
         "replay/read_calls": ahead.read_calls,
         "replay/cold_reads": ahead.cold_reads,
         "replay/prefetch_hits": ahead.prefetch_hits,
@@ -222,17 +235,11 @@ def _indexer_layout(actor: Any) -> ConsumerModelLayout:
     topk = None
     capture_layers = None
     for config, layers in _local_layer_ranges(actor):
-        ratios = getattr(config, "csa_compress_ratios", None)
-        if ratios is None or not hasattr(config, "dsa_indexer_topk") or getattr(config, "dsa_indexer_loss_coeff", 0):
-            raise RuntimeError("Indexer reference replay requires the supported DSV4 C4 configuration")
-        c4_layers = [layer for layer, ratio in enumerate(ratios[: config.num_layers]) if ratio == 4]
-        if not c4_layers or len(ratios) < config.num_layers:
-            raise ValueError("Invalid C4 layer map")
-        if topk is not None and (topk != config.dsa_indexer_topk or capture_layers != c4_layers):
+        model_topk, model_layers = indexer_capture_layout(config)
+        if topk is not None and (topk != model_topk or capture_layers != model_layers):
             raise ValueError("Inconsistent Indexer capture layout")
-        topk = config.dsa_indexer_topk
-        capture_layers = c4_layers
-        local_layers.extend((layer, c4_layers.index(layer)) for layer in layers if layer in c4_layers)
+        topk, capture_layers = model_topk, model_layers
+        local_layers.extend((layer, capture_layers.index(layer)) for layer in layers if layer in capture_layers)
     if topk is None or capture_layers is None:
         raise ValueError("No Indexer model configuration")
     IndexerReplay.begin_step([layer + 1 for layer, _ in local_layers])
@@ -544,8 +551,7 @@ class _LayerIndexerReplay:
 
 
 class IndexerReplay:
-    """Step-local DSV4 C4 indexer choices, keyed by global one-based layer
-    number."""
+    """Step-local indexer choices, keyed by global one-based layer number."""
 
     _enabled = False
     _phase = ConsumerPhase()
@@ -597,8 +603,20 @@ class IndexerReplay:
         try:
             replay = cls._layers[layer_number]
         except KeyError as exc:
-            raise RuntimeError(f"Unexpected DSV4 indexer replay layer {layer_number}") from exc
+            raise RuntimeError(f"Unexpected indexer replay layer {layer_number}") from exc
         replay.record(topk, row_valid)
+
+    @classmethod
+    def read(cls, layer_number: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Consume one local microbatch; chunked models slice the returned
+        rows."""
+        if not cls._enabled or cls._phase.get() == "fallthrough":
+            return None
+        try:
+            replay = cls._layers[layer_number]
+        except KeyError as exc:
+            raise RuntimeError(f"Missing rollout indexer replay for layer {layer_number}") from exc
+        return replay.pop(cls._phase.get())
 
     @classmethod
     def replay(cls, layer_number: int, computed_topk: torch.Tensor | None) -> torch.Tensor | None:
@@ -607,19 +625,19 @@ class IndexerReplay:
         try:
             replay = cls._layers[layer_number]
         except KeyError as exc:
-            raise RuntimeError(f"Missing rollout indexer replay for DSV4 layer {layer_number}") from exc
+            raise RuntimeError(f"Missing rollout indexer replay for Indexer layer {layer_number}") from exc
 
         rollout_topk, row_valid = replay.pop(cls._phase.get())
         if computed_topk is None:
             return None
         if rollout_topk.shape != computed_topk.shape:
             raise RuntimeError(
-                f"DSV4 indexer replay shape mismatch at layer {layer_number}: "
+                f"indexer replay shape mismatch at layer {layer_number}: "
                 f"rollout={tuple(rollout_topk.shape)}, trainer={tuple(computed_topk.shape)}"
             )
         if rollout_topk.device != computed_topk.device or row_valid.device != computed_topk.device:
             raise RuntimeError(
-                f"DSV4 indexer replay device mismatch at layer {layer_number}: "
+                f"indexer replay device mismatch at layer {layer_number}: "
                 f"rollout={rollout_topk.device}, mask={row_valid.device}, trainer={computed_topk.device}"
             )
         return torch.where(row_valid.unsqueeze(1), rollout_topk, computed_topk)
@@ -631,7 +649,7 @@ class IndexerReplay:
                 replay.manager.reset_forward(replay.key, require_consumed=require_consumed)
             except ConsumerConsumptionError as exc:
                 raise RuntimeError(
-                    f"DSV4 layer {layer_number} consumed {exc.consumed}/{exc.recorded} "
+                    f"Indexer layer {layer_number} consumed {exc.consumed}/{exc.recorded} "
                     "forward indexer replay microbatches"
                 ) from None
 
@@ -643,7 +661,7 @@ class IndexerReplay:
             except ConsumerConsumptionError as exc:
                 phase = "training-forward" if exc.phase == "replay_forward" else "recompute-backward"
                 raise RuntimeError(
-                    f"DSV4 layer {layer_number} consumed {exc.consumed}/{exc.recorded} "
+                    f"Indexer layer {layer_number} consumed {exc.consumed}/{exc.recorded} "
                     f"{phase} indexer replay microbatches"
                 ) from None
         cls.clear()

@@ -13,6 +13,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 from ._prefetch import _ConsumerReadAhead
+from .codecs import replay_codec
 from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, validate_sample
 
 
@@ -191,6 +192,7 @@ class ConsumerReadSession:
         self._leases = store.acquire_many(refs, partition=partition)
         self._users = 1
         self._closing = False
+        self._bitmap_authorized: set[int] = set()
         self._lock = RLock()
 
     @property
@@ -263,12 +265,12 @@ class ConsumerReadSession:
 
 
 class ConsumerTensorCache:
-    """One train batch/rank's bounded, immutable CPU materializations.
+    """Bounded CPU materializations and compressed GPU bodies for one batch.
 
-    Shared by both kinds, all layers and microbatches. Eviction drops only our
-    tensor references, never reader leases. No GPU tensor or CUDA graph is
-    kept. H2D still occurs per consumption; a miss may reread after budget
-    eviction.
+    Shared by kinds, layers and microbatches; eviction never drops reader
+    leases. Raw replay keeps its CPU policy. Both bitmap transports share the
+    same small GPU cache; CPU transport copies only on a miss, GDR receives on
+    the device.
     """
 
     def __init__(self, capacity_bytes: int) -> None:
@@ -279,6 +281,13 @@ class ConsumerTensorCache:
         self.bytes = self.peak_bytes = self.hits = self.evictions = 0
         self._source_bytes: dict[Any, int] = {}
         self._working_set_bytes = 0
+        self.encoded_read_bytes = self.encoded_h2d_bytes = self.decoded_rows = 0
+        self.logical_decoded_bytes = 0
+        self.encoded_rdma_bytes = self.gdr_read_calls = 0
+        self.encoded_read_batches = self.encoded_read_bodies = self.encoded_batch_peak_bytes = 0
+        self.encoded_fetch_seconds = 0.0
+        self.gpu_bytes = self.gpu_peak_bytes = 0
+        self.gpu_capacity_bytes = min(capacity_bytes, 64 << 20)
         self._read_ahead = _ConsumerReadAhead(self)
 
     @property
@@ -292,7 +301,8 @@ class ConsumerTensorCache:
     def _register_source(self, source: ConsumerLayerReader, size: int) -> None:
         self._source_bytes[source._cache_key] = size
         self._working_set_bytes += size
-        self._read_ahead.register(source)
+        if source.reader.refs[0].codec == "int32":
+            self._read_ahead.register(source)
 
     def _unregister(self, key: Any) -> None:
         self._working_set_bytes -= self._source_bytes.pop(key, 0)
@@ -310,17 +320,33 @@ class ConsumerTensorCache:
         value = self.entries.pop(key, None)
         if value is not None:
             self.bytes -= value[1]
+            if any(t.is_cuda for t in value[0] if t is not None):
+                self.gpu_bytes -= value[1]
 
     def put(self, key: Any, value: tuple[torch.Tensor, torch.Tensor | None]) -> None:
         size = sum(t.numel() * t.element_size() for t in value if t is not None)
-        if size > self.capacity_bytes:
+        on_gpu = any(t.is_cuda for t in value if t is not None)
+        if size > self.capacity_bytes or (on_gpu and size > self.gpu_capacity_bytes):
             return
-        while self.entries and self.bytes + size > self.capacity_bytes:
+        while self.entries and (
+            self.bytes + size > self.capacity_bytes or (on_gpu and self.gpu_bytes + size > self.gpu_capacity_bytes)
+        ):
             self.discard(next(iter(self.entries)))
             self.evictions += 1
         self.entries[key] = (value, size)
         self.bytes += size
+        if on_gpu:
+            self.gpu_bytes += size
+            self.gpu_peak_bytes = max(self.gpu_peak_bytes, self.gpu_bytes)
         self.peak_bytes = max(self.peak_bytes, self.bytes)
+
+
+@dataclass(frozen=True)
+class _BitmapSelection:
+    key: str
+    count: int
+    source_rows: np.ndarray
+    output_rows: np.ndarray
 
 
 class ConsumerLayerReader(ConsumerSource):
@@ -371,6 +397,8 @@ class ConsumerLayerReader(ConsumerSource):
 
         if self.released:
             raise RuntimeError("Replay source has been released")
+        if replay_codec(self.reader.refs[0].codec).encoded:
+            return self._read_bitmap()
         cached = self.cache._read_ahead.read(self) if self.cache is not None else self._materialize()
         staging, mask = cached
         device = torch.device(self.device)
@@ -384,6 +412,156 @@ class ConsumerLayerReader(ConsumerSource):
         if mask is None:
             return values
         return values, mask.clone() if device.type == "cpu" else mask.to(device, non_blocking=True)
+
+    def _read_bitmap(self) -> tuple[torch.Tensor, torch.Tensor]:
+        with self.reader._lock:
+            if self.reader._closing:
+                raise RuntimeError("Replay reader is closing or released")
+            return self._materialize_bitmap()
+
+    def _materialize_bitmap(self) -> tuple[torch.Tensor, torch.Tensor]:
+        import numpy as np
+        import torch
+
+        codec = replay_codec(self.reader.refs[0].codec)
+        topk = self.reader.refs[0].topk
+        output = torch.full((len(self.batch_layout), topk), -1, dtype=torch.int32, device=self.device)
+        selections = []
+        for sample in self.batch_layout.samples:
+            ref = self.reader.refs[sample.sample_index]
+            if ref.codec != codec.name or ref.topk != topk:
+                raise ValueError("Cannot mix indexer codecs within a microbatch")
+            lease = self.reader._leases[sample.sample_index]
+            # A reader owns immutable refs/leases until its locked release.
+            # Authorize once per sample rather than per model layer/recompute.
+            if sample.sample_index not in self.reader._bitmap_authorized:
+                self.reader.store.invoke("authorize_read", ref, lease)
+                self.reader._bitmap_authorized.add(sample.sample_index)
+            chunks = sample.source_rows // ref.chunk_rows
+            for chunk in np.unique(chunks):
+                key = f"{ref.record}:{chunk}:{self.layer}"
+                select = chunks == chunk
+                selections.append(
+                    _BitmapSelection(
+                        key,
+                        min(ref.chunk_rows, ref.rows - int(chunk) * ref.chunk_rows),
+                        sample.source_rows[select] % ref.chunk_rows,
+                        sample.output_rows[select],
+                    )
+                )
+        capability = getattr(self.reader.store, "encoded_batch_limit", None)
+        limit = capability(device=self.device) if capability is not None and selections else 0
+        cursor = 0
+        while cursor < len(selections):
+            group = []
+            bodies = {}
+            misses = []
+            reserved = 0
+            while cursor < len(selections):
+                selection = selections[cursor]
+                if selection.key not in bodies:
+                    cached = self.cache.get(("encoded", selection.key)) if self.cache is not None else None
+                    # Missing widths come from TQ metadata. Reserve the codec's
+                    # maximum, not an estimate based on this recipe's lengths.
+                    size = (
+                        cached[0].nbytes
+                        if cached is not None
+                        else selection.count * codec.max_encoded_width * codec.element_bytes
+                    )
+                    if group and (not limit or reserved + size > limit or len(bodies) >= 32):
+                        cached = None
+                        break
+                    bodies[selection.key] = cached[0] if cached is not None else None
+                    if cached is None:
+                        misses.append(selection)
+                    cached = None
+                    reserved += size
+                group.append(selection)
+                cursor += 1
+                # Preserve singleton CPU reads, and the previous behavior for
+                # an unavoidable single body larger than the batch budget.
+                if not limit or reserved >= limit:
+                    break
+            if misses:
+                bodies.update(self._fetch_bitmap_bodies(misses, output.device))
+            if self.cache is not None:
+                self.cache.encoded_batch_peak_bytes = max(
+                    self.cache.encoded_batch_peak_bytes, sum(body.nbytes for body in bodies.values())
+                )
+            for selection in group:
+                data = bodies[selection.key]
+                # Hits can be evicted while later misses are inserted. Record
+                # every consuming stream before dropping the group's hold.
+                data.record_stream(torch.cuda.current_stream())
+                # Pageable as_tensor(..., device="cuda") synchronizes the model
+                # stream. Keep these small coordinate copies asynchronous too.
+                host_coordinates = torch.empty((2, len(selection.source_rows)), dtype=torch.long, pin_memory=True)
+                host_coordinates[0].numpy()[:] = selection.source_rows
+                host_coordinates[1].numpy()[:] = selection.output_rows
+                rows, destinations = host_coordinates.to(self.device, non_blocking=True).unbind()
+                # Both transports share the same bounded GPU encoded cache.
+                # Decode into the final microbatch, without another payload copy.
+                if self.cache is not None:
+                    self.cache.decoded_rows += len(selection.source_rows)
+                    self.cache.logical_decoded_bytes += len(selection.source_rows) * topk * codec.element_bytes
+                codec.decode_into(data, rows, destinations, output)
+                del data
+            bodies.clear()
+        # CPU layout is authoritative. The model can compute exact fallback
+        # only for missing rows without a GPU nonzero()/item() synchronization.
+        output._relax_indexer_missing_rows = tuple(int(row) for row in np.flatnonzero(~self.batch_layout.valid))
+        host_mask = torch.empty(self.batch_layout.valid.shape, dtype=torch.bool, pin_memory=True)
+        host_mask.numpy()[:] = self.batch_layout.valid
+        return output, host_mask.to(self.device, non_blocking=True)
+
+    def _fetch_bitmap_bodies(self, selections: list[_BitmapSelection], device: Any) -> dict[str, torch.Tensor]:
+        from time import perf_counter
+
+        import numpy as np
+        import torch
+
+        codec = replay_codec(self.reader.refs[0].codec)
+        started = perf_counter()
+        blocks = self.reader.store.read_encoded([selection.key for selection in selections], device=self.device)
+        if self.cache is not None:
+            self.cache.encoded_fetch_seconds += perf_counter() - started
+        if len(blocks) != len(selections):
+            raise ValueError("Missing encoded replay bodies")
+        # Validate the complete batch before putting any member in the cache.
+        for selection, block in zip(selections, blocks, strict=True):
+            if (
+                block.dtype not in (np.int32, torch.int32)
+                or block.ndim != 2
+                or block.shape[0] != selection.count
+                or not 1 <= block.shape[1] <= codec.max_encoded_width
+            ):
+                raise ValueError("Invalid encoded replay body shape")
+            if isinstance(block, torch.Tensor) and (not block.is_cuda or block.device != device):
+                raise ValueError("GDR body arrived on an unexpected device")
+            if len(blocks) > 1 and not isinstance(block, torch.Tensor):
+                raise ValueError("Batched bitmap reads require GPU bodies")
+        result = {}
+        for selection, block in zip(selections, blocks, strict=True):
+            if isinstance(block, torch.Tensor):
+                staging = block
+                if self.cache is not None:
+                    self.cache.encoded_rdma_bytes += block.nbytes
+            else:
+                host_staging = torch.empty(block.shape, dtype=torch.int32, pin_memory=True)
+                host_staging.numpy()[:] = block
+                staging = host_staging.to(self.device, non_blocking=True)
+                if self.cache is not None:
+                    self.cache.encoded_h2d_bytes += host_staging.nbytes
+            result[selection.key] = staging
+            if self.cache is not None:
+                self.cache.encoded_read_bytes += block.nbytes
+                self.cache.put(("encoded", selection.key), (staging, None))
+        if self.cache is not None:
+            self.cache.encoded_read_batches += 1
+            self.cache.encoded_read_bodies += len(blocks)
+            if all(isinstance(block, torch.Tensor) for block in blocks):
+                self.cache.gdr_read_calls += 1
+        return result
 
     def _materialize(self) -> tuple[torch.Tensor, torch.Tensor | None]:
         staging = self._allocate_staging()

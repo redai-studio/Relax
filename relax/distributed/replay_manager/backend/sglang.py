@@ -88,7 +88,9 @@ class SGLangProducer(Producer):
                             from relax.utils.misc import get_hf_config
 
                             config = get_hf_config(args.hf_checkpoint)
-                            topk = getattr(config, "text_config", config).index_topk
+                            from ..validation import indexer_topk
+
+                            topk = indexer_topk(config)
                         values = values.reshape(len(sample.tokens) - 1, -1, topk)
                     if hasattr(args, "tq_config"):
                         self.manager.store().register_local_owner(args.tq_config)
@@ -315,11 +317,13 @@ def _advance_publication(
             buffer = host.buffer
             if buffer.device.type != "cpu" or str(buffer.dtype) != "torch.int32" or buffer.ndim != 3:
                 raise RuntimeError("Replay streaming requires completed int32 CPU capture storage")
+            codec = getattr(capturer, "publication_codec", None)
             if kind not in streams:
                 streams[kind] = replay_data_manager.register_producer([kind]).begin(
                     kind=kind,
                     layers=buffer.shape[1],
-                    topk=buffer.shape[2],
+                    topk=capturer.topk_size if codec is not None else buffer.shape[2],
+                    codec=codec.name if codec is not None else "int32",
                 )
             publication = streams[kind]
             if target < publication.rows:
@@ -343,7 +347,13 @@ def _advance_publication(
                 start = publication.rows
                 stop = min(start + publication.chunk_rows, end)
                 chunk_slots = slots[start - first : stop - first]
-                publication.append(stop - start, lambda layer: _snapshot_layer(cache, chunk_slots, layer))
+                publication.append(
+                    stop - start,
+                    (lambda layer: capturer.snapshot_layer(chunk_slots, layer, stop))
+                    if codec is not None
+                    else (lambda layer: _snapshot_layer(cache, chunk_slots, layer)),
+                    encoded_width=capturer.encoded_width(stop) if codec is not None else None,
+                )
         if not final:
             return {}
         output_ids = req.output_ids_through_stop if hasattr(req, "output_ids_through_stop") else req.output_ids

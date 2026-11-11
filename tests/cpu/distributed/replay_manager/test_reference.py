@@ -343,3 +343,65 @@ def test_reference_capture_reads_modern_request_kv_slots(published, monkeypatch)
             np.testing.assert_array_equal(output, buffer[[4, 1, 5, 0], layer].numpy())
     store.discard([ref])
     assert all(not key.startswith(ref.record) for key in body.blocks)
+
+
+def test_bitmap_publication_preserves_codec_and_accounts_encoded_bytes():
+    from relax.distributed.replay_manager.ref_data import decode_refs, encode_refs
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2, publication_bytes=32768)
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    publication = store.begin_publication(kind="indexer", layers=2, topk=2048, codec="keye-bitmap-v1")
+    values = np.zeros((2, 65), dtype=np.int32)
+    values[:, 0] = -18  # implicit FULL prefix of 17 tokens
+    publication.append(2, lambda layer: values.copy(), encoded_width=65)
+    ref = publication.finish([10, 11, 12])
+    assert ref.codec == "keye-bitmap-v1"
+    assert inventory.state["objects"][ref.record]["bytes"] == values.nbytes * 2
+    assert decode_refs(encode_refs({"indexer": ref.to_dict()})) == {"indexer": ref.to_dict()}
+    store.discard([ref])
+    assert not body.blocks and not inventory.state["objects"]
+    store.close_run()
+
+
+def test_encoded_capture_publication_uses_adapter_shape_and_snapshot(monkeypatch):
+    from relax.distributed.replay_manager.backend import sglang
+    from relax.distributed.replay_manager.codecs import KEYE_BITMAP
+
+    config = ReplayConfig(delivery="reference", run_id="ada", chunk_rows=2, publication_bytes=32768)
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(sglang, "replay_data_manager", manager)
+    # No model or CUDA dependency: exercise the real scheduler publication and
+    # inventory using an adapter's header-only encoded CPU capture storage.
+    buffer = torch.full((4, 2, 1025), 1234, dtype=torch.int32)
+    buffer[:, :, 0] = -2
+    capturer = SimpleNamespace(
+        host_cache=SimpleNamespace(buffer=buffer),
+        publication_codec=KEYE_BITMAP,
+        topk_size=2048,
+        encoded_width=lambda stop: 1,
+        snapshot_layer=lambda slots, layer, stop: buffer[slots, layer, :1].numpy().copy(),
+    )
+    processor = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[3, 1, 2, 0]])))
+    req = SimpleNamespace(
+        kv=SimpleNamespace(req_pool_idx=0),
+        return_indexer_topk=True,
+        origin_input_ids=[10, 11],
+        output_ids_through_stop=[12, 13, 14],
+    )
+    try:
+        refs = sglang._advance_publication(processor, req, 4, {"indexer": lambda: capturer}, final=True)
+        ref = sglang.ReplayRef.from_dict(refs["indexer"])
+        assert ref.codec == KEYE_BITMAP.name and ref.topk == 2048 and ref.layers == 2
+        assert inventory.state["objects"][ref.record]["bytes"] == 4 * 2 * 4
+        for value in body.blocks.values():
+            np.testing.assert_array_equal(value, np.full((2, 1), -2, dtype=np.int32))
+        store.discard([ref])
+    finally:
+        store._writer.close()

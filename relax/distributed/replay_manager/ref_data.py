@@ -8,6 +8,8 @@ import struct
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .codecs import replay_codec
+
 
 REFERENCE_FIELD = "rollout_replay_refs"
 FIELDS = {"moe": "rollout_routed_experts", "indexer": "rollout_indexer_topk"}
@@ -51,8 +53,10 @@ class ReplayRef:
     topk: int
     chunk_rows: int
     tokens: str
+    codec: str = "int32"
 
     def __post_init__(self) -> None:
+        replay_codec(self.codec).validate(self.kind, self.topk)
         if self.version not in (1, 2) or self.kind not in FIELDS:
             raise ValueError("Unsupported replay manifest version or kind")
         if min(self.rows, self.layers, self.topk, self.chunk_rows) <= 0:
@@ -94,6 +98,7 @@ def encode_refs(value: dict[str, Any]) -> bytes:
     """
     if not value or len(value) > 65535:
         raise ValueError("Invalid replay manifest entry count")
+    wire_version = 3 if any(item.get("codec", "int32") != "int32" for item in value.values()) else 2
     entries = []
     for kind, item in sorted(value.items()):
         ref = ReplayRef.from_dict(item)
@@ -106,12 +111,13 @@ def encode_refs(value: dict[str, Any]) -> bytes:
             + bytes.fromhex(ref.record)
             + bytes.fromhex(ref.tokens)
             + _SHAPE.pack(ref.rows, ref.layers, ref.topk, ref.chunk_rows)
+            + (_text(ref.codec) if wire_version == 3 else b"")
         )
     body = b"".join(entries)
     size = _HEADER.size + len(body)
     if size > _MAX_WIRE_BYTES:
         raise ValueError("Replay manifest exceeds wire limit")
-    return _HEADER.pack(_MAGIC, 2, len(entries), size) + body
+    return _HEADER.pack(_MAGIC, wire_version, len(entries), size) + body
 
 
 def decode_refs(payload: bytes) -> dict[str, Any]:
@@ -130,7 +136,7 @@ def decode_refs(payload: bytes) -> dict[str, Any]:
     if len(payload) < _HEADER.size:
         raise ValueError("Truncated replay header")
     magic, version, count, size = _HEADER.unpack_from(payload)
-    if magic != _MAGIC or version != 2 or size != len(payload) or not count:
+    if magic != _MAGIC or version not in (2, 3) or size != len(payload) or not count:
         raise ValueError("Invalid replay header/version/length")
     offset = _HEADER.size
 
@@ -150,7 +156,9 @@ def decode_refs(payload: bytes) -> dict[str, Any]:
         kind, owner, run = text(), text(), text()
         record, tokens = take(16).hex(), take(32).hex()
         rows, layers, topk, chunk = _SHAPE.unpack(take(_SHAPE.size))
-        ref = ReplayRef(2, owner, run, record, kind, rows, layers, topk, chunk, tokens)
+        ref = ReplayRef(
+            2, owner, run, record, kind, rows, layers, topk, chunk, tokens, text() if version == 3 else "int32"
+        )
         if kind in result:
             raise ValueError("Duplicate replay kind")
         result[kind] = ref.to_dict()

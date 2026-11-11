@@ -43,7 +43,7 @@ def test_keye_decode_accepts_default_context_length(monkeypatch, context_length,
     monkeypatch.setattr(model, "rope", lambda x, *args: x)
     capacities = []
 
-    def decode(query, *args):
+    def decode(query, *args, **kwargs):
         capacities.append(args[-1])
         return query.flatten(1)
 

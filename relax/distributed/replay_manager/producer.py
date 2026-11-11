@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from threading import Condition
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
+from .codecs import replay_codec
 from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, token_digest
 
 
@@ -20,10 +21,10 @@ class Producer:
     manager: "ReplayManager"
     kinds: frozenset[str]
 
-    def begin(self, *, kind: str, layers: int, topk: int) -> "ProducerPublication":
+    def begin(self, *, kind: str, layers: int, topk: int, codec: str = "int32") -> "ProducerPublication":
         if kind not in self.kinds:
             raise ValueError("Replay kind is not registered with this producer")
-        return self.manager.store().begin_publication(kind=kind, layers=layers, topk=topk)
+        return self.manager.store().begin_publication(kind=kind, layers=layers, topk=topk, codec=codec)
 
     def _publish_response(self, values: Any, *, kind: str, tokens: list[int]) -> dict:
         import numpy as np
@@ -97,9 +98,8 @@ class ProducerChunkWriter:
         try:
             values = snapshot()  # scheduler thread: copy before KV slots can be reused
             arrays = values if isinstance(values, tuple) else (values,)
-            if sum(value.nbytes for value in arrays) != size or any(
-                not value.flags.c_contiguous or not value.flags.owndata for value in arrays
-            ):
+            actual = sum(value.nbytes for value in arrays)
+            if actual != size or any(not value.flags.c_contiguous or not value.flags.owndata for value in arrays):
                 raise ValueError("Publication requires an owned contiguous CPU chunk of the reserved size")
 
             def write():
@@ -145,13 +145,16 @@ class ProducerPublication:
     may be short. Retraction/abort drains the writer before removing this body.
     """
 
-    def __init__(self, store: Any, writer: ProducerChunkWriter, *, kind: str, layers: int, topk: int):
+    def __init__(
+        self, store: Any, writer: ProducerChunkWriter, *, kind: str, layers: int, topk: int, codec: str = "int32"
+    ):
         from .core import new_data_id
 
         if kind not in FIELDS or min(layers, topk) <= 0:
             raise ValueError("Invalid streaming replay shape/kind")
         self.store, self.writer = store, writer
         self.kind, self.layers, self.topk = kind, layers, topk
+        self.codec = codec
         self.chunk_rows = min(store.chunk_rows, writer.capacity_bytes // (topk * 4))
         if not self.chunk_rows:
             raise BufferError("One replay row exceeds publication budget")
@@ -160,9 +163,9 @@ class ProducerPublication:
         self._futures = []
         self._sealed = self._aborted = False
         self._finish_future = None
-        store.invoke("begin", self.record, kind, layers, topk, self.chunk_rows)
+        store.invoke("begin", self.record, kind, layers, topk, self.chunk_rows, codec)
 
-    def append(self, count: int, snapshot_layer: Callable[[int], Any]) -> None:
+    def append(self, count: int, snapshot_layer: Callable[[int], Any], *, encoded_width: int | None = None) -> None:
         import numpy as np
 
         if (
@@ -180,17 +183,23 @@ class ProducerPublication:
             else:
                 pending.append(future)
         self._futures = pending
-        size = count * self.topk * 4
+        width = self.topk if self.codec == "int32" else encoded_width
+        if self.codec != "int32":
+            replay_codec(self.codec).validate_width(width)
+        size = count * width * 4
 
         def snapshot(layer: int) -> Any:
             values = snapshot_layer(layer)
-            if not isinstance(values, np.ndarray) or values.dtype != np.int32 or values.shape != (count, self.topk):
+            if not isinstance(values, np.ndarray) or values.dtype != np.int32 or values.shape != (count, width):
                 raise ValueError("Replay layer snapshot must be int32 [chunk rows, topk]")
             return values
 
         # Amortize RPCs across layers while preserving one key per layer.
         # Admission still happens before snapshots; packing runs on the writer.
-        layers_per_batch = max(1, min(self.writer.capacity_bytes, 1 << 20) // size)
+        batch_budget = (
+            self.writer.capacity_bytes if self.codec != "int32" else min(self.writer.capacity_bytes, 1 << 20)
+        )
+        layers_per_batch = max(1, batch_budget // size)
         for first in range(0, self.layers, layers_per_batch):
             layers = tuple(range(first, min(first + layers_per_batch, self.layers)))
             self._futures.append(
