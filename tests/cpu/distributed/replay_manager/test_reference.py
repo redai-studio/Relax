@@ -2,6 +2,8 @@
 
 import asyncio
 import os
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
@@ -116,6 +118,103 @@ def test_reference_retire_before_put_ack_keeps_reader_until_final_release(publis
     store.commit([ref])
     assert body.blocks
     store.release_many([ref], leases)
+    assert not body.blocks and not inventory.state["objects"]
+
+
+def test_reference_prefetches_next_microbatch_without_blocking_cached_layers(published, monkeypatch) -> None:
+    _, store, body, inventory, first_ref, first_values = published
+    second_values = np.arange(4 * 5 * 2, dtype=np.int32).reshape(4, 5, 2) + 216
+    publication = store.begin_publication(kind="moe", layers=5, topk=2)
+    for start in (0, 2):
+        publication.append(2, lambda layer, start=start: second_values[start : start + 2, layer].copy())
+    second_ref = publication.finish([20, 21, 22, 23, 24])
+    refs = [first_ref, second_ref]
+    store.attach(refs, "train_0")
+    store.commit(refs)
+    cache = ConsumerTensorCache(4096)
+    groups = []
+    for ref, rows, layers in ((first_ref, [3, 0], 3), (second_ref, [1, 2], 5)):
+        layout = ConsumerBatchLayout.from_coordinates(np.array([[0, row] for row in rows]))
+        with store.reader([ref], partition="train_0") as session:
+            groups.append(
+                [
+                    ConsumerLayerReader(
+                        session, layout, layer=layer, kind="moe", device="cpu", num_experts=256, cache=cache
+                    )
+                    for layer in range(layers)
+                ]
+            )
+    started, resume = Event(), Event()
+    read_layers = store._read_layers_into
+
+    def gated_read(layers: list) -> None:
+        if layers[0][0][0][0].record == second_ref.record:
+            started.set()
+            assert resume.wait(5), "Next-microbatch read was never released"
+        return read_layers(layers)
+
+    monkeypatch.setattr(store, "_read_layers_into", gated_read)
+    try:
+        groups[0][0].read()
+        groups[0][1].read()
+        assert started.wait(2), "Next-microbatch prefetch did not start"
+        assert len(cache._read_ahead.pending.sources) == 5
+        assert cache.bytes + cache.prefetch_bytes <= cache.capacity_bytes
+        # A pending read for another microbatch must not stall cached layers.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(groups[0][2].read)
+            try:
+                np.testing.assert_array_equal(future.result(timeout=1).numpy(), first_values[[3, 0], 2])
+            finally:
+                resume.set()
+        for layer, source in enumerate(groups[1]):
+            np.testing.assert_array_equal(source.read().numpy(), second_values[[1, 2], layer])
+        first_reads = body.reads
+        for sources, values, rows in ((groups[0], first_values, [3, 0]), (groups[1], second_values, [1, 2])):
+            for layer, source in enumerate(sources):
+                np.testing.assert_array_equal(source.read().numpy(), values[rows, layer])
+        assert body.reads == first_reads
+        assert cache._read_ahead.cold_reads == 1
+        assert cache.prefetch_peak_bytes <= cache.capacity_bytes
+    finally:
+        resume.set()
+        store.retire_partition("train_0")
+        for sources in groups:
+            for source in sources:
+                source.release()
+    assert not body.blocks and not inventory.state["objects"]
+
+
+def test_reference_prefetch_keeps_uncached_current_layers_ahead_of_next_microbatch(published) -> None:
+    _, store, body, inventory, ref, values = published
+    store.attach([ref], "train_0")
+    store.commit([ref])
+    cache = ConsumerTensorCache(600)
+    groups = []
+    for rows, layers in (([0, 1, 2, 3, 0, 1, 2, 3, 0, 1], (0, 1)), ([2], (0,))):
+        layout = ConsumerBatchLayout.from_coordinates(np.array([[0, row] for row in rows]))
+        with store.reader([ref], partition="train_0") as session:
+            groups.append(
+                [
+                    ConsumerLayerReader(
+                        session, layout, layer=layer, kind="moe", device="cpu", num_experts=256, cache=cache
+                    )
+                    for layer in layers
+                ]
+            )
+    try:
+        np.testing.assert_array_equal(groups[0][0].read().numpy(), values[[0, 1, 2, 3, 0, 1, 2, 3, 0, 1], 0])
+        # The next current layer cannot fit the conservative reservation.
+        # A smaller future microbatch must not jump ahead and make it wait.
+        assert cache._read_ahead.pending is None
+        groups[0][1].read()
+        np.testing.assert_array_equal(groups[1][0].read().numpy(), values[[2], 0])
+        assert cache.prefetch_peak_bytes <= cache.capacity_bytes
+    finally:
+        store.retire_partition("train_0")
+        for sources in groups:
+            for source in sources:
+                source.release()
     assert not body.blocks and not inventory.state["objects"]
 
 

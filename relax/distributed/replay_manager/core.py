@@ -886,6 +886,9 @@ def install_tq_cleanup_hook() -> None:
     if not replay_data_manager.uses_references:
         return
 
+    from ._tq_compat import install_tq_topology_cache
+
+    install_tq_topology_cache()
     from transfer_queue.client import AsyncTransferQueueClient
 
     original = AsyncTransferQueueClient.async_clear_partition

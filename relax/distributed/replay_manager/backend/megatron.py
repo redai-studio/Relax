@@ -13,6 +13,7 @@ import torch
 
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
+from relax.utils.logging_utils import get_logger
 
 from ..config import references_enabled
 from ..consumer import (
@@ -33,6 +34,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 ROUTING_REPLAY = None
 _VALID_STAGES = {"fallthrough", "replay_forward", "replay_backward"}
+logger = get_logger(__name__)
 
 
 class MegatronConsumer(Consumer):
@@ -47,7 +49,7 @@ class MegatronConsumer(Consumer):
         batch: dict[str, Any],
         *,
         region: ReplayRegion | None = None,
-    ) -> None:
+    ) -> ConsumerTensorCache:
         self.manager._ensure_open()
         if region is not None and region.manager is not self.manager:
             raise ValueError("Replay region belongs to another manager")
@@ -71,6 +73,59 @@ class MegatronConsumer(Consumer):
                 region=region,
                 cache=cache,
             )
+        return cache
+
+
+def log_reference_replay_metrics(cache: ConsumerTensorCache, args: Any, rollout_id: int) -> None:
+    """Report foreground CPU waits without adding CUDA syncs or collectives.
+
+    Every rank logs its own counters; ClearML uses the same primary rank as the
+    existing training performance report, not a cross-rank maximum.
+    """
+    ahead = cache._read_ahead
+    if not ahead.read_calls:
+        return
+    from megatron.core import mpu
+
+    from relax.utils import tracking_utils
+    from relax.utils.metrics.metric_utils import compute_rollout_step
+    from relax.utils.timer import Timer
+
+    Timer().add("replay_read_cpu", ahead.read_seconds)
+    Timer().add("replay_consumer_wait", ahead.demand_wait_seconds)
+    Timer().add("replay_prefetch_read", ahead.prefetch_read_seconds)
+    metrics = {
+        "replay/read_calls": ahead.read_calls,
+        "replay/cold_reads": ahead.cold_reads,
+        "replay/prefetch_hits": ahead.prefetch_hits,
+        "replay/prefetch_ready_hits": ahead.prefetch_ready_hits,
+        "replay/prefetch_windows": ahead.prefetch_windows,
+        "replay/cross_group_windows": ahead.cross_group_windows,
+        "replay/prefetched_layers": ahead.prefetched_layers,
+        "replay/max_window_layers": ahead.max_window_layers,
+        "replay/cache_hits": cache.hits,
+        "replay/cache_evictions": cache.evictions,
+        "replay/cache_peak_bytes": cache.peak_bytes,
+        "replay/prefetch_peak_bytes": cache.prefetch_peak_bytes,
+    }
+    coordinates = {
+        "tp": mpu.get_tensor_model_parallel_rank(),
+        "pp": mpu.get_pipeline_model_parallel_rank(),
+        "cp": mpu.get_context_parallel_rank(),
+        "dp": mpu.get_data_parallel_rank(with_context_parallel=True),
+    }
+    logger.info(
+        "replay_consumer %s: %s",
+        rollout_id,
+        {
+            **coordinates,
+            **metrics,
+            "read_cpu_seconds": ahead.read_seconds,
+            "demand_wait_seconds": ahead.demand_wait_seconds,
+        },
+    )
+    if coordinates["tp"] == 0 and mpu.is_pipeline_last_stage() and coordinates["dp"] == 0:
+        tracking_utils.log_direct(args, compute_rollout_step(args, rollout_id), metrics)
 
 
 def pack_token_rows(

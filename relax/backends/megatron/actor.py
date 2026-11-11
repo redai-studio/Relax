@@ -32,7 +32,11 @@ from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
-from relax.distributed.replay_manager.backend.megatron import RoutingReplay, reference_execution
+from relax.distributed.replay_manager.backend.megatron import (
+    RoutingReplay,
+    log_reference_replay_metrics,
+    reference_execution,
+)
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
@@ -2155,7 +2159,7 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
 
-        replay_data_manager.register_consumer(rollout_kinds(self.args)).prepare(
+        replay_cache = replay_data_manager.register_consumer(rollout_kinds(self.args)).prepare(
             self,
             data_iterator,
             num_microbatches,
@@ -2342,6 +2346,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
+        log_reference_replay_metrics(replay_cache, self.args, rollout_id)
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout

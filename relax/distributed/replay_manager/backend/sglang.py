@@ -5,6 +5,7 @@
 import ast
 import importlib
 import importlib.util
+from collections.abc import Callable
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
@@ -410,6 +411,9 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
         rank = getattr(parallel, "attn_tp_rank", parallel.tp_rank)
         return rank == 0 and getattr(parallel, "attn_cp_rank", 0) == 0 and getattr(parallel, "pp_rank", 0) == 0
 
+    if prefix and "moe" in capturers:
+        _install_owner_capture_patch(lambda: owner(None))
+
     asynchronous = _install_response_patch(owner)
 
     def collect(self, req):
@@ -506,6 +510,40 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
             reset._relax_replay_cleanup = True
             setattr(Req, method, reset)
     cls._relax_replay_references = True
+
+
+def _install_owner_capture_patch(owner: Callable[[], bool]) -> None:
+    """Only response owners export MoE routing snapshots in reference mode.
+
+    Keep the capturer and capture() intact on every rank: scattered MoE
+    backends may run collectives there, and cache policy uses its presence.
+    Only the result snapshot/D2H is redundant on non-response ranks.
+    """
+    from sglang.srt.state_capturer.routed_experts import RoutedExpertsCapturer
+
+    from relax.utils.logging_utils import get_logger
+
+    cls = RoutedExpertsCapturer
+    if getattr(cls, "_relax_replay_owner_capture", False):
+        return
+    original = cls.on_forward_end
+
+    @wraps(original)
+    def on_forward_end(self, *args: Any, **kwargs: Any) -> Any:
+        export = owner()
+        if not getattr(self, "_relax_replay_snapshot_role_logged", False):
+            import os
+
+            get_logger(__name__).info(
+                "MoE reference snapshot: pid=%s export=%s; capture collectives remain enabled", os.getpid(), export
+            )
+            self._relax_replay_snapshot_role_logged = True
+        if not export:
+            return None
+        return original(self, *args, **kwargs)
+
+    cls.on_forward_end = on_forward_end
+    cls._relax_replay_owner_capture = True
 
 
 def _install_response_patch(owner: Any) -> bool:
@@ -685,6 +723,12 @@ def install_detokenizer_patch() -> None:
     cls._relax_replay_references = True
 
 
+def _install_tq_topology_cache() -> None:
+    from .._tq_compat import install_tq_topology_cache
+
+    install_tq_topology_cache()
+
+
 def run_reference_scheduler(*args, **kwargs):
     from relax.utils.env import Envs
 
@@ -704,6 +748,7 @@ def run_reference_scheduler(*args, **kwargs):
     registration = os.environ.get("RELAX_REPLAY_REGISTRATION")
     if registration is None:
         raise RuntimeError("Scheduler requires its parent's replay registration")
+    _install_tq_topology_cache()
     replay_data_manager.initialize_worker(json.loads(registration), engine="sglang")
     from sglang.srt.managers.scheduler import run_scheduler_process
 
