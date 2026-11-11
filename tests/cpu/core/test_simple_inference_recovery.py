@@ -35,28 +35,20 @@ def _remote(method):
     return SimpleNamespace(remote=method)
 
 
-def test_budget_shared_between_both_inference_roles_and_fourth_requires_global():
-    state = _source()["InferenceRecoveryState"](True)
-    for index, role in enumerate(["rollout", "actor_fwd", "rollout"], 1):
-        state.report_error(role, "explicit error")
-        assert state.request_recovery(role) == index
-        assert state.resume(index) == index
-    state.report_error("actor_fwd", "explicit error")
-    with pytest.raises(RuntimeError, match="exhausted"):
-        state.request_recovery("actor_fwd")
-
-
-@pytest.mark.parametrize("max_attempts", [0, 1, 5])
+@pytest.mark.parametrize("max_attempts", [None, 0, 1, 5])
 def test_configured_budget_is_shared_and_not_reset_after_success(max_attempts):
-    state = _source()["InferenceRecoveryState"](True, max_attempts=max_attempts)
-    for index in range(1, max_attempts + 1):
+    state_type = _source()["InferenceRecoveryState"]
+    state = state_type(True) if max_attempts is None else state_type(True, max_attempts=max_attempts)
+    limit = 3 if max_attempts is None else max_attempts
+    for index in range(1, limit + 1):
         role = "rollout" if index % 2 else "actor_fwd"
         state.report_error(role, "explicit error")
         assert state.request_recovery(role) == index
-        state.resume(index)
-    state.report_error("rollout", "explicit error")
-    with pytest.raises(RuntimeError, match=rf"budget \({max_attempts}\) exhausted"):
-        state.request_recovery("rollout")
+        assert state.resume(index) == index
+    role = "rollout" if (limit + 1) % 2 else "actor_fwd"
+    state.report_error(role, "explicit error")
+    with pytest.raises(RuntimeError, match=rf"budget \({limit}\) exhausted"):
+        state.request_recovery(role)
 
 
 def test_failed_producer_closes_admission_before_any_reset():

@@ -170,6 +170,7 @@ def controller_fixture():
 def test_restart_publishes_state_and_signals_on_every_exit(failure):
     ctrl = controller_fixture()
     error = ValueError("checkpoint or teardown failed")
+    event = ctrl._restart_done_event
 
     def restart(role, worker=None):
         assert ctrl._restarting
@@ -180,7 +181,8 @@ def test_restart_publishes_state_and_signals_on_every_exit(failure):
     ctrl._restart_serve = restart
     ctrl.restart_serve("actor")
     assert ctrl._restarting
-    assert ctrl._restart_done_event.is_set()
+    assert ctrl._restart_done_event is event
+    assert event.is_set()
     assert ctrl._restart_error is (error if failure else None)
     assert ctrl._cancel_pending_tasks.call_count == int(failure)
 
