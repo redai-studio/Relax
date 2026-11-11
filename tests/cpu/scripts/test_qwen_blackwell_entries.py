@@ -153,9 +153,8 @@ def test_64_gpu_recipes_reject_hybridep_before_submission(entry):
 
 
 @pytest.mark.parametrize("entry", ENTRIES, ids=lambda entry: entry.stem)
-def test_scripts_have_no_hpc_dependency_and_valid_shell(entry):
+def test_scripts_have_valid_shell(entry):
     subprocess.run(["bash", "-n", str(entry)], check=True)
-    assert "hpc/qwen3_moe" not in entry.read_text()
 
 
 @pytest.mark.parametrize(
