@@ -210,7 +210,7 @@ def _balanced_candidate(
 def build_flops_schedule(
     lengths: list[int], workloads: list[float], capacity: int, dp_size: int, microbatch_group_size: int = 1
 ) -> tuple[list[list[list[int]]], list[set[int]]]:
-    """Global packing → split to DP/VPP alignment → whole-pack FLOPs placement.
+    """Global FLOPs packing with DP/VPP-aligned repacking and rank placement.
 
     Token capacity is a hard limit except for indivisible oversized samples. If
     alignment needs more slots than samples, duplicate a local pack with zero
@@ -233,6 +233,10 @@ def build_flops_schedule(
         bins = get_binpack_partitions(lengths, capacity)
     alignment = dp_size * microbatch_group_size
     target = (len(bins) + alignment - 1) // alignment * alignment
+    if len(bins) < target <= len(lengths):
+        aligned_bins = _balanced_candidate(lengths, workloads, capacity, target)
+        if aligned_bins is not None:
+            bins = aligned_bins
     while len(bins) < min(target, len(lengths)):
         _, index = max((sum(lengths[i] for i in group), j) for j, group in enumerate(bins) if len(group) > 1)
         halves: list[list[int]] = [[], []]
