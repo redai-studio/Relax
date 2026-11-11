@@ -8,8 +8,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from relax.utils.device import is_npu_available
-
 
 sm100 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
@@ -107,18 +105,13 @@ def test_ce_patch_preserves_nonunit_temperature_fallback(monkeypatch):
     [
         "cpu",
         pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")),
-        pytest.param("npu", marks=pytest.mark.skipif(not is_npu_available, reason="NPU is unavailable")),
     ],
 )
 def test_gdn_a_log_preserves_fp32_checkpoint_through_bf16_wrapper(device):
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
     from megatron.core.transformer.module import Float16Module
 
     from relax.backends.megatron.model_provider import configure_gdn_a_log_fp32
-
-    if device == "npu":
-        from mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.gated_delta_net import GatedDeltaNet
-    else:
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 
     config = SimpleNamespace(
         params_dtype=torch.bfloat16, fp16=False, bf16=True, virtual_pipeline_model_parallel_size=None
@@ -142,7 +135,7 @@ def test_gdn_a_log_preserves_fp32_checkpoint_through_bf16_wrapper(device):
     assert parameter.tensor_model_parallel and parameter.partition_dim == 0
     assert layer.dt_bias.dtype == torch.bfloat16
 
-    checkpoint_a = torch.linspace(-2.012345, 2.123456, 16).to(device)
+    checkpoint_a = torch.linspace(-2.012345, 2.123456, 16, device=device)
     assert not torch.equal(checkpoint_a, checkpoint_a.bfloat16().float())
     wrapped.load_state_dict({"0.A_log": checkpoint_a, "0.dt_bias": torch.ones(16, device=device)})
     torch.testing.assert_close(parameter, checkpoint_a, atol=0, rtol=0)

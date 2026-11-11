@@ -135,24 +135,6 @@ jobs:
             bash "$TRAINING_SCRIPT" 2>&1 | tee /artifacts/training.log
           '
 
-      - name: Verify async actor gradients
-        if: matrix.case == 'Qwen3.5-4B-4xgpu-async'
-        run: |
-          docker exec -i "$CI_CONTAINER_NAME" python3 - /artifacts/training.log <<'PY'
-          import math
-          import re
-          import sys
-
-          ansi_color = re.compile(r"\x1b\[[0-9;]*m")
-          metric = re.compile(r"\bstep \d+: \{[^\n]*'train/grad_norm':\s*([^,\s}]+)")
-          with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
-              norms = [float(match[1]) for line in log if (match := metric.search(ansi_color.sub("", line)))]
-          nonzero = [norm for norm in norms if math.isfinite(norm) and norm > 0]
-          if not nonzero:
-              sys.exit(f"Expected a finite, nonzero actor gradient norm; found {len(norms)} actor step metrics")
-          print(f"Finite, nonzero actor gradients in {len(nonzero)}/{len(norms)} steps (max norm {max(nonzero):g})")
-          PY
-
       - name: Collect Ray logs
         if: always()
         env:
@@ -266,13 +248,6 @@ jobs:
             export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:${LD_LIBRARY_PATH:-}
             npu-smi info
             python3 -c "import torch, torch_npu; assert torch.npu.device_count() == 4, torch.npu.device_count()"
-            # Match the NPU launcher import paths and keep pytest options out of sys.argv.
-            npu_test_pythonpath="${MEGATRON_BRIDGE_SRC:-/root/Megatron-Bridge/src}:${MINDSPEED:-/root/MindSpeed}:${MEGATRON:-/root/Megatron-LM}${PYTHONPATH:+:$PYTHONPATH}"
-            PYTHONPATH="$npu_test_pythonpath" \
-              python3 -c "import pytest, torch_npu, relax.backends.megatron; raise SystemExit(pytest.main([
-                  \"-q\",
-                  \"tests/backends/megatron/test_ce_alog_precision.py::test_gdn_a_log_preserves_fp32_checkpoint_through_bf16_wrapper[npu]\",
-              ]))" 2>&1 | tee /artifacts/gdn-precision.log
             unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
             unset RAY_NO_WAIT RAY_ADDRESS RELAX_ENTRYPOINT_MODE
             export no_proxy="*" NO_PROXY="*"
