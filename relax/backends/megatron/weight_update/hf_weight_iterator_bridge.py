@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
+import inspect
 import re
 import time
 from collections import OrderedDict
@@ -18,6 +19,7 @@ except ImportError:  # bridge <= 0.5.x
     from megatron.bridge.peft.lora import LoRAMerge
 
 
+from relax.distributed.weight_sync import traffic
 from relax.utils import device as device_utils
 from relax.utils.device import device_module
 from relax.utils.logging_utils import get_logger
@@ -88,13 +90,25 @@ def _fused_pair_key(name: str) -> str | None:
 
 class HfWeightIteratorBridge(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
+        agreement = kwargs.pop("publication_agreement", None)
         super().__init__(*args, **kwargs)
         self._bridge_converter = BridgeConverter(
             args=self.args, model=self.model, quantization_config=self.quantization_config
         )
         # All ranks must initialize Bridge tasks before buffer filtering because
         # task construction contains PP collectives.
-        self._bridge_converter.init_tasks()
+        error = None
+        try:
+            if agreement is None:
+                self._bridge_converter.init_tasks()
+            else:
+                self._bridge_converter.init_tasks(agreement=agreement)
+        except Exception as caught:
+            if agreement is None:
+                raise
+            error = f"{type(caught).__name__}: {caught}"
+        if agreement is not None:
+            agreement(error)
         self.lora_merge_mode = is_lora_enabled(self.args) and is_lora_merge_mode(self.args)
         self.lora_adapter_mode = is_lora_enabled(self.args) and is_lora_adapter_mode(self.args)
         collect_adapters = self.lora_merge_mode or self.lora_adapter_mode
@@ -103,6 +117,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             self.model,
             buffer_is_mapped=self._bridge_converter.can_convert,
             collect_adapters=collect_adapters,
+            agreement=agreement,
         )
         self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map, self._adapter_map = buckets_result
         self._expert_broadcast_caches = [({}, {}) for _ in self._expert_buckets]
@@ -274,7 +289,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         except Exception as exc:
             error = str(exc)
         all_owned = [None] * layout.world_size
-        dist.all_gather_object(all_owned, (owned, error), group=metadata_group)
+        traffic.all_gather_object(all_owned, (owned, error), group=metadata_group)
         if any(error is not None for _, error in all_owned):
             raise ValueError(f"Expert routing source capability check failed: {[error for _, error in all_owned]}")
         elected = {}
@@ -449,7 +464,35 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             yield gathered
             del gathered
 
-    def _iter_hf_params(self, megatron_local_weights, *, include_experts=True):
+    def get_hf_weight_chunks_checked(self, megatron_local_weights, agreement):
+        """Agree on local preparation and conversion errors before proceeding.
+
+        The independent publisher creates an ordinary, unquantized iterator. A
+        failed device collective still requires runtime group recovery.
+        """
+        if self._expert_router is not None:
+            raise ValueError("Checked publication requires ordinary Bridge source buckets")
+        yield from _chunk_with_mla_pairing(
+            self._iter_hf_params(megatron_local_weights, agreement=agreement),
+            chunk_size=self.args.update_weight_buffer_size,
+        )
+
+    def _convert_checked(self, info, gathered, agreement, *, owns=True):
+        converted, error = None, None
+        try:
+            if owns:
+                converted = self._bridge_converter.convert(info.name, gathered)
+                if agreement is not None:
+                    device_module.synchronize()
+        except Exception as caught:
+            if agreement is None:
+                raise
+            error = f"{type(caught).__name__}: {caught}"
+        if agreement is not None:
+            agreement(error)
+        return converted
+
+    def _iter_hf_params(self, megatron_local_weights, *, include_experts=True, agreement=None):
         """Yield individual (name, tensor) pairs for all params.
 
         Expert weights: load → TP gather + convert (src_rank only) →
@@ -467,7 +510,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         rank = dist.get_rank()
         # Eagerly init bridge converter so all ranks are ready before broadcast.
         self._bridge_converter.init_tasks()
-        self._bridge_converter.broadcast_and_apply_configs()
+        self._bridge_converter.broadcast_and_apply_configs(agreement=agreement)
 
         # In LoRA merge mode, fold each adapter into its base weight at load time
         # (on the owning rank), so the rest of the pipeline sees a single merged model.
@@ -483,21 +526,26 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         for bucket_infos, phase_caches in zip(expert_buckets, caches, strict=True):
             t_c0 = time.monotonic()
             params = _load_to_gpu(
-                bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
+                bucket_infos,
+                megatron_local_weights,
+                self._vanilla_key_map,
+                device,
+                rank,
+                merge_fn=merge_fn,
+                agreement=agreement,
             )
             all_converted = []
             for info, param in zip(bucket_infos, params, strict=True):
-                gathered = all_gather_param(self.args, info.name, param)
-                if rank == info.src_rank:
-                    all_converted.append(self._bridge_converter.convert(info.name, gathered))
-                else:
-                    all_converted.append(None)
+                gathered = all_gather_param(self.args, info.name, param, agreement=agreement)
+                all_converted.append(self._convert_checked(info, gathered, agreement, owns=rank == info.src_rank))
                 del gathered
             del params
             t_convert_total += time.monotonic() - t_c0
 
             t_b0 = time.monotonic()
-            results = _broadcast_converted_bucket(bucket_infos, all_converted, device, phase_caches=phase_caches)
+            results = _broadcast_converted_bucket(
+                bucket_infos, all_converted, device, phase_caches=phase_caches, agreement=agreement
+            )
             t_bcast_total += time.monotonic() - t_b0
             param_count += len(results)
             yield from results
@@ -507,7 +555,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         for bucket_infos in self._non_expert_buckets:
             t_b0 = time.monotonic()
             params = _load_and_broadcast(
-                bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
+                bucket_infos,
+                megatron_local_weights,
+                self._vanilla_key_map,
+                device,
+                rank,
+                merge_fn=merge_fn,
+                agreement=agreement,
             )
             t_b1 = time.monotonic()
             t_bcast_total += t_b1 - t_b0
@@ -523,6 +577,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                             if not info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
                         ],
                         gdn_split_sizes=self._gdn_split_sizes,
+                        agreement=agreement,
                     )
                 )
                 t_gather_total += time.monotonic() - t_g0
@@ -545,12 +600,14 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
                 t_g0 = time.monotonic()
                 gathered = (
-                    all_gather_param(self.args, info.name, param) if gathered_params is None else next(gathered_params)
+                    all_gather_param(self.args, info.name, param, agreement=agreement)
+                    if gathered_params is None
+                    else next(gathered_params)
                 )
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
 
-                converted = self._bridge_converter.convert(info.name, gathered)
+                converted = self._convert_checked(info, gathered, agreement)
                 t_convert_total += time.monotonic() - t_g1
 
                 param_count += len(converted)
@@ -610,19 +667,20 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         linear_in = linear_in.to(device=device).float()
         linear_out = linear_out.to(device=device).float()
 
-        merged = (
-            LoRAMerge()
-            .merge(
-                param.data.float(),
-                linear_out,
-                linear_in,
-                self.lora_alpha,
-                self.lora_dim,
-                tp_size=tp_size,
-                tp_group=tp_group,
-            )
-            .to(param.dtype)
-        )
+        merge = LoRAMerge().merge
+        merge_options = {"tp_group": tp_group}
+        # Bridge 0.6 derives the TP size from the process group. Older builds
+        # require both arguments; keep the adapter's actual TP group in either API.
+        if "tp_size" in inspect.signature(merge).parameters:
+            merge_options["tp_size"] = tp_size
+        merged = merge(
+            param.data.float(),
+            linear_out,
+            linear_in,
+            self.lora_alpha,
+            self.lora_dim,
+            **merge_options,
+        ).to(param.dtype)
 
         merged_param = torch.nn.Parameter(merged, requires_grad=False)
         for key, value in info.attrs.items():
@@ -642,7 +700,9 @@ def _adapter_base_prefix(name):
     return name.replace(".adapter.linear_in.weight", "").replace(".adapter.linear_out.weight", "")
 
 
-def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], bool], collect_adapters=False):
+def _build_param_info_buckets(
+    args, model, buffer_is_mapped: Callable[[str], bool], collect_adapters=False, agreement=None
+):
     """Build ParamInfo buckets and vanilla-key mapping at init time.
 
     Exchanges parameter metadata across PP/EP ranks so every rank knows about
@@ -666,43 +726,56 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     ep_size = mpu.get_expert_model_parallel_world_size()
 
-    vanilla_iter = named_params_and_buffers(args, model, convert_to_global_name=False, include_persistent_buffers=True)
-    global_iter = named_params_and_buffers(args, model, convert_to_global_name=True, include_persistent_buffers=True)
-
-    local_infos = {}
-    vanilla_key_map = {}
-    adapter_map: dict[str, dict[str, str]] = {}
-    for (v_name, v_param), (g_name, _g_param) in zip(vanilla_iter, global_iter, strict=True):
-        if not isinstance(v_param, torch.nn.Parameter) and not buffer_is_mapped(g_name):
-            continue
-        if collect_adapters and is_lora_adapter_param(g_name):
-            # LoRA adapter param: keep it out of the conversion buckets (no standalone
-            # bridge mapping) and record its vanilla key for load-time merging.
-            slot = adapter_map.setdefault(_adapter_base_prefix(g_name), {})
-            if ".linear_in." in g_name:
-                slot["in"] = v_name
-            elif ".linear_out." in g_name:
-                slot["out"] = v_name
-            continue
-        local_infos[g_name] = ParamInfo(
-            name=g_name,
-            dtype=v_param.dtype,
-            shape=v_param.shape,
-            attrs={
-                "tensor_model_parallel": getattr(v_param, "tensor_model_parallel", False),
-                "partition_dim": getattr(v_param, "partition_dim", -1),
-                "partition_stride": getattr(v_param, "partition_stride", 1),
-                "parallel_mode": getattr(v_param, "parallel_mode", None),
-            },
-            size=v_param.numel() * v_param.element_size(),
-            src_rank=rank,
+    error = None
+    try:
+        vanilla_iter = named_params_and_buffers(
+            args, model, convert_to_global_name=False, include_persistent_buffers=True
         )
-        vanilla_key_map[g_name] = v_name
+        global_iter = named_params_and_buffers(
+            args, model, convert_to_global_name=True, include_persistent_buffers=True
+        )
+
+        local_infos = {}
+        vanilla_key_map = {}
+        adapter_map: dict[str, dict[str, str]] = {}
+        for (v_name, v_param), (g_name, _g_param) in zip(vanilla_iter, global_iter, strict=True):
+            if not isinstance(v_param, torch.nn.Parameter) and not buffer_is_mapped(g_name):
+                continue
+            if collect_adapters and is_lora_adapter_param(g_name):
+                # LoRA adapter param: keep it out of the conversion buckets (no standalone
+                # bridge mapping) and record its vanilla key for load-time merging.
+                slot = adapter_map.setdefault(_adapter_base_prefix(g_name), {})
+                if ".linear_in." in g_name:
+                    slot["in"] = v_name
+                elif ".linear_out." in g_name:
+                    slot["out"] = v_name
+                continue
+            local_infos[g_name] = ParamInfo(
+                name=g_name,
+                dtype=v_param.dtype,
+                shape=v_param.shape,
+                attrs={
+                    "tensor_model_parallel": getattr(v_param, "tensor_model_parallel", False),
+                    "partition_dim": getattr(v_param, "partition_dim", -1),
+                    "partition_stride": getattr(v_param, "partition_stride", 1),
+                    "parallel_mode": getattr(v_param, "parallel_mode", None),
+                },
+                size=v_param.numel() * v_param.element_size(),
+                src_rank=rank,
+            )
+            vanilla_key_map[g_name] = v_name
+
+    except Exception as caught:
+        if agreement is None:
+            raise
+        error = f"{type(caught).__name__}: {caught}"
+    if agreement is not None:
+        agreement(error)
 
     # Exchange across PP so every rank has all PP stages' param infos.
     if pp_size > 1:
         pp_infos_list: list[None | tuple[int, dict]] = [None] * pp_size
-        dist.all_gather_object(
+        traffic.all_gather_object(
             obj=(rank, local_infos),
             object_list=pp_infos_list,
             group=mpu.get_pipeline_model_parallel_group(),
@@ -722,7 +795,7 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
     # replicated across EP and already have the correct PP-local src_rank.
     if ep_size > 1:
         ep_infos_list: list[None | tuple[int, dict]] = [None] * ep_size
-        dist.all_gather_object(
+        traffic.all_gather_object(
             obj=(rank, local_infos),
             object_list=ep_infos_list,
             group=mpu.get_expert_model_parallel_group(),
@@ -804,7 +877,7 @@ def _bucket_by_size(infos, args, *, buffer_size: int | None = None):
     return buckets
 
 
-def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None):
+def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None, agreement=None):
     """Load params from CPU dict to GPU.
 
     No broadcast. When ``merge_fn`` is given (LoRA merge mode), each owned
@@ -812,20 +885,30 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
     gather/convert pipeline.
     """
     params = []
-    for info in bucket_infos:
-        if rank == info.src_rank:
-            vanilla_key = vanilla_key_map[info.name]
-            cpu_tensor = megatron_local_weights[vanilla_key]
-            gpu_tensor = cpu_tensor.to(device=device, non_blocking=_NON_BLOCKING)
-            param = torch.nn.Parameter(gpu_tensor, requires_grad=False)
-        else:
-            param = torch.nn.Parameter(torch.empty(info.shape, dtype=info.dtype, device=device), requires_grad=False)
-        for key, value in info.attrs.items():
-            setattr(param, key, value)
-        if merge_fn is not None and rank == info.src_rank:
-            param = merge_fn(info, param, megatron_local_weights, device)
-        params.append(param)
-    device_module.synchronize()
+    error = None
+    try:
+        for info in bucket_infos:
+            if rank == info.src_rank:
+                vanilla_key = vanilla_key_map[info.name]
+                cpu_tensor = megatron_local_weights[vanilla_key]
+                gpu_tensor = cpu_tensor.to(device=device, non_blocking=_NON_BLOCKING)
+                param = torch.nn.Parameter(gpu_tensor, requires_grad=False)
+            else:
+                param = torch.nn.Parameter(
+                    torch.empty(info.shape, dtype=info.dtype, device=device), requires_grad=False
+                )
+            for key, value in info.attrs.items():
+                setattr(param, key, value)
+            if merge_fn is not None and rank == info.src_rank:
+                param = merge_fn(info, param, megatron_local_weights, device)
+            params.append(param)
+        device_module.synchronize()
+    except Exception as caught:
+        if agreement is None:
+            raise
+        error = f"{type(caught).__name__}: {caught}"
+    if agreement is not None:
+        agreement(error)
     return params
 
 
@@ -839,7 +922,7 @@ def _pp_broadcast(bucket_infos, params):
     pp_ranks = dist.get_process_group_ranks(pp_group)
     for info, param in zip(bucket_infos, params, strict=True):
         if info.src_rank in pp_ranks:
-            handles.append(dist.broadcast(param, src=info.src_rank, group=pp_group, async_op=True))
+            handles.append(traffic.broadcast(param, src=info.src_rank, group=pp_group, async_op=True))
     for handle in handles:
         handle.wait()
 
@@ -856,12 +939,14 @@ def _ep_broadcast(bucket_infos, params):
     for info, param in zip(bucket_infos, params, strict=True):
         if ".experts." in info.name:
             src = info.src_rank if info.src_rank in ep_ranks else rank
-            handles.append(dist.broadcast(param, src=src, group=ep_group, async_op=True))
+            handles.append(traffic.broadcast(param, src=src, group=ep_group, async_op=True))
     for handle in handles:
         handle.wait()
 
 
-def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None):
+def _load_and_broadcast(
+    bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None, agreement=None
+):
     """Load params from CPU dict, PP-broadcast, EP-broadcast.
 
     After this call every rank holds all params from all PP stages and all EP
@@ -871,13 +956,17 @@ def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, d
     LoRA adapters are merged at load time (before broadcast) so the merged base
     weight is what propagates to the non-owning PP/EP ranks.
     """
-    params = _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=merge_fn)
+    params = _load_to_gpu(
+        bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=merge_fn, agreement=agreement
+    )
     _pp_broadcast(bucket_infos, params)
     _ep_broadcast(bucket_infos, params)
     return params
 
 
-def _broadcast_converted_bucket(bucket_infos, all_converted, device, phase_caches: tuple[dict, dict] | None = None):
+def _broadcast_converted_bucket(
+    bucket_infos, all_converted, device, phase_caches: tuple[dict, dict] | None = None, *, agreement=None
+):
     """Broadcast converted expert tensors across PP and EP groups.
 
     ``all_converted[i]`` is ``bridge_converter.convert()`` output for
@@ -896,6 +985,7 @@ def _broadcast_converted_bucket(bucket_infos, all_converted, device, phase_cache
             rank,
             group=mpu.get_pipeline_model_parallel_group(),
             plan_cache=phase_caches[0] if phase_caches is not None else None,
+            agreement=agreement,
         )
 
     ep_size = mpu.get_expert_model_parallel_world_size()
@@ -907,6 +997,7 @@ def _broadcast_converted_bucket(bucket_infos, all_converted, device, phase_cache
             rank,
             group=mpu.get_expert_model_parallel_group(),
             plan_cache=phase_caches[1] if phase_caches is not None else None,
+            agreement=agreement,
         )
 
     out: list[tuple[str, torch.Tensor]] = []
@@ -1026,7 +1117,9 @@ def _decode_metadata(meta_tensor, slot_size):
     return slots
 
 
-def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group, plan_cache: dict | None = None):
+def _broadcast_converted_phase(
+    bucket_infos, all_converted, device, rank, group, plan_cache: dict | None = None, *, agreement=None
+):
     """Single-group broadcast of converted tensors using only NCCL.
 
     1. MAX agrees on slot size and (when caching) whether any rank needs a refresh.
@@ -1034,6 +1127,25 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group,
        caches skip this large exchange and reuse CPU descriptors and byte sizes.
     3. Fresh data buffers are broadcast from their owners on every call.
     """
+    steps = _converted_phase_steps(bucket_infos, all_converted, device, rank, group, plan_cache)
+    while True:
+        request, result, error, done = None, None, None, False
+        try:
+            request = next(steps)
+        except StopIteration as stop:
+            done, result = True, stop.value
+        except Exception as caught:
+            if agreement is None:
+                raise
+            error = f"{type(caught).__name__}: {caught}"
+        if agreement is not None:
+            agreement(error)
+        if done:
+            return result
+        request()
+
+
+def _converted_phase_steps(bucket_infos, all_converted, device, rank, group, plan_cache):
     group_ranks = dist.get_process_group_ranks(group)
     group_ranks_set = set(group_ranks)
 
@@ -1055,19 +1167,22 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group,
     local_size = plan_cache["local_size"] if cache_hit else _compute_slot_size(all_converted, bucket_infos)
     if plan_cache is None:
         slot_size_t = torch.tensor([local_size], dtype=torch.int64, device=device)
-        dist.all_reduce(slot_size_t, op=dist.ReduceOp.MAX, group=group)
+        yield lambda: traffic.all_reduce(slot_size_t, op=dist.ReduceOp.MAX, group=group)
         slot_size = slot_size_t.item()
         refresh = True
     else:
         agreement = torch.tensor([local_size, int(not cache_hit)], dtype=torch.int64, device=device)
-        dist.all_reduce(agreement, op=dist.ReduceOp.MAX, group=group)
+        yield lambda: traffic.all_reduce(agreement, op=dist.ReduceOp.MAX, group=group)
         # Replaces the pre-existing scalar D2H synchronization; no extra sync.
         slot_size, refresh = agreement.cpu().tolist()
 
     if refresh:
         local_meta_tensor = _encode_metadata(all_converted, bucket_infos, group_ranks_set, rank, slot_size)
         meta_buf = local_meta_tensor.to(device)
-        dist.all_reduce(meta_buf, op=dist.ReduceOp.SUM, group=group)
+    else:
+        meta_buf = None
+    yield lambda: traffic.all_reduce(meta_buf, op=dist.ReduceOp.SUM, group=group) if refresh else None
+    if refresh:
         merged_slots = _decode_metadata(meta_buf.cpu(), slot_size)
         src_to_slots: dict[int, list] = {}
         src_bytes: dict[int, int] = {}
@@ -1105,12 +1220,16 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group,
         else:
             buf = torch.empty(total_bytes, dtype=torch.uint8, device=device)
 
-        if total_bytes:
-            handles.append(dist.broadcast(buf, src=src, group=group, async_op=True))
         unpack_tasks.append((src, buf, slot_list))
 
-    for h in handles:
-        h.wait()
+    def broadcast_buffers():
+        for src, buf, _slots in unpack_tasks:
+            if buf.numel():
+                handles.append(traffic.broadcast(buf, src=src, group=group, async_op=True))
+        for handle in handles:
+            handle.wait()
+
+    yield broadcast_buffers
 
     # Unpack buffers back into named tensors
     for src, buf, slot_list in unpack_tasks:

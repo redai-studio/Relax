@@ -151,9 +151,6 @@ class TestCheckpointModeDetection:
     metadata."""
 
     def test_checkpoint_save_with_metadata(self):
-        # checkpoint.py imports megatron.training at module load; skip when unavailable (CPU-only CI).
-        pytest.importorskip("megatron.training.checkpointing")
-
         from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 
         Item = namedtuple("Item", ["param_name", "weight"])
@@ -202,8 +199,6 @@ class TestCheckpointModeDetection:
             assert meta["lora_merge_mode"] is False
 
     def test_empty_adapter_export_is_a_hard_error(self):
-        pytest.importorskip("megatron")
-
         from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 
         args = MagicMock(
@@ -243,8 +238,8 @@ class TestCheckpointModeDetection:
 
 
 def _make_sync(save="/data/run"):
-    # The helper imports relax.backends.megatron.misc_utils; skip if unavailable.
-    lora_adapter_sync = pytest.importorskip("relax.backends.megatron.weight_update.lora_adapter_sync")
+    from relax.backends.megatron.weight_update import lora_adapter_sync
+
     args = SimpleNamespace(
         lora_rank=8,
         lora_alpha=16,
@@ -342,7 +337,7 @@ class TestTargetModuleExpansion:
 
 
 class TestMergeContract:
-    """The TP=1 merge-mode fold must equal base + alpha/dim*(B @ A)."""
+    """TP1 merge equals base + alpha/dim*(B @ A), with the base dtype retained."""
 
     def test_tp1_formula_reference(self):
         # Documents the exact math _merge_full_base depends on (no megatron needed).
@@ -355,18 +350,54 @@ class TestMergeContract:
         expected = base + (alpha / r) * (b @ a)
         assert expected.shape == base.shape
 
-    def test_tp1_matches_real_loramerge(self):
+    def test_tp1_matches_real_loramerge(self, monkeypatch):
+        self._check_merge(monkeypatch, legacy_api=False)
+
+    def test_tp1_supports_legacy_merge_signature(self, monkeypatch):
+        self._check_merge(monkeypatch, legacy_api=True)
+
+    def _check_merge(self, monkeypatch, *, legacy_api):
         from megatron.bridge.peft.lora_merge import LoRAMerge
 
+        from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+
+        # The broadcast-only suite imports this module with lightweight stubs.
+        # Select the installed merger explicitly so this test exercises Bridge.
+        monkeypatch.setattr(bridge, "LoRAMerge", LoRAMerge)
+        monkeypatch.setattr(
+            bridge,
+            "mpu",
+            SimpleNamespace(
+                get_tensor_model_parallel_world_size=lambda: 1,
+                get_tensor_model_parallel_group=lambda: None,
+            ),
+        )
+        if legacy_api:
+
+            class LegacyMerge:
+                def merge(self, base_weight, linear_out, linear_in, alpha, dim, *, tp_size, tp_group):
+                    assert tp_size == 1
+                    assert tp_group is None
+                    return base_weight + (alpha / dim) * (linear_out @ linear_in)
+
+            monkeypatch.setattr(bridge, "LoRAMerge", LegacyMerge)
         torch.manual_seed(0)
-        base = torch.randn(6, 5)
+        base = torch.nn.Parameter(torch.randn(6, 5, dtype=torch.bfloat16))
         b = torch.randn(6, 2)
         a = torch.randn(2, 5)
         alpha, r = 8, 2
-        # Bridge derives TP=1 from a missing process group.
-        merged = LoRAMerge().merge(base.float(), b.float(), a.float(), alpha, r, tp_group=None)
-        expected = base + (alpha / r) * (b @ a)
-        assert torch.allclose(merged, expected, atol=1e-5)
+        name = "decoder.layers.0.self_attention.linear_qkv.to_wrap.weight"
+        iterator = object.__new__(bridge.HfWeightIteratorBridge)
+        iterator._adapter_map = {bridge._base_param_prefix(name): {"in": "a", "out": "b"}}
+        iterator.lora_alpha, iterator.lora_dim = alpha, r
+        info = SimpleNamespace(name=name, attrs={"tensor_model_parallel": True, "partition_dim": 0})
+        merged = iterator._merge_base_with_adapter(info, base, {"a": a, "b": b}, torch.device("cpu"))
+        expected = (base.float() + (alpha / r) * (b @ a)).to(base.dtype)
+        assert torch.equal(merged, expected)
+        assert merged.dtype == base.dtype
+        assert not merged.requires_grad
+        assert merged.tensor_model_parallel is True
+        assert merged.partition_dim == 0
 
 
 class TestPrefixJoin:
@@ -374,7 +405,6 @@ class TestPrefixJoin:
     merge lookup."""
 
     def test_base_and_adapter_prefixes_match(self):
-        pytest.importorskip("megatron.bridge.peft.lora")
         from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (
             _adapter_base_prefix,
             _base_param_prefix,

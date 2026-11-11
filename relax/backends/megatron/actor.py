@@ -3048,6 +3048,29 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("old_actor")
 
     @timer
+    def export_weight_checkpoint(self, **options) -> dict:
+        """Export a FULL package after a completed training step.
+
+        Invoke on every training rank as the final distributed operation in the
+        active training step, after the optimizer update and immediately before
+        any sleep/offload. The caller supplies the shared store, stream and
+        version; rollout processes can consume the result later. This method
+        does not wake an already-offloaded model.
+        """
+        from .weight_update.export_full_checkpoint import export_full_checkpoint
+
+        self._flush_resident_sft_parameters()
+        reload_groups = self.args.offload_train and self._per_step_rollout
+        if reload_groups:
+            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+        try:
+            with self._train_state_offloader.disable_during_update():
+                return export_full_checkpoint(self, get_gloo_group(), **options)
+        finally:
+            if reload_groups:
+                destroy_process_groups()
+
+    @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
