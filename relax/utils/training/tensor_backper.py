@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -12,6 +14,17 @@ _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
 
 _NON_BLOCKING = device_utils.use_non_blocking_copy()
 _PIN_MEMORY = device_utils.use_pinned_host_memory()
+
+
+def _attach_tp_attrs(snapshot: torch.Tensor, param: torch.Tensor, backfill_defaults) -> None:
+    """Preserve TP metadata, including Relax's parallel_mode, on snapshots."""
+    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+
+    copy_tensor_model_parallel_attributes(snapshot, param)
+    if hasattr(param, "parallel_mode"):
+        snapshot.parallel_mode = param.parallel_mode
+    # Unmarked parameters need Megatron's non-parallel defaults.
+    backfill_defaults(snapshot)
 
 
 class TensorBackuper(ABC):
@@ -35,7 +48,7 @@ class TensorBackuper(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def backup(self, tag: str):
+    def backup(self, tag: str, *, on_device: bool = False):
         raise NotImplementedError
 
     def copy(self, *, src_tag: str, dst_tag: str):
@@ -59,11 +72,34 @@ class _TensorBackuperNormal(TensorBackuper):
         return self._backups[tag]
 
     @torch.no_grad()
-    def backup(self, tag: str) -> None:
+    def backup(self, tag: str, *, on_device: bool = False) -> None:
+        """Snapshot to host memory, or to each source device with
+        on_device=True."""
+        from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
+
         backup_dict = self._backups[tag]
+        missing = [(name, param) for name, param in self._source_getter() if name not in backup_dict]
+        if on_device and missing:
+            # Share storage per device/dtype to avoid per-parameter allocation fragmentation.
+            by_device_dtype: dict[tuple[torch.device, torch.dtype], list[tuple[str, torch.Tensor]]] = defaultdict(list)
+            for name, param in missing:
+                by_device_dtype[(param.device, param.dtype)].append((name, param))
+            for (device, dtype), entries in by_device_dtype.items():
+                flat_buffer = torch.empty(sum(p.numel() for _, p in entries), dtype=dtype, device=device)
+                offset = 0
+                for name, param in entries:
+                    numel = param.numel()
+                    snapshot = flat_buffer[offset : offset + numel].view(param.shape)
+                    offset += numel
+                    _attach_tp_attrs(snapshot, param, set_defaults_if_not_set_tensor_model_parallel_attributes)
+                    backup_dict[name] = snapshot
+        else:
+            for name, param in missing:
+                snapshot = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+                _attach_tp_attrs(snapshot, param, set_defaults_if_not_set_tensor_model_parallel_attributes)
+                backup_dict[name] = snapshot
+
         for name, param in self._source_getter():
-            if name not in backup_dict:
-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_module.synchronize()
 
@@ -98,7 +134,7 @@ class _TensorBackuperNoop(TensorBackuper):
         assert _compute_hash_dict(ans) == self._backup_hash_dict
         return ans
 
-    def backup(self, tag: str) -> None:
+    def backup(self, tag: str, *, on_device: bool = False) -> None:
         assert tag == self._single_tag
         self._backup_hash_dict = _compute_hash_dict(dict(self._source_getter()))
         device_module.synchronize()

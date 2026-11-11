@@ -8,11 +8,12 @@ import asyncio
 import copy
 import time
 from argparse import Namespace
-from typing import Any, Callable, Iterable, Literal
+from contextlib import nullcontext
+from typing import Any, AsyncContextManager, Callable, Iterable, Literal
 
 from relax.agentic import format_agentic_status
 from relax.agentic.pipeline import GroupExport, SessionExport
-from relax.agentic.pipeline.runtime import RuntimeGroupStream
+from relax.agentic.pipeline.runtime import RuntimeGroupStream, finish_before_cancellation
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
@@ -47,6 +48,9 @@ class RewardDomain:
 
             self.custom_advantage_func = load_function(custom_advantage_path)
         self._group_filter = group_filter if rollout_mode == "train" else None
+        # Why the last group filter rejected, for the observability stage record.
+        # Set by finalize_group; see the invariant documented there.
+        self.last_filter_drop_reason: str | None = None
         self._metric_gatherer = MetricGatherer()
         self._scored_session_ids: set[str] = set()
         self._progress_callback: Callable[[], None] = lambda: None
@@ -72,7 +76,12 @@ class RewardDomain:
         if len(self._scored_session_ids) != previous_count:
             self._progress_callback()
 
-    async def score_sessions(self, stream: RuntimeGroupStream) -> None:
+    async def score_sessions(
+        self,
+        stream: RuntimeGroupStream,
+        *,
+        observe_reward: Callable[[list[Sample]], AsyncContextManager] | None = None,
+    ) -> None:
         """Start ordinary RM as each Session export becomes available.
 
         A controlled Session drop ends this helper immediately, allowing the
@@ -81,7 +90,7 @@ class RewardDomain:
 
         tasks = tuple(
             asyncio.create_task(
-                self._score_session(result.session_id, result.completion),
+                self._score_session(result.session_id, result.completion, observe_reward),
                 name=f"agentic-session-reward:{result.session_id}",
             )
             for result in stream.session_results
@@ -96,21 +105,29 @@ class RewardDomain:
         finally:
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await finish_before_cancellation(
+                asyncio.gather(*tasks, return_exceptions=True), "agentic-session-reward-cleanup"
+            )
 
-    async def score_group(self, group: GroupExport) -> None:
+    async def score_group(
+        self,
+        group: GroupExport,
+        *,
+        observe_reward: Callable[[list[Sample]], AsyncContextManager] | None = None,
+    ) -> None:
         """Run group RM after every Session export in the Group is complete."""
 
-        samples = group.samples
-        reward_start_at = time.time()
-        for sample in samples:
-            mark_sample_agentic_event(sample, "reward_arrive_at", reward_start_at)
-            mark_sample_agentic_event(sample, "reward_start_at", reward_start_at)
-        rewards = await batched_async_rm(self.args, samples)
-        reward_end_at = time.time()
-        for sample, reward in zip(samples, rewards, strict=True):
-            sample.reward = reward
-            mark_sample_agentic_event(sample, "reward_end_at", reward_end_at)
+        async with observe_reward(group.samples) if observe_reward else nullcontext():
+            samples = group.samples
+            reward_start_at = time.time()
+            for sample in samples:
+                mark_sample_agentic_event(sample, "reward_arrive_at", reward_start_at)
+                mark_sample_agentic_event(sample, "reward_start_at", reward_start_at)
+            rewards = await batched_async_rm(self.args, samples)
+            reward_end_at = time.time()
+            for sample, reward in zip(samples, rewards, strict=True):
+                sample.reward = reward
+                mark_sample_agentic_event(sample, "reward_end_at", reward_end_at)
 
     async def apply_custom_advantage(self, group: GroupExport) -> bool:
         """Write per-export custom advantage values or reject the whole
@@ -145,12 +162,17 @@ class RewardDomain:
         finalize_start_at = time.time()
         for sample in samples:
             mark_sample_agentic_event(sample, "group_finalize_start_at", finalize_start_at)
+        self.last_filter_drop_reason = None
         try:
             # Normalize the configured filter once, preserving its drop reason.
             filter_output = call_dynamic_filter(self._group_filter, samples)
             if not filter_output.keep:
                 self._metric_gatherer.on_dynamic_filter_drop(filter_output.reason)
                 self._log_filtered_group()
+                # Read by the caller's stage recorder. Safe as a plain attribute
+                # because this method is synchronous: nothing can interleave
+                # between it returning None and the caller reading the reason.
+                self.last_filter_drop_reason = filter_output.reason
                 return None
             return group
         finally:
@@ -167,6 +189,7 @@ class RewardDomain:
         self,
         session_id: str,
         completion: "asyncio.Future[SessionExport | None]",
+        observe_reward: Callable[[list[Sample]], AsyncContextManager] | None = None,
     ) -> SessionExport | None:
         """Score every JSONL Sample exported by one completed Session."""
 
@@ -176,19 +199,32 @@ class RewardDomain:
         reward_arrive_at = time.time()
         for export in outcome.exports:
             mark_sample_agentic_event(export.sample, "reward_arrive_at", reward_arrive_at)
-        await asyncio.gather(*(self._score_sample(export.sample) for export in outcome.exports))
+        tasks = [asyncio.create_task(self._score_sample(export.sample, observe_reward)) for export in outcome.exports]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await finish_before_cancellation(
+                asyncio.gather(*tasks, return_exceptions=True), "agentic-export-reward-cleanup"
+            )
         self._add_scored_sessions((session_id,))
         return outcome
 
-    async def _score_sample(self, sample: Sample) -> None:
+    async def _score_sample(
+        self,
+        sample: Sample,
+        observe_reward: Callable[[list[Sample]], AsyncContextManager] | None = None,
+    ) -> None:
         """Reuse an exported reward or submit one ordinary RM call."""
 
-        if sample.reward is None:
-            mark_sample_agentic_event(sample, "reward_start_at")
-            try:
-                sample.reward = await async_rm(self.args, sample)
-            finally:
-                mark_sample_agentic_event(sample, "reward_end_at")
+        async with observe_reward([sample]) if observe_reward else nullcontext():
+            if sample.reward is None:
+                mark_sample_agentic_event(sample, "reward_start_at")
+                try:
+                    sample.reward = await async_rm(self.args, sample)
+                finally:
+                    mark_sample_agentic_event(sample, "reward_end_at")
 
     def _add_scored_sessions(self, session_ids: Iterable[str]) -> None:
         previous_count = len(self._scored_session_ids)
