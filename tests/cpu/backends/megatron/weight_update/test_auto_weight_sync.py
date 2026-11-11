@@ -1,10 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 
 pytest.importorskip("megatron.core", reason="Weight sync tests require Megatron Core", exc_type=ImportError)
@@ -82,19 +85,74 @@ def test_bf16_routing_negotiates_before_enabling_and_restores_fallback(monkeypat
         assert configured[-1] is None
 
 
-def test_bridge_sync_collective_closure_includes_tp_and_etp(monkeypatch):
+def test_bridge_sync_collective_closure_includes_tp_etp_and_edp(monkeypatch):
     from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
 
     expected = []
-    for dimension in ("pipeline_model", "expert_model", "tensor_model", "expert_tensor"):
+    for dimension in ("pipeline_model", "expert_model", "tensor_model", "expert_tensor", "expert_data"):
         group = object()
         expected.append(group)
         monkeypatch.setattr(bridge.mpu, f"get_{dimension}_parallel_world_size", lambda: 2)
         monkeypatch.setattr(bridge.mpu, f"get_{dimension}_parallel_group", lambda value=group: value)
     iterator = HfWeightIteratorBridge.__new__(HfWeightIteratorBridge)
     assert iterator.weight_sync_process_groups() == expected
-    monkeypatch.setattr(bridge.mpu, "get_expert_tensor_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge.mpu, "get_expert_data_parallel_world_size", lambda: 1)
     assert iterator.weight_sync_process_groups() == expected[:-1]
+
+
+def _expert_dp_checkpoint_worker(rank, rendezvous):
+    from megatron.core import parallel_state as mpu
+
+    from relax.backends.megatron.weight_update.shard_p2p_source import MegatronShardP2PSource
+    from relax.utils.reloadable_process_group import (
+        ReloadableProcessGroup,
+        destroy_process_groups,
+        monkey_patch_torch_dist,
+        reload_process_groups,
+        retain_process_groups,
+    )
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=30))
+    try:
+        monkey_patch_torch_dist(SimpleNamespace(offload_train=True))
+        edp_rank_sets = ([0, 2], [1, 3])
+        edp_groups = [
+            ReloadableProcessGroup(dist.new_group(ranks=ranks, backend="gloo"), ranks) for ranks in edp_rank_sets
+        ]
+        edp = edp_groups[rank % 2]
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(mpu, "get_expert_data_parallel_group", lambda: edp)
+            patch.setattr(mpu, "get_expert_data_parallel_world_size", lambda: 2)
+            for axis in ("pipeline_model", "expert_model", "tensor_model", "expert_tensor"):
+                patch.setattr(mpu, f"get_{axis}_parallel_world_size", lambda: 1)
+            for axis in (
+                "expert_model_parallel",
+                "expert_tensor_parallel",
+                "tensor_model_parallel",
+                "pipeline_model_parallel",
+                "context_parallel",
+            ):
+                patch.setattr(mpu, f"get_{axis}_world_size", lambda: 1)
+                patch.setattr(mpu, f"get_{axis}_rank", lambda: 0)
+            iterator = HfWeightIteratorBridge.__new__(HfWeightIteratorBridge)
+            source = MegatronShardP2PSource.__new__(MegatronShardP2PSource)
+            source.group, source.rank = dist.group.WORLD, rank
+            before = source.source_role()
+            assert before[0] == tuple(edp_rank_sets[rank % 2])
+            retained = retain_process_groups(iterator.weight_sync_process_groups(), metadata_group=dist.group.WORLD)
+            assert retained == tuple(edp_groups)
+            # save_model() destroys non-retained groups; update_weights() reloads
+            # only the retained subset before binding the next source snapshot.
+            destroy_process_groups(post_destroy_delay=0)
+            reload_process_groups(process_groups=retained)
+            assert source.source_role() == before
+    finally:
+        ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=0, force=True)
+        dist.destroy_process_group()
+
+
+def test_expert_dp_source_role_survives_checkpoint_group_cycle(tmp_path):
+    mp.spawn(_expert_dp_checkpoint_worker, args=((tmp_path / "rdzv").as_uri(),), nprocs=4, join=True)
 
 
 @pytest.mark.parametrize("quantization", [None, {"quant_method": "fp8"}, {"format": "mxfp4-pack-quantized"}])

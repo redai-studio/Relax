@@ -369,7 +369,7 @@ class UpdateWeightFromTensor:
                 "Weight sync communicator plan: %s",
                 "full reload"
                 if self.process_groups_for_update is None
-                else f"retain {len(self.process_groups_for_update)} PP/EP/TP/ETP groups",
+                else f"retain {len(self.process_groups_for_update)} PP/EP/TP/ETP/EDP groups",
             )
 
     def _configure_auto_expert_routing(self, gpu_counts: Sequence[int], gpu_offsets: Sequence[int]) -> None:

@@ -323,12 +323,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         return max(1, budget // 3) if self.quantization_config else budget
 
     def weight_sync_process_groups(self) -> list[dist.ProcessGroup]:
-        """All collectives used by this iterator, including ordinary TP/ETP."""
+        """Groups needed by export and retained expert shard ownership."""
         dimensions = (
             (mpu.get_pipeline_model_parallel_world_size, mpu.get_pipeline_model_parallel_group),
             (mpu.get_expert_model_parallel_world_size, mpu.get_expert_model_parallel_group),
             (mpu.get_tensor_model_parallel_world_size, mpu.get_tensor_model_parallel_group),
             (mpu.get_expert_tensor_parallel_world_size, mpu.get_expert_tensor_parallel_group),
+            (mpu.get_expert_data_parallel_world_size, mpu.get_expert_data_parallel_group),
         )
         return [group() for size, group in dimensions if size() > 1]
 
