@@ -56,12 +56,19 @@ if [ "${ACTOR_GPUS}" -gt "$((GPUS_PER_NODE * NUM_NODES))" ]; then
 fi
 echo "parallelism: TP=${TP_SIZE} DP=${DP_SIZE} PP=1 CP=1 on ${ACTOR_GPUS} GPU(s)"
 
+GEMMA4_SFT_CONVERSION_MODE="${GEMMA4_SFT_CONVERSION_MODE:-text}"
+case "${GEMMA4_SFT_CONVERSION_MODE}" in
+    text | vl) ;;
+    *) echo "ERROR: GEMMA4_SFT_CONVERSION_MODE must be text or vl." >&2; exit 1 ;;
+esac
+
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
 
 RUNTIME_ENV_JSON=$(printf '%s' "${RUNTIME_ENV_JSON}" | jq -c \
-    '.env_vars.GEMMA4_CONVERSION_MODE = "text"
+    --arg mode "${GEMMA4_SFT_CONVERSION_MODE}" \
+    '.env_vars.GEMMA4_CONVERSION_MODE = $mode
      | .env_vars.RELAX_GEMMA4_FORCE_FLEX_GLOBAL = "1"
      | .env_vars.PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"')
 
@@ -149,6 +156,9 @@ SFT_ARGS=(
 
 if [ -n "${LABEL_KEY}" ]; then
     SFT_ARGS+=(--label-key "${LABEL_KEY}")
+fi
+if [ -n "${MULTIMODAL_KEYS:-}" ]; then
+    SFT_ARGS+=(--multimodal-keys "${MULTIMODAL_KEYS}")
 fi
 
 PERF_ARGS=(

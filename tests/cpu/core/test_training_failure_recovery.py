@@ -301,6 +301,7 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
         "logger": logging.getLogger(__name__),
         "_graceful_shutdown": shutdown,
         "_fault_runtime": None,
+        "_run_recorder": Mock(),
     }
     with pytest.raises(SystemExit) as caught:
         exec(code, scope)

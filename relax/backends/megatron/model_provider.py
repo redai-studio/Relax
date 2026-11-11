@@ -564,22 +564,17 @@ def get_model_provider_func(
                 provider.num_layers_in_first_pipeline_stage = None
                 provider.num_layers_in_last_pipeline_stage = None
 
-        # Fused DSA kernels (FlashMLA forward + cuDNN DSA backward). Deliberately NOT in
-        # bridge_keys: that loop assigns unconditionally, so every bridge-mode model would
-        # get this field set. Only csa.py (DSv4-only) and the dsv4_hybrid branch of
-        # TransformerConfig.__post_init__ read it today, but gating here makes the blast
-        # radius structural rather than an argument about current mcore internals.
-        #
-        # Note the arg polarity: mcore auto-generates only `--no-dsa-kernel-fusion`
-        # (store_false, dest=apply_dsa_kernel_fusion, default True), so args say True
-        # unless the user opts out -- while the TransformerConfig field defaults to False
-        # and DeepSeekV4Bridge sets it False on SM < 10.0. Taking args as authoritative
-        # turns fusion ON for DSv4 by default; without it the CSA layers fall back to the
-        # unfused reference path whose gather backward is quadratic in sequence length
-        # (82GB at 8K tokens). If flash_mla / cuDNN DSA are missing, mcore raises a clear
-        # ValueError naming --no-dsa-kernel-fusion as the escape hatch.
+        # Bridge bypasses MCore's CLI backend resolution. Preserve DSv4's fused default
+        # (FlashMLA forward + cuDNN backward), including newer MCore where the deprecated
+        # fusion flag defaults to None. Let finalize() validate explicit backend/flag conflicts.
         if getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid":
-            want_fusion = bool(getattr(args, "apply_dsa_kernel_fusion", False))
+            want_fusion = getattr(args, "apply_dsa_kernel_fusion", None)
+            if hasattr(provider, "dsa_kernel_backend"):
+                provider.dsa_kernel_backend = getattr(args, "dsa_kernel_backend", None) or (
+                    "cudnn" if want_fusion is None else "none"
+                )
+            else:
+                want_fusion = want_fusion is not False
             if getattr(provider, "apply_dsa_kernel_fusion", False) != want_fusion:
                 logger.info(
                     "Override provider.apply_dsa_kernel_fusion: "

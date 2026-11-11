@@ -121,7 +121,8 @@ def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
     assert _enable_draft_weights_cpu_backup(args, overrides) is expected
 
 
-def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engine_module):
+@pytest.mark.parametrize("omni", [False, True])
+def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engine_module, omni):
     from relax.utils import misc
 
     module = expert_sync_engine_module
@@ -139,14 +140,22 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
         "ignored_server_field": "ignored",
         "json_model_override_args": "{}",
         "custom_weight_loader": ["relax.backends.sglang.weight_loader.load_expert_slices"],
+        "speculative_draft_model_path": "/test/runtime-model",
     }
     get = Mock(return_value=response)
-    config = Mock(return_value=SimpleNamespace(text_config=SimpleNamespace(num_experts=896)))
+    text = SimpleNamespace(num_experts=896, n_shared_experts=1)
+    config = Mock(
+        return_value=SimpleNamespace(thinker_config=SimpleNamespace(text_config=text))
+        if omni
+        else SimpleNamespace(text_config=text)
+    )
     monkeypatch.setattr(module.requests, "get", get)
     monkeypatch.setattr(misc, "get_hf_config", config)
     result = engine.get_expert_weight_sync_layout()
     assert result["enable_eplb"] is True
     assert result["num_experts"] == 896
+    assert result["num_shared_experts"] == 1
+    assert result["speculative_draft_model_path"] == "/test/runtime-model"
     assert result["custom_weight_loader"] == ["relax.backends.sglang.weight_loader.load_expert_slices"]
     assert "ignored_server_field" not in result
     config.assert_called_once_with("/test/runtime-model")
@@ -250,6 +259,46 @@ def test_expert_sync_rejects_inconsistent_scheduler_layouts(monkeypatch, expert_
 
     with pytest.raises(ValueError, match="schedulers disagree"):
         engine.get_expert_weight_sync_layout()
+
+
+@pytest.mark.parametrize(
+    ("supported", "offload", "global_backend", "overrides", "expected"),
+    [
+        (True, True, None, {}, "disabled"),
+        (True, False, None, {}, None),
+        (True, True, "breakable", {}, "breakable"),
+        (True, True, "disabled", {"cuda_graph_backend_prefill": "breakable"}, "breakable"),
+        (True, True, None, {"enable_memory_saver": False}, None),
+        (True, False, None, {"enable_memory_saver": True}, "disabled"),
+        (False, True, None, {}, None),
+    ],
+)
+def test_genrm_prefill_cuda_graph_respects_memory_saver_and_overrides(
+    monkeypatch, sglang_engine_module, supported, offload, global_backend, overrides, expected
+):
+    module = sglang_engine_module
+    fields = [("enable_memory_saver", bool, False)]
+    if supported:
+        fields.append(("cuda_graph_backend_prefill", str, None))
+    monkeypatch.setattr(module, "ServerArgs", make_dataclass("ServerArgs", fields))
+    monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
+    args = SimpleNamespace(
+        genrm_num_gpus_per_engine=1,
+        num_gpus_per_node=8,
+        genrm_model_path="/test/genrm",
+        genrm_engine_config=overrides,
+        seed=42,
+        offload_rollout=offload,
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_cuda_graph_backend_prefill=global_backend,
+    )
+
+    result, _ = module._compute_genrm_server_args(args, 0, "localhost:8000", 8001, "localhost", 8002, base_gpu_id=0)
+
+    assert result.get("cuda_graph_backend_prefill") == expected
+    if not supported:
+        assert "cuda_graph_backend_prefill" not in result
 
 
 @pytest.mark.parametrize(
@@ -417,6 +466,21 @@ def test_external_pd_routing_replay_registers_native_worker(
 def test_transport_respects_engine_topology_and_native_validation(
     request, monkeypatch, engine, worker, gpus, engine_gpus, cli, overrides, expected
 ):
+    actual = _compute_engine_server_args(request, monkeypatch, engine, worker, gpus, engine_gpus, cli, overrides)
+    assert actual["mm_feature_transport"] == expected
+    _check_native_transport_validation(monkeypatch, actual, expected)
+
+
+@pytest.mark.parametrize("engine", ["policy", "genrm"])
+def test_transport_keeps_sglang_auto_policy_on_rocm(request, monkeypatch, engine):
+    # SGLang rejects CUDA IPC on ROCm, so a single-node ROCm engine keeps the auto policy.
+    actual = _compute_engine_server_args(request, monkeypatch, engine, "regular", 2, 2, [], {}, is_rocm=True)
+    assert actual["mm_feature_transport"] is None
+
+
+def _compute_engine_server_args(
+    request, monkeypatch, engine, worker, gpus, engine_gpus, cli, overrides, is_rocm=False
+):
     from relax.backends.sglang.arguments import ServerArgs, add_sglang_arguments
 
     # Keep the real CLI and SGLang validation; isolate only hardware/model discovery.
@@ -441,6 +505,8 @@ def test_transport_respects_engine_topology_and_native_validation(
     module = request.getfixturevalue("sglang_engine_module")
     monkeypatch.setattr(module, "ServerArgs", ServerArgs)
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu: gpu)
+    # The fixture stubs relax.utils.device, so the flag may not exist yet.
+    monkeypatch.setattr(module.device_utils, "is_rocm", is_rocm, raising=False)
     compute = module._compute_genrm_server_args if engine == "genrm" else module._compute_server_args
     options = {} if engine == "genrm" else {"sglang_overrides": overrides, "num_gpus_per_engine": engine_gpus}
     actual, _ = compute(
@@ -455,7 +521,11 @@ def test_transport_respects_engine_topology_and_native_validation(
         base_gpu_id=0,
         **options,
     )
-    assert actual["mm_feature_transport"] == expected
+    return actual
+
+
+def _check_native_transport_validation(monkeypatch, actual, expected):
+    from relax.backends.sglang.arguments import ServerArgs
 
     cfg = SimpleNamespace(
         **{"encoder_only": False, "tokenizer_worker_num": 1, "disaggregation_mode": "null", **actual}

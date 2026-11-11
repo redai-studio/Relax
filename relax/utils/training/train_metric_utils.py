@@ -54,6 +54,7 @@ def log_perf_data_raw(
             batch_seqlens=seq_lens,
             delta_time=1.0,
             images_seqlens=images_seqlens,
+            has_image_inputs=getattr(timer_instance, "has_image_inputs", False),
             audio_seqlens=audio_seqlens,
             image_grid_thw=getattr(timer_instance, "image_grid_thw", None),
             freeze_vision_model=getattr(args, "freeze_vision_model", False),

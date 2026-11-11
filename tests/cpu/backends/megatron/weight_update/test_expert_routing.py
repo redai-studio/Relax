@@ -28,6 +28,7 @@ ExpertRouter = _ROUTING.ExpertRouter
 TensorSpec = _ROUTING.TensorSpec
 build_transfer_plan = _ROUTING.build_transfer_plan
 validate_server_layout = _ROUTING.validate_server_layout
+validate_bf16_server_layout = _ROUTING.validate_bf16_server_layout
 
 
 def _name(expert: int, suffix: str = "packed") -> str:
@@ -109,6 +110,65 @@ def test_expert_routing_checks_resolved_server_overrides(override):
         validate_server_layout(config | override, 2, 2)
 
 
+@pytest.mark.parametrize(
+    "prefix", ["model.layers.3", "model.language_model.layers.3", "language_model.model.layers.3"]
+)
+@pytest.mark.parametrize(
+    "mlp,projections", [("mlp", ("gate_proj", "up_proj", "down_proj")), ("block_sparse_moe", ("w1", "w3", "w2"))]
+)
+def test_bf16_routing_preserves_hf_names_and_sends_only_to_expert_owners(prefix, mlp, projections):
+    layout = ExpertLayout(8, 2, (0, 2), 4)
+    schemas = [[], [], [], []]
+    names = []
+    for expert in range(8):
+        for projection in projections:
+            name = f"{prefix}.{mlp}.experts.{expert}.{projection}.weight"
+            names.append(name)
+            schemas[expert // 2].append(TensorSpec(name, (2, 4), torch.bfloat16))
+    for rank in range(4):
+        plan = build_transfer_plan(schemas, layout, rank)
+        actual = [spec.name for entries in plan.receive_specs for spec in entries]
+        assert actual == [name for name in names if rank in layout.destinations(name)]
+        assert plan.replicated_payload_bytes == 2 * plan.total_payload_bytes
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"ep_size": 1},
+        {"moe_dp_size": 2},
+        {"dtype": "float16"},
+        {"is_cuda": False},
+        {"enable_eplb": True},
+        {"ep_num_redundant_experts": 1},
+        {"init_expert_location": "random"},
+        {"quantization": "fp8"},
+        {"quantization_config": {"quant_method": "fp8"}},
+        {"num_shared_experts": 1},
+        {"enforce_shared_experts_fusion": True},
+        {"speculative_draft_model_path": "different-model"},
+        {"speculative_algorithm": "DRAFT"},
+        {"json_model_override_args": '{"num_experts":4}'},
+    ],
+)
+def test_bf16_receiver_capabilities_reject_unsafe_layouts(override):
+    config = dict(
+        tp_size=2,
+        ep_size=2,
+        pp_size=1,
+        moe_dp_size=1,
+        num_experts=8,
+        is_cuda=True,
+        dtype="bfloat16",
+        moe_runner_backend="deep_gemm",
+        num_shared_experts=0,
+    )
+    validate_bf16_server_layout(config, 2, 2, 8)
+    validate_bf16_server_layout(config | {"speculative_algorithm": "EAGLE"}, 2, 2, 8)
+    with pytest.raises(ValueError):
+        validate_bf16_server_layout(config | override, 2, 2, 8)
+
+
 def _worker_stage(rank: int, stage: str) -> None:
     sys.stderr.write(f"[expert-routing rank={rank}] {stage}\n")
     sys.stderr.flush()
@@ -175,6 +235,7 @@ def _exchange_worker(rank: int, rendezvous: str, with_bridge: bool) -> None:
         if with_bridge:
             _check_bridge_chunk_rounds(rank, layout, interleaved=False)
             _check_bridge_chunk_rounds(rank, layout, interleaved=True)
+            _check_bf16_replicas(rank, layout)
         _worker_stage(rank, "all assertions passed")
     finally:
         _worker_stage(rank, "destroying Gloo")
@@ -209,6 +270,9 @@ def _check_bridge_chunk_rounds(rank: int, layout: ExpertLayout, *, interleaved: 
     iterator._non_expert_buckets = []
     iterator._expert_broadcast_caches = []
     iterator._bf16_expert_buckets = None
+    iterator._bf16_expert_gathers = []
+    iterator._expert_router = None
+    iterator.quantization_config = {"format": "mxfp4-pack-quantized"}
     iterator._async_weight_gather = False
     iterator.lora_merge_mode = False
     iterator._bridge_converter = SimpleNamespace(
@@ -253,6 +317,101 @@ def _check_bridge_chunk_rounds(rank: int, layout: ExpertLayout, *, interleaved: 
             assert actual.keys() == expected.keys()
             for name in actual:
                 torch.testing.assert_close(actual[name], expected[name])
+
+
+def _check_bf16_replicas(rank: int, layout: ExpertLayout) -> None:
+    from types import SimpleNamespace
+
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+    from relax.utils.types import ParamInfo
+
+    iterator = object.__new__(bridge.HfWeightIteratorBridge)
+    iterator.args = SimpleNamespace(update_weight_buffer_size=4096)
+    iterator.quantization_config = None
+    iterator._expert_router = None
+    iterator._packed_expert_sync = False
+    infos = [
+        ParamInfo(
+            name=f"decoder.layers.0.mlp.experts.linear_fc{fc}.weight{expert}",
+            dtype=torch.bfloat16,
+            shape=torch.Size(shape),
+            attrs={},
+            size=2 * shape[0] * shape[1],
+            src_rank=rank,
+        )
+        for expert in range(8)
+        for fc, shape in [(1, (2, 3)), (2, (3, 1))]
+    ]
+    tower = ParamInfo(
+        name="vision_model.experts.linear_fc1.weight",
+        dtype=torch.bfloat16,
+        shape=torch.Size([1]),
+        attrs={},
+        size=2,
+        src_rank=rank,
+    )
+    iterator._expert_buckets = [infos + [tower]]
+    original = iterator._expert_buckets
+    iterator._bf16_expert_buckets = [infos]
+    iterator._bf16_expert_gathers = []
+    iterator._vanilla_key_map = {
+        info.name: info.name for info in infos if int(info.name.rsplit("weight", 1)[1]) // 4 == rank % 2
+    }
+    for prefix, mlp, projections in [
+        ("model.layers.0", "mlp", ("gate_proj", "up_proj", "down_proj")),
+        ("model.language_model.layers.0", "mlp", ("gate_proj", "up_proj", "down_proj")),
+        ("language_model.model.layers.0", "block_sparse_moe", ("w1", "w3", "w2")),
+    ]:
+
+        def convert(name, value):
+            expert = int(name.rsplit("weight", 1)[1])
+            base = f"{prefix}.{mlp}.experts.{expert}."
+            if "linear_fc1" in name:
+                return [(base + projections[0] + ".weight", value[:1]), (base + projections[1] + ".weight", value[1:])]
+            return [(base + projections[2] + ".weight", value)]
+
+        iterator._bridge_converter = SimpleNamespace(
+            init_tasks=lambda: None,
+            broadcast_and_apply_configs=lambda: None,
+            supports_routed_expert=lambda name: name.startswith("decoder."),
+            convert=convert,
+        )
+        with (
+            patch.object(bridge.mpu, "get_expert_tensor_parallel_world_size", return_value=1),
+            patch.object(bridge.device_utils, "make_current_torch_device", return_value=torch.device("cpu")),
+        ):
+            iterator.configure_expert_routing(
+                layout, payload_group=dist.group.WORLD, metadata_group=dist.group.WORLD, allow_replicas=True
+            )
+            assert {info.src_rank for bucket in iterator._expert_buckets for info in bucket} == {0, 1}
+            assert iterator._unrouted_expert_buckets == [[tower]]
+            assert iterator._bf16_expert_buckets is None
+            for step in range(2):
+                weights = {
+                    info.name: torch.full(
+                        info.shape, int(info.name.rsplit("weight", 1)[1]) + step * 16, dtype=torch.bfloat16
+                    )
+                    for info in infos
+                    if info.name in iterator._vanilla_key_map
+                }
+                actual = dict(pair for chunk in iterator._iter_routed_expert_chunks(weights) for pair in chunk)
+                expected = dict(
+                    pair
+                    for info in infos
+                    for pair in convert(
+                        info.name,
+                        torch.full(
+                            info.shape, int(info.name.rsplit("weight", 1)[1]) + step * 16, dtype=torch.bfloat16
+                        ),
+                    )
+                    if rank in layout.destinations(pair[0])
+                )
+                assert actual.keys() == expected.keys()
+                for name in actual:
+                    torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+            iterator.configure_expert_routing(None)
+            assert iterator._expert_buckets is original and iterator._bf16_expert_buckets == [infos]
+            assert iterator._unrouted_expert_buckets == iterator._unrouted_expert_broadcast_caches == []
 
 
 def _require_bridge_runtime() -> None:

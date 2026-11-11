@@ -186,6 +186,28 @@ def test_get_batch_by_indices_preserves_requested_physical_order(tmp_path):
     assert [sample.source_idx for sample in samples] == [4, 1, 5]
 
 
+def test_yaml_sft_source_ids_survive_reordering_and_tq(tmp_path):
+    for name in ("a", "b"):
+        _write_jsonl(
+            tmp_path / f"{name}.jsonl",
+            [{"messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": name}]}],
+        )
+    mixture = tmp_path / "mixture.yaml"
+    mixture.write_text("datasets:\n  a: a.jsonl\n  b: b.jsonl\n")
+    dataset = SFTStreamingDataset(
+        str(mixture), tokenizer=_FakeTokenizer(), prompt_key="messages", prefetch_max_cached=0
+    )
+    samples = dataset.get_batch_by_indices([1, 0, 1])
+    assert [(s.source_idx, s.dataset_id) for s in samples] == [(1, 1), (0, 0), (1, 1)]
+    td = dict_to_tensordict(pack_samples_for_tq(samples), batch_size=len(samples))
+    assert td["dataset_ids"].dtype == torch.long
+    assert td["dataset_ids"].tolist() == [1, 0, 1]
+    assert pack_samples_for_tq(samples[:1])["dataset_ids"] == [1]
+    samples[0].dataset_id = None
+    with pytest.raises(ValueError, match="every sample"):
+        pack_samples_for_tq(samples)
+
+
 class _FakeTokenizer:
     """Minimal tokenizer with generation-mask chat-template support."""
 
@@ -1456,6 +1478,138 @@ def test_expand_loss_mask_alignment_single_image_pad_run():
     assert out.tolist() == [0, 0, 0, 0, 0, 0, 1]
 
 
+@pytest.mark.parametrize("expanded", [[1, 97, 98, 2], [1, 97, 99, 2]])
+def test_gemma4_image_alignment_rejects_empty_or_unterminated_runs(expanded):
+    with pytest.raises(ValueError, match="nonempty image run and matching end"):
+        _expand_loss_mask_via_alignment(
+            short_ids=torch.tensor([1, 99, 2]),
+            short_mask=torch.tensor([0, 0, 1]),
+            expanded_ids=torch.tensor(expanded),
+            pad_token_ids=frozenset({99}),
+            media_token_wrappers={99: (97, 98)},
+        )
+
+
+def test_gemma4_dataset_aligns_image_wrappers_and_disables_row_token_types(tmp_path, monkeypatch):
+    class Tokenizer(_FakeTokenizer):
+        chat_template = "<|turn>user"
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, token):
+            return {"<|image|>": 99, "<|image>": 97, "<image|>": 98}.get(token, 0)
+
+    path = tmp_path / "images.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe"},
+                            {"type": "image_url", "image_url": {"url": "/image-one.png"}},
+                            {"type": "image_url", "image_url": {"url": "/image-two.png"}},
+                        ],
+                    },
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "images": [],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        streaming_module,
+        "render_with_loss_mask",
+        lambda *args, **kwargs: (
+            torch.tensor([1, 99, 2, 99, 3]),
+            torch.tensor([0, 0, 1, 0, 1]),
+        ),
+    )
+    monkeypatch.setattr(streaming_module, "render_to_text", lambda *args, **kwargs: "rendered")
+
+    def preprocess(sample, **kwargs):
+        assert kwargs["processor_kwargs"] == {
+            "return_mm_token_type_ids": False,
+            "return_tensors": "pt",
+            "add_special_tokens": False,
+        }
+        assert len(sample.images) == 2
+        return [1, 97, 99, 99, 98, 2, 97, 99, 98, 3], {"pixel_values": torch.zeros(2, 3, 2, 2)}
+
+    monkeypatch.setattr(streaming_module, "preprocess_multimodal", preprocess)
+    dataset = SFTStreamingDataset(
+        str(path),
+        tokenizer=Tokenizer(),
+        processor_pool=MagicMock(),
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        pad_token_ids={99},
+        prefetch_max_cached=0,
+    )
+    try:
+        processed = dataset.get_batch_in_order(0, 1)[0]
+        assert processed.loss_mask.tolist() == [0, 0, 0, 0, 0, 1, 0, 0, 0, 1]
+    finally:
+        dataset.stop()
+
+
+def test_gemma4_real_processor_image_expansion_aligns_without_token_types():
+    from PIL import Image
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    from transformers.feature_extraction_utils import FeatureExtractionMixin
+    from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor
+    from transformers.models.gemma4.processing_gemma4 import Gemma4Processor
+    from transformers.video_processing_utils import BaseVideoProcessor
+
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "[PAD]": 1, "Q": 2, "A": 3}, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        chat_template="<|turn>user",
+        extra_special_tokens={
+            "image_token": "<|image|>",
+            "boi_token": "<|image>",
+            "eoi_token": "<image|>",
+            "audio_token": "<|audio|>",
+            "boa_token": "<|audio>",
+            "eoa_token": "<audio|>",
+        },
+    )
+    processor = Gemma4Processor(
+        feature_extractor=FeatureExtractionMixin(),
+        video_processor=BaseVideoProcessor(),
+        tokenizer=tokenizer,
+        image_processor=Gemma4ImageProcessor(patch_size=16, pooling_kernel_size=2, max_soft_tokens=70),
+    )
+    text = "Q <|image|> A"
+    expanded = processor(
+        text=[text],
+        images=[[Image.new("RGB", (32, 32))]],
+        return_tensors="pt",
+        return_mm_token_type_ids=False,
+        add_special_tokens=False,
+    )
+    assert "mm_token_type_ids" not in expanded
+    assert "pixel_values" in expanded and "image_position_ids" in expanded
+    short = tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+    short_mask = torch.zeros_like(short)
+    short_mask[-1] = 1
+    image_ids = frozenset({tokenizer.image_token_id})
+    output = _expand_loss_mask_via_alignment(
+        short_ids=short,
+        short_mask=short_mask,
+        expanded_ids=expanded["input_ids"][0],
+        pad_token_ids=image_ids,
+        media_token_wrappers=streaming_module._gemma4_media_token_wrappers(tokenizer, image_ids),
+    )
+    assert output.sum() == 1
+    assert expanded["input_ids"][0][output.bool()].tolist() == [tokenizer.convert_tokens_to_ids("A")]
+
+
 def test_message_loss_mask_preserves_selected_assistant_round(tmp_path):
     path = tmp_path / "selected.jsonl"
     row = {
@@ -1693,11 +1847,15 @@ def test_normalize_tool_calls_rejects_non_object_arguments(arguments):
 
 def test_tool_normalization_rejects_malformed_json_and_preserves_empty_values():
     assert streaming_module._normalize_tools(None) is None
+    assert streaming_module._normalize_tools("") is None
+    assert streaming_module._normalize_tools(" \n\t") is None
     assert streaming_module._normalize_tools([]) == []
     assert streaming_module._normalize_tool_calls(None) is None
     assert streaming_module._normalize_tool_calls([]) == []
     with pytest.raises(json.JSONDecodeError):
         streaming_module._normalize_tools(["{invalid"])
+    with pytest.raises(json.JSONDecodeError):
+        streaming_module._normalize_tools("{invalid")
     with pytest.raises(json.JSONDecodeError):
         streaming_module._normalize_tool_calls([{"function": {"arguments": "{invalid"}}])
 

@@ -315,6 +315,7 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
     namespace = {
         "Sample": Sample,
         "GenerateState": lambda args: state,
+        "opd": SimpleNamespace(is_opd_enabled=lambda *args, **kwargs: False),
         "monotonic": monotonic,
         "_post_generation": post_generation,
         "configure_score_centering_request": configure_score_centering_request,

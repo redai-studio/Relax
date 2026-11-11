@@ -249,7 +249,11 @@ export default defineConfig({
               text: 'Getting Started',
               items: [
                 { text: 'Introduction', link: '/en/guide/introduction' },
-                { text: 'Installation', link: '/en/guide/installation' },
+                {
+                  text: 'Installation',
+                  link: '/en/guide/installation',
+                  items: [{ text: 'AMD ROCm', link: '/en/guide/rocm' }],
+                },
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
                 { text: 'Adding an Algorithm', link: '/en/guide/adding-an-algorithm' },
@@ -305,7 +309,7 @@ export default defineConfig({
               text: 'Best Practices',
               items: [
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
-                { text: 'Qwen3.8 Flash/NV QSA', link: '/en/guide/qwen38-qsa' },
+                { text: 'Qwen3.8 QSA Backends', link: '/en/guide/qwen38-qsa' },
                 { text: 'Compiler Cache Reuse', link: '/en/guide/compiler-cache' },
                 { text: 'Accelerated S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
@@ -385,7 +389,11 @@ export default defineConfig({
               text: '快速开始',
               items: [
                 { text: '介绍', link: '/zh/guide/introduction' },
-                { text: '安装', link: '/zh/guide/installation' },
+                {
+                  text: '安装',
+                  link: '/zh/guide/installation',
+                  items: [{ text: 'AMD ROCm', link: '/zh/guide/rocm' }],
+                },
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
                 { text: '接入新算法', link: '/zh/guide/adding-an-algorithm' },
@@ -435,7 +443,7 @@ export default defineConfig({
               text: '最佳实践',
               items: [
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
-                { text: 'Qwen3.8 Flash/NV QSA', link: '/zh/guide/qwen38-qsa' },
+                { text: 'Qwen3.8 QSA 后端', link: '/zh/guide/qwen38-qsa' },
                 { text: '编译缓存复用', link: '/zh/guide/compiler-cache' },
                 { text: 'S3 模型加载加速', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },

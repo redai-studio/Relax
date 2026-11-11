@@ -36,6 +36,90 @@ def receiver(backend="triton", **overrides):
     )
 
 
+@pytest.mark.parametrize("failure", ["none", "layout", "query", "source", "peer"])
+def test_bf16_routing_negotiates_before_enabling_and_restores_fallback(monkeypatch, failure):
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.args = SimpleNamespace(num_experts=4)
+    updater._route_experts = updater._auto_expert_routing = False
+    updater.rollout_engines = [Mock()]
+    configured, reductions = [], []
+
+    def configure(layout, **kwargs):
+        configured.append(layout)
+        if layout is not None and failure == "source":
+            raise ValueError("unsupported source mapping")
+        if layout is not None:
+            assert kwargs["allow_replicas"]
+
+    updater._hf_weight_iterator = SimpleNamespace(configure_expert_routing=configure)
+    receivers = [receiver(ep_size=2)]
+    if failure == "layout":
+        receivers[0]["quantization"] = "fp8"
+    monkeypatch.setattr(
+        sync.ray,
+        "get",
+        Mock(side_effect=RuntimeError("query failed")) if failure == "query" else Mock(return_value=receivers),
+    )
+    monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(sync.dist, "get_rank", lambda **kwargs: 0)
+    monkeypatch.setattr(sync.dist, "get_world_size", lambda **kwargs: 2)
+    monkeypatch.setattr(sync.dist, "get_backend", lambda **kwargs: "nccl")
+    monkeypatch.setattr(sync.dist, "broadcast_object_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sync.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(sync.mpu, "get_expert_tensor_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(sync.mpu, "get_expert_model_parallel_world_size", lambda: 2)
+
+    def reduce(tensor, **kwargs):
+        reductions.append(tensor.item())
+        if failure == "peer" and len(reductions) == 2:
+            tensor.zero_()
+
+    monkeypatch.setattr(sync.dist, "all_reduce", reduce)
+    updater._configure_auto_expert_routing([2], [0])
+    assert updater._auto_expert_routing == updater._route_experts == (failure == "none")
+    if failure != "none":
+        assert configured[-1] is None
+
+
+def test_bridge_sync_collective_closure_includes_tp_and_etp(monkeypatch):
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+
+    expected = []
+    for dimension in ("pipeline_model", "expert_model", "tensor_model", "expert_tensor"):
+        group = object()
+        expected.append(group)
+        monkeypatch.setattr(bridge.mpu, f"get_{dimension}_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(bridge.mpu, f"get_{dimension}_parallel_group", lambda value=group: value)
+    iterator = HfWeightIteratorBridge.__new__(HfWeightIteratorBridge)
+    assert iterator.weight_sync_process_groups() == expected
+    monkeypatch.setattr(bridge.mpu, "get_expert_tensor_parallel_world_size", lambda: 1)
+    assert iterator.weight_sync_process_groups() == expected[:-1]
+
+
+@pytest.mark.parametrize("quantization", [None, {"quant_method": "fp8"}, {"format": "mxfp4-pack-quantized"}])
+def test_communicator_plan_is_independent_of_quantization_and_releases_on_remote_reconnect(monkeypatch, quantization):
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.args = SimpleNamespace(offload_train=True, colocate=True, num_experts=8, megatron_to_hf_mode="bridge")
+    updater.use_distribute = updater.lora_enabled = updater._sync_groups_configured = False
+    updater.quantization_config = quantization
+    updater.process_groups_for_update = None
+    group = SimpleNamespace(_keep_alive_for_weight_sync=True)
+    updater._hf_weight_iterator = SimpleNamespace(weight_sync_process_groups=Mock(return_value=[group]))
+    monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(sync.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(sync.dist, "get_backend", lambda **kwargs: "nccl")
+    monkeypatch.setattr(sync.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sync.dist, "get_rank", lambda **kwargs: 0)
+    retain = Mock(return_value=(group,))
+    monkeypatch.setattr(sync, "retain_process_groups", retain)
+    updater._configure_sync_process_groups()
+    assert updater.process_groups_for_update == (group,)
+    retain.assert_called_once_with([group], metadata_group="gloo")
+    updater.use_distribute = True
+    updater._configure_sync_process_groups()
+    assert updater.process_groups_for_update is None and not group._keep_alive_for_weight_sync
+
+
 @pytest.mark.parametrize(
     "failure",
     [

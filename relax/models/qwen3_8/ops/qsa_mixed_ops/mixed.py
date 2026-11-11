@@ -10,6 +10,7 @@ import torch
 
 from relax.models.qwen3_8.ops.qsa_mixed_ops.flex import attention as flex
 from relax.models.qwen3_8.ops.qsa_mixed_ops.flex import attention_auto
+from relax.models.qwen3_8.ops.qsa_mixed_ops.geometry import validate_geometry
 from relax.models.qwen3_8.ops.qsa_mixed_ops.grouped import attention_bf16
 from relax.utils.env import Envs
 
@@ -18,7 +19,7 @@ def long_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor, scale: float
 ) -> torch.Tensor:
 
-    assert q.shape[1:] == (12, 256) and k.shape[1:] == (1, 256)
+    validate_geometry("grouped", q.shape[1], k.shape[1], q.shape[-1], k.shape[-1])
     assert k.shape == v.shape
     return attention_bf16(q, k, v, indices, scale, block_k=64, gradient_group=None)
 
