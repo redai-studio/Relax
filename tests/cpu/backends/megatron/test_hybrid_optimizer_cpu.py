@@ -141,17 +141,13 @@ def expert_cpu_hybrid(monkeypatch: pytest.MonkeyPatch, fused: bool) -> Callable[
                     "fused": fused,
                 }
             )
-        optimizer = HybridDeviceOptimizer(
+        if individual:
+            monkeypatch.setenv("RELAX_EXPERT_CPU_ADAM_BATCH_SIZE", "1")
+        else:
+            monkeypatch.delenv("RELAX_EXPERT_CPU_ADAM_BATCH_SIZE", raising=False)
+        return HybridDeviceOptimizer(
             groups, cpu_optimizer_cls=torch.optim.AdamW, offload_fraction=1.0, param_update_in_fp32=True
         )
-        if individual:
-            # Reproduce the old scheduling without changing checkpoint group metadata.
-            optimizer.cpu_optimizers = [
-                torch.optim.AdamW([{**group, "params": [optimizer.param_to_inner_param[parameter]]}])
-                for group in optimizer.param_groups
-                for parameter in group["params"]
-            ]
-        return optimizer
 
     return build
 
@@ -170,6 +166,7 @@ def _assert_cpu_hybrid_equal(expected: HybridDeviceOptimizer, actual: HybridDevi
 @pytest.mark.parametrize("fused", [False, True])
 def test_hybrid_cpu_expert_batches_match_individual_updates(expert_cpu_hybrid) -> None:
     reference = expert_cpu_hybrid(individual=True)
+    assert all(len(child.param_groups[0]["params"]) == 1 for child in reference.cpu_optimizers)
     batched = expert_cpu_hybrid()
     child_groups = [group for child in batched.cpu_optimizers for group in child.param_groups]
     assert [len(group["params"]) for group in child_groups] == [16, 1, 2, 1, 1]
