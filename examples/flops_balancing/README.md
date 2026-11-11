@@ -19,7 +19,8 @@ reporting rules.
 - Ordinary iterators and the existing restricted SFT async-prepack path.
 - Static TP/PP/CP; microbatch counts follow existing DP/VPP agreement.
 - No dynamic CP, streaming fully-async sampler, MTP, expert token dropping,
-  router expert-bias updates or nonzero MoE auxiliary/z losses.
+  router expert-bias updates, LoRA, language-model parameter freezing or nonzero
+  MoE auxiliary/z losses.
 - Wholepack is a separate scheduling policy and cannot be combined with either
   FLOPs flag. FLOPs microbatch packing replaces `balanced`; DP-only placement
   may also use the existing `binpack` microbatch strategy.

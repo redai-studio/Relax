@@ -96,6 +96,11 @@ def validate_flops_scheduling_args(args: Any) -> None:
         raise ValueError("FLOPs scheduling does not support the streaming fully-async sampler")
     if getattr(args, "multimodal_keys", None):
         raise ValueError("FLOPs scheduling is text-only; multimodal inputs are not supported")
+    if (getattr(args, "lora_rank", 0) or 0) > 0:
+        raise ValueError("FLOPs scheduling does not model LoRA training work")
+    for field in ("freeze_language_model", "freeze_params_name_list", "only_train_params_name_list"):
+        if getattr(args, field, None):
+            raise ValueError(f"FLOPs scheduling does not model {field} training work")
     if getattr(args, "mtp_num_layers", 0) not in (None, 0):
         raise ValueError("Disable MTP for FLOPs scheduling; its extra work is not modeled")
     for field in ("moe_aux_loss_coeff", "moe_z_loss_coeff"):
