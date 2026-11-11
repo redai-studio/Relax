@@ -150,6 +150,9 @@ def _compute_hash_dict(tensors: dict[str, torch.Tensor]):
 
 
 def _compute_hash_tensor(x: torch.Tensor):
+    # Check this rank's shard. A CPU-offloaded DTensor still carries its NCCL
+    # mesh; reducing its distributed hash would issue a collective on CPU data.
+    x = getattr(x, "_local_tensor", x)
     # Not a real/good hash, but pretty fast
     raw = x.contiguous().view(-1).view(torch.uint8)
     full_word_bytes = raw.numel() // 4 * 4

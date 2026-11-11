@@ -19,7 +19,14 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
 
-from relax.backends.megatron import fsdp_pp_patch
+
+# Load the CPU-only patch without the backend package's GPU initialization.
+_SPEC = importlib.util.spec_from_file_location(
+    "fsdp_pp_patch_under_test",
+    Path(__file__).resolve().parents[4] / "relax/backends/megatron/fsdp_pp_patch.py",
+)
+fsdp_pp_patch = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(fsdp_pp_patch)
 
 
 def _shared_gradient_worker(rank, rendezvous):

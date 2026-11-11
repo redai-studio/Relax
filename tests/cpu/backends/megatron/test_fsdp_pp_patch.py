@@ -7,6 +7,7 @@ round trip. No GPU, distributed process group, or Megatron runtime is required.
 """
 
 import ast
+import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,13 +16,18 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 
-from relax.backends.megatron import fsdp_pp_patch
-from relax.backends.megatron.fsdp_pp_patch import (
-    _rename_layers_to_global,
-    check_fsdp_pp_checkpoint_support,
-    pp_stage_window,
-    stage_local_arange,
+
+# Load the CPU-only patch without the backend package's GPU initialization.
+_SPEC = importlib.util.spec_from_file_location(
+    "fsdp_pp_patch_under_test",
+    Path(__file__).resolve().parents[4] / "relax/backends/megatron/fsdp_pp_patch.py",
 )
+fsdp_pp_patch = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(fsdp_pp_patch)
+_rename_layers_to_global = fsdp_pp_patch._rename_layers_to_global
+check_fsdp_pp_checkpoint_support = fsdp_pp_patch.check_fsdp_pp_checkpoint_support
+pp_stage_window = fsdp_pp_patch.pp_stage_window
+stage_local_arange = fsdp_pp_patch.stage_local_arange
 
 
 @pytest.mark.parametrize("role", ["reference", "actor_fwd", "actor"])

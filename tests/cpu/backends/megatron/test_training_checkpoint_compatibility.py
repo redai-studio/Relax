@@ -89,11 +89,11 @@ def test_reset_sgd_momentum_prevents_zero_gradient_update(reset):
 
     module = _load(
         "relax/backends/megatron/model.py",
-        {"train", "_get_distributed_wrapper_classes", "_is_distributed_wrapper"},
+        {"train"},
         {
             "get_args": lambda: args,
             "DataIterator": type("DataIterator", (), {}),
-            "DDP": type("DDP", (), {}),
+            "_is_distributed_wrapper": lambda model: False,
             "get_model_config": lambda model: SimpleNamespace(),
             "finalize_model_grads": Mock(),
             "resident_sft_param_overlap_enabled": lambda args: False,

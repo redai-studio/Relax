@@ -322,7 +322,10 @@ def _maybe_get_cpu_backup(x: torch.Tensor) -> torch.Tensor:
     # frees a param's GPU storage via storage().resize_(0), it stashes the CPU copy
     # on the tensor as ``_relax_cpu_offload_data``. If the GPU storage is empty, read
     # from that CPU copy instead of touching the now-invalid CUDA storage.
-    if getattr(x, "_relax_cpu_offload_data", None) is not None and x.storage().size() == 0:
+    if (
+        getattr(x, "_relax_cpu_offload_data", None) is not None
+        and getattr(x, "_local_tensor", x).untyped_storage().nbytes() == 0
+    ):
         return x._relax_cpu_offload_data
 
     # torch_memory_saver path: only usable when its LD_PRELOAD hook is active;

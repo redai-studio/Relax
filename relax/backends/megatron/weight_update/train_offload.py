@@ -149,6 +149,7 @@ class _SelectiveOffloadStrategy:
         # manages its own CPU/GPU tensor placement; moving optimizer state ourselves
         # would break its invariants (_fused_adam device mismatch).
         self._skip_optimizer: bool = bool(getattr(args, "optimizer_cpu_offload", False))
+        self._fsdp_cpu_params: list[torch.Tensor] = []
 
     def _iter_optimizers(self) -> Iterator:
         """Yield every Megatron DistributedOptimizer (unwrapping
@@ -314,6 +315,12 @@ class _SelectiveOffloadStrategy:
 
         # Megatron-FSDP keeps persistent weights and gradients in DataParallelBuffer.data.
         # Gradient slices may share one dtype-level storage, so operate once per storage.
+        fsdp_params = []
+        for model_chunk in self.model or []:
+            if hasattr(model_chunk, "param_and_grad_buffer"):
+                model_chunk._replace_param_with_distributed_if_needed()
+                fsdp_params.extend(model_chunk.parameters())
+        cpu_storages = {}
         for buffer, preserve in self._iter_unique_fsdp_storages():
             data = buffer.data
             storage = data._typed_storage()
@@ -332,9 +339,27 @@ class _SelectiveOffloadStrategy:
                         f"FSDP cpu_data dtype {cpu_data.dtype} != storage dtype {flat_data.dtype}"
                     )
                 cpu_data.copy_(flat_data, non_blocking=False)
+                cpu_storages[storage._cdata] = cpu_data
             buffer._relax_storage_size = storage_size
             buffer._relax_preserve_data = preserve
             storage._resize_(0)
+
+        # Export may run while the actor sleeps with weights_backuper disabled.
+        # Keep the DTensor spec, but point its local shard at the existing CPU
+        # backup, including offsets for parameters sharing a flat allocation.
+        if fsdp_params:
+            from torch.distributed.tensor import DTensor
+
+            for param in fsdp_params:
+                local = param.to_local() if isinstance(param, DTensor) else param
+                cpu_data = cpu_storages.get(local.untyped_storage()._cdata)
+                if cpu_data is None:
+                    continue
+                cpu_view = cpu_data.as_strided(local.shape, local.stride(), local.storage_offset())
+                param._relax_cpu_offload_data = (
+                    DTensor(cpu_view, param._spec, requires_grad=False) if isinstance(param, DTensor) else cpu_view
+                )
+                self._fsdp_cpu_params.append(param)
 
         if not self._skip_optimizer:
             # 2. Optimizer fp32 master params (shard_fp32_from_float16_groups).
@@ -407,6 +432,9 @@ class _SelectiveOffloadStrategy:
                     flat_data.zero_()
                 del buffer._relax_storage_size
                 del buffer._relax_preserve_data
+        for param in self._fsdp_cpu_params:
+            del param._relax_cpu_offload_data
+        self._fsdp_cpu_params.clear()
         if _NON_BLOCKING:
             # The H2D copies above are async; make them observable to non-stream code
             # (and to the optimizer-state moves below) before returning.
