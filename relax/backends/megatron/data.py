@@ -15,6 +15,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.training.global_vars import get_args
 from torch.nn.utils.rnn import pad_sequence
 
+from relax.agentic.policy_audit import POLICY_AUDIT_FIELD
 from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
@@ -989,9 +990,13 @@ def gather_log_data(
                 reduced_log_dict[f"{metric_name}/{key}"] = reduce_fn(metrics[key] for metrics, _ in gathered_metrics)
                 continue
             weights = [weights_by_key.get(key, 1) for _, weights_by_key in gathered_metrics]
-            reduced_log_dict[f"{metric_name}/{key}"] = sum(
-                metrics[key] * weight for (metrics, _), weight in zip(gathered_metrics, weights, strict=True)
-            ) / sum(weights)
+            weight_sum = sum(weights)
+            if not weight_sum:
+                continue
+            reduced_log_dict[f"{metric_name}/{key}"] = (
+                sum(metrics[key] * weight for (metrics, _), weight in zip(gathered_metrics, weights, strict=True))
+                / weight_sum
+            )
         logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
 
         # Calculate step once to avoid duplication
@@ -1470,6 +1475,8 @@ def log_rollout_data(
     rollout_id: int,
     args: Namespace,
     rollout_data: RolloutBatch,
+    *,
+    policy_audit_metrics: tuple[dict[str, float], dict[str, int]] | None = None,
 ) -> None:
     """Summarize rollout fields and log reduced metrics on PP last stage, TP
     rank 0.
@@ -1523,6 +1530,7 @@ def log_rollout_data(
                 # meaningless ~1e18 scalar on the metrics dashboard.
                 "sample_export_ids",
                 "agentic_group_ids",
+                POLICY_AUDIT_FIELD,
                 "rollout_routed_experts",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",
@@ -1627,6 +1635,10 @@ def log_rollout_data(
             log_dict["total_lengths/max"] = int(stats[0].item())
             log_dict["total_lengths/min"] = -int(stats[1].item())
 
+        if policy_audit_metrics is not None:
+            means, weights = policy_audit_metrics
+            log_dict.update({f"agentic_policy/{key}": value for key, value in means.items()})
+            metric_weights.update({f"agentic_policy/{key}": value for key, value in weights.items()})
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict, metric_weights, metric_reductions)
         if args.ci_test and reduced_log_dict is not None:
             if (

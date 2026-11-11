@@ -27,6 +27,7 @@ except ImportError:
 from tensordict import TensorDict
 from transformers import AutoConfig, AutoTokenizer
 
+from relax.agentic.policy_audit import POLICY_AUDIT_FIELD, audit_consumed_rows, policy_audit_enabled
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
@@ -2860,6 +2861,9 @@ class MegatronTrainRayActor(TrainRayActor):
             consume_opd_train_data(data_fields, self.args)
         if agentic_obs_enabled(self.args):
             data_fields.extend(OBSERVATION_DATA_FIELDS)
+        audit_enabled = policy_audit_enabled(self.args)
+        if audit_enabled:
+            data_fields.append(POLICY_AUDIT_FIELD)
         if getattr(self.args, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
             # using token-budget fetches, align num_microbatches across DPs
@@ -2902,7 +2906,22 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 data_for_log = self.data_iterator[0].get_buffer()
             rollout_data = merge_dict_list(data_for_log)
-            log_rollout_data(rollout_id, self.args, rollout_data)
+            policy_audit_metrics = None
+            if audit_enabled:
+                # VPP alignment repeats rows in the buffer with zero loss.
+                iterator = self.data_iterator[0]
+                audit_batches = (
+                    data_for_log[: iterator.dummy_after]
+                    if isinstance(iterator, MicroBatchListIterator)
+                    else data_for_log
+                )
+                reports, metrics, weights = audit_consumed_rows(
+                    [row for batch, _ in audit_batches for row in batch[POLICY_AUDIT_FIELD]],
+                    self.checkpoint_engine_client.published_rollout_versions,
+                )
+                policy_audit_metrics = (metrics, weights)
+                rollout_data[POLICY_AUDIT_FIELD] = reports
+            log_rollout_data(rollout_id, self.args, rollout_data, policy_audit_metrics=policy_audit_metrics)
             train_dump_utils.save_debug_train_data(
                 self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
             )

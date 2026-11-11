@@ -20,6 +20,7 @@ import httpx
 import torch
 import torch.distributed as dist
 
+from relax.agentic.policy_audit import policy_audit_enabled
 from relax.distributed.checkpoint_service.backends import CommBackend, DeviceDirectBackend
 from relax.distributed.checkpoint_service.config import BackendType, DCSConfig, RoleInfo
 from relax.distributed.checkpoint_service.metrics import MetricsCollector
@@ -112,6 +113,7 @@ class CheckpointEngineClient:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._topology_cache: Dict[str, Dict[int, RoleInfo]] = {}
         self._last_topology_update: float = 0
+        self.published_rollout_versions: dict[str, int] = {}
 
         # Metrics
         self._metrics = MetricsCollector() if self.config.enable_metrics else None
@@ -325,7 +327,14 @@ class CheckpointEngineClient:
         all_recipients = [None] * dist.get_world_size(group=group)
         dist.all_gather_object(all_recipients, recipients, group=group)
         sources = [ids for ids in all_recipients if ids is not None]
-        return sorted(set.intersection(*sources)) if self.rank == 0 and sources else []
+        synced = set.intersection(*sources) if sources else set()
+        if synced and policy_audit_enabled(getattr(self, "args", None)):
+            # Raw backend versions can skip actor-fwd-only syncs. Only count
+            # versions delivered by every PP source to a rollout recipient.
+            self.published_rollout_versions[str(self._backend.weight_version)] = (
+                len(self.published_rollout_versions) + 1
+            )
+        return sorted(synced) if self.rank == 0 else []
 
     async def _heartbeat_loop(self) -> None:
         """Periodically send heartbeat signals to coordinator."""
