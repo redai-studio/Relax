@@ -234,6 +234,9 @@ def local_expert_plan(
 class MegatronShardP2PSource:
     """Describe qualified training views and rebind each fresh snapshot."""
 
+    has_experts = True
+    has_ordinary = False
+
     def __init__(self, iterator, layout, *, process_group, num_layers: int, qualified: bool) -> None:
         self.iterator, self.layout = iterator, layout
         self.group = process_group

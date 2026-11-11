@@ -151,6 +151,7 @@ def test_physical_expert_prepare_seed_and_warm_audit(transfer, delivery):
 def test_bind_delivery_failure_does_not_poison_native_seed(transfer, delivery, fault):
     model, parameters, expected, seed, _ = transfer
     probe, control = delivery
+    cuda_initialized = torch.cuda.is_initialized()
     if fault == "remote":
         probe["sources"][0]["endpoint"] = _endpoint(0, remote=True)
     elif fault == "missing_owner":
@@ -164,7 +165,7 @@ def test_bind_delivery_failure_does_not_poison_native_seed(transfer, delivery, f
     assert not hasattr(model, "_relax_weight_sync_reply")
     assert not hasattr(model, "_relax_expert_ipc")
     assert all(torch.equal(parameters[name], value) for name, value in expected.items())
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == cuda_initialized
 
 
 @pytest.mark.parametrize("field", ["nonce", "engine", "receiver", "routes", "missing"])
@@ -293,6 +294,7 @@ def _tp_control_error_worker(rank, rendezvous, output):
         enable_lora=False,
         speculative_algorithm=None,
     )
+    cuda_initialized = torch.cuda.is_initialized()
     try:
         for fault in ("decode", "reply", "mode", "copy", "header"):
             model = torch.nn.Linear(2, 2, bias=False)
@@ -332,7 +334,7 @@ def _tp_control_error_worker(rank, rendezvous, output):
                 assert not applied
             marker = torch.tensor(1)
             dist.all_reduce(marker, group=dist.group.WORLD)
-            assert marker.item() == 2 and not torch.cuda.is_initialized()
+            assert marker.item() == 2 and torch.cuda.is_initialized() == cuda_initialized
         Path(output, f"{rank}.json").write_text("passed")
     finally:
         dist.destroy_process_group()

@@ -93,6 +93,7 @@ class OrdinaryTPSource:
         self.native_specs = {}
         self.selected = frozenset()
         self._schema = None
+        self._recipes = {}
 
     def observe_native(self, values) -> None:
         for name, tensor in values:
@@ -141,6 +142,20 @@ class OrdinaryTPSource:
 
     def catalogue(self, weights: Mapping[str, torch.Tensor]) -> dict:
         tensors, regions, groups = self._views(weights, selected_only=False)
+        self._recipes = {
+            name: dict(
+                key=self.iterator._vanilla_key_map[name],
+                shape=tuple(value.shape),
+                dtype=value.dtype,
+                device=value.device,
+                stride=tuple(value.stride()),
+                offset=value.storage_offset(),
+                nbytes=value.untyped_storage().nbytes(),
+                regions=[dict(region) for region in regions if region["source"] == name],
+                group=tuple(groups[name]),
+            )
+            for name, value in tensors.items()
+        }
         if self.replica_rank != 0:
             tensors, regions, groups = {}, [], {}
         _, views = group_storage_views(tensors)
@@ -158,7 +173,24 @@ class OrdinaryTPSource:
         )
 
     def bind(self, weights: Mapping[str, torch.Tensor], *, seed: bool = False) -> dict:
-        tensors, regions, groups = self._views(weights, selected_only=True)
+        tensors, regions, groups = {}, [], {}
+        for name in sorted(self.selected):
+            recipe = self._recipes[name]
+            if self.iterator._vanilla_key_map.get(name) != recipe["key"]:
+                raise ValueError("Ordinary TP source mapping changed after negotiation")
+            value = weights[recipe["key"]].detach()
+            if (
+                tuple(value.shape) != recipe["shape"]
+                or value.dtype != recipe["dtype"]
+                or value.device != recipe["device"]
+                or tuple(value.stride()) != recipe["stride"]
+                or value.storage_offset() != recipe["offset"]
+                or value.untyped_storage().nbytes() != recipe["nbytes"]
+            ):
+                raise ValueError("Ordinary TP source no longer matches its cold layout")
+            tensors[name] = value
+            regions.extend(recipe["regions"])
+            groups[name] = recipe["group"]
         if self.replica_rank != 0:
             tensors, groups = {}, {}
         sources, views = group_storage_views(tensors)

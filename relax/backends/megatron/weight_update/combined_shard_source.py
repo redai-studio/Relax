@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Ordinary TP and expert adapters sharing one versioned IPC transaction."""
 
-import json
 from math import prod
 
 import torch.distributed as dist
@@ -117,25 +116,12 @@ class CombinedShardSource:
                 specs[name] = spec
         return dict(records=records, native_specs=specs, source_world_size=len(records))
 
-    def select_targets(self, description, commands, responses) -> dict | None:
+    def select_targets(self, description, replies, *, engine_count: int) -> dict | None:
         if self.rank != 0:
             return None
         records = description["records"]
-        replies = []
-        for pair, response in zip(commands, responses, strict=True):
-            if not isinstance(response, dict) or response.get("success") is not True:
-                raise ValueError("Missing ordinary TP layout response")
-            values = json.loads(response["message"])["shard_p2p_tp_targets"]
-            if len(values) != self._tp_size:
-                raise ValueError("Incomplete ordinary TP target inventory")
-            for command, reply in zip(pair, values, strict=True):
-                if reply["description_hash"] != command["description_hash"] or reply["tp_rank"] != command["tp_rank"]:
-                    raise ValueError("Misrouted ordinary TP layout reply")
-            replies.append(values)
-        if any(pair != replies[0] for pair in replies[1:]):
-            raise ValueError("Inference engines disagree on ordinary TP geometry")
-        selected = set.intersection(*(set(reply["selected_hf"]) for reply in replies[0]))
-        groups = [group for reply in replies[0] for group in reply["components"]]
+        selected = set.intersection(*(set(reply["selected_hf"]) for reply in replies))
+        groups = [group for reply in replies for group in reply["components"]]
         groups += [names for record in records for names in record["groups"].values()]
         previous = None
         while previous != selected:
@@ -144,7 +130,7 @@ class CombinedShardSource:
                 if not set(names) <= selected:
                     selected.difference_update(names)
         layouts, plans = [], [[] for _ in records]
-        for tp, reply in enumerate(replies[0]):
+        for tp, reply in enumerate(replies):
             targets = {
                 name: shape
                 for name, shape in reply["target_shapes"].items()
@@ -164,7 +150,7 @@ class CombinedShardSource:
             "SHARD_P2P_TP selected_hf=%d logical_bytes=%d receiver_bytes=%d effective=%s",
             len(selected),
             sum(prod(description["native_specs"][name]["shape"]) * 2 for name in selected),
-            sum(prod(shape) * 2 for layout in layouts for shape in layout.values()) * len(replies),
+            sum(prod(shape) * 2 for layout in layouts for shape in layout.values()) * engine_count,
             bool(selected),
         )
         return dict(
@@ -172,7 +158,7 @@ class CombinedShardSource:
             plans=plans,
             names=names,
             selected_hf=sorted(selected),
-            refresh=[bool(reply.get("native_refresh", False)) for reply in replies[0]],
+            refresh=[bool(reply.get("native_refresh", False)) for reply in replies],
         )
 
     def apply_targets(self, result, weights) -> None:

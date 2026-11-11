@@ -433,6 +433,7 @@ def _control_tp(
                     writes=[],
                     native_refresh=False,
                 )
+            reply.update({key: command[key] for key in ("session", "engine", "version", "nonce")})
         elif command["op"] == "prepare":
             reply = dict(
                 identity=delivery["identity"],

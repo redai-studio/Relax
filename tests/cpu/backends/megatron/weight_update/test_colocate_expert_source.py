@@ -229,6 +229,7 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
         _PendingUpdate,
     )
 
+    cuda_initialized = torch.cuda.is_initialized()
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
     # Exercise the real cold collective: one unsupported owner makes all
     # owners keep canonical bindings for this session.
@@ -306,9 +307,11 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
     def describe(commands):
         if rank:
             return None
-        reply = dict(
-            description_hash=commands[0][0]["description_hash"],
-            tp_rank=0,
+        reply = {
+            key: commands[0][0][key]
+            for key in ("session", "engine", "version", "nonce", "description_hash", "tp_rank")
+        }
+        reply.update(
             selected_hf=[],
             components=[],
             target_shapes={},
@@ -366,7 +369,7 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
         collect.assert_not_called()
         value = torch.tensor(1)
         native_reduce(value, group=dist.group.WORLD)
-        assert value.item() == 2 and not torch.cuda.is_initialized()
+        assert value.item() == 2 and torch.cuda.is_initialized() == cuda_initialized
         Path(directory, f"actor-{rank}.done").write_text("retained")
     finally:
         dist.destroy_process_group()

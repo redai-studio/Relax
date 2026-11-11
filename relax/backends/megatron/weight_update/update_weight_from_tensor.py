@@ -528,12 +528,12 @@ class UpdateWeightFromTensor:
         if not self.shard_p2p_requested:
             return
         layout = self._direct_expert_layout
+        local_receivers = bool(
+            self.actor_weight_retention_enabled and actor_nodes and all(actor_nodes) and len(set(actor_nodes)) == 1
+        )
         ready = bool(
-            self.actor_weight_retention_enabled
+            local_receivers
             and self._expert_ipc_receiver_support
-            and bool(actor_nodes)
-            and all(actor_nodes)
-            and len(set(actor_nodes)) == 1
             and layout is not None
             and (layout.ep_size, layout.moe_dp_size) == (1, 1)
             and all(
@@ -545,11 +545,8 @@ class UpdateWeightFromTensor:
         dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=get_gloo_group())
         self._colocate_expert_ipc_enabled = bool(decision.item())
         ordinary = bool(
-            self.actor_weight_retention_enabled
+            local_receivers
             and getattr(self, "_ordinary_tp_receiver_support", False)
-            and actor_nodes
-            and all(actor_nodes)
-            and len(set(actor_nodes)) == 1
             and not self.lora_enabled
             and not self.quantization_config
             and not self._route_experts
@@ -562,10 +559,10 @@ class UpdateWeightFromTensor:
         dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=get_gloo_group())
         self._colocate_tp_ipc_enabled = bool(decision.item())
         helper = getattr(self, "_colocate_expert_ipc", None)
-        if helper is not None and (getattr(helper.source, "has_ordinary", False) or self._colocate_tp_ipc_enabled):
+        if helper is not None:
 
             def check_receiver_capabilities():
-                previous = (getattr(helper.source, "has_experts", True), getattr(helper.source, "has_ordinary", False))
+                previous = (helper.source.has_experts, helper.source.has_ordinary)
                 if previous != (self._colocate_expert_ipc_enabled, self._colocate_tp_ipc_enabled):
                     raise ValueError("Shard P2P receiver capabilities changed after activation; restart is required")
 
@@ -658,10 +655,8 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
         cold_direct = expert_ipc is not None and expert_ipc.needs_seed
-        native_seed = cold_direct and (
-            getattr(expert_ipc.source, "has_ordinary", False) or Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK
-        )
-        if cold_direct and hasattr(expert_ipc.source, "begin_native_seed"):
+        native_seed = cold_direct and (self._colocate_tp_ipc_enabled or Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK)
+        if cold_direct and self._colocate_tp_ipc_enabled:
             expert_ipc._phase(expert_ipc.source.begin_native_seed)
 
         if self.lora_enabled and self.lora_merge_mode:
@@ -698,18 +693,18 @@ class UpdateWeightFromTensor:
         hf_named_tensors = None
         try:
             self._hf_weight_iterator._shard_p2p_skip_names = (
-                getattr(expert_ipc.source, "native_skip_names", frozenset())
-                if expert_ipc is not None and not cold_direct
+                expert_ipc.source.native_skip_names
+                if expert_ipc is not None and self._colocate_tp_ipc_enabled and not cold_direct
                 else frozenset()
             )
             with export_ctx:
                 iterator = (
                     self._hf_weight_iterator.get_non_expert_hf_weight_chunks
-                    if expert_ipc is not None and getattr(expert_ipc.source, "has_experts", True) and not native_seed
+                    if expert_ipc is not None and self._colocate_expert_ipc_enabled and not native_seed
                     else self._hf_weight_iterator.get_hf_weight_chunks
                 )
                 for hf_named_tensors in iterator(megatron_local_weights):
-                    if cold_direct and hasattr(expert_ipc.source, "observe_native"):
+                    if cold_direct and self._colocate_tp_ipc_enabled:
                         expert_ipc._phase(lambda: expert_ipc.source.observe_native(hf_named_tensors))
                     dispatch_errors = []
                     current_refs, long_lived_tensors = self._send_hf_params(

@@ -179,6 +179,29 @@ class ShardP2PSynchronizer:
             self.engines = engines
         self.needs_seed = True
 
+    def _decode_tp_replies(self, requests, responses) -> list[dict] | None:
+        if self.rank != 0:
+            return None
+        replies = []
+        identity = ("session", "engine", "version", "nonce", "description_hash", "tp_rank")
+        for pair, response in zip(requests, responses, strict=True):
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise ValueError("Missing ordinary TP layout response")
+            values = json.loads(response["message"])["shard_p2p_tp_targets"]
+            if len(values) != self.tp_size:
+                raise ValueError("Incomplete ordinary TP target inventory")
+            for command, reply in zip(pair, values, strict=True):
+                if any(reply.get(key) != command[key] for key in identity):
+                    raise ValueError("Misrouted ordinary TP layout reply")
+            replies.append(values)
+
+        def payload(values):
+            return [{key: value for key, value in reply.items() if key not in identity} for reply in values]
+
+        if any(payload(pair) != payload(replies[0]) for pair in replies[1:]):
+            raise ValueError("Inference engines disagree on ordinary TP geometry")
+        return replies[0]
+
     def _prepare_targets(self, weights: Mapping[str, torch.Tensor], version: int) -> None:
         """Negotiate ordinary TP layouts before building the shared IPC
         plan."""
@@ -210,7 +233,8 @@ class ShardP2PSynchronizer:
 
         requests = self._phase(commands)
         responses = self._fanout(requests)
-        selection = [self._phase(lambda: source.select_targets(description, requests, responses))]
+        replies = self._phase(lambda: self._decode_tp_replies(requests, responses))
+        selection = [self._phase(lambda: source.select_targets(description, replies, engine_count=self.engine_count))]
         dist.broadcast_object_list(selection, src=0, group=self.group)
         self._phase(lambda: source.apply_targets(selection[0], weights))
 
