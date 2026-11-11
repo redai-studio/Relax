@@ -1,15 +1,91 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import json
 import sys
 from dataclasses import make_dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import requests
+from urllib3.util import connection
 
 
 pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
+
+
+def test_weight_update_reuses_connection_and_retries_only_current_chunk(monkeypatch, sglang_engine_module):
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    received = []
+
+    class WeightHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            received.append((self.client_address, self.path, payload))
+            body = b'{"success": true}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            if payload["serialized_named_tensors"] == ["second"]:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+    connect_attempts = 0
+    create_connection = connection.create_connection
+
+    def connect_with_timeout(*args, **kwargs):
+        nonlocal connect_attempts
+        connect_attempts += 1
+        if connect_attempts == 2:
+            raise TimeoutError("connection did not open")
+        return create_connection(*args, **kwargs)
+
+    monkeypatch.setattr(connection, "create_connection", connect_with_timeout)
+    engine = sglang_engine_module.SGLangEngine(SimpleNamespace(rollout_external=True), rank=0)
+    engine.node_rank = 0
+    with ThreadingHTTPServer(("127.0.0.1", 0), WeightHandler) as server:
+        engine.server_host, engine.server_port = server.server_address
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for chunk in ("first", "second", "third"):
+                assert engine.update_weights_from_tensor([chunk], weight_version="7") == {"success": True}
+        finally:
+            engine.shutdown()
+            server.shutdown()
+            thread.join()
+
+    assert connect_attempts == 3
+    assert received[0][0] == received[1][0]
+    assert [path for _, path, _ in received] == ["/update_weights_from_tensor"] * 3
+    assert [payload for _, _, payload in received] == [
+        {"serialized_named_tensors": [chunk], "load_format": None, "flush_cache": False, "weight_version": "7"}
+        for chunk in ("first", "second", "third")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("error", "attempts"), [(requests.ConnectTimeout, 2), (requests.ReadTimeout, 1), (requests.ConnectionError, 1)]
+)
+def test_weight_update_propagates_transport_errors(monkeypatch, sglang_engine_module, error, attempts):
+    send = Mock(side_effect=error("transport failure"))
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+    engine = sglang_engine_module.SGLangEngine(SimpleNamespace(rollout_external=True), rank=0)
+    engine.node_rank = 0
+    engine.server_host, engine.server_port = "localhost", 1234
+
+    try:
+        with pytest.raises(error, match="transport failure"):
+            engine.update_weights_from_tensor(["chunk"])
+    finally:
+        engine.shutdown()
+
+    assert send.call_count == attempts
 
 
 @pytest.mark.parametrize("node_rank", [0, 1])

@@ -19,6 +19,7 @@ import ray
 import requests
 import sglang_router
 from packaging.version import parse
+from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectTimeout
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -51,6 +52,16 @@ from relax.utils.scale_utils import PrecheckProbeCategory
 
 
 logger = get_logger(__name__)
+
+
+class _WeightUpdateHTTPAdapter(HTTPAdapter):
+    def send(self, request: requests.PreparedRequest, **kwargs) -> requests.Response:
+        try:
+            return super().send(request, **kwargs)
+        except ConnectTimeout:
+            # The connection did not open, so this chunk has not reached the engine.
+            logger.warning(f"Connection timed out for {request.url}; retrying weight chunk once")
+            return super().send(request, **kwargs)
 
 
 @dataclasses.dataclass
@@ -495,6 +506,7 @@ class SGLangEngine(RayActor):
         self._evicted = threading.Event()
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
+        self._weight_update_session: requests.Session | None = None
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -698,7 +710,14 @@ class SGLangEngine(RayActor):
             if getattr(self, "_require_router_registration", False) and self.node_rank == 0 and not registered:
                 raise RuntimeError("Required PD router registration failed")
 
-    def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
+    def _make_request(
+        self,
+        endpoint: str,
+        payload: dict | None = None,
+        timeout: float | None = None,
+        *,
+        session: requests.Session | None = None,
+    ):
         """Make a POST request to the specified endpoint with the given
         payload.
 
@@ -708,6 +727,7 @@ class SGLangEngine(RayActor):
             timeout: Optional per-request timeout in seconds. Defaults to None
                 (no timeout) to preserve behaviour for existing callers; pass a
                 bound on paths that must not hang (e.g. colocate offload).
+            session: Optional HTTP session to reuse across requests.
 
         Returns:
             The JSON response from the server
@@ -715,7 +735,8 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {}, timeout=timeout)
+        client = requests if session is None else session
+        response = client.post(url, json=payload or {}, timeout=timeout)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -759,6 +780,11 @@ class SGLangEngine(RayActor):
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
+        if self.node_rank != 0:
+            return None
+        if self._weight_update_session is None:
+            self._weight_update_session = requests.Session()
+            self._weight_update_session.mount("http://", _WeightUpdateHTTPAdapter())
         payload = {
             "serialized_named_tensors": serialized_named_tensors,
             "load_format": load_format,
@@ -769,6 +795,7 @@ class SGLangEngine(RayActor):
         return self._make_request(
             "update_weights_from_tensor",
             payload,
+            session=self._weight_update_session,
         )
 
     def update_weight_version(self, weight_version: str) -> dict:
@@ -1037,6 +1064,9 @@ class SGLangEngine(RayActor):
             time.sleep(1)
 
     def shutdown(self):
+        session = getattr(self, "_weight_update_session", None)
+        if session is not None:
+            session.close()
         if self.args.rollout_external:
             return
 
