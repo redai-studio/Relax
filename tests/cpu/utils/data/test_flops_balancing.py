@@ -62,3 +62,16 @@ def test_flops_schedule_alignment_preserves_capacity_and_padding(
 
     _assert_schedule_contract(schedule, dummy, lengths, capacity, num_microbatches)
     assert sum(len(indices) for indices in dummy) == num_dummy
+
+
+def test_flops_schedule_rebalances_aligned_binpack_fallback() -> None:
+    # Three balanced packs overflow the capacity, and bin-packing already
+    # returns a DP-aligned count of four: [8], [8], [3, 6], [3]. Keeping those
+    # packs gives the ranks 16 and 12; rebalancing at four packs gives 14 each.
+    lengths = [3, 8, 3, 8, 6]
+    costs = [float(length) for length in lengths]
+    schedule, dummy = build_flops_schedule(lengths, costs, 10, 2)
+
+    assert not any(dummy)
+    assert all(sum(lengths[index] for index in pack) <= 10 for rank in schedule for pack in rank)
+    assert [sum(costs[index] for pack in rank for index in pack) for rank in schedule] == [14.0, 14.0]

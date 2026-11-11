@@ -229,11 +229,13 @@ def build_flops_schedule(
     regular_tokens = sum(length for length in lengths if length <= capacity)
     lower_bound = sum(length > capacity for length in lengths) + (regular_tokens + capacity - 1) // capacity
     bins = _balanced_candidate(lengths, workloads, capacity, lower_bound)
+    balanced = bins is not None
     if bins is None:
         bins = get_binpack_partitions(lengths, capacity)
     alignment = dp_size * microbatch_group_size
     target = (len(bins) + alignment - 1) // alignment * alignment
-    if len(bins) < target <= len(lengths):
+    # Bin-packing fills packs to capacity; rebalance it even when its count is already aligned.
+    if (not balanced or len(bins) < target) and target <= len(lengths):
         aligned_bins = _balanced_candidate(lengths, workloads, capacity, target)
         if aligned_bins is not None:
             bins = aligned_bins
