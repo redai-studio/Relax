@@ -210,7 +210,7 @@ def test_actual_gemma4_image_payload_omits_mfu_but_keeps_tps(monkeypatch, image_
     monkeypatch.setattr(train_metric_utils, "Timer", lambda: timer)
     monkeypatch.setattr(train_metric_utils.tracking_utils, "log", lambda *args, **kwargs: metrics.update(args[1]))
     counter = FlopsCounter(_namespace(_config()))
-    args = SimpleNamespace(wandb_always_use_train_step=False)
+    args = SimpleNamespace(wandb_always_use_train_step=False, only_train_params_name_list=None)
     train_metric_utils.log_perf_data_raw(0, args, True, counter, world_size=8)
     assert "perf/mfu/actor_train" not in metrics
     assert "perf/mfu/actor_infer" not in metrics

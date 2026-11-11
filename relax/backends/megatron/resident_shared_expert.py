@@ -67,11 +67,11 @@ def verify_resident_shared_readiness(args: Namespace, model_chunks: Sequence[Any
     if not shared:
         return
     if (
-        getattr(args, "moe_token_dispatcher_type", None) != "flex"
-        or getattr(args, "moe_flex_dispatcher_backend", None) != "deepep"
+        args.moe_token_dispatcher_type != "flex"
+        or args.moe_flex_dispatcher_backend != "deepep"
         or os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") != "32"
         or getattr(args, "cuda_graph_impl", "none") != "none"
-        or getattr(args, "enable_cuda_graph", False)
+        or args.enable_cuda_graph
     ):
         raise ValueError("Shared resident overlap is gated to flex/DeepEP, CUDA connections32 and no CUDA Graphs")
     from megatron.core.distributed import DistributedDataParallel

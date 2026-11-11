@@ -166,6 +166,7 @@ def test_runtime_requires_successful_verification(monkeypatch):
         use_distributed_optimizer=True,
         overlap_grad_reduce=True,
         overlap_param_gather=True,
+        sft_predict_interval=None,
         moe_shared_expert_overlap=True,
     )
     with pytest.raises(ValueError, match="verified gate"):

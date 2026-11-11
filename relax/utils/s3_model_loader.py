@@ -921,7 +921,7 @@ def maybe_resolve_s3_model_to_shm(uri: str, args) -> str:
         return uri
     root = _resolve_shm_root(args)
     endpoint = _resolve_endpoint(args)
-    workers = getattr(args, "s3_model_download_workers", None) or 20
+    workers = args.s3_model_download_workers or 20
     dest = _shm_dest_dir(uri, root, endpoint)
     _download_model_to_shm_once(
         uri,
@@ -946,7 +946,7 @@ def resolve_s3_model_metadata_to_shm(uri: str, args) -> str:
     root = _resolve_shm_root(args)
     endpoint = _resolve_endpoint(args)
     dest = _shm_dest_dir(uri, root, endpoint)
-    workers = getattr(args, "s3_model_download_workers", None) or 20
+    workers = args.s3_model_download_workers or 20
     _download_model_metadata_to_shm_once(
         uri,
         dest,

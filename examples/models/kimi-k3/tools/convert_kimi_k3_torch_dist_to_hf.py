@@ -35,6 +35,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 
+# Allow `python examples/models/kimi-k3/tools/...` from a bare checkout before
+# argparse resolves --repo-root (training images may not install the Relax package).
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 if TYPE_CHECKING:
     import torch
 

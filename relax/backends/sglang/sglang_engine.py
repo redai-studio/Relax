@@ -657,7 +657,7 @@ class SGLangEngine(RayActor):
             os.environ["RELAX_FORCE_LOGPROBS_BASE64"] = "1"
             logger.info(
                 "Set RELAX_FORCE_LOGPROBS_BASE64=1 (opd_log_prob_top_k=%s; query K is sent per request)",
-                getattr(self.args, "opd_log_prob_top_k", 0),
+                self.args.opd_log_prob_top_k,
             )
 
         # Set SGLang external model/processor package env vars so the spawned
@@ -2146,7 +2146,7 @@ def _compute_server_args(
     # LoRA adapter mode: launch the engine with SGLang's runtime LoRA serving so the
     # trained adapter can be pushed each step via load_lora_adapter (see
     # UpdateWeightFromTensor._push_lora_adapter) and selected at generation via lora_path.
-    if is_lora_enabled(args) and getattr(args, "lora_adapter_mode", False):
+    if is_lora_enabled(args) and args.lora_adapter_mode:
         kwargs["enable_lora"] = True
         kwargs["max_lora_rank"] = args.lora_rank
         # SGLang matches modules by leaf name; CLI holds canonical Megatron names. Fused

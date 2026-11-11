@@ -217,7 +217,7 @@ def test_negotiation_preserves_full_engine_placement_for_expert_parallelism(monk
 @pytest.mark.parametrize("rank", [0, 3])
 def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, rank):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=2)
+    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=2, offload_train=False)
     updater._route_experts = False
     updater._ipc_placement = updater._ipc_gather_group = updater._ipc_gather_src = updater._ipc_engine = None
     updater._configure_direct_experts = Mock()

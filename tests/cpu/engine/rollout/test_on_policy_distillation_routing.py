@@ -99,7 +99,11 @@ def test_on_policy_distillation_routing_falls_back_without_group_index():
 
 
 def test_single_teacher_keeps_existing_route():
-    args = Namespace(opd_teacher_routes_map={}, opd_teacher_url="http://single/generate")
+    args = Namespace(
+        opd_teacher_routes_map={},
+        opd_teacher_urls=None,
+        opd_teacher_url="http://single/generate",
+    )
     assert opd._pick_teacher_url(args, Sample()) == args.opd_teacher_url
 
 

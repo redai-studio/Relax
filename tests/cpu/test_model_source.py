@@ -145,7 +145,7 @@ def test_validate_ref_load_keeps_local_reference_behavior(
         ref_load = reference.name
     else:
         ref_load = str(reference)
-    args = SimpleNamespace(ref_load=ref_load)
+    args = SimpleNamespace(ref_load=ref_load, model_source=None)
     if with_model_source:
         args.model_source = m.ModelSource("s3://bucket/models/int4-policy/")
         args._model_source_original_hf_checkpoint = "somesource://models/int4-policy"
@@ -154,7 +154,8 @@ def test_validate_ref_load_keeps_local_reference_behavior(
 
 
 def test_validate_ref_load_without_model_source_still_requires_local_path(tmp_path, arguments_module):
-    args = SimpleNamespace(ref_load=str(tmp_path / "missing-reference"))
+    # Production parse always sets model_source (possibly None); fixtures must too.
+    args = SimpleNamespace(ref_load=str(tmp_path / "missing-reference"), model_source=None)
 
     with pytest.raises(FileNotFoundError, match="does not exist"):
         arguments_module._validate_ref_load(args)
@@ -174,6 +175,10 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch,
         critic_train_only=False,
         actor_num_nodes=1,
         actor_num_gpus_per_node=1,
+        fully_async=False,
+        hybrid=False,
+        colocate_expert_weight_routing=False,
+        lora_target_modules=None,
     )
     pre = SimpleNamespace(
         debug_train_only=True,

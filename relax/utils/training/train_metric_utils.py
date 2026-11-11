@@ -62,7 +62,7 @@ def log_perf_data_raw(
             freeze_language_model=getattr(args, "freeze_language_model", False),
             lora_rank=getattr(args, "lora_rank", 0),
             freeze_params_name_list=getattr(args, "freeze_params_name_list", None),
-            only_train_params_name_list=getattr(args, "only_train_params_name_list", None),
+            only_train_params_name_list=args.only_train_params_name_list,
         )
         for name in ("enable_mtp_training", "mtp_num_layers", "mtp_detach_paths", "mtp_only_training"):
             if hasattr(args, name):

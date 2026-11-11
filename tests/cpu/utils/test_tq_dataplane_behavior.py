@@ -361,6 +361,7 @@ def test_advantages_advances_after_actor_retires_final_batch(tq_factory, streami
                 use_kl_loss=False,
                 use_rollout_logprobs=True,
                 advantage_estimator="grpo",
+                use_opd=False,
             )
             service.data_system_client = real_client
             try:

@@ -170,7 +170,7 @@ def compute_mopd_metrics(args: Namespace, all_samples: list[Sample]) -> dict[str
 
     Returns ``{}`` when OPD is disabled (``opd_teacher_key`` absent).
     """
-    opd_teacher_key = getattr(args, "opd_teacher_key", None)
+    opd_teacher_key = args.opd_teacher_key
     if not opd_teacher_key:
         return {}
 

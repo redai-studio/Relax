@@ -42,6 +42,9 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         debug_train_only=False,
         resource={"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]},
         teacher_hf_checkpoint="/teacher",
+        opd_teacher_routes=None,
+        teacher_num_gpus_per_engine=None,
+        enable_affinity=True,
     )
 
     shared_pg, teacher_manager = opd_utils.maybe_start_managed_opd_teacher(

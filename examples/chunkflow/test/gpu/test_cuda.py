@@ -402,9 +402,15 @@ def test_pp1_native_loss_callback_preserves_head_gradients_and_token_count(monke
         sft_chunked_logits=True,
         sft_logits_chunk_size=32,
         recompute_loss_function=True,
+        recompute_loss_function_use_reentrant=True,
         calculate_per_token_loss=True,
         rollout_temperature=0.7,
         global_batch_size=3,
+        mtp_only_training=False,
+        task_type="causal_lm",
+        advantage_estimator=None,
+        opd_log_prob_top_k=0,
+        entropy_coef=0.0,
     )
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     with _megatron_context():

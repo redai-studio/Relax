@@ -23,6 +23,7 @@ from relax.utils.score_centering import (
     validate_score_centering_sample,
 )
 from relax.utils.types import Sample
+from tests.helpers.relax_args import make_args
 
 
 def _args(**overrides):
@@ -32,6 +33,7 @@ def _args(**overrides):
         rollout_top_logprobs_num=2,
         sglang_speculative_algorithm=None,
         score_centering_vocab_size=8,
+        slime_router_sticky=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -281,7 +283,7 @@ def test_score_centering_capture_rejects_actual_multimodal_sample():
 def test_score_centering_capture_resolves_real_model_vocab_once(monkeypatch):
     import relax.utils.misc as misc
 
-    args = _args(hf_checkpoint="model", score_centering_vocab_size=None, vocab_size=128)
+    args = make_args(advantage_estimator="score_centering", hf_checkpoint="model", vocab_size=128)
     calls = []
     monkeypatch.setattr(
         misc,

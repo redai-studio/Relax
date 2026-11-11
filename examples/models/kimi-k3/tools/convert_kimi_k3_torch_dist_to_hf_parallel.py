@@ -25,6 +25,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 
+# Allow `python examples/models/kimi-k3/tools/...` from a bare checkout before
+# argparse resolves --repo-root (training images may not install the Relax package).
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 if TYPE_CHECKING:
     import torch
 
@@ -248,6 +254,7 @@ def install_parallel_mappings(
 
 
 def _worker(rank: int, master: str, port: int, args: argparse.Namespace) -> dict[str, int]:
+    sys.path.insert(0, args.repo_root)
     sys.path.insert(0, str(Path(args.repo_root) / "examples/models/kimi-k3/tools"))
     import convert_kimi_k3_torch_dist_to_hf as baseline
     from convert_kimi_k3_torch_dist_to_hf_parallel import LocalExpertQuantizer, install_parallel_mappings
