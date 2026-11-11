@@ -206,15 +206,7 @@ def _run_distributed_cases(rank, world_size, rendezvous):
         route_inputs = torch.arange(120, dtype=torch.float64).view(20, 1, 6)
         route_indices = _partition_indices([0, 20], rank, world_size, "zigzag")
         route_local = route_inputs.index_select(0, route_indices).requires_grad_()
-        route_converted, _ = module.convert_module_input_tensors_cp_partition_mode(
-            hidden_states=route_local,
-            packed_seq_params=None,
-            cp_group=group,
-            tp_group=None,
-            target_partition_mode="contiguous",
-            sequence_parallel=False,
-            config=SimpleNamespace(cp_partition_mode="zigzag"),
-        )
+        route_converted = module.convert_relax_cp_layout(route_local, None, "zigzag", "contiguous", group)
         coefficients = (route_inputs + 1).square()
         (route_converted * coefficients.chunk(world_size)[rank]).sum().backward()
         torch.testing.assert_close(
@@ -431,7 +423,9 @@ def test_kimi_k3_chunkwise_cp_reuses_microbatch_route_built_from_host_boundaries
         cu_seqlens_kv_padded=physical,
         cu_seqlens_q_cpu=[0, 8, 20],
     )
-    build_route = module.build_thd_cp_partition_route
+    from megatron.core.context_parallel import layout
+
+    build_route = layout.build_thd_cp_layout_plan
     routes = []
 
     def record_route(boundaries, *args, **kwargs):
@@ -440,12 +434,12 @@ def test_kimi_k3_chunkwise_cp_reuses_microbatch_route_built_from_host_boundaries
         routes.append(route)
         return route
 
-    def inspect_conversion(**kwargs):
-        assert kwargs["packed_seq_params"].cp_partition_route is routes[0]
+    def inspect_conversion(*args, thd_plan):
+        assert thd_plan is routes[0]
         raise RuntimeError("captured cached host route")
 
-    monkeypatch.setattr(module, "build_thd_cp_partition_route", record_route)
-    monkeypatch.setattr(module, "convert_module_input_tensors_cp_partition_mode", inspect_conversion)
+    monkeypatch.setattr(layout, "build_thd_cp_layout_plan", record_route)
+    monkeypatch.setattr(layout, "convert_cp_layout", inspect_conversion)
     for _ in range(2):
         with pytest.raises(RuntimeError, match="captured cached host route"):
             attention._forward_kda(torch.randn(10, 1, 6), params)

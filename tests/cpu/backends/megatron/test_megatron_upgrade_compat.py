@@ -103,24 +103,15 @@ def gpt_postprocess():
     assert source.is_file(), f"Patched GPT source does not exist: {source}"
     import torch
 
-    calls = {"roll": [], "prepare": [], "prefetch": [], "mtp": [], "loss": [], "output": []}
+    calls = {"roll": [], "mtp": [], "loss": [], "output": []}
     state = {"inference": False}
-    cp_group, prefetched_context = object(), object()
+    cp_group = object()
 
-    def roll(tensors, *, shifts, dims, **kwargs):
-        calls["roll"].append((tensors, kwargs))
-        result = [torch.roll(tensor, shifts=shifts, dims=dims) for tensor in tensors]
-        for tensor in result:
-            tensor.select(dims, shifts).zero_()
-        return result
-
-    def prefetch(**kwargs):
-        calls["prefetch"].append(kwargs)
-        return prefetched_context
-
-    def prepare(**kwargs):
-        calls["prepare"].append(kwargs)
-        return types.SimpleNamespace(prefetch_halos=prefetch)
+    def roll(tensor, *, shifts, dims, **kwargs):
+        calls["roll"].append((tensor, kwargs))
+        result = torch.roll(tensor, shifts=shifts, dims=dims)
+        result.select(dims, shifts).zero_()
+        return result, None
 
     def mtp(**kwargs):
         calls["mtp"].append(kwargs)
@@ -142,7 +133,6 @@ def gpt_postprocess():
             "InferenceCudaGraphScope": types.SimpleNamespace(block="block"),
             "roll_tensor": roll,
             "resolve_cp_group": lambda static_group, packed: cp_group,
-            "prepare_mtp_sequence_roll_context": prepare,
             "process_mtp_loss": loss,
         },
         class_name="GPTModel",
@@ -181,7 +171,6 @@ def gpt_postprocess():
         calls=calls,
         state=state,
         cp_group=cp_group,
-        prefetched_context=prefetched_context,
         torch=torch,
     )
 
@@ -197,26 +186,15 @@ def test_megatron_upgrade_gpt_mtp_targets_and_mask_stay_aligned(gpt_postprocess,
 
     assert len(fixture.calls["roll"]) == (0 if preshifted else 1)
     if not preshifted:
-        tensors, roll_kwargs = fixture.calls["roll"][0]
-        assert len(tensors) == 1
-        assert tensors[0] is mtp_labels
+        tensor, roll_kwargs = fixture.calls["roll"][0]
+        assert tensor is mtp_labels
         assert roll_kwargs["cp_group"] is fixture.cp_group
         assert roll_kwargs["packed_seq_params"] is fixture.kwargs["packed_seq_params"]
-    assert len(fixture.calls["prepare"]) == len(fixture.calls["prefetch"]) == 1
     assert len(fixture.calls["mtp"]) == len(fixture.calls["loss"]) == len(fixture.calls["output"]) == 1
-    prepared = fixture.calls["prepare"][0]
-    prefetch = fixture.calls["prefetch"][0]
     processed = fixture.calls["loss"][0]
     output = fixture.calls["output"][0]
     assert fixture.torch.equal(processed["labels"], expected_labels)
-    assert prepared["tensor"] is processed["labels"]
-    assert prefetch["labels"] is processed["labels"]
-    assert prefetch["loss_mask"] is processed["loss_mask"] is output["loss_mask"] is mask
-    assert prefetch["width"] == fixture.model.config.mtp_num_layers + 1
-    assert prefetch["input_ids"] is fixture.kwargs["input_ids"]
-    assert prefetch["position_ids"] is fixture.kwargs["position_ids"]
-    assert fixture.calls["mtp"][0]["sequence_roll_context"] is fixture.prefetched_context
-    assert processed["sequence_roll_context"] is fixture.prefetched_context
+    assert processed["loss_mask"] is output["loss_mask"] is mask
     assert processed["cp_group"] is fixture.cp_group
     assert output["labels"] is None
     assert output["context"] is fixture.kwargs["output_processor_context"]
@@ -237,7 +215,7 @@ def test_megatron_upgrade_gpt_without_mtp_targets_skips_auxiliary_work(gpt_postp
         fixture.kwargs["inference_context"] = context
     result = fixture.fn(fixture.model, **fixture.kwargs)
 
-    for operation in ("roll", "prepare", "prefetch", "mtp", "loss"):
+    for operation in ("roll", "mtp", "loss"):
         assert fixture.calls[operation] == []
     assert len(fixture.calls["output"]) == 1
     assert result is fixture.kwargs["hidden_states"]

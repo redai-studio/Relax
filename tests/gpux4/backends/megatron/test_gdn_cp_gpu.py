@@ -23,7 +23,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def _check_layout_round_trip(cp_group):
-    from megatron.core import context_parallel_layout as cpl
+    from megatron.core.context_parallel.layout import convert_relax_cp_layout
+    from megatron.core.packed_seq_params import PackedSeqParams
 
     rank, world_size = cp_group.rank(), cp_group.size()
     device = torch.device("cuda", rank)
@@ -48,19 +49,8 @@ def _check_layout_round_trip(cp_group):
     local_zig = full[zig_idx]
 
     def convert(value, source, target, cu_seqlens=None):
-        # TODO: Remove the legacy layout API branch once CI uses the upgraded Megatron image.
-        if hasattr(cpl, "zigzag_to_contiguous_chunks"):
-            fn = cpl.zigzag_to_contiguous_chunks if source == "zigzag" else cpl.contiguous_to_zigzag_chunks
-            return fn(value, cp_group=cp_group, seq_dim=0, cu_seqlens=cu_seqlens)
-        from megatron.core.context_parallel_layout.conversion import convert_cp_partition_mode
-
-        return convert_cp_partition_mode(
-            value,
-            source_partition_mode=source,
-            target_partition_mode=target,
-            cp_group=cp_group,
-            cu_seqlens=cu_seqlens,
-        )
+        packed = None if cu_seqlens is None else PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu_seqlens)
+        return convert_relax_cp_layout(value, packed, source, target, cp_group)
 
     got_con = convert(local_zig, "zigzag", "contiguous", cu)
     assert torch.equal(got_con, full[con_idx]), f"rank {rank}: THD zigzag->contiguous is wrong"

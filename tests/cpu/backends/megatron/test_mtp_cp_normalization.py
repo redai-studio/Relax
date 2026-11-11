@@ -29,8 +29,9 @@ class _Head(nn.Module):
 
 
 def _roll(tensors, *, cp_group=None, **kwargs):
+    scalar = torch.is_tensor(tensors)
     results = []
-    for value in tensors:
+    for value in (tensors,) if scalar else tensors:
         if cp_group is not None:
             parts = [torch.empty_like(value) for _ in range(cp_group.size())]
             dist.all_gather(parts, value, group=cp_group)
@@ -41,6 +42,8 @@ def _roll(tensors, *, cp_group=None, **kwargs):
         if cp_group is not None:
             value = value.chunk(cp_group.size(), dim=-1)[dist.get_rank(cp_group)].contiguous()
         results.append(value)
+    if scalar:
+        return results[0], results[0].sum() if kwargs.get("return_sum", True) else None
     return results
 
 

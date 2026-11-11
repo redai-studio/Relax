@@ -20,7 +20,7 @@ import pytest
 import torch
 
 
-pytest.importorskip("megatron.core.context_parallel_layout", reason="requires the patched Megatron-LM")
+pytest.importorskip("megatron.core.ssm.gated_delta_net", reason="requires the patched Megatron-LM")
 
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group  # noqa: E402
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet  # noqa: E402

@@ -1,25 +1,3 @@
-diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
-index e89c6bf..554add8 100644
---- a/megatron/core/models/gpt/gpt_model.py
-+++ b/megatron/core/models/gpt/gpt_model.py
-@@ -703,7 +703,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
-                 packed_seq_params=packed_seq_params,
-                 sequence_len_offset=sequence_len_offset,
-                 padding_mask=padding_mask,
--                **(extra_block_kwargs or {}),
-+                **decoder_extra_block_kwargs,
-             )
- 
-         return self._postprocess(
-@@ -882,7 +882,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
-                 padding_mask=padding_mask,
-                 embedding=self.embedding,
-                 mtp_input_mask=mtp_input_mask,
--                **decoder_extra_block_kwargs,
-+                **(extra_block_kwargs or {}),
-             )
- 
-         if not self.post_process:
 diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
 index 1e69f5b..e1a0b88 100644
 --- a/megatron/core/optimizer/optimizer.py
@@ -314,19 +292,6 @@ index 2ef0df9..c15b125 100644
                  group=self.tp_ep_group,
                  num_local_experts=self.num_local_experts,
                  router_topk=self.tp_size * self.config.moe_router_topk,
-diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index 4cbf741..18dbbc0 100644
---- a/megatron/core/transformer/transformer_config.py
-+++ b/megatron/core/transformer/transformer_config.py
-@@ -65,6 +65,8 @@ class TransformerConfig(ModelParallelConfig):
-     including those in ModelParallelConfig.
-     """
- 
-+    _relax_qwen35_optimized: bool = False
-+
-     ####################
-     # model architecture
-     ####################
 diff --git a/megatron/training/training.py b/megatron/training/training.py
 index 46aedf0..e62cf6c 100644
 --- a/megatron/training/training.py
