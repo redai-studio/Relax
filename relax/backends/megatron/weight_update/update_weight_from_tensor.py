@@ -634,7 +634,6 @@ class UpdateWeightFromTensor:
             serialized_empty = [
                 MultiprocessingSerializer.serialize([], output_str=True)
             ] * self.args.rollout_num_gpus_per_engine
-            self._routed_engine_call(all_engines, "end_weight_update")
             self._routed_engine_call(
                 all_engines,
                 "update_weights_from_tensor",
@@ -642,6 +641,7 @@ class UpdateWeightFromTensor:
                 load_format=NATIVE_SYNC_FENCE_LOADER,
                 flush_cache=False,
             )
+            self._routed_engine_call(all_engines, "end_weight_update")
         elif rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
