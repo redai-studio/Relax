@@ -2078,6 +2078,14 @@ def _compute_genrm_server_args(
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
+    if (
+        "cuda_graph_backend_prefill" in server_arg_fields
+        and kwargs.get("enable_memory_saver")
+        and kwargs.get("cuda_graph_backend_prefill") is None
+    ):
+        # Match policy engines: the default breakable prefill backend is incompatible with memory saver mode.
+        kwargs["cuda_graph_backend_prefill"] = "disabled"
+
     # for compatibility with old args
     if len(unused_keys) > 0:
         logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")

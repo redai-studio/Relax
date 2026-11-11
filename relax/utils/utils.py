@@ -27,6 +27,21 @@ logger = get_logger(__name__)
 CURRENT_ROLLOUT_BATCH = []
 
 
+def _has_image_inputs(multimodal_train_inputs) -> bool:
+    """Detect image payloads without requiring model-specific grid metadata."""
+    if multimodal_train_inputs is None:
+        return False
+    inputs = [multimodal_train_inputs] if isinstance(multimodal_train_inputs, dict) else multimodal_train_inputs
+    for mm_input in inputs:
+        if mm_input is None:
+            continue
+        for key in ("pixel_values", "image_position_ids", "image_grid_thw"):
+            value = mm_input.get(key)
+            if value is not None and (value.numel() > 0 if isinstance(value, torch.Tensor) else len(value) > 0):
+                return True
+    return False
+
+
 def _extract_image_grids(multimodal_train_inputs) -> list[tuple[int, int, int]]:
     """Keep original CPU (T,H,W) geometry for model-specific FLOPs estimates.
 

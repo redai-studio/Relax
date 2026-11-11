@@ -8,7 +8,7 @@
 
 | 配置 | 本 recipe | 作用 |
 | --- | --- | --- |
-| 执行模式 | `--fully-async` | Actor 与 Rollout 使用独立资源池，才能单独扩缩 Rollout Engine。 |
+| 执行模式 | `--fully-async` | Actor 与 Rollout 使用独立资源池，才能单独扩缩 Rollout Engine。Hybrid 模式同样支持——改用 `--hybrid`(见 `run-qwen3-4B-8xgpu-elastic-hybrid.sh`)。 |
 | Autoscaler | `--autoscaler-config <yaml>`，且 YAML 中 `enabled: true` | 启用自动扩缩容决策。 |
 | 初始下限 | `--resource` 中 `"rollout": [1, 4]`，同时设置 `min_engines: 4` | 启动并保护 4 个初始 Rollout Engine。 |
 | 扩缩容单位 | `--rollout-num-gpus-per-engine 1` | 每增加 1 个 Engine，申请 1 GPU 和 1 CPU。 |

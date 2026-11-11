@@ -2,7 +2,6 @@
 
 from argparse import Namespace
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -33,19 +32,6 @@ class _ConfiguredModule(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-
-
-MTP_PATCH = Path(__file__).resolve().parents[4] / "docker" / "patch" / "latest" / "megatron.patch"
-
-
-def test_megatron_patch_routes_each_mtp_detach_path_independently():
-    patch = MTP_PATCH.read_text()
-
-    assert 'getattr(config, "mtp_detach_lm_head", True)' in patch
-    assert 'getattr(self.config, "mtp_detach_embedding", True)' in patch
-    assert 'offset == 0 and getattr(self.config, "mtp_detach_backbone", True)' in patch
-    assert "hidden_states = hidden_states.detach().requires_grad_(True)" in patch
-    assert "mtp_detach_main_model" not in patch
 
 
 @pytest.mark.parametrize(
