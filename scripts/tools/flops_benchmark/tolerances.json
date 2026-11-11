@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "loss": { "atol": 0.00001, "rtol": 0.001 },
+  "gradient": { "atol_rms": 0.0000001, "rtol_l2": 0.01 },
+  "delta": { "atol_rms": 0.00000001, "rtol_l2": 0.01 }
+}
