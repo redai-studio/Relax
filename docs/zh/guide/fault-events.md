@@ -6,7 +6,7 @@ HealthStatus 通过既有健康查询提供稳定故障身份和完成回执，C
 
 ## 启用查询
 
-HTTP 端点要求 Uvicorn 0.36.0 或更新版本，已在 `requirements.txt` 声明。更早版本无法加载用于连接期限控制的自定义事件循环。正式验收环境使用 Uvicorn 0.54.0。
+HTTP 端点要求 Uvicorn 0.36.0 或更新版本，已在 `requirements.txt` 声明。更早版本无法加载用于连接期限控制的自定义事件循环。
 
 在已有训练命令中增加 `--use-health-check --fault-events-enabled`。功能默认关闭；只开启故障历史而未开启健康检查时，记录固定提示并保持采集关闭。
 
@@ -123,11 +123,11 @@ assert len(page["events"]) == 1
 
 ## 通过 OpenTelemetry 导出故障日志
 
-以下最小故障日志接口为提交给维护者确认的方案，确认位置为 [PR #455](https://github.com/redai-studio/Relax/pull/455#pullrequestreview-5628223210)。现有事件 schema、本地查询和恢复判据保持不变。不安装全局 OTel provider，不接管普通 Python 日志，也不启用其他观测信号。
+故障日志导出保持现有事件 schema、本地查询和恢复判据不变。不安装全局 OTel provider，不接管普通 Python 日志，也不启用其他观测信号。
 
 driver 统一持有一个官方 SDK 的私有 `LoggerProvider`，显式资源属性为 `service.name=relax`，并使用官方 OTLP HTTP exporter。只有 Store 新接纳并提交成功的事件，才将不可变的实际记录快照交给独立有界导出队列：最多 512 条排队、1 条在途。`offer` 在 Runtime 消费者线程上、Store 和接纳锁之外构造 SDK `LogRecord`；仅由独立导出线程执行 SDK emit、`SimpleLogRecordProcessor` 及导出／网络 I/O，也不再增加 SDK 批处理队列。
 
-依赖 Python 3.10 及更新版本的 `opentelemetry-sdk>=1.45.0,<1.46` 与 `opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46`，并在同一范围声明 `opentelemetry-exporter-otlp` 汇总包，使镜像中预装的 gRPC exporter 与 SDK 保持同一版本；导出本身只走 HTTP。本地已实际验证 1.45.0 和 1.45.1 环境。约束在 1.45 系列，是为了保留 exporter 自有客户端的诊断接口，用于屏蔽可能包含敏感信息的传输错误细节；不修改全局 logger。若这一兼容契约不再满足，则拒绝启动导出，本地历史继续工作。只在启用故障日志导出时创建私有 provider 和 exporter。
+依赖 Python 3.10 及更新版本的 `opentelemetry-sdk>=1.45.0,<1.46` 与 `opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46`，并在同一范围声明 `opentelemetry-exporter-otlp` 汇总包，使镜像中预装的 gRPC exporter 与 SDK 保持同一版本；导出本身只走 HTTP。约束在 1.45 系列，是为了保留 exporter 自有客户端的诊断接口，用于屏蔽可能包含敏感信息的传输错误细节；不修改全局 logger。若这一兼容契约不再满足，则拒绝启动导出，本地历史继续工作。只在启用故障日志导出时创建私有 provider 和 exporter。
 
 导出要求同时启用故障历史的两个开关，并显式配置接收端。在已有本地 OTLP HTTP 接收端的情况下，先为 driver 设置环境，再运行既有训练命令：
 
@@ -171,7 +171,7 @@ export OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/protobuf
 
 全局恢复在 Controller 重建前后复用同一个 driver 持有的 provider、已提交记录映射和导出队列。回执和 trace 旁路上下文共用既有健康数据包；完成证据不会创建第二个 exporter。
 
-`tests/cpu/utils/test_fault_event_otel_exporter.py` 和 `tests/cpu/core/test_fault_global_otel.py` 使用真实的本地 OTLP HTTP 接收端解码二进制 protobuf，并检查 `relax.fault.*` 属性。后者用明确的 CPU 模型／RPC 替身执行生产 Controller 启动和 handoff。接收端健康检查可使用其文档提供的命令或 `curl`；向 `/v1/logs` 发送普通 JSON 不是有效 OTLP 测试，因为本接口发送的是二进制 `http/protobuf`。
+检查接收端时，使用其文档提供的健康检查命令或 `curl`。向 `/v1/logs` 发送普通 JSON 不是有效的检查方式，因为本接口发送的是二进制 `http/protobuf`。
 
 ## 容量、异常与退出
 
@@ -184,31 +184,3 @@ HTTP 使用一个服务线程、四个活跃业务槽、有限 backlog／库级�
 每个相关副本懒创建一个回执 sender，最多八条排队、一条在途，单条编码回执最多 256 字节。业务方法只尝试本地入队。确认缓慢时持续占用同一槽，不启动替代请求或线程。普通调用和关闭采集时不启动 sender。接收端丢失或队列饱和可能使证据保持未验证，但不改变训练结果。
 
 driver 退出时向 Runtime 和 HTTP 发出关闭信号，不等待队列排空，不新增 Ray 等待。硬退出可能丢失末尾记录；缺少记录或完成回执不能被解释为业务失败。
-
-## CPU 验证
-
-在仓库根目录、装有既有测试及 HTTP 依赖的环境执行：
-
-```bash
-PYTHONPATH=. pytest -q \
-  tests/cpu/utils/test_fault_event_store.py \
-  tests/cpu/utils/test_fault_event_runtime.py \
-  tests/cpu/utils/test_fault_query_server.py \
-  tests/cpu/utils/test_fault_publication.py \
-  tests/cpu/utils/test_fault_health_flow.py \
-  tests/cpu/utils/test_fault_receipts.py \
-  tests/cpu/utils/test_health_checker_thread.py \
-  tests/cpu/core/test_fault_local_recovery_cpu.py \
-  tests/cpu/core/test_fault_global_recovery_cpu.py \
-  tests/cpu/core/test_fault_global_otel.py \
-  tests/cpu/core/test_fault_event_controller_ray.py \
-  tests/cpu/entrypoints/test_fault_events_lifecycle.py \
-  tests/cpu/entrypoints/test_startup_failure.py \
-  tests/cpu/utils/test_fault_event_otel_exporter.py \
-  tests/cpu/utils/test_fault_event_otel_runtime.py \
-  tests/cpu/utils/test_fault_event_trace_context.py \
-  tests/cpu/core/test_fault_event_otel_ray.py
-pre-commit run --all-files
-```
-
-这些用例执行实际 Store／Runtime、健康类、Controller／Service 定义、生产入口和 loopback socket。全局 CPU 用例覆盖启动模式矩阵、全部 24 种回执／handoff 顺序、冲突、generation 和观测失败隔离。Ray 用例使用本地 CPU 集群、真实 Serve 部署及实际组件／RayTrainGroup 完成方法。模型、数据集、生产 placement、外部 manager、恢复 HTTP 和受控部署注册仍为明确替身。原生健康／训练线程在采集开启和关闭时均执行，不代表 GPU 数值或完整模型训练已验收。

@@ -6,7 +6,7 @@ HealthStatus supplies stable fault identities and completion receipts through it
 
 ## Enable the query endpoint
 
-The HTTP endpoint requires Uvicorn 0.36.0 or newer, as declared in `requirements.txt`. Earlier versions cannot load the custom event loop used for connection deadlines. The validated environment uses Uvicorn 0.54.0.
+The HTTP endpoint requires Uvicorn 0.36.0 or newer, as declared in `requirements.txt`. Earlier versions cannot load the custom event loop used for connection deadlines.
 
 Add `--use-health-check --fault-events-enabled` to your existing training command. Both flags are required. The feature is off by default; requesting fault history without health checks prints a fixed warning and leaves collection disabled.
 
@@ -123,11 +123,11 @@ The schema allows only IDs, an allowed service role, fixed event/reason codes, s
 
 ## Fault logs through OpenTelemetry
 
-The following minimal fault-log interface is proposed for maintainer confirmation in [PR #455](https://github.com/redai-studio/Relax/pull/455#pullrequestreview-5628223210). It keeps the existing event schema, local query API and recovery criteria. It does not install a global OTel provider, instrument ordinary Python logging or enable other observability signals.
+Fault-log export keeps the existing event schema, local query API and recovery criteria. It does not install a global OTel provider, instrument ordinary Python logging or enable other observability signals.
 
 The driver owns one private official SDK `LoggerProvider`, with an explicit `service.name=relax` resource, and one official OTLP HTTP exporter. Only a newly accepted Store commit supplies an immutable record snapshot to a separate bounded export queue: at most 512 queued records and one in flight. `offer` constructs the SDK `LogRecord` on the Runtime consumer, outside Store and admission locks. Only the export worker emits the SDK record, invokes `SimpleLogRecordProcessor` and performs export/network I/O. There is no second SDK batch queue.
 
-The dependencies are `opentelemetry-sdk>=1.45.0,<1.46` and `opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46` for Python 3.10 and newer, plus the `opentelemetry-exporter-otlp` umbrella in the same range so a preinstalled gRPC exporter stays on the SDK's release; export itself uses HTTP only. Versions 1.45.0 and 1.45.1 have been exercised locally. The 1.45 range preserves the exporter's owned-client diagnostic interface used to suppress potentially sensitive transport error details, without changing any global logger. If that compatibility contract is unavailable, export startup fails closed while local history continues. The private provider and exporter are created only when this fault-log export is enabled.
+The dependencies are `opentelemetry-sdk>=1.45.0,<1.46` and `opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46` for Python 3.10 and newer, plus the `opentelemetry-exporter-otlp` umbrella in the same range so a preinstalled gRPC exporter stays on the SDK's release; export itself uses HTTP only. The 1.45 range preserves the exporter's owned-client diagnostic interface used to suppress potentially sensitive transport error details, without changing any global logger. If that compatibility contract is unavailable, export startup fails closed while local history continues. The private provider and exporter are created only when this fault-log export is enabled.
 
 Export requires both fault-history flags and an explicitly configured endpoint. For an existing local OTLP HTTP receiver, configure the driver environment before starting the existing training command:
 
@@ -171,7 +171,7 @@ Shutdown stops export admission and waits at most 50 ms for the export worker. `
 
 Global recovery reuses this same driver-owned provider, committed-record mapping and export queue across Controller rebuilding. Receipt and trace sidecars share the existing health envelope; completion evidence creates no second exporter.
 
-The tests in `tests/cpu/utils/test_fault_event_otel_exporter.py` and `tests/cpu/core/test_fault_global_otel.py` use a real local OTLP HTTP receiver to decode binary protobuf and check `relax.fault.*` attributes. The latter executes production Controller startup/handoff with explicit CPU model/RPC substitutes. A receiver's health endpoint can be checked with its own documented command or `curl`; posting plain JSON to `/v1/logs` is not a valid OTLP test because this interface sends binary `http/protobuf`.
+To check a receiver, use its own documented health command or `curl`. Posting plain JSON to `/v1/logs` is not a valid check, because this interface sends binary `http/protobuf`.
 
 ## Bounds, failures and shutdown
 
@@ -184,31 +184,3 @@ HTTP has one server thread, four active business slots, backlog/concurrency limi
 Each relevant replica lazily creates one receipt sender with at most eight queued receipts and one in flight; each encoded receipt is at most 256 bytes. The business method only attempts local enqueue. A slow confirmation keeps occupying its slot without replacement requests or threads. Ordinary calls and disabled collection start no sender. Receiver loss or saturation may leave evidence unverified without changing training results.
 
 Driver shutdown signals Runtime and HTTP closure without waiting for queue drain or adding Ray waits. A hard exit can lose tail records. The history does not establish a business failure merely because a record or completion receipt is absent.
-
-## CPU verification
-
-Run from the repository root in an environment with its existing test and HTTP dependencies:
-
-```bash
-PYTHONPATH=. pytest -q \
-  tests/cpu/utils/test_fault_event_store.py \
-  tests/cpu/utils/test_fault_event_runtime.py \
-  tests/cpu/utils/test_fault_query_server.py \
-  tests/cpu/utils/test_fault_publication.py \
-  tests/cpu/utils/test_fault_health_flow.py \
-  tests/cpu/utils/test_fault_receipts.py \
-  tests/cpu/utils/test_health_checker_thread.py \
-  tests/cpu/core/test_fault_local_recovery_cpu.py \
-  tests/cpu/core/test_fault_global_recovery_cpu.py \
-  tests/cpu/core/test_fault_global_otel.py \
-  tests/cpu/core/test_fault_event_controller_ray.py \
-  tests/cpu/entrypoints/test_fault_events_lifecycle.py \
-  tests/cpu/entrypoints/test_startup_failure.py \
-  tests/cpu/utils/test_fault_event_otel_exporter.py \
-  tests/cpu/utils/test_fault_event_otel_runtime.py \
-  tests/cpu/utils/test_fault_event_trace_context.py \
-  tests/cpu/core/test_fault_event_otel_ray.py
-pre-commit run --all-files
-```
-
-These tests execute actual Store/Runtime, health classes, Controller/Service definitions, entrypoint and loopback sockets. Global CPU tests cover the startup mode matrix, all 24 receipt/handoff orders, conflicts, generations and observation failure isolation. Ray tests use local CPU clusters, real Serve deployments and actual component/RayTrainGroup completion methods. Models, datasets, production placement, external managers, recovery HTTP and controlled deployment registration remain explicit substitutes. Native health/training threads run with collection disabled and enabled. No GPU numerical or full-model training claim is made.
