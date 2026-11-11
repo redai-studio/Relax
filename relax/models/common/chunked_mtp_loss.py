@@ -13,7 +13,6 @@ from megatron.core.transformer.multi_token_prediction import (
     roll_tensor,
 )
 
-from relax.backends.megatron.sft_precision import fused_head_precision_kwargs, native_head_precision
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.training.fused_ce import ce_implementation, te_cross_entropy
@@ -143,40 +142,31 @@ def _chunked_head_ce(
             for start in range(0, seq_len, chunk_size):
                 end = min(start + chunk_size, seq_len)
                 weight = output_weight if output_weight is not None else output_layer.weight
-                from relax.backends.megatron import fused_linear_ce
+                from relax.backends.megatron.fused_linear_ce import linear_cross_entropy, supported
 
-                precision_kwargs = fused_head_precision_kwargs(
-                    output_layer, fused_linear_ce, weight, runtime_gather_output
-                )
-                fused = (
-                    precision_kwargs is not None
-                    and scale_logits_fn is None
-                    and fused_linear_ce.supported(output_layer, mtp_hidden[start:end], weight, runtime_gather_output)
+                fused = scale_logits_fn is None and supported(
+                    output_layer, mtp_hidden[start:end], weight, runtime_gather_output
                 )
                 if fused:
                     needs_metrics = _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None
-                    loss_sb, logits_slice = fused_linear_ce.linear_cross_entropy(
+                    loss_sb, logits_slice = linear_cross_entropy(
                         mtp_hidden[start:end],
                         weight,
                         mtp_labels[:, start:end].T.contiguous(),
                         tp_group or output_layer.tp_group,
                         accumulate=output_layer.gradient_accumulation_fusion,
                         return_logits=needs_metrics,
-                        **precision_kwargs,
                     )
                     loss_slice = loss_sb.T.contiguous()
                     if logits_slice is not None:
                         logits_slice = logits_slice.view(end - start, mtp_hidden.shape[1], -1)
                 else:
-                    with native_head_precision(
-                        output_layer, mtp_hidden[start:end], weight, runtime_gather_output
-                    ) as mapped:
-                        logits_slice, _ = head_forward(
-                            output_layer,
-                            mapped,  # [chunk, b, H], already SP-gathered
-                            weight=output_weight,
-                            runtime_gather_output=runtime_gather_output,
-                        )
+                    logits_slice, _ = head_forward(
+                        output_layer,
+                        mtp_hidden[start:end],  # [chunk, b, H]
+                        weight=output_weight,
+                        runtime_gather_output=runtime_gather_output,
+                    )  # [chunk, b, V/TP] (no re-gather: SP disabled)
                     if scale_logits_fn is not None:
                         logits_slice = scale_logits_fn(logits_slice)
                     # compute_language_model_loss(labels[b,s], logits[s,b,V]) -> [b, s];
