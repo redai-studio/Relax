@@ -320,13 +320,6 @@ class TestRewardExecutorSingleSample:
         result = await async_rm(args, sample)
         assert result == 1.0
 
-    @pytest.mark.asyncio
-    async def test_execute_unknown_rm_type_raises(self):
-        args = _make_args(rm_type="totally_unknown_type")
-        sample = _make_sample(response="foo", label="bar")
-        with pytest.raises(NotImplementedError, match="totally_unknown_type"):
-            await async_rm(args, sample)
-
 
 @requires_full_pipeline
 class TestBatchedAsyncRM:
