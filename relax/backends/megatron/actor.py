@@ -92,6 +92,7 @@ from relax.utils.reloadable_process_group import destroy_process_groups, monkey_
 from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.score_centering import SCORE_CENTERING_TRAIN_FIELDS
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
@@ -2645,7 +2646,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.advantage_estimator == "score_centering":
-                    data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+                    data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
                 if self.args.multimodal_keys is not None:
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
@@ -2849,7 +2850,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
         if self.args.advantage_estimator == "score_centering":
-            data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+            data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
         if not getattr(self.args, "true_on_policy_mode", False):
             data_fields.append("log_probs")
         if self.args.kl_coef != 0 or self.args.use_kl_loss:

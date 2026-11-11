@@ -524,9 +524,10 @@ def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> N
         abort_count=0,
         messages_delta=[{"role": "assistant", "content": "a"}],
         token_delta=[97],
-        logprob_delta=[-1.0],
-        topk_token_ids_delta=np.array([[97, 98]], dtype=np.int32),
-        topk_logprob_delta=np.array([[-1.0, -2.0]], dtype=np.float32),
+        logprob_delta=[0.0],
+        topk_token_ids_delta=np.array([[97, -1]], dtype=np.int32),
+        topk_logprob_delta=np.array([[0.0, -np.inf]], dtype=np.float32),
+        topk_support_complete_delta=np.array([True]),
     )
     observation = forest.append_obs(
         parent_state_hash=first.state_hash,
@@ -550,11 +551,12 @@ def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> N
         sample = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
         assert sample.tokens == [10, 11, 97, 20, 21, token]
         assert sample.loss_mask == [1, 0, 0, 1]
-        assert sample.rollout_log_probs == [-1.0, 0.0, 0.0, -0.5]
-        np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, 98], [-1, -1], [-1, -1], [token, 100]])
+        assert sample.rollout_log_probs == [0.0, 0.0, 0.0, -0.5]
+        np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, -1], [-1, -1], [-1, -1], [token, 100]])
         np.testing.assert_array_equal(
-            sample.rollout_topk_log_probs, [[-1.0, -2.0], [-np.inf, -np.inf], [-np.inf, -np.inf], [-0.5, -2.5]]
+            sample.rollout_topk_log_probs, [[0.0, -np.inf], [-np.inf, -np.inf], [-np.inf, -np.inf], [-0.5, -2.5]]
         )
+        np.testing.assert_array_equal(sample.rollout_topk_support_complete, [True, False, False, False])
 
 
 async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_gap() -> None:
@@ -1606,7 +1608,7 @@ async def test_score_centering_partial_attempts_commit_aligned_candidates() -> N
     session.forest = forest
     ir.parent_state_hash = observation.state_hash
     ir.pending_token_delta = []
-    for token, logprob, finish_type in ((97, -1.0, "abort"), (98, -0.5, "stop")):
+    for token, logprob, finish_type in ((97, 0.0, "abort"), (98, -0.5, "stop")):
         shard._apply_generate_result(
             ir,
             BackendGenerateResult(
@@ -1615,8 +1617,9 @@ async def test_score_centering_partial_attempts_commit_aligned_candidates() -> N
                 finish_type=finish_type,
                 meta_info={"prompt_tokens": 1},
                 elapsed=0.1,
-                new_topk_token_ids=np.array([[token, 100]], dtype=np.int32),
-                new_topk_log_probs=np.array([[logprob, -2.0]], dtype=np.float32),
+                new_topk_token_ids=np.array([[token, -1 if token == 97 else 100]], dtype=np.int32),
+                new_topk_log_probs=np.array([[logprob, -np.inf if token == 97 else -2.0]], dtype=np.float32),
+                new_topk_support_complete=np.array([True]) if token == 97 else None,
             ),
         )
     ir.pending_status = "completed"
@@ -1625,9 +1628,10 @@ async def test_score_centering_partial_attempts_commit_aligned_candidates() -> N
         leaf_state_hash=session.resp_state_hash_by_request_id[ir.request_id], tokenizer=_FakeTokenizer()
     )
     assert sample.tokens == [112, 97, 98]
-    assert sample.rollout_log_probs == [-1.0, -0.5]
-    np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, 100], [98, 100]])
-    np.testing.assert_array_equal(sample.rollout_topk_log_probs, [[-1.0, -2.0], [-0.5, -2.0]])
+    assert sample.rollout_log_probs == [0.0, -0.5]
+    np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, -1], [98, 100]])
+    np.testing.assert_array_equal(sample.rollout_topk_log_probs, [[0.0, -np.inf], [-0.5, -2.0]])
+    np.testing.assert_array_equal(sample.rollout_topk_support_complete, [True, False])
 
 
 @pytest.mark.parametrize("capacity_limit", ["budget", "backend_error", "zero_decode"])

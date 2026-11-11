@@ -117,14 +117,20 @@ def test_score_centering_capture_filtered_support_uses_actual_sampled_probabilit
         "output_top_logprobs": [[[math.log(0.35), 1], [math.log(0.21), 2]]],
     }
     response = _packed_metadata(meta) if packed else meta
-    tokens, sampled, ids, logprobs = parse_score_centering_response(response, 2, sampling_mode="support", vocab_size=8)
+    tokens, sampled, ids, logprobs, coverage = parse_score_centering_response(
+        response, 2, sampling_mode="support", vocab_size=8, return_support_complete=True
+    )
+    np.testing.assert_array_equal(coverage, [False])
     assert tokens == [4]
     assert sampled == pytest.approx([math.log(0.2)])
     np.testing.assert_array_equal(ids, [[1, 2]])
     np.testing.assert_allclose(np.exp(logprobs), [[0.5, 0.3]])
     meta["output_top_logprobs"][0].extend([[math.log(0.14), 4], [math.log(0.1), 5]])
     response = _packed_metadata(meta) if packed else meta
-    _, _, ids, logprobs = parse_score_centering_response(response, 4, sampling_mode="support", vocab_size=8)
+    _, _, ids, logprobs, coverage = parse_score_centering_response(
+        response, 4, sampling_mode="support", vocab_size=8, return_support_complete=True
+    )
+    np.testing.assert_array_equal(coverage, [True])
     np.testing.assert_array_equal(ids, [[1, 2, 4, -1]])
     assert np.isneginf(logprobs[0, 3])
 
@@ -150,6 +156,20 @@ def test_score_centering_capture_rejects_corrupt_probability_metadata(change):
         parse_score_centering_response(meta, 2, vocab_size=8)
 
 
+def test_score_centering_capture_near_unit_mass_does_not_prove_complete_support():
+    meta = {
+        "output_token_logprobs": [[math.log(0.7999992), 1]],
+        "output_top_logprobs": [[[math.log(0.7999992), 1]]],
+        "output_token_sampling_mask": [[1, 2]],
+        "output_token_sampling_logprobs": [math.log(0.999999)],
+    }
+    _, _, _, head, coverage = parse_score_centering_response(
+        meta, 1, sampling_mode="support", return_support_complete=True
+    )
+    assert np.isclose(np.exp(head).sum(), 1.0)
+    np.testing.assert_array_equal(coverage, [False])
+
+
 def test_score_centering_capture_requires_complete_actual_support_metadata():
     with pytest.raises(ValueError, match="actual behavior q"):
         parse_score_centering_response(_metadata(), 2, sampling_mode="support")
@@ -170,7 +190,10 @@ def test_score_centering_capture_singleton_support_handles_argmax_topk_ties():
         "output_token_sampling_mask": [[1]],
         "output_token_sampling_logprobs": [0.0],
     }
-    _, sampled, ids, logprobs = parse_score_centering_response(meta, 1, sampling_mode="support")
+    _, sampled, ids, logprobs, coverage = parse_score_centering_response(
+        meta, 1, sampling_mode="support", return_support_complete=True
+    )
+    np.testing.assert_array_equal(coverage, [True])
     assert sampled == [0.0]
     np.testing.assert_array_equal(ids, [[1]])
     np.testing.assert_array_equal(logprobs, [[0.0]])
@@ -309,8 +332,10 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
 
     async def post_generation(args, state, url, payload, headers, evaluation):
         calls.append(copy.deepcopy(payload))
-        meta = _packed_metadata(_metadata()) if packed else _metadata()
-        return {"text": "answer", "output_ids": [4, 2], "meta_info": meta}
+        meta = _metadata()
+        meta["output_token_sampling_mask"] = [[4, 1, 2], [2, 3]]
+        meta["output_token_sampling_logprobs"] = [math.log(0.2), math.log(0.6 / 0.9)]
+        return {"text": "answer", "output_ids": [4, 2], "meta_info": _packed_metadata(meta) if packed else meta}
 
     namespace = {
         "Sample": Sample,
@@ -335,14 +360,18 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         mask_offpolicy_in_partial_rollout=True,
     )
     sample = Sample(prompt="prompt")
-    asyncio.run(namespace["generate"](args, sample, {"max_new_tokens": 8, "temperature": 0.7}))
+    sampling = {"max_new_tokens": 8, "temperature": 0.7, "top_k": 3}
+    asyncio.run(namespace["generate"](args, sample, sampling))
     sample.loss_mask = [0, 0]
     first_head = sample.rollout_topk_log_probs.copy()
-    asyncio.run(namespace["generate"](args, sample, {"max_new_tokens": 8, "temperature": 0.7}))
+    asyncio.run(namespace["generate"](args, sample, sampling))
     assert calls[0]["top_logprobs_num"] == 2
     assert calls[1]["input_ids"] == [0, 4, 2]
     assert sample.tokens == [0, 4, 2, 4, 2] and sample.loss_mask == [0, 0, 1, 1]
     np.testing.assert_array_equal(sample.rollout_topk_log_probs[:2], first_head)
+    np.testing.assert_array_equal(sample.rollout_topk_support_complete, [False, True, False, True])
+    restored = Sample.from_dict(pickle.loads(pickle.dumps(sample.to_dict())))
+    np.testing.assert_array_equal(restored.rollout_topk_support_complete, sample.rollout_topk_support_complete)
     validate_score_centering_sample(sample, 2, vocab_size=8)
 
 
@@ -359,6 +388,7 @@ def test_score_centering_converter_flattens_candidates_and_rejects_missing_field
         sample = _sample()
         data = module.convert_samples_to_train_data(args, [sample])
         assert data["rollout_topk_token_ids"] == [[1, 2, 2, 3]]
+        assert data["rollout_topk_support_complete"][0].tolist() == [False, False]
         np.testing.assert_allclose(np.reshape(data["rollout_topk_log_probs"], (2, 2)), sample.rollout_topk_log_probs)
         monkeypatch.setattr(module, "post_process_rewards", lambda args, samples: [[0.3, -0.2]] * len(samples))
         assert module.convert_samples_to_train_data(args, [sample])["rewards"] == [[0.3, -0.2]]
@@ -366,9 +396,11 @@ def test_score_centering_converter_flattens_candidates_and_rejects_missing_field
         monkeypatch.setattr(module, "load_function", lambda path: lambda args, samples: {"tokens": [[0, 4, 2]]})
         with pytest.raises(ValueError, match="custom converter omitted"):
             module.convert_samples_to_train_data(args, [sample])
+        del data["rollout_topk_support_complete"]
         monkeypatch.setattr(module, "load_function", lambda path: lambda args, samples: data)
         # Custom converters own their input layout, including grouped samples.
         assert module.convert_samples_to_train_data(args, [[sample]]) is data
+        assert data["rollout_topk_support_complete"][0].tolist() == [False, False]
         args.custom_convert_samples_to_train_data_path = None
         sample.rollout_topk_log_probs = None
         with pytest.raises(ValueError, match="rollout_topk_log_probs"):

@@ -58,7 +58,7 @@ from .cp_utils import (
 from .score_centering import (
     align_score_centering_candidate_ids,
     build_score_centering_context,
-    get_score_centering_chunk,
+    get_score_centering_batch,
 )
 
 
@@ -113,7 +113,7 @@ def get_responses(
 
     Args:
         logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, 1]`
-            (value). Must be float32.
+            (value). Raw Score Centering logits may use model precision.
         args: Configuration containing `rollout_temperature` for scaling.
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
@@ -126,11 +126,12 @@ def get_responses(
     """
     qkv_format = args.qkv_format
 
-    # SFT chunked path (--sft-chunked-logits) feeds hidden_states (bf16) into
-    # this slicer — slicing itself is dtype-agnostic; that caller casts to fp32
-    # per sub-chunk. All other paths (RL, SFT legacy logits, SFT eval PPL)
-    # produce real fp32 logits and must stay strict.
-    if is_sft_mode(args) and getattr(args, "sft_chunked_logits", False):
+    # Score Centering and chunked SFT upcast only their scoring workspace.
+    algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
+    raw_score_centering = (
+        not apply_temperature and algorithm is not None and algorithm.policy_loss_fn == "score_centering"
+    )
+    if raw_score_centering or (is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)):
         assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
     else:
         assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -225,7 +226,17 @@ def get_responses(
             assert logits_0.size(0) == tokens_0.size(0), f"{logits_0.size(0)} vs {tokens_0.size(0)}"
             assert logits_1.size(0) == tokens_1.size(0), f"{logits_1.size(0)} vs {tokens_1.size(0)}"
 
-            logits_chunk = torch.cat([logits_0, logits_1], dim=0)
+            if raw_score_centering:
+                # When the response intersects both local chunks, it covers
+                # the end of the first and the beginning of the second.
+                if logits_0.size(0) and logits_1.size(0):
+                    start = end - 2 * chunk_size + logits_offset[0][0] - chunks_offset[0][0]
+                    stop = end - chunk_size + logits_offset[1][1] - chunks_offset[1][0]
+                    logits_chunk = logits[start:stop]
+                else:
+                    logits_chunk = logits_0 if logits_0.size(0) else logits_1
+            else:
+                logits_chunk = torch.cat([logits_0, logits_1], dim=0)
             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
 
         seq_start += total_length
@@ -426,7 +437,7 @@ def get_log_probs_and_entropy(
     sc_cp_size = dynamic_cp_size
     if is_score_centering and sc_cp_size is None:
         sc_cp_size = mpu.get_context_parallel_world_size()
-    if is_score_centering:
+    if is_score_centering and not cp_output_is_zigzag:
         gather_topk_token_ids = align_score_centering_candidate_ids(
             gather_topk_token_ids,
             logits=logits,
@@ -477,39 +488,21 @@ def get_log_probs_and_entropy(
     entropy_list = []
     topk_token_ids_list = []
     topk_log_probs_list: list[torch.Tensor] = []
-    for sample_idx, (logits_chunk, tokens_chunk) in enumerate(
-        get_responses(
-            logits,
-            args=args,
-            unconcat_tokens=unconcat_tokens,
-            total_lengths=total_lengths,
-            response_lengths=response_lengths,
-            pre_shifted_labels=pre_shifted_labels,
-            max_seq_lens=max_seq_lens,
-            padded_total_lengths=padded_total_lengths,
-            cp_output_is_zigzag=cp_output_is_zigzag,
-            dynamic_cp_size=dynamic_cp_size,
-            dynamic_cp_rank=dynamic_cp_rank,
-        )
-    ):
-        if is_score_centering:
-            chunk = get_score_centering_chunk(
-                logits_chunk,
-                tokens_chunk,
-                tp_group,
-                args=args,
-                candidate_ids=gather_topk_token_ids[sample_idx] if gather_topk_token_ids is not None else None,
-                with_entropy=with_entropy,
-                with_topk=with_topk,
-                topk_k=resolved_topk_k,
-            )
-            log_probs_list.append(chunk["log_probs"])
-            entropy_list.append(chunk["entropy"])
-            if with_topk:
-                topk_token_ids_list.append(chunk["topk_token_ids"])
-            if gather_topk_token_ids is not None:
-                topk_log_probs_list.append(chunk["topk_log_probs"])
-            continue
+    responses = get_responses(
+        logits,
+        args=args,
+        unconcat_tokens=unconcat_tokens,
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        pre_shifted_labels=pre_shifted_labels,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+        cp_output_is_zigzag=cp_output_is_zigzag,
+        apply_temperature=not is_score_centering,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
+    )
+    for sample_idx, (logits_chunk, tokens_chunk) in enumerate(() if is_score_centering else responses):
         if lm_head_forward is not None:
             full_rows = logits_chunk.size(0)
             selected_rows = None
@@ -584,15 +577,27 @@ def get_log_probs_and_entropy(
         if gather_topk_token_ids is not None:
             topk_log_probs_list.append(compute_opd_topk_log_probs(logits_chunk, gather_topk_token_ids, sample_idx))
 
-    res = {
-        "log_probs": log_probs_list,
-    }
-    if with_entropy:
-        res["entropy"] = entropy_list
-    if with_topk:
-        res["topk_token_ids"] = topk_token_ids_list
-    if gather_topk_token_ids is not None:
-        res["topk_log_probs"] = topk_log_probs_list
+    if is_score_centering:
+        with torch.no_grad():
+            response_views = list(responses)
+        res = get_score_centering_batch(
+            logits,
+            response_views,
+            tp_group,
+            args=args,
+            candidate_ids=gather_topk_token_ids,
+            with_entropy=with_entropy,
+            with_topk=with_topk,
+            topk_k=resolved_topk_k,
+        )
+    else:
+        res = {"log_probs": log_probs_list}
+        if with_entropy:
+            res["entropy"] = entropy_list
+        if with_topk:
+            res["topk_token_ids"] = topk_token_ids_list
+        if gather_topk_token_ids is not None:
+            res["topk_log_probs"] = topk_log_probs_list
 
     # we need to turn the all gather kv into zigzag ring attn kv. Guard on
     # cp_world_size > 1 (matching the loss_function guard below): at CP=1 each
@@ -1257,7 +1262,7 @@ def policy_loss_function(
         loss = loss + opd_loss
 
     if log_probs.numel() == 0:
-        loss += 0 * logits.sum()
+        loss += 0 * logits.sum(dtype=torch.float32)
 
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
@@ -1906,7 +1911,7 @@ def loss_function(
     # CP ranks that call it. Adding this zero loss forces autograd to traverse the full
     # graph on every rank without changing gradient values.
     if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
-        loss = loss + 0 * logits.sum()
+        loss = loss + 0 * logits.sum(dtype=torch.float32)
 
     # Fully-async + dynamic-batch path injects per-rollout loss_scale and tags
     # dummy micro-batches (used to align num_microbatches across DPs). Dummy
