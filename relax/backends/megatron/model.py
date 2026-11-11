@@ -35,6 +35,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
+from relax.backends.megatron.telemetry import observe_step, span
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.agentic_obs import agentic_obs_enabled
@@ -1565,16 +1566,17 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
-    )
+    with span("forward_backward", "relax.train.forward_backward"):
+        losses_reduced = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+        )
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
@@ -1625,7 +1627,10 @@ def train_one_step(
         record_optimizer_result(False)
     else:
         try:
-            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+            with span("optimizer", "relax.optimizer.step") as optimizer_span:
+                update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+                if optimizer_span is not None:
+                    optimizer_span.set_attribute("relax.optimizer.update_successful", bool(update_successful))
         except NonFiniteGradientNormError as exc:
             # Only the synchronized pre-update norm guard can take this path: it runs before
             # clipping or *any* child optimizer update. Do not swallow unrelated
@@ -1902,6 +1907,7 @@ def train(
             with (
                 timer(f"train_micro_batch_{step_id}", keep=False),
                 observe_train_step(args, rollout_id, step_id, role=getattr(model[0], "role", "actor")),
+                observe_step(rollout_id, step_id, role=getattr(model[0], "role", "actor")),
             ):
                 loss_dict, grad_norm = train_one_step(
                     args,

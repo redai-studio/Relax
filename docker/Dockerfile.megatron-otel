@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+# Build context: repository root. BASE_IMAGE must be an existing Relax GPU
+# runtime (including SGLang and its CUDA extensions), not a plain CUDA image.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
+ARG MEGATRON_CORE_COMMIT=9e68a11bdd380610396a17594ba4b17c09108cc4
+ARG NEMO_LENS_COMMIT=b85578fc2b736a1804705e537001b5f45e9c715d
+
+# Replace the inherited patched Megatron tree with the clean, paired snapshots.
+# This intentionally does not apply the main image's model/performance patches.
+RUN git init /tmp/otel-bridge && \
+    git -C /tmp/otel-bridge fetch --depth=1 https://github.com/NVIDIA-NeMo/Megatron-Bridge.git "$MEGATRON_BRIDGE_COMMIT" && \
+    git -C /tmp/otel-bridge checkout --detach FETCH_HEAD && \
+    git init /tmp/otel-mcore && \
+    git -C /tmp/otel-mcore fetch --depth=1 https://github.com/NVIDIA/Megatron-LM.git "$MEGATRON_CORE_COMMIT" && \
+    git -C /tmp/otel-mcore checkout --detach FETCH_HEAD && \
+    test "$(git -C /tmp/otel-bridge rev-parse HEAD)" = "$MEGATRON_BRIDGE_COMMIT" && \
+    test "$(git -C /tmp/otel-mcore rev-parse HEAD)" = "$MEGATRON_CORE_COMMIT" && \
+    rm -rf /root/Megatron-LM && mkdir -p /root/Megatron-LM && \
+    cp -a /tmp/otel-bridge/src/megatron/. /root/Megatron-LM/megatron/ && \
+    cp -a /tmp/otel-mcore/megatron/. /root/Megatron-LM/megatron/ && \
+    mkdir -p /opt/relax && \
+    printf 'bridge=%s\nmcore=%s\nlens=%s\npatches=none\n' \
+        "$MEGATRON_BRIDGE_COMMIT" "$MEGATRON_CORE_COMMIT" "$NEMO_LENS_COMMIT" \
+        > /opt/relax/megatron-otel-versions.txt && \
+    rm -rf /tmp/otel-bridge /tmp/otel-mcore
+
+# Only the observability packages change; preserve the base image's Torch,
+# Transformer Engine, SGLang and CUDA ABI combination.
+RUN python -m pip install --no-cache-dir \
+    "opentelemetry-sdk==1.45.1" \
+    "opentelemetry-exporter-otlp==1.45.1" \
+    "opentelemetry-exporter-prometheus==0.66b1" \
+    "nemo-lens[sdk] @ git+https://github.com/NVIDIA-NeMo/Lens.git@${NEMO_LENS_COMMIT}"
+
+ENV PYTHONPATH=/opt/relax-otel:/root/Megatron-LM \
+    MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
+    RELAX_MEGATRON_CORE_COMMIT=${MEGATRON_CORE_COMMIT} \
+    RELAX_NEMO_LENS_COMMIT=${NEMO_LENS_COMMIT}
+
+WORKDIR /opt/relax-otel
+COPY . /opt/relax-otel/
+RUN python -m pip install --no-deps --no-build-isolation -e . && \
+    python -c "import megatron.core, megatron.bridge, nemo.lens; \
+        import relax.backends.megatron.model; \
+        from megatron.core.telemetry.span_groups import MegatronSpanGroup; \
+        assert megatron.core.__file__.startswith('/root/Megatron-LM/'); \
+        assert megatron.bridge.__file__.startswith('/root/Megatron-LM/'); \
+        assert 'microbatch' in MegatronSpanGroup.resolve('per_step,microbatch')"
+
+LABEL org.opencontainers.image.description="Experimental Qwen3.5-35B RL and native Megatron OTel smoke baseline; no numerical, performance or recovery acceptance"
