@@ -19,7 +19,7 @@ python3 examples/opensearch_vl/tools/prepare_data.py \
 
 图片由每个 worker 直接读取 ZIP，避免将数万张原图先解到共享盘；也支持仅有已解压图片的输入。RGB 图按原始像素 hash 去重，输出为 32 像素网格、最多 262,144 像素的 PNG。原始大小和 RGB 像素 hash 写入每行 metadata，供训练去重与评测重叠检查使用。
 
-输出包括 `train.jsonl`、`val.jsonl`、`test.jsonl`、`test_steps.jsonl`、`images/`、`rejected.json` 和 `manifest.json`。manifest 记录源 revision、样本 ID、计数、worker 数和处理时间；图片路径指向本次输出目录。移动数据时应同时处理这些路径，不能只复制 JSONL。
+输出包括 `train.jsonl`、`val.jsonl`、`test.jsonl`、`images/`、`rejected.json` 和 `manifest.json`。manifest 记录源 revision、样本 ID、计数、worker 数和处理时间；图片路径指向本次输出目录。移动数据时应同时处理这些路径，不能只复制 JSONL。
 
 ## 训练前审计
 

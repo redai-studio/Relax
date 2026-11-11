@@ -1,72 +1,76 @@
 # OpenSearch-VL Benchmark
 
-统一记录不同模型在 OpenSearch-VL 数据上的 SFT 与评测效果。每个模型有独立启动脚本和实验文档，共用数据处理、评测协议与指标定义。当前只评测SimpleVQA，采用无工具Direct Answer；带工具 Agentic 结果单独报告。
+统一记录不同模型在OpenSearch-VL数据上的SFT与 **V\*Bench本地裁剪工具评测**。每个模型有独立脚本和实验文档，共用数据处理、工具协议与评分规则。训练数据保持七域完整轨迹；评测只使用V\*Bench。
 
 ## 评测结果汇总
 
-每次正式基准测试保留一行，按模型分组、时间倒序；空白表示尚无结果。分数为 Pass@1（%，原始 / 去重），失败题保留在分母。去重题集由本次实际 SFT train 决定，不同去重集合不能直接排名。
+分数为Pass@1（%，原始 / 训练集去重）。已完成组统一使用v2明确最终选项归一化；仅重评分保存答案，不重新推理。每组完整191题，失败题保留在分母；空白表示尚未评测，不能用其他模型或其他协议的分数代填。
 
-| 模型                 | 阶段 / 预算     | 状态                   | 启动时间 UTC        | 训练 commit    |  SimpleVQA EN | SwanLab                                                                                                                                                                           | 实验文档                                      |
-| -------------------- | --------------- | ---------------------- | ------------------- | -------------- | ------------: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| Qwen3-VL-8B-Instruct | SFT / 2 epochs  | 调优中，正式训练未开始 | 2026-11-10 12:22:41 | `8174e3700fe7` |               |                                                                                                                                                                                   | [详情](results/qwen3-vl-8b.md)                |
-| Qwen3-VL-8B-Instruct | Base            | 完成                   | 2026-11-10 11:26:30 |                | 43.73 / 44.75 | [评测](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/px8l1gou)                                                                                                        | [详情](results/qwen3-vl-8b.md)                |
-| Qwen3.5-4B           | Base            | 完成                   | 2026-11-10 08:33:48 |                | 45.11 / 46.38 | [评测](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/5210g8ibu4eo0y0zzg6ft)                                                                                           | [详情](results/qwen3.5-4b.md#baseline)        |
-| Qwen3.5-4B           | SFT / 100 steps | 完成                   | 2026-11-10 07:04:49 | `28f866220dc3` | 42.74 / 43.93 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/ejccsn9ib17s2swcq6z40) · [评测](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/emr9mnx3q7y5z6e6z3pfi) | [详情](results/qwen3.5-4b.md#sft100-20261110) |
-| Qwen3.6-27B          | SFT / 2 epochs  | 训练未完成             |                     | `1c621a84ae89` |               |                                                                                                                                                                                   | [详情](results/qwen3.6-27b.md)                |
+| 模型                 | 阶段 / 预算   | 状态           | 实验启动 UTC        | 训练 commit    |      V\*Bench | SwanLab训练曲线                                                            | 实验文档                       |
+| -------------------- | ------------- | -------------- | ------------------- | -------------- | ------------: | -------------------------------------------------------------------------- | ------------------------------ |
+| Qwen3-VL-8B-Instruct | Base          | 评测完成       | 2026-11-11 03:48:08 |                | 29.32 / 29.32 |                                                                            | [详情](results/qwen3-vl-8b.md) |
+| Qwen3-VL-8B-Instruct | SFT / 1 epoch | 训练与评测完成 | 2026-11-10 16:08:22 | `f6afec0cb046` | 65.45 / 65.45 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/ykm29sm5) | [详情](results/qwen3-vl-8b.md) |
+| Qwen3.5-4B           | Base          | 评测完成       | 2026-11-11 05:23:15 |                | 60.21 / 60.21 |                                                                            | [详情](results/qwen3.5-4b.md)  |
+| Qwen3.5-4B           | SFT / 1 epoch | 训练与评测完成 | 2026-11-10 18:15:32 | `6d31774a5b94` | 66.49 / 66.49 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/6k29pgn6) | [详情](results/qwen3.5-4b.md)  |
+| Qwen3.6-27B          | Base          | 评测完成       | 2026-11-11 05:43:22 |                | 56.02 / 56.02 |                                                                            | [详情](results/qwen3.6-27b.md) |
+| Qwen3.6-27B          | SFT / 1 epoch | 训练与评测完成 | 2026-11-10 20:26:42 | `6d31774a5b94` | 71.73 / 71.73 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/0iblvpvo) | [详情](results/qwen3.6-27b.md) |
 
-当前分数均为 Direct Answer、temperature=0、4B的thinking开启、32K总上下文。完整生成配置、裁判和评测 commit 见模型文档。SimpleVQA全量对比中，100步SFT比Base低2.37个百分点。评测代码仅裁判重试及帮助文字有差异，已人工审计并保留各自源码SHA，见模型文档；100步是短程实验。[公开参考基准](benchmark-references.md)中的工具模式及其他裁判分数另列。
+4B修复最终选项漏判后由60.21%升至66.49%（+6.28个百分点）；旧解析曾将25条正确答案误计为失败，详见模型文档。
 
-已有VDR分数保留在模型历史文档中；后续实验、数据下载和默认比较均只要求SimpleVQA。
+27B在同一模型内对照提高15.71个百分点，两组各191题且无基础设施错误。
+
+本次8B在相同协议下提高36.13个百分点，基座耗尽轮数的题数为109，SFT为2。差异体现本地工具交互与完成作答的能力，不能把全部增益解释为纯视觉识别能力提高，也不与不同工具或图像预算的公开成绩直接排名。
 
 ## 目录与入口
 
-| 路径                                                                 | 用途                                                   |
-| -------------------------------------------------------------------- | ------------------------------------------------------ |
-| [data-preparation.md](data-preparation.md)                           | 七域数据、图片处理、固定切分及真实 Processor 审计      |
-| [evaluation.md](evaluation.md)                                       | 数据版本、Direct Answer 协议、裁判配置、运行与结果比较 |
-| [evaluation-setup.md](evaluation-setup.md)                           | 可选工具环境和其他评测实现的区别                       |
-| [benchmark-references.md](benchmark-references.md)                   | 公开 Direct Reasoning、Agentic、纯 SFT 参考分数        |
-| [scripts/run-qwen3-vl-8B-8xgpu.sh](scripts/run-qwen3-vl-8B-8xgpu.sh) | Qwen3-VL-8B-Instruct的训练与SimpleVQA入口              |
-| [scripts/run-qwen3.5-4B-8xgpu.sh](scripts/run-qwen3.5-4B-8xgpu.sh)   | Qwen3.5-4B 的训练、基准评测与比较入口                  |
-| [scripts/run-qwen3.6-27B-8xgpu.sh](scripts/run-qwen3.6-27B-8xgpu.sh) | Qwen3.6-27B 模型配置及共用入口                         |
-| [configs/benchmark.env.example](configs/benchmark.env.example)       | 模型、裁判与可选工具的配置占位符                       |
-| [results/](results/)                                                 | 每模型一个 Markdown 文档，新实验插在旧实验之前         |
-| [templates/model-results.md](templates/model-results.md)             | 新模型文档与每次实验的记录模板                         |
-| [tools/](tools/)                                                     | 数据准备/审计、评测、比较、服务验证和 SwanLab 同步实现 |
+| 路径                                                                 | 用途                                             |
+| -------------------------------------------------------------------- | ------------------------------------------------ |
+| [data-preparation.md](data-preparation.md)                           | 七域训练数据、图片处理、切分与Processor审计      |
+| [evaluation.md](evaluation.md)                                       | V\*Bench下载、模型服务、裁剪协议、运行与比较     |
+| [benchmark-references.md](benchmark-references.md)                   | 官方题集与社区实现的协议差异                     |
+| [scripts/run-qwen3-vl-8B-8xgpu.sh](scripts/run-qwen3-vl-8B-8xgpu.sh) | Qwen3-VL-8B-Instruct入口                         |
+| [scripts/run-qwen3.5-4B-8xgpu.sh](scripts/run-qwen3.5-4B-8xgpu.sh)   | Qwen3.5-4B入口与共用流程                         |
+| [scripts/run-qwen3.6-27B-8xgpu.sh](scripts/run-qwen3.6-27B-8xgpu.sh) | Qwen3.6-27B入口                                  |
+| [configs/benchmark.env.example](configs/benchmark.env.example)       | 模型服务、数据与输出的配置占位符                 |
+| [results/](results/)                                                 | 每模型一个中文文档，新实验插在前方               |
+| [templates/model-results.md](templates/model-results.md)             | 新模型及新实验记录模板                           |
+| [tools/](tools/)                                                     | 数据准备、审计、本地工具评测、比较和训练看板同步 |
 
 ## 训练
 
-先按数据准备文档生成七域完整训练集。预处理不按长度过滤，训练在 32K 上限下跳过超长样本；默认训练 2 epochs，只在最后保存 native/HF 权重，不保存 optimizer/RNG。
+先按数据准备文档生成七域训练集。预处理不按长度过滤；训练在32K上限下跳过超长样本。当前脚本默认1 epoch，每200步及最后一步保存含optimizer/RNG的native checkpoint，最多保留最近1份；HF导出也只保留最近1份。
 
-在已经配置好的 8 GPU Ray 环境，从仓库根目录运行：
+在已配置的8 GPU Ray环境中，从仓库根目录执行：
 
 ```bash
 export MODEL_DIR=/path/to/models
-export HF_CHECKPOINT="${MODEL_DIR}/Qwen3.5-4B"
+export HF_CHECKPOINT="${MODEL_DIR}/Qwen3-VL-8B-Instruct"
 export DATA_DIR=/path/to/data
 export SAVE_DIR=/path/to/experiment-artifacts
 export PROJECT_NAME=Relax/sft/opensearch-vl
-export EXP_NAME=qwen3.5-4b-opensearch-vl-my-run
-export NUM_EPOCHS=2
-export GLOBAL_BATCH_SIZE=32
-export MAX_TOKENS_PER_GPU=32768
-bash scripts/entrypoint/ray-job.sh examples/opensearch_vl/scripts/run-qwen3.5-4B-8xgpu.sh relax
+export EXP_NAME=qwen3-vl-8b-opensearch-vl-my-run
+export NUM_EPOCHS=1
+bash scripts/entrypoint/ray-job.sh examples/opensearch_vl/scripts/run-qwen3-vl-8B-8xgpu.sh relax
 ```
 
-短程实验可另设 `TRAIN_STEPS=100`；步数和 epoch 预算取先到者，必须记录实际完成量。27B 换用对应脚本与 HF 目录；TP/PP、重算、CPU optimizer offload 按实际显存和吞吐选择。
+其他模型换用对应脚本与HF目录。并行、重算和offload按实际显存、吞吐选择。短训练可显式设`TRAIN_STEPS`，记录实际完成量；`BENCHMARK_ONLY=1`是训练性能短测，不是V\*Bench评测。训练中的验证loss/PPL继续保留，单独记录。
 
-脚本模式为 `relax`、`benchmark simplevqa <base|relax>`、`evaluate <HF目录> <base|relax>` 和 `compare`。`benchmark` 是公开数据集问答评测，`evaluate` 是留出轨迹决策评测；训练期间每 100 步的验证 loss/PPL 另行记录。`BENCHMARK_ONLY=1` 仅测试训练性能，默认 8 步、不保存权重。
+## 独立评测
 
-## 评测与实验记录
+训练和评测分开执行，通过持久存储交接最终HF目录。先验证导出与模型来源，再按[评测文档](evaluation.md)启动服务。模型脚本只提供以下模式：
 
-最终 HF 导出默认在 `${SAVE_DIR}/${EXP_NAME}/final-hf-<step>`。直接用该目录启动模型服务，再按评测文档运行SimpleVQA；无需先发布权重。每题一次生成、固定提示和裁判，保留失败题，并记录实际数据与模型来源。
+```bash
+bash examples/opensearch_vl/scripts/run-qwen3-vl-8B-8xgpu.sh benchmark vstar base
+bash examples/opensearch_vl/scripts/run-qwen3-vl-8B-8xgpu.sh benchmark vstar relax
+bash examples/opensearch_vl/scripts/run-qwen3-vl-8B-8xgpu.sh compare
+```
 
-每个模型只维护一个 `results/<model>.md`。实验开始时在前方插入新记录，填写 run ID、启动时间、分支、训练/评测 commit 和 SwanLab 链接；结束后在同一节补齐题数、分数、失败情况与产物引用，同时更新上方总表。未确认的字段留空，未完成或限题测试不填正式分数。
+基座与SFT共用数据、提示、图片预算、工具和评分规则。每题生成一条真实多轮轨迹，裁剪从原始分辨率区域执行，最终按明确的选项字母评分。首次小样本运行应检查实际回图和后续模型请求，不能只验证工具调用JSON可解析。
 
-JSON、JSONL、逐题轨迹、日志、数据、缓存和权重保存在仓库外的 `SAVE_DIR`，不提交到 Git。配置示例只用占位符；文档中的产物引用使用可公开分享的位置，无法分享时留空。
+## 实验记录与看板
 
-## SwanLab
+每模型维护`results/<model>.md`。新实验插在前方，填写启动时间、完整branch/commit、模型与数据来源、预算、工具和SwanLab训练曲线；结束后补齐分数及失败原因，并同步总表。生成版本与评分版本不同时分别记录，保留原始答案与修正依据。
 
-可在运行环境安装 `swanlab==0.10.4` 并完成认证，然后设置 `ENABLE_SWANLAB=1`、`SWANLAB_MODE=online`、`SWANLAB_PROJ_NAME`、`SWANLAB_WORKSPACE` 和 `SWANLAB_LOG_DIR`。训练保留 ClearML，并通过 TensorBoard 同步标量。认证文件留在运行环境。
+结构化记录、逐题轨迹、日志、模型来源清单、数据、缓存和权重保存在仓库外，不提交Git。公开配置只使用占位符。最终模型和native checkpoint保留至下游验收，再按本次实验所有权清理。
 
-同步 hook 关闭自动Git、环境、依赖、硬件及终端日志采集，只同步标量和指定来源字段。实验文档分别记录训练与评测链接；实际裁判型号与协议也需写入文档。
+训练沿用ClearML，并可通过TensorBoard同步SwanLab标量。认证留在运行环境；同步hook关闭自动Git、环境、依赖、硬件和终端采集。SwanLab用于训练曲线，评测表格记录在模型文档，不另建评测看板。

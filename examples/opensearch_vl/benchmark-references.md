@@ -1,64 +1,25 @@
-# SimpleVQA 与 VDR 公开基准参考
+# V\*Bench来源与公开实现
 
 [评测运行方式](evaluation.md)
 
-以下保留 OpenSearch-VL 的带工具对照和纯 SFT 消融，并补充无工具参考。分数均为百分数；不同模型、工具、裁判和题集的结果分别报告。来源核对日期：2026-11-10。
+## 官方数据
 
-## 无工具：当前实验优先参考
+[V\*Bench官方仓库](https://github.com/penghao-wu/vstar)与[官方数据集](https://huggingface.co/datasets/craigwu/vstar_bench)提供191道视觉细节题，包含属性识别与空间关系。本例固定数据revision `d9ae62c903da0c98336e85c5ee89cd863b04b4da`，使用带选项和标签的`test_questions.jsonl`。
 
-[OpenSearch-VL v1 Table 2](https://arxiv.org/html/2605.05185v1#S5.T2) 的 Direct Reasoning 只根据图片、问题与模型自身知识作答，由 GPT-4o 判断最终答案：
+原始标注JSON的`options[0]`默认为正确答案，且包含目标bbox。生成式选择题入口不得直接沿用固定正确位置或把bbox提供给模型。本例使用官方题目文件已经给定的选项顺序；目标区域由模型自主决定，参考标签仅用于评分。
 
-| 模型             | SimpleVQA | VDR |
-| ---------------- | --------: | --: |
-| Qwen3-VL-8B      |      47.1 | 2.8 |
-| Qwen3-VL-30B-A3B |      53.2 | 3.8 |
-| Qwen3-VL-32B     |      58.0 | 4.1 |
-| GPT-4o           |      51.7 | 1.7 |
-| GPT-5            |      61.6 | 9.8 |
-| Gemini-2.5-Pro   |      63.0 | 8.0 |
+## 带本地工具的参考实现
 
-论文第5节与附录Table 4明确使用 **Qwen3-VL-8B-Instruct、Qwen3-VL-30B-A3B-Instruct、Qwen3-VL-32B-Instruct**；表格省略了Instruct后缀。[官方固定版本模型配置](https://github.com/shawn0728/OpenSearch-VL/blob/1ac26e2c35a3e813e022813c88888db457d88f7d/opensearch_vl/opensearch_infer/config.py#L176-L198)也指向这些权重。Instruct可以按提示生成推理文本或`<think>`段，这与单独的Thinking权重版本是两件事；“Direct Reasoning”表示无工具，不能据此推断权重为Thinking。
+| 实现                                                                                                                     | 实际工具与入口                                      | 对本项目的用途                                                     |
+| ------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------- | ------------------------------------------------------------------ |
+| [DeepEyes](https://github.com/Visual-Agent/DeepEyes/blob/main/eval/eval_vstar.py)                                        | OpenAI兼容接口，多轮输出工具调用，CPU裁剪并回传图像 | 真实多轮HTTP工具交互的参考；原脚本工具名、坐标及答案处理与本例不同 |
+| [Pixel-Reasoner](https://github.com/TIGER-AI-Lab/Pixel-Reasoner)                                                         | zoom-in交互与专用推理评测入口                       | 视觉工具研究参考；不要求为本项目评测安装其训练栈                   |
+| [lmms-eval的V\*选择题评分](https://github.com/EvolvingLMMs-Lab/lmms-eval/blob/main/lmms_eval/tasks/vstar_bench/utils.py) | 从模型输出提取选项，按标签匹配                      | 评分实现参考；单次图文生成入口本身不等于已经执行工具               |
 
-此外，[Qwen3.5-4B 官方模型卡](https://huggingface.co/Qwen/Qwen3.5-4B#vision-language) 给出的 SimpleVQA 是 **43.4%**；同表 Qwen3.5-9B 为 51.2%。该表没有 VDR 分数，也没有足以对齐本例题集、裁判和生成预算的完整说明，因此不能用 43.4% 替代本机基座实测。
+这些链接提供数据与实现依据，不能仅凭数据集同名就认为成绩同口径。原始V\*实现还使用专用视觉搜索模型及选项似然选择，与本例的通用模型自主crop、生成最终字母不同。
 
-## 带工具：Agentic Workflow
+## 比较要求
 
-以下是此前选定的 [OpenSearch-VL v1 Table 2](https://arxiv.org/html/2605.05185v1#S5.T2) 对照。模型自主搜索、读取和操作图片；OpenSearch-VL 为 **SFT+RL 最终模型**。这些数字保留为工具模式目标，不能直接作为当前关闭工具实验的排名。
+本项目主对照是同一初始模型及其SFT权重，固定191题、初始图/裁剪图预算、工具名称/参数/坐标、提示、温度、完整历史、最大轮数和选项提取规则；记录完整源码来源。并行副本与worker数也记录在协议中。
 
-| 模型                  | SimpleVQA |  VDR | MMSearch | LiveVQA | BrowseComp-VL | FVQA | InfoSeek | 平均 |
-| --------------------- | --------: | ---: | -------: | ------: | ------------: | ---: | -------: | ---: |
-| Qwen3-VL-8B           |      52.0 | 17.0 |     37.4 |    50.6 |          27.9 | 58.7 |     50.3 | 42.0 |
-| OpenSearch-VL-8B      |      71.6 | 20.8 |     64.5 |    59.6 |          37.6 | 71.5 |     70.2 | 56.6 |
-| Qwen3-VL-30B-A3B      |      55.1 | 20.2 |     44.2 |    62.0 |          34.1 | 63.0 |     56.2 | 47.8 |
-| OpenSearch-VL-30B-A3B |      74.9 | 33.5 |     68.7 |    67.4 |          41.1 | 73.2 |     72.4 | 61.6 |
-| Qwen3-VL-32B          |      58.7 | 23.1 |     53.9 |    45.5 |          35.1 | 61.2 |     58.5 | 48.0 |
-| OpenSearch-VL-32B     |      76.2 | 33.8 |     72.3 |    70.5 |          43.8 | 74.7 |     74.8 | 63.7 |
-
-## 纯 SFT：与训练阶段相关的消融
-
-[OpenSearch-VL v1 Table 3](https://arxiv.org/html/2605.05185v1#S5.T3) 仍在带工具的 agent 评测下比较训练阶段：
-
-| Qwen3-VL-8B 阶段 | SimpleVQA | InfoSeek | FVQA | 三项平均 |
-| ---------------- | --------: | -------: | ---: | -------: |
-| 训练前，带工具   |      52.0 |     50.3 | 58.7 |     53.7 |
-| 仅 SFT，带工具   |      66.1 |     62.4 | 65.3 |     64.6 |
-
-这里的“纯 SFT”指没有接 RL，不能理解成关闭工具。该表未报告纯 SFT 的 VDR，也没有 Qwen3.5-4B 结果。
-
-## VDR-testmini 的题集口径
-
-[VDR-Bench 论文](https://arxiv.org/html/2602.02185v1) 定义的是 2,000 题完整基准。[官方评测说明](https://github.com/Osilly/Vision-DeepResearch/blob/main/rllm/eval/README.md#datasets) 另提供 `testmini500_v1.parquet`，共 500 题；同目录的 `simplevqa_300.parquet` 只有 300 题。本例实际使用 SimpleVQA 全部英文 **1,013 题**和 VDR-testmini **500 题**，固定下载 revision 见[评测文档](evaluation.md#评测数据与去重)。
-
-官方仓库的 [Performance 表](https://github.com/Osilly/Vision-DeepResearch#performance) 也提供 VDR Direct Answer：Qwen3-VL-8B-Instruct 2.8%、Qwen3-VL-8B-Thinking 5.6%、Qwen3-VL-30B-A3B-Instruct 3.8%。它有助于理解 thinking/agent 配置的区别；主表未逐行绑定题目 ID 或 parquet hash，不能仅凭列名“VDR”认定与本例 500 题完全一致。
-
-## 如何比较本项目结果
-
-当前协议为无工具、温度 0、32K 输入输出总预算、每题一次生成；Qwen3.5/3.6保留原生thinking，Qwen3-VL-8B-Instruct使用原生模板且无thinking开关。使用配置指定的裁判模型并保存其实际型号。参考答案只给裁判；超限、无答案和异常题均计入分母，另报排除 SFT train 重叠题后的分数。
-
-公开分数用于判断大致量级。严格判断 SFT 的收益，需要同一权重来源、题目 ID、图片处理、提示、生成设置、裁判及去重口径下的基座和训练后两组实测；不能把公开基座分数与本项目 SFT 分数相减，或将无工具结果与上方 agent 分数混排。当前比较脚本还会检查 workers、QPS 和 evaluator source hash，历史协议不同的结果不能直接自动合并。
-
-本项目成绩与来源证据保存在[Qwen3.5-4B 实验记录](results/qwen3.5-4b.md)，公开参考与本项目实测分开保存。
-
-## 官方8B的SFT训练量
-
-官方8B（以及32B、30B-A3B）SFT配置为8 epochs、36,592条、全局batch256、学习率2e-5，视觉编码器与多模态projector均参与全参训练；这是训练预算，不应与本项目短程实验或2epoch计划混淆。[论文附录C.1/Table 4](https://arxiv.org/html/2605.05185v1)
+除准确率外，一并检查调用题占比、执行成功率、轮数耗尽和无效选项。模型可以不调用工具，调用更多也不一定更好；需要进一步分析时，应在同一设置下增加明确标记的对照实验。公开论文采用不同分辨率、工具或答案选择方式的成绩单独列示，不替代本项目的实测基座。
