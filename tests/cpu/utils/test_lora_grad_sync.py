@@ -47,6 +47,47 @@ def test_inherit_lora_tp_grad_sync_marks_replicated_hf_adapter() -> None:
     assert not base.weight.requires_grad
 
 
+def test_inherit_lora_tp_grad_sync_marks_sequence_parallel_adapter() -> None:
+    base = torch.nn.Linear(4, 4)
+    base.requires_grad_(False)
+    base.weight.sequence_parallel = True
+    wrapper = _PlainLoRAWrapper(base)
+    # An already marked A must not prevent B from inheriting the same contract.
+    wrapper.adapter.linear_in.weight.sequence_parallel = True
+
+    assert inherit_lora_tp_grad_sync(wrapper) == 1
+    assert inherit_lora_tp_grad_sync(wrapper) == 0
+
+    assert all(parameter.sequence_parallel for parameter in wrapper.adapter.parameters())
+    assert all(parameter.requires_grad for parameter in wrapper.adapter.parameters())
+    assert all(
+        not getattr(parameter, "average_gradients_across_tp_domain", False)
+        for parameter in wrapper.adapter.parameters()
+    )
+    assert not base.weight.requires_grad
+
+
+@pytest.mark.parametrize(
+    ("base_flag", "adapter_flag"),
+    [
+        ("sequence_parallel", "average_gradients_across_tp_domain"),
+        ("sequence_parallel", "tensor_model_parallel"),
+        ("sequence_parallel", "sum_gradients_across_tp_domain"),
+        ("average_gradients_across_tp_domain", "sequence_parallel"),
+    ],
+)
+def test_inherit_lora_tp_grad_sync_preserves_explicit_adapter_contract(base_flag: str, adapter_flag: str) -> None:
+    base = torch.nn.Linear(4, 4)
+    setattr(base.weight, base_flag, True)
+    wrapper = _PlainLoRAWrapper(base)
+    setattr(wrapper.adapter.linear_in.weight, adapter_flag, True)
+
+    assert inherit_lora_tp_grad_sync(wrapper) == 0
+
+    assert getattr(wrapper.adapter.linear_in.weight, adapter_flag)
+    assert all(not getattr(parameter, base_flag, False) for parameter in wrapper.adapter.parameters())
+
+
 def test_inherit_lora_tp_grad_sync_preserves_unmarked_language_adapter() -> None:
     base = torch.nn.Linear(4, 4)
     base.weight.sum_gradients_across_tp_domain = True
@@ -73,9 +114,10 @@ def test_inherit_lora_tp_grad_sync_skips_non_plain_linear_base() -> None:
     )
 
 
-def test_inherit_lora_tp_grad_sync_is_idempotent_and_counts_shared_parameters_once() -> None:
+@pytest.mark.parametrize("sync_flag", ["average_gradients_across_tp_domain", "sequence_parallel"])
+def test_inherit_lora_tp_grad_sync_is_idempotent_and_counts_shared_parameters_once(sync_flag: str) -> None:
     base = torch.nn.Linear(4, 4)
-    base.weight.average_gradients_across_tp_domain = True
+    setattr(base.weight, sync_flag, True)
     first = _PlainLoRAWrapper(base)
     second = _PlainLoRAWrapper(base)
     second.adapter = first.adapter

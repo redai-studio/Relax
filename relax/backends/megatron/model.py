@@ -83,14 +83,16 @@ from .model_provider import (
 logger = get_logger(__name__)
 
 
-def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None:
+def _finalize_model_grads_with_memory_release(
+    *args: Any, finalize_grads_func: Callable | None = None, **kwargs: Any
+) -> None:
     # Finalization itself can lazily initialize NCCL communicators (e.g. MoE
     # router bias reduction), before forward_backward_func returns to the
     # optimizer. Make unused activation cache available at that boundary too.
     memory_before = available_memory()
     device_module.empty_cache()
     logger.info("Gradient finalization cache release: before=%s after=%s", memory_before, available_memory())
-    finalize_model_grads(*args, **kwargs)
+    (finalize_grads_func or finalize_model_grads)(*args, **kwargs)
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -564,6 +566,9 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
+    from relax.models.qwen3_8.lora import validate_qwen38_lora
+
+    validate_qwen38_lora([_unwrap_module(chunk) for chunk in model], args)
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
@@ -619,6 +624,9 @@ def setup_model_and_optimizer(
         config_overrides=_build_optimizer_config_overrides(args, config),
         use_gloo_process_groups=args.use_gloo_process_groups,
     )
+    from relax.utils.training.lora_grad_sync import exclude_replicated_expert_adapter_grads_from_norm
+
+    exclude_replicated_expert_adapter_grads_from_norm(optimizer, ep_rank=mpu.get_expert_model_parallel_rank())
     if skip_nonfinite:
         install_nonfinite_guard(optimizer, model, process_group=torch.distributed.group.WORLD)
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
@@ -1796,10 +1804,20 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
+    finalize_grads_func = finalize_model_grads
+    if any(getattr(param, "expert_parallel_replicated", False) for chunk in model for param in chunk.parameters()):
+        from megatron.bridge.peft.utils import (
+            enable_expert_parallel_grad_sync_in_finalize,
+            finalize_model_grads_with_expert_adapter_sync,
+        )
+
+        # Fused accumulation writes main_grad; remove the eager grad hooks before backward.
+        enable_expert_parallel_grad_sync_in_finalize(model)
+        finalize_grads_func = finalize_model_grads_with_expert_adapter_sync
     config.finalize_model_grads_func = (
-        _finalize_model_grads_with_memory_release
+        partial(_finalize_model_grads_with_memory_release, finalize_grads_func=finalize_grads_func)
         if getattr(args, "empty_unused_memory_level", 0) >= 1
-        else finalize_model_grads
+        else finalize_grads_func
     )
 
     pre_hook_enabled = False
