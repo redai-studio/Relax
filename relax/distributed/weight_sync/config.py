@@ -2,14 +2,16 @@
 
 """Configuration and topology checks for opt-in TCP memory updates."""
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 from .format import WeightSyncError, integer, parse_json
 
 
-def _validate_sync_execution(args, label: str, *, sharded: bool = False) -> None:
-    unsupported = [
+def _validate_sync_execution(args) -> None:
+    """Current coordinator envelope; model/export capability is checked
+    separately."""
+    unavailable = [
         name
         for name in (
             "fully_async",
@@ -19,38 +21,39 @@ def _validate_sync_execution(args, label: str, *, sharded: bool = False) -> None
             "offload_rollout",
             "use_fault_tolerance",
             "keep_old_actor",
-            "use_lora",
-            "debug_train_only",
-            "debug_rollout_only",
-            "partial_rollout",
-            "use_agentic_rollout",
             "rollout_external",
-            "sglang_speculative_algorithm",
-            "enable_mtp_training",
-            "mtp_num_layers",
         )
         if getattr(args, name, False)
     ]
-    if unsupported:
-        raise WeightSyncError(f"{label} weight sync does not support: {', '.join(unsupported)}")
-    if getattr(args, "lora_rank", 0) > 0 or getattr(args, "save_hf_dtype", "bf16") != "bf16":
-        raise WeightSyncError(f"{label} weight sync requires full-parameter, nonquantized HF export")
-    if getattr(args, "num_experts", None) and not sharded:
-        raise WeightSyncError(f"{label} weight sync currently supports Dense models only")
-    if not getattr(args, "sglang_disable_cuda_graph", False):
-        raise WeightSyncError(f"{label} weight sync currently requires --sglang-disable-cuda-graph")
-    if not sharded and any(
-        getattr(args, name, 1) != 1 for name in ("sglang_pp_size", "sglang_dp_size", "rollout_num_gpus_per_engine")
+    if unavailable:
+        raise WeightSyncError(f"Memory coordinator does not support these lifecycles yet: {', '.join(unavailable)}")
+    unvalidated = [name for name in ("partial_rollout", "use_agentic_rollout") if getattr(args, name, False)]
+    if unvalidated:
+        raise WeightSyncError(
+            f"Memory synchronization has not validated these request boundaries: {', '.join(unvalidated)}"
+        )
+    if getattr(args, "debug_train_only", False) or getattr(args, "debug_rollout_only", False):
+        raise WeightSyncError("Debug-only execution does not perform training-to-rollout synchronization")
+    if (
+        getattr(args, "sglang_speculative_algorithm", None)
+        or getattr(args, "enable_mtp_training", False)
+        or getattr(args, "mtp_num_layers", 0)
     ):
-        raise WeightSyncError(f"The {label.lower()} MVP currently requires single-GPU TP/PP/DP=1 inference engines")
+        raise WeightSyncError("Memory synchronization has no draft/MTP-model update contract")
+    if not getattr(args, "sglang_disable_cuda_graph", False):
+        raise WeightSyncError(
+            "Memory synchronization currently requires --sglang-disable-cuda-graph until replay validation"
+        )
+    if any(getattr(args, name, 1) != 1 for name in ("sglang_pp_size", "sglang_dp_size")):
+        raise WeightSyncError("Memory synchronization has not integrated inference PP/DP routing")
     if getattr(args, "train_backend", "megatron") != "megatron":
-        raise WeightSyncError(f"{label} weight sync requires the Megatron backend")
+        raise WeightSyncError("The memory source adapter is currently integrated with Megatron")
 
 
 @dataclass(frozen=True)
 class MemorySyncConfig:
     stream: str
-    layout: str = "dense"
+    layout: str = "canonical_hf"
     bucket_bytes: int = 512 << 20
     gpu_budget_bytes: int = 16 << 30
     host_budget_bytes: int = 8 << 30
@@ -78,8 +81,10 @@ class MemorySyncConfig:
             integer(getattr(config, name), 1)
         if type(config.full_only) is not bool:
             raise WeightSyncError("full_only must be a boolean")
-        if config.layout not in ("dense", "qwen35_owner_local"):
-            raise WeightSyncError("Unsupported memory shard layout")
+        if config.layout == "qwen35_owner_local":
+            config = replace(config, layout="native_gated_moe")
+        if config.layout not in ("dense", "canonical_hf", "native_gated_moe"):
+            raise WeightSyncError("Unsupported memory application strategy")
         return config
 
 
@@ -87,35 +92,8 @@ def validate_memory_weight_sync_args(args) -> None:
     path = getattr(args, "memory_weight_sync_config", None)
     if path is None:
         return
+    from relax.backends.megatron.weight_update.memory_export import validate_memory_export_args
+
     config = MemorySyncConfig.load(path)
-    sharded = config.layout == "qwen35_owner_local"
-    _validate_sync_execution(args, "Memory", sharded=sharded)
-    if sharded:
-        if (
-            getattr(args, "megatron_to_hf_mode", None) != "bridge"
-            or getattr(args, "num_experts", None) != 256
-            or getattr(args, "num_layers", None) != 40
-            or getattr(args, "hidden_size", None) != 2048
-            or getattr(args, "expert_tensor_parallel_size", 1) != 1
-            or getattr(args, "expert_model_parallel_size", 1) != 8
-            or getattr(args, "tensor_model_parallel_size", 1) != 4
-            or any(
-                getattr(args, name, 1) != 1
-                for name in (
-                    "pipeline_model_parallel_size",
-                    "context_parallel_size",
-                    "sglang_pp_size",
-                    "sglang_dp_size",
-                )
-            )
-            or getattr(args, "rollout_num_gpus_per_engine", 1) != 2
-            or getattr(args, "sglang_moe_runner_backend", None) != "triton"
-            or not getattr(args, "sglang_disable_shared_experts_fusion", False)
-        ):
-            raise WeightSyncError("Owner-local memory sync requires the explicit Qwen3.5 TP4/EP8 to TP2 layout")
-        return
-    if any(
-        getattr(args, name, 1) != 1
-        for name in ("tensor_model_parallel_size", "pipeline_model_parallel_size", "context_parallel_size")
-    ):
-        raise WeightSyncError("Memory sync currently requires training TP/PP/CP=1")
+    _validate_sync_execution(args)
+    validate_memory_export_args(args, config.layout)

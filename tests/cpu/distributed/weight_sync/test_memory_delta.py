@@ -473,9 +473,17 @@ def test_memory_configuration_rejects_unsupported_execution_modes(tmp_path):
     assert MemorySyncConfig.load(path).stream == "test"
     base = dict(memory_weight_sync_config=str(path), sglang_disable_cuda_graph=True)
     validate_memory_weight_sync_args(SimpleNamespace(**base))
+    # Checkpoint serialization dtype does not select the online source dtype.
+    validate_memory_weight_sync_args(SimpleNamespace(**base, save_hf_dtype="fp8"))
+    validate_memory_weight_sync_args(
+        SimpleNamespace(**base, megatron_to_hf_mode="bridge", tensor_model_parallel_size=2)
+    )
     for override, message in [
         (dict(colocate=True), "does not support"),
         (dict(tensor_model_parallel_size=2), "training TP/PP/CP"),
+        (dict(megatron_to_hf_mode="bridge", tensor_model_parallel_size=2, num_experts=8), "training TP/PP/CP"),
+        (dict(megatron_to_hf_mode="bridge", tensor_model_parallel_size=2, context_parallel_size=2), "PP/CP/EP"),
+        (dict(megatron_to_hf_mode="bridge", virtual_pipeline_model_parallel_size=2), "VPP1"),
     ]:
         with pytest.raises(ValueError, match=message):
             validate_memory_weight_sync_args(SimpleNamespace(**(base | override)))
@@ -507,13 +515,29 @@ def test_owner_local_configuration_keeps_dense_guards_and_requires_exact_topolog
         sglang_disable_shared_experts_fusion=True,
     )
     validate_memory_weight_sync_args(SimpleNamespace(**base))
+    # Geometry is derived at runtime; these are validation cases, not GPU acceptance.
+    validate_memory_weight_sync_args(
+        SimpleNamespace(
+            **(
+                base
+                | dict(
+                    num_experts=128,
+                    num_layers=24,
+                    hidden_size=1024,
+                    expert_model_parallel_size=4,
+                    tensor_model_parallel_size=2,
+                    rollout_num_gpus_per_engine=4,
+                )
+            )
+        )
+    )
     for override in (
         dict(expert_tensor_parallel_size=2),
-        dict(sglang_disable_shared_experts_fusion=False),
-        dict(rollout_num_gpus_per_engine=4),
+        dict(megatron_to_hf_mode="raw"),
+        dict(expert_model_parallel_size=1),
     ):
-        with pytest.raises(ValueError, match="explicit Qwen3.5"):
+        with pytest.raises(ValueError, match="Native gated-MoE"):
             validate_memory_weight_sync_args(SimpleNamespace(**(base | override)))
-    path.write_text(json.dumps(dict(stream="dense")))
+    path.write_text(json.dumps(dict(stream="dense", layout="dense")))
     with pytest.raises(ValueError, match="Dense models only"):
         validate_memory_weight_sync_args(SimpleNamespace(**base))

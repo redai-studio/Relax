@@ -35,6 +35,32 @@ class MemoryBucket:
         return metadata
 
 
+def _encode_bucket(snapshot: Any, previous: Any | None, *, full: bool) -> tuple[int, str, bytes]:
+    """Encode an owned BF16/FP32 snapshot using absolute raw-bit values.
+
+    Callers own capture, layout validation and scratch budgeting. A missing
+    previous snapshot selects FULL without measuring changes; otherwise FULL
+    still reports the actual changed count.
+    """
+    import torch
+
+    count, width = snapshot.numel(), snapshot.element_size()
+    if previous is None:
+        changed, encoding, encoded = count, "full", snapshot.view(torch.uint8)
+    else:
+        words = torch.int16 if width == 2 else torch.int32
+        positions = torch.nonzero(snapshot.view(words) != previous.view(words), as_tuple=False).reshape(-1)
+        changed = positions.numel()
+        if full or changed * (4 + width) >= count * width:
+            encoding, encoded = "full", snapshot.view(torch.uint8)
+        else:
+            encoding = "sparse"
+            encoded = torch.cat(
+                [positions.to(torch.int32).view(torch.uint8), snapshot.view(words)[positions].view(torch.uint8)]
+            )
+    return changed, encoding, encoded.cpu().numpy().tobytes()
+
+
 class MemoryDeltaEncoder:
     """One outstanding version. Advance the GPU baseline only after all ACKs.
 
@@ -93,21 +119,8 @@ class MemoryDeltaEncoder:
             count = snapshot.numel()
             if count >= 2**31:
                 raise ValueError("A memory bucket must fit signed int32 positions")
-            if not self._baseline:
-                changed, encoding, encoded = count, "full", snapshot.view(torch.uint8)
-            else:
-                positions = torch.nonzero(
-                    snapshot.view(torch.int16) != self._baseline[index].view(torch.int16), as_tuple=False
-                ).reshape(-1)
-                changed = positions.numel()
-                if full or changed * 6 >= count * 2:
-                    encoding, encoded = "full", snapshot.view(torch.uint8)
-                else:
-                    encoding = "sparse"
-                    encoded = torch.cat(
-                        [positions.to(torch.int32).view(torch.uint8), snapshot[positions].view(torch.uint8)]
-                    )
-            payload = encoded.cpu().numpy().tobytes()
+            previous = self._baseline[index] if self._baseline else None
+            changed, encoding, payload = _encode_bucket(snapshot, previous, full=full)
             buckets.append(
                 MemoryBucket(
                     tuple((name, tuple(t.shape)) for name, t in group), count, changed, encoding, payload, snapshot

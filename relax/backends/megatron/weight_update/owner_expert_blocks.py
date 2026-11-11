@@ -23,36 +23,61 @@ def iter_owner_expert_blocks(
     owner: int,
     owners: int,
     budget: SnapshotBudget,
+    *,
+    bucket_bytes: int | None = None,
+    source_rank: int | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Copy each output before the converter advances; retain one projection.
 
-    Input must be grouped by layer/fc1-or-fc2. The iterator validates exact
-    owner coverage rather than relying on the original lexicographic order. The
+    Input must be grouped by layer/fc1-or-fc2 and bounded expert range. The
+    Bridge grouped iterator provides numeric expert order. The iterator
+    validates exact owner coverage rather than trusting the input order. The
     lease includes the canonical slab and one active TP shard; encoder
     clones/pending/diff scratch remain charged by the existing encoder.
     """
-    if owners <= 0 or layout.num_experts % owners or not 0 <= owner < owners or layout.tp_size != 2:
-        raise ValueError("Owner blocks require evenly partitioned experts and TP2")
+    if owners <= 0 or layout.num_experts % owners or not 0 <= owner < owners:
+        raise ValueError("Owner blocks require evenly partitioned experts")
+    if layout.ep_size != 1 or layout.moe_dp_size != 1:
+        raise ValueError("Owner blocks require receiver EP1 and MoE DP1")
+    capacity = budget.limit_bytes if bucket_bytes is None else bucket_bytes
+    if type(capacity) is not int or capacity <= 0:
+        raise ValueError("Owner packing capacity must be positive")
+    source_rank = owner if source_rank is None else source_rank
     count = layout.num_experts // owners
     start, end = owner * count, (owner + 1) * count
     key, slab, lease = None, None, 0
+    block_start, block_end = start, end
     seen, completed = set(), set()
+    required = set()
 
     def check_complete():
         projections = {"gate_proj", "up_proj"} if key[1] == "gate_up_proj" else {"down_proj"}
-        if seen != {(expert, projection) for expert in range(start, end) for projection in projections}:
+        if seen != {(expert, projection) for expert in range(block_start, block_end) for projection in projections}:
             raise ValueError("Canonical owner block has missing or duplicate expert projections")
 
     try:
         for source_owner, expert, name, tensor in named:
             match = _CANONICAL.fullmatch(name)
-            if match is None or source_owner != owner or int(match[2]) != expert or not start <= expert < end:
+            if match is None or source_owner != source_rank or int(match[2]) != expert or not start <= expert < end:
                 raise ValueError("Canonical expert does not belong to its owner block")
             prefix, _, projection = match.groups()
-            incoming = (prefix, "down_proj" if projection == "down_proj" else "gate_up_proj")
+            h, i = layout.hidden_size, layout.intermediate_size
+            elements = h * i * (1 if projection == "down_proj" else 2)
+            if tensor.dtype != torch.bfloat16:
+                raise ValueError("Canonical owner projection shape, dtype or coverage mismatch")
+            per_expert = elements * tensor.element_size()
+            # Account for canonical storage plus one live receiver TP slice.
+            # Capacity is fixed configuration, never the current free budget.
+            packing_per_expert = per_expert + per_expert // layout.tp_size
+            block_count = min(count, capacity // packing_per_expert, (2**31 - 1) // elements)
+            if block_count < 1 or packing_per_expert > budget.limit_bytes:
+                raise ValueError("A single expert exceeds the owner packing capacity or shared budget")
+            incoming_start = start + (expert - start) // block_count * block_count
+            incoming = (prefix, "down_proj" if projection == "down_proj" else "gate_up_proj", incoming_start)
+            required.update((prefix, incoming[1], offset) for offset in range(start, end, block_count))
             if key is not None and incoming != key:
                 check_complete()
-                yield f"{key[0]}.{key[1]}[{start}:{end}]", slab
+                yield f"{key[0]}.{key[1]}[{block_start}:{block_end}]", slab
                 completed.add(key)
                 slab = None
                 budget.release(lease)
@@ -62,17 +87,18 @@ def iter_owner_expert_blocks(
                 if incoming in completed:
                     raise ValueError("Canonical owner projections must be grouped")
                 key = incoming
-                h, i = layout.hidden_size, layout.intermediate_size
-                shape = (count, h, i) if projection == "down_proj" else (count, 2 * i, h)
-                slab_bytes = 2 * shape[0] * shape[1] * shape[2]
-                # At most 192MiB for the fixed 35B owner/TP2 geometry.
+                block_start, block_end = incoming_start, min(incoming_start + block_count, end)
+                shape = (
+                    (block_end - block_start, h, i)
+                    if projection == "down_proj"
+                    else (block_end - block_start, 2 * i, h)
+                )
+                slab_bytes = (block_end - block_start) * per_expert
                 temporary = slab_bytes + slab_bytes // layout.tp_size
-                if temporary > 192 << 20:
-                    raise ValueError("Canonical owner packing exceeds the bounded conversion scratch")
                 budget.reserve(temporary)
                 lease = temporary
                 slab = torch.empty(shape, dtype=torch.bfloat16, device=tensor.device)
-            target = slab[expert - start]
+            target = slab[expert - block_start]
             if projection == "gate_proj":
                 target = target[: layout.intermediate_size]
             elif projection == "up_proj":
@@ -85,7 +111,13 @@ def iter_owner_expert_blocks(
         if slab is None:
             raise ValueError("No canonical owner expert blocks")
         check_complete()
-        yield f"{key[0]}.{key[1]}[{start}:{end}]", slab
+        completed.add(key)
+        if completed != required or any(
+            {item[1] for item in completed if item[0] == prefix} != {"gate_up_proj", "down_proj"}
+            for prefix in {item[0] for item in completed}
+        ):
+            raise ValueError("Canonical owner block has missing or duplicate expert projections")
+        yield f"{key[0]}.{key[1]}[{block_start}:{block_end}]", slab
     finally:
         if lease:
             budget.release(lease)

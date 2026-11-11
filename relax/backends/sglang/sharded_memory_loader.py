@@ -32,6 +32,8 @@ class ShardedMemoryReceiver:
         self.model, self.gpu_budget_bytes = model, gpu_budget_bytes
         self.version = -1
         self.root: str | None = None
+        self._attempted_root: str | None = None
+        self._topology: tuple | None = None
         self.poisoned = False
         self.layouts: dict[str, list] = {}
         self.schemas: dict[str, str] = {}
@@ -48,6 +50,7 @@ class ShardedMemoryReceiver:
         root, version, group_update = control["stream"], control["version"], control["group_update"]
         reset = control.get("reset") is True
         tp_rank, tp_size, owners = control["tp_rank"], control["tp_size"], control["owners"]
+        ep_size, moe_dp_size = control.get("ep_size", 1), control.get("moe_dp_size", 1)
         if (
             not isinstance(root, str)
             or not root
@@ -56,19 +59,25 @@ class ShardedMemoryReceiver:
             or type(version) is not int
             or version < 0
             or type(tp_rank) is not int
-            or tp_size != 2
+            or type(tp_size) is not int
+            or tp_size <= 0
             or not 0 <= tp_rank < tp_size
             or type(owners) is not int
             or owners <= 0
         ):
             raise ValueError("Invalid sharded group identity or topology")
+        if type(ep_size) is not int or ep_size != 1 or type(moe_dp_size) is not int or moe_dp_size != 1:
+            raise ValueError("Native owner streams require receiver EP1 and MoE DP1")
+        topology = (tp_rank, tp_size, owners, ep_size, moe_dp_size)
+        if not reset and topology != self._topology:
+            raise ValueError("Sharded topology changed; create a new FULL stream")
         expected = [f"{root}:expert:{owner}:tp:{tp_rank}" for owner in range(owners)] + [f"{root}:nonexpert"]
         streams = control["streams"]
         if [item.get("stream") for item in streams] != expected:
             raise ValueError("Sharded request must contain the exact ordered owner stream set")
         if not reset and (self.poisoned or root != self.root or version != self.version + 1):
             raise ValueError("A failed or mismatched group needs a new FULL stream")
-        if reset and root == self.root:
+        if reset and root in (self.root, self._attempted_root):
             raise ValueError("FULL reset requires a new group stream identity")
         if any(
             value is not None and name not in module._non_persistent_buffers_set
@@ -78,6 +87,7 @@ class ShardedMemoryReceiver:
             raise ValueError("Persistent inference buffers require explicit synchronization rules")
         self._validate_storage()
         self.poisoned = True
+        self._attempted_root = root
         if reset:
             self.hf.clear()
             self.hf_bytes = 0
@@ -142,6 +152,7 @@ class ShardedMemoryReceiver:
         hf_load_s = monotonic() - load_started
         self._remember_storage()
         self.version, self.root, self.poisoned = version, root, False
+        self._topology = topology
         self.last_metrics = dict(
             stream=root,
             group_update=group_update,

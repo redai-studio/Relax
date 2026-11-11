@@ -76,7 +76,7 @@ class _WeightWriteCoverageRecorder:
         model: torch.nn.Module,
         *,
         required_hf_names: Collection[str],
-        excluded_expert_names: Collection[str],
+        excluded_parameter_names: Collection[str],
         padding_fill_ranges: Mapping[str, Sequence[tuple[int, int]]] | None,
         allowed_hf_aliases: Mapping[str, Collection[str]] | None,
     ) -> None:
@@ -84,9 +84,9 @@ class _WeightWriteCoverageRecorder:
         self._required_hf_names = frozenset(required_hf_names)
         if any(not isinstance(name, str) or not name for name in self._required_hf_names):
             raise ValueError("required_hf_names must contain nonempty parameter names")
-        self._excluded_expert_names = frozenset(excluded_expert_names)
-        if any(_EXPERT_PARAMETER.search(name) is None for name in self._excluded_expert_names):
-            raise ValueError("Only exact routed-expert w13_weight/w2_weight names may be excluded")
+        self._excluded_expert_names = frozenset(excluded_parameter_names)
+        if any(not isinstance(name, str) or not name for name in self._excluded_expert_names):
+            raise ValueError("Excluded parameter names must be nonempty strings")
         self._padding_fill_ranges = padding_fill_ranges or {}
         self._allowed_hf_aliases = allowed_hf_aliases or {}
         self._regions: list[_ParameterRegion] = []
@@ -107,11 +107,6 @@ class _WeightWriteCoverageRecorder:
         if not self._excluded_expert_names.issubset(named_parameters):
             missing = sorted(self._excluded_expert_names - named_parameters.keys())
             raise ValueError(f"Excluded expert parameters are not live model parameters: {missing}")
-        live_expert_names = {name for name in named_parameters if _EXPERT_PARAMETER.search(name)}
-        if live_expert_names != self._excluded_expert_names:
-            missing = sorted(live_expert_names - self._excluded_expert_names)
-            stale = sorted(self._excluded_expert_names - live_expert_names)
-            raise ValueError(f"Expert exclusion set must be exact: missing={missing}, stale={stale}")
         for name in self._excluded_expert_names:
             if not isinstance(named_parameters[name], torch.nn.Parameter):
                 raise ValueError(f"Excluded expert target is not a parameter: {name}")
@@ -440,6 +435,34 @@ def record_weight_write_coverage(
     padding_fill_ranges: Mapping[str, Sequence[tuple[int, int]]] | None = None,
     allowed_hf_aliases: Mapping[str, Collection[str]] | None = None,
 ) -> Iterator[_WeightWriteCoverageRecorder]:
+    """Validate the native gated-MoE partition before ordinary loading."""
+    excluded = frozenset(excluded_expert_names)
+    if any(not isinstance(name, str) or _EXPERT_PARAMETER.search(name) is None for name in excluded):
+        raise ValueError("Only exact routed-expert w13_weight/w2_weight names may be excluded")
+    live = {name for name, _ in model.named_parameters(remove_duplicate=False) if _EXPERT_PARAMETER.search(name)}
+    if live != excluded:
+        raise ValueError(
+            f"Expert exclusion set must be exact: missing={sorted(live - excluded)}, stale={sorted(excluded - live)}"
+        )
+    with record_parameter_write_coverage(
+        model,
+        required_hf_names=required_hf_names,
+        excluded_parameter_names=excluded,
+        padding_fill_ranges=padding_fill_ranges,
+        allowed_hf_aliases=allowed_hf_aliases,
+    ) as recorder:
+        yield recorder
+
+
+@contextmanager
+def record_parameter_write_coverage(
+    model: torch.nn.Module,
+    *,
+    required_hf_names: Collection[str],
+    excluded_parameter_names: Collection[str] = (),
+    padding_fill_ranges: Mapping[str, Sequence[tuple[int, int]]] | None = None,
+    allowed_hf_aliases: Mapping[str, Collection[str]] | None = None,
+) -> Iterator[_WeightWriteCoverageRecorder]:
     """Record ordinary loader writes and require complete live-parameter
     coverage.
 
@@ -451,7 +474,7 @@ def record_weight_write_coverage(
     recorder = _WeightWriteCoverageRecorder(
         model,
         required_hf_names=required_hf_names,
-        excluded_expert_names=excluded_expert_names,
+        excluded_parameter_names=excluded_parameter_names,
         padding_fill_ranges=padding_fill_ranges,
         allowed_hf_aliases=allowed_hf_aliases,
     )

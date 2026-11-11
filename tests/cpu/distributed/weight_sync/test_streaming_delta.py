@@ -7,7 +7,11 @@ import torch
 
 from relax.distributed.weight_sync.memory_delta import MemoryBucket, validate_bucket
 from relax.distributed.weight_sync.memory_transport import MemorySource, receive_memory_update
-from relax.distributed.weight_sync.streaming_delta import SnapshotBudget, StreamingDeltaEncoder
+from relax.distributed.weight_sync.streaming_delta import (
+    SnapshotBudget,
+    StreamingDeltaEncoder,
+    steady_state_snapshot_bytes,
+)
 
 
 def test_streaming_mixed_dtype_real_tcp_preserves_bits_and_published_bytes():
@@ -18,6 +22,7 @@ def test_streaming_mixed_dtype_real_tcp_preserves_bits_and_published_bytes():
         ("fp32", torch.arange(64, dtype=torch.int32).view(torch.float32)),
     ]
     delivered = {}
+    steady_estimate = None
     source = MemorySource("127.0.0.1", timeout_s=3)
 
     def apply(manifest, payloads):
@@ -40,6 +45,12 @@ def test_streaming_mixed_dtype_real_tcp_preserves_bits_and_published_bytes():
             for name, tensor in values:
                 encoder.add(name, tensor)
             buckets = encoder.finish()
+            estimate = steady_state_snapshot_bytes(buckets)
+            assert estimate >= budget.peak_bytes
+            if steady_estimate is not None:
+                # Sparse payloads shrink; the owned snapshots and admission do not.
+                assert estimate == steady_estimate
+            steady_estimate = estimate
             expected = {name: tensor.view(torch.uint8).numpy().tobytes() for name, tensor in values}
             descriptor = source.publish(
                 buckets,
@@ -105,6 +116,16 @@ def test_full_control_encodes_without_comparing_old_values(monkeypatch):
     encoder.begin()
     encoder.add("x", torch.zeros(16, dtype=torch.bfloat16))
     encoder.finish()
+    encoder.prepare_commit({"a"}, {"a"})
+    encoder.commit()
+
+    # FULL alone preserves diff statistics; skipping comparison is explicit.
+    encoder.begin(full=True)
+    target = torch.zeros(16, dtype=torch.bfloat16)
+    target[0] = 1
+    encoder.add("x", target)
+    bucket = encoder.finish()[0]
+    assert bucket.encoding == "full" and bucket.changed == 1
     encoder.prepare_commit({"a"}, {"a"})
     encoder.commit()
 

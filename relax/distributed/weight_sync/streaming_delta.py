@@ -8,9 +8,31 @@ import hashlib
 import json
 from contextlib import contextmanager
 from time import monotonic
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
-from .memory_delta import MemoryBucket
+from .memory_delta import MemoryBucket, _encode_bucket
+
+
+def steady_state_snapshot_bytes(buckets: Iterable[MemoryBucket], *, packing_bytes: int = 0) -> int:
+    """Conservative next-delta admission from a rank's captured directory.
+
+    Reserve old baseline plus new snapshots, the largest diff scratch or
+    capture/concat clone, and the adapter's largest live slab plus shard.
+    Payload length is irrelevant: even an empty delta owns a full snapshot.
+    Converter/library workspace remains a separate admission estimate.
+    """
+    if type(packing_bytes) is not int or packing_bytes < 0:
+        raise ValueError("Packing bytes must be a nonnegative integer")
+    snapshots, scratch, clone = 0, 0, 0
+    for bucket in buckets:
+        width = {"bfloat16": 2, "float32": 4}.get(bucket.dtype)
+        if width is None or type(bucket.elements) is not int or not 0 < bucket.elements < 2**31:
+            raise ValueError("Steady-state admission requires bounded BF16/FP32 buckets")
+        size = bucket.elements * width
+        snapshots += size
+        clone = max(clone, size)
+        scratch = max(scratch, bucket.elements * (17 + 2 * width))
+    return 2 * snapshots + max(scratch, clone) + packing_bytes
 
 
 class SnapshotBudget:
@@ -145,28 +167,13 @@ class StreamingDeltaEncoder:
             count, width = snapshot.numel(), snapshot.element_size()
             if count >= 2**31:
                 raise ValueError("A shard bucket must fit signed int32 positions")
-            if previous is None or not self._compare:
-                changed, encoding = count, "full"
-                payload = snapshot.view(torch.uint8).cpu().numpy().tobytes()
-            else:
-                # bool comparison + int64 nonzero + int32 cast + gathered
-                # values + concatenated sparse bytes, bounded by bucket size.
-                with self.budget.temporary(count * (17 + 2 * width)):
-                    words = torch.int16 if width == 2 else torch.int32
-                    positions = torch.nonzero(snapshot.view(words) != previous.view(words), as_tuple=False).reshape(-1)
-                    changed = positions.numel()
-                    if self._full or changed * (4 + width) >= count * width:
-                        encoding = "full"
-                        encoded = snapshot.view(torch.uint8)
-                    else:
-                        encoding = "sparse"
-                        encoded = torch.cat(
-                            [
-                                positions.to(torch.int32).view(torch.uint8),
-                                snapshot.view(words)[positions].view(torch.uint8),
-                            ]
-                        )
-                    payload = encoded.cpu().numpy().tobytes()
+            if not self._compare:
+                previous = None
+            # bool comparison + int64 nonzero + int32 cast + gathered
+            # values + concatenated sparse bytes, bounded by bucket size.
+            scratch_bytes = count * (17 + 2 * width) if previous is not None else 0
+            with self.budget.temporary(scratch_bytes):
+                changed, encoding, payload = _encode_bucket(snapshot, previous, full=self._full)
             self._pending.append(MemoryBucket(names, count, changed, encoding, payload, None, dtype_name))
             self._pending_snapshots.append((names, dtype_name, snapshot))
             self._pending_bytes += size

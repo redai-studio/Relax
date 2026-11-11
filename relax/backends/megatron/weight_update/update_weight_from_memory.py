@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Online HF conversion and lossless TCP memory updates for synchronous Dense
-RL."""
+"""Online canonical HF conversion and lossless TCP memory updates."""
 
 from __future__ import annotations
 
@@ -10,6 +9,12 @@ from time import monotonic, sleep
 from relax.distributed.weight_sync.config import MemorySyncConfig
 from relax.distributed.weight_sync.memory_delta import MemoryDeltaEncoder
 from relax.distributed.weight_sync.memory_transport import MemorySource
+from relax.distributed.weight_sync.plan import SyncPlan
+from relax.distributed.weight_sync.streaming_delta import (
+    SnapshotBudget,
+    StreamingDeltaEncoder,
+    steady_state_snapshot_bytes,
+)
 from relax.utils.logging_utils import get_logger
 
 
@@ -18,7 +23,7 @@ logger = get_logger(__name__)
 
 class UpdateWeightFromMemory:
     def __new__(cls, args, model, weights_getter, *, model_name, quantization_config):
-        if MemorySyncConfig.load(args.memory_weight_sync_config).layout == "qwen35_owner_local":
+        if MemorySyncConfig.load(args.memory_weight_sync_config).layout == "native_gated_moe":
             from .update_weight_from_sharded_memory import UpdateWeightFromShardedMemory
 
             return UpdateWeightFromShardedMemory(
@@ -28,7 +33,7 @@ class UpdateWeightFromMemory:
 
     def __init__(self, args, model, weights_getter, *, model_name, quantization_config) -> None:
         if quantization_config:
-            raise ValueError("Memory delta requires unquantized BF16 weights")
+            raise ValueError("Memory delta requires unquantized BF16/FP32 export weights")
         from .hf_weight_iterator_base import HfWeightIteratorBase
 
         self.config = MemorySyncConfig.load(args.memory_weight_sync_config)
@@ -36,9 +41,18 @@ class UpdateWeightFromMemory:
         self.iterator = HfWeightIteratorBase.create(
             args, model, model_name=model_name, quantization_config=quantization_config
         )
-        self.encoder = MemoryDeltaEncoder(
-            bucket_bytes=self.config.bucket_bytes, snapshot_budget_bytes=self.config.gpu_budget_bytes
+        self.canonical_hf = self.config.layout == "canonical_hf"
+        self.capture_dense_bridge = (
+            self.canonical_hf and args.megatron_to_hf_mode == "bridge" and not getattr(args, "num_experts", None)
         )
+        self.encoder = (
+            StreamingDeltaEncoder(SnapshotBudget(self.config.gpu_budget_bytes), bucket_bytes=self.config.bucket_bytes)
+            if self.canonical_hf
+            else MemoryDeltaEncoder(
+                bucket_bytes=self.config.bucket_bytes, snapshot_budget_bytes=self.config.gpu_budget_bytes
+            )
+        )
+        self.receiver_plan: SyncPlan | None = None
         self.source: MemorySource | None = None
         self.members: set[str] | None = None
         self.engines: tuple = ()
@@ -55,6 +69,7 @@ class UpdateWeightFromMemory:
         started = monotonic()
         group = get_gloo_group()
         rank = dist.get_rank(group)
+        self.source_ranks = tuple(dist.get_process_group_ranks(group))
         error, buckets = None, None
         local_weights = None
         try:
@@ -65,19 +80,55 @@ class UpdateWeightFromMemory:
         # Do not let peers enter converter collectives if a rank cannot even
         # access its stopped optimizer snapshot.
         dist.all_gather_object(errors, error, group=group)
+
+        def capture_gate(local_error: str | None) -> None:
+            capture_errors = [None] * dist.get_world_size(group)
+            dist.all_gather_object(capture_errors, local_error, group=group)
+            if any(capture_errors):
+                raise RuntimeError(f"Dense Bridge memory capture failed across source ranks: {capture_errors}")
+
         # Every rank runs the existing converter/collectives while the optimizer
         # is stopped. Encoder freezes each yielded value before buffer reuse.
         named = None
         try:
             if any(errors):
                 raise RuntimeError(f"Cannot access a training snapshot: {errors}")
-            named = (pair for chunk in self.iterator.get_hf_weight_chunks(local_weights) for pair in chunk)
             with torch.no_grad():
-                if rank == 0:
+                if getattr(self, "capture_dense_bridge", False):
+                    preparation_error = None
+                    if rank == 0:
+                        try:
+                            version = self.encoder.version + 1
+                            full = self.config.full_only or version % self.config.anchor_interval == 0
+                            self.encoder.begin(full=full, compare_changes=not self.config.full_only)
+                        except Exception as exc:
+                            preparation_error = f"{type(exc).__name__}: {exc}"
+                    capture_gate(preparation_error)
+                    self.iterator.capture_gated_dense_tensors(
+                        local_weights,
+                        emit=self.encoder.add if rank == 0 else lambda _name, _tensor: None,
+                        error_gate=capture_gate,
+                        metadata_group=group,
+                    )
+                    if rank == 0:
+                        buckets = self.encoder.finish()
+                        if steady_state_snapshot_bytes(buckets) > self.config.gpu_budget_bytes:
+                            raise ValueError("Canonical HF snapshots cannot fit the next delta within the GPU budget")
+                elif rank == 0:
+                    named = (pair for chunk in self.iterator.get_hf_weight_chunks(local_weights) for pair in chunk)
                     version = self.encoder.version + 1
                     full = self.config.full_only or version % self.config.anchor_interval == 0
-                    buckets = self.encoder.prepare(named, full=full)
+                    if self.canonical_hf:
+                        self.encoder.begin(full=full, compare_changes=not self.config.full_only)
+                        for name, tensor in named:
+                            self.encoder.add(name, tensor)
+                        buckets = self.encoder.finish()
+                        if steady_state_snapshot_bytes(buckets) > self.config.gpu_budget_bytes:
+                            raise ValueError("Canonical HF snapshots cannot fit the next delta within the GPU budget")
+                    else:
+                        buckets = self.encoder.prepare(named, full=full)
                 else:
+                    named = (pair for chunk in self.iterator.get_hf_weight_chunks(local_weights) for pair in chunk)
                     for _ in named:
                         pass
         except Exception as exc:
@@ -105,8 +156,11 @@ class UpdateWeightFromMemory:
                     capture_encode_s=capture_s,
                     sync_with_probe_s=monotonic() - started,
                     elements=sum(b.elements for b in buckets),
-                    changed=sum(b.changed for b in buckets),
+                    changed=None if self.canonical_hf and self.config.full_only else sum(b.changed for b in buckets),
                     payload_bytes=sum(len(b.payload) for b in buckets),
+                    protocol_control_bytes=self.source.last_control_bytes,
+                    logical_delivery_bytes=sum(len(b.payload) for b in buckets) * len(self.members),
+                    payload_scope="Logical member deliveries; not physical NIC traffic",
                     members=len(self.members),
                     full=all(b.encoding == "full" for b in buckets),
                 )
@@ -164,13 +218,59 @@ class UpdateWeightFromMemory:
             return value
 
         resolve_started = monotonic()
-        engines, lock, *_ = ray.get(rollout_manager.get_rollout_engines_and_lock.remote(), timeout=remaining())
+        engines, lock, *metadata = ray.get(rollout_manager.get_rollout_engines_and_lock.remote(), timeout=remaining())
         engines = tuple(engines)
         previous_engines = self.engines
         self.engines = tuple({e._actor_id.hex(): e for e in (*previous_engines, *engines)}.values())
-        members = {engine._actor_id.hex() for engine in engines}
-        if not members or len(members) != len(engines):
+        identities = tuple(engine._actor_id.hex() for engine in engines)
+        if not identities or len(set(identities)) != len(engines):
             raise RuntimeError("Memory sync requires distinct, nonempty inference members")
+        if self.canonical_hf:
+            counts = metadata[1] if len(metadata) >= 2 else None
+            if not isinstance(counts, (list, tuple)) or len(counts) != len(engines):
+                raise ValueError("Canonical HF synchronization requires actual engine worker counts")
+            if any(type(count) is not int or count <= 0 for count in counts):
+                raise ValueError("Canonical HF worker counts must be positive integers")
+            capabilities = ray.get(
+                [engine.get_hf_memory_capability.remote(remaining()) for engine in engines], timeout=remaining()
+            )
+            runtime_counts = [capability["workers"] for capability in capabilities]
+            if runtime_counts != list(counts):
+                raise ValueError("Canonical HF runtime worker topology changed or disagrees with manager allocation")
+            capability_fingerprints = {
+                identity: capability["fingerprint"]
+                for identity, capability in zip(identities, capabilities, strict=True)
+            }
+            plan = SyncPlan.build(
+                {
+                    identity: tuple(f"{identity}:tp:{tp}" for tp in range(count))
+                    for identity, count in zip(identities, runtime_counts, strict=True)
+                },
+                tensor_schema=self.encoder.pending_schema,
+                source_ranks=self.source_ranks,
+                receiver_capabilities=capability_fingerprints,
+            )
+        else:
+            counts = metadata[1] if len(metadata) >= 2 else None
+            if not isinstance(counts, (list, tuple)) or list(counts) != [1] * len(engines):
+                raise ValueError("The direct-copy Dense adapter requires one allocated worker per engine")
+            capabilities = ray.get(
+                [engine.get_dense_memory_capability.remote(remaining()) for engine in engines], timeout=remaining()
+            )
+            capability_fingerprints = {
+                identity: capability["fingerprint"]
+                for identity, capability in zip(identities, capabilities, strict=True)
+            }
+            plan = SyncPlan.build(
+                {identity: (identity,) for identity in identities},
+                tensor_schema=self.encoder.pending_schema,
+                source_ranks=self.source_ranks,
+                receiver_capabilities=capability_fingerprints,
+            )
+        if self.receiver_plan is not None and plan != self.receiver_plan:
+            raise RuntimeError("Receiver worker topology changed; start a new memory stream")
+        self.receiver_plan = plan
+        members = plan.members
         if self.members is not None and members != self.members:
             raise RuntimeError("Inference membership changed; restart with a new memory stream")
         self.members = members
@@ -189,6 +289,7 @@ class UpdateWeightFromMemory:
             schema=self.encoder.pending_schema,
             members=members,
             reset=self.encoder.version == -1,
+            group_update=self.receiver_plan.fingerprint if self.canonical_hf else None,
         )
         published_at = monotonic()
         while not ray.get(lock.acquire.remote(), timeout=remaining()):
@@ -197,22 +298,48 @@ class UpdateWeightFromMemory:
         try:
             ray.get([e.pause_generation.remote(timeout=remaining()) for e in engines], timeout=remaining())
             pause_returned = monotonic()
-            loaded = ray.get(
-                [
+            if self.canonical_hf:
+                # Reserve one full HF directory for ordinary loader temporaries.
+                # This is an explicit admission estimate, verified by GPU runs;
+                # arbitrary model-specific loader workspace is not inferred.
+                workspace_bytes = sum(
+                    bucket.elements * {"bfloat16": 2, "float32": 4}[bucket.dtype] for bucket in buckets
+                )
+                installs = [
+                    e.install_hf_memory_update.remote(
+                        descriptor,
+                        self.config.stream,
+                        self.receiver_plan.group_members(e._actor_id.hex()),
+                        self.receiver_plan.fingerprint,
+                        remaining(),
+                        self.config.host_budget_bytes,
+                        self.config.receiver_gpu_budget_bytes,
+                        workspace_bytes,
+                        capability_fingerprints[e._actor_id.hex()],
+                    )
+                    for e in engines
+                ]
+            else:
+                installs = [
                     e.install_memory_update.remote(
                         descriptor,
                         e._actor_id.hex(),
                         remaining(),
                         self.config.host_budget_bytes,
+                        capability_fingerprints[e._actor_id.hex()],
                     )
                     for e in engines
-                ],
-                timeout=remaining(),
-            )
+                ]
+            loaded = ray.get(installs, timeout=remaining())
             receivers_returned = monotonic()
             if any(not isinstance(item, dict) or item.get("success") is not True for item in loaded):
                 raise RuntimeError(f"Inference member failed memory update: {loaded}")
-            self.encoder.commit(self.source.wait(remaining()), members)
+            acknowledged = self.source.wait(remaining())
+            if self.canonical_hf:
+                self.encoder.prepare_commit(acknowledged, members)
+                self.encoder.commit()
+            else:
+                self.encoder.commit(acknowledged, members)
             self.source.finish()
             loaded_at = monotonic()
             ray.get([e.continue_generation.remote(timeout=remaining()) for e in engines], timeout=remaining())

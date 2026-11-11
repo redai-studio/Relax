@@ -4,12 +4,29 @@ import pytest
 import torch
 from torch import nn
 
-from relax.backends.sglang.weight_write_coverage import record_weight_write_coverage
+from relax.backends.sglang.weight_write_coverage import record_parameter_write_coverage, record_weight_write_coverage
 
 
 def _freeze(model: nn.Module) -> None:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
+
+
+def test_ordinary_expert_parameters_are_covered_without_native_exclusions() -> None:
+    model = nn.Module()
+    model.mlp = nn.Module()
+    model.mlp.experts = nn.Module()
+    model.mlp.experts.w13_weight = nn.Parameter(torch.zeros((2, 3), dtype=torch.float32), requires_grad=False)
+    source = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+    with record_parameter_write_coverage(model, required_hf_names={"expert"}) as coverage:
+        for _name, tensor in coverage.tag_weights([("expert", source)]):
+            model.mlp.experts.w13_weight.copy_(tensor.float() + 1)
+    assert torch.equal(model.mlp.experts.w13_weight, source.float() + 1)
+
+    # The native adapter still requires an explicit, complete direct-write set.
+    with pytest.raises(ValueError, match="Expert exclusion set must be exact"):
+        with record_weight_write_coverage(model, required_hf_names={"expert"}, excluded_expert_names=set()):
+            pass
 
 
 class _FusedModel(nn.Module):

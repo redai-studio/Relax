@@ -329,6 +329,91 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                         f"expected {sorted(expected_projections)}"
                     )
 
+    def capture_gated_dense_tensors(
+        self,
+        megatron_local_weights: Mapping[str, torch.Tensor],
+        *,
+        emit: Callable[[str, torch.Tensor], None],
+        error_gate: Callable[[str | None], None],
+        metadata_group: dist.ProcessGroup,
+    ) -> None:
+        """Capture Dense Bridge output at fixed all-rank parameter boundaries.
+
+        Unlike the native expert iterator, this callback path gates conversion
+        and consumer failures together. Every TP/DP rank converts each input;
+        only the designated publisher needs to retain the output. The default
+        NCCL and native expert iterators keep their existing execution paths.
+        """
+        from .common import all_gather_params_gated
+
+        rank = dist.get_rank(group=dist.group.WORLD)
+        error, schema, device = None, None, None
+        try:
+            if (
+                mpu.get_pipeline_model_parallel_world_size() != 1
+                or mpu.get_context_parallel_world_size() != 1
+                or mpu.get_virtual_pipeline_model_parallel_world_size() not in (None, 1)
+                or mpu.get_expert_model_parallel_world_size() != 1
+                or self._expert_buckets
+                or self.quantization_config
+                or self.lora_merge_mode
+                or self.lora_adapter_mode
+            ):
+                raise ValueError("Gated Dense capture requires unquantized PP/CP/VPP/EP1 without experts or LoRA")
+            device = device_utils.make_current_torch_device()
+            schema = []
+            for infos in self._non_expert_buckets:
+                bucket_schema = []
+                for info in infos:
+                    if info.src_rank != rank or info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                        raise ValueError("Gated Dense capture requires local PP1 sources without PLE tables")
+                    source = megatron_local_weights[self._vanilla_key_map[info.name]]
+                    if source.dtype != info.dtype or tuple(source.shape) != tuple(info.shape):
+                        raise ValueError(f"Dense source metadata changed: {info.name}")
+                    bucket_schema.append((info.name, tuple(info.shape), info.dtype, tuple(sorted(info.attrs.items()))))
+                schema.append(tuple(bucket_schema))
+            if not schema:
+                raise ValueError("Gated Dense capture requires nonempty source buckets")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        error_gate(error)
+
+        # DP replicas have different local src_rank values but must execute the
+        # same parameter/gate sequence as every TP rank. Agree before gathering.
+        schemas = [None] * dist.get_world_size(metadata_group)
+        dist.all_gather_object(schemas, tuple(schema), group=metadata_group)
+        error_gate(None if all(item == schemas[0] for item in schemas) else "Dense source bucket schemas disagree")
+        error = None
+        try:
+            # Tasks were initialized by the iterator constructor. PP1 makes
+            # config preparation local; errors still precede the next TP gather.
+            self._bridge_converter.broadcast_and_apply_configs()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        error_gate(error)
+
+        for infos in self._non_expert_buckets:
+            error, params = None, None
+            try:
+                params = _load_to_gpu(infos, megatron_local_weights, self._vanilla_key_map, device, rank)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            error_gate(error)
+            gathered = all_gather_params_gated(
+                list(zip(infos, params, strict=True)), error_gate=error_gate, gdn_split_sizes=self._gdn_split_sizes
+            )
+            for info, param in zip(infos, gathered, strict=True):
+                error, converted = None, None
+                try:
+                    converted = self._bridge_converter.convert(info.name, param)
+                    for name, tensor in converted:
+                        emit(name, tensor)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                error_gate(error)
+                del converted
+            del params, gathered
+
     def iter_gated_nonexpert_tensors(self, megatron_local_weights, *, error_gate):
         """PP1 nonexpert conversion with gates around local failure boundaries.
 

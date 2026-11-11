@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Two-rank Gloo coverage for gated nonexpert preparation and consumer
-drain."""
+"""Two-rank Gloo coverage for native drain and Dense callback failure gates."""
 
 from contextlib import ExitStack
 from datetime import timedelta
@@ -26,21 +25,25 @@ def _info(name: str, rank: int) -> SimpleNamespace:
     )
 
 
-def _make_iterator(names: list[str], rank: int, conversion_failure: bool = False):
+def _make_iterator(names: list[str], rank: int, conversion_failure: bool = False, *, failure_rank: int = 0):
     infos = [_info(name, rank) for name in names]
     iterator = bridge.HfWeightIteratorBridge.__new__(bridge.HfWeightIteratorBridge)
     iterator.lora_merge_mode = False
     iterator.lora_adapter_mode = False
+    iterator.quantization_config = None
+    iterator._expert_buckets = []
     iterator._non_expert_buckets = [infos]
     iterator._vanilla_key_map = {name: name for name in names}
     iterator._gdn_split_sizes = {}
+    iterator.converted_names = []
 
     def convert(name: str, parameter: torch.Tensor):
-        if conversion_failure and rank == 0:
+        iterator.converted_names.append(name)
+        if conversion_failure and rank == failure_rank:
             raise ValueError("injected Bridge convert failure")
         return [(f"hf.{name}", parameter.detach().clone())]
 
-    iterator._bridge_converter = SimpleNamespace(convert=convert)
+    iterator._bridge_converter = SimpleNamespace(convert=convert, broadcast_and_apply_configs=lambda: None)
     return iterator
 
 
@@ -64,6 +67,11 @@ def _rank_worker(rank: int, rendezvous: str, diagnostics: str) -> None:
 
         with ExitStack() as patches:
             patches.enter_context(patch.object(bridge.mpu, "get_pipeline_model_parallel_world_size", return_value=1))
+            patches.enter_context(patch.object(bridge.mpu, "get_context_parallel_world_size", return_value=1))
+            patches.enter_context(patch.object(bridge.mpu, "get_expert_model_parallel_world_size", return_value=1))
+            patches.enter_context(
+                patch.object(bridge.mpu, "get_virtual_pipeline_model_parallel_world_size", return_value=None)
+            )
             patches.enter_context(
                 patch.object(bridge.mpu, "get_tensor_model_parallel_group", return_value=dist.group.WORLD)
             )
@@ -166,6 +174,13 @@ def _rank_worker(rank: int, rendezvous: str, diagnostics: str) -> None:
                 gated(consumer_error)
             assert added == (0 if rank == 0 else 2)
 
+            _exercise_dense_callback(rank, gated, mark, name, tp_size=2)
+            # DP2/TP1 still shares the all-source error gates. Create both
+            # singleton TP groups on both ranks in the same order.
+            singleton_groups = [dist.new_group(ranks=[index], backend="gloo") for index in range(2)]
+            with patch.object(bridge.mpu, "get_tensor_model_parallel_group", return_value=singleton_groups[rank]):
+                _exercise_dense_callback(rank, gated, mark, name, tp_size=1)
+
             # This collective proves each earlier scenario left no unmatched
             # collective operation pending on either process.
             dist.barrier(group=dist.group.WORLD)
@@ -181,6 +196,85 @@ def _assert_converged_error(function, expected: str) -> None:
     dist.all_gather_object(errors, str(caught.value), group=dist.group.WORLD)
     assert errors[0] == errors[1]
     dist.barrier(group=dist.group.WORLD)
+
+
+def _exercise_dense_callback(rank, gate, mark, name, *, tp_size: int) -> None:
+    from relax.backends.megatron.weight_update.update_weight_from_memory import UpdateWeightFromMemory
+    from relax.distributed.weight_sync.config import MemorySyncConfig
+    from relax.distributed.weight_sync.streaming_delta import SnapshotBudget, StreamingDeltaEncoder
+
+    names = [name, "decoder.layers.0.self_attention.k_proj.weight"]
+    weights = {
+        key: torch.arange((rank if tp_size == 2 else 0) * 2, (rank if tp_size == 2 else 0) * 2 + 2).float().view(2, 1)
+        for key in names
+    }
+    iterator = _make_iterator(names, rank)
+    captured = []
+    mark(f"callback-tp{tp_size}-success")
+    iterator.capture_gated_dense_tensors(
+        weights,
+        emit=lambda key, value: captured.append((key, value.clone())) if rank == 0 else None,
+        error_gate=gate,
+        metadata_group=dist.group.WORLD,
+    )
+    assert iterator.converted_names == names  # The nonpublisher also converts.
+    assert len(captured) == (2 if rank == 0 else 0)
+    if rank == 0:
+        for key, value in captured:
+            assert key in [f"hf.{item}" for item in names]
+            torch.testing.assert_close(value, torch.arange(2 * tp_size, dtype=torch.float32).view(-1, 1))
+
+    for failure in ("prepare", "schema", "convert", "emit", "begin"):
+        mark(f"callback-tp{tp_size}-{failure}")
+        iterator = _make_iterator(names, rank, conversion_failure=failure == "convert", failure_rank=1)
+        if failure == "schema" and rank == 1:
+            iterator._non_expert_buckets[0].reverse()
+        local_weights = {} if failure == "prepare" and rank == 1 else weights
+        updater = object.__new__(UpdateWeightFromMemory)
+        updater.config = MemorySyncConfig(stream="callback-test", bucket_bytes=16, gpu_budget_bytes=1 << 20)
+        updater.weights_getter = lambda: local_weights
+        updater.iterator = iterator
+        updater.canonical_hf = updater.capture_dense_bridge = True
+        updater.encoder = StreamingDeltaEncoder(SnapshotBudget(1 << 20), bucket_bytes=16)
+        updater.source = updater.members = None
+        updater.engines = ()
+        updater.failed = False
+        installs = []
+
+        def forbidden_install(*args):
+            installs.append(args)
+            raise AssertionError("An invalid capture reached publication/installation")
+
+        updater._install = forbidden_install
+        updater._close_generation = lambda _manager: []
+        with ExitStack() as patches:
+            patches.enter_context(patch("relax.utils.distributed_utils.get_gloo_group", return_value=dist.group.WORLD))
+            if failure in ("emit", "begin") and rank == 0:
+                patches.enter_context(
+                    patch.object(
+                        updater.encoder,
+                        "add" if failure == "emit" else "begin",
+                        side_effect=MemoryError(f"injected publisher {failure} failure"),
+                    )
+                )
+            expected = {
+                "prepare": "KeyError",
+                "schema": "Dense source bucket schemas disagree",
+                "convert": "injected Bridge convert failure",
+                "emit": "injected publisher emit failure",
+                "begin": "injected publisher begin failure",
+            }[failure]
+            try:
+                _assert_converged_error(lambda: updater.update_weights(None), expected)
+                assert not installs and updater.source is None
+                assert updater.failed and updater.encoder.version == -1
+                assert updater.encoder._pending is None and updater.encoder.budget.used_bytes == 0
+                # Failure at the first fixed parameter boundary must prevent
+                # either rank from converting the following parameter.
+                if failure in ("convert", "emit"):
+                    assert iterator.converted_names == names[:1]
+            finally:
+                updater.encoder.close()
 
 
 def test_gated_nonexpert_conversion_and_consumer_drain_converge(tmp_path) -> None:

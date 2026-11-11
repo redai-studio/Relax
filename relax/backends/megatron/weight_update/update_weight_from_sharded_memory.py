@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Owner-local Qwen3.5 experts and bounded nonexpert HF streams over TCP."""
+"""Unique-owner gated experts and bounded nonexpert HF streams over TCP."""
 
 from __future__ import annotations
 
@@ -12,7 +12,11 @@ from typing import Any
 
 from relax.distributed.weight_sync.config import MemorySyncConfig
 from relax.distributed.weight_sync.memory_transport import MemorySource
-from relax.distributed.weight_sync.streaming_delta import SnapshotBudget, StreamingDeltaEncoder
+from relax.distributed.weight_sync.streaming_delta import (
+    SnapshotBudget,
+    StreamingDeltaEncoder,
+    steady_state_snapshot_bytes,
+)
 from relax.utils.logging_utils import get_logger
 
 
@@ -39,10 +43,8 @@ class UpdateWeightFromShardedMemory:
         self.weights_getter = weights_getter
         self.iterator = HfWeightIteratorBase.create(args, model, model_name=model_name, quantization_config=None)
         self.budget = SnapshotBudget(self.config.gpu_budget_bytes)
-        self.encoders = {
-            f"expert:{tp}": StreamingDeltaEncoder(self.budget, bucket_bytes=self.config.bucket_bytes)
-            for tp in range(2)
-        }
+        self.encoders: dict[str, StreamingDeltaEncoder] = {}
+        self._topology: tuple | None = None
         self.sources: dict[str, MemorySource] = {}
         self.engines: tuple = ()
         self.members: tuple[str, ...] | None = None
@@ -111,11 +113,14 @@ class UpdateWeightFromShardedMemory:
 
         from relax.utils.distributed_utils import get_gloo_group
 
+        from .expert_gather import bucket_expert_projections
         from .expert_layout import DirectExpertLayout, expert_slice_chunk
         from .owner_expert_blocks import iter_owner_expert_blocks
 
         group = get_gloo_group()
         rank, world = dist.get_rank(group), dist.get_world_size(group)
+        source_ranks = tuple(dist.get_process_group_ranks(group))
+        global_rank = dist.get_rank(dist.group.WORLD)
         started = monotonic()
         deadline = started + self.config.sync_timeout_s
 
@@ -130,31 +135,94 @@ class UpdateWeightFromShardedMemory:
         if rank == 0:
             try:
                 engines, lock, *_ = ray.get(manager.get_rollout_engines_and_lock.remote(), timeout=remaining())
-                engines = tuple(engines)
+                engines = tuple(sorted(engines, key=lambda engine: engine._actor_id.hex()))
                 identities = tuple(engine._actor_id.hex() for engine in engines)
                 self.engines = tuple({e._actor_id.hex(): e for e in (*self.engines, *engines)}.values())
-                if len(identities) != 4 or len(set(identities)) != 4 or self.members not in (None, identities):
-                    raise ValueError("Sharded synchronization requires four unchanged TP2 engines")
+                if not identities or len(set(identities)) != len(identities) or self.members not in (None, identities):
+                    raise ValueError("Sharded synchronization requires a nonempty unchanged engine set")
                 layouts = ray.get([e.get_expert_weight_sync_layout.remote() for e in engines], timeout=remaining())
                 direct = [DirectExpertLayout.from_receiver(layout) for layout in layouts]
-                if any(item != direct[0] for item in direct) or direct[0].tp_size != 2:
+                if any(item != direct[0] for item in direct):
                     raise ValueError("Sharded receivers disagree on their native expert layout")
+                if direct[0].ep_size != 1 or direct[0].moe_dp_size != 1 or not direct[0].supports_expert_slices:
+                    raise ValueError("Native owner streams require receiver EP1, MoE DP1 and expert slice support")
                 self.members = identities
-                plan[0] = dict(layout=layouts[0], members=identities, nonce=secrets.token_hex(24))
+                plan[0] = dict(
+                    layout=layouts[0],
+                    members=identities,
+                    nonce=secrets.token_hex(24),
+                    owner_ranks=tuple(dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())),
+                )
             except Exception as exc:
                 plan[0] = dict(error=f"{type(exc).__name__}: {exc}")
-        dist.broadcast_object_list(plan, src=0, group=group)
+        dist.broadcast_object_list(plan, src=source_ranks[0], group=group)
         if "error" in plan[0]:
             raise RuntimeError(plan[0]["error"])
         members, nonce = plan[0]["members"], plan[0]["nonce"]
         layout = DirectExpertLayout.from_receiver(plan[0]["layout"])
         planned_at = monotonic()
         self.members = tuple(members)
-        if world != 8:
-            raise ValueError("Owner-local Qwen3.5 synchronization requires exactly eight source ranks")
-        self._gate(
-            None if mpu.get_expert_model_parallel_rank() == rank else "Expert owners must follow global rank order"
-        )
+        error = None
+        try:
+            owner_ranks = tuple(dist.get_process_group_ranks(mpu.get_expert_model_parallel_group()))
+            if (
+                len(owner_ranks) <= 1
+                or len(owner_ranks) != world
+                or set(owner_ranks) != set(source_ranks)
+                or owner_ranks != tuple(plan[0]["owner_ranks"])
+                or mpu.get_pipeline_model_parallel_world_size() != 1
+                or mpu.get_virtual_pipeline_model_parallel_world_size() not in (None, 1)
+                or mpu.get_context_parallel_world_size() != 1
+                or mpu.get_expert_tensor_parallel_world_size() != 1
+            ):
+                raise ValueError("Native export requires unique EP>1 owners covering the source group, PP/VPP/CP/ETP1")
+            owner = owner_ranks.index(global_rank)
+            if mpu.get_expert_model_parallel_rank() != owner:
+                raise ValueError("Source EP rank disagrees with its actual process-group rank mapping")
+            # Reuse Bridge's metadata validator: every layer/fc must contain
+            # every expert exactly once in contiguous EP-process-group order.
+            expert_buckets = bucket_expert_projections(
+                [info for bucket in self.iterator._expert_buckets for info in bucket],
+                layout.num_experts,
+                owner_ranks,
+            )
+            if not expert_buckets or self.iterator.args.num_experts != layout.num_experts:
+                raise ValueError("Source and receiver expert counts disagree")
+            for bucket in expert_buckets:
+                shape = tuple(bucket[0].shape)
+                expected = (
+                    (2 * layout.intermediate_size, layout.hidden_size)
+                    if ".linear_fc1." in bucket[0].name
+                    else (layout.hidden_size, layout.intermediate_size)
+                )
+                if shape != expected:
+                    raise ValueError("Source expert geometry disagrees with the native receiver layout")
+            topology = (layout, owner_ranks, source_ranks)
+            if self._topology not in (None, topology):
+                raise ValueError("Native layout or source owners changed; create a new FULL stream")
+            self._topology = topology
+            if not self.encoders:
+                self.encoders = {
+                    f"expert:{tp}": StreamingDeltaEncoder(self.budget, bucket_bytes=self.config.bucket_bytes)
+                    for tp in range(layout.tp_size)
+                }
+            source_tp = mpu.get_tensor_model_parallel_world_size()
+            # Admission estimate for the known canonical Bridge path: source
+            # plus converted expert, or source/gather plus converted ordinary
+            # bucket. This is not a bound for arbitrary converter temporaries.
+            conversion_workspace_estimate = max(
+                max(info.size * 2 for bucket in expert_buckets for info in bucket),
+                max(
+                    (
+                        sum(info.size for info in bucket) * 2 * (1 + source_tp)
+                        for bucket in self.iterator._non_expert_buckets
+                    ),
+                    default=0,
+                ),
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        self._gate(error)
         if rank == 0 and "nonexpert" not in self.encoders:
             self.encoders["nonexpert"] = StreamingDeltaEncoder(self.budget, bucket_bytes=self.config.bucket_bytes)
         version = self.version + 1
@@ -165,7 +233,7 @@ class UpdateWeightFromShardedMemory:
             reusable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
             # Snapshots already live in the allocator are counted in used_bytes.
             # Keep an additional margin for conversion/library workspace.
-            required = self.budget.limit_bytes - self.budget.used_bytes + (4 << 30)
+            required = self.budget.limit_bytes - self.budget.used_bytes + conversion_workspace_estimate
             if required > free + reusable:
                 raise ValueError("Insufficient GPU headroom for the configured shard budget and conversion margin")
             weights = self.weights_getter()
@@ -181,21 +249,36 @@ class UpdateWeightFromShardedMemory:
             error = f"{type(exc).__name__}: {exc}"
         self._gate(error)
         local: dict[str, list] = {}
+        packing_peak = 0
         error = None
         try:
             with torch.no_grad():
                 with closing(self.iterator.iter_owner_local_expert_tensors(weights, grouped=True)) as named:
-                    with closing(iter_owner_expert_blocks(named, layout, rank, world, self.budget)) as blocks:
+                    with closing(
+                        iter_owner_expert_blocks(
+                            named,
+                            layout,
+                            owner,
+                            world,
+                            self.budget,
+                            bucket_bytes=self.config.bucket_bytes,
+                            source_rank=global_rank,
+                        )
+                    ) as blocks:
                         for name, packed in blocks:
-                            for tp in range(2):
+                            for tp in range(layout.tp_size):
                                 chunk = expert_slice_chunk([(name, packed)], layout, tp)
                                 if chunk is None or len(chunk) != 1:
                                     raise ValueError("Owner block did not map to one contiguous native TP slice")
                                 descriptor, shard = chunk[0]
+                                packing_peak = max(
+                                    packing_peak,
+                                    packed.numel() * packed.element_size() + shard.numel() * shard.element_size(),
+                                )
                                 self.encoders[f"expert:{tp}"].add(descriptor, shard)
                                 del chunk, shard
                             del packed
-                for tp in range(2):
+                for tp in range(layout.tp_size):
                     key = f"expert:{tp}"
                     local[key] = self.encoders[key].finish()
         except Exception as exc:
@@ -221,15 +304,31 @@ class UpdateWeightFromShardedMemory:
         self._gate(error)
         captured_at = monotonic()
         error = None
-        descriptors = {}
-        stream_metadata = {}
-        expected_members = {}
         try:
+            # A private first capture discovers the exact directory. Refuse
+            # predictable next-delta exhaustion before publishing any stream,
+            # including FULL-only controls, without changing slab boundaries.
+            steady_snapshot_estimate = steady_state_snapshot_bytes(
+                (bucket for buckets in local.values() for bucket in buckets), packing_bytes=packing_peak
+            )
+            if steady_snapshot_estimate > self.budget.limit_bytes:
+                raise ValueError(
+                    f"Steady-state snapshots require an estimated {steady_snapshot_estimate} bytes, "
+                    f"exceeding the shared rank budget {self.budget.limit_bytes}"
+                )
             if (
                 sum(len(bucket.payload) for buckets in local.values() for bucket in buckets)
                 > self.config.host_budget_bytes
             ):
                 raise ValueError("Encoded owner streams exceed their shared source host budget")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        self._gate(error)
+        error = None
+        descriptors = {}
+        stream_metadata = {}
+        expected_members = {}
+        try:
             for key, buckets in local.items():
                 source = self.sources.get(key)
                 if source is None:
@@ -241,10 +340,10 @@ class UpdateWeightFromShardedMemory:
                     self.sources[key] = source
                 if key == "nonexpert":
                     stream = f"{self.config.stream}:nonexpert"
-                    fixed = {f"{engine}:tp:{tp}" for engine in members for tp in range(2)}
+                    fixed = {f"{engine}:tp:{tp}" for engine in members for tp in range(layout.tp_size)}
                 else:
                     tp = int(key.split(":")[1])
-                    stream = f"{self.config.stream}:expert:{rank}:tp:{tp}"
+                    stream = f"{self.config.stream}:expert:{owner}:tp:{tp}"
                     fixed = {f"{engine}:tp:{tp}" for engine in members}
                 expected_members[key] = fixed
                 descriptor = source.publish(
@@ -277,7 +376,12 @@ class UpdateWeightFromShardedMemory:
         if rank == 0:
             try:
                 combined = {key: value for item in all_descriptors for key, value in item.items()}
-                if len(combined) != world * 2 + 1:
+                expected_streams = {
+                    f"{self.config.stream}:expert:{owner}:tp:{tp}"
+                    for owner in range(world)
+                    for tp in range(layout.tp_size)
+                } | {f"{self.config.stream}:nonexpert"}
+                if set(combined) != expected_streams or sum(map(len, all_descriptors)) != len(expected_streams):
                     raise ValueError("Incomplete owner stream descriptor set")
                 lock_started = monotonic()
                 while not ray.get(lock.acquire.remote(), timeout=remaining()):
@@ -291,7 +395,7 @@ class UpdateWeightFromShardedMemory:
                 controls = []
                 for identity in members:
                     per_tp = []
-                    for tp in range(2):
+                    for tp in range(layout.tp_size):
                         names = [f"{self.config.stream}:expert:{owner}:tp:{tp}" for owner in range(world)]
                         names.append(f"{self.config.stream}:nonexpert")
                         per_tp.append(
@@ -302,7 +406,9 @@ class UpdateWeightFromShardedMemory:
                                 group_update=nonce,
                                 owners=world,
                                 tp_rank=tp,
-                                tp_size=2,
+                                tp_size=layout.tp_size,
+                                ep_size=layout.ep_size,
+                                moe_dp_size=layout.moe_dp_size,
                                 host_budget_bytes=self.config.host_budget_bytes,
                                 gpu_budget_bytes=self.config.receiver_gpu_budget_bytes,
                                 timeout_s=remaining(),
@@ -336,7 +442,7 @@ class UpdateWeightFromShardedMemory:
             except Exception as exc:
                 result[0] = dict(error=f"{type(exc).__name__}: {exc}")
         broadcast_started = monotonic()
-        dist.broadcast_object_list(result, src=0, group=group)
+        dist.broadcast_object_list(result, src=source_ranks[0], group=group)
         broadcasted_at = monotonic()
         error = result[0].get("error")
         if error is None:
@@ -385,7 +491,7 @@ class UpdateWeightFromShardedMemory:
                     ready[0] = dict(error=f"{type(exc).__name__}: {exc}")
             else:
                 ready = [None]
-            dist.broadcast_object_list(ready, src=0, group=group)
+            dist.broadcast_object_list(ready, src=source_ranks[0], group=group)
             if "error" in ready[0]:
                 raise RuntimeError(ready[0]["error"])
         except Exception as exc:
@@ -430,6 +536,11 @@ class UpdateWeightFromShardedMemory:
                 item["zero_changed_buckets"] = None
                 item["full_fallback_buckets"] = None
         local_stats = dict(
+            source_global_rank=global_rank,
+            expert_owner=owner,
+            conversion_workspace_estimate_bytes=conversion_workspace_estimate,
+            steady_snapshot_estimate_bytes=steady_snapshot_estimate,
+            packing_peak_bytes=packing_peak,
             groups=groups,
             streams=stream_metadata,
             layout_and_membership_s=planned_at - started,
