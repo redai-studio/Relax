@@ -9,6 +9,13 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.utils.data.flops_schedule import (
+    build_workload_microbatch_plan,
+    flops_microbatch_geometry,
+    validate_text_rollout,
+)
+from relax.utils.training.flops_counter import SequenceFlopsEstimator
+
 
 _ROOT = Path(__file__).resolve().parents[4]
 
@@ -81,8 +88,12 @@ def test_prepack_partitions_respect_token_capacity(partitioning, repack, allgath
         [
             node
             for node in nodes
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
+            if isinstance(node, (ast.Assign, ast.If))
+            and any(
+                isinstance(child, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id in names for target in child.targets)
+                for child in ast.walk(node)
+            )
         ],
         partitioning,
     )
@@ -103,3 +114,37 @@ def test_allgather_capacity_rejects_budget_smaller_than_padding(partitioning):
     args = SimpleNamespace(allgather_cp=True, data_pad_size_multiplier=8)
     with pytest.raises(ValueError, match="padding must fit"):
         partitioning["_get_micro_batch_token_capacity"](args, 10, 1)
+
+
+def test_sft_prepack_flops_planner_uses_shared_geometry_and_rejects_media():
+    actor = next(
+        node
+        for node in _tree("relax/backends/megatron/actor.py").body
+        if isinstance(node, ast.ClassDef) and node.name == "MegatronTrainRayActor"
+    )
+    planner = next(node for node in actor.body if getattr(node, "name", None) == "_plan_sft_flops_microbatches")
+    args = SimpleNamespace(max_tokens_per_gpu=8, data_pad_size_multiplier=1)
+    namespace = {
+        "build_workload_microbatch_plan": build_workload_microbatch_plan,
+        "flops_microbatch_geometry": flops_microbatch_geometry,
+        "get_flops_estimator": lambda _args: SequenceFlopsEstimator(1, 1),
+        "validate_text_rollout": validate_text_rollout,
+        "mpu": SimpleNamespace(
+            get_tensor_model_parallel_world_size=lambda: 1,
+            get_context_parallel_world_size=lambda: 1,
+        ),
+    }
+    _execute([planner], namespace)
+    plan = namespace["_plan_sft_flops_microbatches"](
+        SimpleNamespace(args=args), {"total_lengths": [6, 2, 6, 2]}, count=3
+    )
+    real = [
+        index for offset, group in enumerate(plan.partitions) if offset not in plan.dummy_offsets for index in group
+    ]
+    assert sorted(real) == [0, 1, 2, 3]
+    assert len(plan.partitions) == 3
+    with pytest.raises(ValueError, match="multimodal"):
+        namespace["_plan_sft_flops_microbatches"](
+            SimpleNamespace(args=args),
+            {"total_lengths": [6, 2], "multimodal_train_inputs": {"image": object()}},
+        )

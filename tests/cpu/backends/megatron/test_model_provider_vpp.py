@@ -29,6 +29,8 @@ class _FakeProvider:
         self.fp16 = False
         self.bf16 = False
         self.params_dtype = None
+        self.fp32_residual_connection = False
+        self.pipeline_dtype = torch.bfloat16
         self.vision_dp_when_cp = False
 
     def finalize(self):
@@ -199,6 +201,17 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.virtual_pipeline_model_parallel_size == 2
     assert provider.finalized
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_bridge_provider_forwards_fp32_residual_and_pipeline_dtype(monkeypatch, enabled):
+    module, provider = _load_model_provider(monkeypatch)
+
+    module.get_model_provider_func(_bridge_args(fp32_residual_connection=enabled), role="actor")
+
+    assert provider.fp32_residual_connection is enabled
+    assert provider.pipeline_dtype == (torch.float32 if enabled else torch.bfloat16)
+    assert provider.finalized
 
 
 @pytest.mark.parametrize("inherited_backend", ["none", "cudnn"])

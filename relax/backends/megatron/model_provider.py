@@ -380,6 +380,7 @@ def get_model_provider_func(
             "qsa_force_sparse",
             "dsa_indexer_use_sparse_loss",
             "attention_softmax_in_fp32",
+            "fp32_residual_connection",
             # Bridge mode bypasses core_transformer_config_from_args(), so FP8
             # compute flags must be copied onto the provider explicitly.
             "fp8",
@@ -528,6 +529,9 @@ def get_model_provider_func(
             provider.fp16 = False
             provider.bf16 = True
             provider.params_dtype = torch.bfloat16
+
+        if getattr(provider, "fp32_residual_connection", False):
+            provider.pipeline_dtype = torch.float32
 
         # DSv4's hash-routed MoE layers must share a stage with the embedding, so mcore
         # requires an explicit pipeline_model_parallel_layout when PP > 1. The bridge

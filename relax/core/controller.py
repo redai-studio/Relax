@@ -376,7 +376,25 @@ class Controller:
         elif algo_key == "sft":
             from relax.utils.data.wholepack import WholepackSampler, config_contract, enabled
 
-            if enabled(self.config):
+            if getattr(self.config, "flops_dp_balancing", False):
+                from relax.utils.data.flops_sampler import FlopsBalancedSampler
+                from relax.utils.data.flops_schedule import get_flops_estimator, unequal_flops_dp_enabled
+
+                unequal_size = unequal_flops_dp_enabled(self.config)
+                if unequal_size and self.config.global_batch_size % dp_size:
+                    raise ValueError("Variable-count FLOPs placement requires global_batch_size divisible by DP size")
+                sampler = FlopsBalancedSampler(
+                    estimator=get_flops_estimator(self.config),
+                    n_samples_per_prompt=self.config.n_samples_per_prompt,
+                    dp_size=dp_size,
+                    unequal_size=unequal_size,
+                    max_tokens_per_gpu=getattr(self.config, "max_tokens_per_gpu", None) if unequal_size else None,
+                    pad_multiplier=getattr(self.config, "data_pad_size_multiplier", 128),
+                )
+                logger.info(
+                    "Using FlopsBalancedSampler with dp_size=%d, unequal_size=%s", dp_size, sampler.unequal_size
+                )
+            elif enabled(self.config):
                 capacity, pad_size = config_contract(self.config)
                 sampler = WholepackSampler(
                     n_samples_per_prompt=self.config.n_samples_per_prompt,
@@ -389,7 +407,7 @@ class Controller:
                     n_samples_per_prompt=self.config.n_samples_per_prompt,
                     dp_size=dp_size,
                 )
-            logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
+                logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
         elif getattr(self.config, "balance_data", False):
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")
             logger.info(f"Using IdentityWindowSampler with balanced row placement, dp_size={dp_size}")

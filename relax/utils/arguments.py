@@ -1614,6 +1614,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--flops-microbatch-packing",
+                action="store_true",
+                default=False,
+                help="Use capacity-constrained FLOPs packing for text Qwen3.5 SFT microbatches (opt-in).",
+            )
+            parser.add_argument(
+                "--flops-dp-balancing",
+                action="store_true",
+                default=False,
+                help="Balance text Qwen3.5 SFT samples across DP ranks using estimated FLOPs (opt-in).",
+            )
+            parser.add_argument(
                 "--max-tokens-per-gpu",
                 type=int,
                 default=None,
@@ -4509,6 +4521,9 @@ def slime_validate_args(args):
     elif getattr(args, "sft_async_prepack", False):
         raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
+    from relax.utils.data.flops_schedule import validate_flops_scheduling_args
+
+    validate_flops_scheduling_args(args)
     task_type = getattr(args, "task_type", "causal_lm")
     if task_type == "seq_cls":
         if not is_sft_mode(args):
