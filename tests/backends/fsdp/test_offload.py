@@ -30,7 +30,8 @@ def dist_env(tmp_path):
 
     created = not dist.is_initialized()
     if created:
-        dist.init_process_group("nccl", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1)
+        store = dist.FileStore(str(tmp_path / "rendezvous"), 1)
+        dist.init_process_group("nccl", store=store, rank=0, world_size=1)
     try:
         torch.cuda.set_device(0)
         yield

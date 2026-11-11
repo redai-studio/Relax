@@ -507,8 +507,8 @@ def _megatron_context():
         patcher.setattr(RotaryEmbedding, "get_rotary_seq_len", RotaryEmbedding.get_rotary_seq_len)
         try:
             if own_dist:
-                rendezvous = (Path(directory) / "rendezvous").as_uri()
-                dist.init_process_group("nccl", init_method=rendezvous, rank=0, world_size=1)
+                store = dist.FileStore(str(Path(directory) / "rendezvous"), 1)
+                dist.init_process_group("nccl", store=store, rank=0, world_size=1)
             if own_parallel:
                 parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
             # TE enters Megatron's named RNG stream even with dropout=0.
