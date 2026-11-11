@@ -501,7 +501,7 @@ class UpdateWeightFromTensor:
 
     @torch.no_grad()
     def update_weights(self) -> None:
-        if self.shard_p2p_requested and getattr(self, "actor_weight_retention_enabled", False):
+        if getattr(self, "shard_p2p_requested", False) and getattr(self, "actor_weight_retention_enabled", False):
             self._agree_expert_dispatch()
         if self._has_retained_actor_weights() and getattr(self, "_colocate_expert_ipc_enabled", False):
             from .shard_p2p_source import create_shard_p2p_synchronizer
