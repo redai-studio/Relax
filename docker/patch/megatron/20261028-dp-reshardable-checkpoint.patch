@@ -1,6 +1,8 @@
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index e0aec76..a8ef106 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
-@@ -1951,6 +1951,32 @@
+@@ -2139,6 +2139,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
          data_parallel_world_size = self.data_parallel_group.size()
  
          state = self.get_parameter_state_dp_reshardable()
@@ -33,12 +35,20 @@
          # per_bucket_numel metadata is saved separately for each TPxPP domain.
          for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
              key = (
-@@ -1984,10 +2010,34 @@
+@@ -2170,18 +2196,36 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
+                     )
  
-                     # The global ckpt tensors must be fully covered.
-                     # We add extra empty padding if necessary
--                    assert bucket_state, 'empty bucket encountered'
-+                    if not bucket_state:
+-                    # A highly padded bucket can assign a DP rank only trailing padding.
+-                    # Trailing bucket padding is deliberately excluded from the checkpoint,
+-                    # so that rank has no optimizer state to contribute. An empty shard that
+-                    # intersects the unpadded payload is still a real coverage error.
++                    # The global ckpt tensors must be fully covered.
++                    # We add extra empty padding if necessary
+                     if not bucket_state:
+-                        assert _is_trailing_padding_only_shard(
+-                            data_parallel_rank, gbuf_local_numel, gbuf_world_numel_unpadded
+-                        ), 'empty bucket intersects unpadded optimizer state'
 +                        schema = padding_schemas[(gbuf_idx, dtype, bucket_idx)]
 +                        padding_device = self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.device
 +                        offset = min(data_parallel_rank * gbuf_local_numel, gbuf_world_numel_unpadded)
@@ -58,7 +68,7 @@
 +                                for key, state_dtype in schema.items()
 +                            },
 +                        }]
-+                        continue
+                         continue
  
                      # Insert padding between parameter tensors to ensure full coverage as needed.
                      all_pad_tensors = {}
@@ -68,8 +78,8 @@
 +                    ))
                      for i in range(-1, len(bucket_state)):
                          if i == len(bucket_state) - 1:
-                             # Potential padding at the end
-@@ -1999,16 +2049,13 @@
+                             # Include intra-bucket padding, but exclude the tail
+@@ -2201,16 +2245,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                              cur_param_end = 0
                          else:
                              cur_param_end = bucket_state[i]['gbuf_local_end']
@@ -89,7 +99,7 @@
                                  )
                                  for k, v in bucket_state[i].items()
                                  if isinstance(v, torch.Tensor)
-@@ -2016,7 +2063,7 @@
+@@ -2218,7 +2259,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                              all_pad_tensors[i + 1] = {
                                  **pad_tensors,
                                  'gbuf_local_start': cur_param_end,
@@ -98,3 +108,28 @@
                                  'padding': True,
                              }
  
+@@ -2361,9 +2402,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+ 
+         Inverse of the `get_parameter_state_dp_reshardable` method.
+         """
+-        data_parallel_rank = self.data_parallel_group.rank()
+-        data_parallel_world_size = self.data_parallel_group.size()
+-
+         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
+             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
+             assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
+@@ -2377,14 +2415,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
+                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
+                     if not gbuf_range_map["param_map"]:
+-                        bucket = self.buffers[gbuf_idx].buckets[bucket_idx]
+-                        gbuf_world_numel = bucket.grad_data.numel()
+-                        assert gbuf_world_numel % data_parallel_world_size == 0
+-                        assert _is_trailing_padding_only_shard(
+-                            data_parallel_rank,
+-                            gbuf_world_numel // data_parallel_world_size,
+-                            bucket.numel_unpadded,
+-                        ), 'empty bucket intersects unpadded optimizer state'
+                         continue
+                     bucket_state = state_dict[gbuf_idx][dtype][bucket_idx]
+                     bucket_state = [

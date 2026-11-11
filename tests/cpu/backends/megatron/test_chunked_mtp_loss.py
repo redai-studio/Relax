@@ -33,11 +33,33 @@ except Exception as exc:  # pragma: no cover
     pytest.skip(f"megatron/relax unavailable: {exc}", allow_module_level=True)
 
 
-def _native_process_mtp_loss(*args, **kwargs):
+def _native_process_mtp_loss(
+    hidden_states,
+    labels,
+    loss_mask,
+    output_layer,
+    output_weight,
+    runtime_gather_output,
+    is_training,
+    compute_language_model_loss,
+    config,
+    **kwargs,
+):
     previous = _patch._chunked_mtp_enabled
     _patch._chunked_mtp_enabled = lambda: False
     try:
-        return _mtp_mod.process_mtp_loss(*args, **kwargs)
+        return _mtp_mod.process_mtp_loss(
+            hidden_states,
+            labels,
+            loss_mask,
+            output_layer,
+            output_weight,
+            runtime_gather_output=runtime_gather_output,
+            is_training=is_training,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+            **kwargs,
+        )
     finally:
         _patch._chunked_mtp_enabled = previous
 
@@ -84,6 +106,8 @@ def _stub_clml(labels, logits):
 
 def _make_config(calculate_per_token_loss=False, fuse_linear=False):
     return types.SimpleNamespace(
+        attention_cp_layout="zigzag",
+        mtp_loss_type="cross_entropy",
         mtp_num_layers=LAYERS,
         mtp_loss_scaling_factor=0.3,
         calculate_per_token_loss=calculate_per_token_loss,
@@ -288,7 +312,11 @@ def test_static_dispatch_retains_native_fallback(monkeypatch, enabled, fused):
         body=[branch, ast.Return(ast.Constant("native"))],
         decorator_list=[],
     )
-    scope = {"_chunked_mtp_enabled": lambda: enabled, "config": _make_config(fuse_linear=fused)}
+    scope = {
+        "_chunked_mtp_enabled": lambda: enabled,
+        "config": _make_config(fuse_linear=fused),
+        "main_hidden_states": None,
+    }
     exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "dispatch", "exec"), scope)
     assert scope["dispatch"]() == ("chunked" if enabled and not fused else "native")
 
@@ -413,7 +441,7 @@ def test_chunked_mtp_acceptance_obeys_logging_gate(monkeypatch, is_training, col
     calls = []
     logged = []
 
-    def counts(logits, labels, loss_mask, *args):
+    def counts(logits, labels, loss_mask, *args, **kwargs):
         calls.append(labels.shape[1])
         total = loss_mask.sum()
         return total, total

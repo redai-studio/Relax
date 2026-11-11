@@ -162,12 +162,15 @@ ARG HYBRID_EP_COMMIT
 ENV RELAX_HYBRID_EP_COMMIT=${HYBRID_EP_COMMIT}
 
 ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
+ARG MEGATRON_CORE_COMMIT=f78809f6d9c88f8638ea7822966f35057a63fd5c
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
 
 RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && \
     cd /root/Megatron-Bridge/ && git checkout ${MEGATRON_BRIDGE_COMMIT} && \
-    git submodule update --init --recursive && ./scripts/switch_mcore.sh dev && \
+    git submodule update --init --recursive && \
+    git -C 3rdparty/Megatron-LM fetch --depth 1 origin "${MEGATRON_CORE_COMMIT}" && \
+    git -C 3rdparty/Megatron-LM checkout --detach FETCH_HEAD && \
     mkdir /root/Megatron-LM &&\
     cp -r /root/Megatron-Bridge/src/megatron /root/Megatron-LM/ && \
     rsync -avP /root/Megatron-Bridge/3rdparty/Megatron-LM/megatron/ /root/Megatron-LM/megatron/ && \
@@ -226,28 +229,24 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
 
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
-COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
 COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
-COPY docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
-    patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
+    patch --batch --forward --fuzz=0 -p1 < /root/Megatron-LM/megatron.patch && \
     if grep -R -n '^<<<<<<< ' .; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
     patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
-    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch fully-reshardable-checkpoint-padding.patch && \
+    rm megatron.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 

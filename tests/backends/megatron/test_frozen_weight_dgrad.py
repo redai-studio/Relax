@@ -17,7 +17,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 
 try:
-    from megatron.core.tensor_parallel.layers import LinearWithFrozenWeight
+    from megatron.core.tensor_parallel.layers import LinearWithFrozenWeight, linear_with_frozen_weight
 except ImportError:  # CI installs no training dependencies
     LinearWithFrozenWeight = None
 
@@ -75,7 +75,15 @@ def _run(batch, tokens, vocab, hidden, dtype=torch.float32, device="cpu"):
     # non-detached weight would pass the assertions below on an unpatched Megatron.
     assert not weight.requires_grad, "fixture must stay detached, like the output weight after .detach()"
     inp = torch.randn(tokens, batch, hidden, dtype=dtype, device=device, requires_grad=True)
-    out = LinearWithFrozenWeight.apply(inp, weight, None, False, None)
+    out = linear_with_frozen_weight(
+        inp,
+        weight,
+        bias=None,
+        gradient_accumulation_fusion=False,
+        allreduce_dgrad=False,
+        sequence_parallel=False,
+        tp_group=None,
+    )
     assert out.shape == grad_output.shape
 
     spy = _MatmulSpy()
@@ -104,7 +112,15 @@ def test_frozen_weight_dgrad_passes_2d_grad_through():
     grad_output = torch.randn(32, 64)
     weight = torch.randn(64, 16)
     inp = torch.randn(32, 16, requires_grad=True)
-    out = LinearWithFrozenWeight.apply(inp, weight, None, False, None)
+    out = linear_with_frozen_weight(
+        inp,
+        weight,
+        bias=None,
+        gradient_accumulation_fusion=False,
+        allreduce_dgrad=False,
+        sequence_parallel=False,
+        tp_group=None,
+    )
 
     spy = _MatmulSpy()
     with spy:

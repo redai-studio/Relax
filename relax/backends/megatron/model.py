@@ -11,6 +11,7 @@ from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
@@ -2458,7 +2459,7 @@ def initialize_model_and_optimizer(
             DDP-wrapped model chunks, optimizer, scheduler, and iteration index.
     """
 
-    if torch.version.hip:
+    if torch.version.hip and find_spec("megatron.core.dist_checkpointing.strategies.filesystem_async") is not None:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
 
         from relax.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync

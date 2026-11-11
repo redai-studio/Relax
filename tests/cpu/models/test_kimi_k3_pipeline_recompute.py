@@ -77,9 +77,11 @@ def _block(layers):
         recompute_method="uniform",
         recompute_num_layers=1,
         distribute_saved_activations=False,
+        enable_mhc_connections=False,
         fp8=None,
         fp4=None,
     )
+    block.pg_collection = SimpleNamespace(tp=None)
     block.layers = torch.nn.ModuleList(layers)
     block.num_layers_per_pipeline_rank = len(layers)
     return block

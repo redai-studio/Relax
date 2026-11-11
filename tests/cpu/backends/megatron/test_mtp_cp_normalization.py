@@ -60,6 +60,8 @@ def _exercise(cp_group, *, chunked, mode, mask, teacher_mask):
     labels = full_labels[:, local].contiguous()
     loss_mask = mask[:, local].contiguous()
     config = SimpleNamespace(
+        attention_cp_layout="zigzag",
+        mtp_loss_type="cross_entropy",
         mtp_num_layers=depths,
         mtp_loss_scaling_factor=0.3,
         calculate_per_token_loss=mode != "microbatch",
@@ -94,10 +96,10 @@ def _exercise(cp_group, *, chunked, mode, mask, teacher_mask):
         loss_mask,
         head,
         None,
-        False,
-        True,
-        cross_entropy,
-        config,
+        runtime_gather_output=False,
+        is_training=True,
+        compute_language_model_loss=cross_entropy,
+        config=config,
         cp_group=cp_group,
         mtp_input_mask=None if teacher_mask is None else teacher_mask[:, local].contiguous(),
     )

@@ -304,6 +304,7 @@ def test_mixed_hdo_resume_drops_only_cpu_owned_group_counter_before_chained_save
     distributed.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=True)
     distributed.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
     distributed.grad_scaler = None
+    distributed.is_stub_optimizer = False
     saved = {
         "optimizer": {"param_groups": [{"step": 20} for _ in groups]},
         "param_state": {},

@@ -18,7 +18,10 @@ pytest.importorskip("megatron.core")
 
 @pytest.fixture
 def writer_module(monkeypatch):
-    import megatron.core.dist_checkpointing.strategies.filesystem_async as original
+    original = pytest.importorskip(
+        "megatron.core.dist_checkpointing.strategies.filesystem_async",
+        reason="the legacy writer is available on older MCore images",
+    )
 
     name = original.__name__
     spec = importlib.util.spec_from_file_location(name, original.__file__)
