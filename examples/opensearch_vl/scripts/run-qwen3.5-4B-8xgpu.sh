@@ -31,7 +31,16 @@ case "${MODE}" in
         case "$2" in
             simplevqa) benchmark_data="${BENCHMARK_DATA_ROOT}/simplevqa/test.parquet" ;;
             vdr) benchmark_data="${BENCHMARK_DATA_ROOT}/vdr/data/testmini500_v1.parquet" ;;
-            *) echo "Benchmark must be simplevqa or vdr" >&2; exit 2 ;;
+            vstar)
+                python3 "${SCRIPT_DIR}/../tools/vstar_benchmark.py" \
+                    --data "${BENCHMARK_DATA_ROOT}/vstar" --processor "${HF_CHECKPOINT}" \
+                    --provenance "${AGENT_PROVENANCE_FILE:?Set verified model provenance}" --label "$3" \
+                    --overlap-index "${BENCHMARK_OVERLAP_INDEX}" \
+                    --output "${SAVE_DIR}/${EXP_NAME}/benchmark/$3/vstar" \
+                    --workers "${BENCHMARK_WORKERS:-16}" --max-cases "${BENCHMARK_MAX_CASES:-0}"
+                exit
+                ;;
+            *) echo "Benchmark must be simplevqa, vstar or vdr" >&2; exit 2 ;;
         esac
         benchmark_args=()
         if [[ "${BENCHMARK_MAX_CASES:-0}" != 0 ]]; then benchmark_args+=(--max-cases "${BENCHMARK_MAX_CASES}"); fi
