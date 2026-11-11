@@ -54,6 +54,8 @@ from relax.utils.types import Sample
 
 logger = get_logger(__name__)
 
+_REGISTRATION_RECEIPT_TIMEOUT_S = 10.0
+
 
 # Compiler calibration messages used to measure the chat-template prefix. Their
 # exact roles and text affect prefix subtraction, so changes require tokenizer
@@ -1099,7 +1101,7 @@ class RuntimeDomain:
                 group_id, session_ids, error, uncertain=True, started_at=prepare_started_at
             )
             await finish_before_cancellation(
-                self._release_shard_group(stream),
+                self._release_failed_registration(stream),
                 f"start-group-submit-cleanup:{group_id}",
             )
             raise
@@ -1113,7 +1115,10 @@ class RuntimeDomain:
                 self._inventory.preparation_failed(
                     group_id, session_ids, error, uncertain=True, started_at=prepare_started_at
                 )
-                await self._release_shard_group(stream)
+                await finish_before_cancellation(
+                    self._release_failed_registration(stream),
+                    f"start-group-failed-cleanup:{group_id}",
+                )
             else:
                 if isinstance(error, asyncio.CancelledError):
                     stream.stop_reason = ("prepare_cancelled", "selection", "session preparation cancelled")
@@ -1619,7 +1624,11 @@ class RuntimeDomain:
         # Start remote closing before joining an in-flight grant RPC. Both
         # owners must settle before any local ref or physical debit is retired.
         remote = asyncio.ensure_future(
-            stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason)
+            stream.shard.handle.drop_group.remote(
+                stream.group_id,
+                reason=stream.stop_reason,
+                expected_session_ids=tuple(result.session_id for result in stream.session_results),
+            )
         )
         outcomes = await asyncio.gather(*(t for t in (task, remote) if t is not None), return_exceptions=True)
         receipt = outcomes[-1]
@@ -1648,7 +1657,11 @@ class RuntimeDomain:
             await asyncio.gather(*take_tasks, return_exceptions=True)
         if stream.shard.group_streams.get(stream.group_id) is not stream:
             return
-        await stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason)
+        await stream.shard.handle.drop_group.remote(
+            stream.group_id,
+            reason=stream.stop_reason,
+            expected_session_ids=tuple(result.session_id for result in stream.session_results),
+        )
         if stream.shard.group_streams.get(stream.group_id) is not stream:
             return  # Another joined drop already retired this exact stream.
         if not stream.first_request_barrier.done():
@@ -1738,7 +1751,14 @@ class RuntimeDomain:
             if stream.stop_reason is None:
                 stream.stop_reason = ("shutdown", "selection", "runtime shut down")
         drop_outcomes = await asyncio.gather(
-            *(stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason) for stream in streams),
+            *(
+                stream.shard.handle.drop_group.remote(
+                    stream.group_id,
+                    reason=stream.stop_reason,
+                    expected_session_ids=tuple(result.session_id for result in stream.session_results),
+                )
+                for stream in streams
+            ),
             return_exceptions=True,
         )
         for outcome in drop_outcomes:
@@ -1766,6 +1786,24 @@ class RuntimeDomain:
         if first_error is not None:
             raise first_error
         logger.info("Agentic runtime shutdown complete: session_capacity=%s", capacity)
+
+    async def _release_failed_registration(self, stream: RuntimeGroupStream) -> None:
+        """A failed RPC alone is not evidence that no Session was started."""
+        if self._session_capacity is not None:
+            receipt_wait = asyncio.ensure_future(
+                stream.shard.handle.get_resource_release_receipt.remote(stream.group_id)
+            )
+            try:
+                done, _ = await asyncio.wait((receipt_wait,), timeout=_REGISTRATION_RECEIPT_TIMEOUT_S)
+                if not done:
+                    raise RuntimeGroupError(f"Session resource receipt query timed out for {stream.group_id}")
+                self._confirm_session_resources(stream, receipt_wait.result())
+            finally:
+                if not receipt_wait.done():
+                    # Cancel only the local read-only RPC wait, never its resource owner.
+                    receipt_wait.cancel()
+                    receipt_wait.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+        await self._release_shard_group(stream)
 
     async def _release_shard_group(self, stream: RuntimeGroupStream) -> None:
         """Release driver refs after Shard export/drop commits."""
@@ -1811,7 +1849,11 @@ class RuntimeDomain:
             self._state_changed.set()
         try:
             receipt = await finish_before_cancellation(
-                stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason),
+                stream.shard.handle.drop_group.remote(
+                    stream.group_id,
+                    reason=stream.stop_reason,
+                    expected_session_ids=tuple(result.session_id for result in stream.session_results),
+                ),
                 task_name,
             )
             if stream.shard.group_streams.get(stream.group_id) is stream:

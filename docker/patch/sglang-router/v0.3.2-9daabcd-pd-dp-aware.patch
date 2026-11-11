@@ -65,7 +65,17 @@ diff --git a/src/routers/http/mod.rs b/src/routers/http/mod.rs
 diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 --- a/src/routers/http/pd_router.rs
 +++ b/src/routers/http/pd_router.rs
-@@ -10,16 +10,16 @@
+@@ -1,4 +1,8 @@
+-use std::{sync::Arc, time::Instant};
++use std::{
++    future::Future,
++    sync::Arc,
++    time::{Duration, Instant},
++};
+ 
+ use async_trait::async_trait;
+ use axum::{
+@@ -10,16 +14,16 @@
      },
      response::{IntoResponse, Response},
  };
@@ -84,7 +94,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
  use crate::{
      config::types::RetryConfig,
      core::{
-@@ -76,7 +76,7 @@
+@@ -76,7 +80,7 @@
          headers: Option<Vec<(String, String)>>,
      ) -> Response {
          let workers = self.worker_registry.get_prefill_workers();
@@ -93,7 +103,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
  
          if let Some(worker_url) = first_worker_url {
              self.proxy_to_worker(worker_url, endpoint, headers).await
-@@ -480,6 +480,7 @@
+@@ -480,6 +484,7 @@
                  None,
                  context.return_logprob,
                  false,
@@ -101,7 +111,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  Some(decode_url),
                  Some(response_headers),
                  prefill,
-@@ -557,6 +558,29 @@
+@@ -557,6 +562,267 @@
          }
      }
  
@@ -128,10 +138,248 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +        (prefill_request, decode_request)
 +    }
 +
++    fn request_rids(request: &Value) -> Vec<&str> {
++        // Native parallel sampling creates random child RIDs that cannot be
++        // cancelled safely using only the parent IDs in this HTTP payload.
++        let is_parallel = |params: &Value| {
++            params.get("n").is_some_and(|n| n.as_u64() != Some(1))
++        };
++        let has_parallel_samples = match request.get("sampling_params") {
++            Some(Value::Array(params)) => params.iter().any(is_parallel),
++            Some(params) => is_parallel(params),
++            None => false,
++        };
++        if has_parallel_samples {
++            return Vec::new();
++        }
++        match request.get("rid") {
++            Some(Value::String(rid)) if !rid.is_empty() => vec![rid],
++            Some(Value::Array(rids)) => rids
++                .iter()
++                .filter_map(Value::as_str)
++                .filter(|rid| !rid.is_empty())
++                .collect(),
++            _ => Vec::new(),
++        }
++    }
++
++    fn is_request_abort(body: &[u8], rids: &[&str]) -> bool {
++        let Ok(value) = serde_json::from_slice::<Value>(body) else {
++            return false;
++        };
++        let message = value.pointer("/error/message").and_then(Value::as_str);
++        rids.iter()
++            .any(|rid| message == Some(format!("Request {rid} was aborted").as_str()))
++    }
++
++    // Buffer 499 responses to distinguish SGLang cancellation from gateway errors.
++    // Rebuild unknown 499s so they retain the existing error handling.
++    async fn read_pd_response(
++        request: reqwest::RequestBuilder,
++        rids: &[&str],
++    ) -> (Result<reqwest::Response, reqwest::Error>, bool, bool) {
++        let response = match request.send().await {
++            Ok(response) => response,
++            Err(error) => return (Err(error), false, false),
++        };
++        if response.status().as_u16() != 499 {
++            return (Ok(response), false, false);
++        }
++        let (response, aborted, settled) = Self::finish_pd_response(Ok(response), false, false).await;
++        let response = match response {
++            Ok(response) => response,
++            Err(error) => return (Err(error), aborted, settled),
++        };
++        // The buffered response can be read without another network operation.
++        let status = response.status();
++        let headers = response.headers().clone();
++        let version = response.version();
++        let body = response.bytes().await.expect("buffered PD response body");
++        let aborted = status.as_u16() == 499 && Self::is_request_abort(&body, rids);
++        let mut response = http::Response::new(body);
++        *response.status_mut() = status;
++        *response.headers_mut() = headers;
++        *response.version_mut() = version;
++        (Ok(response.into()), aborted, true)
++    }
++
++    async fn finish_pd_response(
++        response: Result<reqwest::Response, reqwest::Error>,
++        aborted: bool,
++        settled: bool,
++    ) -> (Result<reqwest::Response, reqwest::Error>, bool, bool) {
++        if settled {
++            return (response, aborted, true);
++        }
++        let response = match response {
++            Ok(response) => response,
++            Err(error) => return (Err(error), aborted, false),
++        };
++        let status = response.status();
++        let headers = response.headers().clone();
++        let version = response.version();
++        let body = match response.bytes().await {
++            Ok(body) => body,
++            Err(error) => return (Err(error), aborted, false),
++        };
++        let mut response = http::Response::new(body);
++        *response.status_mut() = status;
++        *response.headers_mut() = headers;
++        *response.version_mut() = version;
++        (Ok(response.into()), aborted, true)
++    }
++
++    async fn native_abort_response(response: reqwest::Response) -> Response {
++        let headers = header_utils::preserve_response_headers(response.headers());
++        let body = response
++            .bytes()
++            .await
++            .expect("buffered PD abort response body");
++        let mut response = Response::new(Body::from(body));
++        *response.status_mut() = StatusCode::from_u16(499).unwrap();
++        *response.headers_mut() = headers;
++        response
++    }
++
++    fn cancellation_unconfirmed(detail: &str) -> Response {
++        (
++            StatusCode::FAILED_DEPENDENCY,
++            axum::Json(json!({"error": {
++                "code": "pd_cancellation_unconfirmed", "message": detail
++            }})),
++        )
++            .into_response()
++    }
++
++    async fn abort_pd_peer(
++        &self,
++        peer: &dyn Worker,
++        rids: &[&str],
++        headers: Option<&HeaderMap>,
++        deadline: tokio::time::Instant,
++    ) -> bool {
++        // All control requests share the cancellation deadline, including their
++        // response bodies. A slow acknowledgement must not fail after just 1s.
++        let outcomes = futures_util::future::join_all(rids.iter().map(|rid| async move {
++            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
++            if remaining.is_zero() {
++                return false;
++            }
++            let attempt = async {
++                let result = self
++                    .build_post_with_headers(
++                        &self.client,
++                        peer.base_url(),
++                        "/abort_request",
++                        &json!({"rid": rid, "abort_all": false}),
++                        headers,
++                        false,
++                    )
++                    .timeout(remaining)
++                    .send()
++                    .await;
++                match result {
++                    Ok(response) if response.status().is_success() => match response.bytes().await {
++                        Ok(_) => true,
++                        Err(error) => {
++                            warn!(peer = peer.url(), rid, %error, "PD sibling abort response failed");
++                            false
++                        }
++                    },
++                    Ok(response) => {
++                        warn!(peer = peer.url(), rid, status = %response.status(), "PD sibling abort failed");
++                        false
++                    }
++                    Err(error) => {
++                        warn!(peer = peer.url(), rid, %error, "PD sibling abort request failed");
++                        false
++                    }
++                }
++            };
++            match tokio::time::timeout_at(deadline, attempt).await {
++                Ok(confirmed) => confirmed,
++                Err(error) => {
++                    warn!(peer = peer.url(), rid, %error, "PD sibling abort deadline failed");
++                    false
++                }
++            }
++        }))
++        .await;
++        outcomes.into_iter().all(|confirmed| confirmed)
++    }
++
++    async fn settle_cancelled_peer<F, T>(
++        &self,
++        future: F,
++        peer: &dyn Worker,
++        rids: &[&str],
++        headers: Option<&HeaderMap>,
++        deadline: Duration,
++    ) -> Result<T, Response>
++    where
++        F: Future<Output = T>,
++    {
++        tokio::pin!(future);
++        let deadline_at = tokio::time::Instant::now() + deadline;
++        let expires = tokio::time::sleep_until(deadline_at);
++        tokio::pin!(expires);
++        let mut retry = tokio::time::interval(Duration::from_millis(250));
++        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
++        let mut aborts_confirmed = true;
++        loop {
++            tokio::select! {
++                biased;
++                result = &mut future => return if aborts_confirmed {
++                    Ok(result)
++                } else {
++                    Err(Self::cancellation_unconfirmed(
++                        "A PD sibling abort request failed; safe RID reuse is unconfirmed",
++                    ))
++                },
++                _ = &mut expires => break,
++                _ = retry.tick() => {
++                    let abort = self.abort_pd_peer(peer, rids, headers, deadline_at);
++                    tokio::pin!(abort);
++                    tokio::select! {
++                        // Join the control request too: dropping an in-flight
++                        // abort could let it cancel the next use of this RID.
++                        result = &mut future => {
++                            aborts_confirmed &= (&mut abort).await;
++                            return if aborts_confirmed {
++                                Ok(result)
++                            } else {
++                                Err(Self::cancellation_unconfirmed(
++                                    "A PD sibling abort request failed; safe RID reuse is unconfirmed",
++                                ))
++                            };
++                        },
++                        confirmed = &mut abort => aborts_confirmed &= confirmed,
++                        _ = &mut expires => {
++                            (&mut abort).await;
++                            break;
++                        },
++                    }
++                },
++            }
++        }
++        // In-flight controls use the same deadline. Only this final explicit
++        // best-effort abort gets one additional second; it cannot prove release.
++        self.abort_pd_peer(
++            peer,
++            rids,
++            headers,
++            tokio::time::Instant::now() + Duration::from_secs(1),
++        )
++        .await;
++        Err(Self::cancellation_unconfirmed(
++            "Timed out waiting for the cancelled PD sibling to finish; remote cleanup is unconfirmed",
++        ))
++    }
++
      // Internal method that performs the actual dual dispatch (without retry logic)
      async fn execute_dual_dispatch_internal(
          &self,
-@@ -578,20 +602,30 @@
+@@ -578,20 +844,30 @@
          inject_trace_context_http(&mut headers_with_trace);
          let headers = Some(&headers_with_trace);
  
@@ -167,27 +415,109 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              headers,
              false,
          );
-@@ -604,10 +638,45 @@
+@@ -604,10 +880,133 @@
          }
          .emit();
  
+-        let (prefill_result, decode_result) =
+-            tokio::join!(prefill_request.send(), decode_request.send());
 +        let merge_prefill_meta = context.route == "/generate";
 +        let capture_prefill_body = context.return_logprob || merge_prefill_meta;
++        let rids = Self::request_rids(&prefill_json);
++        let prefill_url = prefill.url().to_string();
 +        let prefill_future = async {
-+            self.process_prefill_response(
-+                prefill_request.send().await,
-+                prefill.url(),
-+                capture_prefill_body,
-+                &prefill_json,
-+            )
-+            .await
++            let mut settled = false;
++            let result = self
++                .process_prefill_response(
++                    prefill_request.send().await,
++                    &prefill_url,
++                    capture_prefill_body,
++                    &prefill_json,
++                    &mut settled,
++                )
++                .await;
++            let aborted = matches!(&result, Err(response) if response.status().as_u16() == 499);
++            (result, aborted, settled)
 +        };
-+        // Read/log P's result as soon as it arrives, but settle both requests
-+        // before retrying the same rid. Dropping D early can race its asynchronous
-+        // disconnect cleanup and make the next attempt a duplicate request.
-         let (prefill_result, decode_result) =
--            tokio::join!(prefill_request.send(), decode_request.send());
-+            tokio::join!(prefill_future, decode_request.send());
++        let decode_future = Self::read_pd_response(decode_request, &rids);
++        tokio::pin!(prefill_future);
++        tokio::pin!(decode_future);
++        // Preserve ordinary error precedence and settle-before-retry. Only an
++        // exact SGLang cancellation proactively aborts its paired request.
++        // Repeating covers a sibling whose HTTP request registers after abort.
++        let deadline = Duration::from_secs(30);
++        let (
++            (prefill_result, prefill_aborted, prefill_settled),
++            (decode_result, decode_aborted, decode_settled),
++        ) = tokio::select! {
++            prefill_result = &mut prefill_future => {
++                let decode_result = if prefill_result.1 {
++                    let finish = async {
++                        let (response, aborted, settled) = (&mut decode_future).await;
++                        Self::finish_pd_response(response, aborted, settled).await
++                    };
++                    match self
++                        .settle_cancelled_peer(finish, decode.as_ref(), &rids, headers, deadline)
++                        .await
++                    {
++                        Ok(result) => result,
++                        Err(error) => return error,
++                    }
++                } else {
++                    (&mut decode_future).await
++                };
++                (prefill_result, decode_result)
++            },
++            decode_result = &mut decode_future => {
++                let prefill_result = if decode_result.1 {
++                    match self
++                        .settle_cancelled_peer(
++                            &mut prefill_future, prefill.as_ref(), &rids, headers, deadline,
++                        )
++                        .await
++                    {
++                        Ok(result) => result,
++                        Err(error) => return error,
++                    }
++                } else {
++                    (&mut prefill_future).await
++                };
++                let decode_result = if prefill_result.1 && !decode_result.2 {
++                    let (response, aborted, settled) = decode_result;
++                    match self
++                        .settle_cancelled_peer(
++                            Self::finish_pd_response(response, aborted, settled),
++                            decode.as_ref(), &rids, headers, deadline,
++                        )
++                        .await
++                    {
++                        Ok(result) => result,
++                        Err(error) => return error,
++                    }
++                } else {
++                    decode_result
++                };
++                (prefill_result, decode_result)
++            },
++        };
++
++        if (prefill_aborted && !decode_settled) || (decode_aborted && !prefill_settled) {
++            return Self::cancellation_unconfirmed(
++                "The cancelled PD sibling connection failed before its response completed; remote cleanup is unconfirmed",
++            );
++        }
++        if prefill_aborted && !decode_aborted {
++            if let Ok(response) = &decode_result {
++                if !response.status().is_success() {
++                    // A genuine sibling failure must not disappear behind 499.
++                    return self
++                        .handle_decode_error_response(
++                            decode_result.unwrap(), &context, prefill, decode,
++                        )
++                        .await;
++                }
++            }
++        }
  
          events::RequestReceivedEvent {}.emit();
 +
@@ -211,10 +541,17 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                return error_response;
 +            }
 +        };
++
++        if decode_aborted {
++            return Self::native_abort_response(
++                decode_result.expect("known PD abort response"),
++            )
++            .await;
++        }
  
          // Process decode response
          match decode_result {
-@@ -628,23 +697,13 @@
+@@ -628,23 +1027,13 @@
                          .await;
                  }
  
@@ -239,7 +576,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                      } else {
                          None
                      };
-@@ -657,6 +716,7 @@
+@@ -657,6 +1046,7 @@
                          prefill_meta,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -247,7 +584,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                          None,
                          Some(response_headers),
                          prefill,
-@@ -669,6 +729,7 @@
+@@ -669,6 +1059,7 @@
                          status,
                          context.return_logprob,
                          merge_prefill_meta,
@@ -255,7 +592,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                          prefill_body,
                      )
                      .await
-@@ -830,6 +891,7 @@
+@@ -830,6 +1221,7 @@
          prefill_meta: Option<Value>,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -263,7 +600,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          decode_url: Option<String>,
          headers: Option<HeaderMap>,
          prefill: Arc<dyn Worker>,
-@@ -841,39 +903,43 @@
+@@ -841,39 +1233,43 @@
  
          tokio::spawn(async move {
              futures_util::pin_mut!(stream);
@@ -332,7 +669,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              }
          });
  
-@@ -914,6 +980,7 @@
+@@ -914,6 +1310,7 @@
          status: StatusCode,
          return_logprob: bool,
          merge_prefill_meta: bool,
@@ -340,7 +677,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          prefill_body: Option<bytes::Bytes>,
      ) -> Response {
          let response_headers = header_utils::preserve_response_headers(res.headers());
-@@ -934,6 +1001,9 @@
+@@ -934,6 +1331,9 @@
          }
  
          let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) else {
@@ -350,7 +687,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              warn!("Failed to parse decode response for PD meta normalization");
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -951,14 +1021,18 @@
+@@ -951,14 +1351,18 @@
                          None
                      }
                  });
@@ -373,11 +710,12 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          if !changed {
              let mut response = Response::new(Body::from(decode_body));
              *response.status_mut() = status;
-@@ -991,24 +1065,23 @@
+@@ -991,24 +1395,24 @@
          prefill_result: Result<reqwest::Response, reqwest::Error>,
          prefill_url: &str,
          capture_body: bool,
 +        request: &Value,
++        settled: &mut bool,
      ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
          // Check prefill result first - it's critical for disaggregated mode
          let prefill_response = match prefill_result {
@@ -404,7 +742,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  ));
              }
          };
-@@ -1018,6 +1091,13 @@
+@@ -1018,11 +1422,33 @@
  
          // Check if prefill succeeded
          if !prefill_status.is_success() {
@@ -416,9 +754,57 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +                "Prefill HTTP error response"
 +            );
              // Get error body from prefill
-             let error_msg = prefill_response
-                 .text()
-@@ -1111,6 +1191,18 @@
+-            let error_msg = prefill_response
+-                .text()
+-                .await
+-                .unwrap_or_else(|_| "Unknown prefill error".to_string());
++            let error_msg = match prefill_response.text().await {
++                Ok(message) => {
++                    *settled = true;
++                    message
++                }
++                Err(_) => "Unknown prefill error".to_string(),
++            };
++
++            if *settled
++                && prefill_status.as_u16() == 499
++                && Self::is_request_abort(error_msg.as_bytes(), &Self::request_rids(request))
++            {
++                return Err((
++                    prefill_status,
++                    [(CONTENT_TYPE, "application/json")],
++                    error_msg,
++                )
++                    .into_response());
++            }
+ 
+             error!(
+                 "Prefill server returned error status prefill_url={} status={} body={}",
+@@ -1061,7 +1487,10 @@
+ 
+         let prefill_body = if capture_body {
+             match prefill_response.bytes().await {
+-                Ok(body) => Some(body),
++                Ok(body) => {
++                    *settled = true;
++                    Some(body)
++                }
+                 Err(e) => {
+                     warn!("Failed to read prefill response body for merging: {}", e);
+                     None
+@@ -1071,7 +1500,10 @@
+             // For non-logprob requests, just consume the response without storing
+             debug!("Consuming prefill response body (non-logprob request)");
+             match prefill_response.bytes().await {
+-                Ok(_) => debug!("Prefill response consumed successfully"),
++                Ok(_) => {
++                    *settled = true;
++                    debug!("Prefill response consumed successfully");
++                }
+                 Err(e) => warn!("Error consuming prefill response: {}", e),
+             }
+             None
+@@ -1111,6 +1543,18 @@
          return_logprob: bool,
          merge_prefill_meta: bool,
      ) -> bool {
@@ -437,7 +823,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          let Some(decode_meta) = decode_json
              .get_mut("meta_info")
              .and_then(Value::as_object_mut)
-@@ -1140,27 +1232,6 @@
+@@ -1140,27 +1584,6 @@
              }
          }
  
@@ -465,7 +851,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          if merge_prefill_meta {
              if let Some(prefill_meta) = prefill_meta.and_then(Value::as_object) {
                  for (key, value) in prefill_meta {
-@@ -1175,44 +1246,6 @@
+@@ -1175,44 +1598,6 @@
          changed
      }
  
@@ -510,7 +896,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
      fn should_merge_prefill_meta_key(key: &str) -> bool {
          key.starts_with("pd_prefill_") || key.starts_with("pd_transfer_")
      }
-@@ -1223,31 +1256,19 @@
+@@ -1223,31 +1608,19 @@
          merge_prefill_meta: bool,
          decode_chunk: &[u8],
      ) -> Result<bytes::Bytes, ()> {
@@ -552,7 +938,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
      }
  }
  
-@@ -1271,11 +1292,11 @@
+@@ -1271,11 +1644,11 @@
              }
          };
  
@@ -566,10 +952,11 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
                  .send()
          );
  
-@@ -1523,6 +1544,36 @@
+@@ -1522,6 +1895,36 @@
+ mod tests {
      use super::*;
      use crate::core::{BasicWorkerBuilder, WorkerType};
- 
++
 +    #[test]
 +    fn test_pd_dp_requests_select_independent_owners() {
 +        let prefill = crate::core::DPAwareWorkerBuilder::new("http://p:8000", 1, 2)
@@ -599,11 +986,10 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
 +        assert_eq!(p, request);
 +        assert_eq!(d, request);
 +    }
-+
+ 
      fn create_test_pd_router() -> PDRouter {
          let worker_registry = Arc::new(WorkerRegistry::new());
-         let policy_registry =
-@@ -1635,7 +1686,6 @@
+@@ -1635,7 +2038,6 @@
      #[test]
      fn test_merge_prefill_pd_meta_whitelist_and_logprobs() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
@@ -611,7 +997,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          let prefill_meta = json!({
              "pd_prefill_bootstrap_queue_duration": 0.011,
              "pd_prefill_bootstrap_duration": 0.012,
-@@ -1649,6 +1699,8 @@
+@@ -1649,6 +2051,8 @@
              "queue_time": 99.0,
              "finish_reason": {"type": "length"},
              "input_token_logprobs": [[-0.3, 10]],
@@ -620,7 +1006,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              "routed_experts": prefill_routed,
          });
          let mut decode_json = json!({
-@@ -1659,7 +1711,9 @@
+@@ -1659,7 +2063,9 @@
                  "pd_decode_bootstrap_duration": 0.2,
                  "pd_decode_forward_duration": 0.75,
                  "input_token_logprobs": [[-0.2, 20]],
@@ -631,7 +1017,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              }
          });
  
-@@ -1670,6 +1724,7 @@
+@@ -1670,6 +2076,7 @@
              true,
          ));
  
@@ -639,7 +1025,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          let meta = &decode_json["meta_info"];
          assert_eq!(meta["pd_prefill_bootstrap_queue_duration"], 0.011);
          assert_eq!(meta["pd_prefill_bootstrap_duration"], 0.012);
-@@ -1708,21 +1763,24 @@
+@@ -1708,21 +2115,24 @@
      fn test_merge_prefill_routed_experts_when_decode_has_no_decode_rows() {
          let prefill_routed = b64_i32(&[1, 2, 3, 4]);
          let prefill_meta = json!({
@@ -668,7 +1054,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
  
          let meta = &decode_json["meta_info"];
          assert_eq!(
-@@ -1785,7 +1843,7 @@
+@@ -1785,7 +2195,7 @@
          assert_eq!(meta["queue_time"], 0.1);
          assert_eq!(
              decode_b64_i32(meta["routed_experts"].as_str().unwrap()),
@@ -677,7 +1063,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
          );
      }
  
-@@ -1817,6 +1875,7 @@
+@@ -1817,6 +2227,7 @@
              false,
              false,
              None,
@@ -685,7 +1071,7 @@ diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
              Some(headers),
              prefill_worker,
              decode_worker,
-@@ -1870,6 +1929,7 @@
+@@ -1870,6 +2281,7 @@
                  false,
                  None,
                  None,

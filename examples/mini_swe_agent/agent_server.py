@@ -1089,14 +1089,33 @@ class AgentServer:
                         signalled = True
                     time.sleep(0.05)
                 proc.wait()
-            if proc.returncode != 0 or not report_path.exists():
+            if not report_path.exists():
                 raise RuntimeError(f"Session supervisor failed ({proc.returncode}); see {control / 'worker.log'}")
             report = json.loads(report_path.read_text())
+            if not isinstance(report, dict):
+                raise RuntimeError("Invalid supervisor release report")
             if report["nonce"] != record.release_nonce or report["client_session_id"] != record.session_id:
                 raise RuntimeError("Supervisor release identity mismatch")
+            if (
+                any(
+                    type(report.get(key)) is not bool
+                    for key in ("resources_released", "children_reaped", "instance_absent")
+                )
+                or not isinstance(report.get("cleanup_error"), str)
+                or not isinstance(report.get("info"), dict)
+                or not isinstance(report.get("error"), str)
+                or (report["resources_released"] and not (report["children_reaped"] and report["instance_absent"]))
+            ):
+                raise RuntimeError("Invalid supervisor release report")
+            # An atomic release proof survives a later abnormal supervisor exit.
+            # The nonzero exit still fails the sample; it cannot revoke cleanup.
             record.resources_released = report["resources_released"] is True
             record.cleanup_error = report["cleanup_error"]
             info, error = report["info"], report["error"]
+            if proc.returncode != 0:
+                error = (
+                    error + f"\nSession supervisor exited with code {proc.returncode}; see {control / 'worker.log'}"
+                ).strip()
             if not record.resources_released:
                 error = (error + "\nSession resources remain unconfirmed: " + record.cleanup_error).strip()
         except Exception as exc:

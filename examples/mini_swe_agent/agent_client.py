@@ -7,6 +7,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import random
 import signal
 import sys
 import time
@@ -20,6 +21,14 @@ def atomic_json(path: Path, value: dict) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(value))
     temporary.replace(path)
+
+
+class _TransientRequestError(Exception):
+    """An HTTP transport failure, distinct from local output/receipt I/O."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(type(cause).__name__)
+        self.cause = cause
 
 
 def _diagnostic(message: str) -> None:
@@ -51,8 +60,6 @@ def run() -> int:
     nonce = os.environ["RELAX_RESOURCE_RELEASE_NONCE"] if required else uuid.uuid4().hex
     release_path = Path(os.environ["RELAX_RESOURCE_RELEASE_PATH"]) if required else None
     expected = {"schema": 1, "session_id": sid, "nonce": nonce, "status": "released"}
-    if release_path is not None:
-        atomic_json(release_path, {**expected, "status": "unknown"})
     cancel_deadline: float | None = None
     cancel_reason = ""
     protocol_error = False
@@ -72,24 +79,39 @@ def run() -> int:
 
     signal.signal(signal.SIGTERM, cancel)
     signal.signal(signal.SIGINT, cancel)
+    if release_path is not None:
+        atomic_json(release_path, {**expected, "status": "unknown"})
 
     def request(path: str, payload: dict | None = None, *, timeout: float = 2.0) -> dict:
         if cancel_deadline is not None:
             timeout = min(timeout, cancel_deadline - time.monotonic())
             if timeout <= 0:
-                raise TimeoutError("Resource-release deadline elapsed")
+                raise _TransientRequestError(TimeoutError("Resource-release deadline elapsed"))
         req = urllib.request.Request(
             base + path,
             data=json.dumps(payload).encode() if payload is not None else None,
             headers={"Content-Type": "application/json"},
         )
         # Node-local traffic must not be sent to an HTTP proxy.
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as response:
-            raw = response.read()
-            result = json.loads(raw) if raw else {}
-            if not isinstance(result, dict):
-                raise ValueError("Agent server response must be an object")
-            return result
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as response:
+                raw = response.read()
+                result = json.loads(raw) if raw else {}
+                if not isinstance(result, dict):
+                    raise ValueError("Agent server response must be an object")
+                return result
+        except urllib.error.HTTPError as exc:
+            # HTTPError owns a response body/socket. Close without draining an
+            # unbounded body before either retrying or entering cleanup.
+            try:
+                exc.close()
+            except OSError:
+                pass
+            if exc.code in {408, 429, 500, 502, 503, 504}:
+                raise _TransientRequestError(exc) from exc
+            raise
+        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            raise _TransientRequestError(exc) from exc
 
     payload = {
         "session_id": sid,
@@ -100,14 +122,27 @@ def run() -> int:
         "release_nonce": nonce,
     }
     server_sid = None
+    create_attempted = False
     errors = 0
     cancel_sent = False
     result: dict = {}
     while cancel_deadline is None or time.monotonic() < cancel_deadline:
         phase = "create"
+        retry_delay = poll_interval
         try:
+            if cancel_deadline is not None and not create_attempted:
+                # No request could have allocated remote resources. Publish the
+                # exact lease proof in normal control flow, never in the handler.
+                phase = "release_receipt"
+                if release_path is not None:
+                    atomic_json(release_path, expected)
+                _diagnostic(f"cancelled before create reason={cancel_reason}")
+                return 1 if protocol_error else 143
             if server_sid is None:
+                # A lost response cannot prove that creation did not happen.
+                create_attempted = True
                 created_sid = request("/sessions", payload)["session_id"]
+                errors = 0
                 if not isinstance(created_sid, str) or not created_sid:
                     raise ValueError("Agent server Session ID must be a nonempty string")
                 server_sid = created_sid
@@ -119,9 +154,11 @@ def run() -> int:
             if cancel_deadline is not None and not cancel_sent:
                 phase = "cancel"
                 request(f"/sessions/{server_sid}/cancel", {}, timeout=cancel_timeout)
+                errors = 0
                 cancel_sent = True
             phase = "poll"
             result = request(f"/sessions/{server_sid}")
+            errors = 0
             if result.get("client_session_id") != sid or result.get("session_id") != server_sid:
                 raise RuntimeError("Agent server Session identity mismatch")
             release = result.get("resource_release")
@@ -168,8 +205,8 @@ def run() -> int:
                     trace_failure(sid, result)
                     sys.stderr.write(f"Agent session {result['status']}: {result.get('error', '')}\n")
                 return int(result.get("exit_code", 1))
-            errors = 0
-        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+        except _TransientRequestError as failure:
+            exc = failure.cause
             errors += 1
             if errors in {1, failure_limit}:
                 reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
@@ -179,14 +216,33 @@ def run() -> int:
                     f"error={type(exc).__name__} reason_type={type(reason).__name__} "
                     f"errno={getattr(reason, 'errno', None)} http_status={getattr(exc, 'code', None)}"
                 )
-            if errors >= failure_limit and cancel_deadline is None:
-                cancel(0, None)
+            if cancel_deadline is None:
+                if errors >= failure_limit:
+                    cancel(0, None)
+                else:
+                    # Bound recovery attempts and desynchronize clients sharing
+                    # the same server. Jitter never exceeds the five-second cap.
+                    retry_delay = min(5.0, 0.5 * 2 ** min(errors - 1, 4)) * random.uniform(0.9, 1.0)
+        except urllib.error.HTTPError as exc:
+            protocol_error = True
+            cancel(0, None, reason=f"permanent_http:{exc.code}")
+        except OSError as exc:
+            # HTTP I/O is wrapped inside request(); this is local persistence.
+            protocol_error = True
+            cancel(0, None, reason=f"local_io:{type(exc).__name__}")
         except (ValueError, KeyError, TypeError, RuntimeError, http.client.HTTPException) as exc:
             protocol_error = True
             cancel(0, None, reason=f"invalid_response:{type(exc).__name__}")
-        time.sleep(
-            min(poll_interval, max(0.0, cancel_deadline - time.monotonic())) if cancel_deadline else poll_interval
-        )
+        # Keep the normal polling frequency during cleanup, while interrupting
+        # an active retry backoff promptly if cancellation arrives mid-sleep.
+        cancelling = cancel_deadline is not None
+        retry_at = time.monotonic() + (poll_interval if cancelling else retry_delay)
+        if cancelling:
+            retry_at = min(retry_at, cancel_deadline)
+        while time.monotonic() < retry_at:
+            if not cancelling and cancel_deadline is not None:
+                break
+            time.sleep(min(0.1, max(0.0, retry_at - time.monotonic())))
     _diagnostic(f"release deadline elapsed reason={cancel_reason}")
     return 143 if cancel_deadline is not None and not protocol_error else 1
 

@@ -1647,21 +1647,25 @@ class AgenticSessionShard:
         eager_session_generation = (
             rollout_mode == "train" and getattr(self.args, "agentic_session_capacity_per_node", None) is not None
         )
+        if group_id in self._groups:
+            raise RuntimeGroupError(f"group token is already resident: {group_id}")
+        all_ids = tuple(spec.session_id for spec in session_specs)
         if eager_session_generation and (
             self._eager_shutdown
             or start_session_ids is None
             or not all(spec.require_resource_release for spec in session_specs)
         ):
+            # This owner rejected registration before any process could start.
+            # Preserve an older receipt rather than acknowledging another owner.
+            self._resource_release_receipts.setdefault(group_id, all_ids)
             raise RuntimeGroupError("Eager startup requires its resource-accounted train scope")
-        if group_id in self._groups:
-            raise RuntimeGroupError(f"group token is already resident: {group_id}")
-        all_ids = tuple(spec.session_id for spec in session_specs)
         if start_session_ids is not None:
             if (
                 not all(spec.require_resource_release for spec in session_specs)
                 or len(set(start_session_ids)) != len(start_session_ids)
                 or not set(start_session_ids) <= set(all_ids)
             ):
+                self._resource_release_receipts.setdefault(group_id, all_ids)
                 raise RuntimeGroupError("Deferred startup requires exact budgeted Session identities")
 
         result_cells = {session_spec.session_id: _SessionResultCell() for session_spec in session_specs}
@@ -2102,13 +2106,24 @@ class AgenticSessionShard:
         self._groups.pop(group_id)
         self._notify_state_change()
 
-    async def drop_group(self, group_id: str, *, reason: tuple[str, str, str] | None = None) -> Tuple[str, ...]:
+    async def drop_group(
+        self,
+        group_id: str,
+        *,
+        reason: tuple[str, str, str] | None = None,
+        expected_session_ids: Tuple[str, ...] | None = None,
+    ) -> Tuple[str, ...]:
         """Discard one group through an idempotent cleanup path."""
 
         group = self._groups.get(group_id)
         if group is None:
             # Replay a committed cleanup receipt after a lost RPC response.
             return self._resource_release_receipts.get(group_id, ())
+        if expected_session_ids is not None and (
+            len(set(expected_session_ids)) != len(expected_session_ids)
+            or set(expected_session_ids) != set(group.result_cells)
+        ):
+            raise RuntimeGroupError(f"Session cleanup identities do not match the resident Group: {group_id}")
         if group.eager_session_generation:
             await self._close_eager_group(group)
         if group.drop_task is None or (
@@ -2125,6 +2140,11 @@ class AgenticSessionShard:
             f"drop-group:{group.group_id}",
         )
         return tuple(sorted(group.resource_released_session_ids))
+
+    async def get_resource_release_receipt(self, group_id: str) -> Tuple[str, ...]:
+        """Read an exact committed receipt without dropping an unknown
+        owner."""
+        return self._resource_release_receipts.get(group_id, ())
 
     async def forget_resource_receipt(self, group_id: str) -> None:
         """Runtime acknowledges the drop receipt after retiring its physical

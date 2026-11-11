@@ -109,7 +109,7 @@ class PrepareDomain:
         self._ready_prepare_tasks.clear()
         # A completed Prepare task owns a registered stream even when it was
         # never leased. Cancelling that already-done task cannot release it.
-        streams = {outcome.group_id: outcome for outcome in outcomes if isinstance(outcome, RuntimeGroupStream)}
+        streams = {outcome[0].group_id: outcome[0] for outcome in outcomes if isinstance(outcome, tuple)}
         drops = await asyncio.gather(
             *(self.runtime_domain.drop_group(stream) for stream in streams.values()), return_exceptions=True
         )
