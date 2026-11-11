@@ -98,7 +98,7 @@ The training logs record the following optimizer-update timestamps (UTC+8). Thes
 | SFT   | 2026-11-10 20:25:04 (update 1) | 2026-11-10 20:29:17 (update 50)  |
 | GRPO  | 2026-11-10 20:40:16 (update 1) | 2026-11-11 11:43:23 (update 200) |
 
-The following figure contains **all 50 SFT and 200 RL logged updates, without smoothing**. The full numeric series are available in [`sft_metrics.csv`](results/qwen25-7b-sft50-grpo200-20261110/sft_metrics.csv) and [`rl_metrics.csv`](results/qwen25-7b-sft50-grpo200-20261110/rl_metrics.csv). Each RL accuracy point has a denominator of 1,024 training trajectories. Different batches contain different questions; these curves are not held-out learning curves or paired per-question improvements.
+The following figure contains **all 50 SFT and 200 RL logged updates, without smoothing**. The source metric records remain with the experiment outputs and are not checked into this repository. Each RL accuracy point has a denominator of 1,024 training trajectories. Different batches contain different questions; these curves are not held-out learning curves or paired per-question improvements.
 
 ![Raw SFT and GRPO training metrics](results/qwen25-7b-sft50-grpo200-20261110/training_curves.png)
 
@@ -122,7 +122,7 @@ Each model answers every question eight times using the same per-question seed c
 | AIME2025 train |        30 |                  240 |         8/240 (3.33%) |       60/240 (25.00%) |        6/30 (20.00%) |       13/30 (43.33%) |
 | AIME2026 test  |        30 |                  240 |        10/240 (4.17%) |       49/240 (20.42%) |        5/30 (16.67%) |       11/30 (36.67%) |
 
-All eight panels contain 30,064 new trajectories in total. The complete aggregate counters are provided in [`evaluation.json`](results/qwen25-7b-sft50-grpo200-20261110/evaluation.json).
+All eight panels contain 30,064 new trajectories in total. The tables below retain the per-benchmark aggregate counters; machine-readable experiment outputs remain in the run directory.
 
 | Benchmark | Model    | Tool-calling trajectories | Tool feedback ok | Code error | Invalid call | Timeout |
 | --------- | -------- | ------------------------: | ---------------: | ---------: | -----------: | ------: |
@@ -141,4 +141,4 @@ Tool-feedback columns count calls, so their denominator differs from the traject
 
 SFT, RL and both evaluation drivers recorded actual parent wait exit 0. Both evaluation sessions recorded empty owned process groups, and the workflow recorded resource release. The preserved evaluation cleanup records contain sandbox exit −15 and Ray wrapper exit 1; individual native Ray actor parent waits were not recorded. The result does not imply that every subprocess exited 0.
 
-In the run directory, `comparison.json` summarizes the scores; `evaluation/{official,trained}/{benchmark}/case*.json` stores the original scored samples and each arm's `raw/eval_0.pt` stores the native dump. The public artifacts above contain only aggregate counters and training scalars, without deployment paths, credentials or raw questions/answers. Request totals, complete input/output token accounting and billed cost are **unknown** from the collected aggregate receipts; response lengths in the training CSV are not billing totals. No historical response was rescored to create these figures or tables.
+In the run directory, `comparison.json` summarizes the scores; `evaluation/{official,trained}/{benchmark}/case*.json` stores the original scored samples and each arm's `raw/eval_0.pt` stores the native dump. This repository retains only the curve image and summary tables, without raw experiment data, deployment paths, credentials or raw questions/answers. Request totals, complete input/output token accounting and billed cost are **unknown** from the collected aggregate receipts; the plotted mean response lengths are not billing totals. No historical response was rescored to create these figures or tables.
