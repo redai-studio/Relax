@@ -845,6 +845,13 @@ def get_data_from_transfer_queue(
     """
     if not synchronize_per_rank_fetch and not per_rank_fetch:
         raise ValueError("synchronize_per_rank_fetch=False requires per_rank_fetch=True")
+    flops_geometry = None
+    if getattr(args, "balance_by_flops", False) and token_budget is None:
+        from relax.utils.data.flops_balancing import get_dp_packing_geometry
+
+        flops_geometry = get_dp_packing_geometry(args, task_name)
+        if flops_geometry is not None:
+            sampling_config = {**sampling_config, "dp_packing_geometry": flops_geometry}
     # Determine which rank should fetch data
     #
     # CP=0 must be in the predicate (alongside TP=0 / PP=0) — otherwise every CP
@@ -1150,6 +1157,15 @@ def get_data_from_transfer_queue(
     # per micro-batch by get_batch).
     if has_multimodal and mm_inputs is not None:
         rollout_data["multimodal_train_inputs"] = mm_inputs
+
+    if flops_geometry is not None:
+        from relax.utils.data.flops_balancing import restore_schedule
+
+        try:
+            restore_schedule(batch_meta, rollout_data)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            # Surface malformed metadata collectively on the training thread.
+            rollout_data["_flops_schedule_error"] = [str(exc)]
 
     if post_process:
         post_process_rollout_data(args, rollout_data)

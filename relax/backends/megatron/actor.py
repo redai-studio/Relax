@@ -478,6 +478,14 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        if getattr(args, "balance_by_flops", False):
+            from megatron.core.utils import get_model_config
+
+            self.args.flops_microbatch_group_size = (
+                get_model_config(self.model[0]).microbatch_group_size_per_vp_stage
+                if (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) > 1
+                else 1
+            )
         if role == "actor":
             from relax.utils.record_function_tags import install_record_function_tags
 
@@ -3570,6 +3578,10 @@ class MegatronTrainRayActor(TrainRayActor):
             "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
             "task_name": task_name,
         }
+        if getattr(self.args, "balance_by_flops", False):
+            from relax.utils.data.flops_balancing import get_dp_packing_geometry
+
+            sampling_config["dp_packing_geometry"] = get_dp_packing_geometry(self.args, task_name)
         cancel_event = Event()
         self._sft_train_prefetch_cancel = cancel_event
         self._sft_train_prefetch_rollout_id = next_rollout_id

@@ -1204,6 +1204,71 @@ def _get_preference_data_iterator(
     return [iterator], [len(branch_bins)]
 
 
+def _get_synchronised_flops_schedule(
+    args: Namespace, model: torch.nn.Module | Sequence[torch.nn.Module], rollout_data: RolloutBatch
+) -> tuple[list[list[int]], list[int], set[int]]:
+    from relax.utils.data.flops_balancing import STEP_PLANS_FIELD, get_dp_packing_geometry, local_schedule
+
+    counts, signature, error = [], [], None
+    try:
+        if rollout_data.get("_flops_schedule_error"):
+            raise ValueError(rollout_data["_flops_schedule_error"])
+        if any(bool(inputs) for inputs in (rollout_data.get("multimodal_train_inputs") or [])):
+            raise ValueError("FLOPs scheduling does not support multimodal training inputs")
+        indices, counts, dummy = local_schedule(rollout_data)
+        geometry = get_dp_packing_geometry(args, "train")
+        if (
+            geometry["context_parallel_size"] != mpu.get_context_parallel_world_size()
+            or geometry["tensor_parallel_size"] != mpu.get_tensor_model_parallel_world_size()
+            or geometry["pipeline_stages"] != mpu.get_pipeline_model_parallel_world_size()
+        ):
+            raise ValueError("FLOPs plan parallel geometry differs from the training model")
+        if (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) > 1:
+            from megatron.core.utils import get_model_config
+
+            if geometry["microbatch_group_size"] != get_model_config(model[0]).microbatch_group_size_per_vp_stage:
+                raise ValueError("FLOPs plan VPP group differs from the training model")
+        for plan, count in zip(rollout_data[STEP_PLANS_FIELD], counts, strict=True):
+            if (
+                plan["geometry"] != geometry
+                or plan["dp_size"] != mpu.get_data_parallel_world_size(with_context_parallel=False)
+                or plan["dp_rank"] != mpu.get_data_parallel_rank(with_context_parallel=False)
+                or count % geometry["microbatch_group_size"]
+            ):
+                raise ValueError("FLOPs plan ownership or packing geometry differs")
+            pad = geometry["sequence_alignment"]
+            lengths = [(length + pad - 1) // pad * pad for length in plan["lengths"]]
+            token_counts = [sum(lengths[i] for i in group) for group in plan["indices"]]
+            if not _partitions_fit_capacity_or_singleton_oversize(
+                plan["indices"], token_counts, lengths, geometry["capacity"]
+            ):
+                raise ValueError("FLOPs plan exceeds token capacity")
+            digest = int(plan["sha256"][:15], 16)
+            signature.extend([count, -count, plan["global_count"], -plan["global_count"], digest, -digest])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        error = str(exc)
+
+    # Agree on errors and tensor shapes before any rank enters the pipeline.
+    groups = [mpu.get_model_parallel_group(), mpu.get_data_parallel_group(with_context_parallel=True)]
+    status = torch.tensor(
+        [int(error is not None), len(counts), -len(counts)],
+        dtype=torch.int64,
+        device=device_utils.make_current_torch_device(),
+    )
+    for group in groups:
+        dist.all_reduce(status, op=dist.ReduceOp.MAX, group=group)
+    failed, maximum, negative_minimum = status.tolist()
+    if failed or maximum != -negative_minimum:
+        raise ValueError(f"Invalid FLOPs schedule on a training rank: {error or 'peer error or step count mismatch'}")
+    bounds = torch.tensor(signature, dtype=torch.int64, device=status.device)
+    for group in groups:
+        dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=group)
+    values = bounds.tolist()
+    if any(high != -negative_low for high, negative_low in zip(values[::2], values[1::2], strict=True)):
+        raise ValueError("FLOPs schedule differs across ranks")
+    return indices, counts, dummy
+
+
 def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
@@ -1212,9 +1277,10 @@ def get_data_iterator(
 ) -> tuple[list[DataIterator], list[int]]:
     """Create iterators and a micro-batch schedule for a rollout step.
 
+    - FLOPs-balanced training executes the global plan received from the queue.
     - If `use_dynamic_batch_size` is False, splits into fixed-size contiguous
       micro-batches of `micro_batch_size`.
-    - If True, computes the micro-batch count using the token budget, aligns
+    - Otherwise, computes the micro-batch count using the token budget, aligns
       it across DP/VPP, and balances with KK. Falls back to first-fit if KK
       exceeds the capacity.
 
@@ -1224,6 +1290,20 @@ def get_data_iterator(
     """
     if is_preference_mode(args):
         return _get_preference_data_iterator(args, rollout_data, max_tokens_per_gpu)
+
+    if getattr(args, "balance_by_flops", False) and max_tokens_per_gpu is None:
+        indices, counts, dummy = _get_synchronised_flops_schedule(args, model, rollout_data)
+        iterators = [
+            DataIterator(
+                rollout_data,
+                None,
+                indices,
+                max_tokens_per_gpu=args.max_tokens_per_gpu,
+                dummy_micro_batch_offsets=dummy,
+            )
+            for _ in range(mpu.get_virtual_pipeline_model_parallel_world_size() or 1)
+        ]
+        return iterators, counts
 
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     dp_group = mpu.get_data_parallel_group()
