@@ -8,7 +8,7 @@ from relax.utils.utils import checkpoint_resume_step, recovery_load_path
 
 
 @pytest.mark.parametrize("tracker,override,iteration", [(0, None, 0), (199, None, 199), (199, 0, 199), (199, 99, 99)])
-def test_recovery_uses_committed_iteration_and_restores_state(tmp_path, tracker, override, iteration):
+def test_recovery_configures_committed_iteration_and_load_flags(tmp_path, tracker, override, iteration):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text(str(tracker))
     (tmp_path / f"iter_{iteration:07d}").mkdir()
     (tmp_path / "iter_0009999").mkdir()  # An uncommitted future directory is not a recovery point.

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""SwanLab remains lazy, private, and required despite platform fault
-containment."""
+"""Verify lazy initialization, cloud receipts and privacy settings passed to
+SwanLab; SDK calls are stubbed, so actual uploads are outside this scope."""
 
 import importlib.util
 import json
