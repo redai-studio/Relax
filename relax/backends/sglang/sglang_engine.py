@@ -5,6 +5,7 @@ import functools
 import hashlib
 import ipaddress
 import json
+import math
 import multiprocessing
 import os
 import signal
@@ -958,13 +959,41 @@ class SGLangEngine(RayActor):
             )
         ):
             raise ValueError("Memory synchronization requires resolved CUDA graph backends disabled")
+        # Older schedulers report a scalar GB total; newer ones report
+        # per-phase GB values, including draft graph allocations.
+        graph_allocations = []
+        for state in states:
+            usage = state.get("memory_usage", {})
+            if not isinstance(usage, dict):
+                raise ValueError("Memory scheduler graph allocation report is invalid")
+            graph = usage.get("graph", 0)
+            if isinstance(graph, dict):
+                required_phases = {
+                    "prefill",
+                    "decode",
+                    "target_verify",
+                    "draft_prefill",
+                    "draft_decode",
+                    "draft_extend",
+                }
+                if not required_phases.issubset(graph) or any(
+                    not isinstance(phase, str) or not phase for phase in graph
+                ):
+                    raise ValueError("Memory scheduler graph allocation report is invalid")
+                values = graph.values()
+            else:
+                values = (graph,)
+            for value in values:
+                if type(value) not in (int, float) or value < 0 or (type(value) is float and not math.isfinite(value)):
+                    raise ValueError("Memory scheduler graph allocation report is invalid")
+                graph_allocations.append(value)
         if (
             layout["disable_cuda_graph"] is not True
             or layout.get("enable_piecewise_cuda_graph")
             or layout.get("enforce_piecewise_cuda_graph")
             or layout.get("cuda_graph_backend_prefill") not in (None, "disabled")
             or layout.get("cuda_graph_backend_decode") not in (None, "disabled")
-            or any(state.get("memory_usage", {}).get("graph", 0) > 0 for state in states)
+            or any(graph_allocations)
         ):
             raise ValueError("Memory synchronization requires runtime CUDA graphs disabled")
         if load_format not in (layout["custom_weight_loader"] or []):

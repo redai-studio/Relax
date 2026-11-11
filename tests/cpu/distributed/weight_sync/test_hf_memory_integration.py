@@ -60,6 +60,12 @@ def _receiver(model):
     return getattr(model, "_relax_hf_memory_receiver", None) or model._relax_memory_receiver
 
 
+# Actual scheduler graph-memory report schema, in GB, including draft phases.
+_ZERO_GRAPH_USAGE = dict.fromkeys(
+    ("prefill", "decode", "target_verify", "draft_prefill", "draft_decode", "draft_extend"), 0.0
+)
+
+
 class _EngineBoundary:
     """Fake Ray handle and HTTP server, using the actual engine install
     method."""
@@ -91,7 +97,10 @@ class _EngineBoundary:
             speculative_algorithm=None,
             custom_weight_loader=[HF_MEMORY_LOADER if updater.canonical_hf else MEMORY_LOADER],
         )
-        self.runtime_state = dict(self.server_info, memory_usage={"graph": 0})
+        self.runtime_state = dict(
+            self.server_info,
+            memory_usage={"graph": dict(_ZERO_GRAPH_USAGE)},
+        )
         self.engine = SimpleNamespace(
             rank=index,
             node_rank=0,
@@ -343,6 +352,19 @@ def test_worker_loader_failure_quarantines_both_engines_without_sender_commit(cp
         ({"ep_size": 2}, "runtime PP/DP/EP/MoE-DP=1"),
         ({"speculative_algorithm": "EAGLE"}, "unsupported quantization, adapter, draft or routing"),
         ({"disable_cuda_graph": False}, "runtime CUDA graphs disabled"),
+        ({"memory_usage": {"graph": _ZERO_GRAPH_USAGE | {"prefill": 0.01}}}, "runtime CUDA graphs disabled"),
+        ({"memory_usage": {"graph": _ZERO_GRAPH_USAGE | {"draft_extend": 0.01}}}, "runtime CUDA graphs disabled"),
+        ({"memory_usage": {"graph": 0.01}}, "runtime CUDA graphs disabled"),
+        (
+            {"memory_usage": {"graph": _ZERO_GRAPH_USAGE | {"decode": {"allocated": 0}}}},
+            "graph allocation report is invalid",
+        ),
+        (
+            {"memory_usage": {"graph": _ZERO_GRAPH_USAGE | {"decode": float("nan")}}},
+            "graph allocation report is invalid",
+        ),
+        ({"memory_usage": {"graph": -1}}, "graph allocation report is invalid"),
+        ({"memory_usage": {"graph": {"decode": 0.0, "prefill": 0.0}}}, "graph allocation report is invalid"),
         (
             {"cuda_graph_config": {"decode": {"backend": "full"}, "prefill": {"backend": "disabled"}}},
             "resolved CUDA graph backends disabled",
