@@ -81,6 +81,12 @@ def summarize(directories: list[Path], *, warmup: int, steps: int, minimum_runs:
             raise ValueError(
                 "Only successful, non-diagnostic, non-capture training runs may enter throughput comparison"
             )
+        topology = metadata.get("gpu_topology")
+        if not isinstance(topology, dict) or not all(
+            isinstance(topology.get(name), str) and topology[name].strip()
+            for name in ("links_and_numa", "gpu_identity")
+        ):
+            raise ValueError("Throughput runs require recorded GPU topology and physical device identities")
         current = {
             key: metadata[key]
             for key in (
@@ -95,6 +101,7 @@ def summarize(directories: list[Path], *, warmup: int, steps: int, minimum_runs:
                 "native_source_sha256",
                 "transfer_queue_source_sha256",
                 "devices",
+                "gpu_topology",
             )
         }
         if invariant is not None and current != invariant:

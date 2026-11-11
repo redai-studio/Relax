@@ -204,3 +204,26 @@ def test_flops_scheduling_flags_are_independent_and_opt_in(arguments_module, fla
     arguments_module.get_slime_extra_args_provider()(parser)
     args = parser.parse_args(flags)
     assert (args.flops_microbatch_packing, args.flops_dp_balancing) == expected
+
+
+def test_yaml_flops_override_is_validated_after_merge(arguments_module, tmp_path):
+    config = tmp_path / "flops.yaml"
+    config.write_text("flops_dp_balancing: true\nmoe_aux_loss_coeff: 0.01\n")
+    args = _opd_args()
+    vars(args).update(
+        loss_type="sft",
+        prompt_data=["/train.jsonl"],
+        use_dynamic_batch_size=True,
+        max_tokens_per_gpu=4096,
+        sft_oversize_strategy="drop",
+        sft_oversize_custom_function_path=None,
+        n_samples_per_prompt=1,
+        qkv_format="thd",
+        use_gloo_process_groups=True,
+        sft_train_data_prefetch=True,
+        per_rank_fetch=True,
+        sft_max_in_flight_steps=2,
+        custom_config_path=str(config),
+    )
+    with pytest.raises(ValueError, match="zero moe_aux_loss_coeff"):
+        arguments_module.slime_validate_args(args)

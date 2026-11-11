@@ -49,6 +49,7 @@ def test_variable_dp_counts_require_a_supported_fixed_sft_window():
         ("debug_train_only", True),
         ("rollout_batch_size", 32),
         ("use_dynamic_global_batch_size", True),
+        ("polling_mode", False),
     ):
         changed = Namespace(**{**vars(args), name: value})
         assert not unequal_flops_dp_enabled(changed)
@@ -73,6 +74,8 @@ def test_variable_dp_counts_require_a_supported_fixed_sft_window():
         {"moe_z_loss_coeff": [0, 0.1]},
         {"moe_expert_capacity_factor": 1.0},
         {"moe_router_enable_expert_bias": True},
+        {"moe_router_load_balancing_type": "sinkhorn"},
+        {"moe_router_load_balancing_type": ["none", "sinkhorn"]},
     ],
 )
 def test_flops_flags_reject_unmodeled_paths(override):

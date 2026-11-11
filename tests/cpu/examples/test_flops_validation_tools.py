@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from examples.flops_balancing.compare_step_captures import compare_captures
-from examples.flops_balancing.record_run import hash_model_weight_shards
+from examples.flops_balancing.record_run import collect_gpu_topology, hash_model_weight_shards, validate_schedule_mode
 from examples.flops_balancing.summarize_runs import read_window, summarize
 from relax.utils.training.optimizer_step_capture import OptimizerStepCapture, capture_rollout_inputs
 from tests.cpu.utils.test_optimizer_step_capture import _OptimizerContract
@@ -42,6 +42,36 @@ def _compare(left, right):
     return compare_captures(
         left, right, loss_atol=0, loss_rtol=0, grad_atol=0, grad_rtol=0, update_atol=0, update_rtol=0
     )
+
+
+def test_recorded_mode_matches_training_schedule_flags():
+    packing, placement = "--flops-microbatch-packing", "--flops-dp-balancing"
+    for mode, flags in (("A", []), ("B", [packing]), ("C", [placement]), ("D", [packing, placement])):
+        validate_schedule_mode(mode, ["python", "-m", "relax.entrypoints.train", *flags])
+    for mode, flags in (("A", [packing]), ("B", [placement]), ("C", []), ("D", [packing, packing, placement])):
+        with pytest.raises(ValueError, match="does not match"):
+            validate_schedule_mode(mode, ["python", "-m", "relax.entrypoints.train", *flags])
+
+
+def test_formal_run_requires_physical_gpu_topology(monkeypatch):
+    from examples.flops_balancing import record_run
+
+    monkeypatch.setattr(record_run.shutil, "which", lambda _: None)
+    with pytest.raises(ValueError, match="topology"):
+        collect_gpu_topology()
+    monkeypatch.setattr(record_run.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
+    calls = []
+
+    def query(command, **kwargs):
+        calls.append(command)
+        return type("Result", (), {"stdout": "GPU0 NV2 GPU1"})()
+
+    monkeypatch.setattr(record_run.subprocess, "run", query)
+    assert set(collect_gpu_topology()) == {"links_and_numa", "gpu_identity"}
+    assert calls == [
+        ["/usr/bin/nvidia-smi", "topo", "-m"],
+        ["/usr/bin/nvidia-smi", "--query-gpu=uuid,pci.bus_id", "--format=csv,noheader"],
+    ]
 
 
 def test_complete_capture_comparison_rejects_changed_update_and_initial_state(tmp_path):
@@ -93,13 +123,14 @@ def test_capture_comparison_separates_packing_metrics_from_loss(tmp_path):
 
 def _log(seconds):
     return "\n".join(
-        f"perf {index}: {
+        "perf {}: {}".format(
+            index,
             {
-                'perf/step_time': time,
-                'perf/actor_train_tokens': tokens,
-                'perf/step_resp_token_per_s': tokens / 2 / time,
-            }
-        }"
+                "perf/step_time": time,
+                "perf/actor_train_tokens": tokens,
+                "perf/step_resp_token_per_s": tokens / 2 / time,
+            },
+        )
         for index, (time, tokens) in enumerate(seconds)
     )
 
@@ -143,6 +174,7 @@ def _runs(tmp_path):
                 native_source_sha256="native source",
                 transfer_queue_source_sha256="patched TQ source",
                 devices=[{"name": "test fixture"}],
+                gpu_topology={"links_and_numa": "GPU0 NV2 GPU1", "gpu_identity": "uuid-0, bus-0"},
             )
             (directory / "run.json").write_text(json.dumps(metadata))
             (directory / "status.json").write_text(json.dumps({"status": "SUCCEEDED"}))
@@ -176,6 +208,8 @@ def test_weight_shard_recording_hashes_contents_and_requires_every_shard(tmp_pat
         "different_config",
         "different_environment",
         "different_weights",
+        "different_topology",
+        "missing_topology",
         "different_tokens",
         "capture",
         "diagnostic",
@@ -194,6 +228,10 @@ def test_repeated_run_summary_rejects_unfair_or_incomplete_comparisons(tmp_path,
         metadata["launch_environment"]["OMP_NUM_THREADS"] = "2"
     elif change == "different_weights":
         metadata["model_weight_sha256"]["model.safetensors"] = "different weights"
+    elif change == "different_topology":
+        metadata["gpu_topology"]["links_and_numa"] = "GPU0 PIX GPU1"
+    elif change == "missing_topology":
+        metadata.pop("gpu_topology")
     elif change == "capture":
         metadata["capture"] = True
     elif change == "diagnostic":

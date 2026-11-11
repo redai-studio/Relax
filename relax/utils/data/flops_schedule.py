@@ -25,6 +25,7 @@ def unequal_flops_dp_enabled(args: Any) -> bool:
         and getattr(args, "qkv_format", "thd") == "thd"
         and getattr(args, "n_samples_per_prompt", 1) == 1
         and getattr(args, "calculate_per_token_loss", False)
+        and getattr(args, "polling_mode", True)
     ):
         return False
     if any(
@@ -106,6 +107,10 @@ def validate_flops_scheduling_args(args: Any) -> None:
         raise ValueError("FLOPs scheduling does not support expert-capacity token dropping")
     if getattr(args, "moe_router_enable_expert_bias", False):
         raise ValueError("FLOPs scheduling does not support dynamic expert-bias updates")
+    router_type = getattr(args, "moe_router_load_balancing_type", "none")
+    router_types = router_type if isinstance(router_type, (list, tuple)) else (router_type,)
+    if "sinkhorn" in router_types:
+        raise ValueError("FLOPs scheduling does not support Sinkhorn routing across rearranged microbatches")
 
 
 def get_flops_estimator(args: Any, hf_config: Any = None) -> SequenceFlopsEstimator | None:

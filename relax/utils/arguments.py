@@ -4521,9 +4521,6 @@ def slime_validate_args(args):
     elif getattr(args, "sft_async_prepack", False):
         raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
-    from relax.utils.data.flops_schedule import validate_flops_scheduling_args
-
-    validate_flops_scheduling_args(args)
     task_type = getattr(args, "task_type", "causal_lm")
     if task_type == "seq_cls":
         if not is_sft_mode(args):
@@ -4798,6 +4795,9 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    from relax.utils.data.flops_schedule import validate_flops_scheduling_args
+
+    validate_flops_scheduling_args(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")

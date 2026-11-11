@@ -116,6 +116,17 @@ def test_variable_counts_publish_and_restore_all_rank_replays_without_mutating_l
     assert not restored._balanced_cache
 
 
+def test_eval_keeps_equal_rows_with_a_variable_count_training_sampler():
+    sampler = FlopsBalancedSampler(SequenceFlopsEstimator(1, 1), dp_size=2, unequal_size=True)
+    partition = _partition([128] * 5 + [1024], name="sft_eval_0_n1_0")
+    groups = [
+        sampler.sample(list(range(6)), 3, "sft_eval", partition.partition_id, dp_rank=rank, partition=partition)[0]
+        for rank in (0, 1)
+    ]
+    assert [len(group) for group in groups] == [3, 3]
+    assert sorted(i for group in groups for i in group) == list(range(6))
+
+
 def test_variable_counts_wait_for_a_complete_global_batch_before_publishing():
     sampler = FlopsBalancedSampler(SequenceFlopsEstimator(1, 1), dp_size=2, unequal_size=True)
     partition = _partition([1, 1, 1, 1])

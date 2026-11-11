@@ -76,7 +76,8 @@ class FlopsBalancedSampler(SeqlenBalancedSampler):
         if type(rank) is not int or not 0 <= rank < self.dp_size:
             raise ValueError(f"dp_rank must be in [0, {self.dp_size}), got {rank!r}")
         key = (partition_id, task_name, kwargs.get("batch_index", 0))
-        if self.unequal_size and key in self._balanced_cache:
+        use_unequal = self.unequal_size and task_name != "sft_eval"
+        if use_unequal and key in self._balanced_cache:
             groups = self._balanced_cache[key]
             indexes = [index for group in groups for index in group]
             if (
@@ -90,7 +91,7 @@ class FlopsBalancedSampler(SeqlenBalancedSampler):
             partition = kwargs.get("partition")
             if partition is None:
                 raise ValueError("FLOPs DP balancing requires partition metadata; equal splitting is not a fallback")
-            if self.unequal_size:
+            if use_unequal:
                 if "assignment_transform" in kwargs:
                     raise ValueError("FLOPs placement owns assignment_transform")
                 indexes, _ = GRPOGroupNSampler.sample(

@@ -8,6 +8,7 @@ import importlib.metadata
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -28,6 +29,34 @@ def hash_model_weight_shards(checkpoint: Path) -> dict[str, str]:
     }
 
 
+def validate_schedule_mode(mode: str, command: list[str]) -> None:
+    flags = ("--flops-microbatch-packing", "--flops-dp-balancing")
+    expected = {
+        "A": (0, 0),
+        "B": (1, 0),
+        "C": (0, 1),
+        "D": (1, 1),
+    }
+    if mode not in expected or tuple(command.count(flag) for flag in flags) != expected[mode]:
+        raise ValueError(f"Mode {mode} does not match the training schedule flags")
+
+
+def collect_gpu_topology() -> dict[str, str]:
+    executable = shutil.which("nvidia-smi")
+    if executable is None:
+        raise ValueError("Formal throughput runs require nvidia-smi topology evidence")
+    topology = {
+        name: subprocess.run([executable, *arguments], check=True, capture_output=True, text=True, timeout=30).stdout
+        for name, arguments in (
+            ("links_and_numa", ("topo", "-m")),
+            ("gpu_identity", ("--query-gpu=uuid,pci.bus_id", "--format=csv,noheader")),
+        )
+    }
+    if any(not output.strip() for output in topology.values()):
+        raise ValueError("nvidia-smi did not report GPU links and identities")
+    return topology
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", type=Path, required=True)
@@ -38,6 +67,10 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if not args.command or args.command[0] != "--":
+        parser.error("Separate the recorded training command with --")
+    command = args.command[1:]
+    validate_schedule_mode(args.mode, command)
     manifest = json.loads((args.workload / "manifest.json").read_text())
     if sha256_file(args.workload / "train.jsonl") != manifest["train_sha256"]:
         raise ValueError("Frozen dataset changed")
@@ -45,11 +78,10 @@ def main() -> None:
         if sha256_file(args.checkpoint / filename) != digest:
             raise ValueError(f"Model configuration/tokenizer changed: {filename}")
     weight_shards = None
+    gpu_topology = None
     if not args.dry_run:
+        gpu_topology = collect_gpu_topology()
         weight_shards = hash_model_weight_shards(args.checkpoint)
-    if not args.command or args.command[0] != "--":
-        parser.error("Separate the recorded training command with --")
-    command = args.command[1:]
     invariant_command = [arg for arg in command if arg not in ("--flops-microbatch-packing", "--flops-dp-balancing")]
     versions = {}
     for package in ("torch", "transformers", "ray", "TransferQueue", "megatron-core", "transformer-engine"):
@@ -105,8 +137,11 @@ def main() -> None:
                 "CUBLAS_WORKSPACE_CONFIG",
                 "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
                 "RELAX_SFT_RESIDENT_PARAM_OVERLAP",
+                "CUDA_VISIBLE_DEVICES",
+                "NVIDIA_VISIBLE_DEVICES",
             )
         },
+        gpu_topology=gpu_topology,
         source_sha256=source.hexdigest(),
         workload_sha256=sha256_file(args.workload / "manifest.json"),
         model_revision=manifest["model_revision"],
