@@ -68,6 +68,33 @@ def test_rejects_unsupported_recompute_configuration(retention, name, value):
         retention.validate_args(args)
 
 
+def test_h800_retention_leaves_earlier_pipeline_stages_untouched(retention, monkeypatch):
+    args = arguments()
+    args.pipeline_model_parallel_size = 8
+    args.tensor_model_parallel_size = 4
+    monkeypatch.setenv("RELAX_QWEN38_RETAIN_QSA_ATTENTION", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core",
+        SimpleNamespace(parallel_state=SimpleNamespace(is_pipeline_last_stage=lambda: False)),
+    )
+    assert retention.configure(args, None) == []
+
+
+def test_full_mtp_retention_uses_native_mlp(retention, monkeypatch):
+    original = Mock(return_value="output")
+    checkpoint = Mock()
+    monkeypatch.setitem(
+        sys.modules, "megatron.core", SimpleNamespace(tensor_parallel=SimpleNamespace(checkpoint=checkpoint))
+    )
+    layer = SimpleNamespace(training=True, _relax_native_forward_mlp=original, _relax_qsa_full_layer_retained=True)
+    assert retention.retained_mlp(layer, "h", input_ids="ids") == "output"
+    original.assert_called_once_with(
+        "h", inference_context=None, padding_mask=None, input_ids="ids", packed_seq_params=None
+    )
+    checkpoint.assert_not_called()
+
+
 def test_checkpoint_closures_keep_each_microbatch_metadata(retention, monkeypatch):
     original = Mock(return_value="output")
     layer = SimpleNamespace(

@@ -150,3 +150,57 @@ def test_grouped_control_changes_only_long_backend(tmp_path, script, pp, decay, 
         config["argv"][index] = json.dumps(actor, sort_keys=True)
         config["argv"][config["argv"].index("--tb-experiment-name") + 1] = "run"
     assert nv == grouped
+
+
+def test_h800_sft_recipe_reproduces_hopper_profile_and_paths(tmp_path):
+    script = "run-qwen38-qsa-sft-128xh800.sh"
+    output = tmp_path / "run output"
+    config = _dry_run(
+        script,
+        output,
+        MODEL_NAME="Flash Next",
+        DATA_FILE="train split.jsonl",
+        RUNTIME_ENV_JSON=json.dumps({"env_vars": {"LD_LIBRARY_PATH": "/image/lib"}}),
+    )
+    args = config["argv"]
+    assert _value(args, "--hf-checkpoint") == "/models/Flash Next"
+    assert _value(args, "--prompt-data") == "/data/train split.jsonl"
+    assert json.loads(_value(args, "--resource")) == {"sft": [1, 0], "actor": [1, 128]}
+    expected = {
+        "--tensor-model-parallel-size": "4",
+        "--pipeline-model-parallel-size": "8",
+        "--expert-model-parallel-size": "8",
+        "--expert-tensor-parallel-size": "1",
+        "--context-parallel-size": "1",
+        "--pipeline-model-parallel-layout": "Ettttt|ttttttt|tttttt|tttttt|tttttt|ttttttt|ttttttt|ttttmL",
+        "--global-batch-size": "512",
+        "--max-tokens-per-gpu": "65536",
+        "--moe-flex-dispatcher-num-sms": "24",
+        "--sft-logits-chunk-size": "3072",
+        "--num-rollout": "15",
+        "--lr-decay-iters": "15",
+        "--profile-step-start": "10",
+        "--profile-step-end": "10",
+    }
+    assert {flag: _value(args, flag) for flag in expected} == expected
+    assert "--profile-with-stack" in args
+    assert not {"--load", "--save", "--tp-comm-overlap", "--custom-dataset-class-path"}.intersection(args)
+
+    actor = json.loads(_value(args, "--train-env-vars"))
+    runtime = config["runtime_env"]["env_vars"]
+    assert actor == {key: runtime[key] for key in actor}
+    assert actor["LD_LIBRARY_PATH"] == "/image/lib"
+    assert actor["RELAX_QWEN38_QSA_FUSED_ATTENTION"] == "triton_v2"
+    assert actor["RELAX_QWEN38_QSA_SELECTOR_TILE_MIB"] == "384"
+    assert actor["RELAX_QWEN38_RETAIN_QSA_ATTENTION"] == "1"
+    assert actor["RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS"] == "1"
+    assert actor["RELAX_LOGPROB_CE_IMPL"] == actor["RELAX_MTP_CE_IMPL"] == "te"
+    assert "RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT" in runtime["RELAX_PROPAGATE_ENV_VARS"].split(",")
+
+    saved = _dry_run(script, output, DATA_DIR="/data/custom.jsonl", SAVE_INTERVAL="5", NUM_STEPS="7")["argv"]
+    assert _value(saved, "--prompt-data") == "/data/custom.jsonl"
+    assert _value(saved, "--load") == _value(saved, "--save") == str(output / "qwen38-test/checkpoints")
+    assert _value(saved, "--save-interval") == "5"
+    assert _value(saved, "--lr-decay-iters") == "7"
+    assert "--use-pytorch-profiler" not in saved
+    assert not output.exists()

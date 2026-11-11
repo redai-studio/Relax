@@ -15,12 +15,13 @@ from relax.utils.env import Envs
 
 
 def validate_args(args: Any) -> None:
+    last_stage_policy = getattr(args, "pipeline_model_parallel_size", None) == 8
     expected = {
         "recompute_granularity": "full",
         "recompute_method": "uniform",
         "recompute_num_layers": 1,
-        "tensor_model_parallel_size": 8,
-        "pipeline_model_parallel_size": 4,
+        "tensor_model_parallel_size": 4 if last_stage_policy else 8,
+        "pipeline_model_parallel_size": 8 if last_stage_policy else 4,
         "context_parallel_size": 1,
         "expert_model_parallel_size": 8,
         "expert_tensor_parallel_size": 1,
@@ -60,7 +61,11 @@ def retained_mlp(
     kwargs = dict(input_ids=input_ids, packed_seq_params=packed_seq_params)
     if mhc_recompute_manager is not None:
         kwargs["mhc_recompute_manager"] = mhc_recompute_manager
-    if not layer.training or id(layer) in _active_retained_mlp.get():
+    if (
+        not layer.training
+        or id(layer) in _active_retained_mlp.get()
+        or getattr(layer, "_relax_qsa_full_layer_retained", False)
+    ):
         return native(hidden_states, inference_context=inference_context, padding_mask=padding_mask, **kwargs)
     if inference_context is not None:
         raise RuntimeError("QSA retained attention is training-only")
@@ -79,6 +84,12 @@ def configure(args: Any, chunks: Any) -> list[dict[str, Any]]:
     if not Envs.RELAX_QWEN38_RETAIN_QSA_ATTENTION:
         return []
     validate_args(args)
+    last_stage_policy = args.pipeline_model_parallel_size == 8
+    if last_stage_policy:
+        from megatron.core import parallel_state
+
+        if not parallel_state.is_pipeline_last_stage():
+            return []
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block import Qwen3VLTransformerBlock
     from megatron.core import recompute
     from megatron.core.models.hybrid import hybrid_block
@@ -145,6 +156,23 @@ def configure(args: Any, chunks: Any) -> list[dict[str, Any]]:
         raise RuntimeError("All QSA owners must be direct children of HybridStack or guarded Bridge block")
     if hybrid_block.checkpointed_forward is not recompute.checkpointed_forward:
         raise RuntimeError("HybridStack checkpoint entry already changed; review patch composition")
+    full_decoder, full_mtp = None, None
+    if last_stage_policy:
+        # The 128-GPU layout retains activations only on the last stage. Use
+        # layer ownership and numbers so module traversal order cannot change
+        # which decoder and MTP layers are checkpointed.
+        if len(bridge_stacks) != 1:
+            raise RuntimeError("PP8 QSA retention requires one final-stage Bridge block")
+        decoder = {layer.layer_number: layer for layer in bridge_stacks[0].layers}
+        attention, full_decoder = decoder.get(48), decoder.get(47)
+        mtp_stacks = [stack for stack in stacks if getattr(stack, "is_mtp_layer", False)]
+        if full_decoder is None or len(mtp_stacks) != 1 or len(mtp_stacks[0].layers) != 1:
+            raise RuntimeError("PP8 QSA retention requires decoder layer 47 and a one-layer MTP stack")
+        full_mtp = mtp_stacks[0].layers[0]
+        if {id(layer) for _, layer in layers} != {id(attention), id(full_mtp)}:
+            raise RuntimeError("PP8 QSA retention requires QSA in decoder layer 48 and the MTP layer")
+        layers = [(path, layer) for path, layer in layers if layer is attention]
+
     manifest = [
         {
             "path": path,
@@ -156,6 +184,17 @@ def configure(args: Any, chunks: Any) -> list[dict[str, Any]]:
     ]
     for _, layer in layers:
         layer._relax_qsa_attention_retained = True
+    if last_stage_policy:
+        full_decoder._relax_qsa_full_layer_retained = True
+        # HybridStack uses the attention marker to select the split forward.
+        full_mtp._relax_qsa_attention_retained = True
+        full_mtp._relax_qsa_full_layer_retained = True
+        manifest.extend(
+            (
+                {"layer_number": full_decoder.layer_number, "scope": "full decoder layer"},
+                {"layer_number": full_mtp.layer_number, "scope": "full MTP layer"},
+            )
+        )
     from relax.utils.logging_utils import get_logger
 
     get_logger(__name__).info("QSA attention-retention manifest: %s", json.dumps(manifest))
