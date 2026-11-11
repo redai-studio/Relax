@@ -14,13 +14,34 @@ import torch
 
 
 SOURCE = Path(__file__).resolve().parents[4] / "relax/models/qwen3_8/ops/qsa_mixed_ops/cudnn.py"
-SPEC = importlib.util.spec_from_file_location("qsa_mixed_cudnn_under_test", SOURCE)
-adapter = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(adapter)
+PREFIX = "relax.models.qwen3_8.ops.qsa_mixed_ops"
+
+
+@pytest.fixture
+def adapter(monkeypatch):
+    # Load only the geometry contract and adapter, without optional model imports.
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "cudnn_pr1765")
+    for name, path in (
+        (f"{PREFIX}.geometry", SOURCE.with_name("geometry.py")),
+        ("qsa_mixed_cudnn_under_test", SOURCE),
+    ):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def entry(adapter):
+    spec = importlib.util.spec_from_file_location("qsa_mixed_entry_under_test", SOURCE.with_name("__init__.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.mark.parametrize("length", [0, 1, 512, 1024, 2047, 2048, 2049, 2051, 2052, 65536])
-def test_document_length_dispatch(monkeypatch, length):
+def test_document_length_dispatch(adapter, monkeypatch, length):
     monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
     short, long = adapter.document_groups((0, length), length)
     assert bool(short) == (0 < length <= 2051)
@@ -29,7 +50,7 @@ def test_document_length_dispatch(monkeypatch, length):
 
 @pytest.mark.parametrize("limit", [2047, 2051])
 @pytest.mark.parametrize("length", [2047, 2048, 2051, 2052])
-def test_explicit_flash_boundary_matches_baseline(monkeypatch, limit, length):
+def test_explicit_flash_boundary_matches_baseline(adapter, monkeypatch, limit, length):
     monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", str(limit))
     short, long = adapter.document_groups((0, length), length)
     assert bool(short) == (length <= limit)
@@ -37,19 +58,19 @@ def test_explicit_flash_boundary_matches_baseline(monkeypatch, limit, length):
 
 
 @pytest.mark.parametrize("limit", [-2, 2052])
-def test_dispatch_rejects_non_dense_flash_boundary(monkeypatch, limit):
+def test_dispatch_rejects_non_dense_flash_boundary(adapter, monkeypatch, limit):
     monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", str(limit))
     with pytest.raises(ValueError, match="dense selector budget"):
         adapter.document_groups((0, 2052), 2052)
 
 
 @pytest.mark.parametrize("bounds,total", [((1, 4), 4), ((0, 4), 5), ((0, 3, 2), 2), ((0, True), 1)])
-def test_dispatch_rejects_invalid_boundaries(bounds, total):
+def test_dispatch_rejects_invalid_boundaries(adapter, bounds, total):
     with pytest.raises(ValueError, match="producer CPU boundaries"):
         adapter.document_groups(bounds, total)
 
 
-def test_dispatch_packed_offsets_and_empty_documents(monkeypatch):
+def test_dispatch_packed_offsets_and_empty_documents(adapter, monkeypatch):
     monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
     short, long = adapter.document_groups((0, 0, 7, 2055, 4107, 4107, 4110), 4110)
     assert short == ((0, 7), (7, 2055), (4107, 4110))
@@ -57,7 +78,7 @@ def test_dispatch_packed_offsets_and_empty_documents(monkeypatch):
 
 
 @pytest.mark.parametrize("length", [1, 3, 4, 5, 7, 2047, 2048, 2051, 2052])
-def test_metadata_matches_complete_blocks_and_partial_tail(length):
+def test_metadata_matches_complete_blocks_and_partial_tail(adapter, length):
     ids = torch.full((length, 512), -1, dtype=torch.int32)
     position = torch.arange(length)
     # Duplicates, invalid sentinels, current partial and future IDs must not add
@@ -81,7 +102,7 @@ def test_metadata_matches_complete_blocks_and_partial_tail(length):
         assert torch.count_nonzero(zero) == 0
 
 
-def test_packed_metadata_preserves_odd_document_boundaries_and_causal_keys(monkeypatch):
+def test_packed_metadata_preserves_odd_document_boundaries_and_causal_keys(adapter, monkeypatch):
     monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
     bounds = (0, 3, 8, 15)
     ids = torch.full((15, 512), -1, dtype=torch.int32)
@@ -109,7 +130,7 @@ def test_packed_metadata_preserves_odd_document_boundaries_and_causal_keys(monke
 
 
 @pytest.mark.parametrize("maximum", [0, 8192, 16384])
-def test_long_packs_keep_large_documents_independent(maximum):
+def test_long_packs_keep_large_documents_independent(adapter, maximum):
     spans = ((0, 2053), (2053, 4108), (4108, 24108), (24108, 26160))
     packs = adapter.long_document_packs(spans, maximum)
     assert tuple(span for pack in packs for span in pack) == spans
@@ -119,7 +140,7 @@ def test_long_packs_keep_large_documents_independent(maximum):
 
 
 @pytest.mark.parametrize("maximum", [-1, 16385])
-def test_long_packs_reject_dispatch_changing_limits(maximum):
+def test_long_packs_reject_dispatch_changing_limits(adapter, maximum):
     with pytest.raises(ValueError, match="between 0 and 16384"):
         adapter.long_document_packs(((0, 2053),), maximum)
 
@@ -128,7 +149,7 @@ def _selection(total):
     return SimpleNamespace(compress_ratio=4, selected_ids=torch.full((total, 512), -1, dtype=torch.int32))
 
 
-def test_mixed_pack_restores_order_and_gradients(monkeypatch):
+def test_mixed_pack_restores_order_and_gradients(adapter, monkeypatch):
     monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
     bounds = (0, 7, 2055, 4107, 4110)
     total = bounds[-1]
@@ -158,7 +179,7 @@ def test_mixed_pack_restores_order_and_gradients(monkeypatch):
 
 @pytest.mark.parametrize("bounds", [(0, 7, 2060, 2060, 4115, 4118), (0, 2053, 2053, 4108)])
 @pytest.mark.parametrize("maximum", [0, 8192])
-def test_multiple_packed_documents_preserve_all_qkv_gradients(monkeypatch, bounds, maximum):
+def test_multiple_packed_documents_preserve_all_qkv_gradients(adapter, monkeypatch, bounds, maximum):
     monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
     monkeypatch.setenv("RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS", str(maximum))
     total = bounds[-1]
@@ -189,44 +210,126 @@ def test_multiple_packed_documents_preserve_all_qkv_gradients(monkeypatch, bound
     assert torch.equal(v.grad, upstream.sum(dim=2, keepdim=True) * (3 * factor))
 
 
-def test_reject_tp8_and_nonproduction_selector_budget():
-    q = torch.zeros((1, 7, 3, 256), dtype=torch.bfloat16)
-    k = torch.zeros((1, 7, 1, 256), dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="TP2 local 12Q/1KV"):
-        adapter.attention_for_selection(q, k, k, _selection(7), 0.0625, (0, 7))
+@pytest.mark.parametrize("geometry", [(24, 2), (6, 1), (3, 1)])
+@pytest.mark.parametrize("length", [7, 2052])
+def test_cudnn_rejects_unsupported_geometry_before_dispatch(adapter, monkeypatch, geometry, length):
+    q_heads, kv_heads = geometry
+    q = torch.empty((1, length, q_heads, 256), dtype=torch.bfloat16, device="meta")
+    k = torch.empty((1, length, kv_heads, 256), dtype=torch.bfloat16, device="meta")
+
+    def no_dispatch(*args):
+        pytest.fail("Unsupported geometry must fail before document routing")
+
+    monkeypatch.setattr(adapter, "document_groups", no_dispatch)
+    with pytest.raises(NotImplementedError) as error:
+        adapter.attention_for_selection(q, k, k, _selection(length), 0.0625, (0, length))
+    message = str(error.value)
+    assert "backend=cudnn_pr1765" in message
+    assert f"{q_heads}Q/{kv_heads}KV" in message
+    assert "supports only 12Q/1KV/D256" in message
+    assert "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped" in message
+
+
+def test_cudnn_rejects_nonproduction_selector_budget(adapter):
     q = torch.zeros((1, 7, 12, 256), dtype=torch.bfloat16)
+    k = torch.zeros((1, 7, 1, 256), dtype=torch.bfloat16)
     selection = SimpleNamespace(compress_ratio=4, selected_ids=torch.zeros((7, 8), dtype=torch.int32))
     with pytest.raises(ValueError, match="production 2048-token selector budget"):
         adapter.attention_for_selection(q, k, k, selection, 0.0625, (0, 7))
 
 
-def test_entry_routes_nv_before_legacy_expansion(monkeypatch):
-    entry_path = SOURCE.with_name("__init__.py")
-    spec = importlib.util.spec_from_file_location("qsa_mixed_entry_under_test", entry_path)
-    entry = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(entry)
-    name = "relax.models.qwen3_8.ops.qsa_mixed_ops.cudnn"
-    monkeypatch.setitem(sys.modules, name, adapter)
+@pytest.mark.parametrize(
+    "backend,geometry",
+    [("grouped", geometry) for geometry in [(12, 1), (24, 2), (6, 1), (3, 1), (8, 2)]] + [("cudnn_pr1765", (12, 1))],
+)
+def test_entry_uses_selected_backend_geometry(adapter, entry, monkeypatch, backend, geometry):
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", backend)
+    q_heads, kv_heads = geometry
+    q = torch.zeros((1, 7, q_heads, 256), dtype=torch.bfloat16)
+    k = torch.zeros((1, 7, kv_heads, 256), dtype=torch.bfloat16)
+    selection = _selection(7)
+    selection.positions = torch.arange(7, dtype=torch.int32)[None, :]
+    selection._relax_qsa_mixed_bounds = (0, 7)
     seen = []
 
-    def mixed(query, key, value, selection, scale, bounds):
-        seen.append(bounds)
-        return query
+    def nv(query, key, value, selection, scale, bounds):
+        seen.append(("cudnn_pr1765", bounds))
+        return query + 1
 
-    monkeypatch.setattr(adapter, "attention_for_selection", mixed)
-    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "cudnn_pr1765")
-    q = torch.empty((1, 2048, 12, 256), device="meta")
-    k = torch.empty((1, 2048, 1, 256), device="meta")
-    selection = SimpleNamespace(compress_ratio=4, selected_ids=object(), _relax_qsa_mixed_bounds=(0, 2048))
-    assert entry.attention_for_selection(q, k, k, selection, 0.0625, True) is q
-    assert seen == [(0, 2048)]
+    def grouped(query, key, value, indices, scale):
+        seen.append(("grouped", indices._qsa_bounds))
+        return query + 1
+
+    # Keep the production entry and token expansion; replace only GPU execution.
+    spec = importlib.util.spec_from_file_location(f"{PREFIX}.routes", SOURCE.with_name("routes.py"))
+    routes = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(routes)
+    if backend == "cudnn_pr1765":
+
+        def no_expansion(*args):
+            pytest.fail("The NV route must bypass legacy token expansion")
+
+        monkeypatch.setattr(routes, "token_routes", no_expansion)
+    monkeypatch.setitem(sys.modules, f"{PREFIX}.routes", routes)
+    monkeypatch.setitem(sys.modules, f"{PREFIX}.cudnn", SimpleNamespace(attention_for_selection=nv))
+    monkeypatch.setitem(sys.modules, f"{PREFIX}.mixed", SimpleNamespace(attention=grouped))
+    torch.testing.assert_close(entry.attention_for_selection(q, k, k, selection, 0.0625, True), q + 1)
+    assert seen == [(backend, (0, 7))]
+
+
+@pytest.mark.parametrize(
+    "backend,geometry",
+    [
+        (backend, geometry)
+        for backend in ("grouped", "cudnn_pr1765")
+        for geometry in (
+            (0, 1, 256, 256),
+            (12, 0, 256, 256),
+            (3, 2, 256, 256),
+            (12, 1, 128, 256),
+            (12, 1, 256, 128),
+        )
+    ]
+    + [("cudnn_pr1765", (q, kv, 256, 256)) for q, kv in [(24, 2), (6, 1), (3, 1)]],
+)
+def test_entry_rejects_geometry_before_execution(adapter, entry, monkeypatch, backend, geometry):
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", backend)
+    q_heads, kv_heads, q_dim, k_dim = geometry
+    q = torch.empty((1, 7, q_heads, q_dim), dtype=torch.bfloat16)
+    k = torch.empty((1, 7, kv_heads, k_dim), dtype=torch.bfloat16)
+
+    def no_execution(*args):
+        pytest.fail("Unsupported geometry must fail before token expansion or backend execution")
+
+    monkeypatch.setitem(sys.modules, f"{PREFIX}.routes", SimpleNamespace(token_routes=no_execution))
+    monkeypatch.setitem(sys.modules, f"{PREFIX}.mixed", SimpleNamespace(attention=no_execution))
+    monkeypatch.setitem(sys.modules, f"{PREFIX}.cudnn", SimpleNamespace(attention_for_selection=no_execution))
+    with pytest.raises(NotImplementedError) as error:
+        entry.attention_for_selection(q, k, k, _selection(7), 0.0625, False)
+    message = str(error.value)
+    assert f"backend={backend}" in message
+    assert f"{q_heads}Q/{kv_heads}KV" in message
+    assert f"Q D{q_dim}/K D{k_dim}" in message
+    if backend == "cudnn_pr1765":
+        # A direct call must use the same rule even if the environment selects Grouped.
+        monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "grouped")
+        with pytest.raises(NotImplementedError) as direct:
+            adapter.attention_for_selection(q, k, k, _selection(7), 0.0625, (0, 7))
+        assert str(direct.value) == message
+        assert "supports only 12Q/1KV/D256" in message
+        assert "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped" in message
+
+
+def test_entry_rejects_unknown_backend(entry, monkeypatch):
     monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "typo")
-    with pytest.raises(ValueError, match="Unknown mixed QSA long backend"):
-        entry.attention_for_selection(q, k, k, selection, 0.0625, True)
+    q = torch.empty((1, 7, 12, 256))
+    k = torch.empty((1, 7, 1, 256))
+    with pytest.raises(ValueError, match="Unknown mixed QSA long backend: typo"):
+        entry.attention_for_selection(q, k, k, _selection(7), 0.0625, False)
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_autograd_saves_fp32_and_invocation_local_metadata(monkeypatch, packed):
+def test_autograd_saves_fp32_and_invocation_local_metadata(adapter, monkeypatch, packed):
     api = ModuleType("cudnn.QSA.api")
     saved_masks, backwards = [], []
 

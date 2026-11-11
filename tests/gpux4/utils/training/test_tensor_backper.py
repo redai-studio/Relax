@@ -164,7 +164,17 @@ def test_noop_backuper_signature_compatible():
     assert torch.equal(snapshot, param.detach())
 
 
-@pytest.mark.parametrize("devices", [("cuda:0", "cuda:1"), ("cpu", "cuda:0")])
+@pytest.mark.parametrize(
+    "devices",
+    [
+        # Creating CUDA views in FakeTensorMode can still touch the real device.
+        pytest.param(
+            ("cuda:0", "cuda:1"),
+            marks=pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two visible CUDA devices"),
+        ),
+        ("cpu", "cuda:0"),
+    ],
+)
 def test_backup_on_device_preserves_each_source_device(monkeypatch, devices):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
