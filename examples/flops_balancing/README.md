@@ -34,6 +34,7 @@ recomputation, optimizer time, communication and routing imbalance are unmodeled
 decreasing as a feasible fallback, then tries workload-first placement. Every
 real sample appears once and each group satisfies additive capacity. The result
 is heuristic, not optimal. A count below FFD may fail even when a solution exists.
+An individual sample exceeding capacity fails FLOPs microbatch planning.
 More groups than samples are rejected at this low level; the training planner
 splits real groups and adds marked zero-loss dummy execution slots. It accounts
 for CP alignment and final TP padding. A token bound does not guarantee GPU memory.

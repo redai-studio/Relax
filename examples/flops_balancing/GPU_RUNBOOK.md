@@ -185,7 +185,7 @@ python -m examples.flops_balancing.prepare_workload \
   --model-revision fc05daec18b0a78c049392ed2e771dde82bdf654 --samples 2048
 ```
 
-MoE 替换模型/输出目录与模型版本。长序列另用新目录，增加 `--max-length 32768`。已有输出目录会拒绝覆盖。
+MoE 替换模型/输出目录与模型版本。长序列另用新目录，增加 `--max-length 32768`。这只是数据筛选上限；若实际保留了超过微批容量的单条样本，B/D 模式的 FLOPs 打包会直接报错。CP1 下默认 `MAX_TOKENS_PER_GPU=8192` 不能运行 32768-token 样本，须在确认显存足够后同步提高全部 A/B/C/D 对照的预算，或改用经过验证的 CP 布局。已有输出目录会拒绝覆盖。
 
 ## 3. 资源边界与上机检查
 
