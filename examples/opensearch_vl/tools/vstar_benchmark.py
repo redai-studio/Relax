@@ -36,6 +36,16 @@ def file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def final_option(text: str) -> str | None:
+    candidate = extract_answer(text)
+    candidate = text.strip() if candidate is None else candidate
+    if re.fullmatch(r"[A-D]", candidate):
+        return candidate
+    match = re.fullmatch(r"(?:\(([A-D])\)|([A-D])[.)])(?:[ \t]+[^\r\n]+)?", candidate)
+    markers = re.findall(r"\([A-D]\)|\b[A-D][.)]", candidate)
+    return (match[1] or match[2]) if match and len(markers) == 1 else None
+
+
 def prepare(data: Path) -> dict:
     import requests
 
@@ -171,7 +181,7 @@ def main() -> None:
         "image_factor": factor,
         "crop_coordinates": "display-pixels-xywh-mapped-to-original-region",
         "options": "official-test_questions.jsonl-order",
-        "score": "final-option-exact-match",
+        "score": "final-option-exact-match-with-explicit-letter-normalization",
         "workers": args.workers,
         "smoke": bool(args.max_cases),
         "overlap_index_sha256": file_hash(args.overlap_index),
@@ -250,11 +260,9 @@ def main() -> None:
                     record["error"] = "invalid_tool_call"
                     break
                 if not calls:
-                    answer = extract_answer(action)
-                    if answer is None and re.fullmatch(r"\s*[A-D]\s*", action):
-                        answer = action.strip()
+                    answer = final_option(action)
                     record["final_answer"] = answer
-                    if answer is None or not re.fullmatch(r"[A-D]", answer):
+                    if answer is None:
                         record["error"] = "invalid_final_option"
                     else:
                         record["correct"] = answer == case["label"]
