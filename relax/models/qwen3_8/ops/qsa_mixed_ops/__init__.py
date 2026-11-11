@@ -14,29 +14,28 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from relax.models.qwen3_8.ops.qsa_mixed_ops.geometry import validate_geometry
+
 
 def attention_for_selection(
     query: Tensor, key: Tensor, value: Tensor, selection: Any, scale: float, is_thd: bool
 ) -> Tensor:
     """Preserve native selected blocks, expanding the causal tail exactly
     once."""
+    from relax.utils.env import Envs
+
     batch, length, heads, width = query.shape
-    if width != 256 or key.shape[-1] != width or key.shape[2] <= 0 or heads % key.shape[2]:
-        raise NotImplementedError("Mixed QSA requires integral local GQA groups and D256")
+    long_backend = Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND
+    validate_geometry(long_backend, heads, key.shape[2], width, key.shape[-1])
     if selection.compress_ratio != 4 or selection.selected_ids is None:
         raise ValueError("Mixed QSA requires native selected four-token block IDs")
     bounds = getattr(selection, "_relax_qsa_mixed_bounds", None) if is_thd else (0, length)
     if bounds is None or bounds[0] != 0 or bounds[-1] != length:
         raise ValueError("Mixed packed QSA requires producer CPU document boundaries")
-    from relax.utils.env import Envs
-
-    long_backend = Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND
     if long_backend == "cudnn_pr1765":
         from relax.models.qwen3_8.ops.qsa_mixed_ops.cudnn import attention_for_selection as cudnn_mixed
 
         return cudnn_mixed(query, key, value, selection, scale, bounds)
-    if long_backend != "grouped":
-        raise ValueError(f"Unknown mixed QSA long backend: {long_backend}")
     from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import attention
     from relax.models.qwen3_8.ops.qsa_mixed_ops.routes import token_routes
 
