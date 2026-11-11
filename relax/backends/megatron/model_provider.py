@@ -305,6 +305,7 @@ def get_model_provider_func(
 
         ensure_backend(args)
 
+    args._relax_sft_selective_mm_packed = False
     provider = None
     if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
         from megatron.bridge import AutoBridge
@@ -314,6 +315,10 @@ def get_model_provider_func(
     # Resolve once, after provider selection and before model/data setup. A VL
     # checkpoint can produce a text-only provider despite its processor files.
     args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
+    if provider is not None and Envs.RELAX_SFT_SELECTIVE_LOGITS:
+        from .selective_logits import supports_packed_multimodal_selective_logits
+
+        args._relax_sft_selective_mm_packed = supports_packed_multimodal_selective_logits(provider)
 
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):

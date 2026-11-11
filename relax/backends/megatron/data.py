@@ -891,7 +891,9 @@ def get_batch(
         Envs.RELAX_SFT_SELECTIVE_LOGITS
         and cp_size == 1
         and qkv_format == "thd"
-        and not has_mm_inputs
+        # The admitted provider preserves the ordinary CP1 packed row order.
+        # Unsplit/VL repacking and other multimodal providers retain the fallback.
+        and (not has_mm_inputs or getattr(get_args(), "_relax_sft_selective_mm_packed", False))
         and "unsplit_tokens" not in batch
         and "vlm_packed_seq_params" not in batch
         and getattr(get_args(), "loss_type", None) == "sft"

@@ -7,6 +7,16 @@ from argparse import Namespace
 import torch
 
 
+def supports_packed_multimodal_selective_logits(provider: object) -> bool:
+    """Limit multimodal row plans to the reviewed, layout-preserving
+    provider."""
+    if type(provider).__module__ != "megatron.bridge.models.qwen.qwen4_exp_vl_bridge":
+        return False
+    from megatron.bridge.models.qwen.qwen4_exp_vl_bridge import Qwen4ExpVLMoEModelProvider
+
+    return type(provider) is Qwen4ExpVLMoEModelProvider
+
+
 def prepare_selective_logits(batch: dict, args: Namespace) -> None:
     """Attach per-microbatch indices before pinning/copying the CPU batch.
 
