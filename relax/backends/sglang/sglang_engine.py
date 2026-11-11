@@ -476,6 +476,34 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
             time.sleep(2)
 
 
+def _get_memory_server_info(host: str, port: int, timeout: float) -> dict:
+    """Wait within one budget for a fixed engine's resolved scheduler state.
+
+    SGLang may return HTTP 200 with an empty state list after its own query
+    timeout. Never replace that response with startup arguments or a cached
+    capability. Its queueing RPC does not correlate late replies by request ID;
+    this transaction requires unchanged engine configuration and membership.
+    """
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Memory scheduler state timeout must be finite and positive")
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Memory scheduler state remained unavailable within the synchronization timeout")
+        response = requests.get(f"http://{host}:{port}/server_info", timeout=remaining)
+        response.raise_for_status()
+        info = response.json()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Memory scheduler state response exceeded the synchronization timeout")
+        # Only the explicit unavailable response is transient. Malformed or
+        # missing fields still reach the existing strict capability validator.
+        if not isinstance(info, dict) or info.get("internal_states") != []:
+            return info
+        time.sleep(min(1.0, remaining))
+
+
 class SGLangEngine(RayActor):
     def __init__(
         self,
@@ -846,10 +874,10 @@ class SGLangEngine(RayActor):
     def _get_memory_runtime_capability(self, timeout: float, load_format: str) -> dict:
         if self.node_rank != 0 or self.worker_type != "regular":
             raise ValueError("Memory synchronization requires a regular node-0 engine")
-        response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=timeout)
-        response.raise_for_status()
         return SGLangEngine._resolve_memory_capability(
-            response.json(), self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine, load_format
+            _get_memory_server_info(self.server_host, self.server_port, timeout),
+            self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine,
+            load_format,
         )
 
     @staticmethod
@@ -1139,16 +1167,19 @@ class SGLangEngine(RayActor):
 
         if self.node_rank != 0 or self.worker_type != "regular":
             raise ValueError("Expert routing requires a regular node-0 rollout engine")
-        for _ in range(2):
-            response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=timeout)
-            response.raise_for_status()
-            info = response.json()
-            # /server_info can time out fetching scheduler state while still
-            # returning HTTP 200. Retry once before rejecting an unknown auto layout.
-            if info.get("internal_states") or info.get("moe_runner_backend") != "auto":
-                break
+        memory_sync = getattr(getattr(self, "args", None), "memory_weight_sync_config", None)
+        if memory_sync:
+            info = _get_memory_server_info(self.server_host, self.server_port, timeout)
+        else:
+            for _ in range(2):
+                response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=timeout)
+                response.raise_for_status()
+                info = response.json()
+                # Preserve the default path's fallback for an unresolved auto layout.
+                if info.get("internal_states") or info.get("moe_runner_backend") != "auto":
+                    break
         memory_capability = None
-        if getattr(getattr(self, "args", None), "memory_weight_sync_config", None):
+        if memory_sync:
             from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
 
             memory_capability = SGLangEngine._resolve_memory_capability(
