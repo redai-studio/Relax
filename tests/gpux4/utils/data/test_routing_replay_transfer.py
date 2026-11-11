@@ -1,6 +1,7 @@
 """Routing replay transfer regressions without importing Megatron or Ray.
 
-The opt-in NCCL regression is in tests/gpux4/utils/data/test_routing_replay_transfer_nccl.py.
+Run the NCCL cases explicitly on two otherwise available GPUs with
+``RELAX_ROUTING_REPLAY_GPU_TEST=1 pytest -q tests/gpux4/utils/data/test_routing_replay_transfer.py``.
 """
 
 import ast
@@ -18,7 +19,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-_ROOT = Path(__file__).resolve().parents[3]
+_ROOT = Path(__file__).resolve().parents[4]
 _CHUNK_BYTES = 64 * 1024 * 1024
 _GPU_TESTS = os.environ.get("RELAX_ROUTING_REPLAY_GPU_TEST") == "1"
 
@@ -204,6 +205,13 @@ def _transfer_worker(rank: int, init_file: str, topology: tuple[int, int, int], 
 
 def test_routing_replay_cp_pp_tp_broadcast_is_chunked_and_cpu_resident(tmp_path: Path) -> None:
     mp.spawn(_transfer_worker, args=(str(tmp_path / "gloo_init"), (2, 2, 2), "gloo"), nprocs=8, join=True)
+
+
+@pytest.mark.skipif(not _GPU_TESTS, reason="set RELAX_ROUTING_REPLAY_GPU_TEST=1 on two available GPUs")
+def test_routing_replay_nccl_staging_peak_is_independent_of_batch_size(tmp_path: Path) -> None:
+    if not dist.is_nccl_available() or torch.cuda.device_count() < 2:
+        pytest.skip("NCCL and two available GPUs are required")
+    mp.spawn(_transfer_worker, args=(str(tmp_path / "nccl_init"), (2, 1, 1), "nccl"), nprocs=2, join=True)
 
 
 def test_routing_replay_single_rank_preserves_ragged_offsets_without_collectives() -> None:

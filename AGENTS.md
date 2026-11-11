@@ -19,7 +19,7 @@ relax/                   核心框架
 └── utils/               基础设施 — 工具函数、指标监控、多模态处理
 tests/                   模块测试与集成回归测试
 ├── cpu/                 无 GPU 环境执行的测试，内部保留模块层级
-├── gpux4/               需要 2 或 4 张 GPU 的测试
+├── gpux4/               需要 2-4 张 GPU 的测试
 ├── backends/megatron/   Megatron 后端测试（权重转换等）
 ├── backends/sglang/     SGLang 后端测试
 ├── components/          RL 服务组件测试

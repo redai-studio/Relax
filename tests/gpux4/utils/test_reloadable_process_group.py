@@ -9,7 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 dist = torch.distributed
-requires_collective_apis = pytest.mark.skipif(
+pytestmark = pytest.mark.skipif(
     not dist.is_available() or not hasattr(dist, "all_gather_single"), reason="Torch single-tensor collective APIs"
 )
 
@@ -79,10 +79,12 @@ def _collective_worker(rank: int, rendezvous: str, backend: str) -> None:
         dist.destroy_process_group()
 
 
-@requires_collective_apis
-def test_collectives_follow_reloaded_inner_group(tmp_path) -> None:
-    if not dist.is_gloo_available():
+@pytest.mark.parametrize("backend", ["gloo", "nccl"])
+def test_collectives_follow_reloaded_inner_group(tmp_path, backend: str) -> None:
+    if backend == "gloo" and not dist.is_gloo_available():
         pytest.skip("Gloo is not available")
+    if backend == "nccl" and (not dist.is_nccl_available() or torch.cuda.device_count() < 2):
+        pytest.skip("Two CUDA devices and NCCL are required")
     torch.multiprocessing.spawn(
-        _collective_worker, args=((tmp_path / "rendezvous").as_uri(), "gloo"), nprocs=2, join=True
+        _collective_worker, args=((tmp_path / "rendezvous").as_uri(), backend), nprocs=2, join=True
     )
