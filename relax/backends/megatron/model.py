@@ -2126,6 +2126,11 @@ def save(
         args.head_type = "causal_lm_v1"
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+    # Checkpoint planning can initialize NCCL communicators outside PyTorch's
+    # allocator. Return unused training cache before those CUDA allocations.
+    memory_before = available_memory()
+    clear_memory()
+    logger.info("Checkpoint cache release: before=%s after=%s", memory_before, available_memory())
     save_checkpoint(
         iteration,
         model,

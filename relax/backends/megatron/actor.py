@@ -103,6 +103,7 @@ from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
     _extract_audio_seqlens,
     _extract_image_grids,
+    _has_image_inputs,
     get_debug_data,
     get_serve_url,
     merge_dict_list,
@@ -2263,9 +2264,12 @@ class MegatronTrainRayActor(TrainRayActor):
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            all_total_lengths,
+            (total_lengths, _has_image_inputs(rollout_data.get("multimodal_train_inputs"))),
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
         )
-        all_total_lengths = sum(all_total_lengths, [])  # flatten
+        Timer().has_image_inputs = any(has_images for _, has_images in all_total_lengths)
+        all_total_lengths = [length for lengths, _ in all_total_lengths for length in lengths]
         Timer().seq_lens = all_total_lengths
         # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
         # assistant-only tokens; for RL it's the response-only mask sum. Avoids
@@ -2747,9 +2751,12 @@ class MegatronTrainRayActor(TrainRayActor):
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            all_total_lengths,
+            (total_lengths, _has_image_inputs(rollout_data.get("multimodal_train_inputs"))),
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
         )
-        all_total_lengths = sum(all_total_lengths, [])  # flatten
+        Timer().has_image_inputs = any(has_images for _, has_images in all_total_lengths)
+        all_total_lengths = [length for lengths, _ in all_total_lengths for length in lengths]
         Timer().seq_lens = all_total_lengths
         Timer().images_seqlens = []
         Timer().image_grid_thw = []
@@ -2924,9 +2931,12 @@ class MegatronTrainRayActor(TrainRayActor):
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            all_total_lengths,
+            (total_lengths, _has_image_inputs(rollout_data.get("multimodal_train_inputs"))),
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
         )
-        all_total_lengths = sum(all_total_lengths, [])  # flatten
+        Timer().has_image_inputs = any(has_images for _, has_images in all_total_lengths)
+        all_total_lengths = [length for lengths, _ in all_total_lengths for length in lengths]
         Timer().seq_lens = all_total_lengths
         response_token_counts = [
             int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
