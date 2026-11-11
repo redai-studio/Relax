@@ -553,6 +553,15 @@ diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimi
 index 4192b0bb7..3a6fb539d 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -418,7 +418,7 @@
+ 
+                 # fp32 params.
+                 elif model_param.type() == 'torch.cuda.FloatTensor':
+-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
++                    shard_model_param = model_param.detach().view(-1)[param_range.start : param_range.end]
+                     model_fp32_params_this_group.append(model_param)
+                     shard_fp32_params_this_group.append(shard_model_param)
+                     tensor_parallel.copy_tensor_model_parallel_attributes(
 @@ -680,6 +680,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                  # TE FusedAdam will not accumulate step for empty param groups, so we need to
                  # align the step across param groups.
@@ -624,6 +633,70 @@ index 2200b5582..17daad9c7 100644
              return query, key, value, gate
  
          return query, key, value
+diff --git a/megatron/core/transformer/module.py b/megatron/core/transformer/module.py
+--- a/megatron/core/transformer/module.py
++++ b/megatron/core/transformer/module.py
+@@ -409,6 +409,40 @@
+     return conversion_helper(val, float_conversion)
+ 
+ 
++def mark_keep_in_fp32(tensor: torch.Tensor) -> torch.Tensor:
++    """Mark a parameter or buffer so that ``Float16Module`` keeps it in FP32.
++
++    Args:
++        tensor: The parameter or buffer to mark.
++
++    Returns:
++        The same tensor, for call-site convenience.
++    """
++    tensor.keep_in_fp32 = True
++    return tensor
++
++
++def convert_module_to_dtype_except_fp32_marked(
++    module: torch.nn.Module, dtype: torch.dtype
++) -> torch.nn.Module:
++    """Cast floating-point parameters and buffers except those marked to stay in FP32.
++
++    Args:
++        module: The module to convert in place.
++        dtype: The target floating-point dtype.
++
++    Returns:
++        The converted module.
++    """
++    return module._apply(
++        lambda tensor: (
++            tensor.to(dtype)
++            if tensor.is_floating_point() and not getattr(tensor, 'keep_in_fp32', False)
++            else tensor
++        )
++    )
++
++
+ class Float16Module(MegatronModule):
+     """Float 16 Module.
+ 
+@@ -431,13 +465,17 @@
+         self.pg_collection = getattr(module, 'pg_collection', None)
+ 
+         if self.fp16:
+-            self.add_module('module', module.half())
++            self.add_module(
++                'module', convert_module_to_dtype_except_fp32_marked(module, torch.half)
++            )
+ 
+             def float16_convertor(val):
+                 return val.half()
+ 
+         elif self.bf16:
+-            self.add_module('module', module.bfloat16())
++            self.add_module(
++                'module', convert_module_to_dtype_except_fp32_marked(module, torch.bfloat16)
++            )
+ 
+             def float16_convertor(val):
+                 return val.bfloat16()
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
 index 61c7f8d2c..c5aec56a1 100644
 --- a/megatron/core/transformer/moe/moe_utils.py

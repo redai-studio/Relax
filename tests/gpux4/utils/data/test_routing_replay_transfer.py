@@ -1,7 +1,7 @@
 """Routing replay transfer regressions without importing Megatron or Ray.
 
 Run the NCCL cases explicitly on two otherwise available GPUs with
-``RELAX_ROUTING_REPLAY_GPU_TEST=1 pytest -q tests/utils/data/test_routing_replay_transfer.py``.
+``RELAX_ROUTING_REPLAY_GPU_TEST=1 pytest -q tests/gpux4/utils/data/test_routing_replay_transfer.py``.
 """
 
 import ast
@@ -19,7 +19,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-_ROOT = Path(__file__).resolve().parents[3]
+_ROOT = Path(__file__).resolve().parents[4]
 _CHUNK_BYTES = 64 * 1024 * 1024
 _GPU_TESTS = os.environ.get("RELAX_ROUTING_REPLAY_GPU_TEST") == "1"
 
