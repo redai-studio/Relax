@@ -180,7 +180,16 @@ def test_distributed_update_selects_same_checkpoint_nextn_runners(
     monkeypatch, sglang_engine_module, algorithm, draft_model_path, draft_revision, external_draft, selector
 ):
     module = sglang_engine_module
-    args = SimpleNamespace(rollout_external=external_draft is not None, sglang_router_ip=None, sglang_router_port=None)
+    args = SimpleNamespace(
+        rollout_external=external_draft is not None,
+        sglang_router_ip=None,
+        sglang_router_port=None,
+        fully_async=True,
+        rollout_num_gpus_per_engine=1,
+        coordinator_url="http://dcs",
+    )
+    create_client = Mock()
+    monkeypatch.setattr(module, "create_client", create_client)
     engine = module.SGLangEngine(args, rank=0)
     server_args = {
         "node_rank": 0,
@@ -198,9 +207,8 @@ def test_distributed_update_selects_same_checkpoint_nextn_runners(
         actual = {**server_args, "speculative_algorithm": "EAGLE", "speculative_draft_model_path": external_draft}
         monkeypatch.setattr(module, "_wait_server_healthy", Mock())
         monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=actual))))
-    engine.init(
-        "127.0.0.1:6000", 5000, 6001, host="127.0.0.1", skip_dcs_registration=True, skip_router_registration=True
-    )
+    engine.init("127.0.0.1:6000", 5000, 6001, host="127.0.0.1", skip_router_registration=True)
+    assert create_client.call_args.kwargs["metadata"]["sync_nextn_draft"] is (selector == "all")
 
     request = Mock(return_value={"success": True})
     monkeypatch.setattr(engine, "_make_request", request)

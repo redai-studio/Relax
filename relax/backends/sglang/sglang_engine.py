@@ -615,6 +615,7 @@ class SGLangEngine(RayActor):
                     metadata={
                         "num_gpus_per_engine": effective_num_gpus,
                         "actor_id": ray.get_runtime_context().get_actor_id(),
+                        "sync_nextn_draft": self._sync_nextn_draft,
                     },
                 )
             )
