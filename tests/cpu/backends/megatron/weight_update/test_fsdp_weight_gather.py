@@ -4,10 +4,12 @@
 
 import ast
 import importlib.util
+import sys
 import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -57,6 +59,34 @@ def _offloader(model):
     return offloader
 
 
+def _check_device_snapshot(param):
+    # TP metadata helpers are optional Megatron dependencies. Exercise real
+    # snapshot allocation/copy/restore on CPU DTensors without loading CUDA.
+    tp_helpers = SimpleNamespace(
+        copy_tensor_model_parallel_attributes=lambda snapshot, source: None,
+        set_defaults_if_not_set_tensor_model_parallel_attributes=lambda snapshot: None,
+    )
+    source = param.detach().clone()
+    expected = source.to_local().clone()
+    backuper = tensor_backper.TensorBackuper.create(lambda: [("weight", source)], single_tag=None)
+    with patch.dict(sys.modules, {"megatron.core.tensor_parallel": tp_helpers}):
+        backuper.backup("actor", on_device=True)
+        snapshot = backuper.get("actor")["weight"]
+        assert isinstance(snapshot, DTensor)
+        assert snapshot.device_mesh == source.device_mesh
+        assert snapshot.placements == source.placements
+        assert snapshot.shape == source.shape
+        assert snapshot.to_local().shape == expected.shape
+        torch.testing.assert_close(snapshot.to_local(), expected)
+        source.to_local().add_(1)
+        torch.testing.assert_close(snapshot.to_local(), expected)
+        backuper.backup("actor", on_device=True)
+        assert backuper.get("actor")["weight"] is snapshot
+        source.to_local().zero_()
+        backuper.restore("actor")
+        torch.testing.assert_close(source.to_local(), expected + 1)
+
+
 def _gather_worker(rank, rendezvous):
     torch.set_num_threads(1)
     tensor_backper.device_module = SimpleNamespace(synchronize=lambda: None)
@@ -94,6 +124,7 @@ def _gather_worker(rank, rendezvous):
                 )
                 param.tensor_model_parallel = False
                 param.partition_dim = 0
+                _check_device_snapshot(param)
                 for async_op in (False, True):
                     [actual] = gather([(name, param)], split_sizes={}, async_op=async_op)
                     assert not isinstance(actual, DTensor)

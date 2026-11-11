@@ -352,8 +352,7 @@ def _configure_bridge_provider(args: argparse.Namespace, provider: Any = None) -
             want_fusion = want_fusion is not False
         if getattr(provider, "apply_dsa_kernel_fusion", False) != want_fusion:
             logger.info(
-                "Override provider.apply_dsa_kernel_fusion: "
-                f"{provider.apply_dsa_kernel_fusion!r} -> {want_fusion!r}"
+                f"Override provider.apply_dsa_kernel_fusion: {provider.apply_dsa_kernel_fusion!r} -> {want_fusion!r}"
             )
             provider.apply_dsa_kernel_fusion = want_fusion
 
