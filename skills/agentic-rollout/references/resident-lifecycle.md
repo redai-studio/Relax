@@ -1,65 +1,62 @@
 # Resident lifecycle
 
-Use this lifecycle to reason about ownership, barriers, capacity, and cleanup.
+Use this lifecycle to reason about logical Group ownership, physical slots, generation gates, and cleanup.
 
-## Ownership path
+## Ownership and scheduling
 
 ```text
-DataSource GroupInput
--> Prepare owns an unleased Group
--> SessionShard owns every Session, process, SessionForest, and first request
--> all Sessions reach the first-request barrier
--> Runtime leases the Group and opens generation
--> each terminal Session cleans up and publishes its result
--> Runtime gathers the Group and releases resident capacity
--> Reward finalizes the complete Group
--> Transfer accepts the scored Group
+DataSource GroupInput -> Prepare owns an unleased Group -> SessionShard owns its Sessions
+  ordinary: start all members -> all-member first-request barrier -> Runtime lease
+  capacity: reserve slots -> start admitted members -> Runtime lease -> run ready members
+            -> start remaining members as confirmed slots become available
+-> each terminal Session joins requests and releases owned resources
+-> confirm its physical slot return (capacity mode)
+-> Runtime gathers every original result and retires the logical Group
+-> Reward and Transfer retain complete-Group semantics
 ```
 
-Ordinary per-Session RM may overlap Runtime's Group gather; it does not delay publication of the Session result.
+Ordinary per-Session RM can overlap Runtime gather. Reward outside the agent is distinct from a harness that runs tests
+inside its Session; the latter still owns its task resources until confirmed cleanup.
 
 ## Core invariants
 
 | Boundary | Required invariant |
 | --- | --- |
-| Resident capacity | Prepare and Runtime share `agentic_concurrency` Group permits |
-| First-request barrier | Every original Session is active and has at least one live IR |
-| Runtime lease | A Group cannot lease before the all-Session barrier |
-| Group completion | Runtime gathers every original Session result; a controlled Session drop drops the Group |
-| Result publication | Backend attempts, process ownership, and Session cleanup finish before the result is published |
-| Permit release | Completed, rejected, cancelled, and dropped Groups release their resident ownership exactly once |
+| Logical residency | Prepare and Runtime share `agentic_concurrency` Group permits |
+| Physical capacity | Train only; all Shards on one host share `agentic_session_capacity_per_node` within the Runtime |
+| Placement | One complete Group fits one host; allocate slots before submitting the corresponding start RPC |
+| Ordinary lease | Every member has reached its first live request before the Group leases |
+| Capacity-managed lease | Members may be waiting for slots or first requests; only leased, ready members with an open generation gate can run |
+| Prelaunch | Preparation does not bypass the Runtime lease or weight-update generation gate |
+| Group completion | Gather every original Session result; a controlled member drop still drops the complete Group |
+| Physical release | Match the exact launch identity and owner proof; timeouts, lost RPC responses, and logical removal are not proof |
+| Logical release | Retire a Group once; preserve uncertain owners and their debits for later cleanup |
 
-## Prelaunch boundary
+## Prelaunch and cross-step boundaries
 
-Prelaunch fills available resident capacity with next-step Groups before their Runtime lease. It starts every agent
-process in those Groups and lets every Session reach its first request, while the requests remain held at the Prepare
-gate. Warming and ready Groups can remain resident across the current rollout tail, the optimizer step, and Eval before
-the next train lease.
+Prelaunch fills the same logical and physical budgets with next-step work. Without Session capacity it starts all
+members and waits at the ordinary first-request barrier; with capacity it starts admitted members and leaves the rest
+pending. Neither path allows unleased members to generate.
 
-Prelaunch changes timing and overlap rather than adding another train resident allowance: Prepare and Runtime still
-share the same `agentic_concurrency` permits. It can make the train allowance overlap with Eval and external agent
-capacity.
+Prepare-owned work may survive a synchronous weight boundary only when prelaunch retains it. Runtime-owned work must
+drain for that synchronous boundary. Partial rollout and fully async may retain the same Sessions, pending startup,
+requests, and unreleased debits across steps. Step changes never create another host allowance or reset a receipt's
+identity. Read [partial-and-async-lifecycle.md](partial-and-async-lifecycle.md) for mode-specific transitions.
 
-The agent process `--agent-timeout` is not active while a Group is owned by Prepare. The agent application's client
-request to `RELAX_BASE_URL` is already open and its own wall-clock timeout continues. Read
-[runtime-operations.md](runtime-operations.md) before enabling prelaunch.
+Prepare waits do not consume the Session's Runtime active-time budget, but the agent client's open request still has
+a wall-clock deadline. Read [runtime-operations.md](runtime-operations.md) before choosing the client timeout.
 
-## Check before launch
+## Check the integration
 
-- Verify each source Group contains the expected `n_samples_per_prompt` Sessions.
-- Verify every agent process can reach its first model request without waiting for another Group.
-- Verify the Relax-facing agent client can keep that first request open through the longest prelaunch wait.
-- For centralized external executors, run the capacity audit before assuming the all-Session barrier can complete.
-- Treat Group-level failure and replenishment separately from individual Session errors.
+- Verify Group size, eligible host identities, and each resource owner's scope.
+- Verify members can reach model requests without an application-level dependency on unstarted siblings or another Group.
+- Check ordinary barriers or incremental-start/eager-generation behavior according to the selected capacity mode.
+- Observe normal completion, cancellation, failed startup, and cleanup retry without duplicate launches or refunds.
+- Keep Group-level failure/replenishment separate from member resource release.
 
-## Evidence
+Use Prepare/Runtime Group metrics, Shard state, and physical-capacity metrics together. A target progress count proves
+neither that every resident Group has finished nor that all task resources have been released.
 
-Use `warming_prepare_group_count`, `ready_prepare_group_count`, `runtime_reward_group_count`, `finalized_group_count`, `resident_group_count`, and the first-request barrier state. A progress bar at its target does not prove all resident Groups are gone.
-
-Source anchors:
-
-- `relax/agentic/pipeline/prepare.py`
-- `relax/agentic/pipeline/runtime.py::RuntimeDomain`
-- `relax/agentic/session/service.py::ResidentGroup`
-- `relax/agentic/session/service.py::AgenticSessionShard`
-- `relax/agentic/rollout.py::AgenticResidentPipeline`
+Source anchors: `relax/agentic/pipeline/prepare.py`, `relax/agentic/pipeline/runtime.py`,
+`relax/agentic/pipeline/session_capacity.py`, `relax/agentic/session/service.py`,
+`relax/agentic/runner/resources.py`, and `relax/agentic/rollout.py`.

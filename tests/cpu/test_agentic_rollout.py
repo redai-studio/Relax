@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import sys
 import time
@@ -134,6 +135,11 @@ async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) ->
 async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> None:
     from relax.utils.opd.opd_main_worker import LogprobResponse
 
+    # Load OPD's optional backend before the five-second async progress deadline.
+    # A cold import can exceed that deadline when this test runs in isolation.
+    if not cancel:
+        importlib.import_module("relax.engine.rollout.sglang_rollout")
+
     args = _runtime_args(
         rollout_global_dataset=True,
         use_opd=True,
@@ -153,7 +159,7 @@ async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> 
         debug_rollout_only=False,
         save_debug_rollout_data=None,
     )
-    shard = runtime_mod._SessionShardBinding("shard", MagicMock())
+    shard = runtime_mod._SessionShardBinding("shard", MagicMock(), node_id="node")
     runtime = RuntimeDomain(args, "train", [shard], 2)
     monkeypatch.setattr(runtime, "_start_shard_observers", lambda: None)
     shard.handle.pause_generation.remote = AsyncMock(return_value=0)
@@ -562,7 +568,7 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
         start_group=SimpleNamespace(remote=AsyncMock()),
         drop_group=SimpleNamespace(remote=AsyncMock()),
     )
-    shard = SimpleNamespace(actor_name="shard", handle=handle, group_streams={}, next_session_number=0)
+    shard = SimpleNamespace(actor_name="shard", node_id="node", handle=handle, group_streams={}, next_session_number=0)
     runtime = RuntimeDomain(Namespace(rollout_global_dataset=False), "train", [shard], concurrency=2)
 
     async def exit_before_first_ir(_mode: str, group_id: str, _requests: Any) -> None:
@@ -590,12 +596,35 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
         await asyncio.sleep(0)
 
     assert handle.start_group.remote.await_count == 2
-    handle.drop_group.remote.assert_any_await("first", reason=None)
-    handle.drop_group.remote.assert_any_await("second", reason=None)
+    handle.drop_group.remote.assert_any_await(
+        "first", reason=None, expected_session_ids=tuple(sample.session_id for sample in first.samples)
+    )
+    handle.drop_group.remote.assert_any_await(
+        "second", reason=None, expected_session_ids=tuple(sample.session_id for sample in second.samples)
+    )
     assert runtime.resident_group_count == 0
     assert warning.call_count == 2
     assert not prepare._warming_prepare_tasks
     assert not prepare._ready_prepare_tasks
+
+
+async def test_group_placement_balances_pending_reservations_before_launch() -> None:
+    shards = [
+        SimpleNamespace(actor_name=f"{node}-{index}", node_id=node, group_streams={})
+        for node in ("node-a", "node-b")
+        for index in range(2)
+    ]
+    runtime = RuntimeDomain(Namespace(), "train", shards, concurrency=4)
+    reservations = [await runtime._reserve_group_shard(f"group-{index}", None, 8) for index in range(4)]
+    assert [reservation.shard.actor_name for reservation in reservations] == [
+        "node-a-0",
+        "node-b-0",
+        "node-a-1",
+        "node-b-1",
+    ]
+    runtime._release_group_reservation("group-0", reservations[0])
+    replacement = await runtime._reserve_group_shard("replacement", None, 8)
+    assert replacement.shard is shards[0]
 
 
 def test_chat_request_validation_and_logprob_payload() -> None:
@@ -668,7 +697,7 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     expected: bool,
 ) -> None:
     pipeline = object.__new__(AgenticResidentPipeline)
-    pipeline.args = SimpleNamespace(fully_async=fully_async)
+    pipeline.args = SimpleNamespace(fully_async=fully_async, max_staleness=1)
     pipeline.transfer_domain = SimpleNamespace(total_debt=debt, previous_debt=previous_debt)
     pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=tuple(range(interrupted_count)))
 
@@ -680,6 +709,20 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
         get_manager.assert_not_called()
     else:
         get_manager.assert_called_once_with()
+
+
+def test_zero_staleness_keeps_generation_open_until_partition_is_complete() -> None:
+    pipeline = object.__new__(AgenticResidentPipeline)
+    pipeline.args = SimpleNamespace(fully_async=True, max_staleness=0)
+    pipeline.transfer_domain = SimpleNamespace(total_debt=1, previous_debt=0)
+    pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=("tool-idle-group",))
+    context = _StepContext(rollout_id=0, final_backfill=False)
+    manager = SimpleNamespace(training_weight_updating=True)
+    with patch("relax.agentic.rollout.get_local_rollout_manager", return_value=manager) as get_manager:
+        assert not pipeline._step_can_close(context)
+        pipeline.transfer_domain.total_debt = 0
+        assert pipeline._step_can_close(context)
+    get_manager.assert_not_called()
 
 
 def test_runtime_gap_counts_current_debt_oversampling_and_resident_tail() -> None:
@@ -1112,6 +1155,69 @@ async def test_lease_group_preserves_prepare_error_priority_over_drop() -> None:
     shard._open_group.assert_not_awaited()
 
 
+@pytest.mark.parametrize("resists_cancellation", [False, True])
+async def test_terminal_backend_join_retries_owned_abort_and_bounds_stuck_runner(monkeypatch, resists_cancellation):
+    from relax.agentic.session import service as service_mod
+
+    for name in ("_FINALIZATION_ABORT_TIMEOUT_S", "_FINALIZATION_BACKEND_GRACE_S", "_FINALIZATION_CANCEL_GRACE_S"):
+        monkeypatch.setattr(service_mod, name, 0.01)
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    abort = AsyncMock()
+    shard._generation_backend = SimpleNamespace(abort_request=abort)
+    result = _SessionResultCell()
+    group = ResidentGroup("train", "owned-group", {"owned-session": result}, [])
+    session = _SessionRecord(group, "owned-session", {}, result)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def runner():
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            if resists_cancellation:
+                await release.wait()
+            else:
+                raise
+
+    task = asyncio.create_task(runner())
+    unrelated = asyncio.create_task(release.wait())
+    await started.wait()
+    try:
+        operation = shard._join_finalizing_requests(session, [], {task: "owned-rid"})
+        if resists_cancellation:
+            with pytest.raises(RuntimeGroupError, match="backend_join did not settle"):
+                await asyncio.wait_for(operation, timeout=1)
+            assert not task.done()
+            assert not result.terminal
+        else:
+            assert await asyncio.wait_for(operation, timeout=1) == []
+            assert task.cancelled()
+            assert not session.backend_cleanup_tasks
+        assert [call.args for call in abort.await_args_list] == [("owned-rid",), ("owned-rid",)]
+        assert not unrelated.done()
+    finally:
+        release.set()
+        await asyncio.gather(task, unrelated, return_exceptions=True)
+
+
+async def test_drop_group_retains_owner_when_session_cleanup_has_not_settled():
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    result = _SessionResultCell()
+    group = ResidentGroup("train", "owned-group", {"owned-session": result}, [])
+    session = _SessionRecord(group, "owned-session", {}, result)
+    group.sessions.append(session)
+    shard._groups = {group.group_id: group}
+    shard._finish_session = AsyncMock(side_effect=RuntimeGroupError("backend_join did not settle"))
+    with pytest.raises(RuntimeGroupError, match="backend_join did not settle"):
+        await shard._drop_group(group)
+    assert shard._groups[group.group_id] is group
+    assert group.sessions == [session]
+    assert not result.terminal
+
+
 def test_compute_reservation_tokens_uses_expanded_prompt_and_remaining_decode() -> None:
     assert compute_reservation_tokens(prompt_tokens=100, remaining_completion_tokens=50) == 150
     assert compute_reservation_tokens(prompt_tokens=-1, remaining_completion_tokens=-1) == 0
@@ -1537,6 +1643,7 @@ def _router_recovery_shard():
         router_cb_timeout_duration_secs=0,
     )
     shard._train_generation_open = True
+    shard._eager_gate_lock = asyncio.Lock()
     shard._state_revision = 0
     shard._state_changed = asyncio.Event()
     group = ResidentGroup(rollout_mode="train", group_id="g1", result_cells={}, sessions=[])

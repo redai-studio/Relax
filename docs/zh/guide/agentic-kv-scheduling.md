@@ -19,6 +19,10 @@ Relax 从 session 生命周期的两端分别处理这个问题：
 这两个特性优化的是*调度*开销，不是模型质量。当 rollout 是 KV-bound 时才需要开启——engine `token_usage` 高、频繁 eviction、GPU 没打满但 request 在排队。
 :::
 
+`--agentic-session-capacity-per-node` 单独控制物理 Agent 任务槽位，包括工具和容器资源，不预留 KV token，也不设置
+decode 并发数。参见[组并发与物理 Session 容量](./agentic-rollout.md#组并发与物理-session-容量)。
+与上面的可选 KV 优化不同，任务资源释放尚未确认时，物理槽位会继续占用。
+
 ## Session KV Lifecycle
 
 ### 做了什么

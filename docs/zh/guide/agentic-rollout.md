@@ -326,6 +326,49 @@ Relax 会管理 launcher 创建的 process group。Shell wrapper 可以使用 `e
 --agent-env FOO=bar BAZ=qux
 ```
 
+### 资源归属与释放确认
+
+`--agent-resource-owner-path` 声明一个 Session 拥有哪些资源。默认的
+`relax.agentic.runner.resources.ProcessGroupResourceOwner` 只管理 launcher 的本地进程组，不需要应用写回执。
+如果任务还拥有容器、远程作业，或脱离该进程组的子进程，应选择外部资源接口：
+
+```bash
+--agent-resource-owner-path relax.agentic.runner.resources.ReceiptResourceOwner
+```
+
+Adapter 需要结束或取消远程任务，等待其进程和容器退出，再写释放回执并退出。正常完成、任务失败和取消都应走同一套清理路径。
+发出取消请求、写入 `RELAX_OUTPUT_JSON` 或与服务端断开连接，都不等于资源已释放。任务失败时仍可以确认资源释放，
+这不会改变其奖励或整组替换规则。
+
+Relax 注入 `RELAX_REQUIRE_RESOURCE_RELEASE`、`RELAX_RESOURCE_RELEASE_PATH` 和 `RELAX_RESOURCE_RELEASE_NONCE`。
+下面的辅助函数只能在 Adapter 确认外部资源已退出后调用。回执必须匹配当前 Session 与 nonce，并通过原子替换写入，
+避免读到一半 JSON。
+
+```python
+import json
+import os
+from pathlib import Path
+
+
+def write_release_receipt() -> None:
+    if os.environ.get("RELAX_REQUIRE_RESOURCE_RELEASE") != "1":
+        return
+    path = Path(os.environ["RELAX_RESOURCE_RELEASE_PATH"])
+    pending = path.with_name(path.name + ".tmp")
+    pending.write_text(json.dumps({
+        "schema": 1,
+        "session_id": os.environ["RELAX_SESSION_ID"],
+        "nonce": os.environ["RELAX_RESOURCE_RELEASE_NONCE"],
+        "status": "released",
+    }), encoding="utf-8")
+    pending.replace(path)
+```
+
+本地进程组清理完成且资源接口确认匹配后，Relax 才归还物理槽位。回执缺失、无效或属于旧任务时，槽位继续占用，等待后续清理重试。
+自定义资源接口可继承 `relax/agentic/runner/resources.py` 中的 `SessionResourceOwner`；确认方法必须是幂等、有界的本地检查，
+远程取消应由 Agent Adapter 负责。Mini SWE 的 `agent_client.py`、`agent_server.py` 和 `session_process.py`
+展示了监督执行的沙箱如何实现这套分工。
+
 ### 启动训练
 
 在可运行的 Relax 训练命令中加入：
@@ -336,7 +379,28 @@ Relax 会管理 launcher 创建的 process group。Shell wrapper 可以使用 `e
 --agent-command "bash run_agent_app.sh"
 ```
 
-Model、dataset、parallelism 和 algorithm 配置可参考 `examples/` 下的完整 recipe。
+### 编写 Agentic Recipe
+
+从模型和训练模式相近、已经可运行的 recipe 开始。`examples/search_r1/run_search_r1.sh` 展示本地工具任务，
+`examples/deepeyes_agentic/run_deepeyes_agentic.sh` 包含图像输入，
+`examples/mini_swe_agent/run_mini_swe_agent_pd_blackwell.sh` 使用外部沙箱服务，配置为 fully async 的 4 卡训练＋4 卡
+PD＋HiCache rollout。示例的硬件参数是该 recipe 的选择，不是框架默认值。
+
+1. 用 `--prompt-data`、`--input-key`、`--metadata-key` 映射数据集，存在多模态输入时再配置 `--multimodal-keys`。
+   Adapter 从 `RELAX_INPUT_JSON` 读取任务；环境服务和 retriever 在每个 Session 的启动命令之外运行。
+2. 增加 Agent 入口，读取注入的模型端点与 Session 凭据，保留原有工具循环，每次请求发送完整历史。
+   按实际模型配置 reasoning/tool parser，并让模型请求的超时覆盖所选模式的跨步等待。
+   所有可能运行 SessionShard 的节点都需要具备对应命令、工作目录和依赖。
+3. 选择输出契约：线性轨迹可以写 `reward`/metadata，或使用 `--custom-rm-path`；选择分支或训练多个 context 时，
+   按下文使用显式导出及适用的 custom advantage 配置。
+4. 选择资源接口，再按[配置 Runtime 行为](#配置-runtime-行为)分别设置逻辑组并发和物理 Session 容量。
+   `--use-agentic-rollout` 接管 train 和 Eval 的生成链路，这条路径会忽略 `--custom-generate-function-path`。
+5. 先让完整一组走通模型调用、工具、奖励、导出与清理，再扩大并发。随后检查真实 optimizer update，
+   以及配置的跨步恢复或 prelaunch 行为；单次模型调用成功只能说明 API 连通。
+
+单机运行时先检查本地 Ray；未运行时，使用会加载 `scripts/entrypoint/local.sh` 的 recipe，通过 Bash 启动。
+提交到已有集群时使用 `scripts/entrypoint/ray-job.sh`。模型、数据路径和部署参数留在 recipe 中，这条 Adapter
+接入路径不需要另写一套 rollout 循环。
 
 ### 验证第一个 Rollout
 
@@ -505,57 +569,97 @@ Multi-context training 中，reward 用于上报任务结果，custom advantage 
 
 ## 配置 Runtime 行为
 
-::: danger 必须满足的 external agent 容量
-Agent 在带有硬并发限制的远程集中式平台运行时，先计算 train 上限和每个 Eval dataset 的上限：
+### 组并发与物理 Session 容量
+
+一个 Session 是一条完整的 Agent 任务轨迹，包括多轮模型调用、工具执行、测试，以及它所拥有的容器生命周期。
+以下参数控制的对象不同：
+
+| 参数 | 控制对象 | 默认行为 |
+| --- | --- | --- |
+| `--agentic-concurrency` | Prepare 与 Runtime 之间逻辑上同时驻留的训练组数 | 使用 `--over-sampling-batch-size`，后者默认使用 `--rollout-batch-size` |
+| `--n-samples-per-prompt` | 每组采样的 Session 数 | `1`，recipe 通常会覆盖此值 |
+| `--agentic-session-capacity-per-node` | 每节点为启动预留，或已经启动且尚未确认释放的物理训练 Session 槽位数 | 省略时关闭 |
+
+设置物理容量也会启用逐成员调度。例如：
+
+```bash
+--agentic-concurrency 32 \
+--n-samples-per-prompt 8 \
+--agentic-session-capacity-per-node 128
+```
+
+在一台 8 卡机器上，这表示逻辑上可以容纳 32 × 8 = 256 个成员，整个节点最多占用 128 个 Session 槽位，
+其余成员等待槽位；不是每张 GPU 各有 128 个。同节点上的 Shard 在本次训练链路内共享这份预算，其他作业和 Eval
+不共用这本容量账目。
+
+1. **逐成员归还槽位**：某个成员确认其拥有的资源已释放后，立即归还槽位，不必等待整组结束。
+2. **分批启动新组**：若空出 5 个槽位，下一组 8 个成员可以先启动 5 个，剩余 3 个随后补启动。
+3. **就绪成员先运行**：Group 获得 Runtime lease 后，准备好的成员即可生成和执行工具，不等全组首请求到齐；
+   奖励计算方式保持不变，最终仍按完整组收集、筛选和导出。
+
+它控制的是 Agent 任务资源。Session 执行工具或测试时可能没有生成请求，也可能在一次任务中发出并发请求。
+因此容量 128 不等于 128 个并发 decode 请求，也不保证显存占满。它与 SGLang 请求并发、token packing 和 KV admission
+分别计数。
+
+省略 `--agentic-session-capacity-per-node` 表示关闭，不能传 `0`。数值至少要容纳完整一组，
+即 `capacity >= n_samples_per_prompt`。框架不会按硬件自动推算容量；应结合实测主机内存、CPU、进程／容器开销及可用
+executor 槽位选择。Mini SWE 的 PD 脚本使用 Agent Server 的训练容量默认开启；其他 recipe 需要显式配置，并选择正确的资源接口。
+
+做同容量对照时，单节点、每组 8 个成员、外部容量 128 的普通组级调度通常对应 `--agentic-concurrency 16`，
+并省略容量参数。保持 executor 上限、GPU、模型和其余设置不变；关闭优化后仍保留 32 个组，会让 256 个成员竞争 128 个槽位。
+
+### 跨 Step 模式
+
+| 模式 | 开启 Session 容量后的行为 |
+| --- | --- |
+| 同步 rollout | 提前归还已确认释放的成员槽位；权重切换前清理 Runtime 拥有的工作 |
+| `--agentic-prelaunch` | 在同一份预算内准备下一步成员；生成仍需等待 Runtime lease |
+| `--partial-rollout` | 暂停／恢复时保留 Session 身份、被中断的请求和未释放槽位 |
+| `--fully-async` | 跨步保留未完成 Group 及其资源账目，维持分区欠额与整组补采样规则 |
+| `--use-dynamic-global-batch-size` | 需要 partial rollout 且 `over_sampling_batch_size > rollout_batch_size`，不支持 fully async |
+
+容量优化不会放宽原有算法和运行模式的限制。Fully async 有自己的留存与补采样生命周期，不需要额外打开 `--partial-rollout`。
+Dynamic global batch size 与 `--use-dynamic-batch-size`、`--max-tokens-per-gpu` 控制的 token packing 是不同配置。
+
+`--agent-timeout` 限制 Session 在 Runtime 中的活跃时间；prelaunch 等待和普通跨步暂停不消耗该预算，
+受保护的 Session 继续运行。模型客户端的墙钟超时在等待期间仍会计时。资源清理另有完成条件：
+切换 step 或达到采样目标都不等于确认释放槽位。
+
+### 外部 Executor 与 Eval
+
+接入有并发上限的远程服务时，需要分别计算逻辑需求和训练物理上限。`M` 是实际承载训练 SessionShard 的不同主机数，
+不是 GPU 数：
 
 ```text
-T = agentic_concurrency * n_samples_per_prompt
+L = agentic_concurrency * n_samples_per_prompt
+H = 配置的 agentic_session_capacity_per_node
+T = 未设置 H 时取 L；设置后取 min(L, M * H)
 G_d = dataset d 的 n_samples_per_eval_prompt
-C_d = 显式配置的 agentic_eval_concurrency，未配置时为 ceil(T / G_d)
+C_d = 显式 agentic_eval_concurrency，未配置时为 ceil(L / G_d)
 E_d = C_d * G_d
 E_peak = 所有 Eval dataset 的 E_d 最大值
 ```
 
-多个 Eval dataset 串行执行，因此组合峰值是 `E_peak`，无需把所有 `E_d` 相加。
+Eval 保持原组级生命周期，默认容量按 `L` 推导，不会自动缩小为训练物理上限 `T` 或 `H`；必要时显式设置
+`--agentic-eval-concurrency`。Ordinary RM 内部使用 singleton Runtime Group，Group RM 保留采样组大小，
+两者的 Session 上限均为 `E_d`。多个 Eval dataset 串行执行。
 
-启用 `--agentic-prelaunch`、`--partial-rollout` 或 `--fully-async` 时，表格中的
-**Eval 期间是否保留 train sessions** 应选择“是”。Prelaunch 与当前 step 共享 training resident capacity，
-因此 train 上限仍是 `T`；它会让 `T` 与 `E_peak` 同时存在。
+Train 与 Eval 共用外部 executor 时，应提供以下可用容量：
 
-Train 与 Eval 共用一个 executor 时，再选择对应场景：
-
-| 是否启用 Eval | Eval 期间是否保留 train sessions | 所需 slots |
+| 是否启用 Eval | Eval 期间是否保留训练 Session | 所需槽位 |
 | --- | --- | --- |
 | 否 | — | `external_slots >= T` |
 | 是 | 否 | `external_slots >= max(T, E_peak)` |
 | 是 | 是 | `external_slots >= T + E_peak` |
 
-Slots 不足时，Group 启动可能卡在 all-session first-request barrier。启动任务前必须检查该表格。
-:::
+Prelaunch、partial rollout 或 fully async 可能让训练资源留存到 Eval，应按重叠场景预留容量。
+独立资源池则分别需要 `train_slots >= T` 和 `eval_slots >= E_peak`；按主机划分的 executor 还需逐节点检查配额。
+Relax 的参数不会发现或预订远程平台槽位，也不会协调其他作业。
 
-| 目标 | 参数 | 行为 |
-| --- | --- | --- |
-| 限制 resident training Group | `--agentic-concurrency` | Prepare 与 Runtime 共享的 capacity |
-| 设置 resident Eval Group | `--agentic-eval-concurrency` | 逻辑 Eval prompt Group capacity，未配置时根据 training capacity 推导 |
-| 提前启动 agent | `--agentic-prelaunch` | Resident capacity 空闲时启动 process |
-| 复用未完成 sample | `--partial-rollout` | 跨 step abort 并恢复 backend attempt |
-| 异步执行 rollout 与 training | `--fully-async` | Partition 前进时保留未完成 session |
-| 限制 partial abort 次数 | `--partial-rollout-max-aborted-count` | 保护多次被 abort 的 attempt |
-| 终止运行过久的 agent | `--agent-timeout` | Runtime active-time budget 用尽后终止 agent process |
+未启用逐成员调度时，不足的 executor 槽位可能分散到多个不完整 Group，导致所有组都无法越过首请求屏障。
+Group RM 的 Eval 仍需要注意这个条件，不能用远程排队替代容量和释放确认契约。
 
-`--agent-timeout` 在 Session 进入 Runtime 后开始计时。Agent 的 loop、tool call 等持续运行过久时，Relax 会终止
-该进程。Prelaunch Session 等待 Runtime 时不会消耗这段时间；partial rollout 或 fully async 让普通 Session 跨
-step 暂停时，计时也会暂停。
-
-`--agentic-concurrency` 默认使用 `--over-sampling-batch-size`，后者默认使用 `--rollout-batch-size`。
-`--agentic-eval-concurrency` 未配置时，分别根据 `T` 和每个 Eval dataset 的 Group size 推导。两个参数都以逻辑
-prompt Group 为单位。无论使用 ordinary RM 还是 Group RM，dataset `d` 都持有 `E_d` 个 Sessions；ordinary RM
-内部使用 singleton Runtime Group，但不会改变该总数。多个 Eval dataset 串行执行，因此 Train 与 Eval 使用独立
-executor 时，分别为 `T` 和 `E_peak` 配置容量。
-
-Retriever、environment server 等 cross-session service 应在 per-session agent command 外启动。
-
-Session KV lifecycle 与 program-aware admission 是长时间 Agentic workload 的可选能力。参见
+Session KV lifecycle 和 program-aware admission 管理的是另一类资源，参见
 [Agentic KV Scheduling](./agentic-kv-scheduling.md)。
 
 ## 理解 Agentic Rollout 原理
@@ -648,7 +752,8 @@ lineage 至少包含一个 committed response。
 #### Resident Capacity
 
 Prepare 与 Runtime 共享 resident Group capacity。Reward work 位于该 capacity 外。Runtime Group 完成或 drop 后
-会释放 slot。Group 被 filter 后会产生新的需求。
+会释放逻辑组槽位。Group 被 filter 后会产生新的需求。启用物理 Session 容量后，成员确认释放即可提前归还物理槽位，
+所属 Group 此时仍可能驻留。在 Agent 内执行的测试或奖励计算仍占用 Session，直到清理完成；它们与 pipeline 的 Reward 阶段不同。
 
 ![Shared resident capacity and prelaunch](/agentic/resident_capacity.svg)
 
@@ -677,6 +782,10 @@ Program-aware admission 可以根据预测的 KV 使用量延迟 backend attempt
 ## 运维与故障排除
 
 ### Metrics 与 Dump
+
+启用 Session 容量后，`session_capacity/outstanding`、`session_capacity/peak` 和
+`session_capacity/confirmed_releases` 分别报告当前占用、历史峰值和累计确认归还的槽位数。跨步留存期间仍有占用可以是正常情况，
+最终收尾则必须确认资源已释放。
 
 配置 `--save-debug-rollout-data <path-with-{rollout_id}>`，可保存完整 metadata、SessionForest state hash、terminal
 status、turn count、request timing、abort count 与 weight-version 信息。
@@ -876,7 +985,9 @@ Shard 突然退出仍可能使最终复制无法完成。`tokens.jsonl` 按当�
 
 - **Agent 没有启动或异常退出：** 检查 `--agent-cwd` 和 `--agent-command`，然后查看 `run.log`。Relax 会把 agent
   stdout 与 stderr 的末尾内容附加到 `AgentExecutionError`。
-- **第一条 request 长时间等待：** Group 获得 Runtime lease 前，request 会保持等待；client 应配置长 timeout。
+- **第一条 request 长时间等待：** 检查 Runtime lease、生成暂停状态和可用物理槽位；未启用 Session 容量时，
+  还需检查全组首请求屏障。Client 超时需要覆盖这些等待。
+- **任务结束后容量仍被占用：** 检查进程／容器清理，以及释放回执中的 Session 与 nonce。任务完成或 RPC 超时本身不能归还物理槽位。
 - **显式导出无法匹配：** 保留 generation 实际使用的完整 normalized `messages`、`tools` 和
   `chat_template_kwargs`。
 - **隐式导出无法唯一确定 context：** 为需要训练的 context 写入具名显式 record。

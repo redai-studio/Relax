@@ -19,6 +19,11 @@ Both features are **off by default**, are **independent** (either can be enabled
 These features target *scheduling* overhead, not model quality. Enable them when the rollout is KV-bound — high engine `token_usage`, frequent eviction, requests queueing while the GPU is not saturated.
 :::
 
+`--agentic-session-capacity-per-node` is a separate control for physical agent task slots, including tools and containers.
+It neither reserves KV tokens nor sets decode concurrency. See
+[Group Concurrency and Physical Session Capacity](./agentic-rollout.md#group-concurrency-and-physical-session-capacity).
+Unlike the optional KV optimizations above, an unconfirmed task-resource release keeps its physical slot occupied.
+
 ## Session KV Lifecycle
 
 ### What it does

@@ -10,6 +10,7 @@ Read the final parsed arguments after Relax applies defaults and validation. Rep
 | `--use-agentic-rollout` | Selects Agentic train/Eval functions; custom generate is ignored | Startup normalization, without a conflict error |
 | `--agent-command`, `--agent-cwd` | Command runs through `/bin/bash -lc`; cwd and dependencies must exist on every possible SessionShard node | Basic values at startup; node availability at process launch |
 | `--agent-env` | `KEY=VALUE`; `RELAX_*` is reserved; duplicate keys resolve to the last value | Startup validation; effective login-shell environment needs runtime evidence |
+| `--agent-resource-owner-path` | Default process-group scope, or explicit external receipt/custom owner covering containers, remote jobs and detached children | Owner class is loaded before launch; physical cleanup needs runtime evidence |
 | `--agent-timeout` | Positive Runtime active-process safety budget for agent-side hangs; separate from each Chat request's wall-clock timeout | Positivity at startup; adequacy only during execution |
 | reasoning/tool parsers | Match the exact model/template and installed SGLang | First matching model response, not argument parsing |
 
@@ -17,20 +18,23 @@ Read the final parsed arguments after Relax applies defaults and validation. Rep
 
 | Parameters | Required check | Detection |
 | --- | --- | --- |
-| `--agentic-concurrency` and `--n-samples-per-prompt` | Resolve resident train Groups and resulting Session/process count | Positive values at startup; capacity at runtime |
+| `--agentic-concurrency` and `--n-samples-per-prompt` | Resolve logical train Groups and `L = C * N`; do not equate this with occupied physical slots | Positive values at startup; capacity at runtime |
 | `--agentic-eval-concurrency` and per-dataset `--n-samples-per-eval-prompt` | Resolve each dataset and its peak Session count | Positive values at startup; capacity at runtime |
+| `--agentic-session-capacity-per-node` | Unset disables member scheduling; `0` is invalid; `H >= N`; per-host train budget, not per GPU or Eval | Startup value check; actual Shard host identities, owner proof and host/executor headroom at runtime |
 | `--sglang-server-concurrency` | Distinguish fleet generation permits from resident Sessions | Runtime queue/throughput evidence |
 
-Use [external-agent-capacity.md](external-agent-capacity.md) only for a capacity-limited external platform. If
+Use [external-agent-capacity.md](external-agent-capacity.md) when physical Session capacity or a capacity-limited
+external platform is used. Eval defaults still derive from logical `C * N`, not the capped train occupancy. If
 `--agentic-prelaunch`, `--partial-rollout`, or `--fully-async` is enabled, read
-[partial-and-async-lifecycle.md](partial-and-async-lifecycle.md). Treat partial rollout and fully async as mutually
-exclusive. Otherwise skip those rules. Read
+[partial-and-async-lifecycle.md](partial-and-async-lifecycle.md). Fully async has its own retention/backfill path; it
+does not require `--partial-rollout`. Agentic dynamic GBS requires partial rollout, strict oversampling, and a non-fully-async
+configuration. Keep it distinct from dynamic token packing. Read
 [large-scale-rollout.md](large-scale-rollout.md) only when fixed defaults may be stressed.
 
 ## Optional KV lifecycle and admission
 
 If neither `--agentic-session-lifecycle` nor `--agentic-program-admission` is enabled, report this section `N/A` and
-stop here.
+skip its rows; continue with export checks when applicable.
 
 | Parameters | Required check | Detection |
 | --- | --- | --- |
