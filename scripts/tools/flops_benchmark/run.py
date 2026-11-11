@@ -6,6 +6,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import platform
 import subprocess
 import time
 from pathlib import Path
@@ -67,6 +68,27 @@ def environment_snapshot() -> dict:
         "source_files": sources,
         "megatron_source_files": megatron_sources,
         "container_image": os.environ.get("RELAX_FLOPS_IMAGE_DIGEST"),
+        "python": platform.python_version(),
+        "cpu": {
+            row["field"]: row["data"]
+            for row in json.loads(command(["lscpu", "--json"]))["lscpu"]
+            if "MHz" not in row["field"]
+        },
+        "cpu_affinity": sorted(os.sched_getaffinity(0)),
+        "runtime_environment": {
+            key: os.environ.get(key)
+            for key in (
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "CUDA_DEVICE_MAX_CONNECTIONS",
+                "NCCL_SOCKET_IFNAME",
+                "GLOO_SOCKET_IFNAME",
+                "NVTE_FLASH_ATTN",
+                "NVTE_FUSED_ATTN",
+                "RELAX_SFT_SELECTIVE_LOGITS",
+            )
+        },
         "gpus": command(["nvidia-smi", "--query-gpu=name,memory.total,uuid,driver_version", "--format=csv,noheader"]),
         "topology": command(["nvidia-smi", "topo", "-m"]),
     }
