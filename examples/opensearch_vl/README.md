@@ -1,10 +1,117 @@
-# OpenSearch-VL Benchmark
+# OpenSearch-VL：视觉工具轨迹 SFT 与评测
 
-统一记录不同模型在OpenSearch-VL数据上的SFT与 **V\*Bench本地裁剪工具评测**。每个模型有独立脚本和实验文档，共用数据处理、工具协议与评分规则。训练数据保持七域完整轨迹；评测只使用V\*Bench。
+本例使用 OpenSearch-VL 的多模态工具调用轨迹进行监督微调（SFT），并对比基座与训练后模型在 V\*Bench 上的表现。
 
-## 评测结果汇总
+训练样本保留完整的“图片与问题 → 模型推理和工具调用 → 工具观察 → 最终答案”多轮历史。评测时，模型可以自主调用本地 `crop` 工具，查看返回的局部图片后继续作答；不需要配置外部搜索或模型裁判服务。
 
-分数为Pass@1（%，原始 / 训练集去重）。已完成组统一使用v2明确最终选项归一化；仅重评分保存答案，不重新推理。每组完整191题，失败题保留在分母；空白表示尚未评测，不能用其他模型或其他协议的分数代填。
+下面以 **Qwen3-VL-8B-Instruct** 为例，按数据准备、训练、评测的顺序运行。其他模型换用对应的脚本和 HF 权重目录。
+
+| 模型                 | 启动脚本                                                     |
+| -------------------- | ------------------------------------------------------------ |
+| Qwen3-VL-8B-Instruct | [run-qwen3-vl-8B-8xgpu.sh](scripts/run-qwen3-vl-8B-8xgpu.sh) |
+| Qwen3.5-4B           | [run-qwen3.5-4B-8xgpu.sh](scripts/run-qwen3.5-4B-8xgpu.sh)   |
+| Qwen3.6-27B          | [run-qwen3.6-27B-8xgpu.sh](scripts/run-qwen3.6-27B-8xgpu.sh) |
+
+## 环境与目录
+
+先按 [Relax 安装说明](../../README.md) 准备训练环境，并将初始模型的 HF 权重放到 `HF_CHECKPOINT`。以下命令均在仓库根目录执行；训练需要可用的 8 GPU Ray 环境，评测可单独部署模型服务。
+
+```bash
+export MODEL_DIR=/path/to/models
+export HF_CHECKPOINT="${MODEL_DIR}/Qwen3-VL-8B-Instruct"
+export SOURCE_DIR=/path/to/opensearch-source
+export DATA_DIR=/path/to/data
+export SAVE_DIR=/path/to/outputs
+export EXP_NAME=qwen3-vl-8b-opensearch-vl
+export SCRIPT=examples/opensearch_vl/scripts/run-qwen3-vl-8B-8xgpu.sh
+```
+
+`MODEL_DIR` 保存初始模型，`SOURCE_DIR` 保存原始训练数据，`DATA_DIR` 保存处理后的数据与评测题集，`SAVE_DIR` 保存本次实验产物。每次新实验使用独立的 `EXP_NAME`。
+
+## 1. 准备训练数据
+
+训练数据来自 [OpenSearch-VL/Search-VL-SFT-36K](https://huggingface.co/datasets/OpenSearch-VL/Search-VL-SFT-36K)，包括七个域的图文工具轨迹。脚本固定数据版本，首次运行时下载约 11.38 GB 原始文件，再直接读取图片 ZIP 进行处理，无需先解压全部图片：
+
+```bash
+python3 examples/opensearch_vl/tools/prepare_data.py \
+  --download \
+  --source "${SOURCE_DIR}" \
+  --output "${DATA_DIR}/opensearch_vl/32k" \
+  --workers 16
+```
+
+已有完整原始数据时省略 `--download`。输出目录必须是新的。默认保留全部合格轨迹，并按关联图片和问题分组切分：训练 34,607 条，验证与测试各 32 条。预处理不按长度过滤，超长样本由训练阶段按 32K 上限处理。
+
+输出包含 `train.jsonl`、`val.jsonl`、`test.jsonl` 和 `images/`，可直接交给训练脚本。图片处理、切分规则和训练前审计见 [数据准备说明](data-preparation.md)。
+
+## 2. 训练
+
+在已启动的 8 GPU Ray 环境中执行：
+
+```bash
+export PROJECT_NAME=Relax/sft/opensearch-vl
+export NUM_EPOCHS=1
+bash scripts/entrypoint/ray-job.sh "$SCRIPT" relax
+```
+
+模型脚本会先审计数据，再进行完整轨迹 SFT。并行度、重算和 batch 参数可通过脚本支持的环境变量设置。默认每 200 步及最后一步保存 checkpoint，保留最近一份 native 和 HF 导出；最终 HF 权重位于 `${SAVE_DIR}/${EXP_NAME}/final-hf-<step>`。
+
+## 3. 评测基座与 SFT 模型
+
+评测使用 [V\*Bench](https://huggingface.co/datasets/craigwu/vstar_bench) 全部 191 题，覆盖属性识别和相对位置判断。两组使用相同的题目、图片预算、提示和工具协议，按最终选项计算 Pass@1。
+
+先下载题目及图片：
+
+```bash
+export BENCHMARK_DATA_ROOT="${DATA_DIR}/benchmark"
+python3 examples/opensearch_vl/tools/vstar_benchmark.py \
+  --data "${BENCHMARK_DATA_ROOT}/vstar" --prepare-only
+```
+
+然后按 [评测说明](evaluation.md) 准备模型来源文件，并按 [数据准备说明](data-preparation.md#评测去重索引) 从实际训练切分生成去重索引。
+
+先部署基座模型。以下适用于 Qwen3-VL-8B-Instruct；Qwen3.5/3.6 需要按评测说明配置保留 thinking 历史的共用模板。
+
+```bash
+python3 examples/opensearch_vl/tools/serve_sglang.py \
+  --model-path "${HF_CHECKPOINT}" --served-model-name benchmark-model \
+  --host 127.0.0.1 --port 30000 --tp-size 1 --context-length 32768
+```
+
+在另一个终端加载相同的目录变量后，请求该服务评测基座：
+
+```bash
+export AGENT_BASE_URL=http://127.0.0.1:30000/v1
+export AGENT_MODEL=benchmark-model
+export AGENT_PROVENANCE_FILE=/path/to/verified-base-provenance.json
+export BENCHMARK_OVERLAP_INDEX=/path/to/train-overlap-index.json
+export BENCHMARK_WORKERS=16
+bash "$SCRIPT" benchmark vstar base
+```
+
+停止基座服务，在服务终端换成训练后的最终 HF 目录并重新启动：
+
+```bash
+export HF_CHECKPOINT="${SAVE_DIR}/${EXP_NAME}/final-hf-<step>"
+python3 examples/opensearch_vl/tools/serve_sglang.py \
+  --model-path "${HF_CHECKPOINT}" --served-model-name benchmark-model \
+  --host 127.0.0.1 --port 30000 --tp-size 1 --context-length 32768
+```
+
+在请求终端同步模型路径，更新模型来源文件，然后评测 SFT 并生成对照表：
+
+```bash
+export HF_CHECKPOINT="${SAVE_DIR}/${EXP_NAME}/final-hf-<step>"
+export AGENT_PROVENANCE_FILE=/path/to/verified-sft-provenance.json
+bash "$SCRIPT" benchmark vstar relax
+bash "$SCRIPT" compare
+```
+
+逐题轨迹与裁剪图保存在 `${SAVE_DIR}/${EXP_NAME}/benchmark/`，对照结果为 `${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json`。完整的服务配置、工具坐标、生成预算与评分规则见 [评测说明](evaluation.md)。
+
+## 实验列表
+
+分数为 V\*Bench Pass@1（%，原始 / 训练集去重），每组完整 191 题。保留各组实验的阶段、状态、启动时间、训练 commit、训练曲线和详情入口；具体分析见各模型文档。
 
 | 模型                 | 阶段 / 预算   | 状态           | 实验启动 UTC        | 训练 commit    |      V\*Bench | SwanLab训练曲线                                                            | 实验文档                       |
 | -------------------- | ------------- | -------------- | ------------------- | -------------- | ------------: | -------------------------------------------------------------------------- | ------------------------------ |
@@ -15,62 +122,4 @@
 | Qwen3.6-27B          | Base          | 评测完成       | 2026-11-11 05:43:22 |                | 56.02 / 56.02 |                                                                            | [详情](results/qwen3.6-27b.md) |
 | Qwen3.6-27B          | SFT / 1 epoch | 训练与评测完成 | 2026-11-10 20:26:42 | `6d31774a5b94` | 71.73 / 71.73 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/0iblvpvo) | [详情](results/qwen3.6-27b.md) |
 
-4B修复最终选项漏判后由60.21%升至66.49%（+6.28个百分点）；旧解析曾将25条正确答案误计为失败，详见模型文档。
-
-27B在同一模型内对照提高15.71个百分点，两组各191题且无基础设施错误。
-
-本次8B在相同协议下提高36.13个百分点，基座耗尽轮数的题数为109，SFT为2。差异体现本地工具交互与完成作答的能力，不能把全部增益解释为纯视觉识别能力提高，也不与不同工具或图像预算的公开成绩直接排名。
-
-## 目录与入口
-
-| 路径                                                                 | 用途                                             |
-| -------------------------------------------------------------------- | ------------------------------------------------ |
-| [data-preparation.md](data-preparation.md)                           | 七域训练数据、图片处理、切分与Processor审计      |
-| [evaluation.md](evaluation.md)                                       | V\*Bench下载、模型服务、裁剪协议、运行与比较     |
-| [benchmark-references.md](benchmark-references.md)                   | 官方题集与社区实现的协议差异                     |
-| [scripts/run-qwen3-vl-8B-8xgpu.sh](scripts/run-qwen3-vl-8B-8xgpu.sh) | Qwen3-VL-8B-Instruct入口                         |
-| [scripts/run-qwen3.5-4B-8xgpu.sh](scripts/run-qwen3.5-4B-8xgpu.sh)   | Qwen3.5-4B入口与共用流程                         |
-| [scripts/run-qwen3.6-27B-8xgpu.sh](scripts/run-qwen3.6-27B-8xgpu.sh) | Qwen3.6-27B入口                                  |
-| [configs/benchmark.env.example](configs/benchmark.env.example)       | 模型服务、数据与输出的配置占位符                 |
-| [results/](results/)                                                 | 每模型一个中文文档，新实验插在前方               |
-| [templates/model-results.md](templates/model-results.md)             | 新模型及新实验记录模板                           |
-| [tools/](tools/)                                                     | 数据准备、审计、本地工具评测、比较和训练看板同步 |
-
-## 训练
-
-先按数据准备文档生成七域训练集。预处理不按长度过滤；训练在32K上限下跳过超长样本。当前脚本默认1 epoch，每200步及最后一步保存含optimizer/RNG的native checkpoint，最多保留最近1份；HF导出也只保留最近1份。
-
-在已配置的8 GPU Ray环境中，从仓库根目录执行：
-
-```bash
-export MODEL_DIR=/path/to/models
-export HF_CHECKPOINT="${MODEL_DIR}/Qwen3-VL-8B-Instruct"
-export DATA_DIR=/path/to/data
-export SAVE_DIR=/path/to/experiment-artifacts
-export PROJECT_NAME=Relax/sft/opensearch-vl
-export EXP_NAME=qwen3-vl-8b-opensearch-vl-my-run
-export NUM_EPOCHS=1
-bash scripts/entrypoint/ray-job.sh examples/opensearch_vl/scripts/run-qwen3-vl-8B-8xgpu.sh relax
-```
-
-其他模型换用对应脚本与HF目录。并行、重算和offload按实际显存、吞吐选择。短训练可显式设`TRAIN_STEPS`，记录实际完成量；`BENCHMARK_ONLY=1`是训练性能短测，不是V\*Bench评测。训练中的验证loss/PPL继续保留，单独记录。
-
-## 独立评测
-
-训练和评测分开执行，通过持久存储交接最终HF目录。先验证导出与模型来源，再按[评测文档](evaluation.md)启动服务。模型脚本只提供以下模式：
-
-```bash
-bash examples/opensearch_vl/scripts/run-qwen3-vl-8B-8xgpu.sh benchmark vstar base
-bash examples/opensearch_vl/scripts/run-qwen3-vl-8B-8xgpu.sh benchmark vstar relax
-bash examples/opensearch_vl/scripts/run-qwen3-vl-8B-8xgpu.sh compare
-```
-
-基座与SFT共用数据、提示、图片预算、工具和评分规则。每题生成一条真实多轮轨迹，裁剪从原始分辨率区域执行，最终按明确的选项字母评分。首次小样本运行应检查实际回图和后续模型请求，不能只验证工具调用JSON可解析。
-
-## 实验记录与看板
-
-每模型维护`results/<model>.md`。新实验插在前方，填写启动时间、完整branch/commit、模型与数据来源、预算、工具和SwanLab训练曲线；结束后补齐分数及失败原因，并同步总表。生成版本与评分版本不同时分别记录，保留原始答案与修正依据。
-
-结构化记录、逐题轨迹、日志、模型来源清单、数据、缓存和权重保存在仓库外，不提交Git。公开配置只使用占位符。最终模型和native checkpoint保留至下游验收，再按本次实验所有权清理。
-
-训练沿用ClearML，并可通过TensorBoard同步SwanLab标量。认证留在运行环境；同步hook关闭自动Git、环境、依赖、硬件和终端采集。SwanLab用于训练曲线，评测表格记录在模型文档，不另建评测看板。
+公开实现与协议差异见 [基准参考](benchmark-references.md)。新增模型时使用 [实验记录模板](templates/model-results.md)。

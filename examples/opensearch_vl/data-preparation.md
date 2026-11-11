@@ -4,6 +4,8 @@
 
 ## 输入与处理
 
+首次准备可在下面的命令中加 `--download`，脚本会从上述固定版本下载七域 JSON 和图片 ZIP，并写入 `source-revision.json`；不需要手动生成该文件。已有原始数据时直接使用下面的处理命令。
+
 `SOURCE_DIR` 中应有 `source-revision.json` 和七个域目录，每个域包含原始 JSON、`images.zip`。若原始 tar 带 `SHA256SUMS`，先在源目录执行 `sha256sum --check SHA256SUMS`。
 
 ```bash

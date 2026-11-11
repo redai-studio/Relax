@@ -84,6 +84,6 @@ bash "$SCRIPT" compare
 - 来源：同目录`protocol.json`、`model-provenance.json`和`evaluator.json`，记录数据/提示/模板/源码hash、模型来源及评测commit。
 - 对照：`${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json`。比较器只接受同协议的完整191题；基础设施错误和限题测试不能混入。
 
-JSON、逐题输出、日志和权重全部留在仓库外。每次评测在`results/<model>.md`前方插入一段，完成后填入实际分数并更新总表。修改评分提取时保留生成版本、评分版本及原始答案，不重新生成后挑选成绩。
+JSON、逐题输出、日志和权重全部留在仓库外。每次评测在`results/<model>.md`前方插入一段，完成后填入实际分数并更新总表。修改评分提取时保留原始答案，不重新生成后挑选成绩。
 
-评分规则变更时，对同一模型的基座与SFT一并处理，并对其他模型的已完成组统一复核；只重读保存答案，不重新推理。保留原版结果，另写评分版本、源码/补丁SHA256与逐题修改清单；生成commit和评分commit分别记录，未提交的评分修复明确标记。
+评测与评分均使用仓库中的[vstar_benchmark.py](tools/vstar_benchmark.py)。结果文档只记录一个评测代码commit，以该版本的脚本和本页协议复现。若修正答案提取，对所有已完成的基座与SFT统一重评分，原始答案及逐题差异保留在仓库外。

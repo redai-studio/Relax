@@ -14,7 +14,7 @@
 | 评测开始 / 结束 UTC                 |      |
 | 代码分支                            |      |
 | 训练 commit（完整hash）             |      |
-| 生成 / 评分 commit（完整hash）      |      |
+| 评测代码 commit（完整hash）         |      |
 | 初始模型 / revision                 |      |
 | 训练数据 / revision / 切分条数      |      |
 | 计划 / 实际steps、epochs            |      |
