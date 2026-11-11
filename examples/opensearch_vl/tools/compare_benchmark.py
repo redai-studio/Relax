@@ -15,15 +15,24 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     results = {}
-    for dataset, expected in [("simplevqa", 1013)]:
+    for dataset, expected in [("vstar", 191)]:
         runs = {
             label: json.loads((args.root / label / dataset / "summary.json").read_text())
             for label in ["base", "relax"]
         }
         if any(run["protocol"]["smoke"] or run["expected_cases"] != expected for run in runs.values()):
             raise ValueError("Only full benchmark runs can be compared")
+        model_failures = {
+            "context_limit",
+            "turn_limit",
+            "invalid_final_option",
+            "unfinished_reasoning",
+            "invalid_tool_call",
+        }
+        if any(set(run.get("errors", {})) - model_failures for run in runs.values()):
+            raise ValueError("Resolve infrastructure errors before comparing model scores")
         if runs["base"]["protocol"] != runs["relax"]["protocol"]:
-            raise ValueError("Base and Relax used different datasets, templates, tools, judge or deduplication")
+            raise ValueError("Base and Relax used different datasets, templates, tools or deduplication")
         if runs["relax"]["model_source"]["kind"] != "trained-final":
             raise ValueError("Relax results must use a trained final model")
         if runs["base"]["deduplicated_cases"] != runs["relax"]["deduplicated_cases"]:

@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.5-4B full SFT comparison, complete multimodal tool trajectories, 8 GPUs.
 # MODEL_DIR=/models DATA_DIR=/data SAVE_DIR=/checkpoints bash "$0" relax
-# Modes: relax | evaluate <HF-checkpoint> <base|relax> | benchmark <simplevqa|vdr> <base|relax> | compare
+# Modes: relax | benchmark vstar <base|relax> | compare
 
 set -eo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -16,7 +16,7 @@ now=$(date "+%Y%m%d-%H%M%S")
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-${MODEL_DIR}/Qwen3.5-4B}"
-NUM_EPOCHS="${NUM_EPOCHS:-2}"
+NUM_EPOCHS="${NUM_EPOCHS:-1}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-32768}"
 mkdir -p "${SCRIPT_DIR}/log" "${SAVE_DIR}/${EXP_NAME}"
@@ -24,58 +24,22 @@ cd "${RELAX_ROOT}"
 
 case "${MODE}" in
     benchmark)
-        : "${2:?Supply simplevqa or vdr}"
-        : "${3:?Supply base or relax}"
-        : "${BENCHMARK_DATA_ROOT:?Set the downloaded benchmark dataset root}"
+        [[ "${2:-}" == vstar ]] || { echo "Benchmark must be vstar" >&2; exit 2; }
+        case "${3:-}" in base|relax) ;; *) echo "Supply base or relax" >&2; exit 2 ;; esac
+        : "${BENCHMARK_DATA_ROOT:?Set the benchmark dataset root}"
         : "${BENCHMARK_OVERLAP_INDEX:?Set the SFT train overlap index}"
-        case "$2" in
-            simplevqa) benchmark_data="${BENCHMARK_DATA_ROOT}/simplevqa/test.parquet" ;;
-            vdr) benchmark_data="${BENCHMARK_DATA_ROOT}/vdr/data/testmini500_v1.parquet" ;;
-            vstar)
-                python3 "${SCRIPT_DIR}/../tools/vstar_benchmark.py" \
-                    --data "${BENCHMARK_DATA_ROOT}/vstar" --processor "${HF_CHECKPOINT}" \
-                    --provenance "${AGENT_PROVENANCE_FILE:?Set verified model provenance}" --label "$3" \
-                    --overlap-index "${BENCHMARK_OVERLAP_INDEX}" \
-                    --output "${SAVE_DIR}/${EXP_NAME}/benchmark/$3/vstar" \
-                    --workers "${BENCHMARK_WORKERS:-16}" --max-cases "${BENCHMARK_MAX_CASES:-0}"
-                exit
-                ;;
-            *) echo "Benchmark must be simplevqa, vstar or vdr" >&2; exit 2 ;;
-        esac
-        benchmark_args=()
-        if [[ "${BENCHMARK_MAX_CASES:-0}" != 0 ]]; then benchmark_args+=(--max-cases "${BENCHMARK_MAX_CASES}"); fi
-        if [[ "${BENCHMARK_ALLOW_MISSING_TOOLS:-0}" == 1 ]]; then benchmark_args+=(--allow-missing-tools); fi
-        python3 "${SCRIPT_DIR}/../tools/benchmark.py" \
-            --workflow "${BENCHMARK_WORKFLOW:-direct}" --workers "${BENCHMARK_WORKERS:-1}" \
-            --judge-qps "${JUDGE_QPS:-1}" \
-            --dataset "$2" --label "$3" --data "${benchmark_data}" --processor "${HF_CHECKPOINT}" \
-            --output "${SAVE_DIR}/${EXP_NAME}/benchmark/$3/$2" \
-            --tool-cache "${BENCHMARK_CACHE_DIR:-${SAVE_DIR}/${EXP_NAME}/benchmark/tool-cache}" \
-            --overlap-index "${BENCHMARK_OVERLAP_INDEX}" "${benchmark_args[@]}"
-        exit
-        ;;
-    evaluate)
-        : "${2:?Supply one explicit HF checkpoint directory}"
-        : "${3:?Supply base or relax as the evaluation label}"
-        case "$3" in base|relax) ;; *) echo "Evaluation label must be base or relax" >&2; exit 2 ;; esac
-        python3 "${SCRIPT_DIR}/../tools/evaluate.py" \
-            --model "$2" --processor "${HF_CHECKPOINT}" \
-            --data "${DATA_DIR}/opensearch_vl/32k/test_steps.jsonl" \
-            --output "${SAVE_DIR}/${EXP_NAME}/eval/$3" \
-            2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-eval-$3-${now}.log"
+        python3 "${SCRIPT_DIR}/../tools/vstar_benchmark.py" \
+            --data "${BENCHMARK_DATA_ROOT}/vstar" --processor "${HF_CHECKPOINT}" \
+            --provenance "${AGENT_PROVENANCE_FILE:?Set verified model provenance}" --label "$3" \
+            --overlap-index "${BENCHMARK_OVERLAP_INDEX}" \
+            --output "${SAVE_DIR}/${EXP_NAME}/benchmark/$3/vstar" \
+            --workers "${BENCHMARK_WORKERS:-16}" --max-cases "${BENCHMARK_MAX_CASES:-0}"
         exit
         ;;
     compare)
-        if [[ -d "${SAVE_DIR}/${EXP_NAME}/benchmark" ]]; then
-            python3 "${SCRIPT_DIR}/../tools/compare_benchmark.py" \
-                --root "${SAVE_DIR}/${EXP_NAME}/benchmark" \
-                --output "${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json"
-            exit
-        fi
-        python3 "${SCRIPT_DIR}/../tools/compare.py" \
-            --base "${SAVE_DIR}/${EXP_NAME}/eval/base/summary.json" \
-            --relax "${SAVE_DIR}/${EXP_NAME}/eval/relax/summary.json" \
-            --output "${SAVE_DIR}/${EXP_NAME}/comparison.json"
+        python3 "${SCRIPT_DIR}/../tools/compare_benchmark.py" \
+            --root "${SAVE_DIR}/${EXP_NAME}/benchmark" \
+            --output "${SAVE_DIR}/${EXP_NAME}/benchmark-comparison.json"
         exit
         ;;
     relax) ;;

@@ -1,11 +1,11 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3-VL-8B-Instruct SFT and SimpleVQA entry point on 8 GPUs.
+# Qwen3-VL-8B-Instruct SFT and V*Bench entry point on 8 GPUs.
 set -eo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export MODEL_CONFIG=qwen3-vl-8B
 export EXP_NAME="${EXP_NAME:-qwen3-vl-8b-opensearch-vl-32k-8xgpu}"
-export NUM_EPOCHS="${NUM_EPOCHS:-2}"
+export NUM_EPOCHS="${NUM_EPOCHS:-1}"
 export TP_SIZE="${TP_SIZE:-2}"
 export PP_SIZE="${PP_SIZE:-1}"
 export CP_SIZE="${CP_SIZE:-1}"

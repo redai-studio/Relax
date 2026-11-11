@@ -27,10 +27,6 @@ def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
-
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
@@ -78,44 +74,9 @@ def normalized_text(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
-def step_cases(rows: list[dict]) -> list[dict]:
-    """Each case ends before its target; only preceding images are visible."""
-    cases = []
-    for row in rows:
-        for index, message in enumerate(row["messages"]):
-            if message["role"] != "assistant":
-                continue
-            prefix = row["messages"][:index]
-            image_count = sum(m["content"].count("<image>") for m in prefix)
-            calls = extract_calls(message["content"])
-            cases.append(
-                {
-                    "id": f"{row['id']}:{index}",
-                    "messages": prefix,
-                    "images": row["images"][:image_count],
-                    "tools": row["tools"],
-                    "reference": message["content"],
-                    "kind": "call" if calls else "answer",
-                    "metadata": row["metadata"],
-                }
-            )
-    return cases
-
-
 def chat_messages(messages: list[dict]) -> list[dict]:
     """Replace literal image placeholders with Qwen image tokens."""
     return [
         {"role": m["role"], "content": m["content"].replace("<image>", "<|vision_start|><|image_pad|><|vision_end|>")}
         for m in messages
     ]
-
-
-def canonical_sample(row: dict):
-    from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
-
-    return CanonicalSample(
-        messages=[CanonicalMessage(**m, learn=m["role"] == "assistant") for m in chat_messages(row["messages"])],
-        tools=row["tools"],
-        images=row["images"],
-        metadata={"source_dataset": "opensearch", "row_index": row["id"]},
-    )

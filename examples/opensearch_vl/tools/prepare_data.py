@@ -25,7 +25,6 @@ from common import (
     extract_answer,
     extract_calls,
     parse_tools,
-    step_cases,
     write_json,
     write_jsonl,
 )
@@ -231,7 +230,6 @@ def main() -> None:
             ),
             "domain_counts": dict(Counter(row["metadata"]["domain"] for row in selected)),
         }
-    write_jsonl(args.output / "test_steps.jsonl", step_cases(splits["test"]))
     used_images = {path for selected in splits.values() for row in selected for path in row["images"]}
     for path in (args.output / "images").glob("*.png"):
         if str(path.resolve()) not in used_images:

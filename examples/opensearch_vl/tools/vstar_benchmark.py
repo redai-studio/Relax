@@ -38,7 +38,21 @@ def file_hash(path: Path) -> str:
 
 def final_option(text: str) -> str | None:
     candidate = extract_answer(text)
-    candidate = text.strip() if candidate is None else candidate
+    if candidate is None and ("<response>" in text or "</response>" in text):
+        return None
+    candidate = re.sub(r"\*\*|__", "", text.strip() if candidate is None else candidate)
+    last_line = candidate.splitlines()[-1].strip() if candidate else ""
+    prefix = re.match(
+        r"^(?:the\s+)?(?:(?:correct|final)\s+)?answer\s*(?:is\s*)?[:：]?\s*", last_line, flags=re.IGNORECASE
+    )
+    if prefix is None and len(re.findall(r"\([A-D]\)|\b[A-D][.)]", candidate)) > 1:
+        return None
+    candidate = last_line[prefix.end() :] if prefix else last_line
+    if len(set(re.findall(r"\b[A-D]\b", candidate))) > 1:
+        return None
+    boxed = re.fullmatch(r"\\boxed\{([A-D])\}[.!]?", candidate)
+    if boxed:
+        return boxed[1]
     if re.fullmatch(r"[A-D]", candidate):
         return candidate
     match = re.fullmatch(r"(?:\(([A-D])\)|([A-D])[.)])(?:[ \t]+[^\r\n]+)?", candidate)
@@ -181,7 +195,7 @@ def main() -> None:
         "image_factor": factor,
         "crop_coordinates": "display-pixels-xywh-mapped-to-original-region",
         "options": "official-test_questions.jsonl-order",
-        "score": "final-option-exact-match-with-explicit-letter-normalization",
+        "score": "final-option-exact-match-with-terminal-statement-normalization-v2",
         "workers": args.workers,
         "smoke": bool(args.max_cases),
         "overlap_index_sha256": file_hash(args.overlap_index),
