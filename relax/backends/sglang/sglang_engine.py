@@ -778,6 +778,102 @@ class SGLangEngine(RayActor):
             "update_weight_version", {"new_version": weight_version, "abort_all_requests": False}
         )
 
+    def install_memory_update(self, descriptor: dict, member: str, timeout: float, host_budget_bytes: int) -> dict:
+        import torch
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+
+        started = time.monotonic()
+        deadline = started + timeout
+        request_s: dict[str, float] = {}
+
+        def request(endpoint: str, payload: dict) -> dict:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Memory worker installation deadline exceeded")
+            request_started = time.monotonic()
+            response = self._make_request(endpoint, payload, timeout=remaining)
+            request_s[endpoint] = time.monotonic() - request_started
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise RuntimeError(f"SGLang {endpoint} failed: {response}")
+            return response
+
+        if _sglang_has_weight_update_session():
+            request("begin_weight_update", {})
+        control = json.dumps(
+            dict(descriptor=descriptor, member=member, timeout_s=timeout, host_budget_bytes=host_budget_bytes)
+        )
+        serialized = MultiprocessingSerializer.serialize([(control, torch.empty(0))], output_str=True)
+        request(
+            "update_weights_from_tensor",
+            dict(serialized_named_tensors=[serialized], load_format=MEMORY_LOADER, flush_cache=True),
+        )
+        if _sglang_has_weight_update_session():
+            request("end_weight_update", {})
+        request("update_weight_version", dict(new_version=descriptor["update"], abort_all_requests=False))
+        return dict(
+            success=True,
+            engine=self.rank,
+            node_id=ray.get_runtime_context().get_node_id(),
+            install_s=time.monotonic() - started,
+            update=descriptor["update"],
+            request_s=request_s,
+        )
+
+    def install_sharded_memory_update(self, controls: list[dict], timeout: float) -> dict:
+        """Install one complete fixed-owner group on both TP workers."""
+        import torch
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
+
+        if len(controls) != 2 or [item.get("tp_rank") for item in controls] != [0, 1]:
+            raise ValueError("Owner-local memory updates require two ordered TP controls")
+        identities = {(item["stream"], item["version"], item["group_update"]) for item in controls}
+        if len(identities) != 1:
+            raise ValueError("Engine TP workers received different group updates")
+        deadline = time.monotonic() + timeout
+
+        def request(endpoint: str, payload: dict) -> None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Sharded memory engine installation deadline exceeded")
+            response = self._make_request(endpoint, payload, timeout=remaining)
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise RuntimeError(f"SGLang {endpoint} failed: {response}")
+
+        if _sglang_has_weight_update_session():
+            request("begin_weight_update", {})
+        serialized = []
+        for control in controls:
+            encoded = json.dumps(control)
+            if len(encoded) > 65536:
+                raise ValueError("Sharded memory control exceeds its bound")
+            serialized.append(MultiprocessingSerializer.serialize([(encoded, torch.empty(0))], output_str=True))
+        payload = dict(serialized_named_tensors=serialized, load_format=SHARDED_MEMORY_LOADER, flush_cache=True)
+        control_json_bytes = len(json.dumps(payload).encode())
+        request("update_weights_from_tensor", payload)
+        if _sglang_has_weight_update_session():
+            request("end_weight_update", {})
+        request("update_weight_version", dict(new_version=controls[0]["group_update"], abort_all_requests=False))
+        return dict(
+            success=True,
+            engine=self.rank,
+            version=controls[0]["version"],
+            update=controls[0]["group_update"],
+            control_json_bytes=control_json_bytes,
+        )
+
+    def memory_weight_generation_probe(self, timeout: float) -> dict:
+        result = self._make_request(
+            "generate", {"input_ids": [1], "sampling_params": {"max_new_tokens": 1, "temperature": 0}}, timeout=timeout
+        )
+        if not isinstance(result, dict) or not result.get("meta_info", {}).get("output_token_ids", result.get("text")):
+            if not isinstance(result, dict) or result.get("meta_info", {}).get("completion_tokens", 0) < 1:
+                raise RuntimeError(f"Memory weight generation probe failed: {result}")
+        return {"success": True}
+
     def get_expert_weight_sync_layout(self) -> dict:
         """Return resolved layout settings for opt-in colocated expert routing
         and direct BF16 loading."""
@@ -2228,6 +2324,13 @@ def _compute_server_args(
         loaders = list(kwargs.get("custom_weight_loader") or [])
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
+        if getattr(args, "memory_weight_sync_config", None):
+            from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+            from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
+
+            for loader in (MEMORY_LOADER, SHARDED_MEMORY_LOADER):
+                if loader not in loaders:
+                    loaders.append(loader)
         kwargs["custom_weight_loader"] = loaders
 
     if (
