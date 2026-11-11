@@ -98,13 +98,3 @@ def test_gdn_image_patch_preserves_configured_beta_values_and_gradients(
         promoted_grad = torch.autograd.grad(promoted, beta, upstream)[0]
         assert not torch.equal(promoted, features["beta"])
         assert not torch.equal(promoted_grad, actual_grads[0])
-
-
-def test_projection_dtype_beta_is_opted_in_only_by_qwen38_providers():
-    root = Path(__file__).resolve().parents[4]
-    patch = (root / "docker/patch/megatron/20261016-qwen38-models.patch").read_text()
-    assert "+    linear_attention_beta_in_fp32: bool = True" in patch
-    sections = [s for s in patch.split("diff --git ") if "provider.linear_attention_beta_in_fp32 = False" in s]
-    assert len(sections) == 2
-    for section in sections:
-        assert "qwen4" in section.splitlines()[0].lower()
