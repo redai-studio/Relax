@@ -97,7 +97,7 @@ def test_ce_patch_preserves_nonunit_temperature_fallback(monkeypatch):
     hidden.main_grad = torch.zeros(1)
     args = (hidden, hidden, object(), object())
     assert fused_linear_ce.linear_cross_entropy(*args, temperature=0.7, accumulate=True, return_logits=True) is result
-    assert calls == [(*args, 1.0 / 0.7, True, True, False)]
+    assert calls == [(*args, 1.0 / 0.7, True, True)]
 
 
 @pytest.mark.parametrize(
