@@ -235,6 +235,10 @@ class Controller:
         self._sft_line_offsets_cache = resolve_sft_num_rollout(self.config)
 
         try:
+            # Agentic shards and data-source actors may read model metadata as
+            # soon as they are created, before service prefetch begins.
+            self._remove_stale_model_caches_before_startup()
+
             # Include data-system initialization in the constructor cleanup
             # transaction: a cluster-handshake orchestration error can happen
             # after the owner actor has created global TQ state.
@@ -1014,7 +1018,11 @@ class Controller:
             return ModelCompleteness.FULL if shares_actor_pg else ModelCompleteness.NONE
         return ModelCompleteness.FULL
 
-    def _start_model_prefetch(self, service_pgs: dict[Any, Any]) -> list[Any]:
+    def _remove_stale_model_caches_before_startup(self) -> None:
+        """Finish stale-cache removal before any model consumer can start."""
+        if not _uses_s3_model_prefetch(self.config):
+            return
+
         cleanup_task = ray.remote(num_cpus=0, max_retries=0)(_remove_stale_s3_model_caches_on_node)
         accelerator = device_utils.get_ray_accelerator_name()
         cleanup_node_ids = sorted(
@@ -1031,6 +1039,7 @@ class Controller:
         if cleanup_refs:
             ray.get(cleanup_refs)
 
+    def _start_model_prefetch(self, service_pgs: dict[Any, Any]) -> list[Any]:
         source = getattr(self.config, "model_source", None)
         if source is None or not is_s3_uri(source.uri):
             return []
