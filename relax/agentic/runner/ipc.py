@@ -437,6 +437,9 @@ class ManagedAgentProcess:
         self._cleanup_deadline: float | None = None
         self._cleanup_finished = False
         self.resource_released = False
+        self._resource_owner: SessionResourceOwner | None = None
+        self._session_directory: tempfile.TemporaryDirectory[str] | None = None
+        self._process_group_closed = False
         self._launcher = launcher
         self._spec = spec
         self._session_id = session_input.session_id
@@ -540,8 +543,41 @@ class ManagedAgentProcess:
                 self._task.add_done_callback(lambda task: None if task.cancelled() else task.exception())
             elif not self._task.cancelled():
                 self._task.exception()
-            if self._within_cleanup_deadline() and self._task.done() and terminating.done():
-                self._cleanup_finished = True
+            if self._task.done() and self._process is None and not self.resource_released:
+                self._confirm_resource_release()
+            self._retire_resource_owner()
+
+    def _confirm_resource_release(self) -> dict[str, Any]:
+        """Recheck the original lease without renewing its cleanup budget."""
+
+        owner = self._resource_owner
+        confirmed = False
+        proof: dict[str, Any] = {}
+        if owner is not None:
+            if self._process_group_closed and self._within_cleanup_deadline():
+                try:
+                    receipt = owner.confirm_release()
+                    confirmed = type(receipt) is ResourceReleaseReceipt and receipt.matches(owner.lease)
+                except Exception as error:
+                    proof["confirmation_error"] = type(error).__name__
+            if not confirmed:
+                try:
+                    proof.update(owner.diagnostics())
+                except Exception as error:
+                    proof["diagnostic_error"] = type(error).__name__
+        self.resource_released = confirmed and self._within_cleanup_deadline()
+        return proof
+
+    def _retire_resource_owner(self) -> None:
+        """Keep unknown proof state until confirmation or the original
+        deadline."""
+
+        if self.resource_released or not self._within_cleanup_deadline():
+            self._cleanup_finished = True
+            self._resource_owner = None
+            if self._session_directory is not None:
+                self._session_directory.cleanup()
+                self._session_directory = None
 
     def _within_cleanup_deadline(self) -> bool:
         # A blocking file read or a busy event loop can make completion and the
@@ -560,7 +596,9 @@ class ManagedAgentProcess:
             mark_agentic_event(process_events, "managed_prepare_start_at")
             input_payload = session_input.to_agent_payload()
             del session_input
-            with tempfile.TemporaryDirectory(prefix="relax-agentic-command-") as session_dir:
+            self._session_directory = tempfile.TemporaryDirectory(prefix="relax-agentic-command-")
+            session_dir = self._session_directory.name
+            try:
                 session_path = Path(session_dir)
                 input_path = session_path / "session_input.json"
                 output_path = session_path / "session_output.json"
@@ -588,6 +626,7 @@ class ManagedAgentProcess:
                 try:
                     lease = ResourceLease(self._session_id, self._group_id, release_nonce, release_path)
                     resource_owner = self._resource_owner_type(lease)
+                    self._resource_owner = resource_owner
                     owner_env = resource_owner.launch_environment()
                     if not isinstance(owner_env, Mapping) or not all(
                         isinstance(key, str) and isinstance(value, str) for key, value in owner_env.items()
@@ -655,6 +694,8 @@ class ManagedAgentProcess:
                     agentic_trace_events(self._output.metadata).update(process_events)
                 finally:
                     execution_error = sys.exc_info()[1]
+                    if self._cleanup_deadline is None:
+                        self._cleanup_deadline = time.monotonic() + self._termination_policy.join_seconds
                     self._launch_finished.set()
                     try:
                         await self._pause_timeout()
@@ -667,30 +708,17 @@ class ManagedAgentProcess:
                     finally:
                         if self._process is not None:
                             process = self._process
-                            confirmed = False
-                            proof: dict[str, Any] = {}
+                            # Closing the launcher capability must not delete the
+                            # lease or proof needed after a transient verifier failure.
                             try:
-                                if not self._cleanup_timed_out and getattr(process, "group_closed", None) is True:
-                                    try:
-                                        receipt = resource_owner.confirm_release()
-                                        confirmed = type(receipt) is ResourceReleaseReceipt and receipt.matches(lease)
-                                    except Exception as error:
-                                        proof["confirmation_error"] = type(error).__name__
-                                if not confirmed:
-                                    try:
-                                        proof.update(resource_owner.diagnostics())
-                                    except Exception as error:
-                                        proof["diagnostic_error"] = type(error).__name__
-                            finally:
-                                # A broken owner must never bypass launcher capability cleanup.
-                                try:
-                                    await process.close()
-                                except BaseException:
-                                    self.resource_released = False
-                                    raise
-                                else:
-                                    self._process = None
-                            self.resource_released = confirmed and self._within_cleanup_deadline()
+                                await process.close()
+                            except BaseException:
+                                self.resource_released = False
+                                raise
+                            else:
+                                self._process_group_closed = getattr(process, "group_closed", None) is True
+                                self._process = None
+                            proof = self._confirm_resource_release()
                             if (
                                 self._require_resource_release or self._resource_owner_type.requires_external_cleanup
                             ) and not self.resource_released:
@@ -712,12 +740,15 @@ class ManagedAgentProcess:
                                     getattr(process, "group_closed", None),
                                     json.dumps(proof),
                                 )
+            finally:
+                self._retire_resource_owner()
         finally:
             if not launch_attempted:
                 # Payload preparation, temporary I/O and owner setup cannot
                 # allocate agent resources. Only a launch RPC makes their
                 # existence uncertain and requires an owner release proof.
                 self.resource_released = self._within_cleanup_deadline()
+                self._retire_resource_owner()
 
     @best_effort
     async def _persist_observation_log(self, source: Path) -> None:

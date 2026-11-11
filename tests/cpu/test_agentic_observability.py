@@ -2012,7 +2012,9 @@ def test_managed_agent_logs_and_structured_failure_survive_temp_cleanup(tmp_path
             Path(kw["log_path"]).write_text("agent diagnostics\n")
             if mode == "invalid":
                 (workdirs[-1] / "session_output.json").write_text("{bad json")
-            return SimpleNamespace(wait=wait, close=AsyncMock(), terminate=AsyncMock(side_effect=terminated.set))
+            return SimpleNamespace(
+                wait=wait, close=AsyncMock(), terminate=AsyncMock(side_effect=terminated.set), group_closed=True
+            )
 
         process = ManagedAgentProcess(
             SimpleNamespace(launch=launch),

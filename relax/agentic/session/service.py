@@ -3501,8 +3501,8 @@ class AgenticSessionShard:
                 if session.observation is not None and session.observation.failure is None and failure is not None:
                     session.observation.failure = failure
                 if retry:
-                    # Only an unsettled backend join is restartable. Its fatal
-                    # outcome survives a later controlled drop or late success.
+                    # Unsettled backend or resource cleanup retains its fatal
+                    # outcome across a later controlled drop or late success.
                     outcome = session.group.finalization_error
                 session.finalization_retryable = False
                 finish_task = asyncio.create_task(
@@ -3581,6 +3581,31 @@ class AgenticSessionShard:
         session.backend_cleanup_tasks.clear()
         return errors
 
+    def _retain_failed_finalization(
+        self, session: _SessionRecord, outcome: _SessionResultPayload, error: RuntimeGroupError
+    ) -> None:
+        """Keep the original cleanup owner and wake Runtime without refunding
+        it."""
+
+        group = session.group
+        session.finalization_retryable = True
+        if group.finalization_error is None:
+            group.finalization_error = error
+        if session.observation is not None:
+            failure = session.observation.failure
+            if failure is None or failure[0] != "session_cleanup_failed":
+                failure = ("session_cleanup_failed", "infra", str(error))
+                session.observation.failure = failure
+            self._observe_session(
+                session, "cleanup", "failed", reason_code=failure[0], category=failure[1], reason=failure[2]
+            )
+        if isinstance(outcome, SessionExportTransport):
+            # A retry keeps the fatal outcome, not the successful export.
+            self._trajectory_recorder.record_export_failure(
+                outcome.exports, group_id=group.group_id, rollout_mode=group.rollout_mode, reason=str(error)
+            )
+        self._notify_state_change(group)
+
     async def _finish_session_once(
         self,
         session: _SessionRecord,
@@ -3612,35 +3637,7 @@ class AgenticSessionShard:
         try:
             abort_outcomes = await self._join_finalizing_requests(session, pre_backend_tasks, backend_tasks)
         except RuntimeGroupError as error:
-            # No IR, process, or result ownership has been retired yet. Keep
-            # those refs for a later drop/shutdown retry, but wake Runtime now
-            # without claiming a terminal result or a physical release.
-            session.finalization_retryable = True
-            if group.finalization_error is None:
-                group.finalization_error = error
-            if session.observation is not None:
-                failure = session.observation.failure
-                if failure is None or failure[0] != "session_cleanup_failed":
-                    failure = ("session_cleanup_failed", "infra", str(error))
-                    session.observation.failure = failure
-                self._observe_session(
-                    session,
-                    "cleanup",
-                    "failed",
-                    reason_code=failure[0],
-                    category=failure[1],
-                    reason=failure[2],
-                )
-            if isinstance(outcome, SessionExportTransport):
-                # The retry keeps only the fatal error, so retire this export
-                # observation now without publishing or refunding the Session.
-                self._trajectory_recorder.record_export_failure(
-                    outcome.exports,
-                    group_id=group.group_id,
-                    rollout_mode=group.rollout_mode,
-                    reason=str(error),
-                )
-            self._notify_state_change(group)
+            self._retain_failed_finalization(session, outcome, error)
             raise
         lifecycle_closed = True
         if self.args.agentic_session_lifecycle:
@@ -3657,6 +3654,10 @@ class AgenticSessionShard:
             session.queued_irs.clear()
         if resources is not None:
             await asyncio.gather(resources.process.terminate_and_join(), return_exceptions=True)
+            if group.requires_resource_release and getattr(resources.process, "resource_released", False) is not True:
+                error = RuntimeGroupError(f"Session resource release unconfirmed for {session.session_id}")
+                self._retain_failed_finalization(session, outcome, error)
+                raise error
         if process_wait is not None:
             process_wait.cancel()
             await asyncio.gather(process_wait, return_exceptions=True)
