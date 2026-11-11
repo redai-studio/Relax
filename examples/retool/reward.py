@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Final answer reward minus 0.1 per tool failure, without a
-floor."""
+"""Final answer reward minus 0.1 per tool failure, without a floor."""
 
 from typing import Any
 
