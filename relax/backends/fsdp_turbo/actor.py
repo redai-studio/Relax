@@ -149,7 +149,8 @@ def _pin_fp_state_to_compute_dtype(model: torch.nn.Module, turbo_config, master_
 
     FSDP2 mixed precision re-casts managed parameters only; buffers retain the
     master dtype. Managed parameters must keep a uniform original dtype, so
-    they are not pinned here.
+    they are not pinned here. Qwen4 text rotary frequencies stay in FP32 by
+    default; visual frequencies follow Megatron's BF16 path.
     """
     from fsdp_turbo.utils.dtype import get_dtype
 
@@ -158,6 +159,14 @@ def _pin_fp_state_to_compute_dtype(model: torch.nn.Module, turbo_config, master_
     compute_dtype = get_dtype(param_dtype_str) if param_dtype_str else None
     if compute_dtype is None or compute_dtype == master_dtype:
         return
+
+    rotary_buffer_ids = set()
+    if Envs.RELAX_SFT_ROPE_FP32:
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRotaryEmbedding
+
+        for module in model.modules():
+            if isinstance(module, Qwen4ExpTextRotaryEmbedding):
+                rotary_buffer_ids.update(id(buffer) for buffer in module.buffers(recurse=False))
 
     pinned_buffers = []
     for name, buffer in model.named_buffers():
@@ -189,6 +198,161 @@ def _pin_ngram_tables_to_bf16(model: torch.nn.Module) -> None:
             fixed.append(f"{name} ({weight.dtype} -> torch.bfloat16)")
     if fixed:
         logger.warning(f"[fsdp_turbo] n-gram table dtype re-pinned after materialize: {fixed}")
+
+
+def _megatron_qwen4_exp_vision_rope_forward(module: torch.nn.Module, position_ids: torch.Tensor) -> torch.Tensor:
+    """Use BF16 angle products and FP32 trig inputs, matching Megatron."""
+    angles = (position_ids.unsqueeze(-1) * module.inv_freq).flatten(1).float()
+    with torch.autocast(device_type=angles.device.type, enabled=False):
+        emb = torch.cat((angles, angles), dim=-1)
+        module._megatron_position_embeddings = (emb.cos(), emb.sin())
+    return angles
+
+
+def _make_megatron_qwen4_exp_vision_block_hook(rotary_pos_emb: torch.nn.Module) -> Callable:
+    def _hook(_module, args, kwargs):
+        kwargs["position_embeddings"] = rotary_pos_emb._megatron_position_embeddings
+        return args, kwargs
+
+    return _hook
+
+
+class _MegatronQwen4ExpRowParallelLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        group,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(input_, weight, bias)
+        tp_rank = dist.get_rank(group=group)
+        shard_size = weight.shape[1] // dist.get_world_size(group=group)
+        input_shard = input_.narrow(-1, tp_rank * shard_size, shard_size)
+        weight_shard = weight.narrow(1, tp_rank * shard_size, shard_size)
+        output = torch.matmul(input_shard, weight_shard.t()).contiguous()
+        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=group)
+        output = output + bias if bias is not None else output
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        input_, weight, bias = ctx.saved_tensors
+        grad_input = torch.matmul(grad_output, weight) if ctx.needs_input_grad[0] else None
+        grad_weight = None
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.matmul(
+                grad_output.reshape(-1, grad_output.shape[-1]).t(), input_.reshape(-1, input_.shape[-1])
+            )
+        grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0) if bias is not None else None
+        return grad_input, grad_weight, grad_bias, None
+
+
+def _megatron_qwen4_exp_vision_row_parallel_forward(module: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+    return _MegatronQwen4ExpRowParallelLinear.apply(
+        input_,
+        module.weight,
+        module.bias,
+        module._megatron_tp_group,
+    )
+
+
+def _megatron_qwen4_exp_vision_column_parallel_forward(module: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+    """Match Megatron's per-TP-rank output-channel GEMM geometry."""
+    tp_size = dist.get_world_size(group=module._megatron_tp_group)
+    shard_size = module.weight.shape[0] // tp_size
+    outputs = []
+    for tp_rank in range(tp_size):
+        start = tp_rank * shard_size
+        weight_shard = module.weight.narrow(0, start, shard_size)
+        output = torch.matmul(input_, weight_shard.t())
+        if module.bias is not None:
+            output = output + module.bias.narrow(0, start, shard_size)
+        outputs.append(output)
+    return torch.cat(outputs, dim=-1)
+
+
+def _restore_qwen4_exp_nonpersistent_buffers(model: torch.nn.Module, device: str) -> None:
+    """Recompute rotary buffers discarded by meta construction/to_empty()."""
+    from fsdp_turbo.distributed.parallel_state import get_parallel_state
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+        Qwen4ExpTextRotaryEmbedding,
+        Qwen4ExpVisionModel,
+        Qwen4ExpVisionRotaryEmbedding,
+    )
+
+    restored = []
+    for name, module in model.named_modules():
+        if isinstance(module, Qwen4ExpTextRotaryEmbedding):
+            reference = Qwen4ExpTextRotaryEmbedding(module.config, device="cpu")
+        elif isinstance(module, Qwen4ExpVisionRotaryEmbedding):
+            reference = Qwen4ExpVisionRotaryEmbedding(module.dim, module.theta)
+        else:
+            continue
+        for buffer_name, buffer in module.named_buffers(recurse=False):
+            source = getattr(reference, buffer_name, None)
+            if source is not None:
+                if isinstance(module, Qwen4ExpVisionRotaryEmbedding) and buffer_name == "inv_freq":
+                    buffer.data = source.to(device=buffer.device, dtype=torch.bfloat16)
+                elif (
+                    Envs.RELAX_SFT_ROPE_FP32
+                    and isinstance(module, Qwen4ExpTextRotaryEmbedding)
+                    and buffer_name in ("inv_freq", "original_inv_freq")
+                ):
+                    # Widening an already rounded BF16 buffer cannot recover
+                    # its frequencies. Rebuild from the FP32 reference instead.
+                    buffer.data = source.to(device=buffer.device, dtype=torch.float32)
+                else:
+                    buffer.data.copy_(source.to(dtype=buffer.dtype))
+        if isinstance(module, Qwen4ExpVisionRotaryEmbedding):
+            module.forward = types.MethodType(_megatron_qwen4_exp_vision_rope_forward, module)
+        # CPU offload keeps FSDP master params on CPU, but non-persistent
+        # compute buffers must follow position_ids onto the accelerator.
+        module.to(torch.device(device))
+        restored.append(name)
+    parallel_state = get_parallel_state()
+    world_size = dist.get_world_size()
+    global_rank = dist.get_rank()
+    tp_group = None
+    if parallel_state.get_group_size("tp") == 1 and parallel_state.get_group_size("fsdp") == 4:
+        # All four ranks in this FSDP group process the same DP-local visual batch.
+        tp_group = parallel_state.get_group("fsdp")
+        if global_rank == 0:
+            logger.info("[qwen4_exp] vision TP uses the 4-rank FSDP group")
+    else:
+        tp_size = 8
+        if world_size % tp_size == 0:
+            for start_rank in range(0, world_size, tp_size):
+                ranks = list(range(start_rank, start_rank + tp_size))
+                group = dist.new_group(ranks=ranks)
+                if global_rank in ranks:
+                    tp_group = group
+    for module in model.modules():
+        if isinstance(module, Qwen4ExpVisionModel):
+            for block in module.blocks:
+                block.register_forward_pre_hook(
+                    _make_megatron_qwen4_exp_vision_block_hook(module.rotary_pos_emb), with_kwargs=True
+                )
+                if tp_group is not None:
+                    block.attn.proj._megatron_tp_group = tp_group
+                    block.attn.proj.forward = types.MethodType(
+                        _megatron_qwen4_exp_vision_row_parallel_forward, block.attn.proj
+                    )
+                    block.mlp.linear_fc1._megatron_tp_group = tp_group
+                    block.mlp.linear_fc1.forward = types.MethodType(
+                        _megatron_qwen4_exp_vision_column_parallel_forward, block.mlp.linear_fc1
+                    )
+                    block.mlp.linear_fc2._megatron_tp_group = tp_group
+                    block.mlp.linear_fc2.forward = types.MethodType(
+                        _megatron_qwen4_exp_vision_row_parallel_forward, block.mlp.linear_fc2
+                    )
+            if tp_group is not None:
+                module.merger.linear_fc2._megatron_tp_group = tp_group
+                module.merger.linear_fc2.forward = types.MethodType(
+                    _megatron_qwen4_exp_vision_row_parallel_forward, module.merger.linear_fc2
+                )
+    logger.info(f"[qwen4_exp] restored non-persistent rotary buffers on {len(restored)} modules")
 
 
 def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
@@ -230,7 +394,8 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
     text_cfg = getattr(model_config, "text_config", model_config)
     vision_cfg = getattr(model_config, "vision_config", None)
     text_cfg.gdn_implementation = "triton"
-    text_cfg.causal_conv1d_implementation = "triton"
+    text_cfg.causal_conv1d_implementation = getattr(turbo_config.model, "gdn_causal_conv1d", "triton")
+    text_cfg.gdn_decay_exp_bf16 = getattr(turbo_config.model, "gdn_decay_exp_bf16", False)
     text_cfg.qsa_implementation = "triton"
     text_cfg.skip_gdn_recompute = True
     text_cfg.skip_flash_attn_recompute = True
@@ -493,10 +658,32 @@ class FSDPTurboTrainRayActor(TrainRayActor):
             model = load_deepseek_v4_model(args.hf_checkpoint, torch_dtype)
             _apply_param_freeze(model, args)
             self.turbo = FSDPTurbo(config=turbo_config, model=model)
+            # Meta-deferred random-init build (5L/256E): the skeleton was built
+            # on meta device and FSDP/EP-wrapped without materializing, so here
+            # only the local shards (a few GiB/rank) are allocated and filled
+            # with the stock official init rules — no full-model host build.
+            if getattr(model, "_built_on_meta", False):
+                from fsdp_turbo.models.deepseek.deepseek_v4 import (
+                    materialize_deepseek_v4_model,
+                )
+
+                self.turbo.model.to_empty(device="cpu")
+                materialize_deepseek_v4_model(self.turbo.model)
+                if getattr(model, "_weights_path", None):
+                    # real weights: fill the local shards directly (no full
+                    # 67 GiB CPU build + whole-model pad_load). Per-rank IO is
+                    # the local expert block + a few GiB of shared params.
+                    load_deepseek_v4_weights_sharded(
+                        self.turbo.model,
+                        model._weights_path,
+                        model_config=getattr(model, "_weights_config", None),
+                    )
+            self.turbo.model.to(torch.device("cuda" if torch.cuda.is_available() else "npu"))
         else:
             model = load_hf_model(args.hf_checkpoint, torch_dtype)
             _apply_param_freeze(model, args)
             self.turbo = FSDPTurbo(config=turbo_config, model=model)
+
         # MTP (Qwen3.8/qwen4_exp multi-token prediction): scaling applied to
         # the MTP loss stashed by the patched forward; None disables it.
         self._mtp_loss_scaling = (
@@ -620,8 +807,12 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         if block <= 1:
             self._same_data_group = get_gloo_group()
             return
-        group_ranks = list(range(self._dp_rank * block, (self._dp_rank + 1) * block))
-        self._same_data_group = dist.new_group(ranks=group_ranks, backend="gloo")
+        self._same_data_group = None
+        for dp_rank in range(self._dp_size):
+            group_ranks = list(range(dp_rank * block, (dp_rank + 1) * block))
+            group = dist.new_group(ranks=group_ranks, backend="gloo")
+            if dp_rank == self._dp_rank:
+                self._same_data_group = group
 
     # ------------------------------------------------------------------
     # Data plane
