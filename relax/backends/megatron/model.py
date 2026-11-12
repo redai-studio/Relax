@@ -609,9 +609,13 @@ def setup_model_and_optimizer(
     _validate_vit_lr_trainable_params(args, model)
 
     if args.optimizer_cpu_offload:
-        from .compat import patch_hdo_group_steps
+        from .compat import patch_hdo_gpu_gradient_stream, patch_hdo_group_steps, patch_hdo_native_fp32_gradients
 
         patch_hdo_group_steps()
+        if patch_hdo_gpu_gradient_stream():
+            logger.info("Enabled HDO GPU gradient stream dependency.")
+        if patch_hdo_native_fp32_gradients():
+            logger.info("Enabled HDO native FP32 GPU gradients.")
 
     optimizer = get_megatron_optimizer(
         config=config,

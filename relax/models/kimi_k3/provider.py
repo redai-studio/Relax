@@ -55,7 +55,20 @@ class KimiK3VLModelProvider(KimiK3ModelProvider):
     def provide_language_model(
         self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
     ) -> GPTModel:
+        from relax.utils.env import Envs
+
         from .training_ops import configure_training_ops
 
         configure_training_ops()
-        return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        if Envs.RELAX_KIMI_K31_DSA_FUSED_INDEXER:
+            from .dsa_fused_indexer import configure_fused_indexer
+
+            if not self.kimi_dsa_config:
+                raise ValueError("Fused K3.1 indexer requires a K3.1 DSA model")
+            configure_fused_indexer()
+        model = super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        if Envs.RELAX_KIMI_K31_DSA_SELECTION_REUSE:
+            from .dsa_recompute import configure_model_indexer_reuse
+
+            configure_model_indexer_reuse(model, Envs.RELAX_KIMI_K31_DSA_QUERY_CHUNK_SIZE)
+        return model

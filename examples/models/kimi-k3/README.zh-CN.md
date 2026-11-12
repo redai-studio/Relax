@@ -2,6 +2,33 @@
 
 [English](./README.md)
 
+## Kimi K3.1 训练入口
+
+K3.1 只保留 `scripts/run-kimi-k3.1-pro-sft.sh`（全参）和 `scripts/run-kimi-k3.1-pro-lora.sh`（LoRA）两个入口，支持文本和多模态数据。两者通过 `scripts/entrypoint/ray-job.sh` 提交，默认阻塞等待；`DRY_RUN=1` 仅输出参数。
+
+必填 `MODEL_DIR`（原始 HF 基座）、`DATA_DIR`、`SAVE_DIR`（持久化 checkpoint 根）。`EXP_NAME` 是稳定实验名，保存/恢复共用 `${SAVE_DIR}/${EXP_NAME}`；`LOAD_DIR` 可显式指定其他恢复目录。新实验更换保存目录或实验名。
+
+| Variable                                                   | Full SFT             | LoRA                |
+| ---------------------------------------------------------- | -------------------- | ------------------- |
+| `NUM_GPUS` / `TP_SIZE` / `PP_SIZE` / `CP_SIZE` / `EP_SIZE` | 128 / 4 / 4 / 8 / 32 | 64 / 4 / 4 / 4 / 16 |
+| `NUM_ROLLOUT`                                              | 1000                 | 200                 |
+| `GLOBAL_BATCH_SIZE`                                        | 512                  | 128                 |
+| `TRAIN_FILE` / `RAW_TEXT`                                  | train.parquet / 0    | train.parquet / 0   |
+| `SAVE_INTERVAL` / `SAVE_OPTIMIZER`                         | 100 / 1              | 10 / 1              |
+| `EVAL_INTERVAL`                                            | 0                    | 0                   |
+
+`PROMPT_DATA` 可覆盖训练文件路径；启用评测时指定 `EVAL_INTERVAL` 和 `EVAL_FILE`（相对 `DATA_DIR`）。`NUM_ROLLOUT` 对应训练参数 `--num-rollout`；学习率、调度长度、序列长度、LoRA rank/alpha 及 PP 首末层数分别由 `LR`、`LR_DECAY_STEPS`、`MAX_TOKENS_PER_GPU`、`LORA_RANK`/`LORA_ALPHA`、`PP_FIRST_LAYERS`/`PP_LAST_LAYERS` 覆盖。后续 CLI 参数也会原样传入训练入口。
+
+```bash
+# Set MODEL_DIR, DATA_DIR, SAVE_DIR and Ray addresses before submitting.
+TRAIN_FILE=train.jsonl RAW_TEXT=1 GLOBAL_BATCH_SIZE=256 NUM_ROLLOUT=100 EXP_NAME=k31-text bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=336 EXP_NAME=k31-multimodal bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=1000 LR_DECAY_STEPS=1000 EXP_NAME=k31-lora bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-lora.sh
+TRAIN_FILE=train.absolute-images.jsonl GLOBAL_BATCH_SIZE=128 MAX_TOKENS_PER_GPU=16384 NUM_ROLLOUT=241 LR_DECAY_STEPS=241 EXP_NAME=k31-aim bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+```
+
+DSA 复用及融合为显式实验开关：`RELAX_KIMI_K31_DSA_SELECTION_REUSE=1`、`RELAX_KIMI_K31_DSA_FUSED_INDEXER=1`，默认关闭。完整训练严格数值一致性尚未验收。模型权重单独保存（`SAVE_OPTIMIZER=0`）不能精确恢复 Adam 状态。
+
 ## 概述
 
 Relax 支持 Kimi K3 的全参和 LoRA SFT，包括图片输入、packing、固定 CP、PP 和 EP。模型配置位于 `scripts/models/kimi-k3.sh`，公开示例位于 `examples/models/kimi-k3/scripts/`。

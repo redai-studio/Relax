@@ -75,6 +75,12 @@ class KimiK31DSAAttention(KimiK3Attention):
         core_config.dsa_indexer_rotate_activation = False
         if core_config.dsa_kernel_backend == "none":
             core_config.dsa_kernel_backend = "tilelang"
+        from relax.utils.env import Envs
+
+        if Envs.RELAX_KIMI_K31_EXPANDED_DSA_BACKEND not in (None, "", "core"):
+            from relax.models.kimi_k3.expanded_dsa import configure_expanded_attention
+
+            configure_expanded_attention(core_config, Envs.RELAX_KIMI_K31_EXPANDED_DSA_BACKEND)
         self.core_attention = DSAttention(
             config=core_config,
             submodules=DSAttentionSubmodules(indexer=KimiK31Indexer),

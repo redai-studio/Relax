@@ -126,7 +126,7 @@ def _reference(attention, hidden, boundaries, topk):
     return attention.o_proj(output * attention.g_proj(hidden)[0].sigmoid())[0]
 
 
-@pytest.mark.parametrize("topk", [2, 16])
+@pytest.mark.parametrize("topk", [2, 4, 16])
 def test_kimi_k31_absorbed_matches_expanded_sparse_attention_and_gradients(dsa_module, topk):
     from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -139,6 +139,7 @@ def test_kimi_k31_absorbed_matches_expanded_sparse_attention_and_gradients(dsa_m
     boundaries = [0, 4, 7]
     cu = torch.tensor(boundaries, dtype=torch.int32)
     packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=4, max_seqlen_kv=4)
+    packed.cu_seqlens_q_cpu = boundaries
     actual = attention._forward_mla(hidden, packed)
     expected = _reference(reference, reference_hidden, boundaries, topk)
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
@@ -235,3 +236,144 @@ def test_kimi_k31_kv_adapter_preserves_sparse_attention_and_adapter_gradients(ds
     torch.testing.assert_close(
         attention.kv_b_proj.adapter.weight.grad, reference.kv_b_proj.adapter.weight.grad, atol=3e-6, rtol=3e-5
     )
+
+
+@pytest.fixture
+def recompute_module(monkeypatch):
+    path = Path(__file__).resolve().parents[3] / "relax/models/kimi_k3/dsa_recompute.py"
+    spec = importlib.util.spec_from_file_location("_k31_dsa_recompute", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    # CPU tests use torch's real reentrant checkpoint; the GPU test additionally
+    # exercises Core's checkpoint/RNG implementation and this native flag.
+    monkeypatch.setattr(module, "_is_checkpointing", lambda: True)
+    return module
+
+
+def test_kimi_k31_selection_reuse_isolates_inflight_microbatches_and_repeated_backward(dsa_module, recompute_module):
+    import weakref
+
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from torch.utils.checkpoint import checkpoint
+
+    class Block:
+        config = SimpleNamespace(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)
+
+        def __init__(self, attention):
+            self.attention = attention
+            self.scopes = []
+
+        def _checkpointed_forward(self, hidden, packed_seq_params):
+            scope = getattr(packed_seq_params, recompute_module._SCOPE_ATTR, None)
+            if scope is not None:
+                self.scopes.append(weakref.ref(scope))
+            return checkpoint(lambda x: self.attention._forward_mla(x, packed_seq_params), hidden, use_reentrant=True)
+
+    torch.manual_seed(71)
+    attention, reference = _attention(dsa_module, 2), _attention(dsa_module, 2)
+    reference.load_state_dict(attention.state_dict())
+    block, baseline = Block(attention), Block(reference)
+    recompute_module.configure_checkpoint_scope(block)
+    recompute_module.configure_indexer_recompute_reuse(attention.core_attention)
+    calls = []
+    native = attention.core_attention.indexer.forward_before_topk
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return native(*args, **kwargs)
+
+    attention.core_attention.indexer.forward_before_topk = counted
+    cu = torch.tensor([0, 4, 7], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=4, max_seqlen_kv=4)
+    inputs = [torch.randn(7, 1, 6, requires_grad=True) for _ in range(2)]
+    refs = [x.detach().clone().requires_grad_() for x in inputs]
+    actual = [block._checkpointed_forward(x, packed) for x in inputs]
+    expected = [baseline._checkpointed_forward(x, packed) for x in refs]
+    assert len(calls) == 2
+    assert not hasattr(packed, recompute_module._SCOPE_ATTR)
+    assert block.scopes[0]() is not block.scopes[1]()
+    assert all(len(scope().selections) == 1 for scope in block.scopes)
+    cotangents = [torch.randn_like(x) for x in actual]
+    for index in (1, 0):
+        torch.testing.assert_close(actual[index], expected[index])
+        actual[index].backward(cotangents[index], retain_graph=True)
+        expected[index].backward(cotangents[index], retain_graph=True)
+    assert len(calls) == 2, "Checkpoint replay must reuse the original top-k"
+    assert all(not scope().selections for scope in block.scopes)
+    # Repeated backward deliberately recomputes after the one-use entry was consumed.
+    actual[0].backward(cotangents[0])
+    expected[0].backward(cotangents[0])
+    assert len(calls) == 3
+    for x, ref in zip(inputs, refs, strict=True):
+        torch.testing.assert_close(x.grad, ref.grad, atol=3e-6, rtol=3e-5)
+    for (name, parameter), (_, ref) in zip(attention.named_parameters(), reference.named_parameters(), strict=True):
+        if parameter.requires_grad:
+            torch.testing.assert_close(parameter.grad, ref.grad, atol=3e-6, rtol=3e-5, msg=name)
+    assert not attention.core_attention.index_share
+
+
+def test_kimi_k31_selection_reuse_releases_abandoned_graph(dsa_module, recompute_module):
+    import gc
+    import weakref
+
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from torch.utils.checkpoint import checkpoint
+
+    attention = _attention(dsa_module, 2)
+    recompute_module.configure_indexer_recompute_reuse(attention.core_attention)
+    owners = []
+
+    class Block:
+        config = SimpleNamespace(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)
+
+        def _checkpointed_forward(self, hidden, packed_seq_params):
+            owners.append(weakref.ref(getattr(packed_seq_params, recompute_module._SCOPE_ATTR)))
+            return checkpoint(lambda x: attention._forward_mla(x, packed_seq_params), hidden, use_reentrant=True)
+
+    block = Block()
+    recompute_module.configure_checkpoint_scope(block)
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=4, max_seqlen_kv=4)
+    out = block._checkpointed_forward(torch.randn(4, 1, 6, requires_grad=True), packed)
+    assert owners[0]().selections
+    del out
+    gc.collect()
+    assert owners[0]() is None
+    out = block._checkpointed_forward(torch.randn(4, 1, 6, requires_grad=True), packed)
+    out.sum().backward()
+    assert not hasattr(packed, recompute_module._SCOPE_ATTR)
+
+
+def test_kimi_k31_selection_scope_clears_partial_forward_on_error(dsa_module, recompute_module):
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from torch.utils.checkpoint import checkpoint
+
+    attention = _attention(dsa_module, 2)
+    recompute_module.configure_indexer_recompute_reuse(attention.core_attention)
+    scopes = []
+
+    class Block:
+        config = SimpleNamespace(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)
+        fail = True
+
+        def _checkpointed_forward(self, hidden, packed_seq_params):
+            scope = getattr(packed_seq_params, recompute_module._SCOPE_ATTR)
+            scopes.append(scope)
+            output = checkpoint(lambda x: attention._forward_mla(x, packed_seq_params), hidden, use_reentrant=True)
+            assert scope.selections
+            if self.fail:
+                raise RuntimeError("later layer failed")
+            return output
+
+    block = Block()
+    recompute_module.configure_checkpoint_scope(block)
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=4, max_seqlen_kv=4)
+    with pytest.raises(RuntimeError, match="later layer failed"):
+        block._checkpointed_forward(torch.randn(4, 1, 6, requires_grad=True), packed)
+    assert not scopes[0].selections
+    block.fail = False
+    output = block._checkpointed_forward(torch.randn(4, 1, 6, requires_grad=True), packed)
+    output.sum().backward()
+    assert not scopes[1].selections

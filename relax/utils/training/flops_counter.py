@@ -517,6 +517,7 @@ _ESTIMATE_FUNC = {
     "gemma4": estimate_gemma4_flops,
     "gemma4_text": estimate_gemma4_flops,
     "kimi_k3": estimate_kimi_k3_flops,
+    "kimi_k31": estimate_kimi_k3_flops,
     # Dense transformers (SwiGLU + GQA)
     "qwen2": _estimate_qwen2_flops,
     "qwen3": _estimate_qwen2_flops,
@@ -564,12 +565,7 @@ class FlopsCounter:
     """
 
     def __init__(self, config):
-        if getattr(config, "model_type", None) == "kimi_k31":
-            logger.warning(
-                "K3.1 FLOPs/MFU omitted: the K3 estimator does not account for sparse DSA and its frozen indexer. "
-                "Token throughput and timing remain available."
-            )
-        elif hasattr(config, "model_type") and config.model_type not in _ESTIMATE_FUNC:
+        if hasattr(config, "model_type") and config.model_type not in _ESTIMATE_FUNC:
             logger.warning(
                 "Unsupported model_type '%s' for FLOPS estimation — falling back to dense transformer formula. "
                 "Supported: %s.",
@@ -582,14 +578,12 @@ class FlopsCounter:
     def estimate(self, batch_seqlens, delta_time, **kwargs):
         """Return (estimated_tflops, peak_device_tflops).
 
-        ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``. K3
-        honors independent frozen-region flags; other estimators retain their
-        existing 3x-forward training convention.
+        ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``.
+        K3/K3.1 honors independent frozen-region flags; other estimators retain
+        their existing 3x-forward training convention.
         """
         tokens_sum = sum(batch_seqlens)
         model_type = getattr(self.config, "model_type", None)
-        if model_type == "kimi_k31":
-            return float("nan"), get_device_peak_flops(unit="T")
         func = _ESTIMATE_FUNC.get(model_type, _estimate_fallback_flops)
         forward_only = kwargs.pop("forward_only", False)
         if func is estimate_kimi_k3_flops:
@@ -600,7 +594,7 @@ class FlopsCounter:
             ):
                 if not self._warned_unsupported_trainability:
                     logger.warning(
-                        "K3 FLOPs/MFU omitted for LoRA or custom parameter masks: "
+                        "K3/K3.1 FLOPs/MFU omitted for LoRA or custom parameter masks: "
                         "HF config cannot determine adapter dimensions and actual trainability. "
                         "Token throughput and timing remain available."
                     )

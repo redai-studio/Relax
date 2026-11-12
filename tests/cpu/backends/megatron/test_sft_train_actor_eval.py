@@ -35,6 +35,22 @@ def test_should_run_sft_eval_at_interval_boundary():
     assert should_run_sft_eval(args, completed_steps=0) is False
 
 
+def test_sft_early_eval_preserves_periodic_schedule_and_disable_gates(monkeypatch):
+    monkeypatch.setenv("RELAX_SFT_EVAL_FIRST_STEP", "1")
+    args = _mk_actor_args()
+    args.eval_interval = 100
+    assert [step for step in range(201) if should_run_sft_eval(args, step)] == [1, 100, 200]
+    args.eval_interval = None
+    assert not should_run_sft_eval(args, 1)
+    args.eval_interval = 100
+    args.eval_prompt_data = None
+    assert not should_run_sft_eval(args, 1)
+    args.eval_prompt_data = ["eval", "/dev/null"]
+    args.loss_type = "dpo"
+    assert not should_run_sft_eval(args, 1)
+    assert should_run_sft_eval(args, 100)
+
+
 @pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
 def test_preference_eval_follows_configured_interval(loss_type):
     args = _mk_actor_args()
@@ -86,7 +102,7 @@ def test_evaluation_step_mapping_is_completed_for_sft_and_zero_based_for_rl():
     assert evaluation_step_for_rollout(args, rollout_id=9) == 9
 
 
-def test_sft_lookahead_uses_completed_step_eval_boundaries():
+def test_sft_lookahead_uses_completed_step_eval_boundaries(monkeypatch):
     """Exercise the actual lookahead policy without importing the GPU actor."""
     import ast
     from pathlib import Path
@@ -114,3 +130,8 @@ def test_sft_lookahead_uses_completed_step_eval_boundaries():
         )
         assert not namespace["_should_pause_sft_lookahead"](args, 0)
         assert namespace["_should_pause_sft_lookahead"](args, 1)
+    args.loss_type = "sft"
+    args.eval_interval = 100
+    monkeypatch.setenv("RELAX_SFT_EVAL_FIRST_STEP", "1")
+    assert namespace["_should_pause_sft_lookahead"](args, 0)
+    assert not namespace["_should_pause_sft_lookahead"](args, 1)

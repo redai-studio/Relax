@@ -2,6 +2,33 @@
 
 [中文](./README.zh-CN.md)
 
+## Kimi K3.1 training entrypoints
+
+K3.1 uses two entrypoints: `scripts/run-kimi-k3.1-pro-sft.sh` for full SFT and `scripts/run-kimi-k3.1-pro-lora.sh` for LoRA. Both support text and multimodal data. Submit through `scripts/entrypoint/ray-job.sh`; submission blocks by default. `DRY_RUN=1` only prints arguments.
+
+Set `MODEL_DIR` to the original HF base, `DATA_DIR` to the dataset, and `SAVE_DIR` to a persistent checkpoint root. `EXP_NAME` identifies the experiment; save and resume share `${SAVE_DIR}/${EXP_NAME}`. `LOAD_DIR` can select another training checkpoint directory. Use a new save directory or experiment name for a new experiment.
+
+| Variable                                                   | Full SFT             | LoRA                |
+| ---------------------------------------------------------- | -------------------- | ------------------- |
+| `NUM_GPUS` / `TP_SIZE` / `PP_SIZE` / `CP_SIZE` / `EP_SIZE` | 128 / 4 / 4 / 8 / 32 | 64 / 4 / 4 / 4 / 16 |
+| `NUM_ROLLOUT`                                              | 1000                 | 200                 |
+| `GLOBAL_BATCH_SIZE`                                        | 512                  | 128                 |
+| `TRAIN_FILE` / `RAW_TEXT`                                  | train.parquet / 0    | train.parquet / 0   |
+| `SAVE_INTERVAL` / `SAVE_OPTIMIZER`                         | 100 / 1              | 10 / 1              |
+| `EVAL_INTERVAL`                                            | 0                    | 0                   |
+
+`PROMPT_DATA` overrides the training path. For evaluation, set `EVAL_INTERVAL` and `EVAL_FILE` relative to `DATA_DIR`. `NUM_ROLLOUT` maps to `--num-rollout`. Override learning rate, schedule length, token limit, adapter rank/alpha and first/last PP layers with `LR`, `LR_DECAY_STEPS`, `MAX_TOKENS_PER_GPU`, `LORA_RANK`/`LORA_ALPHA` and `PP_FIRST_LAYERS`/`PP_LAST_LAYERS`. Additional CLI arguments pass through to training.
+
+```bash
+# Set MODEL_DIR, DATA_DIR, SAVE_DIR and Ray addresses before submitting.
+TRAIN_FILE=train.jsonl RAW_TEXT=1 GLOBAL_BATCH_SIZE=256 NUM_ROLLOUT=100 EXP_NAME=k31-text bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=336 EXP_NAME=k31-multimodal bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=1000 LR_DECAY_STEPS=1000 EXP_NAME=k31-lora bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-lora.sh
+TRAIN_FILE=train.absolute-images.jsonl GLOBAL_BATCH_SIZE=128 MAX_TOKENS_PER_GPU=16384 NUM_ROLLOUT=241 LR_DECAY_STEPS=241 EXP_NAME=k31-aim bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+```
+
+DSA selection reuse and fused indexer are opt-in experiments: `RELAX_KIMI_K31_DSA_SELECTION_REUSE=1` and `RELAX_KIMI_K31_DSA_FUSED_INDEXER=1`, both off by default. Strict full-training numerical equivalence remains unverified. Model-only checkpoints (`SAVE_OPTIMIZER=0`) cannot restore Adam state exactly.
+
 ## Overview
 
 Relax provides full-parameter and LoRA SFT for Kimi K3, with image inputs, packing, fixed CP, PP and EP. The model configuration is `scripts/models/kimi-k3.sh`; public recipes live in `examples/models/kimi-k3/scripts/`.
