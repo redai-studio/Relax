@@ -123,12 +123,6 @@ jobs:
         if: matrix.gpus > 0
         run: docker exec "$CI_CONTAINER_NAME" nvidia-smi
 
-      - name: Install dependencies
-        run: |
-          docker exec "$CI_CONTAINER_NAME" uv pip install \
-            --system --break-system-packages -r requirements.txt \
-            --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-
       - name: Run unit tests
         timeout-minutes: 20
         env:
