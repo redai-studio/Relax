@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 from collections.abc import Iterator
 from pathlib import Path
@@ -53,7 +54,8 @@ def compute_sample_stats(spans: list[dict[str, Any]], consumed_weight_version: s
     is the train-side stamp; when it is missing every lag is ``None`` rather
     than 0. Known spans are those whose version parses as an int; unknown
     spans (null or non-numeric version) are excluded from lags and counted in
-    the missing rates.
+    the missing rates. The output carries ``spans_count`` / ``unknown_spans``
+    so callers can aggregate span coverage without re-parsing the spans.
     """
 
     known: list[tuple[int, str, int]] = []  # (version int, original string, token count)
@@ -70,7 +72,12 @@ def compute_sample_stats(spans: list[dict[str, Any]], consumed_weight_version: s
     total_spans = len(spans)
     total_tokens = known_tokens + unknown_tokens
 
-    stats: dict[str, Any] = {"known_token_count": known_tokens, "unknown_token_count": unknown_tokens}
+    stats: dict[str, Any] = {
+        "known_token_count": known_tokens,
+        "unknown_token_count": unknown_tokens,
+        "spans_count": total_spans,
+        "unknown_spans": total_spans - len(known),
+    }
     if known:
         min_version = min(item[0] for item in known)
         max_version = max(item[0] for item in known)
@@ -89,7 +96,11 @@ def compute_sample_stats(spans: list[dict[str, Any]], consumed_weight_version: s
         stats["oldest_lag"] = current - min_version
         stats["newest_lag"] = current - max_version
         stats["post_generation_lag"] = current - max_version
-        stats["token_weighted_lag"] = sum((current - version) * tokens for version, _, tokens in known) / known_tokens
+        # Zero-token known spans (token_start == token_end) leave nothing to
+        # weight: undefined, reported as None rather than a division crash.
+        stats["token_weighted_lag"] = (
+            sum((current - version) * tokens for version, _, tokens in known) / known_tokens if known_tokens else None
+        )
     else:
         stats["oldest_lag"] = None
         stats["newest_lag"] = None
@@ -113,11 +124,12 @@ def _median(values: list[float]) -> float | None:
 def compute_run_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Run-level aggregation over per-sample stat rows.
 
-    Each row carries :func:`compute_sample_stats` output plus ``spans`` /
-    ``unknown_spans`` span counts. ``None`` values never enter a mean, median,
-    or max: lag distributions cover only samples with a known consumed
-    version, the generation-span mean covers only samples with known spans,
-    and missing data is quantified by the three missing rates instead.
+    Each row carries :func:`compute_sample_stats` output — including the
+    ``spans_count`` / ``unknown_spans`` span counts — so detail rows from
+    :func:`_detail_row` feed this directly. ``None`` values never enter a
+    mean, median, or max: lag distributions cover only samples with a known
+    consumed version, the generation-span mean covers only samples with known
+    spans, and missing data is quantified by the three missing rates instead.
     """
 
     def values(key: str) -> list[Any]:
@@ -125,11 +137,13 @@ def compute_run_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     oldest_lags = values("oldest_lag")
     newest_lags = values("newest_lag")
-    spans_total = sum(row.get("spans", 0) for row in rows)
+    spans_total = sum(row.get("spans_count", 0) for row in rows)
     unknown_spans = sum(row.get("unknown_spans", 0) for row in rows)
     known_tokens = sum(row.get("known_token_count", 0) for row in rows)
     unknown_tokens = sum(row.get("unknown_token_count", 0) for row in rows)
-    all_unknown = [row for row in rows if row.get("spans", 0) > 0 and row.get("unknown_spans", 0) == row.get("spans")]
+    all_unknown = [
+        row for row in rows if row.get("spans_count", 0) > 0 and row.get("unknown_spans", 0) == row.get("spans_count")
+    ]
     tokens_total = known_tokens + unknown_tokens
     return {
         "sample_count": len(rows),
@@ -149,20 +163,32 @@ def compute_run_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
-    """Yield one parsed JSON object per non-blank line of a JSONL file."""
+    """Yield one parsed JSON object per non-blank line of a JSONL file.
+
+    The writer contract (see :mod:`relax.utils.agentic_obs.writers`) allows a
+    crashed process to leave a partial final line; this reader must tolerate
+    that torn tail — a staleness post-mortem on a crashed run is exactly the
+    audit's use case — so malformed lines are skipped with a warning instead
+    of aborting the report.
+    """
 
     with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
                 yield json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("version_audit: skipping malformed line %s:%d", path, line_number)
 
 
 def load_trajectories(run_dir: Path) -> dict[int, dict[str, Any]]:
     """Index trajectory rows by integer ``sample_export_id``.
 
-    Reads every ``trajectories/shard_*.jsonl`` file in sorted order. The JSON
-    field is a decimal string since schema v2, so rows written before that
-    rewrite are simply absent here — join coverage is what the audit reports.
+    Reads every ``trajectories/shard_*.jsonl`` file. ``sample_export_id`` is a
+    decimal string since schema v2 and a JSON number before it; ``int()``
+    accepts both, so legacy rows join fine — they simply predate span capture
+    and show up as empty spans.
     """
 
     trajectories: dict[int, dict[str, Any]] = {}
@@ -175,16 +201,35 @@ def load_trajectories(run_dir: Path) -> dict[int, dict[str, Any]]:
     return trajectories
 
 
+_TRAIN_SHARD_RE = re.compile(r"^(?:overflow_)?step_(\d+)_dp_(\d+)\.jsonl$")
+
+
+def _train_shard_order(path: Path) -> tuple[int, int, int]:
+    """Sort key ``(rollout_id, dp_rank, is_overflow)`` for one train shard.
+
+    ``overflow_`` shards hold backpressured re-writes of the same step, so
+    they sort after the plain shard of that step. Lexicographic order is wrong
+    here — ``overflow_...`` precedes ``step_...`` and would let a stale stamp
+    clobber a newer one — hence the numeric key parsed from the filename.
+    """
+
+    match = _TRAIN_SHARD_RE.match(path.name)
+    return (int(match.group(1)), int(match.group(2)), 1 if path.name.startswith("overflow_") else 0)
+
+
 def load_consumed_versions(run_dir: Path) -> dict[int, str | None]:
     """Latest consumed weight version per sample across train DP shards.
 
-    Reads every ``train/step_*_dp_*.jsonl`` file in sorted order; a sample
-    consumed by a later step overwrites the earlier stamp, which is the
-    conservative (oldest-freshness) reading for staleness auditing.
+    Covers both regular ``step_*_dp_*.jsonl`` shards and the
+    ``overflow_step_*_dp_*.jsonl`` shards train_hooks writes under
+    backpressure — the regime where staleness is most interesting. Shards are
+    ordered by ``(rollout_id, dp_rank, is_overflow)``, so a sample consumed by
+    a later step always overwrites the earlier stamp.
     """
 
     consumed: dict[int, str | None] = {}
-    for path in sorted((run_dir / "train").glob("step_*_dp_*.jsonl")):
+    shards = [path for path in (run_dir / "train").glob("*step_*_dp_*.jsonl") if _TRAIN_SHARD_RE.match(path.name)]
+    for path in sorted(shards, key=_train_shard_order):
         for row in _iter_jsonl(path):
             for sample in row.get("samples", []):
                 export_id = sample.get("sample_export_id")
@@ -213,7 +258,12 @@ def _span_rows(trajectory: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _detail_row(trajectory: dict[str, Any], consumed: str | None) -> dict[str, Any]:
-    """Join one trajectory with its consumed stamp into an audit detail row."""
+    """Join one trajectory with its consumed stamp into an audit detail row.
+
+    ``spans`` stays the full detail list (the ``--jsonl`` payload), while
+    ``spans_count`` / ``unknown_spans`` come straight from
+    :func:`compute_sample_stats` so downstream aggregation needs no re-parse.
+    """
 
     spans = _span_rows(trajectory)
     stats = compute_sample_stats(spans, consumed)
@@ -223,8 +273,6 @@ def _detail_row(trajectory: dict[str, Any], consumed: str | None) -> dict[str, A
         "run_id": trajectory.get("run_id"),
         "consumed_weight_version": consumed,
         "spans": spans,
-        "spans_count": len(spans),
-        "unknown_spans": sum(1 for span in spans if _version_or_none(span.get("version")) is None),
         **stats,
     }
 
@@ -255,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     run_dir = Path(args.run_dir)
+    if not run_dir.is_dir():
+        parser.error(f"run directory not found: {run_dir}")
     trajectories = load_trajectories(run_dir)
     consumed = load_consumed_versions(run_dir)
 
@@ -273,9 +323,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(row, ensure_ascii=False))
         return 0
 
-    summary = compute_run_summary(
-        [{**row, "spans": row["spans_count"], "unknown_spans": row["unknown_spans"]} for row in rows]
-    )
+    summary = compute_run_summary(rows)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     for row in rows:
         for span in row["spans"]:
