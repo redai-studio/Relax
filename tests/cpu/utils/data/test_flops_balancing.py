@@ -9,10 +9,12 @@ import pytest
 from relax.utils.data.flops_balancing import (
     FlopsWorkload,
     _refine_capacity_packing,
+    _refine_rank_assignment,
     build_flops_schedule,
     load_flops_workload,
     validate_flops_balancing,
 )
+from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from tests.cpu.utils.test_flops_counter import FLOPS_TEST_CONFIGS, FLOPS_TEST_VL_CONFIGS, Config
 
 
@@ -116,6 +118,45 @@ def test_flops_capacity_refinement_moves_samples_without_emptying_packs() -> Non
     assert all(sum(lengths[i] for i in group) <= 10 for group in bins)
     # Cost 42 for the longest sample plus at least 2 for its rank's other pack.
     assert max(sum(costs[i] for index in rank for i in bins[index]) for rank in owners) == 44
+
+
+def test_flops_rank_refinement_improves_equal_count_kk_assignment() -> None:
+    weights = [16.0, 44.0, 83.0, 29.0, 38.0, 94.0, 81.0, 50.0, 30.0, 28.0, 64.0, 84.0]
+    owners = get_seqlen_balanced_partitions(weights, 4, equal_size=True)
+    assert max(sum(weights[i] for i in rank) for rank in owners) == 162
+
+    _refine_rank_assignment(weights, owners)
+
+    assert [len(rank) for rank in owners] == [3] * 4
+    assert sorted(i for rank in owners for i in rank) == list(range(len(weights)))
+    # Integral costs summing to 641 across four ranks require max load >= 161.
+    assert max(sum(weights[i] for i in rank) for rank in owners) == 161
+
+
+def test_flops_rank_refinement_accounts_for_local_dummy_execution() -> None:
+    lengths = [8, 7, 5]
+    costs = [8.0, 7.0, 5.0]
+    schedule, dummy = build_flops_schedule(lengths, costs, 8, 2, microbatch_group_size=2)
+
+    assert [len(rank) for rank in schedule] == [2, 2]
+    assert sum(map(len, dummy)) == 1
+    real = [
+        i
+        for rank, offsets in zip(schedule, dummy, strict=True)
+        for j, pack in enumerate(rank)
+        if j not in offsets
+        for i in pack
+    ]
+    assert sorted(real) == [0, 1, 2]
+    assert all(
+        rank[j] in [pack for k, pack in enumerate(rank) if k not in offsets]
+        for rank, offsets in zip(schedule, dummy, strict=True)
+        for j in offsets
+    )
+    # KK's useful loads 8/12 execute as 16/12 after duplicating the local 8.
+    # Swapping 8 and 7 gives executed loads 14/13, despite useful loads 7/13.
+    assert sorted(sum(costs[i] for pack in rank for i in pack) for rank in schedule) == [13, 14]
+    assert build_flops_schedule(lengths, costs, 8, 2, 2) == (schedule, dummy)
 
 
 @pytest.mark.parametrize("name", ["qwen3_dense", "qwen3_moe"])

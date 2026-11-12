@@ -220,21 +220,25 @@ def _load_score(loads: list[float]) -> tuple[float, float]:
     return maximum, maximum - min(loads)
 
 
+def _rank_pairs(loads: list[float]) -> Iterator[tuple[int, int]]:
+    ranks = sorted(range(len(loads)), key=lambda rank: (-loads[rank], rank))
+    for offset, left in enumerate(ranks):
+        for right in reversed(ranks[offset + 1 :]):
+            if loads[left] != loads[right]:
+                yield left, right
+
+
 def _sample_exchanges(
     bins: list[list[int]], owners: list[list[int]], workloads: list[float], loads: list[float]
 ) -> Iterator[tuple[int, int, int, int, int, int | None]]:
-    ranks = sorted(range(len(owners)), key=lambda rank: (-loads[rank], rank))
-    for offset, left in enumerate(ranks):
-        for right in reversed(ranks[offset + 1 :]):
-            if loads[left] == loads[right]:
-                continue
-            for source in owners[left]:
-                for target in owners[right]:
-                    for sample in sorted(bins[source], key=lambda i: (-workloads[i], i)):
-                        if len(bins[source]) > 1:
-                            yield left, right, source, target, sample, None
-                        for other in sorted(bins[target], key=lambda i: (workloads[i], i)):
-                            yield left, right, source, target, sample, other
+    for left, right in _rank_pairs(loads):
+        for source in owners[left]:
+            for target in owners[right]:
+                for sample in sorted(bins[source], key=lambda i: (-workloads[i], i)):
+                    if len(bins[source]) > 1:
+                        yield left, right, source, target, sample, None
+                    for other in sorted(bins[target], key=lambda i: (workloads[i], i)):
+                        yield left, right, source, target, sample, other
 
 
 def _refine_capacity_packing(
@@ -281,6 +285,43 @@ def _refine_capacity_packing(
         weights[source], weights[target] = source_weight, target_weight
         tokens[source] -= delta
         tokens[target] += delta
+
+
+def _refine_rank_assignment(weights: list[float], owners: list[list[int]]) -> None:
+    """Swap whole real packs, keeping equal counts and at least one real pack
+    per rank.
+
+    Include the cheapest local copy in each dummy slot's cost.
+    """
+    if len(owners[0]) == 1:
+        return
+    for _ in range(_REFINEMENT_PASSES):
+        loads = [_rank_workload([weights[i] for i in owned]) for owned in owners]
+        best_score = _load_score(loads)
+        if best_score[1] == 0:
+            return
+        best = None
+        swaps = (
+            (left, right, source, target)
+            for left, right in _rank_pairs(loads)
+            for source in owners[left]
+            for target in owners[right]
+        )
+        for left, right, source, target in islice(swaps, _REFINEMENT_CANDIDATES):
+            if not weights[source] or not weights[target] or weights[source] == weights[target]:
+                continue
+            candidate = loads.copy()
+            candidate[left] = _rank_workload([weights[target] if i == source else weights[i] for i in owners[left]])
+            candidate[right] = _rank_workload([weights[source] if i == target else weights[i] for i in owners[right]])
+            score = _load_score(candidate)
+            if score < best_score:
+                best_score = score
+                best = left, right, source, target
+        if best is None:
+            return
+        left, right, source, target = best
+        owners[left] = sorted(target if i == source else i for i in owners[left])
+        owners[right] = sorted(source if i == target else i for i in owners[right])
 
 
 def build_flops_schedule(
@@ -332,6 +373,7 @@ def build_flops_schedule(
     if not balanced and all(bins):
         _refine_capacity_packing(bins, owners, lengths, workloads, capacity)
         weights = [sum(workloads[i] for i in group) for group in bins]
+    _refine_rank_assignment(weights, owners)
     rank_bins, rank_dummy = [], []
     for owned in owners:
         dummy = {j for j, index in enumerate(owned) if not bins[index]}
