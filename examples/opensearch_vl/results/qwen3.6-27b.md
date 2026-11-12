@@ -30,7 +30,7 @@
 | 字段                         | 内容                                                                           |
 | ---------------------------- | ------------------------------------------------------------------------------ |
 | Run ID                       | `vstar-qwen36-27b-pair-20261111-053059`                                        |
-| 状态                         | 训练完成，最终native/HF及校验清单已保存                                        |
+| 状态                         | 训练与评测正常完成                                                             |
 | 实验启动 / 产物完成 UTC      | 2026-11-10 20:26:42 / 2026-11-11 00:53:27                                      |
 | 代码分支                     | `github/feat/wuhuan/opensearch_v1`                                             |
 | 训练 commit（完整hash）      | `6d31774a5b942ff06f8769422d580741b29da2bc`                                     |
@@ -47,6 +47,6 @@
 | SwanLab训练曲线              | [完整训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/0iblvpvo) |
 | 最终模型可分享引用 / SHA256  |                                                                                |
 
-最终step 1080权重已校验，native保留optimizer/RNG。训练与评测通过持久目录交接，权重保留至下游验收；验证loss/PPL是留出训练轨迹指标，不代替V\*Bench成绩。
+最终step 1080 HF权重已校验。验证loss/PPL是留出训练轨迹指标，不代替V\*Bench成绩。
 
 运行环境关闭FA4，语言注意力使用FA2；短测TP1约30,336 tokens/s，TP2约29,804 tokens/s，选用通信更少且更快的TP1。

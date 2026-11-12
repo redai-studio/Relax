@@ -6,11 +6,15 @@
 
 下面以 **Qwen3-VL-8B-Instruct** 为例，按数据准备、训练、评测的顺序运行。其他模型换用对应的脚本和 HF 权重目录。
 
-| 模型                 | 启动脚本                                                     |
-| -------------------- | ------------------------------------------------------------ |
-| Qwen3-VL-8B-Instruct | [run-qwen3-vl-8B-8xgpu.sh](scripts/run-qwen3-vl-8B-8xgpu.sh) |
-| Qwen3.5-4B           | [run-qwen3.5-4B-8xgpu.sh](scripts/run-qwen3.5-4B-8xgpu.sh)   |
-| Qwen3.6-27B          | [run-qwen3.6-27B-8xgpu.sh](scripts/run-qwen3.6-27B-8xgpu.sh) |
+| 模型                       | 启动脚本                                                                                   |
+| -------------------------- | ------------------------------------------------------------------------------------------ |
+| Qwen3-VL-8B-Instruct       | [run-qwen3-vl-8B-8xgpu.sh](scripts/run-qwen3-vl-8B-8xgpu.sh)                               |
+| Qwen3.5-4B                 | [run-qwen3.5-4B-8xgpu.sh](scripts/run-qwen3.5-4B-8xgpu.sh)                                 |
+| Qwen3.5-35B-A3B            | [run-qwen3.5-35B-A3B-8xgpu.sh](scripts/run-qwen3.5-35B-A3B-8xgpu.sh)                       |
+| Qwen3.5-35B-A3B（冻结ViT） | [run-qwen3.5-35B-A3B-freeze-vit-8xgpu.sh](scripts/run-qwen3.5-35B-A3B-freeze-vit-8xgpu.sh) |
+| Qwen3.6-27B                | [run-qwen3.6-27B-8xgpu.sh](scripts/run-qwen3.6-27B-8xgpu.sh)                               |
+
+Qwen3.5-35B-A3B当前验证通过的配置冻结视觉主干，继续训练merger和语言部分；原全参配置出现视觉退化，详见[实验结果与修复对照](results/qwen3.5-35b-a3b.md)。
 
 ## 环境与目录
 
@@ -113,13 +117,16 @@ bash "$SCRIPT" compare
 
 分数为 V\*Bench Pass@1（%，原始 / 训练集去重），每组完整 191 题。保留各组实验的阶段、状态、启动时间、训练 commit、训练曲线和详情入口；具体分析见各模型文档。
 
-| 模型                 | 阶段 / 预算   | 状态           | 实验启动 UTC        | 训练 commit    |      V\*Bench | SwanLab训练曲线                                                            | 实验文档                       |
-| -------------------- | ------------- | -------------- | ------------------- | -------------- | ------------: | -------------------------------------------------------------------------- | ------------------------------ |
-| Qwen3-VL-8B-Instruct | Base          | 评测完成       | 2026-11-11 03:48:08 |                | 29.32 / 29.32 |                                                                            | [详情](results/qwen3-vl-8b.md) |
-| Qwen3-VL-8B-Instruct | SFT / 1 epoch | 训练与评测完成 | 2026-11-10 16:08:22 | `f6afec0cb046` | 65.45 / 65.45 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/ykm29sm5) | [详情](results/qwen3-vl-8b.md) |
-| Qwen3.5-4B           | Base          | 评测完成       | 2026-11-11 05:23:15 |                | 60.21 / 60.21 |                                                                            | [详情](results/qwen3.5-4b.md)  |
-| Qwen3.5-4B           | SFT / 1 epoch | 训练与评测完成 | 2026-11-10 18:15:32 | `6d31774a5b94` | 66.49 / 66.49 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/6k29pgn6) | [详情](results/qwen3.5-4b.md)  |
-| Qwen3.6-27B          | Base          | 评测完成       | 2026-11-11 05:43:22 |                | 56.02 / 56.02 |                                                                            | [详情](results/qwen3.6-27b.md) |
-| Qwen3.6-27B          | SFT / 1 epoch | 训练与评测完成 | 2026-11-10 20:26:42 | `6d31774a5b94` | 71.73 / 71.73 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/0iblvpvo) | [详情](results/qwen3.6-27b.md) |
+| 模型                 | 阶段 / 预算           | 状态           | 实验启动 UTC        | 训练 commit    |      V\*Bench | SwanLab训练曲线                                                                                                                                                | 实验文档                           |
+| -------------------- | --------------------- | -------------- | ------------------- | -------------- | ------------: | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| Qwen3-VL-8B-Instruct | Base                  | 评测完成       | 2026-11-11 03:48:08 |                | 29.32 / 29.32 |                                                                                                                                                                | [详情](results/qwen3-vl-8b.md)     |
+| Qwen3-VL-8B-Instruct | SFT / 1 epoch         | 训练与评测完成 | 2026-11-10 16:08:22 | `f6afec0cb046` | 65.45 / 65.45 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/ykm29sm5)                                                                                     | [详情](results/qwen3-vl-8b.md)     |
+| Qwen3.5-4B           | Base                  | 评测完成       | 2026-11-11 05:23:15 |                | 60.21 / 60.21 |                                                                                                                                                                | [详情](results/qwen3.5-4b.md)      |
+| Qwen3.5-4B           | SFT / 1 epoch         | 训练与评测完成 | 2026-11-10 18:15:32 | `6d31774a5b94` | 65.97 / 65.97 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/6k29pgn6)                                                                                     | [详情](results/qwen3.5-4b.md)      |
+| Qwen3.5-35B-A3B      | Base                  | 评测完成       | 2026-11-11 10:49:07 |                | 68.59 / 68.59 |                                                                                                                                                                | [详情](results/qwen3.5-35b-a3b.md) |
+| Qwen3.5-35B-A3B      | 全参SFT / 1 epoch     | 验收失败       | 2026-11-11 09:18:55 | `5650ce254c35` | 37.17 / 37.17 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/3n2rdfwh)                                                                                     | [详情](results/qwen3.5-35b-a3b.md) |
+| Qwen3.5-35B-A3B      | 冻结ViT SFT / 1 epoch | 训练与评测完成 | 2026-11-11 16:40:05 | `5650ce254c35` | 76.44 / 76.44 | [前200步](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/idse0ojb) / [接续训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/efq7iybh) | [详情](results/qwen3.5-35b-a3b.md) |
+| Qwen3.6-27B          | Base                  | 评测完成       | 2026-11-11 05:43:22 |                | 56.02 / 56.02 |                                                                                                                                                                | [详情](results/qwen3.6-27b.md)     |
+| Qwen3.6-27B          | SFT / 1 epoch         | 训练与评测完成 | 2026-11-10 20:26:42 | `6d31774a5b94` | 71.73 / 71.73 | [训练](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/0iblvpvo)                                                                                     | [详情](results/qwen3.6-27b.md)     |
 
 公开实现与协议差异见 [基准参考](benchmark-references.md)。新增模型时使用 [实验记录模板](templates/model-results.md)。

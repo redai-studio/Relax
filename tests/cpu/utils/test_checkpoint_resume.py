@@ -14,11 +14,28 @@ def test_recovery_configures_committed_iteration_and_load_flags(tmp_path, tracke
     (tmp_path / "iter_0009999").mkdir()  # An uncommitted future directory is not a recovery point.
     args = Namespace(save=str(tmp_path), no_save_optim=False, no_save_rng=False, ckpt_step=override)
 
+    assert checkpoint_resume_step(str(tmp_path), override) == iteration + 1
+    args.start_rollout_id = iteration + 1
     recovery_load_path(args)
 
-    assert args.start_rollout_id == iteration + 1
+    assert args.start_rollout_id is None
     assert args.load == str(tmp_path)
     assert not args.no_load_optim and not args.no_load_rng and not args.finetune
+
+
+def test_recovery_uses_checkpoint_committed_after_restart_configuration(tmp_path):
+    from relax.components.actor import _resolve_start_rollout_id
+
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("19")
+    (tmp_path / "iter_0000019").mkdir()
+    args = Namespace(save=str(tmp_path), no_save_optim=False, no_save_rng=False, start_rollout_id=20)
+    recovery_load_path(args)
+
+    (tmp_path / "iter_0000023").mkdir()
+    tracker.write_text("23")
+    loaded_step = checkpoint_resume_step(args.load)
+    assert _resolve_start_rollout_id(args.start_rollout_id, loaded_step, explicitly_set=True) == 24
 
 
 @pytest.mark.parametrize("tracker", ["release", "-1", "incomplete", ""])

@@ -133,7 +133,7 @@ PERF_ARGS=(
     --tensor-model-parallel-size "${TP_SIZE:-2}"
     --pipeline-model-parallel-size "${PP_SIZE:-1}"
     --context-parallel-size "${CP_SIZE:-1}"
-    --expert-model-parallel-size 1
+    --expert-model-parallel-size "${EP_SIZE:-1}"
     --expert-tensor-parallel-size 1
     --calculate-per-token-loss
     --no-rope-fusion
@@ -179,6 +179,8 @@ WANDB_ARGS=(
     --tb-project-name "${PROJECT_NAME}"
     --tb-experiment-name "${EXP_NAME}-relax-${now}"
 )
+# Runtime JSON can contain API keys; keep tracing disabled through submission.
+set +x
 if [[ "${ENABLE_SWANLAB:-0}" == 1 ]]; then
     WANDB_ARGS+=(--use-tensorboard)
     export SWANLAB_PROJ_NAME="${SWANLAB_PROJ_NAME:-Relax-sft-opensearch-vl}"
@@ -203,6 +205,9 @@ MISC_ARGS=(
     --attention-backend auto
     --use-health-check
 )
+if [[ "${FREEZE_VISION_MODEL:-0}" == 1 ]]; then
+    MISC_ARGS+=(--freeze-vision-model)
+fi
 
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOBS_ADDRESS:-http://127.0.0.1:8265}" \
     --submission-id "${SUBMISSION_ID:-${EXP_NAME}-relax-${now}}" \

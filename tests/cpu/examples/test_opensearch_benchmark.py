@@ -35,17 +35,17 @@ def vstar(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "input_tokens,finish_reason,raises,chat_kwargs",
+    "input_tokens,finish_reason,error,chat_kwargs",
     [
-        (32760, "stop", False, {"enable_thinking": True, "preserve_thinking": True}),
-        (32760, "stop", False, {}),
-        (32768, "stop", True, {}),
-        (32760, "length", True, {}),
+        (32760, "stop", None, {"enable_thinking": True, "preserve_thinking": True}),
+        (32760, "stop", None, {}),
+        (32768, "stop", "context_limit", {}),
+        (32760, "length", "context_limit", {}),
+        (32760, "abort", "server_finish_error", {}),
+        (32760, None, "server_finish_error", {}),
     ],
 )
-def test_http_runner_keeps_history_within_32k(
-    monkeypatch, benchmark, input_tokens, finish_reason, raises, chat_kwargs
-):
+def test_http_runner_keeps_history_within_32k(monkeypatch, benchmark, input_tokens, finish_reason, error, chat_kwargs):
     captured = []
 
     def create(**kwargs):
@@ -72,12 +72,13 @@ def test_http_runner_keeps_history_within_32k(
         {"role": "model", "parts": [{"text": "<tool_call>earlier call</tool_call>"}]},
         {"role": "user", "parts": [{"text": "entire earlier observation"}]},
     ]
-    if raises:
+    if error:
         with pytest.raises(ValueError):
             runner.infer(history, "system")
-        assert runner.error == "context_limit"
-        if finish_reason == "length":
+        assert runner.error == error
+        if input_tokens < 32768:
             assert runner.last_response == "<response>answer</response>"
+            assert runner.requests[-1]["finish_reason"] == finish_reason
     else:
         runner.infer(history, "system")
     if input_tokens < 32768:
@@ -94,7 +95,7 @@ def test_http_runner_keeps_history_within_32k(
         assert not captured
 
 
-@pytest.mark.parametrize("invalid", [None, "protocol", "partial", "smoke", "infrastructure"])
+@pytest.mark.parametrize("invalid", [None, "protocol", "partial", "smoke", "infrastructure", "server_abort"])
 def test_comparison_needs_only_full_vstar_results(monkeypatch, tmp_path, invalid):
     monkeypatch.syspath_prepend(str(TOOLS))
     spec = importlib.util.spec_from_file_location("opensearch_comparison", TOOLS / "compare_benchmark.py")
@@ -118,6 +119,8 @@ def test_comparison_needs_only_full_vstar_results(monkeypatch, tmp_path, invalid
                 summary["protocol"]["smoke"] = True
             elif invalid == "infrastructure":
                 summary["errors"] = {"APIConnectionError": 1}
+            elif invalid == "server_abort":
+                summary["errors"] = {"server_finish_error": 1}
         directory = tmp_path / label / "vstar"
         directory.mkdir(parents=True)
         (directory / "summary.json").write_text(json.dumps(summary))
@@ -147,6 +150,8 @@ def test_comparison_needs_only_full_vstar_results(monkeypatch, tmp_path, invalid
         ("<response>(A) red\n(B) blue</response>", None),
         ("Answer: (A) or B", None),
         ("<response>A</response><response>B</response>", None),
+        ("<response>A</response><response>B", None),
+        ("<response>A</response></response>", None),
         ("<response>\nA", None),
         ("No option selected.", None),
     ],
@@ -203,6 +208,8 @@ def test_crop_workflow_maps_display_coordinates_to_original_regions(vstar, monke
     monkeypatch.setattr("openai.OpenAI", lambda **kwargs: SimpleNamespace(close=kwargs["http_client"].close))
     monkeypatch.setenv("AGENT_MODEL", "test-model")
     monkeypatch.setenv("AGENT_BASE_URL", "http://127.0.0.1:1/v1")
+    monkeypatch.setenv("RELAX_GIT_COMMIT", "0" * 40)
+    monkeypatch.chdir(tmp_path)  # Archive checkouts may have no Git metadata.
     output = tmp_path / "result"
     monkeypatch.setattr(
         sys,
@@ -232,6 +239,7 @@ def test_crop_workflow_maps_display_coordinates_to_original_regions(vstar, monke
         ],
     )
     vstar.main()
+    assert json.loads((output / "evaluator.json").read_text())["git_commit"] == "0" * 40
     record = json.loads((output / "trajectories.jsonl").read_text())
     assert record["correct"] and "error" not in record
     assert [call["source_box"] for call in record["tool_calls"]] == [[320, 160, 2240, 1120], [320, 159, 960, 480]]

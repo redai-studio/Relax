@@ -762,11 +762,8 @@ def recovery_load_path(args: Namespace) -> Optional[str]:
         args.no_load_optim = args.no_save_optim
         args.no_load_rng = args.no_save_rng
         args.finetune = False
-        args.start_rollout_id = (
-            checkpoint_resume_step(args.save, getattr(args, "ckpt_step", None))
-            if getattr(args, "train_backend", "megatron") == "megatron"
-            else None
-        )
+        # A save may finish before teardown; use the backend's actual loaded step.
+        args.start_rollout_id = None
         args.load = args.save
 
 

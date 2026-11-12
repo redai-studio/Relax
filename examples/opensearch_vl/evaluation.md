@@ -86,4 +86,6 @@ bash "$SCRIPT" compare
 
 JSON、逐题输出、日志和权重全部留在仓库外。每次评测在`results/<model>.md`前方插入一段，完成后填入实际分数并更新总表。修改评分提取时保留原始答案，不重新生成后挑选成绩。
 
+若评测源码以归档形式交付、没有 `.git`，运行前设置 `RELAX_GIT_COMMIT` 为该源码的完整 commit，作为 `evaluator.json` 的版本来源；未设置时从当前 Git checkout 读取。
+
 评测与评分均使用仓库中的[vstar_benchmark.py](tools/vstar_benchmark.py)。结果文档只记录一个评测代码commit，以该版本的脚本和本页协议复现。若修正答案提取，对所有已完成的基座与SFT统一重评分，原始答案及逐题差异保留在仓库外。

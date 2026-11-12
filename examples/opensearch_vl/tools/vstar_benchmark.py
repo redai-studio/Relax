@@ -38,7 +38,9 @@ def file_hash(path: Path) -> str:
 
 def final_option(text: str) -> str | None:
     candidate = extract_answer(text)
-    if candidate is None and ("<response>" in text or "</response>" in text):
+    if ("<response>" in text or "</response>" in text) and (
+        candidate is None or text.count("<response>") != 1 or text.count("</response>") != 1
+    ):
         return None
     candidate = re.sub(r"\*\*|__", "", text.strip() if candidate is None else candidate)
     last_line = candidate.splitlines()[-1].strip() if candidate else ""
@@ -207,7 +209,8 @@ def main() -> None:
     write_json(
         args.output / "evaluator.json",
         {
-            "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+            "git_commit": os.environ.get("RELAX_GIT_COMMIT")
+            or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
             "source_sha256": protocol["evaluator_sha256"],
         },
     )

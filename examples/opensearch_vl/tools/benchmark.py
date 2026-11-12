@@ -135,6 +135,9 @@ class HTTPRunner:
         if choice.finish_reason == "length":
             self.error = "context_limit"
             raise ValueError("Generation exhausted the 32K context budget")
+        if choice.finish_reason != "stop":
+            self.error = "server_finish_error"
+            raise ValueError(f"Model server ended the response with finish_reason={choice.finish_reason!r}")
         return {
             "candidates": [{"content": {"role": "model", "parts": [{"text": text}]}, "finishReason": "STOP"}],
             "modelVersion": response.model,
