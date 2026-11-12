@@ -27,7 +27,7 @@ OBSERVATION_DATA_FIELDS = ("sample_export_ids", "agentic_group_ids")
 
 # A major bump covers incompatible field/type changes; a minor bump is additive.
 # Version 2 writes sample_export_id as a JSON string instead of a number.
-SCHEMA_VERSION = "3.0.0"
+SCHEMA_VERSION = "3.1.0"
 # The training stream versions its mask encoding independently.
 TRAIN_SCHEMA_VERSION = "4.0.0"
 
@@ -140,6 +140,7 @@ class LineageNode:
     state_hash: str
     token_count: int
     weight_versions: list[str] = field(default_factory=list)
+    weight_version_spans: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
