@@ -139,7 +139,7 @@ The default `--ignore-rules` is tuned for an MoE topology where only **expert** 
 :::
 
 ::: danger
-**Always pass `--is-symmetric` when the resulting checkpoint will be used as the `--hf-checkpoint` for INT4 fake-QAT training.** The training-side STE in `docker/patch/megatron/20260506-85bced0ae.patch` is hardcoded symmetric (`q_max=7`, no zero-point). If the W4A16 checkpoint is asymmetric (the CLI default), `pack_layer(sym=False)` will produce zero-point-shifted weights at rollout that differ from what training "saw", breaking the central premise of QAT.
+**Always pass `--is-symmetric` when the resulting checkpoint will be used as the `--hf-checkpoint` for INT4 fake-QAT training.** The training-side STE uses symmetric quantization (`q_max=7`, no zero-point). If the W4A16 checkpoint is asymmetric (the CLI default), `pack_layer(sym=False)` will produce zero-point-shifted weights at rollout that differ from what training "saw", breaking the central premise of QAT.
 :::
 
 Output:

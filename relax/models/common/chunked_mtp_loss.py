@@ -23,6 +23,10 @@ logger = get_logger(__name__)
 _ROLL_TENSOR_PARAMETERS = set(inspect.signature(roll_tensor).parameters)
 _MTP_TRACKER_PARAMETERS = set(inspect.signature(MTPLossLoggingHelper.save_loss_to_tracker).parameters)
 _COMPUTE_MTP_ACCEPTANCE_COUNTS = getattr(_mtp_mod, "_compute_mtp_acceptance_counts", None)
+_MTP_ACCEPTANCE_USES_OUTPUT_LAYER = (
+    _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None
+    and "output_layer" in inspect.signature(_COMPUTE_MTP_ACCEPTANCE_COUNTS).parameters
+)
 
 
 def _normalization_counts(num_tokens, original_num_tokens, cp_group):
@@ -182,14 +186,22 @@ def _chunked_head_ce(
                         loss_slice = compute_language_model_loss(mtp_labels[:, start:end], logits_slice)
                 per_chunk_losses.append(loss_slice)
                 if _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None:
-                    chunk_correct, chunk_total = _COMPUTE_MTP_ACCEPTANCE_COUNTS(
-                        logits_slice,
-                        mtp_labels[:, start:end],
-                        loss_mask[:, start:end],
-                        output_layer,
-                        runtime_gather_output,
-                        tp_group,
-                    )
+                    labels = mtp_labels[:, start:end]
+                    mask = loss_mask[:, start:end]
+                    if _MTP_ACCEPTANCE_USES_OUTPUT_LAYER:
+                        chunk_correct, chunk_total = _COMPUTE_MTP_ACCEPTANCE_COUNTS(
+                            logits_slice, labels, mask, output_layer, runtime_gather_output, tp_group
+                        )
+                    else:
+                        gathered = (
+                            getattr(output_layer, "gather_output", False)
+                            if runtime_gather_output is None
+                            else runtime_gather_output
+                        )
+                        preds = logits_slice.argmax(dim=-1) if gathered else None
+                        chunk_correct, chunk_total = _COMPUTE_MTP_ACCEPTANCE_COUNTS(
+                            logits_slice, labels, mask, tp_group=tp_group, preds=preds
+                        )
                     correct = chunk_correct if correct is None else correct + chunk_correct
                     total = chunk_total if total is None else total + chunk_total
                 del logits_slice

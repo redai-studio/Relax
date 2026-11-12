@@ -285,6 +285,10 @@ def test_real_mcore_chain_guard_survives_checkpoint_and_skips_all_children(tmp_p
             self.optimizer = torch.optim.AdamW([self.param], lr=0.01)
             self.group = object()
 
+        @property
+        def param_groups(self):
+            return self.optimizer.param_groups
+
         def prepare_grads(self):
             return False
 

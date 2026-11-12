@@ -1,4 +1,6 @@
-# Bounded synchronous checkpoint staging
+# Bounded synchronous checkpoint staging in older images
+
+This describes the writer used before the `f78809f6` upgrade. The current images use the DCP writer described in the [Kimi K3 recipe](../../../examples/models/kimi-k3/README.md#bounded-synchronous-checkpoint-saving).
 
 Adapted from `fix/wuhuan/k3_ckpt_oom` (commit `399fcb8e`), rebased onto the
 current Relax Megatron patch. Apply this patch **after** the versioned Megatron

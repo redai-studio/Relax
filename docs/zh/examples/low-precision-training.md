@@ -139,7 +139,7 @@ python scripts/tools/convert_hf_to_int4.py \
 :::
 
 ::: danger
-**生成用于 INT4 fake-QAT 训练的 `--hf-checkpoint` 时，务必带上 `--is-symmetric`**。`docker/patch/megatron/20260506-85bced0ae.patch` 里的训练侧 STE 是硬编码对称（`q_max=7`，无 zero-point）。如果 W4A16 checkpoint 是非对称（CLI 默认），`pack_layer(sym=False)` 会在 rollout 端打包出带 zero-point 偏移的权重，**与训练侧 STE 所模拟的量化噪声不一致**，QAT 的核心假设就被破坏了。
+**生成用于 INT4 fake-QAT 训练的 `--hf-checkpoint` 时，务必带上 `--is-symmetric`**。训练侧 STE 使用对称量化（`q_max=7`，无 zero-point）。如果 W4A16 checkpoint 是非对称（CLI 默认），`pack_layer(sym=False)` 会在 rollout 端打包出带 zero-point 偏移的权重，**与训练侧 STE 所模拟的量化噪声不一致**，QAT 的核心假设就被破坏了。
 :::
 
 输出：

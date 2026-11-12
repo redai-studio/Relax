@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[3]
 @pytest.mark.parametrize(
     "patch",
     [
-        "megatron/20260915-4a4de8657.patch",
+        "latest/megatron.patch",
         "megatron/20261016-qwen38-models.patch",
         "megatron/20261020-qwen35-optimized.patch",
         "megatron/20261020-model-operators.patch",
@@ -79,7 +79,9 @@ def test_optimized_patch_replays_without_fuzz(variable, patch, tmp_path):
         call = next(
             n
             for n in ast.walk(tree)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_relax_selected_mtp_head"
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id in {"_relax_selected_mtp_head", "selected_mtp_head"}
         )
         assert ast.unparse(call.args[1]) == "layer_loss_mask"
         assert "cumulative_mtp_input_mask" in mtp
@@ -273,7 +275,14 @@ def _exercise_lazy_deepep_contract(source):
         or (isinstance(node, ast.If) and "find_spec" in ast.unparse(node.test))
         or (isinstance(node, ast.FunctionDef) and node.name == "get_elastic_buffer")
     ]
-    scope = {"__builtins__": {**vars(builtins), "__import__": import_backend}, "_elastic_buffer": None}
+    scope = {
+        "__builtins__": {**vars(builtins), "__import__": import_backend},
+        "_elastic_buffer": None,
+        "torch": SimpleNamespace(
+            zeros=lambda *args, **kwargs: object(),
+            distributed=SimpleNamespace(all_reduce=lambda *args, **kwargs: None),
+        ),
+    }
     exec("from __future__ import annotations\n" + ast.unparse(ast.Module(body=nodes, type_ignores=[])), scope)
     assert scope["HAVE_DEEP_EP_V2"] and imported == []
     group = object()
@@ -287,6 +296,7 @@ def _exercise_fused_expert_contract(source):
     padding."""
     from contextlib import nullcontext
     from types import SimpleNamespace
+    from typing import Optional
 
     import torch
 
@@ -296,6 +306,7 @@ def _exercise_fused_expert_contract(source):
         "torch": torch,
         "nullcontext": nullcontext,
         "skip_routed_expert_padding": lambda config: False,
+        "Optional": Optional,
     }
 
     class Offload:
@@ -333,7 +344,13 @@ def _exercise_fused_expert_contract(source):
         calls.append(True)
         return value * 2
 
-    module = SimpleNamespace(config=config, _use_grouped_tensor=False, _fused_ops=(fused,))
+    module = SimpleNamespace(
+        config=config,
+        _use_grouped_tensor=False,
+        _fused_ops=(fused,),
+        _get_paged_stash_scope=lambda value, _: (value, nullcontext()),
+        linear_fc2=SimpleNamespace(use_bias=False),
+    )
     result = scope["_fused_forward"](module, hidden, counts, probs)
     result.sum().backward()
     torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 2))

@@ -213,14 +213,14 @@ bash scripts/entrypoint/ray-job.sh \
 
 ### 有界同步 Checkpoint 保存
 
-两个 Dockerfile 都在主 Megatron patch 后应用 `docker/patch/megatron/sync-save-bounded-staging.patch`。全参 GRPO 脚本显式启用；设置 `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` 可让该脚本回到原同步 writer。其他启动方式默认关闭此优化。异步保存行为不变。
+全参 GRPO 脚本启用 PyTorch Distributed Checkpoint（DCP）的有界同步写入。设置 `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` 可切回 DCP 默认 writer。其他启动方式默认使用 DCP 默认 writer。
 
 - `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=1`：分批暂存并顺序写入，避免将整个 checkpoint 预载到 CPU。
 - `MEGATRON_SYNC_SAVE_STAGE_BYTES`：每个 rank 的活跃暂存预算，默认 1 GiB。窗口为空时允许一个超过预算的大张量，因此边界为 `max(budget, largest_tensor)`。
 - 预算 `0` 表示逐张量暂存和写入，**不表示**切回原 writer。
 - 预算只约束活跃暂存张量，不约束总 RSS、optimizer/offload 内存、序列化临时空间或文件系统页缓存。降低暂存内存可能牺牲写入吞吐，需在目标存储上测量。
 
-脚本会把两个环境变量传递到训练 actor。旧镜像没有此 patch 时，即使设置变量，也仍使用原保存实现；要获得优化，需要统一重建镜像或给所有节点安装 patch。已运行的任务不会自动加载新 patch。Checkpoint 格式和加载方式不变。异常处理与验证边界见 `docker/patch/megatron/sync-save-bounded-staging.md`。
+脚本会把两个环境变量传给训练 actor。DCP 为每个暂存窗口写一个数据文件，继续使用原生 checkpoint 元数据和加载器。
 
 ### 训推差异诊断
 

@@ -7,7 +7,7 @@ import torch.distributed as dist
 from megatron.core import mpu, tensor_parallel
 from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
-from megatron.training.global_vars import _build_tokenizer, set_args
+from megatron.training import global_vars
 
 from relax.utils.logging_utils import get_logger
 
@@ -75,7 +75,22 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 
 def init(args):
-    set_args(args)
+    global_vars.set_args(args)
+    run_config = None
+    if hasattr(global_vars, "set_run_config"):
+        from megatron.training.argument_utils import pretrain_cfg_container_from_args
+
+        run_config = pretrain_cfg_container_from_args(args)
+        run_config.finalize()
+        # Relax's scheduler still reads the legacy argument namespace.
+        args.start_weight_decay = run_config.scheduler.start_weight_decay
+        args.end_weight_decay = run_config.scheduler.end_weight_decay
+        global_vars.set_run_config(run_config)
+        global_vars._set_train_state()
+        if args.async_save and args.use_persistent_ckpt_worker:
+            from megatron.training.async_utils import init_persistent_async_worker
+
+            init_persistent_async_worker(args.rank, "forkserver")
 
     if getattr(args, "disable_jit_fuser", False):
         from megatron.core.jit import disable_jit_fuser
@@ -114,7 +129,10 @@ def init(args):
         args.te_rng_tracker,
         args.inference_rng_tracker,
     )
-    _build_tokenizer(args)
+    if run_config is None:
+        global_vars._build_tokenizer(args)
+    else:
+        global_vars._build_tokenizer(run_config, args)
     # We won't use this. initialize to pass some validation in megatron.
     init_num_microbatches_calculator(
         args.rank,
@@ -135,7 +153,17 @@ def init(args):
     if args.tp_comm_overlap:
         from megatron.training.initialize import _initialize_tp_communicators
 
-        _initialize_tp_communicators()
+        if run_config is None:
+            _initialize_tp_communicators()
+        else:
+            from megatron.training.argument_utils import core_transformer_config_from_args
+
+            _initialize_tp_communicators(
+                core_transformer_config_from_args(args),
+                sequence_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                tp_comm_overlap_cfg=args.tp_comm_overlap_cfg,
+            )
 
     if getattr(args, "custom_megatron_init_path", None):
         from relax.utils.misc import load_function

@@ -58,7 +58,7 @@ def test_fused_mtp_preserves_selective_mask_gradients_and_acceptance(monkeypatch
     monkeypatch.setattr(
         patch,
         "_COMPUTE_MTP_ACCEPTANCE_COUNTS",
-        lambda logits, labels, mask, *_args: (
+        lambda logits, labels, mask, *_args, **_kwargs: (
             ((logits[:, 0].argmax(-1) == labels[0]) & mask[0].bool()).sum(),
             mask.bool().sum(),
         ),
@@ -102,7 +102,7 @@ def test_selective_mtp_masked_loss_and_gradients(rows, chunk_size, teacher_mask,
     head = Head()
     counts = []
 
-    def acceptance(logits, labels, mask, *_args):
+    def acceptance(logits, labels, mask, *_args, **_kwargs):
         counts.append(mask.numel())
         return ((logits[:, 0].argmax(-1) == labels[0]) & mask[0].bool()).sum(), mask.bool().sum()
 
@@ -278,7 +278,7 @@ def test_teacher_mask_multi_depth_loss_gradients_and_acceptance(monkeypatch, all
     monkeypatch.setattr(
         patch,
         "_COMPUTE_MTP_ACCEPTANCE_COUNTS",
-        lambda logits, labels, mask, *_args: (
+        lambda logits, labels, mask, *_args, **_kwargs: (
             ((logits[:, 0].argmax(-1) == labels[0]) & mask[0].bool()).sum(),
             mask.bool().sum(),
         ),

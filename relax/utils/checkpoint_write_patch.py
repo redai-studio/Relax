@@ -190,6 +190,48 @@ def _write_buckets_threaded(transform_list, use_msc, write_buckets):
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+def make_bounded_dcp_writer(checkpoint_dir):
+    """Bound synchronous DCP tensor staging with serial write plans."""
+    from dataclasses import replace
+
+    from torch.distributed.checkpoint import FileSystemWriter
+
+    budget = int(os.environ.get("MEGATRON_SYNC_SAVE_STAGE_BYTES", str(1024**3)))
+    if budget < 0:
+        raise ValueError("MEGATRON_SYNC_SAVE_STAGE_BYTES must be nonnegative")
+
+    class BoundedFileSystemWriter(FileSystemWriter):
+        def write_data(self, plan, planner):
+            results = []
+            window = []
+            window_size = 0
+            window_index = 0
+
+            def write_window():
+                storage = replace(plan.storage_data, prefix=f"{plan.storage_data.prefix}{window_index}_")
+                window_plan = replace(plan, items=window, storage_data=storage)
+                results.extend(super(BoundedFileSystemWriter, self).write_data(window_plan, planner).wait())
+
+            for item in plan.items:
+                item_size = item.tensor_storage_size() or 0
+                if window and (budget == 0 or window_size + item_size > budget):
+                    write_window()
+                    window = []
+                    window_size = 0
+                    window_index += 1
+                window.append(item)
+                window_size += item_size
+
+            if window:
+                write_window()
+
+            future = torch.futures.Future()
+            future.set_result(results)
+            return future
+
+    return BoundedFileSystemWriter(checkpoint_dir, thread_count=1, per_thread_copy_ahead=0)
+
+
 def patch_checkpoint_write():
     """Monkey-patch Megatron checkpoint writing to avoid ``fork()`` with CUDA.
 
@@ -208,7 +250,13 @@ def patch_checkpoint_write():
 
     This function is idempotent — calling it multiple times is safe.
     """
-    from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+    try:
+        from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+    except ModuleNotFoundError as exc:
+        if exc.name != "megatron.core.dist_checkpointing.strategies.filesystem_async":
+            raise
+        # Newer MCore delegates synchronous writes to DCP and async writes to NVRx.
+        return
 
     global _patched
     # NOTE(wuhuan): the latest Megatron-LM of 20260506 use write_preloaded_data_multithread instead of

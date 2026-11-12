@@ -28,7 +28,7 @@ def test_acceptance_switch_preserves_loss_and_gradients(monkeypatch, fused_ce, a
     labels = torch.randint(11, (1, 8))
     counts, logits_flags, scaled, tracked = [], [], [], []
 
-    def acceptance(logits, labels, mask, *_args):
+    def acceptance(logits, labels, mask, *_args, **_kwargs):
         counts.append(True)
         return ((logits[:, 0].argmax(-1) == labels[0]) & mask[0].bool()).sum(), mask.bool().sum()
 
