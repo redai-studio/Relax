@@ -98,6 +98,7 @@ class ProcessedSample:
     # the dropped pixel_values; None keeps the pixel-shipping default mode.
     image_refs_descriptor: dict[str, Any] | None = None
     pre_shifted_labels: torch.Tensor | None = None
+    dataset_id: int | None = None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -185,6 +186,8 @@ def _normalize_tools(value: Any) -> list[dict] | None:
     if value is None:
         return None
     if isinstance(value, str):
+        if not value or value.isspace():
+            return None
         value = json.loads(value)
     elif hasattr(value, "tolist"):
         value = value.tolist()
@@ -1239,6 +1242,7 @@ class SFTStreamingDataset:
             classification_label=rendered.classification_label,
             multimodal_train_inputs=mm_inputs,
             source_idx=rendered.idx,
+            dataset_id=self.reader.dataset_id(rendered.idx) if hasattr(self.reader, "dataset_id") else None,
             image_refs_descriptor=image_refs_descriptor,
         )
 
@@ -1426,6 +1430,10 @@ def pack_samples_for_tq(
         # assistant/function_call token positions.
         "response_lengths": [1] * len(samples) if is_classification else total_lengths,
     }
+    if any(s.dataset_id is not None for s in samples):
+        if not all(s.dataset_id is not None for s in samples):
+            raise ValueError("dataset ids must be present for every sample in a mixture batch")
+        batch["dataset_ids"] = [s.dataset_id for s in samples]
     if is_classification:
         batch["classification_labels"] = [s.classification_label.tolist() for s in samples]
     if has_pre_shifted_labels:

@@ -15,12 +15,12 @@
 
 ### Prerequisites
 
-- Training must use **Fully Async mode**, i.e., the `--fully-async` flag is set
+- Training uses **Fully Async mode (`--fully-async`)** or **Hybrid mode (`--hybrid`)**; Hybrid mode uses DCS by default, so that every weight update reaches scaled-out engines through the DCS broadcast
 - Rollout engines use **SGLang** as the inference backend
 - Training backend uses **Megatron**
 
 ::: tip
-Elastic scaling is only available in Fully Async mode. In this mode, Rollout occupies dedicated GPU resources and runs as an independent service, making it naturally suited for elastic scaling. For more information about Fully Async mode, see [Fully Async Training Pipeline](./fully-async-training.md).
+Elastic scaling is available in Fully Async mode and in Hybrid mode (with the DCS weight-sync backend). In these modes, Rollout occupies dedicated GPU resources and runs as an independent service, making it naturally suited for elastic scaling; engines added by scale-out register with DCS and then receive the latest weights on every broadcast. For more information about Fully Async mode, see [Fully Async Training Pipeline](./fully-async-training.md); for Hybrid mode, see [Hybrid Training](./hybrid-training.md).
 :::
 
 For a runnable Qwen3-4B setup with Autoscaler-based scaling and external

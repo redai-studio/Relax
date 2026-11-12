@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from relax.agentic.profile import agentic_trace_events, mark_agentic_event
+from relax.utils.agentic_obs.writers import best_effort, submit_background
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
@@ -51,6 +52,7 @@ _LAUNCHER_MESSAGE_SIZE = struct.Struct("!I")
 # Pending Unix-socket connections queue at the OS boundary. A low value rejects
 # bursty launches before application-level scheduling can observe them.
 _LAUNCHER_SERVER_BACKLOG = max(1024, socket.SOMAXCONN)
+_OBSERVATION_LOG_TAIL_BYTES = 1024 * 1024
 _PR_SET_CHILD_SUBREAPER = 36
 
 logger = get_logger(__name__)
@@ -58,6 +60,10 @@ logger = get_logger(__name__)
 
 class AgentExecutionError(RuntimeError):
     """Expected agent-level failure that drops its rollout group."""
+
+    def __init__(self, message: str = "", *, reason_code: str = "agent_execution_failed") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class LauncherProtocolError(RuntimeError):
@@ -357,6 +363,8 @@ class ManagedAgentProcess:
         self._timed_out = False
         self._terminated = False
         self._output = SessionOutput()
+        self._observation_log_path: Optional[Path] = None
+        self.observation_log_ref: Optional[str] = None
         self._task = asyncio.create_task(
             self._run(session_input.to_agent_payload()),
             name=f"managed-agent:{session_input.session_id}",
@@ -373,6 +381,18 @@ class ManagedAgentProcess:
         """Expose terminal agent output after process completion."""
 
         return self._output
+
+    def configure_observability(self, log_path: Path) -> None:
+        """Select durable diagnostics before the process task gets
+        scheduled."""
+        self._observation_log_path = log_path
+
+    @property
+    def active_ms(self) -> float:
+        elapsed = self._spec.timeout_s - self._remaining_timeout
+        if self._timeout_started is not None:
+            elapsed += time.monotonic() - self._timeout_started
+        return max(0.0, elapsed * 1000)
 
     async def set_timeout_active(self, active: bool) -> None:
         """Start or pause the process active-time budget."""
@@ -459,11 +479,13 @@ class ManagedAgentProcess:
                 log_tail = _read_log_tail(log_path)
                 if self._timed_out:
                     raise AgentExecutionError(
-                        f"Managed command agent timed out after {self._spec.timeout_s} seconds.\n{log_tail}".rstrip()
+                        f"Managed command agent timed out after {self._spec.timeout_s} seconds.\n{log_tail}".rstrip(),
+                        reason_code="agent_timeout",
                     )
                 if return_code != 0 and not self._terminated:
                     raise AgentExecutionError(
-                        f"Managed command agent exited with code {return_code}.\n{log_tail}".rstrip()
+                        f"Managed command agent exited with code {return_code}.\n{log_tail}".rstrip(),
+                        reason_code="agent_exit_nonzero",
                     )
                 if output_path.exists():
                     try:
@@ -472,16 +494,38 @@ class ManagedAgentProcess:
                         self._output = _session_output_from_text(output_text)
                     except Exception as error:
                         raise AgentExecutionError(
-                            f"Managed command agent produced invalid output.\n{log_tail}".rstrip()
+                            f"Managed command agent produced invalid output.\n{log_tail}".rstrip(),
+                            reason_code="agent_output_invalid",
                         ) from error
                 mark_agentic_event(process_events, "managed_output_ready_at")
                 agentic_trace_events(self._output.metadata).update(process_events)
             finally:
+                execution_error = sys.exc_info()[1]
                 self._launch_finished.set()
-                if self._process is not None:
-                    await self._process.close()
-                    self._process = None
-                await self._pause_timeout()
+                try:
+                    await self._pause_timeout()
+                    if self._observation_log_path is not None:
+                        try:
+                            await self._persist_observation_log(log_path)
+                        except asyncio.CancelledError:
+                            if execution_error is None:
+                                raise
+                finally:
+                    if self._process is not None:
+                        await self._process.close()
+                        self._process = None
+
+    @best_effort
+    async def _persist_observation_log(self, source: Path) -> None:
+        # Snapshot the bounded local tail before TemporaryDirectory removes it.
+        # Output storage is never awaited by process cleanup.
+        with source.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - _OBSERVATION_LOG_TAIL_BYTES))
+            payload = handle.read(_OBSERVATION_LOG_TAIL_BYTES)
+        if submit_background(_persist_log_tail, payload, self._observation_log_path, size_bytes=len(payload)):
+            # A reference to queued diagnostics, not an acknowledgement of persistence.
+            self.observation_log_ref = f"logs/{self._observation_log_path.name}"
 
     async def _expire_timeout(self) -> None:
         """Terminate the process after its active-time budget expires."""
@@ -505,6 +549,12 @@ class ManagedAgentProcess:
         if timeout_task is not None and timeout_task is not asyncio.current_task():
             timeout_task.cancel()
             await asyncio.gather(timeout_task, return_exceptions=True)
+
+
+def _persist_log_tail(payload: bytes, target: Path) -> None:
+    """Persist an independent bounded snapshot on the observation worker."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(payload)
 
 
 def _read_log_tail(path: Path, limit: int = 8192) -> str:

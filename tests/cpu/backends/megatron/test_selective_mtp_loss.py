@@ -33,41 +33,22 @@ def ce(labels, logits):
 
 
 @pytest.mark.parametrize("runtime_gather_output", [None, False])
-def test_te_scores_original_mtp_logits(monkeypatch, runtime_gather_output):
+def test_te_uses_tp_group_only_for_vocab_shards(monkeypatch, runtime_gather_output):
     head = Head()
     head.gather_output = True
     hidden = torch.randn(4, 1, 5)
-    expected = head(hidden)[0].detach()
-    labels = expected.argmax(-1).T
+    labels = torch.zeros(1, 4, dtype=torch.long)
     group = object()
+    seen_groups = []
 
-    def inplace_ce(logits, targets, tp_group):
-        assert tp_group is (group if runtime_gather_output is False else None)
-        losses = ce(targets.T, logits).T
-        with torch.no_grad():
-            logits.fill_(0)
-        return losses
-
-    def counts(logits, targets, *_args):
-        torch.testing.assert_close(logits, expected)
-        return targets.numel(), targets.numel()
+    def te_ce(logits, targets, tp_group):
+        seen_groups.append(tp_group)
+        return ce(targets.T, logits).T
 
     monkeypatch.setenv("RELAX_MTP_CE_IMPL", "te")
-    monkeypatch.setattr(patch, "te_cross_entropy", inplace_ce)
-    monkeypatch.setattr(patch, "_COMPUTE_MTP_ACCEPTANCE_COUNTS", counts)
-    _, correct, total = patch._chunked_head_ce(
-        hidden,
-        labels,
-        head,
-        None,
-        runtime_gather_output,
-        ce,
-        None,
-        4,
-        tp_group=group,
-        loss_mask=torch.ones_like(labels),
-    )
-    assert correct == total == 4
+    monkeypatch.setattr(patch, "te_cross_entropy", te_ce)
+    patch._chunked_head_ce(hidden, labels, head, None, runtime_gather_output, ce, None, 4, tp_group=group)
+    assert seen_groups == [None if runtime_gather_output is None else group]
 
 
 def test_fused_mtp_preserves_selective_mask_gradients_and_acceptance(monkeypatch):

@@ -139,10 +139,9 @@ def _chunked_head_ce(
             else:
                 # Keep the original head/collective path for all-zero masks.
                 selected_rows = None
-            needs_metrics = _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None
             for start in range(0, seq_len, chunk_size):
                 end = min(start + chunk_size, seq_len)
-                labels = mtp_labels[:, start:end]
+                chunk_acceptance = None
                 weight = output_weight if output_weight is not None else output_layer.weight
                 from relax.backends.megatron.fused_linear_ce import linear_cross_entropy, supported
 
@@ -150,10 +149,11 @@ def _chunked_head_ce(
                     output_layer, mtp_hidden[start:end], weight, runtime_gather_output
                 )
                 if fused:
+                    needs_metrics = _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None
                     loss_sb, logits_slice = linear_cross_entropy(
                         mtp_hidden[start:end],
                         weight,
-                        labels.T.contiguous(),
+                        mtp_labels[:, start:end].T.contiguous(),
                         tp_group or output_layer.tp_group,
                         accumulate=output_layer.gradient_accumulation_fusion,
                         return_logits=needs_metrics,
@@ -170,30 +170,47 @@ def _chunked_head_ce(
                     )  # [chunk, b, V/TP] (no re-gather: SP disabled)
                     if scale_logits_fn is not None:
                         logits_slice = scale_logits_fn(logits_slice)
-                # TE overwrites its input with gradients, so score predictions before CE.
-                if needs_metrics:
-                    chunk_correct, chunk_total = _COMPUTE_MTP_ACCEPTANCE_COUNTS(
-                        logits_slice,
-                        labels,
-                        loss_mask[:, start:end],
-                        output_layer,
-                        runtime_gather_output,
-                        tp_group,
-                    )
-                    correct = chunk_correct if correct is None else correct + chunk_correct
-                    total = chunk_total if total is None else total + chunk_total
-                if not fused:
+                    # compute_language_model_loss(labels[b,s], logits[s,b,V]) -> [b, s];
+                    # slice labels on the seq axis (dim=1) to match the logits slice.
                     if ce_implementation("MTP") == "te":
+                        # TE CE overwrites logits with dlogits in forward. Read
+                        # predictions before that write, without cloning vocab tensors.
+                        if _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None:
+                            chunk_acceptance = _COMPUTE_MTP_ACCEPTANCE_COUNTS(
+                                logits_slice,
+                                mtp_labels[:, start:end],
+                                loss_mask[:, start:end],
+                                output_layer,
+                                runtime_gather_output,
+                                tp_group,
+                            )
                         gathered = (
                             runtime_gather_output
                             if runtime_gather_output is not None
                             else getattr(output_layer, "gather_output", False)
                         )
                         group = None if gathered else (tp_group or parallel_state.get_tensor_model_parallel_group())
-                        loss_slice = te_cross_entropy(logits_slice, labels.T, group).T.contiguous()
+                        loss_slice = (
+                            te_cross_entropy(logits_slice, mtp_labels[:, start:end].transpose(0, 1), group)
+                            .transpose(0, 1)
+                            .contiguous()
+                        )
                     else:
-                        loss_slice = compute_language_model_loss(labels, logits_slice)
+                        loss_slice = compute_language_model_loss(mtp_labels[:, start:end], logits_slice)
                 per_chunk_losses.append(loss_slice)
+                if _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None and loss_mask is not None:
+                    if chunk_acceptance is None:
+                        chunk_acceptance = _COMPUTE_MTP_ACCEPTANCE_COUNTS(
+                            logits_slice,
+                            mtp_labels[:, start:end],
+                            loss_mask[:, start:end],
+                            output_layer,
+                            runtime_gather_output,
+                            tp_group,
+                        )
+                    chunk_correct, chunk_total = chunk_acceptance
+                    correct = chunk_correct if correct is None else correct + chunk_correct
+                    total = chunk_total if total is None else total + chunk_total
                 del logits_slice
         finally:
             if sp_enabled:

@@ -293,6 +293,92 @@ def test_clear_partition_and_reinit_are_isolated(tq_factory) -> None:
     assert getattr(_get(tq_factory(capacity=16), "cleanup", ["a"], 4)[0], "size", None) == 0
 
 
+@pytest.mark.parametrize("streaming", [False, True], ids=["fixed", "streaming"])
+def test_advantages_advances_after_actor_retires_final_batch(tq_factory, streaming: bool) -> None:
+    """Real final-output publication may retire a partition before its put
+    returns."""
+    import ray
+    from tensordict import TensorDict
+
+    client = tq_factory()
+    batch = TensorDict(
+        {
+            "tokens": torch.ones(8, 3, dtype=torch.int64),
+            "total_lengths": torch.full((8,), 3),
+            "response_lengths": torch.full((8,), 2),
+            "loss_masks": torch.ones(8, 2),
+            "rollout_log_probs": torch.zeros(8, 2),
+            "rewards": torch.arange(8, dtype=torch.float32),
+        },
+        batch_size=[8],
+    )
+    for step in range(2):
+        client.put(batch, partition_id=f"train_{step}", is_last=True)
+
+    @ray.remote(num_cpus=0, num_gpus=0)
+    class AdvantagesWorker:
+        def run(self, controller_info, storage_config, streaming):
+            from argparse import Namespace
+
+            from transfer_queue import TransferQueueClient
+
+            from relax.components.advantages import Advantages
+            from relax.components.base import Base
+            from relax.utils.async_utils import shutdown_async_loop
+
+            class RetireAfterPublish(TransferQueueClient):
+                async def async_put(self, data, metadata):
+                    result = await super().async_put(data=data, metadata=metadata)
+                    partition_id = metadata.partition_ids[0]
+                    actor_meta = await self.async_get_meta(
+                        data_fields=["advantages", "rewards"],
+                        batch_size=8,
+                        partition_id=partition_id,
+                        task_name="actor_train",
+                    )
+                    assert actor_meta.size == 8
+                    outputs = await self.async_get_data(actor_meta)
+                    assert all(
+                        torch.equal(advantage, torch.full_like(advantage, float(reward)))
+                        for advantage, reward in zip(outputs["advantages"], outputs["rewards"], strict=True)
+                    )
+                    await self.async_clear_partition(partition_id)
+                    return result
+
+            real_client = RetireAfterPublish("advantages-retirement-regression", controller_info)
+            real_client.initialize_storage_manager("SimpleStorage", storage_config)
+            cls = next(cls for cls in Advantages.func_or_class.__mro__ if "_run_blocking" in cls.__dict__)
+            service = cls.__new__(cls)
+            Base.__init__(service)
+            service.config = Namespace(
+                num_rollout=2,
+                global_batch_size=8,
+                num_iters_per_train_update=1,
+                fully_async=True,
+                use_dynamic_batch_size=streaming,
+                true_on_policy_mode=True,
+                kl_coef=0,
+                use_kl_loss=False,
+                use_rollout_logprobs=True,
+                advantage_estimator="grpo",
+            )
+            service.data_system_client = real_client
+            try:
+                service._run_blocking()
+                return real_client.get_partition_list()
+            finally:
+                service.data_system_client = None
+                real_client.close()
+                shutdown_async_loop()
+
+    worker = AdvantagesWorker.remote()
+    try:
+        result = worker.run.remote(client._controller, client.storage_manager.config, streaming)
+        assert ray.get(result, timeout=60) == []
+    finally:
+        ray.kill(worker, no_restart=True)
+
+
 def test_multimodal_non_tensor_full_link_is_byte_exact(tq_factory, record_property) -> None:
     from relax.utils.utils import dict_to_tensordict
 
