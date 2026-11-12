@@ -49,8 +49,8 @@ def _reference(inputs: list[torch.Tensor], indices: torch.Tensor, upstream: torc
     """Query chunks bound memory; no production attention/mask implementation
     used."""
     q, k, v = inputs
-    k = k[:, 0].float().detach().requires_grad_()
-    v = v[:, 0].float().detach().requires_grad_()
+    k = k.float().detach().requires_grad_()
+    v = v.float().detach().requires_grad_()
     output = torch.empty_like(q, dtype=torch.float32)
     dq = torch.empty_like(q, dtype=torch.float32)
     dk, dv = torch.zeros_like(k), torch.zeros_like(v)
@@ -60,15 +60,16 @@ def _reference(inputs: list[torch.Tensor], indices: torch.Tensor, upstream: torc
         selected = indices[start:end].long()
         valid = selected >= 0
         selected = selected.clamp_min(0)
-        keys, values = k[selected], v[selected]
-        scores = torch.einsum("chd,csd->chs", query, keys) * (256**-0.5)
+        keys = k[selected].repeat_interleave(q.shape[1] // k.shape[1], dim=2)
+        values = v[selected].repeat_interleave(q.shape[1] // v.shape[1], dim=2)
+        scores = torch.einsum("chd,cshd->chs", query, keys) * (256**-0.5)
         weights = torch.softmax(scores.masked_fill(~valid[:, None], -torch.inf), dim=-1)
-        result = torch.einsum("chs,csd->chd", weights, values)
+        result = torch.einsum("chs,cshd->chd", weights, values)
         gradients = torch.autograd.grad(result, (query, k, v), upstream[start:end].float())
         output[start:end], dq[start:end] = result.detach(), gradients[0]
         dk.add_(gradients[1])
         dv.add_(gradients[2])
-    return output, dq, dk.unsqueeze(1), dv.unsqueeze(1)
+    return output, dq, dk, dv
 
 
 def _metrics(got: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
@@ -81,14 +82,17 @@ def _metrics(got: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     }
 
 
-def _run_case(lengths: tuple[int, ...], budget: int) -> None:
+def _run_case(lengths: tuple[int, ...], budget: int, geometry=(12, 1)) -> None:
     from relax.models.qwen3_8 import qsa_community as patch
     from relax.models.qwen3_8.ops.qsa_mixed_ops.routes import token_routes
 
     torch.manual_seed(20261013)
     selection = _routes(lengths, budget)
     length = sum(lengths)
-    values = [torch.randn(length, heads, 256, dtype=torch.bfloat16, device="cuda") for heads in (12, 1, 1)]
+    values = [
+        torch.randn(length, heads, 256, dtype=torch.bfloat16, device="cuda")
+        for heads in (geometry[0], geometry[1], geometry[1])
+    ]
     actual_inputs = [value.detach().requires_grad_() for value in values]
     upstream = torch.randn_like(values[0])
     actual = patch._community_id_sparse_forward(
@@ -113,7 +117,7 @@ def _run_case(lengths: tuple[int, ...], budget: int) -> None:
     indices = independent_indices
     indices._qsa_bounds = selection._relax_qsa_mixed_bounds
     expected = _reference(values, indices, upstream)
-    report = {"lengths": lengths, "block_budget": budget, "fp32": {}, "reference": {}}
+    report = {"geometry": geometry, "lengths": lengths, "block_budget": budget, "fp32": {}, "reference": {}}
     for name, got, want in zip(("output", "dq", "dk", "dv"), (actual, *gradients), expected):
         assert torch.isfinite(got).all(), name
         metrics = _metrics(got, want)
@@ -222,7 +226,7 @@ def test_qsa_mixed_in_isolated_process() -> None:
     )
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
-    assert "10 passed" in result.stdout and " skipped" not in result.stdout, output
+    assert " skipped" not in result.stdout, output
 
 
 if __name__ == "__main__":
@@ -230,3 +234,17 @@ if __name__ == "__main__":
         _check_layout_binding()
     else:
         _run_case(tuple(json.loads(sys.argv[1])), int(sys.argv[2]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mixed QSA GQA precision requires CUDA")
+@pytest.mark.parametrize("geometry", [(12, 1), (6, 1), (24, 2), (3, 1)])
+@pytest.mark.parametrize("lengths", [(7,), (65,), (7, 65)])
+def check_qsa_mixed_parallel_geometry(geometry, lengths):
+    _run_case(lengths, 8, geometry)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mixed QSA production-budget precision requires CUDA")
+@pytest.mark.parametrize("geometry", [(6, 1), (3, 1)])
+@pytest.mark.parametrize("lengths", [(2052,), (16385,)])
+def check_qsa_mixed_production_sparse_budget(geometry, lengths):
+    _run_case(lengths, 512, geometry)

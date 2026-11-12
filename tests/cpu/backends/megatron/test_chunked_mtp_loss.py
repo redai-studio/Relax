@@ -443,6 +443,68 @@ def test_chunked_mtp_acceptance_obeys_logging_gate(monkeypatch, is_training, col
                 assert torch.equal(correct, total)
 
 
+@pytest.mark.parametrize("implementation", ["native", "te"])
+@pytest.mark.parametrize("collect_acceptance", [False, True])
+def test_chunked_mtp_acceptance_survives_inplace_ce(monkeypatch, implementation, collect_acceptance):
+    """Acceptance reads predictions before TE CE replaces logits with
+    gradients."""
+
+    class InplaceCE(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, logits, labels):
+            loss = _stub_clml(labels.T, logits).T.contiguous()
+            gradient = logits.softmax(dim=-1)
+            gradient.scatter_add_(-1, labels.unsqueeze(-1), -torch.ones_like(labels.unsqueeze(-1), dtype=logits.dtype))
+            logits.copy_(gradient)
+            ctx.save_for_backward(gradient)
+            return loss
+
+        @staticmethod
+        def backward(ctx, grad_loss):
+            (gradient,) = ctx.saved_tensors
+            return gradient * grad_loss.unsqueeze(-1), None
+
+    def counts(logits, labels, mask, *_args):
+        predictions = logits.detach().argmax(dim=-1).T
+        return ((predictions == labels) & mask.bool()).sum(), mask.bool().sum()
+
+    torch.manual_seed(42)
+    head = _FakeHead(H, V)
+    hidden = torch.randn(7, B, H, requires_grad=True)
+    expected_logits = F.linear(hidden, head.weight) * 0.7
+    labels = expected_logits.detach().argmax(dim=-1).T.contiguous()
+    labels[0, 0] = (labels[0, 0] + 1) % V
+    mask = torch.ones_like(labels, dtype=torch.float32)
+    mask[1, 1::2] = 0
+    expected_loss = _stub_clml(labels, expected_logits)
+    expected_counts = counts(expected_logits, labels, mask)
+    expected_gradients = torch.autograd.grad((expected_loss * mask).sum(), (hidden, head.weight))
+
+    monkeypatch.setenv("RELAX_MTP_CE_IMPL", implementation)
+    monkeypatch.setattr(_patch, "te_cross_entropy", lambda logits, labels, group: InplaceCE.apply(logits, labels))
+    monkeypatch.setattr(_patch, "_COMPUTE_MTP_ACCEPTANCE_COUNTS", counts)
+    loss, correct, total = _patch._chunked_head_ce(
+        hidden,
+        labels,
+        head,
+        None,
+        None,
+        _stub_clml,
+        lambda logits: logits * 0.7,
+        3,
+        tp_group=object(),
+        loss_mask=mask if collect_acceptance else None,
+    )
+    gradients = torch.autograd.grad((loss * mask).sum(), (hidden, head.weight))
+
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(gradients, expected_gradients)
+    if collect_acceptance:
+        torch.testing.assert_close((correct, total), expected_counts)
+    else:
+        assert correct is None and total is None
+
+
 def test_sequence_parallel_gathers_hidden_once(monkeypatch):
     """With sequence_parallel=True on the head, the patch must gather the SP-
     scattered hidden to the full sequence ONCE (so chunk boundaries align with

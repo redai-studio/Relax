@@ -460,6 +460,9 @@ def get_batch(
     else:
         batch, _ = next(data_iterator)
 
+    from relax.utils.agentic_obs.train_hooks import capture_training_input
+
+    capture_training_input(batch)
     if isinstance(batch, PrepackedBatch):
         return batch
 
@@ -1594,7 +1597,12 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "dataset_ids",
                 "sample_index_mask_sums",
+                # An opaque join key, not a measurement: averaging it would put a
+                # meaningless ~1e18 scalar on the metrics dashboard.
+                "sample_export_ids",
+                "agentic_group_ids",
                 "rollout_routed_experts",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",

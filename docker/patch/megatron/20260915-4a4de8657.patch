@@ -781,15 +781,16 @@ index e0f7c9f..1d3c4e4 100644
 diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 --- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 +++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-@@ -1,6 +1,6 @@
+@@ -1,6 +1,7 @@
  # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
++import os
  from collections import defaultdict
 -from typing import Dict
 +from typing import Callable, Dict
 
  import torch
 
-@@ -76,6 +76,14 @@
+@@ -76,6 +77,14 @@
          self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
          self.param_update_in_fp32 = param_update_in_fp32
          self.sub_optimizer_kwargs = kwargs
@@ -804,7 +805,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
 
          self._init_sub_optimizers()
          self._register_load_state_dict_hooks()
-@@ -121,7 +129,11 @@
+@@ -121,7 +130,11 @@
                  with torch.cuda.stream(self._h2d_stream):
                      for param in _param_generator(optimizer):
                          gpu_param = self.cpu_copys_map_gpu_param[param]
@@ -817,7 +818,32 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
                  self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
              return param_copy_back_gpu_hook
-@@ -249,6 +261,11 @@
+@@ -225,8 +238,8 @@
+
+     @staticmethod
+     def build_cpu_optimizer_list(cpu_optimizer_cls, cpu_param_groups):
+-        """Build several cpu optimizers to enable overlap. Currently we naively
+-        assign each parameter to an individual optimizer.
++        """Group expert parameters by RELAX_EXPERT_CPU_ADAM_BATCH_SIZE (default 16).
++        Dense parameters always use individual optimizers.
+
+         Args:
+             cpu_optimizer_cls (Type[torch.optim.Optimizer]): A torch optimizer class
+@@ -242,13 +255,23 @@
+             params = group_defaults.pop("params")
+             if isinstance(params, torch.Tensor):
+                 params = [params]
+-            for param in params:
++            batch_size = 1
++            if group.get("is_expert_parallel", False):
++                batch_size = int(os.getenv("RELAX_EXPERT_CPU_ADAM_BATCH_SIZE", "16"))
++                if batch_size < 1:
++                    raise ValueError("RELAX_EXPERT_CPU_ADAM_BATCH_SIZE must be at least 1")
++            for start in range(0, len(params), batch_size):
+                 _cpu_param_group = group_defaults.copy()
+-                _cpu_param_group["params"] = [param]
++                _cpu_param_group["params"] = params[start : start + batch_size]
+                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
          return cpu_optimizers
  
      def _get_sub_optimizer_param_groups(self, offload_fraction: float):
@@ -829,7 +855,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
          params = []
          for group in self.param_groups:
              params.extend(group["params"])
-@@ -276,6 +293,8 @@
+@@ -276,6 +299,8 @@
                      cpu_copy = True
                  if self.param_update_in_fp32 and param.dtype != torch.float32:
                      param = param.detach().clone().float()
@@ -838,7 +864,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
                      param_to_fp32_param[orig_param] = param
 
                  if cpu_copy:
-@@ -370,11 +389,11 @@
+@@ -370,11 +395,11 @@
          if not self.param_update_in_fp32:
              return
          for param, v in self.state.items():
@@ -855,7 +881,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
  
      def update_fp32_param_by_new_param(self):
          """
-@@ -382,6 +401,16 @@
+@@ -382,6 +407,16 @@
          """
          for param, fp32_param in self.param_to_fp32_param.items():
              fp32_param.data.copy_(param)

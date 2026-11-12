@@ -1,0 +1,20 @@
+diff --git a/python/pyproject.toml b/python/pyproject.toml
+--- a/python/pyproject.toml
++++ b/python/pyproject.toml
+@@ -82,7 +82,7 @@ dependencies = [
+   "torchcodec==0.11.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.11.1 for torch 2.11.x (0.10 is ABI-incompatible: references the pre-2.11 c10::MessageLogger ctor signature). Not available on Linux ARM.
+   "torchvision",
+   "tqdm",
+-  "transformers==5.12.1",
++  "transformers==5.16.0",
+   "uvicorn",
+   "uvloop",
+   "watchfiles",
+diff --git a/python/sglang/srt/configs/qwen3_asr.py b/python/sglang/srt/configs/qwen3_asr.py
+--- a/python/sglang/srt/configs/qwen3_asr.py
++++ b/python/sglang/srt/configs/qwen3_asr.py
+@@ -167,2 +167,2 @@
+-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
+-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
++AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
++AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig, exist_ok=True)
