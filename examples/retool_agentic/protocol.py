@@ -82,6 +82,12 @@ async def feedback_for_turn(text: str, client: Any) -> tuple[dict, str | None]:
         code = parse_code(text)
     except ValueError as exc:
         return {"status": "invalid_call", "stdout": "", "stderr": str(exc)}, None
+    if len(code.encode("utf-8")) > 65536:
+        return {
+            "status": "invalid_call",
+            "stdout": "",
+            "stderr": "Python source exceeds sandbox 65536-byte limit",
+        }, None
     # Only this NEW model-emitted code is executed, exactly once. Infrastructure
     # exceptions propagate rather than becoming a model failure reward.
     feedback = await client.execute(code)

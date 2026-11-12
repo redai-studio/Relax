@@ -4,14 +4,16 @@
 import asyncio
 import json
 import random
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from threading import BoundedSemaphore, Thread
 
 import pytest
 
 from examples.retool_agentic.checkpoint import validate_checkpoint
 from examples.retool_agentic.prepare_data import LEAD, TAIL, deduplicate
-from examples.retool_agentic.protocol import PREFIX
+from examples.retool_agentic.protocol import PREFIX, feedback_for_turn
 from examples.retool_agentic.reward import score
 from examples.retool_agentic.sandbox import SandboxClient, parse_result
 
@@ -75,6 +77,73 @@ def test_retool_http_client_uses_actual_response():
     assert result == dict(status="ok", stdout="2", stderr="")
     assert len(received) == 1 and received[0]["code"] == "print(2)"
     assert received[0]["run_timeout"] == 30 and received[0]["memory_limit_MB"] == 1024
+
+
+def test_retool_http_client_waits_for_queued_execution_without_retry(monkeypatch):
+    slots = BoundedSemaphore(1)
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            received.append(body["code"])
+            with slots:
+                time.sleep(0.2)
+                payload = dict(status="Success", run_result=dict(status="Finished", stdout=body["code"]))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(payload).encode())
+
+        def log_message(self, *args):
+            pass
+
+    original_open = urllib.request.OpenerDirector.open
+
+    def scaled_open(opener, request, *, timeout):
+        # Exercise real socket deadlines and queueing without a 70-second test.
+        return original_open(opener, request, timeout=None if timeout is None else timeout * 0.005)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", scaled_open)
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = Thread(target=server.serve_forever)
+        thread.start()
+
+        async def queued_calls():
+            client = SandboxClient(f"http://127.0.0.1:{server.server_port}/run_code")
+            return await asyncio.gather(*(client.execute(str(i)) for i in range(3)))
+
+        try:
+            results = asyncio.run(queued_calls())
+        finally:
+            server.shutdown()
+            thread.join()
+    assert [result["stdout"] for result in results] == ["0", "1", "2"]
+    assert sorted(received) == ["0", "1", "2"]
+
+
+@pytest.mark.parametrize("character", ["a", "界"])
+@pytest.mark.parametrize("extra_bytes", [0, 1])
+def test_retool_code_limit_counts_utf8_bytes_before_submission(character, extra_bytes):
+    width = len(character.encode("utf-8"))
+    code = "#" + character * (65535 // width) + "a" * (65535 % width + extra_bytes)
+    calls = []
+
+    class Client:
+        async def execute(self, source):
+            calls.append(source)
+            return dict(status="ok", stdout="2", stderr="")
+
+    assert len(code.encode("utf-8")) == 65536 + extra_bytes
+    feedback, executed = asyncio.run(feedback_for_turn(f"<code>\n```python\n{code}\n```\n</code>", Client()))
+    if extra_bytes:
+        assert feedback == dict(
+            status="invalid_call", stdout="", stderr="Python source exceeds sandbox 65536-byte limit"
+        )
+        assert executed is None and calls == []
+        assert score("Answer: 2", "2", {feedback["status"]: 1})["score"] == 0.9
+    else:
+        assert feedback == dict(status="ok", stdout="2", stderr="")
+        assert executed == code and calls == [code]
 
 
 def test_retool_dapo_dedup_and_conflicting_labels():

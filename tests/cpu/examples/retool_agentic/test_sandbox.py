@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import platform
+import signal
 import subprocess
 import sys
 import urllib.error
@@ -18,7 +19,7 @@ from examples.retool_agentic.landlock_sandbox import run_isolated
 from examples.retool_agentic.sandbox import SandboxClient
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 
 
 def test_retool_sandbox_python_limits_highs_without_rewriting_payload(tmp_path):
@@ -126,17 +127,39 @@ def test_retool_guard_failure_stops_before_training(monkeypatch):
         train.main()
 
 
-def test_retool_service_keeps_infrastructure_failure_as_http_error(monkeypatch):
+@pytest.mark.parametrize(
+    "signum,guarded,expected",
+    [
+        (signal.SIGSEGV, True, "code_error"),
+        (signal.SIGABRT, True, "code_error"),
+        (signal.SIGXCPU, True, "timeout"),
+        (signal.SIGTERM, True, None),
+        (signal.SIGKILL, True, None),
+        (signal.SIGSEGV, False, None),
+    ],
+)
+def test_retool_service_classifies_payload_signals_after_guard(monkeypatch, signum, guarded, expected):
     monkeypatch.setattr(landlock_service, "validate_runtime", lambda root: None)
-
-    def broken(code, root):
-        raise RuntimeError("No guard attestation")
-
-    monkeypatch.setattr(landlock_service, "execute", broken)
+    guard = dict(profile=landlock_service.POLICY, uid=65534, gid=65534, seccomp_mode=2, no_new_privs=1)
+    monkeypatch.setattr(
+        landlock_service,
+        "run_isolated",
+        lambda *args, **kwargs: dict(
+            returncode=-signum,
+            timed_out=False,
+            stdout="",
+            stderr="payload diagnostic",
+            guard=guard if guarded else None,
+        ),
+    )
     with landlock_service.local_service() as url:
-        with pytest.raises(urllib.error.HTTPError) as error:
-            asyncio.run(SandboxClient(url).execute("print(2)"))
-        assert error.value.code == 500
+        if expected is None:
+            with pytest.raises(urllib.error.HTTPError) as error:
+                asyncio.run(SandboxClient(url).execute("print(2)"))
+            assert error.value.code == 500
+        else:
+            result = asyncio.run(SandboxClient(url).execute("print(2)"))
+            assert result == dict(status=expected, stdout="", stderr="payload diagnostic")
 
 
 @pytest.mark.skipif(os.getuid() != 0 or platform.machine() != "x86_64", reason="Requires Linux x86_64 root driver")

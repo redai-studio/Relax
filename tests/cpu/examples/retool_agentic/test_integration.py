@@ -20,16 +20,16 @@ from examples.retool_agentic.agent import ModelClient, run_episode
 from examples.retool_agentic.data_source import ReToolAgenticDataSource
 from examples.retool_agentic.protocol import CHAT_TEMPLATE, PREFIX, VERSION, observation_text, render_prompt
 from examples.retool_agentic.reward import reward_func
-from examples.retool_agentic.tests.native_reference import run_episode as native_episode
 from relax.agentic.inventory import InventoryRecorder
 from relax.agentic.pipeline.runtime import SGLangMessageCompiler
 from relax.agentic.runner.ipc import SessionOutput
 from relax.agentic.session.service import AgenticSessionShard, _normalized_chat_request
 from relax.agentic.session.state import SessionForest, check_messages
 from relax.utils.types import Sample
+from tests.cpu.examples.retool_agentic.native_reference import run_episode as native_episode
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 CODE = "<code>\n```python\nprint(1 + 1)\n```\n</code>"
 FINAL = "<answer>\\boxed{2}</answer>"
 
@@ -368,8 +368,8 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path)
     assert all(s["prompt_id"] == group_prompts[s["group_id"]] for s in inventories["sessions"])
     source.save(0)
     args.load = args.save
+    args.start_rollout_id = 1
     restored = ReToolAgenticDataSource(args)
-    restored.load(0)
     next_groups = restored.get_samples(3) + restored.get_samples(1)
     assert [g[0].metadata["scheduled_question"] for g in next_groups] == [rng.randrange(17) for _ in range(4)]
     assert [s.index for g in next_groups for s in g] == list(range(8, 16))
@@ -378,7 +378,9 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path)
     restored.save(1)
     assert replacement[0].group_index == 8
     assert "policy_outer" not in replacement[0].metadata
+    args.start_rollout_id = 2
     after_drop = ReToolAgenticDataSource(args)
+    # The framework's later load of this boundary is idempotent.
     after_drop.load(1)
     assert after_drop.group_cursor == 9
     continued, replayed = restored.get_samples(1), after_drop.get_samples(1)
@@ -392,9 +394,23 @@ def test_chunked_draws_and_checkpoint_resume_match_original(tokenizer, tmp_path)
     state = json.loads(state_path.read_text())
     state.pop("next_group_index")
     state_path.write_text(json.dumps(state))
+    args.start_rollout_id = 1
     compatible = ReToolAgenticDataSource(args)
-    compatible.load(0)
     assert compatible.group_cursor == 4
+    # Validate at construction: the framework catches errors from load().
+    invalid_states = [
+        dict(seed=-1),
+        dict(sha256="changed"),
+        dict(batch=8),
+        dict(K=3),
+        dict(rng_state=[1, [], None]),
+        dict(next_group_index=-1),
+        dict(execution_mode="hybrid"),
+    ]
+    for change in invalid_states:
+        state_path.write_text(json.dumps(dict(state, **change)))
+        with pytest.raises(ValueError):
+            ReToolAgenticDataSource(args)
 
 
 def test_model_client_preserves_relax_route_prefix():

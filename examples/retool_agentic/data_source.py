@@ -61,6 +61,13 @@ class ReToolAgenticDataSource(DataSource):
             if render_prompt(case["prompt"]) != prompt:
                 raise ValueError("Agentic template differs from the model's original initial prompt")
         self.group_cursor = 0
+        start_rollout_id = getattr(args, "start_rollout_id", 0) or 0
+        if start_rollout_id > 0:
+            if args.load is None:
+                raise ValueError("Resume requires a ReTool checkpoint directory")
+            # The framework catches load() errors; construction must fail before
+            # this source can serve samples with an unvalidated resume state.
+            self.load(start_rollout_id - 1)
 
     def __len__(self) -> int:
         return len(self.cases)
@@ -158,8 +165,10 @@ class ReToolAgenticDataSource(DataSource):
         def tuples(value: Any) -> Any:
             return tuple(tuples(item) for item in value) if isinstance(value, list) else value
 
-        self.rng.setstate(tuples(state["rng_state"]))
-        self.cursor = rollout_id + 1
-        self.group_cursor = state.get("next_group_index", self.cursor * self.args.rollout_batch_size)
-        if type(self.group_cursor) is not int or self.group_cursor < self.cursor * self.args.rollout_batch_size:
+        cursor = rollout_id + 1
+        group_cursor = state.get("next_group_index", cursor * self.args.rollout_batch_size)
+        if type(group_cursor) is not int or group_cursor < cursor * self.args.rollout_batch_size:
             raise ValueError("Invalid resumed group index")
+        rng = random.Random()
+        rng.setstate(tuples(state["rng_state"]))
+        self.rng, self.cursor, self.group_cursor = rng, cursor, group_cursor

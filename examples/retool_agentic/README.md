@@ -141,7 +141,7 @@ SANDBOX_IMAGE=/path/to/sandboxfusion.sif \
 
 保持 `SAVE_DIR`、`EXP_NAME`、初始模型配置/tokenizer、数据内容、seed、batch 和每题轨迹数不变，再执行同一脚本，即从最新完整 checkpoint 恢复。迁移训练环境时携带完整实验目录，包括 tracker、native 模型/optimizer 状态和 `dataset/retool_*.json`。单独复制 `hf_*` 只能从权重开始新实验，不能恢复完整训练状态。改变 `SAVE_DIR` 或 `EXP_NAME` 可以新开实验。
 
-原生分片、optimizer、scheduler 和训练 RNG 的完整性由 Relax 续训入口检查。示例的 `checkpoint.py` 只负责实验目录启动条件及匹配的 Retool 抽样游标/RNG 快照；`data_source.py` 负责保存和恢复该自定义状态。
+原生分片、optimizer、scheduler 和训练 RNG 的完整性由 Relax 续训入口检查。示例的 `checkpoint.py` 只负责实验目录启动条件及匹配的 Retool 抽样游标/RNG 快照；`data_source.py` 在初始化时校验数据摘要、seed、batch、每题轨迹数和抽样状态，再恢复 RNG 与下一抽样编号，不匹配时阻止数据源启动。
 
 Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batch。同步配方的抽样编号和训练轮次分别计数，checkpoint 同时记录 RNG 与下一抽样编号；权重版本校验使用 Session 的实际生成轮次。兼容补样前格式的同协议 RNG checkpoint。同步脚本不支持额外 oversampling、prelaunch 或异步选项；异步脚本的保存边界见上节。两个变体均不支持动态过滤、单独的 partial rollout、纯 fully async 或 Eval。
 
@@ -163,7 +163,7 @@ Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batc
 
 奖励为答案判分的 ±1，减去每次工具失败的 0.1，无下限；保留 DAPO verifier 的 `Answer:` 优先、boxed 回退规则。默认配方使用 GRPO，另提供上述 Score Centering 变体；均不是原论文 PPO 配方的等价复现。
 
-代码错误、超时、非法调用和隔离程序的信号退出作为工具反馈；HTTP、服务或响应协议异常直接报错，不伪装成模型负奖励。每段新代码只执行一次，不做 HTTP 重试或历史重放。模型请求不设 wall timeout，以允许 Runtime 暂停；`--agent-timeout 1800` 限制 agent 的 active time，sandbox 请求另有 70 秒 wall timeout。
+代码错误、超时、超过 65536 字节的 Python source 和隔离后程序的同步崩溃作为工具反馈；guard 失败、外部终止、HTTP、服务或响应协议异常直接报错，不伪装成模型负奖励。每段新代码只执行一次，不做 HTTP 重试或历史重放。模型请求不设 wall timeout，以允许 Runtime 暂停；工具 HTTP 请求也不另设 wall timeout，以覆盖执行槽位的排队时间，`--agent-timeout 1800` 限制 agent 的 active time。启动时的 sandbox 探针仍有 70 秒 wall timeout。
 
 机器若出现 NVSwitch multicast 建链故障且 NCCL 返回 CUDA 999，可在重新启动前设置 `NCCL_NVLS_ENABLE=0`。脚本会将显式值传入 Ray worker；这属于通信故障绕过配置。
 
@@ -177,11 +177,11 @@ Agentic 在某个 agent 进程失败时丢弃整组，并重新抽样补足 batc
 - `scripts/`：训练与独立 sandbox 入口。
 
 ```bash
-python -m pytest examples/retool_agentic/tests -q
+CUDA_VISIBLE_DEVICES='' python -m pytest tests/cpu/examples/retool_agentic -q
 
 # 使用实际模型的 tokenizer 检查模板和 token 对齐。
 RETOOL_TEST_MODEL_DIR="$MODEL_DIR" \
-  python -m pytest examples/retool_agentic/tests -q
+  CUDA_VISIBLE_DEVICES='' python -m pytest tests/cpu/examples/retool_agentic -q
 ```
 
 测试通过真实 compiler、上下文匹配和 SessionForest 导出，与目录内冻结的原生参考循环比较 token、mask、logprob 和终止行为；同时覆盖子进程 HTTP、数据补样恢复、sandbox 生命周期和启动命令。CPU 测试用固定模型响应和执行结果替代 GPU 推理；真实吞吐和 GPU 兼容性需在目标训练环境验证。

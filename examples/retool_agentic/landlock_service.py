@@ -70,7 +70,20 @@ def execute(code: str, root: Path) -> dict:
     if result["timed_out"] or result["returncode"] == -signal.SIGXCPU:
         status = "TimeLimitExceeded"
     elif result["returncode"] < 0:
-        raise RuntimeError(f"Unexpected isolated Python signal: {result['returncode']}")
+        # After guard attestation, synchronous faults belong to the payload;
+        # external termination remains an infrastructure failure.
+        payload_faults = {
+            signal.SIGSEGV,
+            signal.SIGBUS,
+            signal.SIGILL,
+            signal.SIGFPE,
+            signal.SIGABRT,
+            signal.SIGXFSZ,
+            signal.SIGTRAP,
+        }
+        if -result["returncode"] not in payload_faults:
+            raise RuntimeError(f"Unexpected isolated Python signal: {result['returncode']}")
+        status = "Error"
     else:
         status = "Finished" if result["returncode"] == 0 else "Error"
     return dict(status="Success", run_result=dict(status=status, stdout=result["stdout"], stderr=result["stderr"]))

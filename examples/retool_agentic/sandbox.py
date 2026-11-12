@@ -48,7 +48,7 @@ class SandboxClient:
             raise ValueError("Configure an explicit SandboxFusion HTTP(S) URL without credentials")
         self.url = url
 
-    def _request(self, code: str) -> dict[str, str]:
+    def _request(self, code: str, *, timeout: float | None = 70) -> dict[str, str]:
         payload = dict(
             language="python",
             code=code,
@@ -68,7 +68,7 @@ class SandboxClient:
                 return None
 
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(request, timeout=70) as response:
+        with opener.open(request, timeout=timeout) as response:
             body = response.read(4 * 1024 * 1024 + 1)
         if len(body) > 4 * 1024 * 1024:
             raise RuntimeError("Sandbox response exceeds 4 MiB")
@@ -80,7 +80,9 @@ class SandboxClient:
             raise
 
     async def execute(self, code: str) -> dict[str, str]:
-        return await asyncio.to_thread(self._request, code)
+        # Queueing precedes the server's execution budget. The managed agent's
+        # active-time budget bounds stuck calls; startup probes keep a timeout.
+        return await asyncio.to_thread(self._request, code, timeout=None)
 
     async def close(self) -> None:
         pass
