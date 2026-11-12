@@ -5,21 +5,55 @@
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tests.cpu.backends.megatron.test_ple_packed_cp_gradients import _added_source
 
-# Avoid importing the backend package, which installs GPU-specific patches.
-_SPEC = importlib.util.spec_from_file_location(
-    "fsdp_hyper_connection_patch_under_test",
-    Path(__file__).resolve().parents[4] / "relax/backends/megatron/fsdp_hyper_connection_patch.py",
-)
-patch = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(patch)
+
+@pytest.fixture
+def native_mcore():
+    """Execute the actual image-built gated-residual classes on CPU."""
+    module = ModuleType("native_hyper_connection")
+
+    class MegatronModule(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+
+    module.__dict__.update(
+        torch=torch,
+        nn=nn,
+        F=F,
+        Tensor=torch.Tensor,
+        MegatronModule=MegatronModule,
+        nvtx_decorator=lambda **kwargs: lambda fn: fn,
+    )
+    source = _added_source("megatron/core/transformer/hyper_connection.py")
+    exec(
+        compile("from __future__ import annotations\n" + source, "docker hyper_connection patch", "exec"),
+        module.__dict__,
+    )
+    return module
+
+
+def make_native(module, kind, dtype=torch.float32):
+    config = SimpleNamespace(
+        hidden_size=8,
+        num_residual_streams=4,
+        mhc_gated_residual_rank=5,
+        layernorm_epsilon=1e-6,
+        params_dtype=dtype,
+        sequence_parallel=True,
+        perform_initialization=True,
+        init_method_std=0.02,
+    )
+    kwargs = {"eps": 1e-5} if kind == "GatedResidualOutputMixer" else {}
+    return getattr(module, kind)(config, **kwargs)
 
 
 @pytest.fixture
@@ -82,17 +116,17 @@ def legacy_mcore(monkeypatch):
 @pytest.mark.parametrize("kind", ["GatedResidualHyperConnection", "GatedResidualOutputMixer"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("input_requires_grad", [False, True])
-def test_patch_preserves_outputs_and_all_gradients(legacy_mcore, kind, dtype, input_requires_grad):
+def test_patch_preserves_outputs_and_all_gradients(legacy_mcore, native_mcore, kind, dtype, input_requires_grad):
     torch.manual_seed(42)
     cls = getattr(legacy_mcore, kind)
-    reference, repaired = cls(dtype=dtype), cls(dtype=dtype)
+    reference = cls(dtype=dtype)
+    repaired = make_native(native_mcore, kind, dtype)
     repaired.load_state_dict(reference.state_dict(), strict=True)
-    assert patch.patch_gated_residual_norms_for_fsdp(repaired) == 1
     inputs = torch.randn(3, 2, 32, dtype=dtype, requires_grad=input_requires_grad)
     repaired_inputs = inputs.detach().clone().requires_grad_(input_requires_grad)
 
     def outputs_and_backward(model, x):
-        outputs = model(x)
+        outputs = model._mix(x) if kind == "GatedResidualHyperConnection" else model(x)
         tensors = (outputs,) if isinstance(outputs, torch.Tensor) else tuple(t for t in outputs if t is not None)
         sum(t.float().square().sum() for t in tensors).backward()
         return tensors
@@ -113,42 +147,18 @@ def test_patch_preserves_outputs_and_all_gradients(legacy_mcore, kind, dtype, in
 
 
 @pytest.mark.parametrize("kind", ["GatedResidualHyperConnection", "GatedResidualOutputMixer"])
-@pytest.mark.parametrize("fused_dispatch", [False, True])
-def test_norm_hook_precedes_weight_read(legacy_mcore, kind, fused_dispatch, monkeypatch):
-    """Reproduce the non-unit FSDP rule: hooks gather only direct
-    parameters."""
-    if fused_dispatch:
-        spec = importlib.util.spec_from_file_location(
-            "hc_fused_mix_for_fsdp_test",
-            Path(__file__).resolve().parents[4] / "relax/models/qwen3_8/ops/hc_fused_mix.py",
-        )
-        fusion = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(fusion)
-        core = ModuleType("megatron.core")
-        core.utils = ModuleType("megatron.core.utils")
-        monkeypatch.setitem(sys.modules, "megatron", ModuleType("megatron"))
-        monkeypatch.setitem(sys.modules, "megatron.core", core)
-        monkeypatch.setenv("RELAX_QWEN38_HC_FUSED_MIX", "1")
-        original_mix = legacy_mcore.GatedResidualHyperConnection._mix
-
-        # Mirror the image-built static dispatch in the current MCore _mix.
-        def mix(self, hidden_states):
-            from relax.utils.env import Envs
-
-            if Envs.RELAX_QWEN38_HC_FUSED_MIX and fusion.supported(self, hidden_states):
-                return fusion.fused_mix(self, hidden_states)
-            return original_mix(self, hidden_states)
-
-        monkeypatch.setattr(legacy_mcore.GatedResidualHyperConnection, "_mix", mix)
-    cls = getattr(legacy_mcore, kind)
+def test_norm_hook_precedes_weight_read(legacy_mcore, native_mcore, kind):
+    """FSDP's non-unit hooks gather only a module's direct parameters."""
     gathered = set()
-    norm_impl = legacy_mcore.gated_residual_group_rmsnorm
 
-    def require_gathered_weight(x, weight, n, eps):
-        assert id(weight) in gathered, "norm parameter read before gather hook"
-        return norm_impl(x, weight, n, eps)
+    def instrument(module):
+        norm_impl = module.gated_residual_group_rmsnorm
 
-    legacy_mcore.gated_residual_group_rmsnorm = require_gathered_weight
+        def require_gathered_weight(x, weight, n, eps):
+            assert id(weight) in gathered, "norm parameter read before gather hook"
+            return norm_impl(x, weight, n, eps)
+
+        module.gated_residual_group_rmsnorm = require_gathered_weight
 
     def attach_gather_hooks(model):
         def gather(module, _inputs):
@@ -157,81 +167,42 @@ def test_norm_hook_precedes_weight_read(legacy_mcore, kind, fused_dispatch, monk
         for module in model.modules():
             module.register_forward_pre_hook(gather)
 
-    broken = cls()
+    instrument(legacy_mcore)
+    instrument(native_mcore)
+    broken = getattr(legacy_mcore, kind)()
     attach_gather_hooks(broken)
     with pytest.raises(AssertionError, match="read before gather"):
         broken(torch.randn(3, 2, 32))
 
     gathered.clear()
-    repaired = cls()
-    patch.patch_gated_residual_norms_for_fsdp(repaired)
+    repaired = make_native(native_mcore, kind)
     attach_gather_hooks(repaired)
     repaired(torch.randn(3, 2, 32))
     assert id(repaired.hc_norm.weight) in gathered
 
 
-def test_patch_preserves_parameter_tree_and_is_idempotent(legacy_mcore):
-    model = nn.ModuleDict(
-        {
-            "decoder": legacy_mcore.GatedResidualOutputMixer(dtype=torch.bfloat16),
-            "mtp": nn.ModuleList([legacy_mcore.GatedResidualHyperConnection()]),
-            "unrelated": nn.Linear(3, 3),
-        }
-    ).eval()
-    model["decoder"].hc_norm.weight.requires_grad_(False)
-    params = dict(model.named_parameters())
-    state = {name: tensor.clone() for name, tensor in model.state_dict().items()}
-    unrelated_forward = model["unrelated"].forward
-
-    assert patch.patch_gated_residual_norms_for_fsdp(model) == 2
-    assert patch.patch_gated_residual_norms_for_fsdp(model) == 0
-    assert model["unrelated"].forward == unrelated_forward
-    assert not model["decoder"].hc_norm.training
-    assert not model["decoder"].hc_norm.weight.requires_grad
-    assert model["decoder"].hc_norm.eps == model["decoder"].norm_eps
-    assert list(model.state_dict()) == list(state)
+def test_patch_preserves_parameter_tree_and_output_norm_epsilon(legacy_mcore, native_mcore):
+    reference = legacy_mcore.GatedResidualOutputMixer(dtype=torch.bfloat16)
+    model = make_native(native_mcore, "GatedResidualOutputMixer", torch.bfloat16).eval()
+    model.load_state_dict(reference.state_dict(), strict=True)
+    assert model.hc_norm.eps == model.norm_eps == 1e-5
+    assert list(model.state_dict()) == list(reference.state_dict())
+    assert not model.hc_norm.training
     for name, param in model.named_parameters():
-        assert param is params[name]
-        assert torch.equal(param, state[name])
-        if "hc_norm" in name:
-            assert param.sequence_parallel
-    model.load_state_dict(state, strict=True)
+        assert torch.equal(param, reference.get_parameter(name))
+        assert param.sequence_parallel
 
 
-def test_patch_preserves_new_upstream_norm_and_custom_mix(legacy_mcore):
-    model = legacy_mcore.GatedResidualOutputMixer()
-    native_norm = nn.Identity()
-    model.hc_norm = native_norm
-    native_mix = model._mix
-    assert patch.patch_gated_residual_norms_for_fsdp(model) == 0
-    assert model.hc_norm is native_norm
-    assert model._mix == native_mix
-
-    class CustomMixer(legacy_mcore.GatedResidualOutputMixer):
-        def _mix(self, hidden_states):
-            return hidden_states, None
-
-    custom = CustomMixer()
-    assert patch.patch_gated_residual_norms_for_fsdp(custom) == 0
-    inputs = torch.randn(3, 2, 32)
-    assert custom(inputs) is inputs
-
-
-def test_patch_is_noop_for_mcore_without_gated_residual(legacy_mcore, monkeypatch):
-    monkeypatch.delattr(legacy_mcore, "GatedResidualHyperConnection")
-    assert patch.patch_gated_residual_norms_for_fsdp(nn.Linear(3, 3)) == 0
-
-
-def test_patch_only_suppresses_missing_hyper_connection(monkeypatch):
-    def missing_module(name):
-        raise ModuleNotFoundError(name=name)
-
-    monkeypatch.setattr(patch, "import_module", missing_module)
-    assert patch.patch_gated_residual_norms_for_fsdp(nn.Linear(3, 3)) == 0
-
-    def missing_dependency(name):
-        raise ModuleNotFoundError(name="required_dependency")
-
-    monkeypatch.setattr(patch, "import_module", missing_dependency)
-    with pytest.raises(ModuleNotFoundError):
-        patch.patch_gated_residual_norms_for_fsdp(nn.Linear(3, 3))
+@pytest.mark.parametrize("hook", ["forward_pre", "forward", "full_backward_pre", "full_backward"])
+def test_fused_mix_respects_norm_hooks(native_mcore, hook):
+    spec = importlib.util.spec_from_file_location(
+        "hc_fused_mix_for_fsdp_test",
+        Path(__file__).resolve().parents[4] / "relax/models/qwen3_8/ops/hc_fused_mix.py",
+    )
+    fusion = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fusion)
+    model = make_native(native_mcore, "GatedResidualOutputMixer", torch.bfloat16)
+    getattr(model.hc_norm, f"register_{hook}_hook")(lambda *args: None)
+    # Only device eligibility is simulated; rejection must occur before tensor math.
+    inputs = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16, ndim=3)
+    assert not fusion._supported(model, inputs, None)

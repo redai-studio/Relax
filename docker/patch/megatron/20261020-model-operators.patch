@@ -136,7 +136,7 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block
 diff --git a/megatron/core/distributed/finalize_model_grads.py b/megatron/core/distributed/finalize_model_grads.py
 --- a/megatron/core/distributed/finalize_model_grads.py
 +++ b/megatron/core/distributed/finalize_model_grads.py
-@@ -429,65 +429,8 @@
+@@ -432,65 +432,8 @@
      gradients from modules with average_gradients_across_tp_domain=True
      across tensor-model-parallel ranks.
      """
@@ -292,7 +292,7 @@ diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/opti
 diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_delta_net/gdn.py
 --- a/megatron/core/ssm/gated_delta_net/gdn.py
 +++ b/megatron/core/ssm/gated_delta_net/gdn.py
-@@ -308,7 +308,11 @@
+@@ -310,7 +310,11 @@
          """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
          # Input projection
          nvtx_range_push(suffix="in_proj")
@@ -305,7 +305,7 @@ diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_
          nvtx_range_pop(suffix="in_proj")
  
          qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
-@@ -388,7 +392,10 @@
+@@ -390,7 +394,10 @@
              nvtx_range_pop(suffix="pre_gated_delta_rule")
  
          nvtx_range_push(suffix="gated_delta_rule")
@@ -317,7 +317,7 @@ diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_
              **kernel_inputs,
              initial_state=None,
              output_final_state=False,
-@@ -430,7 +437,11 @@
+@@ -432,7 +439,11 @@
  
          # Output projection
          nvtx_range_push(suffix="out_proj")
@@ -330,7 +330,7 @@ diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_
          nvtx_range_pop(suffix="out_proj")
  
          if self.recompute_norm_out and self.training:
-@@ -476,6 +487,10 @@
+@@ -478,6 +489,10 @@
      ):
          """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
  
@@ -635,7 +635,7 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
 diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
 --- a/megatron/core/transformer/hyper_connection.py
 +++ b/megatron/core/transformer/hyper_connection.py
-@@ -1012,6 +1012,11 @@
+@@ -1011,6 +1011,11 @@
                  setattr(param, 'sequence_parallel', True)
  
      def _mix(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
@@ -646,8 +646,8 @@ diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/trans
 +                return fused_mix(self, hidden_states)
          s, b, nC = hidden_states.shape
          n, C = self.n, self.hidden_size
-         xn = gated_residual_group_rmsnorm(hidden_states, self.hc_norm.weight, n, self.norm_eps)
-@@ -1054,6 +1059,12 @@
+         xn = self.hc_norm(hidden_states.unflatten(-1, (n, C))).flatten(-2)
+@@ -1053,6 +1058,12 @@
      def _inject(
          residual: Tensor, inject: Tensor, x: Tensor, bias: Optional[Tensor], n: int
      ) -> Tensor:

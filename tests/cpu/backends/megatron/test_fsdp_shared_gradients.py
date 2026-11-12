@@ -17,16 +17,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
-
-# Load the CPU-only patch without the backend package's GPU initialization.
-_SPEC = importlib.util.spec_from_file_location(
-    "fsdp_pp_patch_under_test",
-    Path(__file__).resolve().parents[4] / "relax/backends/megatron/fsdp_pp_patch.py",
-)
-fsdp_pp_patch = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(fsdp_pp_patch)
+from tests.cpu.backends.megatron.test_fsdp_pp_patch import load_pp_utils
 
 
 def _shared_gradient_worker(rank, rendezvous):
@@ -57,14 +50,41 @@ def _shared_gradient_worker(rank, rendezvous):
         spec = importlib.util.spec_from_file_location("chunked_grad_coalesce", source)
         coalesce = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(coalesce)
-        fsdp_pp_patch.patch_embedding_grad_reshard_for_pp()
+        pp_utils = load_pp_utils()
+
+        # Reuse these ranks to check that skipping PP metadata validation still
+        # synchronizes replicated TP parameters, while unchecked loads do not.
+        for pp_size, run_check in ((1, True), (2, True), (2, False)):
+            local = torch.full((4,), float(rank + 1))
+            tensor = pp_utils.make_tp_dtensor(
+                local,
+                mesh,
+                [Replicate()],
+                shape=(4,),
+                stride=(1,),
+                run_check=run_check,
+                pipeline_parallel_size=pp_size,
+            )
+            expected = 1.0 if run_check else float(rank + 1)
+            torch.testing.assert_close(tensor.to_local(), torch.full((4,), expected))
+        tensor = pp_utils.make_tp_dtensor(
+            torch.full((4,), float(rank)),
+            mesh,
+            [Shard(0)],
+            shape=(8,),
+            stride=(1,),
+            run_check=True,
+            pipeline_parallel_size=2,
+        )
+        torch.testing.assert_close(tensor.to_local(), torch.full((4,), float(rank)))
 
         for gradient_field in ("grad", "decoupled_grad"):
             for reduction in ("tp", "pp"):
-                param = torch.nn.Parameter(DTensor.from_local(torch.ones(4), mesh, [Replicate()]))
+                placement = Shard(0) if reduction == "pp" else Replicate()
+                param = torch.nn.Parameter(DTensor.from_local(torch.ones(4), mesh, [placement]))
                 # One replica has no local contribution, as with short SP inputs.
                 local_grad = torch.full((4,), 2.0 if rank == 0 else 0.0)
-                setattr(param, gradient_field, DTensor.from_local(local_grad, mesh, [Replicate()]))
+                setattr(param, gradient_field, DTensor.from_local(local_grad, mesh, [placement]))
                 param.sequence_parallel = True
                 model = SimpleNamespace(
                     ddp_config=SimpleNamespace(use_megatron_fsdp=True),
@@ -74,7 +94,9 @@ def _shared_gradient_worker(rank, rendezvous):
                 if reduction == "tp":
                     coalesce._allreduce_non_tensor_model_parallel_grads([model], config, group)
                 else:
-                    fmg._allreduce_embedding_grad([model], group, group, lambda model: param, config=config)
+                    original = getattr(param, gradient_field)
+                    pp_utils.allreduce_fsdp_embedding_grad(param, group)
+                    assert getattr(param, gradient_field) is original
                 gradient = getattr(param, gradient_field)
                 assert isinstance(gradient, DTensor)
                 torch.testing.assert_close(gradient.to_local(), torch.full((4,), 2.0), rtol=0, atol=0)

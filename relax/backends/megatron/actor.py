@@ -139,14 +139,7 @@ from .data import (
     prepack_sft_micro_batch_cpu,
     record_tensors_on_stream,
 )
-from .fsdp_pp_patch import (
-    check_fsdp_pp_checkpoint_support,
-    patch_bridge_shared_embedding_broadcast_for_pp,
-    patch_checkpoint_layer_numbering_for_pp,
-    patch_dtensor_meta_check_for_pp,
-    patch_embedding_grad_reshard_for_pp,
-    patch_fsdp_mesh_for_pp,
-)
+from .fsdp_pp_patch import check_fsdp_pp_checkpoint_support
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import flush_resident_sft_param_sync, forward_only, initialize_model_and_optimizer, save, train
@@ -472,15 +465,6 @@ class MegatronTrainRayActor(TrainRayActor):
         if getattr(args, "use_megatron_fsdp", False):
             _patch_clip_grad_for_fsdp_empty_grads()
             check_fsdp_pp_checkpoint_support(args, role)
-            if getattr(args, "pipeline_model_parallel_size", 1) > 1:
-                # PP=1 needs no patch: upstream's full-world mesh is already correct.
-                # Runs before init(args) below, so dist/mpu are not up yet — the shim
-                # reads them lazily when the mesh builders actually run.
-                patch_fsdp_mesh_for_pp()
-                patch_dtensor_meta_check_for_pp()
-                patch_bridge_shared_embedding_broadcast_for_pp()
-                patch_embedding_grad_reshard_for_pp()
-                patch_checkpoint_layer_numbering_for_pp()
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
         patch_checkpoint_write()

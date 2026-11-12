@@ -10,7 +10,7 @@ import ast
 import importlib.util
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -24,10 +24,27 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 fsdp_pp_patch = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(fsdp_pp_patch)
-_rename_layers_to_global = fsdp_pp_patch._rename_layers_to_global
+
+
+# Execute the shipped helper module directly from the Docker patch. Its only
+# dependencies are torch; no installed Megatron or GPU initialization is needed.
+def load_pp_utils():
+    path = Path(__file__).resolve().parents[4] / "docker/patch/latest/megatron.patch"
+    name = "megatron/core/distributed/fsdp/src/megatron_fsdp/pp_utils.py"
+    section = path.read_text().split(f"diff --git a/{name} b/{name}\n")[1].split("\ndiff --git ")[0]
+    source = "\n".join(
+        line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++")
+    )
+    module = ModuleType("fsdp_pp_utils")
+    exec(compile(source, str(path), "exec"), module.__dict__)
+    return module
+
+
+pp_utils = load_pp_utils()
+_rename_layers_to_global = pp_utils.rename_layers_to_global
 check_fsdp_pp_checkpoint_support = fsdp_pp_patch.check_fsdp_pp_checkpoint_support
-pp_stage_window = fsdp_pp_patch.pp_stage_window
-stage_local_arange = fsdp_pp_patch.stage_local_arange
+pp_stage_window = pp_utils.pp_stage_window
+stage_local_arange = pp_utils.stage_local_arange
 
 
 @pytest.mark.parametrize("role", ["reference", "actor_fwd", "actor"])
@@ -60,14 +77,6 @@ def test_actor_init_applies_role_overrides_before_fsdp_setup(monkeypatch, role, 
         "_patch_clip_grad_for_fsdp_empty_grads": lambda: calls.append("clip"),
         "check_fsdp_pp_checkpoint_support": lambda args, role: calls.append(("checkpoint", role)),
     }
-    for name in (
-        "patch_fsdp_mesh_for_pp",
-        "patch_dtensor_meta_check_for_pp",
-        "patch_bridge_shared_embedding_broadcast_for_pp",
-        "patch_embedding_grad_reshard_for_pp",
-        "patch_checkpoint_layer_numbering_for_pp",
-    ):
-        namespace[name] = lambda name=name: calls.append(name)
     monkeypatch.setitem(
         sys.modules, "relax.utils.checkpoint_write_patch", SimpleNamespace(patch_checkpoint_write=lambda: None)
     )
@@ -94,7 +103,7 @@ def test_actor_init_applies_role_overrides_before_fsdp_setup(monkeypatch, role, 
     expected_fsdp = base_fsdp if role == "actor" else not base_fsdp
     assert calls[0] == ("dist", expected_fsdp)
     assert ("clip" in calls) == expected_fsdp
-    assert ("patch_fsdp_mesh_for_pp" in calls) == (expected_fsdp and role != "actor")
+    assert (("checkpoint", role) in calls) == expected_fsdp
 
 
 def _default_order_pp_group(world_size: int, pp_size: int, rank: int) -> list[int]:
@@ -276,7 +285,7 @@ def test_check_fsdp_pp_checkpoint_support_short_circuits_on_each_gate(gate):
     check_fsdp_pp_checkpoint_support(_ckpt_args(virtual_pipeline_model_parallel_size=2, **gate))
 
 
-def test_mtp_checkpoint_restores_weights_adam_and_group_metadata(tmp_path, monkeypatch):
+def test_mtp_checkpoint_restores_weights_adam_and_group_metadata(tmp_path):
     """Real CPU DCP/Adam round trip with MCore's shallow-snapshot load
     protocol.
 
@@ -284,10 +293,6 @@ def test_mtp_checkpoint_restores_weights_adam_and_group_metadata(tmp_path, monke
     without adding a distributed fixture. The CPU adapter omits only MCore's
     GPU tensor-layout transforms; the actual Relax preprocessing hook is used.
     """
-    checkpointing = SimpleNamespace(preprocess_fsdp_dtensor_state_dict=lambda args, state, model: state.copy())
-    monkeypatch.setitem(sys.modules, "megatron.training.checkpointing", checkpointing)
-    monkeypatch.setattr(fsdp_pp_patch, "_pp_global_layer_offset", lambda config: config.offset)
-    fsdp_pp_patch.patch_checkpoint_layer_numbering_for_pp()
     args = _ckpt_args(mtp_num_layers=1)
 
     def make_stage(stage, *, loading=False):
@@ -314,9 +319,7 @@ def test_mtp_checkpoint_restores_weights_adam_and_group_metadata(tmp_path, monke
                     value.zero_()
             group_meta.update(lr=0.9, weight_decay=0.9)
         snapshots = {"model": raw["model"].copy(), "optimizer": raw["optimizer"].copy()}
-        processed = checkpointing.preprocess_fsdp_dtensor_state_dict(
-            args, raw, SimpleNamespace(config=SimpleNamespace(offset=stage * 26))
-        )
+        processed = pp_utils.globalize_fsdp_checkpoint_keys(raw, stage * 26, has_mtp=bool(args.mtp_num_layers))
         return params, adam, snapshots, processed
 
     saved = [make_stage(stage) for stage in range(2)]

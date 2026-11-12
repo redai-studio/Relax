@@ -959,9 +959,6 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
     from megatron.bridge import AutoBridge
 
-    if getattr(args, "use_megatron_fsdp", False):
-        import relax.backends.megatron.bridge_column_parallel_dtensor_patch  # noqa: F401
-
     source_path = _select_hf_load_source(args, load_path)
     logger.info(
         f"Load checkpoint from HuggingFace model into Megatron (requested_path={load_path}, source_path={source_path})"
