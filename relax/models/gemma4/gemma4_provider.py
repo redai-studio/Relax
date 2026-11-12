@@ -19,6 +19,7 @@ not importable, so pickling it raises ``PicklingError``.
 
 from contextlib import contextmanager
 from functools import partial
+from typing import ClassVar
 
 from megatron.bridge.models.gemma.gemma4_provider import Gemma4DenseProvider, Gemma4ModelProvider
 from megatron.bridge.models.gemma_vl.gemma4_vl_provider import Gemma4DenseVLProvider, Gemma4VLModelProvider
@@ -71,13 +72,35 @@ class PackedSafeGemma4DenseProvider(_PackedSafeBuildMixin, Gemma4DenseProvider):
     """``Gemma4DenseProvider`` for the text-only path
     (GEMMA4_CONVERSION_MODE=text)."""
 
+    relax_is_multimodal: ClassVar[bool] = False
+
 
 class PackedSafeGemma4DenseVLProvider(_PackedSafeBuildMixin, Gemma4DenseVLProvider):
-    """``Gemma4DenseVLProvider`` for the VL path.
+    """Dense packed image SFT with one SP scatter after visual insertion."""
 
-    Untested -- Relax's gemma-4
-    work is text-only SFT so far.
-    """
+    relax_is_multimodal: ClassVar[bool] = True
+
+    def build(self, *args, **kwargs):
+        model = super().build(*args, **kwargs)
+        if model.pre_process:
+            model.embedding.scatter_to_sequence_parallel = False
+            model.embedding.reduce_scatter_embeddings = False
+            model.embedding.word_embeddings.reduce_scatter_embeddings = False
+        return model
+
+    def provide(self, *args, **kwargs):
+        from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
+
+        from relax.models.gemma4.multimodal_model import PackedGemma4VLModel
+
+        if self.context_parallel_size != 1 or self.pipeline_model_parallel_size != 1:
+            raise NotImplementedError("Packed Gemma4 image SFT requires CP1 and PP1")
+        model = super().provide(*args, **kwargs)
+        model.__class__ = PackedGemma4VLModel
+        hook_hf_module_setattr_for_tp_grad_sync(model.embed_vision)
+        if self.recompute_granularity == "full":
+            model.vision_tower.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        return model
 
 
 #: Where the bridge parks the ``(local, global)`` rope-theta pair. Deliberately
@@ -148,6 +171,8 @@ class _Gemma4MoEProvideMixin:
 class RelaxGemma4MoEProvider(_Gemma4MoEProvideMixin, Gemma4ModelProvider):
     """``Gemma4ModelProvider`` for the text-only MoE path."""
 
+    relax_is_multimodal: ClassVar[bool] = False
+
 
 class RelaxGemma4MoEVLProvider(_Gemma4MoEProvideMixin, Gemma4VLModelProvider):
     """``Gemma4VLModelProvider`` for the MoE VL path.
@@ -156,6 +181,8 @@ class RelaxGemma4MoEVLProvider(_Gemma4MoEProvideMixin, Gemma4VLModelProvider):
     ``provide_language_model()``, which delegates to the ``provide()`` hooked
     here.
     """
+
+    relax_is_multimodal: ClassVar[bool] = True
 
 
 # No subclass adds fields, so an instance can be re-pointed in place and keep

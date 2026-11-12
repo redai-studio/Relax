@@ -36,6 +36,8 @@ from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
 from relax.utils.env import Envs
+from relax.utils.fault_events.models import RecoveryEvidence
+from relax.utils.fault_events.recovery import GlobalStartup
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -179,7 +181,17 @@ def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
 
 
 class Controller:
-    def __init__(self, config: Namespace, runtime_env: dict = None) -> None:
+    # Fault observation is optional; class defaults also cover controllers
+    # built with ``__new__``.
+    _fault_events: Any = None
+    _fault_recovery: Any = None
+    _fault_rebuild_ready: Any = None
+
+    def __init__(
+        self, config: Namespace, runtime_env: dict = None, fault_events: Any = None, fault_recovery: Any = None
+    ) -> None:
+        self._fault_events = fault_events
+        self._fault_recovery = fault_recovery
         self.config = config
         self.serve_dict = {}
         self._teacher_manager = None
@@ -188,7 +200,9 @@ class Controller:
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
-        self._health_manager = HealthManager(check_interval=1.0, config=config)
+        self._health_manager = HealthManager(
+            check_interval=1.0, config=config, fault_events=fault_events, fault_recovery=fault_recovery
+        )
         if not hasattr(self, "_restarting"):
             self._restarting = False  # Flag to indicate a restart is in progress
         # Keep the synchronization object stable across the self.__init__ call
@@ -227,6 +241,10 @@ class Controller:
         self._sft_line_offsets_cache = resolve_sft_num_rollout(self.config)
 
         try:
+            # Agentic shards and data-source actors may read model metadata as
+            # soon as they are created, before service prefetch begins.
+            self._remove_stale_model_caches_before_startup()
+
             # Include data-system initialization in the constructor cleanup
             # transaction: a cluster-handshake orchestration error can happen
             # after the owner actor has created global TQ state.
@@ -346,12 +364,15 @@ class Controller:
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
         dp_size = compute_dp_size(self.config)
+        from relax.engine.sft.runtime import is_i2i_sft
+
         required_node_resources = with_control_plane_affinity(self.config).get("resources", {})
         required_node_resource = next(iter(required_node_resources), None)
         use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)
         if (
             getattr(self.config, "fully_async", False)
             and getattr(self.config, "use_dynamic_batch_size", False)
+            and not (getattr(self.config, "hybrid", False) and getattr(self.config, "balance_data", False))
             and not use_sft_prepack
         ):
             sampler = IdentityWindowSampler(
@@ -360,6 +381,8 @@ class Controller:
                 balance_unit_multiplier=self.config.n_samples_per_prompt,
             )
             logger.info("Using IdentityWindowSampler (fully_async + dynamic batch)")
+        elif is_i2i_sft(self.config):
+            sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")
         elif algo_key == "sft":
             from relax.utils.data.wholepack import WholepackSampler, config_contract, enabled
 
@@ -1001,7 +1024,11 @@ class Controller:
             return ModelCompleteness.FULL if shares_actor_pg else ModelCompleteness.NONE
         return ModelCompleteness.FULL
 
-    def _start_model_prefetch(self, service_pgs: dict[Any, Any]) -> list[Any]:
+    def _remove_stale_model_caches_before_startup(self) -> None:
+        """Finish stale-cache removal before any model consumer can start."""
+        if not _uses_s3_model_prefetch(self.config):
+            return
+
         cleanup_task = ray.remote(num_cpus=0, max_retries=0)(_remove_stale_s3_model_caches_on_node)
         accelerator = device_utils.get_ray_accelerator_name()
         cleanup_node_ids = sorted(
@@ -1018,6 +1045,7 @@ class Controller:
         if cleanup_refs:
             ray.get(cleanup_refs)
 
+    def _start_model_prefetch(self, service_pgs: dict[Any, Any]) -> list[Any]:
         source = getattr(self.config, "model_source", None)
         if source is None or not is_s3_uri(source.uri):
             return []
@@ -1158,7 +1186,9 @@ class Controller:
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
             raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
-        algo: dict = ALGOS.get(algo_key).copy()
+        from relax.core.registry import resolve_algorithm
+
+        algo: dict = resolve_algorithm(self.config)
         ROLES = process_role(self.config)
 
         # Fail-fast on missing SFT producer role; without this the train
@@ -1276,7 +1306,7 @@ class Controller:
     def training_loop(self):
         # Start all services in parallel without blocking on their completion
         # Each service runs independently: rollout, actor, critic, etc.
-        async def run_all_services(*, resume_existing: bool = False):
+        async def run_all_services(*, resume_existing: bool = False, startup: GlobalStartup):
             if not resume_existing and not (self.config.debug_train_only or self.config.debug_rollout_only):
                 # Pass genRM manager(s) to actor for coordinated offload/onload
                 if GENRM_ROLE in self.serve_dict and not self.config.fully_async:
@@ -1332,16 +1362,21 @@ class Controller:
                     # Pure fully_async: actor sends weights to separate actor_fwd/reference services
                     # via checkpoint engine. Hybrid mode skips this because the actor handles
                     # ref/actor_fwd internally via _switch_model.
-                    handles = [self.serve_dict[ROLES.actor].update_weights_fully_async()]
+                    token = startup.token()
+                    handles = [self.serve_dict[ROLES.actor].update_weights_fully_async(recovery_token=token)]
                     if ROLES.actor_fwd in self.serve_dict:
-                        handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async())
+                        handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async(recovery_token=token))
                     if ROLES.reference in self.serve_dict:
-                        handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async())
-                    [await handle for handle in handles]
+                        handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async(recovery_token=token))
+                    # Start senders and receivers together, and await the real
+                    # Serve responses before set_step or generation can start.
+                    with startup.weight_sync():
+                        await asyncio.gather(*handles)
                 if ROLES.actor in self.serve_dict:
-                    step = await self.serve_dict[ROLES.actor].get_step()
-                    for service in self.serve_dict.values():
-                        await service.set_step(step)
+                    with startup.step_restore():
+                        step = await self.serve_dict[ROLES.actor].get_step()
+                        for service in self.serve_dict.values():
+                            await service.set_step(step)
 
             # All startup consumers have now initialized and the first policy
             # weights have been synchronized. Remove source weight shards
@@ -1360,6 +1395,7 @@ class Controller:
             with self._pending_task_refs_lock:
                 self._pending_task_refs = list(task_refs)
 
+            startup.handoff(self.config, self.serve_dict, len(task_refs))
             if task_refs:
                 logger.info(f"Started {len(task_refs)} services in parallel: {service_names}")
 
@@ -1377,15 +1413,20 @@ class Controller:
                         self._pending_task_refs.clear()
 
         resume_existing = False
+        pending_recovery = None
+        pending_initialized = False
         while True:
+            startup = GlobalStartup(self._fault_events, pending_recovery, pending_initialized)
             try:
-                run(run_all_services(resume_existing=resume_existing))
+                run(run_all_services(resume_existing=resume_existing, startup=startup))
                 if self._restarting:
                     raise RuntimeError("Service completion interrupted by recovery")
                 logger.info("All services running successfully")
                 return  # Normal completion, exit
             except Exception as e:
+                startup.fail(self._restarting, self._fault_recovery)
                 if self._restarting:
+                    startup.interrupt()
                     # A restart is in progress (triggered by HealthChecker callback thread).
                     # The service task failure is expected because restart kills the old replica.
                     # Block here until the global restart completes (teardown + re-init),
@@ -1396,8 +1437,17 @@ class Controller:
                     )
                     restart_done_event = self._restart_done_event
                     restart_done_event.wait()  # Block until _global_restart signals done
+                    # Copy the completed attempt before ACK permits the next
+                    # checker callback to replace these shared fields.
+                    pending_recovery = self._fault_recovery
+                    pending_initialized = (
+                        pending_recovery is not None and self._fault_rebuild_ready is pending_recovery
+                    )
                     restart_mode, restart_error = self._consume_restart_cycle()
                     resume_existing = restart_mode == "local"
+                    if resume_existing:
+                        pending_recovery = None
+                        pending_initialized = False
 
                     if restart_error is not None:
                         logger.exception(f"{restart_mode} restart failed, cannot recover: {restart_error}")
@@ -1438,6 +1488,18 @@ class Controller:
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 
+        from relax.engine.sft.runtime import is_i2i_sft
+
+        if is_i2i_sft(getattr(self, "config", None)) and ROLES.sft in self.serve_dict:
+
+            async def stop_image_producer() -> None:
+                await asyncio.wait_for(self.serve_dict[ROLES.sft].handle.stop.remote(), timeout=10)
+
+            try:
+                run(stop_image_producer())
+            except Exception as exc:
+                logger.warning(f"Image SFT producer shutdown failed: {exc}")
+
         self._dispose_rollout_manager()
 
         shutdown_managed_opd_teacher(self._teacher_manager)
@@ -1449,20 +1511,16 @@ class Controller:
         except Exception as e:
             logger.warning(f"Failed to tear down data system during controller shutdown: {e}")
 
-        # Router processes must be terminated explicitly.  They are daemonic,
-        # but ``daemon=True`` only reaps through multiprocessing's atexit hook,
-        # and every exit path in ``entrypoints/train.py`` ends in ``os._exit()``
-        # — which skips atexit entirely.  Without this the router is reparented
-        # to init and outlives the job: measured at ~1.4 GB RSS and a 378 MiB
-        # CUDA context on GPU 0 per submission, accumulating across runs.
+        # Agentic startup launches its Router in this driver process before
+        # creating RolloutManager, so actor-side disposal cannot stop it.
         try:
             from relax.distributed.ray.rollout import stop_launched_routers
 
-            killed = stop_launched_routers()
-            if killed > 0:
-                logger.info(f"Terminated {killed} router process(es) during shutdown")
+            stopped_routers = stop_launched_routers()
+            if stopped_routers > 0:
+                logger.info(f"Terminated {stopped_routers} driver-owned Router(s) during shutdown")
         except Exception as e:
-            logger.warning(f"Failed to terminate router processes during shutdown: {e}")
+            logger.warning(f"Failed to stop driver-owned Routers during shutdown: {e}")
 
         try:
             self._cleanup_s3_model_weights_after_init(force=True)
@@ -1499,6 +1557,7 @@ class Controller:
                 self._restart_done_event.clear()
                 self._restart_error = None
                 self._restart_mode = "global"
+                self._fault_recovery = None
                 break
         try:
             self._restart_serve(role)
@@ -1507,6 +1566,8 @@ class Controller:
             logger.exception("Service recovery failed")
         finally:
             if self._restart_error is not None:
+                if self._restart_mode != "local" and self._fault_events is not None:
+                    self._fault_events.finish(self._fault_recovery, "recovery_failed", "restart_exception")
                 checker = getattr(self._health_manager, "_checker", None)
                 if checker is not None:
                     checker._stop_event.set()
@@ -1539,11 +1600,15 @@ class Controller:
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
             raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
-        algo: dict = ALGOS.get(algo_key).copy()
+        from relax.core.registry import resolve_algorithm
+
+        algo: dict = resolve_algorithm(self.config)
         # Include dynamically added optional roles.
         register_extra_roles(self.config, algo)
         cls = algo.get(role)
         if cls is None:
+            if self._fault_events is not None:
+                self._fault_events.special(role, "handling_skipped", "role_unregistered")
             raise RuntimeError(f"No class registered for role '{role}' during recovery")
 
         restart_count = self._health_manager.increment_restart_count(role)
@@ -1563,6 +1628,11 @@ class Controller:
         }
         global_restart = role in full_rewire_roles or restart_count >= 3
         self._restart_mode = "global" if global_restart else "local"
+        self._fault_recovery = None
+        if self._fault_events is not None:
+            self._fault_recovery = self._fault_events.plan_recovery(
+                role, self._restart_mode, self.config, self.serve_dict
+            )
         if global_restart:
             # Perform full Controller re-initialization from zero when:
             # 1. Actor fails (core training service, all other services depend on it)
@@ -1578,9 +1648,23 @@ class Controller:
         else:
             # Delegate in-place restart to Service (reuses PG, restores step, syncs weights, re-runs task)
             service = self.serve_dict[role]
-            service.restart()
-            self._health_manager.mark_healthy(role)
-            logger.info(f"Service '{role}' restarted successfully")
+            recovery_failed = True
+            try:
+                service.restart(
+                    fault_observer=(
+                        lambda observed=0, failed=0: self._fault_events.evidence(
+                            self._fault_recovery, observed=observed, failed=failed, reason="step_restore_failed"
+                        )
+                    )
+                    if self._fault_recovery is not None
+                    else None
+                )
+                self._health_manager.mark_healthy(role)
+                logger.info(f"Service '{role}' restarted successfully")
+                recovery_failed = False
+            finally:
+                if self._fault_recovery is not None:
+                    self._fault_events.complete_local(self._fault_recovery, failed=recovery_failed)
 
     def _run_global_restart(self) -> None:
         """Perform a full global restart by re-initializing the Controller from
@@ -1612,6 +1696,13 @@ class Controller:
             f"(max={self._max_global_restart}, full Controller re-initialization from zero) ==="
         )
         if self._global_restart_count > self._max_global_restart:
+            if self._fault_recovery is not None:
+                self._fault_events.special(
+                    self._fault_recovery.members[0].role,
+                    "termination_requested",
+                    "restart_limit",
+                    self._fault_recovery,
+                )
             error_msg = (
                 f"Global restart count ({self._global_restart_count}) exceeded "
                 f"maximum allowed ({self._max_global_restart}). "
@@ -1696,6 +1787,22 @@ class Controller:
 
         self._shutdown_agentic_rollout_services()
 
+        # The registry is process-local: agentic Routers belong to this driver,
+        # while other locally launched Rollout Routers belong to the Manager.
+        driver_stopped_routers = 0
+        try:
+            from relax.distributed.ray.rollout import stop_launched_routers
+
+            driver_stopped_routers = stop_launched_routers()
+        except Exception as e:
+            logger.warning(f"[Global Restart] Failed to stop driver-owned Routers: {e}")
+        # Only driver-launched primary Routers are cached in Controller config.
+        # Manager-owned auxiliary Routers can coexist with an external primary.
+        if driver_stopped_routers > 0:
+            self.config.sglang_router_ip = None
+            self.config.sglang_router_port = None
+            logger.info(f"[Global Restart] Terminated {driver_stopped_routers} driver-owned Router(s), endpoint reset")
+
         # --- 1.5 Tear down autoscaler deployment ---
         if self._autoscaler_config is not None:
             try:
@@ -1725,28 +1832,7 @@ class Controller:
         shutdown_async_loop()
         logger.info("[Global Restart] Async event loop stopped")
 
-        # --- 1.9 Terminate router processes and reset cached endpoint ---
-        # The router runs as a daemon subprocess of this main process, so it
-        # survives ray.shutdown().  If we don't kill it, the pre-restart engine
-        # URLs stay in its worker list forever (endless "Connection refused"
-        # health WARNs on dead ports), and post-restart `_start_router` also
-        # short-circuits because `sglang_router_ip`/`_port` were written back
-        # to the config on first launch.
-        try:
-            from relax.distributed.ray.rollout import stop_launched_routers
-
-            killed = stop_launched_routers()
-            # Only clear cached endpoint if we actually owned & killed a router.
-            # An externally-provided router (--sglang-router-ip) was never in
-            # our launched list, so we leave the endpoint set to reuse it.
-            if killed > 0:
-                self.config.sglang_router_ip = None
-                self.config.sglang_router_port = None
-                logger.info(f"[Global Restart] Terminated {killed} router process(es), endpoint reset")
-        except Exception as e:
-            logger.warning(f"[Global Restart] Failed to terminate router: {e}")
-
-        # --- 1.10 Shutdown Ray Serve and Ray to kill all processes ---
+        # --- 1.9 Shutdown Ray Serve and Ray to kill all processes ---
         try:
             serve.shutdown()
             logger.info("[Global Restart] Ray Serve shutdown completed")
@@ -1763,6 +1849,8 @@ class Controller:
 
         try:
             ray.shutdown()
+            if self._fault_events is not None:
+                self._fault_events.retire_source()
             logger.info("[Global Restart] Ray shutdown completed")
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to shutdown Ray: {e}")
@@ -1771,7 +1859,7 @@ class Controller:
         time.sleep(5)
         logger.info("[Global Restart] Waited 5s for resource release")
 
-        # --- 1.11 Re-initialize Ray and Ray Serve (same as train.py) ---
+        # --- 1.10 Re-initialize Ray and Ray Serve (same as train.py) ---
         ray.init(runtime_env=runtime_env)
         logger.info("[Global Restart] Ray re-initialized")
         try:
@@ -1792,7 +1880,10 @@ class Controller:
         saved_global_restart_count = self._global_restart_count
 
         try:
-            self.__init__(config, runtime_env)
+            self.__init__(config, runtime_env, fault_events=self._fault_events, fault_recovery=self._fault_recovery)
+            self._fault_rebuild_ready = self._fault_recovery
+            if self._fault_events is not None:
+                self._fault_events.evidence(self._fault_recovery, observed=RecoveryEvidence.DEPLOYED)
             # Restore fields that __init__ overwrites but must survive across restarts
             self._restarting = saved_restarting
             self._global_restart_count = saved_global_restart_count

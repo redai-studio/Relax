@@ -27,7 +27,7 @@ def common_ops() -> list[Path]:
         if Path(str(f)).name.startswith("common_ops") and str(f).endswith(".so")
     ]
     # SGLang selects the precise-math sm100 variant for Blackwell. A compatible
-    # cubin in the Hopper variant alone does not validate the library B300 loads.
+    # cubin in the Hopper variant alone does not validate the library Blackwell loads.
     blackwell = [lib for lib in libs if lib.parent.name == "sm100"]
     libs = blackwell or [lib for lib in libs if lib.parent.name == "sgl_kernel"]
     if not libs:
@@ -73,7 +73,7 @@ def add_sm103_target(cmake: Path) -> None:
 
 
 def main() -> None:
-    if os.environ["GPU_ARCH"] != "b300":
+    if os.environ["GPU_ARCH"] != "blackwell":
         return
 
     # Pin the installed distribution before downstream dependency resolution.

@@ -69,6 +69,8 @@
 | `--critic-load` | str | None | Critic 模型检查点路径。None 时等于 `--load` |
 | `--critic-save` | str | None | Critic 模型保存路径 |
 
+选中原生 Megatron 检查点后，缺失对应 iteration 目录会直接报错，不再回退到 HF 初始化。加载 DCP 前会检查分片文件是否缺失或被截断。续训需要优化器、scheduler 和 RNG 状态；有意重置时，使用 `--no-load-optim` 重置优化器与 scheduler、`--no-load-rng` 重置 RNG，或使用 `--finetune` 从原生模型权重开始新训练。这些选项不会修复损坏的分片。Megatron release 检查点仍按仅加载权重处理。从 HF 权重初始化时，请明确指定 HF 来源。
+
 ---
 
 ## 数据配置
@@ -476,6 +478,18 @@ SFT producer 如何处理 tokenize + 多模态展开后长度超过单卡容量�
 |------|------|--------|--------|------|
 | `--sft-oversize-strategy` | str | keep | `skip`, `keep`, `truncate_left`, `truncate_right`, `custom` | `skip` 丢弃样本；`keep` 原样返回（可能下游 OOM）；`truncate_left` 保留末尾 `capacity` 个 token；`truncate_right` 保留开头 `capacity` 个 token；`custom` 委托给 `--sft-oversize-custom-function-path`。⚠ 直接截多模态样本可能导致 `multimodal_train_inputs` 错位——需要同时裁剪媒体输入时请用 `custom`。 |
 | `--sft-oversize-custom-function-path` | str | None | - | 在 `--sft-oversize-strategy custom` 时必填。指向一个 Python 可导入函数，签名为 `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) \| None`。返回 `None` 等同于 `skip`。 |
+
+如果希望完整保留超过打包预算的 SFT 样本，同时跳过超过 `--seq-length` 的样本，可在训练命令中加入：
+
+```bash
+--seq-length 262144 \
+--use-dynamic-batch-size \
+--max-tokens-per-gpu 131072 \
+--sft-oversize-strategy custom \
+--sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
+```
+
+该策略直接读取 `--seq-length`，无需额外环境变量。CP=1 时，展开后长度超过 131072、但不超过 262144 tokens 的样本会完整保留并单独组成微批次，更长的样本会被跳过。需要满足 `0 < max_tokens_per_gpu × context_parallel_size <= seq_length`，因为未超过打包预算的样本不会进入 oversize hook。该策略保留原始 tokens 和 loss mask，但不会降低长样本本身的显存需求。
 
 偏好训练先应用 `--preference-max-length` 和 `--preference-max-completion-length`，再使用上述选项处理超长样本对。容量按两条分支的总长度计算：`keep` 保留整对样本并单独组成一个微批次，`skip` 丢弃整对样本。
 

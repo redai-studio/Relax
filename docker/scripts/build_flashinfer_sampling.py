@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Build the FlashInfer AOT sampling kernel for B300."""
+"""Build the FlashInfer AOT sampling kernel for Blackwell."""
 
 import importlib.metadata as md
 import os
@@ -11,7 +11,7 @@ import sys
 
 
 def main() -> None:
-    if os.environ.get("GPU_ARCH") != "b300":
+    if os.environ.get("GPU_ARCH") != "blackwell":
         sys.stdout.write(f"skip flashinfer sampling sm_103a rebuild (GPU_ARCH={os.environ.get('GPU_ARCH')})\n")
         raise SystemExit(0)
 

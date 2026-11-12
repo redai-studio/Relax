@@ -1,0 +1,277 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from examples.chunkflow import adapters
+from examples.chunkflow.adapters import (
+    AttentionAdapter,
+    dense_attention_adapter,
+    register_attention_adapter,
+)
+from examples.chunkflow.integration import install, uninstall
+from examples.chunkflow.runtime import RECOMPUTE_ATTR, UNIT_ATTR
+from examples.chunkflow.scheduler import build_chunks
+from examples.chunkflow.test.cpu.test_gdn import GatedDeltaNet
+from examples.chunkflow.test.cpu.test_gdn import kernels as kernels
+from examples.chunkflow.test.cpu.test_integration import SDPAttention, native_sdpa
+from examples.chunkflow.test.cpu.test_integration import restore_rope_patch as restore_rope_patch
+from examples.chunkflow.units import build_micro_batches, completed_groups, gen_unit_ops
+
+
+class NativeLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(context_parallel_size=1, attention_dropout=0, apply_rope_fusion=True)
+        self.layer_number = 1
+        self.projection = torch.nn.Linear(4, 12, bias=False, dtype=torch.float64)
+        self.core_attention = SDPAttention(gain=True)
+        self.core_attention.softmax_scale = 0.31
+
+
+@pytest.fixture(autouse=True)
+def registry(monkeypatch):
+    monkeypatch.setattr(adapters, "_ADAPTERS", dict(adapters._ADAPTERS))
+    register_attention_adapter(
+        NativeLayer, SDPAttention, dense_attention_adapter(name="native-test", execute=native_sdpa)
+    )
+
+
+@pytest.mark.parametrize("keep_last_k,fp32", [(1, False), (1000, False), (1, True)])
+def test_native_module_packed_outputs_input_and_parameter_gradients(keep_last_k, fp32, monkeypatch):
+    monkeypatch.setenv("RELAX_CHUNKFLOW_KV_GRAD_FP32", str(int(fp32)))
+    torch.manual_seed(32)
+    layer = NativeLayer()
+    reference = copy.deepcopy(layer)
+    lengths = [11, 7, 2, 1]
+    x = torch.randn(sum(lengths), 4, dtype=torch.float64, requires_grad=True)
+    xr = x.detach().clone().requires_grad_()
+    q, k, v = reference.projection(xr).reshape(-1, 3, 1, 4).unbind(1)
+    expected = []
+    start = 0
+    for length in lengths:
+        sl = slice(start, start + length)
+        output = (
+            F.scaled_dot_product_attention(
+                q[sl].transpose(0, 1),
+                k[sl].transpose(0, 1),
+                v[sl].transpose(0, 1),
+                is_causal=True,
+                scale=reference.core_attention.softmax_scale,
+            )
+            .transpose(0, 1)
+            .reshape(length, -1)
+        )
+        expected.append(output * reference.core_attention.gain)
+        start += length
+    expected = torch.cat(expected)
+    dout = torch.randn_like(expected)
+    expected.backward(dout)
+
+    core, original_forward = layer.core_attention, layer.core_attention.forward
+    parameters, state_keys = tuple(layer.parameters()), tuple(layer.state_dict())
+    assert install(layer, 4) == 1
+    assert install(layer, 4) == 0
+    assert layer.core_attention is core
+    assert tuple(layer.parameters()) == parameters
+    assert tuple(layer.state_dict()) == state_keys
+
+    chunks = build_chunks(lengths, 4)
+    units = build_micro_batches(chunks)
+    pending = {}
+    actual = torch.empty_like(expected)
+    for kind, uid in gen_unit_ops(units, chunks, keep_last_k):
+        unit = units[uid]
+        indices = [
+            sum(lengths[: s.seq_id]) + i
+            for c in unit.chunks
+            for s in c.segments
+            for i in range(s.prefix, s.prefix + s.length)
+        ]
+        if kind == "B":
+            pending.pop(uid).backward(dout[indices])
+            for group in completed_groups(unit):
+                layer.chunkflow_runtime.release_group(group)
+            continue
+        cu = [0]
+        for chunk in unit.chunks:
+            for segment in chunk.segments:
+                cu.append(cu[-1] + segment.length)
+        packed = SimpleNamespace(
+            cu_seqlens_q_cpu=cu,
+            cu_seqlens_q=torch.tensor(cu, dtype=torch.int32),
+            **{UNIT_ATTR: unit, RECOMPUTE_ATTR: kind == "Fr"},
+        )
+        with torch.set_grad_enabled(kind != "Fp"):
+            q, k, v = layer.projection(x[indices]).reshape(-1, 3, 1, 4).unbind(1)
+            output = core(q, k, v, packed_seq_params=packed)
+        if kind != "Fp":
+            pending[uid] = output
+            actual[indices] = output.detach()
+
+    layer.chunkflow_runtime.assert_empty("native test")
+    for got, want in ((actual, expected), (x.grad, xr.grad)):
+        torch.testing.assert_close(got, want, rtol=1e-9, atol=1e-9)
+    for got, want in zip(layer.parameters(), reference.parameters()):
+        torch.testing.assert_close(got.grad, want.grad, rtol=1e-9, atol=1e-9)
+    assert uninstall(layer) == 1
+    assert uninstall(layer) == 0
+    assert core.forward == original_forward
+    assert layer.config.apply_rope_fusion is True
+    assert tuple(layer.state_dict()) == state_keys
+
+
+@pytest.mark.parametrize(
+    "feature,value",
+    [
+        ("window_size", (4, 0)),
+        ("attention_dropout", 0.1),
+        ("softmax_type", "learnable"),
+        ("ple_layer_ids", [1]),
+        ("recompute_granularity", "full"),
+        ("checkpoint_core_attention", True),
+        ("_relax_qwen35_optimized", True),
+    ],
+)
+def test_unsupported_features_do_not_partially_install(feature, value):
+    model = torch.nn.ModuleList([NativeLayer(), NativeLayer()])
+    setattr(model[1].config, feature, value)
+    forwards = [layer.core_attention.forward for layer in model]
+    with pytest.raises(NotImplementedError):
+        install(model, 4)
+    assert [layer.core_attention.forward for layer in model] == forwards
+    assert all(layer.config.apply_rope_fusion for layer in model)
+    assert not hasattr(model, "chunkflow_runtime")
+
+
+def test_unknown_outer_attention_does_not_inherit_dense_adapter():
+    class SparseLayer(NativeLayer):
+        pass
+
+    layer = SparseLayer()
+    original = layer.core_attention.forward
+    with pytest.raises(NotImplementedError, match="SparseLayer.*SDPAttention"):
+        install(layer, 4)
+    assert layer.core_attention.forward == original
+    assert not hasattr(layer, "chunkflow_runtime")
+
+
+def test_uninstalled_model_accepts_a_new_chunk_size():
+    layer = NativeLayer()
+    # TE represents unrestricted causal attention with this window pair.
+    layer.core_attention.window_size = (-1, 0)
+    assert install(layer, 4) == 1
+    with pytest.raises(ValueError, match="different chunk size"):
+        install(layer, 8)
+    assert uninstall(layer) == 1
+    assert not hasattr(layer, "chunkflow_runtime")
+    assert install(layer, 8) == 1
+    assert layer.chunkflow_runtime.chunk_size == 8
+    assert uninstall(layer) == 1
+
+
+def test_failed_adapter_install_restores_previously_installed_layers(kernels):
+    class FailingLayer(NativeLayer):
+        pass
+
+    def fail(*args):
+        raise RuntimeError("native setup failed")
+
+    register_attention_adapter(FailingLayer, SDPAttention, AttentionAdapter("failure", lambda layer: None, fail))
+    recurrent = GatedDeltaNet(kernels)
+    model = torch.nn.ModuleList([NativeLayer(), recurrent, FailingLayer()])
+    original = model[0].core_attention.forward
+    original_conv = kernels.causal_conv1d
+    original_rule = recurrent.gated_delta_rule
+    with pytest.raises(RuntimeError, match="native setup failed"):
+        install(model, 4)
+    assert model[0].core_attention.forward == original
+    assert not hasattr(model, "chunkflow_runtime")
+    assert not hasattr(model[0], "_chunkflow_attention_adapter")
+    assert not hasattr(recurrent, "_chunkflow_attention_adapter")
+    assert "forward" not in recurrent.__dict__
+    assert recurrent.gated_delta_rule is original_rule
+    assert kernels.causal_conv1d is original_conv
+
+
+def test_non_chunk_call_preserves_native_arguments_output_and_gradients():
+    torch.manual_seed(42)
+    layer = NativeLayer()
+    reference = copy.deepcopy(layer)
+    inputs = [torch.randn(7, 1, 4, dtype=torch.float64, requires_grad=True) for _ in range(3)]
+    expected_inputs = [t.detach().clone().requires_grad_() for t in inputs]
+    # These are native-only arguments, unsupported by the chunk KV wrapper.
+    kwargs = dict(q_lengths=(4, 3), kv_lengths=(4, 3), scale=0.27)
+    expected = reference.core_attention(*expected_inputs, **kwargs)
+    assert install(layer, 4) == 1
+    actual = layer.core_attention(*inputs, **kwargs)
+    torch.testing.assert_close(actual, expected)
+    dout = torch.randn_like(actual)
+    actual.backward(dout)
+    expected.backward(dout)
+    for got, want in zip(inputs, expected_inputs):
+        torch.testing.assert_close(got.grad, want.grad)
+    torch.testing.assert_close(layer.core_attention.gain.grad, reference.core_attention.gain.grad)
+    layer.chunkflow_runtime.assert_empty("native pass-through")
+    assert uninstall(layer) == 1
+
+
+def test_dense_adapter_accepts_native_positional_mask_and_bias():
+    class Core(SDPAttention):
+        # Megatron places attention_bias before packed_seq_params.
+        def forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=None,
+            packed_seq_params=None,
+            **kwargs,
+        ):
+            return super().forward(query, key, value, **kwargs)
+
+    def execute(original, call):
+        key, value = call.joined_kv()
+        return original(
+            call.query,
+            key,
+            value,
+            None,
+            "causal",
+            q_lengths=call.q_lengths,
+            kv_lengths=call.kv_lengths,
+            scale=call.softmax_scale,
+        )
+
+    register_attention_adapter(NativeLayer, Core, dense_attention_adapter(name="positional", execute=execute))
+    layer = NativeLayer()
+    layer.core_attention = Core()
+    assert install(layer, 4) == 1
+    unit = build_micro_batches(build_chunks([3], 4))[0]
+    packed = SimpleNamespace(cu_seqlens_q_cpu=[0, 3], **{UNIT_ATTR: unit})
+    q, k, v = [torch.randn(3, 1, 4, dtype=torch.float64, requires_grad=True) for _ in range(3)]
+    expected = (
+        F.scaled_dot_product_attention(
+            q.transpose(0, 1),
+            k.transpose(0, 1),
+            v.transpose(0, 1),
+            is_causal=True,
+        )
+        .transpose(0, 1)
+        .reshape(3, 4)
+    )
+    for args, kwargs in (
+        ((None, "causal", None), {"packed_seq_params": packed}),
+        ((None, "causal", None, packed), {}),
+    ):
+        actual = layer.core_attention(q, k, v, *args, **kwargs)
+        torch.testing.assert_close(actual, expected)
+    assert uninstall(layer) == 1

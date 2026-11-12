@@ -20,6 +20,9 @@ def main() -> None:
     import_module("pyarrow")
 
     assert torch.version.cuda == "13.0", torch.version.cuda
+    expected_sglang = os.environ.get("RELAX_SGLANG_VERSION")
+    if expected_sglang:
+        assert md.version("sglang") == expected_sglang, md.version("sglang")
     assert md.version("transformer-engine") == "2.18.0"
     assert md.version("transformer-engine-cu13") == "2.18.0"
     for package in ("transformer-engine-cu13", "transformer-engine-torch", "sglang-kernel"):

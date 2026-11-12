@@ -112,7 +112,7 @@ index ba632f3..99e8aa9 100644
      freeze_language_model: bool = False
      freeze_vision_model: bool = False
 diff --git a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
-index 4ef12d7..01c5180 100644
+index 4ef12d7..7bf9ad0 100644
 --- a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
 +++ b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
 @@ -16,7 +16,9 @@ import logging
@@ -275,6 +275,15 @@ index 4ef12d7..01c5180 100644
  
              if self.config.sequence_parallel:
                  tp_group = self.config._pg_collection.tp if self.config._pg_collection is not None else None
+@@ -532,7 +622,7 @@ class KimiK25VLModel(MegatronModule):
+             runtime_gather_output=runtime_gather_output,
+             packed_seq_params=packed_seq_params,
+         )
+-        if cp_size > 1:
++        if cp_size > 1 and loss_mask is not None:
+             return outputs, loss_mask
+         return outputs
+ 
 diff --git a/megatron/bridge/models/qwen/qwen3_moe_bridge.py b/megatron/bridge/models/qwen/qwen3_moe_bridge.py
 index a6476f4..cab29da 100644
 --- a/megatron/bridge/models/qwen/qwen3_moe_bridge.py
@@ -772,7 +781,69 @@ index e0f7c9f..1d3c4e4 100644
 diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 --- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 +++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-@@ -249,6 +249,11 @@
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
++import os
+ from collections import defaultdict
+-from typing import Dict
++from typing import Callable, Dict
+
+ import torch
+
+@@ -76,6 +77,14 @@
+         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
+         self.param_update_in_fp32 = param_update_in_fp32
+         self.sub_optimizer_kwargs = kwargs
++        # Optional parameter-local replacement for CPU master -> GPU copy-back.
++        # Callbacks enqueue work on the current _h2d_stream; the existing event
++        # below fences their work before the training stream consumes weights.
++        # Keep this instance mapping outside _init_sub_optimizers: state loading
++        # rebuilds sub-optimizers, but does not replace the callback contract.
++        self._param_copy_back_gpu_callbacks: Dict[
++            torch.Tensor, Callable[[torch.Tensor, torch.Tensor], None]
++        ] = {}
+
+         self._init_sub_optimizers()
+         self._register_load_state_dict_hooks()
+@@ -121,7 +130,11 @@
+                 with torch.cuda.stream(self._h2d_stream):
+                     for param in _param_generator(optimizer):
+                         gpu_param = self.cpu_copys_map_gpu_param[param]
+-                        gpu_param.data.copy_(param.data, non_blocking=True)
++                        callback = self._param_copy_back_gpu_callbacks.get(gpu_param)
++                        if callback is None:
++                            gpu_param.data.copy_(param.data, non_blocking=True)
++                        else:
++                            callback(gpu_param, param)
+                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
+
+             return param_copy_back_gpu_hook
+@@ -225,8 +238,8 @@
+
+     @staticmethod
+     def build_cpu_optimizer_list(cpu_optimizer_cls, cpu_param_groups):
+-        """Build several cpu optimizers to enable overlap. Currently we naively
+-        assign each parameter to an individual optimizer.
++        """Group expert parameters by RELAX_EXPERT_CPU_ADAM_BATCH_SIZE (default 16).
++        Dense parameters always use individual optimizers.
+
+         Args:
+             cpu_optimizer_cls (Type[torch.optim.Optimizer]): A torch optimizer class
+@@ -242,13 +255,23 @@
+             params = group_defaults.pop("params")
+             if isinstance(params, torch.Tensor):
+                 params = [params]
+-            for param in params:
++            batch_size = 1
++            if group.get("is_expert_parallel", False):
++                batch_size = int(os.getenv("RELAX_EXPERT_CPU_ADAM_BATCH_SIZE", "16"))
++                if batch_size < 1:
++                    raise ValueError("RELAX_EXPERT_CPU_ADAM_BATCH_SIZE must be at least 1")
++            for start in range(0, len(params), batch_size):
+                 _cpu_param_group = group_defaults.copy()
+-                _cpu_param_group["params"] = [param]
++                _cpu_param_group["params"] = params[start : start + batch_size]
+                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
          return cpu_optimizers
  
      def _get_sub_optimizer_param_groups(self, offload_fraction: float):
@@ -784,7 +855,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
          params = []
          for group in self.param_groups:
              params.extend(group["params"])
-@@ -276,6 +281,8 @@
+@@ -276,6 +299,8 @@
                      cpu_copy = True
                  if self.param_update_in_fp32 and param.dtype != torch.float32:
                      param = param.detach().clone().float()
@@ -793,7 +864,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
                      param_to_fp32_param[orig_param] = param
 
                  if cpu_copy:
-@@ -370,11 +377,11 @@
+@@ -370,11 +395,11 @@
          if not self.param_update_in_fp32:
              return
          for param, v in self.state.items():
@@ -810,7 +881,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
  
      def update_fp32_param_by_new_param(self):
          """
-@@ -382,6 +389,16 @@
+@@ -382,6 +407,16 @@
          """
          for param, fp32_param in self.param_to_fp32_param.items():
              fp32_param.data.copy_(param)
@@ -1165,7 +1236,7 @@ index 59a5fef..62d9a0c 100644
                      )
                  q_indexer_cp = rotate_activation(q_indexer_cp)
 -                weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
-+                with get_fp8_disabled_context():
++                with get_fp8_disabled_context(indexer.config):
 +                    weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
                  weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
                  nvtx_range_pop("dsv4_cp_indexer_q_weights")
