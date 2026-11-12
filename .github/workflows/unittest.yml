@@ -39,11 +39,6 @@ jobs:
           - suite: cpu
             name: Unit Tests (CPU)
             gpus: 0
-            pytest-args: tests/cpu examples/chunkflow/test/cpu -n 2 --dist loadfile --max-worker-restart=0
-          # One bounded comparison before choosing the CPU worker count.
-          - suite: cpu4
-            name: Unit Tests (CPU, 4 workers)
-            gpus: 0
             pytest-args: tests/cpu examples/chunkflow/test/cpu -n 4 --dist loadfile --max-worker-restart=0
           - suite: gpux1
             name: Unit Tests (H20, 1 GPU)
