@@ -69,7 +69,7 @@ def test_mtp_predicts_two_tokens_ahead_without_crossing_documents(monkeypatch, c
         seen.append(labels.clone())
         return torch.ones_like(labels, dtype=torch.float)
 
-    monkeypatch.setattr(patch, "_chunked_mtp_enabled", lambda: True)
+    monkeypatch.setattr(patch, "_chunked_mtp_enabled", lambda: chunked)
     monkeypatch.setattr(patch, "_resolve_chunk_size", lambda: 8)
 
     def capture_auxiliary_loss(hidden, loss):
@@ -84,6 +84,8 @@ def test_mtp_predicts_two_tokens_ahead_without_crossing_documents(monkeypatch, c
         cross_entropy_loss_fusion=False,
         cross_entropy_fusion_impl="native",
         mtp_detach_heads=False,
+        mtp_loss_type="cross_entropy",
+        attention_cp_layout="zigzag",
     )
     fn = patch.process_mtp_loss if chunked else mtp.process_mtp_loss
     fn(
@@ -92,10 +94,10 @@ def test_mtp_predicts_two_tokens_ahead_without_crossing_documents(monkeypatch, c
         kwargs["loss_mask"],
         Head(),
         None,
-        None,
-        False,
-        loss,
-        config,
+        runtime_gather_output=None,
+        is_training=False,
+        compute_language_model_loss=loss,
+        config=config,
         cp_group=None,
         packed_seq_params=packed,
     )

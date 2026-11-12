@@ -1797,3 +1797,48 @@ index 4c02fc3..8a738b1 100644
  
      if args.logits_save_dir is not None:
          assert args.async_save, (
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_config.py
+@@ -74,6 +74,8 @@
+         ffn_hidden_size=hf_config.intermediate_size,
+         add_bias_linear=True,
+         add_qkv_bias=True,
++        attention_backend=megatron_config.attention_backend,
++        flash_attention_version=megatron_config.flash_attention_version,
+     )
+ 
+     # apply text model config to vision model config
+diff --git a/megatron/core/tokenizers/utils/build_tokenizer.py b/megatron/core/tokenizers/utils/build_tokenizer.py
+--- a/megatron/core/tokenizers/utils/build_tokenizer.py
++++ b/megatron/core/tokenizers/utils/build_tokenizer.py
+@@ -2,6 +2,7 @@
+ 
+ import logging
+ import math
++from argparse import Namespace
+ 
+ from megatron.core._rank_utils import safe_get_rank
+ from megatron.core.tokenizers import MegatronTokenizer
+@@ -128,12 +129,19 @@
+ 
+ def vocab_size_with_padding(
+     orig_vocab_size: int,
+-    make_vocab_size_divisible_by: int,
+-    tensor_model_parallel_size: int,
++    make_vocab_size_divisible_by: int | Namespace,
++    tensor_model_parallel_size: int | None = None,
+     logging_enabled=True,
+ ):
+     """Pad vocab size so it is divisible by model parallel size and
+     still having GPU friendly size."""
++
++    # Relax's legacy caller passes the training args as the second argument.
++    if tensor_model_parallel_size is None:
++        args = make_vocab_size_divisible_by
++        make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
++        tensor_model_parallel_size = args.tensor_model_parallel_size
++        logging_enabled = logging_enabled and args.rank == 0
+ 
+     after = orig_vocab_size
+     multiple = make_vocab_size_divisible_by * tensor_model_parallel_size

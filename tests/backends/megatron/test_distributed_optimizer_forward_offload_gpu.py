@@ -65,7 +65,7 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
         model_bytes = sum(parameter.numel() * parameter.element_size() for parameter in source.parameters())
         assert model_bytes < 1024**2
         models, optimizers = [], []
-        for _ in range(2):
+        for offload in (False, True):
             model = TinyMLP().to(device="cuda", dtype=torch.bfloat16)
             model.load_state_dict(source.state_dict())
             for parameter in model.parameters():
@@ -100,7 +100,7 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
                     main_grads_dtype=torch.float32,
                     exp_avg_dtype=torch.float32,
                     exp_avg_sq_dtype=torch.float32,
-                    chunked_optimizer_state_offload=True,
+                    chunked_optimizer_state_offload=offload,
                     optimizer_state_offload_fraction=1.0,
                     optimizer_state_offload_chunk_size_mb=0,
                 ),
@@ -111,13 +111,11 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
             child = optimizer.chained_optimizers[0]
             assert isinstance(child, DistributedOptimizer)
             assert isinstance(child.optimizer, FusedAdam)
-            assert child.optimizer.master_weights and child._optimizer_state_offloader is not None
+            assert child.optimizer.master_weights
+            assert (child._optimizer_state_offloader is not None) == offload
             models.append(ddp)
             optimizers.append(optimizer)
 
-        # Both paths retain chunked state execution. Only the baseline omits the
-        # newly connected optimizer-to-forward master offload lifecycle call.
-        monkeypatch.setattr(optimizers[0], "offload_optimizer_state_for_forward", Mock())
         args = Namespace(
             empty_unused_memory_level=0,
             custom_megatron_before_train_step_hook_path=None,

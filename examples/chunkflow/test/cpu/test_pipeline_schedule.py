@@ -204,6 +204,7 @@ def test_plan_preserves_real_samples_and_excludes_alignment_padding(padding):
 def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, keep_last_k, parent_window):
     pytest.importorskip("megatron.core")
     import torch
+    from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.training import global_vars
 
     from examples.chunkflow import pipeline_schedules as executor
@@ -215,16 +216,18 @@ def test_executor_routes_planned_shapes_for_ragged_units(monkeypatch, stage, kee
         monkeypatch.delenv("RELAX_CHUNKFLOW_PARENT_WINDOW", raising=False)
     else:
         monkeypatch.setenv("RELAX_CHUNKFLOW_PARENT_WINDOW", str(parent_window))
-    config = SimpleNamespace(
+    config = TransformerConfig(
+        num_layers=4,
+        num_attention_heads=2,
+        hidden_size=4,
+        pipeline_model_parallel_size=4,
+        pipeline_dtype=torch.float32,
+        tensor_model_parallel_size=2,
         variable_seq_lengths=True,
         batch_p2p_comm=True,
         sequence_parallel=True,
-        hidden_size=4,
         overlap_p2p_comm=False,
-        no_sync_func=None,
         deallocate_pipeline_outputs=True,
-        grad_sync_func=None,
-        finalize_model_grads_func=None,
     )
     args = SimpleNamespace(
         chunkflow_chunk_size=256,
