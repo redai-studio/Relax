@@ -4637,6 +4637,18 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
     addr_and_ports: dict[int, dict] = {}
 
+    genrm_instances = getattr(args, "_genrm_instances_resolved", None)
+    if genrm_instances is None:
+        genrm_instances = getattr(args, "genrm_instances", None)
+    genrm_count = (
+        len(genrm_instances) if genrm_instances is not None else int(bool(getattr(args, "genrm_model_path", None)))
+    )
+    genrm_ports = None
+    if genrm_count:
+        from .genrm import _GENRM_PORT_BASE, _GENRM_PORT_WINDOW_SIZE
+
+        genrm_ports = (_GENRM_PORT_BASE, _GENRM_PORT_BASE + genrm_count * _GENRM_PORT_WINDOW_SIZE)
+
     # Track per-node port cursors so that different engine groups (called
     # sequentially) never race for the same ports on a given node.
     node_port_cursor: dict[int, int] = {}
@@ -4659,12 +4671,19 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
             def port(consecutive=1):
                 nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
+                while True:
+                    _, port = ray.get(
+                        engine._get_current_node_ip_and_free_port.remote(
+                            start_port=start_port,
+                            consecutive=consecutive,
+                        )
                     )
-                )
+                    # GenRM may have allocated ports without binding yet. Exclude
+                    # its whole window, including blocks that cross the boundary.
+                    if genrm_ports and port < genrm_ports[1] and port + consecutive > genrm_ports[0]:
+                        start_port = genrm_ports[1]
+                        continue
+                    break
                 start_port = port + consecutive
                 node_port_cursor[node_idx] = start_port
                 return port

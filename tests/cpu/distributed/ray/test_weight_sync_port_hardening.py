@@ -18,6 +18,7 @@ trivially pass.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -50,6 +51,52 @@ logger = get_logger(__name__)
 
 
 EPHEMERAL_FLOOR = 32768  # Linux default ephemeral range starts here.
+
+
+@pytest.mark.parametrize(
+    ("genrm_config", "base_port", "busy_below", "expected_port", "expected_dist_port"),
+    [
+        ({}, 16000, 0, 16000, 16002),
+        ({"genrm_model_path": "judge"}, 15000, 16000, 17000, 17002),
+        ({"genrm_model_path": "judge"}, 15995, 0, 15995, 17000),
+        ({"_genrm_instances_resolved": {"judge": {}}}, 16000, 0, 17000, 17002),
+        ({"_genrm_instances_resolved": {"a": {}, "b": {}}}, 17000, 0, 18000, 18002),
+        ({"genrm_instances": {"a": {}, "b": {}}}, 16995, 0, 18000, 18002),
+        ({"genrm_model_path": "judge"}, 17000, 0, 17000, 17002),
+    ],
+    ids=[
+        "no-judge",
+        "scan-into-judge",
+        "block-crosses-boundary",
+        "normalized-legacy",
+        "multi",
+        "raw-multi",
+        "after-window",
+    ],
+)
+def test_rollout_ports_exclude_configured_genrm_windows(
+    monkeypatch, patch_ray_get, genrm_config, base_port, busy_below, expected_port, expected_dist_port
+):
+    """A free-but-not-yet-bound judge port must not become a rollout
+    TCPStore."""
+    from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
+
+    args = SimpleNamespace(num_gpus_per_node=1, rollout_num_gpus_per_engine=1, sglang_dp_size=1, **genrm_config)
+    engine = make_mock_engine()
+    monkeypatch.setattr(misc, "is_port_available", lambda port: port >= busy_below)
+
+    def alloc(start_port=10000, consecutive=1):
+        return AwaitableValue(("10.0.0.1", misc.get_free_port(start_port=start_port, consecutive=consecutive)))
+
+    engine._get_current_node_ip_and_free_port.remote.side_effect = alloc
+    ports, cursors = _allocate_rollout_engine_addr_and_ports_normal(
+        args=args, rollout_engines=[(0, engine)], base_port=base_port
+    )
+
+    assert ports[0]["port"] == expected_port
+    assert ports[0]["nccl_port"] == expected_port + 1
+    assert ports[0]["dist_init_addr"] == f"10.0.0.1:{expected_dist_port}"
+    assert cursors == {0: expected_dist_port + 31}
 
 
 # ---------------------------------------------------------------------------
