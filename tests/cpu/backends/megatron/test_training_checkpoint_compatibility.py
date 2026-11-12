@@ -17,6 +17,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.utils.env import Envs
+
 
 _ROOT = Path(__file__).resolve().parents[4]
 
@@ -66,7 +68,8 @@ def test_sgd_selective_offload_rejected_including_tms_fallback(
 
 
 @pytest.mark.parametrize("reset", [False, True])
-def test_reset_sgd_momentum_prevents_zero_gradient_update(reset):
+def test_reset_sgd_momentum_prevents_zero_gradient_update(monkeypatch, reset):
+    monkeypatch.setenv("RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY", "0")
     torch = pytest.importorskip("torch")
     parameter = torch.nn.Parameter(torch.tensor([1.0]))
     optimizer = torch.optim.SGD([parameter], lr=0.1, momentum=0.9, weight_decay=0)
@@ -89,8 +92,9 @@ def test_reset_sgd_momentum_prevents_zero_gradient_update(reset):
 
     module = _load(
         "relax/backends/megatron/model.py",
-        {"train"},
+        {"train", "_release_memory_for_step"},
         {
+            "Envs": Envs,
             "get_args": lambda: args,
             "DataIterator": type("DataIterator", (), {}),
             "DDP": type("DDP", (), {}),

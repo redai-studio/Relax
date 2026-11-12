@@ -60,6 +60,7 @@ def _args():
 def test_resident_sft_preserves_hooks_across_single_step_calls(monkeypatch, enabled, intermediate_reader):
     monkeypatch.setenv("RELAX_SFT_RESIDENT_PARAM_OVERLAP", "1" if enabled else "0")
     monkeypatch.setenv("RELAX_QWEN38_EMPTY_CACHE_BEFORE_GRAD_SYNC", "0")
+    monkeypatch.setenv("RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY", "0")
     args = _args()
     config = SimpleNamespace(no_sync_func=None, param_sync_func=None)
     trace, forward_hooks = [], []
@@ -136,6 +137,7 @@ def test_resident_sft_preserves_hooks_across_single_step_calls(monkeypatch, enab
         Path("relax/backends/megatron/model.py"),
         {
             "train",
+            "_release_memory_for_step",
             "should_disable_forward_pre_hook",
             "enable_forward_pre_hook",
             "disable_forward_pre_hook",
