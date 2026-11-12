@@ -604,6 +604,7 @@ def test_six_streams_keep_prompt_session_export_and_update_links(args, mpu):
         kind="resp",
         state_hash="leaf",
         weight_version_delta=["v1"],
+        weight_version_spans=[],
     )
     forest = NS(session_id="s", group_index=2, index=5, label="gold", lineage=lambda state: [node])
     inventory = InventoryRecorder(args, "train")
