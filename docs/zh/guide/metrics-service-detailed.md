@@ -250,6 +250,15 @@ client.report_step(step=100)
 3. 点击 "Load" 按钮
 4. 选择生成的 JSON 文件
 
+## Actor 训练步完成信号
+
+`log_perf_data_raw` 在主上报 rank 的 actor 训练完成批次中写入
+`perf/actor_train_step_completed=1`，并保留 `perf/actor_train_time` 耗时。
+该信号由训练后端正常结束训练阶段的日志路径产生，不依赖 FLOPs 或 MFU 支持；
+仅 rollout、推理或非主 rank 的指标不会产生该信号。
+遥测采集器应消费完成信号，按训练 step 去重，避免自行推断后端或将缺失 MFU 当作未完成训练。
+完成信号不代表 checkpoint 保存、权重同步或整个实验已结束。
+
 ## 总结
 
 新的 Metrics Service 提供了：

@@ -39,6 +39,9 @@ def log_perf_data_raw(
     # Pure compute = total train − stream-wait. stream_wait ≈ 0 → rollout sufficient;
     # large → generation-bound. Absent on non-streaming paths → treated as 0.
     if "perf/actor_train_time" in log_dict:
+        # Completion is independent of backend-specific FLOPs/MFU support.
+        # Consumers use this signal instead of interpreting timing snapshots.
+        log_dict["perf/actor_train_step_completed"] = 1
         _stream_wait = log_dict.get("perf/actor_train_stream_wait_time", 0.0)
         log_dict["perf/actor_train_compute_time"] = max(log_dict["perf/actor_train_time"] - _stream_wait, 0.0)
 

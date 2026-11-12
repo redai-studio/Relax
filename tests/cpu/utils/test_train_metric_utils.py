@@ -4,6 +4,8 @@ import math
 from argparse import Namespace
 from unittest.mock import Mock
 
+import pytest
+
 from relax.utils.training import train_metric_utils
 
 
@@ -64,6 +66,7 @@ def test_log_perf_data_raw_reports_mfu_for_known_peak(monkeypatch):
 
     assert logged_metrics["perf/device_peak_tflops"] == 100.0
     assert logged_metrics["perf/mfu/actor_train"] == 0.75
+    assert logged_metrics["perf/actor_train_step_completed"] == 1
 
 
 def test_log_perf_data_raw_reports_baseline_per_card_throughput(monkeypatch):
@@ -73,3 +76,38 @@ def test_log_perf_data_raw_reports_baseline_per_card_throughput(monkeypatch):
     assert logged_metrics["perf/actor_train_tok_per_s_per_card"] == 75.0
     assert logged_metrics["perf/step_token_per_s_per_card"] == 50.0
     assert logged_metrics["perf/step_resp_token_per_s_per_card"] == 25.0
+
+
+@pytest.mark.parametrize(
+    "primary,timings,completed",
+    [
+        (True, {"actor_train": 2.0}, True),
+        (False, {"actor_train": 2.0}, False),
+        (True, {"rollout": 3.0, "log_probs": 1.0}, False),
+    ],
+)
+def test_actor_completion_signal_without_flops(monkeypatch, primary, timings, completed):
+    # Use the real Timer so draining a primary/non-primary snapshot cannot
+    # reproduce a completed stage on a later logging call. Only the sink is mocked.
+    timer = train_metric_utils.Timer()
+    monkeypatch.setattr(timer, "timers", timings)
+    monkeypatch.setattr(timer, "seq_lens", [], raising=False)
+    logged = []
+    monkeypatch.setattr(
+        train_metric_utils.tracking_utils,
+        "log",
+        lambda _args, metrics, step_key: logged.append(metrics),
+    )
+    args = Namespace(wandb_always_use_train_step=False)
+    train_metric_utils.log_perf_data_raw(3, args, is_primary_rank=primary, flops_counter=None, world_size=8)
+
+    assert len(logged) == int(primary)
+    assert timer.log_dict() == {}
+    if primary:
+        assert (logged[0].get("perf/actor_train_step_completed") == 1) == completed
+        assert logged[0]["rollout/step"] == 3
+        assert "perf/mfu/actor_train" not in logged[0]
+        if completed:
+            assert logged[0]["perf/actor_train_time"] == 2.0
+        train_metric_utils.log_perf_data_raw(3, args, is_primary_rank=True)
+        assert "perf/actor_train_step_completed" not in logged[1]

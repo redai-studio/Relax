@@ -250,6 +250,17 @@ client.report_step(step=100)
 3. Click "Load" button
 4. Select the generated JSON file
 
+## Actor training step completion
+
+`log_perf_data_raw` adds `perf/actor_train_step_completed=1` to the primary
+reporter's completed actor-training batch, alongside `perf/actor_train_time`.
+The signal comes from the backend's normal end-of-training logging path and
+does not require FLOPs or MFU support. Rollout-only, inference-only and
+non-primary metrics do not produce it. Telemetry consumers should use this
+signal and deduplicate by training step instead of inferring the backend or
+treating missing MFU as incomplete training. The signal does not mean that
+checkpointing, weight synchronization or the entire experiment has finished.
+
 ## Summary
 
 The new Metrics Service provides:
