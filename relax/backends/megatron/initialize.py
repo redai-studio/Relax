@@ -82,6 +82,9 @@ def init(args):
 
         run_config = pretrain_cfg_container_from_args(args)
         run_config.finalize()
+        # Relax's scheduler still reads the legacy argument namespace.
+        args.start_weight_decay = run_config.scheduler.start_weight_decay
+        args.end_weight_decay = run_config.scheduler.end_weight_decay
         global_vars.set_run_config(run_config)
         global_vars._set_train_state()
         if args.async_save and args.use_persistent_ckpt_worker:
