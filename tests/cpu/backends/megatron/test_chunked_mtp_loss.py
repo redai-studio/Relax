@@ -446,7 +446,8 @@ def test_chunked_mtp_acceptance_obeys_logging_gate(monkeypatch, is_training, col
 @pytest.mark.parametrize("implementation", ["native", "te"])
 @pytest.mark.parametrize("collect_acceptance", [False, True])
 def test_chunked_mtp_acceptance_survives_inplace_ce(monkeypatch, implementation, collect_acceptance):
-    """Acceptance reads predictions before TE CE replaces logits with gradients."""
+    """Acceptance reads predictions before TE CE replaces logits with
+    gradients."""
 
     class InplaceCE(torch.autograd.Function):
         @staticmethod
