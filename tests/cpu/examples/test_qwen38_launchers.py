@@ -62,10 +62,18 @@ def test_launchers_preserve_topology_and_resumable_checkpoint(tmp_path, script, 
     assert not (tmp_path / "checkpoints").exists(), "Dry run must not create output directories"
 
 
-def test_h800_rollout_and_driver_receive_precision_and_model_paths(tmp_path):
-    config = _dry_run("run-qwen38-flash-next-openr1mm-128xgpu.sh", tmp_path / "checkpoints")
+@pytest.mark.parametrize(
+    "script,gpus,nodes",
+    [
+        ("run-qwen38-flash-next-openr1mm-128xgpu.sh", 128, 16),
+        ("run-qwen38-flash-next-openr1mm-grpo-blackwell.sh", 24, 3),
+        ("run-qwen38-flash-next-dapo-math-grpo-blackwell.sh", 24, 3),
+    ],
+)
+def test_rl_rollout_and_driver_receive_precision_and_model_paths(tmp_path, script, gpus, nodes):
+    config = _dry_run(script, tmp_path / "checkpoints", WORLD_SIZE=str(nodes))
     args = config["argv"]
-    assert json.loads(_value(args, "--resource"))["rollout"] == [1, 128]
+    assert json.loads(_value(args, "--resource"))["rollout"] == [1, gpus]
     assert _value(args, "--advantage-estimator") == "grpo"
     assert _value(args, "--rollout-num-gpus-per-engine") == "8"
     assert _value(args, "--moe-token-dispatcher-type") == "alltoall"
@@ -74,7 +82,7 @@ def test_h800_rollout_and_driver_receive_precision_and_model_paths(tmp_path):
     assert env["MEGATRON"] == "/image/megatron"
     assert env["RELAX_QWEN38_PLE_STREAMED"] == "0"
     assert env["RELAX_QWEN38_FP32_ROUTER"] == "1"
-    assert env["QWEN48_PLE_CPU_OFFLOAD"] == "0"
+    assert "QWEN48_PLE_CPU_OFFLOAD" not in env
 
 
 NV_RECIPES = [
