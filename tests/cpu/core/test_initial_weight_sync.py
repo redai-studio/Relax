@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from relax.utils.fault_events.recovery import GlobalStartup
+
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -79,20 +81,25 @@ class InitialWeightSyncTests(unittest.TestCase):
                 service.handle = SimpleNamespace(
                     update_weights_fully_async=SimpleNamespace(remote=lambda response=response, **_kwargs: response)
                 )
-                service.update_weights_fully_async = lambda service=service: self.update(service)
+                service.update_weights_fully_async = lambda service=service, recovery_token=None: self.update(
+                    service, recovery_token=recovery_token
+                )
                 service.get_step = AsyncMock(return_value=0)
                 responses[role] = response
             elif role in required_receivers:
                 response = FakeDeploymentResponse(lambda role=role: receiver(role))
                 service.handle = SimpleNamespace(
-                    recv_weight_fully_async=SimpleNamespace(remote=lambda response=response: response)
+                    recv_weight_fully_async=SimpleNamespace(remote=lambda response=response, **_kwargs: response)
                 )
-                service.recv_weight_fully_async = lambda service=service: self.receive(service)
+                service.recv_weight_fully_async = lambda service=service, recovery_token=None: self.receive(
+                    service, recovery_token=recovery_token
+                )
                 responses[role] = response
             services[role] = service
 
         namespace = {
             "asyncio": asyncio,
+            "GlobalStartup": GlobalStartup,
             "ROLES": roles,
             "GENRM_ROLE": "genrm",
             "logger": MagicMock(),
@@ -105,6 +112,8 @@ class InitialWeightSyncTests(unittest.TestCase):
             config=SimpleNamespace(debug_train_only=False, debug_rollout_only=False, fully_async=True, hybrid=False),
             serve_dict=services,
             _teacher_manager=None,
+            _fault_events=None,
+            _fault_recovery=None,
             _restarting=False,
             _cleanup_s3_model_weights_after_init=MagicMock(),
             _report_error_to_metrics_service=MagicMock(),

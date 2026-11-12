@@ -2,7 +2,9 @@
 """Driver-owned, bounded fault event admission and consumption."""
 
 import threading
+from argparse import Namespace
 from collections import deque
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -10,6 +12,8 @@ from relax.utils.logging_utils import get_logger
 
 from .context import FaultTraceContext, capture_trace_context, parse_trace_context
 from .models import MAX_UINT, REASONS, EventDraft, FaultContext, RecoveryEvidence, new_id, service_role, valid_uint
+from .receipts import parse_snapshot
+from .recovery import RecoveryPlan, expected_evidence, global_plan
 from .store import FaultEventStore, _Record
 from .telemetry import OTelConfigError
 
@@ -47,10 +51,15 @@ class Recovery:
     handoff: bool = False
     outcome: str | None = None
     conflict: bool = False
+    plan: RecoveryPlan | None = None
+    plan_verified: bool = False
     _local_complete: threading.Event = field(default_factory=threading.Event, init=False, repr=False, compare=False)
     _local_failed: threading.Event = field(default_factory=threading.Event, init=False, repr=False, compare=False)
     _local_event_ids: tuple[str, ...] = field(default=(), init=False, repr=False, compare=False)
     _local_context: FaultTraceContext | None = field(default=None, init=False, repr=False, compare=False)
+    # (plan, observed, event_ids, context) recorded by a finished startup and
+    # applied by the next admitted transaction.
+    _startup_handoff: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -86,10 +95,11 @@ class FaultEventRuntime:
         self._publications: dict[tuple[int, str], _Publication] = {}
         self._snapshot: tuple[FaultContext, ...] = ()
         self._recoveries: dict[str, Recovery] = {}
+        self._receipt_seed: dict | None = None
         self.generation = -1
         self._source_disabled = False
         self._source_retired = True
-        self._source_epoch = (-1, threading.Event())
+        self._source_epoch = (-1, threading.Event(), ())
         self._snapshot_invalid = threading.Event()
         self._lock = threading.Lock()
         self._diagnostic_lock = threading.Lock()
@@ -139,6 +149,10 @@ class FaultEventRuntime:
                 return None
             self._admission_context = context
             self._settle_local_completions()
+            if self._source_epoch[1].is_set() and not self._source_retired:
+                self._retire_source(self._source_epoch[0], self._source_epoch[2])
+            # After pending retirement, so a deferred handoff never outlives its receiver.
+            self._settle_startup_handoffs()
             return function(*args) if function is not None else None
         except Exception:
             self.note_unknown()
@@ -334,7 +348,8 @@ class FaultEventRuntime:
                 return
             if (
                 not {"roles", "source_generation", "faults", "observation_error"} <= payload.keys()
-                or payload.keys() - {"roles", "source_generation", "faults", "observation_error", "trace_contexts"}
+                or payload.keys()
+                - {"roles", "source_generation", "faults", "observation_error", "trace_contexts", "receipts"}
                 or not valid_uint(generation)
                 or type(payload["observation_error"]) is not bool
                 or type(payload["roles"]) not in (list, tuple)
@@ -357,19 +372,44 @@ class FaultEventRuntime:
         if payload["observation_error"]:
             self.note_unknown()
         contexts = self._parse_contexts(payload.get("trace_contexts"), faults)
-        result = self._call(self._observe_snapshot, generation, faults, contexts)
+        try:
+            receipts = parse_snapshot(payload.get("receipts"))
+        except Exception:
+            self.note_unknown()
+            receipts = None
+        event_ids = tuple(new_id() for _ in range(2 * _MAX_MEMBERS)) if receipts is not None else ()
+        result = self._call(self._observe_snapshot, generation, faults, contexts, receipts, event_ids)
         if result is None and generation == self.generation:
             self._snapshot_invalid.set()
 
     def _observe_snapshot(
-        self, generation: int, faults: tuple[FaultContext, ...], contexts: dict | None = None
+        self,
+        generation: int,
+        faults: tuple[FaultContext, ...],
+        contexts: dict | None = None,
+        receipts: dict | None = None,
+        event_ids: tuple[str, ...] = (),
     ) -> bool:
-        if (
-            generation != self.generation
-            or self._source_disabled
-            or self._source_retired
-            or self._source_epoch[1].is_set()
-        ):
+        if generation != self.generation or self._source_retired or self._source_epoch[1].is_set():
+            return False
+        # Health queries merge slots before any unhealthy callback can destroy
+        # the receiver, including a query with no unhealthy roles.
+        if receipts is not None and receipts["token"] == self._receipt_seed:
+            if receipts["conflict"]:
+                self.note_unknown("RECEIPT_CONFLICT")
+            recovery = self._recoveries.get(receipts["token"]["recovery_id"])
+            if recovery is not None:
+                recovery.conflict |= receipts["conflict"]
+                if receipts["conflict"]:
+                    # Slots are cumulative. Once a slot conflicts it is
+                    # absent from both masks, including previously merged
+                    # evidence. Keep independent definite results usable.
+                    recovery.observed &= ~RecoveryEvidence.WEIGHT_OPERATIONS.value
+                    recovery.failed &= ~RecoveryEvidence.WEIGHT_OPERATIONS.value
+                self._evidence(
+                    recovery, receipts["observed"], receipts["failed"], False, "operation_failed", event_ids
+                )
+        if self._source_disabled:
             return False
         active = {fault.fault_id for recovery in self._recoveries.values() for fault in recovery.members}
         for publication in self._publications.values():
@@ -394,11 +434,14 @@ class FaultEventRuntime:
                 self._publish(publication)
         return True
 
-    def bind_source(self) -> tuple[int | None, None]:
+    def bind_source(self, recovery: Recovery | None = None) -> tuple[int | None, dict | None]:
         """Retire the old source and reserve the next receiver generation."""
         try:
             event_ids = tuple(new_id() for _ in range(_MAX_RECOVERIES * _MAX_MEMBERS))
-            result = self._call(self._bind_source, event_ids, threading.Event())
+            retirement_ids = tuple(new_id() for _ in range(_MAX_RECOVERIES * _MAX_MEMBERS))
+            if recovery is not None and type(recovery) is not Recovery:
+                raise ValueError("INVALID_RECOVERY: recovery must be a Recovery instance")
+            result = self._call(self._bind_source, event_ids, threading.Event(), recovery, retirement_ids)
             return result if result is not None else (None, None)
         except Exception:
             self.note_unknown()
@@ -418,8 +461,7 @@ class FaultEventRuntime:
             # one. Counting and terminal selection still use admission below.
             epoch[1].set()
             self.note_unknown("SOURCE_RETIRED")
-            event_ids = tuple(new_id() for _ in range(_MAX_RECOVERIES * _MAX_MEMBERS))
-            self._call(self._retire_source, generation, event_ids)
+            self._call(self._retire_source, generation, epoch[2])
         except Exception:
             self.note_unknown()
 
@@ -429,6 +471,7 @@ class FaultEventRuntime:
             return False
         self._source_epoch[1].set()
         self._source_retired = True
+        self._receipt_seed = None
         self._snapshot = ()
         self._snapshot_invalid.set()
         self.note_unknown("SOURCE_RETIRED")
@@ -445,7 +488,13 @@ class FaultEventRuntime:
                 )
         return True
 
-    def _bind_source(self, event_ids: tuple[str, ...], source_fence: threading.Event) -> tuple[int | None, None]:
+    def _bind_source(
+        self,
+        event_ids: tuple[str, ...],
+        source_fence: threading.Event,
+        recovery: Recovery | None,
+        retirement_ids: tuple[str, ...],
+    ) -> tuple[int | None, dict | None]:
         old = self.generation
         self._retire_source(old, event_ids)
         if old >= MAX_UINT:
@@ -456,9 +505,18 @@ class FaultEventRuntime:
         self.generation = old + 1
         self._source_disabled = False
         self._source_retired = False
-        self._source_epoch = (self.generation, source_fence)
+        self._source_epoch = (self.generation, source_fence, retirement_ids)
         self._snapshot_invalid.clear()
-        return self.generation, None
+        if recovery is not None:
+            if (
+                recovery.mode == "global"
+                and recovery.receiver_generation == self.generation
+                and self._recoveries.get(recovery.recovery_id) is recovery
+            ):
+                self._receipt_seed = self.token(recovery)
+            else:
+                self.note_unknown("OUTCOME_UNOBSERVED")
+        return self.generation, self._receipt_seed.copy() if self._receipt_seed is not None else None
 
     def _emit(
         self,
@@ -472,7 +530,19 @@ class FaultEventRuntime:
             if not self._enqueue(self._draft(fault, kind, reason, event_id, recovery)):
                 self._increment("_lost")
 
-    def start_recovery(self, role: str, mode: str, expected: int) -> Recovery | None:
+    def plan_recovery(self, role: str, mode: str, config: Namespace, roles: Collection[str]) -> Recovery | None:
+        """Freeze configured operations before the old controller is torn
+        down."""
+        try:
+            if type(mode) is not str or mode not in ("local", "global"):
+                raise ValueError("INVALID_RECOVERY: mode must be local or global")
+            plan = global_plan(config, roles) if mode == "global" else None
+            return self._admit_recovery(service_role(role), mode, int(expected_evidence(mode, config, roles)), plan)
+        except Exception:
+            self.note_unknown()
+            return None
+
+    def start_recovery(self, role: str, mode: str, expected: int, plan: RecoveryPlan | None = None) -> Recovery | None:
         try:
             role = service_role(role)
             if isinstance(expected, RecoveryEvidence):
@@ -480,17 +550,32 @@ class FaultEventRuntime:
             if (
                 type(mode) is not str
                 or mode not in ("local", "global")
-                or not valid_uint(expected, 63)
+                or not valid_uint(expected, RecoveryEvidence.ALL)
                 or not expected
             ):
                 raise ValueError("INVALID_RECOVERY")
-            recovery_id = new_id()
-            event_ids = tuple(new_id() for _ in range(_MAX_MEMBERS))
-            local_event_ids = tuple(new_id() for _ in range(2 * _MAX_MEMBERS)) if mode == "local" else ()
-            return self._call(self._start_recovery, role, mode, expected, recovery_id, event_ids, local_event_ids)
+            if plan is not None:
+                if type(plan) is not RecoveryPlan:
+                    raise ValueError("INVALID_PLAN: plan must be a RecoveryPlan instance")
+                plan.validate()
+                if mode != "global" or plan.expected != expected:
+                    raise ValueError("INVALID_PLAN: expected evidence must match the global plan")
+            return self._admit_recovery(role, mode, expected, plan)
         except Exception:
             self.note_unknown()
             return None
+
+    def _admit_recovery(self, role: str, mode: str, expected: int, plan: RecoveryPlan | None) -> Recovery | None:
+        return self._call(
+            self._start_recovery,
+            role,
+            mode,
+            expected,
+            new_id(),
+            tuple(new_id() for _ in range(_MAX_MEMBERS)),
+            tuple(new_id() for _ in range(2 * _MAX_MEMBERS)) if mode == "local" else (),
+            plan,
+        )
 
     def _start_recovery(
         self,
@@ -500,6 +585,7 @@ class FaultEventRuntime:
         recovery_id: str,
         event_ids: tuple[str, ...],
         local_event_ids: tuple[str, ...],
+        plan: RecoveryPlan | None,
     ) -> Recovery | None:
         if (
             self._snapshot_invalid.is_set()
@@ -533,12 +619,92 @@ class FaultEventRuntime:
             return None
         members = tuple(candidates)
         recovery = Recovery(recovery_id, members, mode, self.generation + int(mode == "global"), expected)
+        recovery.plan = plan
         recovery._local_event_ids = local_event_ids
         self._recoveries[recovery_id] = recovery
         for fault in members:
             self._publications[(fault.source_generation, fault.role)].consumed = True
         self._emit(members, "handling_started", None, recovery, event_ids)
         return recovery
+
+    def token(self, recovery: Recovery | None) -> dict | None:
+        if type(recovery) is not Recovery or recovery.mode != "global":
+            return None
+        return {
+            "run_id": self.run_id,
+            "recovery_id": recovery.recovery_id,
+            "recovery_generation": recovery.receiver_generation,
+        }
+
+    def startup_handoff(
+        self,
+        recovery: Recovery | None,
+        config: Namespace,
+        roles: Collection[str],
+        observed: RecoveryEvidence,
+    ) -> None:
+        if recovery is None:
+            return
+        try:
+            plan = global_plan(config, roles)
+        except Exception:
+            plan = None  # An unreadable rebuilt graph cannot verify the frozen plan.
+        try:
+            # Record before admission: a rejected or failed admission must not
+            # lose the handoff of a startup that has already finished.
+            recovery._startup_handoff = (
+                plan,
+                int(observed),
+                tuple(new_id() for _ in range(2 * _MAX_MEMBERS)),
+                capture_trace_context(),
+            )
+            self._call(None)
+        except Exception:
+            self.note_unknown()
+
+    def complete_handoff(self, recovery: Recovery | None, actual_plan: RecoveryPlan, observed: int) -> None:
+        """Compare the graph, merge local evidence and select handoff
+        atomically."""
+        if recovery is None:
+            return
+        try:
+            if isinstance(observed, RecoveryEvidence):
+                observed = int(observed)
+            if (
+                type(actual_plan) is not RecoveryPlan
+                or type(recovery) is not Recovery
+                or not valid_uint(observed, RecoveryEvidence.LOCAL)
+            ):
+                raise ValueError("INVALID_HANDOFF: handoff requires a plan, recovery and local evidence bits")
+            actual_plan.validate()
+            event_ids = tuple(new_id() for _ in range(2 * _MAX_MEMBERS))
+            self._call(self._complete_handoff, recovery, actual_plan, observed, event_ids)
+        except Exception:
+            self.note_unknown()
+
+    def _complete_handoff(
+        self,
+        recovery: Recovery,
+        actual_plan: RecoveryPlan,
+        observed: int,
+        event_ids: tuple[str, ...],
+    ) -> None:
+        if self._recoveries.get(recovery.recovery_id) is not recovery or recovery.outcome is not None:
+            return
+        if recovery.receiver_generation != self.generation or self._source_retired or self._source_disabled:
+            # The rebuilt receiver was never bound or is already retired: no
+            # receipt can complete this attempt, so release it without a result.
+            self.note_unknown("OUTCOME_UNOBSERVED")
+            self._recoveries.pop(recovery.recovery_id)
+            return
+        if recovery.mode != "global" or recovery.plan is None or recovery.plan != actual_plan:
+            recovery.conflict = True
+            self.note_unknown()
+            return
+        recovery.plan_verified = True
+        if observed & (recovery.expected & RecoveryEvidence.LOCAL) != recovery.expected & RecoveryEvidence.LOCAL:
+            self.note_unknown("OUTCOME_UNOBSERVED")
+        self._evidence(recovery, observed, 0, True, "handoff_exception", event_ids)
 
     def complete_local(self, recovery: Recovery | None, failed: bool = False) -> None:
         """Remember the original local flow's return/exception without
@@ -560,6 +726,20 @@ class FaultEventRuntime:
             self._call(None)
         except Exception:
             self.note_unknown()
+
+    def _settle_startup_handoffs(self) -> None:
+        for recovery in tuple(self._recoveries.values()):
+            request = recovery._startup_handoff
+            if request is None:
+                continue
+            recovery._startup_handoff = None
+            plan, observed, event_ids, context = request
+            previous_context = self._admission_context
+            self._admission_context = context
+            try:
+                self._complete_handoff(recovery, plan, observed, event_ids)
+            finally:
+                self._admission_context = previous_context
 
     def _settle_local_completions(self) -> None:
         # Every lifecycle transaction drains these fixed fences first, before
@@ -601,13 +781,15 @@ class FaultEventRuntime:
                 failed = int(failed)
             if (
                 type(recovery) is not Recovery
-                or not valid_uint(observed, 63)
-                or not valid_uint(failed, 63)
+                or not valid_uint(observed, RecoveryEvidence.ALL)
+                or not valid_uint(failed, RecoveryEvidence.ALL)
                 or type(handoff) is not bool
                 or type(reason) is not str
                 or reason not in REASONS["recovery_failed"]
             ):
                 raise ValueError("INVALID_EVIDENCE")
+            if recovery.mode == "global" and ((observed & ~RecoveryEvidence.DEPLOYED) or handoff):
+                raise ValueError("UNVALIDATED_HANDOFF: global startup evidence requires an atomic plan comparison")
             event_ids = tuple(new_id() for _ in range(2 * _MAX_MEMBERS))
             self._call(self._evidence, recovery, observed, failed, handoff, reason, event_ids)
         except Exception:
@@ -623,9 +805,6 @@ class FaultEventRuntime:
             return
         if self._recoveries.get(recovery.recovery_id) is not recovery:
             return
-        if recovery.mode == "global" and (observed or handoff):
-            self.note_unknown()
-            return
         if (observed | failed) & ~recovery.expected or (recovery.observed | observed) & (recovery.failed | failed):
             recovery.conflict = True
             self.note_unknown("RECEIPT_CONFLICT")
@@ -638,36 +817,65 @@ class FaultEventRuntime:
         if recovery.failed:
             self._finish(recovery, "recovery_failed", reason, event_ids[_MAX_MEMBERS:])
         elif (
-            recovery.mode == "local"
-            and recovery.handoff
+            recovery.handoff
+            and (recovery.mode == "local" or recovery.plan_verified)
             and recovery.observed == recovery.expected
             and not recovery.conflict
         ):
             self._finish(recovery, "recovery_succeeded", None, event_ids[_MAX_MEMBERS:])
 
-    def finish(self, recovery: Recovery | None, kind: str, reason: str | None) -> None:
+    def finish(
+        self,
+        recovery: Recovery | None,
+        kind: str,
+        reason: str | None,
+        *,
+        observed: int = 0,
+        failed: int = 0,
+    ) -> None:
         if recovery is None:
             return
         try:
+            if isinstance(observed, RecoveryEvidence):
+                observed = int(observed)
+            if isinstance(failed, RecoveryEvidence):
+                failed = int(failed)
             if (
                 type(recovery) is not Recovery
                 or type(kind) is not str
                 or kind not in ("recovery_failed", "recovery_interrupted", "recovery_succeeded")
                 or (reason is not None and type(reason) is not str)
                 or reason not in REASONS[kind]
+                or not valid_uint(observed, RecoveryEvidence.ALL)
+                or not valid_uint(failed, RecoveryEvidence.ALL)
+                or (kind == "recovery_succeeded" and (observed or failed))
             ):
                 raise ValueError("INVALID_OUTCOME")
             event_ids = tuple(new_id() for _ in range(_MAX_MEMBERS))
-            self._call(self._finish, recovery, kind, reason, event_ids)
+            self._call(self._finish, recovery, kind, reason, event_ids, observed, failed)
         except Exception:
             self.note_unknown()
 
-    def _finish(self, recovery: Recovery, kind: str, reason: str | None, event_ids: tuple[str, ...]) -> None:
+    def _finish(
+        self,
+        recovery: Recovery,
+        kind: str,
+        reason: str | None,
+        event_ids: tuple[str, ...],
+        observed: int = 0,
+        failed: int = 0,
+    ) -> None:
         if recovery.outcome is not None or self._recoveries.get(recovery.recovery_id) is not recovery:
             return
+        if (observed | failed) & ~recovery.expected or (recovery.observed | observed) & (recovery.failed | failed):
+            recovery.conflict = True
+            self.note_unknown("RECEIPT_CONFLICT")
+            return
+        recovery.observed |= observed
+        recovery.failed |= failed
         if kind == "recovery_succeeded" and (
-            recovery.mode != "local"
-            or not recovery.handoff
+            not recovery.handoff
+            or (recovery.mode == "global" and not recovery.plan_verified)
             or recovery.observed != recovery.expected
             or recovery.failed
             or recovery.conflict
