@@ -15,15 +15,19 @@ def _chars(text: str) -> list[int]:
 
 
 def test_ir_defaults_and_attempt_counter():
-    ir = InflightRequest(
-        request_id="r1",
-        parent_state_hash="hash",
-        rollout_id=0,
-        kind=RequestKind.FRESH,
-        abort_count=0,
-        waiter=asyncio.get_event_loop_policy().new_event_loop().create_future(),
-        wall_started_at=0.0,
-    )
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    try:
+        ir = InflightRequest(
+            request_id="r1",
+            parent_state_hash="hash",
+            rollout_id=0,
+            kind=RequestKind.FRESH,
+            abort_count=0,
+            waiter=loop.create_future(),
+            wall_started_at=0.0,
+        )
+    finally:
+        loop.close()
     assert ir.pending_weight_version_spans == []
     assert ir.weight_version_attempt_count == 0
 
@@ -134,8 +138,10 @@ def _two_resp_forest():
 def test_build_sample_flattens_spans_to_response_coordinates():
     forest, leaf = _two_resp_forest()
     sample = forest.build_sample(leaf_state_hash=leaf, tokenizer=_FakeTokenizer())
-    # 展平后坐标系变为相对整条 response 的连续下标：第二个 resp node 的 span
-    # 偏移 response_start=2。
+    # Flattened coordinates index the concatenated resp-node (loss_mask=1)
+    # tokens, so the second resp node's span is offset by the first resp
+    # node's 2 tokens (interleaved obs tokens are not part of the coordinate
+    # system).
     assert sample.weight_version_spans == [
         WeightVersionSpan("1", 0, 2, 0),
         WeightVersionSpan("3", 2, 4, 1),
