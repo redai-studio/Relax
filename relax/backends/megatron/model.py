@@ -823,7 +823,7 @@ def _patch_gdn_for_dynamic_cp(linear_cp_mode: str | None = None) -> None:
 
         # Reuse the module's own prep (split/l2norm/GQA-expand) with CP disabled so
         # its internal `// cp_size_headwise` becomes a no-op. Wrap in the dynamo-disable
-        # guard added by docker/patch/megatron/20260506-85bced0ae.patch (Qwen3.6 GDN
+        # guard in the Megatron image patch (Qwen3.6 GDN
         # torch.compile failure); calling _prepare_qkv_for_gated_delta_rule directly
         # would re-trigger that compile failure.
         with torch._dynamo.config.patch(disable=True):

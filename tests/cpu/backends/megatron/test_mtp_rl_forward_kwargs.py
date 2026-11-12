@@ -10,7 +10,7 @@ batch["full_loss_masks"]`` (the response-only mask) BEFORE calling
 do not silently break RL+MTP.
 
 The auxiliary loss is added inside the patched Megatron ``process_mtp_loss``
-(``docker/patch/megatron/20260506-85bced0ae.patch``) when ``mtp_kwargs`` is
+(``docker/patch/latest/megatron.patch``) when ``mtp_kwargs`` is
 present and ``labels`` is None — verified end-to-end by the Day-2 smoke test, not
 here.
 """
