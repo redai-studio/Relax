@@ -39,11 +39,11 @@ jobs:
           - suite: cpu
             name: Unit Tests (CPU)
             gpus: 0
-            pytest-args: tests/cpu examples/chunkflow/test/cpu -n 4 --dist loadfile --max-worker-restart=0
+            pytest-args: tests/cpu examples/chunkflow/test/cpu -n 6 --dist loadfile --max-worker-restart=0
           - suite: gpux1
             name: Unit Tests (H20, 1 GPU)
             gpus: 1
-            pytest-args: tests/ examples/chunkflow/test/gpu --ignore=tests/cpu --ignore=tests/gpux4 -n 2 --dist loadfile --max-worker-restart=0
+            pytest-args: tests/ examples/chunkflow/test/gpu --ignore=tests/cpu --ignore=tests/gpux4 -n 3 --dist loadfile --max-worker-restart=0
           - suite: gpux4
             name: Unit Tests (H20, 4 GPUs)
             gpus: 4
