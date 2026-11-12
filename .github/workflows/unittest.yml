@@ -39,7 +39,9 @@ jobs:
           - suite: cpu
             name: Unit Tests (CPU)
             gpus: 0
-            pytest-args: tests/cpu examples/chunkflow/test/cpu
+            # Reward tests start Ray during collection and reuse named actors.
+            # Run the entire directory separately below, not in xdist workers.
+            pytest-args: tests/cpu examples/chunkflow/test/cpu --ignore=tests/cpu/engine/rewards -n 2 --dist loadfile --max-worker-restart=0
           - suite: gpux1
             name: Unit Tests (H20, 1 GPU)
             gpus: 1
@@ -94,6 +96,8 @@ jobs:
           else
             device_args=(
               --env CUDA_VISIBLE_DEVICES= --env NVIDIA_VISIBLE_DEVICES=void
+              # Do not auto-attach to another test's explicitly started Ray head.
+              --env RAY_ADDRESS=local
               --env OMP_NUM_THREADS=1 --env MKL_NUM_THREADS=1 --env OPENBLAS_NUM_THREADS=1
             )
           fi
@@ -123,6 +127,8 @@ jobs:
         if: matrix.gpus > 0
         run: docker exec "$CI_CONTAINER_NAME" nvidia-smi
 
+      # GPUs remain serial: xdist workers would share the same device allocation
+      # and distributed tests assume exclusive ranks/ports within that allocation.
       - name: Run unit tests
         timeout-minutes: 20
         env:
@@ -133,6 +139,17 @@ jobs:
             python -m pytest "$@" -v -ra --tb=short --durations=50 --junitxml=/artifacts/junit.xml \
               2>&1 | tee /artifacts/pytest.log
           ' bash "${pytest_args[@]}"
+
+      - name: Run serial CPU reward tests
+        # Keep this coverage even when the parallel CPU tests fail.
+        if: ${{ !cancelled() && matrix.suite == 'cpu' }}
+        timeout-minutes: 20
+        run: |
+          docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+            python -m pytest tests/cpu/engine/rewards -n 0 \
+              -v -ra --tb=short --durations=50 --junitxml=/artifacts/junit-rewards.xml \
+              2>&1 | tee /artifacts/pytest-rewards.log
+          '
 
       - name: Stop test container
         if: always()
