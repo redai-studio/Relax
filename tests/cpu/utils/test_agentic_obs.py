@@ -224,7 +224,7 @@ def test_train_jsonl_preserves_nested_ids_and_strict_numbers(tmp_path):
     )
     writer.close()
     (row,) = _read_jsonl(path)
-    assert row["schema_version"] == "3.1.0"
+    assert row["schema_version"] == "3.2.0"
     assert row["samples"] == [{"sample_export_id": str(2**60 + 1), "advantage_mean": None, "returns_mean": None}]
     assert "NaN" not in path.read_text()
     assert json.loads(path.with_suffix(".status.json").read_text())["records_written"] == 1

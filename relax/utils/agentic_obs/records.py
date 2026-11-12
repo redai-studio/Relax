@@ -26,8 +26,10 @@ UNASSIGNED_SAMPLE_EXPORT_ID = -1
 OBSERVATION_DATA_FIELDS = ("sample_export_ids", "agentic_group_ids")
 
 # A major bump covers incompatible field/type changes; a minor bump is additive.
-# Version 2 writes sample_export_id as a JSON string instead of a number.
-SCHEMA_VERSION = "3.1.0"
+# Version 2 writes sample_export_id as a JSON string instead of a number;
+# 3.1 snapshots weight_version_spans into trajectory lineage; 3.2 stamps
+# consumed_weight_version on train samples.
+SCHEMA_VERSION = "3.2.0"
 # The training stream versions its mask encoding independently.
 TRAIN_SCHEMA_VERSION = "4.0.0"
 

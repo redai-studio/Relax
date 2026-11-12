@@ -385,7 +385,7 @@ def test_trajectory_stream_carries_weight_version_spans(tmp_path, rollout_module
     export_id = trajectory["sample_export_id"]
     assert export_id == str(sample.sample_export_id)
     assert int(export_id) >> 56 == 15 and int(export_id) & 1
-    assert trajectory["schema_version"] == "3.1.0" and trajectory["run_id"] == "run_test"
+    assert trajectory["schema_version"] == "3.2.0" and trajectory["run_id"] == "run_test"
     assert trajectory["sample_index"] == 5 and "index" not in trajectory
     assert trajectory["group_index"] == 2 and trajectory["label"] == "gold"
     assert trajectory["export_name"] is None and trajectory["exported_at"].endswith("Z")
