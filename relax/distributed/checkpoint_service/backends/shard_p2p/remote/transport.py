@@ -320,7 +320,6 @@ class BufferedWriter:
             self._record("ranges_producer_wait_s", time.monotonic() - started)
             self._record("ranges_producer_wait_calls", 1)
             keys = sorted({w["target"] for w, _ in writes})
-            parallel = len(keys) > 1
             requests = []
             for key in keys:
                 started = time.monotonic()
@@ -349,12 +348,8 @@ class BufferedWriter:
                 source_descs = self.agent.get_xfer_descs(sources, "VRAM")
                 target_descs = self.agent.get_xfer_descs(targets, target_memory_type)
                 self._record("native_descriptors_s", time.monotonic() - started)
-                if parallel:
-                    requests.append((source_descs, target_descs, self.targets[key][0]))
-                else:
-                    self._transfer(source_descs, target_descs, self.targets[key][0], deadline=deadline, sources=writes)
-            if parallel:
-                self._transfer_many(requests, writes, deadline)
+                requests.append((source_descs, target_descs, self.targets[key][0]))
+            self._transfer_many(requests, writes, deadline)
         except Exception:
             self._retain_failure()
             raise
