@@ -373,6 +373,6 @@ def test_retool_generate_uses_native_sglang_parameters(monkeypatch, evaluation):
     )
     assert result.status == Sample.Status.COMPLETED
     assert "seed" not in requests[0]["sampling_params"]
-    assert ("sampling_seed" in requests[0]["sampling_params"]) != evaluation
+    assert requests[0]["sampling_params"]["sampling_seed"] == args.rollout_seed
     assert requests[0]["custom_logit_processor"]
     assert requests[0]["sampling_params"]["custom_params"]["token_ids"] == list(range(151665, 152064))

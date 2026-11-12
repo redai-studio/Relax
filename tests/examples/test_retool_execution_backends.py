@@ -167,7 +167,15 @@ with mock.patch.object(sandbox.importlib.util, 'spec_from_file_location', return
         self.assertEqual(
             execution_service.execution_status(result(returncode=-signal.SIGKILL, timed_out=True)), "TimeLimitExceeded"
         )
-        for signum in (signal.SIGSEGV, signal.SIGBUS, signal.SIGILL, signal.SIGFPE, signal.SIGABRT, signal.SIGXFSZ):
+        for signum in (
+            signal.SIGSEGV,
+            signal.SIGBUS,
+            signal.SIGILL,
+            signal.SIGFPE,
+            signal.SIGABRT,
+            signal.SIGXFSZ,
+            signal.SIGTRAP,
+        ):
             with self.subTest(signum=signum):
                 self.assertEqual(execution_service.execution_status(result(returncode=-signum)), "Error")
         for signum in (signal.SIGKILL, signal.SIGTERM, signal.SIGINT):

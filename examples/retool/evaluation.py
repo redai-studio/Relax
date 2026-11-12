@@ -3,14 +3,15 @@
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 from examples.retool.execution_service import put
+from examples.retool.lifecycle import close_owned_children, require_job_success
 
 
 def summarize(rollout_id, args, data, extra_metrics=None):
@@ -79,6 +80,65 @@ def summarize(rollout_id, args, data, extra_metrics=None):
     return True
 
 
+def trained_checkpoint(root: Path, updates: int) -> Path:
+    """Resolve completed recovery stages without expecting a copied
+    checkpoint."""
+    source = root
+    final = root / "checkpoints/rl" / f"hf_{updates - 1}"
+    plan = root / "RECOVERY_PLAN.json"
+    if plan.is_file():
+        rl = json.loads(plan.read_text())["rl"]
+        if rl["action"] == "SKIP_COMPLETE":
+            assert rl["completed"] == updates
+            final = Path(rl["hf"]["path"])
+            source = Path(rl["original"]).parents[1]
+    wait = json.loads((source / "gpu_rl/training_actual_wait.json").read_text())
+    assert wait["actual_parent_wait"] and wait["returncode"] == 0, "RL did not exit successfully"
+    assert (source / "checkpoint_rl.log").read_text().strip() == str(updates)
+    return final
+
+
+def completed_evaluation(output: Path, model: str, cases: dict[str, int], smoke: bool) -> dict | None:
+    """Only reuse full panels with successful native execution and cleanup."""
+    try:
+        result = json.loads((output / "evaluation_complete.json").read_text())
+        wait = json.loads((output / "driver_wait.json").read_text())
+        job = json.loads((output / "ray_job_status.json").read_text())
+        closed = json.loads((output / "closed.json").read_text())
+        assert result["status"] == "ALL_NATIVE_K8_PANELS_ACCEPTED"
+        assert Path(result["model"]).resolve() == Path(model).resolve()
+        assert result["K"] == 8 and result["smoke"] == smoke
+        assert set(result["panels"]) == set(cases)
+        assert all(
+            result["panels"][name]["questions"] == n and result["panels"][name]["trajectories"] == n * 8
+            for name, n in cases.items()
+        )
+        assert wait["actual_parent_wait"] and wait["returncode"] == 0
+        assert job["status"] == "SUCCEEDED"
+        assert closed["owned_PG_empty"] and closed["children"]
+        assert all(child["actual_parent_wait"] for child in closed["children"])
+        return result
+    except (OSError, ValueError, KeyError, TypeError, AssertionError):
+        return None
+
+
+def evaluation_attempt(root: Path, temp: Path, sandbox_base: Path, arm: str) -> tuple[Path, Path, Path]:
+    """Preserve partial attempts; reserve fresh output, Ray and sandbox
+    paths."""
+    base = root / "evaluation" / arm
+    attempt = 0
+    while True:
+        suffix = "" if attempt == 0 else f"_attempt{attempt:04d}"
+        output = base if attempt == 0 else base / f"attempt{attempt:04d}"
+        runtime = temp / (arm + suffix)
+        sandbox = sandbox_base / ("eval_" + arm + suffix)
+        if not any(path.exists() for path in (output, runtime, sandbox)):
+            output.mkdir(parents=True)
+            runtime.mkdir()
+            return output, runtime, sandbox
+        attempt += 1
+
+
 def run_comparison(a, env, container, run, reader, helpers):
     from examples.retool.recovery import hf_identity
 
@@ -108,15 +168,21 @@ def run_comparison(a, env, container, run, reader, helpers):
         assert json.loads(manifest.read_text()) == value
     else:
         put(manifest, value)
-    final = root / "checkpoints/rl" / f"hf_{(a.stop_after_updates or a.rl_updates) - 1}"
+    final = trained_checkpoint(root, a.stop_after_updates or a.rl_updates)
     models = {"official": config["official_model"], "trained": str(final)}
     summaries = {}
     for arm, model in models.items():
         hf_identity(model)
-        output = root / "evaluation" / arm
-        output.mkdir(parents=True)
-        runtime = Path(a.temp) / arm
-        runtime.mkdir()
+        base = root / "evaluation" / arm
+        candidates = [base, *sorted(base.glob("attempt[0-9][0-9][0-9][0-9]"))]
+        accepted = next(
+            (result for path in candidates if (result := completed_evaluation(path, model, count, a.smoke))),
+            None,
+        )
+        if accepted is not None:
+            summaries[arm] = accepted
+            continue
+        output, runtime, sandbox = evaluation_attempt(root, Path(a.temp), a.sandbox_base, arm)
         assert (
             len(os.fsencode(str(runtime / "ray/session_2026-11-05_15-00-00_123456_1234567/sockets/plasma_store")))
             <= 107
@@ -154,6 +220,7 @@ def run_comparison(a, env, container, run, reader, helpers):
             RETOOL_EVAL_GPUS="1" if a.smoke else "8",
             CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7",
             MODEL_DIR=model,
+            RETOOL_RAY_SUBMISSION_ID="retool-eval-" + uuid.uuid4().hex,
             SAVE_DIR=str(output),
             RETOOL_EVAL_MANIFEST=str(manifest),
             TMPDIR=str(runtime),
@@ -233,7 +300,7 @@ def run_comparison(a, env, container, run, reader, helpers):
                     "-m",
                     "examples.retool.execution_service",
                     "--root",
-                    str(a.sandbox_base / f"eval_{arm}"),
+                    str(sandbox),
                     "--port",
                     "29080",
                 ],
@@ -254,23 +321,24 @@ def run_comparison(a, env, container, run, reader, helpers):
             code = process.wait(timeout=max(1, a.deadline - time.time()))
             put(output / "driver_wait.json", dict(returncode=code, actual_parent_wait=True, pid=process.pid))
             assert code == 0, "Native evaluation failed"
-            summaries[arm] = json.loads((output / "evaluation_complete.json").read_text())
+            require_job_success(g, output / "ray_job_status.json")
         finally:
-            closure = []
-            for name, proc, ident, log in reversed(children):
-                if proc.poll() is None and helpers.identity(proc.pid) == ident:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                code = proc.wait(timeout=90)
-                closure.append(dict(name=name, pid=proc.pid, actual_parent_wait=True, returncode=code))
-                log.close()
+            closure = close_owned_children(children, helpers)
             deadline = time.monotonic() + 120
-            while any(helpers.group_members(ident["pgid"]) for _, _, ident, _ in children):
-                assert time.monotonic() < deadline, "Owned evaluation PG remains"
+            while (
+                any(helpers.group_members(ident["pgid"]) for _, _, ident, _ in children)
+                and time.monotonic() < deadline
+            ):
                 time.sleep(0.5)
+            empty = not any(helpers.group_members(ident["pgid"]) for _, _, ident, _ in children)
             put(
                 output / "closed.json",
-                dict(children=closure, owned_PG_empty=True, native_Ray_actor_individual_wait="NOT_RECORDED"),
+                dict(children=closure, owned_PG_empty=empty, native_Ray_actor_individual_wait="NOT_RECORDED"),
             )
+            if not empty or not all(child["actual_parent_wait"] for child in closure):
+                raise RuntimeError("Owned evaluation children were not fully reaped")
+        summaries[arm] = completed_evaluation(output, model, count, a.smoke)
+        assert summaries[arm] is not None, "Incomplete evaluation or missing successful exit receipts"
         for _ in range(120):
             try:
                 reader.resources()
@@ -279,12 +347,14 @@ def run_comparison(a, env, container, run, reader, helpers):
                 time.sleep(1)
         else:
             raise RuntimeError("Evaluation resources not released")
-    put(
-        root / "comparison.json",
-        dict(
-            status="OFFICIAL_VS_TRAINED_K8_COMPLETE",
-            arms=summaries,
-            interpretation="SFT plus RL total change, not pure RL gain",
-            smoke=a.smoke,
-        ),
+    comparison = dict(
+        status="OFFICIAL_VS_TRAINED_K8_COMPLETE",
+        arms=summaries,
+        interpretation="SFT plus RL total change, not pure RL gain",
+        smoke=a.smoke,
     )
+    target = root / "comparison.json"
+    if target.exists():
+        assert json.loads(target.read_text()) == comparison
+    else:
+        put(target, comparison)

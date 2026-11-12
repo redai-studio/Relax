@@ -43,7 +43,15 @@ def execution_status(result: dict) -> str:
         # verify_guard runs before this function. Synchronous faults after the
         # attestation are payload failures; external kills remain infrastructure
         # failures and must never be silently scored as model errors.
-        payload_faults = {signal.SIGSEGV, signal.SIGBUS, signal.SIGILL, signal.SIGFPE, signal.SIGABRT, signal.SIGXFSZ}
+        payload_faults = {
+            signal.SIGSEGV,
+            signal.SIGBUS,
+            signal.SIGILL,
+            signal.SIGFPE,
+            signal.SIGABRT,
+            signal.SIGXFSZ,
+            signal.SIGTRAP,
+        }
         signum = -result["returncode"]
         if signum in payload_faults:
             return "Error"

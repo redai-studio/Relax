@@ -11,7 +11,11 @@ else
   GPUS=${RETOOL_EVAL_GPUS:-8}
 fi
 source scripts/models/qwen25-7B.sh
-ray job submit --address="$RAY_ADDRESS" --runtime-env-json="$RUNTIME_ENV_JSON" -- \
+RAY_JOB_ARGS=()
+if [[ -n "${RETOOL_RAY_SUBMISSION_ID:-}" ]]; then
+    RAY_JOB_ARGS+=(--submission-id "${RETOOL_RAY_SUBMISSION_ID}")
+fi
+ray job submit "${RAY_JOB_ARGS[@]}" --address="$RAY_ADDRESS" --runtime-env-json="$RUNTIME_ENV_JSON" -- \
   python3 -m relax.entrypoints.train "${MODEL_ARGS[@]}" \
   --disable-s3-model-download --hf-checkpoint "$MODEL_DIR" --save "$OUTPUT" \
   --debug-rollout-only --rollout-num-gpus "$GPUS" --rollout-num-gpus-per-engine 1 \

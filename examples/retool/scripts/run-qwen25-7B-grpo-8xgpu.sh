@@ -62,7 +62,11 @@ if [[ -n "${EVAL_CONFIG:-}" ]]; then
     ARGS+=(--eval-config "${EVAL_CONFIG}" --eval-interval 25 --eval-max-prompt-len 2048 --eval-max-context-len 10240)
 fi
 mkdir -p "${SCRIPT_DIR}/log"
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS:-http://127.0.0.1:8265}" \
+RAY_JOB_ARGS=()
+if [[ -n "${RETOOL_RAY_SUBMISSION_ID:-}" ]]; then
+    RAY_JOB_ARGS+=(--submission-id "${RETOOL_RAY_SUBMISSION_ID}")
+fi
+ray job submit "${RAY_JOB_ARGS[@]}" ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS:-http://127.0.0.1:8265}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- python3 -m relax.entrypoints.train "${MODEL_ARGS[@]}" "${ARGS[@]}" "$@" \
     2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-${now}.log"

@@ -10,7 +10,10 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 from pathlib import Path
+
+from examples.retool.lifecycle import close_owned_children, require_job_success
 
 
 def put(path, value):
@@ -132,9 +135,9 @@ def main():
             raise RuntimeError(f"{name} failed exit{rc}; see {name}.log")
 
     smoke = a.smoke
+    if a.stop_after_updates is not None:
+        assert smoke and 0 < a.stop_after_updates <= a.rl_updates
     if a.continue_evaluation:
-        assert json.loads((root / "gpu_rl/training_actual_wait.json").read_text())["returncode"] == 0
-        assert (root / "checkpoint_rl.log").read_text().strip() == str(a.stop_after_updates or a.rl_updates)
         from examples.retool.evaluation import run_comparison
 
         run_comparison(a, e, container, run, reader, helpers)
@@ -207,7 +210,6 @@ def main():
         assert not (root / "HUMAN_STOP").exists()
         updates = a.sft_updates if mode == "sft" else a.rl_updates
         stop_target = (a.stop_after_updates or updates) if mode == "rl" else updates
-        assert not a.stop_after_updates or (smoke and mode == "rl" and 0 < a.stop_after_updates <= updates)
         resume = recovery.get(mode, {})
         start = resume.get("completed", 0)
         load = resume.get("load")
@@ -244,6 +246,7 @@ def main():
 
         try:
             g = dict(e, CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7", EXP_NAME=mode, MODEL_DIR=model)
+            g["RETOOL_RAY_SUBMISSION_ID"] = "retool-" + uuid.uuid4().hex
             ray = start_child(
                 "ray",
                 container(
@@ -365,6 +368,7 @@ def main():
                         stream.seek(max(0, stream.tell() - 8192))
                         print("TRAIN_ERROR_TAIL_BEGIN\n" + stream.read().decode("utf-8", "replace"), flush=True)
                 raise RuntimeError(f"{mode} training failed exit{rc}")
+            require_job_success(g, stage / "ray_job_status.json")
             run(
                 "checkpoint_" + mode,
                 container(
@@ -377,17 +381,7 @@ def main():
             hf_identity(root / "checkpoints" / mode / f"hf_{stop_target - 1}")
             success = True
         finally:
-            closed = []
-            for name, proc, identity, out in reversed(children):
-                if proc.poll() is None and helpers.identity(proc.pid) == identity:
-                    os.killpg(identity["pgid"], signal.SIGTERM)
-                try:
-                    rc = proc.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    closed.append(dict(name=name, actual_wait=False, identity=identity))
-                    continue
-                closed.append(dict(name=name, actual_wait=True, returncode=rc, identity=identity))
-                out.close()
+            closed = close_owned_children(children, helpers, timeout=60)
             deadline = time.monotonic() + 120
             while any(helpers.group_members(x[2]["pgid"]) for x in children) and time.monotonic() < deadline:
                 time.sleep(0.5)
@@ -396,8 +390,8 @@ def main():
                 stage / "workers_closed.json",
                 dict(children=closed, exact_owned_pg_empty=empty, native_actor_individual_parent_wait="NOT_RECORDED"),
             )
-            if not empty:
-                raise RuntimeError("Owned process groups remain; retain claims")
+            if not empty or not all(x["actual_parent_wait"] for x in closed):
+                raise RuntimeError("Owned children were not fully reaped; retain claims")
             put(
                 stage / "resource_release.json",
                 dict(complete=success, exact_owned_pg_empty=True, actual_driver_wait=True, owner=owner),
