@@ -18,6 +18,7 @@ import pytest
 def _resources() -> dict:
     report = {
         "pid": os.getpid(),
+        "container_hostname": os.uname().nodename,
         "cpu_count": os.cpu_count(),
         "affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
         "max_rss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
@@ -28,10 +29,31 @@ def _resources() -> dict:
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "nvidia_visible_devices": os.environ.get("NVIDIA_VISIBLE_DEVICES"),
     }
-    for name in ("cpu.max", "cpuset.cpus.effective", "memory.max", "memory.current", "memory.peak", "cpu.stat"):
+    for name in (
+        "cpu.max",
+        "cpuset.cpus.effective",
+        "memory.max",
+        "memory.current",
+        "memory.peak",
+        "cpu.stat",
+        "pids.max",
+        "pids.current",
+    ):
         path = Path("/sys/fs/cgroup") / name
         if path.is_file():
             report[name] = path.read_text().strip()
+    try:
+        import psutil
+    except ImportError:
+        report["tcp_connections"] = "psutil unavailable"
+    else:
+        try:
+            report["tcp_connections"] = [
+                {"pid": item.pid, "local": str(item.laddr), "remote": str(item.raddr), "status": item.status}
+                for item in psutil.net_connections(kind="tcp")
+            ]
+        except psutil.AccessDenied:
+            report["tcp_connections"] = "access denied"
     torch = sys.modules.get("torch")
     if torch is not None:
         report["torch_threads"] = torch.get_num_threads()
@@ -55,6 +77,7 @@ def _sample(stop: threading.Event, path: Path) -> None:
                         processes.append(
                             {
                                 "pid": process.pid,
+                                "created": process.create_time(),
                                 "name": process.name(),
                                 "rss": process.memory_info().rss,
                                 "threads": process.num_threads(),
