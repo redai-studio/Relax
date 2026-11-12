@@ -8,6 +8,9 @@ CU13_BLACKWELL_TRAIN_IMAGE ?=
 CU13_HOPPER_TRAIN_IMAGE ?=
 CU13_BLACKWELL_DEV_IMAGE ?=
 CU13_HOPPER_DEV_IMAGE ?=
+DEV_BASE_IMAGE ?=
+CU13_BLACKWELL_DEV_BASE_IMAGE ?=
+CU13_HOPPER_DEV_BASE_IMAGE ?=
 ASCEND_DOCKERFILE ?= docker/Dockerfile.npu
 SOC_VERSION ?= ascend910_9391
 ASCEND_DOCKER_BUILDKIT ?= 1
@@ -28,6 +31,7 @@ CU13_EXTERNAL_TRAIN_IMAGE = $(strip $(if $(filter blackwell,$*),$(CU13_BLACKWELL
 CU13_DEFAULT_TRAIN_IMAGE = $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):train-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu13-$*
 CU13_EXTERNAL_DEV_IMAGE = $(strip $(if $(filter blackwell,$*),$(CU13_BLACKWELL_DEV_IMAGE),$(CU13_HOPPER_DEV_IMAGE)))
 CU13_DEFAULT_DEV_IMAGE = $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu13-$*
+CU13_EXTERNAL_DEV_BASE_IMAGE = $(strip $(if $(filter blackwell,$*),$(CU13_BLACKWELL_DEV_BASE_IMAGE),$(CU13_HOPPER_DEV_BASE_IMAGE)))
 
 # Ascend/NPU images share the same repository as GPU; the ascend- tag prefix keeps
 # aarch64 artifacts from ever overwriting the amd64 train-/dev- tags.
@@ -52,6 +56,8 @@ export HTTP_PROXY HTTPS_PROXY NO_PROXY
 
 PROXY_BUILD_ARGS = --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
 BASE_IMAGE_BUILD_ARG = $(if $(strip $(BASE_IMAGE)),--build-arg BASE_IMAGE="$(BASE_IMAGE)")
+DEV_DOCKERFILE = $(if $(strip $(DEV_BASE_IMAGE)),docker/Dockerfile.source,$(DOCKERFILE))
+DEV_BUILD_ARGS = $(if $(strip $(DEV_BASE_IMAGE)),--build-arg BASE_IMAGE="$(DEV_BASE_IMAGE)" --build-arg RELAX_SOURCE_SHA="$(shell git rev-parse HEAD)",--build-arg TRAIN_IMAGE="$(TRAIN_IMAGE)" $(BASE_IMAGE_BUILD_ARG))
 IMAGE_INSPECT := $(DOCKER) $(if $(filter 0,$(DO_PUSH)),image,manifest) inspect
 IMAGE_LOCATION := $(if $(filter 0,$(DO_PUSH)),local,remote)
 
@@ -79,6 +85,8 @@ help:
 	@echo "  REGISTRY=... TRAIN_IMAGE=... make docker-dev-cu12 - Build cu12 dev from an existing train image"
 	@echo "  TRAIN_IMAGE and DEV_IMAGE overrides apply to the cu12 variant"
 	@echo "  CUDA 13 dev output tags accept CU13_BLACKWELL_DEV_IMAGE=... and CU13_HOPPER_DEV_IMAGE=..."
+	@echo "  DEV_BASE_IMAGE=... packages the current source on a prebuilt CUDA 12 dev image"
+	@echo "  CUDA 13 source packaging accepts CU13_BLACKWELL_DEV_BASE_IMAGE or CU13_HOPPER_DEV_BASE_IMAGE"
 	@echo "  REGISTRY=... make docker-ascend - Build and push the complete Ascend/NPU image"
 	@echo "  REGISTRY=... ASCEND_QS_DOCKERFILE=... make docker-qs-ascend - Wrap an Ascend dev image into a QS image (optional)"
 	@echo "  Ascend targets accept BASE_IMAGE=... and SOC_VERSION=... (default ascend910_9391)"
@@ -170,26 +178,26 @@ docker-dev-cu13-blackwell docker-dev-cu13-hopper: docker-dev-cu13-%:
 		DOCKERFILE="$(CU13_DOCKERFILE)" \
 		TRAIN_IMAGE="$(or $(CU13_EXTERNAL_TRAIN_IMAGE),$(CU13_DEFAULT_TRAIN_IMAGE))" \
 		DEV_IMAGE="$(or $(CU13_EXTERNAL_DEV_IMAGE),$(CU13_DEFAULT_DEV_IMAGE))" \
+		DEV_BASE_IMAGE="$(CU13_EXTERNAL_DEV_BASE_IMAGE)" \
 		BUILD_DEFAULT_TRAIN=$(if $(CU13_EXTERNAL_TRAIN_IMAGE),0,1) \
 		BASE_IMAGE="$(CU13_BASE_IMAGE)" \
 		DOCKER_BUILD_ARGS="$(DOCKER_BUILD_ARGS) --build-arg GPU_ARCH=$*"
 
 docker-dev-image: check-registry check-train-image
-	@echo "[docker] input train image: $(TRAIN_IMAGE)"
+	@echo "[docker] input $(if $(strip $(DEV_BASE_IMAGE)),dev,train) image: $(or $(DEV_BASE_IMAGE),$(TRAIN_IMAGE))"
 	@echo "[docker] output dev image: $(DEV_IMAGE)"
 	@set -e; \
 	if $(IMAGE_INSPECT) "$(DEV_IMAGE)" >/dev/null 2>&1; then \
 		echo "[docker] skip existing $(IMAGE_LOCATION) dev image: $(DEV_IMAGE)"; \
 	else \
-		if [ "$(BUILD_DEFAULT_TRAIN)" = "1" ]; then \
+		if [ -z "$(strip $(DEV_BASE_IMAGE))" ] && [ "$(BUILD_DEFAULT_TRAIN)" = "1" ]; then \
 			$(MAKE) --no-print-directory docker-train-image TRAIN_IMAGE="$(TRAIN_IMAGE)"; \
 		fi; \
 		$(DOCKER) build --progress=$(DOCKER_BUILD_PROGRESS) \
-			-f $(DOCKERFILE) \
+			-f $(DEV_DOCKERFILE) \
 			--target relax \
 			-t "$(DEV_IMAGE)" \
-			--build-arg TRAIN_IMAGE="$(TRAIN_IMAGE)" \
-			$(PROXY_BUILD_ARGS) $(BASE_IMAGE_BUILD_ARG) $(DOCKER_BUILD_ARGS) \
+			$(PROXY_BUILD_ARGS) $(DEV_BUILD_ARGS) $(DOCKER_BUILD_ARGS) \
 			.; \
 		if [ "$(DO_PUSH)" != "0" ]; then $(DOCKER) push "$(DEV_IMAGE)"; fi; \
 	fi
