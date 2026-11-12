@@ -368,7 +368,7 @@ def main():
                         stream.seek(max(0, stream.tell() - 8192))
                         print("TRAIN_ERROR_TAIL_BEGIN\n" + stream.read().decode("utf-8", "replace"), flush=True)
                 raise RuntimeError(f"{mode} training failed exit{rc}")
-            require_job_success(g, stage / "ray_job_status.json")
+            require_job_success(g, stage / "ray_job_status.json", a.deadline)
             run(
                 "checkpoint_" + mode,
                 container(

@@ -3,12 +3,16 @@
 
 import io
 import json
+import os
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,32 +20,90 @@ from examples.retool.evaluation import completed_evaluation, evaluation_attempt,
 from examples.retool.lifecycle import close_owned_children, require_job_success
 
 
+@pytest.fixture
+def fake_ray(tmp_path):
+    package = tmp_path / "ray"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    module = package / "job_submission.py"
+    return module, dict(os.environ, PYTHONPATH=str(tmp_path))
+
+
 @pytest.mark.parametrize("status", ["SUCCEEDED", "STOPPED", "FAILED", "RUNNING"])
-def test_native_status_is_required_even_after_cli_success(tmp_path, monkeypatch, status):
-    ray = ModuleType("ray")
-    submission = ModuleType("ray.job_submission")
-    queried = []
-
-    class Client:
-        def __init__(self, address):
-            assert address == "http://localhost:8265"
-
-        def get_job_status(self, job):
-            queried.append(job)
-            return SimpleNamespace(value=status)
-
-    submission.JobSubmissionClient = Client
-    monkeypatch.setitem(sys.modules, "ray", ray)
-    monkeypatch.setitem(sys.modules, "ray.job_submission", submission)
+def test_native_status_is_required_even_after_cli_success(tmp_path, fake_ray, status):
+    module, env = fake_ray
+    module.write_text(
+        "class JobSubmissionClient:\n"
+        "    def __init__(self, address): assert address == 'http://localhost:8265'\n"
+        f"    def get_job_status(self, job): assert job == 'owned-job'; return {status!r}\n"
+    )
     receipt = tmp_path / "job.json"
-    env = {"RAY_ADDRESS": "http://localhost:8265", "RETOOL_RAY_SUBMISSION_ID": "owned-job"}
+    env.update(RAY_ADDRESS="http://localhost:8265", RETOOL_RAY_SUBMISSION_ID="owned-job")
     if status == "SUCCEEDED":
-        require_job_success(env, receipt)
+        require_job_success(env, receipt, time.time() + 10)
     else:
         with pytest.raises(RuntimeError, match="expected SUCCEEDED"):
-            require_job_success(env, receipt)
-    assert queried == ["owned-job"]
+            require_job_success(env, receipt, time.time() + 10)
     assert json.loads(receipt.read_text())["status"] == status
+
+
+@pytest.mark.parametrize("stall", ["constructor", "status"])
+def test_http_stall_is_killed_and_reaped_before_cleanup(tmp_path, fake_ray, stall, monkeypatch):
+    module, env = fake_ray
+    entered, release = threading.Event(), threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/" + stall:
+                entered.set()
+                release.wait(10)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    module.write_text(
+        "import urllib.request\n"
+        "class JobSubmissionClient:\n"
+        "    def __init__(self, address):\n"
+        "        self.address = address\n"
+        "        urllib.request.urlopen(address + '/constructor').read()\n"
+        "    def get_job_status(self, job):\n"
+        "        urllib.request.urlopen(self.address + '/status').read()\n"
+        "        return 'SUCCEEDED'\n"
+    )
+    env.update(RAY_ADDRESS=f"http://127.0.0.1:{server.server_port}", RETOOL_RAY_SUBMISSION_ID="owned-job")
+    children = []
+    original = subprocess.Popen
+
+    def start(*args, **kwargs):
+        child = original(*args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", start)
+    cleaned = []
+    started = time.monotonic()
+    try:
+        try:
+            with pytest.raises(RuntimeError, match="run deadline"):
+                require_job_success(env, tmp_path / "job.json", time.time() + 2)
+        finally:
+            cleaned.append(True)
+        assert entered.is_set()
+        assert cleaned == [True]
+        assert len(children) == 1 and children[0].returncode is not None
+        assert time.monotonic() - started < 5
+        assert json.loads((tmp_path / "job.json").read_text())["error"] == "TimeoutExpired"
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_timeout_does_not_skip_other_owned_children(monkeypatch):
@@ -106,16 +168,35 @@ def test_completed_rl_recovery_uses_original_export_and_exit(tmp_path):
     recovery.mkdir()
     (original / "gpu_rl/training_actual_wait.json").write_text(json.dumps(dict(actual_parent_wait=True, returncode=0)))
     (original / "checkpoint_rl.log").write_text("200\n")
+    (original / "gpu_rl/ray_job_status.json").write_text(json.dumps(dict(submission_id="rl", status="SUCCEEDED")))
+    (original / "gpu_sft").mkdir()
+    (original / "gpu_sft/training_actual_wait.json").write_text(
+        json.dumps(dict(actual_parent_wait=True, returncode=0))
+    )
+    (original / "gpu_sft/ray_job_status.json").write_text(json.dumps(dict(submission_id="sft", status="SUCCEEDED")))
+    (original / "checkpoint_sft.log").write_text("50\n")
     export = original / "checkpoints/rl/hf_199"
     (recovery / "RECOVERY_PLAN.json").write_text(
         json.dumps(
             dict(
-                rl=dict(action="SKIP_COMPLETE", completed=200, hf=dict(path=str(export)), original=str(export.parent))
+                rl=dict(action="SKIP_COMPLETE", completed=200, hf=dict(path=str(export)), original=str(export.parent)),
+                sft=dict(action="SKIP_COMPLETE", completed=50, original=str(original / "checkpoints/sft")),
             )
         )
     )
     assert trained_checkpoint(recovery, 200) == export
     assert not (recovery / "checkpoints").exists()
+    for mode in ("sft", "rl"):
+        status = original / f"gpu_{mode}/ray_job_status.json"
+        success = status.read_text()
+        for value in (dict(submission_id=mode, status="STOPPED"), dict(status="SUCCEEDED")):
+            status.write_text(json.dumps(value))
+            with pytest.raises(AssertionError, match="native Ray success"):
+                trained_checkpoint(recovery, 200)
+        status.unlink()
+        with pytest.raises(FileNotFoundError):
+            trained_checkpoint(recovery, 200)
+        status.write_text(success)
     (original / "gpu_rl/training_actual_wait.json").write_text(json.dumps(dict(actual_parent_wait=True, returncode=1)))
     with pytest.raises(AssertionError, match="RL did not exit successfully"):
         trained_checkpoint(recovery, 200)
@@ -215,3 +296,49 @@ def test_bounded_fresh_smoke_reaches_sft_stage(tmp_path, monkeypatch, short_runt
     monkeypatch.setattr(workflow.subprocess, "Popen", start)
     with pytest.raises(ReachedSFT):
         workflow.main()
+
+
+@pytest.mark.parametrize("complete_mode", ["sft", "rl"])
+@pytest.mark.parametrize("status", ["SUCCEEDED", "STOPPED", None])
+def test_recovery_checks_completed_source_native_status(tmp_path, monkeypatch, complete_mode, status):
+    from examples.retool import recovery
+
+    parent, output = tmp_path / "parent", tmp_path / "next"
+    parent.mkdir()
+    (parent / "test_contract.json").write_text(
+        json.dumps(
+            dict(
+                source_commit=recovery.COMMIT,
+                sft_updates=50,
+                rl_updates=200,
+                sft_pool=2000,
+                rl_pool=17903,
+                rl_batch=64,
+                K=16,
+            )
+        )
+    )
+    selected = {}
+    for mode, target in (("sft", 50), ("rl", 200)):
+        completed = target if mode == "sft" or complete_mode == "rl" else 10
+        selected[mode] = dict(completed=completed, original=str(parent / "checkpoints" / mode))
+        stage = parent / f"gpu_{mode}"
+        stage.mkdir()
+        (stage / "training_actual_wait.json").write_text(json.dumps(dict(actual_parent_wait=True, returncode=0)))
+        (parent / f"checkpoint_{mode}.log").write_text(str(target))
+        value = status if mode == complete_mode else "SUCCEEDED"
+        if value is not None:
+            (stage / "ray_job_status.json").write_text(json.dumps(dict(submission_id=mode, status=value)))
+    monkeypatch.setattr(recovery, "select_checkpoint", lambda roots, mode, *args: selected[mode])
+    run = lambda: recovery.plan(parent, output, 50, 200, hf_validator=lambda path: dict(path=str(path)))
+    if status == "SUCCEEDED":
+        result = run()
+        assert result[complete_mode]["action"] == "SKIP_COMPLETE"
+        if complete_mode == "sft":
+            assert result["rl"]["action"] == "RESUME_NATIVE"
+    elif status is None:
+        with pytest.raises(FileNotFoundError):
+            run()
+    else:
+        with pytest.raises(AssertionError, match="native Ray success"):
+            run()

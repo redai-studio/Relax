@@ -8,6 +8,8 @@ import stat
 import struct
 from pathlib import Path
 
+from examples.retool.lifecycle import require_training_success
+
 
 COMMIT = "2b8f3a9840119d461f983619e9d68a7e3619da3e"
 
@@ -88,7 +90,7 @@ def validate_native(view, sft):
         extents[item.relative_path] = max(extents.get(item.relative_path, 0), item.offset + item.length)
     for name, end in extents.items():
         file = checkpoint / name
-        assert file.resolve().is_relative_to(checkpoint.resolve())
+        assert file.resolve(strict=True).is_relative_to(checkpoint.resolve(strict=True))
         info = file.stat()
         assert stat.S_ISREG(info.st_mode) and info.st_size >= end
     return step
@@ -164,6 +166,7 @@ def plan(parent, output, sft_target, rl_target, validator=validate_native, hf_va
     sft = selected["sft"]
     assert sft["completed"] > 0, "Recovery parent has no valid SFT state; explicit clean-start classification required"
     if sft["completed"] == sft_target:
+        require_training_success(Path(sft["original"]).parents[1], "sft", sft_target)
         sft["hf"] = hf_validator(Path(sft["original"]) / f"hf_{sft_target - 1}")
         sft["action"] = "SKIP_COMPLETE"
     else:
@@ -174,6 +177,7 @@ def plan(parent, output, sft_target, rl_target, validator=validate_native, hf_va
             require_zero_update_failure(Path(old_root))
     assert not rl["completed"] or sft["action"] == "SKIP_COMPLETE", "RL checkpoint without complete SFT lineage"
     if rl["completed"] == rl_target:
+        require_training_success(Path(rl["original"]).parents[1], "rl", rl_target)
         rl["hf"] = hf_validator(Path(rl["original"]) / f"hf_{rl_target - 1}")
         rl["action"] = "SKIP_COMPLETE"
     else:

@@ -185,6 +185,18 @@ class TestBoundedCheckpointSelection(unittest.TestCase):
                 with mock.patch.object(checkpoint, "validate_checkpoint", return_value=2):
                     with self.assertRaises(AssertionError):
                         recovery.validate_native(root, False)
+            storage.unlink()
+            with mock.patch.dict(sys.modules, {"torch.distributed.checkpoint": module}):
+                with mock.patch.object(checkpoint, "validate_checkpoint", return_value=2):
+                    with self.assertRaises(FileNotFoundError):
+                        recovery.validate_native(root, False)
+            outside = root / "external.distcp"
+            outside.write_bytes(b"x" * 32)
+            storage.symlink_to(outside)
+            with mock.patch.dict(sys.modules, {"torch.distributed.checkpoint": module}):
+                with mock.patch.object(checkpoint, "validate_checkpoint", return_value=2):
+                    with self.assertRaises(AssertionError):
+                        recovery.validate_native(root, False)
 
 
 if __name__ == "__main__":

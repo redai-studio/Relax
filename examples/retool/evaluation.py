@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from examples.retool.execution_service import put
-from examples.retool.lifecycle import close_owned_children, require_job_success
+from examples.retool.lifecycle import close_owned_children, require_job_success, require_training_success
 
 
 def summarize(rollout_id, args, data, extra_metrics=None):
@@ -80,21 +80,25 @@ def summarize(rollout_id, args, data, extra_metrics=None):
     return True
 
 
-def trained_checkpoint(root: Path, updates: int) -> Path:
+def trained_checkpoint(root: Path, updates: int, sft_updates: int = 50) -> Path:
     """Resolve completed recovery stages without expecting a copied
     checkpoint."""
-    source = root
+    source = sft_source = root
     final = root / "checkpoints/rl" / f"hf_{updates - 1}"
     plan = root / "RECOVERY_PLAN.json"
     if plan.is_file():
-        rl = json.loads(plan.read_text())["rl"]
+        selected = json.loads(plan.read_text())
+        sft = selected["sft"]
+        if sft["action"] == "SKIP_COMPLETE":
+            assert sft["completed"] == sft_updates
+            sft_source = Path(sft["original"]).parents[1]
+        rl = selected["rl"]
         if rl["action"] == "SKIP_COMPLETE":
             assert rl["completed"] == updates
             final = Path(rl["hf"]["path"])
             source = Path(rl["original"]).parents[1]
-    wait = json.loads((source / "gpu_rl/training_actual_wait.json").read_text())
-    assert wait["actual_parent_wait"] and wait["returncode"] == 0, "RL did not exit successfully"
-    assert (source / "checkpoint_rl.log").read_text().strip() == str(updates)
+    require_training_success(sft_source, "sft", sft_updates)
+    require_training_success(source, "rl", updates)
     return final
 
 
@@ -168,7 +172,7 @@ def run_comparison(a, env, container, run, reader, helpers):
         assert json.loads(manifest.read_text()) == value
     else:
         put(manifest, value)
-    final = trained_checkpoint(root, a.stop_after_updates or a.rl_updates)
+    final = trained_checkpoint(root, a.stop_after_updates or a.rl_updates, a.sft_updates)
     models = {"official": config["official_model"], "trained": str(final)}
     summaries = {}
     for arm, model in models.items():
@@ -321,7 +325,7 @@ def run_comparison(a, env, container, run, reader, helpers):
             code = process.wait(timeout=max(1, a.deadline - time.time()))
             put(output / "driver_wait.json", dict(returncode=code, actual_parent_wait=True, pid=process.pid))
             assert code == 0, "Native evaluation failed"
-            require_job_success(g, output / "ray_job_status.json")
+            require_job_success(g, output / "ray_job_status.json", a.deadline)
         finally:
             closure = close_owned_children(children, helpers)
             deadline = time.monotonic() + 120

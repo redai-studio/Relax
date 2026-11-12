@@ -70,7 +70,7 @@ python3 -m examples.retool.workflow \
   2>&1 | tee "$ROOT/launch.log"
 ```
 
-The controller starts SFT, exports its final HF weights, runs GRPO from that checkpoint, then evaluates the official model and final RL checkpoint in separate sessions. The deadline is an absolute Unix timestamp. Do not launch a second controller for the same run. The individual stage recipes are in [`scripts/`](scripts/); the controller supplies their owned Ray and execution-service configuration.
+The controller starts SFT, exports its final HF weights, runs GRPO from that checkpoint, then evaluates the official model and final RL checkpoint in separate sessions. The deadline is an absolute Unix timestamp. Do not launch a second controller for the same run. Completed SFT/RL stages reused from a recovery ancestor or by evaluation continuation must have a recorded native Ray `SUCCEEDED` status and submission ID, parent wait exit 0, and the expected final checkpoint. Legacy records without native success evidence are rejected; a valid partial native checkpoint remains eligible for training recovery. The individual stage recipes are in [`scripts/`](scripts/); the controller supplies their owned Ray and execution-service configuration.
 
 | Setting                            | SFT                              | GRPO                                            |
 | ---------------------------------- | -------------------------------- | ----------------------------------------------- |
