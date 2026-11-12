@@ -44,7 +44,7 @@ from relax.agentic.stage_recorder import (
     STAGE_SHUTDOWN,
     StageRecorder,
 )
-from relax.distributed.ray.rollout import _log_rollout_data
+from relax.distributed.ray.rollout import _log_rollout_data, get_local_rollout_manager
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.agentic_obs import agentic_obs_enabled
@@ -285,7 +285,7 @@ class AgenticResidentPipeline:
         warming, ready = self.prepare_domain.counts
         runtime_reward = len(self._active_group_tasks)
         finalized = len(self._finalized_groups)
-        return {
+        snapshot: dict[str, object] = {
             "active_rollout_id": context.rollout_id if context is not None else None,
             "warming_prepare_group_count": warming,
             "ready_prepare_group_count": ready,
@@ -295,6 +295,9 @@ class AgenticResidentPipeline:
             "resident_group_count": self.runtime_domain.resident_group_count,
             "interrupted_runtime_group_count": len(self.runtime_domain.interrupted_group_ids),
         }
+        if self.runtime_domain.teacher_routing_enabled:
+            snapshot["teacher_responses"] = self._opd_manager.response_stats.metrics()
+        return snapshot
 
     async def run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
         """Generate one rollout step while resident Group refs may cross
@@ -312,6 +315,8 @@ class AgenticResidentPipeline:
             final_backfill=final_backfill,
         )
         self._active_step = context
+        if self.runtime_domain.teacher_routing_enabled:
+            self._opd_manager.response_stats.new_window()
         try:
             if self._stage_recorder.enabled:
                 context.observed_group_ids.update(group.group_id for group in self._finalized_groups)
@@ -330,6 +335,8 @@ class AgenticResidentPipeline:
             metrics = dict(output.metrics or {})
             metrics.update(_aggregate_agentic_timing(samples))
             metrics.update(self.reward_domain.collect_metrics())
+            if self.runtime_domain.teacher_routing_enabled:
+                metrics.update(self._opd_manager.response_stats.metrics())
             if getattr(self.args, "agentic_program_admission", False) or getattr(
                 self.args, "agentic_session_lifecycle", False
             ):
@@ -645,12 +652,16 @@ class AgenticResidentPipeline:
         if debt == 0:
             return True
 
-        # Fully async may close with unfinished physical debt only when the
+        # During an Actor weight update, fully async may carry debt when the
         # same number of resident Groups is confirmed interrupted. Debt from
         # the older partition must finish first: only two physical partitions
         # can be active, so carrying it again would make the next open fail.
         if self.args.fully_async and not context.final_backfill:
-            return self.transfer_domain.previous_debt == 0 and debt <= len(self.runtime_domain.interrupted_group_ids)
+            return (
+                get_local_rollout_manager().training_weight_updating
+                and self.transfer_domain.previous_debt == 0
+                and debt <= len(self.runtime_domain.interrupted_group_ids)
+            )
         return False
 
     async def _close_rollout_step(self, context: _StepContext) -> RolloutFnTrainOutput:
@@ -722,7 +733,9 @@ class AgenticResidentPipeline:
         opens its generation gate.
         """
 
-        for stream in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
+        for stream, teacher_id, response_keys in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
+            for key in response_keys:
+                self._opd_manager.response_stats.admit(key, cast(str, teacher_id))
             await self.runtime_domain.lease_group(stream, context.rollout_id)
             observation = (
                 _GroupObservation(stream, observed_rollout_id=context.rollout_id)
@@ -741,12 +754,18 @@ class AgenticResidentPipeline:
                 ),
                 name=f"agentic-group:{stream.group_id}",
             )
-            group_task.add_done_callback(lambda _task: self._changed.set())
+            # A task cancelled before its coroutine starts still has to release its response counts.
+            group_task.add_done_callback(lambda _task, keys=response_keys: self._finish_group(keys))
             self._active_group_tasks.append(group_task)
             if observation is not None:
                 self._group_observations[group_task] = observation
                 context.observed_group_ids.add(stream.group_id)
         await self._record_rollout(context)
+
+    def _finish_group(self, response_keys: tuple[int | str, ...]) -> None:
+        for key in response_keys:
+            self._opd_manager.response_stats.finish(key)
+        self._changed.set()
 
     def _runtime_group_gap(self, context: _StepContext) -> int:
         oversample_groups = 0

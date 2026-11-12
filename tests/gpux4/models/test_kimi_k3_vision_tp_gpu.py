@@ -21,7 +21,7 @@ def _vision_tp_worker(rank: int, world_size: int, rendezvous: str, checkpoint_pa
     group = dist.new_group(ranks=list(range(world_size)))
     try:
         spec = importlib.util.spec_from_file_location(
-            "_k3_vision_gpu_model", Path(__file__).parents[2] / "relax/models/kimi_k3/model.py"
+            "_k3_vision_gpu_model", Path(__file__).parents[3] / "relax/models/kimi_k3/model.py"
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

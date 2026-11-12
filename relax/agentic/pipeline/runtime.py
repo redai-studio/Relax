@@ -37,6 +37,7 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.engine.rollout import on_policy_distillation as opd
 from relax.utils.agentic_obs.records import utc_now
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
@@ -884,6 +885,7 @@ class RuntimeDomain:
     ) -> None:
         self.args = args
         self.rollout_mode = rollout_mode
+        self.teacher_routing_enabled = rollout_mode == "train" and opd.is_teacher_routing_enabled(args)
         self._shards = shards
         self.concurrency = concurrency
         self._admission_coordinator = admission_coordinator
@@ -963,8 +965,11 @@ class RuntimeDomain:
         group_id = group_input.group_id
         shard = self._shards[zlib.crc32(group_id.encode("utf-8")) % len(self._shards)]
         session_ids = tuple(f"{shard.actor_name}.session-{uuid.uuid4().hex}" for _ in group_input.samples)
-        self._inventory.record_group(group_id, group_input.samples)
         try:
+            if self.teacher_routing_enabled:
+                for sample in group_input.samples:
+                    opd.bind_teacher(self.args, sample)
+            self._inventory.record_group(group_id, group_input.samples)
             await self._resident_group_permits.acquire()
         except BaseException as error:
             self._inventory.record_group(group_id, group_input.samples, session_ids, started_at=prepare_started_at_utc)
@@ -1301,9 +1306,7 @@ class RuntimeDomain:
     async def debug_state(self) -> dict[str, Any]:
         """Project Shard refs into one debug dictionary."""
 
-        shard_snapshots = tuple(
-            await asyncio.gather(*(shard.handle.debug_state.remote(sample_limit=8) for shard in self._shards))
-        )
+        shard_snapshots = tuple(await asyncio.gather(*(shard.handle.debug_state.remote() for shard in self._shards)))
         return {
             "shards": shard_snapshots,
             "group_count": sum(snapshot["group_count"] for snapshot in shard_snapshots),
@@ -1423,8 +1426,30 @@ async def _take_session_results(
     session_ids = tuple(result.session_id for result in results)
     try:
         session_results = await stream.shard.handle.take_session_results.remote(stream.group_id, session_ids)
-        for result, session_result in zip(results, session_results, strict=True):
-            _resolve_session_export(stream, result, session_result)
+        result_pairs = tuple(zip(results, session_results, strict=True))
+        group_error = next(
+            (
+                session_result
+                for _result, session_result in result_pairs
+                if isinstance(session_result, RuntimeGroupError)
+            ),
+            None,
+        )
+        export_error: Exception | None = None
+        for result, session_result in result_pairs:
+            try:
+                _resolve_session_export(result, session_result)
+            except Exception as error:
+                result.completion.set_exception(error)
+                if export_error is None:
+                    export_error = error
+        if not stream.first_request_barrier.done():
+            if group_error is not None:
+                stream.first_request_barrier.set_exception(group_error)
+            elif export_error is not None:
+                stream.first_request_barrier.set_exception(export_error)
+            elif any(session_result is None for _result, session_result in result_pairs):
+                stream.first_request_barrier.set_result(False)
     except Exception as error:
         for result in results:
             completion = result.completion
@@ -1435,7 +1460,6 @@ async def _take_session_results(
 
 
 def _resolve_session_export(
-    stream: RuntimeGroupStream,
     result: _SessionResultRef,
     session_result: SessionExportTransport | RuntimeGroupError | None,
 ) -> None:
@@ -1446,13 +1470,9 @@ def _resolve_session_export(
         return
     if isinstance(session_result, RuntimeGroupError):
         completion.set_exception(session_result)
-        if not stream.first_request_barrier.done():
-            stream.first_request_barrier.set_exception(session_result)
         return
     if session_result is None:
         completion.set_result(None)
-        if not stream.first_request_barrier.done():
-            stream.first_request_barrier.set_result(False)
         return
     exports = []
     for export_payload in session_result.exports:

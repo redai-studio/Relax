@@ -578,6 +578,7 @@ def add_opd_arguments(parser: Any) -> Any:
             "2 replicas, each TP=4."
         ),
     )
+    parser.set_defaults(opd_teacher_routes_map=None)
     parser.add_argument(
         "--opd-teacher-routes",
         type=str,
@@ -884,7 +885,6 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
         # Relax-managed multi-teacher MOPD. The runtime URL map
         # (args.opd_teacher_routes_map) is populated at launch by
         # _start_managed_multi_teacher; here we only validate the spec.
-        args.opd_teacher_routes_map = None
         opd_teacher_routes = getattr(args, "opd_teacher_routes", None)
         if opd_teacher_routes is not None:
             if getattr(args, "teacher_hf_checkpoint", None) is not None:
