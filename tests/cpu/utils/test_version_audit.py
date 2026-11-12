@@ -308,12 +308,29 @@ def test_cli_group_filter(tmp_path, capsys):
     assert out.strip() == ""
 
 
-def test_cli_tolerates_torn_final_jsonl_line(tmp_path, capsys):
+def _cjk_torn_tail() -> bytes:
+    # 含中文的真实样本行，在 3 字节字符“中”内部截断：整行解码即
+    # UnicodeDecodeError——text 模式迭代会从行迭代器抛出、绕过 json 守卫。
+    row = dict(TRAJECTORY_ROW, sample_export_id="2001", label="中文")
+    encoded = json.dumps(row, ensure_ascii=False).encode("utf-8")
+    char_start = encoded.index("中".encode("utf-8"))
+    return encoded[: char_start + 2]  # “中”的 3 字节只保留前 2 字节
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b'{"schema_version": "3.2',  # ASCII 中途截断 → JSONDecodeError
+        _cjk_torn_tail(),
+    ],
+    ids=["ascii_cut", "cjk_multibyte_cut"],
+)
+def test_cli_tolerates_torn_final_jsonl_line(tmp_path, capsys, tail):
     # 写侧契约允许崩溃留下半行（writers.py）：post-mortem 审计必须跳过而非崩溃。
     root = tmp_path / "run-1"
     shard = root / "trajectories" / "shard_00.jsonl"
     shard.parent.mkdir(parents=True)
-    shard.write_text(json.dumps(TRAJECTORY_ROW) + '\n{"schema_version": "3.2', encoding="utf-8")
+    shard.write_bytes(json.dumps(TRAJECTORY_ROW).encode("utf-8") + b"\n" + tail)
     _write_jsonl(root / "train" / "step_00000003_dp_000.jsonl", [TRAIN_ROW])
 
     main([str(root)])

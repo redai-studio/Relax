@@ -170,15 +170,22 @@ def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     that torn tail — a staleness post-mortem on a crashed run is exactly the
     audit's use case — so malformed lines are skipped with a warning instead
     of aborting the report.
+
+    Lines are read as raw bytes and decoded inside the guard: writers emit
+    ``ensure_ascii=False`` and trajectories are dominated by CJK text, so a
+    random byte cut lands inside a multibyte character for many torn tails.
+    Text-mode iteration would raise UnicodeDecodeError from the line iterator
+    itself, before any json guard; ``json.loads`` on bytes performs the
+    decode and raises the same error inside this try block.
     """
 
-    with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
+    with path.open("rb") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            if not raw.strip():
                 continue
             try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
+                yield json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 logger.warning("version_audit: skipping malformed line %s:%d", path, line_number)
 
 
@@ -207,13 +214,16 @@ _TRAIN_SHARD_RE = re.compile(r"^(?:overflow_)?step_(\d+)_dp_(\d+)\.jsonl$")
 def _train_shard_order(path: Path) -> tuple[int, int, int]:
     """Sort key ``(rollout_id, dp_rank, is_overflow)`` for one train shard.
 
-    ``overflow_`` shards hold backpressured re-writes of the same step, so
-    they sort after the plain shard of that step. Lexicographic order is wrong
-    here — ``overflow_...`` precedes ``step_...`` and would let a stale stamp
-    clobber a newer one — hence the numeric key parsed from the filename.
+    ``overflow_`` shards are separate backpressured updates for that
+    ``(rollout_id, dp_rank)``, written to a differently-named file rather than
+    a rewrite; ordering them last within a step is a tie-break heuristic.
+    Lexicographic order is wrong here — ``overflow_...`` precedes ``step_...``
+    and would let a stale stamp clobber a newer one — hence the numeric key
+    parsed from the filename.
     """
 
     match = _TRAIN_SHARD_RE.match(path.name)
+    assert match is not None, f"not a train shard name: {path.name}"
     return (int(match.group(1)), int(match.group(2)), 1 if path.name.startswith("overflow_") else 0)
 
 
