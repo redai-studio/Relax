@@ -42,6 +42,25 @@ def _resources() -> dict:
         path = Path("/sys/fs/cgroup") / name
         if path.is_file():
             report[name] = path.read_text().strip()
+    for controller, names in {
+        "cpu": ("cpu.cfs_quota_us", "cpu.cfs_period_us", "cpu.shares", "cpu.stat"),
+        "cpu,cpuacct": ("cpu.cfs_quota_us", "cpu.cfs_period_us", "cpu.shares", "cpu.stat"),
+        "cpuset": ("cpuset.cpus", "cpuset.effective_cpus"),
+        "memory": ("memory.limit_in_bytes", "memory.usage_in_bytes", "memory.max_usage_in_bytes"),
+        "pids": ("pids.max", "pids.current"),
+    }.items():
+        for name in names:
+            path = Path("/sys/fs/cgroup") / controller / name
+            if path.is_file():
+                report[f"cgroup_v1/{controller}/{name}"] = path.read_text().strip()
+    for name in ("cgroup", "mountinfo"):
+        path = Path("/proc/self") / name
+        if path.is_file():
+            report[f"proc_self_{name}"] = "\n".join(
+                line for line in path.read_text().splitlines() if name == "cgroup" or "cgroup" in line
+            )
+    auto_init_hook = sys.modules.get("ray._private.auto_init_hook")
+    report["ray_auto_init_enabled"] = getattr(auto_init_hook, "enable_auto_connect", None)
     try:
         import psutil
     except ImportError:
