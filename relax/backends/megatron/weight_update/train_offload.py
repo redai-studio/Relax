@@ -318,7 +318,11 @@ class _SelectiveOffloadStrategy:
         fsdp_params = []
         for model_chunk in self.model or []:
             if hasattr(model_chunk, "param_and_grad_buffer"):
-                model_chunk._replace_param_with_distributed_if_needed()
+                for candidate in (model_chunk, getattr(model_chunk, "module", None)):
+                    normalize = getattr(candidate, "_replace_param_with_distributed_if_needed", None)
+                    if callable(normalize):
+                        normalize()
+                        break
                 fsdp_params.extend(model_chunk.parameters())
         cpu_storages = {}
         for buffer, preserve in self._iter_unique_fsdp_storages():

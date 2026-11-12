@@ -17,7 +17,7 @@ import torch
 def test_mtp_hidden_norm_preserves_independent_streams(tmp_path: Path, dtype: torch.dtype) -> None:
     root = Path(__file__).resolve().parents[3]
     relative = "megatron/core/transformer/hyper_connection.py"
-    patch = (root / "docker/patch/megatron/20261016-qwen38-models.patch").read_text()
+    patch = (root / "docker/patch/megatron/20260915-4a4de8657.patch").read_text()
     start = patch.index(f"diff --git a/{relative} b/{relative}\n")
     section = patch[start:].split("\ndiff --git ", 1)[0] + "\n"
     target = tmp_path / relative

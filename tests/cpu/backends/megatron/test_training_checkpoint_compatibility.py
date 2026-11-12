@@ -111,6 +111,50 @@ def test_reset_sgd_momentum_prevents_zero_gradient_update(reset):
     assert torch.equal(parameter, before) == reset
 
 
+@pytest.mark.parametrize("fsdp,requested_overlap", [(True, False), (True, True), (False, True)])
+def test_train_uses_effective_overlap_and_preserves_last_backward_sync(fsdp, requested_overlap):
+    args = SimpleNamespace(
+        overlap_grad_reduce=requested_overlap,
+        align_grad_reduce=True,
+        overlap_param_gather=False,
+        reset_optimizer_states=False,
+    )
+    config = SimpleNamespace(no_sync_func=None, grad_sync_func=None)
+    wrapper = SimpleNamespace(
+        ddp_config=SimpleNamespace(overlap_grad_reduce=True, use_megatron_fsdp=fsdp),
+        train=Mock(),
+        no_sync=Mock(return_value=nullcontext()),
+        start_grad_sync=Mock(),
+    )
+
+    class StopAfterSetup(Exception):
+        pass
+
+    def stop(args):
+        raise StopAfterSetup
+
+    module = _load(
+        "relax/backends/megatron/model.py",
+        {"train"},
+        {
+            "get_args": lambda: args,
+            "DataIterator": type("DataIterator", (), {}),
+            "_is_distributed_wrapper": lambda model: True,
+            "get_model_config": lambda model: config,
+            "finalize_model_grads": Mock(),
+            "resident_sft_param_overlap_enabled": lambda args: False,
+            "should_disable_forward_pre_hook": stop,
+        },
+    )
+    for rollout_id in range(2):
+        with pytest.raises(StopAfterSetup):
+            module.train(rollout_id, [wrapper], SimpleNamespace(scale_loss=Mock()), None, [[]], [])
+        assert config.no_sync_func is wrapper.no_sync
+        # Native schedules exit no_sync before the last backward only when this is None.
+        # FSDP start_grad_sync() does not launch the outer reduction with overlap enabled.
+        assert config.grad_sync_func is (None if fsdp else wrapper.start_grad_sync)
+
+
 @pytest.mark.parametrize("reference_template", [None, "different reference template"])
 def test_bf16_export_keeps_actor_artifacts_with_weights_only_reference(monkeypatch, tmp_path, reference_template):
     actor, reference = tmp_path / "actor", tmp_path / "reference"

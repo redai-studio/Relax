@@ -56,25 +56,22 @@ def fsdp_gather_local_param(param, name: str = ""):
     Megatron-FSDP stores every parameter as a ``DTensor`` sharded over the FSDP
     (data-parallel) mesh dim(s). For TP-parallel params an extra trailing mesh
     dim carries the original Megatron TP placement (see megatron_fsdp
-    ``param_and_grad_buffer._get_fsdp_tensor_spec``: mesh ``(dp_shard[, dp_outer], tp)``,
-    placements ``[Shard(0)[, Shard(0)], tp_placement]``).
+    ``param_and_grad_buffer._get_fsdp_tensor_spec``). HSDP may additionally have
+    an outer mesh dim with ``Replicate()`` placement.
 
-    We eagerly all-gather the FSDP dim(s) — identified by mesh dim *name* — over
-    the current mpu data-parallel(+CP) group, keeping the TP dim sharded, so the
+    We eagerly all-gather the FSDP shard dim over its DeviceMesh subgroup,
+    excluding any replicated outer-DP dim and keeping the TP dim sharded, so the
     result matches the ordinary per-TP-rank Megatron parameter the TP all-gather
     path below already handles. DTensor's own ``redistribute`` / ``full_tensor``
-    are avoided on purpose: they resolve process groups by name and deadlock on
-    Relax's reloaded ``ReloadableProcessGroup`` comms. Using eager ``dist.all_gather``
-    (monkey-patched to the current NCCL comm) matches the proven TP-gather path.
+    are avoided on purpose: use eager ``dist.all_gather`` as on the TP-gather
+    path. Relax keeps the mesh's native process groups alive under Megatron-FSDP.
 
     Expert (MoE) params are sharded over the *expert* data-parallel submesh, not
     the regular one: megatron_fsdp builds their DeviceMesh with the SAME dim name
     (``dp_shard``) but ``is_expert_parallel=True`` (see
     ``param_and_grad_buffer.py`` FSDP tensor-spec / ``dist_index.get_submesh``).
-    So the shard dim is identified the same way by name, but the all-gather must
-    run over the expert-data-parallel group; using the regular DP group makes the
-    owning ranks rendezvous with non-owning partners that never join -> NCCL
-    deadlock. We pick the group from the param name (identical on all ranks).
+    The parameter's own mesh therefore selects the correct expert or dense
+    shard group without including unrelated ranks or outer replicas.
 
     Non-DTensor params (non-FSDP runs) pass through unchanged. Megatron TP metadata
     is re-attached so downstream code keeps working.
@@ -119,13 +116,7 @@ def fsdp_gather_local_param(param, name: str = ""):
             raise NotImplementedError(
                 f"[FSDP weight sync] unexpected FSDP shard dim {shard.dim}, only dim 0 supported"
             )
-        # Expert params shard over the expert-data-parallel submesh; everything
-        # else over the regular data-parallel(+CP) group. Group choice is by name,
-        # so all ranks in a given FSDP group agree and rendezvous correctly.
-        if ".experts." in name:
-            fsdp_group = mpu.get_expert_data_parallel_group()
-        else:
-            fsdp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        fsdp_group = mesh.get_group(fsdp_shard_dims[0])
         local = _allgather_dim0_uneven(local, fsdp_group)
 
     _check_fsdp_gathered_shape(local, data, mesh, placements, fsdp_dims, name)
