@@ -311,8 +311,9 @@ def test_trajectory_stream_carries_weight_version_spans(tmp_path, rollout_module
         forest.lineage(leaf_hash)[2].weight_version_spans.append(
             WeightVersionSpan(version="v1", token_start=0, token_end=1, attempt_seq=0)
         )
+        # The second span exercises the unknown-version (None) path through the JSONL boundary.
         forest.lineage(leaf_hash)[4].weight_version_spans.append(
-            WeightVersionSpan(version="v3", token_start=0, token_end=2, attempt_seq=0)
+            WeightVersionSpan(version=None, token_start=0, token_end=2, attempt_seq=0)
         )
         forest.session_id = session.session_id
         session.forest = forest
@@ -410,15 +411,14 @@ def test_trajectory_stream_carries_weight_version_spans(tmp_path, rollout_module
     ]
     assert committed[0]["update_id"] == rows["train"][0]["update_id"]
     assert committed[0]["status"] == "committed" and committed[0]["group_ids"] == ["g"]
-    session_terminal = [
-        event for event in rows["stages"] if event["scope"] == "session" and event["is_terminal"]
-    ]
+    session_terminal = [event for event in rows["stages"] if event["scope"] == "session" and event["is_terminal"]]
     assert len(session_terminal) == 1 and session_terminal[0]["export_ids"] == [export_id]
 
-    # The resp nodes carry their captured spans; obs nodes carry the empty default.
+    # The resp nodes carry their captured spans (the None version round-trips as
+    # JSON null); obs nodes carry the empty default.
     assert [node["weight_version_spans"] for node in lineage if node["kind"] == "resp"] == [
         [{"version": "v1", "token_start": 0, "token_end": 1, "attempt_seq": 0}],
-        [{"version": "v3", "token_start": 0, "token_end": 2, "attempt_seq": 0}],
+        [{"version": None, "token_start": 0, "token_end": 2, "attempt_seq": 0}],
     ]
     obs_nodes = [node for node in lineage if node["kind"] == "obs"]
     assert all(node["weight_version_spans"] == [] for node in obs_nodes)
