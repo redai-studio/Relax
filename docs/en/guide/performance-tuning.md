@@ -51,8 +51,12 @@ Microbatch token capacity is checked after applicable packing alignment. An
 indivisible sample longer than the capacity remains a singleton under the existing
 oversize behavior; the budget is not an absolute memory bound for that case.
 DP/VPP alignment may introduce dummy microbatches, which copy a local real pack
-with zero contribution to loss. Tighter budgets and multiple microbatches per
-rank can reduce or reverse the benefit.
+with zero contribution to loss. These copies still execute model work.
+Bounded sample moves and swaps refine capacity-safe fallback packs, then whole
+packs can swap between ranks without changing the aligned microbatch count.
+Refinement scores and debug logs include the estimated cost of local dummy
+copies. Tighter budgets and multiple microbatches per rank can reduce or reverse
+the benefit.
 
 Use polling TransferQueue with SFT (`n_samples_per_prompt=1`) or synchronous RL.
 The flag rejects fully asynchronous/hybrid training, wholepack, async prepacking,

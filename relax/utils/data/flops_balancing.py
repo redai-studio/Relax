@@ -380,13 +380,19 @@ def build_flops_schedule(
         cheapest = min((bins[i] for i in owned if bins[i]), key=lambda group: sum(workloads[i] for i in group))
         rank_bins.append([bins[i] or cheapest.copy() for i in owned])
         rank_dummy.append(dummy)
-    loads = [sum(weights[i] for i in group) for group in owners]
+    useful_loads = [math.fsum(weights[i] for i in group) for group in owners]
+    executed_loads = [_rank_workload([weights[i] for i in group]) for group in owners]
     logger.debug(
-        "Global FLOPs schedule K=%s DP loads min=%g mean=%g max=%g",
+        "Global FLOPs schedule K=%s dummy=%s DP estimated useful FLOPs min=%g mean=%g max=%g; "
+        "estimated executed FLOPs including dummy min=%g mean=%g max=%g",
         target,
-        min(loads),
-        sum(loads) / dp_size,
-        max(loads),
+        sum(map(len, rank_dummy)),
+        min(useful_loads),
+        math.fsum(useful_loads) / dp_size,
+        max(useful_loads),
+        min(executed_loads),
+        math.fsum(executed_loads) / dp_size,
+        max(executed_loads),
     )
     return rank_bins, rank_dummy
 
