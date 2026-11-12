@@ -14,15 +14,6 @@ import pytest
 try:
     import ray
 
-    if not ray.is_initialized():
-        try:
-            ray.init(num_cpus=8, ignore_reinit_error=True)
-        except ValueError as exc:
-            if "When connecting to an existing cluster" in str(exc):
-                ray.init(ignore_reinit_error=True)
-            else:
-                raise
-
     from relax.engine import rewards as rewards_module
     from relax.engine.rewards import RewardExecutionError, RewardExecutor, async_rm, batched_async_rm
     from relax.utils.reload_utils import ReloadableMixin
@@ -118,7 +109,7 @@ async def _ready_workers(args: SimpleNamespace) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_executor() -> Iterator[None]:
+def _reset_executor(reward_ray_cluster: None) -> Iterator[None]:
     _kill_workers(RewardExecutor._instance)
     RewardExecutor._instance = None
     yield

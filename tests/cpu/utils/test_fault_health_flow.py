@@ -669,7 +669,12 @@ def test_real_checker_runtime_fatal_records_only_discovery_upgrade_and_terminati
         ("role", "PRIVATE_ROLE", "role must be a supported service role"),
         ("source_generation", -1, "source_generation must be an unsigned 64-bit int"),
         ("reason", "PRIVATE_REASON", "reason must be a fault_detected reason code"),
-        ("fatal_event_id", new_id(), "a nonfatal fault has no fatal_event_id"),
+        pytest.param(
+            "fatal_event_id",
+            new_id(),
+            "a nonfatal fault has no fatal_event_id",
+            id="nonfatal-fault-with-fatal-event-id",
+        ),
     ],
 )
 def test_fault_context_error_names_constraint_without_value(field, value, constraint):
