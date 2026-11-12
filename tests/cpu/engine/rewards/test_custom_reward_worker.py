@@ -293,6 +293,44 @@ class TestRewardExecutorConfiguration:
 
 class TestCustomRewardLoading:
     @pytest.mark.asyncio
+    async def test_explicit_reload_refreshes_background_eval_executor_and_workers(self):
+        from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker
+
+        args = _make_args(reward_num_workers=1, eval_reward_key=None)
+        judge = EvalJudgeWorker.remote(args)
+        owner = ReloadableMixin()
+        owner.args, owner._eval_judge = args, judge
+
+        async def evaluate():
+            sample = _make_sample(index=0)
+            result = SimpleNamespace(data={"eval": {"samples": [sample]}})
+            result = await _wait(
+                judge.score.remote(args, (result, [DeferredReward(sample, {"evaluation": True})])),
+                timeout=RAY_WORKER_STARTUP_TIMEOUT,
+            )
+            return result.data["eval"]["samples"][0].reward
+
+        try:
+            await _wait(judge.__ray_ready__.remote(), timeout=RAY_WORKER_STARTUP_TIMEOUT)
+            # Reuse one owner and one eval worker across both signatures;
+            # the existing reload tests already cover the ordinary pool.
+            for path in (SYNC_RELOAD_COUNT_REWARD, ASYNC_RELOAD_COUNT_REWARD):
+                args.custom_rm_path = path
+                before_eval = await evaluate()
+                reloaded = await _wait(asyncio.to_thread(owner.reload_module, "custom_rm"))
+                after_eval = await evaluate()
+
+                assert reloaded["success"] is True
+                assert before_eval["pid"] != os.getpid()
+                assert after_eval["pid"] == before_eval["pid"]
+                assert after_eval["reload_count"] == before_eval["reload_count"] + 1, path
+        finally:
+            try:
+                await _wait(judge.close.remote())
+            finally:
+                ray.kill(judge)
+
+    @pytest.mark.asyncio
     async def test_sync_custom_reward_is_loaded_once_per_process(self, loaded_reward_paths):
         args = _make_args(
             custom_rm_path=SYNC_LOAD_COUNT_REWARD,

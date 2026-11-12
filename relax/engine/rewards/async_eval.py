@@ -109,6 +109,30 @@ class EvalJudgeWorker:
         )
         self._lock = asyncio.Lock()
 
+    async def reload_custom_reward(self, path: str) -> None:
+        """Refresh the owner and its workers between complete eval jobs."""
+        from relax.utils.reload_utils import reload_function
+
+        def refresh() -> None:
+            function = reload_function(path)
+            if function is None or not callable(function):
+                raise RuntimeError(f"Failed to reload custom reward {path!r} in EvalJudgeWorker.")
+            self._executor._reload_custom_reward(path)
+
+        async with self._lock:
+            task = asyncio.create_task(asyncio.to_thread(refresh))
+            cancelled = False
+            # Cancelling the RPC cannot stop its thread. Keep scoring excluded
+            # until every worker finishes refreshing, even on repeated cancel.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            task.result()
+            if cancelled:
+                raise asyncio.CancelledError
+
     async def score(self, args: Any, payload: tuple[Any, list[DeferredReward]]) -> Any:
         """Score snapshots in submission order; parallelize calls within a
         job."""

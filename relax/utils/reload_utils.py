@@ -385,6 +385,11 @@ class ReloadableMixin:
 
                 try:
                     RewardExecutor.reload_custom_reward(module_path)
+                    eval_judge = getattr(self, "_eval_judge", None)
+                    if eval_judge is not None:
+                        import ray
+
+                        ray.get(eval_judge.reload_custom_reward.remote(module_path))
                 except Exception as exc:
                     logger.error(f"Failed to reload custom reward workers for {module_path}: {exc}")
                     return {

@@ -887,6 +887,7 @@ def get_local_rollout_manager() -> "RolloutManager":
 @ray.remote(
     concurrency_groups={
         "health_monitoring": 1,
+        "reload": 1,
         "scale_out": 8,
         "scale_in": 8,
         "scale_coordination": 1,
@@ -1012,6 +1013,20 @@ class RolloutManager(ReloadableMixin):
         self._eviction_check_interval = getattr(args, "eviction_check_interval", 10.0)
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
+
+    # A slow judge may finish before reload can proceed. Keep these synchronous
+    # RPCs serialized without blocking the generation/health event loop.
+    @ray.method(concurrency_group="reload")
+    def reload_function_by_name(self, module_name: str) -> dict[str, Any]:
+        return super().reload_function_by_name(module_name)
+
+    @ray.method(concurrency_group="reload")
+    def reload_module(self, module_name: str, module_path: str | None = None) -> dict[str, Any]:
+        return super().reload_module(module_name, module_path)
+
+    @ray.method(concurrency_group="reload")
+    def reload_all_functions(self) -> dict[str, Any]:
+        return super().reload_all_functions()
 
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
