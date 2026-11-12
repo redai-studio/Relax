@@ -3,6 +3,8 @@ import json
 import sys
 import types
 from argparse import Namespace
+from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import torch
@@ -627,3 +629,182 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
     torch.testing.assert_close(rollout_data["rollout_topk_token_ids"][0], token_ids[expected_rows])
     torch.testing.assert_close(rollout_data["rollout_topk_log_probs"][0], log_probs[expected_rows])
     assert rollout_data["rollout_log_probs"][0].tolist() == expected_rows
+
+
+def _mapped_file_identity(tensor):
+    for line in Path("/proc/self/maps").read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        start, end = (int(part, 16) for part in fields[0].split("-"))
+        if start <= tensor.data_ptr() < end:
+            assert fields[1].endswith("s") and fields[4] != "0", line
+            assert fields[5].endswith(" (deleted)"), line
+            return fields[3], fields[4]  # Device/inode identifies storage across processes.
+    raise AssertionError("Tensor does not point into a shared file mapping")
+
+
+def _shared_pixel_worker(rank, rendezvous, files_dir, pp_size, host_count):
+    import torch.distributed as dist
+
+    torch.set_num_threads(1)
+    timeout = timedelta(seconds=45)
+    tp_size = 2 * host_count
+    world_size = tp_size * pp_size
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size, timeout=timeout
+    )
+    world = dist.group.WORLD
+    try:
+        tp_group = world
+        pp_group = None
+        if pp_size == 2:
+            groups = {
+                members: dist.new_group(ranks=list(members), backend="gloo", timeout=timeout)
+                for members in ((0, 1), (2, 3), (0, 2), (1, 3))
+            }
+            tp_group = groups[(0, 1) if rank < 2 else (2, 3)]
+            pp_group = groups[(0, 2) if rank % 2 == 0 else (1, 3)]
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            stream_module = _load_stream_module(monkeypatch)
+            if host_count == 2:
+                # Simulate two hosts while retaining real local mappings and collectives.
+                monkeypatch.setattr(stream_module.socket, "gethostname", lambda: f"host-{rank // 2}")
+            original_mkstemp = stream_module.tempfile.mkstemp
+
+            def local_mkstemp(*args, **kwargs):
+                kwargs["dir"] = files_dir  # Never touch the running cluster's /dev/shm.
+                return original_mkstemp(*args, **kwargs)
+
+            monkeypatch.setattr(stream_module.tempfile, "mkstemp", local_mkstemp)
+            for name, value in (
+                ("get_tensor_model_parallel_rank", rank % tp_size),
+                ("get_tensor_model_parallel_world_size", tp_size),
+                ("get_context_parallel_rank", 0),
+                ("get_context_parallel_world_size", 1),
+                ("get_pipeline_model_parallel_rank", rank // tp_size),
+                ("get_pipeline_model_parallel_world_size", pp_size),
+            ):
+                monkeypatch.setattr(stream_module.mpu, name, lambda value=value: value, raising=False)
+            for name in ("get_tensor_model_parallel_group", "get_tensor_and_context_parallel_group"):
+                monkeypatch.setattr(stream_module.mpu, name, lambda: tp_group, raising=False)
+            monkeypatch.setattr(
+                stream_module.mpu, "get_pipeline_model_parallel_group", lambda: pp_group, raising=False
+            )
+            sample = {
+                "pixel_values": torch.arange(12, dtype=torch.bfloat16).reshape(3, 4),
+                "pixel_values_videos": [torch.full((2, 3), 5.0), torch.full((1, 3), 9.0)],
+                "image_grid_thw": torch.tensor([[1, 3, 4]]),
+                "video_grid_thw": torch.tensor([[1, 2, 3], [1, 1, 3]]),
+                "label": "kept-inline",
+            }
+            spec, tensors = stream_module._encode_multimodal_inputs([sample, None, {}])
+
+            def broadcast():
+                return stream_module._broadcast_multimodal_inputs(
+                    spec, tensors if rank == 0 else [], rank == 0, torch.device("cpu"), True
+                )
+
+            result = broadcast()
+            assert result[1:] == [None, {}]
+            for key in ("image_grid_thw", "video_grid_thw"):
+                assert torch.equal(result[0][key], sample[key])
+            assert result[0]["label"] == sample["label"]
+            identity = None
+            if rank < tp_size:
+                pixels = result[0]["pixel_values"]
+                assert pixels.dtype == sample["pixel_values"].dtype and pixels.shape == sample["pixel_values"].shape
+                assert torch.equal(pixels, sample["pixel_values"])
+                identity = _mapped_file_identity(pixels)
+                assert all(
+                    received.dtype == expected.dtype
+                    and received.shape == expected.shape
+                    and torch.equal(received, expected)
+                    and _mapped_file_identity(received) == identity
+                    for received, expected in zip(
+                        result[0]["pixel_values_videos"], sample["pixel_values_videos"], strict=True
+                    )
+                )
+            else:
+                assert torch.equal(result[0]["pixel_values"], sample["pixel_values"])
+                assert not result[0]["pixel_values"].is_shared()
+            identities = [None] * world_size
+            dist.all_gather_object(identities, identity, group=world)
+            for first_rank in range(0, tp_size, 2):
+                assert identities[first_rank] == identities[first_rank + 1] is not None
+            assert len(set(identities[:tp_size])) == host_count
+            assert identities[tp_size:] == [None] * (world_size - tp_size)
+            assert not list(Path(files_dir).iterdir())
+
+            if pp_size == 1:
+                del result  # The remaining pixel view alone must keep the unlinked mapping alive.
+                if rank % 2 == 1:
+                    pixels[0, 0] = 42  # Test-only write proves both processes use the same backing.
+                dist.barrier(group=world)
+                assert pixels[0, 0].item() == 42
+                assert sample["pixel_values"][0, 0].item() == 0
+                other_group = dist.new_group(ranks=list(range(tp_size)), backend="gloo", timeout=timeout)
+                for group in (world, other_group):  # A new batch and a different group each need their own arena.
+                    arena, is_writer = stream_module._shared_pixel_buffer(128, group)
+                    assert is_writer is (rank % 2 == 0)
+                    if is_writer:
+                        arena.fill_(9)
+                    dist.barrier(group=group)
+                    assert torch.all(arena == 9)
+                    assert _mapped_file_identity(arena) != identity
+                    assert pixels[0, 0].item() == 42
+                    del arena
+                del pixels
+                mappings = [line.split(maxsplit=5) for line in Path("/proc/self/maps").read_text().splitlines()]
+                assert identity not in {(fields[3], fields[4]) for fields in mappings}
+            else:
+                for case in ("allocation", "mapping", "view", "copy"):
+                    with pytest.MonkeyPatch.context() as failure_patch:
+
+                        def fail(*_args, **_kwargs):
+                            raise OSError(f"injected {case} failure")
+
+                        original_copy = torch.Tensor.copy_
+
+                        def fail_shared_copy(tensor, *args, **kwargs):
+                            if tensor.is_shared():
+                                raise RuntimeError("injected copy failure")
+                            return original_copy(tensor, *args, **kwargs)
+
+                        original_view = torch.Tensor.view
+
+                        def fail_shared_view(tensor, *args, **kwargs):
+                            if tensor.is_shared():
+                                raise RuntimeError("injected view failure")
+                            return original_view(tensor, *args, **kwargs)
+
+                        if case == "allocation" and rank == 0:
+                            failure_patch.setattr(stream_module.os, "posix_fallocate", fail)
+                        elif case == "mapping" and rank == 1:
+                            failure_patch.setattr(stream_module.torch, "from_file", fail)
+                        elif case == "copy" and rank == 0:
+                            failure_patch.setattr(torch.Tensor, "copy_", fail_shared_copy)
+                        elif case == "view" and rank == 1:
+                            failure_patch.setattr(torch.Tensor, "view", fail_shared_view)
+                        # All PP stages must see the same error without stranding a collective.
+                        with pytest.raises(RuntimeError, match=f"injected {case} failure"):
+                            broadcast()
+                    dist.barrier(group=world)
+                    assert not list(Path(files_dir).iterdir())
+            dist.barrier(group=world)
+            assert not list(Path(files_dir).iterdir())
+    finally:
+        dist.destroy_process_group(world)
+
+
+@pytest.mark.skipif(not Path("/proc/self/maps").exists(), reason="Shared mmap identity checks require Linux procfs")
+@pytest.mark.parametrize(("pp_size", "host_count"), [(1, 1), (2, 1), (1, 2)])
+def test_multimodal_shared_pixels_cpu_processes(tmp_path, pp_size, host_count):
+    files_dir = tmp_path / "buffers"
+    files_dir.mkdir()
+    torch.multiprocessing.spawn(
+        _shared_pixel_worker,
+        args=(str(tmp_path / "rendezvous"), str(files_dir), pp_size, host_count),
+        nprocs=2 * pp_size * host_count,
+        join=True,
+    )
+    assert not list(files_dir.iterdir())
