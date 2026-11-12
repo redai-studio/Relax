@@ -41,7 +41,7 @@ datasets:
 YAML 混合数据自动启用按源训练指标，不需要额外参数。每个 optimizer step 上报：
 
 - `train/dataset/general/loss`：该源的监督 token NLL 总和除以有效监督 token 数。
-- `train/dataset/general/tokens`：实际参与主语言模型监督的 token 数。
+- `train/dataset/general/tokens`：当前 step 实际参与主语言模型监督的有效 token 数，全卡汇总，非累计值。
 - `train/dataset/general/samples`：进入该 step 的实际样本数，包含零监督 token 的样本，排除对齐用 dummy microbatch。
 - `train/dataset/general/token_fraction`、`sample_fraction`：过滤后，该源占当前 step 实际 token 数和样本数的比例。
 
@@ -49,7 +49,7 @@ YAML 混合数据自动启用按源训练指标，不需要额外参数。每个
 
 配比按完整逻辑 epoch 的样本配额生效，不保证逐 step 的固定比例；过滤和跳过样本也会影响实际训练配比，可结合各源 `samples`、`tokens` 观察。这些指标针对主语言模型训练 loss，不包含 MTP 辅助 loss，不改变已有 eval 指标；FSDP、序列分类、DPO/RM 和自定义 dataset 不在此分源统计范围内。续训时应保持 YAML 和数据快照不变。
 
-开启 `--use-clearml --use-metrics-service` 后，ClearML SDK 的 title 统一为 `train`：整体 loss 的 series 为 `loss`，分数据集 loss 的 series 为 `loss/<name>`。在任务列表的 Scalars 对比视图中展开 `train`，每个 series 对应一张独立图，图名包含数据集名称，与原有训练图并列。分源计数及占比保留在原始训练指标中，但不单独上报到 ClearML，避免额外图表或分类；CPT 复用同一映射。历史任务已写入的旧标题不会自动改名，新任务使用此布局。
+开启 `--use-clearml --use-metrics-service` 后，ClearML SDK 的 title 统一为 `train`：整体 loss 的 series 为 `loss`，分数据集 loss 的 series 为 `loss/<name>`，有效监督 token 数的 series 为 `tokens/<name>`，显示当前 step 的数量；该源没有有效监督 token 时也会上报 `0`。在任务列表的 Scalars 对比视图中展开 `train`，每个 series 对应一张独立图，图名包含数据集名称，与原有训练图并列。分源样本数及占比仍保留在原始训练指标中，不额外生成 ClearML 图表；CPT 复用同一映射。历史任务已写入的旧标题不会自动改名，新任务使用此布局。
 
 ## 数据准备
 
