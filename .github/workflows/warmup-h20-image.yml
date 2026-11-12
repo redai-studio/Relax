@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        machine: [h20-m01, h20-m02]
+        machine: [M01, M02]
     concurrency:
       # Deliberately omit workflow/ref/hash: different images must also queue
       # before taking another runner on this host. The cache still keys by hash.
