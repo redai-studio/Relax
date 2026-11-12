@@ -2227,6 +2227,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         self.opt_param_scheduler,
                         data_iterator,
                         num_microbatches,
+                        consumed_weight_version=str(self.weight_updater.weight_version),
                     )
                     self._resident_sft_params_pending = resident_overlap and rollout_id + 1 < self.args.num_rollout
                 finally:
@@ -2723,6 +2724,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.opt_param_scheduler,
                     data_iterator,
                     num_microbatches,
+                    consumed_weight_version=str(self.weight_updater.weight_version),
                 )
 
             self.prof.step(rollout_id=rollout_id)
@@ -2886,6 +2888,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.opt_param_scheduler,
                     self.data_iterator,
                     self.num_microbatches,
+                    consumed_weight_version=str(self.weight_updater.weight_version),
                 )
             self.prof.step(rollout_id=rollout_id)
             # [perf] Time actor spent waiting for TQ data (starvation).

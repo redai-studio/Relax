@@ -78,6 +78,7 @@ class _Update:
     stage: ExportStageRecord | None = None
     reserved: bool = False
     metadata_reserved: bool = False
+    consumed_weight_version: str | None = None
 
 
 _CURRENT: ContextVar[_Update | None] = ContextVar("agentic_obs_update", default=None)
@@ -101,7 +102,13 @@ def _cpu_values(value: Any) -> list:
 
 
 @best_effort
-def _begin_update(args: Namespace, rollout_id: int, step_id: int, role: str) -> _Update | None:
+def _begin_update(
+    args: Namespace,
+    rollout_id: int,
+    step_id: int,
+    role: str,
+    consumed_weight_version: str | None = None,
+) -> _Update | None:
     config = resolve_agentic_obs_config(args)
     if config is None or role != "actor":
         return None
@@ -129,6 +136,7 @@ def _begin_update(args: Namespace, rollout_id: int, step_id: int, role: str) -> 
         cp_size=1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size(),
         train_generation_id=generation,
         update_sequence=sequence,
+        consumed_weight_version=consumed_weight_version,
     )
     write_manifest(args, config)
     start = _stage_record(state, "start")
@@ -179,8 +187,15 @@ def _record_failure(state: _Update, error: BaseException) -> None:
 
 
 @contextmanager
-def observe_train_step(args: Namespace, rollout_id: int, step_id: int, *, role: str = "actor") -> Iterator[None]:
-    state = _begin_update(args, rollout_id, step_id, role)
+def observe_train_step(
+    args: Namespace,
+    rollout_id: int,
+    step_id: int,
+    *,
+    role: str = "actor",
+    consumed_weight_version: str | None = None,
+) -> Iterator[None]:
+    state = _begin_update(args, rollout_id, step_id, role, consumed_weight_version=consumed_weight_version)
     if state is None:
         yield
         return
@@ -327,6 +342,7 @@ def _write_update(state: _Update) -> None:
                         "advantage_mean": values[3 * index] if snapshot.advantage_available else None,
                         "advantage_absmax": values[3 * index + 1] if snapshot.advantage_available else None,
                         "returns_mean": values[3 * index + 2] if snapshot.returns_available else None,
+                        "consumed_weight_version": state.consumed_weight_version,
                     }
                 )
         path = state.config.train_scalar_path(state.rollout_id, state.dp_rank)
