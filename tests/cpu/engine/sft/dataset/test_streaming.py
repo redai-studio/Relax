@@ -1735,11 +1735,21 @@ def test_html_media_tags_remain_literal_training_text(tmp_path, multimodal_keys)
         ds.stop()
 
 
-def test_opt_in_preserves_assistant_literal_media_tags(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_tool_call", [False, True])
+def test_opt_in_preserves_assistant_literal_media_tags(tmp_path, monkeypatch, with_tool_call):
     text = "Use <image> in the example."
     path = tmp_path / "literal.jsonl"
-    row = {"messages": [{"role": "user", "content": "Show the tag."}, {"role": "assistant", "content": text}]}
-    _write_jsonl(path, [row])
+    messages = [{"role": "user", "content": "Show the tag."}]
+    tool_call = {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": {}}}
+    if with_tool_call:
+        messages.extend(
+            [
+                {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+                {"role": "tool", "content": "Example found.", "tool_call_id": "call-1"},
+            ]
+        )
+    messages.append({"role": "assistant", "content": text})
+    _write_jsonl(path, [{"messages": messages}])
     ds = SFTStreamingDataset(
         path=str(path), prompt_key="messages", multimodal_keys={"image": "images"}, prefetch_max_cached=0
     )
@@ -1749,8 +1759,11 @@ def test_opt_in_preserves_assistant_literal_media_tags(tmp_path, monkeypatch):
             ds.get_canonical_sample(0)
         monkeypatch.setenv("RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT", "1")
         sample = ds.get_canonical_sample(0)
-        assert sample.messages[1].content == text
+        assert sample.messages[-1].content == text
         assert sample.images is None
+        if with_tool_call:
+            assert sample.messages[1].content == ""
+            assert sample.messages[1].tool_calls == [tool_call]
     finally:
         ds.stop()
 

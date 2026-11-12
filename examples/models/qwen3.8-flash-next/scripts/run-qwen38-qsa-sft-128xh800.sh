@@ -16,13 +16,13 @@
 # Set PROFILE_STEP=0 to disable profiling and USE_CLEARML=0 for local logging.
 # Set SAVE_INTERVAL to enable checkpoint save/resume under SAVE_DIR/EXP_NAME.
 # Keep SAVE_DIR and EXP_NAME fixed when resuming. DRY_RUN=1 previews the launch.
+# Set RELAX_SKIP_CLUSTER_CLEANUP=1 when reusing a Ray cluster with active workloads.
 
 set -eo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
 export RELAX="${RELAX_ROOT}"
-export RELAX_SKIP_CLUSTER_CLEANUP=1
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 
 : "${MODEL_DIR:?Set MODEL_DIR to the HF checkpoint or its parent directory}"

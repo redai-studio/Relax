@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[3]
 SFT = "scripts/training/sft/run-qwen35-optimized-64xblackwell.sh"
 CPT = "scripts/training/cpt/run-qwen3.6-35B-A3B-cpt-256k-64xgpu.sh"
 QSA = "examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh"
+QSA_H800 = "examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-128xh800.sh"
 
 
 @pytest.mark.parametrize("script", [SFT, CPT, QSA])
@@ -45,8 +46,18 @@ def test_image_recipe_three_path_environment(script):
     assert rendered["runtime_env"]["env_vars"]["RELAX_SKIP_NONFINITE_GRAD"] == "1"
 
 
-@pytest.mark.parametrize("script", [SFT, CPT, QSA])
-def test_recipe_delegates_without_cluster_cleanup(tmp_path, script):
+@pytest.mark.parametrize(
+    "script,cleanup_setting,expected_setting",
+    [
+        (SFT, None, "1"),
+        (CPT, None, "1"),
+        (QSA, None, "1"),
+        (QSA_H800, None, ""),
+        (QSA_H800, "0", "0"),
+        (QSA_H800, "1", "1"),
+    ],
+)
+def test_recipe_delegates_cluster_cleanup_setting(tmp_path, script, cleanup_setting, expected_setting):
     import shutil
 
     target = tmp_path / script
@@ -61,6 +72,8 @@ def test_recipe_delegates_without_cluster_cleanup(tmp_path, script):
     env = {key: value for key, value in os.environ.items() if key in ("PATH", "HOME", "LANG", "TMPDIR")}
     env.update(MODEL_DIR="/models", DATA_DIR="/data", SAVE_DIR="/output", RELAX_HYBRID_EP_COMMIT="image-pinned")
     env.update(MEGATRON="/runtime/megatron", RAY_JOBS_ADDRESS="http://127.0.0.1:8265")
+    if cleanup_setting is not None:
+        env["RELAX_SKIP_CLUSTER_CLEANUP"] = cleanup_setting
     fake_ray = tmp_path / "bin/ray"
     fake_ray.parent.mkdir()
     ray_trace = tmp_path / "ray-called"
@@ -70,5 +83,5 @@ def test_recipe_delegates_without_cluster_cleanup(tmp_path, script):
     env["PATH"] = str(fake_ray.parent) + os.pathsep + env["PATH"]
     result = subprocess.run(["bash", str(target)], env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["1", "http://127.0.0.1:8265"]
+    assert result.stdout.splitlines() == [expected_setting, "http://127.0.0.1:8265"]
     assert not ray_trace.exists(), "Recipes must delegate Ray operations to the entrypoint"

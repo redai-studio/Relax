@@ -368,6 +368,7 @@ def _build_canonical_sample_from_row(
     source_name: str,
     task_type: str = "causal_lm",
     conversation_key_map: dict[str, str] | None = None,
+    assistant_media_tags_as_text: bool = False,
 ) -> CanonicalSample:
     prompt = row.get(prompt_key)
     if prompt is None:
@@ -404,6 +405,8 @@ def _build_canonical_sample_from_row(
             for message in prompt
         ]
         row = {**row, prompt_key: prompt}
+        if assistant_media_tags_as_text and _assistant_quotes_media_tags(row, prompt_key, multimodal_keys):
+            multimodal_keys = None
         _validate_multimodal_contract(
             row,
             prompt,
@@ -808,21 +811,12 @@ class SFTStreamingDataset:
             row = self.reader[idx]
         if self.training_mode == "cpt" and self.cpt_template != "multimodal":
             return build_cpt_sample(row, prompt_key=self.prompt_key, source_name=self.source_name, row_index=idx)
-        multimodal_keys = self.multimodal_keys
-        if (
-            Envs.RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT
-            and self.training_mode == "sft"
-            and self.task_type == "causal_lm"
-            and self.label_key is None
-            and _assistant_quotes_media_tags(row, self.prompt_key, multimodal_keys)
-        ):
-            multimodal_keys = None
         return _build_canonical_sample_from_row(
             row,
             row_index=idx,
             prompt_key=self.prompt_key,
             label_key=self.label_key,
-            multimodal_keys=multimodal_keys,
+            multimodal_keys=self.multimodal_keys,
             conversation_key_map=self.conversation_key_map,
             metadata_key=self.metadata_key,
             tool_key=self.tool_key,
@@ -830,6 +824,11 @@ class SFTStreamingDataset:
             require_response=self.require_response,
             source_name=self.source_name,
             task_type=self.task_type,
+            assistant_media_tags_as_text=(
+                self.training_mode == "sft"
+                and self.task_type == "causal_lm"
+                and Envs.RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT
+            ),
         )
 
     def get_classification_label(self, idx: int, *, row: dict[str, Any] | None = None) -> torch.Tensor | None:
