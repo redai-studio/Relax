@@ -211,8 +211,8 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
 
     rm_calls: list = []
 
-    async def fake_batched_rm(args, group):
-        rm_calls.append(group)
+    async def fake_batched_rm(args, group, *, evaluation):
+        rm_calls.append((group, evaluation))
         return [1.0] * len(group)
 
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: _GroupState())
@@ -226,6 +226,8 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
 
     assert all(sample.status == status for sample in result)
     assert len(rm_calls) == expected_rm_calls
+    if expected_rm_calls:
+        assert rm_calls == [(group, evaluation)]
 
 
 class _RolloutState:

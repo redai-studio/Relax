@@ -1305,7 +1305,8 @@ async def _eval_rollout(
         completed_samples.sort(key=lambda sample: sample.index)
         results[dataset_cfg.name] = {
             "rewards": [
-                sample.reward if not reward_key else sample.reward[reward_key] for sample in completed_samples
+                sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key]
+                for sample in completed_samples
             ],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in completed_samples],
             "samples": completed_samples,

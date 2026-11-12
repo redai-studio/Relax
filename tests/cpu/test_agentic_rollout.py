@@ -108,25 +108,26 @@ def _runtime_args(**overrides):
     return SimpleNamespace(**base)
 
 
-async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) -> None:
-    calls: list[Sample] = []
+@pytest.mark.parametrize("rollout_mode", ["train", "eval"])
+async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch, rollout_mode) -> None:
+    calls: list[tuple[Sample, bool]] = []
 
-    async def fake_async_rm(args, sample):
+    async def fake_async_rm(args, sample, *, evaluation):
         del args
-        calls.append(sample)
+        calls.append((sample, evaluation))
         return 1.0
 
     monkeypatch.setattr("relax.agentic.pipeline.reward.async_rm", fake_async_rm)
     reward_domain = RewardDomain(
         args=_runtime_args(reward_max_concurrency=1),
-        rollout_mode="train",
+        rollout_mode=rollout_mode,
         group_filter=None,
     )
     sample = Sample(index=0, group_index=0, session_id="sample-0", metadata={})
 
     await reward_domain._score_sample(sample)
 
-    assert calls == [sample]
+    assert calls == [(sample, rollout_mode == "eval")]
     assert sample.reward == 1.0
 
 
@@ -253,18 +254,19 @@ async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> 
     assert second.samples[0][0].teacher_log_probs == [-0.5]
 
 
-async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> None:
-    calls: list[list[Sample]] = []
+@pytest.mark.parametrize("rollout_mode", ["train", "eval"])
+async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch, rollout_mode) -> None:
+    calls: list[tuple[list[Sample], bool]] = []
 
-    async def fake_batched_async_rm(args, samples):
+    async def fake_batched_async_rm(args, samples, *, evaluation):
         del args
-        calls.append(samples)
+        calls.append((samples, evaluation))
         return [float(sample.index) for sample in samples]
 
     monkeypatch.setattr("relax.agentic.pipeline.reward.batched_async_rm", fake_batched_async_rm)
     reward_domain = RewardDomain(
         args=_runtime_args(group_rm=True, reward_max_concurrency=1),
-        rollout_mode="train",
+        rollout_mode=rollout_mode,
         group_filter=None,
     )
     samples = [Sample(index=index, group_index=0, session_id=f"sample-{index}", metadata={}) for index in range(3)]
@@ -275,7 +277,7 @@ async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> 
 
     await reward_domain.score_group(group)
 
-    assert calls == [samples]
+    assert calls == [(samples, rollout_mode == "eval")]
     assert [sample.reward for sample in samples] == [0.0, 1.0, 2.0]
 
 

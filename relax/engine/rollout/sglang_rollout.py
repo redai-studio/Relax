@@ -24,6 +24,7 @@ from tqdm import tqdm
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
+from relax.engine.rewards.async_eval import is_eval_reward_pending
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
@@ -732,11 +733,11 @@ async def generate_and_rm(
     # Custom generation may already have assigned rewards to some outputs.
     if isinstance(generated, list):
         samples_need_reward = [sample for sample in generated if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
+        rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
     elif generated.reward is None:
-        generated.reward = await async_rm(args, generated)
+        generated.reward = await async_rm(args, generated, evaluation=evaluation)
 
     if opd.is_opd_enabled(args, evaluation=evaluation):
         await state.opd_manager.prefill(generated, _encode_multimodal_inputs)
@@ -831,7 +832,7 @@ async def generate_and_rm_group(
                 state.opd_manager.response_stats.finish(sample.response_key)
         return group
 
-    rewards = await batched_async_rm(args, group)
+    rewards = await batched_async_rm(args, group, evaluation=evaluation)
     for sample, reward in zip(group, rewards, strict=False):
         sample.reward = reward
 
@@ -1499,7 +1500,11 @@ async def eval_rollout_single_dataset(
         if (
             0 <= prompt_index < len(dataset.samples)
             and [sample.index for sample in group] == list(expected_indices)
-            and all(sample.reward is not None and sample.status != Sample.Status.ABORTED for sample in group)
+            and all(
+                (sample.reward is not None or is_eval_reward_pending(sample))
+                and sample.status != Sample.Status.ABORTED
+                for sample in group
+            )
         ):
             valid_data.extend(group)
     num_valid_prompts = len(valid_data) // group_size
@@ -1512,7 +1517,10 @@ async def eval_rollout_single_dataset(
     data = valid_data
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "rewards": [
+                sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key]
+                for sample in data
+            ],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
             "group_size": group_size,

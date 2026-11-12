@@ -503,6 +503,54 @@ sampled Group 处理 reward；它是否执行不由 `--normalize-advantages` 控
 值。Sibling context 不设置 reward。Custom advantage 需要的 outcome 可以保存在各 context 的 metadata 中。
 Multi-context training 中，reward 用于上报任务结果，custom advantage 决定每个 export 的 advantage。
 
+### 后台 Eval Judge
+
+内置 Agentic 和标准 SGLang eval 支持在轨迹生成完成后，将耗时的 judge 评分交给后台执行。异步评分默认开启，
+无需传入开关；使用 `--disable-eval-async-judge` 关闭异步，恢复等待评分完成的流程。共卡和非共卡模式均可使用，
+但评测轨迹生成仍占用现有 policy 推理资源；后台评分不能继续依赖这些资源。
+
+独立 HTTP 奖励 `remote_rm` 自动使用该机制。自定义 `--custom-rm-path` 需要显式声明支持后台评分。例如，已有
+`train_reward` 和 `eval_reward` 实现时，入口可以继续使用同步函数：
+
+```python
+def reward_func(args, sample, *, evaluation=False, **kwargs):
+    if evaluation:
+        return eval_reward(args, sample)
+    return train_reward(args, sample)
+
+
+reward_func.supports_async_eval = True
+```
+
+同步 `def` 仍由 Ray reward 进程池执行；`async def` 也可使用该声明。内置 Agentic 和标准 SGLang rollout
+在训练时传入 `evaluation=False`，评测时传入 `evaluation=True`，同步评分和后台评分都如此。函数接受
+`evaluation` 关键字参数或 `**kwargs` 时会收到该参数；旧的严格二参数函数不会被额外传参。
+自行实现完整 rollout 或 eval 函数时，调用 `async_rm` / `batched_async_rm` 也需显式传入 `evaluation`；
+框架不会从共享 `args` 或 metadata 推断当前阶段。
+无需为了区分阶段而注入 metadata 或额外编写 YAML，评测数据可以直接通过 CLI 配置：
+
+```bash
+--eval-prompt-data agent_eval "<eval-data-path>"
+```
+
+需要按数据集设置不同采样参数或 metadata 时，仍可使用 `--eval-config`。
+
+声明 `supports_async_eval` 表示 eval 评分只依赖导出的 Sample 快照、持久化 artifact，以及独立 CPU 或远端 judge
+服务。需要判分的 action、工具结果和中间轨迹应事先写入导出数据；评分不能访问已结束的 Session、临时文件，或
+共卡且会被 offload 的模型。函数仍应返回最终真实 reward，不要自行提交后台任务后返回任务 ID 或占位分。
+`group_rm` 的完整列表输入和对应列表输出契约保持不变。
+
+Relax 使用与训练评分隔离的 CPU reward 池，待真实分数返回后，按生成时的 eval 轮次记录指标和 dump。普通规则
+reward、未声明支持的 custom reward、托管 `dapo-genrm` 和 native 图像评分保持原流程；训练 reward 也不受此开关
+影响。普通 RM 路径中，Agent 已填入的 reward 继续直接使用，不会重新评分。
+
+同步 judge 的 eval 池沿用 `--reward-num-workers` 和 `--reward-max-concurrency` 配置，与训练池分别计数；
+需要为新增的评分进程预留 CPU 资源。
+
+正常训练结束时会等待剩余 judge 完成并记录结果；后台评分失败会写入日志，并在收尾时明确报错。该机制不提供
+训练作业退出后仍可执行的持久任务队列，失败或强制退出时可能中断评分。持续慢于评测产生速度的 judge 会积压
+任务，因此应为远端调用设置超时，并保证足够的评分容量；独立 worker 池也不能消除远端 judge 服务本身的竞争。
+
 ## 配置 Runtime 行为
 
 ::: danger 必须满足的 external agent 容量

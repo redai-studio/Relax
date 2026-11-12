@@ -141,6 +141,37 @@ def loaded_reward_paths(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 class TestCustomRewardDispatch:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("batched", [False, True], ids=["sample", "batch"])
+    @pytest.mark.parametrize(
+        ("reward_name", "supports_evaluation"),
+        [
+            ("sync_evaluation_reward", True),
+            ("async_evaluation_reward", True),
+            ("sync_evaluation_kwargs_reward", True),
+            ("async_evaluation_kwargs_reward", True),
+            ("sync_legacy_reward", False),
+            ("async_legacy_reward", False),
+        ],
+    )
+    async def test_custom_reward_receives_evaluation_when_supported(self, reward_name, supports_evaluation, batched):
+        args = _make_args(custom_rm_path=f"{CUSTOM_REWARD_MODULE}.{reward_name}", reward_num_workers=1)
+        samples = [_make_sample(index=index) for index in range(3)]
+        if reward_name.startswith("sync_"):
+            await _ready_workers(args)
+
+        for evaluation in (False, True):
+            if batched:
+                results = await _wait(batched_async_rm(args, samples, evaluation=evaluation))
+                expected_samples = samples
+            else:
+                results = [await _wait(async_rm(args, samples[0], evaluation=evaluation))]
+                expected_samples = samples[:1]
+            assert results == [
+                {"index": sample.index, "evaluation": evaluation if supports_evaluation else None}
+                for sample in expected_samples
+            ]
+
+    @pytest.mark.asyncio
     async def test_sync_reward_runs_in_worker_without_blocking_event_loop(self, monkeypatch):
         event_loop_thread = threading.get_ident()
         submission_threads = []

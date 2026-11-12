@@ -152,6 +152,7 @@ class MetricsService:
                 logger.error(f"Failed to initialize Apprise adapter: {e}")
 
         self._use_wandb = getattr(config, "use_wandb", False)
+        self._wandb_async_steps = False
         if self._use_wandb:
             try:
                 self._init_wandb(config)
@@ -283,7 +284,22 @@ class MetricsService:
 
                 if self._use_wandb:
                     try:
-                        wandb.log(metrics_dict, step=step)
+                        self._wandb_async_steps = self._wandb_async_steps or bool(metrics_dict.get("eval/async_judge"))
+                        if self._wandb_async_steps:
+                            # Late eval results cannot use W&B's monotonic history
+                            # step. Keep all subsequent reports on custom axes too.
+                            wandb_metrics = metrics_dict.copy()
+                            for prefix, step_key in (
+                                ("train/", "train/step"),
+                                ("rollout/", "rollout/step"),
+                                ("eval/", "eval/step"),
+                                ("perf/", "rollout/step"),
+                            ):
+                                if any(name.startswith(prefix) for name in metrics_dict):
+                                    wandb_metrics.setdefault(step_key, step)
+                            wandb.log(wandb_metrics)
+                        else:
+                            wandb.log(metrics_dict, step=step)
                         report_results["wandb"] = "success"
                         logger.debug(f"Reported {len(metrics_dict)} metrics to W&B for step {step}")
                     except Exception as e:
