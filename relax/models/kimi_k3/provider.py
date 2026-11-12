@@ -60,6 +60,8 @@ class KimiK3VLModelProvider(KimiK3ModelProvider):
         from .training_ops import configure_training_ops
 
         configure_training_ops()
+        if Envs.RELAX_KIMI_K31_DSA_SELECTION_REUSE and not self.kimi_dsa_config:
+            raise ValueError("DSA selection reuse requires a K3.1 DSA model")
         if Envs.RELAX_KIMI_K31_DSA_FUSED_INDEXER:
             from .dsa_fused_indexer import configure_fused_indexer
 

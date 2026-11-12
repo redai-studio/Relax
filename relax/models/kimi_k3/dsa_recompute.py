@@ -181,6 +181,7 @@ def configure_model_indexer_reuse(model: Any, query_chunk_size: int = 8192) -> N
             module.core_attention.fused_indexer_block_size = query_chunk_size
             count += 1
     if not count:
-        raise ValueError("DSA selection reuse requested but no K3.1 transformer blocks were found")
+        # A K3.1 pipeline stage may contain only KDA layers.
+        return
     get_logger(__name__).info("Enabled K3.1 checkpoint-scoped DSA selection reuse for %s layers.", count)
     get_logger(__name__).info("K3.1 DSA indexer query chunk size: %s.", query_chunk_size)

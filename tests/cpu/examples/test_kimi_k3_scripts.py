@@ -312,3 +312,20 @@ def test_kimi_k31_external_data_steps_parallelism_and_resume(tmp_path, mode, raw
     assert runtime["env_vars"].get("RELAX_SFT_RAW_TEXT_CONCAT") == ("1" if raw == "1" else None)
     if mode == "lora":
         assert runtime["env_vars"]["RELAX_LORA_SHARE_EXPERT_ADAPTERS"] == "false"
+
+
+@pytest.mark.parametrize("mode", ["sft", "lora"])
+@pytest.mark.parametrize("mapping", [None, '{"image":"pictures","video":"clips"}'])
+def test_kimi_k31_multimodal_mapping_json_is_preserved(tmp_path, mode, mapping):
+    env, capture = _environment(tmp_path)
+    env.update(SAVE_DIR=str(tmp_path / "save"), RAW_TEXT="0")
+    env.pop("MULTIMODAL_KEYS", None)
+    if mapping is not None:
+        env["MULTIMODAL_KEYS"] = mapping
+    script = ROOT / f"examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-{mode}.sh"
+    subprocess.run(["bash", str(script)], cwd=ROOT, env=env, check=True, capture_output=True, timeout=30)
+    argv = json.loads(capture.read_text())
+    actual = argv[argv.index("--multimodal-keys") + 1]
+    assert json.loads(actual) == json.loads(mapping or '{"image":"images"}')
+    if mapping is not None:
+        assert actual == mapping

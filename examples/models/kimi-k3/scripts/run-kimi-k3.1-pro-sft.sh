@@ -81,8 +81,11 @@ SFT_ARGS=(
 )
 
 if [ "${RAW_TEXT}" != 1 ]; then
+    if [ -z "${MULTIMODAL_KEYS:-}" ]; then
+        MULTIMODAL_KEYS='{"image":"images"}'
+    fi
     SFT_ARGS+=(
-        --multimodal-keys "${MULTIMODAL_KEYS:-{\"image\":\"images\"}}"
+        --multimodal-keys "${MULTIMODAL_KEYS}"
         --image-max-token-num "${IMAGE_MAX_TOKENS:-1024}"
     )
 fi
