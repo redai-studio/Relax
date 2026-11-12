@@ -179,7 +179,7 @@ def make_controller(runtime, services, trace, *, count=1, max_global_restart=3, 
         "register_extra_roles": lambda config, algo: None,
         "os": SimpleNamespace(_exit=exit_process),
     }
-    cls = load_classes("relax/core/controller.py", {"Controller"}, namespace)["Controller"]
+    cls = load_classes("relax/core/controller.py", {"Controller", "GlobalRestartRequired"}, namespace)["Controller"]
     controller = object.__new__(cls)
     controller.config = SimpleNamespace(
         fully_async=fully_async, hybrid=False, debug_train_only=debug, debug_rollout_only=False

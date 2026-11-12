@@ -632,7 +632,7 @@ def test_recovery_initial_sync_observes_results_before_cleanup_and_training(monk
     if outcome != "pending":
         release.set()
 
-    async def submit(role):
+    async def submit(role, recovery_token=None):
         events.append(("submit", role))
 
         async def result():
