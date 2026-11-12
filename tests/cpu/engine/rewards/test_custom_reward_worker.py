@@ -141,35 +141,32 @@ def loaded_reward_paths(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 class TestCustomRewardDispatch:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("batched", [False, True], ids=["sample", "batch"])
-    @pytest.mark.parametrize(
-        ("reward_name", "supports_evaluation"),
-        [
-            ("sync_evaluation_reward", True),
-            ("async_evaluation_reward", True),
-            ("sync_evaluation_kwargs_reward", True),
-            ("async_evaluation_kwargs_reward", True),
-            ("sync_legacy_reward", False),
-            ("async_legacy_reward", False),
-        ],
-    )
-    async def test_custom_reward_receives_evaluation_when_supported(self, reward_name, supports_evaluation, batched):
-        args = _make_args(custom_rm_path=f"{CUSTOM_REWARD_MODULE}.{reward_name}", reward_num_workers=1)
+    @pytest.mark.parametrize("reward_kind", ["sync", "async"])
+    async def test_custom_reward_receives_evaluation_when_supported(self, reward_kind: str):
+        args = _make_args(reward_num_workers=1)
         samples = [_make_sample(index=index) for index in range(3)]
-        if reward_name.startswith("sync_"):
+        if reward_kind == "sync":
             await _ready_workers(args)
 
-        for evaluation in (False, True):
-            if batched:
-                results = await _wait(batched_async_rm(args, samples, evaluation=evaluation))
-                expected_samples = samples
-            else:
-                results = [await _wait(async_rm(args, samples[0], evaluation=evaluation))]
-                expected_samples = samples[:1]
-            assert results == [
-                {"index": sample.index, "evaluation": evaluation if supports_evaluation else None}
-                for sample in expected_samples
-            ]
+        for reward_suffix, supports_evaluation in (
+            ("evaluation_reward", True),
+            ("evaluation_kwargs_reward", True),
+            ("legacy_reward", False),
+        ):
+            reward_name = f"{reward_kind}_{reward_suffix}"
+            args.custom_rm_path = f"{CUSTOM_REWARD_MODULE}.{reward_name}"
+            for batched in (False, True):
+                for evaluation in (False, True):
+                    if batched:
+                        results = await _wait(batched_async_rm(args, samples, evaluation=evaluation))
+                        expected_samples = samples
+                    else:
+                        results = [await _wait(async_rm(args, samples[0], evaluation=evaluation))]
+                        expected_samples = samples[:1]
+                    assert results == [
+                        {"index": sample.index, "evaluation": evaluation if supports_evaluation else None}
+                        for sample in expected_samples
+                    ], (reward_name, batched, evaluation)
 
     @pytest.mark.asyncio
     async def test_sync_reward_runs_in_worker_without_blocking_event_loop(self, monkeypatch):

@@ -8,6 +8,7 @@ import socket
 import sys
 import threading
 from argparse import Namespace
+from concurrent.futures import Future
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -79,7 +80,11 @@ class StartupService:
             raise RuntimeError("injected manager failure")
 
     async def get_rollout_manager(self):
-        return object()
+        drained = Future()
+        drained.set_result(None)
+        return SimpleNamespace(
+            drain_eval_judges=SimpleNamespace(remote=lambda: SimpleNamespace(future=lambda: drained))
+        )
 
     async def set_barriers(self, **kwargs):
         self.trace.append((self.role, "barriers", tuple(kwargs)))
