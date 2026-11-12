@@ -10,6 +10,14 @@ from relax.utils.misc import resolve_is_vl_model
 from relax.utils.training import ppo_utils
 
 
+class _FakePEFT:
+    def __init__(self) -> None:
+        self.target_modules = ["linear_qkv"]
+
+    def __call__(self, model: torch.nn.Module, training: bool) -> torch.nn.Module:
+        return model
+
+
 class _FakeProvider:
     def __init__(self, model=None):
         self.calls = []
@@ -643,7 +651,7 @@ def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrappe
         return model
 
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
-    monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: _FakePEFT())
     args = SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None)
     provider = {"modern": modern_provider, "kwargs": kwargs_provider, "legacy": legacy_provider}[signature]
     if "lora" in wrapper:
@@ -684,7 +692,7 @@ def test_custom_provider_forwards_supported_mcore_arguments(monkeypatch, accepts
 def test_bridge_provider_receives_mcore_process_groups_through_wrappers(monkeypatch):
     module, provider = _load_model_provider(monkeypatch)
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
-    monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: _FakePEFT())
     args = _bridge_args(only_train_params_name_list=None, freeze_params_name_list=None)
     wrapped = module.wrap_model_provider_with_freeze(module.get_model_provider_func(args), args)
     config = object()
