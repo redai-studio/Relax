@@ -94,6 +94,289 @@ def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module)
                     del param.grad_norm_group
 
 
+def _initialize_model_provider(args: argparse.Namespace) -> Any:
+    """Resolve model capabilities before constructing either distributed
+    wrapper."""
+    from relax.models.qwen3_5.recipe import enabled as optimized_recipe
+
+    args._relax_qwen35_optimized = optimized_recipe(args)
+    if args._relax_qwen35_optimized:
+        assert not getattr(args, "sft_async_prepack", False), "Whole-pack recipe requires foreground packing"
+        from relax.models.qwen3_5.deepep_backend import ensure_backend
+
+        ensure_backend(args)
+
+    provider = None
+    if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
+    # Resolve once, after provider selection and before model/data setup. A VL
+    # checkpoint can produce a text-only provider despite its processor files.
+    args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
+    return provider
+
+
+def _configure_bridge_provider(args: argparse.Namespace, provider: Any = None) -> Any:
+    """Configure a Bridge provider shared by ordinary DDP and Megatron-FSDP."""
+    if provider is None:
+        provider = _initialize_model_provider(args)
+    is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
+    if is_kimi_k3:
+        from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
+
+    # Override provider attributes with matching args values
+    bridge_keys = [
+        "attention_backend",
+        "tensor_model_parallel_size",
+        "sequence_parallel",
+        "pipeline_model_parallel_size",
+        "virtual_pipeline_model_parallel_size",
+        # Let a launch script pass an explicit --pipeline-model-parallel-layout
+        # (mcore-native, str form "Ett|tt|..|ttL").
+        # Must NOT be combined with --decoder-first/last-pipeline-num-layers
+        # (mcore raises "pipeline_model_parallel_layout cannot be set with other pipeline
+        # layout arguments"); drop those flags in the script when using a layout.
+        "pipeline_model_parallel_layout",
+        "context_parallel_size",
+        "cp_comm_type",
+        "cp_partition_mode",
+        "sequence_packing_scheduler",
+        "max_seqlen_per_dp_cp_rank",
+        "pad_packed_seq_alignment",
+        "expert_model_parallel_size",
+        "expert_tensor_parallel_size",
+        "variable_seq_lengths",
+        "dsa_indexer_loss_coeff",
+        "qsa_indexer_loss_coeff",
+        "qsa_force_sparse",
+        "dsa_indexer_use_sparse_loss",
+        "attention_softmax_in_fp32",
+        # Bridge mode bypasses core_transformer_config_from_args(), so FP8
+        # compute flags must be copied onto the provider explicitly.
+        "fp8",
+        "fp8_recipe",
+        "fp8_quantizer_factory",
+        "masked_softmax_fusion",
+        "bias_dropout_fusion",
+        "apply_rope_fusion",
+        "recompute_granularity",
+        "recompute_method",
+        "recompute_num_layers",
+        "recompute_modules",
+        "distribute_saved_activations",
+        "fine_grained_activation_offloading",
+        "offload_modules",
+        "min_offloaded_tensor_size",
+        "activation_offload_fraction",
+        "delta_offload_bytes_across_pp_ranks",
+        "delay_offload_until_cuda_graph",
+        "fine_grained_offloading_max_inflight_offloads",
+        "moe_router_load_balancing_type",
+        "moe_router_dtype",
+        "moe_router_fusion",
+        "overlap_dispatch_backward_with_experts_wgrad",
+        "_relax_qwen35_optimized",
+        "moe_aux_loss_coeff",
+        "moe_token_dispatcher_type",
+        "moe_shared_expert_overlap",
+        "moe_enable_deepep",
+        "moe_flex_dispatcher_backend",
+        "moe_flex_dispatcher_num_sms",
+        "moe_hybridep_pad_variable_tokens",
+        "use_audio_in_video",
+        "freeze_language_model",
+        "freeze_vision_model",
+        "freeze_vision_projection",
+        "freeze_audio_model",
+        "freeze_audio_projection",
+        # https://github.com/redai-studio/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
+        "vision_dp_when_tp",
+        "vision_dp_when_cp",
+        "calculate_per_token_loss",
+        "cross_entropy_loss_fusion",
+        "cross_entropy_fusion_impl",
+        "mtp_num_layers",
+        "mtp_loss_scaling_factor",
+        # Reuse one physical MTP layer across all mtp_num_layers depths. Must
+        # be copied onto the bridge provider or it stays at the default (False)
+        # even when --mtp-use-repeated-layer is passed, so the model builds N
+        # physical layers (layers.1/2 unloaded/random).
+        "mtp_use_repeated_layer",
+        # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
+        # Allow CLI to override layer count / MoE frequency for layer-reduced training
+        "num_layers",
+        "moe_layer_freq",
+        # Kimi K2 / MLA / MoE override surface — required because published K2 configs
+        # declare DeepseekV3ForCausalLM and route through DeepSeekV3Bridge, which has
+        # different defaults than what slime's K2 launch scripts assume.
+        "q_lora_rank",
+        "kv_lora_rank",
+        "qk_head_dim",
+        "qk_pos_emb_head_dim",
+        "v_head_dim",
+        "rotary_scaling_factor",
+        "rotary_base",
+        "moe_router_pre_softmax",
+        "moe_router_enable_expert_bias",
+        "moe_router_bias_update_rate",
+        "moe_permute_fusion",
+        "moe_grouped_gemm",
+        "moe_shared_expert_intermediate_size",
+        "moe_router_topk",
+        "moe_router_num_groups",
+        "moe_router_group_topk",
+        "moe_router_topk_scaling_factor",
+        "moe_router_score_function",
+        "moe_ffn_hidden_size",
+        "activation_func_clamp_shared_expert",
+        # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
+        # Dynamic CP related args
+        "dynamic_context_parallel",
+        "linear_cp_mode",
+        "gdn_pre_gated_delta_rule_fusion",
+        "gdn_conv_pad_alignment",
+    ]
+
+    args_dict = vars(args)
+    for attr in vars(provider):
+        if attr in args_dict and attr in bridge_keys:
+            if is_kimi_k3 and attr in ARCHITECTURE_KEYS:
+                continue
+            old_val = getattr(provider, attr)
+            new_val = args_dict[attr]
+            if attr == "cp_comm_type" and isinstance(new_val, list) and len(new_val) == 1:
+                new_val = new_val[0]
+            if getattr(args, "dynamic_context_parallel", False):
+                if attr == "dynamic_context_parallel":
+                    new_val = False
+            if old_val != new_val:
+                logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
+            setattr(provider, attr, new_val)
+
+    if callable(getattr(provider, "configure_runtime", None)):
+        provider.configure_runtime(args)
+
+    if is_kimi_k3:
+        configure_runtime(provider, args)
+        # Fake-QAT aligns the training forward with the MXFP4 grid the
+        # rollout engine serves; gated by OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG.
+        from relax.backends.megatron.fake_qat_mxfp4 import maybe_install_mxfp4_fake_qat
+
+        maybe_install_mxfp4_fake_qat()
+
+    # Megatron-Bridge Qwen3.5-VL consumes ``vision_dp_when_cp`` to shard
+    # the vision encoder input before its CP all-gather.  Relax's public
+    # CLI predates that Bridge rename and exposes ``vision_dp_when_tp``.
+    # Without this compatibility mapping the parsed flag is silently
+    # ignored, so every CP rank repeats the full vision forward.
+    if getattr(args, "vision_dp_when_tp", False) and hasattr(provider, "vision_dp_when_cp"):
+        if not provider.vision_dp_when_cp:
+            logger.info("Mapping --vision-dp-when-tp to provider.vision_dp_when_cp for Qwen3.5-VL vision sharding.")
+        provider.vision_dp_when_cp = True
+
+    if getattr(provider, "vision_dp_when_cp", False):
+        _install_bridge_vision_cp_all_gather_compat()
+
+    # Handle name-mismatched attributes that require explicit mapping
+    if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
+        provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
+    if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
+        provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+    if hasattr(args, "gradient_accumulation_fusion"):
+        provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+    if is_npu_available:
+        for key, value in vars(args).items():
+            if not hasattr(provider, key):
+                setattr(provider, key, value)
+
+    if args.fp16:
+        provider.fp16 = True
+        provider.bf16 = False
+        provider.params_dtype = torch.float16
+    elif args.bf16:
+        provider.fp16 = False
+        provider.bf16 = True
+        provider.params_dtype = torch.bfloat16
+
+    # DSv4's hash-routed MoE layers must share a stage with the embedding, so mcore
+    # requires an explicit pipeline_model_parallel_layout when PP > 1. The bridge
+    # auto-installs one in apply_overrides_and_finalize(), which we bypass.
+    if (
+        getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid"
+        and (getattr(provider, "pipeline_model_parallel_size", 1) or 1) > 1
+        and getattr(provider, "pipeline_model_parallel_layout", None) is None
+    ):
+        from megatron.bridge.models.deepseek.deepseek_v4_bridge import (
+            set_deepseek_v4_pipeline_model_parallel_layout,
+        )
+
+        set_deepseek_v4_pipeline_model_parallel_layout(provider)
+        logger.info(f"Set provider.pipeline_model_parallel_layout: {provider.pipeline_model_parallel_layout}")
+
+        # mcore rejects a layout that coexists with num_layers_in_first/last_pipeline_stage
+        # ("pipeline_model_parallel_layout cannot be set with other pipeline layout
+        # arguments"), but Megatron's own validate_args only skips its
+        # "num_layers % pipeline_model_parallel_size == 0" check when
+        # --decoder-first/last-pipeline-num-layers is set -- and DSv4-Flash has 43
+        # layers, a prime, so no PP > 1 divides it. Those flags therefore exist purely
+        # to get past arg validation; the layout already encodes the real split, so
+        # drop their provider-side effect here (lines 311-314 above set them).
+        if (
+            provider.num_layers_in_first_pipeline_stage is not None
+            or provider.num_layers_in_last_pipeline_stage is not None
+        ):
+            logger.info(
+                "Clearing provider.num_layers_in_first/last_pipeline_stage "
+                f"({provider.num_layers_in_first_pipeline_stage}/"
+                f"{provider.num_layers_in_last_pipeline_stage}); superseded by the DSv4 layout."
+            )
+            provider.num_layers_in_first_pipeline_stage = None
+            provider.num_layers_in_last_pipeline_stage = None
+
+    # Bridge bypasses MCore's CLI backend resolution. Preserve DSv4's fused default
+    # (FlashMLA forward + cuDNN backward), including newer MCore where the deprecated
+    # fusion flag defaults to None. Let finalize() validate explicit backend/flag conflicts.
+    if getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid":
+        want_fusion = getattr(args, "apply_dsa_kernel_fusion", None)
+        if hasattr(provider, "dsa_kernel_backend"):
+            provider.dsa_kernel_backend = getattr(args, "dsa_kernel_backend", None) or (
+                "cudnn" if want_fusion is None else "none"
+            )
+        else:
+            want_fusion = want_fusion is not False
+        if getattr(provider, "apply_dsa_kernel_fusion", False) != want_fusion:
+            logger.info(
+                f"Override provider.apply_dsa_kernel_fusion: {provider.apply_dsa_kernel_fusion!r} -> {want_fusion!r}"
+            )
+            provider.apply_dsa_kernel_fusion = want_fusion
+
+    _validate_linear_cp_mode(args, provider)
+    provider.finalize()
+
+    # Pickle provider for offline inspection / reproducibility (only on rank 0)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        save_path = getattr(args, "save", None) or "/tmp/relax"
+        _dump_provider_config(provider, save_path)
+    return provider
+
+
+def _configure_bridge_model(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    role: str,
+    post_process: bool,
+) -> None:
+    """Set detach paths and task heads before PEFT, freezing or distributed
+    wrapping."""
+    configure_gdn_a_log_fp32(model)
+    configure_mtp_detach_paths(args, model)
+    install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
+    install_reward_model_head_in_provider(model, args, role, post_process, stash_lm_head=True)
+    install_sequence_classification_head_in_provider(model, args, role, post_process, stash_lm_head=True)
+
+
 def _make_json_safe(value: Any, seen: set[int] | None = None) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -189,14 +472,15 @@ def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module
     cu_seqlens instead of the pre-split + cp-multiplied form, and by model.py
     to route those through the forward.
     """
-    if getattr(model, "uses_unsplit_forward", False):
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    if any(getattr(chunk, "uses_unsplit_forward", False) for chunk in chunks):
         args.uses_unsplit_forward = True
         return
     try:
         from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     except ImportError:
         return
-    if isinstance(model, Qwen3VLModel):
+    if any(isinstance(chunk, Qwen3VLModel) for chunk in chunks):
         args.uses_unsplit_forward = True
 
 
@@ -253,7 +537,12 @@ def _install_cp_probe(model: torch.nn.Module) -> None:
     def is_llm_backbone(n: str) -> bool:
         return not any(p in n for p in skip_prefixes)
 
-    matches = [(n, m) for n, m in model.named_modules() if type(m).__name__ in target_classes]
+    # The bridge / Megatron-FSDP pre-wrap hook may hand us a list of model
+    # chunks (VPP / distributed model) instead of a single module.
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    named_modules = [(n, m) for chunk in chunks for n, m in chunk.named_modules()]
+
+    matches = [(n, m) for n, m in named_modules if type(m).__name__ in target_classes]
     llm_matches = [(n, m) for n, m in matches if is_llm_backbone(n)]
     chosen = llm_matches or matches  # fallback to vision if no LLM backbone in this stage
 
@@ -268,7 +557,7 @@ def _install_cp_probe(model: torch.nn.Module) -> None:
         _CP_PROBE_INSTALLED = True
         return
 
-    candidates = [(n, type(m).__name__) for n, m in model.named_modules() if "attention" in n.lower()][:8]
+    candidates = [(n, type(m).__name__) for n, m in named_modules if "attention" in n.lower()][:8]
     logger.warning(
         f"[CP-PROBE] no attention module matched on this stage (cp_rank={cp_rank}); "
         f"attention-like candidates: {candidates}"
@@ -293,24 +582,7 @@ def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
-    from relax.models.qwen3_5.recipe import enabled as optimized_recipe
-
-    args._relax_qwen35_optimized = optimized_recipe(args)
-    if args._relax_qwen35_optimized:
-        assert not getattr(args, "sft_async_prepack", False), "Whole-pack recipe requires foreground packing"
-        from relax.models.qwen3_5.deepep_backend import ensure_backend
-
-        ensure_backend(args)
-
-    provider = None
-    if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
-
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        provider = bridge.to_megatron_provider(load_weights=False)
-    # Resolve once, after provider selection and before model/data setup. A VL
-    # checkpoint can produce a text-only provider despite its processor files.
-    args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
+    provider = _initialize_model_provider(args)
 
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
@@ -346,247 +618,7 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
-        if is_kimi_k3:
-            from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
-
-        # Override provider attributes with matching args values
-        bridge_keys = [
-            "attention_backend",
-            "tensor_model_parallel_size",
-            "sequence_parallel",
-            "pipeline_model_parallel_size",
-            "virtual_pipeline_model_parallel_size",
-            # Let a launch script pass an explicit --pipeline-model-parallel-layout
-            # (mcore-native, str form "Ett|tt|..|ttL").
-            # Must NOT be combined with --decoder-first/last-pipeline-num-layers
-            # (mcore raises "pipeline_model_parallel_layout cannot be set with other pipeline
-            # layout arguments"); drop those flags in the script when using a layout.
-            "pipeline_model_parallel_layout",
-            "context_parallel_size",
-            "cp_comm_type",
-            "cp_partition_mode",
-            "sequence_packing_scheduler",
-            "max_seqlen_per_dp_cp_rank",
-            "pad_packed_seq_alignment",
-            "expert_model_parallel_size",
-            "expert_tensor_parallel_size",
-            "variable_seq_lengths",
-            "dsa_indexer_loss_coeff",
-            "qsa_indexer_loss_coeff",
-            "qsa_force_sparse",
-            "dsa_indexer_use_sparse_loss",
-            "attention_softmax_in_fp32",
-            # Bridge mode bypasses core_transformer_config_from_args(), so FP8
-            # compute flags must be copied onto the provider explicitly.
-            "fp8",
-            "fp8_recipe",
-            "fp8_quantizer_factory",
-            "masked_softmax_fusion",
-            "bias_dropout_fusion",
-            "apply_rope_fusion",
-            "recompute_granularity",
-            "recompute_method",
-            "recompute_num_layers",
-            "recompute_modules",
-            "distribute_saved_activations",
-            "fine_grained_activation_offloading",
-            "offload_modules",
-            "min_offloaded_tensor_size",
-            "activation_offload_fraction",
-            "delta_offload_bytes_across_pp_ranks",
-            "delay_offload_until_cuda_graph",
-            "fine_grained_offloading_max_inflight_offloads",
-            "moe_router_load_balancing_type",
-            "moe_router_dtype",
-            "moe_router_fusion",
-            "overlap_dispatch_backward_with_experts_wgrad",
-            "_relax_qwen35_optimized",
-            "moe_aux_loss_coeff",
-            "moe_token_dispatcher_type",
-            "moe_shared_expert_overlap",
-            "moe_enable_deepep",
-            "moe_flex_dispatcher_backend",
-            "moe_flex_dispatcher_num_sms",
-            "moe_hybridep_pad_variable_tokens",
-            "use_audio_in_video",
-            "freeze_language_model",
-            "freeze_vision_model",
-            "freeze_vision_projection",
-            "freeze_audio_model",
-            "freeze_audio_projection",
-            # https://github.com/redai-studio/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
-            "vision_dp_when_tp",
-            "vision_dp_when_cp",
-            "calculate_per_token_loss",
-            "cross_entropy_loss_fusion",
-            "cross_entropy_fusion_impl",
-            "mtp_num_layers",
-            "mtp_loss_scaling_factor",
-            # Reuse one physical MTP layer across all mtp_num_layers depths. Must
-            # be copied onto the bridge provider or it stays at the default (False)
-            # even when --mtp-use-repeated-layer is passed, so the model builds N
-            # physical layers (layers.1/2 unloaded/random).
-            "mtp_use_repeated_layer",
-            # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
-            # Allow CLI to override layer count / MoE frequency for layer-reduced training
-            "num_layers",
-            "moe_layer_freq",
-            # Kimi K2 / MLA / MoE override surface — required because published K2 configs
-            # declare DeepseekV3ForCausalLM and route through DeepSeekV3Bridge, which has
-            # different defaults than what slime's K2 launch scripts assume.
-            "q_lora_rank",
-            "kv_lora_rank",
-            "qk_head_dim",
-            "qk_pos_emb_head_dim",
-            "v_head_dim",
-            "rotary_scaling_factor",
-            "rotary_base",
-            "moe_router_pre_softmax",
-            "moe_router_enable_expert_bias",
-            "moe_router_bias_update_rate",
-            "moe_permute_fusion",
-            "moe_grouped_gemm",
-            "moe_shared_expert_intermediate_size",
-            "moe_router_topk",
-            "moe_router_num_groups",
-            "moe_router_group_topk",
-            "moe_router_topk_scaling_factor",
-            "moe_router_score_function",
-            "moe_ffn_hidden_size",
-            "activation_func_clamp_shared_expert",
-            # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
-            # Dynamic CP related args
-            "dynamic_context_parallel",
-            "linear_cp_mode",
-            "gdn_pre_gated_delta_rule_fusion",
-            "gdn_conv_pad_alignment",
-        ]
-
-        args_dict = vars(args)
-        for attr in vars(provider):
-            if attr in args_dict and attr in bridge_keys:
-                if is_kimi_k3 and attr in ARCHITECTURE_KEYS:
-                    continue
-                old_val = getattr(provider, attr)
-                new_val = args_dict[attr]
-                if attr == "cp_comm_type" and isinstance(new_val, list) and len(new_val) == 1:
-                    new_val = new_val[0]
-                if getattr(args, "dynamic_context_parallel", False):
-                    if attr == "dynamic_context_parallel":
-                        new_val = False
-                if old_val != new_val:
-                    logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
-                setattr(provider, attr, new_val)
-
-        if callable(getattr(provider, "configure_runtime", None)):
-            provider.configure_runtime(args)
-
-        if is_kimi_k3:
-            configure_runtime(provider, args)
-            # Fake-QAT aligns the training forward with the MXFP4 grid the
-            # rollout engine serves; gated by OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG.
-            from relax.backends.megatron.fake_qat_mxfp4 import maybe_install_mxfp4_fake_qat
-
-            maybe_install_mxfp4_fake_qat()
-
-        # Megatron-Bridge Qwen3.5-VL consumes ``vision_dp_when_cp`` to shard
-        # the vision encoder input before its CP all-gather.  Relax's public
-        # CLI predates that Bridge rename and exposes ``vision_dp_when_tp``.
-        # Without this compatibility mapping the parsed flag is silently
-        # ignored, so every CP rank repeats the full vision forward.
-        if getattr(args, "vision_dp_when_tp", False) and hasattr(provider, "vision_dp_when_cp"):
-            if not provider.vision_dp_when_cp:
-                logger.info(
-                    "Mapping --vision-dp-when-tp to provider.vision_dp_when_cp for Qwen3.5-VL vision sharding."
-                )
-            provider.vision_dp_when_cp = True
-
-        if getattr(provider, "vision_dp_when_cp", False):
-            _install_bridge_vision_cp_all_gather_compat()
-
-        # Handle name-mismatched attributes that require explicit mapping
-        if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
-        if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
-        if hasattr(args, "gradient_accumulation_fusion"):
-            provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
-        if is_npu_available:
-            for key, value in vars(args).items():
-                if not hasattr(provider, key):
-                    setattr(provider, key, value)
-
-        if args.fp16:
-            provider.fp16 = True
-            provider.bf16 = False
-            provider.params_dtype = torch.float16
-        elif args.bf16:
-            provider.fp16 = False
-            provider.bf16 = True
-            provider.params_dtype = torch.bfloat16
-
-        # DSv4's hash-routed MoE layers must share a stage with the embedding, so mcore
-        # requires an explicit pipeline_model_parallel_layout when PP > 1. The bridge
-        # auto-installs one in apply_overrides_and_finalize(), which we bypass.
-        if (
-            getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid"
-            and (getattr(provider, "pipeline_model_parallel_size", 1) or 1) > 1
-            and getattr(provider, "pipeline_model_parallel_layout", None) is None
-        ):
-            from megatron.bridge.models.deepseek.deepseek_v4_bridge import (
-                set_deepseek_v4_pipeline_model_parallel_layout,
-            )
-
-            set_deepseek_v4_pipeline_model_parallel_layout(provider)
-            logger.info(f"Set provider.pipeline_model_parallel_layout: {provider.pipeline_model_parallel_layout}")
-
-            # mcore rejects a layout that coexists with num_layers_in_first/last_pipeline_stage
-            # ("pipeline_model_parallel_layout cannot be set with other pipeline layout
-            # arguments"), but Megatron's own validate_args only skips its
-            # "num_layers % pipeline_model_parallel_size == 0" check when
-            # --decoder-first/last-pipeline-num-layers is set -- and DSv4-Flash has 43
-            # layers, a prime, so no PP > 1 divides it. Those flags therefore exist purely
-            # to get past arg validation; the layout already encodes the real split, so
-            # drop their provider-side effect here (lines 311-314 above set them).
-            if (
-                provider.num_layers_in_first_pipeline_stage is not None
-                or provider.num_layers_in_last_pipeline_stage is not None
-            ):
-                logger.info(
-                    "Clearing provider.num_layers_in_first/last_pipeline_stage "
-                    f"({provider.num_layers_in_first_pipeline_stage}/"
-                    f"{provider.num_layers_in_last_pipeline_stage}); superseded by the DSv4 layout."
-                )
-                provider.num_layers_in_first_pipeline_stage = None
-                provider.num_layers_in_last_pipeline_stage = None
-
-        # Bridge bypasses MCore's CLI backend resolution. Preserve DSv4's fused default
-        # (FlashMLA forward + cuDNN backward), including newer MCore where the deprecated
-        # fusion flag defaults to None. Let finalize() validate explicit backend/flag conflicts.
-        if getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid":
-            want_fusion = getattr(args, "apply_dsa_kernel_fusion", None)
-            if hasattr(provider, "dsa_kernel_backend"):
-                provider.dsa_kernel_backend = getattr(args, "dsa_kernel_backend", None) or (
-                    "cudnn" if want_fusion is None else "none"
-                )
-            else:
-                want_fusion = want_fusion is not False
-            if getattr(provider, "apply_dsa_kernel_fusion", False) != want_fusion:
-                logger.info(
-                    "Override provider.apply_dsa_kernel_fusion: "
-                    f"{provider.apply_dsa_kernel_fusion!r} -> {want_fusion!r}"
-                )
-                provider.apply_dsa_kernel_fusion = want_fusion
-
-        _validate_linear_cp_mode(args, provider)
-        provider.finalize()
-
-        # Pickle provider for offline inspection / reproducibility (only on rank 0)
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            save_path = getattr(args, "save", None) or "/tmp/relax"
-            _dump_provider_config(provider, save_path)
-
+        provider = _configure_bridge_provider(args, provider)
         original_provide = provider.provide
 
         def provide_with_cp_probe(*p_args, **p_kwargs):
@@ -598,19 +630,8 @@ def get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = _call_model_provider(original_provide, *p_args, **p_kwargs)
-            configure_gdn_a_log_fp32(model)
-            configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
-            install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
-            install_reward_model_head_in_provider(model, args, role, post_process, stash_lm_head=True)
-
-            install_sequence_classification_head_in_provider(
-                model,
-                args,
-                role,
-                post_process,
-                stash_lm_head=True,
-            )
+            _configure_bridge_model(model, args, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
@@ -855,6 +876,93 @@ def wrap_model_provider_with_lora(original_provider, args):
         return model
 
     return wrapped_provider
+
+
+def get_bridge_distributed_model(
+    args: argparse.Namespace,
+    role: Literal["actor", "critic"] = "actor",
+    wrap_with_ddp: bool = True,
+) -> list[torch.nn.Module]:
+    if args.megatron_to_hf_mode != "bridge":
+        raise ValueError("Megatron-FSDP is only supported with --megatron-to-hf-mode bridge")
+    if getattr(args, "custom_model_provider_path", None):
+        raise ValueError("Megatron-FSDP does not support --custom-model-provider-path; use the Bridge provider")
+    if is_lora_enabled(args):
+        raise ValueError("Megatron-FSDP does not support Relax LoRA yet; use ordinary Megatron DDP for LoRA training")
+
+    provider = _configure_bridge_provider(args)
+    if getattr(args, "pipeline_model_parallel_size", 1) > 1:
+        # megatron_fsdp.py's create_custom_backward_hook() deliberately rewraps every
+        # FSDP-unit module's forward output as `t.view_as(t)` (to give it a distinct
+        # tensor identity from the module's input, for gradient-hook bookkeeping). The
+        # pipelined schedules' `deallocate_output_tensor()` then asserts the boundary
+        # activation it just sent to the next PP stage is not a view of another tensor
+        # ("counter-productive to free a view of another tensor") -- which this view
+        # always is under Megatron-FSDP. GPTModelProvider defaults this True (matching
+        # core_transformer_config_from_args()'s unconditional override for the plain
+        # DDP path, which never hits this because it never wraps outputs in views), and
+        # PP==1 never calls deallocate_output_tensor() at all, so this only needs to be
+        # disabled for the FSDP + PP>1 combination.
+        provider.deallocate_pipeline_outputs = False
+    if not hasattr(provider, "provide_distributed_model"):
+        raise RuntimeError(
+            "Megatron-FSDP requires a Megatron-Bridge provider with provide_distributed_model(); "
+            "please update Megatron-Bridge."
+        )
+    if not hasattr(provider, "register_pre_wrap_hook"):
+        raise RuntimeError(
+            "Megatron-FSDP requires a Megatron-Bridge provider with register_pre_wrap_hook(); "
+            "please update Megatron-Bridge."
+        )
+
+    def relax_pre_wrap_hook(model_chunks: list[torch.nn.Module]) -> list[torch.nn.Module]:
+        for model_chunk in model_chunks:
+            post_process = bool(getattr(model_chunk, "post_process", False))
+            _configure_bridge_model(model_chunk, args, role, post_process)
+            freeze_model_params(model_chunk, args)
+            ensure_sequence_classification_head_trainable(model_chunk, args, role, post_process)
+            install_conditional_branch_sync(args, model_chunk)
+        _maybe_mark_unsplit_forward(args, model_chunks)
+        _install_cp_probe(model_chunks)
+        return model_chunks
+
+    provider.register_pre_wrap_hook(relax_pre_wrap_hook)
+
+    from megatron.training.training import get_megatron_ddp_config
+
+    ddp_config = get_megatron_ddp_config(args) if wrap_with_ddp else None
+    if (
+        ddp_config is not None
+        and getattr(args, "loss_type", None) == "sft"
+        and getattr(args, "sft_chunked_logits", False)
+        and getattr(args, "recompute_loss_function", False)
+        and (
+            ddp_config.overlap_grad_reduce
+            # MegatronFSDP forces overlap on when gradients are sharded.
+            or ddp_config.data_parallel_sharding_strategy in {"optim_grads", "optim_grads_params"}
+        )
+    ):
+        raise ValueError(
+            "Megatron-FSDP does not support --sft-chunked-logits with --recompute-loss-function "
+            "when gradient reduction overlaps backward: reentrant head backward needs a completion policy "
+            "currently implemented only for Megatron DDP. Disable --recompute-loss-function or use ordinary "
+            "Megatron DDP; gradient sharding enables overlap even without --overlap-grad-reduce."
+        )
+    model = provider.provide_distributed_model(
+        wrap_with_ddp=wrap_with_ddp,
+        ddp_config=ddp_config,
+        fp16=provider.fp16,
+        bf16=provider.bf16,
+        use_megatron_fsdp=True,
+        overlap_param_gather_with_optimizer_step=getattr(args, "overlap_param_gather_with_optimizer_step", False),
+        data_parallel_random_init=getattr(args, "data_parallel_random_init", False),
+        use_cpu_initialization=getattr(args, "use_cpu_initialization", False),
+        init_model_with_meta_device=getattr(args, "init_model_with_meta_device", False),
+    )
+    if not isinstance(model, list):
+        model = [model]
+    logger.info("Megatron-FSDP distributed model initialized for %s", role)
+    return model
 
 
 def wrap_model_provider_with_freeze(original_provider, args):

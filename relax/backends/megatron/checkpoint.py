@@ -853,6 +853,95 @@ def _patch_scatter_dtype_cast():
         dist.scatter = original_scatter
 
 
+def _sync_fsdp_model_weights_to_main_weights(model) -> None:
+    """Refresh Megatron-FSDP fp32 main weights from the (just-loaded) model
+    weights.
+
+    Megatron-FSDP populates its high-precision main-weight buffer from the model
+    weights only when the FSDP buffers are constructed, and does not implement a
+    model->main copy: ``optimizer.reload_model_params()`` raises NotImplementedError
+    ("Megatron-FSDP does not implement a model-to-main parameter update"), and
+    upstream Megatron-Bridge guards that call with ``not use_megatron_fsdp``.
+
+    In Relax's flow the HF checkpoint is loaded into the model *compute* weights
+    after the FSDP buffers (and optimizer) already exist, so the fp32 main weights
+    the optimizer actually trains on would otherwise keep their init values.
+    Mirror ``ParamAndGradBuffer.copy_main_weights_to_model_weights()`` in reverse.
+    """
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import (
+        is_blockwise_float8tensor,
+        is_float8tensor,
+    )
+    from megatron.core.utils import to_local_if_dtensor
+
+    for model_chunk in model:
+        buffer = getattr(model_chunk, "param_and_grad_buffer", None)
+        if buffer is None:
+            raise RuntimeError("Megatron-FSDP model chunk has no param_and_grad_buffer; cannot sync main weights")
+        for pg in buffer.parameter_groups:
+            mbuf = pg.main_weight_buffer
+            wbuf = pg.model_weight_buffer
+            if mbuf is None:
+                continue
+            for param in pg.params:
+                if is_float8tensor(param) or is_blockwise_float8tensor(param):
+                    raise NotImplementedError(
+                        "Relax does not yet support Megatron-FSDP model->main weight sync for FP8 params"
+                    )
+                item_id = mbuf.param_idx[param]
+                if wbuf is not None and (wbuf.is_data_distributed or mbuf.is_data_distributed):
+                    model_param = wbuf.get_item(item_id, only_shard=True)
+                    main_weight = mbuf.get_item(item_id, only_shard=True)
+                elif wbuf is not None:
+                    model_param = wbuf.get_item(item_id)
+                    main_weight = mbuf.get_item(item_id)
+                else:
+                    model_param = to_local_if_dtensor(param)
+                    main_weight = mbuf.get_item(item_id)
+                if main_weight.numel() > 0:
+                    main_weight.data.copy_(model_param.view(main_weight.shape))
+
+
+def _dump_fsdp_dtensor_param_layout(ddp_model):
+    """Diagnostic: dump every FSDP DTensor param's local-shard size vs its
+    ``megatron_fsdp_slice`` span, so a bridge HF->Megatron size mismatch can be
+    traced to the exact parameter.
+
+    The bridge copies ``converted_weights.reshape(-1)[megatron_fsdp_slice]`` into
+    ``param._local_tensor``. When the converted (per-rank) param size disagrees
+    with what Megatron-FSDP allocated (seen on MoE / expert-parallel params), the
+    slice silently truncates and ``copy_`` raises a size-mismatch. This report
+    tells us which param (expert vs. non-expert, TP attrs) is inconsistent.
+    """
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor
+
+    models = ddp_model if isinstance(ddp_model, (list, tuple)) else [ddp_model]
+    rank = dist.get_rank(group=dist.group.WORLD) if dist.is_initialized() else 0
+    logger.error("[fsdp-load-diag] rank=%s dumping DTensor param layout", rank)
+    for mi, m in enumerate(models):
+        for name, p in m.named_parameters():
+            if not isinstance(p, DTensor):
+                continue
+            local_numel = p._local_tensor.numel()
+            fsdp_slice = getattr(p, "megatron_fsdp_slice", None)
+            slice_len = (fsdp_slice.stop - fsdp_slice.start) if isinstance(fsdp_slice, slice) else None
+            is_expert = "experts" in name or ".mlp.experts" in name or "local_experts" in name
+            logger.error(
+                "[fsdp-load-diag] chunk=%d %s | global=%s local_numel=%d slice=%s slice_len=%s "
+                "expert=%s tp=%s partition_dim=%s",
+                mi,
+                name,
+                tuple(p.shape),
+                local_numel,
+                (fsdp_slice.start, fsdp_slice.stop) if isinstance(fsdp_slice, slice) else None,
+                slice_len,
+                is_expert,
+                getattr(p, "tensor_model_parallel", None),
+                getattr(p, "partition_dim", None),
+            )
+
+
 def _select_hf_load_source(args: Namespace, load_path: str | None) -> str:
     """Choose an HF source after Megatron resume has been ruled out."""
     # Prefer ref_load (if it's an HF dir) over hf_checkpoint on fallback. INT4 QAT
@@ -883,12 +972,23 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
             with megatron_bridge_utils.patch_megatron_model(ddp_model):
                 bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)
                 with _patch_scatter_dtype_cast():
-                    bridge.load_hf_weights(ddp_model)
+                    try:
+                        bridge.load_hf_weights(ddp_model)
+                    except RuntimeError as e:
+                        # MoE / expert-parallel FSDP path: bridge slice can disagree with
+                        # the FSDP local shard size. Dump param layout to pinpoint it.
+                        if "must match the size of tensor" in str(e) and getattr(args, "use_megatron_fsdp", False):
+                            _dump_fsdp_dtensor_param_layout(ddp_model)
+                        raise
 
     # Copied from Megatron-core :: load_checkpoint (with simplifications)
     if (args.fp16 or args.bf16) and optimizer is not None:
         assert not args.load_main_params_from_ckpt
-        optimizer.reload_model_params()
+        if getattr(args, "use_megatron_fsdp", False):
+            # Megatron-FSDP has no model->main copy in the optimizer; sync manually.
+            _sync_fsdp_model_weights_to_main_weights(ddp_model)
+        else:
+            optimizer.reload_model_params()
 
     # We can see `successfully loaded checkpoint from ... [ t 1/2, p 1/1 ] at iteration 0`
     # when loading Megatron, thus it is 0

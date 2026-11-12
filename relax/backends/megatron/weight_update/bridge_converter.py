@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import copy
 import dataclasses
+import pickle
 import re
 from argparse import Namespace
 from collections.abc import Collection, Iterator, Sequence
@@ -145,6 +147,45 @@ def _normalize_global_name(name: str) -> str:
 
 def _noop_gather_from_ep_ranks(self_m, megatron_weights, megatron_module, hf_param_name):
     return {str(hf_param_name): megatron_weights}
+
+
+def _picklable_config_snapshot(config: Any) -> Any:
+    """Copy conversion config without rank-local process groups or hooks.
+
+    Model providers (e.g. ``GPTModelProvider``) double as the model's
+    ``TransformerConfig`` via multiple inheritance, so they carry live runtime
+    state that ``all_gather_object`` (which pickles its payload) cannot cross a
+    process boundary with: ``_pg_collection`` (a real process group) and
+    ``_pre_wrap_hooks`` (holds a closure local to ``get_bridge_distributed_model``,
+    which pickle has no dotted path for). Both exist only because Megatron-FSDP
+    built the model, and only surface with PP > 1.
+
+    Whether an attribute is a declared dataclass field says nothing about whether
+    its *value* pickles — ``_pg_collection`` is declared, and filtering on that
+    signal is what let it slip through an earlier fix. Clean nested runtime
+    state with Bridge's helper, then probe remaining attributes empirically
+    to cover opaque state and values beyond its recursion limit. This also
+    supports non-dataclass configs used by custom providers.
+
+    Safe to drop: receiving ranks only read hyperparameters off this config
+    through a ``SimpleNamespace(config=config)`` shim for tasks with no local
+    ``megatron_module`` (see :meth:`BridgeConverter.broadcast_and_apply_configs`)
+    — never a real module forward, so nothing reads process groups or wrap hooks
+    off it.
+    """
+    from megatron.bridge.models.conversion.utils import remove_non_pickleables
+
+    if not hasattr(config, "__dict__"):
+        return remove_non_pickleables(config)
+    snapshot = copy.copy(config)
+    for name, value in list(vars(snapshot).items()):
+        try:
+            value = remove_non_pickleables(value, current_depth=1)
+            pickle.dumps(value)
+        except Exception:
+            value = None
+        setattr(snapshot, name, value)
+    return snapshot
 
 
 class BridgeConverter:
@@ -317,11 +358,11 @@ class BridgeConverter:
             return
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         if pp_size > 1:
-            from megatron.bridge.models.conversion.utils import remove_non_pickleables
-
             # Keep live configs local: they can contain process groups that
-            # all_gather_object cannot pickle. Bridge cleans a copy for PP transfer.
-            local_config_map = {prefix: remove_non_pickleables(config) for prefix, config in self._config_map.items()}
+            # all_gather_object cannot pickle. Clean a copy for PP transfer.
+            local_config_map = {
+                prefix: _picklable_config_snapshot(config) for prefix, config in self._config_map.items()
+            }
             all_config_maps: list[dict[str, Any] | None] = [None] * pp_size
             dist.all_gather_object(
                 obj=local_config_map,

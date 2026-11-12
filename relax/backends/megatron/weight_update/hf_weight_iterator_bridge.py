@@ -31,7 +31,13 @@ from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
 from .bridge_converter import BridgeConverter
-from .common import all_gather_param, all_gather_params_async, gdn_component_sizes, named_params_and_buffers
+from .common import (
+    all_gather_param,
+    all_gather_params_async,
+    fsdp_gather_local_param,
+    gdn_component_sizes,
+    named_params_and_buffers,
+)
 from .expert_gather import Bf16ExpertGather, PackedExpertGather, bucket_expert_projections, bucket_experts_by_owner
 from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
@@ -131,10 +137,12 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._bf16_expert_gathers = []
         self._packed_expert_sync = False
         self._direct_expert_layout = None
-        # Complete BF16 experts are owned locally at ETP1/PP1. Other layouts
-        # continue through Bridge's existing PP/TP/quantization/LoRA path.
+        # Complete BF16 experts are owned locally at ETP1/PP1. FSDP experts
+        # must first gather their EDP shards through the ordinary export path.
+        # Other layouts retain Bridge's PP/TP/quantization/LoRA path.
         if (
-            torch.cuda.is_available()
+            not getattr(self.args, "use_megatron_fsdp", False)
+            and torch.cuda.is_available()
             and not self.quantization_config
             and not self.lora_merge_mode
             and not self.lora_adapter_mode
@@ -358,6 +366,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                         tensor = megatron_local_weights[self._vanilla_key_map[info.name]].to(
                             device=device, non_blocking=_NON_BLOCKING
                         )
+                        # Routing requires ETP=1 and EP*PP=world, hence EDP=1.
+                        # Unwrap FSDP DTensors without cross-owner collectives.
+                        tensor = fsdp_gather_local_param(tensor, info.name)
                         converted.extend(self._bridge_converter.convert(info.name, tensor))
                         del tensor
                 raw_bytes = sum(info.size for info in bucket_infos if info.src_rank == router.rank)
@@ -455,8 +466,8 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         Expert weights: load → TP gather + convert (src_rank only) →
         PP+EP broadcast via _broadcast_converted_bucket.
 
-        Non-expert weights: PP/EP broadcast (BF16) → TP all-gather →
-        bridge convert.
+        Non-expert weights: FSDP ungather (src_rank only) → PP/EP broadcast
+        (BF16) → TP all-gather → bridge convert.
         """
         param_count = 0
         t_bcast_total = 0.0
@@ -661,6 +672,17 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
             params owned by this PP rank)
         adapter_map: dict base_prefix -> {"in": vanilla_key, "out": vanilla_key}
             for LoRA adapters owned by this rank (empty unless collect_adapters)
+
+    Under Megatron-FSDP a TP-sharded param's raw ``.shape`` is the fully
+    TP-*and*-FSDP-unsharded logical shape: ``make_fsdp_dtensor`` re-wraps the
+    already-TP-sharded local tensor as a DTensor whose declared global shape has
+    the TP dim multiplied back in (``global_shape[tp_dim] *= tp_mesh.mesh.numel()``),
+    on top of the FSDP dim it actually shards. ``ParamInfo.shape`` must instead be
+    the Megatron-native, still-TP-sharded per-rank shape — the wire format
+    ``_pp_broadcast``/``_ep_broadcast`` place on the wire and non-owning ranks
+    allocate receive buffers for (#19) — so every owned param is routed through
+    ``fsdp_gather_local_param`` (a no-op for non-FSDP tensors) before its shape is
+    recorded.
     """
     rank = dist.get_rank()
     pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -684,17 +706,18 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
             elif ".linear_out." in g_name:
                 slot["out"] = v_name
             continue
+        wire_param = fsdp_gather_local_param(v_param, g_name)
         local_infos[g_name] = ParamInfo(
             name=g_name,
             dtype=v_param.dtype,
-            shape=v_param.shape,
+            shape=wire_param.shape,
             attrs={
                 "tensor_model_parallel": getattr(v_param, "tensor_model_parallel", False),
                 "partition_dim": getattr(v_param, "partition_dim", -1),
                 "partition_stride": getattr(v_param, "partition_stride", 1),
                 "parallel_mode": getattr(v_param, "parallel_mode", None),
             },
-            size=v_param.numel() * v_param.element_size(),
+            size=wire_param.numel() * v_param.element_size(),
             src_rank=rank,
         )
         vanilla_key_map[g_name] = v_name
@@ -862,7 +885,8 @@ def _ep_broadcast(bucket_infos, params):
 
 
 def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None):
-    """Load params from CPU dict, PP-broadcast, EP-broadcast.
+    """Load params from CPU dict, undo Megatron-FSDP sharding, PP-broadcast,
+    EP-broadcast.
 
     After this call every rank holds all params from all PP stages and all EP
     shards (still TP-sharded).  Mirrors the broadcast logic in
@@ -870,8 +894,28 @@ def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, d
 
     LoRA adapters are merged at load time (before broadcast) so the merged base
     weight is what propagates to the non-owning PP/EP ranks.
+
+    Under Megatron-FSDP each owned param is a DTensor additionally sharded over
+    the FSDP (data-parallel) dim, and ``dist.broadcast`` has no sharding strategy
+    for DTensor (``NotImplementedError: c10d.broadcast_.default``, #19). It must be
+    un-FSDP-sharded into a plain tensor *before* the PP/EP broadcast, not after —
+    the non-owning ranks' receive buffers are already plain, full-shape tensors
+    (see ``_load_to_gpu``), so a still-sharded DTensor could never match them
+    anyway. This mirrors the expert-weight path above, which already gathers
+    (via ``all_gather_param``) before broadcasting.
+
+    Safe as a plain per-rank call, not a broadcast of its own: every rank in the
+    owning PP stage's FSDP (data-parallel) group independently resolves
+    ``rank == info.src_rank`` to True for its own locally-owned params (bucket_infos
+    is built without cross-DP-rank exchange, see ``_build_param_info_buckets``), so
+    all of them enter the gather branch for the same params in the same order —
+    exactly the participants ``fsdp_gather_local_param``'s internal all-gather needs.
     """
     params = _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=merge_fn)
+    params = [
+        fsdp_gather_local_param(param, info.name) if rank == info.src_rank else param
+        for info, param in zip(bucket_infos, params, strict=True)
+    ]
     _pp_broadcast(bucket_infos, params)
     _ep_broadcast(bucket_infos, params)
     return params
