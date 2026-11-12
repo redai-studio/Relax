@@ -10,16 +10,20 @@ import pytest
 pytest.importorskip("megatron.core", exc_type=ImportError)
 
 
-def test_gradient_finalization_releases_cache_before_collectives(monkeypatch):
+@pytest.mark.parametrize("gc_enabled", [False, True])
+def test_gradient_finalization_releases_cache_before_collectives(monkeypatch, gc_enabled):
     from relax.backends.megatron import model as module
 
     events = []
+    monkeypatch.setenv("RELAX_MEMORY_RELEASE_GC", "1" if gc_enabled else "0")
+    monkeypatch.setattr(module.gc, "collect", lambda: events.append("gc") or 0)
+    expected = (["gc"] if gc_enabled else []) + ["release"]
     model, num_tokens, pg_collection = object(), object(), object()
     monkeypatch.setattr(module.device_module, "empty_cache", lambda: events.append("release"))
     monkeypatch.setattr(module, "available_memory", lambda: {})
 
     def finalize(actual_model, actual_tokens, *, pg_collection, force_all_reduce):
-        assert events == ["release"]
+        assert events == expected
         assert actual_model is model
         assert actual_tokens is num_tokens
         assert pg_collection is expected_group
@@ -31,13 +35,26 @@ def test_gradient_finalization_releases_cache_before_collectives(monkeypatch):
     module._finalize_model_grads_with_memory_release(
         model, num_tokens, pg_collection=pg_collection, force_all_reduce=True
     )
-    assert events == ["release", "collective"]
+    assert events == expected + ["collective"]
 
 
-@pytest.mark.parametrize("level", [0, 1, 2])
-def test_train_one_step_releases_cache_before_optimizer_collectives(monkeypatch, level):
+@pytest.mark.parametrize(
+    ("level", "first_only", "rollout_id", "step_id", "release"),
+    [
+        (0, False, 1, 0, False),
+        (1, False, 1, 0, True),
+        (2, False, 1, 0, True),
+        (1, True, 0, 0, True),
+        (1, True, 0, 1, False),
+        (1, True, 1, 0, False),
+    ],
+)
+def test_train_one_step_releases_cache_before_optimizer_collectives(
+    monkeypatch, level, first_only, rollout_id, step_id, release
+):
     from relax.backends.megatron import model as module
 
+    monkeypatch.setenv("RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY", "1" if first_only else "0")
     events = []
     args = Namespace(
         empty_unused_memory_level=level,
@@ -64,7 +81,7 @@ def test_train_one_step_releases_cache_before_optimizer_collectives(monkeypatch,
     def optimizer_step():
         # NCCL norm reduction happens within this single optimizer step.
         expected = ["clear_model_grads", "clear_optimizer_grads", "backward"]
-        assert events == expected + (["release"] if level else [])
+        assert events == expected + (["release"] if release else [])
         events.append("optimizer")
         return True, 2.0, 0
 
@@ -72,15 +89,26 @@ def test_train_one_step_releases_cache_before_optimizer_collectives(monkeypatch,
     optimizer = SimpleNamespace(zero_grad=lambda: events.append("clear_optimizer_grads"), step=optimizer_step)
     scheduler = SimpleNamespace(step=lambda **_: events.append("scheduler"))
     model = SimpleNamespace(zero_grad_buffer=lambda: events.append("clear_model_grads"))
-    result = module.train_one_step(args, 1, 0, [], [model], optimizer, scheduler, 1, 8)
+    result = module.train_one_step(args, rollout_id, step_id, [], [model], optimizer, scheduler, 1, 8)
     expected = ["clear_model_grads", "clear_optimizer_grads", "backward"]
-    expected += (["release"] if level else []) + ["optimizer", "scheduler"]
+    expected += (["release"] if release else []) + ["optimizer", "scheduler"]
     expected.extend(["clear_model_grads", "clear_optimizer_grads"])
     if level >= 2:
         expected.append("release")
     assert events == expected
     assert result == ({}, 2.0)
-    assert memory_probe.call_count == (2 if level else 0)
+    assert memory_probe.call_count == (2 if release else 0)
+
+
+def test_first_attempt_release_rejects_resume_and_incompatible_levels(monkeypatch):
+    from relax.backends.megatron import model as module
+
+    monkeypatch.setenv("RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY", "1")
+    with pytest.raises(ValueError, match="resume is unsupported"):
+        module._release_memory_for_step(Namespace(empty_unused_memory_level=1), 7, 0, first_train_call=True)
+    for level in (0, 2):
+        with pytest.raises(ValueError, match="requires empty_unused_memory_level=1"):
+            module._release_memory_for_step(Namespace(empty_unused_memory_level=level), 0, 0)
 
 
 @pytest.mark.parametrize(
