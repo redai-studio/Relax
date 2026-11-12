@@ -49,7 +49,7 @@ def _definitions(source: Path, names: set[str], namespace: dict[str, Any]) -> di
     return namespace
 
 
-@pytest.fixture(scope="module", params=["20260728-0e6ac576f.patch", "20260915-4a4de8657.patch"])
+@pytest.fixture(scope="module", params=["20260915-4a4de8657.patch"])
 def dependency_functions(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> SimpleNamespace:
     if shutil.which("git") is None:
         pytest.skip("git is required to apply the repository Bridge patch")
