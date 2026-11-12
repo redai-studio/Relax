@@ -648,6 +648,9 @@ def validate_i2i_sft_config(args: Namespace) -> None:
         "prefix_gradient_checkpointing": True,
         "fixed_pixels_tiers": None,
         "seed": None,
+        "condition_cache_enabled": False,
+        "condition_cache_max_entries": 256,
+        "condition_cache_max_bytes": 1073741824,
     }
     unknown = (
         set(config)
@@ -665,6 +668,10 @@ def validate_i2i_sft_config(args: Namespace) -> None:
     )
     _fail(errors, bool(unknown), f"Unknown i2i_sft_config keys: {sorted(unknown)}")
     args.i2i_sft_config = config = {**defaults, **config}
+    _fail(errors, type(config["condition_cache_enabled"]) is not bool, "condition_cache_enabled must be boolean")
+    for field in ("condition_cache_max_entries", "condition_cache_max_bytes"):
+        value = config[field]
+        _fail(errors, type(value) is not int or value <= 0, f"{field} must be a positive integer")
     depth, workers = config.get("image_prefetch_depth", 0), config.get("image_prefetch_workers", 2)
     _fail(errors, type(depth) is not int or depth < 0, "image_prefetch_depth must be a nonnegative integer")
     _fail(errors, type(workers) is not int or workers <= 0, "image_prefetch_workers must be a positive integer")

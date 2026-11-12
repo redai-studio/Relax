@@ -44,6 +44,14 @@ if [[ "$IMAGE_DP_TIER_RANK_ROTATION" == 1 && "$IMAGE_DP_TIER_MICRO_BALANCE" != 1
 fi
 BASELINE_STATS_DIR="${BASELINE_STATS_DIR:-}"
 BASELINE_WARMUP_STEPS="${BASELINE_WARMUP_STEPS:-5}"
+CONDITION_CACHE_ENABLED="${CONDITION_CACHE_ENABLED:-0}"
+CONDITION_CACHE_MAX_ENTRIES="${CONDITION_CACHE_MAX_ENTRIES:-256}"
+CONDITION_CACHE_MAX_BYTES="${CONDITION_CACHE_MAX_BYTES:-1073741824}"
+case "$CONDITION_CACHE_ENABLED" in
+    0|1) ;;
+    *) echo "CONDITION_CACHE_ENABLED must be 0 or 1" >&2; exit 1 ;;
+esac
+export CONDITION_CACHE_ENABLED CONDITION_CACHE_MAX_ENTRIES CONDITION_CACHE_MAX_BYTES
 export IMAGE_PREFETCH_DEPTH IMAGE_PREFETCH_WORKERS IMAGE_DP_TIER_MICRO_BALANCE IMAGE_DP_TIER_RANK_ROTATION
 export BASELINE_STATS_DIR BASELINE_WARMUP_STEPS
 if [[ "$MODE" == full ]]; then
@@ -72,6 +80,9 @@ config = {
     "image_prefetch_workers": int(os.environ["IMAGE_PREFETCH_WORKERS"]),
     "fixed_pixels_tiers": tiers,
     "seed": int(sys.argv[9]),
+    "condition_cache_enabled": os.environ["CONDITION_CACHE_ENABLED"] == "1",
+    "condition_cache_max_entries": int(os.environ["CONDITION_CACHE_MAX_ENTRIES"]),
+    "condition_cache_max_bytes": int(os.environ["CONDITION_CACHE_MAX_BYTES"]),
 }
 if os.environ["IMAGE_DP_TIER_MICRO_BALANCE"] == "1":
     config["dp_tier_micro_balance"] = True

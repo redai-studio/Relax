@@ -3,9 +3,11 @@
 trajectories."""
 
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import torch
+
+from relax.engine.sft.condition_cache import ConditionFieldSpec, ConditionRequest
 
 
 class GenerativeSFTAdapter(Protocol):
@@ -34,3 +36,12 @@ class GenerativeSFTAdapter(Protocol):
         that survives checkpoint resume.
         """
         ...
+
+
+@runtime_checkable
+class ConditionCacheAdapter(Protocol):
+    def condition_field_specs(self, model: torch.nn.Module) -> tuple[ConditionFieldSpec, ...]: ...
+
+    def prepare_condition_request(self, model: torch.nn.Module, data: Any) -> dict[str, ConditionRequest]: ...
+
+    def bind_condition_cache(self, model: torch.nn.Module, cache: Any | None) -> None: ...

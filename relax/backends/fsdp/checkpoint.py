@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import traceback
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -413,6 +414,27 @@ def find_latest_committed(save_dir: str, task: str) -> Optional[int]:
 
 
 def load_checkpoint(
+    save_dir: str,
+    task: str,
+    iteration: int,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    *,
+    adapter_only: bool = False,
+) -> Dict[str, Any]:
+    cache = getattr(model, "_condition_cache", None)
+    if cache is not None:
+        cache.bump_encoder_version(version_tag=(task, iteration))
+    try:
+        return _load_checkpoint(save_dir, task, iteration, model, optimizer, adapter_only=adapter_only)
+    except BaseException as exc:
+        if cache is not None:
+            traceback.clear_frames(exc.__traceback__)
+            cache.close()
+        raise
+
+
+def _load_checkpoint(
     save_dir: str,
     task: str,
     iteration: int,

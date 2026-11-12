@@ -37,6 +37,9 @@ def test_fixed_tiers_launcher_seed_and_runtime_json(seed, runtime_env, gpus, bat
         DRIVER_PYTHONPATH="/shared/megatron:/shared/relax",
         IMAGE_DP_TIER_MICRO_BALANCE=balance,
         IMAGE_DP_TIER_RANK_ROTATION=rotation,
+        CONDITION_CACHE_ENABLED="1",
+        CONDITION_CACHE_MAX_ENTRIES="32",
+        CONDITION_CACHE_MAX_BYTES="4096",
     )
     for key, value in (("SEED", seed), ("RUNTIME_ENV_JSON", runtime_env)):
         env.pop(key, None)
@@ -68,6 +71,9 @@ bash "$1"
     assert config["seed"] == int(seed or "42")
     assert config["image_prefetch_depth"] == 4
     assert config["image_prefetch_workers"] == 2
+    assert config["condition_cache_enabled"] is True
+    assert config["condition_cache_max_entries"] == 32
+    assert config["condition_cache_max_bytes"] == 4096
     if balance == "1":
         assert config["dp_tier_micro_balance"] is True
     else:

@@ -409,6 +409,7 @@ def _run_two_step_sft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enable_tr
     trainer.group = None
     trainer.step = 0
     trainer.prefetch = None
+    trainer.condition_cache = None
     trainer.parameters = [p for p in model.parameters() if p.requires_grad]
     trainer.scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     trainer.profiler = SimpleNamespace(step=lambda _s: None)

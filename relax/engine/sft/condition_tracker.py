@@ -739,6 +739,8 @@ class ConditionTracker:
             },
             "micros": micro_list,
         }
+        if hasattr(self, "condition_cache_stats"):
+            step_record["condition_cache"] = self.condition_cache_stats
         self.step_records.append(step_record)
         with self.steps_jsonl_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(step_record, ensure_ascii=False) + "\n")
@@ -868,6 +870,8 @@ class ConditionTracker:
 
     def save_summary(self) -> dict[str, Any]:
         summary = self.build_summary()
+        if hasattr(self, "condition_cache_stats"):
+            summary["condition_cache"] = self.condition_cache_stats
         self.summary_json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return summary
 
@@ -1314,6 +1318,11 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             "global_examples": global_repeat_evidence,
         },
     }
+    cache_stats = {
+        str(rank): data["condition_cache"] for rank, data in rank_summaries.items() if "condition_cache" in data
+    }
+    if cache_stats:
+        summary["condition_cache"] = cache_stats
     baseline_summary_path = out_path / "baseline_summary.json"
     baseline_summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return summary
