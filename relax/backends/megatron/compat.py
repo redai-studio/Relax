@@ -5,6 +5,7 @@ import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import wraps
+from importlib.metadata import PackageNotFoundError, version
 from threading import RLock
 from typing import Any
 
@@ -12,6 +13,37 @@ from typing import Any
 _BUGGY_NATIVE_FP32_LOOKUPS = ("self.param_to_fp32_param[param]", "self.param_to_fp32_param.get(param)")
 _NATIVE_FP32_LOAD_PATCHED = "_relax_native_fp32_load_patched"
 _HDO_STEP_LOAD_LOCK = RLock()
+
+
+def patch_fla_gdn_backward_for_sm103() -> bool:
+    """Route FLA 0.5.2 GDN backward to Triton on misidentified SM103 GPUs."""
+    import torch
+
+    device_count = torch.cuda.device_count()
+    if not device_count or any(torch.cuda.get_device_capability(i) != (10, 3) for i in range(device_count)):
+        return False
+
+    try:
+        if version("fla-core") != "0.5.2":
+            return False
+        from fla.ops.common import chunk_o
+        from fla.ops.common.backends.tilelang import TileLangBackend
+    except (ImportError, PackageNotFoundError):
+        return False
+
+    if not getattr(chunk_o, "IS_NVIDIA_HOPPER", False):
+        return False
+    original = TileLangBackend.chunk_bwd_dqkwg_verifier
+
+    @wraps(original)
+    def verifier(self: Any, *args: Any, **kwargs: Any) -> tuple[bool, str]:
+        return False, "Use Triton for FLA GDN backward on CUDA capability 10.3"
+
+    TileLangBackend.chunk_bwd_dqkwg_verifier = verifier
+    # FLA 0.5.2 also consults the spoofable Hopper flag in the Triton fallback.
+    # Change the flag after import to retain the existing autotune candidates.
+    chunk_o.IS_NVIDIA_HOPPER = False
+    return True
 
 
 def _patch_hdo_group_steps(optimizer_cls: type) -> bool:

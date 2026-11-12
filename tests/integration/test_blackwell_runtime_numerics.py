@@ -15,6 +15,54 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("lengths", [(64, 64), (37, 80), (257, 768, 3071)])
+def test_fla_packed_gdn_backward_on_misidentified_sm103(monkeypatch, lengths):
+    from fla.ops.common import chunk_o
+    from fla.ops.common.backends.tilelang import TileLangBackend
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
+
+    from relax.backends.megatron.compat import patch_fla_gdn_backward_for_sm103
+
+    monkeypatch.setattr(chunk_o, "IS_NVIDIA_HOPPER", chunk_o.IS_NVIDIA_HOPPER)
+    monkeypatch.setattr(TileLangBackend, "chunk_bwd_dqkwg_verifier", TileLangBackend.chunk_bwd_dqkwg_verifier)
+    if not patch_fla_gdn_backward_for_sm103():
+        pytest.skip("Requires the affected FLA 0.5.2 SM103 runtime")
+
+    rng = torch.Generator(device="cuda").manual_seed(1234)
+    boundaries = [0]
+    for length in lengths:
+        boundaries.append(boundaries[-1] + length)
+    tokens = boundaries[-1]
+    inputs = {
+        name: F.normalize(torch.randn(1, tokens, 8, 128, device="cuda", generator=rng), dim=-1)
+        .repeat_interleave(2, dim=2)
+        .bfloat16()
+        .requires_grad_()
+        for name in ("q", "k")
+    }
+    inputs["v"] = torch.randn(1, tokens, 16, 128, device="cuda", dtype=torch.bfloat16, generator=rng).requires_grad_()
+    inputs["g"] = (-F.softplus(torch.randn(1, tokens, 16, device="cuda", generator=rng))).requires_grad_()
+    inputs["beta"] = torch.randn(1, tokens, 16, device="cuda", generator=rng).sigmoid().requires_grad_()
+    cu_seqlens = torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+    output, _ = chunk_gated_delta_rule(**inputs, cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=False)
+    grad_output = torch.randn(output.shape, device="cuda", dtype=output.dtype, generator=rng) / 256
+    gradients = torch.autograd.grad(output, tuple(inputs.values()), grad_output)
+
+    for start, end in zip(boundaries, boundaries[1:]):
+        sample = (slice(None), slice(start, end), slice(0, 1))
+        reference_inputs = {name: tensor[sample].detach().float().requires_grad_() for name, tensor in inputs.items()}
+        reference_output, _ = torch_chunk_gated_delta_rule(**reference_inputs)
+        reference_gradients = torch.autograd.grad(
+            reference_output, tuple(reference_inputs.values()), grad_output[sample].float()
+        )
+        for name, actual, expected in zip(
+            ("output", *inputs), (output, *gradients), (reference_output, *reference_gradients)
+        ):
+            relative_error = (actual[sample].detach().float() - expected.detach()).norm() / expected.detach().norm()
+            assert relative_error < 0.02, f"{name} relative L2 error for sequence {start}:{end}: {relative_error}"
+
+
 @pytest.mark.parametrize("lengths", [(37, 80), (2049, 4097)])
 def test_fla_packed_convolution_forward_and_backward(lengths):
     from fla.modules.conv import causal_conv1d

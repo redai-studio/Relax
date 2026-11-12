@@ -35,6 +35,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
+from relax.backends.megatron.compat import patch_fla_gdn_backward_for_sm103
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.agentic_obs import agentic_obs_enabled
@@ -585,6 +586,8 @@ def setup_model_and_optimizer(
             RoutingReplay.all_routing_replays = active_replays
 
     _patch_gdn_cu_seqlens_validation()
+    if patch_fla_gdn_backward_for_sm103():
+        logger.info("Using Triton for FLA GDN backward on CUDA capability 10.3")
     if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
         # Global, idempotent GatedDeltaNet patch — apply whenever CP is active
         # (dynamic CP, or static context_parallel_size > 1), incl. weight-only
