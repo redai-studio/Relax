@@ -22,7 +22,10 @@ import pytest
     ],
 )
 @pytest.mark.parametrize("offload_enabled", [None, False])
-def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch, schedule_name, offload_enabled):
+@pytest.mark.parametrize("batches", [["first"], ["first", "second"]])
+def test_streaming_schedules_finalize_with_tensor_data_context_group(
+    monkeypatch, schedule_name, offload_enabled, batches
+):
     """New Megatron finalization needs the combined TP/DP/CP reduction
     group."""
     source = Path(__file__).resolve().parents[4] / "relax/backends/megatron/streaming_schedules.py"
@@ -37,6 +40,17 @@ def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch
     tp, dp_cp, tp_dp_cp = object(), object(), object()
     cp = types.SimpleNamespace(size=lambda: 2)
     calls = {"forward": 0, "backward": 0, "finalize": [], "tp_dp_cp": []}
+    backward_sync = []
+    sync_enabled = True
+
+    @contextlib.contextmanager
+    def no_sync():
+        nonlocal sync_enabled
+        sync_enabled = False
+        try:
+            yield
+        finally:
+            sync_enabled = True
 
     def combined_group(**kwargs):
         calls["tp_dp_cp"].append(kwargs)
@@ -57,7 +71,7 @@ def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch
         calls["finalize"].append((models, num_tokens, pg_collection, force_all_reduce))
 
     config = types.SimpleNamespace(
-        no_sync_func=None,
+        no_sync_func=no_sync,
         finalize_model_grads_func=finalize,
         calculate_per_token_loss=True,
         overlap_p2p_comm=False,
@@ -87,6 +101,7 @@ def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch
 
     def backward_step(*args):
         calls["backward"] += 1
+        backward_sync.append(sync_enabled)
 
     namespace = {
         "contextlib": contextlib,
@@ -107,7 +122,7 @@ def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch
     model = object()
     result = namespace[schedule_name](
         forward_step_func=None,
-        data_iterator=iter(["first", "second"]),
+        data_iterator=iter(batches),
         model=model,
         num_microbatches=99,
         seq_length=8,
@@ -115,13 +130,15 @@ def test_streaming_schedules_finalize_with_tensor_data_context_group(monkeypatch
         force_all_reduce=True,
     )
 
-    assert result == ["first", "second"]
-    assert calls["forward"] == calls["backward"] == 2
+    assert result == batches
+    assert calls["forward"] == calls["backward"] == len(batches)
+    assert backward_sync == [False] * (len(batches) - 1) + [True]
+    assert sync_enabled
     assert calls["tp_dp_cp"] == [{"with_context_parallel": True}]
     assert len(calls["finalize"]) == 1
     models, num_tokens, groups, force_all_reduce = calls["finalize"][0]
     assert models == [model]
-    assert num_tokens == 14
+    assert num_tokens == 7 * len(batches)
     assert force_all_reduce is True
     assert groups.tp is tp
     assert groups.cp is cp

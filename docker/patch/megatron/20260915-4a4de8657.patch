@@ -2066,7 +2066,15 @@ diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buf
      from megatron.core.distributed.distributed_data_parallel_config import (
          DistributedDataParallelConfig,
      )
-@@ -5291,12 +5293,18 @@
+@@ -3453,6 +3455,7 @@
+                             "requires_grad",
+                             "sequence_parallel",
+                             "shared",
++                            "grad_norm_group",
+                             "tensor_model_parallel",
+                             "partition_dim",
+                             "partition_stride",
+@@ -5291,12 +5294,18 @@
              placements = [Shard(tp_dim)]
              global_shape[tp_dim] *= tp_mesh.mesh.numel()
 

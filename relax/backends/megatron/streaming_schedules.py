@@ -8,8 +8,8 @@ when ``--use-dynamic-batch-size`` and ``--fully-async`` are both active.
 Key difference from the standard schedules:
 - ``num_microbatches`` is NOT known upfront; each stage discovers it by
   pulling micro-batches from a ``StreamingTQIterator`` until ``StopIteration``.
-- All micro-batches run inside ``no_sync`` (gradient accumulation without
-  inter-rank reduction); ``finalize_model_grads_func`` is called once at the end.
+- Gradient synchronization is enabled before the last backward;
+  ``finalize_model_grads_func`` is called once at the end.
 - Loss normalisation is handled entirely via ``__loss_scale__`` injected by
   the iterator.  Megatron's ``output_tensor /= num_microbatches`` becomes a
   no-op because we pass ``num_microbatches=1`` to ``forward_step``.
@@ -67,9 +67,9 @@ def streaming_forward_backward_no_pipelining(
     """Streaming forward+backward with no pipeline parallelism (PP=1).
 
     Iterates ``data_iterator`` until ``StopIteration``, running one
-    forward+backward pass per micro-batch.  All passes use ``no_sync``
-    (gradient accumulation); ``finalize_model_grads_func`` syncs once at the
-    end.  ``num_microbatches`` is silently ignored.
+    forward+backward pass per micro-batch. One-batch lookahead enables gradient
+    synchronization before the last backward; finalization waits for
+    completion. ``num_microbatches`` is silently ignored.
     """
     if isinstance(model, list):
         assert len(model) == 1, "streaming no-pipelining schedule requires single model chunk"
@@ -117,12 +117,14 @@ def streaming_forward_backward_no_pipelining(
 
     dp_rank = parallel_state.get_data_parallel_rank()
 
-    # All micro-batches run inside no_sync (gradient accumulation).
     # Cross-DP micro-batch alignment (dummy padding to the per-DP max) is done
     # inside the StreamingTQIterator, so every DP rank yields the same number
     # of micro-batches here — keeping the DP gradient all-reduce in lockstep.
-    with no_sync_func():
-        for batch in data_iterator:
+    stop = object()
+    with contextlib.ExitStack() as no_sync_context:
+        no_sync_context.enter_context(no_sync_func())
+        batch = next(data_iterator, stop)
+        while batch is not stop:
             single_mb_iter = iter([batch])
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
@@ -138,7 +140,12 @@ def streaming_forward_backward_no_pipelining(
                 current_microbatch=mb_idx,
             )
             total_num_tokens += num_tokens
+            next_batch = next(data_iterator, stop)
             if not forward_only:
+                if next_batch is stop:
+                    # FSDP launches its outer reduction during the last backward;
+                    # finalize alone cannot initiate a reduction skipped by no_sync.
+                    no_sync_context.close()
                 backward_step(input_tensor, output_tensor, output_tensor_grad, config)
             if mb_idx == 0:
                 logger.info(
@@ -148,6 +155,7 @@ def streaming_forward_backward_no_pipelining(
                     num_tokens,
                 )
             mb_idx += 1
+            batch = next_batch
 
     if mb_idx == 0:
         logger.error(

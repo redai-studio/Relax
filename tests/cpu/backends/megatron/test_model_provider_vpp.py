@@ -855,6 +855,42 @@ def test_bridge_distributed_model_uses_megatron_fsdp(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    "strategy,overlap,recompute,wrap,rejected",
+    [
+        ("optim", True, True, True, True),
+        ("optim_grads", False, True, True, True),
+        ("optim_grads_params", False, True, True, True),
+        ("optim", False, True, True, False),
+        ("optim_grads_params", True, False, True, False),
+        ("optim_grads_params", True, True, False, False),
+    ],
+)
+def test_bridge_fsdp_rejects_reentrant_chunked_overlap_before_wrap(
+    monkeypatch, strategy, overlap, recompute, wrap, rejected
+):
+    module, provider = _load_model_provider(monkeypatch)
+    ddp_config = SimpleNamespace(data_parallel_sharding_strategy=strategy, overlap_grad_reduce=overlap)
+    monkeypatch.setattr(sys.modules["megatron.training.training"], "get_megatron_ddp_config", lambda args: ddp_config)
+    args = _bridge_args(
+        use_megatron_fsdp=True,
+        loss_type="sft",
+        sft_chunked_logits=True,
+        recompute_loss_function=recompute,
+        overlap_grad_reduce=overlap,
+        untie_embeddings_and_output_weights=True,
+        pipeline_model_parallel_size=1,
+        num_distributed_optimizer_instances=1,
+    )
+    if rejected:
+        with pytest.raises(ValueError, match="Megatron-FSDP.*--sft-chunked-logits.*--recompute-loss-function"):
+            module.get_bridge_distributed_model(args, wrap_with_ddp=wrap)
+        assert provider.distributed_calls == []
+    else:
+        assert module.get_bridge_distributed_model(args, wrap_with_ddp=wrap) == [provider.model]
+        assert len(provider.distributed_calls) == 1
+
+
 def test_bridge_distributed_model_disables_pipeline_output_dealloc_under_pp(monkeypatch):
     """#20: megatron_fsdp wraps every FSDP-unit module's forward output in a
     `t.view_as(t)` (see megatron_fsdp.py::create_custom_backward_hook), so the

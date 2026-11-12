@@ -1837,11 +1837,15 @@ def train(
     # train() is invoked once per rollout in Relax (vs. once per run upstream),
     # so guard the sync-func setup to be idempotent — re-assigning would trip
     # Megatron's "no_sync_func must be None" assert on rollout 1+.
-    if _is_distributed_wrapper(model[0]) and args.overlap_grad_reduce and config.no_sync_func is None:
+    ddp_config = getattr(model[0], "ddp_config", None)
+    overlap_grad_reduce = getattr(ddp_config, "overlap_grad_reduce", args.overlap_grad_reduce)
+    if _is_distributed_wrapper(model[0]) and overlap_grad_reduce and config.no_sync_func is None:
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
-        if args.align_grad_reduce:
+        # FSDP needs no_sync to exit BEFORE the last backward to launch DP-Outer reduction;
+        # its start_grad_sync() cannot launch that reduction afterward with overlap enabled.
+        if args.align_grad_reduce and not getattr(ddp_config, "use_megatron_fsdp", False):
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]

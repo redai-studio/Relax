@@ -934,6 +934,23 @@ def get_bridge_distributed_model(
     from megatron.training.training import get_megatron_ddp_config
 
     ddp_config = get_megatron_ddp_config(args) if wrap_with_ddp else None
+    if (
+        ddp_config is not None
+        and getattr(args, "loss_type", None) == "sft"
+        and getattr(args, "sft_chunked_logits", False)
+        and getattr(args, "recompute_loss_function", False)
+        and (
+            ddp_config.overlap_grad_reduce
+            # MegatronFSDP forces overlap on when gradients are sharded.
+            or ddp_config.data_parallel_sharding_strategy in {"optim_grads", "optim_grads_params"}
+        )
+    ):
+        raise ValueError(
+            "Megatron-FSDP does not support --sft-chunked-logits with --recompute-loss-function "
+            "when gradient reduction overlaps backward: reentrant head backward needs a completion policy "
+            "currently implemented only for Megatron DDP. Disable --recompute-loss-function or use ordinary "
+            "Megatron DDP; gradient sharding enables overlap even without --overlap-grad-reduce."
+        )
     model = provider.provide_distributed_model(
         wrap_with_ddp=wrap_with_ddp,
         ddp_config=ddp_config,
