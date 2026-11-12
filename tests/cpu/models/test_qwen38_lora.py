@@ -28,7 +28,7 @@ def _runtime() -> tuple[type, type, type]:
     return lora.LoRA, hc.GatedResidualHyperConnection, ple.PerLayerEmbedding
 
 
-def _model(tp_size: int, with_ple: bool) -> torch.nn.Module:
+def _model(tp_size: int, with_ple: bool, cp_size: int = 1) -> torch.nn.Module:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     _, hc, ple = _runtime()
@@ -39,6 +39,7 @@ def _model(tp_size: int, with_ple: bool) -> torch.nn.Module:
         params_dtype=torch.float32,
         use_cpu_initialization=True,
         tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
         sequence_parallel=tp_size > 1,
         enable_hyper_connections=True,
         mhc_variant="gated_residual",
@@ -66,15 +67,16 @@ def _model(tp_size: int, with_ple: bool) -> torch.nn.Module:
     return model
 
 
-def _inject(model: torch.nn.Module) -> Namespace:
+def _inject(model: torch.nn.Module, dropout: float = 0.0, targets: list[str] | None = None) -> Namespace:
     from relax.models.qwen3_8.lora import HC_TARGETS, PLE_TARGETS, qwen38_lora_targets
     from relax.utils.training.lora_grad_sync import inherit_lora_tp_grad_sync
 
     lora, _, _ = _runtime()
-    targets = list(HC_TARGETS) + (list(PLE_TARGETS) if hasattr(model, "ple") else [])
-    args = Namespace(lora_rank=2, lora_dropout=0.0, lora_scope="all", lora_target_modules=targets)
+    if targets is None:
+        targets = list(HC_TARGETS) + (list(PLE_TARGETS) if hasattr(model, "ple") else [])
+    args = Namespace(lora_rank=2, lora_dropout=dropout, lora_scope="all", lora_target_modules=targets)
     resolved = qwen38_lora_targets(model, targets, args)
-    lora(target_modules=resolved, dim=2, alpha=4, dropout=0.0)(model)
+    lora(target_modules=resolved, dim=2, alpha=4, dropout=dropout)(model)
     inherit_lora_tp_grad_sync(model)
     return args
 
@@ -96,7 +98,7 @@ def _loss(output: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return ((output.square() + 0.1 * output.sin()) * weights).sum()
 
 
-def _single_rank_contract() -> None:
+def _single_rank_contract(dropout: float) -> None:
     from megatron.bridge.peft.lora_layers import LoRALinear
     from megatron.bridge.peft.lora_merge import LoRAMerge
 
@@ -105,7 +107,7 @@ def _single_rank_contract() -> None:
     weights = torch.arange(1, 17, dtype=torch.float32).view(16, 1, 1) / 16
     with torch.no_grad():
         base_output = _forward(model, hidden)
-    _inject(model)
+    _inject(model, dropout=dropout)
     assert len(_adapters(model)) == 10
     torch.testing.assert_close(_forward(model, hidden), base_output, rtol=0, atol=0)
     frozen = {
@@ -136,6 +138,7 @@ def _single_rank_contract() -> None:
         {
             "adapter": {name: value for name, value in model.state_dict().items() if ".adapter." in name},
             "optimizer": optimizer.state_dict(),
+            "rng": torch.get_rng_state(),
         },
         checkpoint,
     )
@@ -147,6 +150,7 @@ def _single_rank_contract() -> None:
     assert not incompatible.unexpected_keys
     assert not any(".adapter." in name for name in incompatible.missing_keys)
     optimizer.load_state_dict(restored["optimizer"])
+    torch.set_rng_state(restored["rng"])
     torch.testing.assert_close(step(2), expected_loss, rtol=0, atol=0)
     for name, parameter in _adapters(model).items():
         torch.testing.assert_close(parameter, expected_params[name], rtol=0, atol=0)
@@ -226,7 +230,8 @@ def _worker(rank: int, rendezvous: str) -> None:
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=120))
     try:
         parallel_state.initialize_model_parallel(tensor_model_parallel_size=1)
-        _single_rank_contract()
+        for dropout in (0.0, 0.25):
+            _single_rank_contract(dropout)
         parallel_state.destroy_model_parallel()
         parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
         _tp_contract(rank)

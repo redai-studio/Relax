@@ -5,6 +5,7 @@
 from argparse import Namespace
 from collections import Counter
 from collections.abc import Sequence
+from types import MethodType
 
 import torch
 import torch.distributed as dist
@@ -14,6 +15,27 @@ from relax.utils.env import Envs
 
 HC_TARGETS = ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight")
 PLE_TARGETS = ("key_proj", "value_proj")
+_PLE_LORA_RNG_NAME = "relax-ple-lora"
+
+
+def _ple_lora_forward(self: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+    from megatron.core.transformer.per_layer_embedding import PerLayerEmbedding
+
+    if not self.training:
+        return PerLayerEmbedding.forward(self, hidden_states)
+    if self.config.sequence_parallel and self.tp_group.size() > 1 and self._cp_packed_seq_params is None:
+        raise ValueError("PLE LoRA dropout with CP>1 and TP sequence parallelism requires packed THD inputs")
+    tracker = get_cuda_rng_tracker()
+    if _PLE_LORA_RNG_NAME not in tracker.get_states():
+        raise RuntimeError(
+            "Checkpoint lacks the PLE LoRA dropout RNG stream; resume a checkpoint saved with this support, "
+            "or use --no-load-rng/--finetune for an intentional warm start"
+        )
+    # CP reconstructs the same logical tokens on every replica. The surrounding
+    # SP RNG stream differs across TP ranks and cannot drive this region.
+    with tracker.fork(_PLE_LORA_RNG_NAME):
+        return PerLayerEmbedding.forward(self, hidden_states)
 
 
 def qwen38_lora_targets(model: torch.nn.Module, targets: list[str], args: Namespace) -> list[str]:
@@ -30,8 +52,6 @@ def qwen38_lora_targets(model: torch.nn.Module, targets: list[str], args: Namesp
     from megatron.core.transformer.hyper_connection import GatedResidualHyperConnection
     from megatron.core.transformer.per_layer_embedding import PerLayerEmbedding
 
-    if requested and args.lora_dropout != 0:
-        raise ValueError("Qwen3.8 HC/PLE LoRA requires --lora-dropout 0; replicated dropout is not supported")
     if requested and getattr(args, "lora_scope", "all") == "vision":
         raise ValueError("Qwen3.8 HC/PLE LoRA targets require --lora-scope language or all")
     if requested and getattr(args, "lora_adapter_mode", False):
@@ -83,17 +103,21 @@ def validate_qwen38_lora(models: Sequence[torch.nn.Module], args: Namespace) -> 
         return
 
     from megatron.bridge.peft.lora_layers import LinearAdapter
+    from megatron.core.transformer.per_layer_embedding import PerLayerEmbedding
 
     from relax.utils.megatron_peft_utils import is_lora_adapter_param
 
     counts: Counter[str] = Counter()
     errors: list[str] = []
     adapters: list[torch.nn.Parameter] = []
+    ple_owners: list[torch.nn.Module] = []
     for model in models:
         errors.extend(getattr(model, "_relax_qwen38_lora_errors", ()))
         modules = dict(model.named_modules())
         targets = getattr(model, "_relax_qwen38_lora_targets", ())
         for owner_name in dict.fromkeys(name.rpartition(".")[0] for name in targets):
+            if isinstance(modules[owner_name], PerLayerEmbedding):
+                ple_owners.append(modules[owner_name])
             for name, parameter in modules[owner_name].named_parameters():
                 if parameter.requires_grad and not is_lora_adapter_param(f".{name}"):
                     errors.append(f"{owner_name}.{name}: HC/PLE base parameters must stay frozen")
@@ -143,6 +167,25 @@ def validate_qwen38_lora(models: Sequence[torch.nn.Module], args: Namespace) -> 
     if dist.is_initialized():
         from megatron.core import parallel_state
 
+        if args.lora_dropout > 0 and totals:
+            if parallel_state.get_data_parallel_world_size() > 1 and not getattr(
+                args, "data_parallel_random_init", False
+            ):
+                raise ValueError(
+                    "HC/PLE LoRA dropout with DP>1 requires --data-parallel-random-init so checkpoints "
+                    "preserve each data-parallel rank's RNG state for variable-length batches"
+                )
+            if ple_owners and parallel_state.get_context_parallel_world_size() > 1:
+                from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+
+                tracker = get_cuda_rng_tracker()
+                if _PLE_LORA_RNG_NAME not in tracker.get_states():
+                    # The default seed includes PP and optional DP, but not TP/CP.
+                    # Register before activation checkpointing and RNG restore;
+                    # never reset an existing stream when another VP chunk is built.
+                    tracker.add(_PLE_LORA_RNG_NAME, torch.cuda.initial_seed() + 0x504C45)
+                for owner in ple_owners:
+                    owner.forward = MethodType(_ple_lora_forward, owner)
         group = parallel_state.get_tensor_model_parallel_group()
         if dist.get_world_size(group=group) > 1:
             source = dist.get_global_rank(group, 0)

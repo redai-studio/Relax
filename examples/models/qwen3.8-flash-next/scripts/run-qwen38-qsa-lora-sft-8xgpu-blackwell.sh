@@ -28,7 +28,7 @@ case "${QWEN38_SFT_MODALITY:-multimodal}" in
 esac
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
-export EXP_NAME="${EXP_NAME:-qwen38-qsa-lora-sft-8xgpu-blackwell}"
+export EXP_NAME="${EXP_NAME:-qwen38-qsa-hc-ple-lora-sft-8xgpu-blackwell}"
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa-lora}"
 # Preserve this recipe's setting when ray-job.sh resets the generic variable.
 export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS="${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
@@ -72,6 +72,7 @@ ENV_ARGS=(
     RELAX_QWEN38_PLE_STREAMED=0
     RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG=1
     RELAX_QWEN38_FLA_CONV_CACHE_REUSE=1
+    # This CP2 recipe uses native QSA; the mixed backend/selector require CP1.
     RELAX_QWEN38_QSA_COMMUNITY_BACKEND=mixed
     "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=${RELAX_QWEN38_QSA_MIXED_LONG_BACKEND:-grouped}"
     "RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN=${RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN:--1}"
@@ -93,7 +94,7 @@ ENV_ARGS=(
     "RELAX_AUTOTUNE_LOG_DIR=${RELAX_AUTOTUNE_LOG_DIR-${SAVE_DIR}/autotune}"
     RELAX_QWEN38_HC_FUSED_MIX=1
     RELAX_SFT_SELECTIVE_LOGITS=1
-    RELAX_QWEN38_QSA_TP_SELECTOR=1
+    RELAX_QWEN38_QSA_TP_SELECTOR=0
     RELAX_QWEN38_QSA_FUSED_SELECTOR=0
     RELAX_QWEN38_QSA_GROUPED_BACKWARD_WARPS=4
     RELAX_QWEN38_QSA_FLEX_SPARSE_MASK=1
@@ -135,7 +136,6 @@ PARALLEL_ARGS=(
     --context-parallel-size 1
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
-    #--pipeline-model-parallel-layout "${QWEN38_PP_LAYOUT:-Et*12|t*14|t*14|t*8mL}"
     --sequence-parallel
     --moe-token-dispatcher-type flex
     --moe-flex-dispatcher-backend hybridep
@@ -165,7 +165,12 @@ LORA_ARGS=(
     --lora-rank "${LORA_RANK:-32}"
     --lora-alpha "${LORA_ALPHA:-32}"
     --lora-dropout 0.0
+    --data-parallel-random-init
     --lora-scope language
+    # 按需选择或追加 LoRA 目标层：
+    # Attention: linear_qkv / linear_proj；GDN: in_proj / out_proj；MLP: linear_fc1 / linear_fc2。
+    # HC: input_mix_weight_down / input_mix_weight_up / block_inject_weight；PLE: key_proj / value_proj。
+    # HC/PLE 必须使用上述规范短名，不支持完整模块路径或通配符。
     --lora-target-modules linear_qkv linear_proj in_proj out_proj linear_fc1 linear_fc2
     --lora-merge-mode
     --freeze-vision-model
@@ -194,9 +199,6 @@ SFT_ARGS=(
     --per-rank-fetch
     --sft-prefetch-num-workers 16
     --sft-train-data-prefetch
-    --freeze-vision-model
-    --freeze-vision-projection
-    --freeze-params-name-list '(^|\.)per_layer_embedding\.|self_attention\.indexer\.'
     --enable-mtp-training
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1

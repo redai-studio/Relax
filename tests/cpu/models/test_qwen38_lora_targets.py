@@ -75,6 +75,7 @@ def _inject(model: torch.nn.Module) -> None:
 
 def test_qwen38_lora_targets_isolate_owners_and_keep_export_names(case):
     model, args = case
+    args.lora_dropout = 0.25
     original = list(args.lora_target_modules)
     result = qwen38_lora_targets(model, ["linear_qkv", *original], args)
 
@@ -104,7 +105,6 @@ def test_qwen38_lora_does_not_change_other_models(case):
 @pytest.mark.parametrize(
     "setting,value,message",
     [
-        ("lora_dropout", 0.05, "dropout 0"),
         ("lora_scope", "vision", "scope"),
         ("lora_adapter_mode", True, "merge mode"),
     ],
