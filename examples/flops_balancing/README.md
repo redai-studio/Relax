@@ -2,12 +2,21 @@
 
 Both training paths are wired locally: `--flops-microbatch-packing` changes
 microbatch construction; `--flops-dp-balancing` changes TransferQueue placement.
-Both default to false. On 4×A800 NVLink, Qwen3-4B SFT effective supervised-token
-throughput improved 15.61% on a three-length workload and 26.84% on a
-preselected long/short workload, each over three independent paired runs.
-Full-gradient and actual-update comparisons passed with the same stabilized
-mathematics on both sides. Default native BF16 did not pass the frozen
-actual-update tolerance and is not claimed as validated.
+Both default to false. On 4×RTX 6000D PCIe, commit `a7eb426` improved
+Qwen3-4B SFT effective supervised-token throughput by 11.39% on a three-length
+workload and 21.01% on a preselected long/short workload, each over three
+independent paired runs. The long/short case failed the frozen A/C gradient
+and FP32-update tolerance despite identical samples and masks, so its 21.01%
+is a throughput observation, not a validated extra-star result. Length-only
+variable-row placement also gives the same assignment in that case, so it
+does not isolate the quadratic FLOPs term.
+Earlier 4×A800 NVLink results were 15.61% and 26.84%, respectively.
+The first effective batch of the measured three-length workload passed
+same-scene one-step full-gradient and actual FP32-update comparisons with the
+same stabilized mathematics on both sides. A separate frozen one-step Dense
+workload passed as well.
+Default native BF16 did not pass the frozen actual-update tolerance and is
+not claimed as validated.
 
 See the [reproduction guide](GPU_RUNBOOK.md) for pinned assets, commands and
 reporting rules.
