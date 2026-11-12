@@ -11,7 +11,7 @@ import ray
 from relax.engine.lora_versions import runtime as runtime_mod
 from relax.engine.lora_versions.manager import LoRAVersionManager, PublicationError, SessionKey
 from relax.engine.lora_versions.runtime import LoRAVersionRuntime
-from tests.engine.lora_versions.test_manager import ENGINES, identity, publish
+from tests.cpu.engine.lora_versions.test_manager import ENGINES, identity, publish
 
 
 def remote(function):

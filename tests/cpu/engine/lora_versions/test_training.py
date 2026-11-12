@@ -15,7 +15,7 @@ from relax.engine.lora_versions import training
 from relax.engine.lora_versions.artifact import read_adapter_artifact
 from relax.engine.lora_versions.training import LoRATrainingConfig, TrainingLoRAPublisher
 from relax.utils import distributed_utils
-from tests.engine.lora_versions.test_artifact import frozen
+from tests.cpu.engine.lora_versions.test_artifact import frozen
 
 
 class ThreadRanks:

@@ -56,8 +56,8 @@ from relax.agentic.session.service import (
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
 from relax.engine.lora_versions.manager import SessionKey
 from relax.utils.types import Sample
-from tests.engine.lora_versions.test_manager import publish
-from tests.engine.lora_versions.test_runtime import host_with_version, remote
+from tests.cpu.engine.lora_versions.test_manager import publish
+from tests.cpu.engine.lora_versions.test_runtime import host_with_version, remote
 
 
 # ``relax.agentic.rollout`` only needs this logging helper at import time. Keep

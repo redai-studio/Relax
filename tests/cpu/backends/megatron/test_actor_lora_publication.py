@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import torch
 
-from tests.engine.lora_versions.test_training import ThreadRanks, assert_rank_errors
+from tests.cpu.engine.lora_versions.test_training import ThreadRanks, assert_rank_errors
 
 
 pytest.importorskip("megatron.core")

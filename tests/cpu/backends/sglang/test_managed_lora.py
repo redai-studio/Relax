@@ -32,8 +32,7 @@ from relax.engine.lora_versions.artifact import AdapterArtifact, write_adapter_a
 from relax.engine.lora_versions.identity import snapshot_adapter, tensor_fingerprint
 from relax.engine.lora_versions.manager import PublicationError, SessionKey, VersionState
 from relax.engine.lora_versions.publisher import LoRAPublisher
-
-from .source_utils import sglang_source_path
+from tests.backends.sglang.source_utils import sglang_source_path
 
 
 def definitions(relative, names, namespace):
@@ -843,7 +842,11 @@ async def test_parallel_children_share_one_reference_until_last_completion(runti
     await manager.lora_registry.register(ref)
     await manager.lora_registry.acquire("a")
     parent = SimpleNamespace(
-        lora_lease=runtime.LoRARequestLease(ref.lora_id), dispatched=False, finished=False, lifecycle_id=object()
+        lora_lease=runtime.LoRARequestLease(ref.lora_id),
+        dispatched=False,
+        finished=False,
+        abort_requested=False,
+        lifecycle_id=object(),
     )
     manager.rid_to_state["parent"] = parent
     manager._raise_if_logical_rid_aborted = lambda _: None
@@ -1073,7 +1076,7 @@ async def test_managed_name_never_implicitly_reloads(runtime):
     manager.lora_ref_cache = {snapshot().identity.lora_name: runtime.LoRARef(lora_path="__tensor__")}
     manager.load_lora_adapter = Mock(side_effect=AssertionError("implicit load must not run"))
     with pytest.raises(fastapi.HTTPException) as error:
-        await manager._resolve_lora_path(SimpleNamespace(lora_path=snapshot().identity.lora_name))
+        await manager._resolve_lora_path(SimpleNamespace(rid="request", lora_path=snapshot().identity.lora_name))
     assert error.value.status_code == 409
     assert error.value.detail == "LORA_VERSION_RETIRED"
     manager.load_lora_adapter.assert_not_called()
@@ -1179,7 +1182,7 @@ def test_gpu_fixture_derives_identity_and_reproducible_adapters(tmp_path, monkey
     from tokenizers.pre_tokenizers import Whitespace
     from transformers import PreTrainedTokenizerFast
 
-    from .test_managed_lora_gpu import lora_fixture
+    from tests.gpux4.backends.sglang.test_managed_lora_gpu import lora_fixture
 
     # Only fixture preparation runs here: no server, CUDA allocation or inference.
     config = {
@@ -1226,7 +1229,7 @@ def test_gpu_fixture_derives_identity_and_reproducible_adapters(tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_gpu_fault_injection_changes_wire_manifest():
-    from .test_managed_lora_gpu import corrupt_lora_manifest
+    from tests.gpux4.backends.sglang.test_managed_lora_gpu import corrupt_lora_manifest
 
     async def receiver(scope, receive, send):
         wire = b""
