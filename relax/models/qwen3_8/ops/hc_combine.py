@@ -14,7 +14,8 @@ from triton.language.extra.cuda import libdevice
 
 @triton.jit
 def _combine_fwd(R, Y, A, O, C: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr):
-    row = tl.program_id(0)
+    # HC stream offsets exceed signed int32 at long sequence lengths.
+    row = tl.program_id(0).to(tl.int64)
     stream = tl.program_id(1)
     c = tl.arange(0, BLOCK)
     offset = (row * N + stream) * C + c
@@ -26,7 +27,8 @@ def _combine_fwd(R, Y, A, O, C: tl.constexpr, N: tl.constexpr, BLOCK: tl.constex
 
 @triton.jit
 def _combine_bwd(DO, Y, A, DY, DA, C: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr):
-    row = tl.program_id(0)
+    # HC stream offsets exceed signed int32 at long sequence lengths.
+    row = tl.program_id(0).to(tl.int64)
     c = tl.arange(0, BLOCK)
     y = tl.load(Y + row * C + c, c < C, other=0).to(tl.float32)
     dy = tl.full((BLOCK,), 0, tl.float32)
