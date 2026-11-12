@@ -8,6 +8,7 @@ import pytest
 
 from relax.utils.data.flops_balancing import (
     FlopsWorkload,
+    _refine_capacity_packing,
     build_flops_schedule,
     load_flops_workload,
     validate_flops_balancing,
@@ -85,6 +86,36 @@ def test_flops_schedule_rebalances_aligned_binpack_fallback() -> None:
     assert not any(dummy)
     assert all(sum(lengths[index] for index in pack) <= 10 for rank in schedule for pack in rank)
     assert [sum(costs[index] for pack in rank for index in pack) for rank in schedule] == [14.0, 14.0]
+
+
+def test_flops_schedule_refines_capacity_fallback_without_more_microbatches() -> None:
+    lengths = [1, 2, 7, 8, 2, 3, 3, 8]
+    costs = [float(length * length + length) for length in lengths]
+    schedule, dummy = build_flops_schedule(lengths, costs, 10, 2)
+
+    assert not any(dummy)
+    assert [len(rank) for rank in schedule] == [2, 2]
+    assert sorted(i for rank in schedule for group in rank for i in group) == list(range(len(lengths)))
+    assert all(sum(lengths[i] for i in group) <= 10 for rank in schedule for group in rank)
+    # The token-only fallback gives 140/98. Two length-8 samples and one
+    # length-7 sample force one rank to carry at least 72 + 56 = 128.
+    assert max(sum(costs[i] for group in rank for i in group) for rank in schedule) == 128
+    assert build_flops_schedule(lengths, costs, 10, 2) == (schedule, dummy)
+
+
+def test_flops_capacity_refinement_moves_samples_without_emptying_packs() -> None:
+    lengths = [6, 3, 2, 4, 1, 1]
+    costs = [float(length * length + length) for length in lengths]
+    bins = [[0, 1], [2], [3], [4, 5]]
+    owners = [[0, 1], [2, 3]]
+
+    _refine_capacity_packing(bins, owners, lengths, costs, 10)
+
+    assert len(bins) == 4 and all(bins)
+    assert sorted(i for group in bins for i in group) == list(range(len(lengths)))
+    assert all(sum(lengths[i] for i in group) <= 10 for group in bins)
+    # Cost 42 for the longest sample plus at least 2 for its rank's other pack.
+    assert max(sum(costs[i] for index in rank for i in bins[index]) for rank in owners) == 44
 
 
 @pytest.mark.parametrize("name", ["qwen3_dense", "qwen3_moe"])

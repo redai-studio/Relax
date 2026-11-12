@@ -7,8 +7,9 @@ import hashlib
 import json
 import math
 from argparse import Namespace
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from itertools import islice
 from numbers import Integral
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +25,8 @@ logger = get_logger(__name__)
 _SUPPORTED_MODELS = {"qwen2", "qwen3", "qwen2_moe", "qwen3_moe", "qwen3_5", "qwen3_5_moe"}
 PLAN_METADATA_FIELD = "_flops_schedule_v1"
 STEP_PLANS_FIELD = "_flops_step_plans"
+_REFINEMENT_PASSES = 4
+_REFINEMENT_CANDIDATES = 1024
 
 
 def _namespace(value: Any) -> Any:
@@ -207,6 +210,79 @@ def _balanced_candidate(
     return oversized + partitions
 
 
+def _rank_workload(weights: list[float]) -> float:
+    real = [weight for weight in weights if weight > 0]
+    return math.fsum(real) + (len(weights) - len(real)) * min(real)
+
+
+def _load_score(loads: list[float]) -> tuple[float, float]:
+    maximum = max(loads)
+    return maximum, maximum - min(loads)
+
+
+def _sample_exchanges(
+    bins: list[list[int]], owners: list[list[int]], workloads: list[float], loads: list[float]
+) -> Iterator[tuple[int, int, int, int, int, int | None]]:
+    ranks = sorted(range(len(owners)), key=lambda rank: (-loads[rank], rank))
+    for offset, left in enumerate(ranks):
+        for right in reversed(ranks[offset + 1 :]):
+            if loads[left] == loads[right]:
+                continue
+            for source in owners[left]:
+                for target in owners[right]:
+                    for sample in sorted(bins[source], key=lambda i: (-workloads[i], i)):
+                        if len(bins[source]) > 1:
+                            yield left, right, source, target, sample, None
+                        for other in sorted(bins[target], key=lambda i: (workloads[i], i)):
+                            yield left, right, source, target, sample, other
+
+
+def _refine_capacity_packing(
+    bins: list[list[int]], owners: list[list[int]], lengths: list[int], workloads: list[float], capacity: int
+) -> None:
+    """Improve a feasible fallback without adding packs or emptying a pack.
+
+    Search a deterministic, bounded set of moves and swaps between ranks.
+    Indivisible oversized samples stay alone; dummy slots are handled later.
+    """
+    weights = [math.fsum(workloads[i] for i in group) for group in bins]
+    tokens = [sum(lengths[i] for i in group) for group in bins]
+    for _ in range(_REFINEMENT_PASSES):
+        loads = [_rank_workload([weights[i] for i in owned]) for owned in owners]
+        best_score = _load_score(loads)
+        if best_score[1] == 0:
+            return
+        best = None
+        exchanges = _sample_exchanges(bins, owners, workloads, loads)
+        for left, right, source, target, sample, other in islice(exchanges, _REFINEMENT_CANDIDATES):
+            if tokens[source] > capacity or tokens[target] > capacity:
+                continue
+            other_length = 0 if other is None else lengths[other]
+            delta = lengths[sample] - other_length
+            if tokens[source] - delta > capacity or tokens[target] + delta > capacity:
+                continue
+            source_group = [i for i in bins[source] if i != sample]
+            target_group = [i for i in bins[target] if i != other] + [sample]
+            if other is not None:
+                source_group.append(other)
+            source_weight = math.fsum(workloads[i] for i in source_group)
+            target_weight = math.fsum(workloads[i] for i in target_group)
+            candidate = loads.copy()
+            candidate[left] = _rank_workload([source_weight if i == source else weights[i] for i in owners[left]])
+            candidate[right] = _rank_workload([target_weight if i == target else weights[i] for i in owners[right]])
+            score = _load_score(candidate)
+            if score < best_score:
+                best_score = score
+                best = source, target, source_group, target_group, source_weight, target_weight, delta
+        if best is None:
+            return
+        source, target, source_group, target_group, source_weight, target_weight, delta = best
+        bins[source], bins[target] = sorted(source_group), sorted(target_group)
+        weights[source], weights[target] = source_weight, target_weight
+        tokens[source] -= delta
+        tokens[target] += delta
+
+
 def build_flops_schedule(
     lengths: list[int], workloads: list[float], capacity: int, dp_size: int, microbatch_group_size: int = 1
 ) -> tuple[list[list[list[int]]], list[set[int]]]:
@@ -237,6 +313,7 @@ def build_flops_schedule(
     # Bin-packing fills packs to capacity; rebalance it even when its count is already aligned.
     if (not balanced or len(bins) < target) and target <= len(lengths):
         aligned_bins = _balanced_candidate(lengths, workloads, capacity, target)
+        balanced = aligned_bins is not None
         if aligned_bins is not None:
             bins = aligned_bins
     while len(bins) < min(target, len(lengths)):
@@ -252,6 +329,9 @@ def build_flops_schedule(
     bins.extend([] for _ in range(target - len(bins)))
     weights = [sum(workloads[i] for i in group) for group in bins]
     owners = get_seqlen_balanced_partitions(weights, dp_size, equal_size=True)
+    if not balanced and all(bins):
+        _refine_capacity_packing(bins, owners, lengths, workloads, capacity)
+        weights = [sum(workloads[i] for i in group) for group in bins]
     rank_bins, rank_dummy = [], []
     for owned in owners:
         dummy = {j for j, index in enumerate(owned) if not bins[index]}
