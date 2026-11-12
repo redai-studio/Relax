@@ -1,0 +1,38 @@
+name: Warm H20 test image
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  warmup:
+    name: Warm H20 image (${{ matrix.machine }})
+    # Each machine label must select runners sharing one host Docker daemon.
+    runs-on: [self-hosted, linux, x64, h20, '${{ matrix.machine }}']
+    timeout-minutes: 130
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: [h20-m01, h20-m02]
+    concurrency:
+      # Deliberately omit workflow/ref/hash: different images must also queue
+      # before taking another runner on this host. The cache still keys by hash.
+      group: h20-image-warmup-${{ matrix.machine }}
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare local test image
+        uses: ./.github/actions/prepare-image
+        timeout-minutes: 120
+        with:
+          dockerfile: docker/Dockerfile.cu13
+          build-args: GPU_ARCH=hopper
+          # Keep these inputs identical to the test jobs' local cache guard.
+          hash-key: ${{ hashFiles('docker/Dockerfile.cu13', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'docker/scripts/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}

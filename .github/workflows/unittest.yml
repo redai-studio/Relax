@@ -25,12 +25,18 @@ jobs:
     with:
       target: gpu-unit
 
-  unittest:
+  warmup:
     needs: bypass
+    # Match the tests' fail-closed bypass policy, including a failed bypass job.
+    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
+    uses: ./.github/workflows/warmup-h20-image.yml
+
+  unittest:
+    needs: [bypass, warmup]
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: ${{ matrix.name }}
-    runs-on: [self-hosted, linux, x64, h20, gpu]
+    runs-on: [self-hosted, linux, x64, h20]
     timeout-minutes: 190
     strategy:
       fail-fast: false
@@ -55,11 +61,22 @@ jobs:
       UV_LINK_MODE: copy
       ARTIFACT_NAME: unittest-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      # Keep the existing required check names failing, not skipped, if warmup fails.
+      - name: Check image warmup result
+        env:
+          WARMUP_RESULT: ${{ needs.warmup.result }}
+        run: |
+          if [[ "$WARMUP_RESULT" != success ]]; then
+            echo "::error::H20 image warmup did not succeed: $WARMUP_RESULT"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
+      # Recheck this runner's daemon: routing changes or GC can invalidate warmup.
       - name: Prepare local test image
         id: image
         uses: ./.github/actions/prepare-image

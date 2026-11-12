@@ -25,12 +25,18 @@ jobs:
     with:
       target: integration
 
-  integration:
+  warmup:
     needs: bypass
+    # Only the H20 jobs depend on this run's warmup; 910C remains independent.
+    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
+    uses: ./.github/workflows/warmup-h20-image.yml
+
+  integration:
+    needs: [bypass, warmup]
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: ${{ matrix.case }}
-    runs-on: [self-hosted, linux, x64, h20, gpu]
+    runs-on: [self-hosted, linux, x64, h20]
     # Allow 120 minutes for image preparation plus the existing 65-minute test job budget.
     timeout-minutes: 185
     strategy:
@@ -48,11 +54,22 @@ jobs:
       TRAINING_SCRIPT: ${{ matrix.script }}
       ARTIFACT_NAME: integration-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      # Keep the existing required check names failing, not skipped, if warmup fails.
+      - name: Check image warmup result
+        env:
+          WARMUP_RESULT: ${{ needs.warmup.result }}
+        run: |
+          if [[ "$WARMUP_RESULT" != success ]]; then
+            echo "::error::H20 image warmup did not succeed: $WARMUP_RESULT"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
+      # Recheck this runner's daemon: routing changes or GC can invalidate warmup.
       - name: Prepare local test image
         id: image
         uses: ./.github/actions/prepare-image
