@@ -83,8 +83,9 @@ RUN python -c "import torch; assert torch.backends.cudnn.version() is not None"
 
 # FA2 is retained as a comparison backend. Build against this image's Torch/CUDA ABI.
 # Hopper-only FA3 is built in fa3_builder below, outside the Blackwell stage chain.
-RUN . /etc/relax_build.env && FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=32 \
-    pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
+COPY docker/scripts/install_patched_fa2.sh docker/patch/flash-attention/2.7.4.post1-fixed-dq-splits.patch /tmp/
+RUN . /etc/relax_build.env && MAX_JOBS=32 sh /tmp/install_patched_fa2.sh /tmp/2.7.4.post1-fixed-dq-splits.patch && \
+    rm /tmp/install_patched_fa2.sh /tmp/2.7.4.post1-fixed-dq-splits.patch && \
     pip install --no-cache-dir flash-linear-attention==0.4.1
 
 # No cu128 nightly wheel in a cu130 build. Compile the pinned TileLang source.
