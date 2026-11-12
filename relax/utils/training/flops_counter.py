@@ -3,8 +3,10 @@
 # FLOPS estimation adapted from verl (volcengine/verl) under Apache License 2.0.
 
 import inspect
+import math
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.training.gemma4_flops import estimate_gemma4_flops
 from relax.utils.training.kimi_k3_flops import estimate_kimi_k3_flops
 from relax.utils.training.qwen38_flops import _estimate_qwen38_flops
 
@@ -499,6 +501,8 @@ def _estimate_fallback_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 
 _ESTIMATE_FUNC = {
+    "gemma4": estimate_gemma4_flops,
+    "gemma4_text": estimate_gemma4_flops,
     "kimi_k3": estimate_kimi_k3_flops,
     # Dense transformers (SwiGLU + GQA)
     "qwen2": _estimate_qwen2_flops,
@@ -588,6 +592,14 @@ class FlopsCounter:
             estimated_tflops = func(self.config, tokens_sum, batch_seqlens, delta_time, **kwargs)
         else:
             estimated_tflops = func(self.config, tokens_sum, batch_seqlens, delta_time)
+        if func is estimate_gemma4_flops and not math.isfinite(estimated_tflops):
+            if not self._warned_unsupported_trainability:
+                logger.warning(
+                    "Gemma4 FLOPs/MFU omitted: the estimator supports full-parameter causal text training "
+                    "without PLE, cross-layer KV sharing, adapters, custom parameter masks or MTP. "
+                    "Image/audio batches require a separate modality formula. Token throughput and timing remain available."
+                )
+                self._warned_unsupported_trainability = True
         if forward_only and func is not estimate_kimi_k3_flops:
             estimated_tflops /= 3
         peak_tflops = get_device_peak_flops(unit="T")

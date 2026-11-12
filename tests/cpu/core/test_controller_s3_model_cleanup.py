@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import sys
 import threading
+from copy import copy
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -430,13 +433,13 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         async def set_rollout_manager(self, _manager):
             events.append("set_rollout_manager")
 
-        def update_weights_fully_async(self):
+        def update_weights_fully_async(self, recovery_token=None):
             async def update():
                 events.append("update_weights")
 
             return update()
 
-        def recv_weight_fully_async(self):
+        def recv_weight_fully_async(self, recovery_token=None):
             async def receive():
                 events.append(f"receive_{self.role.value}")
 
@@ -482,3 +485,127 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
 
 async def _async_noop():
     return None
+
+
+@pytest.mark.parametrize("use_agentic_rollout", [False, True])
+def test_controller_startup_preserves_tokenizer_caches(monkeypatch, tmp_path, use_agentic_rollout):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from relax.utils import s3_model_loader
+    from relax.utils.data.processing_utils import load_tokenizer
+    from relax.utils.model_source import ModelSource
+
+    # Keep real cache publication, cleanup and tokenizer loading. Only the S3
+    # transport and Ray scheduling/service boundaries are replaced.
+    source = tmp_path / "source"
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+    )
+    tokenizer.save_pretrained(source)
+    (source / "config.json").write_text('{"model_type": "bert"}')
+    objects = {f"model/{path.name}": path.read_bytes() for path in source.iterdir()}
+    client = SimpleNamespace(
+        get_paginator=lambda _name: SimpleNamespace(
+            paginate=lambda **_kwargs: [{"Contents": [{"Key": k, "Size": len(v)} for k, v in objects.items()]}]
+        ),
+        head_object=lambda **kwargs: {"ContentLength": len(objects[kwargs["Key"]])},
+        get_object=lambda **kwargs: {
+            "Body": SimpleNamespace(iter_chunks=lambda **_kwargs: [objects[kwargs["Key"]]], close=lambda: None)
+        },
+    )
+    monkeypatch.setattr(s3_model_loader, "_make_s3_client", lambda **_kwargs: client)
+    cache_root = tmp_path / "shm"
+    cache_root.mkdir()
+    stale = cache_root / "relax_model_0123456789abcdef"
+    stale.mkdir()
+    (stale / "abandoned.part").write_bytes(b"old job")
+
+    config = SimpleNamespace(
+        model_source=ModelSource(uri="s3://bucket/model/"),
+        hf_checkpoint="s3://bucket/model/",
+        s3_model_shm_root=str(cache_root),
+        s3_model_download_workers=1,
+        advantage_estimator="grpo",
+        loss_type="policy_loss",
+        use_agentic_rollout=use_agentic_rollout,
+        debug_train_only=False,
+        debug_rollout_only=True,
+        colocate=False,
+        fully_async=False,
+        hybrid=False,
+        resource={ROLES.rollout: (1, 0)},
+        data_source_path="test.data_source",
+        num_rollout=2,
+    )
+    agentic_paths = []
+
+    def create_data_source(args, _cls):
+        # Resume a shard reader before a later data-source download could hide
+        # an intervening deletion by republishing the same cache path.
+        for path in agentic_paths:
+            assert load_tokenizer(path, local_files_only=True).encode("hello") == [1]
+        return s3_model_loader.prepare_model_maybe_update_args(copy(args), completeness="metadata").path
+
+    def deploy_agentic(*, config, runtime_env):
+        agentic_paths.append(create_data_source(config, None))
+
+    class Task:
+        def __init__(self, func):
+            self.func = func
+
+        def options(self, **_kwargs):
+            return self
+
+        def remote(self, *args):
+            return partial(self.func, *args)
+
+    class Service:
+        def __init__(self, _cls, *, data_source, **_kwargs):
+            self.pgs = None
+            self.path = data_source
+
+        def deploy(self):
+            # Resume the asynchronous data-source constructor after resource
+            # allocation/prefetch. A late stale cleanup deletes this path.
+            self.tokens = load_tokenizer(self.path, local_files_only=True).encode("hello")
+
+    monkeypatch.setattr(controller.ray, "remote", lambda **_kwargs: Task)
+    monkeypatch.setattr(controller.ray, "get", lambda refs: [ref() for ref in refs])
+    monkeypatch.setattr(
+        controller.ray, "nodes", lambda: [{"Alive": True, "NodeID": "a" * 56, "Resources": {"GPU": 1}}]
+    )
+    monkeypatch.setattr(controller.device_utils, "get_ray_accelerator_name", lambda: "GPU")
+    monkeypatch.setattr(controller, "Service", Service)
+    monkeypatch.setattr(
+        controller,
+        "HealthManager",
+        lambda **_kwargs: SimpleNamespace(status=None, mark_healthy=lambda _role: None),
+    )
+    monkeypatch.setattr(controller.Controller, "_initialize_data_system", lambda self: None)
+    monkeypatch.setattr(controller, "create_dcs_deployment", lambda **_kwargs: (None, "test-coordinator"))
+    monkeypatch.setattr(controller, "deploy_agentic_chat_api_services", deploy_agentic)
+    monkeypatch.setitem(
+        sys.modules,
+        "relax.core.registry",
+        SimpleNamespace(resolve_algorithm=lambda _config: {ROLES.rollout: object}),
+    )
+    monkeypatch.setattr(controller, "maybe_start_managed_opd_teacher", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(controller, "load_function", lambda _path: object)
+    monkeypatch.setattr(controller, "create_data_source_actor", create_data_source)
+    monkeypatch.setattr(controller.relax_utils, "report_train_start", lambda _config: None)
+    monkeypatch.setattr(controller, "_build_train_start_config", lambda args: args)
+    monkeypatch.setattr(controller.Controller, "_cleanup_aborted_service", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(controller.Controller, "_validate_gpu_resources", lambda *_args: None)
+
+    instance = controller.Controller(config)
+
+    service = instance.serve_dict[ROLES.rollout]
+    assert service.tokens == [1]
+    assert Path(service.path, "tokenizer.json").is_file()
+    assert not stale.exists()
+    assert len(agentic_paths) == int(use_agentic_rollout)
+    for path in agentic_paths:
+        assert load_tokenizer(path, local_files_only=True).encode("hello") == [1]

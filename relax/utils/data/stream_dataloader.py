@@ -329,8 +329,7 @@ class MicroBatchListIterator:
         return out, meta
 
     def get_buffer(self) -> List[Tuple[Dict[str, Any], Any]]:
-        """Return the full mb list — used by actor for end-of-rollout
-        logging."""
+        """Return cached batches, including VPP alignment padding."""
         return self.mbs
 
     def step(self, partition_id: str) -> None:  # noqa: ARG002
@@ -1088,7 +1087,13 @@ def get_data_from_transfer_queue(
         for k, v in rollout_data.items():
             # Keep scalar metadata as Python values across the TensorDict boundary,
             # including NestedTensor values reconstructed by TransferQueue.
-            if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
+            if k == "agentic_group_ids":
+                from relax.utils.agentic_obs.records import decode_group_ids
+
+                new_rollout_data[k] = decode_group_ids(v)
+            elif (
+                "lengths" in k or "reward" in k or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids"}
+            ):
                 new_rollout_data[k] = _tensor_to_python_values(v)
             elif k in MULTIMODAL_PAYLOAD_FIELDS:
                 # Only reached on the per_rank_fetch path (the broadcast path

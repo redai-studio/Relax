@@ -2,11 +2,11 @@
 
 Fault history provides bounded, in-memory records owned by the training driver. It is separate from MetricsService and the performance timeline. The driver can keep the same history while Ray or a Controller is rebuilt; history is not persisted after the driver exits.
 
-HealthStatus supplies stable fault identities through its existing health queries. Controller records handling decisions, local recovery operations, skipped roles, fatal termination and global restart budget exhaustion. Global recovery completion and asynchronous weight-operation receipts are introduced in the next batch; a global `handling_started` record alone does not establish success.
+HealthStatus supplies stable fault identities and completion receipts through its existing health queries. Controller records handling decisions, local and global recovery operations, skipped roles, fatal termination and global restart budget exhaustion. A `handling_started` or `recovery_handoff` record alone does not establish success.
 
 ## Enable the query endpoint
 
-The HTTP endpoint requires Uvicorn 0.36.0 or newer, as declared in `requirements.txt`. Earlier versions cannot load the custom event loop used for connection deadlines. The validated environment uses Uvicorn 0.54.0.
+The HTTP endpoint requires Uvicorn 0.36.0 or newer, as declared in `requirements.txt`. Earlier versions cannot load the custom event loop used for connection deadlines.
 
 Add `--use-health-check --fault-events-enabled` to your existing training command. Both flags are required. The feature is off by default; requesting fault history without health checks prints a fixed warning and leaves collection disabled.
 
@@ -62,7 +62,34 @@ If the original Service catches a `/set_step` failure and continues, the timelin
 
 Each continuous unhealthy period keeps the same discovery ID (D) and first reason. A later nonfatal-to-fatal transition allocates one escalation ID (U); a first fatal report needs only D. Repeated health queries retry unaccepted D/U once per ID per query round. After health clears, cached IDs may still be published, but never trigger another recovery. Replacing or retiring a source settles each unaccepted D/U once; accepted IDs remain the consumer's responsibility. For example, D accepted and U rejected followed by retirement adds one to `known_lost_events`; both rejected adds two; a successful retry adds none. Active publication state prevents D from reappearing after its stored record is evicted.
 
-An unregistered role produces `handling_skipped`; Controller still treats the missing recovery handler as an error, stops the health checker and cancels pending tasks. Fatal handling preserves the existing callback/exit policy. Global members share a recovery ID; this batch reports starts, explicit errors and budget termination, while global completion remains unverified. A new recovery can retry the same still-unhealthy fault in a later health round using a new recovery ID.
+An unregistered role produces `handling_skipped`; Controller still treats the missing recovery handler as an error, stops the health checker and cancels pending tasks. Fatal handling preserves the existing callback/exit policy. Global members share a recovery ID. A new recovery can retry the same still-unhealthy fault in a later health round using a new recovery ID.
+
+## Global recovery and completion receipts
+
+Before rebuilding, the plan freezes the role graph and the configuration branch that determines recovery operations. Handoff atomically compares the rebuilt plan, merges local evidence and selects a terminal result. Different role graphs invalidate the comparison even if their evidence masks match. Ordinary checkpoint paths, router addresses and step values may change.
+
+| Global startup branch | Required evidence |
+| --- | --- |
+| Colocate or hybrid, with actor | Initialization (1), all service step setters (2), task submission (4): 7. |
+| Pure fully async, actor only | The same operations plus actor send (8): 15. |
+| Pure fully async, actor + actor_fwd | Also actor_fwd receive (16): 31. |
+| Pure fully async, actor + reference | Also reference receive (32): 47. |
+| Pure fully async, all three | Both receives: 63. |
+| No actor, or either global debug gate | Initialization and task submission: 5. |
+
+Local remains 7 in debug mode. In colocate/hybrid, the rollout-manager setter waits for initial synchronization only when actor and rollout exist and the existing non-offline branch executes it. No weight receipt is invented for a skipped branch. Task evidence requires references for every service; a partial or empty task set cannot prove submission. It does not prove that training finished.
+
+In pure async recovery, Actor/ActorFwd report after the actual worker-group call returns or raises. Service awaits the actual remote response, and Controller starts senders and receivers concurrently with `asyncio.gather` before restoring steps. The new HealthStatus has its fixed receipt token before deployment. Existing unhealthy queries merge the three receipt slots before callbacks, including empty unhealthy lists. Runtime retains no training responses and adds no driver polling RPC.
+
+For example, handoff for actor + actor_fwd may record:
+
+```json
+{"event_type":"recovery_handoff","expected_evidence":31,"observed_evidence":7,"failed_evidence":0,"availability":"unverified"}
+```
+
+After both receipts arrive, a new `recovery_succeeded` record has expected=observed=31; earlier records stay unchanged. An explicit operation failure records `recovery_failed/operation_failed` with its failed bit. A failed remote response leaves operation evidence unverified until a completion receipt arrives; the original exception still propagates to training. Missing receipts stay unverified; elapsed time does not create a terminal result or increase `known_lost_events`. Conflicting slots prove neither success nor failure, but do not hide another operation's definite failure. `active_recoveries` counts pending contexts for the run rather than exposing per-recovery pending state.
+
+Fault source and receipt receiver generations are independent. A fault from G0 starts a recovery targeting G1; destroying G0 does not interrupt that recovery. Starting another recovery alone does not end it either. Only actually retiring G1 interrupts its pending result with `source_retired`. Source observation failure does not discard the independent receipt slots. Abandoned startup before handoff records `superseded`. Stale tokens cannot affect newer attempts. A successful terminal never reverses: a later opposite receipt only sets `RECEIPT_CONFLICT`. `SOURCE_RETIRED` may coexist with verified success.
 
 ## Python storage API
 
@@ -96,11 +123,11 @@ The schema allows only IDs, an allowed service role, fixed event/reason codes, s
 
 ## Fault logs through OpenTelemetry
 
-The following minimal fault-log interface is proposed for maintainer confirmation in [PR #455](https://github.com/redai-studio/Relax/pull/455#pullrequestreview-5628223210). It keeps the existing event schema, local query API and recovery criteria. It does not install a global OTel provider, instrument ordinary Python logging or enable other observability signals.
+Fault-log export keeps the existing event schema, local query API and recovery criteria. It does not install a global OTel provider, instrument ordinary Python logging or enable other observability signals.
 
 The driver owns one private official SDK `LoggerProvider`, with an explicit `service.name=relax` resource, and one official OTLP HTTP exporter. Only a newly accepted Store commit supplies an immutable record snapshot to a separate bounded export queue: at most 512 queued records and one in flight. `offer` constructs the SDK `LogRecord` on the Runtime consumer, outside Store and admission locks. Only the export worker emits the SDK record, invokes `SimpleLogRecordProcessor` and performs export/network I/O. There is no second SDK batch queue.
 
-The dependencies are `opentelemetry-sdk>=1.45.0,<1.46` and `opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46` for Python 3.10 and newer, plus the `opentelemetry-exporter-otlp` umbrella in the same range so a preinstalled gRPC exporter stays on the SDK's release; export itself uses HTTP only. Versions 1.45.0 and 1.45.1 have been exercised locally. The 1.45 range preserves the exporter's owned-client diagnostic interface used to suppress potentially sensitive transport error details, without changing any global logger. If that compatibility contract is unavailable, export startup fails closed while local history continues. The private provider and exporter are created only when this fault-log export is enabled.
+The dependencies are `opentelemetry-sdk>=1.45.0,<1.46` and `opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46` for Python 3.10 and newer, plus the `opentelemetry-exporter-otlp` umbrella in the same range so a preinstalled gRPC exporter stays on the SDK's release; export itself uses HTTP only. The 1.45 range preserves the exporter's owned-client diagnostic interface used to suppress potentially sensitive transport error details, without changing any global logger. If that compatibility contract is unavailable, export startup fails closed while local history continues. The private provider and exporter are created only when this fault-log export is enabled.
 
 Export requires both fault-history flags and an explicitly configured endpoint. For an existing local OTLP HTTP receiver, configure the driver environment before starting the existing training command:
 
@@ -142,7 +169,9 @@ Local duplicate commits do not enqueue another export; network retries can still
 
 Shutdown stops export admission and waits at most 50 ms for the export worker. `otel_shutdown_dropped` counts only queued records abandoned at shutdown. A request already in flight is not counted as dropped: after the 50 ms wait its outcome remains unknown until the worker returns, when the actual result updates the transport counters. It must not be described as failed or delivered while pending; hard process exit can still lose its record. Export shutdown does not extend the local Runtime's queue-drain policy or wait for Ray.
 
-The second-batch acceptance test in `tests/cpu/utils/test_fault_event_otel_exporter.py` uses a real local OTLP HTTP receiver that decodes the binary protobuf request and checks the received `relax.fault.*` attributes. A receiver's health endpoint can be checked with its own documented command or `curl`; posting plain JSON to `/v1/logs` is not a valid OTLP test because this interface sends binary `http/protobuf`.
+Global recovery reuses this same driver-owned provider, committed-record mapping and export queue across Controller rebuilding. Receipt and trace sidecars share the existing health envelope; completion evidence creates no second exporter.
+
+To check a receiver, use its own documented health command or `curl`. Posting plain JSON to `/v1/logs` is not a valid check, because this interface sends binary `http/protobuf`.
 
 ## Bounds, failures and shutdown
 
@@ -152,28 +181,6 @@ Admission waits at most 5 ms for its lock and does not call the Store, HTTP or R
 
 HTTP has one server thread, four active business slots, backlog/concurrency limits, a 2 KiB request target limit, a 1 KiB cursor limit and a 128 KiB response limit. A business slot remains occupied through response sending and cancellation cleanup. Connection lifetime and request processing/sending have a three-second deadline; keep-alive is disabled and h11's incomplete-event buffer is limited. These controls apply to trusted loopback use and do not promise a hard bound on OS TCP connections or whole-process RSS.
 
+Each relevant replica lazily creates one receipt sender with at most eight queued receipts and one in flight; each encoded receipt is at most 256 bytes. The business method only attempts local enqueue. A slow confirmation keeps occupying its slot without replacement requests or threads. Ordinary calls and disabled collection start no sender. Receiver loss or saturation may leave evidence unverified without changing training results.
+
 Driver shutdown signals Runtime and HTTP closure without waiting for queue drain or adding Ray waits. A hard exit can lose tail records. The history does not establish a business failure merely because a record or completion receipt is absent.
-
-## CPU verification
-
-Run from the repository root in an environment with its existing test and HTTP dependencies:
-
-```bash
-PYTHONPATH=. pytest -q \
-  tests/cpu/utils/test_fault_event_store.py \
-  tests/cpu/utils/test_fault_event_runtime.py \
-  tests/cpu/utils/test_fault_query_server.py \
-  tests/cpu/utils/test_fault_publication.py \
-  tests/cpu/utils/test_fault_health_flow.py \
-  tests/cpu/utils/test_health_checker_thread.py \
-  tests/cpu/core/test_fault_local_recovery_cpu.py \
-  tests/cpu/entrypoints/test_fault_events_lifecycle.py \
-  tests/cpu/entrypoints/test_startup_failure.py \
-  tests/cpu/utils/test_fault_event_otel_exporter.py \
-  tests/cpu/utils/test_fault_event_otel_runtime.py \
-  tests/cpu/utils/test_fault_event_trace_context.py \
-  tests/cpu/core/test_fault_event_otel_ray.py
-pre-commit run --all-files
-```
-
-These tests execute the actual Store/Runtime, health classes, Controller/Service definitions, entrypoint and real loopback sockets. Local recovery tests explicitly substitute model deployment, placement groups, HTTP/Ray transport and process exit; health-thread tests also exercise native thread stopping. They cover D/U retry/settlement, local step failures, decisions and enabled/disabled business traces. Real Ray global rebuilding and operation receipts belong to the next batch. No claim is made about GPU numerical behavior or full training. The health-thread fix is already present on main.

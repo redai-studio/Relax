@@ -1,0 +1,87 @@
+--- a/relax/utils/arguments.py
++++ b/relax/utils/arguments.py
+@@ -2964,6 +2964,9 @@
+         parser = add_genrm_arguments(parser)
+         parser = add_rollout_buffer_arguments(parser)
+         parser = add_mtp_training_arguments(parser)
++        from examples.chunkflow.arguments import add_arguments as add_chunkflow_arguments
++
++        parser = add_chunkflow_arguments(parser)
+         parser = add_ci_arguments(parser)
+         parser = add_autoscaler_arguments(parser)
+         parser = add_custom_megatron_plugins_arguments(parser)
+@@ -4698,6 +4701,9 @@
+
+     _normalize_mtp_detach_paths(args)
+     _normalize_mtp_only_training_args(args)
++    from examples.chunkflow.arguments import validate_args as validate_chunkflow_args
++
++    validate_chunkflow_args(args)
+
+     if args.enable_mtp_training:
+         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
+--- a/relax/backends/megatron/model_provider.py
++++ b/relax/backends/megatron/model_provider.py
+@@ -278,6 +278,14 @@
+     )
+
+
++def _install_chunkflow(args: argparse.Namespace, model: torch.nn.Module) -> None:
++    if not getattr(args, "use_chunkflow", False):
++        return
++    from examples.chunkflow.integration import install
++
++    install(model, args.chunkflow_chunk_size)
++
++
+ def _call_model_provider(provider: Any, *args: Any, **kwargs: Any) -> GPTModel:
+     """Forward current MCore arguments while supporting older/custom
+     providers."""
+@@ -342,6 +350,7 @@
+             _maybe_mark_unsplit_forward(args, model)
+             install_conditional_branch_sync(args, model)
+             _install_cp_probe(model)
++            _install_chunkflow(args, model)
+             return model
+
+         if is_lora_enabled(args) and getattr(args, "task_type", "causal_lm") == "seq_cls":
+@@ -622,6 +631,7 @@
+             _maybe_mark_unsplit_forward(args, model)
+             install_conditional_branch_sync(args, model)
+             _install_cp_probe(model)
++            _install_chunkflow(args, model)
+             return model
+
+         if is_lora_enabled(args):
+@@ -751,6 +761,7 @@
+         _maybe_mark_unsplit_forward(args, model)
+         install_conditional_branch_sync(args, model)
+         _install_cp_probe(model)
++        _install_chunkflow(args, model)
+         return model
+
+     if is_lora_enabled(args):
+--- a/relax/backends/megatron/model.py
++++ b/relax/backends/megatron/model.py
+@@ -1383,7 +1383,7 @@
+
+             forward_kwargs = {
+                 "input_ids": batch["unsplit_tokens"] if use_unsplit else batch["tokens"],
+-                "position_ids": None,
++                "position_ids": batch.get("position_ids"),
+                 "attention_mask": None,
+                 "labels": None,
+                 "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],
+@@ -1498,7 +1498,11 @@
+         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
+         and isinstance(data_iterator[0], StreamingTQIterator)
+     )
+-    if use_streaming:
++    if getattr(args, "use_chunkflow", False):
++        from examples.chunkflow.schedules import get_schedule
++
++        forward_backward_func = get_schedule(args, mpu.get_pipeline_model_parallel_world_size())
++    elif use_streaming:
+         pp_size = mpu.get_pipeline_model_parallel_world_size()
+         if pp_size <= 1:
+             from relax.backends.megatron.streaming_schedules import (

@@ -42,6 +42,9 @@ def test_sft_data_fields_excludes_rl_only_keys():
 
     for forbidden in ("rollout_log_probs", "rewards", "raw_reward", "teacher_log_probs"):
         assert forbidden not in fields, f"SFT data_fields leaked RL key: {forbidden}"
+    assert "dataset_ids" not in fields
+    args._sft_dataset_names = ("general", "code")
+    assert "dataset_ids" in build_data_fields(args)
 
 
 @pytest.mark.parametrize("loss_type", ["dpo", "rm"])
@@ -49,6 +52,7 @@ def test_preference_data_fields_keep_pairs_atomic(loss_type):
     from relax.utils.training.data_fields import build_data_fields
 
     args = _mk_actor_args(loss_type=loss_type)
+    args._sft_dataset_names = ("general", "code")
 
     fields = build_data_fields(args)
 
@@ -94,11 +98,13 @@ def test_sequence_classification_sft_requests_classification_labels():
 
     args = _mk_actor_args(loss_type="sft")
     args.task_type = "seq_cls"
+    args._sft_dataset_names = ("general", "code")
 
     fields = build_data_fields(args)
 
     assert "classification_labels" in fields
     assert "sample_weights" not in fields
+    assert "dataset_ids" not in fields
 
 
 def test_rl_data_fields_include_replay_metadata():

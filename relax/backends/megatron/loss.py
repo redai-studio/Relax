@@ -27,6 +27,7 @@ from relax.utils.opd.opd_utils import (
     validate_opd_topk_gather,
 )
 from relax.utils.replay import capture_hooks
+from relax.utils.training.dataset_metrics import dataset_loss_sums, finalize_dataset_loss_metrics
 from relax.utils.training.fused_ce import ce_implementation, te_cross_entropy
 from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
@@ -47,6 +48,7 @@ from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
     all_gather_with_cp,
+    get_cp_local_loss_masks,
     get_cp_local_num_tokens,
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
@@ -73,14 +75,17 @@ def normalize_reduced_loss_metrics(keys: list[str], values: list[float]) -> dict
         raise ValueError(f"Expected one denominator plus {len(keys)} metric values, got {len(values)} values.")
 
     denominator = values[0]
-    numerators = values[1:]
+    metrics = dict(zip(keys, values[1:], strict=True))
+    dataset_metrics = finalize_dataset_loss_metrics(metrics)
+    keys = list(metrics)
+    numerators = list(metrics.values())
     if denominator == 0:
         nonzero_keys = [key for key, value in zip(keys, numerators, strict=True) if value != 0]
         if nonzero_keys:
             raise RuntimeError(f"Zero loss-metric denominator with nonzero numerator(s): {nonzero_keys}.")
-        return dict.fromkeys(keys, 0.0)
+        return {**dict.fromkeys(keys, 0.0), **dataset_metrics}
 
-    return {key: value / denominator for key, value in zip(keys, numerators, strict=True)}
+    return {**{key: value / denominator for key, value in metrics.items()}, **dataset_metrics}
 
 
 def get_responses(
@@ -1395,6 +1400,42 @@ def value_loss_function(
     return loss, reported_loss
 
 
+def _sft_loss_metrics(
+    args: Namespace,
+    batch: RolloutBatch,
+    loss: torch.Tensor,
+    token_losses: torch.Tensor,
+    *,
+    negate: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Reuse computed token NLL for source diagnostics without changing
+    loss."""
+    metrics = {"loss": loss.clone().detach()}
+    names = getattr(args, "_sft_dataset_names", ())
+    if not names:
+        return metrics
+    if negate:
+        token_losses = -token_losses.detach()
+    dataset_ids = batch.get("dataset_ids")
+    if dataset_ids is None:
+        raise ValueError("YAML mixture training requires dataset_ids in every microbatch")
+    masks = get_cp_local_loss_masks(
+        batch["total_lengths"],
+        batch["response_lengths"],
+        batch["loss_masks"],
+        args.qkv_format,
+        batch.get("max_seq_lens"),
+        batch.get("padded_total_lengths"),
+        batch.get("dynamic_cp_size"),
+        batch.get("dynamic_cp_rank"),
+    )
+    cp_rank = batch.get("dynamic_cp_rank")
+    if cp_rank is None:
+        cp_rank = mpu.get_context_parallel_rank()
+    metrics.update(dataset_loss_sums(names, dataset_ids, token_losses, masks, count_samples=cp_rank == 0))
+    return metrics
+
+
 def sft_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1443,12 +1484,7 @@ def sft_loss_function(
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
 
-    return (
-        loss,
-        {
-            "loss": loss.clone().detach(),
-        },
-    )
+    return loss, _sft_loss_metrics(args, batch, loss, log_probs, negate=True)
 
 
 def dpo_loss_function(
@@ -1689,6 +1725,7 @@ def sft_loss_function_chunked(
         )
         if not pairs or not any(hidden.size(0) for hidden, _ in pairs):
             loss = hidden_states.sum() * 0
+            per_row_loss = hidden_states.new_empty(0)
         else:
             plans = batch.get("selective_logit_rows")
             if plans is not None:
@@ -1700,7 +1737,7 @@ def sft_loss_function_chunked(
                 targets = torch.cat([target for _, target in pairs], dim=0)
                 per_row_loss = lm_head_forward(hidden, labels=targets)
             loss = sum_of_sample_mean(per_row_loss)
-        return loss, {"loss": loss.clone().detach()}
+        return loss, _sft_loss_metrics(args, batch, loss, per_row_loss)
 
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         hidden_states,
@@ -1726,7 +1763,7 @@ def sft_loss_function_chunked(
     if log_probs.numel() == 0:
         loss += 0 * hidden_states.sum()
 
-    return loss, {"loss": loss.clone().detach()}
+    return loss, _sft_loss_metrics(args, batch, loss, log_probs, negate=True)
 
 
 def mtp_only_loss_function(

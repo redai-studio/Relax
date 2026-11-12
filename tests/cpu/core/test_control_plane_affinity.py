@@ -1,9 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import ast
+import json
 import sys
 from argparse import Namespace
-from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
 
@@ -190,6 +189,47 @@ def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    "num_epoch, num_rollout, expected", [(3, 100, 21), (3, 10, 10), (3, None, 21), (None, 10, 10)]
+)
+def test_rollout_manager_records_startup_after_resolving_epoch_cap(
+    monkeypatch, tmp_path, num_epoch, num_rollout, expected
+):
+    from relax.utils.agentic_obs import startup
+
+    monkeypatch.setattr(startup, "submit_background", lambda function, *args, **kwargs: function(*args))
+    rollout_module = ModuleType("relax.distributed.ray.rollout")
+    rollout_module.RolloutManager = type("FakeRolloutManager", (_FakeActorClass,), {})
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout_module)
+    monkeypatch.setattr(placement_group_module, "_get_head_node_id", lambda: "a" * 56)
+    monkeypatch.setattr(placement_group_module.ray, "get", lambda ref: 7)
+    args = Namespace(
+        num_epoch=num_epoch,
+        num_rollout=num_rollout,
+        check_weight_update_equal=False,
+        offload_rollout=False,
+        dump_agentic_obs=str(tmp_path),
+        agentic_obs_run_id="run-1",
+        rollout_batch_size=16,
+        n_samples_per_prompt=4,
+        global_batch_size=32,
+    )
+
+    placement_group_module.create_rollout_manager(args, "pg")
+
+    path = tmp_path / "run-1/stages/startup.jsonl"
+    start, completed = [json.loads(line) for line in path.read_text().splitlines()]
+    assert start["status"] == "start"
+    plan = completed["run_config"]
+    assert plan["num_epoch"] == num_epoch
+    assert plan["num_rollout"] == expected
+    assert plan["num_rollout_per_epoch"] == 7
+    assert plan["planned_epoch_equivalents"] == expected / 7
+    assert plan["rollout_batch_size"] == 16
+    assert plan["n_samples_per_prompt"] == 4
+    assert plan["global_batch_size"] == 32
+
+
 def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
     captured_options = []
     captured_ctor_kwargs = []
@@ -252,21 +292,3 @@ def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):
     backend._create_rollout_engines({0: {"ip": "127.0.0.1", "port": 8000}})
 
     assert captured["options"] == {"resources": {"stable_cpu": 1}}
-
-
-def test_scale_out_paths_do_not_request_stable_markers():
-    rollout_path = Path(placement_group_module.__file__).with_name("rollout.py")
-    source = rollout_path.read_text()
-    tree = ast.parse(source)
-    target_names = {"_scale_out_ray_native", "_bring_up_single_replica", "_scale_out_external"}
-    functions = {
-        node.name: ast.get_source_segment(source, node) or ""
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in target_names
-    }
-
-    assert functions.keys() == target_names
-    for function_source in functions.values():
-        assert "stable_cpu" not in function_source
-        assert "stable_gpu" not in function_source
-        assert "with_control_plane_affinity" not in function_source

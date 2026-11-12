@@ -458,7 +458,7 @@ def test_health_manager_observer_binding_keeps_health_creation_available(monkeyp
     manager = health_system.HealthManager(fault_events=observer)
     assert manager.status is not None
     generation = {"valid": 0, "invalid": True}.get(binding)
-    assert created == [((), {"fault_generation": generation})]
+    assert created == [((), {"fault_generation": generation, "fault_seed": None})]
     assert bind.call_count == int(binding != "disabled")
     assert manager.status._fault_observation_error is (binding == "invalid")
     if binding == "raises":
