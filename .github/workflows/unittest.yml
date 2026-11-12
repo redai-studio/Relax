@@ -36,7 +36,7 @@ jobs:
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: ${{ matrix.name }}
-    runs-on: [self-hosted, linux, x64, h20]
+    runs-on: [gpu, h20]
     timeout-minutes: 190
     strategy:
       fail-fast: false

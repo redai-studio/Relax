@@ -10,7 +10,7 @@ jobs:
   warmup:
     name: Warm H20 image (${{ matrix.machine }})
     # Each machine label must select runners sharing one host Docker daemon.
-    runs-on: [self-hosted, linux, x64, h20, '${{ matrix.machine }}']
+    runs-on: [gpu, h20, '${{ matrix.machine }}']
     timeout-minutes: 130
     strategy:
       fail-fast: false
