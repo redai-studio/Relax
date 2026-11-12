@@ -38,7 +38,7 @@ _MAPPINGS = (
 
 @dataclass
 class _WeightState:
-    original_workspace: Callable[..., Any]
+    original_workspace: Callable[..., Any] | None
     module_name: str
 
 
@@ -106,6 +106,62 @@ def _power2_workspace(
     )
 
 
+def _install_weight_quantizers(module: torch.nn.Module, *, module_name: str) -> None:
+    """Apply weight-only P2 scales through TE 2.18's instance quantizer
+    hook."""
+    original = module._get_weight_quantizers
+
+    def weight_quantizers(self: Any) -> list[Any]:
+        import torch
+        from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockQuantizer
+        from transformer_engine.pytorch.tensor.storage.float8_blockwise_tensor_storage import (
+            Float8BlockwiseQTensorStorage,
+        )
+
+        result = []
+        for index, quantizer in enumerate(original()):
+            if quantizer is None:
+                result.append(None)
+                continue
+            if (
+                not isinstance(quantizer, Float8BlockQuantizer)
+                or quantizer.block_scaling_dim != 2
+                or quantizer.dtype.name != "kFloat8E4M3"
+                or quantizer.amax_epsilon != 0.0
+            ):
+                raise TypeError(f"{module_name}: expected E4M3 128x128 block quantizer with zero amax epsilon")
+            quantizer = quantizer.copy()
+            quantizer.force_pow_2_scales = True
+            result.append(quantizer)
+            cache_name = f"weight{index}" if hasattr(self, "num_gemms") else "weight"
+            weight = getattr(self, cache_name)
+            if weight.dtype != torch.bfloat16 or not weight.is_contiguous() or not quantizer.is_quantizable(weight):
+                raise TypeError(f"{module_name}: expected contiguous, block-quantizable BF16 model weight")
+            cached = self._fp8_workspaces.get(cache_name)
+            if cached is None:
+                continue
+            if not isinstance(cached, Float8BlockwiseQTensorStorage) or not cached._quantizer.force_pow_2_scales:
+                raise RuntimeError(f"{module_name}: incompatible cached weight workspace")
+            # TE decides dgrad usage after this hook and does not validate
+            # Blockwise workspace layouts. Recreate incomplete caches; refresh
+            # both layouts of complete caches through their own quantizer.
+            if (
+                cached._rowwise_data is None
+                or cached._columnwise_data is None
+                or tuple(cached.size()) != tuple(weight.shape)
+            ):
+                del self._fp8_workspaces[cache_name]
+            else:
+                cached_quantizer = quantizer.copy()
+                cached_quantizer.internal = cached._quantizer.internal
+                cached_quantizer.optimize_for_gemm = cached._quantizer.optimize_for_gemm
+                cached_quantizer.set_usage(rowwise=True, columnwise=True)
+                cached._quantizer = cached_quantizer
+        return result
+
+    module._get_weight_quantizers = MethodType(weight_quantizers, module)
+
+
 def _install_workspace(module: torch.nn.Module, *, module_name: str) -> None:
     from transformer_engine.pytorch import LayerNormLinear, Linear
 
@@ -119,8 +175,12 @@ def _install_workspace(module: torch.nn.Module, *, module_name: str) -> None:
         raise ValueError(f"{module_name}: primary FP8 weights and custom module recipes are unsupported")
     if module._fp8_workspaces:
         raise RuntimeError(f"{module_name}: install before the first forward, while the weight cache is empty")
-    module._relax_native_fp8_weights = _WeightState(module.get_weight_workspace, module_name)
-    module.get_weight_workspace = MethodType(_power2_workspace, module)
+    original_workspace = getattr(module, "get_weight_workspace", None)
+    module._relax_native_fp8_weights = _WeightState(original_workspace, module_name)
+    if original_workspace is None:
+        _install_weight_quantizers(module, module_name=module_name)
+    else:
+        module.get_weight_workspace = MethodType(_power2_workspace, module)
 
 
 def install_native_fp8_weights(model: torch.nn.Module, *, hf_checkpoint: str | Path) -> tuple[str, ...]:

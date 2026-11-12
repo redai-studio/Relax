@@ -104,11 +104,17 @@ def test_actor_early_stop_is_not_success_or_health_failure(health):
 
 
 def controller_fixture():
+    from relax.utils.fault_events.recovery import GlobalStartup
+
     ns = dict(logger=logging.getLogger(__name__), run=asyncio.run, asyncio=asyncio, Optional=Optional)
+    ns["GlobalStartup"] = GlobalStartup
     cls = load_methods(
         "relax/core/controller.py", "Controller", {"restart_serve", "training_loop", "_consume_restart_cycle"}, ns
     )
     ctrl = cls()
+    ctrl._fault_events = None
+    ctrl._fault_recovery = None
+    ctrl._fault_rebuild_ready = None
     ctrl._restart_done_event = threading.Event()
     ctrl._restart_lock = threading.RLock()
     ctrl._restart_consumed_event = threading.Event()
@@ -299,6 +305,8 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
         "maybe_pin_baseline_to_stable": Mock(),
         "logger": logging.getLogger(__name__),
         "_graceful_shutdown": shutdown,
+        "_fault_runtime": None,
+        "_run_recorder": Mock(),
     }
     with pytest.raises(SystemExit) as caught:
         exec(code, scope)
@@ -420,7 +428,7 @@ def test_recovery_dispatch_signals_only_after_work_finishes(role, global_restart
     ctrl._health_manager.increment_restart_count = Mock(return_value=1)
     ctrl._health_manager.mark_healthy = Mock()
 
-    def work():
+    def work(fault_observer=None):
         assert ctrl._restarting
         assert not ctrl._restart_done_event.is_set()
 

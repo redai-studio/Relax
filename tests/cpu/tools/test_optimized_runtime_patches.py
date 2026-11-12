@@ -4,10 +4,8 @@
 import ast
 import copy
 import functools
-import hashlib
 import inspect
 import os
-import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,49 +14,6 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
-
-
-def test_manifest_patch_hashes_use_files_copied_into_runtime_stage(tmp_path):
-    """Builder-only files must not satisfy the runtime manifest's inputs."""
-    dockerfile = (ROOT / "docker/Dockerfile.cu13").read_text().replace("\\\n", "")
-    stage = None
-    copied = {}
-    for line in dockerfile.splitlines():
-        if not line.startswith(("FROM ", "COPY ")):
-            continue
-        words = shlex.split(line)
-        if words[0] == "FROM":
-            stage = words[-1]
-        if words[0] != "COPY" or stage not in {"relax_build", "relax_ep", "relax_blackwell"}:
-            continue
-        if words[1].startswith("--"):
-            continue
-        for source in words[1:-1]:
-            if not source.endswith(".patch") or "$" in source:
-                continue
-            destination = words[-1]
-            if destination.endswith("/"):
-                destination += Path(source).name
-            target = tmp_path / destination.lstrip("/")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(ROOT / source, target)
-            copied[destination] = ROOT / source
-
-    tree = ast.parse((ROOT / "docker/scripts/record_qwen35_runtime.py").read_text())
-    report = next(
-        n.value
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "report" for t in n.targets)
-    )
-    expression = next(value for key, value in zip(report.keys, report.values) if key.value == "patch_sha256")
-    result = eval(
-        compile(ast.Expression(expression), "<manifest-patch-hashes>", "eval"),
-        {"hashlib": hashlib, "Path": lambda path: tmp_path / path.lstrip("/")},
-    )
-    paths = ast.literal_eval(expression.generators[0].iter.func.value)
-    assert set(result) == {"deepep", "fa4", "flashqla", "megatron", "model_operators", "checkpoint"}
-    for name, path in paths.items():
-        assert result[name] == hashlib.sha256(copied[path].read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize(

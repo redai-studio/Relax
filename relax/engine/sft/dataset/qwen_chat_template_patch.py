@@ -101,6 +101,29 @@ _PATCH_NAME = "qwen_history_thinking"
 _QWEN_ASSISTANT_WITH_THINK = (
     "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}"
 )
+# Newer Qwen3.8 templates add native generation tags whose assistant mask differs
+# from the Qwen per-message boundaries; SFT renders the earlier unmarked block.
+_QWEN38_GENERATION_START = "\n".join(
+    (
+        "        {{- '<|im_start|>' + message.role + '\\n' }}",
+        "        {%- generation %}",
+        f"        {_QWEN38_PRESERVE_HISTORY_GATE}",
+        "            {{- '<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}",
+        "        {%- else %}",
+        "            {{- content }}",
+    )
+)
+_QWEN38_UNMARKED_START = "\n".join(
+    (
+        f"        {_QWEN38_PRESERVE_HISTORY_GATE}",
+        f"            {_QWEN_ASSISTANT_WITH_THINK}",
+        "        {%- else %}",
+        "            {{- '<|im_start|>' + message.role + '\\n' + content }}",
+    )
+)
+_QWEN38_GENERATION_END = "\n".join(
+    ("        {{- '<|im_end|>' }}", "        {%- endgeneration %}", "        {{- '\\n' }}")
+)
 _QWEN_ASSISTANT_TOOL_CALL = """{%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping and content|trim and not reasoning_content|trim %}
                 {{- '<|im_start|>' + message.role + '\\n' + content }}
             {%- else %}
@@ -199,6 +222,14 @@ def _assistant_generation_mask_matches_sample(sample: CanonicalSample) -> bool:
     return True
 
 
+def _restore_qwen38_unmarked_assistant(template: str) -> tuple[str, bool]:
+    """Drop Qwen3.8 native generation tags; rendered text is unchanged."""
+    if template.count(_QWEN38_GENERATION_START) != 1 or template.count(_QWEN38_GENERATION_END) != 1:
+        return template, False
+    template = template.replace(_QWEN38_GENERATION_START, _QWEN38_UNMARKED_START)
+    return template.replace(_QWEN38_GENERATION_END, _QWEN_ASSISTANT_END), True
+
+
 @lru_cache(maxsize=32)
 def _patch_qwen_history_gate(template: str) -> tuple[str, bool] | None:
     """Backport Qwen3.6's preserve gate to the exact Qwen3.5 gate."""
@@ -217,8 +248,8 @@ def _patch_qwen_history_gate(template: str) -> tuple[str, bool] | None:
     if counts == (0, 1, 0, 0, 0):
         return template, False
     if counts == (0, 0, 1, 0, 0):
-        # Qwen3.8 gate already preserves by default; use it as-is.
-        return template, False
+        # Qwen3.8 gate already preserves by default; keep it.
+        return _restore_qwen38_unmarked_assistant(template)
     if (
         old_count == 0
         and native_count == 0

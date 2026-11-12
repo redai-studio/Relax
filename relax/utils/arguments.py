@@ -5,6 +5,8 @@ import json
 import math
 import os
 import sys
+import time
+import uuid
 import warnings
 from typing import Any
 
@@ -199,6 +201,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "(TensorBackuper + _switch_model), so the actor handles ref / actor_fwd / advantages "
                     "internally on its own GPUs while rollout runs on a separate GPU placement group. "
                     "Mutually exclusive with passing --fully-async and --colocate together."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-weights-backuper-on-gpu",
+                action="store_true",
+                default=False,
+                help=(
+                    "Only takes effect with --hybrid. Keeps the 'actor' "
+                    "TensorBackuper snapshot used for the DCS actor->rollout weight push "
+                    "on-device instead of host-pinned memory, trading a permanent extra "
+                    "device-resident copy of the model (full size at TP=1, sharded by TP degree "
+                    "otherwise) for skipping the D2H backup copy + H2D push-time copy "
+                    "(relax/distributed/checkpoint_service/backends/device_direct.py's "
+                    "_named_params_and_buffers). Off by default: raises peak GPU memory, so only "
+                    "enable if headroom is confirmed for the model being trained."
                 ),
             )
             parser.add_argument(
@@ -2295,7 +2312,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # wandb
         def add_wandb_arguments(parser):
             # wandb parameters
-            parser.add_argument("--use-wandb", action="store_true", default=False)
+            parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=False)
             parser.add_argument(
                 "--wandb-mode",
                 type=str,
@@ -2376,7 +2393,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_clearml_arguments(parser):
             # TODO(yuetian): Reuse tb-experiment-name --tb-project-name as the ClearML experiment name currently.
             # Need to refactor the experiment management part later.
-            parser.add_argument("--use-clearml", action="store_true", default=False)
+            parser.add_argument("--use-clearml", action=argparse.BooleanOptionalAction, default=False)
 
             return parser
 
@@ -2464,6 +2481,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=("Dump all details of training for post-hoc analysis and visualization."),
+            )
+            parser.add_argument(
+                "--dump-agentic-obs",
+                type=str,
+                default=None,
+                help=(
+                    "Dump agentic rollout observability to this directory, one wall-clock subdirectory "
+                    "`<dir>/run_YYYYmmdd_HHMMSS/` per run. Holds three JSONL streams joined by "
+                    "sample_export_id: trajectories/ (the exported lineage, written by each SessionShard), "
+                    "stages/ (reward, selection, transfer and optimizer events) "
+                    "and train/ (actual update inputs, response masks and scalars, written by the policy actor). Unset disables "
+                    "every producer. Independent of --dump-details, which dumps whole .pt tensors."
+                ),
+            )
+            parser.add_argument(
+                "--dump-agentic-obs-media",
+                action="store_true",
+                default=False,
+                help=(
+                    "Also write the media bytes referenced by --dump-agentic-obs trajectories to `media/`, "
+                    "content-addressed by sha256. Without it, inline data: URIs are replaced by their digest "
+                    "and the bytes are dropped. Ignored without --dump-agentic-obs."
+                ),
             )
             parser.add_argument(
                 "--rollout-result-dir",
@@ -4418,6 +4458,19 @@ def slime_validate_args(args):
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
 
+    if getattr(args, "dump_agentic_obs", None):
+        # Derived rather than parsed, and stamped exactly once here on the
+        # driver, then carried inside the pickled args Namespace to every Ray
+        # actor. Deriving it lazily per actor would give the SessionShards, the
+        # rollout driver and the actors different directories, splitting one
+        # run's streams across many roots. The suffix separates launches
+        # started in the same second, even when they share an output root.
+        args.agentic_obs_run_id = f"{time.strftime('run_%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:12]}"
+    elif getattr(args, "dump_agentic_obs_media", False):
+        # The media flag only modifies a dump that is not happening. Say so,
+        # rather than letting the operator wait for images that never appear.
+        logger.warning("--dump-agentic-obs-media is set but --dump-agentic-obs is not; nothing will be written.")
+
     if args.load_debug_rollout_data is not None:
         logger.info(
             f"load_debug_rollout_data {args.load_debug_rollout_data} is set, "
@@ -4525,8 +4578,8 @@ def slime_validate_args(args):
             args.train_memory_margin_bytes = 0
 
     # Resolve --hybrid into the underlying execution flags so downstream
-    # machinery (StreamDataLoader broadcast_pp, UpdateWeightFromTensor
-    # selection, sglang_engine DCS gating) keeps a single semantic axis.
+    # machinery (StreamDataLoader broadcast_pp and SGLang DCS registration)
+    # keeps a single semantic axis.
     # `args.hybrid` remains the canonical switch for hybrid-specific
     # branches (registry, controller dispatch, train_hybrid call site).
     if args.hybrid:
@@ -4536,6 +4589,13 @@ def slime_validate_args(args):
             "hybrid mode: actor/reference/actor_fwd/advantages will share GPUs "
             "via offload/onload role switching, while rollout uses separate GPUs."
         )
+        if not args.enable_weights_backuper:
+            raise ValueError(
+                "Hybrid training requires the weights backuper for DCS synchronization: with "
+                "--disable-weights-backuper the DCS push would read detached live tensors that "
+                "carry no Megatron TP attributes, so all_gather_param would silently treat TP "
+                "shards as replicated weights. Remove --disable-weights-backuper."
+            )
     elif args.fully_async and args.colocate:
         raise ValueError(
             "--fully-async and --colocate cannot be combined directly. "

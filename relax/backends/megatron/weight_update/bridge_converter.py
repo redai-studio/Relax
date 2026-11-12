@@ -15,6 +15,7 @@ from megatron.core import mpu
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding
 from relax.backends.megatron.weight_update.common import named_params_and_buffers
+from relax.backends.megatron.weight_update.expert_routing import bf16_expert_projection
 from relax.utils.logging_utils import get_logger
 
 
@@ -427,6 +428,36 @@ class BridgeConverter:
                 return plain_name, task
 
         return global_name, None
+
+    def supports_routed_expert(self, name: str) -> bool:
+        """Check the names produced by normal Bridge conversion, not packing.
+
+        Keep MTP/tower experts on the ordinary path. Transposes and fused
+        projections remain handled by convert(), including Qwen3.5 mappings.
+        """
+        global_name = _normalize_global_name(name)
+        source = re.search(r"\.experts\.linear_fc([12])\.weight(\d+)$", global_name)
+        if source is None or re.search(r"(?:^|\.)(?:mtp\w*|nextn\w*|multi_token_prediction)(?:\.|$)", global_name):
+            return False
+        task = self._bridge_task_map.get(global_name)
+        mapping = task.mapping if task is not None else self._lookup_mapping(global_name)[1]
+        hf_param = getattr(mapping, "hf_param", None)
+        outputs = list(hf_param.values()) if isinstance(hf_param, dict) else [hf_param]
+        projections = set()
+        expert = int(source[2])
+        for output in outputs:
+            if not isinstance(output, str):
+                return False
+            if output.endswith(".experts.gate_up_proj"):
+                output = output.removesuffix(".gate_up_proj") + f".{expert}.gate_proj.weight"
+                projections.add("up")
+            elif output.endswith(".experts.down_proj"):
+                output = output.removesuffix(".down_proj") + f".{expert}.down_proj.weight"
+            coordinate = bf16_expert_projection(output)
+            if coordinate is None or coordinate[0] != expert:
+                return False
+            projections.add(coordinate[1])
+        return projections == ({"gate", "up"} if source[1] == "1" else {"down"})
 
     def supports_packed_experts(self, names: Collection[str]) -> bool:
         """Whether mappings export canonical gated experts accepted by

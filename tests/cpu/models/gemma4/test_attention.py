@@ -19,6 +19,7 @@ _MODULE_PATH = Path(__file__).parents[4] / "relax/models/gemma4/attention.py"
 _SPEC = importlib.util.spec_from_file_location("_relax_gemma4_attention_test_target", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 Gemma4CoreAttention = _MODULE.Gemma4CoreAttention
 
@@ -206,3 +207,108 @@ def test_flex_rejects_training_dropout():
     query = torch.zeros(8, 2, 512)
     with pytest.raises(NotImplementedError, match="dropout to be zero"):
         attention._thd_flex_per_subseq(query, query, query, [0, 8])
+
+
+def _hf_vision_mask(groups, window_left):
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+    from transformers.models.gemma4.modeling_gemma4 import create_masks_for_vision_model
+
+    config = Gemma4TextConfig(
+        num_hidden_layers=2,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=window_left + 1,
+        use_bidirectional_attention="vision",
+    )
+    config._attn_implementation = "eager"
+    masks = create_masks_for_vision_model(
+        config=config,
+        inputs_embeds=torch.zeros(1, groups.numel(), 4, device=groups.device),
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=torch.arange(groups.numel(), device=groups.device)[None, :],
+        block_sequence_ids=groups[None, :],
+    )
+    return {name: mask[0, 0] == 0 for name, mask in masks.items()}
+
+
+@pytest.mark.parametrize("window_left", [31, 1023])
+def test_vision_mask_matches_transformers_with_future_image_keys(window_left):
+    from torch.nn.attention.flex_attention import flex_attention
+
+    torch.manual_seed(17)
+    groups = torch.full((389,), -1, dtype=torch.long)
+    groups[30:65] = 0
+    groups[100:310] = 1
+    offset, length = 128, 137
+    query = torch.randn(1, 2, length, 4) * 0.1
+    key = torch.randn(1, 1, groups.numel(), 4) * 0.1
+    value = torch.randn_like(key)
+    masks = _hf_vision_mask(groups, window_left)
+    assert masks["sliding_attention"][128, 300]
+    assert not masks["full_attention"][128, 300]
+    assert bool(masks["sliding_attention"][264, 100]) is (window_left >= 164)
+    output = flex_attention(
+        query,
+        key,
+        value,
+        scale=1.0,
+        enable_gqa=True,
+        block_mask=_MODULE._vision_block_mask(groups, length, offset, window_left),
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        scale=1.0,
+        enable_gqa=True,
+        attn_mask=masks["sliding_attention"][offset : offset + length],
+    )
+    torch.testing.assert_close(output, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_vision_flex_preserves_packed_isolation_across_query_chunks(monkeypatch):
+    monkeypatch.setattr(_MODULE, "_FLEX_QUERY_CHUNK_SIZE", 128)
+    attention = _attention()
+    attention.window_size = (31, 0)
+    torch.manual_seed(19)
+    query = torch.randn(260, 2, 4) * 0.1
+    key = torch.randn(260, 1, 4) * 0.1
+    value = torch.randn_like(key)
+    groups = torch.full((260,), -1, dtype=torch.long)
+    groups[120:150] = 0
+    groups[160:220] = 1
+    boundaries = [0, 157, 260]
+    output = attention._thd_vision_flex(query, key, value, boundaries, groups)
+    references = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            query[start:end].transpose(0, 1)[None],
+            key[start:end].transpose(0, 1)[None],
+            value[start:end].transpose(0, 1)[None],
+            scale=1.0,
+            enable_gqa=True,
+            attn_mask=_hf_vision_mask(groups[start:end], 31)["sliding_attention"],
+        )
+        references.append(reference.squeeze(0).transpose(0, 1).flatten(1))
+    torch.testing.assert_close(output, torch.cat(references), atol=2e-5, rtol=2e-5)
+    changed = value.clone()
+    changed[157:] += 100
+    changed_output = attention._thd_vision_flex(query, key, changed, boundaries, groups)
+    torch.testing.assert_close(output[:157], changed_output[:157])
+
+
+def test_image_metadata_keeps_global_layers_causal(monkeypatch):
+    monkeypatch.setenv("RELAX_GEMMA4_FORCE_FLEX_GLOBAL", "1")
+    attention = Gemma4CoreAttention(_attention().config, layer_number=6)
+    torch.manual_seed(20)
+    query = torch.randn(8, 2, 512) * 0.1
+    key = torch.randn(8, 1, 512) * 0.1
+    value = torch.randn_like(key)
+    packed = SimpleNamespace(
+        cu_seqlens_q=torch.tensor([0, 8]),
+        cu_seqlens_q_cpu=[0, 8],
+        max_seqlen_q=8,
+        gemma4_vision_group_ids=torch.zeros(8, dtype=torch.long),
+    )
+    output = attention(query, key, value, packed_seq_params=packed)
+    torch.testing.assert_close(output, _packed_sdpa(query, key, value, [0, 8]), atol=3e-5, rtol=1e-4)
