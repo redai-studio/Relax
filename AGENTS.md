@@ -125,7 +125,8 @@ make docs-dev                       # 启动 VitePress 文档开发服务器
 ```
 
 - 提交遵循 Conventional Commits（`feat:`, `fix:`, `docs:`），详见 `git-commit` skill
-- 默认仅创建本地 commit；用户授权 push 或创建 PR 时，遵循 `relax-github-workflow` skill
+- Relax 修复的分支推送、PR 和代码评审统一走 GitHub 仓库 `redai-studio/Relax`，遵循 `relax-github-workflow` skill
+- 默认仅创建本地 commit，按用户授权推送或创建 PR
 - 测试命名：`test_<module>_<behavior>()`，GPU 测试用 `@pytest.mark.skipif` 优雅跳过
 
 ## Test Scope & Placement

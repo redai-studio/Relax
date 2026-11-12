@@ -48,6 +48,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
+from relax.utils.s3_model_loader import is_s3_uri, prepare_local_model
 from relax.utils.timer import timer
 from relax.utils.training.nonfinite_grad import (
     NonFiniteGradientNormError,
@@ -2347,8 +2348,14 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
             logger.info(f"Saving model in HuggingFace format to {path}")
 
         export_reference = _hf_export_reference(args)
+        uses_actor_reference = export_reference == args.hf_checkpoint
+        model_source = getattr(args, "model_source", None)
+        if uses_actor_reference and model_source is not None and is_s3_uri(model_source.uri):
+            # Bridge can read the original shards during export. The actor may have
+            # released its downloaded weights after model initialization.
+            export_reference = prepare_local_model(args, completeness="full").path
         bridge = AutoBridge.from_hf_pretrained(export_reference, trust_remote_code=True)
-        if export_reference != args.hf_checkpoint:
+        if not uses_actor_reference:
             # Only shard keys come from ref_load; tokenizer, processor and templates
             # must retain the actor checkpoint's semantics. Both bridges load lazily.
             actor_bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
