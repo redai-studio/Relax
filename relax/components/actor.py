@@ -175,7 +175,9 @@ class Actor(Base):
             sync_options["expected_rollout_actor_ids"] = expected_rollout_actor_ids
         try:
             if self._recovery.state is not None:
-                wait_all(self.actor_model.async_inference_call("update_weights_fully_async", self.step, **sync_options))
+                wait_all(
+                    self.actor_model.async_inference_call("update_weights_fully_async", self.step, **sync_options)
+                )
             else:
                 self.actor_model.update_weights_fully_async(0, **sync_options)
         except Exception:
