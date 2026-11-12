@@ -25,7 +25,6 @@ from relax.agentic.stage_recorder import StageRecorder
 from relax.utils.agentic_obs import AsyncJsonlAppender, merge_train_updates, writers
 from relax.utils.agentic_obs import train_hooks as hooks
 from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID, ExportStageRecord, encode_group_ids
-
 from tests.cpu.agentic_obs_args import make_agentic_obs_args
 
 
@@ -957,4 +956,3 @@ def test_session_sampling_config_preserves_falsy_explicit_values() -> None:
     assert cfg["stop"] == []
     assert cfg["stop_token_ids"] == []
     assert "max_new_tokens" not in cfg
-

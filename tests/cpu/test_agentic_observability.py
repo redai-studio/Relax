@@ -44,7 +44,6 @@ from relax.utils.agentic_obs import agentic_obs_enabled, merge_train_updates, re
 from relax.utils.agentic_obs.writers import close_observation_writers
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.types import Sample
-
 from tests.cpu.agentic_obs_args import make_agentic_obs_args
 
 

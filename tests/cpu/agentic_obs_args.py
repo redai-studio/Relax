@@ -13,6 +13,7 @@ from __future__ import annotations
 from argparse import Namespace
 from pathlib import Path
 
+
 # Single source of truth for the rollout sampling params read directly by
 # ``relax.agentic.inventory.session_sampling_config``. These mirror the argparse
 # defaults in ``relax/utils/arguments.py``; the binding test pins them together.

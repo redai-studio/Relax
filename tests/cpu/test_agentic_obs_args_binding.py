@@ -17,6 +17,7 @@ import pytest
 
 from tests.cpu.agentic_obs_args import ROLLOUT_SAMPLING_DEFAULTS
 
+
 # This file lives at <repo>/tests/cpu/, so the repo root is parents[2].
 ARGS_PATH = pathlib.Path(__file__).resolve().parents[2] / "relax" / "utils" / "arguments.py"
 
@@ -69,8 +70,7 @@ def test_rollout_sampling_defaults_match_parser_declarations(monkeypatch):
 
     for key, expected in ROLLOUT_SAMPLING_DEFAULTS.items():
         assert key in parsed, (
-            f"{key!r} is no longer declared by the slime parser; "
-            "update tests/cpu/agentic_obs_args.py"
+            f"{key!r} is no longer declared by the slime parser; update tests/cpu/agentic_obs_args.py"
         )
         actual = parsed[key]
         assert actual == expected, (
