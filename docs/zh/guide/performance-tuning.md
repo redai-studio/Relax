@@ -55,8 +55,7 @@ expert bias，因为重新组批可能改变这些目标或路由决策。TP/PP/
 
 对比吞吐时，固定 checkpoint、有效 batch、样本顺序、精度和并行配置；基线保留
 `--balance-data` 和动态打包。监督 token 吞吐使用 `perf/step_resp_token_per_s`，
-数值验证与计时分别运行。`scripts/tools/flops_benchmark/` 中的实验工具
-提供真实数据冻结、数值比较和成对实验流程。数据准备见 [SFT 训练](./sft-training.md)，
+数值验证与计时分别运行。数据准备见 [SFT 训练](./sft-training.md)，
 通信与算子分析可使用下文的 profiling 工具。
 
 ## 性能分析

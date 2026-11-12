@@ -66,9 +66,8 @@ for example, Qwen3.5 GDN CP requires zigzag packing and per-token normalization.
 To compare throughput, keep the checkpoint, effective batch, sample order,
 precision and parallel layout fixed. The baseline should retain `--balance-data`
 and dynamic batching. Use `perf/step_resp_token_per_s` for supervised-token
-throughput, and compare numerical behavior separately from timed runs. The
-tools in `scripts/tools/flops_benchmark/` provide frozen
-real workloads, correctness comparisons and paired runs. See [SFT Training](./sft-training.md)
+throughput, and compare numerical behavior separately from timed runs.
+See [SFT Training](./sft-training.md)
 for data preparation and the profiling instructions below for communication and
 kernel analysis.
 
