@@ -33,7 +33,6 @@ class Config:
         ("NVIDIA A800-SXM4-80GB", 312e12),
         ("NVIDIA L40S", 362.05e12),
         ("NVIDIA H20", 148e12),
-        ("NVIDIA H20G", 2.25e15),
         ("Ascend910B3", 354e12),
     ],
 )
