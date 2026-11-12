@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from relax.utils.agentic_obs.version_audit import (
@@ -162,3 +164,84 @@ class TestRunSummary:
         assert summary["oldest_lag_max"] == 10
         assert summary["newest_lag_median"] == 2
         assert summary["newest_lag_max"] == 5
+
+
+def _write_jsonl(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+
+TRAJECTORY_ROW = {
+    "schema_version": "3.2.0",
+    "run_id": "run-1",
+    "session_id": "sess-1",
+    "sample_export_id": "1001",
+    "lineage": [
+        {"kind": "obs", "state_hash": "h0", "token_count": 2, "weight_versions": [], "weight_version_spans": []},
+        {
+            "kind": "resp",
+            "state_hash": "h1",
+            "token_count": 2,
+            "weight_versions": ["1"],
+            "weight_version_spans": [{"version": "1", "token_start": 0, "token_end": 2, "attempt_seq": 0}],
+        },
+        {"kind": "obs", "state_hash": "h2", "token_count": 4, "weight_versions": [], "weight_version_spans": []},
+        {
+            "kind": "resp",
+            "state_hash": "h3",
+            "token_count": 2,
+            "weight_versions": ["3"],
+            "weight_version_spans": [{"version": "3", "token_start": 2, "token_end": 4, "attempt_seq": 1}],
+        },
+    ],
+}
+
+TRAIN_ROW = {
+    "schema_version": "3.2.0",
+    "run_id": "run-1",
+    "update_id": "actor:3:2",
+    "dp_rank": 0,
+    "samples": [{"sample_export_id": "1001", "consumed_weight_version": "7"}],
+}
+
+
+def test_cli_joins_streams_and_emits_report(tmp_path, capsys):
+    root = tmp_path / "run-1"
+    _write_jsonl(root / "trajectories" / "shard_00.jsonl", [TRAJECTORY_ROW])
+    _write_jsonl(root / "train" / "step_00000003_dp_000.jsonl", [TRAIN_ROW])
+    from relax.utils.agentic_obs.version_audit import main as audit_main
+
+    audit_main([str(root)])
+    out = capsys.readouterr().out
+    assert "oldest_lag" in out
+    assert "span_missing_rate" in out
+    # 明细行含追溯链：session → turn → attempt。
+    assert "sess-1" in out
+
+
+def test_cli_missing_only_filter_and_jsonl(tmp_path, capsys):
+    root = tmp_path / "run-1"
+    unknown_row = json.loads(json.dumps(TRAJECTORY_ROW))
+    unknown_row["sample_export_id"] = "1002"
+    unknown_row["lineage"][1]["weight_version_spans"] = [
+        {"version": None, "token_start": 0, "token_end": 2, "attempt_seq": 0}
+    ]
+    _write_jsonl(root / "trajectories" / "shard_00.jsonl", [TRAJECTORY_ROW, unknown_row])
+    _write_jsonl(
+        root / "train" / "step_00000003_dp_000.jsonl",
+        [
+            TRAIN_ROW,
+            {
+                **TRAIN_ROW,
+                "samples": [{"sample_export_id": "1002", "consumed_weight_version": "7"}],
+            },
+        ],
+    )
+    from relax.utils.agentic_obs.version_audit import main as audit_main
+
+    audit_main([str(root), "--missing-only", "--jsonl"])
+    out = capsys.readouterr().out
+    rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["sample_export_id"] == "1002"
+    assert rows[0]["spans"][0]["version"] is None

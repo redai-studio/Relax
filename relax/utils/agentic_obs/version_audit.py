@@ -16,7 +16,11 @@ missing-rate metrics instead.
 
 from __future__ import annotations
 
+import argparse
+import json
 import statistics
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 from relax.utils.logging_utils import get_logger
@@ -144,4 +148,154 @@ def compute_run_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-__all__ = ["compute_run_summary", "compute_sample_stats"]
+def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield one parsed JSON object per non-blank line of a JSONL file."""
+
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
+
+
+def load_trajectories(run_dir: Path) -> dict[int, dict[str, Any]]:
+    """Index trajectory rows by integer ``sample_export_id``.
+
+    Reads every ``trajectories/shard_*.jsonl`` file in sorted order. The JSON
+    field is a decimal string since schema v2, so rows written before that
+    rewrite are simply absent here — join coverage is what the audit reports.
+    """
+
+    trajectories: dict[int, dict[str, Any]] = {}
+    for path in sorted((run_dir / "trajectories").glob("shard_*.jsonl")):
+        for row in _iter_jsonl(path):
+            export_id = row.get("sample_export_id")
+            if export_id is None:
+                continue
+            trajectories[int(export_id)] = row
+    return trajectories
+
+
+def load_consumed_versions(run_dir: Path) -> dict[int, str | None]:
+    """Latest consumed weight version per sample across train DP shards.
+
+    Reads every ``train/step_*_dp_*.jsonl`` file in sorted order; a sample
+    consumed by a later step overwrites the earlier stamp, which is the
+    conservative (oldest-freshness) reading for staleness auditing.
+    """
+
+    consumed: dict[int, str | None] = {}
+    for path in sorted((run_dir / "train").glob("step_*_dp_*.jsonl")):
+        for row in _iter_jsonl(path):
+            for sample in row.get("samples", []):
+                export_id = sample.get("sample_export_id")
+                if export_id is None:
+                    continue
+                consumed[int(export_id)] = sample.get("consumed_weight_version")
+    return consumed
+
+
+def _span_rows(trajectory: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten lineage spans into one row per span, with turn attribution.
+
+    Only ``resp`` nodes generate tokens, so the turn counter increments on
+    ``resp`` nodes; the row keeps the node's ``state_hash`` for traceback.
+    """
+
+    spans: list[dict[str, Any]] = []
+    turn = 0
+    for node in trajectory.get("lineage", []):
+        if node.get("kind") != "resp":
+            continue
+        turn += 1
+        for span in node.get("weight_version_spans", []):
+            spans.append({"turn": turn, "state_hash": node.get("state_hash"), **span})
+    return spans
+
+
+def _detail_row(trajectory: dict[str, Any], consumed: str | None) -> dict[str, Any]:
+    """Join one trajectory with its consumed stamp into an audit detail row."""
+
+    spans = _span_rows(trajectory)
+    stats = compute_sample_stats(spans, consumed)
+    return {
+        "sample_export_id": trajectory.get("sample_export_id"),
+        "session_id": trajectory.get("session_id"),
+        "run_id": trajectory.get("run_id"),
+        "consumed_weight_version": consumed,
+        "spans": spans,
+        "spans_count": len(spans),
+        "unknown_spans": sum(1 for span in spans if _version_or_none(span.get("version")) is None),
+        **stats,
+    }
+
+
+def _age(span_version: str | None, consumed: str | None) -> int | None:
+    """Version age at consumption; ``None`` when either side is unknown."""
+
+    version = _version_or_none(span_version)
+    current = _version_or_none(consumed)
+    return current - version if version is not None and current is not None else None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry: audit one run directory and print the staleness report."""
+
+    parser = argparse.ArgumentParser(
+        prog="version_audit", description="Audit weight version staleness for one agentic observation run."
+    )
+    parser.add_argument("run_dir", help="Run directory (<dump_dir>/<run_id>) holding trajectories/ and train/")
+    parser.add_argument("--session", help="Only audit samples of this session_id")
+    parser.add_argument("--group", help="Only audit samples of this group_id")
+    parser.add_argument(
+        "--missing-only", action="store_true", help="Only report samples with unknown spans or unknown tokens"
+    )
+    parser.add_argument(
+        "--jsonl", action="store_true", help="Emit one JSON detail row per sample instead of the report"
+    )
+    args = parser.parse_args(argv)
+
+    run_dir = Path(args.run_dir)
+    trajectories = load_trajectories(run_dir)
+    consumed = load_consumed_versions(run_dir)
+
+    rows: list[dict[str, Any]] = []
+    for export_id, trajectory in sorted(trajectories.items()):
+        if args.session and trajectory.get("session_id") != args.session:
+            continue
+        if args.group and trajectory.get("group_id") != args.group:
+            continue
+        rows.append(_detail_row(trajectory, consumed.get(export_id)))
+    if args.missing_only:
+        rows = [row for row in rows if row["unknown_spans"] > 0 or row["unknown_token_count"] > 0]
+
+    if args.jsonl:
+        for row in rows:
+            print(json.dumps(row, ensure_ascii=False))
+        return 0
+
+    summary = compute_run_summary(
+        [{**row, "spans": row["spans_count"], "unknown_spans": row["unknown_spans"]} for row in rows]
+    )
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    for row in rows:
+        for span in row["spans"]:
+            age = _age(span.get("version"), row["consumed_weight_version"])
+            print(
+                f"sample={row['sample_export_id']} session={row['session_id']} turn={span['turn']} "
+                f"attempt={span['attempt_seq']} tokens=[{span['token_start']},{span['token_end']}) "
+                f"version={span['version']} age={age}"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = [
+    "compute_run_summary",
+    "compute_sample_stats",
+    "load_consumed_versions",
+    "load_trajectories",
+    "main",
+]
