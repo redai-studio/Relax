@@ -31,7 +31,8 @@ def _forward(
     SCALE: tl.constexpr,
     BF16_PRODUCTS: tl.constexpr,
 ):
-    t, kh = tl.program_id(0), tl.program_id(1)
+    # Long-context Q/output and route offsets can exceed signed int32.
+    t, kh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     h = tl.arange(0, BH)
     d = tl.arange(0, D)
     b = tl.arange(0, BK)
@@ -85,7 +86,8 @@ def _backward(
     SCALE: tl.constexpr,
     BF16_PRODUCTS: tl.constexpr,
 ):
-    t, kh = tl.program_id(0), tl.program_id(1)
+    # Long-context Q/output and route offsets can exceed signed int32.
+    t, kh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     h, d, b = tl.arange(0, BH), tl.arange(0, D), tl.arange(0, BK)
     qptr = (t * HQ + kh * G + h[:, None]) * D + d[None, :]
     q = tl.load(Q + qptr, h[:, None] < G, other=0)

@@ -82,6 +82,10 @@ fi
 # Explicit driver/actor settings override entrypoint defaults (notably connections=1).
 ENV_ARGS=(
     "RELAX_SKIP_NONFINITE_GRAD=${RELAX_SKIP_NONFINITE_GRAD:-0}"
+    "RELAX_MEMORY_RELEASE_GC=${RELAX_MEMORY_RELEASE_GC:-0}"
+    "RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY=${RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY:-0}"
+    "QWEN48_PP_PAYLOAD_UNBATCHED=${QWEN48_PP_PAYLOAD_UNBATCHED:-0}"
+    "RELAX_FLA_CONV_NB_MODE=${RELAX_FLA_CONV_NB_MODE:-auto}"
     MCORE_QSA_SPARSE_BACKEND=id_sparse
     TORCHINDUCTOR_COMPILE_THREADS=1
     QWEN38_PLE_CPU_OFFLOAD=1
@@ -93,7 +97,7 @@ ENV_ARGS=(
     "MEGATRON=${MEGATRON}"
     "RELAX=${RELAX}"
     PYTHONNOUSERSITE=1
-    CUDA_DEVICE_MAX_CONNECTIONS=32
+    "CUDA_DEVICE_MAX_CONNECTIONS=${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
     TOKENIZERS_PARALLELISM=false
     RELAX_QWEN38_QSA_FUSED_ATTENTION=0
@@ -171,8 +175,8 @@ PYRUNTIME
 # PIPELINE_LAYOUT can override the layer allocation for a different workload.
 # DP = 32 / TP2 / PP4 / CP1 = 4; PLE and the vision frontend stay on PP0.
 PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
-    --pipeline-model-parallel-size 4
+    --tensor-model-parallel-size "${TP_SIZE:-2}"
+    --pipeline-model-parallel-size "${PP_SIZE:-4}"
     --context-parallel-size 1
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
@@ -190,11 +194,15 @@ PARALLEL_ARGS=(
     --recompute-num-layers 2
     --no-offload-train
     # Retain allocator caches between updates to avoid repeated allocations.
-    --empty-unused-memory-level 0
+    --empty-unused-memory-level "${EMPTY_UNUSED_MEMORY_LEVEL:-0}"
 )
 
 # Relax takes an integer interval and always saves on the final step.
 SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
+SAVE_ARGS=()
+if [[ "${SAVE_INTERVAL}" != none ]]; then
+    SAVE_ARGS=(--save "${SAVE_DIR}/${EXP_NAME}" --save-interval "${SAVE_INTERVAL}")
+fi
 
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}"
@@ -202,22 +210,26 @@ CKPT_ARGS=(
     --megatron-to-hf-mode bridge
     --num-epoch "${NUM_EPOCH:-1}"
     --load "${SAVE_DIR}/${EXP_NAME}"
-    --save "${SAVE_DIR}/${EXP_NAME}"
-    --save-interval "${SAVE_INTERVAL}"
+    "${SAVE_ARGS[@]}"
     --ckpt-format torch_dist
     --max-actor-ckpt-to-keep 2
 )
 
+EVAL_SPLIT_ARGS=()
+if [[ "${EVAL_SIZE:-512}" != none ]]; then
+    EVAL_SPLIT_ARGS=(--eval-size "${EVAL_SIZE:-512}")
+fi
+
 SFT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
-    --eval-size "${EVAL_SIZE:-512}"
+    "${EVAL_SPLIT_ARGS[@]}"
     --input-key messages
     --tool-key tools
     --apply-chat-template
     --apply-chat-template-kwargs '{"add_generation_prompt":false,"preserve_thinking":true,"add_non_thinking_prefix":false}'
-    --sft-invalid-multimodal-strategy skip
-    --sft-oversize-strategy custom
+    --sft-invalid-multimodal-strategy "${SFT_INVALID_MULTIMODAL_STRATEGY:-skip}"
+    --sft-oversize-strategy "${SFT_OVERSIZE_STRATEGY:-custom}"
     --sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
     --calculate-per-token-loss
     # The hook reads --seq-length after multimodal expansion. Do not set
@@ -229,7 +241,7 @@ SFT_ARGS=(
     --seq-length "${SEQ_LENGTH}"
     --use-dynamic-batch-size
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
-    --data-pad-size-multiplier 16384
+    --data-pad-size-multiplier "${DATA_PAD_SIZE_MULTIPLIER:-16384}"
     --per-rank-fetch
     --sft-prefetch-num-workers 16
     --sft-train-data-prefetch
@@ -294,8 +306,8 @@ METRICS_ARGS=(
 )
 
 TRAIN_ARGS=(
-    --resource '{"sft":[1,0],"actor":[1,32]}'
-    --actor-num-nodes 4
+    --resource "{\"sft\":[1,0],\"actor\":[1,$((${ACTOR_NUM_NODES:-4} * 8))]}"
+    --actor-num-nodes "${ACTOR_NUM_NODES:-4}"
     --actor-num-gpus-per-node 8
     --sft-max-in-flight-steps 4
     # The first 256k step can exceed the default 30-minute queue timeout.
@@ -322,8 +334,9 @@ from pathlib import Path
 runtime = json.loads(sys.argv[2])
 # Only record explicitly selected training settings, not inherited credentials.
 selected = {key: value for key, value in runtime.get("env_vars", {}).items()
-            if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_")) or key in
-            ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT")}
+            if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_", "RELAX_MEMORY_RELEASE_")) or key in
+            ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT",
+             "RELAX_FLA_CONV_NB_MODE", "QWEN48_PP_PAYLOAD_UNBATCHED")}
 Path(sys.argv[1]).write_text(json.dumps({"argv": sys.argv[3:], "env_vars": selected}, indent=2) + "\n")
 PYCONFIG
 fi

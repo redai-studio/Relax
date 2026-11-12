@@ -36,6 +36,61 @@ def _value(argv: list[str], flag: str) -> str:
     return argv[len(argv) - 1 - argv[::-1].index(flag) + 1]
 
 
+@pytest.mark.parametrize("fixed", [False, True])
+def test_512k_recipe_exports_complete_training_configuration(tmp_path, fixed):
+    name = "run-qwen38-qsa-sft-512k-" + ("fixed-" if fixed else "") + "64xgpu-blackwell.sh"
+    config = _dry_run(name, tmp_path / "checkpoints")
+    args = config["argv"]
+    assert json.loads(_value(args, "--resource"))["actor"] == [1, 64]
+    for flag, value in {
+        "--actor-num-nodes": "8",
+        "--tensor-model-parallel-size": "8",
+        "--pipeline-model-parallel-size": "2",
+        "--pipeline-model-parallel-layout": "Et*24|t*24mL",
+        "--global-batch-size": "64",
+        "--seq-length": "524288",
+        "--max-tokens-per-gpu": "131072" if fixed else "262144",
+        "--data-pad-size-multiplier": "16384" if fixed else "4096",
+        "--empty-unused-memory-level": "1",
+        "--sft-oversize-strategy": "keep",
+        "--sft-invalid-multimodal-strategy": "error",
+        "--seed": "9714",
+        "--max-global-restart": "0",
+    }.items():
+        assert _value(args, flag) == value, flag
+    assert "--save" not in args and "--save-interval" not in args
+    assert ("--eval-size" in args) == fixed
+    runtime = config["runtime_env"]["env_vars"]
+    actor = json.loads(_value(args, "--train-env-vars"))
+    for key, value in {
+        "RELAX_MEMORY_RELEASE_GC": "1",
+        "RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY": str(int(fixed)),
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "QWEN48_PP_PAYLOAD_UNBATCHED": "1",
+        "RELAX_FLA_CONV_NB_MODE": "none",
+    }.items():
+        assert runtime[key] == actor[key] == value
+    assert not (tmp_path / "checkpoints").exists()
+
+
+def test_fixed_512k_refuses_existing_checkpoint_before_ray(tmp_path):
+    checkpoint = tmp_path / "checkpoints"
+    (checkpoint / "qwen38-test").mkdir(parents=True)
+    with pytest.raises(AssertionError, match="resume is unsupported"):
+        _dry_run("run-qwen38-qsa-sft-512k-fixed-64xgpu-blackwell.sh", checkpoint)
+
+
+def test_variable_512k_allows_full_corpus_length_and_explicit_checkpointing(tmp_path):
+    config = _dry_run(
+        "run-qwen38-qsa-sft-512k-64xgpu-blackwell.sh",
+        tmp_path / "checkpoints",
+        SEQ_LENGTH="655360",
+        SAVE_INTERVAL="100",
+    )
+    assert _value(config["argv"], "--seq-length") == "655360"
+    assert _value(config["argv"], "--save-interval") == "100"
+
+
 @pytest.mark.parametrize(
     "script,gpus,tp,pp,ep",
     [

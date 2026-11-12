@@ -1,0 +1,84 @@
+--- a/fla/modules/conv/triton/kernels.py
++++ b/fla/modules/conv/triton/kernels.py
+@@ -61,10 +61,10 @@
+     USE_INITIAL_STATE: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
+ ):
+-    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
+ 
+     if IS_VARLEN:
+-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
++        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+         T = eos - bos
+         p_x = x + bos * stride_x_t
+@@ -191,10 +191,10 @@
+     USE_FINAL_STATE: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
+ ):
+-    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
+     if IS_VARLEN:
+         i_tg = i_t
+-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
++        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+         T = eos - bos
+         p_x = x + bos * stride_x_t
+--- a/fla/modules/conv/triton/kernels_none.py
++++ b/fla/modules/conv/triton/kernels_none.py
+@@ -60,10 +60,10 @@
+     USE_INITIAL_STATE: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
+ ):
+-    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
+ 
+     if IS_VARLEN:
+-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
++        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+         T = eos - bos
+         p_x = x + bos * stride_x_t
+@@ -189,10 +189,10 @@
+     USE_FINAL_STATE: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
+ ):
+-    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
+     if IS_VARLEN:
+         i_tg = i_t
+-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
++        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+         T = eos - bos
+         p_x = x + bos * stride_x_t
+--- a/fla/modules/conv/triton/kernels_pow2.py
++++ b/fla/modules/conv/triton/kernels_pow2.py
+@@ -61,10 +61,10 @@
+     USE_INITIAL_STATE: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
+ ):
+-    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
+ 
+     if IS_VARLEN:
+-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
++        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+         T = eos - bos
+         p_x = x + bos * stride_x_t
+@@ -191,10 +191,10 @@
+     USE_FINAL_STATE: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
+ ):
+-    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
+     if IS_VARLEN:
+         i_tg = i_t
+-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
++        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+         T = eos - bos
+         p_x = x + bos * stride_x_t

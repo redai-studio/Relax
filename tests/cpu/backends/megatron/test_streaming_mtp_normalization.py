@@ -16,6 +16,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from relax.utils.env import Envs
+
 
 _ROOT = Path(__file__).resolve().parents[4]
 
@@ -73,6 +75,7 @@ class _Stream:
 
 
 def _train_loop(monkeypatch, step, *, enable_mtp=True, per_token=False):
+    monkeypatch.setenv("RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY", "0")
     args = Namespace(
         enable_mtp_training=enable_mtp,
         calculate_per_token_loss=per_token,
@@ -97,6 +100,7 @@ def _train_loop(monkeypatch, step, *, enable_mtp=True, per_token=False):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda **kwargs: 0)
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
     namespace = {
+        "Envs": Envs,
         "torch": torch,
         "get_args": lambda: args,
         "get_model_config": lambda _: SimpleNamespace(),
@@ -128,7 +132,13 @@ def _train_loop(monkeypatch, step, *, enable_mtp=True, per_token=False):
     _load("relax/utils/data/stream_dataloader.py", {"MicroBatchListIterator"}, namespace)
     _load(
         "relax/backends/megatron/model.py",
-        {"train", "_mtp_metric_scales", "_attach_mtp_forward_kwargs", "_prepare_mtp_training_window"},
+        {
+            "train",
+            "_release_memory_for_step",
+            "_mtp_metric_scales",
+            "_attach_mtp_forward_kwargs",
+            "_prepare_mtp_training_window",
+        },
         namespace,
     )
 

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
+import gc
 import itertools
 import json
 import math
@@ -83,11 +84,29 @@ from .model_provider import (
 logger = get_logger(__name__)
 
 
+def _release_memory_for_step(
+    args: Namespace, rollout_id: int, step_id: int, *, first_train_call: bool = False
+) -> bool:
+    """Opt-in fixed-shape experiment: release only on the first training
+    attempt."""
+    level = getattr(args, "empty_unused_memory_level", 0)
+    if not Envs.RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY:
+        return level >= 1
+    if level != 1:
+        raise ValueError("First-attempt memory release requires empty_unused_memory_level=1")
+    if first_train_call and rollout_id != 0:
+        raise ValueError("First-attempt memory release requires a fresh rollout 0; resume is unsupported")
+    return rollout_id == 0 and step_id == 0
+
+
 def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None:
     # Finalization itself can lazily initialize NCCL communicators (e.g. MoE
     # router bias reduction), before forward_backward_func returns to the
     # optimizer. Make unused activation cache available at that boundary too.
     memory_before = available_memory()
+    if Envs.RELAX_MEMORY_RELEASE_GC:
+        collected = gc.collect()
+        logger.info("Gradient finalization GC: collected=%d", collected)
     device_module.empty_cache()
     logger.info("Gradient finalization cache release: before=%s after=%s", memory_before, available_memory())
     finalize_model_grads(*args, **kwargs)
@@ -1599,7 +1618,7 @@ def train_one_step(
     # Match Megatron's memory-level control. Reloaded NCCL groups may allocate
     # their buffers for the first time during gradient-norm reduction; release
     # unused forward/backward cache before those allocations, not after an OOM.
-    if getattr(args, "empty_unused_memory_level", 0) >= 1:
+    if _release_memory_for_step(args, rollout_id, step_id):
         memory_before = available_memory()
         device_module.empty_cache()
         logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
@@ -1796,11 +1815,13 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = (
-        _finalize_model_grads_with_memory_release
-        if getattr(args, "empty_unused_memory_level", 0) >= 1
-        else finalize_model_grads
+    _release_memory_for_step(
+        args,
+        rollout_id,
+        0,
+        first_train_call=not getattr(config, "_relax_memory_release_initialized", False),
     )
+    config._relax_memory_release_initialized = True
 
     pre_hook_enabled = False
     param_sync_func = None
@@ -1893,6 +1914,11 @@ def train(
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
+        config.finalize_model_grads_func = (
+            _finalize_model_grads_with_memory_release
+            if _release_memory_for_step(args, rollout_id, step_id)
+            else finalize_model_grads
+        )
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
         step_num_microbatches = num_microbatches[step_id]
         from relax.utils.agentic_obs.train_hooks import observe_train_step

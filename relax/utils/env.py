@@ -219,6 +219,8 @@ class Envs(metaclass=_EnvsMeta):
     # Qwen model compatibility and optional training kernels.
     RELAX_LOGPROB_FAST_PATH = EnvProperty("RELAX_LOGPROB_FAST_PATH", bool, False)
     RELAX_SFT_RESIDENT_PARAM_OVERLAP = EnvProperty("RELAX_SFT_RESIDENT_PARAM_OVERLAP", bool, False)
+    RELAX_MEMORY_RELEASE_GC = EnvProperty("RELAX_MEMORY_RELEASE_GC", bool, False)
+    RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY = EnvProperty("RELAX_MEMORY_RELEASE_FIRST_ATTEMPT_ONLY", bool, False)
     RELAX_PROFILE_RANKS = EnvProperty("RELAX_PROFILE_RANKS", str, None)
     RELAX_PROFILE_GZIP_LEVEL = EnvProperty("RELAX_PROFILE_GZIP_LEVEL", int, None)
     RELAX_QWEN38_HC_FUSED_MIX = EnvProperty("RELAX_QWEN38_HC_FUSED_MIX", bool, True)
