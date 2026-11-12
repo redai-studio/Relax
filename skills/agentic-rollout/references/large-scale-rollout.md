@@ -9,8 +9,10 @@ return `Internal scale: N/A` without naming internal constants.
 
 ## Establish the possible mismatch
 
-One resident Session owns one agent process. Runtime assigns a complete Group to one SessionShard by Group ID
-hash, so inspect the maximum observed load on any Shard instead of dividing the total by the Shard count.
+A started Session owns an agent process; pending members may own no process yet. Runtime assigns each complete Group
+to one Shard, balancing node/shard load and, when enabled, available host Session credits. Inspect actual maximum load
+on each host and Shard instead of dividing logical `C * N` evenly. Concurrent model calls within one Session can make
+HTTP demand larger than the occupied Session count.
 
 Escalate this check only when at least one signal exists:
 
@@ -44,7 +46,7 @@ target-load validation.
 ## Validate the change
 
 1. Record the exact revision, relevant current values, target Session counts, and maximum observed per-Shard load.
-2. Prove one complete Group and its first-request barrier.
+2. Prove complete-Group results under the chosen ordinary barrier or capacity-managed incremental-start lifecycle.
 3. Reach the target Prepare/prelaunch fanout without stalled first-request progress.
 4. Complete a target-size train rollout and optimizer step.
 5. Exercise train/Eval overlap when configured.

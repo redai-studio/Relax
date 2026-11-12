@@ -86,6 +86,8 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "dump_agentic_obs_media": False,
         "reward_key": None,
         "use_rollout_routing_replay": False,
+        "agentic_prelaunch": False,
+        "num_rollout": 10,
     }
     args.update(overrides)
     return Namespace(**args)
@@ -611,7 +613,10 @@ def _obs_pipeline(module, args):
     pipeline._record_rollout = AsyncMock()  # These fixtures exercise trajectory ownership, not rollout membership.
     pipeline.prepare_domain = SimpleNamespace(close_step=lambda: None, shutdown=AsyncMock())
     pipeline.runtime_domain = SimpleNamespace(
-        pause_generation=AsyncMock(), trim_memory=AsyncMock(), shutdown=AsyncMock()
+        pause_generation=AsyncMock(),
+        trim_memory=AsyncMock(),
+        shutdown=AsyncMock(),
+        session_capacity_snapshot=lambda: None,
     )
     pipeline.transfer_domain = SimpleNamespace(
         flush_batches=lambda: (),
@@ -1403,6 +1408,8 @@ def test_runtime_drop_joins_inflight_export_delivery(tmp_path, cancelled):
         runtime = object.__new__(runtime_module.RuntimeDomain)
         runtime._resident_group_permits = asyncio.Semaphore(0)
         runtime._state_changed = asyncio.Event()
+        runtime._session_capacity = None
+        runtime._reserved_group_shards = {"g": runtime_module._GroupShardReservation(shard, None)}
 
         async def take():
             take_started.set()
@@ -1423,11 +1430,78 @@ def test_runtime_drop_joins_inflight_export_delivery(tmp_path, cancelled):
                 await task
         else:
             await task
-        shard.handle.drop_group.remote.assert_awaited_once_with("g", reason=None)
+        shard.handle.drop_group.remote.assert_awaited_once_with("g", reason=None, expected_session_ids=("s",))
         assert completion.result() is group.sessions[0]
         assert not result.take_task.cancelled()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_source", ["prepare", "finalization"])
+def test_group_failure_preserves_inflight_export_observation(tmp_path, failure_source):
+    from relax.agentic.pipeline import (
+        RuntimeGroupError,
+        SessionExportTransport,
+        SessionGroupProgress,
+        SessionShardProgress,
+    )
+    from relax.agentic.pipeline import runtime as runtime_module
+
+    args = _obs_args(tmp_path)
+    recorder = StageRecorder(args)
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        sample = _group("g", export_ids=[7]).sessions[0].exports[0].sample
+        transport = SessionExportTransport(
+            exports=({"name": None, "sample_payload": TrainingFieldArtifact.from_sample(sample).sample_payload},)
+        )
+
+        async def take(*_args):
+            started.set()
+            await release.wait()
+            return (transport,)
+
+        binding = runtime_module._SessionShardBinding(
+            "shard", SimpleNamespace(take_session_results=SimpleNamespace(remote=take)), node_id="host"
+        )
+        runtime = runtime_module.RuntimeDomain(args, "train", [binding], 1)
+        loop = asyncio.get_running_loop()
+        results = tuple(runtime_module._SessionResultRef(sid, loop.create_future()) for sid in ("done", "waiting"))
+        stream = runtime_module.RuntimeGroupStream("g", binding, loop.create_future(), results)
+        binding.group_streams[stream.group_id] = stream
+        take_task = asyncio.create_task(runtime_module._take_session_results(stream, results[:1]))
+        results[0].take_task = take_task
+        await started.wait()
+        error = RuntimeGroupError("incremental grant failed")
+
+        async def fail():
+            raise error
+
+        preparation = asyncio.create_task(fail())
+        await asyncio.gather(preparation, return_exceptions=True)
+        try:
+            if failure_source == "prepare":
+                runtime._eager_preparation_done(stream, preparation)
+            else:
+                runtime._apply_shard_progress(
+                    binding,
+                    SessionShardProgress(1, (SessionGroupProgress("g", False, (), False, False, error=error),)),
+                )
+            assert stream.first_request_barrier.exception() is error
+            assert results[1].completion.exception() is error
+            assert not results[0].completion.done()
+        finally:
+            release.set()
+            await take_task
+        await recorder.record_stream_dropped(stream, rollout_id=7, stage=STAGE_SHUTDOWN, reason=str(error))
+        recorder.close()
+        await runtime._inventory.aclose()
+
+    asyncio.run(scenario())
+    (end,) = _read_stage_ends(resolve_agentic_obs_config(args).stage_path(7))
+    assert end["sample_export_id"] == "7" and end["is_terminal"]
+    assert end["reason"] == "incremental grant failed"
 
 
 def test_rollout_membership_cannot_reopen_after_terminal(tmp_path, rollout_module):
@@ -1698,7 +1772,7 @@ def test_runtime_inventory_covers_prepare_failure_before_any_export(
         handle = SimpleNamespace(
             start_group=SimpleNamespace(remote=AsyncMock(side_effect=RuntimeError("prepare broke")))
         )
-        binding = runtime_module._SessionShardBinding("shard", handle)
+        binding = runtime_module._SessionShardBinding("shard", handle, node_id="host")
         runtime = runtime_module.RuntimeDomain(args, "eval", [binding], 1)
         runtime._start_shard_observers = lambda: None
         if not remote_unknown:
@@ -1769,6 +1843,7 @@ def _session_observation_fixture(tmp_path):
     shard._generation_backend = SimpleNamespace(abort_request=AsyncMock(), tokenizer=_FakeTokenizer())
     shard._notify_state_change = lambda group=None: None
     shard._train_generation_open = True
+    shard._resource_release_receipts = {}
     cell = service._SessionResultCell()
     group = service.ResidentGroup("train", "g", {"s": cell}, [], ownership=service.GroupOwnership.RUNTIME)
     session = service._SessionRecord(group, "s", {}, cell, observation=SessionObservation())
@@ -1937,7 +2012,9 @@ def test_managed_agent_logs_and_structured_failure_survive_temp_cleanup(tmp_path
             Path(kw["log_path"]).write_text("agent diagnostics\n")
             if mode == "invalid":
                 (workdirs[-1] / "session_output.json").write_text("{bad json")
-            return SimpleNamespace(wait=wait, close=AsyncMock(), terminate=AsyncMock(side_effect=terminated.set))
+            return SimpleNamespace(
+                wait=wait, close=AsyncMock(), terminate=AsyncMock(side_effect=terminated.set), group_closed=True
+            )
 
         process = ManagedAgentProcess(
             SimpleNamespace(launch=launch),
@@ -1978,7 +2055,7 @@ def test_deferred_prepare_does_not_create_failed_or_duplicate_sessions(tmp_path,
     args = _obs_args(tmp_path, rollout_global_dataset=False)
 
     async def scenario():
-        binding = runtime_module._SessionShardBinding("shard", None)
+        binding = runtime_module._SessionShardBinding("shard", None, node_id="host")
         runtime = runtime_module.RuntimeDomain(args, "train", [binding], 1)
         runtime._start_shard_observers = lambda: None
         group_input = GroupInput("g", [Sample(prompt="q"), Sample(prompt="q")])
@@ -2357,9 +2434,9 @@ def test_registration_error_after_shard_execution_has_only_one_session_end(tmp_p
         shard, _ = _session_observation_fixture(tmp_path)
         shard._groups.clear()
         shard._session_records.clear()
-        shard._start_session = lambda *a: (_ for _ in ()).throw(RuntimeError("launch failed"))
+        shard._start_session = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("launch failed"))
         binding = runtime_module._SessionShardBinding(
-            "shard", SimpleNamespace(start_group=SimpleNamespace(remote=shard.start_group))
+            "shard", SimpleNamespace(start_group=SimpleNamespace(remote=shard.start_group)), node_id="host"
         )
         runtime = runtime_module.RuntimeDomain(
             _obs_args(tmp_path, rollout_global_dataset=False), "train", [binding], 1

@@ -533,8 +533,10 @@ def test_dropping_protected_group_progress_and_release_wake_cleanup():
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "RuntimeDomain")
     names = {
         "_apply_shard_progress",
+        "_confirm_session_resources",
         "_wait_for_no_protected_groups",
         "_drop_group_and_release",
+        "_release_group_reservation",
         "_release_shard_group",
     }
     cls.body = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
@@ -547,6 +549,9 @@ def test_dropping_protected_group_progress_and_release_wake_cleanup():
         runtime._state_changed = asyncio.Event()
         runtime._resident_group_permits = asyncio.Semaphore(0)
         runtime._start_shard_observers = lambda: None
+        runtime._session_capacity = None
+        reservation = NS(session_capacity=None, released=asyncio.Event())
+        runtime._reserved_group_shards = {"g": reservation}
         observer = asyncio.create_task(asyncio.sleep(10))
         shard = NS(group_streams={}, revision_changed=asyncio.Event(), observer_task=observer)
         stream = NS(
@@ -555,6 +560,8 @@ def test_dropping_protected_group_progress_and_release_wake_cleanup():
             protected=True,
             dropping=False,
             stop_reason=None,
+            error=None,
+            preparation_task=None,
             session_results=(),
             first_request_barrier=asyncio.get_running_loop().create_future(),
         )
@@ -577,6 +584,9 @@ def test_dropping_protected_group_progress_and_release_wake_cleanup():
         await runtime._drop_group_and_release(stream)
         await asyncio.wait_for(waiter, 0.2)
         assert not shard.group_streams and runtime._state_changed.is_set()
+        assert not runtime._reserved_group_shards and reservation.released.is_set()
+        assert stream.first_request_barrier.result() is False
+        await asyncio.wait_for(runtime._resident_group_permits.acquire(), 0.2)
         observer.cancel()
         await asyncio.gather(observer, return_exceptions=True)
 

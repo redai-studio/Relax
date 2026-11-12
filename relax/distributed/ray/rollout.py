@@ -440,6 +440,10 @@ class EngineGroup:
                 key: os.environ.get(key, default_val)
                 for key, default_val in {
                     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                    # Mooncake's default 15000-17000 overlaps allocated HTTP ports
+                    # before they bind. Use the upper range reserved by ray-job.sh.
+                    "MC_MIN_RPC_PORT": "65001",
+                    "MC_MAX_RPC_PORT": "65500",
                     # OPD per-position token_ids logprob patch: default off, enabled
                     # via env (affects the student engine too, like the teacher).
                     "RELAX_OPD_PER_POS_TOKEN_IDS": "0",

@@ -9,7 +9,6 @@ import base64
 import json
 import time
 import uuid
-import zlib
 from argparse import Namespace
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
@@ -35,6 +34,7 @@ from relax.agentic.pipeline import (
     SessionSpec,
     TrainingFieldArtifact,
 )
+from relax.agentic.pipeline.session_capacity import SessionCapacity, SessionReservation
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
 from relax.engine.rollout import on_policy_distillation as opd
@@ -53,6 +53,8 @@ from relax.utils.types import Sample
 
 
 logger = get_logger(__name__)
+
+_REGISTRATION_RECEIPT_TIMEOUT_S = 10.0
 
 
 # Compiler calibration messages used to measure the chat-template prefix. Their
@@ -829,6 +831,7 @@ class _SessionShardBinding:
 
     actor_name: str
     handle: Any
+    node_id: str
     group_streams: Dict[str, "RuntimeGroupStream"] = field(default_factory=dict)
     observed_revision: int = 0
     revision_changed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -846,6 +849,17 @@ class _SessionResultRef:
 
 
 @dataclass(eq=False)
+class _GroupShardReservation:
+    """One pending or resident Group's placement and deferred-Prepare
+    handoff."""
+
+    shard: _SessionShardBinding
+    launch_decision: Optional[asyncio.Future[bool]]
+    released: asyncio.Event = field(default_factory=asyncio.Event)
+    session_capacity: SessionReservation | None = None
+
+
+@dataclass(eq=False)
 class RuntimeGroupStream:
     """Driver capability for one group owned wholly by one SessionShard.
 
@@ -860,7 +874,15 @@ class RuntimeGroupStream:
     interrupted: bool = False
     protected: bool = False
     dropping: bool = False
+    # Submission may commit remotely even if the lease response is lost. Keep
+    # this ownership boundary until the stream's resources are fully retired.
+    lease_submitted: bool = False
     stop_reason: tuple[str, str, str] | None = None
+    eager_session_generation: bool = False
+    preparation_task: Optional["asyncio.Task[bool]"] = None
+    closing: bool = False
+    drop_task: Optional["asyncio.Task[None]"] = None
+    error: RuntimeGroupError | None = None
 
 
 def agentic_eval_concurrency_from_args(args: Namespace, eval_group_size: int) -> int:
@@ -890,6 +912,16 @@ class RuntimeDomain:
         self.concurrency = concurrency
         self._admission_coordinator = admission_coordinator
         self._resident_group_permits = asyncio.Semaphore(concurrency)
+        per_node = getattr(args, "agentic_session_capacity_per_node", None) if rollout_mode == "train" else None
+        self._rollout_epoch: int | None = None
+        self._eager_generation_open = False
+        self._eager_closing = False
+        self._session_capacity = (
+            SessionCapacity({shard.node_id for shard in shards}, per_node) if per_node is not None else None
+        )
+        # Include Prepare calls that are still building Session specs. Reserve
+        # synchronously so concurrent callers cannot all choose an idle node.
+        self._reserved_group_shards: Dict[str, _GroupShardReservation] = {}
         self._progress_callback: Callable[[], None] = lambda: None
         self._state_changed = asyncio.Event()
         self._inventory = InventoryRecorder(args, rollout_mode)
@@ -916,10 +948,19 @@ class RuntimeDomain:
 
         service = serve.get_app_handle(AGENTIC_CHAT_API_SERVICE_NAME)
         shard_entries, admission_coordinator = await service.runtime_resources.remote()
+        node_ids = await asyncio.wait_for(
+            asyncio.gather(*(handle.runtime_node_id.remote() for _name, handle in shard_entries)),
+            timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
+        )
+        if not shard_entries or any(not isinstance(node_id, str) or not node_id for node_id in node_ids):
+            raise RuntimeGroupError("SessionShard node identity is required before starting groups")
         return cls(
             args,
             rollout_mode,
-            [_SessionShardBinding(actor_name=actor_name, handle=handle) for actor_name, handle in shard_entries],
+            [
+                _SessionShardBinding(actor_name=actor_name, handle=handle, node_id=node_id)
+                for (actor_name, handle), node_id in zip(shard_entries, node_ids, strict=True)
+            ],
             concurrency,
             admission_coordinator,
         )
@@ -953,18 +994,19 @@ class RuntimeDomain:
         group_input: GroupInput,
         launch_decision: Optional[asyncio.Future[bool]] = None,
     ) -> Optional[RuntimeGroupStream]:
-        """Start one group on a Shard and wait for its first-IR barrier.
+        """Register a Group and start members with available Session credits.
 
-        Session launch and progress observation share one Shard event stream. A
-        controlled drop before the barrier resolves this operation without a
-        Runtime capability.
+        Capacity-managed train Groups return before all first IRs arrive so
+        ready members can generate. Ordinary Groups wait for their barrier.
+        Session launch and progress observation share one Shard event stream.
         """
 
+        if self._session_capacity is not None and self._eager_closing:
+            raise RuntimeGroupError("Eager Runtime is closing")
         prepare_started_at = time.monotonic()
         prepare_started_at_utc = utc_now()
         group_id = group_input.group_id
-        shard = self._shards[zlib.crc32(group_id.encode("utf-8")) % len(self._shards)]
-        session_ids = tuple(f"{shard.actor_name}.session-{uuid.uuid4().hex}" for _ in group_input.samples)
+        session_ids: Tuple[str, ...] = ()
         try:
             if self.teacher_routing_enabled:
                 for sample in group_input.samples:
@@ -972,11 +1014,26 @@ class RuntimeDomain:
             self._inventory.record_group(group_id, group_input.samples)
             await self._resident_group_permits.acquire()
         except BaseException as error:
+            # These terminal inventory identities never acquire a physical owner.
+            session_ids = tuple(f"unassigned.session-{uuid.uuid4().hex}" for _ in group_input.samples)
             self._inventory.record_group(group_id, group_input.samples, session_ids, started_at=prepare_started_at_utc)
             self._inventory.preparation_failed(group_id, session_ids, error, started_at=prepare_started_at)
             raise
+        reservation: _GroupShardReservation | None = None
         try:
+            if self._session_capacity is not None and self._eager_closing:
+                raise RuntimeGroupError("Eager Runtime is closing")
+            reservation = await self._reserve_group_shard(group_id, launch_decision, len(group_input.samples))
+            if reservation is None:
+                self._resident_group_permits.release()
+                return None
+            if self._session_capacity is not None and self._eager_closing:
+                raise RuntimeGroupError("Eager Runtime is closing")
+            shard = reservation.shard
             self._start_shard_observers()
+            session_ids = tuple(f"{shard.actor_name}.session-{uuid.uuid4().hex}" for _ in group_input.samples)
+            if reservation.session_capacity is not None:
+                self._session_capacity.bind(reservation.session_capacity, session_ids)
             loop = asyncio.get_running_loop()
             session_specs = await loop.run_in_executor(
                 None,
@@ -987,10 +1044,16 @@ class RuntimeDomain:
                     include_input_payload=self.args.rollout_global_dataset,
                 ),
             )
+            if self._session_capacity is not None:
+                for spec in session_specs:
+                    spec.require_resource_release = True
+            if self._session_capacity is not None and self._eager_closing:
+                raise RuntimeGroupError("Eager Runtime is closing")
             if launch_decision is not None:
                 if not launch_decision.done():
                     launch_decision.set_result(True)
                 if not launch_decision.result():
+                    self._release_group_reservation(group_id, reservation)
                     self._resident_group_permits.release()
                     return None
             for sample_position, session_id in enumerate(session_ids):
@@ -1002,13 +1065,18 @@ class RuntimeDomain:
                 session_results=tuple(
                     _SessionResultRef(session_spec.session_id, loop.create_future()) for session_spec in session_specs
                 ),
+                eager_session_generation=self._session_capacity is not None,
             )
-            # Register before the first await so concurrent Prepare calls observe
-            # one Shard binding for this stable Group token.
+            # The reservation above already excludes duplicate pending Groups.
             if group_id in shard.group_streams:
                 raise RuntimeGroupError(f"group token is already resident: {group_id}")
         except BaseException as error:
+            if reservation is not None:
+                self._release_group_reservation(group_id, reservation)
             self._resident_group_permits.release()
+            if not session_ids:
+                # Placement failed before any routing identity or physical debit existed.
+                session_ids = tuple(f"unassigned.session-{uuid.uuid4().hex}" for _ in group_input.samples)
             self._inventory.record_group(group_id, group_input.samples, session_ids, started_at=prepare_started_at_utc)
             self._inventory.preparation_failed(group_id, session_ids, error, started_at=prepare_started_at)
             raise
@@ -1017,16 +1085,23 @@ class RuntimeDomain:
             spec.observation_stage_id = f"session:{spec.session_id}:rollout"
             spec.observation_started_at = prepare_started_at_utc
         shard.group_streams[group_id] = stream
+        if reservation.session_capacity is not None:
+            reservation.session_capacity.submitted = True
         try:
+            start_options = {}
+            if self._session_capacity is not None:
+                start_options["start_session_ids"] = tuple(
+                    sid for sid in session_ids if sid in reservation.session_capacity.allocated_ids
+                )
             registration = asyncio.ensure_future(
-                shard.handle.start_group.remote(self.rollout_mode, group_id, session_specs)
+                shard.handle.start_group.remote(self.rollout_mode, group_id, session_specs, **start_options)
             )
         except BaseException as error:
             self._inventory.preparation_failed(
                 group_id, session_ids, error, uncertain=True, started_at=prepare_started_at
             )
             await finish_before_cancellation(
-                self._release_shard_group(stream),
+                self._release_failed_registration(stream),
                 f"start-group-submit-cleanup:{group_id}",
             )
             raise
@@ -1040,7 +1115,10 @@ class RuntimeDomain:
                 self._inventory.preparation_failed(
                     group_id, session_ids, error, uncertain=True, started_at=prepare_started_at
                 )
-                await self._release_shard_group(stream)
+                await finish_before_cancellation(
+                    self._release_failed_registration(stream),
+                    f"start-group-failed-cleanup:{group_id}",
+                )
             else:
                 if isinstance(error, asyncio.CancelledError):
                     stream.stop_reason = ("prepare_cancelled", "selection", "session preparation cancelled")
@@ -1050,6 +1128,13 @@ class RuntimeDomain:
         # Registration copied every launch field into the Shard. Drop the
         # driver-side source and transport payloads before the first-IR wait.
         del group_input, session_specs, registration, session_ids
+        if stream.eager_session_generation:
+            stream.preparation_task = asyncio.create_task(
+                self._prepare_eager_stream(stream, reservation.session_capacity),
+                name=f"eager-prepare:{group_id}",
+            )
+            stream.preparation_task.add_done_callback(lambda task: self._eager_preparation_done(stream, task))
+            return stream
         try:
             ready_for_lease = await asyncio.shield(stream.first_request_barrier)
             if not ready_for_lease:
@@ -1069,10 +1154,172 @@ class RuntimeDomain:
         preparation."""
         self._inventory.record_group(group_input.group_id, group_input.samples)
 
+    async def _prepare_eager_stream(self, stream: RuntimeGroupStream, reservation: SessionReservation) -> bool:
+        await self._fill_session_capacity(stream, reservation)
+        return await asyncio.shield(stream.first_request_barrier)
+
+    def _eager_preparation_done(self, stream: RuntimeGroupStream, task: "asyncio.Task[bool]") -> None:
+        """Surface background preparation failure through the existing result
+        refs."""
+        if task.cancelled():
+            error = None if stream.closing else RuntimeGroupError("Eager preparation was cancelled without its owner")
+        else:
+            error = task.exception()
+        if error is not None:
+            reservation = self._reserved_group_shards.get(stream.group_id)
+            if reservation is not None:
+                self._session_capacity.close(reservation.session_capacity)
+            # Keep payloads already leaving the Shard owned by their take task,
+            # so group failure can still retire their trajectory observations.
+            for ref in (
+                stream.first_request_barrier,
+                *(
+                    result.completion
+                    for result in stream.session_results
+                    if result.take_task is None or result.take_task.done()
+                ),
+            ):
+                if not ref.done():
+                    ref.set_exception(error)
+        self._state_changed.set()
+        self._progress_callback()
+
+    async def _fill_session_capacity(self, stream: RuntimeGroupStream, reservation: SessionReservation) -> None:
+        """Fill the host's one partial Group before admitting another partial
+        owner."""
+        while reservation.pending_ids:
+            self._state_changed.clear()
+            if reservation.closing:
+                raise RuntimeGroupError("Group closed while waiting for Session startup credits")
+            if stream.first_request_barrier.done():
+                if stream.first_request_barrier.result():
+                    raise RuntimeGroupError("First-IR barrier crossed before all Sessions were granted")
+                return
+            for shard in self._shards:
+                if shard.observer_task is not None and shard.observer_task.done():
+                    shard.observer_task.result()
+            if self._session_capacity.available(reservation.node_id):
+                ids = self._session_capacity.grant(reservation)
+                # The debit precedes the RPC. An unknown response never refunds
+                # it; cleanup must obtain the same identity-bound receipts.
+                started = await finish_before_cancellation(
+                    stream.shard.handle.start_group_sessions.remote(stream.group_id, ids),
+                    f"start-group-sessions:{stream.group_id}",
+                )
+                if started is False:
+                    if not stream.first_request_barrier.done():
+                        stream.first_request_barrier.set_result(False)
+                    return
+                self._state_changed.set()
+            else:
+                await self._state_changed.wait()
+
+    async def _reserve_group_shard(
+        self, group_id: str, launch_decision: Optional[asyncio.Future[bool]], session_count: int = 0
+    ) -> Optional[_GroupShardReservation]:
+        """Keep one Group owner while balancing pending and resident Groups by
+        node."""
+
+        if self._session_capacity is not None:
+            if not 0 < session_count <= self._session_capacity.per_node:
+                raise RuntimeGroupError("A complete Group must fit within one host's Session capacity")
+
+        def wake_placement(_decision: asyncio.Future[bool]) -> None:
+            self._state_changed.set()
+
+        if launch_decision is not None:
+            launch_decision.add_done_callback(wake_placement)
+        try:
+            while True:
+                self._state_changed.clear()
+                if launch_decision is not None and launch_decision.done() and not launch_decision.result():
+                    return None
+                previous = self._reserved_group_shards.get(group_id)
+                if previous is not None:
+                    decision = previous.launch_decision
+                    if (
+                        decision is None
+                        or not decision.done()
+                        or decision.cancelled()
+                        or decision.result() is not False
+                        or group_id in previous.shard.group_streams
+                    ):
+                        raise RuntimeGroupError(f"group token is already resident: {group_id}")
+                    # close_step can requeue a declined Prepare while its specs
+                    # executor is still running. Join that exact predecessor.
+                    await previous.released.wait()
+                    continue
+                candidates = self._shards
+                if self._session_capacity is not None:
+                    candidates = [shard for shard in self._shards if self._session_capacity.can_reserve(shard.node_id)]
+                if candidates:
+                    break
+                for shard in self._shards:
+                    if shard.observer_task is not None and shard.observer_task.done():
+                        shard.observer_task.result()
+                # Recheck both the launch decision and the Group owner after
+                # every wake: a declined Prepare may be requeued across steps.
+                await self._state_changed.wait()
+        finally:
+            if launch_decision is not None:
+                launch_decision.remove_done_callback(wake_placement)
+        node_load: Dict[str, int] = {}
+        shard_load: Dict[str, int] = {}
+        for previous in self._reserved_group_shards.values():
+            shard = previous.shard
+            node_load[shard.node_id] = node_load.get(shard.node_id, 0) + 1
+            shard_load[shard.actor_name] = shard_load.get(shard.actor_name, 0) + 1
+        shard = min(
+            candidates,
+            key=lambda item: (
+                self._session_capacity.used[item.node_id]
+                if self._session_capacity is not None
+                else node_load.get(item.node_id, 0),
+                shard_load.get(item.actor_name, 0),
+            ),
+        )
+        reservation = _GroupShardReservation(shard, launch_decision)
+        if self._session_capacity is not None:
+            reservation.session_capacity = self._session_capacity.reserve(group_id, shard.node_id, session_count)
+        self._reserved_group_shards[group_id] = reservation
+        return reservation
+
+    def _release_group_reservation(self, group_id: str, reservation: _GroupShardReservation) -> None:
+        if self._reserved_group_shards.get(group_id) is reservation:
+            if reservation.session_capacity is not None:
+                self._session_capacity.retire(reservation.session_capacity)
+            self._reserved_group_shards.pop(group_id)
+            reservation.released.set()
+            self._state_changed.set()
+
+    def _confirm_session_resources(self, stream: RuntimeGroupStream, session_ids: Tuple[str, ...]) -> None:
+        if self._session_capacity is None:
+            return
+        reservation = self._reserved_group_shards.get(stream.group_id)
+        if reservation is None or reservation.shard is not stream.shard:
+            raise RuntimeGroupError("Resource receipt owner differs from the Group reservation")
+        self._session_capacity.confirm(reservation.session_capacity, session_ids)
+        self._state_changed.set()
+
+    def session_capacity_snapshot(self) -> dict[str, Any] | None:
+        return self._session_capacity.snapshot() if self._session_capacity is not None else None
+
     async def lease_group(self, stream: RuntimeGroupStream, rollout_id: int) -> None:
         """Move one prepared group into Runtime and release its IR gate."""
 
         try:
+            if stream.eager_session_generation:
+                if (
+                    rollout_id != self._rollout_epoch
+                    or stream.closing
+                    or self._eager_closing
+                    or not self._eager_generation_open
+                ):
+                    raise RuntimeGroupError("Eager lease requires its live rollout epoch")
+                if stream.preparation_task is not None and stream.preparation_task.done():
+                    if not stream.preparation_task.result():
+                        return  # Controlled drop is collected through its original None result.
+            stream.lease_submitted = True
             await stream.shard.handle.lease_group.remote(stream.group_id, rollout_id)
         except BaseException:
             await finish_before_cancellation(
@@ -1084,11 +1331,23 @@ class RuntimeDomain:
     async def resume_generation(self, rollout_id: int) -> None:
         """Release the partial-resume gate for the same requests."""
 
+        if self._session_capacity is not None and (
+            self._eager_closing
+            or self._eager_generation_open
+            or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
+        ):
+            raise RuntimeGroupError("Eager generation must open a new paused rollout")
+        if self._session_capacity is not None and not (
+            getattr(self.args, "partial_rollout", False) or getattr(self.args, "fully_async", False)
+        ):
+            self._assert_epoch_drained(allow_prepared=getattr(self.args, "agentic_prelaunch", False))
         self._start_shard_observers()
         revisions = await asyncio.gather(
             *(shard.handle.resume_generation.remote(rollout_id) for shard in self._shards)
         )
         await self._wait_for_shard_revisions(revisions)
+        self._rollout_epoch = rollout_id
+        self._eager_generation_open = self._session_capacity is not None
 
     async def pause_generation(self) -> None:
         """Seal train IR admission, abort active attempts, and join
@@ -1098,6 +1357,31 @@ class RuntimeDomain:
         revisions = await asyncio.gather(*(shard.handle.pause_generation.remote() for shard in self._shards))
         await self._wait_for_shard_revisions(revisions)
         await self._wait_for_no_protected_groups()
+        self._eager_generation_open = False
+
+    def _assert_epoch_drained(self, *, allow_prepared: bool = False) -> None:
+        if allow_prepared:
+            # A never-leased Prepare cannot have generated with the old
+            # weights. Failed cleanup is not eligible for this exemption.
+            for shard in self._shards:
+                for stream in shard.group_streams.values():
+                    task = stream.preparation_task
+                    if (
+                        stream.lease_submitted
+                        or stream.closing
+                        or stream.error is not None
+                        or (task is not None and task.done() and (task.cancelled() or task.exception() is not None))
+                    ):
+                        raise RuntimeGroupError("Synchronous eager cannot retain a Runtime or failed Prepare owner")
+            if any(
+                reservation.session_capacity is not None and reservation.session_capacity.closing
+                for reservation in self._reserved_group_shards.values()
+            ):
+                raise RuntimeGroupError("Synchronous eager cannot retain task resources awaiting cleanup")
+            return
+        capacity = self.session_capacity_snapshot()
+        if self.resident_group_count or self._reserved_group_shards or (capacity and capacity["outstanding"]):
+            raise RuntimeGroupError("Synchronous eager cannot change weights with resident task resources")
 
     def _start_shard_observers(self) -> None:
         """Start the sole progress observer for each Ray Shard."""
@@ -1153,13 +1437,34 @@ class RuntimeDomain:
             stream = shard.group_streams.get(group_progress.group_id)
             if stream is None:
                 continue
-            # The step close predicate reads interrupted Group IDs as Fully-async credit.
+            self._confirm_session_resources(stream, getattr(group_progress, "resource_released_session_ids", ()))
+            # Preserve the real protection/resource state even when cleanup
+            # fails; an error is not an interruption or release receipt.
             stream.interrupted = group_progress.interrupted
             stream.protected = group_progress.protected
+            error = getattr(group_progress, "error", None)
+            if error is not None:
+                stream.error = error
+                for ref in (
+                    stream.first_request_barrier,
+                    *(
+                        result.completion
+                        for result in stream.session_results
+                        if result.take_task is None or result.take_task.done()
+                    ),
+                ):
+                    if not ref.done():
+                        ref.set_exception(error)
+                continue
             if stream.dropping:
                 continue
             # RuntimeDomain.prepare_group() owns the first-IR readiness waiter.
-            if group_progress.ready_for_lease and not stream.first_request_barrier.done():
+            ready = (
+                group_progress.all_first_ir_arrived
+                if stream.eager_session_generation
+                else group_progress.ready_for_lease
+            )
+            if ready and not stream.first_request_barrier.done():
                 stream.first_request_barrier.set_result(True)
             # Group execution and ordinary RM await these terminal Session refs.
             results = []
@@ -1186,6 +1491,10 @@ class RuntimeDomain:
 
         self._start_shard_observers()
         while any(stream.protected for shard in self._shards for stream in shard.group_streams.values()):
+            for shard in self._shards:
+                for stream in shard.group_streams.values():
+                    if stream.error is not None:
+                        raise stream.error
             self._state_changed.clear()
             if not any(stream.protected for shard in self._shards for stream in shard.group_streams.values()):
                 break
@@ -1254,8 +1563,14 @@ class RuntimeDomain:
                 outcomes = [session_export_ref.result() for session_export_ref in done]
                 if any(outcome is None for outcome in outcomes):
                     logger.info(format_agentic_status("Dropped 1 group"))
+                    if stream.eager_session_generation:
+                        await self.drop_group(stream)
                     return None
 
+            if stream.preparation_task is not None:
+                if not await asyncio.shield(stream.preparation_task):
+                    await self.drop_group(stream)
+                    return None
             await stream.shard.handle.release_group.remote(stream.group_id)
             group = GroupExport(
                 group_id=stream.group_id,
@@ -1275,6 +1590,59 @@ class RuntimeDomain:
     async def drop_group(self, stream: RuntimeGroupStream) -> None:
         """Release Prepare, Runtime, and runner state with one group RPC."""
 
+        if stream.eager_session_generation:
+            if stream.shard.group_streams.get(stream.group_id) is not stream:
+                return
+            if stream.drop_task is None or (
+                stream.drop_task.done() and (stream.drop_task.cancelled() or stream.drop_task.exception() is not None)
+            ):
+                # A failed RPC may have committed cleanup remotely. Retry only
+                # this retained owner, using the Shard's exact receipt replay.
+                stream.closing = True
+                # Cancel the waiting owner before waking its capacity Event.
+                # Completed preparation failures still propagate unchanged.
+                task = stream.preparation_task
+                if task is not None and not task.done():
+                    task.cancel()
+                self._session_capacity.close(self._reserved_group_shards[stream.group_id].session_capacity)
+                self._state_changed.set()
+                stream.drop_task = asyncio.create_task(
+                    self._drop_eager_stream(stream), name=f"eager-drop:{stream.group_id}"
+                )
+            await finish_before_cancellation(stream.drop_task, f"eager-drop:{stream.group_id}")
+            return
+        await self._drop_group_once(stream)
+
+    async def _drop_eager_stream(self, stream: RuntimeGroupStream) -> None:
+        stream.dropping = True
+        take_tasks = {result.take_task for result in stream.session_results if result.take_task is not None}
+        if take_tasks:
+            await asyncio.gather(*take_tasks, return_exceptions=True)
+        if stream.shard.group_streams.get(stream.group_id) is not stream:
+            return
+        task = stream.preparation_task
+        # Start remote closing before joining an in-flight grant RPC. Both
+        # owners must settle before any local ref or physical debit is retired.
+        remote = asyncio.ensure_future(
+            stream.shard.handle.drop_group.remote(
+                stream.group_id,
+                reason=stream.stop_reason,
+                expected_session_ids=tuple(result.session_id for result in stream.session_results),
+            )
+        )
+        outcomes = await asyncio.gather(*(t for t in (task, remote) if t is not None), return_exceptions=True)
+        receipt = outcomes[-1]
+        if isinstance(receipt, BaseException):
+            raise receipt
+        self._confirm_session_resources(stream, receipt or ())
+        if not stream.first_request_barrier.done():
+            stream.first_request_barrier.set_result(False)
+        for result in stream.session_results:
+            if not result.completion.done():
+                result.completion.set_result(None)
+        await self._release_shard_group(stream)
+
+    async def _drop_group_once(self, stream: RuntimeGroupStream) -> None:
         if stream.shard.group_streams.get(stream.group_id) is not stream:
             return
         await finish_before_cancellation(self._drop_group_and_release(stream), f"runtime-drop:{stream.group_id}")
@@ -1287,7 +1655,15 @@ class RuntimeDomain:
         take_tasks = {result.take_task for result in stream.session_results if result.take_task is not None}
         if take_tasks:
             await asyncio.gather(*take_tasks, return_exceptions=True)
-        await stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason)
+        if stream.shard.group_streams.get(stream.group_id) is not stream:
+            return
+        await stream.shard.handle.drop_group.remote(
+            stream.group_id,
+            reason=stream.stop_reason,
+            expected_session_ids=tuple(result.session_id for result in stream.session_results),
+        )
+        if stream.shard.group_streams.get(stream.group_id) is not stream:
+            return  # Another joined drop already retired this exact stream.
         if not stream.first_request_barrier.done():
             stream.first_request_barrier.set_result(False)
         for result in stream.session_results:
@@ -1308,6 +1684,7 @@ class RuntimeDomain:
 
         shard_snapshots = tuple(await asyncio.gather(*(shard.handle.debug_state.remote() for shard in self._shards)))
         return {
+            "session_capacity": self.session_capacity_snapshot(),
             "shards": shard_snapshots,
             "group_count": sum(snapshot["group_count"] for snapshot in shard_snapshots),
             "session_count": sum(snapshot["session_count"] for snapshot in shard_snapshots),
@@ -1352,36 +1729,90 @@ class RuntimeDomain:
     async def _shutdown_runtime(self) -> None:
 
         first_error: Optional[BaseException] = None
+        if self._session_capacity is not None:
+            self._eager_closing = True
+            streams = tuple(stream for shard in self._shards for stream in shard.group_streams.values())
+            for stream in streams:
+                if stream.stop_reason is None:
+                    stream.stop_reason = ("shutdown", "selection", "runtime shut down")
+            outcomes = await asyncio.gather(*(self.drop_group(stream) for stream in streams), return_exceptions=True)
+            first_error = next((outcome for outcome in outcomes if isinstance(outcome, BaseException)), None)
+            for reservation in self._reserved_group_shards.values():
+                self._session_capacity.close(reservation.session_capacity)
+            self._state_changed.set()
         try:
             await self._stop_shard_observers()
         except BaseException as error:
-            first_error = error
+            if first_error is None:
+                first_error = error
 
         streams = tuple(stream for shard in self._shards for stream in shard.group_streams.values())
         for stream in streams:
             if stream.stop_reason is None:
                 stream.stop_reason = ("shutdown", "selection", "runtime shut down")
         drop_outcomes = await asyncio.gather(
-            *(stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason) for stream in streams),
+            *(
+                stream.shard.handle.drop_group.remote(
+                    stream.group_id,
+                    reason=stream.stop_reason,
+                    expected_session_ids=tuple(result.session_id for result in stream.session_results),
+                )
+                for stream in streams
+            ),
             return_exceptions=True,
         )
         for outcome in drop_outcomes:
             if first_error is None and isinstance(outcome, BaseException):
                 first_error = outcome
-        for stream in streams:
-            await self._release_shard_group(stream)
+        for stream, receipt in zip(streams, drop_outcomes, strict=True):
+            try:
+                if stream.shard.group_streams.get(stream.group_id) is not stream:
+                    continue
+                if not isinstance(receipt, BaseException):
+                    self._confirm_session_resources(stream, receipt or ())
+                await self._release_shard_group(stream)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
 
         await self.trim_memory()
 
         # Shards belong to the Serve deployment lifecycle. Runtime releases its
         # borrowed handles after every owned Group has completed cleanup.
+        capacity = self.session_capacity_snapshot()
+        if capacity is not None and capacity["outstanding"]:
+            raise RuntimeGroupError(f"Runtime shutdown has unconfirmed task resources: {capacity}") from first_error
         self._shards.clear()
         if first_error is not None:
             raise first_error
+        logger.info("Agentic runtime shutdown complete: session_capacity=%s", capacity)
+
+    async def _release_failed_registration(self, stream: RuntimeGroupStream) -> None:
+        """A failed RPC alone is not evidence that no Session was started."""
+        if self._session_capacity is not None:
+            receipt_wait = asyncio.ensure_future(
+                stream.shard.handle.get_resource_release_receipt.remote(stream.group_id)
+            )
+            try:
+                done, _ = await asyncio.wait((receipt_wait,), timeout=_REGISTRATION_RECEIPT_TIMEOUT_S)
+                if not done:
+                    raise RuntimeGroupError(f"Session resource receipt query timed out for {stream.group_id}")
+                self._confirm_session_resources(stream, receipt_wait.result())
+            finally:
+                if not receipt_wait.done():
+                    # Cancel only the local read-only RPC wait, never its resource owner.
+                    receipt_wait.cancel()
+                    receipt_wait.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+        await self._release_shard_group(stream)
 
     async def _release_shard_group(self, stream: RuntimeGroupStream) -> None:
         """Release driver refs after Shard export/drop commits."""
 
+        stream.closing = True
+        if stream.preparation_task is not None:
+            if not stream.preparation_task.done():
+                raise RuntimeGroupError("Cannot retire an unsettled eager preparation owner")
+            await asyncio.gather(stream.preparation_task, return_exceptions=True)
         take_tasks = {result.take_task for result in stream.session_results if result.take_task is not None}
         for task in take_tasks:
             if not task.done():
@@ -1399,20 +1830,34 @@ class RuntimeDomain:
         # Remote cleanup can commit before cancellation reaches this driver ref.
         group_id = stream.group_id
         if stream.shard.group_streams.get(group_id) is stream:
+            # Retain the stream and permit if physical release is unknown, so
+            # shutdown can retry its exact owner and cannot silently succeed.
+            self._release_group_reservation(group_id, self._reserved_group_shards[group_id])
             stream.shard.group_streams.pop(group_id)
             self._resident_group_permits.release()
             self._state_changed.set()
+            if self._session_capacity is not None:
+                await stream.shard.handle.forget_resource_receipt.remote(group_id)
 
     async def _drop_prepared_group(self, stream: RuntimeGroupStream, task_name: str) -> None:
         """Drop a registered Prepare group and release its local stream."""
 
         if stream.shard.group_streams.get(stream.group_id) is not stream:
             return
+        if self._session_capacity is not None:
+            self._session_capacity.close(self._reserved_group_shards[stream.group_id].session_capacity)
+            self._state_changed.set()
         try:
-            await finish_before_cancellation(
-                stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason),
+            receipt = await finish_before_cancellation(
+                stream.shard.handle.drop_group.remote(
+                    stream.group_id,
+                    reason=stream.stop_reason,
+                    expected_session_ids=tuple(result.session_id for result in stream.session_results),
+                ),
                 task_name,
             )
+            if stream.shard.group_streams.get(stream.group_id) is stream:
+                self._confirm_session_resources(stream, receipt or ())
         finally:
             await self._release_shard_group(stream)
 

@@ -189,6 +189,7 @@ class DeviceDirectBackend(CommBackend):
         self._pending_recvs: Dict[str, asyncio.Future] = {}
         self._model_update_groups = None
         self._model_update_groups_for_actor_fwd_ref = None
+        self._skip_empty_actor_fwd_ref_sync = False
 
         # World size for process group initialization
         self.world_size: Optional[int] = None
@@ -640,6 +641,10 @@ class DeviceDirectBackend(CommBackend):
         world_size = topology_data.get("world_size", 1)
 
         if self.role_info.role_name == "actor":
+            # A source-only topology has no actor_fwd/reference recipients.
+            self._skip_empty_actor_fwd_ref_sync = topology_data.get("world_size") == 1
+            if self._skip_empty_actor_fwd_ref_sync:
+                return
             # Actor side: PP source rank (rank 0) manages connection for this PP stage
 
             if self._is_pp_src_rank:
@@ -818,7 +823,7 @@ class DeviceDirectBackend(CommBackend):
         else:
             self._run_expert_pass(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, pbar=pbar)
         dist.barrier(group=get_gloo_group())
-        if not rollout_only:
+        if not rollout_only and not self._skip_empty_actor_fwd_ref_sync:
             if dist.get_rank() == 0:
                 payload = {
                     "names": [
@@ -1238,6 +1243,10 @@ class DeviceDirectBackend(CommBackend):
         receiving nodes can allocate buffers, then weights are broadcast using
         the process group set up for actor_fwd reception.
         """
+        if self._skip_empty_actor_fwd_ref_sync:
+            return
+        if self._model_update_groups_for_actor_fwd_ref is None:
+            raise RuntimeError("Actor_fwd/reference weight-update group is not initialized")
         # Prepare metadata for weight transfer
         pp_rank = self._megatron.mpu.get_pipeline_model_parallel_rank()
         group_name = f"update_actor_pp_{pp_rank}"

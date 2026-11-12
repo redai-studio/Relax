@@ -2,7 +2,8 @@
 
 Load this reference when prelaunch, partial rollout, or fully async is enabled.
 
-Partial rollout and fully async are mutually exclusive. Apply the sections for the selected mode.
+Use the lifecycle for the selected training mode. Fully async already retains unfinished work and does not require
+`--partial-rollout`; do not combine its partition debt rules with the dynamic-GBS close path.
 
 ## Partial rollout transition
 
@@ -26,6 +27,17 @@ process timer continues; timeout still terminates the agent process. Step close 
 finalize both before and after the Shard pause transition. Process timeout does not bound every backend or finalization
 RPC.
 
+## Physical Session capacity across steps
+
+When `--agentic-session-capacity-per-node` is set, a step transition keeps the same reservation, Session IDs, release
+nonce, pending starts, and unconfirmed debits. Pausing generation or collecting enough training samples is not physical
+release. Ready leased members can run while siblings await startup credit; completing one member can admit work from
+another Group without changing complete-Group reward/filter/export rules.
+
+Prelaunch shares the same budgets and does not open the generation gate. At a synchronous boundary, drain Runtime
+owners; only authorized prelaunch preparation may remain. A final step has no next lease for surplus prepared work,
+so cleanup must also drop completed Prepare tasks that were never leased. Cleanup timeout retains ownership for retry.
+
 ## Timeout boundary
 
 One call made by the agent application's Relax-facing Chat Completions, Responses, or Messages client remains the same
@@ -46,11 +58,12 @@ no read/overall deadline and retain explicit cancellation and the agent process 
 
 Fully async may close a step with physical debt only when resident Groups provide interrupted credit. Unfinished Groups remain resident for later steps. Final backfill closes remaining partition debt without opening a new train partition.
 
-Dynamic global batch close is a separate partial-rollout path: it pauses generation, collects a DP-aligned completed surplus, seals the partition, and waits for Transfer writes. Do not combine its accounting with fully-async backfill.
+Agentic dynamic global batch size requires `--partial-rollout` and `over_sampling_batch_size > rollout_batch_size`;
+it remains incompatible with fully async. Its close is a separate partial-rollout path: it pauses generation, collects a DP-aligned completed surplus, seals the partition, and waits for Transfer writes. Do not combine its accounting with fully-async backfill.
 
 ## Check before launch
 
-- Confirm which Sessions may survive a step boundary.
+- Confirm which Sessions, pending starts, and physical debits may survive a step boundary.
 - Confirm Eval overlap and external slots using the retained-Session capacity rule.
 - Confirm protection threshold semantics and timeout behavior.
 - Confirm the Relax-facing client timeout spans every applicable prelaunch, abort, park, resume, and fully-async hold.

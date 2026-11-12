@@ -338,6 +338,52 @@ but `exec` is not required. Pass application settings with `--agent-env`:
 --agent-env FOO=bar BAZ=qux
 ```
 
+### Resource Ownership and Release
+
+`--agent-resource-owner-path` declares which resources a Session owns. The default,
+`relax.agentic.runner.resources.ProcessGroupResourceOwner`, covers the launcher's local process group. It requires no
+application receipt. Containers, remote jobs, or descendants that detach from that process group need an external
+resource contract:
+
+```bash
+--agent-resource-owner-path relax.agentic.runner.resources.ReceiptResourceOwner
+```
+
+The adapter must cancel or finish remote work, wait for its processes and containers to stop, then publish a release
+receipt and exit. Use the same cleanup path on success, task failure, and cancellation. Sending a cancel request,
+writing `RELAX_OUTPUT_JSON`, or losing the server connection does not prove release. A failed task can still confirm
+resource release without changing its reward or Group replacement behavior.
+
+Relax supplies `RELAX_REQUIRE_RESOURCE_RELEASE`, `RELAX_RESOURCE_RELEASE_PATH`, and `RELAX_RESOURCE_RELEASE_NONCE`.
+Call the following helper only after the adapter has confirmed that its external resources are gone. The payload must
+match the current Session and nonce; replace the receipt atomically rather than exposing a partial JSON file.
+
+```python
+import json
+import os
+from pathlib import Path
+
+
+def write_release_receipt() -> None:
+    if os.environ.get("RELAX_REQUIRE_RESOURCE_RELEASE") != "1":
+        return
+    path = Path(os.environ["RELAX_RESOURCE_RELEASE_PATH"])
+    pending = path.with_name(path.name + ".tmp")
+    pending.write_text(json.dumps({
+        "schema": 1,
+        "session_id": os.environ["RELAX_SESSION_ID"],
+        "nonce": os.environ["RELAX_RESOURCE_RELEASE_NONCE"],
+        "status": "released",
+    }), encoding="utf-8")
+    pending.replace(path)
+```
+
+Relax returns a physical slot only after local process-group cleanup and a matching owner confirmation. Missing,
+invalid, or stale receipts leave the slot occupied while cleanup is retried. A custom class can subclass
+`SessionResourceOwner` in `relax/agentic/runner/resources.py`; its confirmation hook must be an idempotent, bounded local
+check. Remote cancellation belongs in the agent adapter, not in that hook. Mini SWE's `agent_client.py`,
+`agent_server.py`, and `session_process.py` show this separation for a supervised sandbox.
+
 ### Launch Training
 
 Add these options to a working Relax training command:
@@ -348,7 +394,32 @@ Add these options to a working Relax training command:
 --agent-command "bash run_agent_app.sh"
 ```
 
-Use a recipe under `examples/` for model, data, parallelism, and algorithm settings.
+### Build a Recipe
+
+Start from a working recipe with the same model and training mode. `examples/search_r1/run_search_r1.sh` is a local
+tool-agent example; `examples/deepeyes_agentic/run_deepeyes_agentic.sh` adds images;
+`examples/mini_swe_agent/run_mini_swe_agent_pd_blackwell.sh` uses an external sandbox service with fully async 4-GPU
+training and 4-GPU PD + HiCache rollout. Hardware settings in an example are recipe choices, not framework defaults.
+
+1. Map the task dataset with `--prompt-data`, `--input-key`, `--metadata-key`, and, when needed, `--multimodal-keys`.
+   Let the adapter read `RELAX_INPUT_JSON`; keep environment servers and retrievers outside the per-Session command.
+2. Add an agent entry point that reads the injected endpoint and Session credential, preserves the existing tool loop,
+   and sends complete histories. Configure reasoning/tool parsers for the actual model and allow model requests to
+   survive the selected cross-step waits. The command, working directory, and dependencies must exist on every node
+   that can host a SessionShard.
+3. Choose the output contract: a linear trajectory can write `reward`/metadata or use `--custom-rm-path`; selected
+   branches and multi-context training need explicit exports and the applicable custom-advantage configuration below.
+4. Select a resource owner, then configure logical Group concurrency and physical Session capacity separately using
+   [Configure Runtime Behavior](#configure-runtime-behavior). `--use-agentic-rollout` selects Agentic generation for
+   both train and Eval; a configured `--custom-generate-function-path` is ignored on this path.
+5. Run a complete Group through model calls, tools, reward, export, and cleanup before scaling up. Then check a real
+   optimizer update and the configured pause/resume or prelaunch lifecycle; a single successful model call proves only
+   API connectivity.
+
+For a single-node run, check whether local Ray is running; if it is not, use a recipe that sources
+`scripts/entrypoint/local.sh` and run it with Bash. Use `scripts/entrypoint/ray-job.sh` when submitting to an existing
+cluster. Keep model/data paths and deployment settings in the recipe; no custom rollout loop is needed for this adapter
+path.
 
 ### Verify the First Rollout
 
@@ -523,58 +594,102 @@ advantage.
 
 ## Configure Runtime Behavior
 
-::: danger Required external-agent capacity
-When agents run on a centralized remote platform with a hard concurrency limit, calculate the train limit and each Eval
-dataset's limit:
+### Group Concurrency and Physical Session Capacity
+
+A Session is one complete agent task trajectory, including its model turns, tools, tests, and owned container lifetime.
+These parameters control different objects:
+
+| Parameter | Controls | Default |
+| --- | --- | --- |
+| `--agentic-concurrency` | Logical training Groups resident across Prepare and Runtime | `--over-sampling-batch-size`, which defaults to `--rollout-batch-size` |
+| `--n-samples-per-prompt` | Sessions sampled for each Group | `1`; recipes commonly override it |
+| `--agentic-session-capacity-per-node` | Physical training Session slots reserved or started and not yet confirmed released on each host | Unset: disabled |
+
+Setting the physical capacity also enables scheduling individual Group members. For example:
+
+```bash
+--agentic-concurrency 32 \
+--n-samples-per-prompt 8 \
+--agentic-session-capacity-per-node 128
+```
+
+On one 8-GPU host, this permits up to 32 × 8 = 256 logical members but at most 128 occupied Session slots across that
+host, not 128 per GPU. The remaining members wait for slots. Shards on the same host share the budget within this
+training pipeline; separate jobs and Eval do not share this ledger.
+
+1. A member returns its slot as soon as its owned resources are confirmed released, without waiting for its siblings.
+2. If five slots are free, the next eight-member Group can start five members and start the remaining three later.
+3. Once leased to Runtime, ready members can generate and execute tools before all members reach their first request.
+   Reward behavior is unchanged; results are still collected, filtered, and exported as complete Groups.
+
+The limit concerns agent task resources. A Session running tools or tests may have no active generation request, and a
+Session can issue concurrent requests. A capacity of 128 is neither 128 concurrent decode requests nor a promise to
+fill GPU memory. It is independent of SGLang request permits, token packing, and KV admission.
+
+Omit `--agentic-session-capacity-per-node` to disable it; `0` is invalid. The value must fit at least one complete Group
+(`capacity >= n_samples_per_prompt`). There is no automatic hardware-based capacity selection. Choose it from measured
+host memory, CPU, process/container costs, and available executor slots. The Mini SWE PD scripts enable it using their
+Agent Server training capacity; other recipes must opt in and select the appropriate resource owner.
+
+For a same-capacity comparison on one host with eight members per Group and 128 external slots, the ordinary
+Group-barrier path normally uses `--agentic-concurrency 16` and omits the capacity flag. Keep the executor limit, GPU
+budget, model, and other settings fixed; keeping 32 ordinary Groups would allow 256 members to compete for 128 slots.
+
+### Cross-Step Modes
+
+| Mode | Behavior with Session capacity enabled |
+| --- | --- |
+| Synchronous rollout | Return confirmed member slots early; drain Runtime-owned work before a weight boundary |
+| `--agentic-prelaunch` | Prepare next-step members within the same budgets; generation still waits for a Runtime lease |
+| `--partial-rollout` | Retain Session identity, interrupted requests, and unreleased slots across pause/resume |
+| `--fully-async` | Retain unfinished Groups and their resource accounting; preserve partition debt and whole-Group replenishment |
+| `--use-dynamic-global-batch-size` | Requires partial rollout and `over_sampling_batch_size > rollout_batch_size`; fully async is not supported |
+
+Capacity does not relax existing algorithm or mode constraints. Fully async has its own retention/backfill lifecycle
+and does not require enabling `--partial-rollout`. Dynamic global batch size is distinct from token packing with
+`--use-dynamic-batch-size` and `--max-tokens-per-gpu`.
+
+`--agent-timeout` limits a Session's Runtime active time. Prelaunch waits and normal cross-step pauses do not consume
+that budget; protected Sessions keep running. The model client's wall-clock timeout still runs during these waits.
+Resource cleanup has its own completion requirement: changing steps or reaching the sample target does not release a
+slot without confirmation.
+
+### External Executors and Eval
+
+For a capacity-limited remote service, calculate both logical demand and the physical training bound. Let `M` be the
+number of distinct hosts that actually run training SessionShards, not the GPU count:
 
 ```text
-T = agentic_concurrency * n_samples_per_prompt
+L = agentic_concurrency * n_samples_per_prompt
+H = agentic_session_capacity_per_node, when set
+T = L if H is unset, otherwise min(L, M * H)
 G_d = dataset d's n_samples_per_eval_prompt
-C_d = explicit agentic_eval_concurrency or ceil(T / G_d)
+C_d = explicit agentic_eval_concurrency or ceil(L / G_d)
 E_d = C_d * G_d
 E_peak = max(E_d across Eval datasets)
 ```
 
-Eval datasets run serially, so their combined peak is `E_peak`, not the sum of all `E_d` values.
+Eval keeps its ordinary Group lifecycle. Its default derives from `L`, not the smaller physical bound `T` or `H`;
+set `--agentic-eval-concurrency` explicitly when necessary. Ordinary RM uses singleton Runtime Groups internally;
+Group RM retains the sampled Group size. Both have the same `E_d` Session ceiling. Eval datasets run serially.
 
-When `--agentic-prelaunch`, `--partial-rollout`, or `--fully-async` is enabled, select **Yes** in the
-**Train sessions remain resident during Eval** column. Prelaunch shares the training resident capacity, so the train limit
-stays `T`; it makes `T` overlap with `E_peak`.
+For one shared external executor, provision its available capacity as follows:
 
-Then use the matching row for an executor shared by train and Eval:
-
-| Eval enabled | Train sessions remain resident during Eval | Required slots |
+| Eval enabled | Training Sessions remain resident during Eval | Required slots |
 | --- | --- | --- |
 | No | — | `external_slots >= T` |
 | Yes | No | `external_slots >= max(T, E_peak)` |
 | Yes | Yes | `external_slots >= T + E_peak` |
 
-Fewer slots can deadlock Group startup at the all-session first-request barrier. Check this table before starting a run.
-:::
+Prelaunch, partial rollout, or fully async can retain train resources during Eval; budget for the overlapping row.
+Dedicated pools instead need `train_slots >= T` and `eval_slots >= E_peak`. For a per-host executor, also check each
+host's quota. The Relax limit does not discover or reserve a remote platform's slots, or coordinate other jobs.
 
-| Goal | Option | Behavior |
-| --- | --- | --- |
-| Limit resident training Groups | `--agentic-concurrency` | Shared capacity for Prepare and Runtime |
-| Set resident Eval Groups | `--agentic-eval-concurrency` | Logical Eval prompt-Group capacity derived from training capacity when unset |
-| Start agents early | `--agentic-prelaunch` | Starts processes while resident capacity is free |
-| Reuse unfinished samples | `--partial-rollout` | Aborts and resumes backend attempts across steps |
-| Run asynchronous rollout and training | `--fully-async` | Keeps unfinished sessions while partitions advance |
-| Limit partial aborts | `--partial-rollout-max-aborted-count` | Protects a repeatedly aborted attempt |
-| Stop an agent that runs too long | `--agent-timeout` | Terminates the agent process when its Runtime active-time budget expires |
+Without member scheduling, an undersized executor can spread slots across incomplete Groups so none passes the
+all-member first-request barrier. This still matters for Group-RM Eval. Do not treat a remote queue as a substitute
+for the capacity and release contract.
 
-`--agent-timeout` starts after a Session enters Runtime. It stops an agent that remains active for too long, for example
-because its loop or a tool call is stuck. A prelaunched Session waiting for Runtime does not consume this budget. The
-budget also pauses when partial rollout or fully async pauses a Session between steps.
-
-`--agentic-concurrency` defaults to `--over-sampling-batch-size`, which defaults to `--rollout-batch-size`.
-`--agentic-eval-concurrency` is derived separately for each Eval dataset from `T` and that dataset's Group size when
-unset. Both options count logical prompt Groups. Dataset `d` owns `E_d` sessions with either ordinary RM or Group RM;
-ordinary RM uses singleton Runtime Groups internally without changing that total. Eval datasets run serially, so with
-dedicated train and Eval executors, provision `T` and `E_peak` separately.
-
-Start retrievers, environment servers, and other cross-session services outside the per-session agent command.
-
-Session KV lifecycle and program-aware admission are optional controls for long-running workloads. See
+Session KV lifecycle and program-aware admission address different resources. See
 [Agentic KV Scheduling](./agentic-kv-scheduling.md).
 
 ## Understand How Agentic Rollout Works
@@ -667,7 +782,9 @@ aligned rollout logprobs. An exported lineage must contain at least one committe
 #### Resident Capacity
 
 Prepare and Runtime share the resident Group capacity. Reward work is outside this capacity. A completed or dropped
-Runtime Group frees a slot. A filtered Group creates new demand.
+Runtime Group frees a logical Group slot. A filtered Group creates new demand. With physical Session capacity enabled,
+confirmed member releases can free physical slots earlier while the Group remains resident. Tests or reward work run
+inside the agent still occupy its Session until cleanup; they are distinct from the pipeline's Reward stage.
 
 ![Shared resident capacity and prelaunch](/agentic/resident_capacity.svg)
 
@@ -697,6 +814,11 @@ radix-cache entries when a session ends. See [Agentic KV Scheduling](./agentic-k
 ## Operations and Troubleshooting
 
 ### Metrics and Dumps
+
+With Session capacity enabled, `session_capacity/outstanding`, `session_capacity/peak`, and
+`session_capacity/confirmed_releases` report current occupied slots, historical peak occupancy, and cumulative confirmed
+returns for the pipeline.
+Outstanding slots can be expected during cross-step retention; final shutdown must confirm their release.
 
 Set `--save-debug-rollout-data <path-with-{rollout_id}>` to save complete metadata, SessionForest state hashes, terminal
 status, turn count, request timing, abort count, and weight-version information.
@@ -932,7 +1054,10 @@ the current design.
 
 - **The agent does not start or exits with an error:** check `--agent-cwd` and `--agent-command`, then inspect `run.log`.
   Relax adds a bounded tail of the agent's stdout and stderr to `AgentExecutionError`.
-- **The first request waits:** it is held until the Group receives a Runtime lease. Use a long client timeout.
+- **The first request waits:** check the Runtime lease, generation pause, and available physical slots. Without Session
+  capacity, also check the all-member first-request barrier. Use a client timeout that covers these waits.
+- **Capacity stays occupied after a task ends:** inspect process/container cleanup and the Session/nonce in its release
+  receipt. A completed task or timed-out RPC does not by itself release a physical slot.
 - **Explicit export does not match:** preserve the exact normalized `messages`, `tools`, and `chat_template_kwargs` used
   during generation.
 - **Implicit export is ambiguous:** write named explicit records for the contexts selected for training.
