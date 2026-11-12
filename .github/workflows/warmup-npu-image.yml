@@ -1,0 +1,37 @@
+name: Warm 910C test image
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  warmup:
+    name: Warm 910C image
+    runs-on: [self-hosted, linux, ARM64, 910c, npu]
+    timeout-minutes: 130
+    concurrency:
+      # Serialize this pool without assuming an unverified per-host label.
+      # Test jobs still recheck their own daemon if placed on another host.
+      group: npu-image-warmup-910c
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare local test image
+        uses: ./.github/actions/prepare-image
+        timeout-minutes: 120
+        with:
+          dockerfile: docker/Dockerfile.npu
+          platform: linux/arm64
+          build-args: |
+            NO_PROXY=localhost,127.0.0.1,::1,mirrors.tuna.tsinghua.edu.cn
+            SOC_VERSION=ascend910_9362
+            SOC_VERSION_FOR_SGL_BUILD=Ascend910_9362
+          # Keep these inputs identical to the NPU test job's local cache guard.
+          hash-key: ${{ hashFiles('docker/Dockerfile.npu', '.dockerignore', 'requirements.txt', 'docker/npu_patch/**', '.github/actions/prepare-image/action.yml') }}

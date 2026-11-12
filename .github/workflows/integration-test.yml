@@ -27,16 +27,21 @@ jobs:
 
   warmup:
     needs: bypass
-    # Only the H20 jobs depend on this run's warmup; 910C remains independent.
+    # Only H20 jobs depend on this call; NPU has its own independent warmup.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     uses: ./.github/workflows/warmup-h20-image.yml
+
+  warmup-npu:
+    needs: bypass
+    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
+    uses: ./.github/workflows/warmup-npu-image.yml
 
   integration:
     needs: [bypass, warmup]
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: ${{ matrix.case }}
-    runs-on: [gpu, h20]
+    runs-on: [self-hosted, linux, x64, h20, gpu]
     # Allow 120 minutes for image preparation plus the existing 65-minute test job budget.
     timeout-minutes: 185
     strategy:
@@ -171,7 +176,7 @@ jobs:
           retention-days: 14
 
   npu-integration:
-    needs: bypass
+    needs: [bypass, warmup-npu]
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Qwen3.5-4B-4xnpu-async
@@ -183,11 +188,22 @@ jobs:
       ARTIFACT_NAME: integration-Qwen3.5-4B-4xnpu-async-${{ github.run_id }}-${{ github.run_attempt }}
       CLEARML_TAGS: branch=${{ github.head_ref || github.ref_name }},commit=${{ github.sha }}
     steps:
+      # Preserve the existing required check's failure, rather than skipping it.
+      - name: Check image warmup result
+        env:
+          WARMUP_RESULT: ${{ needs['warmup-npu'].result }}
+        run: |
+          if [[ "$WARMUP_RESULT" != success ]]; then
+            echo "::error::NPU image warmup did not succeed: $WARMUP_RESULT"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
+      # Recheck the actual test host even after its pool's warmup.
       - name: Prepare local test image
         id: image
         uses: ./.github/actions/prepare-image
