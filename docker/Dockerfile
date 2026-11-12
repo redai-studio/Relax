@@ -43,7 +43,9 @@ RUN pip install nvidia-cudnn-cu12==9.16.0.29
 FROM base as train
 
 # Build for the base Torch ABI without relying on a guessed GitHub wheel URL.
-RUN FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
+COPY docker/scripts/install_patched_fa2.sh docker/patch/flash-attention/2.7.4.post1-fixed-dq-splits.patch /tmp/
+RUN MAX_JOBS=64 sh /tmp/install_patched_fa2.sh /tmp/2.7.4.post1-fixed-dq-splits.patch && \
+    rm /tmp/install_patched_fa2.sh /tmp/2.7.4.post1-fixed-dq-splits.patch && \
     pip install --no-cache-dir flash-linear-attention==0.4.2 && \
     pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 

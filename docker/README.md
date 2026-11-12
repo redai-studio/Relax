@@ -47,6 +47,25 @@ The Blackwell targets pass `GPU_ARCH=blackwell`; the Hopper targets pass `GPU_AR
 
 > CUDA 13 provides candidate compilation configurations for Hopper and Blackwell. Full image builds and GPU runtime validation, including forward/backward checks, require separate verification. These build targets alone do not establish Blackwell support in the published `latest` image.
 
+### Packed training numerical checks
+
+The CUDA train images build the patched FlashAttention 2.7.4.post1. For a
+deterministic FA2 run, merge the following into the existing trainer environment
+to select dQ splits from each sequence's K length and use FP32 weight gradients
+in the standalone TE attention RMSNorms in BF16 training.
+
+```bash
+--train-env-vars '{"RELAX_FA2_DQ_SPLITS":"sequence","RELAX_RMSNORM_FP32_WEIGHT_GRAD":"1"}'
+```
+
+Use the same settings for both scheduling arms. Verify that the training
+attention backend selected at runtime is FA2. In `sequence` mode each sequence
+uses one split per 2,048 K tokens, rounded up and capped at five, within the
+same varlen call. A value from `1` to `32` uses that count for every sequence.
+Both settings apply to deterministic variable-length backward. Each option is
+opt-in and can be omitted independently. The FP32 weight gradient option covers the standalone
+`q_layernorm`, `k_layernorm` and `out_norm` Transformer Engine modules.
+
 ### Image Tags and Reuse
 
 Images use `<REGISTRY>/<IMAGE_REPOSITORY>:<tag>`, with these default tags:
