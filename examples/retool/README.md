@@ -61,6 +61,7 @@ export RELAX_SKIP_CLUSTER_CLEANUP=1 RAY_USAGE_STATS_ENABLED=0
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1 TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
+export RETOOL_SOURCE_COMMIT="${RETOOL_SOURCE_COMMIT:-$(git rev-parse HEAD)}"
 python3 -m examples.retool.workflow \
   --root "$ROOT" --temp "$RT" --model "$ROOT/model" \
   --sandbox-base "$SANDBOX_BASE" \
