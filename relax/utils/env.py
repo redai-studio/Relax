@@ -365,7 +365,10 @@ class Envs(metaclass=_EnvsMeta):
 
     # Overlap the Actor CPU backup with sending weights to SGLang.
     RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP = EnvProperty("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", bool, False)
-    # Debug only: compare the first Colocate expert direct update with a full native update.
+    # Experimental persistent receiver host target for Colocate remote shard writes.
+    RELAX_COLOCATE_PINNED_NIXL_TARGET = EnvProperty("RELAX_COLOCATE_PINNED_NIXL_TARGET", bool, False)
+    # Master gate for numerical audits in every shard-direct adapter, including
+    # future integrations. Schema, ownership, completion and lifetime checks remain enabled.
     RELAX_P2P_WEIGHT_CONSISTENCY_CHECK = EnvProperty("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", bool, False)
 
     # ------------- Routing Replay -------------

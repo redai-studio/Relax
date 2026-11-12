@@ -528,12 +528,12 @@ class UpdateWeightFromTensor:
         if not self.shard_p2p_requested:
             return
         layout = self._direct_expert_layout
-        local_receivers = bool(
-            self.actor_weight_retention_enabled and actor_nodes and all(actor_nodes) and len(set(actor_nodes)) == 1
-        )
         ready = bool(
-            local_receivers
+            self.actor_weight_retention_enabled
             and self._expert_ipc_receiver_support
+            and bool(actor_nodes)
+            and all(actor_nodes)
+            and (len(set(actor_nodes)) == 1 or getattr(self, "_colocate_nixl_receiver_support", False))
             and layout is not None
             and (layout.ep_size, layout.moe_dp_size) == (1, 1)
             and all(
@@ -545,8 +545,11 @@ class UpdateWeightFromTensor:
         dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=get_gloo_group())
         self._colocate_expert_ipc_enabled = bool(decision.item())
         ordinary = bool(
-            local_receivers
+            self.actor_weight_retention_enabled
             and getattr(self, "_ordinary_tp_receiver_support", False)
+            and actor_nodes
+            and all(actor_nodes)
+            and (len(set(actor_nodes)) == 1 or getattr(self, "_colocate_nixl_receiver_support", False))
             and not self.lora_enabled
             and not self.quantization_config
             and not self._route_experts
@@ -558,6 +561,8 @@ class UpdateWeightFromTensor:
         decision = torch.tensor([int(ordinary)], dtype=torch.int32, device="cpu")
         dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=get_gloo_group())
         self._colocate_tp_ipc_enabled = bool(decision.item())
+        if len(set(actor_nodes)) > 1 and self._colocate_expert_ipc_enabled:
+            self._prefetch_remote_writer_agent()
         helper = getattr(self, "_colocate_expert_ipc", None)
         if helper is not None:
 
@@ -579,8 +584,26 @@ class UpdateWeightFromTensor:
                 self._colocate_expert_ipc_enabled,
                 "none"
                 if self._colocate_expert_ipc_enabled
-                else "requires retained source weights, supported receiver and single-node PP1/CP1/ETP1 layout",
+                else "requires retained source weights, supported receiver and PP1/CP1/ETP1 layout",
             )
+
+    def _prefetch_remote_writer_agent(self) -> None:
+        """Overlap the first sender UCX agent startup with model setup."""
+        if getattr(self, "_remote_writer_agent_future", None) is not None:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        from relax.distributed.checkpoint_service.backends.shard_p2p.remote.common import create_agent
+
+        device = torch.cuda.current_device()
+
+        def initialize() -> Any:
+            torch.cuda.set_device(device)
+            return create_agent()
+
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="p2p-agent")
+        self._remote_writer_agent_pool = pool
+        self._remote_writer_agent_future = pool.submit(initialize)
 
     def _agree_expert_dispatch(self) -> None:
         """Agree on the consumer incarnation before choosing cold or warm
@@ -655,7 +678,7 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
         cold_direct = expert_ipc is not None and expert_ipc.needs_seed
-        native_seed = cold_direct and (self._colocate_tp_ipc_enabled or Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK)
+        native_seed = cold_direct and Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK
         if cold_direct and self._colocate_tp_ipc_enabled:
             expert_ipc._phase(expert_ipc.source.begin_native_seed)
 
@@ -825,15 +848,28 @@ class UpdateWeightFromTensor:
         status = [None]
         if dist.get_rank(group) == 0:
             try:
-                status[0] = (ray.get([e.get_expert_weight_sync_layout.remote() for e in self.rollout_engines]), None)
+                status[0] = (
+                    ray.get(
+                        [
+                            e.get_expert_weight_sync_layout.remote(require_nixl=len(set(actor_nodes)) > 1)
+                            for e in self.rollout_engines
+                        ]
+                    ),
+                    None,
+                )
             except Exception as error:
                 status[0] = ([], f"receiver capability query failed: {error}")
         dist.broadcast_object_list(status, src=0, group=group)
         receivers, reason = status[0]
+        if reason and self.shard_p2p_requested and len(set(actor_nodes)) > 1:
+            raise RuntimeError(f"Cross-node receiver capability is unknown: {reason}")
+        if any(receiver.get("colocate_nixl_probe_failed") for receiver in receivers):
+            raise RuntimeError("Colocate NIXL receiver probe failed after native worker dispatch")
         self._expert_ipc_receiver_support = False
         self._ordinary_tp_receiver_support = False
+        self._colocate_nixl_receiver_support = False
         if self.shard_p2p_requested:
-            from relax.backends.sglang.weight_loader import EXPERT_IPC_LOADER, TP_IPC_LOADER
+            from relax.backends.sglang.weight_loader import COLOCATE_NIXL_LOADER, EXPERT_IPC_LOADER, TP_IPC_LOADER
 
             self._expert_ipc_receiver_support = bool(receivers) and all(
                 {EXPERT_IPC_LOADER, TP_IPC_LOADER} <= set(receiver.get("custom_weight_loader") or [])
@@ -841,6 +877,11 @@ class UpdateWeightFromTensor:
             )
             self._ordinary_tp_receiver_support = self._expert_ipc_receiver_support and all(
                 receiver.get("ordinary_tp_protocol") == 1 for receiver in receivers
+            )
+            self._colocate_nixl_receiver_support = self._expert_ipc_receiver_support and all(
+                receiver.get("colocate_nixl_protocol") == 1
+                and COLOCATE_NIXL_LOADER in set(receiver.get("custom_weight_loader") or [])
+                for receiver in receivers
             )
         reason = reason or validate_sglang_weight_sync_support(
             actor_nodes, engine_nodes, counts, offsets, receivers, self.args.rollout_num_gpus_per_engine
