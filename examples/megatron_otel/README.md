@@ -50,16 +50,16 @@ recorded in `/opt/relax/megatron-otel-versions.txt`. Keep the build's Relax comm
 base image and output digest alongside this file. Build-time imports do not
 establish that GPU training works.
 
-Image builds and GPU smoke execution are performed by the operator. The default
-Dockerfile change itself has only been checked locally; no image build or GPU
-run has been accepted for this revision.
+An operator-built image from Relax `1e72874b76ec6a92a1b9f68344e096fb9cf4972b`
+completed the GPU smoke run described below. That run supplied the same runtime
+flags now used by this recipe. Image builds remain operator-owned.
 
 ## Prepare assets
 
 Run commands from the Relax checkout included in the candidate image. Provide
 an exclusive eight-GPU node and mount model/data directories into the container.
-The required GPU memory and the tested hardware will be recorded with the image
-acceptance results; this document does not claim that every eight-GPU system fits.
+The accepted run used one node with eight H20-3e 141 GB GPUs; this document does
+not claim that every eight-GPU system fits.
 
 ```bash
 export MODEL_DIR=/path/to/models
@@ -71,7 +71,7 @@ hf download --repo-type dataset zhuzilin/dapo-math-17k \
     --local-dir "${DATA_DIR}/dapo-math-17k"
 ```
 
-Existing copies can be reused. Keep all model config, tokenizer, processor and
+Existing copies can be reused and mounted read-only. Keep all model config, tokenizer, processor and
 weight files. The original checkpoint's architecture is detected through
 AutoBridge, including its vision-language wrapper when present; text-only data
 does not automatically convert a conditional-generation checkpoint into a pure
@@ -90,25 +90,36 @@ bash examples/megatron_otel/scripts/run-qwen35-35B-A3B-dapo-8xgpu-colocate.sh
 
 Direct execution uses `scripts/entrypoint/local.sh`, which cleans local
 Ray/Python training processes before starting a local Ray head. Use an exclusive
-node. To submit to an existing cluster, use its actual Ray Jobs HTTP address:
+node. If the candidate image is already present on every node of an existing
+cluster, skip local cluster startup and supply its Ray head address:
 
 ```bash
-export RAY_ADDRESS=http://<ray-head>:8265
-RELAX_SKIP_CLUSTER_CLEANUP=1 WORKING_DIR=./ \
-    bash scripts/entrypoint/ray-job.sh \
+RELAX_ENTRYPOINT_MODE=existing \
+HOST_IP=<ray-head-ip> \
+RAY_NO_WAIT=1 \
+    bash \
     examples/megatron_otel/scripts/run-qwen35-35B-A3B-dapo-8xgpu-colocate.sh
 ```
 
 Submission blocks and follows logs by default. For an explicitly nonblocking
 submission, set `RAY_NO_WAIT=1`; then inspect the returned job ID using
-`ray job logs --address="${RAY_ADDRESS}" <job-id>`. A successful submission alone
+`ray job logs --address="http://<ray-head-ip>:8265" <job-id>`. A successful submission alone
 is not proof of a completed optimizer step. Per-launch logs are under this
 example's `scripts/log/` directory. With no-wait, that file contains only the
 submission output.
 
 The default layout is BF16, training TP4/SP/PP1/CP1/EP8/ETP1, and one TP8 SGLang
-engine. It retains CPU optimizer offload and full activation recomputation, but
-uses the native all-to-all MoE dispatcher. It enables no FP8, MTP, custom Qwen
+engine. It retains CPU optimizer offload and full activation recomputation, and
+uses selective parameter/gradient offload and the native all-to-all MoE
+dispatcher. The candidate image's TMS preload reproduced a CUDA IPC
+`_share_cuda_()` invalid-argument failure on the tested driver; selective offload
+avoids that preload while preserving colocate sleep/wake. No dependency patch
+is required for this workaround.
+
+Streaming input, two reward workers, disabled SGLang CUDA Graph/custom all-reduce
+and disabled TransferQueue RDMA keep this smoke run small. The script also
+forwards `RAY_OVERRIDE_JOB_RUNTIME_ENV=1` so the job and driver runtime environments
+can merge when using an existing Ray cluster. It enables no FP8, MTP, custom Qwen
 whole-pack optimizations, fully asynchronous training, evaluation or checkpoint
 save/load. Every default invocation initializes from the HF checkpoint.
 
@@ -187,22 +198,28 @@ data and observable native Megatron spans. The second default rollout also
 exercises the normal colocate return to rollout after training. No tensor-level
 weight comparison or numerical equivalence assertion is part of acceptance.
 
-| Check                                                            | Status                                                                                    |
-| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Shell syntax and argument/environment forwarding                 | Passed locally with `bash -n` and an isolated Ray CLI stub; no GPU or Ray cluster started |
-| Clean dependency imports and text provider configuration         | Passed on CPU; no weight loading or GPU model construction                                |
-| Lens setup, native DDP decorators and exception-path trace flush | Passed on CPU with empty DDP buckets; no GPU communication                                |
-| Candidate image build and actual import provenance               | Pending recorded validation                                                               |
-| Qwen3.5-35B DAPO generation, backward and optimizer update       | Pending GPU validation                                                                    |
-| Native Megatron spans exported from the real training run        | Pending GPU validation                                                                    |
-| Numerical accuracy, RL quality and weight equivalence            | Not validated                                                                             |
-| Throughput, memory regression and long-running stability         | Not validated                                                                             |
-| Checkpoint save/load, old-checkpoint compatibility and recovery  | Not validated                                                                             |
-| Other models, vision inputs, PP/CP > 1 and fully async           | Not validated                                                                             |
+| Check                                                            | Status                                                                                                                                 |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Shell syntax and argument/environment forwarding                 | Passed locally with `bash -n` and an isolated Ray CLI stub; no GPU or Ray cluster started                                              |
+| Clean dependency imports and text provider configuration         | Passed on CPU; no weight loading or GPU model construction                                                                             |
+| Lens setup, native DDP decorators and exception-path trace flush | Passed on CPU with empty DDP buckets; no GPU communication                                                                             |
+| Candidate image and actual import provenance                     | Operator-built image exercised; Core/Bridge import paths and relevant source digests matched the pinned revisions                      |
+| Qwen3.5-35B DAPO generation, backward and optimizer update       | Passed: two rollouts and two actor steps on eight H20-3e 141 GB GPUs; job succeeded                                                    |
+| Native Megatron spans exported from the real training run        | Passed: verifier exited 0; two actor traces each contained native forward/backward and an optimizer span with `update_successful=true` |
+| Numerical accuracy, RL quality and weight equivalence            | Not validated; both smoke steps had zero loss and grad norm                                                                            |
+| Throughput, memory regression and long-running stability         | Not validated                                                                                                                          |
+| Checkpoint save/load, old-checkpoint compatibility and recovery  | Not validated                                                                                                                          |
+| Other models, vision inputs, PP/CP > 1 and fully async           | Not validated                                                                                                                          |
 
-The draft branch is for observability development. Completed image and training
-evidence must replace the pending entries before describing the baseline as
-successfully exercised.
+The accepted console capture contained 14 unique spans: two `relax.train.step`,
+two `relax.optimizer.step`, four `megatron.microbatch.forward`, two
+`megatron.microbatch.backward` and two `megatron.grad_sync.finish`, plus two Relax
+forward/backward parent spans. Two native forward spans were standalone log-prob
+passes; the verifier did not count them as descendants of a training step.
+
+The draft branch is for observability development. This validates the execution
+path and console export, not nonzero parameter changes or useful learning. OTLP
+collector delivery has not been validated.
 
 An exploratory run of the existing checkpoint/HDO CPU tests returned 25 passes
 and one failure in `test_hybrid_cpu_hf_reload_refreshes_bf16_and_native_fp32_copies`

@@ -48,8 +48,12 @@ ROLLOUT_ARGS=(
     --label-key label
     --apply-chat-template
     --rollout-shuffle
+    --use-streaming-dataset
+    --streaming-buffer-size 64
+    --prefetch-max-cached 0
     --rm-type dapo
     --reward-key score
+    --reward-num-workers 2
     --num-rollout "${NUM_ROLLOUT}"
     --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
     --n-samples-per-prompt "${N_SAMPLES}"
@@ -95,6 +99,7 @@ OPTIMIZER_ARGS=(
     --optimizer-cpu-offload
     --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
+    --selective-offload
     --no-rope-fusion
     --moe-router-load-balancing-type none
     --moe-aux-loss-coeff 0.0
@@ -103,7 +108,9 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 8
     --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.7}"
-    --sglang-cuda-graph-bs 1 2 4 8 16
+    --sglang-disable-custom-all-reduce
+    --sglang-cuda-graph-backend-decode disabled
+    --sglang-cuda-graph-backend-prefill disabled
 )
 
 METRICS_ARGS=(
@@ -124,6 +131,7 @@ MISC_ARGS=(
     --attention-backend flash
     --skip-eval-before-train
     --custom-megatron-init-path relax.backends.megatron.telemetry.initialize
+    --tq-rdma-mode off
 )
 
 TRAIN_ARGS=(
@@ -164,6 +172,7 @@ import os
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON", "{}"))
 env_vars = runtime.setdefault("env_vars", {})
 env_vars["RAY_DEDUP_LOGS"] = "0"
+env_vars.setdefault("RAY_OVERRIDE_JOB_RUNTIME_ENV", "1")
 for key, value in os.environ.items():
     if key.startswith(("MEGATRON_OTEL_", "NEMO_LENS_", "OTEL_")):
         env_vars[key] = value
