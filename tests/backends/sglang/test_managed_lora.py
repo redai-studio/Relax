@@ -1102,11 +1102,13 @@ def test_tp_collective_uses_parallel_state_and_checks_all_ranks(runtime, failure
     operation = Mock(return_value=local)
     if failure == "local_exception":
         operation.side_effect = ValueError("receiver validation failed")
-    ns = {"torch": SimpleNamespace(distributed=SimpleNamespace(all_gather_object=Mock(side_effect=gather)))}
-    ns.update(dataclass=dataclasses.dataclass, Optional=typing.Optional)
-    definitions("srt/distributed/parallel_state_wrapper.py", ["ParallelState"], ns)
+    parallel = SimpleNamespace(tp_size=tp_size)
+    ns = {
+        "torch": SimpleNamespace(distributed=SimpleNamespace(all_gather_object=Mock(side_effect=gather))),
+        "get_parallel": lambda: parallel,
+    }
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), ns)
-    scheduler = SimpleNamespace(ps=ns["ParallelState"].trivial(tp_size=tp_size), tp_cpu_group=group)
+    scheduler = SimpleNamespace(ps=parallel, tp_cpu_group=group)
     result = ns["_managed_lora_update"](scheduler, operation, object())
     assert result.success is (failure is None)
     ns["torch"].distributed.all_gather_object.assert_called_once()

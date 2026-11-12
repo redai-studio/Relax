@@ -1,0 +1,472 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Local CPU tests: no Ray connection, CUDA allocation or cluster jobs."""
+
+import faulthandler
+import importlib.util
+import sys
+from datetime import timedelta
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+
+# Spawned CPU workers must not run Megatron's model-registration side effects.
+# Load the production module intact; the optional bridge checks still import
+# the real backend below when its runtime is available.
+_ROUTING_PATH = Path(__file__).resolve().parents[5] / "relax/backends/megatron/weight_update/expert_routing.py"
+_ROUTING_SPEC = importlib.util.spec_from_file_location("_expert_routing_cpu_test", _ROUTING_PATH)
+_ROUTING = importlib.util.module_from_spec(_ROUTING_SPEC)
+sys.modules[_ROUTING_SPEC.name] = _ROUTING  # Dataclasses and collective object pickling need a stable module name.
+_ROUTING_SPEC.loader.exec_module(_ROUTING)
+ExpertLayout = _ROUTING.ExpertLayout
+ExpertRouter = _ROUTING.ExpertRouter
+TensorSpec = _ROUTING.TensorSpec
+build_transfer_plan = _ROUTING.build_transfer_plan
+validate_server_layout = _ROUTING.validate_server_layout
+validate_bf16_server_layout = _ROUTING.validate_bf16_server_layout
+
+
+def _name(expert: int, suffix: str = "packed") -> str:
+    return f"language_model.model.layers.2.block_sparse_moe.experts.{expert}.w1.weight_{suffix}"
+
+
+def _values(expert: int, step: int = 0) -> list[tuple[str, torch.Tensor]]:
+    # Mixed dtype + odd byte count exercises alignment across tensors and ranks.
+    return [
+        (_name(expert), torch.arange(15, dtype=torch.uint8).reshape(3, 5).t() + step),
+        (_name(expert, "scale"), torch.full((3,), expert + step, dtype=torch.int32)),
+    ]
+
+
+def _specs(values):
+    return tuple(TensorSpec(name, tuple(t.shape), t.dtype) for name, t in values)
+
+
+def test_expert_routing_kimi_128_rank_coverage_and_payload():
+    layout = ExpertLayout(896, 16, tuple(range(0, 128, 16)), 128)
+    assert layout.destinations(_name(0)) == tuple(range(0, 128, 16))
+    assert layout.destinations(_name(895)) == tuple(range(15, 128, 16))
+    # EP32 * PP4 sources; every expert belongs to exactly one source.
+    schemas = [[] for _ in range(128)]
+    for expert in range(896):
+        schemas[expert // 28].extend(_specs(_values(expert)))
+    plans = [build_transfer_plan(schemas, layout, rank) for rank in range(128)]
+    for destination, plan in enumerate(plans):
+        names = [s.name for specs in plan.receive_specs for s in specs]
+        expected = [
+            _name(expert, suffix)
+            for expert in range(896)
+            if expert // 56 == destination % 16
+            for suffix in ("packed", "scale")
+        ]
+        assert names == expected
+        for source in range(128):
+            assert plans[source].send_splits[destination] == plan.receive_splits[source]
+        assert plan.replicated_payload_bytes == 16 * plan.total_payload_bytes
+        assert plan.destination_bytes == tuple(sum(other.receive_splits) for other in plans)
+
+
+@pytest.mark.parametrize("offsets", [(), (0,), (0, 0), (-1,), (3,)])
+def test_expert_routing_rejects_invalid_placement(offsets):
+    with pytest.raises(ValueError):
+        ExpertLayout(8, 2, offsets, 4)
+
+
+def test_expert_routing_rejects_missing_pairs_duplicates_and_unknown_names():
+    layout = ExpertLayout(8, 2, (0, 2), 4)
+    schema = _specs(_values(0))
+    for schemas in (
+        [schema[:1], (), (), ()],
+        [schema, schema, (), ()],
+        [(TensorSpec("model.norm.weight", (1,), torch.float32),), (), (), ()],
+        [_specs(_values(8)), (), (), ()],
+    ):
+        with pytest.raises(ValueError):
+            build_transfer_plan(schemas, layout, 0)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"tp_size": 4},
+        {"moe_dp_size": 2},
+        {"enable_eplb": True},
+        {"ep_num_redundant_experts": 1},
+        {"init_expert_location": "random"},
+        {"ep_join_mode": "scale"},
+        {"speculative_algorithm": "EAGLE"},
+        {"moe_runner_backend": "triton"},
+    ],
+)
+def test_expert_routing_checks_resolved_server_overrides(override):
+    config = dict(tp_size=2, ep_size=2, pp_size=1, moe_dp_size=1, moe_runner_backend="flashinfer_mxfp4")
+    validate_server_layout(config, 2, 2)
+    with pytest.raises(ValueError):
+        validate_server_layout(config | override, 2, 2)
+
+
+@pytest.mark.parametrize(
+    "prefix", ["model.layers.3", "model.language_model.layers.3", "language_model.model.layers.3"]
+)
+@pytest.mark.parametrize(
+    "mlp,projections", [("mlp", ("gate_proj", "up_proj", "down_proj")), ("block_sparse_moe", ("w1", "w3", "w2"))]
+)
+def test_bf16_routing_preserves_hf_names_and_sends_only_to_expert_owners(prefix, mlp, projections):
+    layout = ExpertLayout(8, 2, (0, 2), 4)
+    schemas = [[], [], [], []]
+    names = []
+    for expert in range(8):
+        for projection in projections:
+            name = f"{prefix}.{mlp}.experts.{expert}.{projection}.weight"
+            names.append(name)
+            schemas[expert // 2].append(TensorSpec(name, (2, 4), torch.bfloat16))
+    for rank in range(4):
+        plan = build_transfer_plan(schemas, layout, rank)
+        actual = [spec.name for entries in plan.receive_specs for spec in entries]
+        assert actual == [name for name in names if rank in layout.destinations(name)]
+        assert plan.replicated_payload_bytes == 2 * plan.total_payload_bytes
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"ep_size": 1},
+        {"moe_dp_size": 2},
+        {"dtype": "float16"},
+        {"is_cuda": False},
+        {"enable_eplb": True},
+        {"ep_num_redundant_experts": 1},
+        {"init_expert_location": "random"},
+        {"quantization": "fp8"},
+        {"quantization_config": {"quant_method": "fp8"}},
+        {"num_shared_experts": 1},
+        {"enforce_shared_experts_fusion": True},
+        {"speculative_draft_model_path": "different-model"},
+        {"speculative_algorithm": "DRAFT"},
+        {"json_model_override_args": '{"num_experts":4}'},
+    ],
+)
+def test_bf16_receiver_capabilities_reject_unsafe_layouts(override):
+    config = dict(
+        tp_size=2,
+        ep_size=2,
+        pp_size=1,
+        moe_dp_size=1,
+        num_experts=8,
+        is_cuda=True,
+        dtype="bfloat16",
+        moe_runner_backend="deep_gemm",
+        num_shared_experts=0,
+    )
+    validate_bf16_server_layout(config, 2, 2, 8)
+    validate_bf16_server_layout(config | {"speculative_algorithm": "EAGLE"}, 2, 2, 8)
+    with pytest.raises(ValueError):
+        validate_bf16_server_layout(config | override, 2, 2, 8)
+
+
+def _worker_stage(rank: int, stage: str) -> None:
+    sys.stderr.write(f"[expert-routing rank={rank}] {stage}\n")
+    sys.stderr.flush()
+
+
+def _exchange_worker(rank: int, rendezvous: str, with_bridge: bool) -> None:
+    faulthandler.enable(all_threads=True)
+    _worker_stage(rank, f"start python={sys.version.split()[0]} torch={torch.__version__}")
+    torch.set_num_threads(1)
+    _worker_stage(rank, "initializing Gloo")
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60))
+    _worker_stage(rank, "Gloo initialized")
+    try:
+        layout = ExpertLayout(8, 2, (0, 2), 4)
+        router = ExpertRouter(layout, payload_group=dist.group.WORLD, metadata_group=dist.group.WORLD)
+        previous = []
+        gather = dist.all_gather_object
+        for step in range(4):
+            _worker_stage(rank, f"exchange step={step}")
+            router.reset_metrics()
+            # Two common buckets. Some sources and receivers are empty in each.
+            for bucket in range(2):
+                experts = [bucket * 4 + i for i in range(4)]
+                local = _values(experts[rank], step) if rank < 3 else []
+                if step >= 2 and rank == 1:
+                    local[1] = (local[1][0], torch.full((5,), step, dtype=torch.int64))
+                if step == 3 and rank == 2:
+                    router._plans.clear()
+                with patch.object(dist, "all_gather_object", wraps=gather) as collect:
+                    result = router.exchange(bucket, local, torch.device("cpu"))
+                    assert collect.call_count == (0 if step == 1 else 1)
+                expected = []
+                for source, expert in enumerate(experts[:3]):
+                    if rank in layout.destinations(_name(expert)):
+                        values = _values(expert, step)
+                        if step >= 2 and source == 1:
+                            values[1] = (values[1][0], torch.full((5,), step, dtype=torch.int64))
+                        expected.extend(values)
+                assert [name for name, _ in result] == [name for name, _ in expected]
+                for (_, actual), (_, target) in zip(result, expected, strict=True):
+                    torch.testing.assert_close(actual, target)
+                for old, snapshot in previous:
+                    torch.testing.assert_close(old, snapshot)
+                previous.extend((tensor, tensor.clone()) for _, tensor in result)
+            assert router.payload_bytes * 2 == router.replicated_bytes
+        _worker_stage(rank, "checking invalid schemas and budgets")
+        # All ranks receive the same invalid schema and fail before payload exchange.
+        bad = _values(0) if rank in (0, 1) else []
+        with pytest.raises(ValueError, match="unique owner"):
+            router.exchange(10, bad, torch.device("cpu"))
+        assert router.exchange(11, [], torch.device("cpu")) == []
+        with pytest.raises(RuntimeError, match="conversion failed"):
+            router.exchange(12, [], torch.device("cpu"), error="injected conversion failure" if rank == 2 else None)
+        local = _values(rank)
+        # Both fresh and cached schemas must reject on every rank before any
+        # packing allocation or payload collective, including empty receivers.
+        for _ in range(2):
+            with (
+                patch.object(torch, "cat", side_effect=AssertionError("allocated send buffer")),
+                patch.object(dist, "all_to_all_single", side_effect=AssertionError("entered payload collective")),
+                pytest.raises(ValueError, match="exceeds the IPC budget"),
+            ):
+                router.exchange(13, local, torch.device("cpu"), receive_budget=1)
+        if with_bridge:
+            _check_bridge_chunk_rounds(rank, layout, interleaved=False)
+            _check_bridge_chunk_rounds(rank, layout, interleaved=True)
+            _check_bf16_replicas(rank, layout)
+        _worker_stage(rank, "all assertions passed")
+    finally:
+        _worker_stage(rank, "destroying Gloo")
+        dist.destroy_process_group()
+        _worker_stage(rank, "Gloo destroyed")
+
+
+def _check_bridge_chunk_rounds(rank: int, layout: ExpertLayout, *, interleaved: bool) -> None:
+    from types import SimpleNamespace
+
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+    from relax.utils.types import ParamInfo
+
+    iterator = object.__new__(bridge.HfWeightIteratorBridge)
+    iterator.args = SimpleNamespace(update_weight_buffer_size=2304)
+    # Alternate receiving EP shards, exercising aggregation across disjoint
+    # destinations as well as common flush boundaries and empty receivers.
+    order = (0, 4, 1, 5, 2, 6, 3, 7) if interleaved else tuple(range(8))
+    infos = [
+        ParamInfo(
+            name=f"decoder.layers.{i}.mlp.experts.linear_fc1.weight{expert}",
+            dtype=torch.float32,
+            shape=torch.Size([1]),
+            attrs={},
+            size=96,
+            src_rank=0,
+        )
+        for i, expert in enumerate(order)
+    ]
+    iterator._expert_buckets = [infos]
+    iterator._vanilla_key_map = {info.name: info.name for i, info in enumerate(infos) if i % 3 == rank}
+    iterator._non_expert_buckets = []
+    iterator._expert_broadcast_caches = []
+    iterator._bf16_expert_buckets = None
+    iterator._bf16_expert_gathers = []
+    iterator._expert_router = None
+    iterator.quantization_config = {"format": "mxfp4-pack-quantized"}
+    iterator._async_weight_gather = False
+    iterator.lora_merge_mode = False
+    iterator._bridge_converter = SimpleNamespace(
+        init_tasks=lambda: None,
+        broadcast_and_apply_configs=lambda: None,
+        convert=lambda name, tensor: _values(int(name.rsplit("weight", 1)[1]), int(tensor[0])),
+    )
+    with (
+        patch.object(bridge.mpu, "get_expert_tensor_parallel_world_size", return_value=1),
+        patch.object(bridge.mpu, "get_expert_model_parallel_world_size", return_value=2),
+        patch.object(bridge.mpu, "get_pipeline_model_parallel_world_size", return_value=2),
+        patch.object(bridge.device_utils, "make_current_torch_device", return_value=torch.device("cpu")),
+    ):
+        iterator.configure_expert_routing(layout, payload_group=dist.group.WORLD, metadata_group=dist.group.WORLD)
+        assert len(iterator._expert_buckets) < 8
+        # Isolate the IPC aggregation regression with one expert per round.
+        iterator._expert_buckets = [
+            [info]
+            for info in sorted(
+                (info for bucket in iterator._expert_buckets for info in bucket), key=lambda info: info.name
+            )
+        ]
+        iterator.args.update_weight_buffer_size = 288
+        for step in range(2):
+            weights = {name: torch.tensor([step]) for name in iterator._vanilla_key_map}
+            chunks = list(iterator.get_hf_weight_chunks(weights))
+            # Each destination gets 3 * 32 bytes in the first IPC, then 32.
+            # Summing bucket maxima would flush at 3+3+2 (three requests).
+            if interleaved:
+                assert len(chunks) == 2
+                assert [len(chunk) for chunk in chunks] == [6, 2]
+            else:
+                assert len(chunks) == 3
+                assert any(not chunk for chunk in chunks)
+            actual = dict(pair for chunk in chunks for pair in chunk)
+            expected = dict(
+                pair
+                for expert in range(8)
+                if rank in layout.destinations(_name(expert))
+                for pair in _values(expert, step)
+            )
+            assert actual.keys() == expected.keys()
+            for name in actual:
+                torch.testing.assert_close(actual[name], expected[name])
+
+
+def _check_bf16_replicas(rank: int, layout: ExpertLayout) -> None:
+    from types import SimpleNamespace
+
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+    from relax.utils.types import ParamInfo
+
+    iterator = object.__new__(bridge.HfWeightIteratorBridge)
+    iterator.args = SimpleNamespace(update_weight_buffer_size=4096)
+    iterator.quantization_config = None
+    iterator._expert_router = None
+    iterator._packed_expert_sync = False
+    infos = [
+        ParamInfo(
+            name=f"decoder.layers.0.mlp.experts.linear_fc{fc}.weight{expert}",
+            dtype=torch.bfloat16,
+            shape=torch.Size(shape),
+            attrs={},
+            size=2 * shape[0] * shape[1],
+            src_rank=rank,
+        )
+        for expert in range(8)
+        for fc, shape in [(1, (2, 3)), (2, (3, 1))]
+    ]
+    tower = ParamInfo(
+        name="vision_model.experts.linear_fc1.weight",
+        dtype=torch.bfloat16,
+        shape=torch.Size([1]),
+        attrs={},
+        size=2,
+        src_rank=rank,
+    )
+    iterator._expert_buckets = [infos + [tower]]
+    original = iterator._expert_buckets
+    iterator._bf16_expert_buckets = [infos]
+    iterator._bf16_expert_gathers = []
+    iterator._vanilla_key_map = {
+        info.name: info.name for info in infos if int(info.name.rsplit("weight", 1)[1]) // 4 == rank % 2
+    }
+    for prefix, mlp, projections in [
+        ("model.layers.0", "mlp", ("gate_proj", "up_proj", "down_proj")),
+        ("model.language_model.layers.0", "mlp", ("gate_proj", "up_proj", "down_proj")),
+        ("language_model.model.layers.0", "block_sparse_moe", ("w1", "w3", "w2")),
+    ]:
+
+        def convert(name, value):
+            expert = int(name.rsplit("weight", 1)[1])
+            base = f"{prefix}.{mlp}.experts.{expert}."
+            if "linear_fc1" in name:
+                return [(base + projections[0] + ".weight", value[:1]), (base + projections[1] + ".weight", value[1:])]
+            return [(base + projections[2] + ".weight", value)]
+
+        iterator._bridge_converter = SimpleNamespace(
+            init_tasks=lambda: None,
+            broadcast_and_apply_configs=lambda: None,
+            supports_routed_expert=lambda name: name.startswith("decoder."),
+            convert=convert,
+        )
+        with (
+            patch.object(bridge.mpu, "get_expert_tensor_parallel_world_size", return_value=1),
+            patch.object(bridge.device_utils, "make_current_torch_device", return_value=torch.device("cpu")),
+        ):
+            iterator.configure_expert_routing(
+                layout, payload_group=dist.group.WORLD, metadata_group=dist.group.WORLD, allow_replicas=True
+            )
+            assert {info.src_rank for bucket in iterator._expert_buckets for info in bucket} == {0, 1}
+            assert iterator._unrouted_expert_buckets == [[tower]]
+            assert iterator._bf16_expert_buckets is None
+            for step in range(2):
+                weights = {
+                    info.name: torch.full(
+                        info.shape, int(info.name.rsplit("weight", 1)[1]) + step * 16, dtype=torch.bfloat16
+                    )
+                    for info in infos
+                    if info.name in iterator._vanilla_key_map
+                }
+                actual = dict(pair for chunk in iterator._iter_routed_expert_chunks(weights) for pair in chunk)
+                expected = dict(
+                    pair
+                    for info in infos
+                    for pair in convert(
+                        info.name,
+                        torch.full(
+                            info.shape, int(info.name.rsplit("weight", 1)[1]) + step * 16, dtype=torch.bfloat16
+                        ),
+                    )
+                    if rank in layout.destinations(pair[0])
+                )
+                assert actual.keys() == expected.keys()
+                for name in actual:
+                    torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+            iterator.configure_expert_routing(None)
+            assert iterator._expert_buckets is original and iterator._bf16_expert_buckets == [infos]
+            assert iterator._unrouted_expert_buckets == iterator._unrouted_expert_broadcast_caches == []
+
+
+def _require_bridge_runtime() -> None:
+    pytest.importorskip("megatron.core", reason="Bridge iterator checks require Megatron Core", exc_type=ImportError)
+    pytest.importorskip(
+        "megatron.bridge", reason="Bridge iterator checks require Megatron Bridge", exc_type=ImportError
+    )
+
+
+@pytest.mark.parametrize("with_bridge", [False, True])
+def test_expert_routing_multirank_values_empty_ranks_and_cache_refresh(tmp_path, with_bridge, monkeypatch):
+    if with_bridge:
+        _require_bridge_runtime()
+    # Enable native-crash tracebacks before spawned interpreters import torch.
+    monkeypatch.setenv("PYTHONFAULTHANDLER", "1")
+    mp.start_processes(
+        _exchange_worker,
+        args=((tmp_path / "rendezvous").as_uri(), with_bridge),
+        nprocs=4,
+        join=True,
+        start_method="spawn",
+    )
+
+
+def test_expert_routing_rejects_model_expert_count_mismatch():
+    config = dict(tp_size=2, ep_size=2, pp_size=1, moe_dp_size=1, moe_runner_backend="flashinfer_mxfp4", num_experts=8)
+    validate_server_layout(config, 2, 2, 8)
+    with pytest.raises(ValueError, match="expert counts"):
+        validate_server_layout(config, 2, 2, 16)
+    with pytest.raises(ValueError, match="model config overrides"):
+        validate_server_layout(config | {"json_model_override_args": '{"num_experts": 16}'}, 2, 2, 8)
+
+
+def test_expert_routing_parallel_owner_buckets_respect_fanin_and_uneven_owners():
+    _require_bridge_runtime()
+    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _bucket_experts_by_owner
+    from relax.utils.types import ParamInfo
+
+    layout = ExpertLayout(8, 2, (0, 2), 4)
+    infos = [
+        ParamInfo(
+            name=f"decoder.layers.{layer}.mlp.experts.linear_fc1.weight{owner * 2}",
+            dtype=torch.bfloat16,
+            shape=torch.Size([48]),
+            attrs={},
+            size=96,
+            src_rank=owner,
+        )
+        for owner in range(4)
+        for layer in range(owner + 1)
+    ]
+    buckets = _bucket_experts_by_owner(infos, 1152, layout)
+    assert len(buckets) == 2
+    assert sorted(info.name for bucket in buckets for info in bucket) == sorted(info.name for info in infos)
+    for bucket in buckets:
+        assert all(sum(info.size for info in bucket if info.src_rank == owner) <= 192 for owner in range(4))
+    with pytest.raises(ValueError, match="exceeding owner budget"):
+        _bucket_experts_by_owner(infos, 288, layout)

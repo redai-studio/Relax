@@ -13,6 +13,7 @@ from tests.engine.lora_versions.test_training import ThreadRanks, assert_rank_er
 pytest.importorskip("megatron.core")
 
 from relax.distributed.checkpoint_service.backends import device_direct
+from relax.distributed.checkpoint_service.client import engine as engine_module
 from relax.distributed.checkpoint_service.client.engine import CheckpointEngineClient
 from relax.engine.lora_versions.training import LoRATrainingConfig
 
@@ -21,6 +22,7 @@ from relax.engine.lora_versions.training import LoRATrainingConfig
 def backends(monkeypatch):
     ranks = ThreadRanks(monkeypatch)
     monkeypatch.setattr(device_direct, "get_gloo_group", lambda: ranks)
+    monkeypatch.setattr(engine_module, "get_gloo_group", lambda: ranks)
     monkeypatch.setattr(device_direct.ray, "get", lambda value, **kwargs: value)
     monkeypatch.setattr(device_direct.device_module, "empty_cache", lambda: None)
     workers = []
@@ -29,6 +31,9 @@ def backends(monkeypatch):
         backend = object.__new__(device_direct.DeviceDirectBackend)
         backend.args = SimpleNamespace(num_experts=0, rollout_http_timeout=10)
         backend.weight_version = 0
+        backend.quantization_config = None
+        backend._weights_getter = None
+        backend._rollout_bucket_splitter = None
         backend._use_bridge = backend._lora_merge_mode = backend._is_pp_src_rank = False
         backend._lora_adapter_mode = True
         backend._lora_sync = SimpleNamespace(base_sync_done=False, adapter_loaded=False)
@@ -45,7 +50,9 @@ def backends(monkeypatch):
                 flush_cache=SimpleNamespace(remote=Mock(side_effect=lambda e=events: e.append("flush")))
             )
         }
-        backend._batch_request = Mock(side_effect=lambda path, events=events: events.append(path))
+        backend._batch_request = Mock(
+            side_effect=lambda path, payload=None, events=events: events.append((path, payload) if payload else path)
+        )
         backend._group_name = "test"
         backend._run_expert_pass = Mock(side_effect=lambda **kwargs: None)
         backend.coordinator_url = "http://coordinator"
@@ -57,10 +64,22 @@ def backends(monkeypatch):
     return ranks, workers
 
 
-def test_first_sync_resumes_before_probe_and_later_sync_never_pauses(backends):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_first_sync_resumes_before_probe_and_later_sync_never_pauses(backends, quantized):
     ranks, workers = backends
+    if quantized:
+        for worker in workers:
+            worker.quantization_config = {"quant_method": "compressed-tensors"}
     assert ranks.run(lambda rank: workers[rank].update_weights_for_rollout(rollout_only=True)) == [None, None]
-    assert workers[0].events == ["/pause_generation", "flush", "/continue_generation", "publish"]
+    quantization_events = (
+        [
+            ("/post_process_weights", {"restore_weights_before_load": True, "post_process_quantization": False}),
+            ("/post_process_weights", {"restore_weights_before_load": False, "post_process_quantization": True}),
+        ]
+        if quantized
+        else []
+    )
+    assert workers[0].events == ["/pause_generation", "flush", *quantization_events, "/continue_generation", "publish"]
     assert workers[1].events == ["publish"]
     assert all(worker._lora_sync.base_sync_done and worker._lora_sync.adapter_loaded for worker in workers)
     for worker in workers:
@@ -153,7 +172,7 @@ def test_client_agrees_on_incomplete_initial_pool_and_skips_later_topology(backe
         response = Mock()
         response.json.return_value = topology
         client._http_client = SimpleNamespace(get=AsyncMock(return_value=response))
-        if rank == 1 and failure == "lookup":
+        if rank == 0 and failure == "lookup":
             client._http_client.get.side_effect = RuntimeError("lookup failed")
         elif rank == 1 and failure == "pruned":
             backend.rollout_topology = {}
@@ -164,6 +183,7 @@ def test_client_agrees_on_incomplete_initial_pool_and_skips_later_topology(backe
         assert all(worker.update_weights_for_rollout.call_count == 0 for worker in workers)
         return
     assert results == [[], []]
+    assert [client._http_client.get.call_count for client in clients] == [1, 0]
     for client in clients:
         client._backend._lora_sync.base_sync_done = True
         client._http_client.get.reset_mock()

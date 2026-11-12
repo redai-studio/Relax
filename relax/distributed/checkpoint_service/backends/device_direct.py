@@ -18,8 +18,9 @@ import logging
 import re
 import socket
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import timedelta
 from functools import lru_cache
 from types import SimpleNamespace
@@ -69,6 +70,7 @@ def _load_megatron_dependencies() -> SimpleNamespace:
         )
         from relax.backends.megatron.weight_update.lora_adapter_sync import LoraAdapterSync
         from relax.distributed.checkpoint_service.utils import load_weight
+        from relax.models.deepseek_v4.weight_sync import get_dcs_bucket_splitter
     except ModuleNotFoundError as exc:
         missing = exc.name or ""
         if missing == "megatron" or missing.startswith("megatron."):
@@ -84,6 +86,7 @@ def _load_megatron_dependencies() -> SimpleNamespace:
         named_params_and_buffers=named_params_and_buffers,
         adapter_base_prefix=_adapter_base_prefix,
         base_param_prefix=_base_param_prefix,
+        get_dcs_bucket_splitter=get_dcs_bucket_splitter,
         LoraAdapterSync=LoraAdapterSync,
         load_weight=load_weight,
     )
@@ -148,6 +151,7 @@ class DeviceDirectBackend(CommBackend):
         coordinator_url=None,
         lock: Any = None,
         timeout_seconds: int = 300,
+        weights_getter: Optional[Callable[[], Mapping[str, torch.Tensor]]] = None,
     ) -> None:
         """Initialize DeviceDirectBackend.
 
@@ -161,6 +165,7 @@ class DeviceDirectBackend(CommBackend):
             coordinator_url: URL of the coordinator service
             lock: Remote lock for coordinating weight updates
             timeout_seconds: Operation timeout (default 300)
+            weights_getter: Optional snapshot source; defaults to the live model.
         """
         super().__init__(backend_type, role_info)
         self._megatron = _load_megatron_dependencies()
@@ -173,6 +178,7 @@ class DeviceDirectBackend(CommBackend):
         self.coordinator_url = coordinator_url
         self.lock = lock
         self.timeout_seconds = timeout_seconds
+        self._weights_getter = weights_getter
         self.device = next(model[0].parameters()).device if model else device_module.current_device()
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
@@ -198,6 +204,9 @@ class DeviceDirectBackend(CommBackend):
 
         # Bridge-based HF weight converter (lazy-initialized on first use)
         self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
+        self._rollout_bucket_splitter = self._megatron.get_dcs_bucket_splitter(
+            model_name, use_bridge=self._use_bridge, has_model=bool(model)
+        )
         if self._use_bridge:
             from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter
 
@@ -217,6 +226,30 @@ class DeviceDirectBackend(CommBackend):
         self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
         self._lora_moe_etp_checked = False  # guard the (actor-side) MoE ETP=1 assertion to run once
         self._managed_lora_publisher = None
+
+        # Snapshot names are rank-local; bridge conversion needs global PP/VP names.
+        # Track live Parameter names because snapshots are plain Tensors.
+        self._vanilla_to_global_name: Optional[Dict[str, str]] = None
+        self._live_param_global_names: Optional[frozenset] = None
+        if weights_getter is not None and self._use_bridge:
+            vanilla_items = list(
+                self._megatron.named_params_and_buffers(
+                    self.args, self.model, convert_to_global_name=False, include_persistent_buffers=True
+                )
+            )
+            global_items = list(
+                self._megatron.named_params_and_buffers(
+                    self.args, self.model, convert_to_global_name=True, include_persistent_buffers=True
+                )
+            )
+            self._vanilla_to_global_name = {
+                v_name: g_name for (v_name, _), (g_name, _) in zip(vanilla_items, global_items, strict=True)
+            }
+            self._live_param_global_names = frozenset(
+                g_name
+                for (_, v_param), (g_name, _) in zip(vanilla_items, global_items, strict=True)
+                if isinstance(v_param, torch.nn.Parameter)
+            )
 
     @property
     def managed_lora_publication_enabled(self) -> bool:
@@ -259,6 +292,39 @@ class DeviceDirectBackend(CommBackend):
         if result["status"] == "published":
             self._lora_sync.adapter_loaded = True
         return result
+
+    def _named_params_and_buffers(
+        self, name_filter: Callable[[str], bool] | None = None
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield live weights or snapshots, translating names and preserving TP
+        metadata.
+
+        Filter before H2D so expert/non-expert pushes only stage their own
+        subset.
+        """
+        if self._weights_getter is not None:
+            from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+
+            for name, tensor in self._weights_getter().items():
+                vanilla_to_global = getattr(self, "_vanilla_to_global_name", None)
+                if vanilla_to_global is not None:
+                    name = vanilla_to_global.get(name, name)
+                if name_filter is not None and not name_filter(name):
+                    continue
+                if tensor.device != self.device:
+                    moved = tensor.to(self.device)
+                    copy_tensor_model_parallel_attributes(moved, tensor)
+                    if hasattr(tensor, "parallel_mode"):
+                        moved.parallel_mode = tensor.parallel_mode
+                    tensor = moved
+                yield name, tensor
+            return
+        for name, tensor in self._megatron.named_params_and_buffers(
+            self.args, self.model, include_persistent_buffers=self._use_bridge
+        ):
+            if name_filter is not None and not name_filter(name):
+                continue
+            yield name, tensor
 
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
@@ -330,7 +396,10 @@ class DeviceDirectBackend(CommBackend):
 
         for rank, engine in list(self.rollout_engines.items()):
             try:
-                future = engine.health.remote(timeout=float(timeout_seconds))
+                future = engine.health.remote(
+                    timeout=float(timeout_seconds),
+                    generate=not (getattr(self.args, "hybrid", False) and self.args.offload_rollout),
+                )
                 futures_to_rank[future] = rank
             except Exception as e:
                 logger.warning(f"RolloutEngine #{rank} failed to schedule healthcheck: {e}")
@@ -731,6 +800,10 @@ class DeviceDirectBackend(CommBackend):
                     n_expert,
                 )
         self._lora_skip_rollout_base = self._lora_adapter_mode and self._lora_sync.base_sync_done
+        reload_quantized_base = (
+            not self._lora_skip_rollout_base
+            and (self.quantization_config or {}).get("quant_method") == "compressed-tensors"
+        )
 
         pause_rollout = not actor_fwd_only and (not managed or not self._lora_sync.base_sync_done)
         if pause_rollout:
@@ -750,6 +823,11 @@ class DeviceDirectBackend(CommBackend):
             elif dist.get_rank() == 0:
                 pause_and_flush()
             dist.barrier(group=get_gloo_group())
+            if reload_quantized_base:
+                self._rollout_control_request(
+                    "/post_process_weights",
+                    {"restore_weights_before_load": True, "post_process_quantization": False},
+                )
 
         buffer_size = 0
         converted_named_tensors = []
@@ -757,12 +835,8 @@ class DeviceDirectBackend(CommBackend):
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
 
-        for name, param in self._megatron.named_params_and_buffers(
-            self.args, self.model, include_persistent_buffers=self._use_bridge
-        ):
+        for name, param in self._named_params_and_buffers(name_filter=lambda n: ".experts." not in n):
             if not self._should_sync_tensor(name, param):
-                continue
-            if ".experts." in name:
                 continue
             buffer_size = self._update_weight_from_distributed(
                 name,
@@ -779,6 +853,8 @@ class DeviceDirectBackend(CommBackend):
             if not rollout_only:
                 self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
             if converted_named_tensors and not actor_fwd_only:
+                if self._rollout_bucket_splitter is not None:
+                    self._rollout_bucket_splitter(converted_named_tensors, require_complete=True)
                 self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
                 converted_named_tensors.clear()
             origin_named_tensors.clear()
@@ -836,6 +912,11 @@ class DeviceDirectBackend(CommBackend):
         push_error: Exception | None = None
         if managed and not actor_fwd_only:
             if pause_rollout:
+                if reload_quantized_base:
+                    self._rollout_control_request(
+                        "/post_process_weights",
+                        {"restore_weights_before_load": False, "post_process_quantization": True},
+                    )
                 # Publication probes use /generate, so admission must reopen
                 # after base synchronization, before the first publication.
                 run_on_training_rank_zero(
@@ -863,10 +944,12 @@ class DeviceDirectBackend(CommBackend):
                 flag = torch.tensor([1 if push_error is not None else 0], dtype=torch.int32)
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
                 push_failed = bool(flag.item())
-            if dist.get_rank() == 0:
-                # Continue generation on all rollout nodes
-                logger.info("Resuming generation on all rollout nodes...")
-                self._batch_request("/continue_generation")
+            if reload_quantized_base:
+                self._rollout_control_request(
+                    "/post_process_weights",
+                    {"restore_weights_before_load": False, "post_process_quantization": True},
+                )
+            self._rollout_control_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
             if push_failed:
                 # Abort rather than roll out with a stale/absent adapter: in adapter mode the
@@ -893,9 +976,28 @@ class DeviceDirectBackend(CommBackend):
         # to allocate contiguous Adam state buffers.
         device_module.empty_cache()
 
+    def _rollout_control_request(self, endpoint: str, payload: Optional[Dict] = None) -> None:
+        """Await receiver lifecycle operations and share failures with every
+        trainer."""
+        group = get_gloo_group()
+        status = [None]
+        if dist.get_rank(group=group) == 0:
+            try:
+                ray.get(self._batch_request(endpoint, payload))
+            except Exception as exc:
+                status[0] = str(exc)
+        dist.broadcast_object_list(status, src=0, group=group)
+        if status[0] is not None:
+            raise RuntimeError(f"Rollout {endpoint} failed: {status[0]}")
+
     def _should_sync_tensor(self, name: str, tensor: torch.Tensor) -> bool:
+        # Preserve live Parameter eligibility for detached snapshots.
+        live_param_names = getattr(self, "_live_param_global_names", None)
         return (
-            not self._use_bridge or isinstance(tensor, torch.nn.Parameter) or self._bridge_converter.can_convert(name)
+            not self._use_bridge
+            or isinstance(tensor, torch.nn.Parameter)
+            or (live_param_names is not None and name in live_param_names)
+            or self._bridge_converter.can_convert(name)
         )
 
     def _update_weight_from_distributed(
@@ -909,10 +1011,14 @@ class DeviceDirectBackend(CommBackend):
         actor_fwd_only=False,
         pbar: tqdm | None = None,
     ) -> int | None:
-        """Gather parameter across TP, convert to HF format and buffer it.
+        """Gather dense parameters or stream PLE shards into update buckets.
 
         Returns updated buffer size on the source rank, otherwise None.
         """
+        if self._use_bridge and name.endswith(".per_layer_embedding.ple_embedding.ngram_embedding.weight"):
+            return self._update_ple_weight_from_distributed(
+                name, param, converted_named_tensors, origin_named_tensors, rollout_only, actor_fwd_only, pbar
+            )
         param = self._megatron.all_gather_param(self.args, name, param)
         if not self._is_pp_src_rank:
             return
@@ -920,13 +1026,18 @@ class DeviceDirectBackend(CommBackend):
         param_size = param.numel() * param.element_size()
         if buffer_size + param_size > self.args.update_weight_buffer_size:
             if converted_named_tensors or origin_named_tensors:
+                ready = converted_named_tensors
+                pending = []
+                if self._rollout_bucket_splitter is not None and not actor_fwd_only:
+                    ready, pending = self._rollout_bucket_splitter(converted_named_tensors)
                 if not rollout_only:
                     self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
-                if converted_named_tensors and not actor_fwd_only:
-                    self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
-                    converted_named_tensors.clear()
+                if ready and not actor_fwd_only:
+                    self._update_bucket_weights_from_distributed(ready, pbar=pbar)
+                if not actor_fwd_only:
+                    converted_named_tensors[:] = pending
                 origin_named_tensors.clear()
-                buffer_size = 0
+                buffer_size = sum(tensor.numel() * tensor.element_size() for _, tensor in pending)
         origin_named_tensors += [(name, param)]
         if not actor_fwd_only and not self._lora_skip_rollout_base:
             if self._lora_enabled and is_lora_adapter_param(name):
@@ -947,6 +1058,85 @@ class DeviceDirectBackend(CommBackend):
         buffer_size += param_size
         return buffer_size
 
+    def _update_ple_weight_from_distributed(
+        self,
+        name: str,
+        local_rows: torch.Tensor,
+        converted_named_tensors: list[tuple[str, torch.Tensor]],
+        origin_named_tensors: list[tuple[str, torch.Tensor]],
+        rollout_only: bool,
+        actor_fwd_only: bool,
+        pbar: tqdm | None,
+    ) -> int | None:
+        """Keep every TP rank in Bridge's shard collectives; only src sends."""
+
+        # PP stages iterate different local parameters. Coordinate only ranks
+        # that share this stage, including DP/CP replicas outside the src TP group.
+        control_group = self._megatron.mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        source_rank = dist.get_global_rank(control_group, 0)
+
+        def send_from_source(action: Callable[[], None]) -> None:
+            error = None
+            status = [None]
+            if self._is_pp_src_rank:
+                try:
+                    action()
+                except Exception as exc:
+                    error = exc
+                    status[0] = f"{type(exc).__name__}: {exc}"
+            # The next shard export contains a TP collective. Every stage rank
+            # must learn whether sending succeeded before advancing its iterator.
+            dist.broadcast_object_list(status, src=source_rank, group=control_group)
+            if status[0] is not None:
+                if error is not None:
+                    raise error
+                raise RuntimeError(f"PLE update {name} failed on source rank {source_rank}: {status[0]}")
+
+        def flush_rollout_bucket() -> None:
+            if not converted_named_tensors or actor_fwd_only:
+                return
+            ready, pending = converted_named_tensors, []
+            if self._rollout_bucket_splitter is not None:
+                ready, pending = self._rollout_bucket_splitter(converted_named_tensors)
+            if ready:
+                self._update_bucket_weights_from_distributed(ready, pbar=pbar)
+            converted_named_tensors[:] = pending
+
+        def flush_previous_weights() -> None:
+            if origin_named_tensors and not rollout_only:
+                self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
+            origin_named_tensors.clear()
+            flush_rollout_bucket()
+
+        send_from_source(flush_previous_weights)
+
+        if not rollout_only:
+            # actor_fwd/ref still consume full Megatron weights. Do not retain
+            # that separate payload while streaming the HF shards to rollout.
+            gathered = self._megatron.all_gather_param(self.args, name, local_rows)
+            try:
+                send_from_source(
+                    lambda: self._update_bucket_weights_from_distributed_for_actor_fwd_ref([(name, gathered)])
+                )
+            finally:
+                del gathered
+
+        def send_shard(converted: tuple[str, torch.Tensor]) -> None:
+            converted_named_tensors.append(converted)
+            flush_rollout_bucket()
+
+        if not actor_fwd_only and not self._lora_skip_rollout_base:
+            # PLE mappings expect TP-local rows and perform an all-reduce per
+            # HF shard. Neither gather the full table nor filter non-src ranks.
+            with closing(self._bridge_converter.iter_ple_shards(name, local_rows)) as shards:
+                for converted in shards:
+                    send_from_source(lambda converted=converted: send_shard(converted))
+                    del converted
+
+        if self._is_pp_src_rank:
+            return sum(tensor.numel() * tensor.element_size() for _, tensor in converted_named_tensors)
+        return None
+
     def _run_expert_pass(self, *, rollout_only: bool, actor_fwd_only: bool, pbar: tqdm | None) -> None:
         """One full pass over the grouped-expert params: gather, (optionally)
         fold, bucket-flush.
@@ -958,12 +1148,8 @@ class DeviceDirectBackend(CommBackend):
         """
         buffer_size = 0
         named_tensors: list[tuple[str, torch.Tensor]] = []
-        for name, param in self._megatron.named_params_and_buffers(
-            self.args, self.model, include_persistent_buffers=self._use_bridge
-        ):
+        for name, param in self._named_params_and_buffers(name_filter=lambda n: ".experts." in n):
             if not self._should_sync_tensor(name, param):
-                continue
-            if ".experts." not in name:
                 continue
             buffer_size = self._update_expert_weight_from_distributed(
                 name, param, named_tensors, buffer_size, rollout_only, actor_fwd_only, pbar=pbar
@@ -1087,27 +1273,37 @@ class DeviceDirectBackend(CommBackend):
 
         while not ray.get(self.lock.acquire.remote()):
             time.sleep(0.1)
-        # Prepare payload for weight update
-        weight_payload = {
-            "names": [name for name, _ in converted_named_tensors],
-            "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
-            "shapes": [param.shape for _, param in converted_named_tensors],
-            "group_name": self._group_name,
-            "weight_version": str(self.weight_version),
-            "flush_cache": False,
-        }
-        # Send weight update to all rollout nodes via Ray actors
-        futures = self._batch_request("/update_weights_from_distributed", weight_payload)
+        completed = False
+        try:
+            # Prepare payload for weight update
+            weight_payload = {
+                "names": [name for name, _ in converted_named_tensors],
+                "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
+                "shapes": [param.shape for _, param in converted_named_tensors],
+                "group_name": self._group_name,
+                "weight_version": str(self.weight_version),
+                "flush_cache": False,
+            }
+            # Send weight update to all rollout nodes via Ray actors
+            futures = self._batch_request("/update_weights_from_distributed", weight_payload)
 
-        # Broadcast weights via PyTorch distributed
-        handles = []
-        for _, param in converted_named_tensors:
-            handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
-        for handle in handles:
-            handle.wait()
-        ray.get(futures)  # Ensure remote update completes
-
-        ray.get(self.lock.release.remote())
+            # Broadcast weights via PyTorch distributed
+            handles = []
+            for _, param in converted_named_tensors:
+                handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
+            for handle in handles:
+                handle.wait()
+            ray.get(futures)  # Ensure remote update completes
+            completed = True
+        finally:
+            try:
+                ray.get(self.lock.release.remote())
+            except Exception:
+                if completed:
+                    raise
+                # Preserve the original sync error if cluster teardown also
+                # makes releasing the lock fail.
+                logger.exception("Failed to release the DCS weight-update lock after a sync error")
         if pbar is not None:
             pbar.update(1)
 
@@ -1419,8 +1615,9 @@ class RolloutEngine:
         self.base_url = f"http://{node_info['ip']}:{node_info['port']}"
         logger.info(f"RolloutEngine #{self.rank} initialized for {self.base_url}")
 
-    def health(self, timeout: float = 5.0) -> bool:
-        response = requests.get(f"{self.base_url}/health_generate", timeout=timeout)
+    def health(self, timeout: float = 5.0, generate: bool = True) -> bool:
+        endpoint = "health_generate" if generate else "get_server_info"
+        response = requests.get(f"{self.base_url}/{endpoint}", timeout=timeout)
         response.raise_for_status()
         return True
 

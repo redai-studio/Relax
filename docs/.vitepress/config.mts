@@ -249,11 +249,16 @@ export default defineConfig({
               text: 'Getting Started',
               items: [
                 { text: 'Introduction', link: '/en/guide/introduction' },
-                { text: 'Installation', link: '/en/guide/installation' },
+                {
+                  text: 'Installation',
+                  link: '/en/guide/installation',
+                  items: [{ text: 'AMD ROCm', link: '/en/guide/rocm' }],
+                },
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
                 { text: 'Adding an Algorithm', link: '/en/guide/adding-an-algorithm' },
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
+                { text: 'Image-to-Image SFT', link: '/en/guide/i2i-sft' },
                 { text: 'DPO Training', link: '/en/guide/dpo-training' },
                 { text: 'CPT Training', link: '/en/guide/cpt-training' },
                 { text: 'MTP Training', link: '/en/guide/mtp-rl-training' },
@@ -270,6 +275,7 @@ export default defineConfig({
                 { text: 'Dataset Design', link: '/en/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/en/guide/distributed-checkpoint' },
                 { text: 'Health Check Manager', link: '/en/guide/health-check-manager' },
+                { text: 'Fault Event History', link: '/en/guide/fault-events' },
               ],
             },
             {
@@ -303,6 +309,7 @@ export default defineConfig({
               text: 'Best Practices',
               items: [
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
+                { text: 'Qwen3.8 QSA Backends', link: '/en/guide/qwen38-qsa' },
                 { text: 'Compiler Cache Reuse', link: '/en/guide/compiler-cache' },
                 { text: 'Accelerated S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
@@ -382,11 +389,16 @@ export default defineConfig({
               text: '快速开始',
               items: [
                 { text: '介绍', link: '/zh/guide/introduction' },
-                { text: '安装', link: '/zh/guide/installation' },
+                {
+                  text: '安装',
+                  link: '/zh/guide/installation',
+                  items: [{ text: 'AMD ROCm', link: '/zh/guide/rocm' }],
+                },
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
                 { text: '接入新算法', link: '/zh/guide/adding-an-algorithm' },
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
+                { text: '图像编辑 SFT', link: '/zh/guide/i2i-sft' },
                 { text: 'DPO 训练', link: '/zh/guide/dpo-training' },
                 { text: 'CPT 训练', link: '/zh/guide/cpt-training' },
                 { text: 'MTP 训练', link: '/zh/guide/mtp-rl-training' },
@@ -403,6 +415,7 @@ export default defineConfig({
                 { text: '数据集设计', link: '/zh/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/zh/guide/distributed-checkpoint' },
                 { text: '健康检查管理器', link: '/zh/guide/health-check-manager' },
+                { text: '故障事件历史', link: '/zh/guide/fault-events' },
               ],
             },
             {
@@ -430,6 +443,7 @@ export default defineConfig({
               text: '最佳实践',
               items: [
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
+                { text: 'Qwen3.8 QSA 后端', link: '/zh/guide/qwen38-qsa' },
                 { text: '编译缓存复用', link: '/zh/guide/compiler-cache' },
                 { text: 'S3 模型加载加速', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },

@@ -13,8 +13,10 @@ import asyncio
 import copy
 import threading
 import time
+import uuid
 from argparse import Namespace
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Deque, List, Optional, Tuple, cast
 
@@ -24,6 +26,7 @@ from relax.agentic import format_agentic_event
 from relax.agentic.pipeline import (
     GroupExport,
     GroupInput,
+    RuntimeGroupError,
 )
 from relax.agentic.pipeline.prepare import PrepareDomain
 from relax.agentic.pipeline.reward import RewardDomain
@@ -36,9 +39,15 @@ from relax.agentic.pipeline.runtime import (
 )
 from relax.agentic.pipeline.transfer import TransferBatch, TransferDomain, _transfer_batch_to_data_system
 from relax.agentic.profile import TRACE_KEY
-from relax.distributed.ray.rollout import _log_rollout_data
+from relax.agentic.stage_recorder import (
+    STAGE_OVERSAMPLING,
+    STAGE_SHUTDOWN,
+    StageRecorder,
+)
+from relax.distributed.ray.rollout import _log_rollout_data, get_local_rollout_manager
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
@@ -69,6 +78,18 @@ class _StepContext:
     progress: Any = None
     scored: int = 0
     prepared: int = 0
+    observed_group_ids: set[str] = field(default_factory=set)
+    event_seq: int = 0
+    terminal_recorded: bool = False
+
+
+@dataclass
+class _GroupObservation:
+    """Retain export refs only while their Runtime/Reward task is owned."""
+
+    stream: RuntimeGroupStream
+    terminal_drop_recorded: bool = False
+    observed_rollout_id: int | None = None
 
 
 async def _run_group(
@@ -76,34 +97,131 @@ async def _run_group(
     reward_domain: RewardDomain,
     stream: RuntimeGroupStream,
     opd_manager: opd.OpdManager | None = None,
+    stage_recorder: Optional[StageRecorder] = None,
+    rollout_id: int = -1,
+    observation: Optional[_GroupObservation] = None,
 ) -> Optional[GroupExport]:
-    """Run one Group through Runtime and the configured Reward barrier."""
+    """Run one Group through Runtime and the configured Reward barrier.
+
+    ``stage_recorder`` is the only place the two reward-side drops are visible
+    per Sample: both return ``None`` for the whole Group, and the drop reason
+    lives in the filter output rather than in any downstream state.
+
+    ``rollout_id`` is the step that leased this Group, which under partial
+    rollout is not always the step it dies in. It only picks the stage file;
+    readers join on ``sample_export_id``.
+    """
+
+    def current_rollout_id() -> int:
+        if observation is not None and observation.observed_rollout_id is not None:
+            return observation.observed_rollout_id
+        return rollout_id
 
     requires_complete_group = reward_domain.group_rm or reward_domain.custom_advantage_func is not None
+
+    def observe_reward(samples: list[Sample]):
+        return stage_recorder.observe(
+            samples,
+            rollout_id=current_rollout_id(),
+            group_id=stream.group_id,
+            stage="reward",
+            operation="provided_reward" if all(s.reward is not None for s in samples) else "rm",
+        )
+
+    def observe_filter(group: GroupExport, operation: str):
+        if stage_recorder is None:
+            return nullcontext({})
+        return stage_recorder.observe(
+            group.samples,
+            rollout_id=current_rollout_id(),
+            group_id=group.group_id,
+            stage="filter",
+            operation=operation,
+        )
+
     try:
         if requires_complete_group:
             group = await runtime_domain.collect_group(stream)
         else:
-            group, _ = await asyncio.gather(
-                runtime_domain.collect_group(stream),
-                reward_domain.score_sessions(stream),
+            tasks = (
+                asyncio.create_task(runtime_domain.collect_group(stream)),
+                asyncio.create_task(
+                    reward_domain.score_sessions(stream, observe_reward=observe_reward)
+                    if stage_recorder is not None
+                    else reward_domain.score_sessions(stream)
+                ),
             )
+            try:
+                group, _ = await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await finish_before_cancellation(
+                    asyncio.gather(*tasks, return_exceptions=True), "agentic-group-reward-cleanup"
+                )
         if group is None:
             reward_domain.discard_group_progress(stream)
             await runtime_domain.drop_group(stream)
+            if stage_recorder is not None:
+                if observation is not None:
+                    observation.terminal_drop_recorded = True
+                await stage_recorder.record_stream_dropped(
+                    stream,
+                    rollout_id=current_rollout_id(),
+                    stage="execution",
+                    reason_code="group_member_failed",
+                    category="selection",
+                    reason="another session in the group did not produce a usable export",
+                )
             return None
 
         if reward_domain.group_rm:
-            await reward_domain.score_group(group)
-        if reward_domain.custom_advantage_func is not None and not await reward_domain.apply_custom_advantage(group):
-            reward_domain.discard_group_progress(stream)
-            return None
+            if stage_recorder is not None:
+                await reward_domain.score_group(group, observe_reward=observe_reward)
+            else:
+                await reward_domain.score_group(group)
+        elif reward_domain.custom_advantage_func is not None and stage_recorder is not None:
+            for sample in group.samples:
+                if sample.reward is not None:
+                    async with observe_reward([sample]):
+                        pass
+        if reward_domain.custom_advantage_func is not None:
+            async with observe_filter(group, "custom_advantage") as result:
+                accepted = await reward_domain.apply_custom_advantage(group)
+                if not accepted:
+                    if observation is not None:
+                        observation.terminal_drop_recorded = True
+                    result.update(
+                        status="filtered",
+                        reason="custom_advantage_func returned None",
+                        reason_code="custom_advantage_rejected",
+                        category="selection",
+                        is_terminal=True,
+                    )
+            if not accepted:
+                reward_domain.discard_group_progress(stream)
+                if observation is not None:
+                    observation.terminal_drop_recorded = True
+                return None
         if requires_complete_group:
             reward_domain.note_scored_sessions(stream)
 
-        scored_group = reward_domain.finalize_group(group)
+        async with observe_filter(group, "dynamic_filter") as result:
+            scored_group = reward_domain.finalize_group(group)
+            if scored_group is None:
+                if observation is not None:
+                    observation.terminal_drop_recorded = True
+                result.update(
+                    status="filtered",
+                    reason=reward_domain.last_filter_drop_reason,
+                    reason_code="filter_rejected",
+                    category="selection",
+                    is_terminal=True,
+                )
         if scored_group is None:
             reward_domain.discard_group_progress(stream)
+            if observation is not None:
+                observation.terminal_drop_recorded = True
             return None
         if opd_manager is None:
             return scored_group
@@ -111,9 +229,20 @@ async def _run_group(
 
         await opd_manager.prefill(scored_group.samples, _encode_multimodal_inputs)
         return scored_group
-    except BaseException:
+    except BaseException as error:
         reward_domain.discard_group_progress(stream)
         await runtime_domain.drop_group(stream)
+        if stage_recorder is not None and not isinstance(error, asyncio.CancelledError):
+            if observation is not None:
+                observation.terminal_drop_recorded = True
+            await stage_recorder.record_stream_dropped(
+                stream,
+                rollout_id=current_rollout_id(),
+                stage="execution",
+                reason=f"{type(error).__name__}: {error}",
+                reason_code="group_execution_failed",
+                category="infra" if isinstance(error, RuntimeGroupError) else "execution",
+            )
         raise
 
 
@@ -143,8 +272,10 @@ class AgenticResidentPipeline:
         self.runtime_domain.set_progress_callback(self._changed.set)
         self.reward_domain.set_progress_callback(self._changed.set)
         self._active_group_tasks: List[asyncio.Task[Optional[GroupExport]]] = []
+        self._group_observations: dict[asyncio.Task[Optional[GroupExport]], _GroupObservation] = {}
         self._finalized_groups: Deque[GroupExport] = deque()
         self._active_step: Optional[_StepContext] = None
+        self._stage_recorder = StageRecorder(args)
 
     def snapshot(self) -> dict[str, object]:
         """Project debug state from owned refs without feeding it into
@@ -154,7 +285,7 @@ class AgenticResidentPipeline:
         warming, ready = self.prepare_domain.counts
         runtime_reward = len(self._active_group_tasks)
         finalized = len(self._finalized_groups)
-        return {
+        snapshot: dict[str, object] = {
             "active_rollout_id": context.rollout_id if context is not None else None,
             "warming_prepare_group_count": warming,
             "ready_prepare_group_count": ready,
@@ -164,6 +295,9 @@ class AgenticResidentPipeline:
             "resident_group_count": self.runtime_domain.resident_group_count,
             "interrupted_runtime_group_count": len(self.runtime_domain.interrupted_group_ids),
         }
+        if self.runtime_domain.teacher_routing_enabled:
+            snapshot["teacher_responses"] = self._opd_manager.response_stats.metrics()
+        return snapshot
 
     async def run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
         """Generate one rollout step while resident Group refs may cross
@@ -181,7 +315,15 @@ class AgenticResidentPipeline:
             final_backfill=final_backfill,
         )
         self._active_step = context
+        if self.runtime_domain.teacher_routing_enabled:
+            self._opd_manager.response_stats.new_window()
         try:
+            if self._stage_recorder.enabled:
+                context.observed_group_ids.update(group.group_id for group in self._finalized_groups)
+                for item in self._group_observations.values():
+                    context.observed_group_ids.add(item.stream.group_id)
+                    item.observed_rollout_id = rollout_id
+                await self._record_rollout(context)
             self.prepare_domain.open_step(
                 prelaunch_next_step=self.args.agentic_prelaunch and rollout_id + 1 < self.args.num_rollout
             )
@@ -193,6 +335,8 @@ class AgenticResidentPipeline:
             metrics = dict(output.metrics or {})
             metrics.update(_aggregate_agentic_timing(samples))
             metrics.update(self.reward_domain.collect_metrics())
+            if self.runtime_domain.teacher_routing_enabled:
+                metrics.update(self._opd_manager.response_stats.metrics())
             if getattr(self.args, "agentic_program_admission", False) or getattr(
                 self.args, "agentic_session_lifecycle", False
             ):
@@ -237,6 +381,18 @@ class AgenticResidentPipeline:
                     interrupted_groups=len(self.runtime_domain.interrupted_group_ids),
                 )
             )
+            context.terminal_recorded = True
+            await self._record_rollout(context, status="completed", groups_finalized=True)
+        except BaseException as error:
+            if not context.terminal_recorded:
+                context.terminal_recorded = True
+                await self._record_rollout(
+                    context,
+                    status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed",
+                    groups_finalized=True,
+                    reason=str(error),
+                )
+            raise
         finally:
             if not step_progress_finished:
                 self._finish_step_progress(context)
@@ -244,6 +400,27 @@ class AgenticResidentPipeline:
                 await stop_sglang_profile(self.args, rollout_id)
         self._active_step = None
         return output
+
+    async def _record_rollout(
+        self,
+        context: _StepContext,
+        *,
+        status: str = "start",
+        groups_finalized: bool = False,
+        reason: Optional[str] = None,
+    ) -> None:
+        if status == "start" and context.event_seq > 0:
+            return
+        if self._stage_recorder.enabled:
+            context.event_seq += 1
+            await self._stage_recorder.record_rollout(
+                context.rollout_id,
+                group_ids=context.observed_group_ids,
+                event_seq=context.event_seq,
+                status=status,
+                groups_finalized=groups_finalized,
+                reason=reason,
+            )
 
     def _finish_step_progress(self, context: _StepContext) -> None:
         if context.progress is not None:
@@ -366,19 +543,87 @@ class AgenticResidentPipeline:
     def _submit_tq_batch(self, context: _StepContext, batch: TransferBatch) -> None:
         """Create one TQ transfer call owned by the active step."""
 
-        rollout_id, groups, is_last = batch
+        partition_id, groups, is_last = batch
+        if self._stage_recorder.enabled:
+            context.observed_group_ids.update(group.group_id for group in groups)
         task = asyncio.create_task(
-            _transfer_batch_to_data_system(
-                args=self.args,
-                batch_samples=[group.samples for group in groups],
-                rollout_id=rollout_id,
-                data_system_client=self._data_system_client,
-                is_last=is_last,
-            ),
-            name=f"agentic-transfer:train_{rollout_id}:{len(groups)}-groups",
+            self._transfer_and_record(context, partition_id, groups, is_last),
+            name=f"agentic-transfer:train_{partition_id}:{len(groups)}-groups",
         )
         task.add_done_callback(lambda _task: self._changed.set())
         context.tq_put_tasks.append(task)
+
+    async def _transfer_and_record(
+        self,
+        context: _StepContext,
+        partition_id: int,
+        groups: Tuple[GroupExport, ...],
+        is_last: bool,
+    ) -> None:
+        """Cross the TQ boundary, then record the samples that made it.
+
+        The completed boundary is emitted only after ``async_put`` returns: a
+        failed or cancelled write must not leave a ``queued_for_train`` line
+        claiming the samples reached training. It is filed under the driver
+        step rather than ``partition_id`` because the transfer domain keeps a
+        previous and a current partition open, so one step can write into two
+        of them.
+        """
+
+        put_started = False
+
+        def on_put_started() -> None:
+            nonlocal put_started
+            put_started = True
+
+        try:
+            await self._stage_recorder.begin_samples(
+                [sample for group in groups for sample in group.samples],
+                rollout_id=context.rollout_id,
+                partition_id=partition_id,
+                stage="transfer",
+                transfer_batch_id=uuid.uuid4().hex,
+                group_ids={s.sample_export_id: g.group_id for g in groups for s in g.samples},
+            )
+            if self._stage_recorder.enabled:
+                await self._record_rollout(context)
+            await _transfer_batch_to_data_system(
+                args=self.args,
+                batch_samples=[group.samples for group in groups],
+                partition_id=partition_id,
+                data_system_client=self._data_system_client,
+                is_last=is_last,
+                on_put_started=on_put_started,
+            )
+        except BaseException as error:
+            if put_started:
+                event = self._stage_recorder.record_transfer_unknown(
+                    groups,
+                    rollout_id=context.rollout_id,
+                    partition_id=partition_id,
+                    reason=f"{type(error).__name__}: {error}",
+                    cancelled=isinstance(error, asyncio.CancelledError),
+                )
+            else:
+                event = self._stage_recorder.record_groups_dropped(
+                    groups,
+                    rollout_id=context.rollout_id,
+                    stage="transfer",
+                    reason=f"{type(error).__name__}: {error}",
+                    category="infra",
+                    reason_code="transfer_not_submitted",
+                    status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed",
+                )
+            await event
+            raise
+        if not self._stage_recorder.enabled:
+            return
+        await self._stage_recorder.record_queued(
+            [sample for group in groups for sample in group.samples],
+            rollout_id=context.rollout_id,
+            partition_id=partition_id,
+            group_ids={sample.sample_export_id: group.group_id for group in groups for sample in group.samples},
+        )
 
     async def _await_tq_puts(self, context: _StepContext) -> None:
         """Cross the TQ durability barrier for batches owned by this step."""
@@ -393,8 +638,9 @@ class AgenticResidentPipeline:
         for task in tuple(self._active_group_tasks):
             if not task.done():
                 continue
-            self._active_group_tasks.remove(task)
             outcome = task.result()
+            self._active_group_tasks.remove(task)
+            self._group_observations.pop(task, None)
             if outcome is not None:
                 self._finalized_groups.append(outcome)
 
@@ -406,14 +652,18 @@ class AgenticResidentPipeline:
         if debt == 0:
             return True
 
-        # Fully async may close with unfinished physical debt only when the
+        # During an Actor weight update, fully async may carry debt when the
         # same number of resident Groups is confirmed interrupted. Debt from
         # the older partition must finish first: only two physical partitions
         # can be active, so carrying it again would make the next open fail.
         # Zero staleness blocks the next rollout until training consumes this
         # partition, so it cannot leave debt for that next rollout to fill.
         if self.args.fully_async and self.args.max_staleness > 0 and not context.final_backfill:
-            return self.transfer_domain.previous_debt == 0 and debt <= len(self.runtime_domain.interrupted_group_ids)
+            return (
+                get_local_rollout_manager().training_weight_updating
+                and self.transfer_domain.previous_debt == 0
+                and debt <= len(self.runtime_domain.interrupted_group_ids)
+            )
         return False
 
     async def _close_rollout_step(self, context: _StepContext) -> RolloutFnTrainOutput:
@@ -439,8 +689,14 @@ class AgenticResidentPipeline:
         )
         retain_resident_tail = not context.final_backfill and (self.args.partial_rollout or self.args.fully_async)
         if not retain_resident_tail:
-            self._finalized_groups.clear()
-            await self._cancel_active_group_tasks()
+            await finish_before_cancellation(
+                self._cancel_active_group_tasks(
+                    rollout_id=context.rollout_id,
+                    stage=STAGE_OVERSAMPLING,
+                    reason="step closed with partition debt already met",
+                ),
+                "agentic-groups-discard",
+            )
         elif dynamic_close:
             # Generation is now paused. Harvest Group tasks already complete,
             # append their aligned FIFO prefix, seal the partition, and wait for
@@ -479,14 +735,39 @@ class AgenticResidentPipeline:
         opens its generation gate.
         """
 
-        for stream in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
+        for stream, teacher_id, response_keys in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
+            for key in response_keys:
+                self._opd_manager.response_stats.admit(key, cast(str, teacher_id))
             await self.runtime_domain.lease_group(stream, context.rollout_id)
+            observation = (
+                _GroupObservation(stream, observed_rollout_id=context.rollout_id)
+                if self._stage_recorder.enabled
+                else None
+            )
             group_task = asyncio.create_task(
-                _run_group(self.runtime_domain, self.reward_domain, stream, self._opd_manager),
+                _run_group(
+                    self.runtime_domain,
+                    self.reward_domain,
+                    stream,
+                    self._opd_manager,
+                    stage_recorder=self._stage_recorder if self._stage_recorder.enabled else None,
+                    rollout_id=context.rollout_id,
+                    observation=observation,
+                ),
                 name=f"agentic-group:{stream.group_id}",
             )
-            group_task.add_done_callback(lambda _task: self._changed.set())
+            # A task cancelled before its coroutine starts still has to release its response counts.
+            group_task.add_done_callback(lambda _task, keys=response_keys: self._finish_group(keys))
             self._active_group_tasks.append(group_task)
+            if observation is not None:
+                self._group_observations[group_task] = observation
+                context.observed_group_ids.add(stream.group_id)
+        await self._record_rollout(context)
+
+    def _finish_group(self, response_keys: tuple[int | str, ...]) -> None:
+        for key in response_keys:
+            self._opd_manager.response_stats.finish(key)
+        self._changed.set()
 
     def _runtime_group_gap(self, context: _StepContext) -> int:
         oversample_groups = 0
@@ -502,7 +783,9 @@ class AgenticResidentPipeline:
     async def _shutdown(self) -> None:
         """Cancel and join active-step TQ writes, then release every owner."""
 
-        self._finalized_groups.clear()
+        # Preserve accepted but not yet detached groups until their producers
+        # have stopped; the cancellation helper records all successful results.
+        self._finalized_groups.extend(self.transfer_domain.pending_groups())
         first_error: Optional[BaseException] = None
         context = self._active_step
         tq_put_tasks: Tuple[asyncio.Task[None], ...] = ()
@@ -526,18 +809,47 @@ class AgenticResidentPipeline:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+        await self._stage_recorder.aclose()
         if first_error is not None:
             raise first_error
 
-    async def _cancel_active_group_tasks(self) -> None:
+    async def _cancel_active_group_tasks(
+        self,
+        *,
+        rollout_id: Optional[int] = None,
+        stage: str = STAGE_SHUTDOWN,
+        reason: str = "pipeline shut down before the samples were written",
+    ) -> None:
         """Drop resident Runtime/Reward tasks when the mode cannot retain
         them."""
 
         tasks = tuple(self._active_group_tasks)
         self._active_group_tasks.clear()
         for task in tasks:
+            observation = self._group_observations.get(task)
+            if observation is not None:
+                observation.stream.stop_reason = (stage, "selection", reason)
             task.cancel()
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        observations = [self._group_observations.pop(task, None) for task in tasks]
+        # A task can finish during the TQ/pause barriers or even while handling
+        # cancellation. Join every producer before snapshotting terminal groups.
+        self._finalized_groups.extend(outcome for outcome in outcomes if isinstance(outcome, GroupExport))
+        groups = tuple(self._finalized_groups)
+        self._finalized_groups.clear()
+        if rollout_id is None:
+            rollout_id = self._active_step.rollout_id if self._active_step is not None else -1
+        if self._stage_recorder.enabled:
+            await self._stage_recorder.record_groups_dropped(groups, rollout_id=rollout_id, stage=stage, reason=reason)
+            for outcome, observation in zip(outcomes, observations, strict=True):
+                if (
+                    isinstance(outcome, BaseException)
+                    and observation is not None
+                    and not observation.terminal_drop_recorded
+                ):
+                    await self._stage_recorder.record_stream_dropped(
+                        observation.stream, rollout_id=rollout_id, stage=stage, reason=reason
+                    )
         for outcome in outcomes:
             if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
                 raise outcome
@@ -610,6 +922,8 @@ async def _eval_groups(
     runtime_domain: RuntimeDomain,
     reward_domain: RewardDomain,
     progress: Any,
+    stage_recorder: Optional[StageRecorder] = None,
+    observed_group_ids: set[str] | None = None,
 ) -> Tuple[GroupExport, ...]:
     """Evaluate finite source Groups through the shared Runtime/Reward core."""
 
@@ -621,13 +935,35 @@ async def _eval_groups(
         if stream is None:
             return None
         await runtime_domain.lease_group(stream, eval_id)
-        return await _run_group(runtime_domain, reward_domain, stream)
+        observation = _GroupObservation(stream)
+        try:
+            group = await _run_group(
+                runtime_domain,
+                reward_domain,
+                stream,
+                stage_recorder=stage_recorder,
+                rollout_id=eval_id,
+                observation=observation,
+            )
+            if group is not None and stage_recorder is not None:
+                if observation is not None:
+                    observation.terminal_drop_recorded = True
+                await stage_recorder.record_evaluated(group, rollout_id=eval_id)
+            return group
+        except asyncio.CancelledError:
+            if stage_recorder is not None and not observation.terminal_drop_recorded:
+                await stage_recorder.record_stream_dropped(
+                    stream, rollout_id=eval_id, stage="shutdown", reason="eval was cancelled"
+                )
+            raise
 
     sample_groups = groups if reward_domain.group_rm else tuple((sample,) for group in groups for sample in group)
     group_inputs = tuple(
         GroupInput(f"{scope_id}:prepare_group_{sequence}", list(sample_group))
         for sequence, sample_group in enumerate(sample_groups)
     )
+    if observed_group_ids is not None:
+        observed_group_ids.update(group.group_id for group in group_inputs)
     group_tasks = tuple(
         asyncio.create_task(
             run_eval_group(group_input),
@@ -878,6 +1214,8 @@ def _build_eval_samples(
             use_audio_in_video=args.use_audio_in_video,
             system_prompt=args.system_prompt,
             custom_prompt_func=custom_prompt_func,
+            record_source=agentic_obs_enabled(args),
+            source_split="eval",
         )
         samples = []
         sample_index = 0
@@ -900,6 +1238,40 @@ def _build_eval_samples(
 
 
 async def eval_rollout(args, rollout_id: int) -> RolloutFnEvalOutput:
+    recorder = StageRecorder(args, rollout_mode="eval")
+    group_ids: set[str] = set()
+    try:
+        await recorder.record_rollout(rollout_id, group_ids=(), event_seq=1)
+        result = await _eval_rollout(args, rollout_id, recorder, group_ids)
+    except BaseException as error:
+        await recorder.record_rollout(
+            rollout_id,
+            group_ids=group_ids,
+            event_seq=2,
+            groups_finalized=True,
+            status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed",
+            reason=str(error),
+        )
+        raise
+    else:
+        await recorder.record_rollout(
+            rollout_id,
+            group_ids=group_ids,
+            event_seq=2,
+            groups_finalized=True,
+            status="completed",
+        )
+        return result
+    finally:
+        await recorder.aclose()
+
+
+async def _eval_rollout(
+    args: Namespace,
+    rollout_id: int,
+    stage_recorder: StageRecorder,
+    group_ids: set[str],
+) -> RolloutFnEvalOutput:
     results = {}
     eval_metrics = {}
     reward_key = args.eval_reward_key or args.reward_key
@@ -920,6 +1292,8 @@ async def eval_rollout(args, rollout_id: int) -> RolloutFnEvalOutput:
                 runtime_domain=runtime_domain,
                 reward_domain=RewardDomain(args, "eval", None),
                 progress=progress,
+                stage_recorder=stage_recorder,
+                observed_group_ids=group_ids,
             )
             if dataset_index + 1 == len(args.eval_datasets):
                 eval_metrics = {

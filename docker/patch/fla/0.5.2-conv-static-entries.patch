@@ -19,7 +19,7 @@ diff --git a/fla/modules/conv/triton/conv_policy.py b/fla/modules/conv/triton/co
 +def _select_mode():
 +    mode = os.environ.get("RELAX_FLA_CONV_NB_MODE", "auto").strip().lower()
 +    if mode == "auto":
-+        mode = "none" if os.environ.get("RELAX_GPU_ARCH") == "b300" else "original"
++        mode = "none" if os.environ.get("RELAX_GPU_ARCH") == "blackwell" else "original"
 +    if mode not in {"original", "pow2", "none"}:
 +        raise ValueError(f"Unknown FLA convolution mode: {mode!r}")
 +    return mode

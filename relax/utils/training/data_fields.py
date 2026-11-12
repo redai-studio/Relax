@@ -3,6 +3,8 @@
 from argparse import Namespace
 
 from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
+from relax.utils.agentic_obs import agentic_obs_enabled
+from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.data.image_refs import sft_multimodal_data_fields
 from relax.utils.env import Envs
 
@@ -34,6 +36,9 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         fields.append("rollout_routed_experts")
     if getattr(args, "multimodal_keys", None) is not None:
         fields.append("multimodal_train_inputs")
+    if agentic_obs_enabled(args):
+        # Produced by convert_samples_to_train_data under the same gate.
+        fields.extend(OBSERVATION_DATA_FIELDS)
     return fields
 
 
@@ -47,6 +52,8 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return list(PREFERENCE_DATA_FIELDS)
     if is_sft_mode(args):
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
+        if getattr(args, "_sft_dataset_names", ()) and getattr(args, "task_type", "causal_lm") == "causal_lm":
+            fields.append("dataset_ids")
         if Envs.RELAX_SFT_PRE_SHIFTED_LABELS:
             fields.append("pre_shifted_labels")
         if getattr(args, "task_type", "causal_lm") == "seq_cls":

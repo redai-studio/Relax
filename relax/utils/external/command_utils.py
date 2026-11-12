@@ -239,14 +239,15 @@ def save_to_temp_file(text: str, ext: str):
     return str(path)
 
 
+# Hardware-name compatibility lookups, not a record of deployed hardware.
 NUM_GPUS_OF_HARDWARE = {
-    "H100": 8,
-    "GB200": 4,
-    "GB300": 4,
+    "H100": 8,  # gitleaks:allow
+    "GB200": 4,  # gitleaks:allow
+    "GB300": 4,  # gitleaks:allow
 }
 
 GENERATION_HARDWARE = {
-    "H100": "Hopper",
-    "GB200": "Blackwell",
-    "GB300": "Blackwell",
+    "H100": "Hopper",  # gitleaks:allow
+    "GB200": "Blackwell",  # gitleaks:allow
+    "GB300": "Blackwell",  # gitleaks:allow
 }

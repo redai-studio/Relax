@@ -1,0 +1,13 @@
+diff --git a/python/sglang/srt/models/qwen3.py b/python/sglang/srt/models/qwen3.py
+index 2939fc608d..231db0302d 100644
+--- a/python/sglang/srt/models/qwen3.py
++++ b/python/sglang/srt/models/qwen3.py
+@@ -53,7 +53,7 @@ if _use_aiter:
+     try:
+         from aiter import fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
+ 
+-        _has_fused_qk_norm_mrope = True
++        _has_fused_qk_norm_mrope = False  # Relax ROCm: this aiter fused decode path breaks Qwen3-VL M-RoPE decode
+         logger.info("aiter fused_qk_norm_mrope_3d kernel available")
+     except ImportError:
+         pass

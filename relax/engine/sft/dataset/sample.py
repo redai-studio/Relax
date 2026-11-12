@@ -18,9 +18,13 @@ class CanonicalMessage:
     learn: bool
     # OpenAI-style assistant tool calls, e.g.
     # [{"type": "function", "function": {"name": ..., "arguments": {...}}}].
-    # Passed through to the chat template unchanged.
+    # Arguments are normalized to mappings before reaching this contract.
     tool_calls: list[dict] | None = None
     reasoning_content: str | None = None
+    # OpenAI tool-result correlation fields. ``name`` is also populated from
+    # the matching assistant tool call when the input only carries an id.
+    tool_call_id: str | None = None
+    name: str | None = None
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:

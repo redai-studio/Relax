@@ -192,6 +192,12 @@ def linear_cross_entropy(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Return unreduced losses in hidden row order; SP gathering is the
     caller's job."""
+    if Envs.RELAX_SFT_FUSED_LINEAR_CE and temperature == 1.0:
+        from .kernels.linear_cross_entropy import linear_cross_entropy as backport_linear_cross_entropy
+
+        return backport_linear_cross_entropy(
+            hidden, weight, labels, tp_group, accumulate=accumulate, return_logits=return_logits
+        )
     if temperature <= 0:
         raise ValueError("Linear CE temperature must be positive")
     if hidden.numel() == 0:

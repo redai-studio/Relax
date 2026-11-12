@@ -31,6 +31,9 @@ RUN apt-get update && apt-get install -y locales tzdata && \
     locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
+# Optional build-time package mirror; keep the base pip configuration by default.
+ARG PIP_INDEX_URL
+
 FROM base as sglang
 
 WORKDIR /sgl-workspace/sglang
@@ -39,7 +42,8 @@ RUN pip install nvidia-cudnn-cu12==9.16.0.29
 
 FROM base as train
 
-RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
+# Build for the base Torch ABI without relying on a guessed GitHub wheel URL.
+RUN FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
     pip install --no-cache-dir flash-linear-attention==0.4.2 && \
     pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 
@@ -84,7 +88,7 @@ RUN MAX_JOBS=64 \
     cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'stray top-level flash_attn_interface still importable'; import flash_attn_config" && \
     rm -rf /opt/flash-attention/
 
-RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
+RUN NVTE_PYTORCH_FORCE_BUILD=TRUE pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir && \
     pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
@@ -226,6 +230,8 @@ COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
+COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
+COPY docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
@@ -236,10 +242,12 @@ RUN cd Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
+    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
+    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch fully-reshardable-checkpoint-padding.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 
@@ -259,11 +267,11 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
 fi
 
 # Shared MCore model sources are installed above, but this CUDA 12 image retains
-# its SGLang 0.5.17/TE 2.14 runtime. The optimized B300 TP4 recipe and Qwen3.8
+# its SGLang 0.5.17/TE 2.14 runtime. The optimized 280G Blackwell TP4 recipe and Qwen3.8
 # SGLang 0.5.20 rollout require Dockerfile.cu13; Torch stays on CUDA 12.
 
 # Shared experiment fixes belong in the default CUDA 12 build as well. Keep its
-# NumPy<2, TE 2.14 and CUDA 12 libraries; do not install the B300 cu13/v2 stack.
+# NumPy<2, TE 2.14 and CUDA 12 libraries; do not install the 280G Blackwell cu13/v2 stack.
 COPY docker/scripts/install_legacy_fla.py \
     docker/scripts/validate_hybridep_install.py \
     docker/scripts/record_qwen35_runtime.py \
@@ -275,15 +283,38 @@ RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2
         --patch /tmp/fla042.patch --manifest /etc/relax-fla042-runtime.json && \
     rm /tmp/fla042.patch
 COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
+COPY docker/patch/sglang/v0.5.17-transformers5-compat.patch /tmp/sglang-transformers5.patch
 COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
 COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
+# Apply after all pip installs; this cache specialization requires Frontend 1.27.0 / CuTe DSL 4.6.0.
+COPY docker/patch/cudnn/1.27.0-dsa-sm90-signature-cache.patch /tmp/cudnn-dsa-sm90-signature-cache.patch
 # Resolve late so existing compiled layers remain cached. NIXL packages both
 # backends, but dispatches to cu12 based on Torch; this does not change CUDA.
+# Pin Qwen3.8 HF support without replacing the CUDA/Torch/TE/DeepEP stack.
 RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt && \
     pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt -r /opt/relax/cu12-runtime-requirements.txt && \
     python /opt/relax/repair_te_wheel_metadata.py /opt/relax/te-wheel-tag.patch && \
     pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
+    patch --batch --forward --fuzz=0 -d /sgl-workspace/sglang -p1 < /tmp/sglang-transformers5.patch && \
+    pip install --no-cache-dir setuptools-scm==9.2.2 && \
+    SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
+        pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python && \
+    pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.16.0 tokenizers==0.23.2 && \
+    rm /tmp/sglang-transformers5.patch && \
+    python -c 'from importlib.metadata import version; \
+        assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
+        assert version("sglang") == "0.5.17"; \
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
+        assert CONFIG_MAPPING["qwen4_exp"].model_type == "qwen4_exp"; \
+        import sglang.srt.configs.qwen3_asr' && \
     python /opt/relax/validate_hybridep_install.py && \
+    CUDNN_SITE="$(python -c 'import importlib.metadata as m; \
+        assert m.version("nvidia-cudnn-frontend") == "1.27.0", "DSA SM90 patch requires cuDNN Frontend 1.27.0"; \
+        assert m.version("nvidia-cutlass-dsl") == "4.6.0", "DSA SM90 patch requires CuTe DSL 4.6.0"; \
+        print(m.distribution("nvidia-cudnn-frontend").locate_file(""))')" && \
+    patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa-sm90-signature-cache.patch && \
+    python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" && \
+    rm /tmp/cudnn-dsa-sm90-signature-cache.patch && \
     python /opt/relax/validate_final_runtime.py --profile cu12

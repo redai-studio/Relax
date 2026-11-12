@@ -13,9 +13,11 @@ Provides:
 
 import asyncio
 import time
+from collections.abc import Callable, Mapping
 from typing import Any, Dict, Optional, Sequence
 
 import httpx
+import torch
 import torch.distributed as dist
 
 from relax.distributed.checkpoint_service.backends import CommBackend, DeviceDirectBackend
@@ -61,6 +63,7 @@ class CheckpointEngineClient:
         model_name: Optional[str] = None,
         quantization_config: Optional[Dict[str, int | str | list[str]]] = None,
         lock: Any = None,
+        weights_getter: Optional[Callable[[], Mapping[str, torch.Tensor]]] = None,
     ):
         """Initialize checkpoint engine client.
 
@@ -79,6 +82,7 @@ class CheckpointEngineClient:
             model_name (Optional[str]): Model name (e.g., "qwen3-4B"). Default: None
             quantization_config (Optional[Dict]): Quantization configuration. Default: None
             lock :
+            weights_getter: Optional actor snapshot source; defaults to the live model.
         """
         self.coordinator_url = coordinator_url.rstrip("/")
         self.config = config or DCSConfig()
@@ -99,6 +103,7 @@ class CheckpointEngineClient:
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.lock = lock
+        self.weights_getter = weights_getter
 
         # State
         self._registered = False
@@ -252,6 +257,7 @@ class CheckpointEngineClient:
                 quantization_config=self.quantization_config,
                 coordinator_url=self.coordinator_url,
                 lock=lock,
+                weights_getter=self.weights_getter,
             )
 
     async def init_process_groups_for_actor_fwd_ref(self, rollout_id: int) -> None:
@@ -305,20 +311,28 @@ class CheckpointEngineClient:
     async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> list[str]:
         """Update rollout weights; rank 0 returns the actual recipient Actor
         IDs."""
+        group = get_gloo_group()
         managed = getattr(self._backend, "managed_lora_publication_enabled", False) is True
-        if managed:
-            if not actor_fwd_only and not self._backend._lora_sync.base_sync_done:
-                from relax.engine.lora_versions.training import agree_training_error
-
-                error = None
-                data = None
+        if not managed or (not actor_fwd_only and not self._backend._lora_sync.base_sync_done):
+            topology = [None]
+            if dist.get_rank(group=group) == 0:
                 try:
                     response = await self._http_client.get(f"{self.coordinator_url}/topology")
                     response.raise_for_status()
-                    data = response.json()
-                    self._backend.validate_lora_base_recipients(data)
+                    topology[0] = (response.json(), None)
                 except Exception as exc:
-                    error = exc
+                    topology[0] = (None, str(exc))
+            dist.broadcast_object_list(topology, src=0, group=group)
+            data, lookup_error = topology[0]
+            if managed:
+                from relax.engine.lora_versions.training import agree_training_error
+
+                error = RuntimeError(lookup_error) if lookup_error is not None else None
+                if error is None:
+                    try:
+                        self._backend.validate_lora_base_recipients(data)
+                    except Exception as exc:
+                        error = exc
                 agree_training_error(error, "base topology lookup")
                 error = None
                 try:
@@ -327,13 +341,16 @@ class CheckpointEngineClient:
                 except Exception as exc:
                     error = exc
                 agree_training_error(error, "base weight group initialization")
-        else:
-            response = await self._http_client.get(f"{self.coordinator_url}/topology")
-            response.raise_for_status()
-            data = response.json()
-            logger.info(f"get topology: {data}")
-            if not actor_fwd_only:
-                self._backend.init_process_group_for_rollout(data)
+            else:
+                if lookup_error is not None:
+                    raise RuntimeError(f"Failed to fetch rollout topology: {lookup_error}")
+                logger.info(f"get topology: {data}")
+                if not actor_fwd_only:
+                    if not data.get("nodes", {}).get("rollout"):
+                        logger.warning(
+                            "update_weights_for_rollout: no rollout nodes in DCS topology; push will be a no-op"
+                        )
+                    self._backend.init_process_group_for_rollout(data)
         self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
         logger.info("Weights updated for rollout role.")
         # Adapter delta-skip can't confirm a replacement got base+adapter; keep existing behavior.
@@ -348,7 +365,6 @@ class CheckpointEngineClient:
                 for info in self._backend.rollout_topology.values()
                 if (actor_id := (info.get("metadata") or {}).get("actor_id"))
             }
-        group = get_gloo_group()
         all_recipients = [None] * dist.get_world_size(group=group)
         dist.all_gather_object(all_recipients, recipients, group=group)
         sources = [ids for ids in all_recipients if ids is not None]
