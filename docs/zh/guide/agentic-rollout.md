@@ -710,7 +710,9 @@ Token 加权年龄只使用年龄已知且版本可比的 token。版本和年�
 
 首版对 CP=1、标准 reducer 的 policy 训练提供精确目标成员统计，包含 OPSM、vanilla
 TIS、ICEPOP、entropy 和 KL。Direct OPD、MTP、CP 分片和自定义 loss/reducer 路径保留
-输入记录，但最终成员身份为未知。发布追踪接入 Megatron tensor/distributed 更新及
+输入记录，但最终成员身份为未知。序列比值目标（如 GSPO）配合逐 token 拒绝采样时，
+只要 mask 内有 token 被过滤，成员身份同样记为未知——被过滤位置的 log-prob 仍参与
+序列比值，逐位置 mask 无法精确表达。发布追踪接入 Megatron tensor/distributed 更新及
 fully-async DCS 的完整/合并权重更新；adapter-only LoRA 和未接入的后端无法提供经过
 确认的年龄。启用审计时，backend 标签包含发布者生命周期的唯一前缀，避免重启后
 版本号重复。自定义 Slime router middleware 可能要求数值版本，因此该组合关闭发布

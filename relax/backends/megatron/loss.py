@@ -1362,6 +1362,7 @@ def policy_loss_function(
             tis_weights=audit_tis_weights,
             direct_opd=opd_loss is not None,
             score_centering_mask=sc_valid if is_score_centering else None,
+            sequence_level_ratio=algorithm.kl_level == "sequence",
         )
 
     return loss, reported_loss

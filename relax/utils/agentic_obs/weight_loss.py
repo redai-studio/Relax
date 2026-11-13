@@ -20,6 +20,7 @@ def observe_policy_tokens(
     tis_weights: Any = None,
     direct_opd: bool = False,
     score_centering_mask: Any = None,
+    sequence_level_ratio: bool = False,
 ) -> None:
     """Union supported token objectives; unsupported coverage stays unknown."""
     if "_weight_audit_capture" not in batch:
@@ -29,6 +30,10 @@ def observe_policy_tokens(
     reason = None
     if batch.get("dynamic_cp_size", mpu.get_context_parallel_world_size()) != 1:
         reason = "cp_shards_unavailable"
+    elif getattr(args, "loss_type", None) == "custom_loss":
+        # A custom objective may nest `policy_loss_function` and add further
+        # terms; the nested call would certify only its own slice as complete.
+        reason = "custom_loss"
     elif getattr(args, "enable_mtp_training", False) or getattr(args, "mtp_only_training", False):
         reason = "mtp_targets_unavailable"
     elif getattr(args, "custom_pg_loss_reducer_function_path", None):
@@ -60,5 +65,12 @@ def observe_policy_tokens(
     auxiliary = bool(getattr(args, "entropy_coef", 0)) or (
         getattr(args, "use_kl_loss", False) and bool(getattr(args, "kl_loss_coef", 0))
     )
+    if sequence_level_ratio and not auxiliary and bool((base & ~policy).any()):
+        # Sequence-level objectives (e.g. GSPO) build a differentiable sequence
+        # ratio from every log-prob inside `loss_masks` before per-token gating
+        # (TIS/OPSM) zeroes outer terms. Rejected tokens still contribute through
+        # the ratio, so a per-position membership mask cannot be exact.
+        capture_effective_loss_mask(batch, None, status="sequence_ratio_unresolved")
+        return
     effective = policy | reducer if auxiliary else policy
     capture_effective_loss_mask(batch, list(effective.split(lengths)))

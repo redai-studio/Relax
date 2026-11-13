@@ -1237,6 +1237,184 @@ def test_weight_audit_observes_actual_icepop_filter_without_changing_gradient(
     }
 
 
+def test_weight_audit_gspo_icepop_partial_rejection_stays_unknown(tmp_path, fake_mpu, monkeypatch):
+    """ICEPOP-rejected tokens still feed `compute_gspo_kl` through
+    `loss_masks`, so a sequence-ratio objective reports unknown instead of a
+    wrongly precise complete mask."""
+    fake_mpu()
+    from relax.backends.megatron import loss as loss_module
+    from relax.utils.agentic_obs import train_hooks
+
+    # `loss`/`cp_utils` bind `megatron.core.mpu` at import time; stub the bound
+    # instance so the GSPO full-log-probs gather takes the CP=1 passthrough.
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: None, raising=False)
+    monkeypatch.setattr(
+        loss_module.mpu, "get_dynamic_data_context_parallel_groups", lambda group_size: None, raising=False
+    )
+
+    log_probs = torch.tensor([-1.0] * 4, requires_grad=True)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *a, **k: (None, {"log_probs": [log_probs], "entropy": [-log_probs]}),
+    )
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *a, **k: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **k: (None, {}))
+    args = _train_args(
+        tmp_path,
+        advantage_estimator="gspo",
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=True,
+        custom_tis_function_path="relax.backends.megatron.loss.icepop_function",
+        custom_pg_loss_reducer_function_path=None,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        entropy_coef=0,
+        use_kl_loss=False,
+        tis_clip_low=0.5,
+        tis_clip=1.5,
+        qkv_format="thd",
+        calculate_per_token_loss=False,
+    )
+    batch = _rollout_data(
+        [7],
+        advantages=torch.ones(4),
+        log_probs=[log_probs.detach()],
+        rollout_log_probs=[log_probs.detach() - torch.tensor([2.0, 1.0, 2.0, 1.0]).log()],
+        unconcat_tokens=[torch.arange(6)],
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    with train_hooks.observe_train_step(args, 1, 0):
+        train_hooks.capture_training_input(batch)
+        loss_module.policy_loss_function(args, batch, torch.empty(1, 1, 1), lambda v: v.mean())
+        train_hooks.record_optimizer_result(True)
+    train_hooks.close_train_appenders()
+    (record,) = _read_jsonl(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["effective_loss_mask"] is None
+    assert sample["effective_loss_mask_status"] == "sequence_ratio_unresolved"
+
+
+def test_weight_audit_gspo_icepop_full_acceptance_stays_exact(tmp_path, fake_mpu, monkeypatch):
+    """When no in-mask token is filtered, sequence-ratio membership remains
+    exact: every masked log-prob enters the sequence ratio."""
+    fake_mpu()
+    from relax.backends.megatron import loss as loss_module
+    from relax.utils.agentic_obs import train_hooks
+
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: None, raising=False)
+    monkeypatch.setattr(
+        loss_module.mpu, "get_dynamic_data_context_parallel_groups", lambda group_size: None, raising=False
+    )
+
+    log_probs = torch.tensor([-1.0] * 4, requires_grad=True)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *a, **k: (None, {"log_probs": [log_probs], "entropy": [-log_probs]}),
+    )
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *a, **k: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **k: (None, {}))
+    args = _train_args(
+        tmp_path,
+        advantage_estimator="gspo",
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=True,
+        custom_tis_function_path="relax.backends.megatron.loss.icepop_function",
+        custom_pg_loss_reducer_function_path=None,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        entropy_coef=0,
+        use_kl_loss=False,
+        tis_clip_low=0.5,
+        tis_clip=1.5,
+        qkv_format="thd",
+        calculate_per_token_loss=False,
+    )
+    batch = _rollout_data(
+        [7],
+        advantages=torch.ones(4),
+        log_probs=[log_probs.detach()],
+        # train/rollout ratio of 1 on every token: ICEPOP accepts all.
+        rollout_log_probs=[log_probs.detach()],
+        unconcat_tokens=[torch.arange(6)],
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    with train_hooks.observe_train_step(args, 1, 0):
+        train_hooks.capture_training_input(batch)
+        loss_module.policy_loss_function(args, batch, torch.empty(1, 1, 1), lambda v: v.mean())
+        train_hooks.record_optimizer_result(True)
+    train_hooks.close_train_appenders()
+    (record,) = _read_jsonl(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["effective_loss_mask"] == {"ranges": [[0, 4, 1]]}
+    assert sample["effective_loss_mask_status"] == "complete"
+
+
+def test_weight_audit_custom_loss_objective_stays_unknown(tmp_path, fake_mpu, monkeypatch):
+    """A `custom_loss` objective may nest `policy_loss_function` and add
+    further targets; the nested policy call must not certify its own slice as
+    complete."""
+    fake_mpu()
+    from relax.backends.megatron import loss as loss_module
+    from relax.utils.agentic_obs import train_hooks
+
+    log_probs = torch.tensor([-1.0] * 4, requires_grad=True)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *a, **k: (None, {"log_probs": [log_probs], "entropy": [-log_probs]}),
+    )
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *a, **k: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **k: (None, {}))
+    args = _train_args(
+        tmp_path,
+        loss_type="custom_loss",
+        advantage_estimator="rloo",
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=True,
+        custom_tis_function_path="relax.backends.megatron.loss.icepop_function",
+        custom_pg_loss_reducer_function_path=None,
+        entropy_coef=0,
+        use_kl_loss=False,
+        tis_clip_low=0.5,
+        tis_clip=1.5,
+        qkv_format="thd",
+        calculate_per_token_loss=False,
+    )
+    batch = _rollout_data(
+        [7],
+        advantages=torch.ones(4),
+        log_probs=[log_probs.detach()],
+        rollout_log_probs=[log_probs.detach() - torch.tensor([2.0, 1.0, 2.0, 1.0]).log()],
+        unconcat_tokens=[torch.arange(6)],
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    with train_hooks.observe_train_step(args, 1, 0):
+        train_hooks.capture_training_input(batch)
+        # The custom objective calls the stock policy path once, then would add
+        # its own terms (not run here: membership must already be unknown).
+        loss_module.policy_loss_function(args, batch, torch.empty(1, 1, 1), lambda v: v.mean())
+        train_hooks.record_optimizer_result(True)
+    train_hooks.close_train_appenders()
+    (record,) = _read_jsonl(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["effective_loss_mask"] is None
+    assert sample["effective_loss_mask_status"] == "custom_loss"
+
+
 def test_update_exception_does_not_run_a_collective_or_commit(tmp_path, fake_mpu, monkeypatch):
     from relax.utils.agentic_obs import train_hooks
 

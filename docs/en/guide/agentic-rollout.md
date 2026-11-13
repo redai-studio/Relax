@@ -739,7 +739,10 @@ cannot establish a complete run, even if the available records look consistent.
 This initial implementation provides exact objective membership for CP=1 policy
 training with standard reducers, including OPSM, vanilla TIS, ICEPOP, entropy and
 KL. Direct OPD, MTP, CP shards and custom loss/reducer paths retain input records
-but leave final membership unknown. Publication tracking is wired to Megatron
+but leave final membership unknown. Sequence-ratio objectives (such as GSPO)
+under per-token rejection sampling likewise report unknown membership when any
+in-mask token is filtered, since rejected log-probs still enter the sequence
+ratio. Publication tracking is wired to Megatron
 tensor/distributed updates and fully-async DCS full/merged-weight updates;
 adapter-only LoRA and uninstrumented backends cannot provide certified ages.
 Audit-enabled publishers use a unique lifetime prefix in backend labels to prevent
