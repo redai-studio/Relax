@@ -172,7 +172,7 @@ Cover at least:
   the test file as a reference and compare bit-for-bit
   (`view(torch.int32).equal`). Do not use `allclose` — its default tolerance is
   wide enough to swallow the difference between a biased and an unbiased
-  standard deviation. `tests/algorithms/test_reward_normalizers.py` is a
+  standard deviation. `tests/cpu/algorithms/test_reward_normalizers.py` is a
   worked example.
 
 ### 4. Add an example and documentation

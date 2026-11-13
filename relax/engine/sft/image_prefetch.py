@@ -1,13 +1,18 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+"""Bounded CPU image decoding and rank-side reconstruction for SFT."""
 
-"""CPU image reconstruction and bounded cache for SFT prefetch."""
+from __future__ import annotations
 
 from argparse import Namespace
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Event
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.distributed as dist
 
+from relax.engine.sft.image import ImageBatchSampler, assign_image_batch
 from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD, extract_image_ref_descriptors
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
@@ -19,6 +24,69 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
+class ImagePrefetch:
+    def __init__(
+        self,
+        dataset: Any,
+        sampler: ImageBatchSampler,
+        rank: int,
+        world: int,
+        start: int,
+        stop: int,
+        depth: int = 4,
+        workers: int = 2,
+    ) -> None:
+        if depth <= 0 or workers <= 0 or not 0 <= rank < world or start < 0 or stop < start:
+            raise ValueError("Invalid image prefetch bounds")
+        if sampler.batch_size % world:
+            raise ValueError("Image prefetch requires equal samples per rank")
+        self.dataset = dataset
+        # Do not advance the trainer's mutable epoch cache.
+        self.sampler = ImageBatchSampler(sampler.size, sampler.batch_size, sampler.seed)
+        self.rank, self.world, self.stop = rank, world, stop
+        self.step, self.micro = start, 0
+        self.depth = depth
+        self.pending: deque[tuple[int, int, int, Future]] = deque()
+        self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image-prefetch")
+        self.closed = False
+        self._fill()
+
+    def _fill(self) -> None:
+        while not self.closed and len(self.pending) < self.depth and self.step < self.stop:
+            ids = assign_image_batch(
+                self.sampler.batch(self.step), getattr(self.dataset, "config", {}), step=self.step, world=self.world
+            )[self.rank :: self.world]
+            sample_id = ids[self.micro]
+            future = self.pool.submit(self.dataset.__getitem__, sample_id)
+            self.pending.append((self.step, self.micro, sample_id, future))
+            self.micro += 1
+            if self.micro == len(ids):
+                self.step, self.micro = self.step + 1, 0
+
+    def get(self, step: int, micro: int, sample_id: int) -> Any:
+        if self.closed or not self.pending:
+            raise ValueError("Image prefetch is closed or exhausted")
+        expected = self.pending[0]
+        if expected[:3] != (step, micro, sample_id):
+            raise ValueError("Image prefetch cursor differs from the verified training batch")
+        self.pending.popleft()
+        try:
+            sample = expected[3].result()
+        except BaseException:
+            self.close()
+            raise
+        self._fill()
+        return sample
+
+    def close(self) -> None:
+        # Cancel queued reads. Python cannot interrupt an already running NFS
+        # read; process termination remains the fallback for a hung filesystem.
+        self.closed = True
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.pending.clear()
+
 
 # Samples of one prefetched batch are rebuilt in parallel — one processor call
 # per sample (a sample carries ~20 images), submitted together by
@@ -107,6 +175,7 @@ class SFTImagePrefetch:
         partition_id: str,
         task_name: str,
         sampling_config: dict,
+        cancel_event: Event | None = None,
     ) -> tuple[list, float]:
         """Background SFT prefetch with the rank-side pixel rebuild.
 
@@ -117,7 +186,7 @@ class SFTImagePrefetch:
         worker process. No collectives and no GPU work happen here; the main
         thread re-attaches the finished tensors in ``resolve``.
         """
-        prefetched = self.fetch_data(
+        fetch_kwargs = dict(
             data_fields=data_fields,
             batch_size=batch_size,
             partition_id=partition_id,
@@ -125,6 +194,14 @@ class SFTImagePrefetch:
             sampling_config=sampling_config,
             batch_index=0,
         )
+        if cancel_event is None:
+            prefetched = self.fetch_data(**fetch_kwargs)
+        else:
+            from relax.utils.data.stream_dataloader import _prefetch_data_from_transfer_queue
+
+            prefetched = _prefetch_data_from_transfer_queue(
+                tq_client=None, fetch_data=self.fetch_data, cancel_event=cancel_event, **fetch_kwargs
+            )
         raw_batch = prefetched[0][0]
         if raw_batch is None or not self.owns_vision(model):
             return prefetched

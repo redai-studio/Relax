@@ -64,6 +64,16 @@ def apply_patch():
     Must be called inside the SGLang scheduler subprocess, before the model
     runner initialises the routed-experts capturer.
     """
+    try:
+        from sglang.srt.state_capturer.base import TopkCaptureOutput
+    except ImportError:
+        pass
+    else:
+        # New SGLang snapshots routing tensors and copies them on the result
+        # stream before finalizing the host cache. Keep that native lifecycle.
+        logger.info("Routing replay uses native SGLang async capture (%s)", TopkCaptureOutput.__name__)
+        return
+
     from sglang.srt.layers.moe.routed_experts_capturer import (
         _RoutedExpertsCapturerReal,
     )

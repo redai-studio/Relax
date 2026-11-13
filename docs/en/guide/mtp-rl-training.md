@@ -10,7 +10,7 @@ The example below uses Qwen3.5-35B-A3B and `pokemon-gpt4o-captions`. Training re
 
 | Mode | Script | What it trains |
 | --- | --- | --- |
-| Joint training | [`run-qwen3.5-35B-A3B-pokemon-mtp-8xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-8xgpu.sh) | Initializes from the original HF checkpoint and updates the main model and one MTP layer together. |
+| Joint training | [`run-qwen3.5-35B-A3B-pokemon-mtp-4xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-4xgpu.sh) | Initializes from the original HF checkpoint and updates the main model and one MTP layer together. |
 | Stage 1 | [`run-qwen3.5-35B-A3B-pokemon-8xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-8xgpu.sh) | Runs standard SFT only and exports an HF checkpoint for Stage 2. |
 | Stage 2 | [`run-qwen3.5-35B-A3B-pokemon-mtp-only-8xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-only-8xgpu.sh) | Loads Stage 1, freezes non-MTP parameters, and updates only MTP. |
 

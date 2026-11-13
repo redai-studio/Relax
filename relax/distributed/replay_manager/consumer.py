@@ -174,7 +174,7 @@ class Consumer:
         for kind in ("moe", "indexer"):
             field = FIELDS[kind]
             if field in batch and (kind == "moe" or kind in self.kinds):
-                batch[field] = self.manager.receive(field, batch[field], device=device)
+                batch[field] = self.manager.receive(field, batch[field], device="cpu" if kind == "moe" else device)
 
 
 class ConsumerReadSession:

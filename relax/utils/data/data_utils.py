@@ -117,8 +117,14 @@ def _normalize_inline_multimodal_items(prompt: Any) -> Any:
     return normalized_messages
 
 
-def count_message_multimodal_items(prompt: str | list[Any]) -> dict[str, int]:
-    """Count literal placeholders and structured media items in messages."""
+def count_message_multimodal_items(
+    prompt: str | list[Any], *, literal_modalities: set[str] | None = None
+) -> dict[str, int]:
+    """Count structured media and selected literal placeholders.
+
+    None preserves counting all literal modalities for existing callers.
+    Structured items are always counted, even when literals are disabled.
+    """
     counts = {media.name: 0 for media in MultimodalTypes.all()}
     if isinstance(prompt, str):
         contents: list[Any] = [prompt]
@@ -128,7 +134,8 @@ def count_message_multimodal_items(prompt: str | list[Any]) -> dict[str, int]:
     for content in contents:
         if isinstance(content, str):
             for media in MultimodalTypes.all():
-                counts[media.name] += content.count(media.placeholder)
+                if literal_modalities is None or media.name in literal_modalities:
+                    counts[media.name] += content.count(media.placeholder)
         elif isinstance(content, list):
             for item in content:
                 if not isinstance(item, dict):
@@ -221,6 +228,20 @@ def build_messages(
         else:
             prompt = [{"role": "user", "content": prompt}]
 
+    # OpenAI tool-only assistant turns may explicitly have no text body.
+    # Preserve all tool/supervision metadata without mutating the reader cache.
+    if isinstance(prompt, list):
+        prompt = [
+            {**message, "content": ""}
+            if isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and "content" in message
+            and message["content"] is None
+            and isinstance(message.get("tool_calls"), list)
+            and message["tool_calls"]
+            else message
+            for message in prompt
+        ]
     prompt = _normalize_inline_multimodal_items(prompt)
 
     # TODO(xide): audio in video special case
@@ -704,7 +725,7 @@ def resolve_path_plan(path: Any) -> tuple[list[str], Optional[slice]]:
     return _normalize_paths(path), None
 
 
-def _build_reader_for_path(path: str):
+def _build_reader_for_path(path: str, *, with_source: bool = False):
     path, row_slice = parse_generalized_path(path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Prompt dataset path '{path}' does not exist.")
@@ -718,7 +739,12 @@ def _build_reader_for_path(path: str):
                     if not line:
                         continue
                     try:
-                        yield json.loads(line)
+                        data = json.loads(line)
+                        if with_source:
+                            from relax.utils.agentic_obs.source import SourceRow
+
+                            data = SourceRow(data, p, line_num)
+                        yield data
                     except json.JSONDecodeError as e:
                         logger.warning(f"JSON decode error at line {line_num}: {e}")
                         continue
@@ -739,8 +765,15 @@ def _build_reader_for_path(path: str):
             # iter_batches() creates chunked arrays for multi-row-group files,
             # which fails with ArrowNotImplementedError on nested types
             # (e.g. list<struct<...>>, struct<...>).
+            row_id = 0
             for i in range(pf.metadata.num_row_groups):
-                yield from pf.read_row_group(i).to_pylist()
+                for data in pf.read_row_group(i).to_pylist():
+                    if with_source:
+                        from relax.utils.agentic_obs.source import SourceRow
+
+                        data = SourceRow(data, p, row_id)
+                    yield data
+                    row_id += 1
 
         reader = parquet_reader(path)
         if row_slice is not None:
@@ -750,7 +783,7 @@ def _build_reader_for_path(path: str):
     raise ValueError(f"Unsupported file format: {path}. Supported formats are .jsonl and .parquet.")
 
 
-def read_file(path: str):
+def read_file(path: str, *, with_source: bool = False):
     """Read data from JSONL or Parquet files.
 
     # Supports path with slice notation like 'file.jsonl@[0:100]'.
@@ -765,7 +798,7 @@ def read_file(path: str):
         Parsed data dictionaries
     """
     paths, row_slice = resolve_path_plan(path)
-    reader = itertools.chain.from_iterable(_build_reader_for_path(item) for item in paths)
+    reader = itertools.chain.from_iterable(_build_reader_for_path(item, with_source=with_source) for item in paths)
 
     if row_slice is not None:
         logger.info("read_file paths=%s applying slice row_slice=%s", paths, row_slice)
@@ -859,7 +892,14 @@ class BaseDataset(abc.ABC):
 
         Uses shared utility function for consistency.
         """
-        return process_raw_sample(
+        from relax.utils.agentic_obs.source import SourceRow, snapshot_source
+
+        source = (
+            snapshot_source(data, metadata_key=self.metadata_key, split=getattr(self, "source_split", "train"))
+            if isinstance(data, SourceRow)
+            else None
+        )
+        sample = process_raw_sample(
             data,
             self.tokenizer,
             self.processor,
@@ -877,3 +917,5 @@ class BaseDataset(abc.ABC):
             teacher_prompt_key=self.teacher_prompt_key,
             teacher_multimodal_keys=self.teacher_multimodal_keys,
         )
+        sample.agentic_prompt_source = source
+        return sample

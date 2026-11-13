@@ -401,7 +401,7 @@ class ReplayManager:
 
         if field not in frozenset(FIELDS.values()):
             raise KeyError(field)
-        dtype = torch.long if field == "rollout_routed_experts" else torch.int32
+        dtype = torch.int32
         return [
             torch.as_tensor(value.data if isinstance(value, NonTensorData) else value, dtype=dtype, device=device)
             for value in values

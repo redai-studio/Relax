@@ -29,6 +29,9 @@ def rotate_ckpt(
     ``<save>/<task>/iter_NNNNNNN`` (see ``relax/backends/fsdp/checkpoint.py``),
     so it passes the per-task root; without it the glob below would match
     nothing and retention would silently never run.
+
+    Call only after ``global_step`` has been saved successfully. Newer dirs
+    may belong to failed or in-progress saves and must not consume retention.
     """
     if config.max_actor_ckpt_to_keep is None and not config.rotate_ckpt:
         return
@@ -43,7 +46,7 @@ def rotate_ckpt(
     ckpt_dirs = [
         (int(ckpt_dir.name.split("_")[-1]), ckpt_dir)
         for ckpt_dir in ckpt_dirs
-        if ckpt_dir.name.split("_")[-1].isdigit()
+        if ckpt_dir.name.split("_")[-1].isdigit() and int(ckpt_dir.name.split("_")[-1]) <= global_step
     ]
     if not ckpt_dirs:
         return

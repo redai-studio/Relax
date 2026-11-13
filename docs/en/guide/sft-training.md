@@ -24,6 +24,33 @@ The current launch scripts use `ray job submit` and auto-source [`scripts/entryp
 | [`run-qwen3.5-9B-classification-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-9B` | 8 GPU actor plus SFT producer | Full-parameter binary, multiclass, or multilabel sequence-classification SFT. |
 | [`run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-35B-A3B` | 8 GPU actor plus SFT producer | LoRA sequence-classification SFT; defaults to GoEmotions. |
 
+## YAML mixtures and per-dataset loss
+
+Megatron generative SFT/CPT accepts a YAML mixture through `--prompt-data`. Sources share the same sample field configuration, including `--input-key` and `--label-key`:
+
+```yaml
+datasets:
+  general:
+    path: /data/general.jsonl
+    weight: 0.7
+  code:
+    path: /data/code.parquet
+    weight: 0.3
+```
+
+YAML mixtures automatically enable per-source training metrics, without an extra flag. Each optimizer step reports:
+
+- `train/dataset/general/loss`: summed supervised-token NLL divided by the source's effective supervised-token count.
+- `train/dataset/general/tokens`: effective tokens contributing to the main language-model objective in the current step, summed across ranks rather than cumulative.
+- `train/dataset/general/samples`: accepted samples, including fully masked rows and excluding dummy microbatches used for alignment.
+- `train/dataset/general/token_fraction` and `sample_fraction`: this source's share of the step's actual tokens and samples after filtering.
+
+Other sources use the same suffixes. Source names are URL percent-encoded: `code/python` becomes `code%2Fpython`. Statistics are summed across microbatches, DP and CP before source-specific normalization. Sources without supervised tokens report counts but omit undefined loss. Source loss is an additive monitoring metric only: ordinary, chunked and fused-head paths reuse detached token losses, without contributing to backpropagation, optimizer updates or subsequent training decisions. The original aggregate `train/loss` retains its configured normalization, so it need not equal the token-weighted average of source losses.
+
+Mixture weights allocate sample quotas over a complete logical epoch, rather than fixed proportions within every step. Filtering can change the accepted proportions; inspect source sample and token counts. These metrics cover the main language-model training loss, exclude MTP auxiliary loss, and leave evaluation metrics unchanged. FSDP, sequence classification, DPO/RM and custom datasets are outside this source-metric scope. Keep the YAML and data snapshot unchanged when resuming.
+
+With `--use-clearml --use-metrics-service`, ClearML uses the single SDK title `train`: the aggregate loss has series `loss`, and each dataset has series `loss/<name>` and `tokens/<name>`. The token series shows the current step's effective supervised-token count, including zero for a source with no supervised tokens. In the task-list Scalars comparison view, expand `train` to see a separate plot named after each series, alongside the existing training plots. Per-source sample counts and fractions remain in the canonical training metrics without additional ClearML plots. CPT uses the same mapping. Historical tasks retain previously reported titles; start a new task to use this layout.
+
 ## Data Preparation
 
 The SFT scripts default to `DATA_DIR=${SCRIPT_DIR}/data` unless you override `DATA_DIR`. For reusable jobs, put datasets on persistent storage and export `DATA_DIR` explicitly.
@@ -357,6 +384,8 @@ When historical reasoning is compressed, those reasoning tokens are absent from 
 
 Values other than a JSON boolean or `null`, such as `"false"`, raise `ValueError`. A Qwen-like template with a duplicated, conflicting, or unrecognized history gate raises `RuntimeError` instead of being patched heuristically. The SFT log reports `source=qwen_history_thinking (patched|native)` and the resolved `preserve_thinking` value for verification.
 
+Newer Qwen3.8 templates mark assistant turns with native `{% generation %}` tags. Relax removes them for SFT rendering, so tokens and loss masks match the earlier Qwen3.8 template.
+
 ### Evaluation and Predict
 
 PPL evaluation is controlled by:
@@ -650,7 +679,7 @@ Patch signatures must be mutually exclusive. The dispatcher evaluates all regist
 
 ### Tests
 
-Follow [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/test_qwen_chat_template_patch.py) and cover at least:
+Follow [`test_qwen_chat_template_patch.py`](../../../tests/cpu/engine/sft/dataset/test_qwen_chat_template_patch.py) and cover at least:
 
 1. Unrelated-template strict no-op behavior.
 2. Correct legacy-template patching and native-template idempotence.
@@ -666,3 +695,47 @@ Follow [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/te
 - Read [Configuration Reference](./configuration.md) for the full SFT parameter table.
 - Read [Performance Tuning](./performance-tuning.md) for broader throughput tuning.
 - Read [OOM Troubleshooting](./oom-troubleshooting.md) if the job fails during model load or training.
+
+
+### Gemma4 tool-call trajectories
+
+OpenAI tool messages retain `tool_call_id` and `name`; a missing tool name is resolved from the corresponding call ID. Assistant tool calls may omit `content` or set it to `null`. Function arguments encoded as JSON objects are decoded without modifying the source row. An optional row-level `message_loss_mask` selects supervised messages with one `0` or `1` per input message.
+
+Gemma4 template patches are opt-in environment variables and must be propagated to the training workers:
+
+- `GEMMA4_SFT_TOOL_TURN_BOUNDARY=1` adds a supervised end-of-turn after a tool-call batch. Embedded tool responses remain context-only. The fallback loss mask supports all assistant messages or only the final assistant answer; other supervision selections fail explicitly.
+- `GEMMA4_SFT_THINKING=1` inserts an empty thought scaffold at each new model turn without enabling the separate system thinking prefix.
+- `GEMMA4_SFT_MS_SWIFT_COMPAT=1` omits tool correlation fields from template inputs for explicit ms-swift compatibility.
+
+When using these template patches with HF export, pass `--save-hf-post-hook-path scripts.tools.gemma4_chat_template_hook.patch_gemma4_chat_template`. Keep the same environment flags enabled during export so `chat_template.jinja` preserves the training-time boundaries for serving. The exported template also retains the ms-swift correlation-field filter, so a reloaded tokenizer applies it without Relax preprocessing or environment variables. This hook only patches the template; the existing exporter handles vision weights.
+
+
+### Gemma4 31B text SFT at 64K
+
+The opt-in `RELAX_GEMMA4_FORCE_FLEX_GLOBAL=1` worker environment variable selects chunked FlexAttention for Gemma4 global layers. Sliding-window layers continue to use FlashAttention; leaving the flag unset keeps the existing SDPA global path. Packed samples are handled independently. FlexAttention training requires zero attention dropout and currently supports CP1 only.
+
+The text launcher defaults to TP8/PP1/CP1, 65,536 tokens, chunked logits with per-chunk loss recomputation, full activation recomputation, and optimizer CPU offload. Two equal 8-GPU nodes can use TP8/DP2 by setting `NUM_NODES=2 GPUS_PER_NODE=8`. Tied embeddings require gradient overlap to remain disabled. The default profile selects text conversion; use the separate image profile below for image inputs.
+
+```bash
+RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/messages.jsonl \
+  bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-gemma4-31B-sft-64k-8xgpu.sh
+```
+
+`run-gemma4-31B-multiturn-flex64k.sh` reuses that launcher with messages input and nonblocking submission. Both profiles default to `GEMMA4_SFT_THINKING=0`, enable tool-turn boundaries, and export the matching template using the Gemma4 post-hook. `DISABLE_CHECKPOINT_SAVE=1` disables model saves; `OPTIMIZER_CPU_OFFLOAD=0` disables CPU offload. Oversized samples are skipped by default (`SFT_OVERSIZE_STRATEGY=skip`).
+
+The Flex path needs a PyTorch runtime with FlexAttention and BlockMask support. Validate CUDA forward/backward agreement, actual 64K peak memory, and training stability on the target runtime before production use; CPU reference checks do not establish full-model GPU numerical equivalence.
+
+### Gemma4 31B packed image SFT
+
+The dense 31B image profile selects `GEMMA4_SFT_CONVERSION_MODE=vl` and reuses the text profile's TP8/PP1/CP1 settings, chunked loss and template-only export hook. Vision and projection weights use the existing checkpoint/export path. Supply a checkpoint containing the vision tower and projector weights, and JSONL rows with complete `messages` plus an `images` column; each image needs a matching `<image>` placeholder. Inline `image_url` message parts are also supported.
+
+```bash
+RAY_NO_WAIT=1 CKPT=/path/to/gemma4 PROMPT_DATA=/path/to/image-messages.jsonl \
+  bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-gemma4-31B-multimodal-flex64k.sh
+```
+
+Visual features are inserted before a single sequence-parallel scatter. Processor-added image delimiters and expanded image tokens remain outside the loss. Attention follows [Transformers 5.16 Gemma4 masks](https://github.com/huggingface/transformers/blob/v5.16.0/src/transformers/models/gemma4/modeling_gemma4.py): global layers remain causal; sliding layers use `(causal OR same image) AND sliding window` when `use_bidirectional_attention="vision"`. Packed samples never share attention.
+
+This adapter supports images with CP1 and PP1; audio, video and MoE VL integration are outside this profile. Use the default oversize policy `skip` to retain matching image features and tokens. Full-model CUDA numerical parity, TP8 image training, 64K memory/stability and trained vision-weight export must be validated on the target runtime; CPU adapter tests establish interface and gradient flow only.

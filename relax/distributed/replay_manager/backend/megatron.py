@@ -315,11 +315,11 @@ class RoutingReplay:
 
     def pop_forward(self):
         values = self.manager.consume(self.channel_key, "replay_forward")
-        return values.to(device_utils.make_current_torch_device())
+        return values.to(device=device_utils.make_current_torch_device(), dtype=torch.long)
 
     def pop_backward(self):
         values = self.manager.consume(self.channel_key, "replay_backward")
-        return values.to(device_utils.make_current_torch_device())
+        return values.to(device=device_utils.make_current_torch_device(), dtype=torch.long)
 
     def clear(self):
         self.manager.clear()

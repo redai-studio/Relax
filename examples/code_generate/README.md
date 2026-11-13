@@ -62,6 +62,6 @@ RAY_NO_WAIT=1 bash scripts/entrypoint/ray-job.sh examples/code_generate/baseline
 ## CPU 回归
 
 ```bash
-pytest -q tests/examples/test_code_generate.py
+pytest -q tests/cpu/examples/test_code_generate.py
 bash -n examples/code_generate/baseline.sh
 ```

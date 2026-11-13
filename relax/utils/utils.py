@@ -15,6 +15,8 @@ from tensordict import TensorDict
 from relax.algorithms import get_algorithm
 from relax.algorithms.rewards import REWARD_NORMALIZERS
 from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+from relax.utils.agentic_obs import agentic_obs_enabled
+from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID, encode_group_ids, group_ids_to_tensor
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
@@ -25,6 +27,21 @@ from relax.utils.types import Sample
 
 logger = get_logger(__name__)
 CURRENT_ROLLOUT_BATCH = []
+
+
+def _has_image_inputs(multimodal_train_inputs) -> bool:
+    """Detect image payloads without requiring model-specific grid metadata."""
+    if multimodal_train_inputs is None:
+        return False
+    inputs = [multimodal_train_inputs] if isinstance(multimodal_train_inputs, dict) else multimodal_train_inputs
+    for mm_input in inputs:
+        if mm_input is None:
+            continue
+        for key in ("pixel_values", "image_position_ids", "image_grid_thw"):
+            value = mm_input.get(key)
+            if value is not None and (value.numel() > 0 if isinstance(value, torch.Tensor) else len(value) > 0):
+                return True
+    return False
 
 
 def _extract_image_grids(multimodal_train_inputs) -> list[tuple[int, int, int]]:
@@ -106,6 +123,41 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
                 raise ValueError(
                     f"Score Centering custom converter omitted required behavior probability fields: {missing}"
                 )
+        if agentic_obs_enabled(args):
+            # Output rows may be reordered/expanded. Missing observation IDs
+            # degrade to unknown, while both TQ columns must still be published.
+            rows = (
+                int(train_data.batch_size[0])
+                if isinstance(train_data, TensorDict)
+                else len(
+                    next(train_data[key] for key in ("total_lengths", "tokens", "sample_indices") if key in train_data)
+                )
+            )
+            try:
+                ids = train_data.get("sample_export_ids")
+                if isinstance(ids, torch.Tensor):
+                    if ids.device.type != "cpu" or ids.dtype != torch.int64 or ids.ndim != 1:
+                        raise ValueError("sample_export_ids must be a one-dimensional CPU int64 column")
+                    ids = ids.tolist()
+                flat_samples = [sample for item in samples for sample in (item if isinstance(item, list) else [item])]
+                by_id = {sample.sample_export_id: sample.agentic_group_id or "" for sample in flat_samples}
+                if (
+                    ids is None
+                    or len(ids) != rows
+                    or any(type(value) is not int or not UNASSIGNED_SAMPLE_EXPORT_ID <= value < 2**63 for value in ids)
+                ):
+                    raise ValueError("missing or misaligned sample_export_ids")
+                groups = [by_id[export_id] if export_id >= 0 else "" for export_id in ids]
+            except Exception as error:
+                logger.warning("agentic_obs: custom converter identities unavailable: %s", error)
+                ids, groups = [UNASSIGNED_SAMPLE_EXPORT_ID] * rows, [""] * rows
+            train_data["sample_export_ids"] = (
+                torch.tensor(ids, dtype=torch.int64) if isinstance(train_data, TensorDict) else ids
+            )
+            encoded = encode_group_ids(groups)
+            train_data["agentic_group_ids"] = (
+                group_ids_to_tensor(encoded) if isinstance(train_data, TensorDict) else encoded
+            )
         return train_data
 
     rewards = post_process_rewards(args, samples)
@@ -191,6 +243,14 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         from relax.engine.rollout.on_policy_distillation import produce_opd_transfer_data
 
         produce_opd_transfer_data(args, samples, train_data)
+
+    if agentic_obs_enabled(args):
+        # The join key linking this row to its trajectory and stage records.
+        # Written only when observability is on, because the consumer-side field
+        # whitelist is gated on the same flag and a requested-but-absent column
+        # makes async_get_meta wait forever.
+        train_data["sample_export_ids"] = [sample.sample_export_id for sample in samples]
+        train_data["agentic_group_ids"] = encode_group_ids([sample.agentic_group_id or "" for sample in samples])
 
     total_lengths = [len(t) for t in train_data["tokens"]]
     train_data["total_lengths"] = total_lengths
@@ -303,6 +363,9 @@ def dict_to_tensordict(
                     "classification_labels must be scalar class ids or fixed-width multi-hot vectors; "
                     f"got nesting depth {depth}"
                 )
+            continue
+        if key == "agentic_group_ids":
+            result[key] = group_ids_to_tensor(value, device=device)
             continue
         if replay_data_manager.handles(key):
             result[key] = replay_data_manager.pack(key, value)
@@ -424,6 +487,9 @@ def post_process_env(args, env):
     if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
         env["env_vars"]["RELAX_SFT_TQ_SHARDS"] = str(Envs.RELAX_SFT_TQ_SHARDS)
 
+    # Use the same file-scanning concurrency in the driver and SFT replicas.
+    env["env_vars"].setdefault("RELAX_JSONL_INDEX_WORKERS", str(Envs.RELAX_JSONL_INDEX_WORKERS))
+
     # ray-job.sh prepares the node-local cache before launching the inner Ray
     # job. Carry its resolved session into the runtime env that Controller
     # explicitly forwards through detached Serve deployments to TrainGroup.
@@ -445,6 +511,10 @@ def post_process_env(args, env):
     # name is copied from the driver's os.environ; missing names are
     # silently skipped.
     propagate_list = Envs.RELAX_PROPAGATE_ENV_VARS
+    # Training scripts may replace the generic passthrough list. Preserve the
+    # explicitly selected numerical-failure policy across detached Ray actors.
+    if (value := os.environ.get("RELAX_SKIP_NONFINITE_GRAD")) is not None:
+        env["env_vars"].setdefault("RELAX_SKIP_NONFINITE_GRAD", value)
     for var in propagate_list.split(","):
         var = var.strip()
         if not var or var in env["env_vars"]:
@@ -452,6 +522,10 @@ def post_process_env(args, env):
         val = os.environ.get(var)
         if val is not None:
             env["env_vars"][var] = val
+
+    # Apply the default after passthrough so preprocessing pools can disable
+    # tokenizer threads without overriding an explicit runtime configuration.
+    env["env_vars"].setdefault("TOKENIZERS_PARALLELISM", "true")
 
     logger.info(f"Ray runtime env: {env['env_vars']}")
 

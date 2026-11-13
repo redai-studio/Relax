@@ -10,7 +10,7 @@
 
 | 方式 | 脚本 | 训练内容 |
 | --- | --- | --- |
-| 联合训练 | [`run-qwen3.5-35B-A3B-pokemon-mtp-8xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-8xgpu.sh) | 从原始 HF checkpoint 初始化，同时更新主模型和一层 MTP。 |
+| 联合训练 | [`run-qwen3.5-35B-A3B-pokemon-mtp-4xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-4xgpu.sh) | 从原始 HF checkpoint 初始化，同时更新主模型和一层 MTP。 |
 | Stage 1 | [`run-qwen3.5-35B-A3B-pokemon-8xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-8xgpu.sh) | 只做普通 SFT，并导出供 Stage 2 使用的 HF checkpoint。 |
 | Stage 2 | [`run-qwen3.5-35B-A3B-pokemon-mtp-only-8xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-only-8xgpu.sh) | 加载 Stage 1，冻结非 MTP 参数，只更新 MTP。 |
 

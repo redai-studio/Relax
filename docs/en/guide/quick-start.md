@@ -177,7 +177,7 @@ When a score drops, compare identical prompts/labels, effective sample counts, t
 Run CPU regression checks with:
 
 ```bash
-python -m pytest tests/engine/rewards/test_openr1mm.py tests/tools/test_process_openr1.py
+python -m pytest tests/cpu/engine/rewards/test_openr1mm.py tests/cpu/tools/test_process_openr1.py
 ```
 
 ---
@@ -194,6 +194,7 @@ Download the dataset and convert it to the Relax format:
 # Download dataset
 hf download --repo-type dataset harryhsing/AVQA-R1-6K \
   --local-dir /root/AVQA
+tar -zxvf /root/AVQA/AVQA_R1.tar.gz -C /root/AVQA
 
 # Convert to Relax format
 # --md-dir points to the directory containing image and audio files,

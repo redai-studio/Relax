@@ -27,10 +27,13 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
 )
+from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
 from .bridge_converter import BridgeConverter
-from .common import all_gather_param, named_params_and_buffers
+from .common import all_gather_param, all_gather_params_async, gdn_component_sizes, named_params_and_buffers
+from .expert_gather import Bf16ExpertGather, PackedExpertGather, bucket_expert_projections, bucket_experts_by_owner
+from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
@@ -59,6 +62,7 @@ _FUSED_PAIR_FRAGMENTS = (
     (".compressor.wkv.", ".compressor.wgate."),
 )
 _PAIR_SENTINEL = "\x00"
+_QWEN4EXP_PLE_TABLE_SUFFIX = ".per_layer_embedding.ple_embedding.ngram_embedding.weight"
 
 
 def _fused_pair_key(name: str) -> str | None:
@@ -103,6 +107,50 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map, self._adapter_map = buckets_result
         self._expert_broadcast_caches = [({}, {}) for _ in self._expert_buckets]
         self._expert_router: ExpertRouter | None = None
+        self._async_weight_gather = (
+            torch.cuda.is_available()
+            and not self.quantization_config
+            and not self.lora_merge_mode
+            and not self.lora_adapter_mode
+        )
+        self._gdn_split_sizes = {}
+        if self._async_weight_gather:
+            names = {
+                info.name.replace(".to_wrap.", ".")
+                for bucket in self._non_expert_buckets
+                for info in bucket
+                if info.attrs.get("tensor_model_parallel")
+                and info.attrs.get("parallel_mode") != "duplicated"
+                and ("self_attention.conv1d.weight" in info.name or "self_attention.in_proj.weight" in info.name)
+            }
+            if names:
+                config = get_hf_config(self.args.hf_checkpoint)
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+                self._gdn_split_sizes = {name: gdn_component_sizes(config, tp_size, name) for name in names}
+        self._bf16_expert_buckets = None
+        self._bf16_expert_gathers = []
+        self._packed_expert_sync = False
+        self._direct_expert_layout = None
+        # Complete BF16 experts are owned locally at ETP1/PP1. Other layouts
+        # continue through Bridge's existing PP/TP/quantization/LoRA path.
+        if (
+            torch.cuda.is_available()
+            and not self.quantization_config
+            and not self.lora_merge_mode
+            and not self.lora_adapter_mode
+            and mpu.get_pipeline_model_parallel_world_size() == 1
+            and mpu.get_virtual_pipeline_model_parallel_world_size() in (None, 1)
+            and mpu.get_expert_tensor_parallel_world_size() == 1
+            and mpu.get_expert_model_parallel_world_size() > 1
+            and self._expert_buckets
+            and all(info.dtype == torch.bfloat16 for bucket in self._expert_buckets for info in bucket)
+        ):
+            infos = [info for bucket in self._expert_buckets for info in bucket]
+            ranks = dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())
+            budget = self.args.update_weight_buffer_size
+            if all(info.src_rank in ranks and 0 < info.size <= budget for info in infos):
+                self._bf16_expert_buckets = bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, ranks)
+                self._bf16_expert_gathers = [Bf16ExpertGather() for _ in self._bf16_expert_buckets]
         if self.lora_merge_mode:
             self.lora_alpha = self.args.lora_alpha
             self.lora_dim = self.args.lora_rank
@@ -119,33 +167,170 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 "DOES fold expert deltas for actor_fwd and so also needs ETP=1.)"
             )
 
+    def configure_direct_experts(self, layout: DirectExpertLayout | None) -> bool:
+        """Select packed export only after the colocated receiver layout is
+        known."""
+        if self._packed_expert_sync and layout == self._direct_expert_layout:
+            return True
+        if not self._packed_expert_sync and layout is None:
+            return False
+        self._packed_expert_sync = False
+        self._direct_expert_layout = None
+        if self._bf16_expert_buckets is None:
+            return False
+        infos = [info for bucket in self._bf16_expert_buckets for info in bucket]
+        ranks = dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())
+        # Reconnect may disable a previous direct plan. Restore standard HF export.
+        self._bf16_expert_buckets = bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, ranks)
+        self._bf16_expert_gathers = [Bf16ExpertGather() for _ in self._bf16_expert_buckets]
+        if layout is None or layout.num_experts != self.args.num_experts:
+            return False
+        if not self._bridge_converter.supports_packed_experts([info.name for info in infos]):
+            return False
+        try:
+            buckets = bucket_expert_projections(infos, layout.num_experts, ranks)
+        except ValueError:
+            return False
+        packed_buckets, gathers = [], []
+        for bucket in buckets:
+            expected = (
+                (2 * layout.intermediate_size, layout.hidden_size)
+                if ".linear_fc1." in bucket[0].name
+                else (layout.hidden_size, layout.intermediate_size)
+            )
+            if tuple(bucket[0].shape) != expected:
+                return False
+            # Preserve the whole-projection fast path for small layers. Larger
+            # projections use bounded native slices, negotiated with SGLang.
+            if sum(info.size for info in bucket) <= 2 * self.args.update_weight_buffer_size:
+                packed_buckets.append(bucket)
+                gathers.append(PackedExpertGather(layout.num_experts))
+            else:
+                if not layout.supports_expert_slices:
+                    return False
+                # Keep owners loading/packing in parallel. A global contiguous
+                # slice would serialize CPU-to-GPU staging on just one owner.
+                local_count = layout.num_experts // len(ranks)
+                per_owner = max(1, self.args.update_weight_buffer_size // (len(ranks) * bucket[0].size))
+                active_owners = min(len(ranks), self.args.update_weight_buffer_size // (per_owner * bucket[0].size))
+                if not active_owners:
+                    return False
+                for offset in range(0, local_count, per_owner):
+                    for first_owner in range(0, len(ranks), active_owners):
+                        ranges = [
+                            (
+                                owner * local_count + offset,
+                                owner * local_count + min(offset + per_owner, local_count),
+                            )
+                            if first_owner <= owner < first_owner + active_owners
+                            else (owner * local_count, owner * local_count)
+                            for owner in range(len(ranks))
+                        ]
+                        packed_buckets.append([info for start, end in ranges for info in bucket[start:end]])
+                        gathers.append(PackedExpertGather(layout.num_experts, expert_ranges=ranges))
+        self._bf16_expert_buckets = packed_buckets
+        self._bf16_expert_gathers = gathers
+        self._packed_expert_sync = True
+        self._direct_expert_layout = layout
+        return True
+
     def configure_expert_routing(
-        self, layout: ExpertLayout, *, payload_group: dist.ProcessGroup, metadata_group: dist.ProcessGroup
+        self,
+        layout: ExpertLayout | None,
+        *,
+        payload_group: dist.ProcessGroup | None = None,
+        metadata_group: dist.ProcessGroup | None = None,
+        allow_replicas: bool = False,
     ) -> None:
+        source_buckets = getattr(self, "_source_expert_buckets", self._expert_buckets)
+        if layout is None:
+            if self._expert_router is not None:
+                self._expert_buckets = source_buckets
+                self._expert_router = None
+                self._bf16_expert_buckets, self._bf16_expert_gathers = self._routed_previous_gather
+                self._unrouted_expert_buckets = []
+                self._unrouted_expert_broadcast_caches = []
+            return
         if (
             mpu.get_expert_tensor_parallel_world_size() != 1
-            or mpu.get_expert_model_parallel_world_size() * mpu.get_pipeline_model_parallel_world_size()
+            or not allow_replicas
+            and mpu.get_expert_model_parallel_world_size() * mpu.get_pipeline_model_parallel_world_size()
             != layout.world_size
         ):
             raise ValueError("Expert routing requires ETP=1 and unique owners across PP*EP=world")
         # Derive owners from actual local backup keys, not a PP/EP relay rank.
         # Exchange once so every rank has exactly the same source buckets.
         rank = dist.get_rank(metadata_group)
-        owned = [
-            dataclasses.replace(info, src_rank=rank)
-            for bucket in self._expert_buckets
-            for info in bucket
-            if info.name in self._vanilla_key_map
-        ]
+        owned, error = [], None
+        try:
+            for bucket in source_buckets:
+                for info in bucket:
+                    if info.name in self._vanilla_key_map and (
+                        not allow_replicas or self._bridge_converter.supports_routed_expert(info.name)
+                    ):
+                        if allow_replicas and info.dtype != torch.bfloat16:
+                            raise ValueError("Automatic expert routing requires complete BF16 source experts")
+                        owned.append(dataclasses.replace(info, src_rank=rank))
+        except Exception as exc:
+            error = str(exc)
         all_owned = [None] * layout.world_size
-        dist.all_gather_object(all_owned, owned, group=metadata_group)
-        infos = sorted((info for entries in all_owned for info in entries), key=lambda info: info.name)
-        if not infos or len({info.name for info in infos}) != len(infos):
+        dist.all_gather_object(all_owned, (owned, error), group=metadata_group)
+        if any(error is not None for _, error in all_owned):
+            raise ValueError(f"Expert routing source capability check failed: {[error for _, error in all_owned]}")
+        elected = {}
+        for entries, _ in all_owned:
+            for info in entries:
+                previous = elected.get(info.name)
+                if previous is not None:
+                    if not allow_replicas:
+                        raise ValueError("Expert routing requires nonempty, globally unique expert owners")
+                    if (previous.dtype, previous.shape, previous.size, previous.attrs) != (
+                        info.dtype,
+                        info.shape,
+                        info.size,
+                        info.attrs,
+                    ):
+                        raise ValueError(f"Expert replicas disagree on their schema: {info.name}")
+                if previous is None or info.src_rank < previous.src_rank:
+                    elected[info.name] = info
+        infos = sorted(elected.values(), key=lambda info: info.name)
+        if not infos:
             raise ValueError("Expert routing requires nonempty, globally unique expert owners")
-        self._expert_buckets = _bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, layout)
-        self._expert_router = ExpertRouter(layout, payload_group=payload_group, metadata_group=metadata_group)
+        buckets = _bucket_experts_by_owner(
+            infos, self.args.update_weight_buffer_size, layout, receive_budget=self._routed_ipc_budget
+        )
+        router = ExpertRouter(layout, payload_group=payload_group, metadata_group=metadata_group)
+        if getattr(self, "_packed_expert_sync", False):
+            self.configure_direct_experts(None)
+        if self._expert_router is None:
+            self._routed_previous_gather = (self._bf16_expert_buckets, self._bf16_expert_gathers)
+        self._source_expert_buckets = source_buckets
+        # Stacked tower experts and MTP keep their original Bridge export.
+        unrouted = [info for bucket in source_buckets for info in bucket if info.name not in elected]
+        self._unrouted_expert_buckets = _bucket_by_size(unrouted, self.args)
+        self._unrouted_expert_broadcast_caches = [({}, {}) for _ in self._unrouted_expert_buckets]
+        self._expert_buckets = buckets
+        self._expert_router = router
+        self._bf16_expert_buckets = None
         if rank == 0:
             logger.info("[Bridge Expert Routing] configured %d parallel source rounds", len(self._expert_buckets))
+
+    @property
+    def _routed_ipc_budget(self) -> int:
+        budget = self.args.update_weight_buffer_size
+        # BF16 uses no quantization scratch and each IPC is acknowledged before
+        # advancing. Preserve the conservative existing MXFP4 staging budget.
+        return max(1, budget // 3) if self.quantization_config else budget
+
+    def weight_sync_process_groups(self) -> list[dist.ProcessGroup]:
+        """All collectives used by this iterator, including ordinary TP/ETP."""
+        dimensions = (
+            (mpu.get_pipeline_model_parallel_world_size, mpu.get_pipeline_model_parallel_group),
+            (mpu.get_expert_model_parallel_world_size, mpu.get_expert_model_parallel_group),
+            (mpu.get_tensor_model_parallel_world_size, mpu.get_tensor_model_parallel_group),
+            (mpu.get_expert_tensor_parallel_world_size, mpu.get_expert_tensor_parallel_group),
+        )
+        return [group() for size, group in dimensions if size() > 1]
 
     def _iter_routed_expert_chunks(
         self, megatron_local_weights: Mapping[str, torch.Tensor]
@@ -160,8 +345,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         pending_bytes = [0] * router.layout.world_size
         rounds = 0
         ipc_chunks = 0
-        # Reserve space for the route packing buffer and previous in-flight IPC.
-        ipc_budget = max(1, self.args.update_weight_buffer_size // 3)
+        ipc_budget = self._routed_ipc_budget
         for bucket_index, bucket_infos in enumerate(self._expert_buckets):
             start = time.monotonic()
             converted = []
@@ -216,12 +400,54 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             )
 
     def get_hf_weight_chunks(self, megatron_local_weights):
+        if self._bf16_expert_buckets is not None:
+            if self._packed_expert_sync:
+                yield from _chunk_with_mla_pairing(
+                    self._iter_hf_params(megatron_local_weights, include_experts=False),
+                    chunk_size=self.args.update_weight_buffer_size,
+                )
+                # Yield each native projection/range immediately
+                # instead of materializing the next layer through chunk lookahead.
+                yield from self._iter_bf16_expert_chunks(megatron_local_weights)
+                return
+            yield from _chunk_with_mla_pairing(
+                self._iter_bf16_expert_params(megatron_local_weights), chunk_size=self.args.update_weight_buffer_size
+            )
+            return
         if self._expert_router is not None:
             yield from self._iter_routed_expert_chunks(megatron_local_weights)
         yield from _chunk_with_mla_pairing(
             self._iter_hf_params(megatron_local_weights, include_experts=self._expert_router is None),
             chunk_size=self.args.update_weight_buffer_size,
         )
+
+    def _iter_bf16_expert_params(self, megatron_local_weights, *, include_non_experts=True):
+        # Preserve the current GDN and vision conversion; only expert ownership
+        # and transport differ. ETP1 owners already hold complete expert tensors.
+        if include_non_experts:
+            yield from self._iter_hf_params(megatron_local_weights, include_experts=False)
+        for chunk in self._iter_bf16_expert_chunks(megatron_local_weights):
+            yield from chunk
+
+    def _iter_bf16_expert_chunks(self, megatron_local_weights):
+        group = mpu.get_expert_model_parallel_group()
+        rank = dist.get_rank(group=dist.group.WORLD)
+        device = device_utils.make_current_torch_device()
+        for infos, gather in zip(self._bf16_expert_buckets, self._bf16_expert_gathers, strict=True):
+            converted = []
+            for info in infos:
+                if info.src_rank == rank:
+                    tensor = (
+                        megatron_local_weights[self._vanilla_key_map[info.name]]
+                        .detach()
+                        .to(device=device, non_blocking=_NON_BLOCKING)
+                    )
+                    converted.extend(self._bridge_converter.convert(info.name, tensor))
+                    del tensor
+            gathered = gather(converted, group=group, device=device)
+            del converted
+            yield gathered
+            del gathered
 
     def _iter_hf_params(self, megatron_local_weights, *, include_experts=True):
         """Yield individual (name, tensor) pairs for all params.
@@ -248,8 +474,12 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         merge_fn = self._merge_base_with_adapter if self.lora_merge_mode else None
 
         # --- Expert weights: quantize-before-broadcast path ---
-        expert_buckets = self._expert_buckets if include_experts else []
-        caches = self._expert_broadcast_caches if include_experts else []
+        expert_buckets = self._expert_buckets if include_experts else getattr(self, "_unrouted_expert_buckets", [])
+        caches = (
+            self._expert_broadcast_caches
+            if include_experts
+            else getattr(self, "_unrouted_expert_broadcast_caches", [])
+        )
         for bucket_infos, phase_caches in zip(expert_buckets, caches, strict=True):
             t_c0 = time.monotonic()
             params = _load_to_gpu(
@@ -282,9 +512,41 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             t_b1 = time.monotonic()
             t_bcast_total += t_b1 - t_b0
 
-            for info, param in zip(bucket_infos, params, strict=True):
+            gathered_params = None
+            if self._async_weight_gather:
                 t_g0 = time.monotonic()
-                gathered = all_gather_param(self.args, info.name, param)
+                gathered_params = iter(
+                    all_gather_params_async(
+                        [
+                            (info, param)
+                            for info, param in zip(bucket_infos, params, strict=True)
+                            if not info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
+                        ],
+                        gdn_split_sizes=self._gdn_split_sizes,
+                    )
+                )
+                t_gather_total += time.monotonic() - t_g0
+            for info, param in zip(bucket_infos, params, strict=True):
+                if info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                    # Bridge's PLE mapping assembles one HF shard per TP collective.
+                    # A full TP gather here would materialize the entire n-gram
+                    # table (and convert() would retain all its shard views).
+                    shards = self._bridge_converter.iter_ple_shards(info.name, param)
+                    while True:
+                        t_g0 = time.monotonic()
+                        try:
+                            converted = next(shards)
+                        except StopIteration:
+                            break
+                        t_convert_total += time.monotonic() - t_g0
+                        param_count += 1
+                        yield converted
+                    continue
+
+                t_g0 = time.monotonic()
+                gathered = (
+                    all_gather_param(self.args, info.name, param) if gathered_params is None else next(gathered_params)
+                )
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
 
@@ -295,7 +557,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 yield from converted
                 del gathered, converted
 
-            del params
+            del params, gathered_params
 
         if rank == 0:
             logger.info(
@@ -483,7 +745,9 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
     return expert_buckets, non_expert_buckets, vanilla_key_map, adapter_map
 
 
-def _bucket_experts_by_owner(infos: list[ParamInfo], buffer_size: int, layout: ExpertLayout) -> list[list[ParamInfo]]:
+def _bucket_experts_by_owner(
+    infos: list[ParamInfo], buffer_size: int, layout: ExpertLayout, *, receive_budget: int | None = None
+) -> list[list[ParamInfo]]:
     """Run owner-local buckets concurrently with conservative BF16 byte
     bounds."""
     by_owner: dict[int, list[ParamInfo]] = {}
@@ -492,14 +756,14 @@ def _bucket_experts_by_owner(infos: list[ParamInfo], buffer_size: int, layout: E
         match = re.search(r"\.experts\.linear_fc[12]\.weight(\d+)$", info.name)
         if match is None or not 0 <= info.src_rank < layout.world_size:
             raise ValueError(f"Unsupported routed Megatron expert: {info.name}")
-        name = f"model.layers.0.block_sparse_moe.experts.{match[1]}.w1.weight_packed"
-        for destination in layout.destinations(name):
+        for destination in layout.expert_destinations(int(match[1])):
             destination_owners.setdefault(destination, set()).add(info.src_rank)
         by_owner.setdefault(info.src_rank, []).append(info)
     fanin = max(len(owners) for owners in destination_owners.values())
     # MXFP4 packed+scale bytes must not exceed the original BF16 bytes (checked
     # during conversion). Each destination receives at most `fanin` such buckets.
-    budget = min(buffer_size // len(layout.engine_offsets), buffer_size // 3 // fanin)
+    receive_budget = max(1, buffer_size // 3) if receive_budget is None else receive_budget
+    budget = min(buffer_size // len(layout.engine_offsets), receive_budget // fanin)
     owner_buckets = []
     for owner in sorted(by_owner):
         buckets: list[list[ParamInfo]] = [[]]

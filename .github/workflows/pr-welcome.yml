@@ -4,7 +4,7 @@ on:
   pull_request_target:
     types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft]
   workflow_run:
-    workflows: [Review Signal, CI, GPU Unit Tests, Integration Tests]
+    workflows: [Review Signal, CI, Unit Tests, Integration Tests]
     types: [in_progress, completed]
 
 permissions:
