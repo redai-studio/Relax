@@ -462,7 +462,7 @@ FROM relax_ep as relax_hopper
 RUN --mount=type=bind,from=fa3_builder,source=/opt/fa3-wheels,target=/tmp/fa3-wheels \
     --mount=type=bind,source=docker/scripts/native_wheel_abi.py,target=/tmp/native_wheel_abi.py \
     python /tmp/native_wheel_abi.py check /tmp/fa3-wheels/abi.json && \
-    pip install --no-cache-dir --no-deps /tmp/fa3-wheels/*.whl && \
+    pip install --no-cache-dir --force-reinstall --no-deps /tmp/fa3-wheels/*.whl && \
     python -c "import torch; import flash_attn_3._C"
 ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/sglang/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}
 
