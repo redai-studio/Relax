@@ -41,9 +41,8 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
     """Request probabilities of the actual per-call sampler, without changing
     it.
 
-    Filtered sampling uses SGLang's support IDs and sampled behavior
-    probability to recover the common renormalization of the returned candidate
-    logprobs.
+    Request per-candidate behavior logprobs when the PyTorch sampler is known
+    to be in use. Older servers ignore the mode and return the sampled logprob.
     """
     if not score_centering_enabled(args):
         return None
@@ -97,6 +96,14 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
     payload.pop("sampling_logprobs_mode", None)
     if filtered:
         payload["return_sampling_mask"] = True
+        # The PyTorch sampler captures its actual support. The fused FlashInfer
+        # path can reconstruct it, and engine overrides can change the backend.
+        if getattr(args, "sglang_sampling_backend", None) == "pytorch" and not (
+            getattr(args, "rollout_external", False)
+            or getattr(args, "sglang_config", None)
+            or getattr(args, "rollout_engine_class_path", None)
+        ):
+            payload["sampling_logprobs_mode"] = "support"
     return "support" if filtered else "selected"
 
 
@@ -241,6 +248,7 @@ def parse_score_centering_response(
         vocab_size=vocab_size,
     )
     support_complete = np.zeros(n, dtype=bool)
+    covers_reported_support = np.zeros(n, dtype=bool)
     if sampling_mode == "support":
         supports = meta_info.get("output_token_sampling_mask")
         probabilities = meta_info.get("output_token_sampling_logprobs")
@@ -251,47 +259,67 @@ def parse_score_centering_response(
             )
         if len(supports or []) != n or len(probabilities or []) != n:
             raise ValueError("Score Centering sampling support rows must match generated token count")
-        for position, (support_ids, support_logprob) in enumerate(
+        for position, (support_ids, behavior_logprobs) in enumerate(
             zip(supports or [], probabilities or [], strict=True)
         ):
             row_ids = np.asarray(support_ids)
-            if row_ids.ndim != 1 or not np.isscalar(support_logprob) or not len(row_ids):
-                raise ValueError(f"Score Centering position {position}: malformed sampling support probabilities")
+            if row_ids.ndim != 1 or not len(row_ids):
+                raise ValueError(f"Score Centering position {position}: malformed sampling support IDs")
             if not np.issubdtype(row_ids.dtype, np.integer) or (row_ids < 0).any():
                 raise ValueError(f"Score Centering position {position}: invalid sampling support IDs")
             if (row_ids > np.iinfo(np.int32).max).any() or (vocab_size is not None and (row_ids >= vocab_size).any()):
                 raise ValueError(f"Score Centering position {position}: sampling support ID exceeds vocabulary")
             if len(np.unique(row_ids)) != len(row_ids):
                 raise ValueError(f"Score Centering position {position}: duplicate sampling support IDs")
-            support_logprob = float(support_logprob)
-            if not math.isfinite(support_logprob) or support_logprob > _PROBABILITY_TOLERANCE:
-                raise ValueError(f"Score Centering position {position}: invalid sampled behavior log-q")
             match = np.flatnonzero(row_ids == tokens[position])
             if len(match) != 1:
                 raise ValueError(f"Score Centering position {position}: sampled token is absent from sampling support")
+
+            row_logprobs = np.asarray(behavior_logprobs, dtype=np.float64)
+            native_support = row_logprobs.ndim != 0
+            if native_support:
+                if (
+                    row_logprobs.shape != row_ids.shape
+                    or not np.isfinite(row_logprobs).all()
+                    or (row_logprobs > _PROBABILITY_TOLERANCE).any()
+                    or not np.isclose(np.exp(row_logprobs).sum(), 1.0, rtol=1e-5, atol=1e-5)
+                ):
+                    raise ValueError(f"Score Centering position {position}: invalid per-candidate behavior log-q")
+                sampled_logprob = float(row_logprobs[match[0]])
+            else:
+                sampled_logprob = float(row_logprobs)
+                if not math.isfinite(sampled_logprob) or sampled_logprob > _PROBABILITY_TOLERANCE:
+                    raise ValueError(f"Score Centering position {position}: invalid sampled behavior log-q")
+
             if len(row_ids) == 1:
-                if not math.isclose(support_logprob, 0.0, abs_tol=_PROBABILITY_TOLERANCE):
+                if not math.isclose(sampled_logprob, 0.0, abs_tol=_PROBABILITY_TOLERANCE):
                     raise ValueError(f"Score Centering position {position}: singleton support must have probability 1")
-                # argmax and topk can choose different IDs at a tied maximum.
-                # The emitted singleton support, not topk's tie break, defines q.
+                # Argmax and topk may pick different IDs at a tied maximum.
                 ids[position] = -1
                 logprobs[position] = -np.inf
                 ids[position, 0] = tokens[position]
-                logprobs[position, 0] = support_logprob
-                sampled[position] = support_logprob
-                support_complete[position] = True
-                continue
-            # Pure top-k/top-p/min-p truncation multiplies every retained
-            # probability by the same factor, including the sampled token.
-            log_normalizer_shift = support_logprob - sampled[position]
-            if log_normalizer_shift < -_PROBABILITY_TOLERANCE:
-                raise ValueError(f"Score Centering position {position}: filtering increased the normalization mass")
-            in_support = np.isin(ids[position], row_ids) & (ids[position] >= 0)
-            logprobs[position, in_support] += log_normalizer_shift
-            logprobs[position, ~in_support] = -np.inf
-            ids[position, ~in_support] = -1
-            sampled[position] = support_logprob
-            support_complete[position] = np.count_nonzero(in_support) == len(row_ids)
+                logprobs[position, 0] = sampled_logprob
+                covers_reported_support[position] = True
+            else:
+                _, candidate_indices, support_indices = np.intersect1d(ids[position], row_ids, return_indices=True)
+                if native_support:
+                    logprobs[position, candidate_indices] = row_logprobs[support_indices]
+                else:
+                    # Legacy selected-logprob metadata may rebuild the mask
+                    # independently. Preserve the approximate scoring path.
+                    log_normalizer_shift = sampled_logprob - sampled[position]
+                    if log_normalizer_shift < -_PROBABILITY_TOLERANCE:
+                        raise ValueError(
+                            f"Score Centering position {position}: filtering increased the normalization mass"
+                        )
+                    logprobs[position, candidate_indices] += log_normalizer_shift
+                padding = np.ones(k, dtype=bool)
+                padding[candidate_indices] = False
+                ids[position, padding] = -1
+                logprobs[position, padding] = -np.inf
+                covers_reported_support[position] = len(candidate_indices) == len(row_ids)
+            sampled[position] = sampled_logprob
+            support_complete[position] = native_support and covers_reported_support[position]
     elif sampling_mode != "selected":
         raise ValueError(f"Unknown Score Centering sampling mode: {sampling_mode}")
     _validate_rows(
@@ -302,7 +330,7 @@ def parse_score_centering_response(
         np.ones(n, dtype=bool),
         context="Score Centering generation",
         vocab_size=vocab_size,
-        support_complete=support_complete,
+        support_complete=covers_reported_support,
     )
     result = tokens, sampled, ids, logprobs
     return (*result, support_complete) if return_support_complete else result
