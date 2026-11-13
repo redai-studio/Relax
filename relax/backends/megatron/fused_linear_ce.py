@@ -25,8 +25,18 @@ from relax.utils.logging_utils import get_logger
 @lru_cache(maxsize=2)
 def _log_enabled(metric_logits: bool) -> None:
     get_logger(__name__).info(
-        "Fused linear CE active: Blackwell BF16, per-token loss, temporary metric logits=%s", metric_logits
+        "Fused linear CE active: Quack BF16, per-token loss, temporary metric logits=%s", metric_logits
     )
+
+
+@lru_cache(maxsize=1)
+def _hopper_runtime_available() -> bool:
+    from importlib.util import find_spec
+
+    try:
+        return find_spec("quack.epilogue.frontend") is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def supported(
@@ -73,9 +83,11 @@ def supported(
             return False
     if getattr(layer.config, "defer_embedding_wgrad_compute", False):
         return False
+    architecture = torch.cuda.get_device_capability(hidden.device)[0]
+    if architecture not in (9, 10) or (architecture == 9 and not _hopper_runtime_available()):
+        return False
     return (
-        torch.cuda.get_device_capability(hidden.device)[0] == 10
-        and hidden.device == weight.device
+        hidden.device == weight.device
         and weight.dtype == torch.bfloat16
         and weight.ndim == 2
         and weight.is_contiguous()
@@ -192,7 +204,10 @@ def linear_cross_entropy(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Return unreduced losses in hidden row order; SP gathering is the
     caller's job."""
-    if Envs.RELAX_SFT_FUSED_LINEAR_CE and temperature == 1.0:
+    # The backport uses Blackwell TCGEN05/TMEM instructions. Hopper instead
+    # reuses the Quack epilogues below, which have an SM90 GEMM backend.
+    hopper = hidden.is_cuda and torch.cuda.get_device_capability(hidden.device)[0] == 9
+    if Envs.RELAX_SFT_FUSED_LINEAR_CE and temperature == 1.0 and not hopper:
         from .kernels.linear_cross_entropy import linear_cross_entropy as backport_linear_cross_entropy
 
         return backport_linear_cross_entropy(
