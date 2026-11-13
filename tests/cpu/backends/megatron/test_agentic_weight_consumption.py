@@ -115,6 +115,21 @@ def test_missing_async_publisher_is_unknown_and_non_agentic_adds_no_collective(a
     dist.broadcast_object_list.assert_not_called()
 
 
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_dcs_consumption_uses_published_snapshot_including_hybrid(actor_audit, hybrid):
+    audit, actor, _, _, _ = actor_audit
+    actor.args.fully_async = True
+    actor.args.hybrid = hybrid
+    del actor.weight_updater
+    actor.checkpoint_engine_client = SimpleNamespace(backend=SimpleNamespace(_agentic_publication=("run", 4, "13")))
+    data = {AUDIT_FIELD: [_row(0)]}
+    audit(actor, data)
+    report = data[AUDIT_FIELD][0]
+    assert report["consumption_age_token_mean"] == 3
+    assert report["version_missing_token_rate"] == 0
+    assert report["generation_version_span"] == 0
+
+
 def _distributed_worker(rank, rendezvous, missing_publisher):
     import torch
     import torch.distributed as dist

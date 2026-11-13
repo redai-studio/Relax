@@ -2992,7 +2992,7 @@ class MegatronTrainRayActor(TrainRayActor):
             try:
                 publisher = (
                     self.checkpoint_engine_client.backend
-                    if self.args.fully_async and not getattr(self.args, "hybrid", False)
+                    if self.args.fully_async
                     else getattr(self, "weight_updater", None)
                 )
                 snapshot[0] = consumption_snapshot(publisher)
