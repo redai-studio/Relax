@@ -8,6 +8,7 @@
 - 设计：`docs/superpowers/specs/2026-11-10-weight-version-tracking-design.md`
 - 实施计划：`docs/superpowers/plans/2026-11-10-weight-version-tracking.md`
 - 报告样例：`docs/superpowers/examples/weight-version-audit-report.md`
+- 验证指南：`docs/superpowers/2026-11-13-weight-version-verification-guide.md`
 
 ## 状态：实现完成，待合并
 
