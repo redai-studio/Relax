@@ -56,6 +56,10 @@ def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mt
         save_hf="export",
         eval_interval=5,
         eval_prompt_data=["validation"],
+        sft_predict_interval=None,
+        # should_skip_sft_weight_management() reads these directly.
+        offload_train=False,
+        keep_old_actor=False,
     )
 
     assert should_skip_sft_weight_management(args)
@@ -76,7 +80,16 @@ def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mt
 )
 @pytest.mark.parametrize("mtp_only_training", [False, True])
 def test_sft_keeps_weight_management_for_consumers_and_other_losses(overrides, consumers, mtp_only_training):
-    args = Namespace(**{"loss_type": "sft", "mtp_only_training": mtp_only_training, **overrides})
+    args = Namespace(
+        **{
+            "loss_type": "sft",
+            "mtp_only_training": mtp_only_training,
+            "sft_predict_interval": None,
+            "offload_train": False,
+            "keep_old_actor": False,
+            **overrides,
+        }
+    )
 
     assert not should_skip_sft_weight_management(args, **consumers)
 

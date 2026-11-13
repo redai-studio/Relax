@@ -30,6 +30,9 @@ def make_args(**overrides):
         context_parallel_size=1,
         virtual_pipeline_model_parallel_size=None,
         multimodal_keys=None,
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
+        use_rollout_indexer_replay=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -89,12 +92,12 @@ def test_rl_preserves_explicit_per_rank_fetch(per_rank):
 
 
 def test_pipeline_accepts_partial_non_sft_arguments():
-    args = SimpleNamespace(train_backend="megatron", per_rank_fetch=True)
+    # ``loss_type`` is always present after parse (pre-parse default None).
+    args = SimpleNamespace(train_backend="megatron", per_rank_fetch=True, loss_type=None)
     configure_sft_data_pipeline(args)
     assert args.per_rank_fetch is True
     assert args.sft_train_data_prefetch is False
     assert args.sft_image_preprocess_on_rank is False
-    assert not hasattr(args, "loss_type")
     assert not hasattr(args, "sft_async_prepack")
 
 
@@ -202,6 +205,8 @@ def test_wholepack_recipe_keeps_raw_prefetch_and_valid_geometry(tp, capacity):
         sft_wholepack=True,
         tensor_model_parallel_size=tp,
         global_batch_size=1600,
+        # config_contract() requires one GBS1600 optimizer step per rollout.
+        rollout_batch_size=1600,
         n_samples_per_prompt=1,
         expert_model_parallel_size=8,
         expert_tensor_parallel_size=1,
