@@ -17,6 +17,8 @@ def _args(**overrides):
     values = dict(
         loss_type="sft",
         advantage_estimator=None,
+        mtp_only_training=False,
+        task_type="causal_lm",
         qkv_format="thd",
         allgather_cp=False,
         calculate_per_token_loss=True,

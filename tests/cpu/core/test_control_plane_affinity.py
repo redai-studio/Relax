@@ -17,7 +17,12 @@ from tests.cpu.core.controller_test_utils import load_controller_with_stubbed_de
 def _elastic_args(tmp_path, **kwargs):
     config_path = tmp_path / "autoscaler.yaml"
     config_path.write_text("enabled: true\n")
-    values = {"autoscaler_config": str(config_path), "enable_affinity": True}
+    # Controller init → is_i2i_sft reads loss_type before affinity assertions.
+    values = {
+        "autoscaler_config": str(config_path),
+        "enable_affinity": True,
+        "loss_type": "policy_loss",
+    }
     values.update(kwargs)
     return Namespace(**values)
 

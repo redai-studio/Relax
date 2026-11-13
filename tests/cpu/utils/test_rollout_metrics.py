@@ -29,6 +29,7 @@ def _args(**overrides):
         partial_rollout=False,
         fully_async=False,
         rollout_num_gpus=2,
+        opd_teacher_key=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
