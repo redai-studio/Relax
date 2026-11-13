@@ -25,7 +25,7 @@ def ple_converter(monkeypatch, request):
     monkeypatch.setattr(mpu, "get_expert_model_parallel_group", lambda: None)
     monkeypatch.setattr(mpu, "get_expert_tensor_parallel_group", lambda: None)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.delenv("QWEN48_PLE_CPU_OFFLOAD", raising=False)
+    monkeypatch.delenv("QWEN38_PLE_CPU_OFFLOAD", raising=False)
     name = "language_model.decoder.layers.1.per_layer_embedding.ple_embedding.ngram_embedding.weight"
     mapping = PLENGramEmbeddingMapping(
         name, "model.language_model.ple.ple_embedding.ngram_embedding.shard_{}.weight", 3

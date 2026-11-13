@@ -263,8 +263,6 @@ def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
     ``--eval-size``, mutually exclusive — see ``utils/arguments.py``).
 
     Pure Megatron path; no Rollout/SGLang involvement.
-    ``RELAX_SFT_EVAL_FIRST_STEP`` optionally adds one early SFT evaluation;
-    producer, consumer and lookahead gating all use this same predicate.
     """
     if not is_offline_mode(args):
         return False
@@ -274,8 +272,7 @@ def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
     interval = getattr(args, "eval_interval", None)
     if interval is None or interval <= 0:
         return False
-    first_step = Envs.RELAX_SFT_EVAL_FIRST_STEP if is_sft_mode(args) else 0
-    return completed_steps > 0 and (completed_steps % interval == 0 or completed_steps == first_step)
+    return completed_steps > 0 and completed_steps % interval == 0
 
 
 def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:

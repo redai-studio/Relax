@@ -160,7 +160,7 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 # Keep streamed PLE disabled. Host-only training PLE is not supported by the
 # colocated GPU weight iterator; keep the frozen table on its owning GPU ranks.
 export RELAX_QWEN38_PLE_STREAMED=0
-export QWEN48_PLE_CPU_OFFLOAD=0
+export QWEN38_PLE_CPU_OFFLOAD=0
 export SGLANG_VLM_CACHE_SIZE_MB=0
 # Attention TP8 GDN projection has width 2060, incompatible with DeepGEMM TMA alignment.
 export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0
@@ -324,7 +324,7 @@ env = runtime.setdefault("env_vars", {})
 for name, value in os.environ.items():
     if name.startswith(("CLEARML_", "RELAX_QWEN38_", "RELAX_GDN_", "RELAX_HC_", "RELAX_MOE_", "RELAX_QSA_")) or name in (
         "PYTHONPATH", "MEGATRON", "RELAX", "PYTHONNOUSERSITE",
-        "QWEN48_PLE_CPU_OFFLOAD", "MCORE_QSA_SPARSE_BACKEND",
+        "QWEN38_PLE_CPU_OFFLOAD", "MCORE_QSA_SPARSE_BACKEND",
         "SGLANG_VLM_CACHE_SIZE_MB", "CUDA_HOME", "TRITON_F32_DEFAULT",
         "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM",
         "NCCL_P2P_PXN_LEVEL",
