@@ -912,6 +912,9 @@ async def _init_agentic_resident_pipeline_async(
             data_system_client=data_system_client,
         )
         _RESIDENT_PIPELINE = pipeline
+        if args.agentic_prelaunch:
+            prepare_domain.open_step(prelaunch_next_step=True)
+            prepare_domain.fill()
     except BaseException:
         if runtime_domain is not None:
             await runtime_domain.shutdown()
