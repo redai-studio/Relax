@@ -882,7 +882,7 @@ Shard 突然退出仍可能使最终复制无法完成。`tokens.jsonl` 按当�
 python -m relax.utils.agentic_obs.version_audit <run_dir> [--session S] [--group G] [--missing-only] [--jsonl]
 ```
 
-输出 run 级汇总（各滞后均值/中位数/最大值、三口径缺失率）与样本级明细（session → turn → attempt → token 区间 → 来源版本 → 消费时年龄）。指标口径定义见 `docs/superpowers/specs/2026-11-10-weight-version-tracking-design.md` §6。
+输出 run 级汇总（各滞后均值/中位数/最大值、三口径缺失率）与样本级明细（session → turn → attempt → token 区间 → 来源版本 → 消费时年龄）。指标口径与容错行为详见[权重版本滞后审计](./weight-version-audit.md)。
 
 ### 常见问题
 

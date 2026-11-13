@@ -939,7 +939,7 @@ Run offline against a produced observation directory:
 python -m relax.utils.agentic_obs.version_audit <run_dir> [--session S] [--group G] [--missing-only] [--jsonl]
 ```
 
-Emits a run-level summary (lag mean/median/max, three missing-rate facets) and per-sample detail lines (session → turn → attempt → token interval → source version → age at consumption). Metric definitions: `docs/superpowers/specs/2026-11-10-weight-version-tracking-design.md` §6.
+Emits a run-level summary (lag mean/median/max, three missing-rate facets) and per-sample detail lines (session → turn → attempt → token interval → source version → age at consumption). See [Weight Version Staleness Audit](./weight-version-audit.md) for metric definitions and fault-tolerance behavior.
 
 ### Common Problems
 
