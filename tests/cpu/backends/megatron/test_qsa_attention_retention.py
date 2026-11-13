@@ -42,8 +42,13 @@ def arguments():
     )
 
 
-def test_default_disabled_does_not_import_megatron(retention, monkeypatch):
-    monkeypatch.delenv("RELAX_QWEN38_RETAIN_QSA_ATTENTION", raising=False)
+@pytest.mark.parametrize("enabled", [None, "0"])
+def test_disabled_retention_does_not_validate_a_selected_policy(retention, monkeypatch, enabled):
+    monkeypatch.setenv("RELAX_QWEN38_QSA_RETENTION_POLICY", "last_stage_l48")
+    if enabled is None:
+        monkeypatch.delenv("RELAX_QWEN38_RETAIN_QSA_ATTENTION", raising=False)
+    else:
+        monkeypatch.setenv("RELAX_QWEN38_RETAIN_QSA_ATTENTION", enabled)
     assert retention.configure(None, None) == []
 
 
@@ -66,6 +71,123 @@ def test_rejects_unsupported_recompute_configuration(retention, name, value):
     setattr(args, name, value)
     with pytest.raises(RuntimeError):
         retention.validate_args(args)
+
+
+@pytest.mark.parametrize(("policy", "tp_size"), [("last_stage_l44", 8), ("last_stage_l48", 4)])
+def test_last_stage_retention_leaves_earlier_stages_untouched(retention, monkeypatch, policy, tp_size):
+    args = arguments()
+    args.pipeline_model_parallel_size = 8
+    args.tensor_model_parallel_size = tp_size
+    monkeypatch.setenv("RELAX_QWEN38_RETAIN_QSA_ATTENTION", "1")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_RETENTION_POLICY", policy)
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core",
+        SimpleNamespace(parallel_state=SimpleNamespace(is_pipeline_last_stage=lambda: False)),
+    )
+    assert retention.configure(args, None) == []
+
+
+@pytest.mark.parametrize(
+    ("policy", "tp_size", "attention_number"),
+    [(None, 8, 44), ("last_stage_l44", 8, 44), ("last_stage_l48", 4, 48)],
+)
+def test_last_stage_retention_preserves_h800_recipe_layers(retention, monkeypatch, policy, tp_size, attention_number):
+    args = arguments()
+    args.pipeline_model_parallel_size = 8
+    args.tensor_model_parallel_size = tp_size
+    args.max_tokens_per_gpu = 131072 if tp_size == 8 else 65536
+    monkeypatch.setenv("RELAX_QWEN38_RETAIN_QSA_ATTENTION", "1")
+    monkeypatch.delenv("RELAX_QWEN38_QSA_RETENTION_POLICY", raising=False)
+    # The 128K launcher provided these settings before the policy was public.
+    legacy = {"AIO_TUNE_PP7_RETAIN": "1", "AIO_TUNE_PP7_FULL_LAYER": "47", "AIO_TUNE_PP7_FULL_SCOPE": "mtp"}
+    for name, value in legacy.items():
+        if policy == "last_stage_l44":
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    if policy is not None:
+        monkeypatch.setenv("RELAX_QWEN38_QSA_RETENTION_POLICY", policy)
+
+    class TransformerLayer(SimpleNamespace):
+        def _forward_mlp(self):
+            raise AssertionError("Model forward is outside the configuration test")
+
+        _relax_native_forward_mlp = _forward_mlp
+
+    class QwenSparseSelfAttention(SimpleNamespace):
+        pass
+
+    class BridgeBlock(SimpleNamespace):
+        def _checkpointed_forward(self):
+            raise AssertionError("Model forward is outside the configuration test")
+
+        _relax_native_checkpointed_forward = _checkpointed_forward
+
+    class HybridStack(SimpleNamespace):
+        pass
+
+    def qsa_layer(number):
+        return TransformerLayer(
+            layer_number=number,
+            self_attention=QwenSparseSelfAttention(
+                config=SimpleNamespace(qsa_indexer_loss_coeff=0),
+                indexer=SimpleNamespace(parameters=lambda: ()),
+            ),
+            mlp=SimpleNamespace(),
+        )
+
+    checkpointed_forward = object()
+    megatron_modules = {
+        "megatron.core": SimpleNamespace(
+            recompute=SimpleNamespace(checkpointed_forward=checkpointed_forward),
+            parallel_state=SimpleNamespace(is_pipeline_last_stage=lambda: True),
+        ),
+        "megatron.core.models.hybrid": SimpleNamespace(
+            hybrid_block=SimpleNamespace(HybridStack=HybridStack, checkpointed_forward=checkpointed_forward),
+        ),
+        "megatron.core.transformer.multi_token_prediction": SimpleNamespace(
+            MultiTokenPredictionLayer=type("MTP", (), {})
+        ),
+        "megatron.core.transformer.transformer_layer": SimpleNamespace(TransformerLayer=TransformerLayer),
+        "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block": SimpleNamespace(
+            Qwen3VLTransformerBlock=BridgeBlock
+        ),
+    }
+    for name, module in megatron_modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    layer_47 = TransformerLayer(layer_number=47)
+    decoder_layers = [layer_47, qsa_layer(48)]
+    if tp_size == 8:
+        decoder_layers.insert(0, qsa_layer(44))
+    decoder = BridgeBlock(config=args, layers=decoder_layers)
+    mtp = HybridStack(config=args, layers=[qsa_layer(1)], is_mtp_layer=True)
+    modules = [("decoder", decoder), ("mtp", mtp)]
+    modules.extend((f"decoder.layers.{layer.layer_number}", layer) for layer in decoder_layers)
+    modules.append(("mtp.layers.0", mtp.layers[0]))
+
+    manifest = retention.configure(args, [SimpleNamespace(named_modules=lambda: modules)])
+
+    assert {entry["layer_number"]: entry.get("scope", "attention") for entry in manifest} == {
+        attention_number: "attention",
+        47: "full decoder layer",
+        1: "full MTP layer",
+    }
+
+
+def test_full_mtp_retention_uses_native_mlp(retention, monkeypatch):
+    original = Mock(return_value="output")
+    checkpoint = Mock()
+    monkeypatch.setitem(
+        sys.modules, "megatron.core", SimpleNamespace(tensor_parallel=SimpleNamespace(checkpoint=checkpoint))
+    )
+    layer = SimpleNamespace(training=True, _relax_native_forward_mlp=original, _relax_qsa_full_layer_retained=True)
+    assert retention.retained_mlp(layer, "h", input_ids="ids") == "output"
+    original.assert_called_once_with(
+        "h", inference_context=None, padding_mask=None, input_ids="ids", packed_seq_params=None
+    )
+    checkpoint.assert_not_called()
 
 
 def test_checkpoint_closures_keep_each_microbatch_metadata(retention, monkeypatch):

@@ -555,10 +555,9 @@ def get_log_probs_and_entropy(
             log_prob = (
                 torch.cat(chunk_lps, dim=0)
                 if chunk_lps
-                # fp32 to match calculate_log_probs_and_entropy's return dtype;
-                # logits are upcast above. A mismatch would break the downstream
-                # torch.cat over per-sample log-probabilities.
-                else logits_chunk.new_zeros((0,), dtype=torch.float32)
+                # Keep empty shards connected for CP collective backward, in fp32
+                # to match the non-empty log-probabilities.
+                else logits_chunk.float().sum(dim=-1)
             )
             if selected_rows is not None:
                 log_prob = log_prob.new_zeros(full_rows).index_copy(0, selected_rows, log_prob)
@@ -1705,6 +1704,19 @@ def sft_loss_function_chunked(
     ``lm_head_forward`` into ``get_log_probs_and_entropy`` (which then chunks
     the lm_head + CE matmul internally — see that function's docstring).
     """
+    plans = batch.get("selective_logit_rows")
+    if plans and Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS:
+        # Compare the CPU-built plan against the actual supervision mask
+        # after multimodal expansion and alignment.
+        coverage = []
+        for mask, (full_rows, indices) in zip(batch["loss_masks"], plans, strict=True):
+            flat = mask.reshape(-1)
+            if flat.numel() != full_rows or flat.device != indices.device:
+                raise ValueError("Selective SFT logits metadata does not match the loss mask")
+            kept = torch.zeros_like(flat, dtype=torch.bool).index_fill_(0, indices, True)
+            coverage.append(((flat == 0) | kept).all())
+        torch._assert_async(torch.stack(coverage).all(), "Selective SFT logits omit supervised rows")
+
     if getattr(args, "_qwen_fused_head", False):
         assert args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == "linear"
         assert args.context_parallel_size == 1 and args.rollout_temperature == 1.0
@@ -1727,7 +1739,6 @@ def sft_loss_function_chunked(
             loss = hidden_states.sum() * 0
             per_row_loss = hidden_states.new_empty(0)
         else:
-            plans = batch.get("selective_logit_rows")
             if plans is not None:
                 from relax.models.qwen3_5.selective_loss import selected_linear_loss
 
@@ -1753,7 +1764,7 @@ def sft_loss_function_chunked(
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         lm_head_forward=lm_head_forward,
-        selective_logit_rows=batch.get("selective_logit_rows"),
+        selective_logit_rows=plans,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]

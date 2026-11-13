@@ -67,9 +67,19 @@ def test_mtp_plan_respects_document_and_physical_padding():
 @pytest.mark.parametrize("allgather_cp", [False, True])
 @pytest.mark.parametrize(
     "case",
-    ["packed", "response", "dummy", "repeated_dummy", "vl_text_only", "vl_multimodal", "vl_multimodal_unadmitted"],
+    [
+        "packed",
+        "response",
+        "dummy",
+        "repeated_dummy",
+        "vl_text_only",
+        "vl_with_images",
+        "vl_images_opt_out",
+        "vl_multimodal",
+        "vl_multimodal_unadmitted",
+    ],
 )
-def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_cp, case):
+def test_ordinary_pp_iterator_preserves_selection_plans(monkeypatch, allgather_cp, case):
     """Exercise ingestion -> ordinary DataIterator -> get_batch without async
     prepack.
 
@@ -87,6 +97,7 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
     from relax.utils.data import stream_dataloader
 
     monkeypatch.setenv("RELAX_SFT_SELECTIVE_LOGITS", "1")
+    monkeypatch.setenv("RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS", "1" if case == "vl_with_images" else "0")
     args = Namespace(
         loss_type="sft",
         qkv_format="thd",
@@ -94,7 +105,7 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
         enable_mtp_training=True,
         mtp_num_layers=2,
         allgather_cp=allgather_cp,
-        pipeline_model_parallel_size=4,
+        pipeline_model_parallel_size=8 if case in ("vl_with_images", "vl_images_opt_out") else 4,
         is_vl_model=case.startswith("vl_"),
         _relax_sft_selective_mm_packed=case == "vl_multimodal",
         use_opd=False,
@@ -122,6 +133,9 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
             {"pixel_values": torch.arange(6).reshape(2, 3), "image_grid_thw": torch.tensor([[1, 1, 2]])},
             None,
         ]
+    elif case in ("vl_with_images", "vl_images_opt_out"):
+        rollout["multimodal_train_inputs"] = [{"pixel_values": torch.zeros((1, 3, 4, 4))}, None]
+    if "multimodal_train_inputs" in rollout:
         keys.append("multimodal_train_inputs")
     stream_dataloader.post_process_rollout_data(args, rollout)
     assert "selective_loss_masks_cpu" in rollout
@@ -156,7 +170,7 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
     assert "unsplit_tokens" not in batch
     assert "vlm_packed_seq_params" not in batch
     assert batch.get("__is_dummy__", False) == (case in ("dummy", "repeated_dummy"))
-    if case == "vl_multimodal_unadmitted":
+    if case in ("vl_multimodal_unadmitted", "vl_images_opt_out"):
         assert "selective_logit_rows" not in batch
         assert not hasattr(batch["packed_seq_params"], "relax_sft_selective_mtp_rows")
         return
@@ -168,7 +182,7 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
         [full_mask] = roll_tensor([full_mask], cp_group=None, packed_seq_params=packed)
         expected_mtp.append(full_mask[0].nonzero().flatten())
 
-    # CPU get_batch provided one reference plan. Normal PP4 training uses this
+    # CPU get_batch provided one reference plan. Ordinary PP training uses this
     # separate helper because its tokens/full_loss_masks already reside on CUDA.
     rebuilt = dict(batch, selective_loss_masks_cpu=seen)
     rebuilt["packed_seq_params"] = copy(packed)
