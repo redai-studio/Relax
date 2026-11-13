@@ -179,6 +179,7 @@ class DeviceDirectBackend(CommBackend):
         self.lock = lock
         self.timeout_seconds = timeout_seconds
         self._weights_getter = weights_getter
+        self._async_shard_sync = None
         self.device = next(model[0].parameters()).device if model else device_module.current_device()
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
@@ -280,6 +281,9 @@ class DeviceDirectBackend(CommBackend):
             self.args, self.model, include_persistent_buffers=self._use_bridge
         ):
             if name_filter is not None and not name_filter(name):
+                continue
+            shard = getattr(self, "_async_shard_sync", None)
+            if shard is not None and shard.skips_native(name):
                 continue
             yield name, tensor
 
@@ -704,6 +708,28 @@ class DeviceDirectBackend(CommBackend):
         Sequence: pause rollout generation, flush caches, gather and broadcast
         model parameters (non-expert then expert), then resume generation.
         """
+        shard = getattr(self, "_async_shard_sync", None)
+        if (
+            getattr(self.args, "use_shard_p2p_weight_sync", False)
+            and not getattr(self, "_async_shard_force_native", False)
+            and not (shard is not None and shard.native_phase)
+        ):
+            from relax.backends.megatron.weight_update.async_shard import AsyncShardSync, supports_async_shards
+
+            if supports_async_shards(self, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only):
+                if shard is None:
+                    self._async_shard_sync = shard = AsyncShardSync(self)
+                shard.update(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+                return
+            if (
+                self.weight_version == 0
+                and supports_async_shards(self, rollout_only=True, actor_fwd_only=actor_fwd_only)
+                and not Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK
+            ):
+                self._async_shard_initial_seed = dict(
+                    specs={}, ready=False, version=1, signature=self._rollout_topology_signature
+                )
+        external_lifecycle = shard is not None and shard.native_phase
         self.weight_version += 1
 
         if self._use_bridge:
@@ -756,7 +782,7 @@ class DeviceDirectBackend(CommBackend):
         )
 
         if not actor_fwd_only:
-            if dist.get_rank() == 0:
+            if dist.get_rank() == 0 and not external_lifecycle:
                 # Pause generation on all rollout nodes
                 logger.info("Pausing generation on all rollout nodes...")
                 ray.get(self._batch_request("/pause_generation"))
@@ -871,7 +897,8 @@ class DeviceDirectBackend(CommBackend):
                     "/post_process_weights",
                     {"restore_weights_before_load": False, "post_process_quantization": True},
                 )
-            self._rollout_control_request("/continue_generation")
+            if not external_lifecycle:
+                self._rollout_control_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
             if push_failed:
                 # Abort rather than roll out with a stale/absent adapter: in adapter mode the
@@ -896,7 +923,13 @@ class DeviceDirectBackend(CommBackend):
         # allocator keeps large reserved blocks that are internally
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
-        device_module.empty_cache()
+        if external_lifecycle:
+            shard.release_native_cache()
+        else:
+            device_module.empty_cache()
+        initial_seed = getattr(self, "_async_shard_initial_seed", None)
+        if initial_seed is not None and initial_seed["version"] == self.weight_version:
+            initial_seed["ready"] = True
 
     def _rollout_control_request(self, endpoint: str, payload: Optional[Dict] = None) -> None:
         """Await receiver lifecycle operations and share failures with every
@@ -1193,6 +1226,13 @@ class DeviceDirectBackend(CommBackend):
         updates complete.
         """
 
+        shard = getattr(self, "_async_shard_sync", None)
+        if shard is not None:
+            shard.observe_native(converted_named_tensors)
+        elif getattr(self, "_async_shard_initial_seed", None) is not None:
+            from relax.backends.megatron.weight_update.async_shard import observe_initial_native
+
+            observe_initial_native(self, converted_named_tensors)
         while not ray.get(self.lock.acquire.remote()):
             time.sleep(0.1)
         completed = False
@@ -1561,6 +1601,21 @@ class RolloutEngine:
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
             raise
+        return response.json()
+
+    def update_weights_from_tensor(
+        self, serialized_named_tensors: list[str], load_format: str, flush_cache: bool = False
+    ) -> dict:
+        """Use the same checked native-loader RPC as colocated shard
+        sessions."""
+        response = requests.post(
+            self.base_url + "/update_weights_from_tensor",
+            json=dict(
+                serialized_named_tensors=serialized_named_tensors, load_format=load_format, flush_cache=flush_cache
+            ),
+            timeout=600,
+        )
+        response.raise_for_status()
         return response.json()
 
     def flush_cache(self) -> None:

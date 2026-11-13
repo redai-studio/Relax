@@ -43,3 +43,47 @@ def test_unused_cold_plan_does_not_start_allocation(monkeypatch, enabled, remote
     state = dict(nixl_agent=object(), delivery=dict(routes=dict(nixl=["remote"] if remote else [])))
     loader._prefetch_pinned_targets(state, {})
     assert "pinned_future" not in state and "pinned_pool" not in state
+
+
+def test_resident_gpu_targets_do_not_allocate_pinned_memory(monkeypatch):
+    monkeypatch.setenv("RELAX_COLOCATE_PINNED_NIXL_TARGET", "1")
+    state = dict(persistent_targets=True, nixl_agent=object())
+    loader._prefetch_pinned_targets(state, {})
+    assert "pinned_future" not in state and "pinned_targets" not in state
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_persistent_registration_retires_only_after_completion(busy):
+    registration = Mock()
+    model = torch.nn.Linear(2, 2)
+    model._relax_expert_ipc = dict(
+        persistent_targets=True,
+        failed=False,
+        epoch=object() if busy else None,
+        persistent_registration=registration,
+        persistent_parameters={"weight": model.weight},
+        persistent_storage_ids={"weight": model.weight.untyped_storage()._cdata},
+    )
+    if busy:
+        with pytest.raises(RuntimeError, match="pending"):
+            loader.retire_persistent_targets(model)
+        registration.release.assert_not_called()
+        assert model._relax_expert_ipc["persistent_registration"] is registration
+    else:
+        loader.retire_persistent_targets(model)
+        loader.retire_persistent_targets(model)
+        registration.release.assert_called_once()
+        assert "persistent_parameters" not in model._relax_expert_ipc
+
+
+def test_replica_completion_requires_matching_receipts_and_gpu_completion():
+    from relax.backends.sglang.replica_weight_sync import validate_replica_completion
+    from relax.distributed.checkpoint_service.backends.shard_p2p.plan import fingerprint
+
+    state = dict(replicas={}, epoch=dict(replica_ready=dict(receipt_hash=fingerprint([]))))
+    with pytest.raises(RuntimeError, match="GPU collective"):
+        validate_replica_completion(state, [])
+    state["epoch"]["replica_complete"] = "completed"
+    validate_replica_completion(state, [])
+    with pytest.raises(RuntimeError, match="GPU collective"):
+        validate_replica_completion(state, [dict(version=2)])

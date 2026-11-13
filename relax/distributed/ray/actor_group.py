@@ -96,7 +96,10 @@ class RayTrainGroup:
         if (
             self.role == "actor"
             and getattr(self.args, "use_shard_p2p_weight_sync", False)
-            and (not getattr(self.args, "colocate", False) or self.args.train_backend != "megatron")
+            and (
+                not (getattr(self.args, "colocate", False) or getattr(self.args, "fully_async", False))
+                or self.args.train_backend != "megatron"
+            )
         ):
             logger.info(
                 "ShardP2P weight sync requested=True effective=False: currently requires colocated Megatron; using native sync"
