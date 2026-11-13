@@ -13,7 +13,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
 
-from .async_eval import defer_eval_reward, eval_reward_deferral_enabled
+from .async_eval import collect_eval_rewards, defer_eval_reward, eval_reward_deferral_enabled
 from .dapo_genrm import async_compute_score_genrm
 from .math_utils import extract_answer as extract_boxed_answer
 from .registry import get_reward_spec, list_reward_types, register_reward, resolve_rm_type
@@ -388,7 +388,10 @@ class RewardExecutor:
                 return [None] * len(sample) if isinstance(sample, list) else None
         self._ensure_semaphore()
         async with self._semaphore:
-            return await self._execute_custom(args, sample, kwargs)
+            # Keep inline custom scoring intact: nested RM calls must return
+            # real scores, even while the surrounding eval collects judges.
+            with collect_eval_rewards(args, enabled=False):
+                return await self._execute_custom(args, sample, kwargs)
 
     async def execute(self, args, sample: Sample, *, _resolved_route=None, **kwargs):
         """Execute a single reward computation with concurrency control.

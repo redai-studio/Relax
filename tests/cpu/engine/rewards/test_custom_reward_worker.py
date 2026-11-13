@@ -7,6 +7,7 @@ import os
 import threading
 from types import SimpleNamespace
 from typing import Any, Awaitable, Iterator, TypeVar
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -140,6 +141,45 @@ def loaded_reward_paths(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 class TestCustomRewardDispatch:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("batched", [False, True])
+    async def test_inline_custom_keeps_nested_rewards_inline(self, monkeypatch, batched):
+        from relax.engine.rewards.async_eval import collect_eval_rewards, eval_reward_deferral_enabled
+
+        async def nested_reward(args, sample_or_group, **kwargs):
+            if isinstance(sample_or_group, list):
+                scores = await batched_async_rm(args, sample_or_group, ignore_custom=True, **kwargs)
+                return [{"score": score["score"] - 0.25} for score in scores]
+            score = await async_rm(args, sample_or_group, ignore_custom=True, **kwargs)
+            return {"score": score["score"] - 0.25}
+
+        monkeypatch.setattr(rewards_module, "_test_nested_reward", nested_reward, raising=False)
+        response = MagicMock()
+        response.json = AsyncMock(return_value={"score": 1.0})
+        session = MagicMock()
+        session.post.return_value.__aenter__.return_value = response
+        monkeypatch.setattr(rewards_module, "_get_shared_session", lambda: session)
+        args = _make_args(custom_rm_path="relax.engine.rewards._test_nested_reward", rm_type="remote_rm")
+        samples = [_make_sample(index=index) for index in range(2)]
+        payload = samples if batched else samples[0]
+        call = batched_async_rm if batched else async_rm
+
+        with collect_eval_rewards(args) as pending:
+            result = await _wait(call(args, payload, evaluation=True))
+            assert result == ([{"score": 0.75}] * 2 if batched else {"score": 0.75})
+            assert session.post.call_count == (2 if batched else 1)
+            assert pending.calls == []
+
+            # Restore the surrounding collector for other eligible calls.
+            assert await async_rm(args, samples[0], ignore_custom=True, evaluation=True) is None
+            assert len(pending.calls) == 1
+            nested_reward.supports_async_eval = True
+            assert await call(args, payload, evaluation=True) == ([None] * 2 if batched else None)
+            assert len(pending.calls) == 2
+            assert session.post.call_count == (2 if batched else 1)
+
+        assert not eval_reward_deferral_enabled()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("reward_kind", ["sync", "async"])
     async def test_custom_reward_receives_evaluation_when_supported(self, reward_kind: str):
