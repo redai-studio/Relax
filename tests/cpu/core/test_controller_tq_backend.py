@@ -30,6 +30,11 @@ def _config(**overrides: Any) -> SimpleNamespace:
         "seq_length": 8192,
         "multimodal_keys": None,
         "max_staleness": 0,
+        "loss_type": "policy_loss",
+        "generation_task": None,
+        # resolve_tq_capacity_batch_size() reads these directly.
+        "partial_rollout": False,
+        "use_dynamic_global_batch_size": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)

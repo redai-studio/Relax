@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
-from argparse import Namespace
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -11,22 +10,30 @@ import pytest
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout import sglang_rollout
 from relax.utils.opd.opd_main_worker import LogprobResponse
+from relax.utils.opd.opd_utils import validate_opd_args
 from relax.utils.types import Sample
+from tests.helpers.relax_args import make_args
 
 
 @pytest.fixture
 def rollout(monkeypatch):
-    args = Namespace(
+    # Declared defaults + OPD runtime init; routes_map is set after validate
+    # (validator clears it) so OpdManager can bind teacher response stats.
+    args = make_args(
         use_opd=True,
         opd_type="sglang",
         group_rm=False,
         partial_rollout=False,
         custom_generate_function_path=None,
         opd_token_selection="student_sampled",
+        opd_kl_coef=1.0,
+        opd_loss_coef=0.0,
         opd_teacher_timeout_s=10,
         opd_teacher_key="data_source",
-        opd_teacher_routes_map={"A": ["http://a/generate"], "B": ["http://b/generate"]},
+        opd_teacher_url="http://teacher/generate",
     )
+    validate_opd_args(args, is_offline=False)
+    args.opd_teacher_routes_map = {"A": ["http://a/generate"], "B": ["http://b/generate"]}
     manager = opd.OpdManager(args)
     state = SimpleNamespace(
         aborted=False, opd_manager=manager, dp_rank_context=nullcontext, semaphore=asyncio.Semaphore(3)

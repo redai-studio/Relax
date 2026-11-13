@@ -543,6 +543,8 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
         debug_train_only=False,
         rollout_external=mode == "initial_external",
         hf_checkpoint="/test/model",
+        # Parse always attaches model_source (possibly None) before engine start.
+        model_source=None,
     )
     first_ref, second_ref = InitResult(pending=True), InitResult(pending=True)
 
@@ -614,6 +616,7 @@ def test_start_engines_preserves_submitted_record_on_later_synchronous_failure(m
         debug_train_only=False,
         rollout_external=True,
         hf_checkpoint="/test/model",
+        model_source=None,
     )
     group.pg = (object(), list(range(8)), list(range(8)))
     first_ref = InitResult(pending=True)

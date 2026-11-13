@@ -469,7 +469,7 @@ class EngineGroup:
             )
             env_vars.update(
                 build_runai_streamer_env_for_load(
-                    getattr(self.args, "model_source", None),
+                    self.args.model_source,
                     effective_model_path,
                     effective_load_format,
                 )
@@ -727,7 +727,7 @@ class RolloutServer:
         # is retried. Do not return None slots to the synchronous weight updater.
         for group, dead_indices in zip(groups, dead_per_group, strict=True):
             if not (
-                getattr(group.args, "fully_async", False)
+                group.args.fully_async
                 and group.is_scaled_out
                 and group.pg is not None
                 and group.skip_router_registration
@@ -4631,7 +4631,7 @@ def _start_router(
         and not force_new
         and has_pd_disaggregation
         and not args.use_slime_router
-        and not getattr(args, "debug_train_only", False)
+        and not args.debug_train_only
         and getattr(args, "router_decode_policy", None) == "power_of_two"
     ):
         # The owner chooses and binds the endpoint after engines are ready.
@@ -4937,7 +4937,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     routers_before = tuple(_LAUNCHED_ROUTER_PROCESSES)
     try:
         servers = _start_rollout_servers_impl(args, pg, groups)
-        if getattr(args, "use_agentic_rollout", False):
+        if args.use_agentic_rollout:
             from relax.agentic.rollout import bind_agentic_router
 
             bind_agentic_router(args.sglang_router_ip, args.sglang_router_port)

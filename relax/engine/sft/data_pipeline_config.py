@@ -21,15 +21,15 @@ def configure_sft_data_pipeline(args: Namespace) -> None:
             # Wholepack owns the packing plan and requires raw prefetched batches.
             and not wholepack_enabled(args)
             and lookahead
-            and "image" not in (getattr(args, "multimodal_keys", None) or {})
+            and "image" not in (args.multimodal_keys or {})
             and args.distributed_backend == "nccl"
             and args.qkv_format == "thd"
             and args.pipeline_model_parallel_size == 1
             and args.context_parallel_size == 1
             and (getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) == 1
             and not getattr(args, "dynamic_context_parallel", False)
-            and not getattr(args, "use_routing_replay", False)
-            and not getattr(args, "use_rollout_routing_replay", False)
+            and not args.use_routing_replay
+            and not args.use_rollout_routing_replay
             and not getattr(args, "use_rollout_indexer_replay", False)
         )
         args.sft_train_data_prefetch = lookahead and not args.sft_async_prepack

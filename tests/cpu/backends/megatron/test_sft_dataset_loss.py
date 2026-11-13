@@ -14,9 +14,13 @@ from tests.cpu.backends.megatron.test_score_centering_loss import _backend
 
 
 def _args(**overrides):
+    from tests.helpers.relax_args import make_args
+
     values = dict(
         loss_type="sft",
         advantage_estimator=None,
+        mtp_only_training=False,
+        task_type="causal_lm",
         qkv_format="thd",
         allgather_cp=False,
         calculate_per_token_loss=True,
@@ -29,7 +33,7 @@ def _args(**overrides):
         _sft_dataset_names=("general", "code/a", "unused"),
     )
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return make_args(**values)
 
 
 def test_source_loss_uses_token_weights_across_microbatches_and_missing_sources():

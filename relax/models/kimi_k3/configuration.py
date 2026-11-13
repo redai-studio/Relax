@@ -41,7 +41,7 @@ def configure_runtime(provider: Any, args: Namespace) -> None:
     if getattr(args, "dynamic_context_parallel", False):
         raise ValueError("Kimi K3 dynamic context parallelism is not supported; use a fixed CP size.")
     if getattr(provider, "context_parallel_size", 1) > 1 and (
-        getattr(args, "allgather_cp", False) or getattr(args, "cp_partition_mode", "zigzag") != "zigzag"
+        args.allgather_cp or getattr(args, "cp_partition_mode", "zigzag") != "zigzag"
     ):
         raise ValueError("Kimi K3 context parallelism requires zigzag partitioning without --allgather-cp.")
     if getattr(provider, "virtual_pipeline_model_parallel_size", None) is not None:

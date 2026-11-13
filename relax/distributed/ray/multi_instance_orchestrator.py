@@ -77,7 +77,7 @@ def start_multi_instance_managers(
         # budgets, so each region must start where the previous one ended.
         bundle_offset += spec["num_gpus"]
 
-    if getattr(args, "offload_rollout", False):
+    if args.offload_rollout:
         ray.get([m.offload.remote() for m in managers.values()])
 
     return managers

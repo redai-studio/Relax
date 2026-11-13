@@ -198,6 +198,8 @@ def _group_args(*, group_rm: bool) -> SimpleNamespace:
         partial_rollout=False,
         mask_offpolicy_in_partial_rollout=False,
         sglang_enable_deterministic_inference=False,
+        use_opd=False,
+        opd_type=None,
     )
 
 
@@ -258,6 +260,9 @@ def _rollout_args(**overrides):
         "num_iters_per_train_update": 1,
         "partial_rollout": False,
         "use_dynamic_global_batch_size": False,
+        "debug_rollout_only": False,
+        "use_opd": False,
+        "use_rollout_routing_replay": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
