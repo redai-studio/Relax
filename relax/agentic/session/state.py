@@ -424,6 +424,8 @@ class MsgNode:
     backend_audio_data_delta: list[str] = field(default_factory=list)
     backend_video_data_delta: list[str] = field(default_factory=list)
     weight_version_delta: list[str] = field(default_factory=list)
+    generation_segments: list[dict[str, Any]] = field(default_factory=list)
+    generation_end_version: dict[str, Any] | None = None
     spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     tools: list[dict[str, Any]] | None = None
@@ -458,6 +460,8 @@ class InflightRequest:
     pending_topk_token_ids_delta: list[np.ndarray] = field(default_factory=list)
     pending_topk_logprob_delta: list[np.ndarray] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
+    pending_generation_segments: list[dict[str, Any]] = field(default_factory=list)
+    pending_generation_end_version: dict[str, Any] | None = None
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
@@ -700,6 +704,8 @@ class SessionForest:
         topk_token_ids_delta: np.ndarray | None = None,
         topk_logprob_delta: np.ndarray | None = None,
         weight_version_delta: list[str] | None = None,
+        generation_segments: list[dict[str, Any]] | None = None,
+        generation_end_version: dict[str, Any] | None = None,
         spec_delta: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
@@ -738,6 +744,8 @@ class SessionForest:
                 topk_token_ids_delta=topk_token_ids_delta,
                 topk_logprob_delta=topk_logprob_delta,
                 weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
+                generation_segments=copy.deepcopy(generation_segments or []),
+                generation_end_version=copy.deepcopy(generation_end_version),
                 spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
                 prefix_cache_delta=prefix_cache_delta
                 if prefix_cache_delta is not None

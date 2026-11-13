@@ -681,6 +681,60 @@ Program-aware admission 可以根据预测的 KV 使用量延迟 backend attempt
 配置 `--save-debug-rollout-data <path-with-{rollout_id}>`，可保存完整 metadata、SessionForest state hash、terminal
 status、turn count、request timing、abort count 与 weight-version 信息。
 
+### 权重来源与版本年龄审计
+
+启用 `--dump-agentic-obs <directory>` 后，Agentic rollout 会记录已提交生成片段的
+token 区间与权重来源。中断后保留的前缀维持原始来源；取消的尝试和未选中的分支不会
+进入导出轨迹。审计不改变采样、GRPO 分组、loss 权重或训练 mask。
+
+收集所有生产节点的 run 文件后，可以生成报告：
+
+```bash
+python -m relax.utils.agentic_obs.weight_report <collected-run-directory> --output weight-report.json
+```
+
+报告通过 export 身份关联轨迹和成功的 optimizer update。每个样本列出 Session、轮次、
+生成尝试、response 相对 token 区间、来源版本和消费年龄。年龄按照同一策略、同一发布者
+生命周期内的成功发布次数计算，不直接对原始 backend 标签或 optimizer step 作差。
+
+设片段来源序号为 `v`、生成结束序号为 `e`、训练消费序号为 `c`，消费年龄为 `c-v`，
+生成年龄为 `e-v`，生成后的等待滞后为 `c-e`。来源跨度是有效生成 token 的
+`max(v)-min(v)`。生成结束边界取 Session 收到最终 backend 结果、释放 permit 之前的
+观测点；消费快照取 optimizer step 入口。它不是对 GPU 最后一个 token 完成时间的估计。
+
+Token 加权年龄只使用年龄已知且版本可比的 token。版本和年龄缺失率的分母包含所有
+最终目标成员身份已知的 token。未知来源不会填成版本 0 或当前版本。最终 mask 缺失的
+样本单独计入 `unknown_mask_samples`，此时聚合只描述已知子集。`complete=false`
+表示存在缺失、冲突或未支持的证据。只收集部分生产节点时，即使现有记录相互一致，也
+不能证明整个 run 的记录完整。
+
+首版对 CP=1、标准 reducer 的 policy 训练提供精确目标成员统计，包含 OPSM、vanilla
+TIS、ICEPOP、entropy 和 KL。Direct OPD、MTP、CP 分片和自定义 loss/reducer 路径保留
+输入记录，但最终成员身份为未知。发布追踪接入 Megatron tensor/distributed 更新及
+fully-async DCS 的完整/合并权重更新；adapter-only LoRA 和未接入的后端无法提供经过
+确认的年龄。启用审计时，backend 标签包含发布者生命周期的唯一前缀，避免重启后
+版本号重复。自定义 Slime router middleware 可能要求数值版本，因此该组合关闭发布
+追踪并保留原标签。无法访问 coordinator 时证据为未知；推理端拒绝加载不会计入成功
+发布。支持默认的 Ray separate-loop Serve router；current-loop 配置可能导致
+coordinator 发现不可用。空的日志集合和冲突的消费记录不会产生完整审计。
+
+下面的 CPU 示例先由发布版本 1 生成 4 个 token，在工具等待期间经历版本 2、3，再由
+版本 3 生成 6 个 token，最后在版本 4 发布后消费：
+
+```bash
+python -m examples.agentic_weight_audit.demo --output weight-demo.json
+```
+
+来源跨度为 2，生成后等待为 1，token 加权年龄为 `(4*3 + 6*1)/10 = 1.8`。示例使用真实
+Session chat 入口：Agent 协程先生成第一轮，在本地工具等待期间完成两次发布，再发起
+第二轮请求。发布钩子使用一个本地 Ray coordinator 和一个 CPU Gloo rank；导出的
+Sample 经过训练审计钩子参与一次 CPU PyTorch 参数更新，报告从实际写出的 JSONL 重建。
+
+在具备项目 Ray、PyTorch 依赖的独立进程中运行。示例在报告旁创建
+`weight-demo-records/`，拒绝复用已有目录，重复运行时请更换输出文件名。
+示例使用受控字符编码器、生成后端和单 rank Megatron 拓扑，不验证 SGLang GPU
+权重加载、Serve 服务发现或分布式训练。
+
 ### Agentic 可观测性 JSONL
 
 设置 `--dump-agentic-obs <directory>` 后，Relax 在生成的 `run_*` 目录下写入
@@ -701,11 +755,14 @@ status、turn count、request timing、abort count 与 weight-version 信息。
 作用域为 `(run_id, train_generation_id)`；一个 rollout 可以包含多次 update。输入在 micro-batch 被实际消费时、
 packing 和 dynamic CP 切分前采集。Dummy batch 不计入，真实的全零 loss mask 样本仍保留。
 每个样本包含长度、有效 token 数，以及按 mask 计算的 advantage/return 统计。
-Train schema `4.0.0` 将 `loss_mask.ranges` 保存为 response 空间中从零开始的
+Train schema `4.x` 将 `loss_mask.ranges` 保存为 response 空间中从零开始的
 左闭右开区间 `[start, end, value]`。按 `response_length` 还原完整长度，区间外填零。
 例如 `[1, 1, 0, 1]` 写成 `{"ranges": [[0, 2, 1], [3, 4, 1]]}`。
 Train schema `3.0.0` 的 `loss_mask` 是逐 token 数组。Static CP 下统计为 `null`，
 dynamic CP 在切分前采集完整序列。这里记录的是 loss 内部 TIS/OPSM 筛选前的输入 mask。
+Schema `4.1.0` 还包含 `consumption_version`、同样使用区间格式的
+`effective_loss_mask` 及 `effective_loss_mask_status`。第二个 mask 表示最终目标成员，
+无法观测时为 `null`。
 
 DP 分片主键是 `(run_id, train_generation_id, update_id, dp_rank)`，平台按
 `(run_id, train_generation_id, update_id)` 合并。Actor group 初始化时为 worker 参数副本
@@ -779,7 +836,7 @@ Daemon 队列同时限制条目数和字节数，正在写入的任务也计入�
 不能据此断言训练仍在等待或已被拒绝。
 Managed 日志在临时目录清理前提取本地最后 1 MiB 快照；`log_ref` 表示后台写入已接纳，
 读取端仍需检查文件是否存在。
-Manifest 使用 `record_format=agentic-observability-full-v3`、schema `3.0.0`。
+Manifest 使用 `record_format=agentic-observability-full-v3`、schema `3.1.0`。
 `train_schema_version` 标明 train 数据流的版本。读取端通过合并 DP 事实判断 update 结果。
 
 Eager 和 streaming reader 在自定义 prompt 处理、模板渲染、过滤、打乱和复制之前保存来源身份。

@@ -701,6 +701,77 @@ radix-cache entries when a session ends. See [Agentic KV Scheduling](./agentic-k
 Set `--save-debug-rollout-data <path-with-{rollout_id}>` to save complete metadata, SessionForest state hashes, terminal
 status, turn count, request timing, abort count, and weight-version information.
 
+### Weight source and age audit
+
+With `--dump-agentic-obs <directory>`, Agentic rollout records token intervals and
+weight sources for committed generation attempts. Partial prefixes retained after
+an interruption keep their original source; cancelled attempts and unselected
+branches are excluded from the exported trajectory. The audit leaves sampling,
+GRPO groups, loss weights and training masks unchanged.
+
+Collect the run's files from all producing nodes, then generate a report:
+
+```bash
+python -m relax.utils.agentic_obs.weight_report <collected-run-directory> --output weight-report.json
+```
+
+The report joins trajectories and successful optimizer updates by export identity.
+Each sample lists its Session, turn, attempt, response-relative token interval,
+source version and consumption age. Ages count successful rollout publications
+within one policy and publisher lifetime, not differences between raw backend
+labels or optimizer step numbers.
+
+For source ordinal `v`, generation-end ordinal `e` and consumption ordinal `c`,
+consumption age is `c-v`, generation age is `e-v`, and post-generation waiting is
+`c-e`. Source span is `max(v)-min(v)` over effective generated tokens. The end
+boundary is the final backend result observed by the Session before permit
+release; the consumption snapshot is taken at optimizer-step entry. It is not a
+wall-clock estimate of the GPU's last token time.
+
+Token-weighted age uses tokens with known comparable ages. Version and age
+missing rates use all tokens with known final objective membership as their
+denominator. Unknown sources are never filled with version zero or the current
+version. Missing final masks are reported separately as `unknown_mask_samples`;
+aggregates then describe only the known subset. `complete=false` indicates
+missing, conflicting or unsupported evidence. Collecting only some producers
+cannot establish a complete run, even if the available records look consistent.
+
+This initial implementation provides exact objective membership for CP=1 policy
+training with standard reducers, including OPSM, vanilla TIS, ICEPOP, entropy and
+KL. Direct OPD, MTP, CP shards and custom loss/reducer paths retain input records
+but leave final membership unknown. Publication tracking is wired to Megatron
+tensor/distributed updates and fully-async DCS full/merged-weight updates;
+adapter-only LoRA and uninstrumented backends cannot provide certified ages.
+Audit-enabled publishers use a unique lifetime prefix in backend labels to prevent
+restart collisions. Custom Slime router middleware disables this tracking and
+keeps original labels, because middleware may require numeric versions. Missing
+coordinator access also yields unknown evidence; receiver rejections never count
+as successful publications. The default Ray separate-loop Serve router is
+supported; a current-loop router can leave coordinator discovery unavailable.
+Empty collections and conflicting consumption
+fragments cannot produce a complete audit.
+
+A CPU example demonstrates four tokens from publication 1, a tool
+wait across publications 2 and 3, six tokens from publication 3, and consumption
+after publication 4:
+
+```bash
+python -m examples.agentic_weight_audit.demo --output weight-demo.json
+```
+
+The source span is 2, post-generation wait is 1, and token-weighted age is
+`(4*3 + 6*1)/10 = 1.8`. An agent coroutine calls the real Session chat API, waits
+for a local tool while two publications complete, and submits the next turn.
+Publication hooks use one local Ray coordinator and one CPU Gloo rank. The
+exported Sample feeds a CPU PyTorch optimizer step through the training audit
+hooks; the report is rebuilt from the resulting JSONL files.
+
+Run it in a fresh process with the project's Ray and PyTorch dependencies.
+It creates `weight-demo-records/` beside the report and refuses to reuse that
+directory; choose a new output name when rerunning. This example controls the
+character codec, generation backend and single-rank Megatron topology. It
+does not exercise SGLang GPU loading, Serve discovery or distributed training.
+
 ### Agentic Observability JSONL
 
 Set `--dump-agentic-obs <directory>` to write `manifest.json` and sharded JSONL
@@ -722,13 +793,16 @@ The current train producer covers the Megatron policy actor. An update ID is
 may contain several updates. Inputs are captured as micro-batches are consumed, before packing or
 dynamic CP splitting. Dummy batches are omitted, but real samples with zero
 loss masks remain. Each sample includes lengths, effective tokens, and masked
-advantage/return statistics. Train records with schema `4.0.0` encode
+advantage/return statistics. Train records with schema `4.x` encode
 `loss_mask.ranges` as zero-based, half-open `[start, end, value]` intervals over
 the response. Fill uncovered positions with zero up to `response_length`.
 For example, `[1, 1, 0, 1]` becomes `{"ranges": [[0, 2, 1], [3, 4, 1]]}`.
 Train records with schema `3.0.0` store `loss_mask` as a per-token array.
 Static CP statistics are `null`; dynamic CP captures full sequences before
 splitting. The mask describes training input before loss-local TIS/OPSM filtering.
+Schema `4.1.0` also records `consumption_version`, `effective_loss_mask` in the same
+interval format, and `effective_loss_mask_status`. This second mask describes
+final objective membership; `null` means that membership could not be observed.
 
 Identify each DP fragment by `(run_id, train_generation_id, update_id, dp_rank)`
 and join by `(run_id, train_generation_id, update_id)`. The actor-group initializer
@@ -819,7 +893,7 @@ Missing records, missing log files, unacknowledged export delivery, and partial 
 tails mean **unknown**, never proof of a pending or rejected training update.
 Managed logs snapshot the final 1 MiB locally before temporary-directory cleanup;
 `log_ref` names an accepted background write, so readers must check file availability.
-The manifest uses `record_format=agentic-observability-full-v3` and schema `3.0.0`.
+The manifest uses `record_format=agentic-observability-full-v3` and schema `3.1.0`.
 Its `train_schema_version` identifies the train stream's schema. Readers merge
 DP facts to determine the update outcome.
 

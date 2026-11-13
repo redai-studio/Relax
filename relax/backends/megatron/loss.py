@@ -1336,6 +1336,34 @@ def policy_loss_function(
         raise ValueError(f"Policy scalar metrics would overwrite existing metrics: {sorted(duplicate_policy_metrics)}")
     reported_loss.update(policy_scalar_metrics)
 
+    if "_weight_audit_capture" in batch:
+        from relax.utils.agentic_obs.weight_loss import observe_policy_tokens
+
+        audit_tis_weights = None
+        if not is_score_centering and (args.get_mismatch_metrics or args.use_tis):
+            audit_ratio = (
+                torch.cat(tis_train_log_probs).detach() - torch.cat(batch["rollout_log_probs"]).detach()
+            ).exp()
+            if tis_func is icepop_function:
+                audit_tis_weights = torch.where(
+                    (audit_ratio >= args.tis_clip_low) & (audit_ratio <= args.tis_clip),
+                    audit_ratio,
+                    torch.zeros_like(audit_ratio),
+                )
+            elif tis_func is vanilla_tis_function:
+                audit_tis_weights = torch.clamp(audit_ratio, min=args.tis_clip_low, max=args.tis_clip)
+        observe_policy_tokens(
+            args,
+            batch,
+            reducer_masks=modified_response_masks
+            if not is_score_centering and (args.get_mismatch_metrics or args.use_tis)
+            else batch["loss_masks"],
+            policy_gate=opsm_mask if args.use_opsm else None,
+            tis_weights=audit_tis_weights,
+            direct_opd=opd_loss is not None,
+            score_centering_mask=sc_valid if is_score_centering else None,
+        )
+
     return loss, reported_loss
 
 

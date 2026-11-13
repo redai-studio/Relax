@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import socket
 import time
 from argparse import Namespace
@@ -13,6 +15,7 @@ from ray.actor import ActorHandle
 from tqdm import tqdm
 
 from relax.utils import device as device_utils
+from relax.utils.agentic_obs.weight_publication import observe_install_result, publication_label
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
@@ -104,16 +107,23 @@ class UpdateWeightFromDistributed:
         """
         self.weight_version += 1
 
+        from relax.utils.agentic_obs.weight_publication import begin_publication, commit_publication
+
+        begin_publication(self)
+
         if dist.get_rank() == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
             # int4/fp4 pre_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=True,
-                    post_process_quantization=False,
-                    rollout_engines=self.rollout_engines,
+                observe_install_result(
+                    self,
+                    post_process_weights(
+                        restore_weights_before_load=True,
+                        post_process_quantization=False,
+                        rollout_engines=self.rollout_engines,
+                    ),
                 )
         dist.barrier(group=get_gloo_group())
 
@@ -150,11 +160,16 @@ class UpdateWeightFromDistributed:
         if dist.get_rank() == 0:
             # int4/fp4 post_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=False,
-                    post_process_quantization=True,
-                    rollout_engines=self.rollout_engines,
+                observe_install_result(
+                    self,
+                    post_process_weights(
+                        restore_weights_before_load=False,
+                        post_process_quantization=True,
+                        rollout_engines=self.rollout_engines,
+                    ),
                 )
+        commit_publication(self)
+        if dist.get_rank(get_gloo_group()) == 0:
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
@@ -259,12 +274,12 @@ class UpdateWeightFromDistributed:
         refs = update_weights_from_distributed(
             self._group_name,
             self._model_update_groups,
-            self.weight_version,
+            publication_label(self),
             self.rollout_engines,
             converted_named_tensors,
         )
 
-        ray.get(refs)
+        observe_install_result(self, ray.get(refs))
         converted_named_tensors.clear()
         ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
@@ -351,7 +366,7 @@ def disconnect_rollout_engines_from_distributed(args, group_name, model_update_g
 def update_weights_from_distributed(
     group_name: str,
     group: dist.ProcessGroup,
-    weight_version: int,
+    weight_version: int | str,
     rollout_engines: Sequence[ActorHandle],
     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
 ) -> list[ObjectRef]:
@@ -383,7 +398,7 @@ def post_process_weights(
 ):
     """Trigger post-process for int4/fp4 quantization on all rollout
     engines."""
-    ray.get(
+    return ray.get(
         [
             engine.post_process_weights.remote(
                 restore_weights_before_load=restore_weights_before_load,

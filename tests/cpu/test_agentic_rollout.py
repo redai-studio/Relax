@@ -1592,6 +1592,59 @@ async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix
     assert ir.pending_prefix_cache_delta["cached_tokens"] == 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_final", [False, True])
+async def test_agentic_weight_segments_follow_committed_partial_content(cancel_final):
+    from relax.utils.agentic_obs.weight_audit import PublicationLedger
+
+    shard, _group, session, ir = _router_recovery_shard()
+    shard.args.dump_agentic_obs = "/unused"
+    shard.args.agentic_reasoning_parser = None
+    shard.args.agentic_tool_call_parser = None
+    forest, observation = _forest_with_initial_obs(
+        session_id=session.session_id,
+        messages=[{"role": "user", "content": "p"}],
+        train_token_delta=[112],
+        rollout_token_delta=[112],
+    )
+    session.forest = forest
+    ir.parent_state_hash = observation.state_hash
+    ir.pending_token_delta = []
+    ledger = PublicationLedger()
+    shard._sglang_request_limiter = SimpleNamespace(
+        weight_publication_snapshot=SimpleNamespace(remote=AsyncMock(side_effect=ledger.snapshot))
+    )
+    for version, tokens, finish in (("10", [97, 98, 99], "abort"), ("90", [100, 101], "stop")):
+        ledger.begin("policy", "epoch", version)
+        ledger.commit("policy", "epoch", version)
+
+        async def generate(**_kwargs):
+            if cancel_final and finish == "stop":
+                session.live_irs.remove(ir)
+            return BackendGenerateResult(
+                new_tokens=tokens,
+                new_log_probs=[-0.1] * len(tokens),
+                finish_type=finish,
+                meta_info={"weight_version": version, "prompt_tokens": 1},
+                elapsed=0.1,
+            )
+
+        shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
+        task = asyncio.create_task(shard._run_ir(session, ir))
+        ir.runner_task = task
+        await task
+    responses = [node for node in forest.nodes_by_hash.values() if node.kind == "resp"]
+    if cancel_final:
+        assert not responses
+        assert len(ir.pending_generation_segments) == 1
+    else:
+        (response,) = responses
+        assert response.train_token_delta == [97, 98, 99, 100, 101]
+        assert [(row["start"], row["end"]) for row in response.generation_segments] == [(0, 3), (3, 5)]
+        assert [row["version"]["ordinal"] for row in response.generation_segments] == [1, 2]
+        assert response.generation_end_version["ordinal"] == 2
+
+
 async def test_score_centering_partial_attempts_commit_aligned_candidates() -> None:
     shard, _group, session, ir = _router_recovery_shard()
     shard.args.agentic_reasoning_parser = None

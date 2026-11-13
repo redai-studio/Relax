@@ -25,7 +25,7 @@ import math
 import time
 import uuid
 from argparse import Namespace
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -423,6 +423,8 @@ def build_trajectory_record(
                 token_count=len(node.train_token_delta),
                 weight_versions=list(node.weight_version_delta),
                 messages=messages,
+                generation_segments=deepcopy(node.generation_segments),
+                generation_end_version=deepcopy(node.generation_end_version),
             )
         )
 
