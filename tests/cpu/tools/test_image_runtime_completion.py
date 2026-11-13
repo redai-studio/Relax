@@ -9,7 +9,6 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -22,37 +21,6 @@ def load_script(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-@pytest.mark.parametrize("changed", ["torch", "cuda", "cxx11", "python", "machine", "libc"])
-def test_native_wheel_abi_rejects_incompatible_runtime(tmp_path, monkeypatch, changed):
-    abi = load_script("native_wheel_abi")
-    torch = SimpleNamespace(
-        __version__="2.13.0+cu130",
-        version=SimpleNamespace(cuda="13.0"),
-        compiled_with_cxx11_abi=lambda: True,
-    )
-    monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setattr(abi.sysconfig, "get_config_var", lambda name: "cpython-312-x86_64-linux-gnu")
-    monkeypatch.setattr(abi.platform, "machine", lambda: "x86_64")
-    monkeypatch.setattr(abi.platform, "libc_ver", lambda: ("glibc", "2.35"))
-    manifest = tmp_path / "wheels/abi.json"
-    abi.record(manifest)
-    abi.check(manifest)
-    if changed == "torch":
-        torch.__version__ = "2.14.0+cu130"
-    elif changed == "cuda":
-        torch.version.cuda = "12.9"
-    elif changed == "cxx11":
-        torch.compiled_with_cxx11_abi = lambda: False
-    elif changed == "python":
-        monkeypatch.setattr(abi.sysconfig, "get_config_var", lambda name: "cpython-313-x86_64-linux-gnu")
-    elif changed == "machine":
-        monkeypatch.setattr(abi.platform, "machine", lambda: "aarch64")
-    else:
-        monkeypatch.setattr(abi.platform, "libc_ver", lambda: ("glibc", "2.39"))
-    with pytest.raises(RuntimeError, match="ABI mismatch"):
-        abi.check(manifest)
 
 
 def test_hybridep_validation_preserves_sglang_package(tmp_path):

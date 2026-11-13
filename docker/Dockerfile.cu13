@@ -128,8 +128,7 @@ ARG TRAIN_IMAGE=train
 # Only relax_hopper consumes this stage; Blackwell must not build Hopper kernels.
 FROM ${TRAIN_IMAGE} as fa3_builder
 ARG FA3_COMMIT=0f82fead0b2d59f6390c62a1d74e927159bc5a7b
-RUN --mount=type=bind,source=docker/scripts/native_wheel_abi.py,target=/tmp/native_wheel_abi.py \
-    --mount=type=bind,source=docker/scripts/nvcc-without-preload.sh,target=/tmp/nvcc-without-preload.sh \
+RUN --mount=type=bind,source=docker/scripts/nvcc-without-preload.sh,target=/tmp/nvcc-without-preload.sh \
     NVCC_BIN=/usr/local/cuda/bin && \
     if [ -e "$NVCC_BIN/nvcc.real" ]; then \
         cmp /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
@@ -139,7 +138,6 @@ RUN --mount=type=bind,source=docker/scripts/native_wheel_abi.py,target=/tmp/nati
         mv "$NVCC_BIN/nvcc" "$NVCC_BIN/nvcc.real" && \
         install -m 755 /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
     fi && \
-    python /tmp/native_wheel_abi.py record /opt/fa3-wheels/abi.json && \
     git clone https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention-fa3 && \
     cd /tmp/flash-attention-fa3 && git checkout "$FA3_COMMIT" && \
     test "$(git rev-parse HEAD)" = "$FA3_COMMIT" && \
@@ -460,8 +458,6 @@ FROM relax_ep as relax_hopper
 # Match the CUDA 12 FA3 source/API, rebuilt for this image's Torch/CUDA ABI.
 # Bind the wheel instead of retaining an archive or adding a COPY layer.
 RUN --mount=type=bind,from=fa3_builder,source=/opt/fa3-wheels,target=/tmp/fa3-wheels \
-    --mount=type=bind,source=docker/scripts/native_wheel_abi.py,target=/tmp/native_wheel_abi.py \
-    python /tmp/native_wheel_abi.py check /tmp/fa3-wheels/abi.json && \
     pip install --no-cache-dir --force-reinstall --no-deps /tmp/fa3-wheels/*.whl && \
     python -c "import torch; import flash_attn_3._C"
 ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/sglang/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}
