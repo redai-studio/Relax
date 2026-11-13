@@ -8,6 +8,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, contextmanager
+from itertools import groupby
 from time import monotonic
 from typing import Any
 
@@ -706,25 +707,26 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
-    # For samples with existing response, check if they're complete
-    if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
+    if sample.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
         return sample
 
     state = GenerateState(args)
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args, evaluation=evaluation)
+    if teacher_routing_enabled and not args.group_rm:
+        state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
 
-    # Resolve the generate function and run it under the right permit scope
-    # (session-level lock by default; per-request permits for opt-in functions).
     generated = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
-
-    # Group rewards and Teacher scoring run in generate_and_rm_group.
+    # Group reward and Teacher scoring run in generate_and_rm_group.
     if args.group_rm:
         return generated
 
     results = generated if isinstance(generated, list) else [generated]
     if any(result.status == Sample.Status.ABORTED for result in results):
+        if teacher_routing_enabled:
+            state.opd_manager.response_stats.finish(sample.response_key)
         return generated
 
     # Custom generation may already have assigned rewards to some outputs.
@@ -798,6 +800,15 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args, evaluation=evaluation)
+    if teacher_routing_enabled:
+        for sample in group:
+            opd.bind_teacher(args, sample)
+
+    if teacher_routing_enabled and args.group_rm:
+        for sample in group:
+            state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
+
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
@@ -810,13 +821,14 @@ async def generate_and_rm_group(
 
     group = await asyncio.gather(*tasks)
 
-    # Skip group scoring if any training response was aborted.
-    group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
+    # Group rewards require complete trajectories, including during evaluation.
+    group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
     if not args.group_rm:
         return group
-    if state.aborted and not evaluation:
-        return group
-    if group_has_training_abort:
+    if (state.aborted and not evaluation) or group_aborted:
+        if teacher_routing_enabled:
+            for sample in group:
+                state.opd_manager.response_stats.finish(sample.response_key)
         return group
 
     rewards = await batched_async_rm(args, group)
@@ -929,6 +941,9 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args)
+    if teacher_routing_enabled:
+        state.opd_manager.response_stats.new_window()
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1301,6 +1316,8 @@ async def generate_rollout_async(
 
     global CURRENT_ROLLOUT_BATCH
     filter_metrics = metric_gatherer.collect()
+    if teacher_routing_enabled:
+        filter_metrics.update(state.opd_manager.response_stats.metrics())
     if CURRENT_ROLLOUT_BATCH:
         save_debug_rollout_data(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
@@ -1325,7 +1342,7 @@ async def generate_rollout_async(
 EVAL_PROMPT_DATASET = {}
 
 
-async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
+async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[RolloutFnEvalOutput, list[list[Sample]]]:
 
     state = GenerateState(args)
     # Increment evaluating counter so that abort() knows to wait for eval to finish.
@@ -1346,7 +1363,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
 
 async def eval_rollout_single_dataset(
     args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
-) -> dict[str, dict[str, list[Any]]]:
+) -> dict[str, dict[str, Any]]:
     """An example to implement the eval_rollout function for an rule based rm
     rollout generation.
 
@@ -1421,7 +1438,8 @@ async def eval_rollout_single_dataset(
         pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
         for coro in asyncio.as_completed(tasks):
             group = await coro
-            if do_print:
+            pbar.update(1)
+            if do_print and group:
                 sample = group[0]
                 logger.info(
                     "eval_rollout_single_dataset example data: "
@@ -1430,7 +1448,6 @@ async def eval_rollout_single_dataset(
                 )
                 do_print = False
             data.extend(group)
-            pbar.update(1)
         pbar.close()
     else:
         tasks = []
@@ -1473,11 +1490,34 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+    # Preserve original prompt boundaries for pass@k, including missing samples.
+    group_size = dataset_cfg.n_samples_per_eval_prompt
+    valid_data = []
+    for prompt_index, samples in groupby(data, key=lambda sample: sample.index // group_size):
+        group = list(samples)
+        expected_indices = range(prompt_index * group_size, (prompt_index + 1) * group_size)
+        if (
+            0 <= prompt_index < len(dataset.samples)
+            and [sample.index for sample in group] == list(expected_indices)
+            and all(sample.reward is not None and sample.status != Sample.Status.ABORTED for sample in group)
+        ):
+            valid_data.extend(group)
+    num_valid_prompts = len(valid_data) // group_size
+    if num_valid_prompts != len(dataset.samples):
+        logger.warning(
+            "eval_rollout_single_dataset: partial evaluation, retaining %d/%d complete prompts",
+            num_valid_prompts,
+            len(dataset.samples),
+        )
+    data = valid_data
     return {
         dataset_cfg.name: {
             "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
+            "group_size": group_size,
+            "num_prompts": len(dataset.samples),
+            "num_valid_prompts": num_valid_prompts,
         }
     }
 

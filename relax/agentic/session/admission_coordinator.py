@@ -136,6 +136,7 @@ class AdmissionCoordinator:
         if permit_id in self._active_request_permits:
             self._active_request_permits.remove(permit_id)
             self._request_permits.release()
+            return
         self._cancelled_request_permits[permit_id] = True
 
     @ray.method(max_task_retries=2)

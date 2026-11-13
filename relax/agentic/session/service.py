@@ -156,6 +156,13 @@ async def _wait_process(process: ManagedAgentProcess) -> Optional[BaseException]
     return None
 
 
+def _is_ray_task_cancelled(error: BaseException) -> bool:
+    return isinstance(error, ray.exceptions.TaskCancelledError) or (
+        isinstance(error, ray.exceptions.RayTaskError)
+        and isinstance(error.as_instanceof_cause(), ray.exceptions.TaskCancelledError)
+    )
+
+
 def _extend_token_ids(target: set[int], value: Any) -> None:
     if isinstance(value, int):
         target.add(value)
@@ -1697,13 +1704,13 @@ class AgenticSessionShard:
 
         group = self._groups[group_id]
         self._raise_group_error(group)
-        if group.dropped:
-            raise RuntimeGroupError(f"cannot lease group that failed during Prepare: {group.group_id}")
+        if group.drop_task is not None or group.dropped:
+            return
         if not group.first_request_barrier_crossed:
             raise RuntimeGroupError(f"cannot lease group before every first IR exists: {group.group_id}")
+        # Commit every Session ID and Runtime ownership before a drop can interleave at an await.
         for session in group.sessions:
-            async with session.lock:
-                session.rollout_id = rollout_id
+            session.rollout_id = rollout_id
         group.ownership = GroupOwnership.RUNTIME
         self._mark_group_timing(group, "group_runtime_leased_at")
         await self._set_group_timeout_active(group, self._group_generation_open(group))
@@ -1749,8 +1756,17 @@ class AgenticSessionShard:
     async def _interrupt_running_requests(self) -> None:
         """Ask selected backend attempts to return their generated prefix."""
 
+        async def abort_owned_request(session: _SessionRecord, request_id: str) -> None:
+            try:
+                await self._generation_backend.abort_request(request_id)
+            except BaseException as error:
+                cancelled = isinstance(error, asyncio.CancelledError) or _is_ray_task_cancelled(error)
+                if cancelled and session.phase is SessionPhase.FINALIZING:
+                    return
+                raise
+
         runner_tasks: list[asyncio.Task[None]] = []
-        backend_request_ids: list[str] = []
+        backend_aborts: list[tuple[_SessionRecord, str]] = []
         try:
             for group in tuple(self._groups.values()):
                 self._raise_group_error(group)
@@ -1780,13 +1796,13 @@ class AgenticSessionShard:
                                 runner.cancel()
                                 runner_tasks.append(runner)
                                 continue
-                            backend_request_ids.append(_backend_request_id(ir))
+                            backend_aborts.append((session, _backend_request_id(ir)))
                             runner_tasks.append(runner)
                         session.queued_irs.extendleft(reversed(requeued_irs))
                 self._notify_state_change(group)
         finally:
             abort_outcomes = await asyncio.gather(
-                *(self._generation_backend.abort_request(request_id) for request_id in backend_request_ids),
+                *(abort_owned_request(session, request_id) for session, request_id in backend_aborts),
                 return_exceptions=True,
             )
             await asyncio.gather(*runner_tasks, return_exceptions=True)
@@ -2029,7 +2045,7 @@ class AgenticSessionShard:
             "ir_queue": {"queued": sum(len(session.queued_irs) for session in sessions)},
         }
 
-    async def debug_state(self, *, sample_limit: int = 8) -> dict[str, Any]:
+    async def debug_state(self) -> dict[str, Any]:
         """Project actor-local refs into a debug dictionary."""
 
         groups = tuple(self._group_debug_state(group) for group in self._groups.values())
@@ -2039,7 +2055,7 @@ class AgenticSessionShard:
             "groups": groups,
             "group_ids": tuple(group["group_id"] for group in groups),
             "group_count": len(groups),
-            "session_ids": session_ids[:sample_limit],
+            "session_ids": session_ids,
             "session_count": len(session_ids),
             "retained_request_count": sum(group["retained_request_count"] for group in groups),
             "backend_request_count": sum(group["backend_request_count"] for group in groups),
@@ -2447,6 +2463,8 @@ class AgenticSessionShard:
         try:
             acquired = await acquire_ref
         except Exception as error:
+            if _is_ray_task_cancelled(error):
+                return
             await self._cancel_sglang_request_permit(permit_id)
             raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
         if acquired:
@@ -2512,10 +2530,12 @@ class AgenticSessionShard:
             cleanup_task.add_done_callback(self._discard_successful_permit_cleanup)
             raise
         except Exception as error:
+            if _is_ray_task_cancelled(error):
+                raise asyncio.CancelledError() from error
             await self._cancel_sglang_request_permit(permit_id)
             raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
         if not acquired:
-            raise RuntimeGroupError("SGLang permit acquire was cancelled")
+            raise asyncio.CancelledError()
         audit = {}
         try:
             yield audit
@@ -3472,9 +3492,7 @@ class AgenticChatAPIService:
                 logprobs=normalized["logprobs"],
             )
         except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError) as error:
-            if isinstance(error, ray.exceptions.RayTaskError) and not isinstance(
-                error.as_instanceof_cause(), ray.exceptions.TaskCancelledError
-            ):
+            if not _is_ray_task_cancelled(error):
                 raise
             return _error_result(
                 "client disconnected before agentic completion was produced",
@@ -3581,10 +3599,8 @@ class AgenticChatAPIService:
         return {"ok": True, "shards": snapshots}
 
     @app.get("/debug_state")
-    async def debug_state(self, sample_limit: int = 8) -> dict[str, Any]:
-        snapshots = await asyncio.gather(
-            *(shard.debug_state.remote(sample_limit=sample_limit) for shard in self._session_shards.values())
-        )
+    async def debug_state(self) -> dict[str, Any]:
+        snapshots = await asyncio.gather(*(shard.debug_state.remote() for shard in self._session_shards.values()))
         return {
             "totals": {
                 "group_count": sum(snapshot["group_count"] for snapshot in snapshots),

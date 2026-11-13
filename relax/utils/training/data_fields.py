@@ -52,6 +52,8 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return list(PREFERENCE_DATA_FIELDS)
     if is_sft_mode(args):
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
+        if getattr(args, "_sft_dataset_names", ()) and getattr(args, "task_type", "causal_lm") == "causal_lm":
+            fields.append("dataset_ids")
         if Envs.RELAX_SFT_PRE_SHIFTED_LABELS:
             fields.append("pre_shifted_labels")
         if getattr(args, "task_type", "causal_lm") == "seq_cls":

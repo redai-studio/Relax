@@ -891,7 +891,7 @@ def get_batch(
         Envs.RELAX_SFT_SELECTIVE_LOGITS
         and cp_size == 1
         and qkv_format == "thd"
-        and not has_mm_inputs
+        and (not has_mm_inputs or Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS)
         and "unsplit_tokens" not in batch
         and "vlm_packed_seq_params" not in batch
         and getattr(get_args(), "loss_type", None) == "sft"
@@ -1518,6 +1518,7 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "dataset_ids",
                 "sample_index_mask_sums",
                 # An opaque join key, not a measurement: averaging it would put a
                 # meaningless ~1e18 scalar on the metrics dashboard.

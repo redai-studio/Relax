@@ -8,7 +8,7 @@ between 4 and 8 engines while training continues.
 
 | Setting | This recipe | Purpose |
 | --- | --- | --- |
-| Execution mode | `--fully-async` | Keeps Actor and Rollout in separate resource pools so Rollout engines can scale independently. |
+| Execution mode | `--fully-async` | Keeps Actor and Rollout in separate resource pools so Rollout engines can scale independently. Hybrid mode also works — use `--hybrid` instead (see `run-qwen3-4B-8xgpu-elastic-hybrid.sh`). |
 | Autoscaler | `--autoscaler-config <yaml>` with `enabled: true` | Enables automatic scaling decisions. |
 | Initial floor | `"rollout": [1, 4]` in `--resource` and `min_engines: 4` | Starts and protects four initial Rollout engines. |
 | Scaling unit | `--rollout-num-gpus-per-engine 1` | Each added engine requests 1 GPU and 1 CPU. |

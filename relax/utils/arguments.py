@@ -204,6 +204,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hybrid-weights-backuper-on-gpu",
+                action="store_true",
+                default=False,
+                help=(
+                    "Only takes effect with --hybrid. Keeps the 'actor' "
+                    "TensorBackuper snapshot used for the DCS actor->rollout weight push "
+                    "on-device instead of host-pinned memory, trading a permanent extra "
+                    "device-resident copy of the model (full size at TP=1, sharded by TP degree "
+                    "otherwise) for skipping the D2H backup copy + H2D push-time copy "
+                    "(relax/distributed/checkpoint_service/backends/device_direct.py's "
+                    "_named_params_and_buffers). Off by default: raises peak GPU memory, so only "
+                    "enable if headroom is confirmed for the model being trained."
+                ),
+            )
+            parser.add_argument(
                 "--checkpoint-engine-backend",
                 type=str,
                 default=device_utils.get_dist_backend(),
@@ -2297,7 +2312,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # wandb
         def add_wandb_arguments(parser):
             # wandb parameters
-            parser.add_argument("--use-wandb", action="store_true", default=False)
+            parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=False)
             parser.add_argument(
                 "--wandb-mode",
                 type=str,
@@ -2378,7 +2393,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_clearml_arguments(parser):
             # TODO(yuetian): Reuse tb-experiment-name --tb-project-name as the ClearML experiment name currently.
             # Need to refactor the experiment management part later.
-            parser.add_argument("--use-clearml", action="store_true", default=False)
+            parser.add_argument("--use-clearml", action=argparse.BooleanOptionalAction, default=False)
 
             return parser
 
@@ -4563,8 +4578,8 @@ def slime_validate_args(args):
             args.train_memory_margin_bytes = 0
 
     # Resolve --hybrid into the underlying execution flags so downstream
-    # machinery (StreamDataLoader broadcast_pp, UpdateWeightFromTensor
-    # selection, sglang_engine DCS gating) keeps a single semantic axis.
+    # machinery (StreamDataLoader broadcast_pp and SGLang DCS registration)
+    # keeps a single semantic axis.
     # `args.hybrid` remains the canonical switch for hybrid-specific
     # branches (registry, controller dispatch, train_hybrid call site).
     if args.hybrid:
@@ -4574,6 +4589,13 @@ def slime_validate_args(args):
             "hybrid mode: actor/reference/actor_fwd/advantages will share GPUs "
             "via offload/onload role switching, while rollout uses separate GPUs."
         )
+        if not args.enable_weights_backuper:
+            raise ValueError(
+                "Hybrid training requires the weights backuper for DCS synchronization: with "
+                "--disable-weights-backuper the DCS push would read detached live tensors that "
+                "carry no Megatron TP attributes, so all_gather_param would silently treat TP "
+                "shards as replicated weights. Remove --disable-weights-backuper."
+            )
     elif args.fully_async and args.colocate:
         raise ValueError(
             "--fully-async and --colocate cannot be combined directly. "

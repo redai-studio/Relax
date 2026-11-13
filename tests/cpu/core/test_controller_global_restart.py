@@ -138,7 +138,7 @@ def test_global_restart_cleans_both_router_owners(
     monkeypatch.setattr(controller_module.serve, "start", Mock())
     monkeypatch.setattr(controller_module.time, "sleep", Mock())
 
-    def reinit(self, config, runtime_env, fault_events=None):
+    def reinit(self, config, runtime_env, fault_events=None, fault_recovery=None):
         events.append("reinit")
         assert config.sglang_router_ip == expected_router_ip
         assert config.sglang_router_port == (3000 if expected_router_ip else None)
