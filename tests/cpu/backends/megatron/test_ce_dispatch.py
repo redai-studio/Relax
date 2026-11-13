@@ -8,7 +8,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 
-def _check_ce_dispatch_entrypoint(enabled: bool, backport_first: bool) -> None:
+def _check_ce_dispatch_entrypoint(enabled: bool, backport_first: bool, cli: bool) -> None:
     script = f"""
 import importlib
 if {backport_first!r}:
@@ -23,14 +23,14 @@ fused_linear_ce._LinearCE.apply = lambda *args: fallback_result
 fused_linear_ce._log_enabled = lambda *args: None
 import torch
 hidden = torch.ones(1)
-expected = backport_result if {enabled!r} else fallback_result
-assert fused_linear_ce.linear_cross_entropy(hidden, hidden, hidden, None) is expected
+expected = backport_result if {enabled or cli!r} else fallback_result
+assert fused_linear_ce.linear_cross_entropy(hidden, hidden, hidden, None, enabled={cli!r}) is expected
 assert fused_linear_ce.linear_cross_entropy is original
 """
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", RELAX_SFT_FUSED_LINEAR_CE=str(int(enabled)))
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, (
-        f"enabled={enabled}, backport_first={backport_first}\n{result.stdout}{result.stderr}"
+        f"enabled={enabled}, backport_first={backport_first}, cli={cli}\n{result.stdout}{result.stderr}"
     )
 
 
@@ -39,9 +39,10 @@ def test_ce_dispatch_preserves_entrypoint_identity() -> None:
     # Bound CPU-only subprocess concurrency without sharing import state.
     with ThreadPoolExecutor(max_workers=4) as executor:
         cases = [
-            executor.submit(_check_ce_dispatch_entrypoint, enabled, backport_first)
+            executor.submit(_check_ce_dispatch_entrypoint, enabled, backport_first, cli)
             for backport_first in (False, True)
             for enabled in (False, True)
+            for cli in (False, True)
         ]
         for case in cases:
             case.result()

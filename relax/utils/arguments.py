@@ -574,6 +574,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--fused-linear-ce",
+                action="store_true",
+                default=False,
+                help="Fuse the LM head with token CE (SFT) or log-probabilities and entropy (RL). "
+                "Default off. SFT uses the existing --sft-chunked-logits path and also accepts "
+                "RELAX_SFT_FUSED_LINEAR_CE=1. RL requires native BF16 GPT heads; unsupported "
+                "models and parallel configurations retain the original head path.",
+            )
+            parser.add_argument(
                 "--sft-logits-chunk-size",
                 type=int,
                 default=1024,

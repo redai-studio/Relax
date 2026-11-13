@@ -64,6 +64,7 @@ def test_train_one_step_counts_each_logical_microbatch_once(
         dynamic_context_parallel=False,
         enable_mtp_training=False,
         is_vl_model=False,
+        loss_type="sft",
         mtp_only_training=False,
         micro_batch_size=1,
         qkv_format="thd",
