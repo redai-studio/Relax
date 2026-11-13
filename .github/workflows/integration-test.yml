@@ -119,12 +119,6 @@ jobs:
             nvidia-smi
           '
 
-      - name: Install dependencies
-        run: |
-          docker exec "$CI_CONTAINER_NAME" uv pip install \
-            --system --break-system-packages -r requirements.txt \
-            --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-
       - name: Run integration test
         timeout-minutes: 10
         run: |
