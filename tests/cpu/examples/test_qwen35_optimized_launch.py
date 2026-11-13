@@ -110,15 +110,24 @@ def test_multimodal_recipe_separates_preprocessing_and_training_threads():
         "scripts/training/cpt/run-qwen3.6-35B-A3B-cpt-256k-64xgpu.sh",
     ],
 )
-def test_wholepack_can_be_disabled_without_disabling_model_optimizations(entry):
+@pytest.mark.parametrize("wholepack", ["0", "1"])
+def test_wholepack_can_be_disabled_without_disabling_model_optimizations(entry, wholepack):
     environment = dict(
-        os.environ, MODEL_DIR="/model", DATA_DIR="/data", SAVE_DIR="/checkpoints", DRY_RUN="1", QWEN35_WHOLEPACK="0"
+        os.environ,
+        MODEL_DIR="/model",
+        DATA_DIR="/data",
+        SAVE_DIR="/checkpoints",
+        DRY_RUN="1",
+        QWEN35_WHOLEPACK=wholepack,
+        GLOBAL_BATCH_SIZE="2048",
     )
     script = ROOT / entry
     output = json.loads(subprocess.check_output(["bash", str(script)], env=environment, text=True))
     argv = output["argv"]
-    assert "--sft-wholepack" not in argv
-    assert argv[argv.index("--sft-packing-strategy") + 1] == "binpack"
+    assert argv[argv.index("--global-batch-size") + 1] == "2048"
+    assert ("--sft-wholepack" in argv) is (wholepack == "1")
+    if wholepack == "0":
+        assert argv[argv.index("--sft-packing-strategy") + 1] == "binpack"
     assert argv[argv.index("--custom-megatron-before-train-step-hook-path") + 1] == (
         "relax.models.qwen3_5.recipe.before_step"
     )

@@ -70,6 +70,8 @@ def test_wholepack_scope_requires_explicit_recipe():
         (8, 1600, 4, 262144, None),
         (14, 1400, 4, 262144, None),
         (16, 1600, 4, 262144, None),
+        (16, 2048, 4, 262144, None),
+        (16, 16, 4, 262144, None),
         (32, 1600, 2, 262144, None),
         (16, 800, 2, 131072, None),
         (32, 3200, 4, 262144, None),
@@ -118,6 +120,19 @@ def test_wholepack_real_sampler_checkpoint_replay(oversize, dp, gbs, tp, capacit
     assert sorted(i for ids in original for i in ids) == list(range(gbs))
     assert len(hashes) == len(waves) == 1
     recovered = wp.WholepackSampler(dp_size=dp, capacity=capacity, pad_size=pad, tp_size=tp, global_batch_size=gbs)
+    if gbs == 2048:
+        incompatible = wp.WholepackSampler(
+            dp_size=dp, capacity=capacity, pad_size=pad, tp_size=tp, global_batch_size=1600
+        )
+        with pytest.raises(ValueError, match="GBS mismatch"):
+            incompatible.load_checkpoint(copy.deepcopy(sampler.save_checkpoint()))
+        corrupt = copy.deepcopy(sampler.save_checkpoint())
+        for updates in corrupt["wholepack_metadata"].values():
+            for meta in updates.values():
+                if "slots" in meta.get(wp.PLAN_KEY, {}):
+                    meta[wp.PLAN_KEY]["global_count"] = 1600
+        with pytest.raises(ValueError, match="padding geometry mismatch"):
+            recovered.load_checkpoint(corrupt)
     recovered.load_checkpoint(copy.deepcopy(sampler.save_checkpoint()))
     partition = Partition()
     for rank in reversed(range(dp)):
@@ -240,7 +255,7 @@ def test_real_assignment_api_owns_cache_and_checkpoint_replay(invalid):
         cls(n_samples_per_prompt=1, dp_size=4).load_checkpoint(sampler.save_checkpoint())
 
 
-@pytest.mark.parametrize("dp,gbs,tp", [(0, 400, 4), (3, 400, 4), (8, 801, 4), (8, 0, 4), (8, 800, 3)])
+@pytest.mark.parametrize("dp,gbs,tp", [(0, 400, 4), (3, 400, 4), (8, 801, 4), (8, 0, 4), (8, 800, 3), (16, 2047, 4)])
 def test_wholepack_rejects_incomplete_geometry(dp, gbs, tp):
     with pytest.raises(ValueError):
         wp.WholepackSampler(dp_size=dp, global_batch_size=gbs, tp_size=tp)
@@ -259,7 +274,9 @@ def test_model_recipe_and_wholepack_are_independent(wholepack, optimized):
 
 
 @pytest.mark.parametrize("wholepack", [False, True])
-def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholepack):
+@pytest.mark.parametrize("gbs", [16, 1600, 2048])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholepack, gbs, multimodal):
     from relax.models.qwen3_5 import recipe
 
     args = SimpleNamespace(
@@ -273,7 +290,12 @@ def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholep
         expert_tensor_parallel_size=1,
         qkv_format="thd",
         use_dynamic_batch_size=True,
-        global_batch_size=800,
+        global_batch_size=gbs,
+        loss_type="sft",
+        train_backend="megatron",
+        max_staleness=1,
+        distributed_backend="nccl",
+        multimodal_keys={"image": "images"} if multimodal else None,
         data_pad_size_multiplier=1024,
         max_tokens_per_gpu=262144,
         hidden_size=2048,
@@ -285,6 +307,11 @@ def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholep
         optimizer_cpu_offload=True,
         optimizer_offload_fraction=0.0,
     )
+    from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
+
+    configure_sft_data_pipeline(args)
+    assert not args.sft_async_prepack
+    assert args.sft_train_data_prefetch
     recipe._check_args(args)
     for key, value in (
         ("pipeline_model_parallel_size", 2),
@@ -294,7 +321,7 @@ def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholep
         ("sft_async_prepack", True),
         ("use_dynamic_batch_size", False),
         ("data_pad_size_multiplier", 0),
-        ("rollout_batch_size", 1600),
+        ("rollout_batch_size", gbs + 1),
     ):
         invalid = copy.copy(args)
         setattr(invalid, key, value)

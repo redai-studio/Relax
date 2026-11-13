@@ -185,7 +185,7 @@ CPT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
     --seq-length 262144
-    --global-batch-size 1600
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-1600}"
     --use-dynamic-batch-size
     --sft-packing-strategy binpack
     --balance-data
