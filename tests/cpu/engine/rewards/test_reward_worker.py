@@ -31,16 +31,6 @@ _HAS_MATH_VERIFY = False
 try:
     import ray
 
-    if not ray.is_initialized():
-        try:
-            ray.init(num_cpus=8, ignore_reinit_error=True)
-        except ValueError as e:
-            if "When connecting to an existing cluster" in str(e):
-                # Already connected to an existing cluster
-                ray.init(ignore_reinit_error=True)
-            else:
-                raise
-
     from relax.engine.rewards import (
         RewardExecutor,
         RewardWorker,
@@ -213,6 +203,7 @@ requires_full_pipeline = pytest.mark.skipif(
 
 
 @requires_full_pipeline
+@pytest.mark.usefixtures("reward_ray_cluster")
 class TestRewardWorkerDirect:
     """Test RewardWorker.compute() dispatched via Ray actor."""
 
@@ -274,6 +265,7 @@ def _kill_executor_workers():
 
 
 @requires_full_pipeline
+@pytest.mark.usefixtures("reward_ray_cluster")
 class TestRewardExecutorSingleSample:
     """Test RewardExecutor.execute() with single samples (the async_rm
     path)."""
@@ -322,6 +314,7 @@ class TestRewardExecutorSingleSample:
 
 
 @requires_full_pipeline
+@pytest.mark.usefixtures("reward_ray_cluster")
 class TestBatchedAsyncRM:
     """Test batched_async_rm() — the main batched entry point."""
 
@@ -365,6 +358,7 @@ class TestBatchedAsyncRM:
 
 
 @requires_full_pipeline
+@pytest.mark.usefixtures("reward_ray_cluster")
 class TestHighConcurrency:
     """Validate reward computation correctness and stability under high
     concurrency.
