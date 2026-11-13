@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from relax.backends.megatron.telemetry import span
 from relax.utils.agentic_obs.train_hooks import record_optimizer_result
 from relax.utils.training.nonfinite_grad import configure_nonfinite_guard, install_nonfinite_guard
 
@@ -50,6 +51,7 @@ def update_block(guard):
     def run(optimizer, scheduler, chunks):
         errors = []
         context = dict(
+            span=span,
             optimizer=optimizer,
             opt_param_scheduler=scheduler,
             model=chunks,

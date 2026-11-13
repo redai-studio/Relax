@@ -96,7 +96,10 @@ def _train_loop(monkeypatch, step, *, enable_mtp=True, per_token=False):
     monkeypatch.setitem(sys.modules, hooks.__name__, hooks)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda **kwargs: 0)
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    from relax.backends.megatron.telemetry import observe_step
+
     namespace = {
+        "observe_step": observe_step,
         "torch": torch,
         "get_args": lambda: args,
         "get_model_config": lambda _: SimpleNamespace(),

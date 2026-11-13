@@ -12,6 +12,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.backends.megatron.telemetry import observe_step
 from relax.engine.sft.runtime import (
     is_dpo_mode,
     is_offline_mode,
@@ -108,6 +109,7 @@ def test_resident_sft_preserves_hooks_across_single_step_calls(monkeypatch, enab
         return {}, 0.0
 
     namespace = dict(
+        observe_step=observe_step,
         Envs=Envs,
         get_args=lambda: args,
         get_model_config=lambda _: config,
