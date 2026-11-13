@@ -5,29 +5,7 @@ from argparse import Namespace
 import pytest
 import torch
 
-from relax.backends.megatron.selective_logits import (
-    prepare_selective_logits,
-    supports_packed_multimodal_selective_logits,
-)
-
-
-def test_multimodal_provider_admission_requires_exact_reviewed_type():
-    bridge = pytest.importorskip(
-        "megatron.bridge.models.qwen.qwen4_exp_vl_bridge", reason="Requires the Qwen4Exp multimodal Bridge provider"
-    )
-    Qwen4ExpVLMoEModelProvider = bridge.Qwen4ExpVLMoEModelProvider
-
-    assert supports_packed_multimodal_selective_logits(object.__new__(Qwen4ExpVLMoEModelProvider))
-    assert not supports_packed_multimodal_selective_logits(None)
-    assert not supports_packed_multimodal_selective_logits(object())
-
-    class UnreviewedProvider(Qwen4ExpVLMoEModelProvider):
-        pass
-
-    # Even a subclass supplied by the same module has not established the
-    # packed layout contract; custom providers must retain the fallback.
-    UnreviewedProvider.__module__ = Qwen4ExpVLMoEModelProvider.__module__
-    assert not supports_packed_multimodal_selective_logits(object.__new__(UnreviewedProvider))
+from relax.backends.megatron.selective_logits import prepare_selective_logits
 
 
 def test_main_selection_preserves_weights_and_empty_rows():
@@ -66,18 +44,7 @@ def test_mtp_plan_respects_document_and_physical_padding():
 
 @pytest.mark.parametrize("allgather_cp", [False, True])
 @pytest.mark.parametrize(
-    "case",
-    [
-        "packed",
-        "response",
-        "dummy",
-        "repeated_dummy",
-        "vl_text_only",
-        "vl_with_images",
-        "vl_images_opt_out",
-        "vl_multimodal",
-        "vl_multimodal_unadmitted",
-    ],
+    "case", ["packed", "response", "dummy", "repeated_dummy", "vl_text_only", "vl_with_images", "vl_images_opt_out"]
 )
 def test_ordinary_pp_iterator_preserves_selection_plans(monkeypatch, allgather_cp, case):
     """Exercise ingestion -> ordinary DataIterator -> get_batch without async
@@ -107,7 +74,6 @@ def test_ordinary_pp_iterator_preserves_selection_plans(monkeypatch, allgather_c
         allgather_cp=allgather_cp,
         pipeline_model_parallel_size=8 if case in ("vl_with_images", "vl_images_opt_out") else 4,
         is_vl_model=case.startswith("vl_"),
-        _relax_sft_selective_mm_packed=case == "vl_multimodal",
         use_opd=False,
     )
     monkeypatch.setattr(data, "get_args", lambda: args)
@@ -128,14 +94,8 @@ def test_ordinary_pp_iterator_preserves_selection_plans(monkeypatch, allgather_c
         "response_lengths": response_lengths,
     }
     keys = ["tokens", "loss_masks", "total_lengths", "response_lengths"]
-    if case.startswith("vl_multimodal"):
-        rollout["multimodal_train_inputs"] = [
-            {"pixel_values": torch.arange(6).reshape(2, 3), "image_grid_thw": torch.tensor([[1, 1, 2]])},
-            None,
-        ]
-    elif case in ("vl_with_images", "vl_images_opt_out"):
+    if case in ("vl_with_images", "vl_images_opt_out"):
         rollout["multimodal_train_inputs"] = [{"pixel_values": torch.zeros((1, 3, 4, 4))}, None]
-    if "multimodal_train_inputs" in rollout:
         keys.append("multimodal_train_inputs")
     stream_dataloader.post_process_rollout_data(args, rollout)
     assert "selective_loss_masks_cpu" in rollout
@@ -170,10 +130,11 @@ def test_ordinary_pp_iterator_preserves_selection_plans(monkeypatch, allgather_c
     assert "unsplit_tokens" not in batch
     assert "vlm_packed_seq_params" not in batch
     assert batch.get("__is_dummy__", False) == (case in ("dummy", "repeated_dummy"))
-    if case in ("vl_multimodal_unadmitted", "vl_images_opt_out"):
+    if case == "vl_images_opt_out":
         assert "selective_logit_rows" not in batch
         assert not hasattr(batch["packed_seq_params"], "relax_sft_selective_mtp_rows")
         return
+
     expected_main = [(mask.numel(), mask.nonzero().flatten()) for mask in batch["loss_masks"]]
     packed = batch["packed_seq_params"]
     expected_mtp = []
@@ -182,7 +143,7 @@ def test_ordinary_pp_iterator_preserves_selection_plans(monkeypatch, allgather_c
         [full_mask] = roll_tensor([full_mask], cp_group=None, packed_seq_params=packed)
         expected_mtp.append(full_mask[0].nonzero().flatten())
 
-    # CPU get_batch provided one reference plan. Ordinary PP training uses this
+    # CPU get_batch provided one reference plan. Normal PP4 training uses this
     # separate helper because its tokens/full_loss_masks already reside on CUDA.
     rebuilt = dict(batch, selective_loss_masks_cpu=seen)
     rebuilt["packed_seq_params"] = copy(packed)

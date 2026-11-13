@@ -30,8 +30,9 @@ export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
 ENV_ARGS=(
     RELAX_SKIP_NONFINITE_GRAD=0
-    # Select supervised head rows by default; Hopper linear CE remains opt-in.
+    # Reuse the multimodal selective gate; Hopper linear CE remains opt-in.
     "RELAX_SFT_SELECTIVE_LOGITS=${RELAX_SFT_SELECTIVE_LOGITS:-1}"
+    "RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS=${RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS:-1}"
     "RELAX_SFT_FUSED_LINEAR_CE=${RELAX_SFT_FUSED_LINEAR_CE:-0}"
     MCORE_QSA_SPARSE_BACKEND=flex
     TORCHINDUCTOR_COMPILE_THREADS=1
