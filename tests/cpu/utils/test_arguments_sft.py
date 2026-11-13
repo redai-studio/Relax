@@ -250,4 +250,3 @@ def test_final_yaml_controls_single_switch(arguments_module, monkeypatch, enable
     )
     arguments_module.relax_validate_args(args)
     assert args.balance_by_flops is enabled
-

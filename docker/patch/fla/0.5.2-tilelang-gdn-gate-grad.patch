@@ -1,0 +1,55 @@
+--- a/fla/ops/common/backends/tilelang/chunk_bwd.py
++++ b/fla/ops/common/backends/tilelang/chunk_bwd.py
+@@ -94,12 +94,11 @@
+         s_h = T.alloc_shared((_thD1, _thD2), _dtype)
+         s_dh = T.alloc_shared((_thD1, _thD2), _dtype)
+ 
+-        # dg_last accumulator (shared scalar, accumulated across V-loop)
++        # Each thread receives the reduced contribution. Accumulate in registers
++        # so that the consumer warps do not race on a shared read-modify-write.
+         if _USE_G:
+-            s_dg_last_acc = T.alloc_shared((1,), T.float32)
+-            for _i in T.Parallel(1):
+-                s_dg_last_acc[0] = 0.0
+-            T.sync_threads()
++            dg_last_acc = T.alloc_var(T.float32)
++            dg_last_acc = 0.0
+ 
+         # ========== V-loop ==========
+         for i_v_py in T.Pipelined(_NV, num_stages=2):
+@@ -128,7 +127,7 @@
+                 T.reduce_sum(f_hdh, f_hdh_row, dim=1)
+                 f_hdh_scalar = T.alloc_fragment((1,), T.float32)
+                 T.reduce_sum(f_hdh_row, f_hdh_scalar, dim=0)
+-                s_dg_last_acc[0] = s_dg_last_acc[0] + f_hdh_scalar[0]
++                dg_last_acc = dg_last_acc + f_hdh_scalar[0]
+ 
+             if _TS:
+                 T.gemm(s_do, s_h, b_dq)
+@@ -155,8 +154,6 @@
+                 if (i_t_local * _BT + _i) < T_seq:
+                     dw[i_b, t_s + _i, i_h, k_off + _j] = s_dw_out[_i, _j]
+ 
+-        # dg_last is now in s_dg_last_acc[0] (shared memory, visible to all threads)
+-
+         # ========== load q, k ==========
+         # q/k are indexed by the shared qk-head, not the value-head.
+         s_q = T.alloc_shared((_BT, _BK), _dtype)
+@@ -166,8 +163,6 @@
+ 
+         # ========== USE_G path ==========
+         if _USE_G:
+-            # dg_last_acc already reduced to `red` scalar above
+-
+             # g in shared memory (all threads can cross-read any element)
+             s_g = T.alloc_shared((_BT,), T.float32)
+             T.copy(g[i_b, t_s:t_s + _BT, i_h], s_g, disable_tma=True)
+@@ -175,7 +170,7 @@
+             last_pos = T.max(0, T.min(_BT, T_seq - i_t_local * _BT) - 1)
+             g_last = s_g[last_pos]
+             b_dg_last = T.alloc_var(T.float32)
+-            b_dg_last = s_dg_last_acc[0] * T.exp2(g_last)
++            b_dg_last = dg_last_acc * T.exp2(g_last)
+ 
+             # b_dq *= exp2(g) * scale  (inline, no extra fragment)
+             for _i, _j in T.Parallel(_BT, _BK):

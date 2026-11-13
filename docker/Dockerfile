@@ -211,11 +211,13 @@ RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path
 ENV RELAX_FLA_CONV_NB_MODE=auto
 COPY docker/patch/fla/0.5.2-qwen38-output-config.patch /tmp/fla-output-config.patch
 COPY docker/patch/fla/0.5.2-conv-static-entries.patch /tmp/fla-conv-entries.patch
+COPY docker/patch/fla/0.5.2-tilelang-gdn-gate-grad.patch /tmp/fla-tilelang-gdn-gate-grad.patch
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/fla-output-config.patch && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/fla-conv-entries.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-tilelang-gdn-gate-grad.patch && \
     python -m compileall -q fla/modules/conv/triton && \
-    rm /tmp/fla-output-config.patch /tmp/fla-conv-entries.patch
+    rm /tmp/fla-output-config.patch /tmp/fla-conv-entries.patch /tmp/fla-tilelang-gdn-gate-grad.patch
 
 # Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
