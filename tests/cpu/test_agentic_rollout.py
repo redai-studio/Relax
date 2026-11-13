@@ -55,6 +55,7 @@ from relax.agentic.session.service import (
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
 from relax.utils.types import Sample
+from tests.helpers.relax_args import make_args
 
 
 # ``relax.agentic.rollout`` only needs this logging helper at import time. Keep
@@ -101,6 +102,7 @@ def _runtime_args(**overrides):
         "colocate": True,
         "global_batch_size": 2,
         "num_iters_per_train_update": 1,
+        "use_opd": False,
     }
     base.update(overrides)
     if base["over_sampling_batch_size"] is None:
@@ -133,14 +135,23 @@ async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) ->
 @pytest.mark.parametrize("cancel", [False, True], ids=["across_steps", "cancel"])
 async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> None:
     from relax.utils.opd.opd_main_worker import LogprobResponse
+    from relax.utils.opd.opd_utils import validate_opd_args
 
     args = _runtime_args(
         rollout_global_dataset=True,
         use_opd=True,
         opd_type="sglang",
         opd_token_selection="student_sampled",
+        opd_kl_coef=1.0,
+        opd_loss_coef=0.0,
+        opd_fkl_entropy_gate=False,
+        opd_student_eos_token_id=None,
+        opd_teacher_eos_token_id=None,
+        opd_teacher_response_prefix_token_ids=None,
+        opd_teacher_prompt_key=None,
+        opd_teacher_image_key=None,
         opd_teacher_key="domain",
-        opd_teacher_routes_map={"A": ["http://a"], "B": ["http://b"]},
+        opd_teacher_url="http://teacher/generate",
         opd_teacher_timeout_s=10,
         rollout_batch_size=1,
         over_sampling_batch_size=2,
@@ -153,6 +164,9 @@ async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> 
         debug_rollout_only=False,
         save_debug_rollout_data=None,
     )
+    args = make_args(**vars(args))
+    validate_opd_args(args, is_offline=False)
+    args.opd_teacher_routes_map = {"A": ["http://a"], "B": ["http://b"]}
     shard = runtime_mod._SessionShardBinding("shard", MagicMock())
     runtime = RuntimeDomain(args, "train", [shard], 2)
     monkeypatch.setattr(runtime, "_start_shard_observers", lambda: None)
@@ -563,7 +577,7 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
         drop_group=SimpleNamespace(remote=AsyncMock()),
     )
     shard = SimpleNamespace(actor_name="shard", handle=handle, group_streams={}, next_session_number=0)
-    runtime = RuntimeDomain(Namespace(rollout_global_dataset=False), "train", [shard], concurrency=2)
+    runtime = RuntimeDomain(Namespace(rollout_global_dataset=False, use_opd=False), "train", [shard], concurrency=2)
 
     async def exit_before_first_ir(_mode: str, group_id: str, _requests: Any) -> None:
         shard.group_streams[group_id].first_request_barrier.set_result(False)
@@ -862,6 +876,10 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         use_rollout_routing_replay=False,
         sglang_router_policy="cache_aware",
         slime_router_sticky=False,
+        advantage_estimator="grpo",
+        lora_rank=0,
+        lora_adapter_mode=False,
+        use_rollout_indexer_replay=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
     adapter.tokenizer = _FakeTokenizer()
@@ -1237,7 +1255,7 @@ async def test_runtime_router_publication_waits_for_every_owner(fails) -> None:
         for i in range(3)
     ]
     runtime = RuntimeDomain(
-        Namespace(rollout_engine_init_timeout=1.0),
+        Namespace(rollout_engine_init_timeout=1.0, use_opd=False),
         "train",
         [SimpleNamespace(handle=handle) for handle in handles[:2]],
         concurrency=1,

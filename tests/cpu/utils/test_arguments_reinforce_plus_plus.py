@@ -22,6 +22,7 @@ def arguments_module(monkeypatch):
 
     device = ModuleType("relax.utils.device")
     device.get_dist_backend = lambda: "gloo"
+    device.device_module = SimpleNamespace(synchronize=lambda: None)
     monkeypatch.setitem(sys.modules, "relax.utils.device", device)
 
     eval_config = ModuleType("relax.utils.training.eval_config")

@@ -53,7 +53,13 @@ def test_checkpoint_sync_rotation_follows_successful_save(save_method, rank, fai
         }
     )
     actor = SimpleNamespace(
-        args=SimpleNamespace(debug_rollout_only=False, offload_train=False, async_save=False, save_hf=None),
+        args=SimpleNamespace(
+            debug_rollout_only=False,
+            offload_train=False,
+            async_save=False,
+            save_hf=None,
+            save_lora_only=False,
+        ),
         model=None,
         optimizer=None,
         opt_param_scheduler=None,
@@ -123,6 +129,7 @@ def test_checkpoint_async_preserves_recovery_point(save_method, monkeypatch, tmp
             max_actor_ckpt_to_keep=1,
             rotate_ckpt=rotate,
             save_interval=4,
+            save_lora_only=False,
         ),
         model=None,
         optimizer=None,
@@ -190,6 +197,7 @@ def test_checkpoint_async_entry_skips_rotation_without_an_older_commit(
             save=str(tmp_path),
             max_actor_ckpt_to_keep=1,
             rotate_ckpt=False,
+            save_lora_only=False,
         ),
         model=None,
         optimizer=None,
@@ -233,7 +241,12 @@ def test_checkpoint_async_dpo_rotation_requires_sidecar(save_method, monkeypatch
     )
     actor = SimpleNamespace(
         args=SimpleNamespace(
-            debug_rollout_only=False, offload_train=False, async_save=True, save_hf=None, save="unused"
+            debug_rollout_only=False,
+            offload_train=False,
+            async_save=True,
+            save_hf=None,
+            save="unused",
+            save_lora_only=False,
         ),
         model=None,
         optimizer=None,
@@ -308,6 +321,7 @@ def test_checkpoint_failure_annotation_covers_write_and_async_finalization(monke
             save_hf=None,
             dump_agentic_obs="unused",
             save=str(tmp_path),
+            save_lora_only=False,
         ),
         model=None,
         optimizer=None,

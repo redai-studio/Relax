@@ -42,7 +42,7 @@ def install(args: Any, model: list, optimizer: Any) -> None:
 
     assert args.tensor_model_parallel_size in (4,)
     assert args.context_parallel_size == 1
-    assert not getattr(args, "use_megatron_fsdp", False)
+    assert not args.use_megatron_fsdp
     assert args.expert_tensor_parallel_size == 1
     assert args.bf16 and not getattr(args, "fp8", None) and not getattr(args, "fp4", None)
     verify_runtime()
@@ -61,7 +61,7 @@ def install(args: Any, model: list, optimizer: Any) -> None:
         assert not module.linear_fc1.use_bias and not module.linear_fc2.use_bias
         assert module.linear_fc1.fuse_wgrad_accumulation == module.linear_fc2.fuse_wgrad_accumulation
         assert module.linear_fc1.delay_wgrad_compute == module.linear_fc2.delay_wgrad_compute
-        if getattr(args, "use_megatron_fsdp", False):
+        if args.use_megatron_fsdp:
             assert not module.linear_fc1.fuse_wgrad_accumulation
             assert not module.linear_fc1.delay_wgrad_compute
     for module in modules.values():

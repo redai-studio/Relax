@@ -1,2 +1,3 @@
 max_turns: 10
+normalize_bbox: true
 rollout_interaction_env_path: examples.deepeyes.env_deepeyes

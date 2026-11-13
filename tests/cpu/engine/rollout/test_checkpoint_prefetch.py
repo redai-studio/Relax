@@ -35,6 +35,8 @@ def test_resume_reads_next_unconsumed_group(monkeypatch, tmp_path, interval, rot
         over_sampling_batch_size=4,
         n_samples_per_prompt=4,
         rollout_shuffle=True,
+        # generate_rollout() reads lora_rank before resume-order asserts.
+        lora_rank=0,
     )
 
     def source():

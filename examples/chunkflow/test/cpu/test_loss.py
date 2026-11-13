@@ -172,6 +172,11 @@ def test_unit_loss_and_gradients_match_unchunked_native_slicing(native_loss, mod
         recompute_loss_function=False,
         allgather_cp=False,
         global_batch_size=3,
+        mtp_only_training=False,
+        task_type="causal_lm",
+        sft_chunked_logits=False,
+        advantage_estimator=None,
+        opd_log_prob_top_k=0,
     )
     full_logits = torch.randn(1, 11, 19, generator=torch.Generator().manual_seed(42), requires_grad=True)
     chunk_logits = full_logits.detach().clone().requires_grad_()

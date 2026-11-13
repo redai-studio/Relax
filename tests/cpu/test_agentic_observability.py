@@ -86,6 +86,8 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "dump_agentic_obs_media": False,
         "reward_key": None,
         "use_rollout_routing_replay": False,
+        "use_opd": False,
+        "advantage_estimator": "grpo",
     }
     args.update(overrides)
     return Namespace(**args)
@@ -307,6 +309,7 @@ def test_export_id_column_is_gated_on_the_flag(tmp_path) -> None:
         "reward_key": None,
         "multimodal_keys": None,
         "use_opd": False,
+        "use_rollout_routing_replay": False,
         "debug_train_only": True,
         "n_samples_per_prompt": 1,
         "loss_type": "grpo",

@@ -235,8 +235,17 @@ def _logged_metrics(monkeypatch, counter, **args):
     logs = {}
     monkeypatch.setattr(train_metric_utils, "Timer", lambda: timer)
     monkeypatch.setattr(train_metric_utils.tracking_utils, "log", lambda _, values, **kw: logs.update(values))
+    metric_args = {
+        "wandb_always_use_train_step": False,
+        "only_train_params_name_list": None,
+    }
+    metric_args.update(args)
     train_metric_utils.log_perf_data_raw(
-        0, SimpleNamespace(wandb_always_use_train_step=False, **args), True, counter, world_size=128
+        0,
+        SimpleNamespace(**metric_args),
+        True,
+        counter,
+        world_size=128,
     )
     return logs
 

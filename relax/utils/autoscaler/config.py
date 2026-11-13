@@ -265,7 +265,7 @@ class AutoscalerConfig:
         if config_path is None:
             return None
 
-        rollout_service_url = getattr(args, "rollout_service_url", None)
+        rollout_service_url = args.rollout_service_url
         return cls.from_yaml(config_path, rollout_service_url)
 
     def to_dict(self) -> dict:

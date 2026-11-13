@@ -12,6 +12,7 @@ from argparse import Namespace
 
 import numpy as np
 
+from relax.backends.megatron.compat import megatron_context_parallel_size, megatron_dynamic_context_parallel
 from relax.utils.env import Envs
 
 
@@ -96,40 +97,40 @@ def validate_preference_args(args: Namespace) -> None:
     """Reject unsupported preference configurations before Serve starts."""
     if not is_preference_mode(args):
         return
-    if is_rm_mode(args) and getattr(args, "save_hf", None) is not None:
+    if is_rm_mode(args) and args.save_hf is not None:
         raise ValueError("RM training does not support --save-hf; use native Megatron checkpoints for RM persistence")
 
-    if getattr(args, "sft_async_prepack", False):
+    if args.sft_async_prepack:
         raise ValueError("preference objectives v1 do not support --sft-async-prepack")
-    if getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if args.task_type != "causal_lm":
         raise ValueError("preference objectives require --task-type causal_lm")
-    if getattr(args, "mtp_only_training", False):
+    if args.mtp_only_training:
         raise ValueError("preference objectives v1 do not support MTP-only training")
-    if getattr(args, "custom_dataset_class_path", None):
+    if args.custom_dataset_class_path:
         raise ValueError("preference objectives do not support --custom-dataset-class")
-    if getattr(args, "multimodal_keys", None) is not None:
+    if args.multimodal_keys is not None:
         raise ValueError("preference objectives v1 support pure text only")
-    if int(getattr(args, "n_samples_per_prompt", 1)) != 1:
+    if int(args.n_samples_per_prompt) != 1:
         raise ValueError("preference objectives require --n-samples-per-prompt 1")
     topology = {
         "tensor_model_parallel_size": int(getattr(args, "tensor_model_parallel_size", 1) or 1),
         "pipeline_model_parallel_size": int(getattr(args, "pipeline_model_parallel_size", 1) or 1),
-        "context_parallel_size": int(getattr(args, "context_parallel_size", 1) or 1),
+        "context_parallel_size": int(megatron_context_parallel_size(args) or 1),
     }
     invalid = {name: size for name, size in topology.items() if size != 1}
     if invalid:
         raise ValueError(f"preference objectives v1 require TP=CP=PP=1, got {invalid}")
-    if getattr(args, "dynamic_context_parallel", False):
+    if megatron_dynamic_context_parallel(args):
         raise ValueError("preference objectives v1 do not support dynamic context parallelism")
-    if getattr(args, "qkv_format", "thd") != "thd":
+    if args.qkv_format != "thd":
         raise ValueError("preference objectives v1 require --qkv-format thd")
-    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+    if args.fully_async or args.hybrid:
         raise ValueError("preference objectives v1 support synchronous offline training only")
-    if not getattr(args, "use_gloo_process_groups", False):
+    if not args.use_gloo_process_groups:
         raise ValueError("preference objectives require --use-gloo-process-groups for DP iterator control data")
-    if getattr(args, "sft_chunked_logits", False) or getattr(args, "enable_mtp_training", False):
+    if args.sft_chunked_logits or getattr(args, "enable_mtp_training", False):
         raise ValueError("preference objectives v1 do not support SFT chunked logits or MTP")
-    if getattr(args, "calculate_per_token_loss", False):
+    if args.calculate_per_token_loss:
         raise ValueError("preference objectives use pair reduction and reject --calculate-per-token-loss")
     if int(getattr(args, "lora_rank", 0) or 0) > 0:
         raise ValueError("preference objectives v1 do not support LoRA")
@@ -138,32 +139,32 @@ def validate_preference_args(args: Namespace) -> None:
         or float(getattr(args, "attention_dropout", 0.0) or 0.0) != 0.0
     ):
         raise ValueError("preference objectives require hidden and attention dropout to be 0.0")
-    if getattr(args, "sft_predict_interval", None) is not None:
+    if args.sft_predict_interval is not None:
         raise ValueError("preference objectives do not use SFT generation prediction")
-    max_length = int(getattr(args, "preference_max_length", 0) or 0)
-    max_completion_length = int(getattr(args, "preference_max_completion_length", 0) or 0)
+    max_length = int(args.preference_max_length or 0)
+    max_completion_length = int(args.preference_max_completion_length or 0)
     if max_length <= 0 or max_completion_length <= 0:
         raise ValueError("preference length limits must be positive")
     if max_completion_length > max_length:
         raise ValueError("--preference-max-completion-length must not exceed --preference-max-length")
-    seq_length = int(getattr(args, "seq_length", max_length) or max_length)
+    seq_length = int(getattr(args, "seq_length", None) or max_length)
     if max_length > seq_length:
         raise ValueError("--preference-max-length must not exceed --seq-length")
-    if not is_dpo_mode(args) and getattr(args, "dpo_reference_free", False):
+    if not is_dpo_mode(args) and args.dpo_reference_free:
         raise ValueError("--dpo-reference-free is valid only with --loss-type dpo")
     if is_dpo_mode(args):
-        beta = float(getattr(args, "dpo_beta", 0.1))
+        beta = float(args.dpo_beta)
         if not math.isfinite(beta) or beta <= 0:
             raise ValueError(f"--dpo-beta must be finite and positive, got {beta}")
-        likelihood_temperature = float(getattr(args, "rollout_temperature", 1.0))
+        likelihood_temperature = float(args.rollout_temperature)
         if not math.isfinite(likelihood_temperature) or likelihood_temperature != 1.0:
             raise ValueError(
                 "DPO requires --rollout-temperature 1.0 so sampling temperature does not scale "
                 "policy/reference likelihood logits"
             )
-        if not getattr(args, "dpo_reference_free", False) and getattr(args, "ref_update_interval", None) is not None:
+        if not args.dpo_reference_free and args.ref_update_interval is not None:
             raise ValueError("standard DPO requires a frozen reference and rejects --ref-update-interval")
-        if not getattr(args, "dpo_reference_free", False) and not getattr(args, "enable_weights_backuper", False):
+        if not args.dpo_reference_free and not args.enable_weights_backuper:
             raise ValueError("standard DPO requires --enable-weights-backuper for actor/ref snapshots")
 
 
@@ -181,24 +182,24 @@ def should_skip_sft_weight_management(
     """
     return bool(
         is_sft_mode(args)
-        and getattr(args, "sft_predict_interval", None) is None
-        and not getattr(args, "offload_train", False)
+        and args.sft_predict_interval is None
+        and not args.offload_train
         and not with_ref
         and not with_opd_teacher
-        and not getattr(args, "keep_old_actor", False)
+        and not args.keep_old_actor
     )
 
 
 def should_bypass_main_output_layer(args: Namespace) -> bool:
     """Return whether training needs hidden states instead of main language-
     model logits."""
-    return getattr(args, "mtp_only_training", False) or should_use_sft_chunked(args)
+    return args.mtp_only_training or should_use_sft_chunked(args)
 
 
 def should_use_sft_chunked(args: Namespace) -> bool:
     """Return whether regular SFT explicitly enabled chunked language-model
     logits."""
-    return is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)
+    return is_sft_mode(args) and args.sft_chunked_logits
 
 
 def sft_partition_prefix(args: Namespace) -> str:
@@ -221,7 +222,7 @@ def sft_tq_num_shards(args: Namespace) -> int:
     Kept as an env knob while this path is experimental so launch scripts can
     do A/B tests without adding a public CLI surface.
     """
-    if not is_sft_mode(args) or not getattr(args, "sft_async_prepack", False):
+    if not is_sft_mode(args) or not args.sft_async_prepack:
         return 1
     return max(1, Envs.RELAX_SFT_TQ_SHARDS)
 
@@ -266,10 +267,10 @@ def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
     """
     if not is_offline_mode(args):
         return False
-    has_eval_source = bool(getattr(args, "eval_prompt_data", None)) or (getattr(args, "eval_size", None) is not None)
+    has_eval_source = bool(getattr(args, "eval_prompt_data", None)) or (args.eval_size is not None)
     if not has_eval_source:
         return False
-    interval = getattr(args, "eval_interval", None)
+    interval = args.eval_interval
     if interval is None or interval <= 0:
         return False
     return completed_steps > 0 and completed_steps % interval == 0
@@ -283,7 +284,7 @@ def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:
     """
     if not is_sft_mode(args):
         return False
-    interval = getattr(args, "sft_predict_interval", None)
+    interval = args.sft_predict_interval
     if interval is None or interval <= 0:
         return False
     return completed_steps > 0 and completed_steps % interval == 0
@@ -313,7 +314,6 @@ def resident_sft_param_overlap_enabled(args: Namespace) -> bool:
         "mtp_only_training",
         "eval_prompt_data",
         "eval_size",
-        "sft_predict_interval",
         "save",
         "save_hf",
         "rotate_ckpt",
@@ -324,6 +324,8 @@ def resident_sft_param_overlap_enabled(args: Namespace) -> bool:
     if not is_sft_mode(args) or any(not getattr(args, name, False) for name in required):
         raise ValueError("Resident parameter overlap requires SFT and distributed optimizer with both overlap flags")
     conflicts = [name for name in incompatible if getattr(args, name, None)]
+    if args.sft_predict_interval:
+        conflicts.append("sft_predict_interval")
     if conflicts:
         raise ValueError(f"Resident SFT parameter overlap does not support: {', '.join(conflicts)}")
     if getattr(args, "moe_shared_expert_overlap", False) and not getattr(

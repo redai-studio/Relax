@@ -4,7 +4,7 @@
 
 import importlib
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -54,7 +54,9 @@ def _stub_policy_forward(monkeypatch, log_probs):
 
 
 def _args(*, calculate_per_token_loss):
-    return SimpleNamespace(
+    from tests.helpers.relax_args import make_args
+
+    return make_args(
         loss_type="policy_loss",
         advantage_estimator="m2po",
         calculate_per_token_loss=calculate_per_token_loss,

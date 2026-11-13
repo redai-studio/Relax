@@ -162,8 +162,8 @@ def main(args):
 
                 _fault_runtime = start_fault_events(
                     enabled=True,
-                    health_enabled=getattr(args, "use_health_check", False),
-                    port=getattr(args, "fault_events_port", 0),
+                    health_enabled=args.use_health_check,
+                    port=args.fault_events_port,
                 )
             except Exception:
                 try:

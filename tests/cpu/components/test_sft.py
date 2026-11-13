@@ -816,6 +816,7 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real, im
         multimodal_keys={"image": "images"} if image_preprocess_on_rank else None,
         sft_image_preprocess_on_rank=image_preprocess_on_rank,
         sft_eval_chunk_drain_timeout_sec=1,
+        sft_async_prepack=False,
     )
     sft.step = 0
     sft.data_system_client = fake_client

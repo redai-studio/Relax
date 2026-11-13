@@ -13,7 +13,7 @@ import pytest
 @pytest.mark.parametrize("force_sparse", [False, True])
 def test_bridge_forwards_qsa_force_sparse(force_sparse):
     source = Path(__file__).resolve().parents[4] / "relax/backends/megatron/model_provider.py"
-    tree = ast.parse(source.read_text())
+    tree = ast.parse(source.read_text(encoding="utf-8"))
     statements = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -22,11 +22,15 @@ def test_bridge_forwards_qsa_force_sparse(force_sparse):
         if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and node.target.id == "attr":
             if ast.unparse(node.iter) == "vars(provider)":
                 statements["override_loop"] = node
+    from relax.backends.megatron.compat import megatron_dynamic_context_parallel
+
     namespace = {
         "args": SimpleNamespace(qsa_force_sparse=force_sparse),
         "provider": SimpleNamespace(qsa_force_sparse=not force_sparse),
         "logger": Mock(),
         "is_kimi_k3": False,
+        # Override loop calls this helper; bind the real symbol for AST exec.
+        "megatron_dynamic_context_parallel": megatron_dynamic_context_parallel,
     }
     body = [statements[key] for key in ("bridge_keys", "args_dict", "override_loop")]
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), namespace)

@@ -53,7 +53,17 @@ def test_sft_peer_error_agreement_propagates_peer_failure(monkeypatch):
 def test_sft_lookahead_pauses_on_checkpoint_boundary(monkeypatch):
     monkeypatch.setattr(actor_module, "should_run_sft_eval", lambda *_args: False)
     monkeypatch.setattr(actor_module, "should_run_sft_predict", lambda *_args: False)
-    args = Namespace(num_rollout=100, save="/checkpoint", rotate_ckpt=False, save_interval=20)
+    args = Namespace(
+        loss_type="policy_loss",
+        num_rollout=100,
+        save="/checkpoint",
+        rotate_ckpt=False,
+        save_interval=20,
+        eval_interval=None,
+        eval_prompt_data=None,
+        eval_size=None,
+        sft_predict_interval=None,
+    )
 
     assert actor_module._should_pause_sft_lookahead(args, rollout_id=19) is True
     assert actor_module._should_pause_sft_lookahead(args, rollout_id=18) is False
@@ -185,7 +195,7 @@ def test_sft_prepack_fetch_concatenates_ready_tq_shards(monkeypatch):
     monkeypatch.setattr(actor_module, "get_data_from_transfer_queue", _get_data_from_transfer_queue)
 
     actor = object.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = Namespace(global_batch_size=8, loss_type="sft", sft_async_prepack=True)
+    actor.args = Namespace(global_batch_size=8, loss_type="sft", sft_async_prepack=True, generation_task=None)
     actor.data_system_client = MagicMock()
     actor.data_system_client.async_get_partition_list.return_value = partition_ids
 
@@ -209,7 +219,7 @@ def test_sft_prepack_fetch_waits_until_all_tq_shards_are_ready(monkeypatch):
     monkeypatch.setattr(actor_module, "get_data_from_transfer_queue", fetch)
 
     actor = object.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = Namespace(global_batch_size=8, loss_type="sft", sft_async_prepack=True)
+    actor.args = Namespace(global_batch_size=8, loss_type="sft", sft_async_prepack=True, generation_task=None)
     actor.data_system_client = MagicMock()
     actor.data_system_client.async_get_partition_list.return_value = ["sft_3_shard_0_of_2"]
 

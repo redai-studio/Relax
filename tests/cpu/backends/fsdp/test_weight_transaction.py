@@ -75,7 +75,12 @@ def _manifest():
 
 def _shell():
     shell = object.__new__(FSDPTrainRayActor)
-    shell.args = SimpleNamespace(fsdp_trainable_attr="transformer")
+    shell.args = SimpleNamespace(
+        fsdp_trainable_attr="transformer",
+        offload_rollout=False,
+        offload_train=False,
+        use_fault_tolerance=False,
+    )
     return shell
 
 
@@ -160,6 +165,7 @@ def _adapter_shell():
         weight_sync_wire_dtype="fp32",
         lora_alpha=4,
         fsdp_trainable_attr="transformer",
+        offload_rollout=False,
     )
     shell.device = torch.device("cpu")
     shell._named_sync_params = lambda: []
