@@ -128,21 +128,12 @@ ARG TRAIN_IMAGE=train
 # Only relax_hopper consumes this stage; Blackwell must not build Hopper kernels.
 FROM ${TRAIN_IMAGE} as fa3_builder
 ARG FA3_COMMIT=0f82fead0b2d59f6390c62a1d74e927159bc5a7b
-RUN --mount=type=bind,source=docker/scripts/nvcc-without-preload.sh,target=/tmp/nvcc-without-preload.sh \
-    NVCC_BIN=/usr/local/cuda/bin && \
-    if [ -e "$NVCC_BIN/nvcc.real" ]; then \
-        cmp /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
-    else \
-        test -f "$NVCC_BIN/nvcc" && test -x "$NVCC_BIN/nvcc" && \
-        ! cmp -s /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc" && \
-        mv "$NVCC_BIN/nvcc" "$NVCC_BIN/nvcc.real" && \
-        install -m 755 /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
-    fi && \
-    git clone https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention-fa3 && \
+# Clear training-library preloads only for this build, not the final runtime.
+RUN git clone https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention-fa3 && \
     cd /tmp/flash-attention-fa3 && git checkout "$FA3_COMMIT" && \
     test "$(git rev-parse HEAD)" = "$FA3_COMMIT" && \
     git submodule update --init --depth=1 && \
-    CUDA_VISIBLE_DEVICES="" FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTENTION_DISABLE_SM80=TRUE \
+    env -u LD_PRELOAD CUDA_VISIBLE_DEVICES="" FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTENTION_DISABLE_SM80=TRUE \
         MAX_JOBS=32 pip wheel --no-cache-dir --no-build-isolation --no-deps \
         --wheel-dir /opt/fa3-wheels ./hopper && \
     cd /root && rm -rf /tmp/flash-attention-fa3
