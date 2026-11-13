@@ -27,7 +27,7 @@
 
 ```text
 sample=1001 session=sess-1 turn=1 attempt=0 tokens=[0,2) version=1 age=4
-sample=1001 session=sess-1 turn=2 attempt=0 tokens=[2,5) version=3 age=2
+sample=1001 session=sess-1 turn=2 attempt=0 tokens=[0,3) version=3 age=2
 ```
 
-读法：第 1 轮的 2 个 token 来自 v1，训练消费时已老化 4 个版本；第 2 轮的 3 个 token 来自 v3（工具等待期间经历 v2、v3 两次更新），消费时老化 2 个版本。生成期跨度 2（v1→v3），等待滞后 2（v3→v5），token 加权滞后 2.8。
+读法：第 1 轮的 2 个 token 来自 v1，训练消费时已老化 4 个版本；第 2 轮的 3 个 token 来自 v3（工具等待期间经历 v2、v3 两次更新），消费时老化 2 个版本。生成期跨度 2（v1→v3），等待滞后 2（v3→v5），token 加权滞后 2.8。明细行中的 token 区间是 resp 节点内相对坐标（每轮从 0 起算）；映射到整条 response 的展平坐标由 `build_sample` 完成，见 `Sample.weight_version_spans`。
