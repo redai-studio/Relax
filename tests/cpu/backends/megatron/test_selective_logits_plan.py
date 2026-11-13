@@ -43,8 +43,10 @@ def test_mtp_plan_respects_document_and_physical_padding():
 
 
 @pytest.mark.parametrize("allgather_cp", [False, True])
-@pytest.mark.parametrize("case", ["packed", "response", "dummy", "repeated_dummy", "vl_text_only"])
-def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_cp, case):
+@pytest.mark.parametrize(
+    "case", ["packed", "response", "dummy", "repeated_dummy", "vl_text_only", "vl_with_images", "vl_images_opt_out"]
+)
+def test_ordinary_pp_iterator_preserves_selection_plans(monkeypatch, allgather_cp, case):
     """Exercise ingestion -> ordinary DataIterator -> get_batch without async
     prepack.
 
@@ -62,6 +64,7 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
     from relax.utils.data import stream_dataloader
 
     monkeypatch.setenv("RELAX_SFT_SELECTIVE_LOGITS", "1")
+    monkeypatch.setenv("RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS", "1" if case == "vl_with_images" else "0")
     args = Namespace(
         loss_type="sft",
         qkv_format="thd",
@@ -69,8 +72,8 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
         enable_mtp_training=True,
         mtp_num_layers=2,
         allgather_cp=allgather_cp,
-        pipeline_model_parallel_size=4,
-        is_vl_model=case == "vl_text_only",
+        pipeline_model_parallel_size=8 if case in ("vl_with_images", "vl_images_opt_out") else 4,
+        is_vl_model=case.startswith("vl_"),
         use_opd=False,
     )
     monkeypatch.setattr(data, "get_args", lambda: args)
@@ -90,6 +93,10 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
         "total_lengths": [3, 5],
         "response_lengths": response_lengths,
     }
+    keys = ["tokens", "loss_masks", "total_lengths", "response_lengths"]
+    if case in ("vl_with_images", "vl_images_opt_out"):
+        rollout["multimodal_train_inputs"] = [{"pixel_values": torch.zeros((1, 3, 4, 4))}, None]
+        keys.append("multimodal_train_inputs")
     stream_dataloader.post_process_rollout_data(args, rollout)
     assert "selective_loss_masks_cpu" in rollout
     assert all(mask.device.type == "cpu" for mask in rollout["selective_loss_masks_cpu"])
@@ -111,7 +118,7 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
     monkeypatch.setattr(iterator, "get_next", capture_next)
     batch = data.get_batch(
         iterator,
-        ["tokens", "loss_masks", "total_lengths", "response_lengths"],
+        keys,
         pad_multiplier=8,
         allgather_cp=allgather_cp,
         is_vl_model=args.is_vl_model,
@@ -123,6 +130,11 @@ def test_ordinary_pp4_iterator_preserves_selection_plans(monkeypatch, allgather_
     assert "unsplit_tokens" not in batch
     assert "vlm_packed_seq_params" not in batch
     assert batch.get("__is_dummy__", False) == (case in ("dummy", "repeated_dummy"))
+    if case == "vl_images_opt_out":
+        assert "selective_logit_rows" not in batch
+        assert not hasattr(batch["packed_seq_params"], "relax_sft_selective_mtp_rows")
+        return
+
     expected_main = [(mask.numel(), mask.nonzero().flatten()) for mask in batch["loss_masks"]]
     packed = batch["packed_seq_params"]
     expected_mtp = []
