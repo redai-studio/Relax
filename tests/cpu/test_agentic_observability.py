@@ -230,6 +230,10 @@ def test_stage_recorder_keeps_the_open_file_count_flat(tmp_path) -> None:
                 rollout_id=rollout_id,
                 stage=STAGE_FILTER,
             )
+        # Drain before checking descriptors: close() may discard queued work after its deadline.
+        drained = threading.Event()
+        assert recorder._worker.submit(drained.set)
+        assert await asyncio.to_thread(drained.wait, 5)
         assert len(recorder._appenders) <= 4
         recorder.close()
 
