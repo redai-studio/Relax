@@ -4,8 +4,14 @@ ARG HTTPS_PROXY
 ARG NO_PROXY
 ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.17-cu129
 ARG TRAIN_IMAGE=train
+ARG RELAX_CUDNN_VERSION=9.20.0.48
 ARG HYBRID_EP_COMMIT=eb9cee7de5a24193bf09500668d3a619d3d3f3fb
 FROM ${BASE_IMAGE} as base
+
+ARG RELAX_CUDNN_VERSION
+# TE can load the system cuDNN before the Python wheel.
+RUN --mount=type=bind,source=docker/scripts/align_cu12_cudnn_packages.sh,target=/tmp/align_cu12_cudnn_packages.sh \
+    bash /tmp/align_cu12_cudnn_packages.sh "${RELAX_CUDNN_VERSION}-1"
 
 ENV NVIDIA_PYTORCH_VERSION=25.06 \
     PYTORCH_BUILD_VERSION=2.9.0 \
@@ -38,7 +44,7 @@ FROM base as sglang
 
 WORKDIR /sgl-workspace/sglang
 
-RUN pip install nvidia-cudnn-cu12==9.16.0.29
+RUN pip install "nvidia-cudnn-cu12==${RELAX_CUDNN_VERSION}"
 
 FROM base as train
 
@@ -88,10 +94,11 @@ RUN MAX_JOBS=64 \
     cd / && python -c "import importlib.util as u; assert u.find_spec('flash_attn_interface') is None, 'stray top-level flash_attn_interface still importable'; import flash_attn_config" && \
     rm -rf /opt/flash-attention/
 
-RUN NVTE_PYTORCH_FORCE_BUILD=TRUE pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
+RUN pip install --no-cache-dir "nvidia-cudnn-cu12==${RELAX_CUDNN_VERSION}" && \
+    NVTE_PYTORCH_FORCE_BUILD=TRUE pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation --no-cache-dir && \
-    pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
+    pip install "numpy<2" --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \
     --no-build-isolation \
@@ -153,6 +160,12 @@ COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
 RUN bash /tmp/build_sglang_router.sh /tmp/router-patch /opt/router-wheels
 
 FROM ${TRAIN_IMAGE} as relax
+
+ARG RELAX_CUDNN_VERSION
+# An external train image may have bypassed the base and train stages.
+RUN --mount=type=bind,source=docker/scripts/align_cu12_cudnn_packages.sh,target=/tmp/align_cu12_cudnn_packages.sh \
+    bash /tmp/align_cu12_cudnn_packages.sh "${RELAX_CUDNN_VERSION}-1" && \
+    pip install --no-cache-dir "nvidia-cudnn-cu12==${RELAX_CUDNN_VERSION}"
 
 WORKDIR /root
 
@@ -317,4 +330,4 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
     patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa-sm90-signature-cache.patch && \
     python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" && \
     rm /tmp/cudnn-dsa-sm90-signature-cache.patch && \
-    python /opt/relax/validate_final_runtime.py --profile cu12
+    python /opt/relax/validate_final_runtime.py --profile cu12 --cudnn-version "${RELAX_CUDNN_VERSION}"

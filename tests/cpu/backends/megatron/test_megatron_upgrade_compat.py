@@ -13,12 +13,16 @@ import ast
 import os
 import sys
 import types
+from functools import wraps
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 
 _MODEL_SOURCE = Path(__file__).resolve().parents[4] / "relax/backends/megatron/model.py"
+_COMPAT_SOURCE = _MODEL_SOURCE.with_name("compat.py")
 
 
 def _load_functions(source: Path, names: set[str], namespace: dict, class_name: str | None = None) -> dict:
@@ -37,6 +41,56 @@ def _install_module(monkeypatch, name: str, **attributes) -> types.ModuleType:
     module.__dict__.update(attributes)
     monkeypatch.setitem(sys.modules, name, module)
     return module
+
+
+@pytest.mark.parametrize(
+    "capabilities,fla_version,misidentified,should_patch",
+    [
+        ([(10, 3), (10, 3)], "0.5.2", True, True),
+        ([(9, 0)], "0.5.2", True, False),
+        ([(10, 3), (9, 0)], "0.5.2", True, False),
+        ([(10, 3)], "0.5.2", False, False),
+        ([(10, 3)], "0.5.3", True, False),
+        ([], "0.5.2", True, False),
+    ],
+)
+def test_fla_gdn_backward_uses_triton_only_on_misidentified_sm103(
+    monkeypatch, capabilities, fla_version, misidentified, should_patch
+):
+    class TileLangBackend:
+        def chunk_bwd_dqkwg_verifier(self):
+            return True, None
+
+        def unrelated_verifier(self):
+            return True, None
+
+    versions = {"fla-core": fla_version}
+    patch = _load_functions(
+        _COMPAT_SOURCE,
+        {"patch_fla_gdn_backward_for_sm103"},
+        {"version": versions.__getitem__, "PackageNotFoundError": PackageNotFoundError, "wraps": wraps, "Any": Any},
+    )["patch_fla_gdn_backward_for_sm103"]
+    _install_module(
+        monkeypatch,
+        "torch",
+        cuda=types.SimpleNamespace(
+            device_count=lambda: len(capabilities),
+            get_device_capability=capabilities.__getitem__,
+        ),
+    )
+    chunk_o = types.SimpleNamespace(IS_NVIDIA_HOPPER=misidentified, NUM_WARPS=[2, 4])
+    _install_module(monkeypatch, "fla.ops.common", chunk_o=chunk_o)
+    _install_module(monkeypatch, "fla.ops.common.backends.tilelang", TileLangBackend=TileLangBackend)
+    original = TileLangBackend.chunk_bwd_dqkwg_verifier
+    unrelated = TileLangBackend.unrelated_verifier
+
+    assert patch() is should_patch
+    assert chunk_o.IS_NVIDIA_HOPPER is (misidentified and not should_patch)
+    assert chunk_o.NUM_WARPS == [2, 4]
+    assert TileLangBackend.unrelated_verifier is unrelated
+    assert (TileLangBackend.chunk_bwd_dqkwg_verifier is not original) is should_patch
+    assert TileLangBackend().chunk_bwd_dqkwg_verifier()[0] is (not should_patch)
+    assert not patch()
 
 
 @pytest.fixture

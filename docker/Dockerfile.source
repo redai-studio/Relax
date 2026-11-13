@@ -1,0 +1,12 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS relax
+
+ARG BASE_IMAGE
+ARG RELAX_SOURCE_SHA
+LABEL org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      org.opencontainers.image.revision="${RELAX_SOURCE_SHA}"
+
+RUN --mount=type=bind,source=.,target=/tmp/relax-build-context \
+    bash /tmp/relax-build-context/docker/scripts/embed_relax_source.sh \
+        /tmp/relax-build-context "${RELAX_SOURCE_SHA}"

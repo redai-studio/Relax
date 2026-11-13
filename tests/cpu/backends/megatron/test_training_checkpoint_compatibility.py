@@ -124,6 +124,7 @@ def test_bf16_export_keeps_actor_artifacts_with_weights_only_reference(monkeypat
         (reference / "tokenizer.json").write_text(reference_template)
         (reference / "processor.json").write_text("reference processor")
     recorded = {}
+    prepare_local_model = Mock()
 
     class Bridge:
         def __init__(self, source):
@@ -165,6 +166,7 @@ def test_bf16_export_keeps_actor_artifacts_with_weights_only_reference(monkeypat
             "torch": SimpleNamespace(distributed=SimpleNamespace(is_initialized=lambda: False)),
             "patch_megatron_model": lambda model: nullcontext(),
             "is_lora_enabled": lambda args: False,
+            "prepare_local_model": prepare_local_model,
             "_invoke_save_hf_post_hook": Mock(),
             "logger": Mock(),
         },
@@ -172,14 +174,67 @@ def test_bf16_export_keeps_actor_artifacts_with_weights_only_reference(monkeypat
     args = SimpleNamespace(
         hf_checkpoint=str(actor),
         ref_load=str(reference),
+        model_source=SimpleNamespace(uri="s3://models/actor"),
         save_hf_dtype="bf16",
         save_hf=str(tmp_path / "out"),
         mtp_num_layers=None,
     )
     module.save_hf_model(args, 0, [])
     output = tmp_path / "out/iter_0000000"
+    prepare_local_model.assert_not_called()
     assert recorded == {"weights": reference, "strict": True}
     assert (output / "tokenizer.json").read_text() == "actor template"
     assert (output / "processor.json").read_text() == "actor processor"
     assert "quantization_config" not in json.loads((output / "config.json").read_text())
     assert "quantization_config" in json.loads((actor / "config.json").read_text())
+
+
+def test_hf_export_refills_cleaned_s3_actor_weights(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    metadata_cache = tmp_path / "metadata-cache"
+    metadata_cache.mkdir()
+    (metadata_cache / "config.json").write_text("{}")
+    full_cache = tmp_path / "full-cache"
+    prepare_local_model = Mock(return_value=SimpleNamespace(path=str(full_cache)))
+    bridge = SimpleNamespace(save_hf_pretrained=Mock())
+    from_hf_pretrained = Mock(return_value=bridge)
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.bridge",
+        SimpleNamespace(AutoBridge=SimpleNamespace(from_hf_pretrained=from_hf_pretrained)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "relax.utils.hf_export",
+        SimpleNamespace(
+            reference_expects_mtp=lambda _: False,
+            reference_expects_vision=lambda _: False,
+            reconcile_hf_export_index=Mock(),
+        ),
+    )
+    module = _load(
+        "relax/backends/megatron/model.py",
+        {"_hf_export_reference", "_resolve_save_hf_path", "save_hf_model"},
+        {
+            "Path": Path,
+            "string": string,
+            "torch": SimpleNamespace(distributed=SimpleNamespace(is_initialized=lambda: False)),
+            "is_s3_uri": lambda uri: uri.startswith("s3://"),
+            "prepare_local_model": prepare_local_model,
+            "patch_megatron_model": lambda model: nullcontext(),
+            "is_lora_enabled": lambda args: False,
+            "_invoke_save_hf_post_hook": Mock(),
+            "logger": Mock(),
+        },
+    )
+    args = SimpleNamespace(
+        hf_checkpoint=str(metadata_cache),
+        model_source=SimpleNamespace(uri="s3://models/actor"),
+        save_hf=str(tmp_path / "out"),
+        mtp_num_layers=None,
+    )
+    module.save_hf_model(args, 0, [])
+
+    prepare_local_model.assert_called_once_with(args, completeness="full")
+    from_hf_pretrained.assert_called_once_with(str(full_cache), trust_remote_code=True)
+    bridge.save_hf_pretrained.assert_called_once_with([], path=tmp_path / "out/iter_0000000", strict=True)
+    assert args.hf_checkpoint == str(metadata_cache)
