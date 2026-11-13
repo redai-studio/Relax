@@ -32,6 +32,25 @@ def ce(labels, logits):
     return F.cross_entropy(logits[:, 0], labels[0], reduction="none").unsqueeze(0)
 
 
+@pytest.mark.parametrize("runtime_gather_output", [None, False])
+def test_te_uses_tp_group_only_for_vocab_shards(monkeypatch, runtime_gather_output):
+    head = Head()
+    head.gather_output = True
+    hidden = torch.randn(4, 1, 5)
+    labels = torch.zeros(1, 4, dtype=torch.long)
+    group = object()
+    seen_groups = []
+
+    def te_ce(logits, targets, tp_group):
+        seen_groups.append(tp_group)
+        return ce(targets.T, logits).T
+
+    monkeypatch.setenv("RELAX_MTP_CE_IMPL", "te")
+    monkeypatch.setattr(patch, "te_cross_entropy", te_ce)
+    patch._chunked_head_ce(hidden, labels, head, None, runtime_gather_output, ce, None, 4, tp_group=group)
+    assert seen_groups == [None if runtime_gather_output is None else group]
+
+
 def test_fused_mtp_preserves_selective_mask_gradients_and_acceptance(monkeypatch):
     from relax.backends.megatron import fused_linear_ce as fused
 

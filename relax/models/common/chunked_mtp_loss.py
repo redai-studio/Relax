@@ -184,7 +184,12 @@ def _chunked_head_ce(
                                 runtime_gather_output,
                                 tp_group,
                             )
-                        group = tp_group if tp_group is not None else parallel_state.get_tensor_model_parallel_group()
+                        gathered = (
+                            runtime_gather_output
+                            if runtime_gather_output is not None
+                            else getattr(output_layer, "gather_output", False)
+                        )
+                        group = None if gathered else (tp_group or parallel_state.get_tensor_model_parallel_group())
                         loss_slice = (
                             te_cross_entropy(logits_slice, mtp_labels[:, start:end].transpose(0, 1), group)
                             .transpose(0, 1)

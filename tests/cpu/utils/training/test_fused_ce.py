@@ -14,7 +14,10 @@ def test_te_adapter_normalizes_offset_transposed_labels(monkeypatch, batch, rows
     labels = parent[:, 5 : 5 + rows].transpose(0, 1)
     logits = torch.randn(batch, rows, 17).transpose(0, 1).requires_grad_()
 
+    tp_group = object()
+
     def checked_kernel(x, target, **kwargs):
+        assert kwargs["dist_process_group"] is tp_group
         assert x.shape == (1, rows * batch, 17)
         assert target.shape == (1, rows * batch)
         if target.numel() > 1:
@@ -26,7 +29,7 @@ def test_te_adapter_normalizes_offset_transposed_labels(monkeypatch, batch, rows
         return F.cross_entropy(x[0], target[0], reduction="none").unsqueeze(0)
 
     monkeypatch.setattr(fused_ce, "_te_ce", lambda: checked_kernel)
-    actual = fused_ce.te_cross_entropy(logits, labels)
+    actual = fused_ce.te_cross_entropy(logits, labels, tp_group)
     expected = F.cross_entropy(logits.reshape(-1, 17), labels.reshape(-1), reduction="none").reshape_as(labels)
     torch.testing.assert_close(actual, expected)
     upstream = torch.randn_like(actual)
