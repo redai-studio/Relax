@@ -12,8 +12,8 @@ from relax.utils.straggler.analysis.detector import DetectorConfig, DetectorStat
 from relax.utils.straggler.analysis.report import REPORTED_METRICS
 from relax.utils.straggler.analysis.trace import TIMELINE_PID_BASE
 from relax.utils.timer import Timer
-from tests.cpu.utils.straggler_helpers import meta as _meta
-from tests.cpu.utils.straggler_helpers import row as _row
+from tests.cpu.utils.straggler.helpers import meta as _meta
+from tests.cpu.utils.straggler.helpers import row as _row
 
 
 @pytest.fixture(autouse=True)

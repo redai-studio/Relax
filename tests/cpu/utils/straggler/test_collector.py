@@ -13,7 +13,7 @@ from relax.utils.straggler.core.health import HEALTH_DISABLE
 from relax.utils.straggler.core.modules import module_segment
 from relax.utils.straggler.core.stats import FIELD_INDEX, GPU_SEGMENTS, PP_PHASE_FIELDS, RECORD_WIDTH
 from relax.utils.straggler.megatron_adapter import GRAD_SYNC_TIMERS, MODULE_NAMES
-from tests.cpu.utils.straggler_helpers import FakeEvent, bracket, make_collector, meta, timers
+from tests.cpu.utils.straggler.helpers import FakeEvent, bracket, make_collector, meta, timers
 
 
 _ATTN_FWD = module_segment(MODULE_NAMES, "attn", False)

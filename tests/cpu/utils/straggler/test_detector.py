@@ -15,8 +15,8 @@ from relax.utils.straggler.analysis.detector import (
     analyze_window,
 )
 from relax.utils.straggler.core.stats import FIELD_INDEX, RankMeta
-from tests.cpu.utils.straggler_helpers import meta as _meta
-from tests.cpu.utils.straggler_helpers import row as _row
+from tests.cpu.utils.straggler.helpers import meta as _meta
+from tests.cpu.utils.straggler.helpers import row as _row
 
 
 def _healthy_row(steps=10, fwd=100.0, bwd=200.0, optim=20.0, tokens=8000.0, dp_grad_sync=5.0, **extra):

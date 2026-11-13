@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 
-_PACKAGE = Path(__file__).resolve().parents[3] / "relax" / "utils" / "straggler"
+_PACKAGE = Path(__file__).resolve().parents[4] / "relax" / "utils" / "straggler"
 _CORE = "relax.utils.straggler.core"
 _ANALYSIS = "relax.utils.straggler.analysis"
 # requests: the level poller's HTTP client, imported when a poller is created.

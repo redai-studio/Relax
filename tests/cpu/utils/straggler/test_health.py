@@ -15,7 +15,7 @@ from relax.utils.straggler.core.health import (
     ProfilerHealth,
 )
 from relax.utils.straggler.core.stats import FIELD_INDEX
-from tests.cpu.utils.straggler_helpers import bracket, make_collector
+from tests.cpu.utils.straggler.helpers import bracket, make_collector
 
 
 def test_health_goes_degraded_on_drops_and_back_to_active_on_a_clean_window():

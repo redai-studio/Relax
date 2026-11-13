@@ -6,7 +6,7 @@ import threading
 from relax.utils.straggler.analysis import report as report_module
 from relax.utils.straggler.core.health import HealthConfig
 from relax.utils.straggler.core.stats import FIELD_INDEX
-from tests.cpu.utils.straggler_helpers import bracket, make_collector
+from tests.cpu.utils.straggler.helpers import bracket, make_collector
 
 
 def _collector(**kwargs):

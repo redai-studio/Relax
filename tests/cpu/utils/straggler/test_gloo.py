@@ -26,7 +26,7 @@ def _rank_worker(rank, world_size, init_file, out_dir, failure):
     from relax.utils.straggler.analysis.report import WindowAnalyzer
     from relax.utils.straggler.core.collector import StragglerCollector
     from relax.utils.straggler.core.stats import RankMeta
-    from tests.cpu.utils.straggler_helpers import FakeEvent, bracket
+    from tests.cpu.utils.straggler.helpers import FakeEvent, bracket
 
     dist.init_process_group(
         "gloo",
@@ -80,7 +80,7 @@ def _trace_worker(rank, world_size, init_file, out_dir, failure):
     from relax.utils.straggler.analysis.report import WindowAnalyzer
     from relax.utils.straggler.core.collector import StragglerCollector
     from relax.utils.straggler.core.stats import RankMeta
-    from tests.cpu.utils.straggler_helpers import FakeEvent, bracket
+    from tests.cpu.utils.straggler.helpers import FakeEvent, bracket
 
     dist.init_process_group(
         "gloo",
