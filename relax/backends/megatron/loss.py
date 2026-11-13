@@ -555,10 +555,9 @@ def get_log_probs_and_entropy(
             log_prob = (
                 torch.cat(chunk_lps, dim=0)
                 if chunk_lps
-                # fp32 to match calculate_log_probs_and_entropy's return dtype;
-                # logits are upcast above. A mismatch would break the downstream
-                # torch.cat over per-sample log-probabilities.
-                else logits_chunk.new_zeros((0,), dtype=torch.float32)
+                # Keep empty shards connected for CP collective backward, in fp32
+                # to match the non-empty log-probabilities.
+                else logits_chunk.float().sum(dim=-1)
             )
             if selected_rows is not None:
                 log_prob = log_prob.new_zeros(full_rows).index_copy(0, selected_rows, log_prob)
