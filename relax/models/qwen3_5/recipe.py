@@ -11,12 +11,23 @@ ENTRY = "relax.models.qwen3_5.recipe.before_step"
 
 
 def enabled(args: Any) -> bool:
-    return wholepack_policy.enabled(args)
+    return getattr(args, "custom_megatron_before_train_step_hook_path", None) == ENTRY
 
 
 def _check_args(args: Any) -> None:
     assert enabled(args)
-    wholepack_policy.config_contract(args)
+    if wholepack_policy.enabled(args):
+        wholepack_policy.config_contract(args)
+    assert (args.pipeline_model_parallel_size, args.context_parallel_size, args.n_samples_per_prompt) == (1, 1, 1)
+    assert (args.expert_model_parallel_size, args.expert_tensor_parallel_size) == (8, 1)
+    assert args.qkv_format == "thd" and args.use_dynamic_batch_size
+    assert getattr(args, "virtual_pipeline_model_parallel_size", None) in (None, 1)
+    assert not getattr(args, "sft_async_prepack", False)
+    assert not getattr(args, "dynamic_context_parallel", False)
+    assert args.global_batch_size > 0
+    assert getattr(args, "rollout_batch_size", args.global_batch_size) == args.global_batch_size
+    padding = args.tensor_model_parallel_size * args.data_pad_size_multiplier
+    assert padding > 0 and args.max_tokens_per_gpu > 0 and args.max_tokens_per_gpu % padding == 0
     assert args.tensor_model_parallel_size == 4
     assert args.hidden_size == 2048 and args.num_experts == 256
     assert args.bf16 and args.use_distributed_optimizer and args.sequence_parallel

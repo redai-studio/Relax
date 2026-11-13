@@ -393,6 +393,8 @@ class Controller:
                     dp_size=dp_size,
                     capacity=capacity,
                     pad_size=pad_size,
+                    tp_size=self.config.tensor_model_parallel_size,
+                    global_batch_size=self.config.global_batch_size,
                 )
             else:
                 sampler = SeqlenBalancedSampler(

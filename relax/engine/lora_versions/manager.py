@@ -9,6 +9,8 @@ before an absence releases capacity, including on engines that never
 acknowledged a load. Engine-side compare-and-unload remains required.
 """
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -103,8 +105,22 @@ class _Version:
     targets: dict[str, str]
     state: VersionState = VersionState.LOADING
     verified: dict[str, Replica] = field(default_factory=dict)
+    revoked_engines: set[str] = field(default_factory=set)
     cleanup: dict[str, CleanupObservation] = field(default_factory=dict)
     session_count: int = 0
+
+
+@dataclass(frozen=True)
+class _CompletedVersion:
+    identity: VersionIdentity
+    attempt_id: int
+    state: VersionState
+    expected_default: int | None
+    retry_fingerprint_digest: bytes | None
+
+
+def _fingerprint_digest(fingerprints: tuple[tuple[str, int], ...]) -> bytes:
+    return hashlib.sha256(json.dumps(fingerprints, separators=(",", ":")).encode("utf-8")).digest()
 
 
 @dataclass
@@ -132,7 +148,8 @@ class LoRAVersionManager:
             raise ValueError("max_versions must be at least two")
         self._engines = dict(engines)
         self._max_versions = max_versions
-        self._versions: dict[int, _Version] = {}
+        self._versions: dict[int, _Version | _CompletedVersion] = {}
+        self._active_versions: dict[int, _Version] = {}
         self._shards: dict[str, _Shard] = {}
         self._default: int | None = None
         self._next_attempt = 0
@@ -147,13 +164,13 @@ class LoRAVersionManager:
 
     @property
     def occupied_versions(self) -> int:
-        return sum(v.state not in (VersionState.ABORTED, VersionState.RECLAIMED) for v in self._versions.values())
+        return len(self._active_versions)
 
     @property
     def serving_engines(self) -> tuple[str, ...]:
         """Only engines holding all currently bindable or bound versions
         serve."""
-        live = [v for v in self._versions.values() if v.state in (VersionState.PUBLISHED, VersionState.RETIRED)]
+        live = [v for v in self._active_versions.values() if v.state in (VersionState.PUBLISHED, VersionState.RETIRED)]
         if not live:
             return ()
         return tuple(
@@ -163,8 +180,14 @@ class LoRAVersionManager:
         )
 
     def publication(self, version_id: int) -> Publication:
-        """Return detached immutable metadata, safe to pass to a caller."""
+        """Return detached immutable metadata, safe to pass to a caller.
+
+        ABORTED/RECLAIMED records retain identity and attempt metadata only;
+        their replica details are empty after confirmed cleanup.
+        """
         v = self._versions[version_id]
+        if isinstance(v, _CompletedVersion):
+            return Publication(v.identity, v.attempt_id, v.state, v.expected_default, (), (), 0, ())
         return Publication(
             v.identity,
             v.attempt_id,
@@ -185,7 +208,7 @@ class LoRAVersionManager:
                 raise PublicationError("VERSION_CONFLICT", f"{existing.identity.digest} != {identity.digest}")
             if existing.state is not VersionState.ABORTED:
                 return Reservation(self.publication(identity.version_id), should_load=False)
-            if tuple(sorted(fingerprints.items())) != existing.fingerprints:
+            if _fingerprint_digest(tuple(sorted(fingerprints.items()))) != existing.retry_fingerprint_digest:
                 raise PublicationError("REPLICA_INVALID", "retry fingerprints must match the original snapshot")
         if self._default is not None and identity.version_id <= self._default:
             raise PublicationError("VERSION_SUPERSEDED", "a retry cannot replace a newer published version")
@@ -193,16 +216,18 @@ class LoRAVersionManager:
             raise ValueError("expected transport fingerprints are required")
         if self.occupied_versions >= self._max_versions:
             raise PublicationError("CAPACITY_EXHAUSTED", "live, loading and unconfirmed replicas occupy capacity")
-        if any(v.state is VersionState.LOADING for v in self._versions.values()):
+        if any(v.state is VersionState.LOADING for v in self._active_versions.values()):
             raise PublicationError("PUBLICATION_IN_PROGRESS", "only one publication may load at a time")
         self._next_attempt += 1
-        self._versions[identity.version_id] = _Version(
+        version = _Version(
             identity,
             tuple(sorted(fingerprints.items())),
             self._next_attempt,
             self._default,
             dict(self._engines),
         )
+        self._versions[identity.version_id] = version
+        self._active_versions[identity.version_id] = version
         return Reservation(self.publication(identity.version_id), should_load=True)
 
     def record_verified(
@@ -218,21 +243,25 @@ class LoRAVersionManager:
 
         Also accepts recovery of a published/retired version after engine
         replacement. Old attempts/instances are ignored, never resurrected.
+        Invalid or conflicting receipts revoke this instance until replacement.
         """
         v = self._versions[version_id]
         if (
             v.attempt_id != attempt_id
             or v.state not in (VersionState.LOADING, VersionState.PUBLISHED, VersionState.RETIRED)
             or v.targets.get(replica.engine_id) != replica.instance_id
+            or replica.engine_id in v.revoked_engines
         ):
             return False
         previous = v.verified.get(replica.engine_id)
         if not replica.lora_id or not pinned or tuple(sorted(fingerprints.items())) != v.fingerprints:
             v.verified.pop(replica.engine_id, None)
+            v.revoked_engines.add(replica.engine_id)
             self.cancel(version_id, attempt_id)
             raise PublicationError("REPLICA_INVALID", "probe receipt must identify pinned, matching adapter contents")
         if previous is not None and previous != replica:
             v.verified.pop(replica.engine_id, None)
+            v.revoked_engines.add(replica.engine_id)
             self.cancel(version_id, attempt_id)
             raise PublicationError("LORA_ID_MISMATCH", "one attempt cannot overwrite its verified replica")
         v.verified[replica.engine_id] = replica
@@ -309,8 +338,15 @@ class LoRAVersionManager:
             engine in v.cleanup and v.cleanup[engine].lora_id is None and v.cleanup[engine].attempt_fenced
             for engine in v.targets
         ):
-            v.state = VersionState.ABORTED if v.state is VersionState.ABORTING else VersionState.RECLAIMED
-            v.verified.clear()
+            aborted = v.state is VersionState.ABORTING
+            self._versions[version_id] = _CompletedVersion(
+                v.identity,
+                v.attempt_id,
+                VersionState.ABORTED if aborted else VersionState.RECLAIMED,
+                v.expected_default,
+                _fingerprint_digest(v.fingerprints) if aborted else None,
+            )
+            del self._active_versions[version_id]
         return True
 
     def unload_candidates(self, version_id: int) -> tuple[Replica, ...]:
@@ -340,11 +376,10 @@ class LoRAVersionManager:
         if self._engines[engine_id] != expected_instance or new_instance == expected_instance:
             return False
         self._engines[engine_id] = new_instance
-        for v in self._versions.values():
-            if v.state in (VersionState.ABORTED, VersionState.RECLAIMED):
-                continue
+        for v in self._active_versions.values():
             v.targets[engine_id] = new_instance
             v.verified.pop(engine_id, None)
+            v.revoked_engines.discard(engine_id)
             v.cleanup.pop(engine_id, None)
             if v.state is VersionState.LOADING:
                 v.state = VersionState.ABORTING

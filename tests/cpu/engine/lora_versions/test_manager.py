@@ -347,6 +347,93 @@ def test_conflicting_replica_receipt_revokes_serving_readiness(manager):
     assert manager.default_version == 0
 
 
+@pytest.mark.parametrize("retired", [False, True])
+@pytest.mark.parametrize("replay_conflict", [False, True])
+def test_conflict_replays_stay_revoked_until_engine_replacement(manager, retired, replay_conflict):
+    a = publish(manager, 0)
+    if retired:
+        manager.bind(SessionKey("s", "s0", 0))
+        publish(manager, 1)
+    conflict = replace(a.verified[0], lora_id="unexpected")
+    with pytest.raises(PublicationError, match="LORA_ID_MISMATCH"):
+        manager.record_verified(0, a.attempt_id, conflict, FINGERPRINTS, pinned=True)
+    replay = conflict if replay_conflict else a.verified[0]
+    for _ in range(2):
+        assert not manager.record_verified(0, a.attempt_id, replay, FINGERPRINTS, pinned=True)
+        assert manager.serving_engines == ("e1",)
+    assert not manager.replace_engine("e0", "stale-boot", "boot2")
+    assert not manager.record_verified(0, a.attempt_id, replay, FINGERPRINTS, pinned=True)
+    assert manager.replace_engine("e0", "boot0", "boot2")
+    assert not manager.record_verified(0, a.attempt_id, replay, FINGERPRINTS, pinned=True)
+    for version_id in range(2 if retired else 1):
+        publication = manager.publication(version_id)
+        verify(manager, publication, "e0")
+    assert manager.serving_engines == ("e0", "e1")
+
+
+@pytest.mark.parametrize("invalid", ["fingerprint", "pinned", "lora_id"])
+def test_invalid_receipt_cannot_be_cleared_by_a_valid_replay(manager, invalid):
+    a = publish(manager, 0)
+    replica = a.verified[0]
+    with pytest.raises(PublicationError, match="REPLICA_INVALID"):
+        manager.record_verified(
+            0,
+            a.attempt_id,
+            replace(replica, lora_id="") if invalid == "lora_id" else replica,
+            {"a": 999} if invalid == "fingerprint" else FINGERPRINTS,
+            pinned=invalid != "pinned",
+        )
+    assert not manager.record_verified(0, a.attempt_id, replica, FINGERPRINTS, pinned=True)
+    assert manager.serving_engines == ("e1",)
+
+
+def test_completed_versions_are_compact_and_not_scanned_by_active_operations(manager):
+    previous = publish(manager, 0)
+    first = previous
+    for version_id in range(1, 21):
+        current = publish(manager, version_id)
+        for engine in ENGINES:
+            manager.observe_cleanup(version_id - 1, previous.attempt_id, cleanup_observation(previous, engine))
+        previous = current
+    completed = manager.publication(0)
+    assert completed.state is VersionState.RECLAIMED
+    assert completed.targets == completed.verified == completed.absent_engines == ()
+    # Previously returned snapshots remain detached from history compaction.
+    assert len(first.targets) == len(first.verified) == len(ENGINES)
+    assert len(manager._versions) == 21
+    for version_id in range(20):
+        record = manager._versions[version_id]
+        assert not any(hasattr(record, name) for name in ("fingerprints", "targets", "verified", "cleanup"))
+
+    class NoHistoryScan(dict):
+        def values(self):
+            raise AssertionError("active operations must not scan historical versions")
+
+    manager._versions = NoHistoryScan(manager._versions)
+    assert manager.occupied_versions == 1
+    assert manager.serving_engines == tuple(ENGINES)
+    assert manager.bind(SessionKey("s", "s0", 0)) == identity(20)
+    assert not manager.reserve(identity(0), FINGERPRINTS).should_load
+    assert manager.commit(0, first.attempt_id, None) == completed
+    with pytest.raises(PublicationError, match="VERSION_CONFLICT"):
+        manager.reserve(replace(identity(0), digest="f" * 64), FINGERPRINTS)
+    pending = manager.reserve(identity(21), FINGERPRINTS).publication
+    assert manager.occupied_versions == 2
+    assert manager.replace_engine("e0", "boot0", "boot2")
+    pending = manager.publication(21)
+    for engine in ENGINES:
+        manager.observe_cleanup(21, pending.attempt_id, cleanup_observation(pending, engine))
+    assert manager.publication(21).state is VersionState.ABORTED
+    assert manager.publication(21).targets == ()
+    assert len(manager._versions[21].retry_fingerprint_digest) == 32
+    with pytest.raises(PublicationError, match="REPLICA_INVALID"):
+        manager.reserve(identity(21), {"a": 999})
+    retry = manager.reserve(identity(21), dict(reversed(tuple(FINGERPRINTS.items()))))
+    assert retry.should_load
+    assert retry.publication.attempt_id != pending.attempt_id
+    assert manager.occupied_versions == 2
+
+
 def test_release_before_bind_and_watermark_prevent_resurrection(manager):
     publish(manager, 0)
     key = SessionKey("s", "s0", 4)
