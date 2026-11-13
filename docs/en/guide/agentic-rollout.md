@@ -749,7 +749,11 @@ Audit-enabled publishers use a unique lifetime prefix in backend labels to preve
 restart collisions. Custom Slime router middleware disables this tracking and
 keeps original labels, because middleware may require numeric versions. Missing
 coordinator access also yields unknown evidence; receiver rejections never count
-as successful publications. The default Ray separate-loop Serve router is
+as successful publications. Certification additionally requires every PP
+source rank to report the same receiver set: when per-stage pruning diverges
+(for example PP0={A,B} but PP1={B}), a partially installed engine could
+inherit the label, so the publication stays unknown instead. The default Ray
+separate-loop Serve router is
 supported; a current-loop router can leave coordinator discovery unavailable.
 Empty collections and conflicting consumption
 fragments cannot produce a complete audit.

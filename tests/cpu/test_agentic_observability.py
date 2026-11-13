@@ -1299,9 +1299,9 @@ def test_weight_audit_gspo_icepop_partial_rejection_stays_unknown(tmp_path, fake
     assert sample["effective_loss_mask_status"] == "sequence_ratio_unresolved"
 
 
-def test_weight_audit_gspo_icepop_full_acceptance_stays_exact(tmp_path, fake_mpu, monkeypatch):
-    """When no in-mask token is filtered, sequence-ratio membership remains
-    exact: every masked log-prob enters the sequence ratio."""
+def test_weight_audit_gspo_ungated_stays_exact(tmp_path, fake_mpu, monkeypatch):
+    """Without per-token gating, a sequence-ratio objective keeps exact
+    membership: every masked log-prob enters the ratio and the outer term."""
     fake_mpu()
     from relax.backends.megatron import loss as loss_module
     from relax.utils.agentic_obs import train_hooks
@@ -1326,15 +1326,12 @@ def test_weight_audit_gspo_icepop_full_acceptance_stays_exact(tmp_path, fake_mpu
         use_rollout_logprobs=False,
         use_opsm=False,
         get_mismatch_metrics=False,
-        use_tis=True,
-        custom_tis_function_path="relax.backends.megatron.loss.icepop_function",
+        use_tis=False,
         custom_pg_loss_reducer_function_path=None,
         eps_clip=0.2,
         eps_clip_high=0.2,
         entropy_coef=0,
         use_kl_loss=False,
-        tis_clip_low=0.5,
-        tis_clip=1.5,
         qkv_format="thd",
         calculate_per_token_loss=False,
     )
@@ -1342,7 +1339,6 @@ def test_weight_audit_gspo_icepop_full_acceptance_stays_exact(tmp_path, fake_mpu
         [7],
         advantages=torch.ones(4),
         log_probs=[log_probs.detach()],
-        # train/rollout ratio of 1 on every token: ICEPOP accepts all.
         rollout_log_probs=[log_probs.detach()],
         unconcat_tokens=[torch.arange(6)],
         dynamic_cp_size=1,

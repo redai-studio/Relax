@@ -142,8 +142,27 @@ def commit_publication(owner: Any) -> None:
     group = get_gloo_group()
     rejected = torch.tensor([int(getattr(owner, "_weight_audit_rejected", False))], dtype=torch.int32)
     dist.all_reduce(rejected, op=dist.ReduceOp.MAX, group=group)
+
+    # Each PP source rank maintains its own receiver set and prunes failed
+    # engines independently, so the sets can diverge (e.g. PP0={A,B}, PP1={B})
+    # without any explicit rejection. A partially installed engine would then
+    # inherit the new label from a healthy PP stage alone, certifying weights
+    # it never fully received. Require all reporting sets to be identical;
+    # when they cannot be confirmed equal, leave the evidence unknown.
+    receiver_keys = getattr(owner, "rollout_engines", None)
+    keys = sorted(receiver_keys) if isinstance(receiver_keys, dict) else []
+    gathered: list[Any] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(gathered, keys, group=group)
+    receiver_sets = {tuple(reported) for reported in gathered if reported}
+    consistent = len(receiver_sets) <= 1
+
     value = [None]
-    if dist.get_rank(group) == 0 and not rejected.item() and not getattr(owner, "_weight_audit_failed", False):
+    if (
+        dist.get_rank(group) == 0
+        and not rejected.item()
+        and consistent
+        and not getattr(owner, "_weight_audit_failed", False)
+    ):
         try:
             value[0] = ray.get(
                 owner._weight_audit_coordinator.commit_weight_publication.remote(*owner._weight_audit_attempt),

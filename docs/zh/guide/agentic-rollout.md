@@ -717,7 +717,10 @@ fully-async DCS 的完整/合并权重更新；adapter-only LoRA 和未接入的
 确认的年龄。启用审计时，backend 标签包含发布者生命周期的唯一前缀，避免重启后
 版本号重复。自定义 Slime router middleware 可能要求数值版本，因此该组合关闭发布
 追踪并保留原标签。无法访问 coordinator 时证据为未知；推理端拒绝加载不会计入成功
-发布。支持默认的 Ray separate-loop Serve router；current-loop 配置可能导致
+发布。认证还要求每个 PP 源 rank 报告相同的接收集合：当各 stage 的剔除
+发生分歧（例如 PP0={A,B} 而 PP1={B}）时，只安装了部分权重的引擎可能
+继承新版本标签，此时发布保持未知。支持默认的 Ray separate-loop Serve
+router；current-loop 配置可能导致
 coordinator 发现不可用。空的日志集合和冲突的消费记录不会产生完整审计。
 
 下面的 CPU 示例先由发布版本 1 生成 4 个 token，在工具等待期间经历版本 2、3，再由

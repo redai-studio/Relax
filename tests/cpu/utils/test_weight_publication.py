@@ -67,6 +67,45 @@ def test_publication_rejection_on_peer_and_restart_with_lost_begin(tmp_path):
     mp.spawn(_publication_worker, args=((tmp_path / "gloo").as_uri(),), nprocs=2, join=True)
 
 
+def _divergent_receiver_worker(rank, rendezvous):
+    """Two PP source ranks report different receiver sets (PP0={A,B}, PP1={B});
+
+    the intersection {B} is non-empty yet engine A only installed PP0's stage,
+    so committing a shared new label would certify a partial install.
+    """
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
+    ledger = PublicationLedger()
+    coordinator = SimpleNamespace(
+        begin_weight_publication=SimpleNamespace(remote=ledger.begin),
+        commit_weight_publication=SimpleNamespace(remote=ledger.commit),
+    )
+    try:
+        with (
+            patch("relax.utils.distributed_utils.get_gloo_group", return_value=dist.group.WORLD),
+            patch("ray.get", side_effect=lambda result, **kwargs: result),
+            patch.object(publication, "_resolve_coordinator", return_value=coordinator),
+        ):
+            # Rank 0 kept receivers {0, 1}; rank 1 pruned receiver 0 after its
+            # proxy died (the SGLang engine behind it stays healthy).
+            engines = {0: object(), 1: object()} if rank == 0 else {1: object()}
+            owner = SimpleNamespace(args=_args(), weight_version=1, rollout_engines=engines)
+            publication.begin_publication(owner)
+            publication.commit_publication(owner)
+            assert publication.consumption_snapshot(owner.args) is None
+            # With identical receiver sets the same flow certifies normally.
+            owner = SimpleNamespace(args=_args(), weight_version=2, rollout_engines={0: object(), 1: object()})
+            publication.begin_publication(owner)
+            publication.commit_publication(owner)
+            assert publication.consumption_snapshot(owner.args)["ordinal"] == 1
+    finally:
+        dist.destroy_process_group()
+
+
+def test_publication_rejects_divergent_pp_receiver_sets(tmp_path):
+    # A rank-zero-only mock cannot exercise a cross-PP receiver-set mismatch.
+    mp.spawn(_divergent_receiver_worker, args=((tmp_path / "gloo").as_uri(),), nprocs=2, join=True)
+
+
 def test_coordinator_lookup_is_bounded_even_when_handle_discovery_blocks(monkeypatch):
     from ray import serve
 

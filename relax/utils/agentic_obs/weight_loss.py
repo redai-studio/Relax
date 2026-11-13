@@ -65,11 +65,14 @@ def observe_policy_tokens(
     auxiliary = bool(getattr(args, "entropy_coef", 0)) or (
         getattr(args, "use_kl_loss", False) and bool(getattr(args, "kl_loss_coef", 0))
     )
-    if sequence_level_ratio and not auxiliary and bool((base & ~policy).any()):
+    if sequence_level_ratio and not auxiliary and (tis_weights is not None or policy_gate is not None):
         # Sequence-level objectives (e.g. GSPO) build a differentiable sequence
         # ratio from every log-prob inside `loss_masks` before per-token gating
         # (TIS/OPSM) zeroes outer terms. Rejected tokens still contribute through
-        # the ratio, so a per-position membership mask cannot be exact.
+        # the ratio, so a per-position membership mask cannot be exact. Whether
+        # any token was actually filtered lives on the training device; reading
+        # it here would synchronize the loss hot path, so the combination is
+        # conservatively reported unknown whenever a gate could reject.
         capture_effective_loss_mask(batch, None, status="sequence_ratio_unresolved")
         return
     effective = policy | reducer if auxiliary else policy
