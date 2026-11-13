@@ -25,6 +25,13 @@ from sglang.srt.utils import kill_process_tree
 
 
 try:
+    from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+except ImportError:
+    # Older SGLang releases rely on the wire value instead of the constant.
+    GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+
+
+try:
     from sglang.srt.server_args import LOAD_FORMAT_CHOICES as _SGLANG_LOAD_FORMAT_CHOICES
 except ImportError:
     # Older SGLang releases do not expose the supported load formats. Keep
@@ -1434,10 +1441,11 @@ class SGLangEngine(RayActor):
             "resume_memory_occupation",
             {"tags": tags},
         )
-        # Re-open the admission closed by release_memory_occupation. Only after
-        # a full resume: a weights-only resume must not re-enable generation
-        # before the KV cache is back.
-        if self.node_rank == 0 and not tags:
+        # Re-open the admission closed by release_memory_occupation once the
+        # KV cache is back. That is the final staged resume (``onload_kv``) as
+        # well as a full resume; a weights-only resume must keep it closed.
+        reopens_admission = not tags or GPU_MEMORY_TYPE_KV_CACHE in tags
+        if self.node_rank == 0 and reopens_admission:
             self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
         return result
 

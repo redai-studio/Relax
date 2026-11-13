@@ -194,3 +194,14 @@ def test_partial_resume_does_not_reopen_admission(patched, engine_cls, m):
     _make_engine(m, engine_cls).resume_memory_occupation(tags=["weights"])
 
     assert "continue_generation" not in fake_requests.calls
+
+
+def test_kv_stage_resume_reopens_admission(patched, engine_cls, m):
+    # The rollout manager restores weights and KV in separate staged calls. The
+    # KV stage is the end of the offload window, so admission must re-open even
+    # though `tags` is not None (a LoRA-unchanged step may skip the weight stage).
+    fake_requests, _ = patched()
+    _make_engine(m, engine_cls).resume_memory_occupation(tags=[m.GPU_MEMORY_TYPE_KV_CACHE, "cuda_graph"])
+
+    assert "continue_generation" in fake_requests.calls
+    assert fake_requests.calls.index("resume_memory_occupation") < fake_requests.calls.index("continue_generation")
