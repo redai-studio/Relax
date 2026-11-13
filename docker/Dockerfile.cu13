@@ -270,6 +270,7 @@ ENV RELAX_FLA_CONV_NB_MODE=auto
 RUN --mount=type=bind,source=docker/patch/fla/0.5.2-kda-backward-precision.patch,target=/tmp/fla-patches/0.5.2-kda-backward-precision.patch \
     --mount=type=bind,source=docker/patch/fla/0.5.2-qwen38-output-config.patch,target=/tmp/fla-patches/0.5.2-qwen38-output-config.patch \
     --mount=type=bind,source=docker/patch/fla/0.5.2-conv-static-entries.patch,target=/tmp/fla-patches/0.5.2-conv-static-entries.patch \
+    --mount=type=bind,source=docker/patch/fla/0.5.2-tilelang-gdn-gate-grad.patch,target=/tmp/fla-patches/0.5.2-tilelang-gdn-gate-grad.patch \
     sed -i '/^nvidia-resiliency-ext==/d' "$PIP_CONSTRAINT" && \
     printf '%s\n' 'nvidia-resiliency-ext==0.6.0' 'grpcio-tools==1.81.1' >> "$PIP_CONSTRAINT" && \
     pip install --no-cache-dir \
@@ -286,6 +287,7 @@ RUN --mount=type=bind,source=docker/patch/fla/0.5.2-kda-backward-precision.patch
     patch --batch --forward -p1 < /tmp/fla-patches/0.5.2-kda-backward-precision.patch && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/fla-patches/0.5.2-qwen38-output-config.patch && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/fla-patches/0.5.2-conv-static-entries.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-patches/0.5.2-tilelang-gdn-gate-grad.patch && \
     python -m compileall -q fla/modules/conv/triton
 
 # Install runtime system packages together and discard the package lists/deb.
