@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU-only absolute Qwen3 dense work estimates using Relax's training convention.
+"""CPU-only absolute Qwen3 dense work estimates using Relax's training
+convention.
 
 Mathematical model work, not executed kernel FLOPs, memory capacity or latency.
 Covers the official Qwen3 dense family: ``model_type="qwen3"``, tied or untied
@@ -20,7 +21,7 @@ from numbers import Integral
 from types import SimpleNamespace
 from typing import Any
 
-from relax.utils.training.flops_estimator import SampleMeta, RelaxFlopsEstimator
+from relax.utils.training.flops_estimator import RelaxFlopsEstimator, SampleMeta
 
 
 _MISSING = object()
@@ -110,9 +111,7 @@ def _snapshot_qwen3_config(config: Any) -> SimpleNamespace:
             or len(layer_types) != values["num_hidden_layers"]
             or any(value != "full_attention" for value in layer_types)
         ):
-            raise ValueError(
-                f"Qwen3 dense contract requires uniform full_attention layers, got {layer_types!r}"
-            )
+            raise ValueError(f"Qwen3 dense contract requires uniform full_attention layers, got {layer_types!r}")
     return SimpleNamespace(model_type=model_type, **values)
 
 
@@ -167,7 +166,9 @@ class RelaxQwen3DenseEstimator(RelaxFlopsEstimator):
         dense_N = mlp_N + attn_proj_N + emd_and_lm_head_N
         dense_N_flops = 6 * dense_N * sum(lengths)
         seqlen_square_sum = sum(value * value for value in lengths)
-        attn_qkv_flops = 6 * seqlen_square_sum * config.head_dim * config.num_attention_heads * config.num_hidden_layers
+        attn_qkv_flops = (
+            6 * seqlen_square_sum * config.head_dim * config.num_attention_heads * config.num_hidden_layers
+        )
         total = dense_N_flops + attn_qkv_flops
         if not math.isfinite(total) or total < 0:
             raise ValueError(f"Non-finite or negative FLOPs estimate: {total!r}")
