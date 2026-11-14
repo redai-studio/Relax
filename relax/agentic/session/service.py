@@ -12,9 +12,11 @@ import json
 import time
 from argparse import Namespace
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import partial
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple, cast
 from uuid import uuid4
@@ -105,6 +107,10 @@ _AGENTIC_SHARD_ALLOCATOR_ENV = {
 _AGENTIC_SHARD_MAX_CONCURRENCY = 4096
 _SESSION_CLOSE_TIMEOUT_S = 2.0
 _ADMISSION_SHUTDOWN_TIMEOUT_S = 5.0
+# Sample assembly runs off the Shard event loop on this many threads. The work
+# is GIL-bound Python plus tokenizer decode, so extra threads would mostly
+# contend with the event loop for the GIL instead of exporting faster.
+_SESSION_EXPORT_WORKERS = 1
 
 # Identity sentinels encode the complete result-cell state machine without a
 # parallel status field. They must remain unique objects and must never cross a
@@ -1356,6 +1362,7 @@ class GroupOwnership(Enum):
 
 
 _SessionResultPayload = SessionExportTransport | RuntimeGroupError | None
+_PreparedSessionExports = tuple[tuple[str, dict[str, Any]], ...]
 
 
 @dataclass(eq=False)
@@ -1467,6 +1474,7 @@ class _SessionRecord:
     resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
+    export_task: Optional["asyncio.Task[_PreparedSessionExports]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
     observation: SessionObservation | None = None
@@ -1513,6 +1521,12 @@ class AgenticSessionShard:
         self._lifecycle_close_count = 0
         self._lifecycle_close_failure_count = 0
         self._generation_backend = SGLangBackendAdapter(args)
+        self._export_executor = ThreadPoolExecutor(
+            max_workers=_SESSION_EXPORT_WORKERS,
+            thread_name_prefix="agentic-session-export",
+        )
+        self._export_slots = asyncio.Semaphore(_SESSION_EXPORT_WORKERS)
+        self._inflight_exports: set[asyncio.Task[_PreparedSessionExports]] = set()
         self._agent_launcher = ManagedAgentLauncher(
             load_agent_app_spec_from_args(args),
             resolve_chat_api_base_url(),
@@ -1542,7 +1556,7 @@ class AgenticSessionShard:
             return
         timestamp = time.time()
         for session in group.sessions:
-            if session.forest is not None:
+            if session.phase is SessionPhase.ACTIVE and session.forest is not None:
                 events = agentic_trace_events(session.forest.static_metadata)
                 mark_agentic_event_once(events, event, timestamp)
 
@@ -1993,7 +2007,8 @@ class AgenticSessionShard:
         async with session.lock:
             forest = session.forest
             state_hash = session.resp_state_hash_by_request_id.get(request_id)
-            if forest is None or state_hash is None:
+            # A finalizing Forest is frozen: its export job reads it off-loop.
+            if session.phase is not SessionPhase.ACTIVE or forest is None or state_hash is None:
                 return False
             response_node = forest.nodes_by_hash.get(state_hash)
             if response_node is None:
@@ -2061,6 +2076,7 @@ class AgenticSessionShard:
             "live_process_count": sum(group["live_process_count"] for group in groups),
             "interrupted_group_ids": tuple(group["group_id"] for group in groups if group["interrupted"]),
             "permit_cleanup_task_count": len(self._permit_cleanup_tasks),
+            "pending_export_count": len(self._inflight_exports),
         }
 
     async def agentic_kv_metrics(self, reset: bool = False) -> dict[str, float]:
@@ -2115,6 +2131,10 @@ class AgenticSessionShard:
         for outcome in permit_cleanup_outcomes:
             if first_error is None and isinstance(outcome, BaseException):
                 first_error = outcome
+        # A Session retired by an infra failure mid-export is no longer in its
+        # group, so wait for every tracked job before joining the worker.
+        await asyncio.gather(*tuple(self._inflight_exports), return_exceptions=True)
+        self._export_executor.shutdown(wait=True, cancel_futures=True)
         # Drain queued trajectories before the backend goes away: shards run with
         # max_restarts=0, so anything still in the writer queue is lost for good.
         try:
@@ -3040,58 +3060,101 @@ class AgenticSessionShard:
         )
 
     async def _finalize_terminal_session(self, session: _SessionRecord) -> None:
-        """Build the compact export, release Session resources, then
+        """Freeze the Session, build its export off the event loop, then
         publish."""
 
         finalize_arrive_at = time.time()
         outcome: _SessionResultPayload
         failure = None
-        async with session.lock:
-            finalize_lock_acquired_at = time.time()
-            if session.phase is not SessionPhase.ACTIVE:
-                return
-            session.phase = SessionPhase.FINALIZING
-            try:
+        export: asyncio.Task[_PreparedSessionExports] | None = None
+        try:
+            async with session.lock:
+                finalize_lock_acquired_at = time.time()
+                if session.phase is not SessionPhase.ACTIVE:
+                    return
+                # FINALIZING excludes Forest writes while the worker reads it.
+                session.phase = SessionPhase.FINALIZING
                 output = cast(SessionResources, session.resources).process.output
-                finalize_events = {
-                    "finalize_arrive_at": finalize_arrive_at,
-                    "finalize_lock_acquired_at": finalize_lock_acquired_at,
-                    "finalize_start_at": time.time(),
-                }
-                outcome = self._build_session_export_transport(
-                    session=session,
+                prepare = partial(
+                    self._prepare_session_exports,
+                    forest=cast(SessionForest, session.forest),
+                    rollout_mode=session.group.rollout_mode,
                     reward=output.reward,
                     metadata=output.metadata,
                     output_records=output.records,
-                    finalize_events=finalize_events,
+                    finalize_events={
+                        "finalize_arrive_at": finalize_arrive_at,
+                        "finalize_lock_acquired_at": finalize_lock_acquired_at,
+                    },
                 )
-            except AgentExecutionError as error:
-                logger.error(
-                    "Dropping non-finalizable agentic session session_id=%s group_id=%s error_type=%s\n%s",
-                    session.session_id,
-                    session.group.group_id,
-                    type(error).__name__,
-                    error,
+                export = asyncio.create_task(
+                    self._run_session_export(session, prepare), name=f"session-export:{session.session_id}"
                 )
-                outcome = None
-                failure = ("export_validation_failed", "execution", str(error))
-            except Exception as error:
-                outcome = RuntimeGroupError(
-                    f"agent export failed for {session.session_id}: {type(error).__name__}: {error}"
+                session.export_task = export
+                self._inflight_exports.add(export)
+                export.add_done_callback(self._inflight_exports.discard)
+            prepared = await asyncio.shield(export)
+            if session.finish_task is not None:
+                # Cleanup owns this Session now; do not record a late export.
+                return
+            outcome = self._build_session_export_transport(session=session, prepared=prepared)
+        except asyncio.CancelledError:
+            if export is not None and export.cancelled() and session.finish_task is not None:
+                return
+            if export is not None:
+                export.cancel()
+                await finish_before_cancellation(
+                    asyncio.gather(export, return_exceptions=True), f"drain-export:{session.session_id}"
                 )
-                failure = ("export_failed", "infra", str(outcome))
+            raise
+        except AgentExecutionError as error:
+            logger.error(
+                "Dropping non-finalizable agentic session session_id=%s group_id=%s error_type=%s\n%s",
+                session.session_id,
+                session.group.group_id,
+                type(error).__name__,
+                error,
+            )
+            outcome = None
+            failure = ("export_validation_failed", "execution", str(error))
+        except Exception as error:
+            outcome = RuntimeGroupError(
+                f"agent export failed for {session.session_id}: {type(error).__name__}: {error}"
+            )
+            failure = ("export_failed", "infra", str(outcome))
+        finally:
+            if export is not None:
+                session.export_task = None
         await self._finish_session(session, outcome, failure=failure)
 
-    def _build_session_export_transport(
+    async def _run_session_export(
+        self, session: _SessionRecord, prepare: Callable[[], _PreparedSessionExports]
+    ) -> _PreparedSessionExports:
+        # Wait outside the pool: cancelling a queued executor Future does not
+        # release its arguments until the worker dequeues it.
+        async with self._export_slots:
+            if session.finish_task is not None:
+                raise asyncio.CancelledError
+            work = asyncio.get_running_loop().run_in_executor(self._export_executor, prepare)
+            return await finish_before_cancellation(work, f"export-worker:{session.session_id}")
+
+    def _prepare_session_exports(
         self,
         *,
-        session: _SessionRecord,
+        forest: SessionForest,
+        rollout_mode: str,
         reward: Any,
         metadata: dict[str, Any],
         output_records: tuple[dict[str, Any], ...],
         finalize_events: dict[str, float],
-    ) -> SessionExportTransport:
-        forest = cast(SessionForest, session.forest)
+    ) -> _PreparedSessionExports:
+        """Build and validate compact payloads on the Shard's export worker.
+
+        Reads the frozen Forest and agent output. Only this job may merge
+        metadata into the implicit export's leaf node.
+        """
+
+        finalize_events["finalize_start_at"] = time.time()
         prepared: list[tuple[str, dict[str, Any]]] = []
         if output_records:
             for output_record in output_records:
@@ -3117,8 +3180,6 @@ class AgenticSessionShard:
                     mutate_node=False,
                     finalize_events=finalize_events,
                 )
-                sample.sample_export_id = self._trajectory_recorder.next_sample_export_id()
-                sample.agentic_group_id = session.group.group_id
                 prepared.append((state_hash, self._export_payload(name=output_record["name"], sample=sample)))
         else:
             state_hash = self._implicit_export_state_hash(forest)
@@ -3130,15 +3191,12 @@ class AgenticSessionShard:
                 mutate_node=True,
                 finalize_events=finalize_events,
             )
-            sample.sample_export_id = self._trajectory_recorder.next_sample_export_id()
-            sample.agentic_group_id = session.group.group_id
             prepared.append((state_hash, self._export_payload(name=None, sample=sample)))
         # Retain only compact payloads; full Samples contain long training arrays.
         del sample
-        export_payloads = [payload for _, payload in prepared]
-        if session.group.rollout_mode == "train" and self.args.use_rollout_routing_replay:
+        if rollout_mode == "train" and self.args.use_rollout_routing_replay:
             # NOTE(wulumeng): An observation leaf has no routed experts (None). Samples should never end there, so this safeguard should never trigger.
-            for export_payload in export_payloads:
+            for _, export_payload in prepared:
                 sample_payload = export_payload["sample_payload"]
                 expected_shape = (len(sample_payload["tokens"]) - 1, self.args.num_layers, self.args.moe_router_topk)
                 routed_experts = sample_payload["rollout_routed_experts"]
@@ -3147,23 +3205,33 @@ class AgenticSessionShard:
                     raise _NonFinalizableExportError(
                         f"R3 export routed-experts shape {actual_shape} does not match expected {expected_shape}"
                     )
-        # Publish trajectories only after every export has passed validation.
-        for state_hash, export_payload in prepared:
+        return tuple(prepared)
+
+    def _build_session_export_transport(
+        self, *, session: _SessionRecord, prepared: _PreparedSessionExports
+    ) -> SessionExportTransport:
+        """Assign export IDs and record validated trajectories on the Shard
+        loop."""
+
+        forest = cast(SessionForest, session.forest)
+        group = session.group
+        export_ids = [self._trajectory_recorder.next_sample_export_id() for _ in prepared]
+        for (state_hash, export_payload), export_id in zip(prepared, export_ids, strict=True):
             sample_payload = export_payload["sample_payload"]
+            sample_payload["sample_export_id"] = export_id
+            sample_payload["agentic_group_id"] = group.group_id
             self._trajectory_recorder.record(
                 forest=forest,
                 state_hash=state_hash,
-                sample_export_id=sample_payload["sample_export_id"],
+                sample_export_id=export_id,
                 metadata=sample_payload["metadata"],
                 export_name=export_payload["name"],
-                group_id=session.group.group_id,
-                rollout_mode=session.group.rollout_mode,
+                group_id=group.group_id,
+                rollout_mode=group.rollout_mode,
             )
         if session.observation is not None:
-            session.observation.export_ids = [
-                payload["sample_payload"]["sample_export_id"] for payload in export_payloads
-            ]
-        return SessionExportTransport(exports=tuple(export_payloads))
+            session.observation.export_ids = export_ids
+        return SessionExportTransport(exports=tuple(payload for _, payload in prepared))
 
     def _build_sample(
         self,
@@ -3207,7 +3275,7 @@ class AgenticSessionShard:
         mark_sample_agentic_event(sample, "sample_export_ready_at")
         return {
             "name": name,
-            "sample_payload": TrainingFieldArtifact.from_sample(sample).sample_payload,
+            "sample_payload": TrainingFieldArtifact.from_sample(sample, take_ownership=True).sample_payload,
         }
 
     async def _finish_session(
@@ -3241,6 +3309,8 @@ class AgenticSessionShard:
         record."""
 
         group = session.group
+        if session.export_task is not None:
+            session.export_task.cancel()
         pre_backend_tasks: list[asyncio.Task[None]] = []
         backend_tasks: list[asyncio.Task[None]] = []
         backend_request_ids: list[str] = []

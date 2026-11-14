@@ -381,7 +381,27 @@ def _decode_tokens(
 ) -> str:
     if not token_ids:
         return ""
-    return tokenizer.decode(token_ids, skip_special_tokens=False)
+    decode = tokenizer.decode
+    try:
+        from tokenizers import Tokenizer
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+        from transformers.tokenization_utils_tokenizers import TokenizersBackend
+    except ImportError:
+        return decode(token_ids, skip_special_tokens=False)
+
+    # Only bypass the HF wrapper when it would call exactly this Rust decoder
+    # with no Python post-processing. Custom decoders keep their public API.
+    if (
+        isinstance(tokenizer, TokenizersBackend)
+        and getattr(decode, "__func__", None) is PreTrainedTokenizerBase.decode
+        and getattr(tokenizer._decode, "__func__", None) is TokenizersBackend._decode
+        and tokenizer.clean_up_tokenization_spaces is False
+        and type(backend := tokenizer._tokenizer) is Tokenizer
+    ):
+        # The native batch entry point releases the GIL even for one sequence,
+        # and respects the tokenizer library's existing parallelism setting.
+        return backend.decode_batch([token_ids], skip_special_tokens=False)[0]
+    return decode(token_ids, skip_special_tokens=False)
 
 
 def _multimodal_inputs_from_messages(messages: list[dict[str, Any]]) -> dict[str, Any] | None:

@@ -105,15 +105,20 @@ class TrainingFieldArtifact:
     sample_payload: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_sample(cls, sample: Sample) -> "TrainingFieldArtifact":
-        return cls(sample_payload=_compact_sample_payload(sample.to_dict()))
+    def from_sample(cls, sample: Sample, *, take_ownership: bool = False) -> "TrainingFieldArtifact":
+        """Snapshot a Sample, or take ownership of a newly built export.
+
+        With take_ownership, unconverted fields are shared; the caller must not
+        retain or mutate those fields.
+        """
+        return cls(sample_payload=_compact_sample_payload(sample.to_dict(), take_ownership=take_ownership))
 
     def to_sample(self) -> Sample:
         return Sample.from_dict(_expand_sample_payload(self.sample_payload))
 
 
-def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    compacted = copy.deepcopy(payload)
+def _compact_sample_payload(payload: dict[str, Any], *, take_ownership: bool) -> dict[str, Any]:
+    compacted = payload if take_ownership else copy.deepcopy(payload)
 
     tokens = compacted.get("tokens")
     rollout_tokens = compacted.get("rollout_tokens")

@@ -907,9 +907,10 @@ def test_shard_export_preserves_rollout_identity(tmp_path, rollout_module, rollo
     )
 
     async def scenario():
-        transport = shard._build_session_export_transport(
-            session=session, reward=1.0, metadata={}, output_records=(), finalize_events={}
+        prepared = shard._prepare_session_exports(
+            forest=forest, rollout_mode=rollout_mode, reward=1.0, metadata={}, output_records=(), finalize_events={}
         )
+        transport = shard._build_session_export_transport(session=session, prepared=prepared)
         await shard._trajectory_recorder.aclose()
         return transport
 
@@ -1329,7 +1330,9 @@ def test_multiple_exports_publish_only_after_all_payloads_succeed(
     shard._generation_backend = SimpleNamespace(
         tokenizer=_FakeTokenizer(), compiler=SimpleNamespace(apply_chat_template_kwargs={})
     )
-    session = SimpleNamespace(forest=forest, group=SimpleNamespace(group_id="g", rollout_mode="train"))
+    session = SimpleNamespace(
+        forest=forest, group=SimpleNamespace(group_id="g", rollout_mode="train"), observation=None
+    )
     hashes = iter([leaf_hash, "missing" if failure_phase == "validation" else leaf_hash])
     monkeypatch.setattr(service, "_messages_tools_template_state_hash", lambda *a: next(hashes))
     original_payload = shard._export_payload
@@ -1351,13 +1354,15 @@ def test_multiple_exports_publish_only_after_all_payloads_succeed(
 
     async def scenario():
         with pytest.raises((RuntimeError, service._NonFinalizableExportError)):
-            shard._build_session_export_transport(
-                session=session,
+            prepared = shard._prepare_session_exports(
+                forest=forest,
+                rollout_mode="train",
                 reward=1.0,
                 metadata={},
                 finalize_events={},
                 output_records=tuple({"name": name, "metadata": {}, "messages": []} for name in ("one", "two")),
             )
+            shard._build_session_export_transport(session=session, prepared=prepared)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -2112,13 +2117,15 @@ def test_all_six_streams_join_from_prompt_to_committed_update(tmp_path, rollout_
         forest.session_id = session.session_id
         session.forest = forest
         inventory.record_group("g", [Sample(prompt="hi", group_index=2, index=5)], ["s"])
-        transport = shard._build_session_export_transport(
-            session=session,
+        prepared = shard._prepare_session_exports(
+            forest=forest,
+            rollout_mode=session.group.rollout_mode,
             reward={"score": 0.8, "judge": 0.9},
             metadata={},
             output_records=(),
             finalize_events={},
         )
+        transport = shard._build_session_export_transport(session=session, prepared=prepared)
         await shard._finish_session(session, transport)
         sample = TrainingFieldArtifact(sample_payload=transport.exports[0]["sample_payload"]).to_sample()
         group = GroupExport("g", (SessionExport(exports=(SampleExport(name=None, sample=sample),)),))
