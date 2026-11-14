@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Regression tests for the GenRM colocate offload drain state machine.
+"""Regression tests for the colocate offload drain state machine.
 
 These cover the two failure modes that motivated the drain rewrite:
 
@@ -11,22 +11,20 @@ These cover the two failure modes that motivated the drain rewrite:
   a wall-clock deadline; a wedged scheduler must surface as ``TimeoutError``
   rather than blocking rank-0 (and every rank at the downstream barrier).
 
-The engine is exercised without a live SGLang server by constructing a bare
-instance and faking the module-level ``requests`` / ``time`` so the pure
+The barrier now lives on the base ``SGLangEngine`` so every offloaded rollout
+engine gets it, not only ``GenRMEngine`` (Relax #282). Both classes are
+exercised without a live SGLang server: the module is imported through the
+stubbed-SGLang fixture and ``requests`` / ``time`` are faked so the pure
 control flow is observable.
 """
 
 from __future__ import annotations
 
 import pytest
+import requests as real_requests
 
 
-pytest.importorskip("sglang.srt.server_args")
-
-try:
-    import relax.backends.sglang.sglang_engine as m
-except (ImportError, AssertionError) as _exc:
-    pytest.skip(f"relax.backends.sglang.sglang_engine unavailable: {_exc}", allow_module_level=True)
+pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
 
 
 class _FakeResp:
@@ -35,7 +33,7 @@ class _FakeResp:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise m.requests.exceptions.HTTPError(f"status {self.status_code}")
+            raise real_requests.exceptions.HTTPError(f"status {self.status_code}")
 
     def json(self):
         return {}
@@ -49,9 +47,7 @@ class _FakeRequests:
     """
 
     def __init__(self, flush_statuses=None, post_raises=None):
-        import requests as _real_requests
-
-        self.exceptions = _real_requests.exceptions
+        self.exceptions = real_requests.exceptions
         self.calls: list[str] = []
         # Queue of status codes to return from successive /flush_cache GETs;
         # the last value is repeated once exhausted.
@@ -94,16 +90,27 @@ class _FakeClock:
         self.t += seconds
 
 
-def _make_engine():
-    engine = m.GenRMEngine.__new__(m.GenRMEngine)
+@pytest.fixture
+def m(sglang_engine_module):
+    return sglang_engine_module
+
+
+def _make_engine(module, engine_cls):
+    engine = engine_cls.__new__(engine_cls)
     engine.node_rank = 0
     engine.server_host = "127.0.0.1"
     engine.server_port = 30000
     return engine
 
 
+@pytest.fixture(params=["sglang_engine", "genrm_engine"])
+def engine_cls(request, m):
+    """Run every scenario against the base engine and the GenRM subclass."""
+    return {"sglang_engine": m.SGLangEngine, "genrm_engine": m.GenRMEngine}[request.param]
+
+
 @pytest.fixture
-def patched(monkeypatch):
+def patched(monkeypatch, m):
     """Install fakes; return a helper that wires a scenario and returns
     state."""
 
@@ -112,79 +119,89 @@ def patched(monkeypatch):
         fake_clock = _FakeClock()
         monkeypatch.setattr(m, "requests", fake_requests)
         monkeypatch.setattr(m, "time", fake_clock)
-        monkeypatch.setattr(m, "_GENRM_OFFLOAD_DRAIN_TIMEOUT_S", drain_timeout)
+        monkeypatch.setattr(m, "_OFFLOAD_DRAIN_TIMEOUT_S", drain_timeout, raising=False)
         return fake_requests, fake_clock
 
     return _install
 
 
-def test_release_retries_flush_until_ready_then_releases(patched):
+def test_release_retries_flush_until_ready_then_releases(patched, engine_cls, m):
     # 400 (pending) twice, then 200 -> drain converges and release runs once.
     fake_requests, _ = patched(flush_statuses=[400, 400, 200])
-    _make_engine().release_memory_occupation()
+    _make_engine(m, engine_cls).release_memory_occupation()
 
     assert fake_requests.calls.count("flush_cache") == 3
     assert fake_requests.calls.count("release_memory_occupation") == 1
 
 
-def test_release_closes_admission_before_touching_engine(patched):
+def test_release_closes_admission_before_touching_engine(patched, engine_cls, m):
     # pause_generation (admission gate) must precede any flush and the release.
     fake_requests, _ = patched(flush_statuses=[200])
-    _make_engine().release_memory_occupation()
+    _make_engine(m, engine_cls).release_memory_occupation()
 
     assert "pause_generation" in fake_requests.calls
     assert fake_requests.calls.index("pause_generation") < fake_requests.calls.index("flush_cache")
     assert fake_requests.calls.index("pause_generation") < fake_requests.calls.index("release_memory_occupation")
 
 
-def test_release_raises_timeout_and_skips_release_when_never_idle(patched):
+def test_release_raises_timeout_and_skips_release_when_never_idle(patched, engine_cls, m):
     # flush never returns 200 -> bounded deadline surfaces as TimeoutError and
-    # release is NOT attempted (would crash the scheduler assert).
+    # release is NOT attempted (would crash the scheduler assert). Admission
+    # stays closed so the caller restarts instead of serving on a half-freed
+    # pool.
     fake_requests, _ = patched(flush_statuses=[400], drain_timeout=5.0)
     with pytest.raises(TimeoutError):
-        _make_engine().release_memory_occupation()
+        _make_engine(m, engine_cls).release_memory_occupation()
 
     assert "release_memory_occupation" not in fake_requests.calls
+    assert "continue_generation" not in fake_requests.calls
 
 
-def test_release_tolerates_abort_failure(patched):
+def test_release_tolerates_abort_failure(patched, engine_cls, m):
     # A flaky /abort_request must not abort the offload; drain still completes.
-    import requests as _real_requests
-
     fake_requests, _ = patched(
         flush_statuses=[200],
-        post_raises={"abort_request": _real_requests.exceptions.ConnectionError("boom")},
+        post_raises={"abort_request": real_requests.exceptions.ConnectionError("boom")},
     )
-    _make_engine().release_memory_occupation()
+    _make_engine(m, engine_cls).release_memory_occupation()
 
     assert fake_requests.calls.count("release_memory_occupation") == 1
 
 
-def test_release_tolerates_pause_failure_and_still_drains(patched):
+def test_release_tolerates_pause_failure_and_still_drains(patched, engine_cls, m):
     # If pause does not take, per-retry abort still drains and release proceeds.
-    import requests as _real_requests
-
     fake_requests, _ = patched(
         flush_statuses=[200],
-        post_raises={"pause_generation": _real_requests.exceptions.ConnectionError("boom")},
+        post_raises={"pause_generation": real_requests.exceptions.ConnectionError("boom")},
     )
-    _make_engine().release_memory_occupation()
+    _make_engine(m, engine_cls).release_memory_occupation()
 
     assert "abort_request" in fake_requests.calls
     assert fake_requests.calls.count("release_memory_occupation") == 1
 
 
-def test_full_resume_reopens_admission(patched):
+def test_full_resume_reopens_admission(patched, engine_cls, m):
     fake_requests, _ = patched()
-    _make_engine().resume_memory_occupation(tags=None)
+    _make_engine(m, engine_cls).resume_memory_occupation(tags=None)
 
     assert "continue_generation" in fake_requests.calls
     assert fake_requests.calls.index("resume_memory_occupation") < fake_requests.calls.index("continue_generation")
 
 
-def test_partial_resume_does_not_reopen_admission(patched):
+def test_partial_resume_does_not_reopen_admission(patched, engine_cls, m):
     # A weights-only resume must not re-enable generation before KV cache is back.
     fake_requests, _ = patched()
-    _make_engine().resume_memory_occupation(tags=["weights"])
+    _make_engine(m, engine_cls).resume_memory_occupation(tags=["weights"])
 
     assert "continue_generation" not in fake_requests.calls
+
+
+def test_kv_stage_resume_reopens_admission(patched, engine_cls, m):
+    # The rollout manager restores weights and KV in separate staged calls. The
+    # KV stage is the end of the offload window, so admission must re-open even
+    # though `tags` is not None (a LoRA-unchanged step may skip the weight stage).
+    fake_requests, _ = patched()
+    _make_engine(m, engine_cls).resume_memory_occupation(tags=[m.GPU_MEMORY_TYPE_KV_CACHE, "cuda_graph"])
+
+    assert "continue_generation" in fake_requests.calls
+    assert fake_requests.calls.index("resume_memory_occupation") < fake_requests.calls.index("continue_generation")
