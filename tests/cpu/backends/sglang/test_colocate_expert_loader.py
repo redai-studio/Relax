@@ -420,6 +420,7 @@ def test_prepare_rpc_response_binds_actual_receiver_without_files(transfer, deli
     probe, control = delivery
     helper = object.__new__(ShardP2PSynchronizer)
     helper.rank, helper.geometry = 0, seed["geometry"]
+    helper.persistent_targets = False
     helper.source = MegatronShardP2PSource
     helper._phase = lambda operation: operation()
     helper.group, helper._actor_endpoints = "actor-group", []
