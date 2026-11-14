@@ -7,16 +7,17 @@ import pytest
 import torch
 
 from relax.backends.megatron.weight_conversion.qwen3_vl import convert_qwen3vl_to_hf
+from relax.backends.megatron.weight_conversion.qwen3_vl_moe import convert_qwen3vlmoe_to_hf
 
 
-@pytest.fixture
-def convert(monkeypatch):
+@pytest.fixture(params=[convert_qwen3vl_to_hf, convert_qwen3vlmoe_to_hf])
+def convert(request, monkeypatch):
     from relax.utils import misc
 
     monkeypatch.setattr(
         misc, "get_hf_config", lambda _: SimpleNamespace(vision_config=SimpleNamespace(num_heads=2, hidden_size=4))
     )
-    return lambda name, value: convert_qwen3vl_to_hf(
+    return lambda name, value: request.param(
         SimpleNamespace(hf_checkpoint="unused"), "module.module.vision_model." + name, value
     )
 

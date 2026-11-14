@@ -39,6 +39,7 @@ from relax.utils.env import Envs
 from relax.utils.fault_events.models import RecoveryEvidence
 from relax.utils.fault_events.recovery import GlobalStartup
 from relax.utils.health_system import HealthManager
+from relax.utils.http_utils import get_serve_http_port
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -70,7 +71,7 @@ from relax.utils.tq.lifecycle import (
     verify_cluster_attach,
 )
 from relax.utils.training.ppo_utils import validate_ppo_config
-from relax.utils.utils import compute_dp_size, recovery_load_path
+from relax.utils.utils import compute_dp_size, get_serve_url, recovery_load_path
 
 
 def create_data_source_actor(config: Namespace, data_source_cls: Any) -> Any:
@@ -1287,7 +1288,7 @@ class Controller:
 
             # Send to metrics service
             response = requests.post(
-                "http://localhost:8000/metrics/log_error",
+                get_serve_url("metrics/log_error"),
                 json={"error_message": error_message, "error_traceback": error_traceback},
                 timeout=5.0,
             )
@@ -1866,7 +1867,7 @@ class Controller:
         logger.info("[Global Restart] Ray re-initialized")
         try:
             serve.start(
-                http_options={"host": "0.0.0.0", "port": "8000"},
+                http_options={"host": "0.0.0.0", "port": get_serve_http_port()},
                 detached=True,
             )
         except RuntimeError:

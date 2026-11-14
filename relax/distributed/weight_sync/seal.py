@@ -1,8 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Verified, retained version sets for replay after the producer exits."""
 
+import threading
+
 from .codec import decode
 from .deadline import checkpoint
+from .parallel_io import ordered_map
 from .store import (
     DTYPES,
     VersionStore,
@@ -68,30 +71,56 @@ def seal_versions(store: VersionStore, stream: str, versions: list[int], name: s
         for version, manifest in sorted(manifests.items()):
             if manifest["schema_context"]["model_config"] is None:
                 raise ValueError("Sealing requires the published model configuration")
-            store._materialize(stream, version)
             previous = (
                 {tensor["name"]: tensor for tensor in manifests[manifest["base_version"]]["tensors"]}
                 if manifest["kind"] == "delta"
                 else {}
             )
-            for tensor in manifest["tensors"]:
-                for index, chunk in enumerate(tensor["chunks"]):
-                    checkpoint("offline seal verification")
-                    object_path = store.object_path(chunk["object"])
-                    if object_path.stat().st_size != chunk["encoded_size"]:
-                        raise ValueError("Sealed object size differs from its manifest")
-                    payload = object_path.read_bytes()
-                    if digest(payload) != chunk["object"]:
-                        raise ValueError("Sealed object content differs from its manifest")
-                    base = None
-                    if chunk["kind"] not in ("raw", "raw_zlib"):
-                        base = store.read_chunk(
-                            stream, manifest["base_version"], tensor["name"], previous[tensor["name"]]["chunks"][index]
-                        )
-                    value = decode(chunk["kind"], payload, base, DTYPES[tensor["dtype"]], chunk["size"])
-                    if digest(value) != chunk["output"]:
-                        raise ValueError("Sealed object does not reconstruct its recorded weight")
-                    objects[chunk["object"]] = chunk["encoded_size"]
+            repair_lock = threading.Lock()
+
+            def read_base(tensor, index):
+                chunk = previous[tensor["name"]]["chunks"][index]
+                try:
+                    return store.read_chunk(stream, manifest["base_version"], tensor["name"], chunk)
+                except (FileNotFoundError, ValueError):
+                    with repair_lock:
+                        try:
+                            return store.read_chunk(stream, manifest["base_version"], tensor["name"], chunk)
+                        except (FileNotFoundError, ValueError):
+                            store._materialize(stream, manifest["base_version"])
+                            return store.read_chunk(stream, manifest["base_version"], tensor["name"], chunk)
+
+            def verify(job):
+                tensor, index, chunk = job
+                checkpoint("offline seal verification")
+                object_path = store.object_path(chunk["object"])
+                if object_path.stat().st_size != chunk["encoded_size"]:
+                    raise ValueError("Sealed object size differs from its manifest")
+                payload = object_path.read_bytes()
+                if digest(payload) != chunk["object"]:
+                    raise ValueError("Sealed object content differs from its manifest")
+                base = None
+                if chunk["kind"] not in ("raw", "raw_zlib"):
+                    base = read_base(tensor, index)
+                value = decode(chunk["kind"], payload, base, DTYPES[tensor["dtype"]], chunk["size"])
+                # Raw decode returns the exact immutable payload just hashed.
+                # Other codecs must hash their reconstructed output separately.
+                output = chunk["object"] if chunk["kind"] == "raw" else digest(value)
+                if output != chunk["output"]:
+                    raise ValueError("Sealed object does not reconstruct its recorded weight")
+                return chunk["object"], chunk["encoded_size"]
+
+            jobs = (
+                (tensor, index, chunk)
+                for tensor in manifest["tensors"]
+                for index, chunk in enumerate(tensor["chunks"])
+            )
+            # Verify the delivery objects directly, without first reading the
+            # entire target cache. Every delta checks its base bytes as consumed
+            # and repairs missing/corrupt base caches before decoding. Drain one
+            # version before advancing to its dependents.
+            for key, size in ordered_map(verify, jobs, 8):
+                objects[key] = size
         record = {
             "format": 1,
             "name": name,

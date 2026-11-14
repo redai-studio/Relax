@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 import zlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Iterator
@@ -168,7 +168,7 @@ def ensure_directory(path: Path) -> None:
     sync_directory(path.parent)
 
 
-_deferred_directory_sync = ContextVar("weight_store_deferred_directory_sync", default=None)
+_deferred_directory_sync = ContextVar("weight_store_deferred_directory_sync", default=frozenset())
 _held_content_locks = ContextVar("weight_store_content_locks", default=frozenset())
 
 
@@ -186,7 +186,7 @@ def durable_directory_batch(directory: Path) -> Iterator[None]:
     operations outside this scope on their normal per-write durability path.
     """
     ensure_directory(directory)
-    token = _deferred_directory_sync.set(directory)
+    token = _deferred_directory_sync.set(_deferred_directory_sync.get() | {directory})
     try:
         yield
         sync_directory(directory)
@@ -206,7 +206,7 @@ def atomic_write(path: Path, data: bytes) -> None:
             out.flush()
             os.fsync(out.fileno())
         os.replace(temporary, path)
-        if _deferred_directory_sync.get() != path.parent:
+        if path.parent not in _deferred_directory_sync.get():
             sync_directory(path.parent)
     finally:
         Path(temporary).unlink(missing_ok=True)
@@ -893,9 +893,13 @@ class VersionStore:
         return value
 
     def iter_tensor(self, manifest: dict, tensor: dict):
-        for chunk in tensor["chunks"]:
+        def read(chunk):
             check_deadline("canonical read")
-            yield self.read_chunk(manifest["stream"], manifest["version"], tensor["name"], chunk)
+            return self.read_chunk(manifest["stream"], manifest["version"], tensor["name"], chunk)
+
+        # Hashing releases the GIL. Pipeline bounded verified blocks with the
+        # sequential checkpoint writer, retaining byte order and exceptions.
+        yield from ordered_map(read, tensor["chunks"], min(4, max(1, len(tensor["chunks"]))))
 
     def _materialize_blocks(self, stream: str, version: int) -> dict:
         chain = []
@@ -1135,7 +1139,9 @@ class VersionStore:
             self.refresh_budget()
             base = None
             if version and not full_only and version % anchor_interval:
-                base = self._materialize(stream, version - 1)
+                # Encoding reads and verifies every base chunk itself. Avoid a
+                # complete preliminary scan; reconstruct only if a read fails.
+                base = self.manifest(stream, version - 1, prefer_full=True)
                 context = {
                     "model_config_sha256": digest(canonical(model_config)) if model_config is not None else None,
                     "model_config": model_config,
@@ -1170,12 +1176,20 @@ class VersionStore:
                 m["source"] = load_json(canonical(source))
             total = 0
             previous_tensors = {t["name"]: t for t in base["tensors"]} if base else {}
-            jobs = []
+            jobs, source_status = [], {}
             for name, (dtype, shape, path) in sorted(tensors.items(), key=lambda item: item[0].encode("utf-8")):
                 size = math.prod(shape) * DTYPES[dtype]
                 total += size
-                if total > self.max_weight_bytes or Path(path).stat().st_size != size:
+                status = Path(path).stat()
+                if total > self.max_weight_bytes or status.st_size != size:
                     raise ValueError("Input size does not match schema or budget")
+                source_status[Path(path)] = (
+                    status.st_dev,
+                    status.st_ino,
+                    status.st_size,
+                    status.st_mtime_ns,
+                    status.st_ctime_ns,
+                )
                 tensor = {"name": name, "dtype": dtype, "shape": list(shape), "chunks": []}
                 previous_chunks = {c["offset"]: c for c in previous_tensors[name]["chunks"]} if base else {}
                 for offset in range(0, size, chunk_bytes):
@@ -1186,6 +1200,21 @@ class VersionStore:
                     jobs.append((tensor, path, offset, length, previous_chunk))
                 m["tensors"].append(tensor)
 
+            base_repair_lock = threading.Lock()
+
+            def read_base(name, chunk):
+                try:
+                    return self.read_chunk(stream, version - 1, name, chunk)
+                except (FileNotFoundError, ValueError):
+                    # Only the failing path repairs. Other readers may finish
+                    # from intact immutable blocks while this worker rebuilds.
+                    with base_repair_lock:
+                        try:
+                            return self.read_chunk(stream, version - 1, name, chunk)
+                        except (FileNotFoundError, ValueError):
+                            self._materialize(stream, version - 1)
+                            return self.read_chunk(stream, version - 1, name, chunk)
+
             def encode_chunk(job):
                 tensor, path, offset, length, previous_chunk = job
                 check_deadline("publication block read")
@@ -1194,10 +1223,16 @@ class VersionStore:
                     current = source.read(length)
                 if len(current) != length:
                     raise ValueError("Source changed while publication was pending")
-                prior = self.read_chunk(stream, version - 1, tensor["name"], previous_chunk) if base else None
+                prior = read_base(tensor["name"], previous_chunk) if base else None
                 kind, payload = encode(current, prior, DTYPES[tensor["dtype"]], compression=compression)
-                key = digest(payload)
+                output = digest(current)
+                key = output if kind == "raw" else digest(payload)
                 self.put_object(key, payload)
+                if self.canonical_blocks:
+                    # Retain the bytes already read for this immutable input.
+                    # Both stores still validate their payloads and sync files;
+                    # commit independently verifies the durable encoded bytes.
+                    self._put_raw_block(current, output)
                 return (
                     tensor,
                     {
@@ -1206,16 +1241,29 @@ class VersionStore:
                         "kind": kind,
                         "object": key,
                         "encoded_size": len(payload),
-                        "output": digest(current),
+                        "output": output,
                     },
                 )
 
             # Immutable objects may complete out of order. Per-content locks
             # deduplicate writes, budget reservations are serialized, and one
             # owner assembles the ordered manifest after all writes complete.
-            with durable_directory_batch(self.root / "objects"):
+            canonical_batch = (
+                durable_directory_batch(self.canonical_directory / "blocks")
+                if self.canonical_blocks
+                else nullcontext()
+            )
+            with durable_directory_batch(self.root / "objects"), canonical_batch:
                 for tensor, chunk in ordered_map(encode_chunk, jobs, encode_workers):
                     tensor["chunks"].append(chunk)
+            # Inputs belong to the caller until publication returns. Detect
+            # same-size rewrites and path replacement as well as truncation;
+            # ctime also catches writes that restore the original mtime.
+            for path, before in source_status.items():
+                status = path.stat()
+                after = (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+                if after != before:
+                    raise ValueError("Source changed while publication was pending")
             identify(m)
             validate_manifest(m, self.max_weight_bytes)
             if self.manifest_path(stream, version).exists():
@@ -1228,26 +1276,6 @@ class VersionStore:
             previous = {}
             if version and self.manifest_path(stream, version - 1).exists():
                 previous = {t["name"]: t for t in self.manifest(stream, version - 1)["tensors"]}
-            if self.canonical_blocks:
-
-                def persist_block(job):
-                    tensor, path, offset, length, _ = job
-                    with Path(path).open("rb") as source:
-                        source.seek(offset)
-                        value = source.read(length)
-                    chunk = tensor["chunks"][offset // chunk_bytes]
-                    if len(value) != length or digest(value) != chunk["output"]:
-                        raise ValueError("Source changed while publication was pending")
-                    self._put_raw_block(value, chunk["output"])
-
-                with durable_directory_batch(self.canonical_directory / "blocks"):
-                    for _ in ordered_map(persist_block, jobs, encode_workers):
-                        pass
-                if any(
-                    Path(path).stat().st_size != math.prod(shape) * DTYPES[dtype]
-                    for dtype, shape, path in tensors.values()
-                ):
-                    raise ValueError("Source grew while publication was pending")
             for tensor in m["tensors"]:
                 if self.canonical_blocks:
                     continue

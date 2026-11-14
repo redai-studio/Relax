@@ -9,6 +9,8 @@ import struct
 import sys
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 
 from .deadline import checkpoint as check_deadline
@@ -123,11 +125,16 @@ def snapshot_checkpoint(source: str | Path, destination: str | Path, *, max_weig
     return result
 
 
-def snapshot_tensors(tensors: object, directory: str | Path) -> dict:
+def snapshot_tensors(tensors: object, directory: str | Path, *, hashes: dict | None = None) -> dict:
     """Snapshot iterable (name, torch.Tensor) at a quiescent update boundary.
 
     Conversion may synchronize the device; this is an explicit checkpoint
     boundary, not the forward hot path. Caller must freeze optimizer mutation.
+
+    Optional hashes describe the same CPU byte views written to the snapshot;
+    they do not certify an independent disk readback. Publish/consumer storage
+    checks still verify actual files. The supplied mapping changes only after
+    every tensor has been written successfully; the returned table is unchanged.
     """
     import torch
 
@@ -148,17 +155,33 @@ def snapshot_tensors(tensors: object, directory: str | Path) -> dict:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     result = {}
-    for name, tensor in tensors:
-        if name in result or tensor.dtype not in names:
-            raise ValueError("Duplicate tensor or unsupported dtype")
-        path = directory / (digest(name.encode()) + ".bin")
-        # Conversion output is owned by this synchronous export until it returns.
-        # A second host clone would double the largest tensor's CPU footprint.
-        host = tensor.detach().contiguous().cpu()
-        with path.open("wb") as out:
-            host.reshape(-1).view(torch.uint8).numpy().tofile(out)
-        file_write(path, host.numel() * host.element_size())
-        result[name] = (names[tensor.dtype], list(tensor.shape), path)
+    written_hashes = {}
+    workers = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="weight-snapshot-hash")
+        if hashes is not None
+        else nullcontext(None)
+    )
+    with workers as pool:
+        for name, tensor in tensors:
+            if name in result or tensor.dtype not in names:
+                raise ValueError("Duplicate tensor or unsupported dtype")
+            path = directory / (digest(name.encode()) + ".bin")
+            # Conversion output is owned by this synchronous export until it returns.
+            # A second host clone would double the largest tensor's CPU footprint.
+            host = tensor.detach().contiguous().cpu()
+            value = memoryview(host.reshape(-1).view(torch.uint8).numpy()).toreadonly()
+            # One hashing worker overlaps this same view's write. Its result is
+            # drained before advancing to another tensor, bounding retained memory.
+            future = pool.submit(digest, value) if pool is not None else None
+            with path.open("wb") as out:
+                if out.write(value) != value.nbytes:
+                    raise OSError("Incomplete tensor snapshot write")
+            if future is not None:
+                written_hashes[name] = future.result()
+            file_write(path, host.numel() * host.element_size())
+            result[name] = (names[tensor.dtype], list(tensor.shape), path)
+    if hashes is not None:
+        hashes.update(written_hashes)
     return result
 
 
@@ -182,7 +205,10 @@ def write_checkpoint(
     store.pin(stream, version, owner)
     staging = None
     try:
-        m = store.materialize(stream, version)
+        # iter_tensor verifies each chunk while it is copied. A preliminary
+        # materialize would read and hash the complete cached model a second
+        # time. Missing/corrupt caches are repaired on the first failed read.
+        m = store.manifest(stream, version, prefer_full=True)
         config = load_json(Path(config_source).read_bytes()) if config_source else m["schema_context"]["model_config"]
         if m.get("schema_context", {}).get("model_config_sha256") != digest(canonical(config)):
             raise ValueError("Checkpoint config differs from published model schema")
@@ -204,9 +230,34 @@ def write_checkpoint(
             out.write(struct.pack("<Q", len(encoded)))
             out.write(encoded)
             for tensor in m["tensors"]:
-                for block in store.iter_tensor(m, tensor):
-                    check_deadline("checkpoint construction")
-                    out.write(block)
+                start = out.tell()
+                repaired = False
+                blocks = iter(store.iter_tensor(m, tensor))
+                try:
+                    while True:
+                        check_deadline("checkpoint construction")
+                        try:
+                            block = next(blocks)
+                        except StopIteration:
+                            break
+                        except (FileNotFoundError, ValueError):
+                            if repaired:
+                                raise
+                            store.materialize(stream, version)
+                            # A tensor may have yielded a prefix before failure.
+                            # Rewrite that tensor from the now verified cache.
+                            out.seek(start)
+                            out.truncate()
+                            blocks = iter(store.iter_tensor(m, tensor))
+                            repaired = True
+                            continue
+                        out.write(block)
+                finally:
+                    # On writer/deadline failure, drain prefetched reads before
+                    # releasing the durable pin in the outer cleanup.
+                    close = getattr(blocks, "close", None)
+                    if close is not None:
+                        close()
             out.flush()
             os.fsync(out.fileno())
         (staging / "config.json").write_bytes(canonical(config))

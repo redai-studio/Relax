@@ -52,8 +52,9 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     [(False, True), (True, True), (False, False)],
     ids=["plain-launch", "patched-launch", "parent-exited"],
 )
+@pytest.mark.parametrize("weight_plugin", [False, True])
 def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
-    monkeypatch, sglang_engine_module, routing_replay, parent_alive
+    monkeypatch, sglang_engine_module, routing_replay, parent_alive, weight_plugin
 ):
     module = sglang_engine_module
     events = []
@@ -74,10 +75,17 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     monkeypatch.setattr(module.os, "getppid", getppid)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
     server_args = SimpleNamespace()
+    plugin = ModuleType("relax.distributed.weight_sync.sglang_http")
+    plugin.install_http_extension = lambda: events.append("weight_plugin")
+    monkeypatch.setitem(sys.modules, "relax.distributed.weight_sync.sglang_http", plugin)
+    if weight_plugin:
+        monkeypatch.setenv("RELAX_WEIGHT_VERSION_PLUGIN", "1")
+    else:
+        monkeypatch.delenv("RELAX_WEIGHT_VERSION_PLUGIN", raising=False)
     module._launch_server_with_patches(server_args, 123)
 
     if parent_alive:
-        assert events == ["guard", "parent_check", "launch"]
+        assert events == ["guard", "parent_check"] + (["weight_plugin"] if weight_plugin else []) + ["launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
         http_server.launch_server.assert_called_once_with(server_args, **kwargs)
     else:
@@ -554,3 +562,92 @@ def _check_native_transport_validation(monkeypatch, actual, expected):
     else:
         validate_transport(cfg)
         assert cfg.mm_feature_transport == (expected or native_default)
+
+
+@pytest.mark.parametrize("versioned", [False, True])
+def test_startup_readiness_with_closed_installation_gate(monkeypatch, sglang_engine_module, versioned):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from relax.distributed.weight_sync.admission import AdmissionGate, AdmissionMiddleware, InstallationFence
+
+    app, calls = FastAPI(), []
+
+    @app.get("/health")
+    async def health():
+        calls.append("health")
+        return {}
+
+    @app.get("/health_generate")
+    async def health_generate():
+        calls.append("health_generate")
+        return {}
+
+    @app.get("/flush_cache")
+    async def flush():
+        calls.append("flush_cache")
+        return {}
+
+    if versioned:
+        import asyncio
+
+        monkeypatch.setenv("RELAX_WEIGHT_VERSION_PLUGIN", "1")
+        fence = InstallationFence()
+        app.add_middleware(AdmissionMiddleware, gate=AdmissionGate(), fence=fence, control=asyncio.Lock())
+    else:
+        monkeypatch.delenv("RELAX_WEIGHT_VERSION_PLUGIN", raising=False)
+    monkeypatch.setattr(sglang_engine_module.requests, "Session", lambda: TestClient(app))
+    # This checks endpoint selection and admission, including TestClient startup.
+    sglang_engine_module._wait_server_healthy("http://testserver", None, lambda: True, timeout=5)
+    assert calls == (["health"] if versioned else ["health_generate", "flush_cache"])
+    if versioned:
+        with TestClient(app) as client:
+            assert client.get("/flush_cache").status_code == 200
+            fence.claim({"epoch": 0, "installation_id": "startup", "root": "target", "workers": {"0": "worker"}})
+            assert client.get("/flush_cache").status_code == 409
+            assert client.get("/health_generate").status_code == 503
+
+
+def test_offload_flush_uses_current_installation_identity(monkeypatch, sglang_engine_module):
+    import asyncio
+
+    import requests
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from relax.distributed.weight_sync.admission import AdmissionGate, AdmissionMiddleware, InstallationFence
+
+    app, calls = FastAPI(), []
+    identity = {"epoch": 2, "installation_id": "install-2", "root": "target-2", "workers": {"0": "worker-0"}}
+    fence = InstallationFence()
+    fence.claim(identity)
+    app.add_middleware(AdmissionMiddleware, gate=AdmissionGate(), fence=fence, control=asyncio.Lock())
+
+    @app.get("/flush_cache")
+    async def flush():
+        calls.append("flush")
+        return {}
+
+    client = TestClient(app)
+
+    def get(url, **options):
+        result = client.get(url, **options)
+        response = requests.Response()
+        response.status_code, response._content = result.status_code, result.content
+        return response
+
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
+    engine.node_rank = 0
+    engine.server_host, engine.server_port = "testserver", 80
+    engine._weight_consumer_enabled = True
+    group = SimpleNamespace(installation_identity=identity)
+    monkeypatch.setattr(
+        engine, "_get_version_consumer", lambda: SimpleNamespace(session=SimpleNamespace(engines=group))
+    )
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    engine.flush_cache(timeout_s=0.1)
+    assert calls == ["flush"]
+    group.installation_identity = {**identity, "epoch": 1}
+    with pytest.raises(requests.HTTPError, match="409"):
+        engine.flush_cache(timeout_s=0.1)
+    assert calls == ["flush"]

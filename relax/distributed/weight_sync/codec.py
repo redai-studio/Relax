@@ -42,6 +42,8 @@ def _encode_replacement(current: bytes, base: bytes | None, width: int, limit: i
     for start in range(0, len(values), 65536):
         changed = current_bits[start : start + 65536] != previous_bits[start : start + 65536]
         count = np.count_nonzero(changed)
+        if not count:
+            continue
         sparse_size = len(sparse) + count * record_dtype.itemsize
         sparse_cost = _stored_size("sparse", sparse_size)
         if sparse_cost > budget or sparse_cost == raw_cost:

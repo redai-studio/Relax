@@ -978,12 +978,15 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         if is_pp_src_rank:
             master_address = ray._private.services.get_node_ip_address()
-            with socket.socket() as sock:
+            with socket.socket() as sock, socket.socket() as ref_sock:
                 sock.bind(("", 0))
+                ref_sock.bind(("", 0))
                 master_port = sock.getsockname()[1]
+                reference_master_port = ref_sock.getsockname()[1]
         else:
             master_address = None
             master_port = None
+            reference_master_port = None
         metadata = {
             "tp_size": mpu.get_tensor_model_parallel_world_size(),
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
@@ -994,6 +997,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "is_pp_src_rank": is_pp_src_rank,
             "master_address": master_address,
             "master_port": master_port,
+            "reference_master_port": reference_master_port,
         }
         from relax.utils.quant_cast import augment_compressed_tensors_ignore
 
@@ -2804,7 +2808,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # gaps it owes) before we swap weights. Without this gate the rollout
         # can race ahead while train_hybrid is still mid-consume on a
         # partially-filled partition, deadlocking against the staleness bound.
-        self._wait_for_previous_eval()
+        self._wait_for_previous_eval(before_publication=True)
         rollout_only, actor_fwd_only = self._check_services_health()
 
         # DCS shares the full-async lock and recovered-engine publication path.
@@ -2911,7 +2915,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
             # Wait for prior eval before pausing rollout for weight sync.
-            self._wait_for_previous_eval()
+            self._wait_for_previous_eval(before_publication=True)
 
             rollout_only, actor_fwd_only = self._check_services_health()
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
@@ -3075,6 +3079,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def update_weights(self) -> None:
+        if getattr(self.args, "weight_version_config", None):
+            return self.publish_weight_version()
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
         self._flush_resident_sft_parameters()
@@ -3228,9 +3234,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if dist.get_rank(process_group) == 0:
             # Check rollout service
             try:
-                rollout_serve_url = get_serve_url("rollout")
+                independent_publication = bool(getattr(self.args, "weight_version_config", None))
+                rollout_serve_url = None if independent_publication else get_serve_url("rollout")
                 retry_deadline = None
-                while True:
+                while not independent_publication:
                     request_timeout = self.args.rollout_http_timeout
                     if retry_deadline is not None:
                         request_timeout = retry_deadline - time.monotonic()
@@ -3296,15 +3303,21 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return rollout_only, actor_fwd_only
 
-    def _wait_for_previous_eval(self, max_wait_seconds: int = 1800) -> None:
+    def _wait_for_previous_eval(self, max_wait_seconds: int = 1800, *, before_publication: bool = False) -> None:
         """Block until the rollout service's previous evaluation has finished.
 
         Only rank 0 polls the rollout HTTP endpoint; all ranks synchronise via
         a barrier afterwards so they proceed together.
         Args:
             max_wait_seconds: Maximum time (in seconds) to wait for eval
-                completion before giving up and proceeding. Defaults to 300.
+                completion before giving up and proceeding. Defaults to 1800.
+            before_publication: Allow versioned publication to proceed while
+                evaluation uses the installed inference weights.
         """
+        if before_publication and getattr(self.args, "weight_version_config", None):
+            # Consumers install between batches; source publication does not
+            # wait for inference. Final shutdown still waits for evaluation.
+            return
         if dist.get_rank() == 0:
             try:
                 rollout_serve_url = get_serve_url("rollout")
@@ -3335,6 +3348,26 @@ class MegatronTrainRayActor(TrainRayActor):
         This sends weights to both rollout and actor_fwd nodes using pipelined
         design.
         """
+        if getattr(self.args, "weight_version_config", None):
+            published = self.publish_weight_version()
+            ref_interval = getattr(self.args, "ref_update_interval", None)
+            reference_enabled = (
+                "reference" in (getattr(self.args, "resource", None) or {})
+                or getattr(self.args, "use_kl_loss", False)
+                or getattr(self.args, "kl_coef", 0) != 0
+            )
+            update_reference = reference_enabled and ref_interval is not None and (rollout_id + 1) % ref_interval == 0
+            if getattr(self.args, "hybrid", False) or (
+                (rollout_only or getattr(self.args, "true_on_policy_mode", False)) and not update_reference
+            ):
+                # Initial synchronization can arrive before the health check
+                # sets rollout_only. These modes have no actor_fwd recipient.
+                return published
+            # Training-side forward/reference models keep their existing path.
+            # Rollout consumers discover the independently committed version.
+            rollout_only = False
+            actor_fwd_only = True
+
         if rollout_only and actor_fwd_only:
             logger.warning("Both rollout_only and actor_fwd_only are True, skipping async weight update.")
             return
@@ -3371,6 +3404,47 @@ class MegatronTrainRayActor(TrainRayActor):
         finally:
             if weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())
+
+    def _backup_published_actor(self) -> None:
+        if getattr(self.args, "keep_old_actor", False):
+            if self.args.update_weights_interval == 1:
+                logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
+                self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
+                self.weights_backuper.backup("rollout_actor")
+            else:
+                self.weights_backuper.backup("old_actor")
+
+    def publish_weight_version(self, update_id: str | None = None) -> dict:
+        """Publish at a quiescent training boundary without rollout handles."""
+        from dataclasses import asdict
+
+        from .weight_update.version_integration import create_version_publisher
+
+        if self.args.offload_train:
+            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+        try:
+            with self._train_state_offloader.disable_during_update():
+                # Bridge setup also allocates temporary device tensors while
+                # the training pool may be paused by the offloader.
+                if not hasattr(self, "_version_publisher"):
+                    self._version_publisher = create_version_publisher(self, get_gloo_group())
+                from relax.distributed.weight_sync.provenance import source_progress
+
+                published = self._version_publisher.publish(update_id, progress=source_progress(self.args))
+                self._backup_published_actor()
+            return asdict(published)
+        finally:
+            if self.args.offload_train:
+                destroy_process_groups()
+
+    def finalize_weight_publication(self) -> dict | None:
+        """Finalize the final candidate before destroying training groups."""
+        from dataclasses import asdict
+
+        publisher = getattr(self, "_version_publisher", None)
+        if publisher is None or publisher.pending is None:
+            return None
+        return asdict(publisher.finalize_pending(publisher.pending))
 
     @timer
     def recv_weight_fully_async(self, rollout_id) -> None:
