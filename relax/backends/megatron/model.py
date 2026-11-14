@@ -1397,8 +1397,7 @@ def train_one_step(
         if Envs.ENABLE_ROUTING_REPLAY:
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
-        # set in the SFT branch below; left as None for return_schedule_plan or
-        # the non-SFT path so the original loss_function is used.
+        # Set when the head is deferred below; otherwise use the ordinary loss.
         lm_head_forward = None
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
@@ -1472,10 +1471,12 @@ def train_one_step(
                     inner = inner.module
                 inner.pg_collection.cp = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
 
-            # SFT chunking defers the main lm_head into the loss. MTP-only
+            # SFT chunking and response-only policy loss defer lm_head into the loss. MTP-only
             # bypasses that main head entirely while preserving the preceding
             # MTP head calls that build the auxiliary-loss autograd graph.
-            if should_bypass_main_output_layer(args):
+            if should_bypass_main_output_layer(args) or (
+                getattr(args, "response_only_lm_head", False) and args.loss_type == "policy_loss"
+            ):
                 # The chunked-MTP patch runs the MTP heads via the class-level
                 # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
                 # calls. This gate MUST match _chunked_mtp_enabled() in that patch.
@@ -1520,8 +1521,8 @@ def train_one_step(
         output_tensor = _unwrap_single_sequence_cp_output(output_tensor, batch)
 
         # Always dispatch via loss_function. MTP-only consumes the bypassed
-        # hidden states directly; chunked SFT uses lm_head_forward to compute
-        # the regular language loss in bounded chunks.
+        # hidden states directly; SFT/policy loss use lm_head_forward after
+        # selecting the response positions.
         loss_callback = partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
 
         def loss_callback_with_packing_metrics(
