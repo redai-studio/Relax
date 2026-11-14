@@ -25,6 +25,7 @@ from relax.agentic.stage_recorder import StageRecorder
 from relax.utils.agentic_obs import AsyncJsonlAppender, merge_train_updates, writers
 from relax.utils.agentic_obs import train_hooks as hooks
 from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID, ExportStageRecord, encode_group_ids
+from tests.cpu.agentic_obs_args import make_agentic_obs_args
 
 
 @pytest.fixture(autouse=True)
@@ -178,12 +179,7 @@ def test_group_reward_observation_preserves_results_and_cancellation(args, cance
 
 @pytest.fixture
 def args(tmp_path):
-    return Namespace(
-        dump_agentic_obs=str(tmp_path),
-        agentic_obs_run_id="run",
-        agentic_obs_train_generation_id="generation",
-        reward_key=None,
-    )
+    return make_agentic_obs_args(tmp_path, run_id="run")
 
 
 @pytest.mark.parametrize("fleet_rebuild", [False, True])
@@ -931,3 +927,32 @@ def test_unused_appender_does_not_create_status(tmp_path):
     appender = AsyncJsonlAppender(path)
     appender.close()
     assert not path.exists() and not path.with_suffix(".status.json").exists()
+
+
+def test_session_sampling_config_preserves_falsy_explicit_values() -> None:
+    """None is dropped, but explicit False / 0 / empty-list must survive.
+
+    Regression guard: the filter in session_sampling_config is `value is not
+    None`; a future change to a truthiness check would silently drop False and
+    empty-list overrides, changing sampling semantics.
+    """
+    from relax.agentic.inventory import session_sampling_config
+
+    args = Namespace(
+        rollout_temperature=0.0,
+        rollout_top_p=1.0,
+        rollout_top_k=0,  # explicit greedy top-1, not a missing value
+        rollout_max_response_len=None,  # unset -> must be dropped
+        rollout_stop=[],  # explicit empty list -> must be kept
+        rollout_stop_token_ids=[],
+        rollout_skip_special_tokens=False,  # explicit False -> must be kept
+        sglang_enable_deterministic_inference=False,
+    )
+    cfg = session_sampling_config(args, None, position=0)
+
+    assert cfg["temperature"] == 0.0  # explicit float 0 kept
+    assert cfg["top_k"] == 0
+    assert cfg["skip_special_tokens"] is False
+    assert cfg["stop"] == []
+    assert cfg["stop_token_ids"] == []
+    assert "max_new_tokens" not in cfg
