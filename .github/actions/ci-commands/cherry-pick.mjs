@@ -40,7 +40,12 @@ export async function requestCherryPick({ github, repo, pr, author, branch, toke
     return `Label \`${label}\` is already present; no new cherry-pick event was requested.`
   }
   try {
-    await github.rest.issues.getLabel({ ...repo, name: label })
+    const { data: configuredLabel } = await github.rest.issues.getLabel({ ...repo, name: label })
+    if (configuredLabel.name !== label) {
+      throw new Error(
+        `Configure the repository label \`${label}\` with exactly this capitalization.`
+      )
+    }
   } catch (error) {
     if (error.status !== 404) throw error
     throw new Error(`Configure the repository label \`${label}\` before requesting a cherry-pick.`)
