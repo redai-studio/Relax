@@ -592,7 +592,7 @@ class EngineGroup:
                 try:
                     ray.get(engine.shutdown.remote(), timeout=10)
                 except Exception as e:
-                    logger.warning(f"Failed to shutdown engine {i}: {e}")
+                    raise RuntimeError(f"Engine {i} resource release is unconfirmed") from e
                 try:
                     ray.get(engine.unregister_dcs.remote(), timeout=10)
                 except Exception as e:
@@ -1080,9 +1080,6 @@ class RolloutManager(ReloadableMixin):
         (scheduler, detokenizer, etc.) are properly terminated when training
         completes, instead of being orphaned.
         """
-        if not self.servers:
-            return
-
         all_engines = []
         for srv in self.servers.values():
             for group in srv.engine_groups:
@@ -1090,6 +1087,7 @@ class RolloutManager(ReloadableMixin):
                     if engine is not None:
                         all_engines.append(engine)
 
+        all_engines.extend(getattr(self, "_unconfirmed_rollback_engines", []))
         if not all_engines:
             return
 
@@ -1098,12 +1096,13 @@ class RolloutManager(ReloadableMixin):
         # Step 1: Call shutdown() on each engine to kill child processes
         # (sglang::scheduler, sglang::detokenizer, etc.)
         shutdown_refs = []
+        failures = []
         for engine in all_engines:
             try:
                 ref = engine.shutdown.remote()
                 shutdown_refs.append((engine, ref))
             except Exception as e:
-                logger.warning(f"[Shutdown] Failed to call shutdown on engine: {e}")
+                failures.append(e)
 
         # Bound the whole batch so router cleanup can finish before the driver's
         # signal-exit watchdog, even when every engine is unresponsive.
@@ -1112,12 +1111,9 @@ class RolloutManager(ReloadableMixin):
             try:
                 ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
             except Exception as e:
-                logger.warning(f"[Shutdown] Engine shutdown timed out or failed: {e}")
-                # Force-kill the Ray actor as a fallback
-                try:
-                    ray.kill(engine)
-                except Exception:
-                    pass
+                failures.append(e)
+        if failures:
+            raise RuntimeError(f"Engine resource release is unconfirmed: {failures}")
 
         logger.info(f"[Shutdown] All {len(all_engines)} SGLang engine(s) shut down.")
 
@@ -1994,10 +1990,8 @@ class RolloutManager(ReloadableMixin):
                             logger.exception(f"[ScaleOut] Unexpected exception during parallel bring-up: {result}")
                             failed_replica_ids.append(f"replica_{replica_idx_for_result}")
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED))
-                            try:
-                                ray.util.remove_placement_group(per_replica_pgs[replica_idx_for_result])
-                            except Exception:
-                                pass
+                            # Cleanup may itself have failed. Keep the PG reserved
+                            # until the retained actors confirm process exit.
                             continue
                         idx, success, reason, engine_offset = result
                         if success:
@@ -3311,7 +3305,7 @@ class RolloutManager(ReloadableMixin):
         Steps:
         1. Unregister from DCS coordinator
         2. Graceful shutdown (unregisters from router + kills sglang process)
-        3. Force-kill Ray actor only if shutdown fails
+        3. Retain actors and propagate failure if process exit is unconfirmed
 
         Args:
             engines_or_group: List of engines or EngineGroup
@@ -3329,20 +3323,16 @@ class RolloutManager(ReloadableMixin):
                 await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
             except Exception as e:
                 logger.warning(f"Failed to unregister DCS for engine during rollback: {e}")
-            shutdown_ok = False
+            retained = getattr(self, "_unconfirmed_rollback_engines", None)
+            if retained is None:
+                retained = self._unconfirmed_rollback_engines = []
+            if engine not in retained:
+                retained.append(engine)
             try:
-                # Graceful shutdown (unregisters from router + kills sglang process)
                 await asyncio.wait_for(engine.shutdown.remote(), timeout=30)
-                shutdown_ok = True
             except Exception as e:
-                logger.warning(f"Failed to shutdown engine during rollback: {e}")
-            # Force-kill Ray actor only as a last resort (if shutdown failed or
-            # we need to ensure the actor is fully cleaned up).
-            if not shutdown_ok:
-                try:
-                    ray.kill(engine)
-                except Exception as e:
-                    logger.warning(f"Failed to kill engine actor during rollback: {e}")
+                raise RuntimeError("Rollback resource release is unconfirmed") from e
+            retained.remove(engine)
 
     @ray.method(concurrency_group="scale_out")
     def get_scale_out_status(self, request_id: str) -> Optional[dict]:
@@ -4180,13 +4170,11 @@ class RolloutManager(ReloadableMixin):
             *[_shutdown(engine) for _, engine in live_actors],
             return_exceptions=True,
         )
-        for (i, engine), result in zip(live_actors, shutdown_results):
-            if isinstance(result, BaseException):
-                logger.warning(f"[ScaleIn] Failed to shutdown engine {engine_id}[{i}]: {result}")
-                try:
-                    ray.kill(engine)
-                except Exception as e:
-                    logger.warning(f"[ScaleIn] Failed to kill engine actor {engine_id}[{i}]: {e}")
+        failures = [
+            (i, result) for (i, _), result in zip(live_actors, shutdown_results) if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise RuntimeError(f"Engine {engine_id} resource release is unconfirmed: {failures}")
 
         with self._engine_lifecycle_lock:
             for i, _ in live_actors:

@@ -336,7 +336,7 @@ class MultiEngineManager:
                     # and keep holding GPU memory, so the rebuild can't fit.
                     ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
                 except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={i} shutdown failed (killing anyway): {exc}")
+                    raise RuntimeError(f"{self._log_prefix} engine rank={i} resource release is unconfirmed") from exc
                 try:
                     ray.kill(engine)
                 except Exception as exc:

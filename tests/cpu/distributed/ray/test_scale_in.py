@@ -714,18 +714,24 @@ class TestRemoveEngine:
         assert g.all_engines[0] is None
 
     @pytest.mark.asyncio
-    async def test_fallback_to_ray_kill_on_shutdown_failure(self):
+    @pytest.mark.parametrize("failure", ["timeout", "unavailable"])
+    async def test_shutdown_failure_preserves_engine(self, failure):
         e1 = make_mock_engine()
         e1.shutdown.remote.return_value = AwaitableValue(None)
         # Make shutdown raise a timeout
-        e1.shutdown.remote.side_effect = Exception("timeout")
+        from ray.exceptions import ActorUnavailableError
+
+        e1.shutdown.remote.side_effect = (
+            TimeoutError("timeout") if failure == "timeout" else ActorUnavailableError("unknown", None)
+        )
         g = make_engine_group(engines=[e1], is_scaled_out=True)
 
         with patch("ray.kill") as mock_kill, patch("ray.get", side_effect=mock_ray_get):
             manager = create_test_manager()
-            await manager._remove_engine(g, 0, shutdown_timeout=1)
-            mock_kill.assert_called_once_with(e1)
-        assert g.all_engines[0] is None
+            with pytest.raises(RuntimeError, match="release is unconfirmed"):
+                await manager._remove_engine(g, 0, shutdown_timeout=1)
+            mock_kill.assert_not_called()
+        assert g.all_engines[0] is e1
 
     @pytest.mark.asyncio
     async def test_dcs_failure_still_shuts_down_engine(self):
@@ -879,3 +885,34 @@ class TestScaleInStatusQueries:
         manager = create_test_manager()
         with pytest.raises(ValueError, match="Invalid status"):
             manager.list_all_scale_in_requests(status_filter="BOGUS")
+
+
+@pytest.mark.parametrize("path", ["group", "manager"])
+def test_shutdown_failure_keeps_resource_owner(path):
+    from types import SimpleNamespace
+
+    from relax.distributed.ray.rollout import RolloutManager
+
+    engine = make_mock_engine()
+    group = make_engine_group(engines=[engine], is_scaled_out=True)
+    manager = create_test_manager()
+    manager.servers = {"default": SimpleNamespace(engine_groups=[group])}
+    engine.shutdown.remote.side_effect = TimeoutError("result unknown")
+    with patch("ray.kill") as kill, pytest.raises(RuntimeError, match="release is unconfirmed"):
+        if path == "group":
+            group.shutdown_engines({0})
+        else:
+            RolloutManager.__ray_metadata__.modified_class._shutdown_all_engines(manager)
+    assert group.all_engines == [engine]
+    kill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rollback_unknown_release_retains_actor():
+    manager = create_test_manager()
+    engine = make_mock_engine()
+    engine.shutdown.remote.side_effect = TimeoutError("unknown")
+    with patch("ray.kill") as kill, pytest.raises(RuntimeError, match="release is unconfirmed"):
+        await manager._rollback_engines([engine])
+    assert manager._unconfirmed_rollback_engines == [engine]
+    kill.assert_not_called()

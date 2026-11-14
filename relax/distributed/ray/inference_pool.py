@@ -195,10 +195,8 @@ class RolloutPool:
             lock.release()
 
     def dispose(self) -> None:
-        try:
-            self.backend.dispose()
-        finally:
-            self._dispose_locks()
+        self.backend.dispose()
+        self._dispose_locks()
 
     def _dispose_locks(self) -> None:
         for name in ("rollout_engine_lock", "_weight_sync_lock"):

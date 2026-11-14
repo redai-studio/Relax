@@ -370,3 +370,30 @@ def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_p
     assert manager.all_engines == [None, None, *healthy_engines]
     assert set(manager._engine_placements) == {2, 3}
     assert all(engine not in _patch_ray.killed for engine in healthy_engines)
+
+
+@pytest.mark.parametrize("operation", ["shutdown", "offload"])
+@pytest.mark.parametrize("failure", ["unavailable", "timeout"])
+def test_unknown_release_preserves_slot_and_placement(_patch_ray, monkeypatch, operation, failure):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=1, owns_pg=True)
+    engine = manager.all_engines[0]
+    placements = dict(manager._engine_placements)
+    original_get = mem.ray.get
+
+    def fail_shutdown(ref, timeout=None):
+        if isinstance(ref, tuple) and ref[1] == "shutdown":
+            if failure == "timeout":
+                raise TimeoutError("shutdown result unknown")
+            raise mem.ray.exceptions.ActorUnavailableError("temporarily unreachable", None)
+        return original_get(ref, timeout=timeout)
+
+    monkeypatch.setattr(mem.ray, "get", fail_shutdown)
+    if operation == "offload":
+        engine.dead_methods = frozenset({"release_memory_occupation"})
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        getattr(manager, operation)()
+    assert manager.all_engines == [engine]
+    assert manager._engine_placements == placements
+    assert engine not in _patch_ray.killed

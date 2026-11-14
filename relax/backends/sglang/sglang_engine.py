@@ -1045,8 +1045,24 @@ class SGLangEngine(RayActor):
             self.unregister_from_router(timeout=5.0)
         finally:
             process = getattr(self, "process", None)
-            if process is not None:
-                kill_process_tree(process.pid)
+            if process is not None and not getattr(self, "_server_exit_confirmed", False):
+                import psutil
+
+                # Freeze each parent before enumerating children so no scheduler
+                # can fork an untracked descendant between enumeration and kill.
+                processes = []
+                pending = [psutil.Process(process.pid)]
+                while pending:
+                    current = pending.pop()
+                    current.suspend()
+                    processes.append(current)
+                    pending.extend(current.children())
+                for current in reversed(processes):
+                    current.kill()
+                _, alive = psutil.wait_procs(processes, timeout=5)
+                if alive:
+                    raise RuntimeError(f"SGLang process exit unconfirmed: {[proc.pid for proc in alive]}")
+                self._server_exit_confirmed = True
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-

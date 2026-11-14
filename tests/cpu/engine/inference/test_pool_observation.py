@@ -137,7 +137,7 @@ def test_planning_uses_original_probes_without_allocating_gpu_actors(monkeypatch
     assert planner.allocations()[0].gpus_per_slot == 2
 
 
-def test_pool_cleanup_releases_distributed_locks_when_backend_shutdown_fails(monkeypatch):
+def test_pool_cleanup_preserves_distributed_locks_when_backend_shutdown_fails(monkeypatch):
     pool = RolloutPool.__new__(RolloutPool)
 
     def failed_shutdown():
@@ -150,7 +150,7 @@ def test_pool_cleanup_releases_distributed_locks_when_backend_shutdown_fails(mon
     monkeypatch.setattr(ray, "kill", released.append)
     with pytest.raises(RuntimeError, match="engine shutdown failed"):
         pool.dispose()
-    assert released == ["topology", "weights"]
+    assert released == []
 
 
 def test_pool_startup_failure_cleans_partial_engine_and_lock_ownership(monkeypatch):
