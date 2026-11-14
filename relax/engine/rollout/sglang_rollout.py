@@ -641,7 +641,7 @@ async def generate(
             ),
         )
 
-    sample.update_from_meta_info(args, output["meta_info"])
+    sample.update_from_meta_info(args, output["meta_info"], response_delta=len(new_response_tokens))
     _t_post_generate = monotonic() - _t_post_generate_start
 
     _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}

@@ -1686,10 +1686,14 @@ class AgenticSessionShard:
         )
 
     @staticmethod
-    def _accumulate_request_meta(request, *, meta_info: dict[str, Any]) -> None:
+    def _accumulate_request_meta(request, *, meta_info: dict[str, Any], new_token_count: int = 0) -> None:
         weight_version = meta_info.get("weight_version")
-        if weight_version is not None:
-            request.pending_weight_version_delta.append(str(weight_version))
+        version = str(weight_version) if weight_version is not None else None
+        if version is not None:
+            request.pending_weight_version_delta.append(version)
+        # Record how many tokens this attempt produced under that version so the
+        # audit can attribute token ranges instead of averaging across versions.
+        request.pending_weight_version_tokens.append((version, int(new_token_count)))
         spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
         request.pending_spec_delta["spec_accept_token_num"] += spec_accept_token_num
         request.pending_spec_delta["spec_draft_token_num"] += spec_draft_token_num
@@ -2830,7 +2834,7 @@ class AgenticSessionShard:
             ir.pending_topk_logprob_delta.append(result.new_topk_log_probs)
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
-        self._accumulate_request_meta(ir, meta_info=result.meta_info)
+        self._accumulate_request_meta(ir, meta_info=result.meta_info, new_token_count=len(result.new_tokens))
         routed_experts = _decode_routed_experts(
             args=self.args,
             meta_info=result.meta_info,
@@ -2915,6 +2919,7 @@ class AgenticSessionShard:
             if ir.pending_topk_logprob_delta
             else None,
             weight_version_delta=ir.pending_weight_version_delta,
+            weight_version_tokens=ir.pending_weight_version_tokens,
             spec_delta=ir.pending_spec_delta,
             prefix_cache_delta=ir.pending_prefix_cache_delta,
             wall_elapsed_s=time.monotonic() - ir.wall_started_at,

@@ -29,6 +29,7 @@ def _shallow_copy_sample(src: Sample) -> Sample:
     new.tokens = list(src.tokens)
     new.rollout_tokens = list(src.rollout_tokens)
     new.weight_versions = list(src.weight_versions)
+    new.generation_segments = list(src.generation_segments)
     new.metadata = dict(src.metadata)
     # Per-sample accumulators — create fresh instances.
     new.spec_info = Sample.SpecInfo()
