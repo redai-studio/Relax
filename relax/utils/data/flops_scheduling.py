@@ -68,6 +68,13 @@ def build_estimator(args: Any, model_config: Any) -> RelaxFlopsEstimator | None:
         raise ValueError("FLOPs scheduling requires the causal_lm head; classification heads are not supported")
     if not hasattr(args, "enable_mtp_training"):
         raise ValueError("FLOPs scheduling requires the normalized args.enable_mtp_training runtime switch")
+    model_type = (
+        model_config.get("model_type") if hasattr(model_config, "get") else getattr(model_config, "model_type", None)
+    )
+    if model_type == "qwen3":
+        from relax.utils.training.flops_estimator_qwen3 import RelaxQwen3DenseEstimator
+
+        return RelaxQwen3DenseEstimator(model_config, mtp_training_enabled=args.enable_mtp_training)
     return RelaxFlopsEstimator(model_config, mtp_training_enabled=args.enable_mtp_training)
 
 

@@ -19,7 +19,7 @@ from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 
 SCHEMA = 1
 ALGORITHM = "no16-global-capacity-kk-v1"
-COST_MODEL = "relax-p2-non-mtp-main-training-v1"
+COST_MODEL = "relax-p2-non-mtp-main-training-v2"
 TRAIN_TASKS = frozenset(("train", "sft_train", "train_actor", "actor_train"))
 
 

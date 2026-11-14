@@ -53,6 +53,7 @@ def cost_identity(estimator: Any) -> tuple[str, str]:
         for name in (
             "flops_estimator.py",
             "flops_counter.py",
+            "flops_estimator_qwen3.py",
         )
     }
     return model, digest(dict(version=COST_MODEL, scope=estimator.compute_scope, sources=sources))
