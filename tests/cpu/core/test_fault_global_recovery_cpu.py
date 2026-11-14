@@ -527,18 +527,27 @@ def test_actual_actor_setter_sync_matches_plan_condition(fully_async, hybrid, lo
 
     tree = ast.parse((ROOT / "relax/components/actor.py").read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Actor")
-    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "set_rollout_manager")
-    module = ast.Module(body=ast.parse("from __future__ import annotations").body + [fn], type_ignores=[])
-    namespace = {"is_offline_mode": is_offline_mode}
+    # Execute the actual async entry point and its blocking implementation,
+    # without importing the GPU-backed Serve deployment or replacing its logic.
+    cls.body = [
+        node
+        for node in cls.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"set_rollout_manager", "_set_rollout_manager_blocking"}
+    ]
+    cls.decorator_list = []
+    cls.bases = []
+    module = ast.Module(body=ast.parse("from __future__ import annotations").body + [cls], type_ignores=[])
+    namespace = {"is_offline_mode": is_offline_mode, "asyncio": asyncio}
     exec(compile(ast.fix_missing_locations(module), str(ROOT / "relax/components/actor.py"), "exec"), namespace)
     calls = []
     worker = SimpleNamespace(
         set_rollout_manager=lambda m: calls.append("manager"), update_weights=lambda: calls.append("sync")
     )
-    owner = SimpleNamespace(
-        config=SimpleNamespace(fully_async=fully_async, hybrid=hybrid, loss_type=loss_type), actor_model=worker
-    )
-    namespace[fn.name](owner, object())
+    owner = namespace["Actor"]()
+    owner.config = SimpleNamespace(fully_async=fully_async, hybrid=hybrid, loss_type=loss_type)
+    owner.actor_model = worker
+    asyncio.run(owner.set_rollout_manager(object()))
     assert calls == (["manager", "sync"] if (not fully_async or hybrid) and loss_type is None else ["manager"])
 
 

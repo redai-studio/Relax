@@ -2,8 +2,10 @@
 
 import dataclasses
 import functools
+import hashlib
 import ipaddress
 import json
+import math
 import multiprocessing
 import os
 import signal
@@ -474,6 +476,34 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
             time.sleep(2)
 
 
+def _get_memory_server_info(host: str, port: int, timeout: float) -> dict:
+    """Wait within one budget for a fixed engine's resolved scheduler state.
+
+    SGLang may return HTTP 200 with an empty state list after its own query
+    timeout. Never replace that response with startup arguments or a cached
+    capability. Its queueing RPC does not correlate late replies by request ID;
+    this transaction requires unchanged engine configuration and membership.
+    """
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Memory scheduler state timeout must be finite and positive")
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Memory scheduler state remained unavailable within the synchronization timeout")
+        response = requests.get(f"http://{host}:{port}/server_info", timeout=remaining)
+        response.raise_for_status()
+        info = response.json()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Memory scheduler state response exceeded the synchronization timeout")
+        # Only the explicit unavailable response is transient. Malformed or
+        # missing fields still reach the existing strict capability validator.
+        if not isinstance(info, dict) or info.get("internal_states") != []:
+            return info
+        time.sleep(min(1.0, remaining))
+
+
 class SGLangEngine(RayActor):
     def __init__(
         self,
@@ -778,21 +808,387 @@ class SGLangEngine(RayActor):
             "update_weight_version", {"new_version": weight_version, "abort_all_requests": False}
         )
 
-    def get_expert_weight_sync_layout(self) -> dict:
+    def install_memory_update(
+        self, descriptor: dict, member: str, timeout: float, host_budget_bytes: int, capability_fingerprint: str
+    ) -> dict:
+        import torch
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+
+        started = time.monotonic()
+        deadline = started + timeout
+        capability = self.get_dense_memory_capability(timeout)
+        if capability["fingerprint"] != capability_fingerprint:
+            raise ValueError("Dense memory runtime capability changed before installation")
+        request_s: dict[str, float] = {}
+
+        def request(endpoint: str, payload: dict) -> dict:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Memory worker installation deadline exceeded")
+            request_started = time.monotonic()
+            response = self._make_request(endpoint, payload, timeout=remaining)
+            request_s[endpoint] = time.monotonic() - request_started
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise RuntimeError(f"SGLang {endpoint} failed: {response}")
+            return response
+
+        if _sglang_has_weight_update_session():
+            request("begin_weight_update", {})
+        control = json.dumps(
+            dict(descriptor=descriptor, member=member, timeout_s=timeout, host_budget_bytes=host_budget_bytes)
+        )
+        serialized = MultiprocessingSerializer.serialize([(control, torch.empty(0))], output_str=True)
+        request(
+            "update_weights_from_tensor",
+            dict(serialized_named_tensors=[serialized], load_format=MEMORY_LOADER, flush_cache=True),
+        )
+        if _sglang_has_weight_update_session():
+            request("end_weight_update", {})
+        request("update_weight_version", dict(new_version=descriptor["update"], abort_all_requests=False))
+        return dict(
+            success=True,
+            engine=self.rank,
+            node_id=ray.get_runtime_context().get_node_id(),
+            install_s=time.monotonic() - started,
+            update=descriptor["update"],
+            request_s=request_s,
+        )
+
+    def get_hf_memory_capability(self, timeout: float) -> dict:
+        """Resolve the managed scheduler's actual canonical-memory contract."""
+        from relax.backends.sglang.hf_memory_loader import HF_MEMORY_LOADER
+
+        return SGLangEngine._get_memory_runtime_capability(self, timeout, HF_MEMORY_LOADER)
+
+    def get_dense_memory_capability(self, timeout: float) -> dict:
+        """The legacy direct-copy strategy has exactly one receiver worker."""
+        from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+
+        capability = SGLangEngine._get_memory_runtime_capability(self, timeout, MEMORY_LOADER)
+        if capability["workers"] != 1:
+            raise ValueError("The direct-copy Dense adapter requires exactly one runtime worker")
+        return capability
+
+    def _get_memory_runtime_capability(self, timeout: float, load_format: str) -> dict:
+        if self.node_rank != 0 or self.worker_type != "regular":
+            raise ValueError("Memory synchronization requires a regular node-0 engine")
+        return SGLangEngine._resolve_memory_capability(
+            _get_memory_server_info(self.server_host, self.server_port, timeout),
+            self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine,
+            load_format,
+        )
+
+    @staticmethod
+    def _resolve_memory_capability(info: dict, allocated: int, load_format: str) -> dict:
+        """Validate the memory coordinator envelope against resolved runtime
+        state."""
+        from relax.utils.misc import get_hf_config
+
+        states = info.get("internal_states") if isinstance(info, dict) else None
+        if not isinstance(states, list) or not states or any(not isinstance(state, dict) for state in states):
+            raise ValueError("Memory capability requires live scheduler internal_states")
+        required = (
+            "model_path",
+            "tp_size",
+            "pp_size",
+            "dp_size",
+            "ep_size",
+            "moe_dp_size",
+            "disable_cuda_graph",
+            "quantization",
+            "enable_lora",
+            "speculative_algorithm",
+            "custom_weight_loader",
+        )
+        optional = (
+            "dtype",
+            "device",
+            "dwdp_size",
+            "attn_cp_size",
+            "enable_dp_attention",
+            "enable_dp_lm_head",
+            "speculative_draft_model_path",
+            "quantization_param_path",
+            "lora_paths",
+            "enable_memory_saver",
+            "enable_piecewise_cuda_graph",
+            "enforce_piecewise_cuda_graph",
+            "cuda_graph_backend_prefill",
+            "cuda_graph_backend_decode",
+            "cuda_graph_config",
+            "disaggregation_mode",
+            "json_model_override_args",
+            "enable_eplb",
+            "ep_num_redundant_experts",
+            "init_expert_location",
+            "ep_join_mode",
+            "elastic_ep_backend",
+            "kt_weight_path",
+            "moe_runner_backend",
+            "moe_a2a_backend",
+            "disable_shared_experts_fusion",
+            "enforce_shared_experts_fusion",
+        )
+        layouts = []
+        for state in states:
+            effective = info | state
+            if any(key not in effective for key in required):
+                raise ValueError("Memory scheduler capability is incomplete")
+            layouts.append({key: effective[key] for key in (*required, *optional) if key in effective})
+        layout = layouts[0]
+        if any(candidate != layout for candidate in layouts[1:]):
+            raise ValueError("Memory schedulers disagree on their runtime capability")
+        if any(
+            type(layout[key]) is not int or layout[key] != 1
+            for key in ("pp_size", "dp_size", "ep_size", "moe_dp_size")
+        ):
+            raise ValueError("Memory synchronization requires runtime PP/DP/EP/MoE-DP=1")
+        if len(states) != 1:
+            raise ValueError("Memory synchronization requires one scheduler DP group")
+        count = layout["tp_size"]
+        if type(count) is not int or count <= 0 or count != allocated:
+            raise ValueError("Memory runtime TP worker count disagrees with engine GPU allocation")
+        if (
+            any(
+                layout.get(key)
+                for key in (
+                    "quantization",
+                    "quantization_param_path",
+                    "enable_lora",
+                    "lora_paths",
+                    "speculative_algorithm",
+                    "speculative_draft_model_path",
+                    "enable_memory_saver",
+                    "enable_dp_attention",
+                    "enable_dp_lm_head",
+                    "enable_eplb",
+                    "ep_num_redundant_experts",
+                    "ep_join_mode",
+                    "elastic_ep_backend",
+                    "kt_weight_path",
+                )
+            )
+            or any(layout.get(key, 1) != 1 for key in ("dwdp_size", "attn_cp_size"))
+            or layout.get("disaggregation_mode") not in (None, "null")
+            or layout.get("init_expert_location") not in (None, "trivial")
+            or json.loads(layout.get("json_model_override_args") or "{}")
+        ):
+            raise ValueError("Memory runtime has an unsupported quantization, adapter, draft or routing contract")
+        # A default disable_piecewise=False does not prove a graph is active;
+        # use resolved enable/backend fields and scheduler graph allocations.
+        graph_config = layout.get("cuda_graph_config")
+        if "cuda_graph_config" in layout and (
+            not isinstance(graph_config, dict)
+            or any(
+                not isinstance(graph_config.get(phase), dict) or graph_config[phase].get("backend") != "disabled"
+                for phase in ("decode", "prefill")
+            )
+        ):
+            raise ValueError("Memory synchronization requires resolved CUDA graph backends disabled")
+        # Older schedulers report a scalar GB total; newer ones report
+        # per-phase GB values, including draft graph allocations.
+        graph_allocations = []
+        for state in states:
+            usage = state.get("memory_usage", {})
+            if not isinstance(usage, dict):
+                raise ValueError("Memory scheduler graph allocation report is invalid")
+            graph = usage.get("graph", 0)
+            if isinstance(graph, dict):
+                required_phases = {
+                    "prefill",
+                    "decode",
+                    "target_verify",
+                    "draft_prefill",
+                    "draft_decode",
+                    "draft_extend",
+                }
+                if not required_phases.issubset(graph) or any(
+                    not isinstance(phase, str) or not phase for phase in graph
+                ):
+                    raise ValueError("Memory scheduler graph allocation report is invalid")
+                values = graph.values()
+            else:
+                values = (graph,)
+            for value in values:
+                if type(value) not in (int, float) or value < 0 or (type(value) is float and not math.isfinite(value)):
+                    raise ValueError("Memory scheduler graph allocation report is invalid")
+                graph_allocations.append(value)
+        if (
+            layout["disable_cuda_graph"] is not True
+            or layout.get("enable_piecewise_cuda_graph")
+            or layout.get("enforce_piecewise_cuda_graph")
+            or layout.get("cuda_graph_backend_prefill") not in (None, "disabled")
+            or layout.get("cuda_graph_backend_decode") not in (None, "disabled")
+            or any(graph_allocations)
+        ):
+            raise ValueError("Memory synchronization requires runtime CUDA graphs disabled")
+        if load_format not in (layout["custom_weight_loader"] or []):
+            raise ValueError("Memory loader is not registered on the runtime engine")
+        config = get_hf_config(layout["model_path"])
+        text_config = getattr(config, "text_config", config)
+        if getattr(config, "quantization_config", None) or getattr(text_config, "quantization_config", None):
+            raise ValueError("Memory synchronization requires an unquantized runtime model")
+        fingerprint = hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return {"workers": count, "fingerprint": fingerprint}
+
+    def install_hf_memory_update(
+        self,
+        descriptor: dict,
+        stream: str,
+        members: tuple[str, ...],
+        plan_fingerprint: str,
+        timeout: float,
+        host_budget_bytes: int,
+        receiver_gpu_budget_bytes: int,
+        loader_workspace_budget_bytes: int,
+        capability_fingerprint: str,
+    ) -> dict:
+        """Install the canonical HF stream on every actual inference worker."""
+        import torch
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        from relax.backends.sglang.hf_memory_loader import HF_MEMORY_LOADER
+
+        deadline = time.monotonic() + timeout
+        capability = self.get_hf_memory_capability(timeout)
+        if capability["fingerprint"] != capability_fingerprint:
+            raise ValueError("Canonical HF runtime capability changed before installation")
+        count = capability["workers"]
+        if len(members) != count or len(set(members)) != count:
+            raise ValueError("Canonical HF controls must cover every actual engine worker")
+        if len(plan_fingerprint) != 64 or any(c not in "0123456789abcdef" for c in plan_fingerprint):
+            raise ValueError("Invalid canonical HF synchronization plan")
+
+        def request(endpoint: str, payload: dict) -> None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Canonical HF installation deadline exceeded")
+            response = self._make_request(endpoint, payload, timeout=remaining)
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise RuntimeError(f"SGLang {endpoint} failed during canonical HF installation")
+
+        serialized = []
+        for member in members:
+            control = json.dumps(
+                dict(
+                    descriptor=descriptor,
+                    stream=stream,
+                    member=member,
+                    plan_fingerprint=plan_fingerprint,
+                    timeout_s=timeout,
+                    host_budget_bytes=host_budget_bytes,
+                    receiver_gpu_budget_bytes=receiver_gpu_budget_bytes,
+                    loader_workspace_budget_bytes=loader_workspace_budget_bytes,
+                )
+            )
+            if len(control.encode()) > 65536:
+                raise ValueError("Canonical HF control exceeds its bound")
+            serialized.append(MultiprocessingSerializer.serialize([(control, torch.empty(0))], output_str=True))
+        if _sglang_has_weight_update_session():
+            request("begin_weight_update", {})
+        request(
+            "update_weights_from_tensor",
+            dict(serialized_named_tensors=serialized, load_format=HF_MEMORY_LOADER, flush_cache=True),
+        )
+        if _sglang_has_weight_update_session():
+            request("end_weight_update", {})
+        request("update_weight_version", dict(new_version=descriptor["update"], abort_all_requests=False))
+        return dict(success=True, engine=self.rank, workers=count, plan_fingerprint=plan_fingerprint)
+
+    def install_sharded_memory_update(self, controls: list[dict], timeout: float) -> dict:
+        """Install one complete fixed-owner group on every TP worker."""
+        import torch
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
+
+        deadline = time.monotonic() + timeout
+        if getattr(self, "_native_memory_capability", None) is None:
+            raise ValueError("Native memory installation requires a verified runtime capability")
+        # Recheck resolved scheduler state after planning and before any weight write.
+        layout = self.get_expert_weight_sync_layout(timeout=timeout)
+        count = layout["memory_capability"]["workers"]
+        if (
+            not controls
+            or len(controls) != count
+            or [item.get("tp_rank") for item in controls] != list(range(count))
+            or any(item.get("tp_size") != count for item in controls)
+        ):
+            raise ValueError("Native memory controls must cover every actual ordered TP worker")
+        identities = {(item["stream"], item["version"], item["group_update"]) for item in controls}
+        if len(identities) != 1:
+            raise ValueError("Engine TP workers received different group updates")
+
+        def request(endpoint: str, payload: dict) -> None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Sharded memory engine installation deadline exceeded")
+            response = self._make_request(endpoint, payload, timeout=remaining)
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise RuntimeError(f"SGLang {endpoint} failed: {response}")
+
+        if _sglang_has_weight_update_session():
+            request("begin_weight_update", {})
+        serialized = []
+        for control in controls:
+            encoded = json.dumps(control)
+            if len(encoded) > 65536:
+                raise ValueError("Sharded memory control exceeds its bound")
+            serialized.append(MultiprocessingSerializer.serialize([(encoded, torch.empty(0))], output_str=True))
+        payload = dict(serialized_named_tensors=serialized, load_format=SHARDED_MEMORY_LOADER, flush_cache=True)
+        control_json_bytes = len(json.dumps(payload).encode())
+        request("update_weights_from_tensor", payload)
+        if _sglang_has_weight_update_session():
+            request("end_weight_update", {})
+        request("update_weight_version", dict(new_version=controls[0]["group_update"], abort_all_requests=False))
+        return dict(
+            success=True,
+            engine=self.rank,
+            version=controls[0]["version"],
+            update=controls[0]["group_update"],
+            control_json_bytes=control_json_bytes,
+        )
+
+    def memory_weight_generation_probe(self, timeout: float) -> dict:
+        result = self._make_request(
+            "generate", {"input_ids": [1], "sampling_params": {"max_new_tokens": 1, "temperature": 0}}, timeout=timeout
+        )
+        if not isinstance(result, dict) or not result.get("meta_info", {}).get("output_token_ids", result.get("text")):
+            if not isinstance(result, dict) or result.get("meta_info", {}).get("completion_tokens", 0) < 1:
+                raise RuntimeError(f"Memory weight generation probe failed: {result}")
+        return {"success": True}
+
+    def get_expert_weight_sync_layout(self, timeout: float = 30) -> dict:
         """Return resolved layout settings for opt-in colocated expert routing
         and direct BF16 loading."""
         from relax.utils.misc import get_hf_config
 
         if self.node_rank != 0 or self.worker_type != "regular":
             raise ValueError("Expert routing requires a regular node-0 rollout engine")
-        for _ in range(2):
-            response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
-            response.raise_for_status()
-            info = response.json()
-            # /server_info can time out fetching scheduler state while still
-            # returning HTTP 200. Retry once before rejecting an unknown auto layout.
-            if info.get("internal_states") or info.get("moe_runner_backend") != "auto":
-                break
+        memory_sync = getattr(getattr(self, "args", None), "memory_weight_sync_config", None)
+        if memory_sync:
+            info = _get_memory_server_info(self.server_host, self.server_port, timeout)
+        else:
+            for _ in range(2):
+                response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=timeout)
+                response.raise_for_status()
+                info = response.json()
+                # Preserve the default path's fallback for an unresolved auto layout.
+                if info.get("internal_states") or info.get("moe_runner_backend") != "auto":
+                    break
+        memory_capability = None
+        if memory_sync:
+            from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
+
+            memory_capability = SGLangEngine._resolve_memory_capability(
+                info, self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine, SHARDED_MEMORY_LOADER
+            )
+            previous = getattr(self, "_native_memory_capability", memory_capability)
+            if memory_capability != previous:
+                raise ValueError("Native memory runtime capability changed; restart the engine and stream")
+            self._native_memory_capability = memory_capability
         keys = (
             "model_path",
             "device",
@@ -865,6 +1261,8 @@ class SGLangEngine(RayActor):
         )
         for key in ("hidden_size", "moe_intermediate_size", "quantization_config"):
             layout[key] = getattr(text_config, key, None)
+        if memory_capability is not None:
+            layout["memory_capability"] = memory_capability
         return layout
 
     def load_lora_adapter_from_tensors(
@@ -2228,6 +2626,14 @@ def _compute_server_args(
         loaders = list(kwargs.get("custom_weight_loader") or [])
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
+        if getattr(args, "memory_weight_sync_config", None):
+            from relax.backends.sglang.hf_memory_loader import HF_MEMORY_LOADER
+            from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+            from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
+
+            for loader in (HF_MEMORY_LOADER, MEMORY_LOADER, SHARDED_MEMORY_LOADER):
+                if loader not in loaders:
+                    loaders.append(loader)
         kwargs["custom_weight_loader"] = loaders
 
     if (

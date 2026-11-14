@@ -554,3 +554,130 @@ def _check_native_transport_validation(monkeypatch, actual, expected):
     else:
         validate_transport(cfg)
         assert cfg.mm_feature_transport == (expected or native_default)
+
+
+@pytest.mark.parametrize("adapter", ["canonical", "dense", "native"])
+def test_memory_capability_waits_for_nonempty_scheduler_state_over_http(
+    monkeypatch, expert_sync_engine_module, adapter
+):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from relax.backends.sglang.hf_memory_loader import HF_MEMORY_LOADER
+    from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+    from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
+    from relax.utils import misc
+
+    module = expert_sync_engine_module
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    workers = 1 if adapter == "dense" else 2
+    startup = dict(
+        model_path="/test/model",
+        tp_size=workers,
+        pp_size=1,
+        dp_size=1,
+        ep_size=1,
+        moe_dp_size=1,
+        disable_cuda_graph=True,
+        quantization=None,
+        enable_lora=False,
+        speculative_algorithm=None,
+        custom_weight_loader=[HF_MEMORY_LOADER, MEMORY_LOADER, SHARDED_MEMORY_LOADER],
+        moe_runner_backend="triton",  # The failed explicit backend, not auto.
+    )
+    state = startup | {"memory_usage": {"graph": 0.0}}
+    requests_seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests_seen.append(self.path)
+            body = json.dumps(startup | {"internal_states": [] if len(requests_seen) == 1 else [state]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank, engine.worker_type = 0, "regular"
+    engine.server_host, engine.server_port = server.server_address
+    engine.num_gpus_per_engine = workers
+    engine.args = SimpleNamespace(memory_weight_sync_config="enabled", rollout_num_gpus_per_engine=workers)
+    monkeypatch.setattr(misc, "get_hf_config", lambda _: SimpleNamespace(num_experts=64))
+    try:
+        if adapter == "native":
+            value = engine.get_expert_weight_sync_layout(timeout=5)["memory_capability"]
+        else:
+            value = getattr(engine, f"get_{'hf' if adapter == 'canonical' else 'dense'}_memory_capability")(5)
+        assert value["workers"] == workers
+        assert len(value["fingerprint"]) == 64
+        assert requests_seen == ["/server_info", "/server_info"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+        assert not thread.is_alive()
+
+
+def test_memory_scheduler_state_retry_shares_deadline_and_rejects_late_success(monkeypatch, sglang_engine_module):
+    module = sglang_engine_module
+    clock = SimpleNamespace(now=0.0)
+    sleeps, timeouts = [], []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
+    ready = {"internal_states": [{"resolved": True}]}
+    replies = [{"internal_states": []}, ready]
+
+    def get(_url, *, timeout):
+        timeouts.append(timeout)
+        clock.now += 0.25
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: replies.pop(0))
+
+    monkeypatch.setattr(module.requests, "get", get)
+    assert module._get_memory_server_info("worker", 1234, 3) is ready
+    assert timeouts == [3, 1.75]
+    assert sleeps == [1]
+
+    clock.now = 0
+    replies[:] = [{"internal_states": []}]
+    with pytest.raises(TimeoutError, match="unavailable"):
+        module._get_memory_server_info("worker", 1234, 0.5)
+    assert clock.now == 0.5
+    assert not replies  # No renewed budget or second request after expiration.
+
+    clock.now = 0
+    replies[:] = [ready]
+    with pytest.raises(TimeoutError, match="exceeded"):
+        module._get_memory_server_info("worker", 1234, 0.1)
+    for timeout in (0, float("inf")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            module._get_memory_server_info("worker", 1234, timeout)
+
+
+@pytest.mark.parametrize("states", [None, {}, ["invalid"], [{"quantization": "fp8"}]])
+def test_memory_state_retry_never_masks_invalid_capability(monkeypatch, expert_sync_engine_module, states):
+    module = expert_sync_engine_module
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank, engine.worker_type = 0, "regular"
+    engine.server_host, engine.server_port = "worker", 1234
+    engine.num_gpus_per_engine = 1
+    engine.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
+    # One nonempty/malformed response must reach the strict validator, rather
+    # than retrying until a convenient compatible response appears.
+    response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"internal_states": states})
+    get = Mock(return_value=response)
+    monkeypatch.setattr(module.requests, "get", get)
+    with pytest.raises(ValueError, match="live scheduler|incomplete"):
+        engine.get_hf_memory_capability(5)
+    assert get.call_count == 1

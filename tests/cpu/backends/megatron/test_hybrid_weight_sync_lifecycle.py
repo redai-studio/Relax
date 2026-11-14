@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -136,12 +137,14 @@ def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_ac
 
     actor.update_weights_fully_async = push
     config = SimpleNamespace(hybrid=True, fully_async=True, autoscaler_config="elastic.yaml", loss_type="policy_loss")
-    service = SimpleNamespace(config=config, actor_model=actor)
+    service = object.__new__(Actor.func_or_class)
+    service.config = config
+    service.actor_model = actor
     if fail_sync:
         with pytest.raises(RuntimeError, match="sync failed"):
-            Actor.func_or_class.set_rollout_manager(service, object())
+            asyncio.run(service.set_rollout_manager(object()))
     else:
-        Actor.func_or_class.set_rollout_manager(service, object())
+        asyncio.run(service.set_rollout_manager(object()))
     assert state.awake is not offload_train
     assert (state.tp_group is None) is offload_train
     assert not state.updating
