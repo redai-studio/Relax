@@ -987,7 +987,7 @@ def test_update_membership_masks_and_optimizer_skip(tmp_path, fake_mpu):
     config = resolve_agentic_obs_config(args)
     first, second = _read_jsonl(config.train_scalar_path(8, 0))
     assert first["update_id"] != second["update_id"]
-    assert first["schema_version"] == "4.0.0"
+    assert first["schema_version"] == "4.1.0"
     assert json.loads(config.manifest_path.read_text())["train_schema_version"] == first["schema_version"]
     assert first["run_id"] == "run_test"
     assert first["capture_phase"] == "training_input"
@@ -1065,6 +1065,357 @@ def test_update_joins_remote_dp_members_even_when_local_input_is_empty(tmp_path,
     assert event["status"] == "committed"
     assert event["group_ids"] == ["remote-group"] and event["groups_finalized"]
     assert _read_jsonl(config.train_scalar_path(1, 0))[0]["samples"] == []
+
+
+@pytest.mark.parametrize("auxiliary", ["none", "entropy", "kl"])
+def test_weight_audit_final_masks_preserve_auxiliary_targets_and_do_not_recount(
+    tmp_path, fake_mpu, monkeypatch, auxiliary
+):
+    from relax.utils.agentic_obs import train_hooks
+    from relax.utils.agentic_obs.weight_loss import observe_policy_tokens
+
+    fake_mpu()
+    args = _train_args(
+        tmp_path, entropy_coef=0.1 if auxiliary == "entropy" else 0, use_kl_loss=auxiliary == "kl", kl_loss_coef=0.1
+    )
+    from relax.utils.agentic_obs import weight_publication
+
+    version = {"policy": "p", "epoch": "e", "ordinal": 4}
+    monkeypatch.setitem(weight_publication._FRONTIERS, args.agentic_obs_run_id, version)
+    batch = _rollout_data([7])
+    with train_hooks.observe_train_step(args, 1, 0):
+        train_hooks.capture_training_input(batch)
+        observe_policy_tokens(args, batch, reducer_masks=batch["loss_masks"], policy_gate=torch.zeros(4))
+        # Activation checkpoint recomputation must neither append nor overwrite.
+        observe_policy_tokens(args, batch, reducer_masks=batch["loss_masks"], policy_gate=torch.ones(4))
+        train_hooks.record_optimizer_result(True)
+    train_hooks.close_train_appenders()
+    (record,) = _read_jsonl(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["loss_mask"] == {"ranges": [[0, 4, 1]]}
+    assert sample["effective_loss_mask"] == {"ranges": [[0, 4, 1]] if auxiliary != "none" else []}
+    assert sample["effective_loss_mask_status"] == "complete"
+    assert record["consumption_version"] == version
+
+
+def test_weight_audit_reader_joins_successful_consumption_and_keeps_unknown(tmp_path, fake_mpu, monkeypatch):
+    import copy
+
+    from relax.utils.agentic_obs import train_hooks
+    from relax.utils.agentic_obs.weight_report import build_weight_report
+
+    fake_mpu()
+    args = _train_args(tmp_path)
+    version = {"policy": "p", "epoch": "e", "ordinal": 1}
+    from relax.utils.agentic_obs import weight_publication
+
+    monkeypatch.setitem(weight_publication._FRONTIERS, args.agentic_obs_run_id, {**version, "ordinal": 4})
+    for step, successful in ((0, True), (1, False)):
+        with train_hooks.observe_train_step(args, 1, step):
+            batch = _rollout_data([7])
+            train_hooks.capture_training_input(batch)
+            train_hooks.capture_effective_loss_mask(batch, [torch.tensor([1, 0, 1, 0])])
+            train_hooks.record_optimizer_result(successful)
+    train_hooks.close_train_appenders()
+    close_observation_writers()
+    config = resolve_agentic_obs_config(args)
+    stages = [row for path in config.stages_dir.glob("*.jsonl") for row in _read_jsonl(path)]
+    inputs = _read_jsonl(config.train_scalar_path(1, 0))
+    trajectories = [
+        {
+            "run_id": "run_test",
+            "sample_export_id": "7",
+            "session_id": "s",
+            "lineage": [
+                {
+                    "kind": "resp",
+                    "token_count": 4,
+                    "generation_end_version": version,
+                    "generation_segments": [{"start": 0, "end": 4, "version": version}],
+                },
+            ],
+        }
+    ]
+    report = build_weight_report(trajectories, stages, inputs + inputs)
+    assert report["effective_tokens"] == 2
+    assert report["token_weighted_age"] == 3
+    assert len(report["samples"]) == 1
+    assert report["excluded_updates"] == [{"update_id": "actor:1:1", "status": "failed"}]
+    complete_stages = [row for row in stages if row.get("update_id") == "actor:1:0"]
+    assert build_weight_report(trajectories, complete_stages, inputs)["complete"]
+    missing_end = copy.deepcopy(trajectories)
+    missing_end[0]["lineage"][0]["generation_end_version"] = None
+    assert not build_weight_report(missing_end, complete_stages, inputs)["complete"]
+    report = build_weight_report([], stages, inputs)
+    assert report["version_missing_rate"] == 1
+    assert report["token_weighted_age"] is None
+    assert not report["complete"]
+    conflicting = copy.deepcopy(inputs[0])
+    conflicting["consumption_version"]["ordinal"] = 5
+    report = build_weight_report(trajectories, stages, inputs + [conflicting])
+    assert report["effective_tokens"] == 0
+    assert report["samples"] == []
+    assert len(report["conflicting_input_owners"]) == 1
+    assert not report["complete"]
+
+
+@pytest.mark.parametrize(
+    "overrides,reason",
+    [
+        ({"dynamic_cp_size": 2}, "cp_shards_unavailable"),
+        ({"custom_pg_loss_reducer_function_path": "custom.reducer"}, "custom_reducer"),
+    ],
+)
+def test_weight_audit_unsupported_final_masks_remain_unknown(tmp_path, fake_mpu, overrides, reason):
+    from relax.utils.agentic_obs import train_hooks
+    from relax.utils.agentic_obs.weight_loss import observe_policy_tokens
+
+    fake_mpu()
+    args = _train_args(tmp_path, **overrides)
+    batch = _rollout_data([7], **overrides)
+    with train_hooks.observe_train_step(args, 1, 0):
+        train_hooks.capture_training_input(batch)
+        observe_policy_tokens(args, batch, reducer_masks=batch["loss_masks"])
+        train_hooks.record_optimizer_result(True)
+    train_hooks.close_train_appenders()
+    (record,) = _read_jsonl(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
+    assert record["samples"][0]["effective_loss_mask"] is None
+    assert record["samples"][0]["effective_loss_mask_status"] == reason
+
+
+@pytest.mark.parametrize("entropy_coef", [0, 0.1])
+def test_weight_audit_observes_actual_icepop_filter_without_changing_gradient(
+    tmp_path, fake_mpu, monkeypatch, entropy_coef
+):
+    fake_mpu()
+    from relax.backends.megatron import loss as loss_module
+    from relax.utils.agentic_obs import train_hooks
+
+    log_probs = torch.tensor([-1.0] * 4, requires_grad=True)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *a, **k: (None, {"log_probs": [log_probs], "entropy": [-log_probs]}),
+    )
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *a, **k: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **k: (None, {}))
+    args = _train_args(
+        tmp_path,
+        advantage_estimator="rloo",
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=True,
+        custom_tis_function_path="relax.backends.megatron.loss.icepop_function",
+        custom_pg_loss_reducer_function_path=None,
+        entropy_coef=entropy_coef,
+        use_kl_loss=False,
+        tis_clip_low=0.5,
+        tis_clip=1.5,
+        qkv_format="thd",
+        calculate_per_token_loss=False,
+    )
+    batch = _rollout_data(
+        [7],
+        advantages=torch.ones(4),
+        log_probs=[log_probs.detach()],
+        rollout_log_probs=[log_probs.detach() - torch.tensor([2.0, 1.0, 2.0, 1.0]).log()],
+        unconcat_tokens=[torch.arange(6)],
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    baseline, _ = loss_module.policy_loss_function(args, batch, torch.empty(1, 1, 1), lambda v: v.mean())
+    (baseline_gradient,) = torch.autograd.grad(baseline, log_probs)
+    with train_hooks.observe_train_step(args, 1, 0):
+        train_hooks.capture_training_input(batch)
+        observed, _ = loss_module.policy_loss_function(args, batch, torch.empty(1, 1, 1), lambda v: v.mean())
+        train_hooks.record_optimizer_result(True)
+    (observed_gradient,) = torch.autograd.grad(observed, log_probs)
+    torch.testing.assert_close(observed, baseline)
+    torch.testing.assert_close(observed_gradient, baseline_gradient)
+    # Current == old, but train/rollout == 2 on tokens 0 and 2: ICEPOP rejects them.
+    expected = [bool(entropy_coef), True, bool(entropy_coef), True]
+    assert (observed_gradient != 0).tolist() == expected
+    train_hooks.close_train_appenders()
+    (record,) = _read_jsonl(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
+    assert record["samples"][0]["effective_loss_mask"] == {
+        "ranges": [[0, 4, 1]] if entropy_coef else [[1, 2, 1], [3, 4, 1]]
+    }
+
+
+def test_weight_audit_gspo_icepop_partial_rejection_stays_unknown(tmp_path, fake_mpu, monkeypatch):
+    """ICEPOP-rejected tokens still feed `compute_gspo_kl` through
+    `loss_masks`, so a sequence-ratio objective reports unknown instead of a
+    wrongly precise complete mask."""
+    fake_mpu()
+    from relax.backends.megatron import loss as loss_module
+    from relax.utils.agentic_obs import train_hooks
+
+    # `loss`/`cp_utils` bind `megatron.core.mpu` at import time; stub the bound
+    # instance so the GSPO full-log-probs gather takes the CP=1 passthrough.
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: None, raising=False)
+    monkeypatch.setattr(
+        loss_module.mpu, "get_dynamic_data_context_parallel_groups", lambda group_size: None, raising=False
+    )
+
+    log_probs = torch.tensor([-1.0] * 4, requires_grad=True)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *a, **k: (None, {"log_probs": [log_probs], "entropy": [-log_probs]}),
+    )
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *a, **k: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **k: (None, {}))
+    args = _train_args(
+        tmp_path,
+        advantage_estimator="gspo",
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=True,
+        custom_tis_function_path="relax.backends.megatron.loss.icepop_function",
+        custom_pg_loss_reducer_function_path=None,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        entropy_coef=0,
+        use_kl_loss=False,
+        tis_clip_low=0.5,
+        tis_clip=1.5,
+        qkv_format="thd",
+        calculate_per_token_loss=False,
+    )
+    batch = _rollout_data(
+        [7],
+        advantages=torch.ones(4),
+        log_probs=[log_probs.detach()],
+        rollout_log_probs=[log_probs.detach() - torch.tensor([2.0, 1.0, 2.0, 1.0]).log()],
+        unconcat_tokens=[torch.arange(6)],
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    with train_hooks.observe_train_step(args, 1, 0):
+        train_hooks.capture_training_input(batch)
+        loss_module.policy_loss_function(args, batch, torch.empty(1, 1, 1), lambda v: v.mean())
+        train_hooks.record_optimizer_result(True)
+    train_hooks.close_train_appenders()
+    (record,) = _read_jsonl(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["effective_loss_mask"] is None
+    assert sample["effective_loss_mask_status"] == "sequence_ratio_unresolved"
+
+
+def test_weight_audit_gspo_ungated_stays_exact(tmp_path, fake_mpu, monkeypatch):
+    """Without per-token gating, a sequence-ratio objective keeps exact
+    membership: every masked log-prob enters the ratio and the outer term."""
+    fake_mpu()
+    from relax.backends.megatron import loss as loss_module
+    from relax.utils.agentic_obs import train_hooks
+
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: None, raising=False)
+    monkeypatch.setattr(
+        loss_module.mpu, "get_dynamic_data_context_parallel_groups", lambda group_size: None, raising=False
+    )
+
+    log_probs = torch.tensor([-1.0] * 4, requires_grad=True)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *a, **k: (None, {"log_probs": [log_probs], "entropy": [-log_probs]}),
+    )
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *a, **k: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **k: (None, {}))
+    args = _train_args(
+        tmp_path,
+        advantage_estimator="gspo",
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=False,
+        custom_pg_loss_reducer_function_path=None,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        entropy_coef=0,
+        use_kl_loss=False,
+        qkv_format="thd",
+        calculate_per_token_loss=False,
+    )
+    batch = _rollout_data(
+        [7],
+        advantages=torch.ones(4),
+        log_probs=[log_probs.detach()],
+        rollout_log_probs=[log_probs.detach()],
+        unconcat_tokens=[torch.arange(6)],
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    with train_hooks.observe_train_step(args, 1, 0):
+        train_hooks.capture_training_input(batch)
+        loss_module.policy_loss_function(args, batch, torch.empty(1, 1, 1), lambda v: v.mean())
+        train_hooks.record_optimizer_result(True)
+    train_hooks.close_train_appenders()
+    (record,) = _read_jsonl(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["effective_loss_mask"] == {"ranges": [[0, 4, 1]]}
+    assert sample["effective_loss_mask_status"] == "complete"
+
+
+def test_weight_audit_custom_loss_objective_stays_unknown(tmp_path, fake_mpu, monkeypatch):
+    """A `custom_loss` objective may nest `policy_loss_function` and add
+    further targets; the nested policy call must not certify its own slice as
+    complete."""
+    fake_mpu()
+    from relax.backends.megatron import loss as loss_module
+    from relax.utils.agentic_obs import train_hooks
+
+    log_probs = torch.tensor([-1.0] * 4, requires_grad=True)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *a, **k: (None, {"log_probs": [log_probs], "entropy": [-log_probs]}),
+    )
+    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *a, **k: None)
+    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **k: (None, {}))
+    args = _train_args(
+        tmp_path,
+        loss_type="custom_loss",
+        advantage_estimator="rloo",
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=True,
+        custom_tis_function_path="relax.backends.megatron.loss.icepop_function",
+        custom_pg_loss_reducer_function_path=None,
+        entropy_coef=0,
+        use_kl_loss=False,
+        tis_clip_low=0.5,
+        tis_clip=1.5,
+        qkv_format="thd",
+        calculate_per_token_loss=False,
+    )
+    batch = _rollout_data(
+        [7],
+        advantages=torch.ones(4),
+        log_probs=[log_probs.detach()],
+        rollout_log_probs=[log_probs.detach() - torch.tensor([2.0, 1.0, 2.0, 1.0]).log()],
+        unconcat_tokens=[torch.arange(6)],
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    with train_hooks.observe_train_step(args, 1, 0):
+        train_hooks.capture_training_input(batch)
+        # The custom objective calls the stock policy path once, then would add
+        # its own terms (not run here: membership must already be unknown).
+        loss_module.policy_loss_function(args, batch, torch.empty(1, 1, 1), lambda v: v.mean())
+        train_hooks.record_optimizer_result(True)
+    train_hooks.close_train_appenders()
+    (record,) = _read_jsonl(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["effective_loss_mask"] is None
+    assert sample["effective_loss_mask_status"] == "custom_loss"
 
 
 def test_update_exception_does_not_run_a_collective_or_commit(tmp_path, fake_mpu, monkeypatch):
@@ -2179,7 +2530,7 @@ def test_all_six_streams_join_from_prompt_to_committed_update(tmp_path, rollout_
     export_id = trajectory["sample_export_id"]
     assert export_id == str(sample.sample_export_id)
     assert int(export_id) >> 56 == 15 and int(export_id) & 1
-    assert trajectory["schema_version"] == "3.0.0" and trajectory["run_id"] == "run_test"
+    assert trajectory["schema_version"] == "3.1.0" and trajectory["run_id"] == "run_test"
     assert trajectory["sample_index"] == 5 and "index" not in trajectory
     assert trajectory["group_index"] == 2 and trajectory["label"] == "gold"
     assert trajectory["export_name"] is None and trajectory["exported_at"].endswith("Z")

@@ -3139,9 +3139,12 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
                 engine_version = ray.get(engine.get_weight_version.remote())
-                if str(engine_version) != str(self.weight_updater.weight_version):
+                from relax.utils.agentic_obs.weight_publication import publication_label
+
+                expected_version = publication_label(self.weight_updater)
+                if str(engine_version) != expected_version:
                     raise RuntimeError(
-                        f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
+                        f"Weight version mismatch! Engine: {engine_version}, Updater: {expected_version}"
                     )
 
             self._advance_keep_old_actor_queue()

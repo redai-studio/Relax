@@ -105,6 +105,18 @@ class AdmissionCoordinator:
         self._counters: dict[str, float] = {}
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(_METRICS_TIMEOUT_S))
         self._poll_task: asyncio.Task[None] | None = None
+        from relax.utils.agentic_obs.weight_audit import PublicationLedger
+
+        self._weight_publications = PublicationLedger()
+
+    async def begin_weight_publication(self, policy: str, epoch: str, raw_version: str) -> bool:
+        return self._weight_publications.begin(policy, epoch, raw_version)
+
+    async def commit_weight_publication(self, policy: str, epoch: str, raw_version: str) -> dict[str, Any] | None:
+        return self._weight_publications.commit(policy, epoch, raw_version)
+
+    async def weight_publication_snapshot(self) -> dict[str, Any] | None:
+        return self._weight_publications.snapshot()
 
     async def start(self) -> None:
         if not self._program_admission or not self._router_ip or not self._router_port or self._poll_task is not None:
