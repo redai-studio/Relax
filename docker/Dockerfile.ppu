@@ -1,0 +1,414 @@
+# Build context: Relax repository root.
+#
+# PPU (Zhenwu ZW-M890P / ZW-810E) counterpart of docker/Dockerfile, organised
+# the same way as docker/Dockerfile.npu: the platform lives in this file plus
+# docker/ppu_patch/, and the shared Dockerfile is left untouched.
+#
+# The base image already ships the whole PPU stack (torch 2.11 on the CUDA 13
+# ABI, sglang 0.5.17, triton, flash-attn, DeepEP, ...).  Those wheels are built
+# against one specific torch, so none of them is reinstalled:
+#   * the base stage freezes the stack into /etc/relax-ppu-constraints.txt and
+#     ENV PIP_CONSTRAINT points at it;
+#   * the CUDA-only layers of docker/Dockerfile are dropped -- the flash-attn /
+#     FA3 / FlashMLA / tilelang / apex source builds and the cu12 runtime
+#     requirements either ship as PPU wheels in the base image or have no PPU
+#     equivalent at all.  The HybridEP wheel has no PPU build either, so its
+#     namespace is re-exported from DeepEP (docker/ppu_patch/megatron/).
+#
+# Stage order follows docker/Dockerfile: base -> train -> router_builder -> relax.
+#
+#   docker build -f docker/Dockerfile.ppu -t relax-sail:ppu-v0.1.0 .
+#
+# TMS_LINE selects the torch_memory_saver line (`vmm` by default, `mempool` for
+# the mainline fork); it is the only build-arg that changes the shipped stack.
+ARG BASE_IMAGE=pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
+ARG TRAIN_IMAGE=train
+FROM ${BASE_IMAGE} AS base
+
+# TARGETARCH / PYVER / PYSFX / OPENCV_VERSION come from docker/Dockerfile and
+# nothing in this build reads them; the rest set up the PPU toolchain and pip.
+ENV TARGETARCH=amd64 \
+    PYVER=3.12 \
+    PYSFX=3 \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
+    TZ=Asia/Shanghai \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    OPENCV_VERSION=4.7.0 \
+    DEBIAN_FRONTEND=noninteractive \
+    PPU_SDK=/usr/local/PPU_SDK \
+    CUDA_HOME=/usr/local/PPU_SDK/CUDA_SDK \
+    CUDA_SDK_VER=cuda-13.0 \
+    PIP_CONSTRAINT=/etc/relax-ppu-constraints.txt \
+    PATH=/usr/local/PPU_SDK/CUDA_SDK/bin:/usr/local/PPU_SDK/ppu-smi/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/pccl/nccl_wrapper/lib:/usr/local/pccl/lib:/usr/local/PPU_SDK/lib:/usr/local/PPU_SDK/CUDA_SDK/lib64:${LD_LIBRARY_PATH}
+
+# transformer_engine is not on the pip index (2.16 max there), and 2.18 is the
+# first release with the PPU CUTLASS grouped-GEMM kernels the MoE path needs.
+# Take the published wheel of flytiger-eco/TransformerEngine-for-sail instead of
+# rebuilding it: tag 2.18+v0.1.0 is the NVTE_FRAMEWORK=pytorch /
+# NVTE_WITH_NCCL_EP=0 / NVTE_CUDA_ARCHS="80;89" build its CI produces.
+ARG TE_VERSION=2.18.0+efa9bf4
+ARG TE_WHEEL_FILE=transformer_engine-2.18.0+efa9bf4-cp312-cp312-linux_x86_64.whl
+ARG TE_WHEEL_SHA256=30dc401b47a4bef9a39b6030c010a72c2d361c831c064a09e3e469255b4a66df
+ARG TE_WHEEL_URL=https://github.com/flytiger-eco/TransformerEngine-for-sail/releases/download/2.18%2Bv0.1.0/${TE_WHEEL_FILE}
+ARG TE_WHEEL_MIRROR=https://ghfast.top/
+ARG APEX_VERSION=25.9+v0.1.0.ppu2.2.0
+ARG FHT_VERSION=1.1.0.post2+v0.1.0.ppu2.2.0
+# The wheel ships include/cutlass3 where the CUTLASS-RTC resolver never looks.
+ENV TE_VERSION=${TE_VERSION} \
+    APEX_VERSION=${APEX_VERSION} \
+    FHT_VERSION=${FHT_VERSION} \
+    NVTE_CUTLASS3_INCLUDE_DIR=/usr/local/lib/python3.12/site-packages/include/cutlass3
+
+# Freeze the base PPU stack into PIP_CONSTRAINT so no later install can swap it.
+# torch-memory-saver is absent on purpose: the relax stage writes back the
+# version it installs at the end of its own layer.
+RUN python - <<'PY' > /etc/relax-ppu-constraints.txt
+import importlib.metadata as md
+import os
+
+import torch
+
+assert torch.version.cuda == "13.0", (torch.__version__, torch.version.cuda)
+
+for name in """torch torchvision torchaudio triton sglang sglang-kernel flashinfer-python
+              torchao flash-attn flash-attn-3 flash-attn-4 flash-mla tilelang deep_gemm
+              deep_ep torchcodec xgrammar""".split():
+    try:
+        print(f"{name}=={md.version(name)}")
+    except md.PackageNotFoundError:
+        if name in ("torch", "triton", "sglang"):
+            raise
+
+for name, env in (
+    ("transformer_engine", "TE_VERSION"),
+    ("apex", "APEX_VERSION"),
+    ("fast-hadamard-transform", "FHT_VERSION"),
+):
+    print(f"{name}=={os.environ[env]}")
+
+# numpy stays at the base build and requirements.txt asks for <2; the two agree.
+print("numpy==1.26.4")
+print("protobuf>=6.33.5,<7")
+PY
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+    build-essential patchelf tmux net-tools htop nano iputils-ping \
+    autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
+    libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
+    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y locales tzdata && \
+    locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LANG" && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+FROM base AS train
+
+# TE dispatches FlashAttention-3 off `flash_attention_backend.major == 3`, but
+# the PPU flash-attn-3 wheel is versioned 2.8.2 (major=2), so forwards silently
+# fell back to the FA2 extension while the log still claimed 2.8.2.
+# te_fa3_dispatch.py also accepts "selected backend == installed FA3 version",
+# is idempotent, and prints "te_fa3_dispatch: patched OK".
+COPY docker/ppu_patch/transformer_engine/2.18.0-fa3-dispatch.py /tmp/te-wheel/te_fa3_dispatch.py
+RUN set -eu ; \
+    whl="/tmp/te-wheel/${TE_WHEEL_FILE}" ; \
+    for src in "${TE_WHEEL_MIRROR}${TE_WHEEL_URL}" "${TE_WHEEL_URL}"; do \
+        [ -n "$src" ] || continue ; \
+        if curl -fSL --retry 3 --connect-timeout 20 -o "$whl" "$src"; then break ; else rm -f "$whl" ; fi ; \
+    done ; \
+    [ -f "$whl" ] || { echo "TE wheel ${TE_WHEEL_FILE} could not be downloaded" >&2 ; exit 1 ; } ; \
+    echo "${TE_WHEEL_SHA256}  ${whl}" | sha256sum -c - && \
+    pip install --no-cache-dir --no-deps --no-index "$whl" && \
+    rm -f "$whl" && \
+    python3 /tmp/te-wheel/te_fa3_dispatch.py && rm -rf /tmp/te-wheel
+
+RUN pip install --no-cache-dir "apex==${APEX_VERSION}" "fast-hadamard-transform==${FHT_VERSION}"
+
+# INT4 fake-quant extension for QAT weight sync; the PPU runtime reports 8.9.
+COPY relax/backends/megatron/kernels/int4_qat /tmp/int4_qat
+RUN cd /tmp/int4_qat && \
+    TORCH_CUDA_ARCH_LIST=8.9 pip install . --no-build-isolation --no-cache-dir && \
+    rm -rf /tmp/int4_qat
+
+# No hybridep_builder stage here: the HybridEP wheel is compiled against
+# nvidia-nvshmem-cu12 and CUDA 12 SM targets, neither of which exists on this
+# base.  The relax stage supplies the `_relax_hybrid_ep` namespace that
+# Megatron-Core imports from the PPU DeepEP instead.
+
+FROM ${TRAIN_IMAGE} AS router_builder
+
+ARG ROUTER_RUST_VERSION=stable
+ARG ROUTER_BUILD_JOBS=16
+# Toolchain downloads are the slowest step here: ustc / tuna / rsproxy mirrors
+# ship channel-*.toml whose URLs still point at static.rust-lang.org, while
+# aliyun rewrites them to itself but only mirrors the "stable" channel.
+# rustup-init comes from that same mirror, so nothing touches sh.rustup.rs.
+ARG RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+ARG RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
+ARG CARGO_SOURCE_REGISTRY=sparse+https://rsproxy.cn/index/
+ENV PATH=/root/.cargo/bin:${PATH} \
+    CARGO_BUILD_JOBS=${ROUTER_BUILD_JOBS} \
+    CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
+    RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git libssl-dev pkg-config protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl --proto '=https' --tlsv1.2 --fail --location \
+        "${RUSTUP_DIST_SERVER}/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init" -o /tmp/rustup-init && \
+    chmod +x /tmp/rustup-init && \
+    /tmp/rustup-init -y --profile minimal --default-toolchain "${ROUTER_RUST_VERSION}" && \
+    rm -f /tmp/rustup-init && \
+    mkdir -p /root/.cargo && \
+    printf '%s\n' \
+        '[source.crates-io]' \
+        "replace-with = 'rsproxy-sparse'" \
+        '[source.rsproxy-sparse]' \
+        "registry = \"${CARGO_SOURCE_REGISTRY}\"" \
+        '[net]' \
+        'git-fetch-with-cli = true' \
+        > /root/.cargo/config.toml && \
+    python -m pip install --no-cache-dir "maturin==1.9.6"
+COPY docker/patch/sglang-router /tmp/router-patch
+COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
+RUN bash /tmp/build_sglang_router.sh /tmp/router-patch /opt/router-wheels
+
+FROM ${TRAIN_IMAGE} AS relax
+
+WORKDIR /root
+
+ARG PATCH_VERSION=latest
+ARG ENABLE_SGLANG_PATCH=1
+# TE 2.18 needs no patch (unlike the cu13 image): upstream already carries the
+# CP-padding fix.
+
+# switch_mcore.sh dev -> .dev.commit 4a4de8657 (mcore 0.19.0), the patch baseline.
+ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
+ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
+    PYTHONPATH=/root/Megatron-LM/
+
+RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && \
+    cd /root/Megatron-Bridge/ && git checkout ${MEGATRON_BRIDGE_COMMIT} && \
+    git submodule update --init --recursive && ./scripts/switch_mcore.sh dev && \
+    mkdir /root/Megatron-LM && \
+    cp -r /root/Megatron-Bridge/src/megatron /root/Megatron-LM/ && \
+    rsync -avP /root/Megatron-Bridge/3rdparty/Megatron-LM/megatron/ /root/Megatron-LM/megatron/ && \
+    rm -rf /root/Megatron-Bridge
+
+# NVRx 0.6 async checkpoint API for the pinned MCore; the manylinux wheel brings
+# the CUPTI extension, which cannot be built against this SDK.
+RUN printf '%s\n' 'nvidia-resiliency-ext==0.6.0' 'grpcio-tools==1.81.1' 'setuptools>=80,<82' >> "$PIP_CONSTRAINT" && \
+    pip install --no-cache-dir "nvidia-ml-py>=12.570.86" "setuptools>=80,<82" "pulp<4.0" && \
+    pip install --no-cache-dir --no-deps "nvidia-resiliency-ext==0.6.0" && \
+    pip install --no-cache-dir "grpcio-tools==1.81.1"
+
+# FLA 0.4.1 from t-head's PPU fork: the tag carries the IS_PPU probe and the AIU
+# staging, so none of the FLA patches of the shared Dockerfile applies.
+ARG FLA_GIT_URL=https://github.com/t-head/flash-linear-attention-for-sail
+ARG FLA_GIT_REF=0.4.1+v0.1.0
+RUN set -eu ; \
+    rm -rf /tmp/fla-src ; \
+    git clone --depth 1 --branch "${FLA_GIT_REF}" "${FLA_GIT_URL}" /tmp/fla-src ; \
+    ( cd /tmp/fla-src && python scripts/build_packages.py ) ; \
+    pip install --no-cache-dir --force-reinstall --no-deps /tmp/fla-src/dist-packages/*.whl ; \
+    printf 'repo=%s\nref=%s\n' "${FLA_GIT_URL}" "${FLA_GIT_REF}" > /etc/relax-ppu-fla.txt
+
+# apptainer is only used by the agentic examples.
+ARG APPTAINER_DEB_URL=https://github.com/apptainer/apptainer/releases/download/v1.4.1/apptainer_1.4.1_amd64.deb
+ARG APPTAINER_DEB_MIRROR=https://ghfast.top/
+RUN set -eu ; \
+    deb=/tmp/apptainer_1.4.1_amd64.deb ; \
+    for src in "${APPTAINER_DEB_MIRROR}${APPTAINER_DEB_URL}" "${APPTAINER_DEB_URL}"; do \
+        [ -n "$src" ] || continue ; \
+        if curl -fSL --retry 3 --connect-timeout 20 --max-time 600 -o "$deb" "$src"; then break ; else rm -f "$deb" ; fi ; \
+    done ; \
+    apt-get update ; \
+    apt-get install -y --no-install-recommends "$deb" ; \
+    rm -f "$deb" ; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+
+# Align the Relax pins with the versions the base image already carries, so the
+# requirements resolve is a no-op for them instead of a downgrade.
+RUN sed -i \
+    -e 's/^clearml==2\.1\.3$/clearml==2.1.4/' \
+    -e 's/^numpy<2$/numpy==1.26.4/' \
+    -e 's/pyarrow==14\.0\.2/pyarrow==25.0.1/g' \
+    -e 's/huggingface_hub==1\.7\.2/huggingface_hub==1.15.0/g' \
+    /tmp/requirements.txt
+
+COPY docker/patch/transferqueue/9784ad0-assignment-transform.patch /tmp/tq-assignment.patch
+
+RUN pip install --no-cache-dir "ray[default,serve]==2.56.1" && \
+    pip install --ignore-installed --no-cache-dir 'PyJWT>=2.10.1,<3' && \
+    pip install -r /tmp/requirements.txt --no-cache-dir && \
+    pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
+    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-cache-dir --no-deps && \
+    TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch
+
+# Install the R3 + PD DP-aware router after requirements, including externally
+# supplied TRAIN_IMAGE builds.
+COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
+RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
+    python -c "import json, importlib.resources as r, sglang_router; from sglang_router import sglang_router_rs; \
+        b = json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()); \
+        assert sglang_router.__version__ == b['version'] == '0.3.2+slime.dpaware'; \
+        assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)" && \
+    rm -rf /tmp/router-wheels
+
+COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
+COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
+COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
+RUN cd Megatron-LM && \
+    patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
+    if grep -R -n '^<<<<<<< ' .; then \
+    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+    exit 1; \
+    fi && \
+    patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
+    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
+    python -m compileall -q megatron && \
+    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch \
+       20261020-qwen35-optimized.patch 20261020-model-operators.patch mtp-cp-normalization.patch && \
+    apt update && apt install -y jq
+
+# torch_memory_saver ships in two lines; TMS_LINE picks one and nothing else in
+# the build depends on it:
+#   vmm (default)  stock upstream bdab8c55, the line that hooks cuMemCreate /
+#                  cuMemMap and therefore tolerates
+#                  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+#   mempool        redai-studio fork afc13785 (same commit as Dockerfile.cu13).
+#                  It drives the saver through torch.cuda.MemPool and refuses
+#                  expandable_segments; PPU allocates in 8 MiB granules, not
+#                  2 MiB, so it needs the alignment patch or every cuMemCreate
+#                  fails with INVALID_VALUE.
+ARG TMS_LINE=vmm
+ARG TMS_COMMIT_VMM=bdab8c55f490a00a746ec34e301391617f5ca878
+ARG TMS_COMMIT_MEMPOOL=afc13785c50119048e2dd8ac497cc9e29ec75bd4
+COPY docker/ppu_patch/torch_memory_saver/afc13785-granularity-align.patch /tmp/tms-granularity.patch
+# The base image already carries git and Python.h, and one commit is all the
+# source tree needs, so fetch that commit shallowly.
+RUN set -eu ; \
+    case "$TMS_LINE" in \
+        vmm) repo=https://github.com/zhuzilin/torch_memory_saver.git ; \
+             commit="$TMS_COMMIT_VMM" ; patch=none ;; \
+        mempool) repo=https://github.com/redai-studio/torch_memory_saver.git ; \
+             commit="$TMS_COMMIT_MEMPOOL" ; \
+             patch=afc13785-granularity-align.patch ;; \
+        *) echo "TMS_LINE must be vmm or mempool, got '$TMS_LINE'" >&2 ; exit 1 ;; \
+    esac ; \
+    git init --quiet /tmp/tms-src ; \
+    cd /tmp/tms-src ; \
+    git remote add origin "$repo" ; \
+    git fetch --quiet --depth 1 origin "$commit" ; \
+    git checkout --quiet FETCH_HEAD ; \
+    if [ "$TMS_LINE" = "mempool" ]; then \
+        git apply --verbose --whitespace=nowarn /tmp/tms-granularity.patch ; \
+    fi ; \
+    TMS_CUDA_MAJOR="$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" ; \
+    export TMS_CUDA_MAJOR ; \
+    [ "$TMS_CUDA_MAJOR" = "13" ] || { echo "unexpected CUDA major: $TMS_CUDA_MAJOR" >&2; exit 1 ; } ; \
+    PIP_CONSTRAINT= pip install . \
+        --no-cache-dir --force-reinstall --no-deps --no-build-isolation && \
+    cd / ; rm -rf /tmp/tms-src /tmp/tms-granularity.patch ; \
+    printf 'repo=%s\nref=%s\npatch=%s\n' "$repo" "$commit" "$patch" > /etc/relax-ppu-tms.txt ; \
+    printf 'torch-memory-saver==%s\n' "$(python -c 'import importlib.metadata as m; print(m.version("torch_memory_saver"))')" >> "$PIP_CONSTRAINT"
+
+# Every process of every actor (train, rollout, sglang workers) needs this, and
+# Ray workers only inherit what the runtime env carries -> image default.
+ENV HGGC_DEVICE_GRAPH=2
+
+# relax/distributed/ray/actor_group.py builds the LD_PRELOAD path by hand as
+# ..._hook_mode_preload.abi3.so (hit whenever --selective-offload is absent),
+# while both lines ship one file per CUDA major.  The check follows the link on
+# purpose: it dlopens the exact path relax computes, so a bad alias fails the
+# build.
+RUN set -eu ; \
+    SP=/usr/local/lib/python3.12/site-packages ; \
+    MAJ="$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" ; \
+    src="$SP/torch_memory_saver_hook_mode_preload_cu${MAJ}.abi3.so" ; \
+    [ -e "$src" ] || { echo "torch_memory_saver preload .so missing: $src" >&2; exit 1 ; } ; \
+    ln -sf "$(basename "$src")" "$SP/torch_memory_saver_hook_mode_preload.abi3.so" ; \
+    python -c "import ctypes, pathlib, torch; \
+p = pathlib.Path('$SP/torch_memory_saver_hook_mode_preload.abi3.so'); \
+assert p.resolve().name == 'torch_memory_saver_hook_mode_preload_cu%s.abi3.so' % torch.version.cuda.split('.')[0], p.resolve(); \
+ctypes.CDLL(str(p)); print('preload OK:', p.resolve())"
+
+# SGLang is a wheel (no source tree), so the two upstream patches apply to
+# site-packages with -p2.  flytiger's 0.5.17 fork leaves seven of their hunks
+# unplaced; 0.5.17-ppu-adapt.patch re-anchors exactly those, and the count check
+# below turns any drift on either side into a build failure.
+COPY docker/patch/latest/sglang.patch /tmp/sglang.patch
+COPY docker/patch/latest/sglang_per_pos_topk.patch /tmp/sglang-per-pos-topk.patch
+COPY docker/ppu_patch/sglang/0.5.17-ppu-adapt.patch /tmp/sglang-ppu-adapt.patch
+RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+    cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("sglang").origin).parent.parent)')" && \
+    { patch --batch --forward -p2 --fuzz=0 --no-backup-if-mismatch \
+        --reject-file=/dev/null \
+        < /tmp/sglang.patch > /tmp/sglang-upstream.log 2>&1 || true ; } && \
+    test "$(grep -c ' FAILED at ' /tmp/sglang-upstream.log)" = \
+         "$(grep -c '^@@' /tmp/sglang-ppu-adapt.patch)" && \
+    patch --batch --forward -p2 --fuzz=0 --no-backup-if-mismatch \
+        < /tmp/sglang-ppu-adapt.patch && \
+    patch --batch --forward -p2 --fuzz=0 --no-backup-if-mismatch \
+        < /tmp/sglang-per-pos-topk.patch && \
+    rm -f /tmp/sglang.patch /tmp/sglang-per-pos-topk.patch \
+          /tmp/sglang-ppu-adapt.patch /tmp/sglang-upstream.log; \
+fi
+
+# Fill the gaps the --no-deps installs leave (hydra-core, packaging, audioread);
+# packaging 25.0 is also the only version the base's nvidia-dali accepts.  onnx /
+# onnxscript are TE's own ONNX-export dependencies, which --no-deps skipped.
+RUN printf '%s\n' 'packaging==25.0' >> "$PIP_CONSTRAINT" && \
+    pip install --no-cache-dir "packaging==25.0" "hydra-core==1.3.2" "audioread==3.1.0" "virtualenv<21" && \
+    pip install --no-cache-dir "onnx==1.23.2" "onnxscript==0.7.2"
+
+# Megatron-Core's fused_a2a.py imports `_relax_hybrid_ep` unconditionally and
+# has no `deep_ep` fallback, while this base has no HybridEP build at all (see
+# the note in the train stage).  The PPU DeepEP exposes the same Buffer / Config
+# API, so the namespace forwards to it -- without this, launching with
+# --moe-flex-dispatcher-backend deepep dies in token_dispatcher.py with
+# "DeepEP is not installed".
+COPY docker/ppu_patch/megatron/4a4de8657-relax-hybrid-ep /usr/local/lib/python3.12/site-packages/_relax_hybrid_ep
+RUN python -c "import _relax_hybrid_ep as h, deep_ep; \
+    assert h.Buffer is deep_ep.Buffer, 'namespace does not forward Buffer' ; \
+    assert h.Config is deep_ep.Config, 'namespace does not forward Config' ; \
+    print('hybrid-ep namespace OK:', h.__file__)"
+
+# A pre-FROM ARG must be re-declared in the stage to interpolate into LABEL.
+ARG BASE_IMAGE
+ARG RELAX_PPU_TAG=ppu-v0.1.0
+LABEL org.opencontainers.image.title="relax-sail" \
+      org.opencontainers.image.version="${RELAX_PPU_TAG}" \
+      org.opencontainers.image.description="Relax RL framework on Zhenwu PPU (ZW-M890P / ZW-810E)" \
+      relax.ppu.base_image="${BASE_IMAGE}" \
+      relax.ppu.tms_line="${TMS_LINE}"
+
+# The cache wipe must stay last: the image ships a cold JIT cache, and a fresh
+# .rej/.orig means a patch left debris.  It lists only what no earlier layer
+# removes -- a later `rm` cannot shrink an image.
+RUN rm -rf /root/.cache /root/.triton /root/.nv /tmp/torchinductor_root \
+           /tmp/requirements.txt \
+           /tmp/sglang.patch /tmp/sglang-per-pos-topk.patch \
+           /tmp/sglang-ppu-adapt.patch /tmp/sglang-upstream.log \
+           /tmp/fla-src /tmp/tq-assignment.patch \
+           /var/lib/apt/lists/* && \
+    if find /usr/local/lib/python3.12/site-packages \( -name '*.rej' -o -name '*.orig' \) \
+            -newermt '2026-10-01' -print | grep -q . ; then \
+        echo "patch leftovers found:" ; \
+        find /usr/local/lib/python3.12/site-packages \( -name '*.rej' -o -name '*.orig' \) -newermt '2026-10-01' ; \
+        exit 1 ; \
+    fi
+
+WORKDIR /workspace
