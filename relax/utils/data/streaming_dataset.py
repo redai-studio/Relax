@@ -32,7 +32,7 @@ import time
 from bisect import bisect_right
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 import numpy as np
 
@@ -46,6 +46,8 @@ from relax.utils.data.data_utils import (
     BaseDataset,
     check_sample_length,
     parse_generalized_path,
+    resolve_base_dataset_columns,
+    resolve_parquet_columns,
     resolve_path_plan,
 )
 from relax.utils.env import Envs
@@ -80,11 +82,15 @@ class StreamingReader:
         pre_make_index: bool = False,
         line_offsets_cache: dict | None = None,
         with_source: bool = False,
+        columns: Optional[Sequence[str]] = None,
+        required_columns: Optional[Sequence[str]] = None,
     ):
         """Initialize the streaming reader.
 
         Args:
             path: Path to the data file (JSONL or Parquet)
+            columns: Optional top-level column whitelist for Parquet files
+            required_columns: Optional columns that must exist for projection to apply
         """
         self.path, self.row_slice = parse_generalized_path(path)
         self._pre_make_index = pre_make_index
@@ -92,6 +98,8 @@ class StreamingReader:
         self._cache_key = path
         self.with_source = with_source
         self._source_row_ids: list[int] = []
+        self._columns = tuple(columns) if columns is not None else None
+        self._required_columns = tuple(required_columns) if required_columns is not None else None
 
         if not os.path.exists(self.path):
             raise FileNotFoundError(f"Dataset path '{self.path}' does not exist.")
@@ -162,6 +170,7 @@ class StreamingReader:
 
         logger.info(f"Loading parquet file {self.path}...")
         pf = pq.ParquetFile(self.path)
+        effective_columns = resolve_parquet_columns(pf.schema_arrow.names, self._columns, self._required_columns)
         self._parquet_data = []
 
         # Read row groups individually instead of using iter_batches().
@@ -169,7 +178,7 @@ class StreamingReader:
         # which fails with ArrowNotImplementedError on nested types
         # (e.g. list<struct<...>>, struct<...>).
         for i in range(pf.metadata.num_row_groups):
-            self._parquet_data.extend(pf.read_row_group(i).to_pylist())
+            self._parquet_data.extend(pf.read_row_group(i, columns=effective_columns).to_pylist())
 
         # Apply row slice if specified
         if self.row_slice is not None:
@@ -953,11 +962,33 @@ class StreamingDataset(BaseDataset):
 
         # Streaming-specific components
         self.source_split = source_split
+        columns, required_columns = resolve_base_dataset_columns(
+            prompt_key=prompt_key,
+            multimodal_keys=multimodal_keys,
+            label_key=label_key,
+            tool_key=tool_key,
+            metadata_key=metadata_key,
+            custom_prompt_func=custom_prompt_func,
+            teacher_prompt_key=teacher_prompt_key,
+            teacher_multimodal_keys=teacher_multimodal_keys,
+            record_source=record_source,
+        )
         paths, row_slice = resolve_path_plan(path)
         if len(paths) == 1 and row_slice is None:
-            self.reader = StreamingReader(paths[0], with_source=record_source)
+            self.reader = StreamingReader(
+                paths[0],
+                with_source=record_source,
+                columns=columns,
+                required_columns=required_columns,
+            )
         else:
-            self.reader = CompositeStreamingReader(paths, row_slice, with_source=record_source)
+            self.reader = CompositeStreamingReader(
+                paths,
+                row_slice,
+                with_source=record_source,
+                columns=columns,
+                required_columns=required_columns,
+            )
         self.buffer = SampleBuffer(max_size=buffer_size)
         self.index_manager = IndexManager(len(self.reader), seed=seed)
 

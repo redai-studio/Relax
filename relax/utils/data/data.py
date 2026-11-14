@@ -6,6 +6,7 @@ from relax.utils.data.data_utils import (
     BaseDataset,
     filter_long_prompts,
     read_file,
+    resolve_base_dataset_columns,
 )
 from relax.utils.types import Sample
 
@@ -70,10 +71,27 @@ class Dataset(BaseDataset):
             teacher_multimodal_keys=teacher_multimodal_keys,
         )
 
+        columns, required_columns = resolve_base_dataset_columns(
+            prompt_key=prompt_key,
+            multimodal_keys=multimodal_keys,
+            label_key=label_key,
+            tool_key=tool_key,
+            metadata_key=metadata_key,
+            custom_prompt_func=custom_prompt_func,
+            teacher_prompt_key=teacher_prompt_key,
+            teacher_multimodal_keys=teacher_multimodal_keys,
+            record_source=record_source,
+        )
+
         # Load all samples into memory
         self.source_split = source_split
         origin_samples = []
-        for data in read_file(path, with_source=record_source):
+        for data in read_file(
+            path,
+            with_source=record_source,
+            columns=columns,
+            required_columns=required_columns,
+        ):
             sample = self._process_data(data)
             origin_samples.append(sample)
 
