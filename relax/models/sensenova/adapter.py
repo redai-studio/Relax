@@ -7,11 +7,26 @@ Accelerator, or DeepSpeed training loop is used here.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import torch
+
+from relax.models.condition_cache import (
+    ConditionFeatureCache,
+    FrozenConditionSpec,
+    SharedConditionStore,
+    all_ranks_hit,
+    bind_condition_cache,
+    build_condition_cache,
+    condition_cache_key,
+    encoder_identity,
+)
+from relax.utils.env import Envs
 
 
 LORA_TARGETS = (
@@ -25,6 +40,23 @@ LORA_TARGETS = (
 )
 
 
+def _condition_encoder_identity(model_path: str) -> str:
+    """Verified external SHA if provided, else a cheap model-directory
+    identity.
+
+    Never rereads the multi-GB weights on every rank at startup: the cache does
+    not outlive the run that loaded those frozen weights.
+    """
+    return encoder_identity(model_path)
+
+
+def _condition_adapter_version() -> str:
+    digest = hashlib.sha256()
+    for name in ("adapter.py", "pipeline.py", "processing.py", "model.py"):
+        digest.update((Path(__file__).parent / name).read_bytes())
+    return digest.hexdigest()
+
+
 def configure_attention(implementation: str, deterministic: bool = False) -> None:
     """Pin the process-local kernel; optional deterministic backward for
     parity."""
@@ -35,8 +67,6 @@ def configure_attention(implementation: str, deterministic: bool = False) -> Non
     os.environ["RELAX_ATTENTION_IMPLEMENTATION"] = implementation
     os.environ["RELAX_DETERMINISTIC_ATTENTION"] = "1" if deterministic else "0"
     if deterministic:
-        if implementation != "flash_attention_2":
-            raise ValueError("Deterministic attention validation currently requires FlashAttention 2")
         # Masked prefix attention uses Torch SDPA, and vision uses cuDNN.
         # FA2's flag alone does not make full-parameter backward repeatable.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -81,13 +111,163 @@ class SenseNovaSFTModel(torch.nn.Module):
 
     _no_split_modules = ("SenseNovaU1DecoderLayer",)
 
-    def __init__(self, pipe: Any, training_mode: str = "lora", prefix_gradient_checkpointing: bool = True) -> None:
+    def __init__(
+        self,
+        pipe: Any,
+        training_mode: str = "lora",
+        prefix_gradient_checkpointing: bool = True,
+        condition_cache: ConditionFeatureCache | None = None,
+        condition_identity: str | None = None,
+    ) -> None:
         super().__init__()
         self.pipe = pipe
         self.training_mode = training_mode
         self.prefix_gradient_checkpointing = prefix_gradient_checkpointing
+        if condition_cache is not None and (training_mode != "lora" or not condition_identity):
+            raise ValueError("Frozen prefix reuse requires LoRA mode and a content-bound encoder identity")
+        self.condition_cache = condition_cache
+        self.condition_identity = condition_identity
+        self.condition_cache_group = None
+        self._condition_version = _condition_adapter_version() if condition_cache is not None else ""
+        self._prefix_device_identities: dict[int, dict[str, Any]] = {}
+        self._prefix_versions = None
+        self._condition_metrics = dict(
+            prefix_encodes=0, local_hits=0, global_hits=0, global_misses=0, bypasses=0, invalidations=0
+        )
+        self._condition_encode_seconds = 0.0
+        self.register_load_state_dict_post_hook(lambda module, incompatible: module.clear_condition_cache())
         if training_mode == "full":
             self._mark_fine_grained_modules()
+
+    def _prefix_cache_is_frozen(self) -> bool:
+        # Generation-specific MoT weights/adapters are not prefix dependencies.
+        # Any adapter injected into understanding/vision must disable reuse.
+        parameters = [
+            (name, parameter)
+            for name, parameter in self.pipe.dit.named_parameters()
+            if "mot_gen" not in name and not name.startswith("fm_modules.")
+        ]
+        if not parameters or any(parameter.requires_grad for _, parameter in parameters):
+            return False
+        versions = tuple((name, parameter._version) for name, parameter in parameters)
+        if self._prefix_versions is not None and versions != self._prefix_versions:
+            self.clear_condition_cache()
+            self._condition_metrics["invalidations"] += 1
+        self._prefix_versions = versions
+        # Future prefix dropout must not accidentally reuse a random feature.
+        for name, module in self.pipe.dit.named_modules():
+            if (
+                "mot_gen" not in name
+                and isinstance(module, torch.nn.modules.dropout._DropoutNd)
+                and module.training
+                and module.p
+            ):
+                return False
+        return True
+
+    def _prefix_encoder_device(self) -> str | dict[str, Any]:
+        # A shared entry follows a sample when the sampler assigns it to a
+        # different rank. Local CUDA ordinals identify placement, not encoder
+        # semantics; heterogeneous devices must still use different keys.
+        if not isinstance(self.condition_cache, SharedConditionStore):
+            return str(self.pipe.device)
+        device = torch.device(self.pipe.device)
+        if device.type != "cuda":
+            return str(device)
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        if index not in self._prefix_device_identities:
+            properties = torch.cuda.get_device_properties(index)
+            self._prefix_device_identities[index] = {
+                "type": device.type,
+                "backend": "hip" if torch.version.hip else "cuda",
+                "runtime": torch.version.hip or torch.version.cuda,
+                "name": properties.name,
+                "capability": (properties.major, properties.minor),
+                "multiprocessors": properties.multi_processor_count,
+                "memory_bytes": properties.total_memory,
+            }
+        return self._prefix_device_identities[index]
+
+    def _prefix_key(self, data: dict[str, Any], unit: Any) -> str:
+        images = data["edit_image"]
+        if images is None:
+            images = []
+        elif not isinstance(images, (list, tuple)):
+            images = [images]
+        device_type = torch.device(self.pipe.device).type
+        autocast = torch.is_autocast_enabled(device_type)
+        # Hash the effective CPU pixels, after prepare_sample's crop/resize.
+        # Never hash a filename or copy already-on-device pixels back to CPU.
+        content = {
+            "prompt": data["prompt"],
+            "conditions": tuple((image.mode, image.size, image.tobytes()) for image in images),
+            "target_size": (data["image"].height, data["image"].width),
+            "think_mode": False,
+            "attention": os.environ.get("RELAX_ATTENTION_IMPLEMENTATION", "flash_attention_2"),
+            "deterministic_attention": os.environ.get("RELAX_DETERMINISTIC_ATTENTION", "0"),
+            "torch_version": str(torch.__version__),
+            "encoder_device": self._prefix_encoder_device(),
+            "autocast": autocast,
+            "autocast_dtype": str(torch.get_autocast_dtype(device_type)) if autocast else None,
+        }
+        spec = FrozenConditionSpec(
+            encoder_identity=self.condition_identity,
+            preprocessing_version=self._condition_version,
+            dtype=str(self.pipe.torch_dtype),
+            feature_schema=unit.frozen_condition_schema,
+            adapter_version=self._condition_version,
+        )
+        return condition_cache_key(spec, content)
+
+    def clear_condition_cache(self) -> None:
+        if self.condition_cache is not None:
+            self.condition_cache.clear()
+
+    def close_condition_cache(self) -> None:
+        if self.condition_cache is not None:
+            self.condition_cache.close()
+
+    def condition_cache_stats(self) -> dict[str, Any]:
+        return {
+            "enabled": self.condition_cache is not None,
+            **(self.condition_cache.stats() if self.condition_cache is not None else {}),
+            **self._condition_metrics,
+            "encode_seconds_host": self._condition_encode_seconds,
+        }
+
+    def _run_condition_unit(self, unit: Any, inputs: Any, data: dict[str, Any]) -> Any:
+        cache = self.condition_cache
+        reusable = self.training_mode == "lora" and self._prefix_cache_is_frozen()
+        # Agreement applies to both eligibility and hit decisions. Independent
+        # rank-local skips would mismatch the sharded decoder collectives.
+        eligible = all_ranks_hit(reusable, self.condition_cache_group)
+        if not eligible:
+            self._condition_metrics["bypasses"] += 1
+            cache.clear()
+            started = time.monotonic()
+            result = self.pipe.unit_runner(unit, self.pipe, *inputs)
+            self._condition_metrics["prefix_encodes"] += 1
+            self._condition_encode_seconds += time.monotonic() - started
+            return result
+        key = self._prefix_key(data, unit)
+        local_hit = cache.contains(key)
+        self._condition_metrics["local_hits"] += int(local_hit)
+        if all_ranks_hit(local_hit, self.condition_cache_group):
+            self._condition_metrics["global_hits"] += 1
+            payload = cache.get(key, device=self.pipe.device)
+            if payload is None:
+                # A single-owner cache cannot change between probe/read.
+                raise RuntimeError("Frozen condition disappeared after collective hit agreement")
+            shared, positive, negative = inputs
+            outputs = unit.unpack_frozen_conditions(payload)
+            return shared, {**positive, **outputs}, {**negative, **outputs}
+        self._condition_metrics["global_misses"] += 1
+        started = time.monotonic()
+        result = self.pipe.unit_runner(unit, self.pipe, *inputs)
+        self._condition_metrics["prefix_encodes"] += 1
+        self._condition_encode_seconds += time.monotonic() - started
+        cache.put(key, unit.pack_frozen_conditions(result[1]))
+        return result
 
     def _mark_fine_grained_modules(self) -> None:
         from .model import SenseNovaU1Attention, SenseNovaU1ForCausalLM, SenseNovaU1MLP
@@ -112,6 +292,13 @@ class SenseNovaSFTModel(torch.nn.Module):
                 module.lm_head._fsdp_fine_grained = True
 
     def forward(self, data: dict[str, Any]) -> torch.Tensor:
+        try:
+            return self._forward_sample(data)
+        except BaseException:
+            self.close_condition_cache()
+            raise
+
+    def _forward_sample(self, data: dict[str, Any]) -> torch.Tensor:
         image = data["image"]
         shared = {
             "input_image": image,
@@ -128,7 +315,14 @@ class SenseNovaSFTModel(torch.nn.Module):
         # never checkpoint the mutable prefix cache in this LoRA-only path.
         with torch.no_grad() if self.training_mode == "lora" else nullcontext():
             for unit in self.pipe.units:
-                inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+                if self.condition_cache is not None and hasattr(unit, "frozen_condition_schema"):
+                    inputs = self._run_condition_unit(unit, inputs, data)
+                else:
+                    started = time.monotonic()
+                    inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+                    if hasattr(unit, "frozen_condition_schema"):
+                        self._condition_metrics["prefix_encodes"] += 1
+                        self._condition_encode_seconds += time.monotonic() - started
         return flow_matching_loss(self.pipe, {**inputs[0], **inputs[1]})
 
 
@@ -144,6 +338,9 @@ class SenseNovaSFTAdapter:
         from .pipeline import SenseNovaU1ImagePipeline
 
         config = args.i2i_sft_config
+        budget = Envs.RELAX_CONDITION_CACHE_BYTES
+        if budget < 0:
+            raise ValueError("RELAX_CONDITION_CACHE_BYTES cannot be negative")
         configure_attention(
             config.get("attention_implementation", "flash_attention_2"), config.get("deterministic_attention", False)
         )
@@ -156,10 +353,17 @@ class SenseNovaSFTAdapter:
         )
         pipe.scheduler.set_timesteps(1000, training=True)
         pipe.freeze_except(["dit"] if mode == "full" else [])
+        condition_cache = None
+        identity = None
+        if budget and mode == "lora":
+            identity = _condition_encoder_identity(args.model_path)
+            condition_cache = build_condition_cache(budget)
         return SenseNovaSFTModel(
             pipe,
             training_mode=mode,
             prefix_gradient_checkpointing=config.get("prefix_gradient_checkpointing", True),
+            condition_cache=condition_cache,
+            condition_identity=identity,
         )
 
     def prepare_for_sharding(self, model: SenseNovaSFTModel) -> None:
@@ -169,6 +373,23 @@ class SenseNovaSFTAdapter:
     def on_device_ready(self, model: SenseNovaSFTModel, device: torch.device) -> None:
         # Never move the already sharded parameters through Module.to().
         model.pipe.device = device
+        if model.condition_cache is not None:
+            import torch.distributed as dist
+
+            if dist.is_initialized() and dist.get_world_size(dist.group.WORLD) > 1:
+                from relax.utils.distributed_utils import get_gloo_group
+
+                # Native Ray actor initializes this CPU control group. A
+                # standalone runner may instead set condition_cache_group.
+                try:
+                    model.condition_cache_group = get_gloo_group()
+                except RuntimeError:
+                    model.condition_cache_group = dist.group.WORLD
+            # All ranks of the node share one run directory (no-op for
+            # private caches), so samples reassigned across ranks still hit.
+            bind_condition_cache(model.condition_cache, model.condition_cache_group)
+            # Query device metadata once here, before the per-sample hot path.
+            model._prefix_encoder_device()
 
     def prepare_sample(
         self, row: dict[str, Any], root: Path, config: dict[str, Any], index: int = 0

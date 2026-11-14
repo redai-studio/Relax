@@ -6,35 +6,48 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from relax.backends.fsdp.sft import FSDPSFTTrainer, _report_sft_metrics
+from relax.models.condition_cache import ConditionFeatureCache
+
+
+@pytest.fixture
+def cached_trainer():
+    trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
+    cache = ConditionFeatureCache(1024)
+    cache.put("condition", {"embedding": torch.ones(4)})
+    trainer.actor = SimpleNamespace(model=SimpleNamespace(close_condition_cache=cache.close))
+    trainer.prefetch = Mock()
+    return trainer, cache
 
 
 @pytest.mark.parametrize("operation,internal,args", [("train", "_train_step", (0,)), ("save", "_save_checkpoint", ())])
-def test_sft_failure_closes_prefetch_and_preserves_error(operation, internal, args):
-    trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
-    trainer.prefetch = Mock()
+def test_sft_failure_closes_prefetch_and_preserves_error(operation, internal, args, cached_trainer):
+    trainer, cache = cached_trainer
     error = RuntimeError("training failed")
     setattr(trainer, internal, Mock(side_effect=error))
     with pytest.raises(RuntimeError) as raised:
         getattr(trainer, operation)(*args)
     assert raised.value is error
     trainer.prefetch.close.assert_called_once()
+    assert cache.stats()["bytes"] == 0
 
 
-def test_sft_success_keeps_prefetch_for_next_step():
-    trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
-    trainer.prefetch = Mock()
+def test_sft_success_keeps_prefetch_for_next_step(cached_trainer):
+    trainer, cache = cached_trainer
     trainer._train_step = Mock()
     trainer.train(0)
     trainer._train_step.assert_called_once_with(0)
     trainer.prefetch.close.assert_not_called()
+    assert cache.stats()["bytes"] > 0
 
 
-def test_sft_close_without_prefetch():
-    trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
+def test_sft_close_without_prefetch(cached_trainer):
+    trainer, cache = cached_trainer
     trainer.prefetch = None
     trainer.close()
+    assert cache.stats()["bytes"] == 0
 
 
 def test_sft_metrics_flush_exact_completed_step(monkeypatch):
