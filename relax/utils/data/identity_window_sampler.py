@@ -95,10 +95,14 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         dp_size: int,
         placement: Literal["sequential", "balanced", "streaming"],
         balance_unit_multiplier: int = 1,
+        row_placement: Any = None,
     ) -> None:
         super().__init__(n_samples_per_prompt=1, balance_unit_multiplier=balance_unit_multiplier)
         self.dp_size = dp_size
         self.placement = placement
+        self.row_placement = row_placement
+        if row_placement is not None and placement != "balanced":
+            raise ValueError("Custom FLOPs row placement requires the balanced count path")
         self._partition_task_states: dict[tuple[str, str], _PartitionTaskState] = {}
         self._cache_window_by_key: dict[tuple[str, str, int, int], int] = {}
         self._window_buckets: dict[tuple[str, str, int], dict[int, list[int]]] = {}
@@ -208,14 +212,18 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         if len(identity_order) < target_identity_count:
             return [], []
 
-        window = self._window(task_state, batch_index, target_identity_count)
         selected_identities = identity_order[:target_identity_count]
+        if self.row_placement is not None:
+            planned_rows = [index for identity in selected_identities for index in rows_by_identity[identity]]
+            rank_rows = self.row_placement(planned_rows, custom_meta, self.dp_size)
+        window = self._window(task_state, batch_index, target_identity_count)
         self._admit_identities(task_state, window, selected_identities, rows_by_identity)
         window.admission_closed = True
 
         selected_rows = [index for identity in selected_identities for index in rows_by_identity[identity]]
         lengths = {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows}
-        rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
+        if self.row_placement is None:
+            rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
 
         for rank, rows in enumerate(rank_rows):
             self._cache_result(partition_id, task_name, rank, batch_index, (rows, rows.copy()))
@@ -498,9 +506,17 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
                 "dummy_rounds": self._dummy_rounds,
             }
         )
+        if self.row_placement is not None:
+            state["flops_placement_signature"] = self.row_placement.signature
+            state["flops_placement_dp_size"] = self.dp_size
         return state
 
     def load_checkpoint(self, state: dict) -> None:
+        expected = None if self.row_placement is None else self.row_placement.signature
+        if state.get("flops_placement_signature") != expected:
+            raise ValueError("Checkpoint FLOPs placement differs from active model/mode")
+        if self.row_placement is not None and state.get("flops_placement_dp_size") != self.dp_size:
+            raise ValueError("Checkpoint FLOPs DP geometry mismatch")
         super().load_checkpoint(state)
         self._partition_task_states = state["partition_task_states"]
         self._cache_window_by_key = state["cache_window_by_key"]

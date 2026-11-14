@@ -303,12 +303,13 @@ def test_resident_sft_live_initialization_reaches_train_without_snapshots(monkey
 
     _functions(
         Path("relax/backends/megatron/actor.py"),
-        {"_resident_sft_overlap_enabled", "_is_standard_dpo", "train_actor"},
+        {"_resident_sft_overlap_enabled", "_is_standard_dpo", "_get_data_iterator", "train_actor"},
         namespace,
         class_method=True,
     )
     actor._resident_sft_overlap_enabled = MethodType(namespace["_resident_sft_overlap_enabled"], actor)
     actor._is_standard_dpo = MethodType(namespace["_is_standard_dpo"], actor)
+    actor._get_data_iterator = MethodType(namespace["_get_data_iterator"], actor)
     rollout_id = args.num_rollout - 1 if final_rollout else 0
     rollout_data = {}
     kwargs = (

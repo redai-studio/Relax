@@ -789,6 +789,8 @@ def get_data_from_transfer_queue(
     synchronize_per_rank_fetch: bool = True,
     prefetched_rollout_data: list | None = None,
     prefetched_fetch_time_s: float | None = None,
+    pack_first_context: Any = None,
+    pack_first_is_drained: Callable[[], bool] | None = None,
 ):
     """Fetch a batch from the transfer queue and broadcast it across tensor-
     parallel and optionally pipeline-parallel ranks.
@@ -895,9 +897,41 @@ def get_data_from_transfer_queue(
             token_budget=token_budget,
             allow_underfill=allow_underfill,
         )
+        if pack_first_context is not None and rollout_data[0] is not None:
+            if any(
+                key in rollout_data[0]
+                for key in (
+                    "multimodal_train_inputs",
+                    "rollout_routed_experts",
+                    "rollout_indexer_topk",
+                    "chosen_tokens",
+                )
+            ):
+                raise ValueError("Pack-first requires ordinary text payloads without phase-dependent replay")
         return rollout_data
 
-    if prefetched_rollout_data is not None:
+    if pack_first_context is not None:
+        from relax.utils.data.global_flops_pack_protocol import PackFirstExhausted, agree_cpu, checked_fetch
+
+        if prefetched_rollout_data is not None:
+            raise ValueError("Pack-first background prefetch is not supported")
+        with timer(fetch_timer_name):
+            try:
+                rollout_data = checked_fetch(
+                    _fetch_once,
+                    should_fetch,
+                    lambda values: agree_cpu(values, pack_first_context.control_group),
+                    timeout_seconds=(
+                        getattr(args, "sft_tq_timeout_minutes", None)
+                        or getattr(args, "distributed_timeout_minutes", 30.0)
+                    )
+                    * 60,
+                    is_drained=pack_first_is_drained,
+                )
+            except PackFirstExhausted:
+                # This lifecycle signal is raised collectively, including non-fetching model-parallel peers.
+                return None, None
+    elif prefetched_rollout_data is not None:
         rollout_data = prefetched_rollout_data
         if prefetched_fetch_time_s is not None:
             Timer().add(fetch_timer_name, prefetched_fetch_time_s)
@@ -910,7 +944,7 @@ def get_data_from_transfer_queue(
                 # will receive the real data via broadcast.
                 rollout_data = [None, None]
 
-    if per_rank_fetch and synchronize_per_rank_fetch:
+    if per_rank_fetch and synchronize_per_rank_fetch and pack_first_context is None:
         # No broadcast follows, so a producer race can split this logical DP
         # rank into "got data" and "empty meta" model-parallel subsets.
         rollout_data = _agree_on_fetch(
@@ -1043,7 +1077,7 @@ def get_data_from_transfer_queue(
     if indexer_topk_extract_error is not None:
         raise RuntimeError(f"Unable to transfer rollout indexer replay: {indexer_topk_extract_error}")
 
-    if rollout_data is None:
+    if rollout_data is None and pack_first_context is None:
         return None, batch_meta
 
     # --- Stream multimodal tensors via NCCL (zero-copy, CPU-resident result) ---
@@ -1080,82 +1114,117 @@ def get_data_from_transfer_queue(
             )
         indexer_topk_offsets = indexer_topk_offsets.cpu()
 
-    # If the received object is a Tensordict, convert it into a plain Python
-    # dict so downstream code can mix tensors and Python lists freely.
-    if isinstance(rollout_data, TensorDict):
-        new_rollout_data: Dict[str, Any] = {}
-        for k, v in rollout_data.items():
-            # Keep scalar metadata as Python values across the TensorDict boundary,
-            # including NestedTensor values reconstructed by TransferQueue.
-            if k == "agentic_group_ids":
-                from relax.utils.agentic_obs.records import decode_group_ids
+    conversion_error = None
+    try:
+        # If the received object is a Tensordict, convert it into a plain Python
+        # dict so downstream code can mix tensors and Python lists freely.
+        if isinstance(rollout_data, TensorDict):
+            new_rollout_data: Dict[str, Any] = {}
+            for k, v in rollout_data.items():
+                # Keep scalar metadata as Python values across the TensorDict boundary,
+                # including NestedTensor values reconstructed by TransferQueue.
+                if k == "agentic_group_ids":
+                    from relax.utils.agentic_obs.records import decode_group_ids
 
-                new_rollout_data[k] = decode_group_ids(v)
-            elif (
-                "lengths" in k or "reward" in k or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids"}
-            ):
-                new_rollout_data[k] = _tensor_to_python_values(v)
-            elif k in MULTIMODAL_PAYLOAD_FIELDS:
-                # Only reached on the per_rank_fetch path (the broadcast path
-                # extracts and NCCL-streams these before broadcast). Stored as a
-                # list of tensordicts / dicts; some entries may be None for
-                # text-only samples in a multimodal batch. Turn each non-None
-                # entry into a plain dict.
-                from tensordict.tensorclass import NonTensorData
+                    new_rollout_data[k] = decode_group_ids(v)
+                elif (
+                    "lengths" in k
+                    or "reward" in k
+                    or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids"}
+                ):
+                    new_rollout_data[k] = _tensor_to_python_values(v)
+                elif k in MULTIMODAL_PAYLOAD_FIELDS:
+                    # Only reached on the per_rank_fetch path (the broadcast path
+                    # extracts and NCCL-streams these before broadcast). Stored as a
+                    # list of tensordicts / dicts; some entries may be None for
+                    # text-only samples in a multimodal batch. Turn each non-None
+                    # entry into a plain dict.
+                    from tensordict.tensorclass import NonTensorData
 
-                new_rollout_data[k] = []
-                for item in list(v):
-                    # NonTensorStack iteration yields NonTensorData wrappers
-                    raw = item.data if isinstance(item, NonTensorData) else item
-                    if raw is None:
-                        new_rollout_data[k].append(None)
-                    elif isinstance(raw, dict):
-                        new_rollout_data[k].append(raw)
-                    else:
-                        # TensorDict or similar — convert to plain dict
-                        new_rollout_data[k].append(dict(raw.items()) if hasattr(raw, "items") else dict(raw.data))
-            elif k == "rollout_routed_experts":
-                # rollout_routed_experts is stored as a NonTensorStack /
-                # LinkedList in TensorDict (raw numpy arrays).  Iterating may
-                # yield NonTensorData wrappers, so unwrap via `.data` when
-                # needed to get the underlying numpy array.
-                from tensordict.tensorclass import NonTensorData
+                    new_rollout_data[k] = []
+                    for item in list(v):
+                        # NonTensorStack iteration yields NonTensorData wrappers
+                        raw = item.data if isinstance(item, NonTensorData) else item
+                        if raw is None:
+                            new_rollout_data[k].append(None)
+                        elif isinstance(raw, dict):
+                            new_rollout_data[k].append(raw)
+                        else:
+                            # TensorDict or similar — convert to plain dict
+                            new_rollout_data[k].append(dict(raw.items()) if hasattr(raw, "items") else dict(raw.data))
+                elif k == "rollout_routed_experts":
+                    # rollout_routed_experts is stored as a NonTensorStack /
+                    # LinkedList in TensorDict (raw numpy arrays).  Iterating may
+                    # yield NonTensorData wrappers, so unwrap via `.data` when
+                    # needed to get the underlying numpy array.
+                    from tensordict.tensorclass import NonTensorData
 
-                new_rollout_data[k] = [item.data if isinstance(item, NonTensorData) else item for item in v]
-            elif has_indexer_topk and k == "rollout_indexer_topk":
-                from tensordict.tensorclass import NonTensorData
+                    new_rollout_data[k] = [item.data if isinstance(item, NonTensorData) else item for item in v]
+                elif has_indexer_topk and k == "rollout_indexer_topk":
+                    from tensordict.tensorclass import NonTensorData
 
-                new_rollout_data[k] = [item.data if isinstance(item, NonTensorData) else item for item in v]
-            elif isinstance(v, torch.Tensor):
-                # Expand a tensor with batch dimension into a Python list of
-                # per-sample tensors so downstream code can index them.
-                new_rollout_data[k] = [tensor for tensor in v]  # noqa: C416
-            else:
-                raise TypeError(f"Unsupported rollout_data type for key '{k}': {type(v)}")
+                    new_rollout_data[k] = [item.data if isinstance(item, NonTensorData) else item for item in v]
+                elif isinstance(v, torch.Tensor):
+                    # Expand a tensor with batch dimension into a Python list of
+                    # per-sample tensors so downstream code can index them.
+                    new_rollout_data[k] = [tensor for tensor in v]  # noqa: C416
+                else:
+                    raise TypeError(f"Unsupported rollout_data type for key '{k}': {type(v)}")
 
-        rollout_data = new_rollout_data
+            rollout_data = new_rollout_data
 
-    # Re-attach routed_experts as a list of 2D tensors (per-sample) — only on
-    # the bcast path, where the NestedTensor was extracted into ``routed_experts_values``
-    # before broadcast.  per_rank_fetch never strips it (each rank pulls its own
-    # copy from TQ), so the TensorDict→dict conversion above already produced
-    # the per-sample list under "rollout_routed_experts".
-    if has_routed_experts and not per_rank_fetch:
-        rollout_data["rollout_routed_experts"] = [
-            routed_experts_values[routed_experts_offsets[i] : routed_experts_offsets[i + 1]]
-            for i in range(len(routed_experts_offsets) - 1)
-        ]
+        # Re-attach routed_experts as a list of 2D tensors (per-sample) — only on
+        # the bcast path, where the NestedTensor was extracted into ``routed_experts_values``
+        # before broadcast.  per_rank_fetch never strips it (each rank pulls its own
+        # copy from TQ), so the TensorDict→dict conversion above already produced
+        # the per-sample list under "rollout_routed_experts".
+        if has_routed_experts and not per_rank_fetch:
+            rollout_data["rollout_routed_experts"] = [
+                routed_experts_values[routed_experts_offsets[i] : routed_experts_offsets[i + 1]]
+                for i in range(len(routed_experts_offsets) - 1)
+            ]
 
-    if has_indexer_topk and not per_rank_fetch:
-        rollout_data["rollout_indexer_topk"] = [
-            indexer_topk_values[indexer_topk_offsets[i] : indexer_topk_offsets[i + 1]]
-            for i in range(len(indexer_topk_offsets) - 1)
-        ]
+        if has_indexer_topk and not per_rank_fetch:
+            rollout_data["rollout_indexer_topk"] = [
+                indexer_topk_values[indexer_topk_offsets[i] : indexer_topk_offsets[i + 1]]
+                for i in range(len(indexer_topk_offsets) - 1)
+            ]
 
-    # Re-attach the NCCL-streamed multimodal inputs (CPU-resident; moved to GPU
-    # per micro-batch by get_batch).
-    if has_multimodal and mm_inputs is not None:
-        rollout_data["multimodal_train_inputs"] = mm_inputs
+        # Re-attach the NCCL-streamed multimodal inputs (CPU-resident; moved to GPU
+        # per micro-batch by get_batch).
+        if has_multimodal and mm_inputs is not None:
+            rollout_data["multimodal_train_inputs"] = mm_inputs
+
+    except Exception as exc:
+        if pack_first_context is None:
+            raise
+        conversion_error = f"{type(exc).__name__}: {exc}"
+
+    if pack_first_context is not None:
+        from relax.utils.data.global_flops_pack_planner import ExecutionContract
+        from relax.utils.data.global_flops_pack_protocol import REQUEST_CONTRACT, agree_cpu, restore_plan
+
+        plan_error = conversion_error
+        try:
+            if conversion_error is not None:
+                raise ValueError(conversion_error)
+            restore_plan(
+                batch_meta,
+                rollout_data,
+                task=task_name,
+                partition=partition_id,
+                mini=batch_index,
+                rank=mpu.get_data_parallel_rank(with_context_parallel=False),
+                contract=ExecutionContract.from_dict(sampling_config[REQUEST_CONTRACT]),
+                estimator=pack_first_context.estimator,
+            )
+        except Exception as exc:
+            plan_error = f"{type(exc).__name__}: {exc}"
+        control = agree_cpu([int(plan_error is not None)], pack_first_context.control_group)
+        if control[0]:
+            raise ValueError(
+                "Pack-first metadata restoration failed on an Actor rank: " + (plan_error or "peer error")
+            )
 
     if post_process:
         post_process_rollout_data(args, rollout_data)
