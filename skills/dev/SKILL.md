@@ -28,6 +28,16 @@ Unless the user explicitly asks for a refactoring, apply the smallest diff that 
 
 If the user says "refactor" or "restructure", the minimum-change constraint is lifted — but confirm the scope before proceeding.
 
+### 测试准入与验证
+
+新增、修改或审查测试前，阅读 [测试质量准则](../code-review/references/test-quality-checklist.md)，并遵守 `AGENTS.md` 的 Testing。
+
+1. 先定位真实风险、已有覆盖和产品入口，再决定是否需要永久用例；一次性验证、脚本参数核对不默认进入仓库。
+2. 对需要新增或重写的用例，明确生产调用、mock 边界、独立期望、可观察结果，以及哪个具体错误应使它失败。不得用源码/补丁/AST 检查或 fixture 自己的计算替代被测能力。
+3. 优先扩展已有相关用例。参数行按独立故障选择，不能为每个脚本、常量和实现细节机械生成测试。
+4. 实际验证与结论一一对应；记录版本、命令、结果和硬件限制。没有运行的旧版本对照、mutation、GPU 或多节点路径，明确标为未验证。
+5. 删除或合并用例前指出失去的保护、保留的更强用例或失效的旧契约。review-only 请求只输出证据与建议，不自动修改测试或启动训练。
+
 ______________________________________________________________________
 
 ## Part 2: Debugging (Remote Training Validation)

@@ -1,37 +1,84 @@
-# Test Quality and Verification (Relax Project)
+# 测试质量与验证准则
 
-## Risk, Oracle, and Execution
+适用于 Relax 的人工与 coding agent 开发、测试维护和全库审查。与 `AGENTS.md` 的 Testing、`skills/dev/SKILL.md` 共同使用。准则约束永久测试的价值与证据，不要求每次代码修改都新增测试。
 
-- For each test group, name the real regression, supported boundary, or failure it protects. Trace the expectation to the algorithm, user contract, prior bug, or independent reference; an expectation copied from the new implementation can repeat its error.
-- Identify which production entry point and execution boundary actually run, and what fixtures or mocks replace. Follow the asserted output back through that path. Test names, assertion volume, coverage percentage, and a passing suite do not establish the claimed capability.
-- A bug regression should make the original faulty version fail for the expected reason, rather than an unrelated import or fixture error. Run that comparison when practical; otherwise state the unverified claim and the scope of evidence available.
+## 准入规则
 
-## Choosing the Boundary
+| 编号 | 要求 | 审查时需要回答的问题 |
+| --- | --- | --- |
+| TQ01 | 真实保护目标 | 保护哪个已发生的 bug、可推导性质或必要对外契约？哪个具体生产代码错误会使测试失败？ |
+| TQ02 | 实际产品实现 | 从测试入口到断言，哪段产品代码实际执行？被测能力是否被 fake、复制实现、AST 抽取或补丁拼装替换？ |
+| TQ03 | 独立期望 | 期望来自算法定义、手算、独立实现、外部规范还是已确认行为？是否与产品代码共用可能出错的计算？ |
+| TQ04 | 可观察结果 | 断言是否检查结果、状态、输出、必要交互或真实错误？仅调用次数、日志文本、非空或 mock 回传值是否足够证明声称的行为？ |
+| TQ05 | 配置与结构镜像 | 是否只把脚本默认参数、环境变量、路径、源码拼写或私有布局再写一遍？不改变对外行为的重构是否会让它失败？ |
+| TQ06 | mock 边界 | 是否只隔离外部 I/O、昂贵后端或非关注组件？fixture 是否自己实现了被声称验证的恢复、计算、同步或生命周期？ |
+| TQ07 | 独立故障覆盖 | 每个用例和参数行保护什么独立错误？合并或删除后，哪个错误会漏过？相同执行行不等于重复。 |
+| TQ08 | 确定性与资源 | 竞态是否用事件、受控交错或真实进程协议触发？超时、清理、随机输入和失败路径是否受控？ |
+| TQ09 | 运行边界与成本 | CPU、GPU、多进程或多节点要求是否与实际路径一致？新增维护和 CI 成本是否有必要？未验证能力是否明确？ |
+| TQ10 | 变更与删除证据 | 旧实现失败、新实现通过或受控故障是否实际验证？删除是否有保留用例、失效契约或明确的无效断言依据？ |
 
-| Evidence | What it can establish | Limit |
-|----------|-----------------------|-------|
-| Small numerical case with an independent oracle | Mask coordinates, reductions, gradients, or algorithmic definitions | Does not establish backend or multi-node execution |
-| Production parser, loader, or protocol path with controlled I/O | Accepted inputs, metadata compatibility, ordering, and failure propagation | Replacing the core operation restricts the claim to the surrounding boundary |
-| Controlled concurrency or collective-participation case | A concrete interleaving, ownership rule, or required group-wide call | Serial mocks do not reproduce a hardware deadlock or scheduling mode |
-| Real backend, end-to-end run, or resume | Integration and preserved behavior in the exercised configuration | Does not replace focused edge cases or cover unexercised topology and precision |
+可接受的保护目标包括实际 bug 回归，边界数学、数值与梯度、排序和 round-trip 等独立性质，以及注册完整性、字段生命周期、协议交互、外部格式等容易遗漏的必要契约。纯粹的 Python/第三方库行为、自造 fake 的行为、没有消费方的常量读回不属于产品回归覆盖。
 
-Use the smallest test that establishes the risk and execution boundary. Combine these forms when their evidence is complementary; neither CPU tests nor end-to-end runs are universally sufficient.
+## 明确不收录的模式
 
-## Mocks and Implementation Assertions
+- 训练 recipe 执行 dry-run 或替换 Ray 命令后，逐项断言 TP/PP/CP/EP、GPU 数、默认环境变量、路径或日志文案。运行了脚本，不代表验证了训练或后端能力。
+- 搜索源码字符串、读取 `inspect.getsource`、检查 AST 节点或私有名字，来证明数值、恢复、并发、导入或资源释放行为。
+- 测试中拼装补丁、抽取被测函数到自造命名空间，或重写产品算法，再用结果证明完整产品路径正确。
+- mock 核心计算、保存恢复或任务调度后，只验证返回预设结果；fixture 完成的能力不能记为产品实现已通过。
+- 每个分支、配置项、脚本或常量都配一个用例；只因“这次改了这行”而永久锁定该实现细节。
 
-- A mock may isolate external I/O, a worker, or a wrapper contract. It must not implement the core capability whose correctness the test claims to prove. Assert the production result or required interaction, and describe the boundary honestly.
-- Source strings, `inspect.getsource`, hashes, and helper call counts are useful only when the observed fact is itself a confirmed contract or directly proves a relevant mechanism. A metadata schema, artifact digest, or required protocol call may qualify; incidental spelling and refactor choices usually do not.
-- A static check can complement behavior tests, but cannot establish numerical correctness, state restoration, or successful execution of code it never runs.
+这些是审查入口，不是关键词删除规则。真实解析器、源码转换器、lint 或补丁应用工具的输入就是源码/补丁，直接执行这些工具并检查转换结果、错误拒绝和失败原子性可以是有效测试。部署产物摘要、外部协议字段、必须发生的通信调用也可能是明确契约。必须具体说明边界，不能把这种例外扩展成对普通产品实现的源码快照。
 
-## Retain, Merge, or Remove
+## 选择验证边界
 
-- Compare independent failure modes and execution boundaries, not test counts. Two tests using similar data may protect different contracts; differently named tests may assert the same weak fact.
-- When removing or merging redundant tests, name the retained stronger coverage, what failure it detects, and the boundary it exercises. Tests of behavior that still exists need continued coverage; tests for an intentionally removed policy need not preserve that policy.
-- Do not add tests for optional style preferences or every implementation detail. Keep a test when its protection justifies its maintenance and execution cost.
+| 证据 | 可以证明 | 不能单独证明 |
+| --- | --- | --- |
+| 小规模实际数值路径与独立参考 | mask 坐标、归一化、梯度、算法定义 | 完整后端、多节点执行或性能 |
+| 实际解析、加载、序列化与受控 I/O | 输入兼容、协议载荷、错误传播、顺序 | 被替换的远端计算能力 |
+| 受控并发或真实进程/collective 路径 | 指定交错、拥有权、参与规则、退出与回收 | 未执行的硬件死锁或拓扑 |
+| 实际后端、端到端训练或恢复 | 已运行配置下的集成行为 | 其他精度、拓扑或独立边界条件 |
 
-## Calibration Examples
+使用能够证明目标风险的最小边界。CPU mock、单元测试、真实 GPU 与端到端测试提供不同证据，不能互相冒充。基础设施不可用时保留验证缺口，不能改成源码断言来制造“已验证”。
 
-- **Insufficient for resume correctness:** a fake loader restores model, optimizer, scheduler, and RNG, then the test compares next-step loss. The fixture implemented restoration. **Stronger evidence:** exercise the production save/load path and compare resumed state or the next update; if dependencies prevent that, keep any useful wrapper-contract test and state that resume is unverified.
-- **Useful mock:** replace transport with a recording endpoint while the production serializer constructs and sends a request. This can verify the wire payload and required ordering, but makes no claim about the remote worker's computation.
-- **Weak oracle:** expected token scores use the same mask shift helper as production. **Stronger evidence:** hand-computed scores with distinct values and unequal sequence lengths that expose a one-position shift; exercise the production metric path.
-- **Distinct coverage:** a unit case protects pair adjacency and a backend case protects partial DP partitions. Retain both if they detect independent errors, even when both involve a tail batch.
+mock 外部传输，但让产品序列化器构造并发送请求，可以验证真实 wire payload。用 mock 记录必要交互或包裹真实操作，可以验证该操作不能被省略；不能把 `assert_called_once()` 自动视为无价值或充分证据。
+
+数值参考不能复用被测归一化、mask 或索引 helper。采用独立参考、手算、metamorphic property、真实 round-trip 或不同代码路径交叉验证，并说明精度容差依据。不得直接把实际输出抄成期望。
+
+固定历史版本的参考实现可以保护重构前后的兼容性，须注明来源版本、保持冻结并明确仅证明行为不变；不能随当前实现同步修改，也不能据此声称算法本身正确。算法正确性另需独立性质或数值参考。真实 round-trip 同样要防止编码和解码共享错误相互抵消，涉及对外格式时还需规范载荷或独立消费方检查。
+
+竞态优先用事件、barrier、受控调度或真实请求协议触发。纯 sleep 等待、无失败断言的循环、吞掉异常后仍成功会削弱证据；不能仅因存在 sleep 就判删，轮询和清理的用途需要单独判断。
+
+## 新增或重写测试的流程
+
+1. 先搜索已有用例，记录缺少的具体故障保护。已有覆盖足够时不新增永久测试。
+2. 写清产品入口、期望来源、mock 边界、可观察结果和一项可使测试失败的具体生产错误。
+3. 对 bug 回归，条件允许时验证旧版本因目标 bug 失败、新版本通过；导入或 fixture 失败不是 bug 复现。
+4. 对容易“永远通过”的新增或强化用例，条件允许时在隔离副本中省略目标操作或注入受控错误，确认测试会失败；未实际做的 mutation 不得写成已验证。
+5. 用例按独立失败模式选择。一个强用例通常优于多个只读回配置的弱用例；不要用参数化规模充当覆盖。
+6. 区分临时 smoke、一次性测量和永久回归用例。记录已运行命令、版本、结果、跳过原因与未执行的能力；不必把临时验证脚本加入仓库。
+
+不得为了通过而删除有效断言、替换实际被测代码或无依据放宽容差。契约确实改变时重写测试并解释新契约。
+
+## 全库 review 与结论
+
+审查清单必须来自固定 base SHA 的已跟踪文件，包含 CI 实际运行的仓库外层测试目录，以及测试 helper/fixture。记录文件哈希和实际读取范围；静态扫描只用于定位，不能直接把命中标为缺陷或未命中标为保留。
+
+每个文件给出以下一种结论，并保留具体理由：
+
+- **keep**：已定位有效产品调用、期望和可观察结果，没有发现准则问题；只代表静态质量判断，不代表测试运行通过。
+- **rewrite**：风险值得保护，但实际产品路径、期望或断言不足；指出要补的最小行为验证。
+- **merge**：与指定用例保护相同输入、结果和边界；指出保留哪一个以及不会丢失的故障保护。
+- **delete**：只有被禁止的镜像断言、自造行为、失效契约等，且没有独立产品保护。对混合文件必须精确到用例，不整文件删除有效测试。
+- **mixed**：文件内不同用例需要不同处理，列出各自结论。
+- **defer**：信息、依赖、硬件或调用追踪不足，尚不能完成判断。说明缺少什么，不能当成缺陷或保留证明。
+- **support**：fixture、helper、包初始化或运行工具；审查它是否替换核心能力及是否被依赖，不当作普通用例计数。
+
+问题项记录文件、函数和行号、违反的规则、实际调用/替换边界、断言及期望来源、具体漏检错误或维护负担、建议动作和置信度。删除/合并前还要记录失去的保护以及保留的更强用例；无法说明时使用 rewrite/defer。
+
+全库覆盖率由清单核对，不能用“发现 N 个问题”代替“审查了所有文件”。审查完成度、运行结果和 mutation/硬件证据分别报告。review-only 请求不自动修改测试或训练代码。
+
+## 依据
+
+- Relax `AGENTS.md` 与 `skills/dev/SKILL.md`：最小修改、实际调用与验证边界、CPU/GPU 分类和不以静态检查冒充运行。
+- [SGLang-Omni 测试准则](https://github.com/sgl-project/sglang-omni/blob/b127947b224917ef84e3568005f637fe22f4740d/.claude/skills/code-review/coding-style.md#L314)：具体失败变更、独立保护、mock 边界与非结构快照。
+- [SGLang-Omni PR #2874](https://github.com/sgl-project/sglang-omni/pull/2874)：用例级清理、弱断言强化、覆盖变化归因与受控故障验证。该 PR 的结果不作为 Relax 的验证结果。
