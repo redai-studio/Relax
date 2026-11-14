@@ -6829,3 +6829,1353 @@ diff --git a/python/sglang/srt/models/qwen3_omni_moe.py b/python/sglang/srt/mode
 
 
  class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index fb062ce..7bcfefb 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -1648,6 +1648,30 @@ async def pd_role_switch(
+     )
+ 
+ 
++@app.get("/relax/lora/inventory")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def relax_lora_inventory():
++    return _global_state.tokenizer_manager.relax_lora.inventory()
++
++
++@app.post("/relax/lora/load")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def relax_lora_load(obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()]):
++    try:
++        return await _global_state.tokenizer_manager.relax_lora.load(obj)
++    except ValueError as exc:
++        return ORJSONResponse({"error": str(exc)}, status_code=409)
++
++
++@app.post("/relax/lora/control")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def relax_lora_control(body: dict = Body(...)):
++    try:
++        return await _global_state.tokenizer_manager.relax_lora.control(body)
++    except ValueError as exc:
++        return ORJSONResponse({"error": str(exc)}, status_code=409)
++
++
+ @app.api_route("/load_lora_adapter", methods=["POST"])
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def load_lora_adapter(
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index dae118d..8000251 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -396,6 +396,14 @@ class LoRAManager:
+         """
+ 
+         loaded_lora_ref = self.lora_refs.get(lora_ref.lora_id)
++        if (
++            lora_ref.lora_name.startswith("relax_lora@")
++            and loaded_lora_ref is not None
++            and loaded_lora_ref.lora_name != lora_ref.lora_name
++        ):
++            return self.create_lora_update_result(
++                success=False, error_message="LORA_ID_MISMATCH"
++            )
+         try:
+             pending_events = getattr(self, "pending_lora_load_events", {})
+             pending_event = pending_events.get(lora_ref.lora_id)
+diff --git a/python/sglang/srt/lora/lora_registry.py b/python/sglang/srt/lora/lora_registry.py
+index ed7101b..cd478c9 100644
+--- a/python/sglang/srt/lora/lora_registry.py
++++ b/python/sglang/srt/lora/lora_registry.py
+@@ -15,6 +15,7 @@
+ 
+ import asyncio
+ from collections import OrderedDict
++from dataclasses import dataclass
+ from typing import Dict, List, Optional, Union
+ from uuid import NAMESPACE_URL, uuid4, uuid5
+ 
+@@ -62,6 +63,12 @@ class LoRARef(msgspec.Struct, frozen=True, array_like=True):
+         return f"{self.__class__.__name__}({', '.join(parts)})"
+ 
+ 
++@dataclass
++class LoRARequestLease:
++    lora_id: str
++    owners: int = 1
++
++
+ class LoRARegistry:
+     """
+     The central registry to keep track of available LoRA adapters and ongoing LoRA requests.
+@@ -80,8 +87,8 @@ class LoRARegistry:
+         )
+ 
+         # A read-write lock to ensure adapters loading / unloading operations are exclusive.
+-        # Please note that the counter increment/decrement operations are not synchronized through this
+-        # lock, as they are designed to be non-blocking and can be performed concurrently.
++        # Acquire holds this lock through counter increment so unregister cannot
++        # observe zero users while a previously admitted request is still acquiring.
+         self._registry_lock = RWLock()
+         # An ordered dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
+         # The LoRARefs are stored in LRU order, such that LoRA adapters that have been
+@@ -142,27 +149,26 @@ class LoRARegistry:
+             self._registry.move_to_end(name)
+             return lora_ref.lora_id
+ 
+-        if isinstance(lora_name, str):
+-            async with self._registry_lock.writer_lock:
+-                lora_id = _lookup(lora_name)
+-
+-            await self._counters[lora_id].increment(notify_all=False)
+-            return lora_id
+-        elif isinstance(lora_name, list):
+-            async with self._registry_lock.writer_lock:
+-                lora_ids = [_lookup(name) for name in lora_name]
+-
+-            # Increment the counters only after all IDs are looked up.
+-            await asyncio.gather(
+-                *[
+-                    self._counters[id].increment(notify_all=False)
+-                    for id in lora_ids
+-                    if id is not None
+-                ]
+-            )
+-            return lora_ids
+-        else:
++        if not isinstance(lora_name, (str, list)):
+             raise TypeError("lora_name must be either a string or a list of strings.")
++        async with self._registry_lock.writer_lock:
++            names = [lora_name] if isinstance(lora_name, str) else lora_name
++            lora_ids = [_lookup(name) for name in names]
++            acquired = []
++            try:
++                for lora_id in lora_ids:
++                    if lora_id is not None:
++                        await self._counters[lora_id].increment(notify_all=False)
++                        acquired.append(lora_id)
++            except BaseException:
++                for lora_id in acquired:
++                    await self._counters[lora_id].decrement()
++                raise
++            return lora_ids[0] if isinstance(lora_name, str) else lora_ids
++
++    def request_count(self, lora_id: str) -> int:
++        counter = self._counters.get(lora_id)
++        return counter.value() if counter is not None else 0
+ 
+     async def release(self, lora_id: Union[str, List[str]]):
+         """
+diff --git a/python/sglang/srt/lora/relax_control.py b/python/sglang/srt/lora/relax_control.py
+new file mode 100644
+index 0000000..dc16df9
+--- /dev/null
++++ b/python/sglang/srt/lora/relax_control.py
+@@ -0,0 +1,332 @@
++# Copyright 2026 SGLang Team
++"""Fenced immutable adapters. Metadata locks never wait for inference to drain."""
++
++import asyncio
++import hashlib
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from uuid import uuid4
++
++from sglang.srt.lora.lora_registry import LoRARef
++
++
++# The receiver is packaged in SGLang, without a dependency on the Relax wheel.
++# Keep this transport checksum in sync with Relax's lora_versions.identity.
++def tensor_fingerprint(tensor: "torch.Tensor") -> "torch.Tensor":
++    """Position-weighted byte checksum, returned as a device int64 scalar.
++
++    SplitMix64 weights and the sum wrap modulo 2**64; byte length seeds the sum
++    so dropping zero bytes is detected too. Chunking bounds scratch memory and
++    uses absolute byte positions, independent of chunk boundaries. This is a
++    transport check, not a substitute for the snapshot's SHA-256.
++    """
++    import torch
++
++    data = tensor.detach().contiguous().reshape(-1).view(torch.uint8)
++    checksum = torch.full((), data.numel(), dtype=torch.int64, device=data.device)
++    for start in range(0, data.numel(), 1 << 20):
++        end = min(start + (1 << 20), data.numel())
++        positions = torch.arange(start, end, dtype=torch.int64, device=data.device)
++        weights = positions + (-7046029254386353131)
++        weights = (weights ^ ((weights >> 30) & ((1 << 34) - 1))) * (
++            -4658895280553007687
++        )
++        weights = (weights ^ ((weights >> 27) & ((1 << 37) - 1))) * (
++            -7723592293110705685
++        )
++        weights = weights ^ ((weights >> 31) & ((1 << 33) - 1))
++        checksum += (data[start:end].to(torch.int64) * weights).sum()
++    return checksum
++
++
++def verify_snapshot(req, tensors):
++    """Validate receiver bytes, dtype and shape before any backend mutation."""
++    import torch
++
++    manifest = json.loads(req.relax_manifest)
++    if (
++        hashlib.sha256(req.relax_manifest.encode("utf-8")).hexdigest()
++        != req.relax_digest
++    ):
++        raise ValueError("snapshot manifest digest mismatch")
++    if manifest["format_version"] != 1 or manifest["adapter_config"] != req.config_dict:
++        raise ValueError("snapshot configuration mismatch")
++    expected = {entry["name"]: entry for entry in manifest["tensors"]}
++    if set(expected) != set(tensors):
++        raise ValueError("snapshot tensor names mismatch")
++    fingerprints = {}
++    for name, tensor in tensors.items():
++        entry = expected[name]
++        data = tensor.detach().cpu().contiguous()
++        if str(data.dtype) != entry["dtype"] or list(data.shape) != entry["shape"]:
++            raise ValueError(f"snapshot dtype/shape mismatch: {name}")
++        digest = hashlib.sha256(data.reshape(-1).view(torch.uint8).numpy()).hexdigest()
++        if digest != entry["sha256"]:
++            raise ValueError(f"snapshot bytes mismatch: {name}")
++        fingerprints[name] = int(tensor_fingerprint(data))
++    return fingerprints
++
++
++def read_artifact_tensors(req):
++    """Read engine-format tensors locally on each worker, without HF repacking.
++
++    The caller verifies these exact tensors before passing them to the model;
++    paths alone are not evidence of successful transfer or complete content.
++    """
++    from safetensors.torch import load_file
++
++    path = Path(req.relax_artifact_path)
++    if not path.is_absolute():
++        raise ValueError("managed artifact path must be absolute")
++    metadata = json.loads((path / "manifest.json").read_text())
++    identity = metadata["identity"]
++    if (
++        identity["digest"] != req.relax_digest
++        or req.lora_name
++        != f"relax_lora@{identity['version_id']}.{req.relax_digest[:12]}"
++        or metadata["snapshot"] != json.loads(req.relax_manifest)
++        or json.loads((path / "adapter_config.json").read_text()) != req.config_dict
++    ):
++        raise ValueError("artifact identity or manifest mismatch")
++    # Own the bytes before verification; later filesystem changes must not
++    # mutate a mapped tensor between hashing and model installation.
++    return {
++        name: tensor.clone()
++        for name, tensor in load_file(
++            str(path / "adapter_model.safetensors"), device="cpu"
++        ).items()
++    }
++
++
++@dataclass
++class ManagedAdapter:
++    ref: LoRARef
++    attempt_id: int
++    digest: str
++    phase: str = "loading"
++    admission_closed: bool = True
++    attempt_fenced: bool = False
++    fingerprints: dict | None = None
++    error: str | None = None
++    task: asyncio.Task | None = None
++
++
++class RelaxLoRAControl:
++    def __init__(self, manager):
++        self.manager = manager
++        self.instance_id = uuid4().hex
++        self.records = {}
++        self.fences = set()
++        self.lock = asyncio.Lock()
++        self.tasks = set()
++
++    def check_instance(self, instance_id):
++        if instance_id != self.instance_id:
++            raise ValueError("ENGINE_INSTANCE_MISMATCH")
++
++    def inventory(self):
++        return {
++            "instance_id": self.instance_id,
++            "tp_size": self.manager.server_args.tp_size,
++            "max_loras_per_batch": self.manager.server_args.max_loras_per_batch,
++            "adapters": [
++                self.receipt(name, record) for name, record in self.records.items()
++            ],
++            "fences": [[name, attempt] for name, attempt in sorted(self.fences)],
++        }
++
++    def receipt(self, name, record):
++        return {
++            "instance_id": self.instance_id,
++            "lora_name": name,
++            "attempt_id": record.attempt_id,
++            "digest": record.digest,
++            "lora_id": None if record.phase == "absent" else record.ref.lora_id,
++            "phase": record.phase,
++            "pinned": bool(record.ref.pinned),
++            "requests": self.manager.lora_registry.request_count(record.ref.lora_id),
++            "admission_closed": record.admission_closed,
++            "attempt_fenced": record.attempt_fenced,
++            "fingerprints": record.fingerprints,
++            "error": record.error,
++        }
++
++    async def load(self, req):
++        self.check_instance(req.relax_instance_id)
++        args = self.manager.server_args
++        if (
++            not args.enable_lora
++            or args.dp_size != 1
++            or args.pp_size != 1
++            or args.disaggregation_mode != "null"
++            or args.speculative_algorithm
++            or args.hicache_storage_backend
++            or args.tokenizer_worker_num != 1
++        ):
++            raise ValueError(
++                "managed LoRA requires LoRA enabled, DP=PP=1, one tokenizer worker, no PD/speculation/L3"
++            )
++        if (
++            not req.lora_name.startswith("relax_lora@")
++            or not req.pinned
++            or req.relax_attempt_id is None
++            or req.relax_manifest is None
++            or not req.relax_digest
++            or not req.lora_name.endswith("." + req.relax_digest[:12])
++        ):
++            raise ValueError(
++                "managed load requires immutable identity, manifest and pinned=True"
++            )
++        artifact_path = getattr(req, "relax_artifact_path", None)
++        if (artifact_path is not None) == bool(req.serialized_named_tensors):
++            raise ValueError("managed load requires exactly one tensor source")
++        if artifact_path is not None and (
++            not Path(artifact_path).is_absolute()
++            or req.load_format is not None
++            or req.added_tokens_config is not None
++        ):
++            raise ValueError(
++                "managed artifacts require an absolute path and unmodified tensor layout"
++            )
++        async with self.lock:
++            key = (req.lora_name, req.relax_attempt_id)
++            if key in self.fences:
++                raise ValueError("ATTEMPT_FENCED")
++            record = self.records.get(req.lora_name)
++            if record is not None:
++                if record.digest != req.relax_digest:
++                    raise ValueError("VERSION_CONFLICT")
++                if (
++                    record.attempt_id != req.relax_attempt_id
++                    and record.phase != "absent"
++                ):
++                    raise ValueError("previous attempt is not physically absent")
++            if record is None or record.attempt_id != req.relax_attempt_id:
++                ref = LoRARef(
++                    lora_name=req.lora_name, lora_path="__tensor__", pinned=True
++                )
++                record = ManagedAdapter(ref, req.relax_attempt_id, req.relax_digest)
++                self.records[req.lora_name] = record
++                req.lora_id = ref.lora_id
++                record.task = asyncio.create_task(self._load(req, record))
++            task = record.task
++        await asyncio.shield(task)
++        return self.receipt(req.lora_name, record)
++
++    async def _load(self, req, record):
++        from sglang.srt.managers.tokenizer_control_mixin import (
++            _merge_lora_update_results,
++        )
++        from sglang.srt.utils import normalize_serialized_named_tensor_payloads
++
++        self.manager.auto_create_handle_loop()
++        try:
++            if getattr(req, "relax_artifact_path", None) is None:
++                req.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
++                    req.serialized_named_tensors
++                )
++            async with self.manager.lora_update_lock:
++                # Even a failed RPC can have changed a worker: retain the ID until unload ACK.
++                async with self.lock:
++                    if record.attempt_fenced:
++                        record.phase = "absent"
++                        return
++                result = _merge_lora_update_results(
++                    await self.manager.update_lora_adapter_communicator(req)
++                )
++                async with self.lock:
++                    record.phase = "loaded" if result.success else "failed"
++                    record.error = result.error_message
++                    record.fingerprints = result.fingerprints
++                    if result.success and not record.attempt_fenced:
++                        # Initial load opens admission for the publisher's generation probe.
++                        await self.manager.lora_registry.register(record.ref)
++                        record.admission_closed = False
++        except Exception as exc:
++            async with self.lock:
++                record.phase = "failed"
++                record.error = str(exc)
++
++    async def control(self, body):
++        # HTTP disconnect must not strand an unload between worker ACK and metadata update.
++        task = asyncio.create_task(self._control(body))
++        self.tasks.add(task)
++        task.add_done_callback(self.tasks.discard)
++        return await asyncio.shield(task)
++
++    async def _control(self, body):
++        from sglang.srt.managers.io_struct import UnloadLoRAAdapterReqInput
++        from sglang.srt.managers.tokenizer_control_mixin import (
++            _merge_lora_update_results,
++        )
++
++        self.check_instance(body["instance_id"])
++        name, attempt, action = body["lora_name"], body["attempt_id"], body["action"]
++        if not name.startswith("relax_lora@") or action not in (
++            "fence",
++            "stop",
++            "unload",
++        ):
++            raise ValueError("invalid managed control")
++        async with self.lock:
++            record = self.records.get(name)
++            if record is not None and record.attempt_id == attempt:
++                expected_id = body.get("lora_id")
++                if (
++                    action in ("stop", "unload") or expected_id is not None
++                ) and expected_id != record.ref.lora_id:
++                    raise ValueError("LORA_ID_MISMATCH")
++            if action == "fence":
++                self.fences.add((name, attempt))
++            if record is None or record.attempt_id != attempt:
++                if action != "fence":
++                    raise ValueError("ATTEMPT_MISMATCH")
++                return {
++                    "instance_id": self.instance_id,
++                    "lora_name": name,
++                    "attempt_id": attempt,
++                    "lora_id": None,
++                    "phase": "absent",
++                    "requests": 0,
++                    "admission_closed": True,
++                    "attempt_fenced": True,
++                }
++            if action in ("stop", "fence"):
++                # Retirement closes both admission and this load attempt.
++                # A pending completion must never reopen a stopped name.
++                record.attempt_fenced = True
++                self.fences.add((name, attempt))
++                if not record.admission_closed:
++                    await self.manager.lora_registry.unregister(name)
++                    record.admission_closed = True
++                return self.receipt(name, record)
++            if (
++                not record.admission_closed
++                or not record.attempt_fenced
++                or record.phase in ("loading", "unloading")
++                or self.manager.lora_registry.request_count(record.ref.lora_id)
++            ):
++                raise ValueError("ADAPTER_BUSY")
++            if record.phase == "absent":
++                return self.receipt(name, record)
++            record.phase = "unloading"
++        try:
++            async with self.manager.lora_update_lock:
++                req = UnloadLoRAAdapterReqInput(
++                    lora_name=name, lora_id=record.ref.lora_id
++                )
++                result = _merge_lora_update_results(
++                    await self.manager.update_lora_adapter_communicator(req)
++                )
++            async with self.lock:
++                record.phase = "absent" if result.success else "failed"
++                record.error = result.error_message
++                if result.success:
++                    self.manager.lora_registry._counters.pop(record.ref.lora_id, None)
++                return self.receipt(name, record)
++        except Exception as exc:
++            async with self.lock:
++                record.phase = "failed"
++                record.error = str(exc)
++            raise
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index d1f593a..adafa3c 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -376,12 +376,17 @@ class GenerateReqInput:
+         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
+     ] = None
+
+-    def regenerate_rid(self):
++    def regenerate_rid(self, prefix: Optional[str] = None):
+         """Generate a new request ID and return it."""
++
++        def new_rid() -> str:
++            suffix = uuid.uuid4().hex
++            return f"{prefix}_{suffix}" if prefix is not None else suffix
++
+         if isinstance(self.rid, list):
+-            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
++            self.rid = [new_rid() for _ in range(len(self.rid))]
+         else:
+-            self.rid = uuid.uuid4().hex
++            self.rid = new_rid()
+         return self.rid
+
+     def _validate_rid_uniqueness(self):
+@@ -2455,6 +2460,11 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+     lora_id: Optional[str] = None
+     load_format: Optional[str] = None
+     expected_checksums: Optional[Dict[str, str]] = None
++    relax_instance_id: Optional[str] = None
++    relax_attempt_id: Optional[int] = None
++    relax_digest: Optional[str] = None
++    relax_manifest: Optional[str] = None
++    relax_artifact_path: Optional[str] = None
+ 
+     def to_ref(self) -> LoRARef:
+         return LoRARef(
+@@ -2505,6 +2515,7 @@ class UpdateLoRAFromDistributedReqInput(BaseReq, kw_only=True):
+ 
+ 
+ class LoRAUpdateOutput(BaseReq, kw_only=True):
++    fingerprints: Optional[Dict[str, int]] = None
+     success: bool
+     error_message: Optional[str] = None
+     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 796e766..8ede95e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -5817,8 +5817,9 @@ class Scheduler(
+     ) -> LoadLoRAAdapterFromTensorsReqOutput:
+         """In-place loading a new lora adapter from serialized tensors."""
+ 
+-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+-        return result
++        if recv_req.relax_attempt_id is not None:
++            return self._managed_lora_update(self.tp_worker.load_lora_adapter_from_tensors, recv_req)
++        return self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+ 
+     def update_lora_from_distributed(
+         self, recv_req: UpdateLoRAFromDistributedReqInput
+@@ -5833,8 +5834,25 @@ class Scheduler(
+     ) -> UnloadLoRAAdapterReqOutput:
+         """Unload the lora adapter."""
+ 
+-        result = self.tp_worker.unload_lora_adapter(recv_req)
+-        return result
++        if recv_req.lora_name.startswith("relax_lora@"):
++            return self._managed_lora_update(self.tp_worker.unload_lora_adapter, recv_req)
++        return self.tp_worker.unload_lora_adapter(recv_req)
++
++    def _managed_lora_update(self, operation, req):
++        from sglang.srt.managers.io_struct import LoRAUpdateOutput
++
++        try:
++            result = operation(req)
++        except Exception as exc:
++            result = LoRAUpdateOutput(success=False, error_message=str(exc))
++        results = [None] * get_parallel().tp_size
++        torch.distributed.all_gather_object(results, result, group=self.tp_cpu_group)
++        errors = [r.error_message or "worker failed" for r in results if not r.success]
++        if errors:
++            return LoRAUpdateOutput(success=False, error_message=" | ".join(errors))
++        if any(r.fingerprints != results[0].fingerprints for r in results):
++            return LoRAUpdateOutput(success=False, error_message="TP fingerprint mismatch")
++        return results[0]
+ 
+     def init_weights_send_group_for_remote_instance(
+         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index 26072a6..9a7be0d 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -662,6 +662,8 @@ class TokenizerControlMixin:
+         obj: LoadLoRAAdapterReqInput,
+         _: Optional[fastapi.Request] = None,
+     ) -> LoadLoRAAdapterReqOutput:
++        if obj.lora_name.startswith("relax_lora@"):
++            raise ValueError("managed LoRA requires /relax/lora control endpoints")
+         self.auto_create_handle_loop()
+ 
+         try:
+@@ -748,6 +750,8 @@ class TokenizerControlMixin:
+         obj: LoadLoRAAdapterFromTensorsReqInput,
+         _: Optional[fastapi.Request] = None,
+     ) -> LoadLoRAAdapterFromTensorsReqOutput:
++        if obj.lora_name.startswith("relax_lora@"):
++            raise ValueError("managed LoRA requires /relax/lora control endpoints")
+         self.auto_create_handle_loop()
+ 
+         try:
+@@ -834,6 +838,8 @@ class TokenizerControlMixin:
+         obj: UpdateLoRAFromDistributedReqInput,
+         _: Optional[fastapi.Request] = None,
+     ) -> UpdateLoRAFromDistributedReqOutput:
++        if obj.lora_name.startswith("relax_lora@"):
++            raise ValueError("managed LoRA requires /relax/lora control endpoints")
+         self.auto_create_handle_loop()
+ 
+         try:
+@@ -933,6 +939,8 @@ class TokenizerControlMixin:
+         obj: UnloadLoRAAdapterReqInput,
+         _: Optional[fastapi.Request] = None,
+     ) -> UnloadLoRAAdapterReqOutput:
++        if obj.lora_name.startswith("relax_lora@"):
++            raise ValueError("managed LoRA requires /relax/lora control endpoints")
+         self.auto_create_handle_loop()
+ 
+         try:
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 898ef2b..a709da1 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -64,7 +64,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+ from sglang.srt.environ import envs
+-from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
++from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry, LoRARequestLease
+ from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+ from sglang.srt.managers.disagg_service import start_disagg_service
+ from sglang.srt.managers.embed_types import PositionalEmbeds
+@@ -249,10 +249,11 @@ class ReqState:
+     last_completion_tokens: int = 1
+     ttft_observed: bool = False
+ 
++    lora_lease: Optional[LoRARequestLease] = None
+     dispatched: bool = False
+     abort_sent: bool = False
+     abort_requested: bool = False
+-    lora_lease_released: bool = False
++    lifecycle_id: object = dataclasses.field(default_factory=object)
+ 
+     # For streaming output
+     last_output_offset: int = 0
+@@ -664,6 +665,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+     def init_running_status(self):
+         # Request states
+         self.rid_to_state: Dict[str, ReqState] = {}
++        self._lora_draining_requests: Dict[str, ReqState] = {}
++        self.logical_rid_to_child_rids: Dict[str, set[str]] = {}
++        self.child_rid_to_logical_rid: Dict[str, str] = {}
++        self._lora_release_tasks: set[asyncio.Task] = set()
+         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
+         self.event_loop = None
+         self.asyncio_tasks = set()
+@@ -742,6 +747,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
+         # LoRA updates and inference to overlap.
+         self.lora_update_lock = asyncio.Lock()
++        from sglang.srt.lora.relax_control import RelaxLoRAControl
++
++        self.relax_lora = RelaxLoRAControl(self)
+         # A cache for mapping the lora_name for LoRA adapters that have been loaded at any
+         # point to their latest LoRARef objects, so that they can be
+         # dynamically loaded if needed for inference
+@@ -888,8 +896,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                 )
+ 
+-        self._init_req_state(obj, request)
+-        request_rids = {obj.rid} if obj.is_single else set(obj.rid)
++        request_lifecycles = self._init_req_state(obj, request)
++        request_rids = set(request_lifecycles)
+         try:
+             if get_disagg().language_only:
+                 self._handle_epd_disaggregation_encode_request(obj)
+@@ -926,7 +934,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             # request -- would otherwise leak those entries forever. Drop
+             # undelivered states, but abort dispatched requests for scheduler-side
+             # cleanup.
+-            self._release_req_states_on_failure(request_rids)
++            self._release_req_states_on_failure(
++                request_rids, set(request_lifecycles.values())
++            )
+             raise
+
+     async def _wait_for_request_unpaused(self, rids: set[str]) -> None:
+@@ -1894,10 +1904,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             # Delete the key to prevent resending abort request to the scheduler and
+             # to ensure aborted request state is cleaned up.
+             if state.obj.rid in self.rid_to_state:
+-                del self.rid_to_state[state.obj.rid]
+-
+-            # Mark ongoing LoRA request as finished.
+-            self._finalize_lora_lease(state)
++                self._remove_req_state(state.obj.rid, state.lifecycle_id)
+             if not is_stream:
+                 raise fastapi.HTTPException(
+                     status_code=finish_reason["status_code"],
+@@ -1941,7 +1948,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     and await request.is_disconnected()
+                 ):
+                     # Abort the request for disconnected requests (non-streaming, waiting queue)
+-                    self.abort_request(obj.rid)
++                    if self.rid_to_state.get(obj.rid) is state:
++                        self.abort_request(obj.rid)
+                     # Use exception to kill the whole call stack and asyncio task
+                     raise ValueError(
+                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
+@@ -2029,7 +2037,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     and await request.is_disconnected()
+                 ):
+                     # Abort the request for disconnected requests (non-streaming, running)
+-                    self.abort_request(obj.rid)
++                    if self.rid_to_state.get(obj.rid) is state:
++                        self.abort_request(obj.rid)
+                     # Use exception to kill the whole call stack and asyncio task
+                     raise ValueError(
+                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+@@ -2042,7 +2051,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         request_rids: Optional[set[str]] = None,
+     ):
+         if request_rids is None:
+-            request_rids = set(obj.rid)
++            request_rids = set(self._logical_rids(obj))
+         batch_size = obj.batch_size
+ 
+         generators = []
+@@ -2104,13 +2113,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     tokenized_obj.mm_inputs.mm_items = [
+                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
+                     ]
+-                tokenized_obj.rid = tmp_obj.regenerate_rid()
++                tokenized_obj.rid = tmp_obj.regenerate_rid(prefix=objs[i].rid)
+                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
+                 tokenized_obj.sampling_params.max_new_tokens = 0
+                 tokenized_obj.stream = False
+-                await self._init_parallel_req_state(
+-                    tmp_obj, tokenized_obj, request_rids
+-                )
++                self._init_child_req_state(objs[i].rid, tmp_obj)
++                request_rids.add(tmp_obj.rid)
+                 await self._send_one_request(tokenized_obj)
+                 await self._wait_one_response(tmp_obj, request).__anext__()
+ 
+@@ -2126,10 +2134,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         tokenized_obj.mm_inputs.mm_items = [
+                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
+                         ]
+-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+-                    await self._init_parallel_req_state(
+-                        tmp_obj, tokenized_obj, request_rids
+-                    )
++                    tokenized_obj.rid = tmp_obj.regenerate_rid(prefix=objs[i].rid)
++                    self._init_child_req_state(objs[i].rid, tmp_obj)
++                    request_rids.add(tmp_obj.rid)
+                     state = self.rid_to_state[tmp_obj.rid]
+                     tokenized_obj.time_stats = state.time_stats
+                     if tmp_obj.return_prompt_token_ids:
+@@ -2138,14 +2145,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     generators.append(self._wait_one_response(tmp_obj, request))
+                     rids.append(tmp_obj.rid)
+ 
+-            # Normalization expanded the parent IDs/leases to batch_size * n.
+-            # Every dispatched clone now owns its own lease; retire all parent
+-            # states, including expanded entries unused by prefix tokenization.
+-            for rid in obj.rid:
+-                state = self.rid_to_state.pop(rid, None)
++            # Children retain the logical parent's lease until every scheduler
++            # request finishes. Retire only the actual logical parent states.
++            for rid in self._logical_rids(obj):
++                state = self._remove_req_state(rid)
+                 if state is not None:
+                     state.time_stats.set_finished_time()
+-                    self._finalize_lora_lease(state)
+ 
+         # Wait for all requests
+         is_stream = hasattr(obj, "stream") and obj.stream
+@@ -2156,19 +2161,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             async for response in self._stream_batch_responses(generators, rids):
+                 yield response
+ 
+-    async def _init_parallel_req_state(self, obj, tokenized_obj, request_rids):
+-        # copy.copy inherits the parent's ID, but a scheduler-visible clone
+-        # needs its own lease. Clear it before any await so failed acquisition
+-        # cannot release the parent's lease during handler cleanup.
+-        needs_lora = self.enable_lora and obj.lora_path is not None
+-        if needs_lora:
+-            obj.lora_id = None
+-        self._init_req_state(obj)
+-        request_rids.add(obj.rid)
+-        if needs_lora:
+-            obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+-            tokenized_obj.lora_id = obj.lora_id
+-
+     async def _collect_batch_responses(self, generators):
+         tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
+         try:
+@@ -2218,27 +2210,49 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         if not abort_all and not rid:
+             logger.warning("Ignore abort_request with empty rid and abort_all=False")
+             return
+-        state = None if abort_all else self.rid_to_state.get(rid)
+-        pending_states = self.rid_to_state.values() if abort_all else (state,)
+-        for pending_state in pending_states:
+-            if pending_state is not None and not pending_state.dispatched:
+-                pending_state.abort_requested = True
+-                pending_state.event.set()
+-        if not abort_all:
++        if abort_all:
++            for state in self.rid_to_state.values():
++                if not state.dispatched:
++                    state.abort_requested = True
++                    state.event.set()
++            target_rids = (rid,)
++        elif children := self.logical_rid_to_child_rids.get(rid):
++            # The logical parent may already be retired while children run.
++            parent = self.rid_to_state.get(rid)
++            if parent is not None:
++                parent.abort_requested = True
++                parent.event.set()
++            target_rids = tuple(sorted(children))
++        elif (
++            rid in self.rid_to_state
++            or rid in self._lora_draining_requests
++            or get_serving().tokenizer_worker_num != 1
++        ):
++            target_rids = (rid,)
++        else:
++            return
++
++        sent = False
++        for target_rid in target_rids:
++            state = None if abort_all else (
++                self.rid_to_state.get(target_rid)
++                or self._lora_draining_requests.get(target_rid)
++            )
+             if state is not None:
++                if not state.dispatched:
++                    state.abort_requested = True
++                    state.event.set()
+                 if state.abort_sent:
+-                    return
++                    continue
+                 state.abort_sent = True
+-            elif get_serving().tokenizer_worker_num == 1:
+-                return
+-        req = AbortReq(rid=rid, abort_all=abort_all)
+-        try:
+-            self._dispatch_to_scheduler(req)
+-        except BaseException:
+-            if state is not None:
+-                state.abort_sent = False
+-            raise
+-        if self.enable_metrics:
++            try:
++                self._dispatch_to_scheduler(AbortReq(rid=target_rid, abort_all=abort_all))
++            except BaseException:
++                if state is not None:
++                    state.abort_sent = False
++                raise
++            sent = True
++        if sent and self.enable_metrics:
+             # TODO: also use custom_labels from the request
+             self.metrics_collector.observe_one_aborted_request(
+                 self.metrics_collector.labels
+@@ -2467,6 +2481,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         for i, rid in enumerate(recv_obj.rids):
+             state = self.rid_to_state.get(rid, None)
+             if state is None:
++                draining = self._lora_draining_requests.get(rid)
++                if draining is not None and recv_obj.finished_reasons[i] is not None:
++                    draining.finished = True
++                    self._remove_req_state(rid, draining.lifecycle_id)
++                if draining is not None:
++                    continue
+                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                     continue
+@@ -2732,10 +2752,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         )
+                     )
+ 
+-                del self.rid_to_state[rid]
+-
+-                # Mark ongoing LoRA request as finished.
+-                self._finalize_lora_lease(state)
++                self._remove_req_state(rid)
+ 
+             if out_dict is not None:
+                 state.out_list.append(out_dict)
+@@ -3541,6 +3558,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         # disconnects, amplified by prefix / abort_all fan-out.
+         state = self.rid_to_state.get(recv_obj.rid)
+         if state is None:
++            draining = self._lora_draining_requests.get(recv_obj.rid)
++            if draining is not None:
++                draining.finished = True
++                self._remove_req_state(recv_obj.rid, draining.lifecycle_id)
++                return
+             logger.info(
+                 "Abort request for rid=%s not found in rid_to_state; "
+                 "likely already finished/removed.",
+@@ -3591,8 +3613,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         }
+         if state.prompt_token_ids is not None:
+             out["prompt_token_ids"] = state.prompt_token_ids
+-        self._finalize_lora_lease(state)
+-        del self.rid_to_state[recv_obj.rid]
++        self._remove_req_state(recv_obj.rid)
+ 
+         state.out_list.append(out)
+         state.event.set()
+@@ -3695,6 +3716,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         await self._resolve_lora_path(obj)
+
+     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
++        request_states = {
++            rid: self.rid_to_state.get(rid) for rid in self._logical_rids(obj)
++        }
+         if isinstance(obj.lora_path, str):
+             unique_lora_paths = set([obj.lora_path])
+         else:
+@@ -3717,6 +3741,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             if lora_path is None:
+                 continue
+ 
++            if lora_path.startswith("relax_lora@"):
++                raise fastapi.HTTPException(status_code=409, detail="LORA_VERSION_RETIRED")
+             if lora_path not in self.lora_ref_cache:
+                 raise ValueError(
+                     f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+@@ -3741,18 +3767,106 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 )
+ 
+         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
+-        obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
++        # Parallel sampling expands lora_path, but creates one logical RID per
++        # prompt. Children share that prompt's lease instead of acquiring n times.
++        lora_paths = obj.lora_path
++        if isinstance(lora_paths, list):
++            lora_paths = lora_paths[:len(self._logical_rids(obj))]
++        try:
++            obj.lora_id = await self.lora_registry.acquire(lora_paths)
++        except ValueError:
++            if any(path and path.startswith("relax_lora@") for path in unique_lora_paths):
++                raise fastapi.HTTPException(status_code=409, detail="LORA_VERSION_RETIRED") from None
++            raise
++        ids = obj.lora_id if isinstance(obj.lora_id, list) else [obj.lora_id]
++        stale = False
++        for rid, lora_id in zip(self._logical_rids(obj), ids):
++            if lora_id is None:
++                continue
++            state = self.rid_to_state.get(rid)
++            if state is not None and state is request_states[rid]:
++                state.lora_lease = LoRARequestLease(lora_id)
++            else:
++                # Never attach a delayed acquire to a new request reusing this RID.
++                stale = True
++                task = asyncio.create_task(self.lora_registry.release(lora_id))
++                self._lora_release_tasks.add(task)
++                task.add_done_callback(self._lora_release_tasks.discard)
++        if stale:
++            raise RequestAbortedError("Request changed while acquiring its LoRA adapter")
+         # Propagate lora_id to any sub-objects already cached by __getitem__.
+         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+             sub_obj.lora_id = (
+                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
+             )
+ 
++    @staticmethod
++    def _logical_rids(obj) -> List[str]:
++        if not hasattr(obj, "is_single") or obj.is_single:
++            return [obj.rid]
++        # Normalization may expand autogenerated RIDs for n samples, but only the
++        # original prompts own leases; sampling children are created below.
++        return list(obj.rid[:obj.batch_size])
++
++    def _remove_req_state(
++        self, rid: str, lifecycle_id: Optional[object] = None
++    ) -> Optional[ReqState]:
++        state = self.rid_to_state.get(rid) or self._lora_draining_requests.get(rid)
++        if state is None or (
++            lifecycle_id is not None and state.lifecycle_id is not lifecycle_id
++        ):
++            return None
++        self.rid_to_state.pop(rid, None)
++        if state.dispatched and not state.finished and (
++            state.lora_lease is not None or rid in self.child_rid_to_logical_rid
++        ):
++            self._lora_draining_requests[rid] = state
++            return state
++        self._lora_draining_requests.pop(rid, None)
++        self._release_lora_lease(state)
++        logical_rid = self.child_rid_to_logical_rid.pop(rid, None)
++        if logical_rid is not None:
++            children = self.logical_rid_to_child_rids[logical_rid]
++            children.remove(rid)
++            if not children:
++                self.logical_rid_to_child_rids.pop(logical_rid)
++        return state
++
++    def _init_child_req_state(
++        self,
++        logical_rid: str,
++        obj: Union[GenerateReqInput, EmbeddingReqInput],
++        request: Optional[fastapi.Request] = None,
++    ) -> None:
++        parent = self.rid_to_state.get(logical_rid)
++        if parent is None or parent.abort_requested:
++            raise RequestAbortedError(f"Request {logical_rid} was aborted")
++        self._init_req_state(obj, request, lifecycle_id=parent.lifecycle_id)
++        lease = parent.lora_lease
++        if lease is not None:
++            lease.owners += 1
++            self.rid_to_state[obj.rid].lora_lease = lease
++        self.child_rid_to_logical_rid[obj.rid] = logical_rid
++        self.logical_rid_to_child_rids.setdefault(logical_rid, set()).add(obj.rid)
++
++    def _release_lora_lease(self, state: ReqState) -> None:
++        lease = state.lora_lease
++        if lease is None:
++            return
++        state.lora_lease = None
++        lease.owners -= 1
++        if lease.owners == 0:
++            task = asyncio.create_task(self.lora_registry.release(lease.lora_id))
++            self._lora_release_tasks.add(task)
++            task.add_done_callback(self._lora_release_tasks.discard)
++
+     def _init_req_state(
+         self,
+         obj: Union[GenerateReqInput, EmbeddingReqInput],
+         request: Optional[fastapi.Request] = None,
+-    ):
++        *,
++        lifecycle_id: Optional[object] = None,
++    ) -> Dict[str, object]:
+         created_time = obj.received_time
+
+         external_trace_header = None
+@@ -3780,33 +3894,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         else None
+                     ),
+                 )
+-                for i in range(len(obj.rid))
++                for i in range(obj.batch_size)
+             ]
+ 
+-        for rid, sub_obj, bootstrap_room in items:
+-            if rid in self.rid_to_state:
++        seen_rids = set()
++        for rid, _, _ in items:
++            if (
++                rid in seen_rids
++                or rid in self.rid_to_state
++                or rid in self._lora_draining_requests
++                or rid in self.logical_rid_to_child_rids
++                or rid in self.child_rid_to_logical_rid
++            ):
+                 raise ValueError(f"Duplicate request ID detected: {rid}")
++            seen_rids.add(rid)
++
++        # Validate the whole batch before adding any state.
++        lifecycle_ids = {}
++        for rid, sub_obj, bootstrap_room in items:
+             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+-            state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
++            state = ReqState(
++                [], False, asyncio.Event(), sub_obj, time_stats,
++                lifecycle_id=lifecycle_id if lifecycle_id is not None else object(),
++            )
+             self.rid_to_state[rid] = state
++            lifecycle_ids[rid] = state.lifecycle_id
+             if self.enable_trace:
+                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
+             time_stats.set_created_time(created_time)
++        return lifecycle_ids
+ 
+-    def _finalize_lora_lease(self, state: ReqState) -> None:
+-        # A terminal output and its waiter can both finalize the same state.
+-        # Undispatched failures have no scheduler output to release their lease.
+-        if (
+-            state.lora_lease_released
+-            or not self.enable_lora
+-            or state.obj.lora_path is None
+-            or state.obj.lora_id is None
+-        ):
+-            return
+-        state.lora_lease_released = True
+-        asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+-
+-    def _release_req_states_on_failure(self, rids: Iterable[str]):
++    def _release_req_states_on_failure(
++        self, rids: Iterable[str], lifecycle_ids: Optional[set[object]] = None
++    ):
+         """Release rid_to_state entries created for a failed handler.
+ 
+         Undelivered states are removed locally. Dispatched requests are aborted
+@@ -3815,6 +3935,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         for rid in rids:
+             state = self.rid_to_state.get(rid)
+             if state is not None:
++                if lifecycle_ids is not None and state.lifecycle_id not in lifecycle_ids:
++                    continue
+                 if state.dispatched:
+                     try:
+                         self.abort_request(rid)
+@@ -3823,8 +3945,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                             "Failed to abort request %s during cleanup", rid
+                         )
+                 else:
+-                    self._finalize_lora_lease(state)
+-                    del self.rid_to_state[rid]
++                    self._remove_req_state(rid)
+             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
+             if dispatch_ready is not None:
+                 dispatch_ready.set()
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 6168468..86729a8 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -226,15 +226,27 @@ class BaseTpWorker(ABC):
+     ):
+         # The LoRA code handles TP sharding internally using slice_lora_a_weights
+         # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
+-        data = self.deserialize_own_rank(recv_req.serialized_named_tensors)
+-        if recv_req.load_format == "flattened_bucket":
+-            bucket = FlattenedTensorBucket(
+-                flattened_tensor=data["flattened_tensor"],
+-                metadata=data["metadata"],
+-            )
+-            tensors = dict(bucket.reconstruct_tensors())
++        if recv_req.relax_artifact_path is not None:
++            from sglang.srt.lora.relax_control import read_artifact_tensors
++
++            if (
++                recv_req.relax_attempt_id is None
++                or recv_req.serialized_named_tensors
++                or recv_req.load_format is not None
++                or recv_req.added_tokens_config is not None
++            ):
++                raise ValueError("file tensors require an exclusive managed load")
++            tensors = read_artifact_tensors(recv_req)
+         else:
+-            tensors = data
++            data = self.deserialize_own_rank(recv_req.serialized_named_tensors)
++            if recv_req.load_format == "flattened_bucket":
++                bucket = FlattenedTensorBucket(
++                    flattened_tensor=data["flattened_tensor"],
++                    metadata=data["metadata"],
++                )
++                tensors = dict(bucket.reconstruct_tensors())
++            else:
++                tensors = data
+         if recv_req.expected_checksums is not None:
+             import hashlib
+ 
+@@ -266,12 +278,18 @@ class BaseTpWorker(ABC):
+             logger.info(
+                 f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+             )
++        fingerprints = None
++        if recv_req.relax_attempt_id is not None:
++            from sglang.srt.lora.relax_control import verify_snapshot
++
++            fingerprints = verify_snapshot(recv_req, tensors)
+         result = self.model_runner.load_lora_adapter_from_tensors(
+             recv_req.to_ref(),
+             tensors,
+             recv_req.config_dict,
+             recv_req.added_tokens_config,
+         )
++        result.fingerprints = fingerprints
+         return result
+ 
+     def update_lora_from_distributed(
+diff --git a/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py b/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
+index a0ffe87..603ea38 100644
+--- a/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
++++ b/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
+@@ -5,7 +5,11 @@ import asyncio
+ import copy
+ import logging
+ import os
+-from collections import OrderedDict
++import uuid
++from collections import Counter, OrderedDict
++from dataclasses import dataclass, field
++from enum import IntEnum
++from functools import total_ordering
+ from http import HTTPStatus
+ from pathlib import Path
+ from types import SimpleNamespace as N
+@@ -29,7 +33,10 @@ def _production_class(root, path, name, methods=None):
+         ]
+     for item in node.body:
+         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+-            item.decorator_list = []
++            item.decorator_list = [
++                decorator for decorator in item.decorator_list
++                if isinstance(decorator, ast.Name) and decorator.id in {"staticmethod", "classmethod", "property"}
++            ]
+     return node
+ 
+ 
+@@ -48,18 +55,32 @@ def runtime():
+         Path(override).parents[1] if override else Path(__file__).resolve().parents[4]
+     )
+     namespace = {
++        "__name__": __name__,
+         "asyncio": asyncio,
++        "dataclass": dataclass,
++        "field": field,
++        "uuid": uuid,
++        "Counter": Counter,
++        "IntEnum": IntEnum,
++        "total_ordering": total_ordering,
+         "copy": copy,
+         "HTTPStatus": HTTPStatus,
+         "logger": logging.getLogger(__name__),
+-        "GenerateReqInput": type("GenerateReqInput", (), {}),
+         "get_disagg": lambda: N(language_only=False),
+         "get_lora": lambda: N(max_loaded_loras=None),
+         "get_serving": lambda: N(tokenizer_worker_num=1),
+         "AbortReq": lambda **kwargs: N(kind="abort", **kwargs),
+     }
+     path = "python/sglang/srt/managers/tokenizer_manager.py"
+-    nodes = [
++    nodes = []
++    for source, name in (
++        ("python/sglang/srt/model_executor/forward_batch_info.py", "CaptureHiddenMode"),
++        ("python/sglang/srt/managers/schedule_batch.py", "get_return_hidden_states_mode"),
++    ):
++        nodes.extend(item for item in ast.parse((root / source).read_text()).body if getattr(item, "name", None) == name)
++    nodes += [
++        _production_class(root, "python/sglang/srt/managers/io_struct.py", "GenerateReqInput"),
++        _production_class(root, "python/sglang/srt/lora/lora_registry.py", "LoRARequestLease"),
+         _production_class(
+             root, "python/sglang/srt/utils/common.py", "ConcurrentCounter"
+         ),
+@@ -83,10 +104,12 @@ def runtime():
+                 "_release_req_states_on_failure",
+                 "_send_one_request",
+                 "abort_request",
+-                "_finalize_lora_lease",
++                "_logical_rids",
++                "_remove_req_state",
++                "_release_lora_lease",
++                "_init_child_req_state",
+                 "_handle_abort_finish_reason",
+                 "_handle_batch_request",
+-                "_init_parallel_req_state",
+                 "_collect_batch_responses",
+             },
+         ),
+@@ -116,6 +139,7 @@ def _manager(runtime):
+     manager.enable_lora, manager.enable_metrics, manager.is_pause = True, False, False
+     manager.tokenizer = None
+     manager.encoder_dispatch_ready, manager.rid_to_state = {}, {}
++    manager._lora_draining_requests, manager._lora_release_tasks = {}, set()
+     manager.model_update_lock = N(reader_lock=_AsyncLock())
+     manager.lora_registry = registry
+     manager.request_logger = N(log_received_request=lambda *args: None)
+@@ -124,7 +148,7 @@ def _manager(runtime):
+ 
+     def init_state(obj, request=None):
+         objects = (
+-            [obj[i] for i in range(len(obj.rid))]
++            [obj[i] for i in range(obj.batch_size)]
+             if isinstance(obj.rid, list)
+             else [obj]
+         )
+@@ -143,7 +167,8 @@ def _state(obj, dispatched=False):
+         dispatched=dispatched,
+         abort_sent=False,
+         abort_requested=False,
+-        lora_lease_released=False,
++        finished=False,
++        lora_lease=None,
+         time_stats=N(set_finished_time=lambda: None),
+     )
+ 
+@@ -194,12 +219,11 @@ def test_abort_after_acquire_before_dispatch_allows_unload(runtime):
+     asyncio.run(run())
+ 
+ 
+-@pytest.mark.parametrize("stop", [None, "prefix", "child", "acquire"])
++@pytest.mark.parametrize("stop", [None, "prefix", "child", "close_admission"])
+ @pytest.mark.parametrize("n", [2, 3])
+-def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, stop, n):
+-    # Use the actual n-expansion and cached sub-objects: the original request
+-    # has n parent states/leases, not just one, before clones are constructed.
+-    from sglang.srt.managers.io_struct import GenerateReqInput
++def test_parallel_sampling_retains_shared_lease_and_retires_parents(runtime, stop, n):
++    # Execute the target source's normalizer; only logical prompts own leases.
++    GenerateReqInput = runtime["GenerateReqInput"]
+ 
+     async def run():
+         manager, registry, sent = _manager(runtime)
+@@ -226,16 +250,17 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
+                 manager.abort_request(obj.rid[0])
+ 
+         async def response(request, *_):
+-            state = manager.rid_to_state.pop(request.rid)
+-            manager._finalize_lora_lease(state)
++            state = manager.rid_to_state[request.rid]
++            state.finished = True
++            manager._remove_req_state(request.rid)
+             await asyncio.sleep(0)
+             if len(generated) == 1:
+-                assert registry._counters["lease"].value() == n
++                assert registry._counters["lease"].value() == 1
+                 if stop == "prefix":
+                     manager.abort_request(obj.rid[0])
+-                if stop == "acquire":
+-                    # Removal during a clone acquire must not release the
+-                    # copied parent's ID a second time.
++                if stop == "close_admission":
++                    # Already-admitted children retain their shared lease even
++                    # after new admission closes; unload must still wait.
+                     registry._registry.clear()
+             yield {"rid": request.rid}
+ 
+@@ -245,7 +270,7 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
+             manager._wait_one_response,
+         ) = tokenize, send, response
+         stream = manager.generate_request(obj)
+-        if stop is None:
++        if stop in (None, "close_admission"):
+             outputs = await stream.__anext__()
+             assert len(outputs) == n and len(generated) == n + 1
+         else:
+@@ -254,8 +279,8 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
+             # Only dispatched children may remain until their terminal echo.
+             assert all(state.dispatched for state in manager.rid_to_state.values())
+             for state in list(manager.rid_to_state.values()):
+-                manager._finalize_lora_lease(state)
+-                del manager.rid_to_state[state.obj.rid]
++                state.finished = True
++                manager._remove_req_state(state.obj.rid)
+         await stream.aclose()
+         await _unload(registry)
+         assert not manager.rid_to_state
+@@ -272,6 +297,9 @@ def test_batch_leases_are_per_request_and_terminal_release_is_once(
+         manager, registry, sent = _manager(runtime)
+         objects = [N(rid=f"r{i}", lora_path="adapter", lora_id=None) for i in range(2)]
+         batch = N(
++            is_single=False,
++            batch_size=len(objects),
++            rid=[obj.rid for obj in objects],
+             lora_path=["adapter", "adapter"],
+             lora_id=None,
+             _sub_obj_cache=dict(enumerate(objects)),
+@@ -299,7 +327,8 @@ def test_batch_leases_are_per_request_and_terminal_release_is_once(
+         for state in states:
+             # Terminal output processing and the awaiting client can both
+             # finalize; each batch child owns one lease even for the same ID.
+-            manager._finalize_lora_lease(state)
++            state.finished = True
++            manager._remove_req_state(state.obj.rid)
+             assert (
+                 await manager._handle_abort_finish_reason(out, state, is_stream=True)
+                 == out

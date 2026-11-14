@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
+from relax.engine.lora_versions.identity import AdapterSnapshot, snapshot_adapter
 from relax.utils import megatron_bridge_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
@@ -121,6 +122,20 @@ class LoraAdapterSync:
                 for item in bridge.export_adapter_weights(self.model, cpu=True, show_progress=False)
             }
         return repack_gdn_adapter_for_sglang(exported)
+
+    def export_snapshot(
+        self, all_params: dict, version_id: int, *, base_fingerprint: str, all_gather: bool = False
+    ) -> AdapterSnapshot | None:
+        """Collective full export for immutable publication at a sync point.
+
+        Call on every training rank in the same order. The caller selects the
+        publisher rank after this returns, as with gather_full_adapter.
+        """
+        local = self.export_local_adapter(all_params)
+        full = self.gather_full_adapter(local, all_gather=all_gather)
+        if full is None:
+            return None
+        return snapshot_adapter(version_id, full, self.config_dict(), base_fingerprint=base_fingerprint)
 
     def should_skip(self, all_params) -> tuple[bool, dict[str, torch.Tensor]]:
         """Collective delta-skip decision: has any rank's adapter changed

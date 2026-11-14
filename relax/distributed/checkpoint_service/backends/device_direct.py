@@ -225,6 +225,7 @@ class DeviceDirectBackend(CommBackend):
         self._lora_adapter_full = None  # merge mode: per-call {base_prefix: {"in","out"}} full tensors
         self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
         self._lora_moe_etp_checked = False  # guard the (actor-side) MoE ETP=1 assertion to run once
+        self._managed_lora_publisher = None
 
         # Snapshot names are rank-local; bridge conversion needs global PP/VP names.
         # Track live Parameter names because snapshots are plain Tensors.
@@ -249,6 +250,48 @@ class DeviceDirectBackend(CommBackend):
                 for (_, v_param), (g_name, _) in zip(vanilla_items, global_items, strict=True)
                 if isinstance(v_param, torch.nn.Parameter)
             )
+
+    @property
+    def managed_lora_publication_enabled(self) -> bool:
+        return getattr(self, "_managed_lora_publisher", None) is not None
+
+    def configure_lora_publication(self, config: Any, rollout_manager: Any) -> None:
+        """Install the same immutable publication configuration on every
+        rank."""
+        from relax.engine.lora_versions.training import TrainingLoRAPublisher
+
+        if not self._lora_adapter_mode or self.weight_version != 0:
+            raise ValueError("managed publication requires adapter mode before the first weight sync")
+        if self.managed_lora_publication_enabled:
+            raise RuntimeError("training publication is already configured")
+        for module in self.model:
+            if any(
+                param.requires_grad and not is_lora_adapter_param(name) for name, param in module.named_parameters()
+            ):
+                raise ValueError("managed LoRA publication requires all non-adapter parameters to be frozen")
+        self._managed_lora_publisher = TrainingLoRAPublisher(
+            self._lora_sync, config, rollout_manager, float(self.args.rollout_http_timeout)
+        )
+
+    def validate_lora_base_recipients(self, topology: dict | None = None) -> None:
+        """Never bootstrap a version against a partially synchronized pool."""
+        if topology is None:
+            if not self._is_pp_src_rank:
+                return
+            nodes = self.rollout_topology
+        else:
+            nodes = topology.get("nodes", {}).get("rollout", {})
+        recipients = [(node.get("metadata") or {}).get("actor_id") for node in nodes.values()]
+        expected = self._managed_lora_publisher.config.engine_actor_ids
+        if len(recipients) != len(expected) or set(recipients) != set(expected):
+            raise RuntimeError("initial LoRA base synchronization requires every configured engine generation")
+
+    def _publish_managed_lora(self) -> dict[str, Any]:
+        all_params = dict(self._megatron.named_params_and_buffers(self.args, self.model, convert_to_global_name=False))
+        result = self._managed_lora_publisher.publish(all_params)
+        if result["status"] == "published":
+            self._lora_sync.adapter_loaded = True
+        return result
 
     def _named_params_and_buffers(
         self, name_filter: Callable[[str], bool] | None = None
@@ -705,6 +748,13 @@ class DeviceDirectBackend(CommBackend):
         model parameters (non-expert then expert), then resume generation.
         """
         self.weight_version += 1
+        managed = self.managed_lora_publication_enabled
+        if managed:
+            from relax.engine.lora_versions.training import run_on_training_rank_zero
+
+        if managed and self._lora_sync.base_sync_done and rollout_only and not actor_fwd_only:
+            self._publish_managed_lora()
+            return
 
         if self._use_bridge:
             # Bridge task construction and config exchange contain PP
@@ -755,8 +805,10 @@ class DeviceDirectBackend(CommBackend):
             and (self.quantization_config or {}).get("quant_method") == "compressed-tensors"
         )
 
-        if not actor_fwd_only:
-            if dist.get_rank() == 0:
+        pause_rollout = not actor_fwd_only and (not managed or not self._lora_sync.base_sync_done)
+        if pause_rollout:
+
+            def pause_and_flush() -> None:
                 # Pause generation on all rollout nodes
                 logger.info("Pausing generation on all rollout nodes...")
                 ray.get(self._batch_request("/pause_generation"))
@@ -765,6 +817,11 @@ class DeviceDirectBackend(CommBackend):
                 logger.info("Flushing cache on all rollout nodes...")
                 for rank, engine in self.rollout_engines.items():
                     ray.get(engine.flush_cache.remote())
+
+            if managed:
+                run_on_training_rank_zero(pause_and_flush, phase="initial LoRA base pause")
+            elif dist.get_rank() == 0:
+                pause_and_flush()
             dist.barrier(group=get_gloo_group())
             if reload_quantized_base:
                 self._rollout_control_request(
@@ -819,7 +876,8 @@ class DeviceDirectBackend(CommBackend):
             self._run_expert_pass(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, pbar=pbar)
         dist.barrier(group=get_gloo_group())
         if not rollout_only:
-            if dist.get_rank() == 0:
+
+            def finish_actor_fwd_sync() -> None:
                 payload = {
                     "names": [
                         "weight_updated_stop",
@@ -834,6 +892,11 @@ class DeviceDirectBackend(CommBackend):
                     json=payload,
                 )
                 response.raise_for_status()
+
+            if managed:
+                run_on_training_rank_zero(finish_actor_fwd_sync, phase="actor_fwd weight completion")
+            elif dist.get_rank() == 0:
+                finish_actor_fwd_sync()
             dist.barrier(group=get_gloo_group())
 
         # Adapter mode: (re)register the trained LoRA adapter on every rollout engine. The base
@@ -847,7 +910,22 @@ class DeviceDirectBackend(CommBackend):
         # the barrier below waiting for a rank that already unwound. The verdict is shared
         # across ranks first, generation is resumed, and only then does everyone raise together.
         push_error: Exception | None = None
-        if self._lora_adapter_mode and not actor_fwd_only:
+        if managed and not actor_fwd_only:
+            if pause_rollout:
+                if reload_quantized_base:
+                    self._rollout_control_request(
+                        "/post_process_weights",
+                        {"restore_weights_before_load": False, "post_process_quantization": True},
+                    )
+                # Publication probes use /generate, so admission must reopen
+                # after base synchronization, before the first publication.
+                run_on_training_rank_zero(
+                    lambda: ray.get(self._batch_request("/continue_generation")),
+                    phase="initial LoRA base resume",
+                )
+                self._lora_sync.base_sync_done = True
+            self._publish_managed_lora()
+        elif self._lora_adapter_mode and not actor_fwd_only:
             try:
                 self._push_lora_adapter_distributed(first_sync=not self._lora_sync.adapter_loaded)
             except Exception as e:  # noqa: BLE001 - re-raised below, after the engines are resumed
@@ -857,7 +935,7 @@ class DeviceDirectBackend(CommBackend):
                 self._lora_sync.adapter_loaded = True
                 self._lora_sync.base_sync_done = True
 
-        if not actor_fwd_only:
+        if not actor_fwd_only and not managed:
             # MAX over gloo: rank 0 is the only rank that can observe the push failure, so
             # without this the other ranks would take the success path and desync. Gated on
             # the (rank-uniform) adapter-mode flag so no other path pays for the collective.
