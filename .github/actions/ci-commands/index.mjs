@@ -19,7 +19,7 @@ function help(targets) {
     '- `/cancel <workflow|all>`: cancel entire workflows, including their matrix jobs.',
     '- `/help`: show this help.',
     '- `/review`: request Nyanpasu review.',
-    '- `/cherry-pick <branch>`: label a PR merged into main for the Cherry Pick workflow (write access required).',
+    '- `/cherry-pick <branch>`: label a PR merged into main for the Cherry Pick workflow.',
     '',
     'Rerun/cancel require PR authorship or repository write access. Put the command on the first line.',
     'Targets use workflow or workflow/job names, such as ci or ci/pre-commit. Job targets support rerun only.',
@@ -52,7 +52,6 @@ async function execute(github, repo, pr, author, command, cherryPickToken) {
       github,
       repo,
       pr,
-      author,
       branch: command.args,
       token: cherryPickToken,
     })

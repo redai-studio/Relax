@@ -63,7 +63,7 @@ Unless maintainers explicitly approve a special case, merge every change into `m
 Request automation on the original `main` PR:
 
 - Add a `cherry-pick: <branch>` label, for example `cherry-pick: release/0.2.0`. The label can be added before merge; `rai-studio-bot` waits until the source PR merges. Adding it after merge also requests a backport.
-- After the source PR has merged into `main`, a user with repository write access can comment `/cherry-pick <branch>`. This command assigns the corresponding existing label; it does not queue requests on unmerged PRs.
+- After the source PR has merged into `main`, comment `/cherry-pick <branch>` to assign the corresponding existing label. Repository write access is not required. The comment command does not queue requests on unmerged PRs.
 
 The bot opens a cherry-pick PR; it does not merge it. Review its complete changes and merge that PR into `release/*` through the normal protected-branch workflow. If the cherry-pick conflicts, backport the complete already merged PR manually in your fork and open the release-targeted PR yourself, linking the original `main` PR. Do not include unrelated or not-yet-merged changes.
 

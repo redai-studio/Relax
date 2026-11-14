@@ -275,8 +275,6 @@ PR 会运行 pre-commit 检查、GPU 单元测试和 GPU/NPU 集成测试。操�
 | `/cherry-pick <branch>` | 请求回移已合入 `main` 的 PR |
 | `/review` | 请求代码 review |
 
-`/cherry-pick` 要求仓库 `write` / `maintain` / `admin` 权限，仅为 PR 作者不够。目标分支及精确大小写的 `cherry-pick: <branch>` 标签须已存在。回复只确认请求，不代表回移成功；合并前仍需审查完整回移内容。
-
 Target 使用 `workflow` 或 `workflow/job` 命名。例如，`/rerun ci` 重跑整个 pre-commit workflow，`/rerun ci/pre-commit` 选择其中的 pre-commit 检查；`all` 表示所有已配置的 workflow。
 
 | Target | Workflow / 检查 |

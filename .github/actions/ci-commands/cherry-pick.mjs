@@ -1,11 +1,4 @@
-export async function requestCherryPick({ github, repo, pr, author, branch, token }) {
-  const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
-    ...repo,
-    username: author,
-  })
-  if (!['admin', 'maintain', 'write'].includes(permission.permission)) {
-    throw new Error('Only users with repository write access can request a cherry-pick.')
-  }
+export async function requestCherryPick({ github, repo, pr, branch, token }) {
   if (!pr.merged || pr.base.ref !== 'main') {
     throw new Error('/cherry-pick requires a PR already merged into main.')
   }

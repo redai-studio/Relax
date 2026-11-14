@@ -275,8 +275,6 @@ PRs run pre-commit checks, GPU unit tests, and GPU/NPU integration tests. To ope
 | `/cherry-pick <branch>` | Request a backport of a PR already merged into `main` |
 | `/review` | Request a code review |
 
-`/cherry-pick` requires repository `write` / `maintain` / `admin` permission; PR authorship alone is insufficient. The target branch and the exact-case `cherry-pick: <branch>` label must already exist. The reply confirms only the request, not a successful backport; review the complete backport before merging it.
-
 Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
 
 | Target | Workflow / check |
