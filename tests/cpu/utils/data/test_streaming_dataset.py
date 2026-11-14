@@ -811,6 +811,44 @@ class TestStreamingDataset:
         assert dataset._filter_count == len(filtered)
         assert dataset._total_processed == len(data)
 
+    def test_resume_restarts_prefetch_from_consumed_position(self, tmp_path, mock_tokenizer, monkeypatch):
+        from relax.utils.data import streaming_dataset
+
+        path = tmp_path / "resume.jsonl"
+        path.write_text("".join(json.dumps({"text": str(i), "label": i}) + "\n" for i in range(64)))
+        options = dict(tokenizer=mock_tokenizer, processor=None, max_length=1, label_key="label")
+        reference = streaming_dataset.StreamingDataset(str(path), **options)
+        reference.shuffle(0)
+        order = reference.index_manager.indices
+        too_long = {order[0], order[33]}
+        monkeypatch.setattr(
+            streaming_dataset, "check_sample_length", lambda sample, *args, **kwargs: sample.label not in too_long
+        )
+        reference.get_batch(31)
+        checkpoint = reference.get_state()
+
+        resumed = streaming_dataset.StreamingDataset(
+            str(path), multimodal_keys={"image": "images"}, prefetch_max_cached=4, prefetch_num_workers=4, **options
+        )
+        buffer = resumed._prefetch_buffer
+        try:
+            resumed.shuffle(0)
+            assert all(buffer.wait_for(idx, timeout=5) for idx in order[:4])
+            assert resumed.get_state()["total_processed"] == resumed.get_state()["filter_count"] == 0
+            resumed.load_state(checkpoint)
+            assert all(buffer.wait_for(idx, timeout=5) for idx in order[32:36])
+            assert resumed.get_state() == {"epoch_id": 0, "position": 32, "total_processed": 32, "filter_count": 1}
+
+            first, _ = resumed.get_batch(3)
+            assert buffer.hit_rate == 1.0
+            assert resumed.get_state() == {"epoch_id": 0, "position": 36, "total_processed": 36, "filter_count": 2}
+            rest, _ = resumed.get_batch(28)
+            expected, _ = reference.get_batch(31)
+            assert [sample.label for sample in first + rest] == [sample.label for sample in expected]
+            assert resumed.get_state() == reference.get_state()
+        finally:
+            buffer.stop()
+
     def test_shuffle_epoch(self, jsonl_file, mock_tokenizer):
         """Test that shuffle produces different order."""
         from relax.utils.data.streaming_dataset import StreamingDataset
