@@ -380,6 +380,9 @@ class Envs(metaclass=_EnvsMeta):
         "RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES", int, 512 * 1024**2
     )
 
+    # Overlap the Actor CPU backup with sending weights to SGLang.
+    RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP = EnvProperty("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", bool, False)
+
     # ------------- Routing Replay -------------
     ENABLE_ROUTING_REPLAY = EnvProperty("ENABLE_ROUTING_REPLAY", bool, False)
 

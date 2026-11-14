@@ -35,7 +35,7 @@ from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rol
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
-from relax.utils.env import Envs
+from relax.utils.env import Envs, resolve_in
 from relax.utils.fault_events.models import RecoveryEvidence
 from relax.utils.fault_events.recovery import GlobalStartup
 from relax.utils.health_system import HealthManager
@@ -798,6 +798,25 @@ class Controller:
             if role == "sft" and getattr(self, "_sft_line_offsets_cache", None) is not None:
                 service_config = copy.copy(self.config)
                 service_config._sft_line_offsets_cache = self._sft_line_offsets_cache
+            service_runtime_env = self.runtime_env
+            if role == ROLES.rollout and getattr(self.config, "colocate", False):
+                # Share only the weight-sync protocol setting with SGLang, including
+                # an explicit opt-out. NCCL and other training settings stay Actor-only.
+                name = "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP"
+                runtime_env = self.runtime_env or {}
+                effective_env = {
+                    **os.environ,
+                    **runtime_env.get("env_vars", {}),
+                    **getattr(self.config, "train_env_vars", {}),
+                }
+                if name in effective_env:
+                    service_runtime_env = {
+                        **runtime_env,
+                        "env_vars": {
+                            **runtime_env.get("env_vars", {}),
+                            name: "1" if resolve_in(name, effective_env) else "0",
+                        },
+                    }
             service = Service(
                 cls,
                 role=role,
@@ -807,7 +826,7 @@ class Controller:
                 data_source=data_source,
                 actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in actor_rollout_pg_roles else None,
                 defer_deploy=True,
-                runtime_env=self.runtime_env,
+                runtime_env=service_runtime_env,
             )
             if self._startup_abort_event.is_set():
                 self._cleanup_aborted_service(role, service, deploy=False)

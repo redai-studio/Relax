@@ -8,8 +8,9 @@ import os
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import ray
@@ -29,6 +30,94 @@ def _actor(probe: Any = None) -> Any:
 
 def _raise(error: BaseException) -> None:
     raise error
+
+
+@pytest.fixture
+def offload_launch(monkeypatch, tmp_path):
+    from relax.distributed.ray import actor_group as module
+
+    # Capture actual RayTrainGroup launch/init arguments without spawning workers.
+    captured = {}
+    actor = SimpleNamespace(init=Mock(), get_master_addr_and_port=SimpleNamespace(remote=lambda: ("host", 1234)))
+    remote_class = Mock()
+    remote_class.options.return_value = remote_class
+    remote_class.remote.return_value = actor
+
+    def remote(**kwargs):
+        captured.update(kwargs["runtime_env"]["env_vars"])
+        return lambda _cls: remote_class
+
+    monkeypatch.setattr(module.ray, "remote", remote)
+    monkeypatch.setattr(module.ray, "get", lambda value: value)
+    monkeypatch.setattr(module, "_resolve_train_actor_class", lambda args: object)
+    monkeypatch.setattr(module, "Lock", SimpleNamespace(options=lambda **kwargs: SimpleNamespace(remote=lambda: None)))
+    monkeypatch.setattr(module, "with_control_plane_affinity", lambda *args, **kwargs: {})
+    monkeypatch.setattr(module, "get_ray_accelerator_kwargs", lambda *args: {})
+    monkeypatch.setattr(module, "PlacementGroupSchedulingStrategy", lambda **kwargs: None)
+    log = Mock()
+    monkeypatch.setattr(module, "logger", log)
+    tms = ModuleType("torch_memory_saver")
+    tms.__file__ = str(tmp_path / "torch_memory_saver" / "__init__.py")
+    hook = tmp_path / "torch_memory_saver_hook_mode_preload.abi3.so"
+    hook.touch()
+    monkeypatch.setitem(sys.modules, "torch_memory_saver", tms)
+    monkeypatch.delenv("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", raising=False)
+
+    def launch(enabled, matching_world, selective, optimizer="adam"):
+        config = dict(
+            train_backend="megatron",
+            colocate=True,
+            offload_train=True,
+            offload_rollout=True,
+            enable_weights_backuper=True,
+            selective_offload=selective,
+            optimizer=optimizer,
+            use_routing_replay=False,
+            megatron_to_hf_mode="bridge",
+            train_env_vars={},
+            resource={"actor": (1, 1), "rollout": (1, 1 if matching_world else 2)},
+            rollout_num_gpus_per_engine=1,
+        )
+        args = SimpleNamespace(**config)
+        env = {"RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP": "1"} if enabled else {}
+        group = RayTrainGroup(args, 1, (object(), [0], [0]), role="actor", runtime_env={"env_vars": env})
+        return group, args, actor, captured, log
+
+    return launch, str(hook)
+
+
+@pytest.mark.parametrize(
+    "enabled,matching_world,selective,optimizer",
+    [
+        (False, True, False, "adam"),
+        (True, True, False, "adam"),
+        (True, False, False, "adam"),
+        (True, False, True, "adam"),
+        (True, True, False, "sgd"),
+        (True, True, False, "muon"),
+    ],
+)
+def test_overlap_selects_offload_only_when_enabled_and_supported(
+    monkeypatch, offload_launch, enabled, matching_world, selective, optimizer
+):
+    launch, hook = offload_launch
+    preload = "/user/first.so /user/last.so"
+    monkeypatch.setenv("LD_PRELOAD", preload if selective else f"{preload}:{hook}")
+    group, args, actor, env, log = launch(enabled, matching_world, selective, optimizer)
+    group.async_init(args, "actor")
+    sent = actor.init.remote.call_args.args[0]
+    selected = enabled and matching_world and optimizer == "adam"
+    assert sent.selective_offload == (selected or selective)
+    assert (sent is args) == (not selected)
+    assert args.selective_offload == selective
+    if selected:
+        assert env["LD_PRELOAD"] == preload
+        assert env["TMS_INIT_ENABLE"] == env["TMS_INIT_ENABLE_CPU_BACKUP"] == "0"
+        assert "automatically selecting selective offload" in log.info.call_args.args[0] % log.info.call_args.args[1:]
+    else:
+        log.info.assert_not_called()
+        if not selective:
+            assert env["LD_PRELOAD"] == hook and env["TMS_INIT_ENABLE"] == "1"
 
 
 def test_init_and_wait_preserves_success_and_cleans_submission_failure(monkeypatch: pytest.MonkeyPatch) -> None:
