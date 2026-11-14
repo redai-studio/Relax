@@ -24,3 +24,18 @@ python -m pytest -q tests/cpu/backends/sglang/test_weight_version_verification.p
 ```
 
 The [FULL checkpoint guide](./weight-checkpoints.md) provides GPU entrypoints for training export and an independent Loader.
+
+## TCP transport
+
+Set `transport.type=tcp`, `host`, and `port` in the consumer configuration. SharedFS and TCP share version identities, encoded objects, and installation behavior.
+
+```bash
+python -m relax.distributed.weight_sync \
+  --store /path/to/published --disk-budget 34359738368 \
+  --max-weight-bytes 8589934592 \
+  serve --bind 127.0.0.1 --port 9010
+```
+
+TCP transfers objects in chunks and reuses verified content after reconnection. Consumers can request a same-target FULL package from the publication owner. Transport `timeout` covers connections and frames, `control_timeout` covers control operations, and `full_timeout` covers FULL repair; corresponding server options are available. The send ledger records actual delivery and retries.
+
+For cross-host deployments, bind to an address reachable by consumers and provide access control or an authenticated tunnel at the deployment layer.

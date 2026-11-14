@@ -12,7 +12,7 @@ from relax.distributed.weight_sync.fence import WorkerFence
 from relax.distributed.weight_sync.runtime import ConsumptionError, ConsumptionRunner
 from relax.distributed.weight_sync.session import InstallSession
 from relax.distributed.weight_sync.store import VersionStore, load_json, stored_bytes
-from relax.distributed.weight_sync.transport import SharedFSTransport, fetch
+from relax.distributed.weight_sync.transport import ObjectServer, SharedFSTransport, TCPTransport, fetch
 
 
 class Engines:
@@ -176,6 +176,34 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(prepared.manifest["root"], target["root"])
         self.assertEqual(prepared.manifest["kind"], "full")
 
+    def test_missing_tcp_object_and_sharedfs_repair_use_publisher_owner(self):
+        self.publish(0, model_config={})
+        target = self.publish(1, model_config={})
+        key = target["tensors"][0]["chunks"][0]["object"]
+        with ObjectServer(("127.0.0.1", 0), self.store) as server:
+            worker = threading.Thread(target=server.serve_forever)
+            worker.start()
+            try:
+                for mode in ("tcp", "sharedfs"):
+                    self.store.object_path(key).unlink(missing_ok=True)
+                    transport = TCPTransport(server.server_address)
+                    if mode == "sharedfs":
+                        reader = self.make_store("source")
+                        transport = SharedFSTransport(reader, repair=transport)
+                        reader.ensure_full = lambda *args: self.fail("repair ran on consumer's store view")
+                    consumer = VersionConsumer(
+                        transport,
+                        self.make_store("cache-" + mode),
+                        self.root / ("prepared-" + mode),
+                        checkpoint_budget=64 * 1024**2,
+                    )
+                    prepared = consumer.prepare("s", 1, "engine-" + mode)
+                    self.assertEqual(prepared.manifest["root"], target["root"])
+                    self.assertEqual(prepared.manifest["kind"], "full")
+            finally:
+                server.shutdown()
+                worker.join()
+
     def test_pin_reply_loss_is_reconciled_with_persisted_identity(self):
         self.publish(0)
         target = self.make_store("cache")
@@ -303,6 +331,22 @@ class ReviewRecoveryTests(unittest.TestCase):
                 thread.join(5)
         self.assertEqual(errors, [])
         self.assertEqual([v["version"] for v in self.store.versions("s")], [0, 1])
+
+    def test_busy_does_not_consume_network_retry_count(self):
+        self.publish(0)
+        with ObjectServer(("127.0.0.1", 0), self.store, max_workers=1) as server:
+            server._slots.acquire()
+            timer = threading.Timer(0.3, server._slots.release)
+            worker = threading.Thread(target=server.serve_forever)
+            worker.start()
+            timer.start()
+            try:
+                result = TCPTransport(server.server_address, timeout=2, retries=0).versions("s")
+                self.assertEqual(result[0]["version"], 0)
+            finally:
+                timer.join()
+                server.shutdown()
+                worker.join()
 
 
 class IdentityTests(unittest.TestCase):

@@ -1,11 +1,12 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from relax.distributed.weight_sync.publication import VersionPublisher
 from relax.distributed.weight_sync.store import VersionStore, canonical, load_json, validate_manifest
-from relax.distributed.weight_sync.transport import SharedFSTransport, fetch
+from relax.distributed.weight_sync.transport import ObjectServer, SharedFSTransport, TCPTransport, fetch
 
 
 class PublicationTests(unittest.TestCase):
@@ -114,6 +115,23 @@ class PublicationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.register("latest", "run", mode="all_versions")
 
+    def test_tcp_latest_subscription_can_skip_installations(self):
+        self.publish(0)
+        manifest = self.publish(1)
+        target = {key: manifest[key] for key in ("stream", "version", "root")}
+        with ObjectServer(("127.0.0.1", 0), self.store) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+            thread.start()
+            try:
+                transport = TCPTransport(server.server_address)
+                self.assertEqual(transport.register("latest", "run", mode="latest")["mode"], "latest")
+                receipt = {"phase": "ACTIVE", "target": target, "serving": target}
+                self.assertEqual(transport.acknowledge("latest", receipt)["cursor"], 1)
+                self.assertEqual(transport.acknowledge("latest", receipt)["cursor"], 1)
+            finally:
+                server.shutdown()
+                thread.join()
+
     def test_fetch_protects_old_chain_during_collection(self):
         for version in range(10):
             self.publish(version, anchor_interval=2)
@@ -129,6 +147,20 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(target.tensor_path("run", 1, "层.weight").read_bytes(), bytes([1]) + bytes(255))
         source.collect()
         self.assertFalse(source.manifest_path("run", 1).exists())
+
+    def test_tcp_and_sharedfs_full_artifacts_are_identical(self):
+        self.publish(0)
+        self.publish(1)
+        with ObjectServer(("127.0.0.1", 0), self.store) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                fs = fetch(SharedFSTransport(self.store), self.make_store("fs"), "run", 1, full=True)
+                tcp = fetch(TCPTransport(server.server_address), self.make_store("tcp"), "run", 1, full=True)
+                self.assertEqual(fs, tcp)
+            finally:
+                server.shutdown()
+                thread.join()
 
     def test_publisher_freezes_inputs_and_explicitly_confirms(self):
         publisher = VersionPublisher(

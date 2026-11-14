@@ -9,7 +9,7 @@ from relax.distributed.weight_sync.consumer import VersionConsumer
 from relax.distributed.weight_sync.runtime import ConsumptionError, ConsumptionRunner
 from relax.distributed.weight_sync.session import InstallSession
 from relax.distributed.weight_sync.store import VersionStore, canonical, load_json
-from relax.distributed.weight_sync.transport import SharedFSTransport
+from relax.distributed.weight_sync.transport import ObjectServer, SharedFSTransport, TCPTransport
 
 
 class Engines:
@@ -394,6 +394,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(state["error"], "drain deadline exceeded")
         self.assertIsNone(state["serving"])
         self.assertIn("restart_unresponsive_engine_then_recover", caught.exception.state["allowed_actions"])
+
+    def test_tcp_discovery_and_all_versions_consumption(self):
+        with ObjectServer(("127.0.0.1", 0), self.source) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                transport = TCPTransport(server.server_address)
+                self.assertEqual(transport.versions("s", limit=1, newest_first=True)[0]["version"], 3)
+                runner, engines = self.runner(transport)
+                self.assertEqual([m["version"] for m in runner.available(limit=2)], [0, 1])
+                with self.assertRaises(ValueError):
+                    runner.apply(2)
+                for version in range(4):
+                    self.assertEqual(runner.apply(version)["cursor"], version)
+                self.assertEqual(runner.available(), [])
+                self.assertTrue(engines.serving)
+                transport.unregister("reader")
+                self.assertFalse((self.source.root / "consumers/reader.json").exists())
+            finally:
+                server.shutdown()
+                thread.join()
 
     def test_diagnostic_status_write_failure_preserves_active_receipt(self):
         from relax.distributed.weight_sync import store

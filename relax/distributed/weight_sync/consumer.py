@@ -12,7 +12,7 @@ from .diagnostics import save_diagnostic
 from .metrics import MemorySampler, SyncMetrics
 from .store import VersionStore, atomic_write, canonical, load_json, sync_directory, valid_id, writer_lock
 from .traffic import capture
-from .transport import ContentError, RemoteStoreError, SharedFSTransport, fetch
+from .transport import ContentError, RemoteStoreError, SharedFSTransport, TCPTransport, fetch
 
 
 logger = get_logger(__name__)
@@ -29,7 +29,7 @@ class PreparedVersion:
 class VersionConsumer:
     def __init__(
         self,
-        transport: SharedFSTransport,
+        transport: SharedFSTransport | TCPTransport,
         cache: VersionStore,
         checkpoint_root: str | Path,
         config: str | Path | None = None,

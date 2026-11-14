@@ -24,3 +24,18 @@ python -m pytest -q tests/cpu/backends/sglang/test_weight_version_verification.p
 ```
 
 [FULL checkpoint 指南](./weight-checkpoints.md) 提供训练导出与独立 Loader 的 GPU 运行入口。
+
+## TCP 传输
+
+消费者配置 `transport.type=tcp`，并设置发布服务的 `host` 与 `port`。SharedFS 与 TCP 使用同一版本身份、编码对象和安装流程。
+
+```bash
+python -m relax.distributed.weight_sync \
+  --store /path/to/published --disk-budget 34359738368 \
+  --max-weight-bytes 8589934592 \
+  serve --bind 127.0.0.1 --port 9010
+```
+
+TCP 按块传输对象，连接恢复后复用已经校验的内容。消费者可向发布 owner 请求同目标 FULL。传输配置的 `timeout` 用于连接和帧传输，`control_timeout` 用于控制操作，`full_timeout` 用于 FULL 修复；服务端提供对应命令行参数。发送账本记录实际交付与重试流量。
+
+跨主机部署时，将服务绑定到消费者可达的地址，由部署网络提供访问控制或认证隧道。

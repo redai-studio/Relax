@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .checkpoint import snapshot_checkpoint, write_checkpoint
 from .store import VersionStore, canonical
-from .transport import SharedFSTransport, fetch
+from .transport import ObjectServer, SharedFSTransport, TCPTransport, fetch
 
 
 def main() -> None:
@@ -27,8 +27,18 @@ def main() -> None:
     publish.add_argument("--anchor-interval", type=int, default=20)
     publish.add_argument("--full-only", action="store_true")
     publish.add_argument("--compression", action="store_true", help="Compare raw and XOR zlib encodings")
+    serve = sub.add_parser("serve")
+    serve.add_argument("--full-timeout", type=float, default=600, help="Owner FULL repair operation budget in seconds")
+    serve.add_argument("--control-timeout", type=float, default=120, help="Store control operation budget in seconds")
+    serve.add_argument("--bind", default="127.0.0.1")
+    serve.add_argument("--port", type=int, required=True)
+    serve.add_argument("--metrics-output", help="Save server socket and repair-write counters on orderly shutdown")
     get = sub.add_parser("fetch")
-    get.add_argument("--source-store", required=True)
+    location = get.add_mutually_exclusive_group(required=True)
+    location.add_argument("--source-store")
+    location.add_argument("--host")
+    get.add_argument("--port", type=int)
+    get.add_argument("--control-timeout", type=float, default=120, help="TCP control operation budget in seconds")
     get.add_argument("--stream", required=True)
     get.add_argument("--version", type=int, required=True)
     get.add_argument("--checkpoint-output", required=True)
@@ -94,6 +104,30 @@ def main() -> None:
                 converter_revision="hf-safetensors-v1",
             )
         sys.stdout.buffer.write(canonical(manifest) + b"\n")
+    elif args.command == "serve":
+        from .diagnostics import save_diagnostic
+        from .metrics import SyncMetrics
+
+        metrics = SyncMetrics("object-service") if args.metrics_output else None
+        server = ObjectServer(
+            (args.bind, args.port),
+            store,
+            metrics=metrics,
+            full_timeout=args.full_timeout,
+            control_timeout=args.control_timeout,
+        )
+        try:
+            with server:
+                server.serve_forever()
+        finally:
+            if metrics is not None:
+                try:
+                    save_diagnostic(
+                        Path(args.metrics_output),
+                        canonical({"io_metrics": metrics.report(), "socket_ledger": server.ledger.report()}),
+                    )
+                except OSError as error:
+                    print(f"Object service stopped; metric output could not be saved: {error}", file=sys.stderr)
     elif args.command == "status":
         sys.stdout.buffer.write(canonical(store.manifest(args.stream, args.version)) + b"\n")
     elif args.command == "full":
@@ -128,8 +162,15 @@ def main() -> None:
 
         consume_versions(store, args.runtime_config)
     elif args.command == "fetch":
-        source = VersionStore(args.source_store, disk_budget=args.disk_budget, max_weight_bytes=args.max_weight_bytes)
-        transport = SharedFSTransport(source)
+        if args.source_store:
+            source = VersionStore(
+                args.source_store, disk_budget=args.disk_budget, max_weight_bytes=args.max_weight_bytes
+            )
+            transport = SharedFSTransport(source)
+        else:
+            if not args.port:
+                parser.error("--host requires --port")
+            transport = TCPTransport((args.host, args.port), control_timeout=args.control_timeout)
         manifest = fetch(transport, store, args.stream, args.version, full=args.full)
         path = write_checkpoint(
             store, args.stream, args.version, Path(args.checkpoint_output), config_source=args.config

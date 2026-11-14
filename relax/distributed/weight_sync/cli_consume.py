@@ -16,7 +16,7 @@ from .session import InstallSession
 from .sglang_loader import EmbeddedSGLangGroup
 from .sglang_plugin import create_engine
 from .store import VersionStore, canonical, load_json
-from .transport import SharedFSTransport
+from .transport import SharedFSTransport, TCPTransport
 
 
 logger = get_logger(__name__)
@@ -40,11 +40,27 @@ def consume_versions(cache: VersionStore, configuration: str | Path) -> None:
             disk_budget=transport_config["disk_budget"],
             max_weight_bytes=cache.max_weight_bytes,
         )
-        if transport_config.get("repair_owner"):
-            raise ValueError("Remote repair owners require the TCP delivery extension")
-        transport = SharedFSTransport(source)
+        owner = transport_config.get("repair_owner")
+        repair = (
+            TCPTransport(
+                (owner["host"], owner["port"]),
+                timeout=owner.get("timeout", 30),
+                full_timeout=owner.get("full_timeout", 600),
+                control_timeout=owner.get("control_timeout", 120),
+            )
+            if owner
+            else None
+        )
+        transport = SharedFSTransport(source, repair=repair)
+    elif transport_config["type"] == "tcp":
+        transport = TCPTransport(
+            (transport_config["host"], transport_config["port"]),
+            timeout=transport_config.get("timeout", 30),
+            full_timeout=transport_config.get("full_timeout", 600),
+            control_timeout=transport_config.get("control_timeout", 120),
+        )
     else:
-        raise ValueError("Transport must be sharedfs")
+        raise ValueError("Transport must be sharedfs or tcp")
     consumer = VersionConsumer(
         transport,
         cache,

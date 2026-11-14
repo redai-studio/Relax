@@ -1,12 +1,13 @@
 import random
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 from relax.distributed.weight_sync.checkpoint import write_checkpoint
 from relax.distributed.weight_sync.session import InstallSession
 from relax.distributed.weight_sync.store import VersionStore
-from relax.distributed.weight_sync.transport import SharedFSTransport, fetch
+from relax.distributed.weight_sync.transport import ObjectServer, SharedFSTransport, TCPTransport, fetch
 
 
 class VersionTests(unittest.TestCase):
@@ -37,6 +38,31 @@ class VersionTests(unittest.TestCase):
             source.publish("s", version, {"w": ("BF16", [4096], path)}, compression=True, model_config={})
             fetch(SharedFSTransport(source), target, "s", version)
             self.assertEqual(target.tensor_path("s", version, "w").read_bytes(), value)
+
+    def test_offline_hundred_versions_both_transports(self):
+        source = self.store("source")
+        values = []
+        value = bytearray(256)
+        for version in range(101):
+            value[version % 256] ^= 1
+            values.append(bytes(value))
+            self.publish(source, version, value)
+        # Producer no longer exists: only durable files are used below.
+        with ObjectServer(("127.0.0.1", 0), source) as server:
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                for mode, transport in [
+                    ("fs", SharedFSTransport(source)),
+                    ("tcp", TCPTransport(server.server_address)),
+                ]:
+                    target = self.store(mode)
+                    for version, expected in enumerate(values):
+                        fetch(transport, target, "test", version)
+                        self.assertEqual(target.tensor_path("test", version, "w").read_bytes(), expected)
+            finally:
+                server.shutdown()
+                worker.join()
 
     def test_corrupt_object_and_cache(self):
         source, target = self.store("source"), self.store("target")
