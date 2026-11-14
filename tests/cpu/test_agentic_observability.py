@@ -661,7 +661,8 @@ def test_cancel_records_exports_while_reward_is_pending(tmp_path, rollout_module
         pipeline = _obs_pipeline(rollout_module, args)
         rm_started = asyncio.Event()
 
-        async def slow_rm(*args):
+        async def slow_rm(*args, evaluation=False):
+            assert evaluation is False
             rm_started.set()
             await asyncio.Event().wait()
 

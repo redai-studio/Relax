@@ -13,6 +13,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
 
+from .async_eval import collect_eval_rewards, defer_eval_reward, eval_reward_deferral_enabled
 from .dapo_genrm import async_compute_score_genrm
 from .math_utils import extract_answer as extract_boxed_answer
 from .registry import get_reward_spec, list_reward_types, register_reward, resolve_rm_type
@@ -77,6 +78,26 @@ def _is_async_callable(function: Callable[..., Any]) -> bool:
     except ValueError:
         pass
     return inspect.iscoroutinefunction(call)
+
+
+def _custom_reward_kwargs(function: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Pass the evaluation flag only to custom rewards that accept it."""
+    if "evaluation" not in kwargs:
+        return kwargs
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == "evaluation"
+            and parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        for parameter in parameters
+    ):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key != "evaluation"}
 
 
 def _sample_context(sample: Sample | list[Sample]) -> str:
@@ -167,7 +188,7 @@ class RewardWorker:
     ) -> Any:
         """Execute a synchronous custom reward payload."""
         function = self._load_custom_reward(path)
-        result = function(args, sample, **(kwargs or {}))
+        result = function(args, sample, **_custom_reward_kwargs(function, kwargs or {}))
         if inspect.isawaitable(result):
             close = getattr(result, "close", None)
             if close is not None:
@@ -202,9 +223,10 @@ class RewardExecutor:
 
     _instance: "RewardExecutor | None" = None
 
-    def __init__(self, max_concurrency: int = 64, num_workers: int = 16):
+    def __init__(self, max_concurrency: int = 64, num_workers: int = 16, *, worker_name_prefix: str = "reward_worker"):
         self._max_concurrency = max_concurrency
         self._num_workers = num_workers
+        self._worker_name_prefix = worker_name_prefix
         self._semaphore: asyncio.Semaphore | None = None
         self._workers: list = []
         self._worker_init_lock = None
@@ -249,7 +271,7 @@ class RewardExecutor:
                         **with_control_plane_affinity(
                             args,
                             {
-                                "name": f"reward_worker_{i}",
+                                "name": f"{self._worker_name_prefix}_{i}",
                                 "get_if_exists": True,
                             },
                         )
@@ -329,7 +351,7 @@ class RewardExecutor:
         try:
             function = self._load_custom_reward(path)
             if self._custom_reward_is_async[path]:
-                return await function(args, sample, **kwargs)
+                return await function(args, sample, **_custom_reward_kwargs(function, kwargs))
 
             await self._ensure_workers(args)
             worker = self._next_worker()
@@ -355,11 +377,23 @@ class RewardExecutor:
 
     async def _execute_custom_with_concurrency(self, args, sample: Sample | list[Sample], **kwargs):
         """Execute one custom reward call with concurrency control."""
+        if eval_reward_deferral_enabled():
+            try:
+                function = self._load_custom_reward(args.custom_rm_path)
+            except Exception as exc:
+                raise RewardExecutionError(
+                    custom_rm_path=args.custom_rm_path, sample_context=_sample_context(sample), cause=exc
+                ) from exc
+            if getattr(function, "supports_async_eval", False) and defer_eval_reward(sample, kwargs):
+                return [None] * len(sample) if isinstance(sample, list) else None
         self._ensure_semaphore()
         async with self._semaphore:
-            return await self._execute_custom(args, sample, kwargs)
+            # Keep inline custom scoring intact: nested RM calls must return
+            # real scores, even while the surrounding eval collects judges.
+            with collect_eval_rewards(args, enabled=False):
+                return await self._execute_custom(args, sample, kwargs)
 
-    async def execute(self, args, sample: Sample, **kwargs):
+    async def execute(self, args, sample: Sample, *, _resolved_route=None, **kwargs):
         """Execute a single reward computation with concurrency control.
 
         - Custom rm paths bypass the format-aware router: async customs are
@@ -371,17 +405,23 @@ class RewardExecutor:
         if args.custom_rm_path is not None and not kwargs.get("ignore_custom", False):
             return await self._execute_custom_with_concurrency(args, sample, **kwargs)
 
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        route = _resolved_route or resolve_rm_type(
+            metadata_rm_type=metadata.get("rm_type"),
+            args_rm_type=args.rm_type,
+            label=sample.label,
+            infer=getattr(args, "rm_type_infer", False),
+            fallback=getattr(args, "rm_type_fallback", None),
+            sample_index=getattr(sample, "index", None),
+        )
+        # Managed GenRM may share/offload policy GPUs; only independent
+        # HTTP judges are safe to detach automatically. Capture before taking
+        # a training-pool permit, and pin the resolved route for later scoring.
+        if route.rm_type == "remote_rm" and defer_eval_reward(sample, kwargs, route=route):
+            return None
+
         self._ensure_semaphore()
         async with self._semaphore:
-            metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-            route = resolve_rm_type(
-                metadata_rm_type=metadata.get("rm_type"),
-                args_rm_type=args.rm_type,
-                label=sample.label,
-                infer=getattr(args, "rm_type_infer", False),
-                fallback=getattr(args, "rm_type_fallback", None),
-                sample_index=getattr(sample, "index", None),
-            )
             if route.zero_reward:
                 # Fallback "zero": no dispatch. Reuse the dummy reward so the
                 # 0.0 is reward-key aware and cannot mix dict/scalar shapes.
