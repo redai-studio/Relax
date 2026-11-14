@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Paired image metadata and deterministic, resumable SFT sample ordering.
+"""Supervised image metadata and deterministic, resumable SFT sample ordering.
 
 The CPU producer only plans row IDs. Model adapters decode and preprocess the
 corresponding images on training workers, where the dataset mount is available.
@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+from relax.engine.sft.runtime import get_image_sft_config
 
 
 def image_tier_budget(config: dict[str, Any], index: int) -> int | None:
@@ -61,9 +63,9 @@ def assign_image_batch(
     ]
 
 
-class ImageEditDataset:
+class ImageSFTDataset:
     def __init__(self, args: Any, adapter: Any) -> None:
-        self.config = args.i2i_sft_config
+        self.config = get_image_sft_config(args)
         self.root = Path(self.config["data_root"])
         raw = Path(args.prompt_data).read_bytes()
         self.sha256 = hashlib.sha256(raw).hexdigest()
@@ -80,13 +82,18 @@ class ImageEditDataset:
         except (TypeError, ValueError):
             self._accepts_index = False
         if not isinstance(self.rows, list) or len(self.rows) != self.config["dataset_size"]:
-            raise ValueError("Image metadata must be a JSON array matching i2i_sft_config.dataset_size")
-        count = self.config["conditioning_images"]
+            raise ValueError("Image metadata must be a JSON array matching image SFT config.dataset_size")
+        task = args.generation_task
         for index, row in enumerate(self.rows):
             if not isinstance(row, dict) or not isinstance(row.get("prompt"), str):
                 raise ValueError(f"Invalid prompt at metadata row {index}")
             if not isinstance(row.get("image"), str) or not row["image"]:
                 raise ValueError(f"Missing target image at metadata row {index}")
+            if task == "t2i":
+                if "edit_image" in row:
+                    raise ValueError(f"Text-to-image metadata must not contain edit_image at row {index}")
+                continue
+            count = self.config["conditioning_images"]
             conditions = row.get("edit_image")
             if not isinstance(conditions, list) or len(conditions) != count:
                 raise ValueError(f"Expected {count} ordered condition images at metadata row {index}")
@@ -97,6 +104,15 @@ class ImageEditDataset:
         if self._accepts_index:
             return self.adapter.prepare_sample(self.rows[index], self.root, self.config, index=index)
         return self.adapter.prepare_sample(self.rows[index], self.root, self.config)
+
+
+class ImageEditDataset(ImageSFTDataset):
+    """Backward-compatible entry for the original image-edit data contract."""
+
+    def __init__(self, args: Any, adapter: Any) -> None:
+        if getattr(args, "generation_task", None) != "i2i":
+            raise ValueError("ImageEditDataset requires generation_task=i2i")
+        super().__init__(args, adapter)
 
 
 class ImageBatchSampler:

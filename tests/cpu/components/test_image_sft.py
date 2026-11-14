@@ -17,8 +17,8 @@ from relax.engine.sft.runtime import sft_partition_id
 from relax.utils.tq import lifecycle as tq_lifecycle
 
 
-@pytest.fixture
-def producer(monkeypatch):
+@pytest.fixture(params=["i2i", "t2i"])
+def producer(monkeypatch, request):
     client = SimpleNamespace(async_get_partition_list=AsyncMock(return_value=[]), async_put=AsyncMock())
     attach = MagicMock(return_value=client)
     monkeypatch.setattr(tq_lifecycle, "attach_tq_client", attach)
@@ -34,9 +34,7 @@ def producer(monkeypatch):
 
     config = Namespace(
         loss_type="sft",
-        generation_task="i2i",
-        _i2i_sft_attempt_id="current",
-        i2i_sft_config={"dataset_size": 19},
+        generation_task=request.param,
         global_batch_size=8,
         seed=42,
         start_rollout_id=0,
@@ -45,6 +43,8 @@ def producer(monkeypatch):
         sft_tq_timeout_minutes=1e-10,
         tq_config={},
     )
+    setattr(config, f"_{request.param}_sft_attempt_id", "current")
+    setattr(config, f"{request.param}_sft_config", {"dataset_size": 19})
     instance = module.ImageSFT(MagicMock(), None, 0, config, "sft")
     instance._logger_instance = MagicMock()
     attach.assert_called_once_with(config.tq_config, role="sft")
