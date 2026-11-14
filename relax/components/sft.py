@@ -64,6 +64,7 @@ from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.training.eval_config import build_named_prompt_data_configs
+from relax.utils.training.microbatch_cost import add_flops_cost_metadata
 from relax.utils.utils import dict_to_tensordict
 
 
@@ -221,6 +222,7 @@ def _prepare_sft_tq_payload(
     *,
     force_multimodal_field: bool,
     force_image_refs_field: bool = False,
+    config: Any = None,
 ) -> dict[str, Any]:
     if samples and isinstance(samples[0], ProcessedPreferencePair):
         backend_batch, custom_meta = pack_preference_pairs_for_tq(samples)
@@ -236,7 +238,9 @@ def _prepare_sft_tq_payload(
     assert backend_batch is not None
     return {
         "data": dict_to_tensordict(backend_batch, batch_size=len(backend_batch["tokens"])),
-        "custom_meta": [{"total_lengths": int(length)} for length in backend_batch["total_lengths"]],
+        "custom_meta": add_flops_cost_metadata(
+            config, backend_batch, [{"total_lengths": int(length)} for length in backend_batch["total_lengths"]]
+        ),
     }
 
 
@@ -503,6 +507,7 @@ class _SFTBatchProducerActor:
 
         payload = _prepare_sft_tq_payload(
             samples,
+            config=self.config,
             force_multimodal_field=force_multimodal_field,
             force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
         )
@@ -1058,6 +1063,7 @@ class SFT(Base):
         ):
             payload = _prepare_sft_tq_payload(
                 shard_samples,
+                config=self.config,
                 force_multimodal_field=self.config.multimodal_keys is not None,
                 force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
             )

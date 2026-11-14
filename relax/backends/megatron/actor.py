@@ -55,6 +55,7 @@ from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.agentic_obs.run_hooks import annotate_failure_stage
 from relax.utils.async_utils import run
 from relax.utils.data.data import get_minimum_num_micro_batch_size
+from relax.utils.data.flops_balancing import STEP_PLANS_FIELD, get_dp_packing_geometry, local_schedule
 from relax.utils.data.micro_batch_ring import (
     PrefetchedSFTWindow,
     SFTWindowPrefetcher,
@@ -98,6 +99,7 @@ from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
+from relax.utils.training.microbatch_cost import validate_flops_balance
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -235,7 +237,7 @@ def _select_rollout_samples(rollout_data: RolloutBatch, indices: list[int]) -> R
             return value[indices]
         return value
 
-    return {key: _select(value) for key, value in rollout_data.items()}
+    return {key: _select(value) for key, value in rollout_data.items() if key != STEP_PLANS_FIELD}
 
 
 class _SFTPrefetchMiss(RuntimeError):
@@ -403,6 +405,7 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
         with_opd_teacher: bool = False,
     ) -> int | None:
+        validate_flops_balance(args)
         monkey_patch_torch_dist(args)
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
@@ -1621,29 +1624,40 @@ class MegatronTrainRayActor(TrainRayActor):
 
         window = self._agree_sft_prefetch_window(task_name, rollout_id, data_fields, window, local_error)
 
+        planned_k = None
+        if getattr(self.args, "balance_by_flops", False):
+            from relax.backends.megatron.data import _get_synchronised_flops_schedule
+
+            _, counts = _get_synchronised_flops_schedule(self.args, window.rollout_data)
+            planned_k = counts[0]
+
         local_k = len(window.packed_micro_batches)
         local_samples = len(window.rollout_data["total_lengths"])
 
         # Run every collective unconditionally, aggregate failure into a
         # single global bit, then raise together. Raising between collectives
         # would leave peers stuck in the next all_reduce.
-        # tp_bounds: [max_k, -min_k, max_samples, -min_samples] MAX-reduced
-        # across TP replicas. Only tp_max_k / TP sample-count agreement are
-        # used downstream; tp_min_k folds into DP-wide MAX below.
+        # Compare actual prepared buffers across TP replicas. FLOPs K is
+        # already agreed globally; the token path still aligns K across DP.
         tp_bounds = torch.tensor([local_k, -local_k, local_samples, -local_samples], dtype=torch.int, device=device)
         dist.all_reduce(tp_bounds, op=dist.ReduceOp.MAX, group=tp_group)
         tp_max_k = int(tp_bounds[0].item())
         tp_max_samples, tp_min_samples = int(tp_bounds[2].item()), -int(tp_bounds[3].item())
 
-        dp_k_bounds = torch.tensor([tp_max_k], dtype=torch.int, device=device)
-        dist.all_reduce(dp_k_bounds, op=dist.ReduceOp.MAX, group=dp_group)
-        max_k = int(dp_k_bounds[0].item())
+        if planned_k is None:
+            dp_k_bounds = torch.tensor([tp_max_k], dtype=torch.int, device=device)
+            dist.all_reduce(dp_k_bounds, op=dist.ReduceOp.MAX, group=dp_group)
+            max_k = int(dp_k_bounds[0].item())
+        else:
+            max_k = planned_k
 
         global_samples = torch.tensor([local_samples], dtype=torch.int, device=device)
         dist.all_reduce(global_samples, op=dist.ReduceOp.SUM, group=dp_group)
         total_samples = int(global_samples.item())
 
         errors: list[str] = []
+        if planned_k is not None and (tp_max_k != planned_k or int(tp_bounds[1].item()) != -planned_k):
+            errors.append("central FLOPs schedule K differs across training ranks")
         if tp_max_samples != tp_min_samples:
             errors.append(f"real sample count differs across TP ranks (min={tp_min_samples}, max={tp_max_samples})")
         if total_samples != self.args.global_batch_size:
@@ -1831,22 +1845,28 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> PrefetchedSFTWindow:
         batch_size = self._sft_prepack_local_batch_size()
         dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
-        if len(rollout_data["total_lengths"]) != batch_size:
+        if not getattr(self.args, "balance_by_flops", False) and len(rollout_data["total_lengths"]) != batch_size:
             raise RuntimeError(
                 f"SFT prefetch local shard size mismatch for rollout_id={rollout_id}: "
                 f"expected {batch_size}, got {len(rollout_data['total_lengths'])}."
             )
 
-        # K_local is speculative so CPU packing can stay in the background.
-        # The training thread performs the DP-wide MAX and only short ranks
-        # repack their real samples to K_global.
+        # Token packing is speculative until foreground DP alignment.
+        # FLOPs packing executes the already agreed global plan.
         samples = rollout_data["total_lengths"]
         # CP=1 by _validate_sft_prepack_pipeline; cp_size factor is a no-op
         # but kept explicit to mirror get_data_iterator's formula.
         cp_size = mpu.get_context_parallel_world_size()
         max_tokens = _get_micro_batch_token_capacity(self.args, self.args.max_tokens_per_gpu, cp_size)
-        k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
-        micro_batch_indices = _get_capacity_safe_balanced_partitions(samples, k_local, max_tokens)
+        if getattr(self.args, "balance_by_flops", False):
+            if rollout_data.get("_flops_schedule_error"):
+                raise ValueError(rollout_data["_flops_schedule_error"])
+            micro_batch_indices, counts = local_schedule(rollout_data)
+            if len(counts) != 1:
+                raise ValueError("SFT prepack requires one complete global step")
+        else:
+            k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
+            micro_batch_indices = _get_capacity_safe_balanced_partitions(samples, k_local, max_tokens)
         packed_cpu = [
             (prepack_sft_micro_batch_cpu(self.args, _select_rollout_samples(rollout_data, indices)), None)
             for indices in micro_batch_indices
@@ -3655,6 +3675,10 @@ class MegatronTrainRayActor(TrainRayActor):
             "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
             "task_name": task_name,
         }
+        if getattr(self.args, "balance_by_flops", False):
+            geometry = get_dp_packing_geometry(self.args, task_name)
+            if geometry is not None:
+                sampling_config["packing_geometry"] = geometry
         cancel_event = Event()
         self._sft_train_prefetch_cancel = cancel_event
         self._sft_train_prefetch_rollout_id = next_rollout_id

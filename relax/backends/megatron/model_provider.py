@@ -873,6 +873,17 @@ def wrap_model_provider_with_freeze(original_provider, args):
         freeze_model_params(model, args)
         ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
 
+        if Envs.RELAX_RMSNORM_FP32_WEIGHT_GRAD:
+            if not args.bf16 or getattr(args, "fp8", None) or getattr(args, "fp4", None):
+                raise ValueError("RELAX_RMSNORM_FP32_WEIGHT_GRAD requires BF16 training")
+            if getattr(args, "cpu_offloading", False) and getattr(args, "cpu_offloading_activations", True):
+                raise ValueError("RELAX_RMSNORM_FP32_WEIGHT_GRAD does not support CPU activation offload")
+            from relax.backends.megatron.kernels.rmsnorm_fp32_grad import enable_rmsnorm_fp32_weight_grad
+
+            norms = enable_rmsnorm_fp32_weight_grad(model)
+            if norms:
+                logger.info(f"Enabled FP32 RMSNorm weight gradients for {len(norms)} standalone attention norms")
+
         return model
 
     return wrapped_provider

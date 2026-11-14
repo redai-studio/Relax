@@ -1,0 +1,151 @@
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -11,6 +11,9 @@
+ #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
+ 
+ #include <cutlass/numeric_types.h>
++
++#include <cstdlib>
++#include <cstring>
+ 
+ #include "namespace_config.h"
+ #include "hardware_info.h"
+@@ -930,6 +933,8 @@
+                      deterministic,
+                      /*unpadded_lse*/false);
+     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
++    params.dq_splits = 0;  // Keep the fixed-length API on its original heuristic.
++    params.dq_splits_by_length = false;
+ 
+     auto launch = &run_mha_bwd;
+ 
+@@ -1099,6 +1104,25 @@
+     auto opts = q.options();
+     auto softmax_d = torch::empty({num_heads, total_q + 128 * batch_size}, opts.dtype(at::kFloat));
+     at::Tensor dq_accum;
++    int dq_splits = 0;
++    bool dq_splits_by_length = false;
++    if (deterministic) {
++        const char *fixed_splits = std::getenv("RELAX_FA2_DQ_SPLITS");
++        if (fixed_splits == nullptr) {
++            dq_splits = (get_num_sm(get_current_device()) + batch_size * num_heads - 1)
++                      / (batch_size * num_heads);
++        } else if (std::strcmp(fixed_splits, "sequence") == 0) {
++            dq_splits_by_length = true;
++            // Upper bound for the launch and rectangular scratch, with no host read of cu_seqlens.
++            dq_splits = dq_splits_for_seqlen(max_seqlen_k);
++        } else {
++            char *end = nullptr;
++            const long parsed = std::strtol(fixed_splits, &end, 10);
++            TORCH_CHECK(end != fixed_splits && *end == '\0' && parsed >= 1 && parsed <= 32,
++                        "RELAX_FA2_DQ_SPLITS must be an integer from 1 to 32 or sequence");
++            dq_splits = static_cast<int>(parsed);
++        }
++    }
+     if (loop) {
+         // We don't want to allocate dq_accum of size (batch, seqlen_q_rounded, num_heads, head_size_rounded)
+         // because that would be too large if there is a very long sequence and the rest of the sequences are short.
+@@ -1112,8 +1136,7 @@
+         if (!deterministic) {
+             dq_accum = torch::empty({total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+         } else {
+-            const int nsplits = (get_num_sm(get_current_device()) + batch_size * num_heads - 1) / (batch_size * num_heads);
+-            dq_accum = torch::zeros({nsplits, total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
++            dq_accum = torch::zeros({dq_splits, total_q + 128 * batch_size, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
+         }
+     }
+ 
+@@ -1158,6 +1181,8 @@
+                      deterministic,
+                      /*unpadded_lse*/true);
+     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
++    params.dq_splits = dq_splits;
++    params.dq_splits_by_length = dq_splits_by_length;
+     params.total_q = total_q;
+ 
+     auto launch = &run_mha_bwd;
+--- a/csrc/flash_attn/src/flash.h
++++ b/csrc/flash_attn/src/flash.h
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
++#include <c10/macros/Macros.h>
+ 
+ namespace FLASH_NAMESPACE {
+ constexpr int TOTAL_DIM = 0;
+@@ -143,6 +144,14 @@
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
++
++// Select a stable split count for each K sequence, independent of its neighbors.
++C10_HOST_DEVICE inline int dq_splits_for_seqlen(int seqlen_k) {
++    constexpr int tokens_per_split = 2048;
++    constexpr int max_splits = 5;
++    const int splits = seqlen_k > 0 ? 1 + (seqlen_k - 1) / tokens_per_split : 1;
++    return splits < max_splits ? splits : max_splits;
++}
+ 
+ struct Flash_bwd_params : public Flash_fwd_params {
+ 
+@@ -182,6 +191,8 @@
+ 
+     bool deterministic;
+     index_t dq_accum_split_stride;
++    int dq_splits;  // Set by the varlen API from the same count used for allocation.
++    bool dq_splits_by_length;
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+--- a/csrc/flash_attn/src/flash_bwd_launch_template.h
++++ b/csrc/flash_attn/src/flash_bwd_launch_template.h
+@@ -60,7 +60,11 @@
+ }
+ 
+ template<typename Kernel_traits>
+-__global__ void flash_bwd_convert_dq_kernel(const Flash_bwd_params params, const int nsplits) {
++__global__ void flash_bwd_convert_dq_kernel(const Flash_bwd_params params, int nsplits) {
++    // Each sequence reads exactly the partial sums produced by its CTAs.
++    if (params.dq_splits_by_length) {
++        nsplits = dq_splits_for_seqlen(BlockInfo<true>(params, blockIdx.y).actual_seqlen_k);
++    }
+     FLASH_NAMESPACE::convert_dQ<Kernel_traits>(params, nsplits);
+ }
+ 
+@@ -76,8 +80,12 @@
+     const int num_n_block = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
+     int gridDimx = num_n_block;
+     if (params.deterministic) {
+-        int num_sm = get_num_sm(get_current_device());
+-        gridDimx = (num_sm + params.b * params.h - 1) / (params.b * params.h);
++        if (params.dq_splits > 0) {
++            gridDimx = params.dq_splits;
++        } else {
++            int num_sm = get_num_sm(get_current_device());
++            gridDimx = (num_sm + params.b * params.h - 1) / (params.b * params.h);
++        }
+     }
+     dim3 grid_n(gridDimx, params.b, params.h);
+ 
+--- a/csrc/flash_attn/src/flash_bwd_kernel.h
++++ b/csrc/flash_attn/src/flash_bwd_kernel.h
+@@ -829,8 +829,16 @@
+     // The block index for the head.
+     const int bidh = blockIdx.z;
+ 
+-    // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
+-    for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
++    int seqlen_k = params.seqlen_k;
++    int split_stride = gridDim.x;
++    if (params.dq_splits_by_length) {
++        seqlen_k = BlockInfo<true>(params, bidb).actual_seqlen_k;
++        split_stride = dq_splits_for_seqlen(seqlen_k);
++        if (blockIdx.x >= split_stride) return;
++    }
++    // Each deterministic CTA owns a distinct dQ partial sum for this sequence.
++    const int n_blocks = (seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
++    for (int n_block = blockIdx.x; n_block < n_blocks; n_block += split_stride) {
+         compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+     }
+ }

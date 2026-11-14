@@ -18,6 +18,7 @@ from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
+from relax.utils.data.flops_balancing import get_dp_packing_geometry
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
@@ -845,6 +846,10 @@ def get_data_from_transfer_queue(
     """
     if not synchronize_per_rank_fetch and not per_rank_fetch:
         raise ValueError("synchronize_per_rank_fetch=False requires per_rank_fetch=True")
+    if token_budget is None and getattr(args, "balance_by_flops", False):
+        geometry = get_dp_packing_geometry(args, task_name)
+        if geometry is not None:
+            sampling_config = {**sampling_config, "packing_geometry": geometry}
     # Determine which rank should fetch data
     #
     # CP=0 must be in the predicate (alongside TP=0 / PP=0) — otherwise every CP
@@ -1134,6 +1139,16 @@ def get_data_from_transfer_queue(
                 raise TypeError(f"Unsupported rollout_data type for key '{k}': {type(v)}")
 
         rollout_data = new_rollout_data
+
+    if getattr(args, "balance_by_flops", False):
+        from relax.utils.data.flops_balancing import restore_schedule
+
+        try:
+            restore_schedule(batch_meta, rollout_data)
+        except Exception as error:  # noqa: BLE001
+            # Background fetch stays collective-free; the training thread
+            # propagates malformed plans before any forward/backward call.
+            rollout_data["_flops_schedule_error"] = [str(error)]
 
     # Re-attach routed_experts as a list of 2D tensors (per-sample) — only on
     # the bcast path, where the NestedTensor was extracted into ``routed_experts_values``
