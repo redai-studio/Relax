@@ -333,6 +333,8 @@ def test_actual_startup_cancelled_by_next_restart_is_interrupted_not_failed(runt
 
 
 def test_actual_error_return_flows_through_restart_consume_and_training_loop(runtime, monkeypatch):
+    from relax.utils.http_utils import get_serve_http_port
+
     controller = startup_controller(runtime, (Roles.actor,), [])
     observe(runtime, (Roles.actor,))
     controller.runtime_env = {}
@@ -349,6 +351,7 @@ def test_actual_error_return_flows_through_restart_consume_and_training_loop(run
         tq=SimpleNamespace(close=lambda: None),
         shutdown_async_loop=lambda: None,
         time=SimpleNamespace(sleep=lambda seconds: None),
+        get_serve_http_port=get_serve_http_port,
     )
     router = ModuleType("relax.distributed.ray.rollout")
     router.stop_launched_routers = lambda: 0
@@ -522,14 +525,14 @@ def test_actual_checker_merges_receipts_before_callback_destroys_receiver(runtim
 
 @pytest.mark.parametrize("fully_async,hybrid", [(False, False), (True, True), (True, False)])
 @pytest.mark.parametrize("loss_type", [None, "sft", "dpo", "rm"])
-def test_actual_actor_setter_sync_matches_plan_condition(fully_async, hybrid, loss_type):
+async def test_actual_actor_setter_sync_matches_plan_condition(fully_async, hybrid, loss_type):
     from relax.engine.sft.runtime import is_offline_mode
 
     tree = ast.parse((ROOT / "relax/components/actor.py").read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Actor")
-    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "set_rollout_manager")
+    fn = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "set_rollout_manager")
     module = ast.Module(body=ast.parse("from __future__ import annotations").body + [fn], type_ignores=[])
-    namespace = {"is_offline_mode": is_offline_mode}
+    namespace = {"is_offline_mode": is_offline_mode, "asyncio": asyncio}
     exec(compile(ast.fix_missing_locations(module), str(ROOT / "relax/components/actor.py"), "exec"), namespace)
     calls = []
     worker = SimpleNamespace(
@@ -538,7 +541,7 @@ def test_actual_actor_setter_sync_matches_plan_condition(fully_async, hybrid, lo
     owner = SimpleNamespace(
         config=SimpleNamespace(fully_async=fully_async, hybrid=hybrid, loss_type=loss_type), actor_model=worker
     )
-    namespace[fn.name](owner, object())
+    await namespace[fn.name](owner, object())
     assert calls == (["manager", "sync"] if (not fully_async or hybrid) and loss_type is None else ["manager"])
 
 

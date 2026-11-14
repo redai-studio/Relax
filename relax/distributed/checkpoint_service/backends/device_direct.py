@@ -621,81 +621,50 @@ class DeviceDirectBackend(CommBackend):
             self._rollout_topology_signature = self._rollout_topology_signature_of(self.rollout_topology)
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
-        """Initialize process groups used for actor -> actor_fwd weight sync.
-
-        This sets up deterministic groups so actor (source) ranks broadcast
-        updated weights and actor_fwd ranks receive them.
-        """
+        """Reuse groups only for the same members and process generations."""
         if self.role_info is None:
-            raise RuntimeError("Role info not set. Cannot initialize process group.")
-
-        # Determine if this rank is the PP source rank (for weight gathering)
+            raise RuntimeError("Role info not set")
         self._is_pp_src_rank = (
             self._megatron.mpu.get_data_parallel_rank(with_context_parallel=True) == 0
             and self._megatron.mpu.get_tensor_model_parallel_rank() == 0
         )
+        self._forward_update_id = topology_data["update_id"]
+        self._forward_topology_id = topology_data["topology_id"]
+        mode = topology_data["includes_reference"]
+        cache = getattr(self, "_forward_group_cache", {})
+        self._forward_group_cache = cache
+        previous = cache.get(mode)
+        if previous and previous[0] == self._forward_topology_id:
+            self._model_update_groups_for_actor_fwd_ref = previous[1]
+            return
+        if previous:
+            groups = previous[1]
+            for group in groups.values() if isinstance(groups, dict) else [groups]:
+                if group is not None:
+                    dist.destroy_process_group(group)
+            del cache[mode]
         pp_rank = self._megatron.mpu.get_pipeline_model_parallel_rank()
-        global_rank = topology_data.get("global_rank")
-        pp_groups = topology_data.get("pp_groups")
-        world_size = topology_data.get("world_size", 1)
-
-        if self.role_info.role_name == "actor":
-            # Actor side: PP source rank (rank 0) manages connection for this PP stage
-
-            if self._is_pp_src_rank:
-                if self._model_update_groups_for_actor_fwd_ref is not None:
-                    # TODO: This case should not happen in current design since we only init once, but if we want to support dynamic re-init in the future we need to destroy old groups before creating new ones
-                    return
-
-                    # dist.destroy_process_group(self._model_update_groups_for_actor_fwd_ref)
-                    # time.sleep(1)  # Ensure all ranks have destroyed before creating new group
-                # This actor's PP rank 0 establishes the master address/port for this PP group
-                group_name = f"update_actor_pp_{pp_rank}"
-                init_method = pp_groups.get(group_name)
-                # Create the process group for this actor PP stage
-                # Rank 0 is always the actor PP source rank
-                self._model_update_groups_for_actor_fwd_ref = init_process_group(
-                    backend=self.backend_type,
-                    init_method=init_method,
-                    world_size=world_size,
-                    rank=0,
-                    group_name=group_name,
-                    timeout=timedelta(seconds=180),
-                )
-                logger.info(
-                    f"Actor PP{pp_rank} initialized process group {group_name} "
-                    f"(world_size={world_size}) at {init_method}"
-                )
-
-        else:  # actor_fwd side
-            # Actor_fwd side: Each rank joins all groups corresponding to actor PP stages
-            # to receive weights for inference reference model updates
-            if self._model_update_groups_for_actor_fwd_ref is not None:
-                return
-                # for group_name, group in self._model_update_groups_for_actor_fwd_ref.items():
-                #     dist.destroy_process_group(group)
-                # time.sleep(1)  # Ensure all ranks have destroyed before creating new group
-
-            self._model_update_groups_for_actor_fwd_ref = {}
-
-            # Calculate this actor_fwd rank's position in the cluster
-
-            # For each actor PP stage, join the corresponding group in deterministic order
-            # This ensures all ranks call init_process_group in the same order
-            for group_name, init_method in pp_groups.items():
-                # Actor_fwd ranks join with rank = actor_fwd_rank + 1 (rank 0 is actor)
-                group = init_process_group(
-                    backend=self.backend_type,
-                    init_method=init_method,
-                    world_size=world_size,
-                    rank=global_rank,
-                    group_name=group_name,
-                    timeout=timedelta(seconds=180),
-                )
-                self._model_update_groups_for_actor_fwd_ref[group_name] = group
-                logger.info(
-                    f"Actor_fwd PP{pp_rank} joined group {group_name} as rank {global_rank} (world_size={world_size})"
-                )
+        groups = None if self.role_info.role_name == "actor" else {}
+        for name, endpoint in sorted(topology_data["pp_groups"].items()):
+            if self.role_info.role_name == "actor" and (
+                not self._is_pp_src_rank or name != f"update_actor_pp_{pp_rank}_{self._forward_topology_id}"
+            ):
+                continue
+            group = init_process_group(
+                backend=self.backend_type,
+                init_method=endpoint,
+                world_size=topology_data["world_size"],
+                rank=topology_data["global_rank"],
+                group_name=name,
+                timeout=timedelta(seconds=180),
+            )
+            if self.role_info.role_name == "actor":
+                groups = group
+            else:
+                groups[name] = group
+            logger.info("Initialized forward/reference group %s with %s members", name, topology_data["world_size"])
+        cache[mode] = (self._forward_topology_id, groups)
+        self._model_update_groups_for_actor_fwd_ref = groups
 
     @torch.no_grad()
     def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
@@ -776,7 +745,10 @@ class DeviceDirectBackend(CommBackend):
         converted_named_tensors = []
         origin_named_tensors = []
         # non expert params
-        pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
+        pbar = None
+        if self._is_pp_src_rank:
+            destination = "actor_fwd/ref" if actor_fwd_only else self._group_name
+            pbar = tqdm(desc=f"[{destination}] Update weights")
 
         for name, param in self._named_params_and_buffers(name_filter=lambda n: ".experts." not in n):
             if not self._should_sync_tensor(name, param):
@@ -827,6 +799,7 @@ class DeviceDirectBackend(CommBackend):
                     "dtypes": [],
                     "shapes": [],
                     "group_name": "end",
+                    "update_id": getattr(self, "_forward_update_id", ""),
                 }
                 logger.info("start post end send_weight_meta to actor fwd nodes...")
                 response = self.http_client.post(
@@ -1240,12 +1213,13 @@ class DeviceDirectBackend(CommBackend):
         """
         # Prepare metadata for weight transfer
         pp_rank = self._megatron.mpu.get_pipeline_model_parallel_rank()
-        group_name = f"update_actor_pp_{pp_rank}"
+        group_name = f"update_actor_pp_{pp_rank}_{self._forward_topology_id}"
         payload = {
             "names": [name for name, _ in named_tensors],
             "dtypes": [str(param.dtype).replace("torch.", "") for _, param in named_tensors],
             "shapes": [list(param.shape) for _, param in named_tensors],
             "group_name": group_name,
+            "update_id": self._forward_update_id,
         }
         response = self.http_client.post(
             f"{self.coordinator_url}/send_weight_meta",
@@ -1276,7 +1250,7 @@ class DeviceDirectBackend(CommBackend):
             try:
                 response = self.http_client.get(
                     f"{self.coordinator_url}/recv_weight_meta",
-                    params={"index": index, "wait_timeout_s": long_poll_wait_s},
+                    params={"index": index, "wait_timeout_s": long_poll_wait_s, "update_id": self._forward_update_id},
                     timeout=recv_timeout,
                 )
             except httpx.ReadTimeout:
@@ -1292,9 +1266,11 @@ class DeviceDirectBackend(CommBackend):
                 # termination marker
                 if names and names[0] == "weight_updated_stop":
                     dist.barrier(get_gloo_group())
-                    if dist.get_rank() == 0:
-                        response = self.http_client.get(f"{self.coordinator_url}/clear_weight_meta")
-                        response.raise_for_status()
+                    response = self.http_client.get(
+                        f"{self.coordinator_url}/clear_weight_meta",
+                        params={"update_id": self._forward_update_id, "receiver": self.role_info.node_id},
+                    )
+                    response.raise_for_status()
 
                     logger.info("Received final weight update marker for actor_fwd nodes")
                     return

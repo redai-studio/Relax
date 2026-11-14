@@ -277,6 +277,7 @@ class Envs(metaclass=_EnvsMeta):
     # Ray's own knob; it accepts "1" and "legacy", so it stays a string rather
     # than a bool to avoid rejecting a value Ray itself considers valid.
     RAY_DEBUG = EnvProperty("RAY_DEBUG", str, "0")
+    RELAX_SERVE_HTTP_PORT = EnvProperty("RELAX_SERVE_HTTP_PORT", int, 8000)
 
     # ------------- Device / Training -------------
     RELAX_DEVICE_TYPE = EnvProperty("RELAX_DEVICE_TYPE", str, "")

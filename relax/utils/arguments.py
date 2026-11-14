@@ -1115,6 +1115,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             # update weight
+            from relax.distributed.weight_sync.config import add_weight_version_arguments
+
+            parser = add_weight_version_arguments(parser)
             parser.add_argument(
                 "--update-weight-buffer-size",
                 type=int,
@@ -3170,6 +3173,10 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
     slime_validate_args(args)
+
+    from relax.distributed.weight_sync.config import validate_weight_version_arguments
+
+    validate_weight_version_arguments(args, offline_training=is_offline_mode(args))
 
     if args.train_backend == "fsdp":
         from relax.backends.fsdp.arguments import validate_generative_config
