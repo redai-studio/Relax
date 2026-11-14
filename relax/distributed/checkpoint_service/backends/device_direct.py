@@ -843,29 +843,31 @@ class DeviceDirectBackend(CommBackend):
         #
         # The failure is captured rather than propagated on the spot: generation is currently
         # PAUSED (see /pause_generation above) and only rank 0 can fail here, so an immediate
-        # raise would strand the engines paused forever AND leave every other rank blocked in
-        # the barrier below waiting for a rank that already unwound. The verdict is shared
-        # across ranks first, generation is resumed, and only then does everyone raise together.
+        # raise would leave every other rank blocked in the collective below. Share the
+        # verdict first, then fail on every rank while keeping generation paused: the
+        # Controller/entrypoint tears down engines whose weights may be partially updated.
         push_error: Exception | None = None
         if self._lora_adapter_mode and not actor_fwd_only:
             try:
                 self._push_lora_adapter_distributed(first_sync=not self._lora_sync.adapter_loaded)
-            except Exception as e:  # noqa: BLE001 - re-raised below, after the engines are resumed
-                logger.exception("LoRA adapter push failed; resuming generation before aborting")
+            except Exception as e:  # noqa: BLE001 - shared with the other ranks below
+                logger.exception("LoRA adapter push failed; keeping generation paused for shutdown")
                 push_error = e
-            else:
-                self._lora_sync.adapter_loaded = True
-                self._lora_sync.base_sync_done = True
 
         if not actor_fwd_only:
             # MAX over gloo: rank 0 is the only rank that can observe the push failure, so
             # without this the other ranks would take the success path and desync. Gated on
             # the (rank-uniform) adapter-mode flag so no other path pays for the collective.
-            push_failed = False
             if self._lora_adapter_mode:
                 flag = torch.tensor([1 if push_error is not None else 0], dtype=torch.int32)
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
-                push_failed = bool(flag.item())
+                if bool(flag.item()):
+                    raise RuntimeError(
+                        "LoRA adapter push to the rollout engines failed; generation remains paused "
+                        "until the failed weight update is shut down."
+                    ) from push_error
+                self._lora_sync.adapter_loaded = True
+                self._lora_sync.base_sync_done = True
             if reload_quantized_base:
                 self._rollout_control_request(
                     "/post_process_weights",
@@ -873,15 +875,6 @@ class DeviceDirectBackend(CommBackend):
                 )
             self._rollout_control_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
-            if push_failed:
-                # Abort rather than roll out with a stale/absent adapter: in adapter mode the
-                # engine's base weights are frozen, so a dropped adapter means the rollout
-                # policy silently stops tracking the trained one.
-                raise RuntimeError(
-                    "LoRA adapter push to the rollout engines failed; aborting the weight update "
-                    "instead of generating with a stale or missing adapter. Generation has been "
-                    "resumed so the engines are not left paused."
-                ) from push_error
             # NOTE: rollout proxy actors are intentionally kept alive across weight
             # updates so init_process_group_for_rollout can reuse them (and the NCCL
             # group) when the topology is unchanged. They are torn down only when the
@@ -1382,7 +1375,7 @@ class DeviceDirectBackend(CommBackend):
 
         ``param`` is the already-TP-gathered full base weight; the paired adapter tensors were
         gathered to full in ``_collect_full_adapter_tensors``. Uses ``LoRAMerge`` with
-        ``tp_size=1`` so no collective runs here (safe on the PP-src-only path). Never mutates
+        ``tp_group=None`` so no collective runs here (safe on the PP-src-only path). Never mutates
         ``param`` (which may alias the model's live weight when TP=1). Unpaired weights
         (layernorm/embed/router) pass through unchanged.
 
@@ -1421,7 +1414,6 @@ class DeviceDirectBackend(CommBackend):
                 linear_in,
                 self.args.lora_alpha,
                 self.args.lora_rank,
-                tp_size=1,
                 tp_group=None,
             )
             .to(param.dtype)

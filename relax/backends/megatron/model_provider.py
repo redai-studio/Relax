@@ -26,6 +26,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from relax.models.qwen3_8.lora import qwen38_lora_targets
 from relax.utils.device import is_npu_available, make_current_torch_device
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -56,6 +57,46 @@ from .conditional_branch_sync import install_conditional_branch_sync
 
 
 logger = get_logger(__name__)
+
+
+def _install_qwen38_decoder_release() -> None:
+    """Release the temporary GPT decoder before pinned Bridge rebuilds it."""
+    import gc
+    import weakref
+    from functools import wraps
+
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
+
+    base = Qwen3VLGPTModel.__bases__[0]
+    original_init = base.__init__
+    if getattr(original_init, "_relax_qwen38_decoder_release", False):
+        return
+    # Do not remove a live decoder if a future Bridge stops replacing it.
+    if "self.decoder = Qwen3VLTransformerBlock(" not in inspect.getsource(Qwen3VLGPTModel.__init__):
+        logger.warning("Qwen3-VL decoder release skipped: Bridge constructor no longer matches the rebuild path")
+        return
+
+    @wraps(original_init)
+    def init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        if type(self) is not Qwen3VLGPTModel or not getattr(self.config, "ple_layer_ids", None):
+            return
+        # The subclass rebuilds RoPE, then constructs its replacement decoder.
+        # Keep initialization/RNG order unchanged, but avoid two live decoders.
+        old_decoder = weakref.ref(self.decoder)
+        cuda_initialized = torch.cuda.is_initialized()
+        before = torch.cuda.memory_allocated() if cuda_initialized else 0
+        del self.decoder
+        gc.collect()
+        after = torch.cuda.memory_allocated() if cuda_initialized else 0
+        logger.info(
+            f"[QWEN38-DECODER-RELEASE] old_decoder_alive={old_decoder() is not None}, "
+            f"cuda_allocated_gib={before / 2**30:.2f}->{after / 2**30:.2f}, "
+            f"freed_gib={(before - after) / 2**30:.2f}"
+        )
+
+    init._relax_qwen38_decoder_release = True
+    base.__init__ = init
 
 
 def configure_gdn_a_log_fp32(model: torch.nn.Module) -> None:
@@ -308,6 +349,8 @@ def get_model_provider_func(
 
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         provider = bridge.to_megatron_provider(load_weights=False)
+        if type(provider).__name__ == "Qwen4ExpVLMoEModelProvider":
+            _install_qwen38_decoder_release()
     # Resolve once, after provider selection and before model/data setup. A VL
     # checkpoint can produce a text-only provider despite its processor files.
     args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
@@ -796,12 +839,13 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             peft = build_lora_peft(args)
+            peft.target_modules = qwen38_lora_targets(model, list(peft.target_modules), args)
             # Restrict adapter injection to the requested model region (e.g. language-only
             # for VL models). Overriding target_modules post-construction is supported:
             # PEFT.__call__ rebuilds its matcher state from the current target_modules.
             scope = getattr(args, "lora_scope", "all")
             if scope != "all":
-                peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
+                peft.target_modules = scope_target_modules_to_region(model, list(peft.target_modules), scope)
             if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
                 peft.target_modules = exclude_frozen_lora_target_modules(
                     model, list(peft.target_modules), args.freeze_params_name_list
