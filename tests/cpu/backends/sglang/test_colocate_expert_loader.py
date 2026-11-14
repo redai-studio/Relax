@@ -151,6 +151,7 @@ def test_physical_expert_prepare_seed_and_warm_audit(transfer, delivery):
 def test_bind_delivery_failure_does_not_poison_native_seed(transfer, delivery, fault):
     model, parameters, expected, seed, _ = transfer
     probe, control = delivery
+    cuda_initialized = torch.cuda.is_initialized()
     if fault == "remote":
         probe["sources"][0]["endpoint"] = _endpoint(0, remote=True)
     elif fault == "missing_owner":
@@ -164,7 +165,7 @@ def test_bind_delivery_failure_does_not_poison_native_seed(transfer, delivery, f
     assert not hasattr(model, "_relax_weight_sync_reply")
     assert not hasattr(model, "_relax_expert_ipc")
     assert all(torch.equal(parameters[name], value) for name, value in expected.items())
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == cuda_initialized
 
 
 @pytest.mark.parametrize("field", ["nonce", "engine", "receiver", "routes", "missing"])
@@ -219,11 +220,39 @@ def test_failed_transfer_cannot_publish_or_accept_later_updates(transfer, invali
 
 
 @pytest.mark.parametrize("new_receiver", [False, True])
-def test_completed_session_can_reseed_after_full_native_recovery(transfer, new_receiver):
+@pytest.mark.parametrize("mode", ["expert", "ordinary", "mixed"])
+def test_completed_session_can_reseed_after_full_native_recovery(transfer, new_receiver, mode):
     model, parameters, expected, seed, update = transfer
+    if mode != "expert":
+        if mode == "ordinary":
+            parameters.clear()
+            expected.clear()
+            seed["writes"].clear()
+            update["bindings"].clear()
+        value = torch.arange(12, dtype=torch.bfloat16).view(3, 4)
+        parameters["projection"], expected["projection"] = value.clone(), value.clone()
+        seed["geometry"].update(expert_enabled=mode == "mixed", ordinary_targets={"projection": [3, 4]})
+        seed["writes"].append(
+            dict(
+                id="ordinary",
+                target="tp-0",
+                source_rank=0,
+                source="ordinary",
+                param="projection",
+                src_offset=0,
+                dst_offset=0,
+                src_stride=24,
+                dst_stride=24,
+                rows=1,
+                row_bytes=24,
+            )
+        )
+        update["bindings"].append(dict(source_rank=0, source="ordinary", payload=value.view(-1)))
+        seed["plan_hash"] = update["plan_hash"] = fingerprint(dict(geometry=seed["geometry"], writes=seed["writes"]))
     apply_command(model, seed, 0)
     apply_command(model, update, 0)
     if new_receiver:
+        parameters = {name: value.clone() for name, value in parameters.items()}
         model = SimpleNamespace(
             named_parameters=lambda: parameters.items(),
             **({"get_submodule": model.get_submodule} if hasattr(model, "get_submodule") else {}),
@@ -232,7 +261,7 @@ def test_completed_session_can_reseed_after_full_native_recovery(transfer, new_r
     for name, parameter in parameters.items():
         parameter.copy_(expected[name] + 1)
     for binding in update["bindings"]:
-        binding["payload"].add_(1)
+        binding["payload"] = binding["payload"].clone() + 1
     seed.update(previous_version=7, version=8, nonce="reseed8")
     apply_command(model, seed, 0)
     assert all(torch.isnan(parameter).all() for parameter in parameters.values())
@@ -265,6 +294,7 @@ def _tp_control_error_worker(rank, rendezvous, output):
         enable_lora=False,
         speculative_algorithm=None,
     )
+    cuda_initialized = torch.cuda.is_initialized()
     try:
         for fault in ("decode", "reply", "mode", "copy", "header"):
             model = torch.nn.Linear(2, 2, bias=False)
@@ -304,7 +334,7 @@ def _tp_control_error_worker(rank, rendezvous, output):
                 assert not applied
             marker = torch.tensor(1)
             dist.all_reduce(marker, group=dist.group.WORLD)
-            assert marker.item() == 2 and not torch.cuda.is_initialized()
+            assert marker.item() == 2 and torch.cuda.is_initialized() == cuda_initialized
         Path(output, f"{rank}.json").write_text("passed")
     finally:
         dist.destroy_process_group()
