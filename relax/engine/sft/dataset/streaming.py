@@ -37,7 +37,9 @@ from relax.utils.data.kimi_k3 import (
     make_kimi_k3_sft_request,
 )
 from relax.utils.data.streaming_dataset import CompositeStreamingReader, IndexManager, PrefetchBuffer, StreamingReader
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.types import MultimodalTypes
 
 
 logger = get_logger(__name__)
@@ -61,10 +63,7 @@ def _resolve_learn_flag(raw: dict, role: str) -> bool:
       3. ``step_loss_mask == 0`` — exclude original Slime trajectory turns.
       4. Role default. A nonzero step mask does not make user/tool turns learnable.
 
-    Ignoring ``loss`` silently trains on turns the dataset explicitly excluded. On the
-    pevek mix-0820 agentic rows that meant ~41% more loss tokens than ms-swift counted
-    (e.g. one 24-turn trajectory marks 21 turns ``loss: false``), which alone accounted
-    for the reported per-token loss sitting ~10% below the ms-swift baseline.
+    Ignoring ``loss`` silently trains on turns the dataset explicitly excluded.
     """
     if "learn" in raw:
         return bool(raw["learn"])
@@ -101,6 +100,7 @@ class ProcessedSample:
     # the dropped pixel_values; None keeps the pixel-shipping default mode.
     image_refs_descriptor: dict[str, Any] | None = None
     pre_shifted_labels: torch.Tensor | None = None
+    dataset_id: int | None = None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -111,6 +111,27 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
+
+
+def _assistant_quotes_media_tags(row: dict[str, Any], prompt_key: str, multimodal_keys: dict[str, str] | None) -> bool:
+    """Recognize assistant-only literal tags in conversations without media."""
+    if not multimodal_keys or any(row.get(key) for key in multimodal_keys.values()):
+        return False
+    messages = row.get(prompt_key)
+    if not isinstance(messages, list):
+        return False
+    markers = tuple(media.placeholder for media in MultimodalTypes.all() if media.name in multimodal_keys)
+    if len(markers) != len(multimodal_keys):
+        return False
+    found = False
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            return False
+        if any(marker in message["content"] for marker in markers):
+            if message.get("role") != "assistant":
+                return False
+            found = True
+    return found
 
 
 def _validate_multimodal_contract(
@@ -188,6 +209,8 @@ def _normalize_tools(value: Any) -> list[dict] | None:
     if value is None:
         return None
     if isinstance(value, str):
+        if not value or value.isspace():
+            return None
         value = json.loads(value)
     elif hasattr(value, "tolist"):
         value = value.tolist()
@@ -222,7 +245,7 @@ def _normalize_tool_calls(value: Any) -> list[dict] | None:
             if "arguments" in function:
                 arguments = function["arguments"]
                 if isinstance(arguments, str):
-                    arguments = json.loads(arguments)
+                    arguments = json.loads(arguments) if arguments.strip() else {}
                 if not isinstance(arguments, dict):
                     raise TypeError(
                         f"tool_calls[{index}].function.arguments must be a JSON object, got {type(arguments)}"
@@ -268,14 +291,25 @@ def _apply_conversation_key_map(messages: list[Any], key_map: dict[str, str]) ->
 def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) -> list[CanonicalMessage]:
     messages: list[CanonicalMessage] = []
     has_learn = False
+    tool_names_by_id = {}
+    for raw in raw_messages:
+        for tool_call in raw.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if tool_call.get("id") and isinstance(function, dict) and function.get("name"):
+                tool_names_by_id[tool_call["id"]] = function["name"]
+
     for raw in raw_messages:
         role = raw.get("role")
         if role is None:
             raise ValueError(f"SFT message missing role: {raw}")
-        if "content" not in raw:
+        if "content" not in raw and not (role == "assistant" and raw.get("tool_calls")):
             raise ValueError(f"SFT message missing content: {raw}")
+        content = raw.get("content")
+        if content is None and role == "assistant" and raw.get("tool_calls"):
+            content = ""
         if role == "tool_call":
-            content = raw["content"]
             # Multimodal build_messages wraps string content in text parts.
             if isinstance(content, list):
                 if any(not isinstance(part, dict) or part.get("type") != "text" for part in content):
@@ -288,6 +322,9 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
                 "type": "function",
                 "function": {"name": call["name"], "arguments": call.get("arguments", {})},
             }
+            normalized_tool_calls = _normalize_tool_calls([tool_call])
+            assert normalized_tool_calls is not None
+            tool_call = normalized_tool_calls[0]
             learn = _resolve_learn_flag(raw, "assistant")
             has_learn = has_learn or learn
             if messages and messages[-1].role == "assistant" and messages[-1].learn == learn:
@@ -300,12 +337,15 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
             role = "tool"
         learn = _resolve_learn_flag(raw, role)
         has_learn = has_learn or learn
+        tool_call_id = raw.get("tool_call_id")
         messages.append(
             CanonicalMessage(
                 role=role,
-                content=raw["content"],
+                content=content,
                 learn=learn,
                 tool_calls=_normalize_tool_calls(raw.get("tool_calls")),
+                tool_call_id=tool_call_id,
+                name=raw.get("name") or tool_names_by_id.get(tool_call_id),
                 reasoning_content=raw.get("reasoning_content"),
             )
         )
@@ -328,6 +368,7 @@ def _build_canonical_sample_from_row(
     source_name: str,
     task_type: str = "causal_lm",
     conversation_key_map: dict[str, str] | None = None,
+    assistant_media_tags_as_text: bool = False,
 ) -> CanonicalSample:
     prompt = row.get(prompt_key)
     if prompt is None:
@@ -347,6 +388,25 @@ def _build_canonical_sample_from_row(
             # mutate the reader's cache.
             prompt = _apply_conversation_key_map(prompt, conversation_key_map)
             row = {**row, prompt_key: prompt}
+        if "message_loss_mask" in row:
+            message_mask = row["message_loss_mask"]
+            if not isinstance(message_mask, list) or len(message_mask) != len(prompt):
+                raise ValueError("message_loss_mask must have exactly one entry per input message")
+            if any(not isinstance(value, (bool, Integral)) or value not in (0, 1) for value in message_mask):
+                raise ValueError("message_loss_mask entries must be 0 or 1")
+            prompt = [{**message, "learn": bool(value)} for message, value in zip(prompt, message_mask, strict=True)]
+            row = {**row, prompt_key: prompt}
+        # OpenAI tool-call messages may have null content. Normalize before
+        # build_messages walks multimodal parts; canonicalization happens later.
+        prompt = [
+            {**message, "content": ""}
+            if message.get("role") == "assistant" and message.get("content") is None and message.get("tool_calls")
+            else message
+            for message in prompt
+        ]
+        row = {**row, prompt_key: prompt}
+        if assistant_media_tags_as_text and _assistant_quotes_media_tags(row, prompt_key, multimodal_keys):
+            multimodal_keys = None
         _validate_multimodal_contract(
             row,
             prompt,
@@ -764,6 +824,11 @@ class SFTStreamingDataset:
             require_response=self.require_response,
             source_name=self.source_name,
             task_type=self.task_type,
+            assistant_media_tags_as_text=(
+                self.training_mode == "sft"
+                and self.task_type == "causal_lm"
+                and Envs.RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT
+            ),
         )
 
     def get_classification_label(self, idx: int, *, row: dict[str, Any] | None = None) -> torch.Tensor | None:
@@ -1070,6 +1135,15 @@ class SFTStreamingDataset:
                     apply_chat_template_kwargs=self.apply_chat_template_kwargs,
                     last_turn_only=self.loss_last_turn_only,
                 )
+                if _gemma4_media_token_wrappers(self.tokenizer, self._pad_token_ids):
+                    # Packed image groups are rebuilt from input IDs on the
+                    # actor. Per-row [1, T] token types cannot be concatenated
+                    # as encoder inputs across different-length samples.
+                    processor_kwargs = {
+                        "return_mm_token_type_ids": False,
+                        "return_tensors": "pt",
+                        "add_special_tokens": False,
+                    }
         return _RenderedSample(
             idx=idx,
             sample=sample,
@@ -1137,6 +1211,7 @@ class SFTStreamingDataset:
                 short_mask=rendered.short_mask,
                 expanded_ids=tokens,
                 pad_token_ids=self._pad_token_ids,
+                media_token_wrappers=_gemma4_media_token_wrappers(self.tokenizer, self._pad_token_ids),
             )
         untruncated_tokens = tokens
         if self.task_type == "seq_cls":
@@ -1198,6 +1273,7 @@ class SFTStreamingDataset:
             classification_label=rendered.classification_label,
             multimodal_train_inputs=mm_inputs,
             source_idx=rendered.idx,
+            dataset_id=self.reader.dataset_id(rendered.idx) if hasattr(self.reader, "dataset_id") else None,
             image_refs_descriptor=image_refs_descriptor,
         )
 
@@ -1274,12 +1350,27 @@ def _to_long_tensor(ids: Any) -> torch.Tensor:
     return t.long()
 
 
+def _gemma4_media_token_wrappers(tokenizer: Any, pad_token_ids: frozenset[int]) -> dict[int, tuple[int, int]]:
+    template = getattr(tokenizer, "chat_template", "") or ""
+    if "<|turn>" not in template or not hasattr(tokenizer, "convert_tokens_to_ids"):
+        return {}
+    image_id = tokenizer.convert_tokens_to_ids("<|image|>")
+    start_id = tokenizer.convert_tokens_to_ids("<|image>")
+    end_id = tokenizer.convert_tokens_to_ids("<image|>")
+    if image_id not in pad_token_ids or any(
+        token_id is None or token_id == getattr(tokenizer, "unk_token_id", None) for token_id in (start_id, end_id)
+    ):
+        return {}
+    return {image_id: (start_id, end_id)}
+
+
 def _expand_loss_mask_via_alignment(
     *,
     short_ids: torch.Tensor,
     short_mask: torch.Tensor,
     expanded_ids: torch.Tensor,
     pad_token_ids: frozenset[int],
+    media_token_wrappers: dict[int, tuple[int, int]] | None = None,
 ) -> torch.Tensor:
     if short_ids.dim() != 1 or short_mask.dim() != 1 or expanded_ids.dim() != 1:
         raise ValueError("Inputs must be 1D tensors")
@@ -1296,6 +1387,17 @@ def _expand_loss_mask_via_alignment(
     while i < n_short and j < n_long:
         s_tok = s[i]
         e_tok = e[j]
+        wrapper = (media_token_wrappers or {}).get(s_tok)
+        if wrapper is not None and e_tok == wrapper[0]:
+            j += 1
+            media_start = j
+            while j < n_long and e[j] == s_tok:
+                j += 1
+            if j == media_start or j >= n_long or e[j] != wrapper[1]:
+                raise ValueError("SFT media alignment requires a nonempty image run and matching end token")
+            j += 1
+            i += 1
+            continue
         if s_tok == e_tok and s_tok not in pad_token_ids:
             out[j] = m[i]
             i += 1
@@ -1359,6 +1461,10 @@ def pack_samples_for_tq(
         # assistant/function_call token positions.
         "response_lengths": [1] * len(samples) if is_classification else total_lengths,
     }
+    if any(s.dataset_id is not None for s in samples):
+        if not all(s.dataset_id is not None for s in samples):
+            raise ValueError("dataset ids must be present for every sample in a mixture batch")
+        batch["dataset_ids"] = [s.dataset_id for s in samples]
     if is_classification:
         batch["classification_labels"] = [s.classification_label.tolist() for s in samples]
     if has_pre_shifted_labels:

@@ -98,7 +98,7 @@ Two invariants hold regardless of configuration:
 | **Coordinator** | Single-writer Ray actor, global FIFO, `/metrics` poller, lease TTL reclaim | `relax/agentic/session/admission_coordinator.py` |
 | **Shard integration** | Cancellation-safe lease acquisition before the fleet permit | `relax/agentic/session/service.py` |
 
-`BudgetState` is separated from Ray, so capacity, pressure, lease, TTL, and usage accounting are deterministic and CPU-testable with an injected monotonic `now`. Global FIFO ordering, aging, cancellation, and metrics polling live in the Ray-backed `AdmissionCoordinator`; tests exercise its underlying class without starting Ray (`tests/test_agentic_rollout.py`).
+`BudgetState` is separated from Ray, so capacity, pressure, lease, TTL, and usage accounting are deterministic and CPU-testable with an injected monotonic `now`. Global FIFO ordering, aging, cancellation, and metrics polling live in the Ray-backed `AdmissionCoordinator`; tests exercise its underlying class without starting Ray (`tests/cpu/test_agentic_rollout.py`).
 
 ### The reservation
 

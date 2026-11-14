@@ -14,6 +14,129 @@ _NATIVE_FP32_LOAD_PATCHED = "_relax_native_fp32_load_patched"
 _HDO_STEP_LOAD_LOCK = RLock()
 
 
+def patch_te_optimizer_remainder_initialization() -> bool:
+    """Keep native FP32 masters when MCore requests BF16 remainder storage."""
+    import torch
+    from transformer_engine.pytorch.optimizers import FusedAdam
+
+    original = FusedAdam.initialize_state
+    if getattr(original, "_relax_dtype_aware_remainders", False):
+        return False
+
+    @wraps(original)
+    def initialize_state(self: Any, param: torch.Tensor, store_param_remainders: bool) -> Any:
+        # MCore's checkpoint initializer passes the global remainder setting
+        # for every parameter. TE's serializer and normal step only use int16
+        # remainders for BF16 parameters; FP32 gates must retain FP32 masters.
+        return original(self, param, store_param_remainders and param.dtype == torch.bfloat16)
+
+    initialize_state._relax_dtype_aware_remainders = True
+    FusedAdam.initialize_state = initialize_state
+    return True
+
+
+def _patch_hdo_group_steps(optimizer_cls: type) -> bool:
+    """Keep group-owned Adam counters when HDO synchronizes tensor state."""
+    import torch
+
+    original = optimizer_cls._sync_sub_optimizers_state_to_hdo
+    if getattr(original, "_relax_group_steps", False):
+        return False
+
+    @wraps(original)
+    def sync(self: Any) -> None:
+        original(self)
+        owners = {param: i for i, group in enumerate(self.param_groups) for param in group["params"]}
+        steps: dict[int, int] = {}
+        for child in self.sub_optimizers:
+            if isinstance(child, (torch.optim.Adam, torch.optim.AdamW)):
+                continue
+            for group in child.param_groups:
+                # Torch Adam keeps counters in per-parameter state, already
+                # handled by HDO; TE/Apex Adam keeps them on the group.
+                if "step" not in group or not group["params"]:
+                    continue
+                owner = owners[self.inner_param_to_orig_param[group["params"][0]]]
+                step = group["step"]
+                if not isinstance(step, int) or step < 0:
+                    raise RuntimeError("HDO group-owned Adam step must be a non-negative Python integer")
+                if owner in steps and steps[owner] != step:
+                    raise RuntimeError("HDO sub-optimizers disagree on their Adam group step")
+                steps[owner] = step
+        for owner, step in steps.items():
+            self.param_groups[owner]["step"] = step
+
+    sync._relax_group_steps = True
+    optimizer_cls._sync_sub_optimizers_state_to_hdo = sync
+    return True
+
+
+def patch_hdo_group_steps() -> bool:
+    """Backport HDO group-counter synchronization without tensor copies."""
+    from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+    return _patch_hdo_group_steps(HybridDeviceOptimizer)
+
+
+def patch_hdo_gpu_gradient_stream() -> bool:
+    """Order GPU Adam after HDO's asynchronous FP32 gradient conversion."""
+    import torch
+    from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+    original = HybridDeviceOptimizer._register_param_copy_back_gpu_hook
+    if getattr(original, "_relax_gpu_gradient_stream", False):
+        return False
+
+    @wraps(original)
+    def register(self: Any) -> None:
+        original(self)
+        if self.gpu_optimizer is None:
+            return
+
+        def wait_for_gradients(optimizer: Any, args: Any, kwargs: Any) -> None:
+            # HDO prepares GPU FP32 gradients on its D2H stream too. A CPU
+            # optimizer's event wait does not order the earlier GPU Adam step.
+            # Use a device-side dependency, preserving asynchronous CPU updates.
+            torch.cuda.current_stream().wait_stream(self._d2h_stream)
+
+        self.gpu_optimizer.register_step_pre_hook(wait_for_gradients)
+
+    register._relax_gpu_gradient_stream = True
+    # HDO rebuilds its children on load; install the dependency on each new child.
+    HybridDeviceOptimizer._register_param_copy_back_gpu_hook = register
+    return True
+
+
+def patch_hdo_native_fp32_gradients() -> bool:
+    """Forward decoupled gradients for native FP32 parameters retained on
+    GPU."""
+    import torch
+    from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+    original = HybridDeviceOptimizer._set_sub_optimizer_grads
+    if getattr(original, "_relax_native_fp32_gradients", False):
+        return False
+
+    @wraps(original)
+    def set_grads(self: Any) -> None:
+        original(self)
+        if not self.param_update_in_fp32 or self.gpu_optimizer is None:
+            return
+        for group in self.gpu_optimizer.param_groups:
+            for param in group["params"]:
+                # BF16 masters already receive .grad in HDO. Native FP32
+                # parameters have no master copy, but MCore still supplies
+                # their gradient through .decoupled_grad rather than .grad.
+                if self.inner_param_to_orig_param[param] is param and param.dtype == torch.float32:
+                    if hasattr(param, "decoupled_grad"):
+                        grad = param.decoupled_grad
+                        param.grad = grad.to(param.dtype) if grad is not None else None
+
+    set_grads._relax_native_fp32_gradients = True
+    HybridDeviceOptimizer._set_sub_optimizer_grads = set_grads
+    return True
+
+
 def _patch_hybrid_optimizer_class(optimizer_cls: type) -> bool:
     """Restore all HDO inner parameters when loading older-image
     checkpoints."""
@@ -53,7 +176,7 @@ def patch_hybrid_optimizer_native_fp32_checkpoint_load() -> bool:
 
 @contextmanager
 def preserve_hdo_dp_reshardable_steps_on_load() -> Iterator[None]:
-    """Preserve saved Adam steps during full CPU-offloaded HDO DCP loads.
+    """Preserve saved CPU Adam steps during HDO DCP loads.
 
     MCore's local parameter-state template can overwrite the saved step with
     dummy_step=1. Repair only the tested precision-aware Torch AdamW path;
@@ -76,8 +199,8 @@ def preserve_hdo_dp_reshardable_steps_on_load() -> Iterator[None]:
                 and self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
                 and not self.ddp_config.use_megatron_fsdp
                 and hdo.param_update_in_fp32
-                and hdo.offload_fraction == 1.0
-                and hdo.gpu_optimizer is None
+                and 0 < hdo.offload_fraction <= 1.0
+                and bool(hdo.cpu_optimizers)
                 and all(isinstance(child, torch.optim.AdamW) for child in hdo.cpu_optimizers)
                 and "param_state" in state_dict
                 and state_dict.get("param_state_sharding_type") == "dp_reshardable"
@@ -103,8 +226,28 @@ def preserve_hdo_dp_reshardable_steps_on_load() -> Iterator[None]:
                         raise RuntimeError(
                             "Unsupported HDO state mapping: CPU and outer optimizer states do not alias"
                         )
-            for state in hdo.state.values():
-                state["step"] = torch.tensor(saved_step, dtype=torch.float32, device="cpu")
+            # Mixed offload also has GPU-owned states; FusedAdam uses group
+            # counters. Repair only the CPU AdamW per-parameter counters.
+            for child in hdo.cpu_optimizers:
+                for state in child.state.values():
+                    state["step"] = torch.tensor(saved_step, dtype=torch.float32, device="cpu")
+            cpu_owned = {
+                hdo.inner_param_to_orig_param[param]
+                for child in hdo.cpu_optimizers
+                for group in child.param_groups
+                for param in group["params"]
+            }
+            gpu_owned = {
+                hdo.inner_param_to_orig_param[param]
+                for group in (hdo.gpu_optimizer.param_groups if hdo.gpu_optimizer is not None else [])
+                for param in group["params"]
+            }
+            for group in hdo.param_groups:
+                if group["params"] and all(param in cpu_owned and param not in gpu_owned for param in group["params"]):
+                    # CPU AdamW advances per-parameter counters, not this saved
+                    # group field. Leaving it stale breaks chained save checks.
+                    # DistributedOptimizer.state_dict regenerates it from Adam.
+                    group.pop("step", None)
             return result
 
         DistributedOptimizer.load_state_dict = load_state_dict

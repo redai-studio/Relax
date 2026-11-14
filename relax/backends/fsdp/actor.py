@@ -24,8 +24,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import torch
 
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.sft.runtime import is_i2i_sft
 from relax.models import flow_grpo
 from relax.models.generative import GenerativeModelAdapter
+from relax.models.generative_sft import GenerativeSFTAdapter
 from relax.utils.logging_utils import get_logger
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.utils import load_function
@@ -341,9 +343,13 @@ class FSDPTrainRayActor(TrainRayActor):
 
             init_tracking(args, primary=False)
 
-        self.adapter: GenerativeModelAdapter = self._load_adapter(args)
+        if is_i2i_sft(args):
+            from relax.backends.fsdp.sft import seed_training
+
+            seed_training(args.seed)
+        self.adapter = self._load_adapter(args)
         self.bundle = self._load_train_model_waved(args)
-        self.model = getattr(self.bundle, args.fsdp_trainable_attr, self.bundle)
+        self.model = self.bundle if is_i2i_sft(args) else getattr(self.bundle, args.fsdp_trainable_attr, self.bundle)
 
         # LoRA must be injected here: after the base weights are materialized
         # (``load_train_model`` returns the bundle already frozen down to the
@@ -366,6 +372,8 @@ class FSDPTrainRayActor(TrainRayActor):
                 task_type=self._lora_task_type(),
             )
 
+        if is_i2i_sft(args):
+            self.adapter.prepare_for_sharding(self.model)
         self._assert_trainable_boundary()
 
         from relax.backends.fsdp.runtime import fsdp2_wrap
@@ -379,15 +387,16 @@ class FSDPTrainRayActor(TrainRayActor):
             activation_checkpointing=getattr(args, "fsdp_activation_checkpointing", False),
             master_dtype=getattr(args, "fsdp_master_dtype", None),
         )
-        if self._trainable_mode == "lora":
+        if self._trainable_mode == "lora" and not is_i2i_sft(args):
             from relax.backends.fsdp.lora import build_lora_sync_plan
 
             # Built once, after sharding: the plan holds parameter OBJECTS, whose
             # .data the optimizer and the offload/onload helpers mutate in place.
             self._lora_plan = build_lora_sync_plan(self.model)
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.model.parameters() if p.requires_grad], **_adamw_kwargs(args)
-        )
+        optimizer_kwargs = _adamw_kwargs(args)
+        if is_i2i_sft(args) and self._trainable_mode == "full":
+            optimizer_kwargs["foreach"] = False
+        self.optimizer = torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad], **optimizer_kwargs)
         # Step-driven LR schedule (see :func:`lr_at_step`). Counts OPTIMIZER steps,
         # not rollouts, and round-trips through the checkpoint so a resumed run does
         # not restart warmup from zero.
@@ -402,6 +411,12 @@ class FSDPTrainRayActor(TrainRayActor):
         self._last_sync_tensors = 0
         self._last_sync_bytes = 0
         self._data_system_client = None  # lazy TransferQueue client for reading train partitions
+        if is_i2i_sft(args):
+            from relax.backends.fsdp.sft import FSDPSFTTrainer
+
+            self._get_parallel_config()
+            self.sft = FSDPSFTTrainer(self)
+            return self.sft.step
         self._base_model_sha256 = self._hash_base_model(args)
         self._assert_sync_plan_aligned()
         # Publish the parallel config so TrainRayActor.set_rollout_manager (called
@@ -439,7 +454,7 @@ class FSDPTrainRayActor(TrainRayActor):
     # -- construction helpers -------------------------------------------------
 
     @staticmethod
-    def _load_adapter(args) -> GenerativeModelAdapter:
+    def _load_adapter(args) -> GenerativeModelAdapter | GenerativeSFTAdapter:
         adapter_cls = load_function(args.model_adapter_path)
         return adapter_cls()
 
@@ -794,6 +809,8 @@ class FSDPTrainRayActor(TrainRayActor):
         step moves the weights. The heavy diffusion replay is delegated to
         :func:`flow_grpo_update`.
         """
+        if is_i2i_sft(self.args):
+            return self.sft.train(rollout_id)
         from relax.utils.timer import Timer, timer
 
         # Bracket the whole step so log_perf_data_raw emits perf/step_time
@@ -1500,6 +1517,8 @@ class FSDPTrainRayActor(TrainRayActor):
             phase_lap("engine_full_onload")
 
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+        if is_i2i_sft(self.args):
+            return self.sft.save()
 
         from relax.backends.fsdp import checkpoint as ckpt
 
@@ -2289,6 +2308,8 @@ class FSDPTrainRayActor(TrainRayActor):
             "total_lengths",
             "skip_optimizer_step",
         ]
+        if is_i2i_sft(self.args):
+            data_fields = ["sample_id"]
         deadline = time.time() + float(getattr(self.args, "rollout_request_timeout", 3600.0))
         while time.time() < deadline:
             meta = client.get_meta(

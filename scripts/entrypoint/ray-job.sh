@@ -212,6 +212,7 @@ relax_kernel_cache_start_agents cluster
 export RUNTIME_ENV_JSON="{
 \"worker_process_setup_hook\": \"relax.utils.logging_utils.install_asyncio_noise_filter\",
 \"env_vars\": {
+   \"PATH\": \"${PATH}\",
    \"PYTHONUNBUFFERED\": \"1\",
    \"PYTHONPATH\": \"${PYTHONPATH}\",
    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
@@ -235,6 +236,9 @@ export RUNTIME_ENV_JSON="{
 }"
 
 relax_kernel_cache_inject_runtime_env
+
+# Enforce terminal success for every local Ray submission from the launcher.
+source "${DIR}/ray-status.sh"
 
 echo "=== Ray-job environment ready ==="
 

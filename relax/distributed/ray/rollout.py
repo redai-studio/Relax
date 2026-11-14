@@ -1015,6 +1015,11 @@ class RolloutManager(ReloadableMixin):
             return rank_offset
 
     @property
+    def training_weight_updating(self) -> bool:
+        with self._engine_lifecycle_lock:
+            return self._training_weight_updating
+
+    @property
     def _is_weight_updating(self) -> bool:
         with self._engine_lifecycle_lock:
             return self._training_weight_updating or self._scale_out_weight_updating
@@ -4816,8 +4821,8 @@ def _start_managed_pd_router(args, engine_groups: list[EngineGroup], *, force_ne
     return router_ip, router_port
 
 
-# Router processes launched via `_start_router`. Retained so
-# `Controller._global_restart` can terminate them before re-initializing —
+# Router processes launched via `_start_router`, tracked per calling process.
+# Retained so RolloutManager can terminate its Routers before re-initializing —
 # otherwise the daemon router survives with stale pre-restart engine URLs and
 # spams "Connection refused" health-check WARNs against dead ports forever.
 _LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []
@@ -5094,6 +5099,19 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
 
     log_dict = extra_metrics or {}
     for key in data.keys():
+        if "num_prompts" in data[key]:
+            expected = data[key]["num_prompts"]
+            valid = data[key]["num_valid_prompts"]
+            log_dict |= dict_add_prefix(
+                {
+                    "num_prompts": expected,
+                    "num_valid_prompts": valid,
+                    "num_dropped_prompts": expected - valid,
+                    "coverage": valid / expected if expected else 0.0,
+                    "partial": int(valid != expected),
+                },
+                f"eval/{key}/",
+            )
         rewards = data[key]["rewards"]
         if not rewards:
             # Every rollout for this eval dataset failed or was dropped (e.g. all
@@ -5117,7 +5135,7 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
                     flat_rewards=rewards,
-                    group_size=args.n_samples_per_eval_prompt,
+                    group_size=data[key].get("group_size", args.n_samples_per_eval_prompt),
                 ),
                 f"eval/{key}-",
             )

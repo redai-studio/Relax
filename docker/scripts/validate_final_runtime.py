@@ -17,17 +17,20 @@ from record_qwen35_runtime import validate_pip_check
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("cu12", "cu13", "unified"), default="cu13")
+    parser.add_argument("--profile", choices=("cu12", "cu13"), default="cu13")
     args = parser.parse_args()
     expected = {"ray": "2.56.1", "numpy": "2.2.6", "nvidia-nccl-cu13": "2.30.7", "fla-core": "0.5.2"}
-    if args.profile in ("cu12", "unified"):
-        expected.pop("numpy")
     if args.profile == "cu12":
+        expected.pop("numpy")
         expected.pop("nvidia-nccl-cu13")
     for package, version in expected.items():
         if md.version(package) != version:
             raise ValueError(f"{package}: expected {version}, got {md.version(package)}")
     import torch
+    from flash_mla import flash_mla_sparse_fwd
+
+    if not callable(flash_mla_sparse_fwd):
+        raise ValueError("FlashMLA is missing the sparse forward API required by cuDNN DSA")
 
     if not torch.version.cuda or not torch.version.cuda.startswith("12." if args.profile == "cu12" else "13."):
         raise ValueError(f"CUDA runtime does not match {args.profile}: {torch.version.cuda}")
@@ -38,7 +41,7 @@ def main() -> None:
         raise ValueError(f"HybridEP revision mismatch: {hybrid}")
     expected["relax-hybrid-ep"] = hybrid
     check = subprocess.run([sys.executable, "-m", "pip", "check"], capture_output=True, text=True)
-    if args.profile != "cu12":
+    if args.profile == "cu13":
         validate_pip_check(check)
     elif check.returncode:
         raise ValueError(check.stdout + check.stderr)
@@ -47,8 +50,8 @@ def main() -> None:
 
         if Version(md.version("numpy")) >= Version("2"):
             raise ValueError("The CUDA 12 image requires numpy<2")
-    expected["numpy"] = md.version("numpy")
-    if args.profile in ("cu12", "unified") or os.environ["RELAX_GPU_ARCH"] == "b300":
+        expected["numpy"] = md.version("numpy")
+    if args.profile == "cu12" or os.environ["RELAX_GPU_ARCH"] == "blackwell":
         manifest = json.loads(Path("/etc/relax-fla042-runtime.json").read_text())
         if manifest["source_sha256"] != SOURCE_SHA256 or source_hash(Path(manifest["root"]) / "fla") != SOURCE_SHA256:
             raise ValueError("Legacy FLA source closure is incomplete or changed")

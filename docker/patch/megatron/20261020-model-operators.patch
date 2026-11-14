@@ -70,10 +70,25 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py b/megatro
  
  
  def _get_flat_packed_ranges(
+@@ -253,6 +262,14 @@
+     video_index: int,
+ ) -> tuple[torch.Tensor, int, int]:
+     """Build Qwen3-VL MRoPE positions for one logical sample."""
++    recipe = sys.modules.get("relax.models.qwen3_5.recipe")
++    if (
++        recipe is not None and recipe._TEXT_ONLY_CPT
++        and image_grid_thw is None and video_grid_thw is None
++    ):
++        # Literal vision markers in text-only CPT are ordinary text tokens.
++        positions = torch.arange(sample_input_ids.numel()).view(1, -1).expand(3, -1)
++        return positions, image_index, video_index
+     vision_start_indices = torch.argwhere(sample_input_ids == vision_start_token_id).squeeze(1)
+     vision_tokens = sample_input_ids[vision_start_indices + 1]
+     image_nums = int((vision_tokens == image_token_id).sum().item())
 diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
 --- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
 +++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
-@@ -519,6 +519,28 @@
+@@ -519,7 +519,33 @@
          visual_pos_masks: Optional[torch.Tensor] = None,
          deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
      ):
@@ -100,8 +115,24 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block
 +        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
 +    ):
          """Forward method with activation checkpointing."""
++
++        checkpoint_mask = None
++        if getattr(self.config, "_relax_qwen35_optimized", False):
++            checkpoint_mask = tuple(getattr(packed_seq_params, "_qwen_recompute_mask"))
  
          def custom(start: int, end: int):
+             # Pipeline schedules may prepare a later microbatch before this checkpoint
+@@ -637,7 +663,9 @@
+                 if self.config.fp8 and not hidden_states.requires_grad:
+                     recompute_skip_num_layers += 1
+                 if (
+-                    layer_idx >= recompute_skip_num_layers
++                    layer_idx in checkpoint_mask
++                    if checkpoint_mask is not None
++                    else layer_idx >= recompute_skip_num_layers
+                     and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                 ):
+                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
 diff --git a/megatron/core/distributed/finalize_model_grads.py b/megatron/core/distributed/finalize_model_grads.py
 --- a/megatron/core/distributed/finalize_model_grads.py
 +++ b/megatron/core/distributed/finalize_model_grads.py
