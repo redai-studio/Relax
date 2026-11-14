@@ -1489,6 +1489,8 @@ class Controller:
         logger.info("Controller shutting down — cleaning up engine processes...")
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
+        for service in self.serve_dict.values():
+            service._stop_heartbeat_thread()
 
         from relax.engine.sft.runtime import is_i2i_sft
 
