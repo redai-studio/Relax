@@ -30,6 +30,7 @@ def test_streamed_packed_cp_preserves_hidden_gradients(monkeypatch, tp_size):
             "parallel_state": parallel_state,
             "checkpoint": checkpoint,
             "PerLayerEmbedding": cls,
+            "_STREAM_CHUNK_ROWS": 3,
         }
         hyper = ast.parse(contract._added_source("megatron/core/transformer/hyper_connection.py"))
         norm = next(

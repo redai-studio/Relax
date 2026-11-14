@@ -23,11 +23,13 @@ from relax.utils.metrics.adapters.tensorboard import _TensorboardAdapter
 from relax.utils.metrics.adapters.wandb import _is_offline_mode
 from relax.utils.metrics.sglang_exporter import SGLangMetricsExporter
 from relax.utils.metrics.timeline_trace import TimelineTraceAdapter
+from relax.utils.straggler.control_routes import router as straggler_router
 
 
 logger = get_logger(__name__)
 
 app = FastAPI()
+app.include_router(straggler_router)
 
 
 @app.middleware("http")

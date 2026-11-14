@@ -34,7 +34,7 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 # CP1 cannot use streamed PLE. Host-only training PLE is not supported by the
 # colocated GPU weight iterator; keep the frozen table on its owning GPU ranks.
 export RELAX_QWEN38_PLE_STREAMED=0
-export QWEN48_PLE_CPU_OFFLOAD=0
+export QWEN38_PLE_CPU_OFFLOAD=0
 export SGLANG_VLM_CACHE_SIZE_MB=0
 # Match Megatron's FP32 router. Other AutoModel parity knobs remain opt-in:
 # their BF16 rounding contracts are not established for Megatron fused kernels.
@@ -147,7 +147,7 @@ runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 env = runtime.setdefault("env_vars", {})
 for name, value in os.environ.items():
     if name.startswith(("CLEARML_", "RELAX_QWEN38_", "RELAX_GDN_", "RELAX_HC_", "RELAX_MOE_", "RELAX_QSA_")) or name in (
-        "PYTHONPATH", "MEGATRON", "RELAX", "PYTHONNOUSERSITE", "QWEN48_PLE_CPU_OFFLOAD",
+        "PYTHONPATH", "MEGATRON", "RELAX", "PYTHONNOUSERSITE", "QWEN38_PLE_CPU_OFFLOAD",
         "SGLANG_VLM_CACHE_SIZE_MB", "CUDA_HOME", "TRITON_F32_DEFAULT",
     ):
         env[name] = value

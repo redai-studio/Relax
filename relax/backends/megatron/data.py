@@ -26,6 +26,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.multimodal.stats import count_images, get_multimodal_token_counts
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
+from relax.utils.straggler import straggler_rollout_end
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
@@ -891,7 +892,7 @@ def get_batch(
         Envs.RELAX_SFT_SELECTIVE_LOGITS
         and cp_size == 1
         and qkv_format == "thd"
-        and not has_mm_inputs
+        and (not has_mm_inputs or Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS)
         and "unsplit_tokens" not in batch
         and "vlm_packed_seq_params" not in batch
         and getattr(get_args(), "loss_type", None) == "sft"
@@ -1717,6 +1718,8 @@ def log_perf_data(rollout_id: int, args: Namespace, flops_counter: FlopsCounter 
         ),
         flops_counter=flops_counter,
         world_size=dist.get_world_size(),
+        # A Gloo collective once per window: every rank of the actor group must reach it.
+        extra_metrics=straggler_rollout_end(rollout_id),
     )
 
 

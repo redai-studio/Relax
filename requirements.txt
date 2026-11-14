@@ -12,6 +12,7 @@ clearml==2.1.3
 numpy<2
 pytest
 pytest-asyncio
+pytest-xdist
 requests
 pydantic
 blobfile

@@ -459,6 +459,11 @@ def process_mtp_loss(
             layer_loss_mask = loss_mask * cumulative_mtp_input_mask
             num_tokens = layer_loss_mask.sum()
 
+        selected_rows = selected_rows_by_depth[mtp_layer_number] if selected_rows_by_depth is not None else None
+        if selected_rows is not None and Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS:
+            kept = torch.zeros_like(layer_loss_mask, dtype=torch.bool).index_fill_(1, selected_rows, True)
+            torch._assert_async(((layer_loss_mask == 0) | kept).all(), "Selective MTP logits omit supervised rows")
+
         # Chunked head+CE (dynamo-disabled) -> per-token loss [b, s].
         mtp_loss, correct, total = _chunked_head_ce(
             hidden_states_list[mtp_layer_number + 1],
@@ -471,7 +476,7 @@ def process_mtp_loss(
             chunk_size,
             tp_group=tp_group,
             loss_mask=layer_loss_mask if collect_acceptance else None,
-            selected_rows=(selected_rows_by_depth[mtp_layer_number] if selected_rows_by_depth is not None else None),
+            selected_rows=selected_rows,
         )
 
         # ---- identical to upstream from here (operates on [b, s], no vocab dim) ----

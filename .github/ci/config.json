@@ -2,29 +2,44 @@
   "ciTeam": ["SigureMo", "NINGBENZHE", "Yangruipis"],
   "targets": {
     "ci": {
-      "workflow": "ci.yml"
+      "workflow": "ci.yml",
+      "bypassOnly": true
     },
     "ci/pre-commit": {
       "workflow": "ci.yml",
       "job": "Pre-commit Checks"
     },
     "gpu-unit": {
-      "workflow": "unittest.yml"
+      "workflow": "ci.yml",
+      "bypassOnly": true
     },
     "integration": {
-      "workflow": "integration-test.yml"
+      "workflow": "ci.yml",
+      "bypassOnly": true
     },
     "integration/gpu-async": {
-      "workflow": "integration-test.yml",
+      "workflow": "ci.yml",
       "job": "Qwen3.5-4B-4xgpu-async"
     },
     "integration/gpu-vl": {
-      "workflow": "integration-test.yml",
+      "workflow": "ci.yml",
       "job": "Qwen3.5-4B-2xgpu-vl"
     },
     "integration/npu-async": {
-      "workflow": "integration-test.yml",
+      "workflow": "ci.yml",
       "job": "Qwen3.5-4B-4xnpu-async"
+    },
+    "gpu-unit/cpu": {
+      "workflow": "ci.yml",
+      "job": "Unit Tests (CPU)"
+    },
+    "gpu-unit/gpux1": {
+      "workflow": "ci.yml",
+      "job": "Unit Tests (H20, 1 GPU)"
+    },
+    "gpu-unit/gpux4": {
+      "workflow": "ci.yml",
+      "job": "Unit Tests (H20, 4 GPUs)"
     }
   }
 }

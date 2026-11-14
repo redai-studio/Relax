@@ -10,11 +10,11 @@ Prefer a workflow label for authorized maintenance operations:
 gh pr edit <PR> --repo redai-studio/Relax --add-label 'ci-bypass: gpu-unit'
 ```
 
-Workflow targets are entries without a `job` in `config.json`: `ci`, `gpu-unit`, and `integration`. Job targets such as `integration/gpu-async` are not valid bypass targets. Use `ci-bypass: <workflow>` or `ci-bypass: all`; create needed labels in repository settings before use. ShigureLab/ci-bypass checks the label actor against the configured team.
+Bypass scopes are the `bypassOnly` entries in `config.json`: `ci` (pre-commit only), `gpu-unit`, and `integration`. They keep their existing exemption semantics after consolidation into `ci.yml`; they are not rerun/cancel targets. Job targets such as `integration/gpu-async` are not valid bypass targets. Use `ci-bypass: <workflow>` or `ci-bypass: all`; create needed labels in repository settings before use. ShigureLab/ci-bypass checks the label actor against the configured team.
 
 A comment alternative is `/bypass <workflow>` or `/bypass all`, with an optional reason after the target. The gate reads comments directly; this command creates no status reply, label or automatic rerun. The current pattern accepts the command at the start of the comment, a target followed by whitespace or end of input, and optional trailing text.
 
-After adding an exemption, rerun the whole affected workflow using `gh run rerun <RUN_ID> --repo redai-studio/Relax` so the gate is reevaluated. A job-only rerun can reuse the old gate result. Wait for an active workflow or cancel it only within the authorized scope.
+After adding an exemption, reevaluating the gate requires rerunning the unified workflow using `gh run rerun <RUN_ID> --repo redai-studio/Relax`. This also reruns non-exempt suites, including training integrations; do so only when that full scope is authorized. A job-only rerun can reuse the old gate result. Wait for an active workflow or cancel it only within the authorized scope.
 
 The independent synchronize workflow removes `ci-bypass:` labels after new commits. Historical bypass comments remain eligible under ci-bypass's comment rules. To withdraw an exemption, remove its label or edit/delete its comment, then rerun the workflow.
 
@@ -38,6 +38,8 @@ Comment commands and welcome publishing load trusted default-branch code. Config
 The welcome comment refreshes on PR changes, review signal runs and configured CI workflow runs. Add new CI workflow names to `pr-welcome.yml` when extending CI. Fork runs with empty PR associations are resolved using both head repository and branch; publishing is serialized per PR. The relay does not execute PR code or pass credentials to consumers.
 
 Merge status reads active rulesets, classic branch protection, current reviews and required checks. The requirement table covers approval count, required Team approvals and aggregate CI status. Team candidates exclude the PR author; approvals only count when GitHub reports repository push access. The approval-count row puts the minimum count and write-access requirement in the status column, alongside approvals and requests for changes. Conditional team file patterns remain marked for GitHub to decide. Bypass eligibility is not inferred from a bot's limited view.
+
+Automatic CI now has one push/PR entrypoint, `ci.yml`, with no `workflow_dispatch` entry that could silently turn the former lint-only dispatch into training. Rerun a specific existing job for narrow validation, or use an explicitly authorized full rerun.
 
 CI uses GraphQL status-check contexts and GitHub's `isRequired(pullRequestNumber)` flag, preferring the test merge commit when a required context is present there. Missing required contexts remain pending. API errors fail the refresh instead of being converted into unknown rows; an absent classic branch-protection rule and inaccessible Team membership are handled explicitly.
 

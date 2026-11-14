@@ -6,8 +6,52 @@ on:
 permissions:
   contents: read
 
+env:
+  H20_IMAGE_DOCKERFILE: docker/Dockerfile.cu13
+  H20_IMAGE_PLATFORM: linux/amd64
+  H20_IMAGE_BUILD_ARGS: GPU_ARCH=hopper
+
 jobs:
+  fingerprint:
+    # Compute before taking an H20 runner; Docker cache stays on each host.
+    runs-on: ubuntu-slim
+    timeout-minutes: 3
+    outputs:
+      image-key: ${{ steps.key.outputs.image-key }}
+      cache-key: ${{ steps.key.outputs.cache-key }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Identify the image
+        id: key
+        shell: bash
+        env:
+          IMAGE_KEY: ${{ hashFiles('docker/Dockerfile.cu13', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'docker/scripts/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
+          DOCKERFILE: ${{ env.H20_IMAGE_DOCKERFILE }}
+          PLATFORM: ${{ env.H20_IMAGE_PLATFORM }}
+          BUILD_ARGS: ${{ env.H20_IMAGE_BUILD_ARGS }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_KEY" =~ ^[0-9a-f]{64}$ ]]
+          # Match prepare-image's canonical key, including all build configuration.
+          build_args=(--build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY)
+          while IFS= read -r argument; do
+            [[ -z "$argument" ]] && continue
+            if [[ ! "$argument" =~ ^[a-zA-Z_][a-zA-Z0-9_]*= ]]; then
+              echo '::error::build-args must contain one KEY=VALUE per line'
+              exit 1
+            fi
+            build_args+=(--build-arg "$argument")
+          done <<< "$BUILD_ARGS"
+          cache_key="$(printf '%s\0' "$IMAGE_KEY" "$DOCKERFILE" "$PLATFORM" "${build_args[@]}" | sha256sum)"
+          cache_key="${cache_key%% *}"
+          [[ "$cache_key" =~ ^[0-9a-f]{64}$ ]]
+          echo "image-key=$IMAGE_KEY" >> "$GITHUB_OUTPUT"
+          echo "cache-key=$cache_key" >> "$GITHUB_OUTPUT"
+
   warmup:
+    needs: fingerprint
     name: Warm H20 image (${{ matrix.machine }})
     # Each caller runs its own jobs; only the host's Docker cache is shared.
     # Each machine label must select runners sharing one host Docker daemon.
@@ -18,9 +62,9 @@ jobs:
       matrix:
         machine: [M01, M02]
     concurrency:
-      # Deliberately omit workflow/ref/hash: different images must also queue
-      # before taking another runner on this host. The cache still keys by hash.
-      group: h20-image-warmup-${{ matrix.machine }}
+      # Coordinate only identical images; unrelated cold builds must not gate cache hits.
+      # This bounds each key, not the total number of different cold images.
+      group: h20-image-warmup-${{ matrix.machine }}-${{ needs.fingerprint.outputs.cache-key }}
       queue: max
       cancel-in-progress: false
     steps:
@@ -33,7 +77,8 @@ jobs:
         uses: ./.github/actions/prepare-image
         timeout-minutes: 120
         with:
-          dockerfile: docker/Dockerfile.cu13
-          build-args: GPU_ARCH=hopper
+          dockerfile: ${{ env.H20_IMAGE_DOCKERFILE }}
+          platform: ${{ env.H20_IMAGE_PLATFORM }}
+          build-args: ${{ env.H20_IMAGE_BUILD_ARGS }}
           # Keep these inputs identical to the test jobs' local cache guard.
-          hash-key: ${{ hashFiles('docker/Dockerfile.cu13', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'docker/scripts/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
+          hash-key: ${{ needs.fingerprint.outputs.image-key }}
