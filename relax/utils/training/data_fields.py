@@ -7,6 +7,7 @@ from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.data.image_refs import sft_multimodal_data_fields
 from relax.utils.env import Envs
+from relax.utils.score_centering import SCORE_CENTERING_TRAIN_FIELDS
 
 
 PREFERENCE_DATA_FIELDS = (
@@ -85,7 +86,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
 
     fields = _base_rollout_fields(args)
     if getattr(args, "advantage_estimator", None) == "score_centering":
-        fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+        fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
     if getattr(args, "use_rollout_indexer_replay", False):
         fields.append("rollout_indexer_topk")
     if has_critic:

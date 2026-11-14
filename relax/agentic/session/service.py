@@ -2828,6 +2828,10 @@ class AgenticSessionShard:
         if getattr(result, "new_topk_token_ids", None) is not None:
             ir.pending_topk_token_ids_delta.append(result.new_topk_token_ids)
             ir.pending_topk_logprob_delta.append(result.new_topk_log_probs)
+            coverage = getattr(result, "new_topk_support_complete", None)
+            ir.pending_topk_support_complete_delta.append(
+                coverage if coverage is not None else np.zeros(len(result.new_tokens), dtype=bool)
+            )
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
         self._accumulate_request_meta(ir, meta_info=result.meta_info)
@@ -2913,6 +2917,9 @@ class AgenticSessionShard:
             else None,
             topk_logprob_delta=np.concatenate(ir.pending_topk_logprob_delta)
             if ir.pending_topk_logprob_delta
+            else None,
+            topk_support_complete_delta=np.concatenate(ir.pending_topk_support_complete_delta)
+            if ir.pending_topk_support_complete_delta
             else None,
             weight_version_delta=ir.pending_weight_version_delta,
             spec_delta=ir.pending_spec_delta,

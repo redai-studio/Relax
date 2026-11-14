@@ -1256,6 +1256,7 @@ def post_process_rollout_data(args, rollout_data):
         *iter_opd_cp_float_fields(),
     ]
     response_field_dtypes = dict.fromkeys(response_float_fields, torch.float32)
+    response_field_dtypes["rollout_topk_support_complete"] = torch.bool
     for key, dtype in (("rollout_topk_token_ids", torch.long), ("rollout_topk_log_probs", torch.float32)):
         if key in rollout_data:
             rollout_data[key] = [

@@ -190,6 +190,7 @@ class BackendGenerateResult:
     elapsed: float
     new_topk_token_ids: np.ndarray | None = None
     new_topk_log_probs: np.ndarray | None = None
+    new_topk_support_complete: np.ndarray | None = None
 
 
 class BackendContextLengthExceededError(RuntimeError):
@@ -652,15 +653,17 @@ class SGLangBackendAdapter:
         token_logprobs = list(meta_info.get("output_token_logprobs") or ())
         tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
         sampled_logprobs = [float(item[0]) for item in token_logprobs]
-        topk_token_ids = topk_log_probs = None
+        topk_token_ids = topk_log_probs = support_complete = None
         if sc_sampling_mode is not None:
-            tokens, sampled_logprobs, topk_token_ids, topk_log_probs = parse_score_centering_response(
+            sc_result = parse_score_centering_response(
                 meta_info,
                 self._args.rollout_top_logprobs_num,
                 sampling_mode=sc_sampling_mode,
                 expected_tokens=tokens,
                 vocab_size=self._args.score_centering_vocab_size,
+                return_support_complete=True,
             )
+            tokens, sampled_logprobs, topk_token_ids, topk_log_probs, support_complete = sc_result
         sanitized_tokens = _sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor)
         if sc_sampling_mode is not None and sanitized_tokens != tokens:
             raise ValueError(
@@ -674,6 +677,7 @@ class SGLangBackendAdapter:
             elapsed=elapsed,
             new_topk_token_ids=topk_token_ids,
             new_topk_log_probs=topk_log_probs,
+            new_topk_support_complete=support_complete,
         )
 
     async def abort_request(self, request_id: str) -> None:

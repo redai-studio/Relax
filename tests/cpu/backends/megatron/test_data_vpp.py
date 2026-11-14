@@ -108,6 +108,7 @@ def test_dynamic_cp_microbatch_slices_score_centering_heads_with_sampled_probs(m
     monkeypatch.setattr(data_module.dist, "get_rank", lambda group: cp_rank)
     token_ids = torch.arange(16).reshape(8, 2)
     log_probs = -torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    coverage = torch.tensor([True, False, False, True, False, True, False, True])
     batch = {
         "tokens": [torch.arange(12)],
         "total_lengths": [12],
@@ -116,12 +117,14 @@ def test_dynamic_cp_microbatch_slices_score_centering_heads_with_sampled_probs(m
         "rollout_log_probs": [torch.arange(8, dtype=torch.float32)],
         "rollout_topk_token_ids": [token_ids],
         "rollout_topk_log_probs": [log_probs],
+        "rollout_topk_support_complete": [coverage],
     }
 
     result = data_module.get_batch(iter([(batch, None)]), list(batch), pad_multiplier=1)
 
     torch.testing.assert_close(result["rollout_topk_token_ids"][0], token_ids[expected_rows])
     torch.testing.assert_close(result["rollout_topk_log_probs"][0], log_probs[expected_rows])
+    torch.testing.assert_close(result["rollout_topk_support_complete"][0], coverage[expected_rows])
     assert result["rollout_log_probs"][0].tolist() == expected_rows
 
 

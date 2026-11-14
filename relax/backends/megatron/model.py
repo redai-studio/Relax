@@ -1379,6 +1379,7 @@ def train_one_step(
                     "rollout_log_probs",
                     "rollout_topk_token_ids",
                     "rollout_topk_log_probs",
+                    "rollout_topk_support_complete",
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
@@ -1458,6 +1459,14 @@ def train_one_step(
             mm_inputs = batch.get("multimodal_train_inputs")
             if is_vl_model and mm_inputs:
                 forward_kwargs.update(mm_inputs)
+
+            # Score Centering upcasts response blocks internally.
+            if (
+                getattr(args, "loss_type", None) == "policy_loss"
+                and getattr(args, "advantage_estimator", None) == "score_centering"
+                and (args.bf16 or args.fp16)
+            ):
+                forward_kwargs["fp32_output"] = False
 
             _attach_mtp_forward_kwargs(args, batch, forward_kwargs)
 
