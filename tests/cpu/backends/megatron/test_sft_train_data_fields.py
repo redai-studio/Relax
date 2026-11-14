@@ -12,6 +12,7 @@ import torch
 def _mk_actor_args(loss_type: str):
     return Namespace(
         loss_type=loss_type,
+        task_type="causal_lm",
         compute_advantages_and_returns=(loss_type not in {"sft", "dpo", "rm"}),
         debug_train_only=False,
         offload_train=False,

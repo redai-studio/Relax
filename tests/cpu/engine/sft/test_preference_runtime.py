@@ -14,6 +14,7 @@ from relax.engine.sft.runtime import is_preference_mode, validate_preference_arg
 def _args(**overrides) -> Namespace:
     values = {
         "loss_type": "dpo",
+        "task_type": "causal_lm",
         "custom_dataset_class_path": None,
         "multimodal_keys": None,
         "n_samples_per_prompt": 1,
