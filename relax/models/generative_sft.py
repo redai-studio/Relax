@@ -2,10 +2,47 @@
 """Model contract for image-edit supervision, independent of RL
 trajectories."""
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 import torch
+
+
+@dataclass(frozen=True)
+class ConditioningSpec:
+    """Adapter-declared dependencies of one reusable frozen computation.
+
+    ``dependencies`` contains JSON-compatible input/processing metadata. The
+    runtime adds its immutable encoder-weight fingerprint before building the
+    cache key. ``cacheable`` is checked against the actual parameter boundary,
+    not just a training-mode name.
+    """
+
+    name: str
+    dependencies: dict[str, Any]
+    cacheable: bool
+
+
+class ConditioningResolver(Protocol):
+    """Resolve features inside the model's FSDP forward boundary.
+
+    The runtime makes the compute/skip choice unanimous across the parameter-
+    sharding group so every rank executes matching encoder collectives. It must
+    call ``restore(compute())`` without detaching or storing the result when
+    ``spec.cacheable`` is false, because those features may carry conditioning
+    gradients.
+    """
+
+    enabled: bool
+
+    def resolve(
+        self,
+        spec: ConditioningSpec,
+        compute: Callable[[], dict[str, torch.Tensor]],
+        restore: Callable[[dict[str, torch.Tensor]], dict[str, Any]],
+    ) -> dict[str, Any]: ...
 
 
 class GenerativeSFTAdapter(Protocol):
