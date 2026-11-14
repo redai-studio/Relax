@@ -10,6 +10,7 @@ from ray import serve
 
 from relax.components.background_loop import BackgroundLoopRunner
 from relax.components.base import Base
+from relax.core.inference_recovery import RecoveryGate, UnsafeInferenceError, wait_all
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.utils.tq.lifecycle import attach_tq_client
 
@@ -29,6 +30,7 @@ class ActorFwd(Base):
         self._lock = threading.RLock()
         self.healthy = healthy
         self.role = role
+        self._recovery = RecoveryGate(config, role)
 
         # Threading primitives so the computation loop doesn't block the Serve/FastAPI thread
         self._stop_event = threading.Event()
@@ -64,24 +66,35 @@ class ActorFwd(Base):
                     self._logger.info(f"All {self.role} steps finished")
                     break
 
-                self._logger.info(
-                    f"{self.role} model computing log prob for step {local_step}/{self.config.num_rollout}"
-                )
-                if self.role == "actor_fwd":
-                    self.compute_actor_log_prob(local_step)
-                else:
-                    self.compute_ref_log_prob(local_step)
-                self._logger.info(
-                    f"{self.role} model computed log prob for step {local_step}/{self.config.num_rollout}"
-                )
-
+                fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
+                if getattr(self.config, "multimodal_keys", None) is not None:
+                    fields.append("multimodal_train_inputs")
+                local_step = self._recovery.admit(local_step, self.data_system_client, fields, self._stop_event)
+                if local_step is None:
+                    break
+                self.step = local_step
                 try:
-                    self.healthy.update_heartbeat.remote(self.role, local_step + 1)
-                except Exception:
-                    pass
-
-                with self._lock:
-                    self.step += 1
+                    self._logger.info(
+                        f"{self.role} model computing log prob for step {local_step}/{self.config.num_rollout}"
+                    )
+                    if self.role == "actor_fwd":
+                        self.compute_actor_log_prob(local_step)
+                    else:
+                        self.compute_ref_log_prob(local_step)
+                    self._logger.info(
+                        f"{self.role} model computed log prob for step {local_step}/{self.config.num_rollout}"
+                    )
+                    try:
+                        self.healthy.update_heartbeat.remote(self.role, local_step + 1)
+                    except Exception:
+                        pass
+                    with self._lock:
+                        self.step = local_step + 1
+                except Exception as exc:
+                    self._recovery.fail(exc)
+                    raise
+                finally:
+                    self._recovery.leave()
 
                 # Re-check stop flag after the long blocking compute call.
                 # This minimises the window between stop() and actual termination.
@@ -93,7 +106,7 @@ class ActorFwd(Base):
             error_msg = f"{self.role} failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
             self.healthy.report_error.remote(self.role, error_msg)
-            if not getattr(self.config, "use_health_check", False):
+            if self._recovery.state is not None or not getattr(self.config, "use_health_check", False):
                 raise
 
     async def stop(self) -> None:
@@ -110,12 +123,25 @@ class ActorFwd(Base):
                     "Proceeding with restart anyway — stale thread may leak."
                 )
 
+    async def stop_for_recovery(self, timeout: float = 30) -> list[Any]:
+        self._stop_event.set()
+        if not await self._loop_runner.join(timeout=timeout):
+            raise TimeoutError(f"{self.role} still owns a forward/receive operation")
+        wait_all(self.actor_model.async_inference_call("unregister_inference_transport"))
+        children = list(self.actor_model._actor_handlers)
+        if self.actor_model._actor_lock is not None:
+            children.append(self.actor_model._actor_lock)
+        return children
+
     def recv_weight_fully_async(self, recovery_token: dict | None = None) -> None:
         from relax.utils.fault_events.receipts import emit_receipt
 
         operation = "reference_recv" if self.role == "reference" else "actor_fwd_recv"
         try:
-            self.actor_model.recv_weight_fully_async(0)
+            if self._recovery.state is None:
+                self.actor_model.recv_weight_fully_async(0)
+            else:
+                wait_all(self.actor_model.async_inference_call("recv_weight_fully_async", self.step))
         except Exception:
             emit_receipt(self, recovery_token, operation, "failed")
             raise
@@ -143,7 +169,18 @@ class ActorFwd(Base):
         return {"status": "ok"}
 
     def compute_actor_log_prob(self, step: int) -> None:
-        ray.get(self.actor_model.async_compute_actor_log_prob(step))
+        refs = self.actor_model.async_compute_actor_log_prob(step)
+        if self._recovery.state is None:
+            ray.get(refs)
+            return
+        wait_all(refs)
+        ray.get(self._recovery.state.set_fwd_ready.remote(True))
+        try:
+            wait_all(self.actor_model.async_inference_call("recv_weight_fully_async", step))
+        except Exception as exc:
+            raise UnsafeInferenceError("Forward weight receive failed; require global restart") from exc
+        finally:
+            ray.get(self._recovery.state.set_fwd_ready.remote(False))
 
     def compute_ref_log_prob(self, step: int) -> None:
         ray.get(self.actor_model.async_compute_ref_log_prob(step))

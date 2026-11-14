@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import sys
 import threading
 from copy import copy
@@ -21,6 +22,18 @@ if not hasattr(transfer_queue, "StreamingTokenBudgetSampler"):
 
 controller = load_controller_with_stubbed_dependencies("_test_controller_s3_model_cleanup_controller")
 ROLES = controller.ROLES
+
+
+def controller_shell():
+    instance = controller.Controller.__new__(controller.Controller)
+    instance._model_cache_node_ids = set()
+    instance._inference_recovery = None
+    instance._restart_lock = threading.Lock()
+    instance._training_wait_done = threading.Event()
+    instance._metrics_service_enabled = False
+    instance._startup_abort_event = threading.Event()
+    instance._startup_services = []
+    return instance
 
 
 def test_train_start_config_attaches_remote_model_config_without_mutating_args(monkeypatch):
@@ -84,7 +97,7 @@ class _FakeCleanupTask:
 def test_controller_s3_cleanup_runs_once_on_each_alive_node(monkeypatch):
     monkeypatch.setenv("RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S", "17.5")
     config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = config
     instance.serve_dict = {}
     cleanup_task = _FakeCleanupTask()
@@ -182,7 +195,7 @@ def test_controller_s3_cleanup_requires_model_source():
 def test_controller_s3_cleanup_timeout_cancels_pending_tasks(monkeypatch):
     monkeypatch.setenv("RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S", "2.5")
     config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = config
     instance.serve_dict = {}
     cleanup_task = _FakeCleanupTask()
@@ -214,7 +227,7 @@ def test_controller_s3_cleanup_timeout_cancels_pending_tasks(monkeypatch):
 
 def test_controller_s3_cleanup_timeout_raises_when_cancel_remains_pending(monkeypatch):
     config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = config
     instance.serve_dict = {}
     cleanup_task = _FakeCleanupTask()
@@ -235,7 +248,7 @@ def test_controller_s3_cleanup_timeout_raises_when_cancel_remains_pending(monkey
 def test_controller_s3_cleanup_rejects_non_positive_task_timeout(monkeypatch, value):
     monkeypatch.setenv("RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S", value)
     config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = config
     instance.serve_dict = {}
     cleanup_task = _FakeCleanupTask()
@@ -249,7 +262,7 @@ def test_controller_s3_cleanup_rejects_non_positive_task_timeout(monkeypatch, va
 
 def test_controller_s3_cleanup_disable_skips_node_discovery(monkeypatch):
     config = SimpleNamespace(model_source=SimpleNamespace(), disable_s3_model_cleanup=True)
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = config
     monkeypatch.setattr(controller.ray, "nodes", lambda: (_ for _ in ()).throw(AssertionError("must not run")))
 
@@ -261,7 +274,7 @@ def test_controller_local_model_source_skips_node_discovery(monkeypatch):
         model_source=SimpleNamespace(uri="/models/local"),
         disable_s3_model_cleanup=False,
     )
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = config
     monkeypatch.setattr(controller.ray, "nodes", lambda: (_ for _ in ()).throw(AssertionError("must not run")))
 
@@ -307,7 +320,7 @@ def test_controller_prepares_then_deploys_service(monkeypatch):
         def deploy(self):
             events.append(("deploy", self.pgs))
 
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = SimpleNamespace()
     instance.runtime_env = None
     instance._health_manager = SimpleNamespace(status=object())
@@ -330,7 +343,7 @@ def test_controller_prepares_then_deploys_service(monkeypatch):
 
 
 def test_controller_service_phase_preserves_fully_async_concurrency():
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = SimpleNamespace(fully_async=True)
     barrier = threading.Barrier(2)
 
@@ -361,7 +374,7 @@ def test_controller_uses_staged_startup_only_for_s3(model_source, expected):
 
 
 def test_controller_local_model_uses_constructor_immediate_deploy(monkeypatch):
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = SimpleNamespace(model_source=SimpleNamespace(uri="/models/qwen"))
     instance.serve_dict = {}
     service = object()
@@ -385,7 +398,7 @@ def test_controller_local_model_uses_constructor_immediate_deploy(monkeypatch):
 
 
 def test_controller_s3_model_allocates_prefetches_then_deploys(monkeypatch):
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/qwen"))
     instance.serve_dict = {}
     prepared = SimpleNamespace(pgs=("pg", [0], [0]))
@@ -455,7 +468,7 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
             events.append(f"run_{self.role.value}")
             return None
 
-    instance = controller.Controller.__new__(controller.Controller)
+    instance = controller_shell()
     instance.config = SimpleNamespace(
         debug_train_only=False,
         debug_rollout_only=False,
@@ -609,3 +622,83 @@ def test_controller_startup_preserves_tokenizer_caches(monkeypatch, tmp_path, us
     assert len(agentic_paths) == int(use_agentic_rollout)
     for path in agentic_paths:
         assert load_tokenizer(path, local_files_only=True).encode("hello") == [1]
+
+
+@pytest.mark.parametrize("outcome", ["success", "pending", ROLES.actor, ROLES.actor_fwd])
+def test_recovery_initial_sync_observes_results_before_cleanup_and_training(monkeypatch, outcome):
+    events = []
+    roles = (ROLES.actor, ROLES.actor_fwd)
+    started, release = asyncio.Event(), asyncio.Event()
+    if outcome != "pending":
+        release.set()
+
+    async def submit(role, recovery_token=None):
+        events.append(("submit", role))
+
+        async def result():
+            assert all(("submit", peer) in events for peer in roles)
+            events.append(("result", role))
+            if all(("result", peer) in events for peer in roles):
+                started.set()
+            if outcome == role:
+                raise ValueError(f"initial-sync-{role.value}")
+            await release.wait()
+
+        await asyncio.sleep(0)
+        return await result()
+
+    def begin_sync(*, maintenance):
+        assert maintenance is True
+        events.append("begin")
+        return True
+
+    async def get_step():
+        return 0
+
+    async def drive(coro):
+        task = asyncio.create_task(coro)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert events[:3] == ["begin", *(("submit", role) for role in roles)]
+        assert events.count("begin") == 1
+        if outcome == "pending":
+            assert not task.done()
+            assert "end" not in events and "cleanup" not in events
+            assert not any(("run", role) in events for role in roles)
+            release.set()
+        return await task
+
+    instance = controller_shell()
+    instance.config = SimpleNamespace(debug_train_only=False, debug_rollout_only=False, fully_async=True, hybrid=False)
+    instance._inference_recovery = SimpleNamespace(
+        begin_sync=SimpleNamespace(remote=begin_sync),
+        end_sync=SimpleNamespace(remote=lambda: events.append("end")),
+    )
+    instance.serve_dict = {
+        role: SimpleNamespace(
+            role=role,
+            update_weights_fully_async=partial(submit, role),
+            recv_weight_fully_async=partial(submit, role),
+            get_step=get_step,
+            set_step=lambda _step: _async_noop(),
+            run=partial(events.append, ("run", role)),
+        )
+        for role in roles
+    }
+    instance._teacher_manager = None
+    instance._pending_task_refs, instance._pending_task_refs_lock = [], threading.Lock()
+    instance._restarting = False
+    monkeypatch.setattr(instance, "_cleanup_s3_model_weights_after_init", lambda: events.append("cleanup"))
+    monkeypatch.setattr(instance, "_report_error_to_metrics_service", lambda _error: None)
+    monkeypatch.setattr(controller, "set_managed_opd_teacher_on_actor_service", lambda *_args: _async_noop())
+    monkeypatch.setattr(controller.ray, "get", lambda value: value)
+    monkeypatch.setattr(controller, "run", lambda coro: asyncio.run(drive(coro)))
+
+    if outcome in roles:
+        with pytest.raises(ValueError, match=f"initial-sync-{outcome.value}"):
+            instance.training_loop()
+        assert "end" not in events and "cleanup" not in events
+        assert not any(("run", role) in events for role in roles)
+    else:
+        instance.training_loop()
+        assert events.index("end") < events.index("cleanup")
+        assert all(events.index("cleanup") < events.index(("run", role)) for role in roles)

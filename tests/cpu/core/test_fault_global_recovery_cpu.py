@@ -7,6 +7,7 @@ import asyncio
 import socket
 import sys
 import threading
+import time
 from argparse import Namespace
 from types import ModuleType, SimpleNamespace
 
@@ -154,18 +155,6 @@ def prepare_handoff(controller, runtime):
     controller._restart_mode = "global"
     controller._restart_done_event.set()
     controller._restarting = True
-    namespace = type(controller).training_loop.__globals__
-    calls = 0
-
-    def run(coroutine):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            coroutine.close()
-            raise RuntimeError("old tasks cancelled by global restart")
-        return asyncio.run(coroutine)
-
-    namespace["run"] = run
     return recovery
 
 
@@ -348,7 +337,7 @@ def test_actual_error_return_flows_through_restart_consume_and_training_loop(run
         recovery_load_path=lambda config: None,
         tq=SimpleNamespace(close=lambda: None),
         shutdown_async_loop=lambda: None,
-        time=SimpleNamespace(sleep=lambda seconds: None),
+        time=SimpleNamespace(sleep=lambda seconds: None, monotonic=time.monotonic),
     )
     router = ModuleType("relax.distributed.ray.rollout")
     router.stop_launched_routers = lambda: 0
@@ -364,6 +353,7 @@ def test_actual_error_return_flows_through_restart_consume_and_training_loop(run
         coroutine.close()
         # Executes actual restart_serve and _run_global_restart. The latter
         # catches initializer failure, stores the error, and returns normally.
+        controller._training_wait_done.set()
         controller.restart_serve(Roles.actor)
         raise RuntimeError("old task failed")
 
@@ -551,17 +541,6 @@ def test_actual_empty_task_graph_keeps_submission_required_and_unverified(runtim
     controller._fault_recovery = controller._fault_rebuild_ready = recovery
     controller._restart_mode, controller._restarting = "global", True
     controller._restart_done_event.set()
-    calls = 0
-
-    def old_cancelled(coroutine):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            coroutine.close()
-            raise RuntimeError("old generation stopped")
-        return asyncio.run(coroutine)
-
-    type(controller).training_loop.__globals__["run"] = old_cancelled
     controller.training_loop()
     assert recovery.expected == 5 and recovery.observed == 1 and recovery.handoff
     assert recovery.outcome is None and "OUTCOME_UNOBSERVED" in runtime.diagnostics()["unknown_reasons"]

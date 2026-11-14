@@ -1048,6 +1048,21 @@ class SGLangEngine(RayActor):
             if process is not None:
                 kill_process_tree(process.pid)
 
+    def shutdown_for_recovery(self, timeout: float = 15.0) -> None:
+        """Confirm the still-observable local server tree exits after
+        shutdown."""
+        import psutil
+
+        process = getattr(self, "process", None)
+        if self.args.rollout_external or process is None or not process.is_alive():
+            raise RuntimeError("Local recovery requires a live, owned SGLang server process")
+        root = psutil.Process(process.pid)
+        processes = [root, *root.children(recursive=True)]
+        self.shutdown()
+        _, alive = psutil.wait_procs(processes, timeout=timeout)
+        if alive:
+            raise RuntimeError(f"SGLang server processes did not exit: {[child.pid for child in alive]}")
+
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
         collected.

@@ -1,0 +1,522 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+import asyncio
+import threading
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
+
+try:
+    from relax.core import controller as controller_module
+    from relax.core.inference_recovery_executor import InferenceRecoveryExecutor, InferenceRecoveryResult
+
+    Controller = controller_module.Controller
+except (ImportError, AssertionError) as exc:
+    pytest.skip(f"relax.core.controller requires the full runtime environment: {exc}", allow_module_level=True)
+
+
+def _controller_shell():
+    controller = object.__new__(Controller)
+    with patch.object(
+        controller_module, "require_control_plane_resource", side_effect=RuntimeError("stop before runtime startup")
+    ):
+        with pytest.raises(RuntimeError, match="stop before runtime startup"):
+            controller.__init__(SimpleNamespace(), {})
+    controller._restart_done_event = threading.Event()
+    controller._restart_lock = threading.Lock()
+    controller._training_wait_done = threading.Event()
+    controller._training_wait_done.set()
+    controller._local_recovery_thread = None
+    controller._local_recovery_role = None
+    controller._inference_recovery = None
+    controller._inference_recovery_timeout = 2.0
+    controller._restart_consumed_event = threading.Event()
+    controller._restart_consumed_event.set()
+    controller._restart_error = None
+    controller._restart_mode = None
+    controller._restarting = False
+    controller._pending_task_refs = []
+    controller._pending_task_refs_lock = threading.Lock()
+    controller._global_restart_count = 0
+    controller._max_global_restart = 3
+    controller._health_manager = SimpleNamespace(_checker=None)
+    return controller
+
+
+def test_global_restart_count_limit_remains_terminal(monkeypatch):
+    controller = _controller_shell()
+    controller._global_restart_count = 0
+    controller._max_global_restart = 0
+    controller._health_manager = SimpleNamespace(_checker=None)
+    controller._report_error_to_metrics_service = Mock()
+    exit_process = Mock(side_effect=SystemExit(1))
+    monkeypatch.setattr(controller_module.os, "_exit", exit_process)
+
+    with pytest.raises(SystemExit) as raised:
+        controller._run_global_restart()
+
+    assert raised.value.code == 1
+    assert controller._global_restart_count == 1
+    exit_process.assert_called_once_with(1)
+    controller._report_error_to_metrics_service.assert_called_once()
+
+
+def _patch_restart_entry(monkeypatch, controller):
+    monkeypatch.setattr(controller_module, "resolve_sft_algo_key", lambda config: "grpo")
+    monkeypatch.setattr(controller_module, "ALGOS", {"grpo": {}})
+    monkeypatch.setattr(controller_module, "register_extra_roles", Mock())
+    monkeypatch.setattr(
+        "relax.core.registry.resolve_algorithm",
+        lambda config: {"actor": object(), "rollout": object(), "sft": object()},
+    )
+    controller._health_manager = SimpleNamespace(increment_restart_count=Mock(return_value=1))
+
+
+@pytest.mark.parametrize("role", ["rollout", "actor_fwd"])
+def test_unhealthy_inference_without_local_owner_keeps_original_restart(role):
+    controller = _controller_shell()
+    controller._inference_recovery = object()
+    controller.restart_serve = Mock()
+
+    controller._on_service_unhealthy(role)
+
+    controller.restart_serve.assert_called_once_with(role, expected_state=controller._inference_recovery)
+
+
+def test_unhealthy_inference_defers_only_same_live_local_worker():
+    controller = _controller_shell()
+    controller.restart_serve = Mock()
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait)
+    controller._local_recovery_thread, controller._local_recovery_role = worker, "rollout"
+    worker.start()
+    try:
+        controller._on_service_unhealthy("rollout")
+        controller.restart_serve.assert_not_called()
+        controller._on_service_unhealthy("actor")
+        controller.restart_serve.assert_called_once_with("actor", expected_state=None)
+    finally:
+        release.set()
+        worker.join(timeout=2)
+    controller.restart_serve.reset_mock()
+    controller._on_service_unhealthy("rollout")
+    controller.restart_serve.assert_called_once_with("rollout", expected_state=None)
+
+
+def test_restart_requests_claim_only_one_cycle(monkeypatch):
+    controller = _controller_shell()
+    _patch_restart_entry(monkeypatch, controller)
+    entered, release = threading.Event(), threading.Event()
+
+    def restart_once(role, worker):
+        entered.set()
+        assert release.wait(2)
+        controller._restart_done_event.set()
+
+    controller._inference_recovery = object()
+    controller._restart_serve = Mock(side_effect=restart_once)
+    first = threading.Thread(target=controller.restart_serve, args=("actor",))
+    first.start()
+    try:
+        assert entered.wait(2)
+        controller.restart_serve("rollout", expected_state=controller._inference_recovery)
+        controller._restart_serve.assert_called_once_with("actor", None)
+        assert not controller._restart_done_event.is_set()
+    finally:
+        release.set()
+        first.join(timeout=2)
+    assert not first.is_alive()
+    assert controller._restart_done_event.is_set()
+
+
+def test_restart_rejects_previous_recovery_state(monkeypatch):
+    controller = _controller_shell()
+    _patch_restart_entry(monkeypatch, controller)
+    controller._inference_recovery = object()
+    controller._restart_serve = Mock()
+
+    controller.restart_serve("rollout", expected_state=object())
+
+    controller._restart_serve.assert_not_called()
+    assert not controller._restarting
+    assert controller._restart_consumed_event.is_set()
+
+
+def test_global_takeover_waits_for_actual_worker_exit(monkeypatch):
+    controller = _controller_shell()
+    _patch_restart_entry(monkeypatch, controller)
+    release, joining, exited = threading.Event(), threading.Event(), threading.Event()
+
+    def old_work():
+        assert release.wait(2)
+        exited.set()
+
+    worker = threading.Thread(target=old_work)
+    actual_join = worker.join
+
+    def observe_join(*args, **kwargs):
+        joining.set()
+        return actual_join(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "join", observe_join)
+    controller._local_recovery_thread, controller._local_recovery_role = worker, "rollout"
+
+    def teardown():
+        assert exited.is_set() and not worker.is_alive()
+
+    controller._run_global_restart = Mock(side_effect=teardown)
+    worker.start()
+    restart = threading.Thread(target=controller.restart_serve, args=("actor",))
+    restart.start()
+    try:
+        assert joining.wait(2)
+        controller._run_global_restart.assert_not_called()
+    finally:
+        release.set()
+        actual_join(timeout=2)
+        restart.join(timeout=2)
+    assert not restart.is_alive()
+    assert controller._restart_error is None
+    controller._run_global_restart.assert_called_once_with()
+
+
+def test_global_takeover_timeout_terminates_before_reinitialization(monkeypatch):
+    controller = _controller_shell()
+    _patch_restart_entry(monkeypatch, controller)
+    controller._inference_recovery_timeout = 0.01
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait)
+    controller._local_recovery_thread = worker
+    controller._run_global_restart = Mock()
+    exit_process = Mock(side_effect=SystemExit(1))
+    monkeypatch.setattr(controller_module.os, "_exit", exit_process)
+    worker.start()
+    try:
+        controller.restart_serve("actor")
+        exit_process.assert_called_once_with(1)
+        controller._run_global_restart.assert_not_called()
+    finally:
+        release.set()
+        worker.join(timeout=2)
+
+
+def test_global_handoff_waits_for_main_service_wait_to_return():
+    controller = _controller_shell()
+    controller._training_wait_done.clear()
+    cancelled, continued = threading.Event(), threading.Event()
+    controller._cancel_pending_tasks = Mock(side_effect=cancelled.set)
+
+    def handoff():
+        controller._wait_recovery_exit(None)
+        continued.set()
+
+    restart = threading.Thread(target=handoff)
+    restart.start()
+    try:
+        assert cancelled.wait(2)
+        assert not continued.is_set()
+    finally:
+        controller._training_wait_done.set()
+        restart.join(timeout=2)
+    assert not restart.is_alive()
+    assert continued.is_set()
+
+
+def test_original_in_place_restart_keeps_other_service_responses(monkeypatch):
+    controller = _controller_shell()
+    _patch_restart_entry(monkeypatch, controller)
+    controller._health_manager.mark_healthy = Mock()
+    service = SimpleNamespace(restart=Mock())
+    controller.serve_dict = {"sft": service}
+    response = Mock()
+    controller._pending_task_refs = [response]
+    controller._training_wait_done.clear()
+
+    controller.restart_serve("sft")
+
+    service.restart.assert_called_once_with(fault_observer=None)
+    response.cancel.assert_not_called()
+    assert controller._pending_task_refs == [response]
+    assert controller._restart_mode == "local"
+    assert controller._restart_done_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_failure_requests_global_outside_async_loop():
+    controller = _controller_shell()
+    controller._inference_recovery = object()
+    controller._recover_inference = Mock(side_effect=RuntimeError("cannot rebuild"))
+    controller.restart_serve = Mock()
+
+    async def failed_response():
+        raise ValueError("inference failed")
+
+    with pytest.raises(controller_module.GlobalRestartRequired) as raised:
+        await controller._supervise_inference("rollout", failed_response(), asyncio.Lock())
+
+    assert raised.value.role == "rollout"
+    assert raised.value.state is controller._inference_recovery
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    controller.restart_serve.assert_not_called()
+    assert controller._local_recovery_thread is None
+
+
+def test_training_loop_requests_global_after_service_wait_returns(monkeypatch):
+    controller = _controller_shell()
+    state = controller._inference_recovery = object()
+    stages = []
+
+    def service_wait(coroutine):
+        coroutine.close()
+        stages.append("wait")
+        if len(stages) == 1:
+            raise controller_module.GlobalRestartRequired("rollout", state)
+
+    def restart(role, *, expected_state):
+        assert controller._training_wait_done.is_set()
+        assert expected_state is state
+        stages.append("global")
+        controller._restarting = True
+        controller._restart_mode = "global"
+        controller._restart_done_event.set()
+
+    monkeypatch.setattr(controller_module, "run", service_wait)
+    controller.restart_serve = Mock(side_effect=restart)
+
+    controller.training_loop()
+
+    assert stages == ["wait", "global", "wait"]
+    assert not controller._restarting
+    assert controller._restart_consumed_event.is_set()
+
+
+@pytest.mark.parametrize(
+    "rollout_step,advance_tail,needs_global", [(3, True, False), (4, False, True), (4, True, True), (5, False, True)]
+)
+def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
+    monkeypatch, rollout_step, advance_tail, needs_global
+):
+    from relax.utils.tq import recovery_storage
+
+    controller = _controller_shell()
+    _patch_restart_entry(monkeypatch, controller)
+    monkeypatch.setattr("relax.core.registry.resolve_algorithm", lambda config: {"actor_fwd": object()})
+    controller.config = SimpleNamespace(
+        num_rollout=5, fully_async=True, hybrid=False, debug_train_only=False, debug_rollout_only=False
+    )
+    controller._teacher_manager = None
+    controller._cleanup_s3_model_weights_after_init = Mock()
+    controller._report_error_to_metrics_service = Mock()
+    monkeypatch.setattr(controller_module, "set_managed_opd_teacher_on_actor_service", AsyncMock())
+    monkeypatch.setattr(controller_module, "_needs_rollout_manager_setup", lambda services: False)
+    monkeypatch.setattr(controller_module.ray, "get", lambda result, **kwargs: result)
+    state = controller._inference_recovery = SimpleNamespace(
+        request_recovery=SimpleNamespace(remote=Mock(return_value=1)),
+        snapshot=SimpleNamespace(
+            remote=Mock(
+                return_value=dict(paused=True, unsafe=False, sync=False, failures={"actor_fwd": "error"}, active={})
+            )
+        ),
+        begin_sync=SimpleNamespace(remote=Mock(return_value=True)),
+        end_sync=SimpleNamespace(remote=Mock()),
+    )
+    client = SimpleNamespace(
+        async_get_partition_list=AsyncMock(return_value=["train_2"]),
+        _get_partition_meta=AsyncMock(return_value=SimpleNamespace(global_indexes=[1, 2])),
+    )
+    monkeypatch.setattr(controller_module.tq, "get_client", lambda: client)
+    monkeypatch.setattr(recovery_storage, "require_strict_clear_contract", Mock())
+    clear = AsyncMock()
+    monkeypatch.setattr(recovery_storage, "strict_clear_partition", clear)
+    discard, reset = AsyncMock(), AsyncMock()
+
+    async def completed():
+        return None
+
+    async def failed():
+        raise ValueError("explicit forward error")
+
+    def service(role):
+        return SimpleNamespace(role=role, run=lambda: asyncio.create_task(completed()), set_step=AsyncMock())
+
+    actor, rollout, forward = [service(role) for role in ("actor", "rollout", "actor_fwd")]
+    actor.get_step = AsyncMock(return_value=2)
+    # Current Service wrappers await the actual deployment response.
+    actor.update_weights_fully_async = AsyncMock()
+    forward.recv_weight_fully_async = AsyncMock()
+    rollout.step = rollout_step
+
+    async def observe_rollout_step():
+        observed = rollout.step
+        # The old post-generate tail can finish after the step snapshot, even
+        # though admission is paused and no generation operation remains active.
+        if advance_tail:
+            rollout.step += 1
+        return observed
+
+    rollout.get_step = observe_rollout_step
+    rollout.data_source = SimpleNamespace(discard_pending=SimpleNamespace(remote=discard))
+    rollout.get_rollout_manager = AsyncMock(
+        return_value=SimpleNamespace(reset_data_window=SimpleNamespace(remote=reset))
+    )
+    forward.run = lambda: asyncio.create_task(failed())
+    forward.rebuild_for_recovery = Mock()
+    controller.serve_dict = {service.role: service for service in (actor, rollout, forward)}
+    # This case isolates preparation from replacement weight transport, as before.
+    synchronize = AsyncMock(return_value=1)
+    monkeypatch.setattr(InferenceRecoveryExecutor, "_synchronize", synchronize)
+    controller._activate_inference_recovery = AsyncMock(side_effect=lambda *args: asyncio.create_task(completed()))
+
+    def global_restart():
+        raise RuntimeError("test reached original global restart")
+
+    controller._run_global_restart = Mock(side_effect=global_restart)
+    if needs_global:
+        with pytest.raises(RuntimeError, match="test reached original global restart"):
+            controller.training_loop()
+        controller._run_global_restart.assert_called_once_with()
+        clear.assert_not_awaited()
+        discard.assert_not_awaited()
+        reset.assert_not_awaited()
+        forward.rebuild_for_recovery.assert_not_called()
+        synchronize.assert_not_awaited()
+        controller._activate_inference_recovery.assert_not_awaited()
+    else:
+        controller.training_loop()
+        controller._run_global_restart.assert_not_called()
+        clear.assert_awaited_once_with(client, "train_2", [1, 2])
+        discard.assert_awaited_once_with()
+        reset.assert_awaited_once_with()
+        forward.rebuild_for_recovery.assert_called_once()
+        role, recovery_state, recovery = controller._activate_inference_recovery.await_args.args
+        assert (role, recovery_state, recovery.step) == ("actor_fwd", state, 2)
+
+
+def test_old_global_owner_does_not_publish_completion_into_next_cycle(monkeypatch):
+    controller = _controller_shell()
+    _patch_restart_entry(monkeypatch, controller)
+    controller._run_global_restart = Mock()
+
+    class AcknowledgeAndBeginNextCycle(threading.Event):
+        def __init__(self):
+            super().__init__()
+            self.publications = 0
+
+        def set(self):
+            self.publications += 1
+            super().set()
+            if self.publications == 1:
+                controller._consume_restart_cycle()
+                controller._restarting = True
+                controller._restart_mode = "global"
+                controller._restart_consumed_event.clear()
+                self.clear()
+
+    event = controller._restart_done_event = AcknowledgeAndBeginNextCycle()
+
+    controller.restart_serve("actor")
+
+    assert event.publications == 1
+    assert not event.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("global_takeover,sync_failure", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("role,hybrid", [("actor_fwd", False), ("rollout", False), ("rollout", True)])
+async def test_activation_publishes_and_registers_only_current_recovery(
+    monkeypatch, global_takeover, sync_failure, role, hybrid
+):
+    controller = _controller_shell()
+    controller.config = SimpleNamespace(fully_async=True, hybrid=hybrid)
+    controller._health_manager = SimpleNamespace(mark_healthy=Mock())
+    old_response, replacement = object(), object()
+    controller._pending_task_refs = [old_response]
+
+    def resume(step):
+        if global_takeover:
+
+            def claim_global():
+                with controller._restart_lock:
+                    controller._restarting = True
+
+            health_thread = threading.Thread(target=claim_global)
+            health_thread.start()
+            health_thread.join(timeout=2)
+            assert not health_thread.is_alive()
+        return 1
+
+    state = controller._inference_recovery = SimpleNamespace(
+        begin_sync=SimpleNamespace(remote=Mock(return_value=True)),
+        end_sync=SimpleNamespace(remote=Mock()),
+        resume=SimpleNamespace(remote=Mock(side_effect=resume)),
+    )
+    failed = SimpleNamespace(
+        set_step=AsyncMock(),
+        handle=SimpleNamespace(recv_weight_fully_async=SimpleNamespace(remote=AsyncMock())),
+        run=Mock(return_value=replacement),
+    )
+    engines = [SimpleNamespace(_actor_id=SimpleNamespace(hex=Mock(return_value=actor_id))) for actor_id in ("A", "B")]
+    rollout_manager = SimpleNamespace(
+        get_rollout_engines_and_lock=SimpleNamespace(remote=AsyncMock(return_value=(engines, None, 0, [], [])))
+    )
+    rollout = SimpleNamespace(
+        set_step=AsyncMock(),
+        get_rollout_manager=AsyncMock(return_value=rollout_manager),
+        handle=SimpleNamespace(resume_data_source=SimpleNamespace(remote=AsyncMock())),
+        run=Mock(return_value=replacement),
+    )
+    controller.serve_dict = {
+        "actor": SimpleNamespace(
+            handle=SimpleNamespace(
+                rebind_rollout_manager=SimpleNamespace(remote=AsyncMock()),
+                reset_inference_transport=SimpleNamespace(remote=AsyncMock()),
+                update_weights_fully_async=SimpleNamespace(remote=AsyncMock()),
+            )
+        ),
+        "rollout": rollout,
+    }
+    if not hybrid:
+        controller.serve_dict["actor_fwd"] = failed
+    failed = controller.serve_dict[role]
+    monkeypatch.setattr(controller_module.ray, "get", lambda value: value)
+
+    executor = InferenceRecoveryExecutor(
+        controller.config,
+        controller.serve_dict,
+        state,
+        controller._inference_recovery_timeout,
+        lambda: controller._check_inference_recovery(state),
+    )
+    sender = controller.serve_dict["actor"].handle
+    if sync_failure:
+        sender.update_weights_fully_async.remote.side_effect = RuntimeError("Replacement weight sync incomplete")
+        with pytest.raises(RuntimeError, match="Replacement weight sync incomplete"):
+            await executor._synchronize(role, step=3)
+        state.end_sync.remote.assert_not_called()
+        state.resume.remote.assert_not_called()
+        failed.run.assert_not_called()
+        return
+    generation = await executor._synchronize(role, step=3)
+    sender.reset_inference_transport.remote.assert_awaited_once_with(role)
+    sync_options = {"expected_rollout_actor_ids": ["A", "B"]} if role == "rollout" else {}
+    sender.update_weights_fully_async.remote.assert_awaited_once_with(
+        rollout_only=role == "rollout", actor_fwd_only=role == "actor_fwd", **sync_options
+    )
+    recovery = InferenceRecoveryResult(
+        step=3, attempt=1, generation=generation, started=controller_module.time.monotonic()
+    )
+    activation = controller._activate_inference_recovery(role, state, recovery)
+    if global_takeover:
+        with pytest.raises(RuntimeError, match="Global restart has taken over"):
+            await activation
+        failed.run.assert_not_called()
+        controller._health_manager.mark_healthy.assert_not_called()
+        assert controller._pending_task_refs == [old_response]
+    else:
+        assert await activation is replacement
+        failed.run.assert_called_once_with()
+        controller._health_manager.mark_healthy.assert_called_once_with(role)
+        assert controller._pending_task_refs == [old_response, replacement]
+    state.resume.remote.assert_called_once_with(3)
