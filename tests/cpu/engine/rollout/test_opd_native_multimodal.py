@@ -5,6 +5,7 @@ import copy
 import pickle
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import numpy as np
 import pybase64
@@ -132,11 +133,18 @@ async def test_image_teacher_prefix_uses_collapsed_prompt_boundary(processor_sta
 
 
 @pytest.mark.asyncio
-async def test_image_teacher_rejects_same_length_retokenization_before_assigning_logprobs(processor_state):
+@pytest.mark.parametrize("shared", [False, True])
+async def test_image_teacher_rejects_same_length_retokenization_before_assigning_logprobs(processor_state, shared):
     sample = _sample()
-    session = _Session(_response(sample.tokens[:-2] + [12, 13]))
+    result = _response(sample.tokens[:-2] + [12, 13])
+    manager = _manager(opd_shared_teacher=shared, opd_teacher_routes_map={"A": ["http://teacher/generate"]})
+    sample.metadata = {"teacher_id": "A"}
+    if shared:
+        manager.args._opd_shared_teacher_manager = SimpleNamespace(
+            score=SimpleNamespace(remote=AsyncMock(return_value=result))
+        )
     with pytest.raises(ValueError, match="expanded input IDs differ"):
-        await _manager()._teacher_prefill(sample, session)
+        await manager._teacher_prefill(sample, None if shared else _Session(result))
     assert sample.teacher_log_probs is None
 
 

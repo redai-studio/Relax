@@ -217,6 +217,7 @@ class TeacherResponseStats:
 class OpdManager:
     def __init__(self, args):
         self.args = args
+        self.use_shared_teacher = getattr(args, "opd_shared_teacher", False)
         routes = args.opd_teacher_routes_map
         self.response_stats = TeacherResponseStats(routes) if routes else None
         self.student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
@@ -351,8 +352,17 @@ class OpdManager:
             await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
 
         async with _create_teacher_client_session(self.args) as session:
-            successes = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, successes)
+            requests = [self._teacher_prefill(s, session) for s in sample_list]
+            if self.use_shared_teacher:
+                # Let every queued score settle before propagating a scheduler or validation error.
+                results = await asyncio.gather(*requests, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                if not all(results):
+                    raise RuntimeError("Shared Teacher failed to produce complete logprobs for this batch")
+            else:
+                self._raise_if_all_failed(sample_list, await asyncio.gather(*requests))
 
             if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
                 await asyncio.gather(
@@ -388,6 +398,31 @@ class OpdManager:
                 raise RuntimeError(f"Native image OPD {err_tag} failed for sample_index={sample.index}") from exc
             return None
 
+        response = opd_main_worker.LogprobResponse(data)
+        if expected_input_ids is not None:
+            response.validate_native_prefill(expected_input_ids, int(sample.response_length))
+        return response
+
+    async def _score_shared_teacher(
+        self, teacher: str, payload: dict, sample: Sample, expected_input_ids: list[int] | None
+    ) -> opd_main_worker.LogprobResponse:
+        import ray
+
+        manager = getattr(self.args, "_opd_shared_teacher_manager", None)
+        if manager is None:
+            raise RuntimeError("Shared Teacher scoring requires the managed scheduler")
+        score_ref = manager.score.remote(teacher, payload)
+        try:
+            data = await score_ref
+        except asyncio.CancelledError:
+            # Cancel this caller's queued score; the manager drains already dispatched HTTP work.
+            try:
+                ray.cancel(score_ref, recursive=False)
+            except Exception:
+                logger.warning("Could not cancel shared Teacher score for sample %s", sample.index, exc_info=True)
+            raise
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Shared Teacher returned a non-object response for sample {sample.index}")
         response = opd_main_worker.LogprobResponse(data)
         if expected_input_ids is not None:
             response.validate_native_prefill(expected_input_ids, int(sample.response_length))
@@ -477,10 +512,12 @@ class OpdManager:
         if native:
             payload["return_prompt_token_ids"] = True
 
-        teacher_url = _pick_teacher_url(self.args, sample)
-        resp_obj = await self._post_logprob(
-            session, teacher_url, payload, sample, "teacher prefill", expanded_ids if native else None
-        )
+        expected_ids = expanded_ids if native else None
+        if self.use_shared_teacher:
+            resp_obj = await self._score_shared_teacher(sample.metadata["teacher_id"], payload, sample, expected_ids)
+        else:
+            teacher_url = _pick_teacher_url(self.args, sample)
+            resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill", expected_ids)
         if resp_obj is None:
             return False
 
@@ -500,6 +537,9 @@ class OpdManager:
                 response_length,
             )
             return False
+
+        if self.use_shared_teacher and not np.isfinite(token_logprobs[1:]).all():
+            raise ValueError(f"Shared Teacher returned non-finite logprobs for sample {sample.index}")
 
         fields = {}
         if self.sampled_worker is not None:
@@ -593,6 +633,14 @@ class OpdManager:
                 teacher_at_student_lp=sample.teacher_at_student_topk_log_probs,
                 student_at_teacher_lp=sample.student_at_teacher_topk_log_probs,
             )
+            if self.use_shared_teacher and sample.response_length:
+                for name in self.topk_worker.topk_transfer_fields():
+                    values = channels.get(name)
+                    if values is None:
+                        raise ValueError(f"Missing shared OPD field {name} for sample {sample.index}")
+                    # A zero-probability token may have logprob -inf; NaN and +inf are invalid.
+                    if values.dtype.kind == "f" and not (values < np.inf).all():
+                        raise ValueError(f"Invalid shared OPD logprobs in {name} for sample {sample.index}")
             sample.opd_topk_token_ids = channels.get(opd_main_worker.TopkWorker.TRANSFER_TOKEN_IDS)
             sample.opd_topk_student_log_probs = channels.get(opd_main_worker.TopkWorker.TRANSFER_STUDENT_LOG_PROBS)
             sample.opd_topk_teacher_log_probs = channels.get(opd_main_worker.TopkWorker.TRANSFER_TEACHER_LOG_PROBS)
