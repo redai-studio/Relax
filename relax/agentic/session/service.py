@@ -2823,7 +2823,8 @@ class AgenticSessionShard:
     ) -> None:
         """Accumulate one backend attempt on the stable IR ref."""
 
-        ir.pending_token_delta.extend(result.new_tokens)
+        version = result.meta_info.get("weight_version")
+        ir.append_generated_tokens(result.new_tokens, str(version) if version is not None else None)
         ir.pending_logprob_delta.extend(result.new_log_probs)
         if getattr(result, "new_topk_token_ids", None) is not None:
             ir.pending_topk_token_ids_delta.append(result.new_topk_token_ids)
@@ -2915,6 +2916,7 @@ class AgenticSessionShard:
             if ir.pending_topk_logprob_delta
             else None,
             weight_version_delta=ir.pending_weight_version_delta,
+            weight_version_spans=ir.pending_weight_version_spans,
             spec_delta=ir.pending_spec_delta,
             prefix_cache_delta=ir.pending_prefix_cache_delta,
             wall_elapsed_s=time.monotonic() - ir.wall_started_at,

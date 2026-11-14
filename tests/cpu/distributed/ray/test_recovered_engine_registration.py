@@ -4,6 +4,7 @@
 alone."""
 
 import asyncio
+from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -117,6 +118,19 @@ def make_client(*, rank=0, fail=False):
 def test_success_returns_only_actual_weight_recipient_generations():
     client = make_client()
     assert asyncio.run(client.update_weights_for_rollout()) == ["actor-b"]
+
+
+def test_policy_audit_counts_only_completed_rollout_publications():
+    client = make_client()
+    client.args = Namespace(use_agentic_rollout=True, fully_async=True)
+    client.published_rollout_versions = {}
+    for version, actor_fwd_only in [(1, False), (2, True), (3, False)]:
+        client._backend.weight_version = version
+        asyncio.run(client.update_weights_for_rollout(actor_fwd_only=actor_fwd_only))
+    client._backend.rollout_topology.clear()
+    client._backend.weight_version = 4
+    asyncio.run(client.update_weights_for_rollout())
+    assert client.published_rollout_versions == {"1": 1, "3": 2}
 
 
 def test_publication_requires_all_pipeline_stages(monkeypatch):

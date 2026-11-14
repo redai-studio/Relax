@@ -11,6 +11,7 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from relax.agentic.policy_audit import POLICY_AUDIT_FIELD, encode_policy_audit, policy_audit_enabled
 from relax.algorithms import get_algorithm
 from relax.algorithms.rewards import REWARD_NORMALIZERS
 from relax.utils.agentic_obs import agentic_obs_enabled
@@ -270,6 +271,11 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         train_data["sample_export_ids"] = [sample.sample_export_id for sample in samples]
         train_data["agentic_group_ids"] = encode_group_ids([sample.agentic_group_id or "" for sample in samples])
 
+    if policy_audit_enabled(args):
+        train_data[POLICY_AUDIT_FIELD] = encode_group_ids(
+            [encode_policy_audit(sample, mask) for sample, mask in zip(samples, loss_masks, strict=True)]
+        )
+
     total_lengths = [len(t) for t in train_data["tokens"]]
     train_data["total_lengths"] = total_lengths
     if args.debug_train_only:
@@ -392,7 +398,7 @@ def dict_to_tensordict(
             ]
             result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
             continue
-        if key == "agentic_group_ids":
+        if key in ("agentic_group_ids", POLICY_AUDIT_FIELD):
             result[key] = group_ids_to_tensor(value, device=device)
             continue
         if key == "rollout_indexer_topk":

@@ -424,6 +424,7 @@ class MsgNode:
     backend_audio_data_delta: list[str] = field(default_factory=list)
     backend_video_data_delta: list[str] = field(default_factory=list)
     weight_version_delta: list[str] = field(default_factory=list)
+    weight_version_spans: list[tuple[int, int, str | None]] = field(default_factory=list)
     spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     tools: list[dict[str, Any]] | None = None
@@ -458,6 +459,7 @@ class InflightRequest:
     pending_topk_token_ids_delta: list[np.ndarray] = field(default_factory=list)
     pending_topk_logprob_delta: list[np.ndarray] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
+    pending_weight_version_spans: list[tuple[int, int, str | None]] = field(default_factory=list)
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
@@ -465,6 +467,12 @@ class InflightRequest:
     pending_routed_experts: Any = None
     pending_export_metadata_patch: dict[str, Any] = field(default_factory=dict)
     latest_backend_meta: dict[str, Any] = field(default_factory=dict)
+
+    def append_generated_tokens(self, tokens: list[int], weight_version: str | None) -> None:
+        if tokens:
+            start = len(self.pending_token_delta)
+            self.pending_token_delta.extend(tokens)
+            self.pending_weight_version_spans.append((start, len(self.pending_token_delta), weight_version))
 
 
 @dataclass(frozen=True)
@@ -700,6 +708,7 @@ class SessionForest:
         topk_token_ids_delta: np.ndarray | None = None,
         topk_logprob_delta: np.ndarray | None = None,
         weight_version_delta: list[str] | None = None,
+        weight_version_spans: list[tuple[int, int, str | None]] | None = None,
         spec_delta: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
@@ -738,6 +747,7 @@ class SessionForest:
                 topk_token_ids_delta=topk_token_ids_delta,
                 topk_logprob_delta=topk_logprob_delta,
                 weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
+                weight_version_spans=list(weight_version_spans or []),
                 spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
                 prefix_cache_delta=prefix_cache_delta
                 if prefix_cache_delta is not None
@@ -815,6 +825,13 @@ class SessionForest:
                     first_response_node = node
                 turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
                 response_start = len(continuation_train_tokens)
+                turns[-1]["weight_version_spans"] = [
+                    (response_start + start, response_start + end, version)
+                    for start, end, version in (
+                        getattr(node, "weight_version_spans", None) or [(0, len(node.train_token_delta), None)]
+                    )
+                    if end > start
+                ]
                 continuation_train_tokens.extend(node.train_token_delta)
                 response_node_spans.append([response_start, len(continuation_train_tokens)])
                 loss_mask.extend([1] * len(node.train_token_delta))

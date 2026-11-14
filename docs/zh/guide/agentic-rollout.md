@@ -872,6 +872,47 @@ call，不是 failed call。
 data URI 和原始二进制 payload 替换为摘要/大小引用。日志在 agent 临时目录被移除前复制；
 Shard 突然退出仍可能使最终复制无法完成。`tokens.jsonl` 按当前设计继续留到后续。
 
+### Fully Async 权重版本审计
+
+Megatron 的 Fully Async Agentic 训练会在已有 rollout 日志中记录
+`rollout/agentic_policy/*`。统计输入是 Actor 实际消费的训练行，按训练输入
+loss mask 计数。取消后未提交的请求、选中轨迹以外的分支及 VPP 对齐用的
+虚拟微批均不计入。partial rollout 中断后保留并最终提交的 token 按各次生成
+返回的版本分别计数。
+
+| 指标后缀 | 统计口径 |
+| --- | --- |
+| `generation_version_span` | 样本训练 token 的最大与最小发布序号之差，按版本完整的样本平均。 |
+| `post_generation_version_lag` | 消费时最新的发布序号减去最后一个非空生成片段的发布序号，按有可比较版本的样本平均。 |
+| `token_weighted_version_lag` | 对版本可识别的训练 token 求平均，每个 token 的年龄等于消费序号减去来源序号。 |
+| `missing_version_fraction` | 版本不可识别的训练 token 占全部训练 token 的比例。 |
+
+发布序号在同一次运行的策略内从 1 开始。一次同步至少有一个 Rollout 引擎被所有
+PP 来源确认为完整接收者时才计入。Actor Forward 独有的同步不计入。当前版本在
+训练消费期间保持不变，下次权重同步发生在该训练批次之后。空分母的指标省略。
+后端未返回版本、版本不在当前发布记录内以及旧轨迹缺少片段时，诊断中的年龄为
+`null`。LoRA adapter-only 更新没有可用的逐片段发布序号，按未知统计。
+该审计走标准样本转换器，适用范围是纯 Fully Async 路径。
+
+设置 `--save-debug-train-data` 后，训练 dump 的
+`samples[i]["agentic_policy_audit"]` 包含 Session、选中叶节点、逻辑请求、
+轮次和片段。片段区间以样本的 response token 为坐标，从零开始且右端不含。
+工具 observation 占 response 坐标但不属于生成片段。
+
+以下 CPU 用例可复现工具等待期间发布两次权重、第二轮中断续写，以及消费前再发布一次的诊断。
+
+```bash
+python -m pytest -q tests/cpu/agentic/test_policy_audit.py
+```
+
+| 轮次 | 片段区间 | 后端版本 | 发布序号 | 消费时年龄（发布序号 5） |
+| --- | --- | --- | --- | --- |
+| 0 | `[0, 2)` | 10 | 1 | 4 |
+| 1 | `[3, 4)` | 13 | 3 | 2 |
+| 1 | `[4, 6)` | 15 | 4 | 1 |
+
+该样本的生成跨度为 3，完成后的等待滞后为 1，token 加权滞后为 2.4，缺失率为 0。
+
 ### 常见问题
 
 - **Agent 没有启动或异常退出：** 检查 `--agent-cwd` 和 `--agent-command`，然后查看 `run.log`。Relax 会把 agent
