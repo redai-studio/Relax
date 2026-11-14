@@ -2,6 +2,12 @@
 
 On-Policy Distillation (OPD) enables knowledge transfer from a large teacher model to a smaller student model by training the student on its own rollout data while matching the teacher's token-level log-probabilities. OPD is orthogonal to the advantage estimator—it acts as a KL penalty term that can be combined with any estimator, including PPO, GRPO, GSPO, SAPO, CISPO, and REINFORCE++.
 
+## Dedicated and external teachers
+
+For a standard SGLang task without `--colocate`, a Relax-managed single teacher uses the common inference manager and request executor. Requests resolve current replica endpoints after recovery, and `--opd-teacher-timeout-s` bounds the teacher request including admission and response reading. The teacher keeps checkpoint weights independently of Actor updates. Custom lifecycle hooks, Agentic tasks and colocated teachers retain their existing orchestration. Managed multi-teacher routing remains colocate-only.
+
+With `--opd-teacher-url`, the teacher is external: Relax sends requests but does not allocate its GPUs or stop its process when training ends. Existing external teacher routing remains applicable.
+
 ## Key Parameters
 
 | Parameter                 | Description                                                                                                                                |

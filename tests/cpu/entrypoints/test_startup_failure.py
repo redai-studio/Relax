@@ -561,7 +561,8 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
     methods = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"shutdown", "_dispose_rollout_manager", "_dispose_managed_genrm"}
     ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
@@ -585,6 +586,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
         _cleanup_s3_model_weights_after_init=Mock(),
     )
     partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
+    partial_controller._dispose_managed_genrm = ns["_dispose_managed_genrm"].__get__(partial_controller)
     stop_image = AsyncMock(side_effect=RuntimeError("producer unavailable") if mode == "i2i_stop_failure" else None)
     if mode != "missing_config":
         partial_controller.config = SimpleNamespace(
@@ -630,7 +632,8 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
     methods = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"shutdown", "_dispose_rollout_manager", "_dispose_managed_genrm"}
     ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
@@ -658,6 +661,7 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
         _cleanup_s3_model_weights_after_init=Mock(),
     )
     controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(controller)
+    controller._dispose_managed_genrm = ns["_dispose_managed_genrm"].__get__(controller)
 
     ns["shutdown"](controller)
 

@@ -19,6 +19,7 @@ class FakeBackend:
         self.reject_update = False
         self.fail_offload = False
         self.rollout_engines = []
+        self.engines = []
         self.status = "onload"
 
     async def offload(self):
@@ -175,8 +176,8 @@ async def test_pool_operation_cancellation_does_not_spin_the_actor_loop():
 @pytest.mark.parametrize(
     "legacy",
     [
-        {"_genrm_instances_resolved": {"judge": {}}},
-        {"use_opd": True},
+        {"_genrm_instances_resolved": {"judge": {}}, "colocate": True},
+        {"use_opd": True, "colocate": True},
         {"loss_type": "sft"},
         {"use_agentic_rollout": True},
         {"rollout_engine_class_path": "custom.Engine"},
@@ -223,7 +224,8 @@ async def test_snapshot_rereads_background_generation_changes():
     assert replace(after, models=before.models, topology_revision=before.topology_revision) == before
 
 
-def test_real_cpu_ray_drain_can_receive_permit_completions():
+@pytest.mark.parametrize("role", list(Role))
+def test_real_cpu_ray_drain_can_receive_permit_completions(role):
     # Runs the actual production actor API; only the GPU pool is synthetic.
     # No existing Ray cluster is attached or modified.
     if ray.is_initialized():
@@ -233,6 +235,8 @@ def test_real_cpu_ray_drain_can_receive_permit_completions():
         def __init__(self):
             super().__init__()
             self.pool = FakePool()
+            self.role = role
+            self._last_health = float("inf")
             self.memory_ready = True
             self.state = LifecycleState.READY
 
@@ -245,26 +249,27 @@ def test_real_cpu_ray_drain_can_receive_permit_completions():
     )
     actor = ray.remote(num_cpus=1, max_concurrency=4096)(Harness).remote()
     try:
-        permits = ray.get([actor.admit_request.remote("rollout", "default") for _ in range(64)], timeout=20)
+        permits = ray.get([actor.admit_request.remote(role, "default") for _ in range(64)], timeout=20)
         drain = actor.pool_call.remote("offload")
         # Async Ray methods are deliberately unordered; observe the fence
         # before releasing permits, without relying on submission order.
         import time
 
         deadline = time.monotonic() + 10
-        while ray.get(actor.snapshot.remote(), timeout=10).models[0].admission:
+        while ray.get(actor.snapshot.remote(role), timeout=10).models[0].admission:
             assert time.monotonic() < deadline
             time.sleep(0.01)
         ray.get([actor.complete_request.remote(token) for token in permits], timeout=20)
         ray.get(drain, timeout=20)
-        assert ray.get(actor.pool_call.remote("get_status"), timeout=10) == "offload"
-        ray.get(actor.pool_call.remote("onload_kv"), timeout=10)
-        assert ray.get(actor.snapshot.remote(), timeout=10).models[0].admission
+        if role is Role.ROLLOUT:
+            assert ray.get(actor.pool_call.remote("get_status"), timeout=10) == "offload"
+        ray.get(actor.pool_call.remote("onload_kv" if role is Role.ROLLOUT else "onload"), timeout=10)
+        assert ray.get(actor.snapshot.remote(role), timeout=10).models[0].admission
         from relax.distributed.ray.inference_manager import dispose_managed_rollout
 
         ray.get(dispose_managed_rollout.remote(actor, None), timeout=20)
         with pytest.raises(ray.exceptions.ActorDiedError):
-            ray.get(actor.snapshot.remote(), timeout=10)
+            ray.get(actor.snapshot.remote(role), timeout=10)
     finally:
         ray.kill(actor)
         ray.shutdown()
@@ -434,6 +439,68 @@ async def test_concurrent_dispose_closes_worker_only_once(monkeypatch):
     assert closes == ["closed"]
     assert killed == [worker]
     assert owner.pool is None
+
+
+@pytest.mark.parametrize("role", ["genrm", "teacher"])
+def test_independent_auxiliary_tasks_select_managed_path(role):
+    from relax.distributed.ray.inference_handle import use_managed_auxiliary
+
+    args = SimpleNamespace(
+        colocate=False, use_opd=role == "teacher", _genrm_instances_resolved={"judge": {}} if role == "genrm" else {}
+    )
+    assert use_managed_auxiliary(args)
+    assert use_managed_rollout(args)
+    args.colocate = True
+    assert not use_managed_auxiliary(args)
+    assert not use_managed_rollout(args)
+
+
+@pytest.mark.asyncio
+async def test_static_role_recovery_drains_before_replacement_and_refreshes_snapshot():
+    owner = manager()
+    owner.role = Role.TEACHER
+    owner._last_health = asyncio.get_running_loop().time()
+    owner.pool.unhealthy_ranks = lambda: [0]
+    recovered = []
+
+    def recover(dead):
+        recovered.extend(dead)
+        owner.pool.generation += 1
+
+    owner.pool.recover = recover
+    owner.pool.record_placement = lambda planner: None
+    before = await owner.snapshot(Role.TEACHER)
+    permit = await owner.admit_request(Role.TEACHER, "default")
+    recovery = asyncio.create_task(owner.recover_static())
+    for _ in range(100):
+        if "health" in owner.ledger.fences:
+            break
+        await asyncio.sleep(0.001)
+    assert "health" in owner.ledger.fences
+    assert not recovered
+    assert not (await owner.snapshot(Role.TEACHER)).models[0].admission
+    await owner.complete_request(permit)
+    await asyncio.wait_for(recovery, 2)
+    after = await owner.snapshot(Role.TEACHER)
+    assert recovered == [0]
+    assert after.role is Role.TEACHER
+    assert after.topology_revision > before.topology_revision
+    assert after.models[0].admission
+    with pytest.raises(ValueError, match="Static"):
+        await owner.begin_weight_update("actor")
+
+
+@pytest.mark.asyncio
+async def test_static_healthy_probe_does_not_drain_requests():
+    owner = manager()
+    owner.role = Role.GENRM
+    owner._last_health = asyncio.get_running_loop().time()
+    owner.pool.unhealthy_ranks = lambda: []
+    permit = await owner.admit_request(Role.GENRM, "default")
+    await asyncio.wait_for(owner.recover_static(), 2)
+    assert owner.ledger.permits
+    assert not owner.ledger.fences
+    await owner.complete_request(permit)
 
 
 @pytest.mark.asyncio

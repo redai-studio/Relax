@@ -54,20 +54,15 @@ class _PoolCall:
 
 
 def use_managed_rollout(args: Any) -> bool:
-    """Choose a complete task path once; unsupported consumers keep the old
-    path.
-
-    PR 2 owns auxiliary-role migration; PR 3 owns shared scoring. Custom/local
-    hooks, Agentic sessions and native engines still depend on the original
-    actor identity and are retained as complete legacy tasks in this first PR.
-    """
+    """Select engine ownership for the complete task, including auxiliary
+    roles."""
     from relax.engine.sft.runtime import is_offline_mode
 
     standard = "relax.engine.rollout.sglang_rollout.generate_rollout"
     return not (
         is_offline_mode(args)
-        or bool(getattr(args, "_genrm_instances_resolved", None))
-        or bool(getattr(args, "use_opd", False))
+        or (bool(getattr(args, "_genrm_instances_resolved", None)) and bool(getattr(args, "colocate", False)))
+        or (bool(getattr(args, "use_opd", False)) and bool(getattr(args, "colocate", False)))
         or bool(getattr(args, "use_agentic_rollout", False))
         or bool(getattr(args, "rollout_engine_class_path", None))
         or bool(getattr(args, "custom_reward_post_process_path", None))
@@ -82,3 +77,8 @@ def use_managed_rollout(args: Any) -> bool:
             getattr(dataset, "custom_generate_function_path", None) for dataset in getattr(args, "eval_datasets", [])
         )
     )
+
+
+def use_managed_auxiliary(args: Any) -> bool:
+    """Use independent ownership for non-colocated auxiliary roles."""
+    return not getattr(args, "colocate", False) and use_managed_rollout(args)

@@ -21,6 +21,8 @@ Relax supports two top-level deployment modes for GenRM:
 - **Colocate** (`--colocate`, recommended) — all roles (Actor / Rollout / GenRM) share one placement group. The Actor reclaims all GPUs during training, so GenRM GPUs are never wasted.
 - **Fully Async** (`--fully-async`) — each role has its own dedicated GPU pool. Rollout and training run fully in parallel; GenRM GPUs are dedicated and idle during training.
 
+For the standard Fully Async SGLang path, dedicated GenRM models use the common inference manager and request executor automatically; no new flag is needed. Multiple judge instances retain their separate GPU budgets and `route_key` routing. Custom lifecycle hooks and Agentic tasks retain their existing execution path. See the [GenRM API](../api/genrm.md) for the lifecycle boundary.
+
 Under `--colocate`, how Rollout and GenRM cohabit the shared bundles has three flavors — pick based on GenRM size and rollout length variance:
 
 | Sub-mode                    | Bundles                | Concurrency during inference     | Inline reward | Trigger                                                                                                        | Best for                                                                                       |

@@ -283,6 +283,11 @@ def create_genrm_manager(args, pg, runtime_env=None):
     Returns:
         Initialized GenRM manager
     """
+    from .inference_handle import use_managed_auxiliary
+
+    if use_managed_auxiliary(args):
+        return create_genrm_managers(args, pg, runtime_env)["__default__"]
+
     from .genrm import GenRMManager
 
     # `name` (with no explicit namespace) lets user code inside other actors of
@@ -330,7 +335,41 @@ def create_genrm_managers(args, pg, runtime_env=None):
     import copy
 
     from .genrm import GenRMManager
+    from .inference_handle import use_managed_auxiliary
     from .multi_instance_orchestrator import start_multi_instance_managers
+
+    if use_managed_auxiliary(args):
+        from .inference_manager import create_static_inference_manager
+
+        managers = {}
+        offset = 0
+        try:
+            for index, (key, spec) in enumerate(args._genrm_instances_resolved.items()):
+                instance_args = copy.copy(args)
+                for field in ("model_path", "num_gpus", "num_gpus_per_engine", "engine_config", "sampling_config"):
+                    setattr(instance_args, f"genrm_{field}", spec[field])
+                name = "relax_genrm_manager" if key == "__default__" else f"relax_genrm_manager_{key}"
+                managers[key] = create_static_inference_manager(
+                    instance_args,
+                    "genrm",
+                    pg,
+                    runtime_env=runtime_env,
+                    name=name,
+                    model_id=key,
+                    bundle_offset=offset,
+                    port_window_index=index,
+                )
+                offset += spec["num_gpus"]
+            return managers
+        except BaseException:
+            for manager in managers.values():
+                try:
+                    ray.get(manager.dispose.remote(), timeout=60)
+                except Exception:
+                    logger.exception("GenRM startup rollback could not confirm cleanup")
+                finally:
+                    ray.kill(manager)
+            raise
 
     instance_specs = args._genrm_instances_resolved
     if list(instance_specs.keys()) == ["__default__"]:

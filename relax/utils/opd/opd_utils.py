@@ -165,6 +165,29 @@ def create_managed_opd_teacher_manager(
 ) -> tuple[Any, list[str]]:
     import ray
 
+    from relax.distributed.ray.inference_handle import use_managed_auxiliary
+
+    if not shared_pg and use_managed_auxiliary(args):
+        from relax.distributed.ray.inference_manager import create_static_inference_manager
+
+        manager = create_static_inference_manager(
+            args,
+            "teacher",
+            runtime_env=runtime_env,
+            num_replicas=num_replicas,
+            gpus_per_replica=gpus_per_replica,
+        )
+        try:
+            urls = ray.get(manager.get_urls.remote())
+        except BaseException:
+            try:
+                ray.get(manager.dispose.remote(), timeout=60)
+            finally:
+                ray.kill(manager)
+            raise
+        args._teacher_inference_manager_handle = manager
+        return manager, urls
+
     from relax.distributed.ray.teacher_manager import TeacherManager
 
     teacher_manager = TeacherManager.options(
@@ -428,6 +451,7 @@ def shutdown_managed_opd_teacher(teacher_manager: Any) -> None:
     for mgr in managers:
         try:
             ray.get(mgr.shutdown.remote(), timeout=30)
+            ray.kill(mgr)
             logger.info("OPD teacher shut down.")
         except Exception as e:
             logger.warning(f"Failed to shut down OPD teacher: {e}")

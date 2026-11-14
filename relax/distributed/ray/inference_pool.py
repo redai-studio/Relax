@@ -1,12 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Adapt the current engine implementation without duplicating its recovery
-code.
+"""Host the Rollout engine implementation locally in engine-only mode.
 
-The legacy actor still serves unmigrated tasks. The managed path instantiates
-its implementation locally, in engine-only mode: no second Ray actor, workload
-or TransferQueue client owns the engines. This adapter is removed when the
-remaining roles no longer need the legacy implementation.
+No separate Ray manager actor, workload or TransferQueue client owns the
+engines.
 """
 
 from typing import Any

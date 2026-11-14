@@ -134,12 +134,14 @@ class InferenceRequestExecutor:
     async def snapshot(self) -> RoleSnapshot:
         return await self.manager_call("snapshot", self.role)
 
-    async def resolve(self, *, model: str | None = None, route_key: str | None = None) -> tuple[str, str, bool]:
+    async def resolve(
+        self, *, model: str | None = None, route_key: str | None = None, advance: bool = True
+    ) -> tuple[str, str, bool]:
         """Return ``(target, model_id, via_router)``, or raise
         :class:`RoutingError`."""
         snapshot = await self.snapshot()
         selected = resolve_model(snapshot, model=model, route_key=route_key)
-        target = select_target(selected, cursor=next(self._cursor)).base_url.rstrip("/")
+        target = select_target(selected, cursor=next(self._cursor) if advance else 0).base_url.rstrip("/")
         return target, selected.model_id, target == (selected.router_url or "").rstrip("/")
 
     async def admit(self, trace_id: str, *, model: str | None = None, route_key: str | None = None) -> AdmittedRequest:
@@ -148,7 +150,9 @@ class InferenceRequestExecutor:
         Raises :class:`RoutingError` when no target resolves or the Manager
         refuses the admission (503, e.g. the model is draining).
         """
-        target, model_id, via_router = await self.resolve(model=model, route_key=route_key)
+        target, model_id, via_router = await self.resolve(
+            model=model, route_key=route_key, advance=self.role is Role.ROLLOUT
+        )
         call = asyncio.ensure_future(self.manager_call("admit_request", self.role, model_id, trace_id))
         try:
             permit = await asyncio.shield(call)
@@ -162,6 +166,14 @@ class InferenceRequestExecutor:
             raise RoutingError(
                 "unavailable", "Inference request is not admitted", status_code=503, model_id=model_id
             ) from exc
+        if self.role is not Role.ROLLOUT:
+            try:
+                # Recovery may move a replica before admission. Its permit now
+                # prevents replacement: select once from the current snapshot.
+                target, _, via_router = await self.resolve(model=model_id)
+            except BaseException:
+                await self._return_unclaimed_permit(call, trace_id)
+                raise
         return AdmittedRequest(
             model_id=model_id,
             target=target,

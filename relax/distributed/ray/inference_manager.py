@@ -78,6 +78,8 @@ async def _blocking(fn: Any, *args: Any, **kwargs: Any) -> Any:
 class InferenceManager:
     def __init__(self) -> None:
         self.pool: Any = None
+        self.role = Role.ROLLOUT
+        self._last_health = 0.0
         self.placement = PlacementPlanner()
         self.ledger = AdmissionLedger()
         self.epoch = new_manager_epoch()
@@ -114,9 +116,59 @@ class InferenceManager:
             primary = next(iter(self.pool.backend.servers))
             return self.pool.backend.get_router_address(primary)
 
+    async def start_static(self, role: str, args: Any, binding: Any, options: dict[str, Any]) -> None:
+        from relax.distributed.ray.static_inference_pool import StaticInferencePool
+
+        async with self._transition:
+            if self.pool is not None or self._closing:
+                raise RuntimeError("Inference manager is already started or closed")
+            self.role = Role(role)
+            if self.role is Role.ROLLOUT:
+                raise ValueError("Static pools only support auxiliary roles")
+
+            def create_pool() -> None:
+                self.pool = StaticInferencePool(self.role, args, binding, options)
+                self.pool.record_placement(self.placement)
+
+            await _blocking(create_pool)
+            self.memory_ready = True
+            self.state = LifecycleState.READY
+            self._last_health = asyncio.get_running_loop().time()
+
+    async def recover_static(self) -> None:
+        async with self._transition:
+            if self._closing or self.pool is None:
+                raise RuntimeError("Inference manager is closed")
+            dead = await _blocking(self.pool.unhealthy_ranks)
+            self._last_health = asyncio.get_running_loop().time()
+            if not dead:
+                return
+            await self.ledger.drain("health", timeout=120)
+            self.state = LifecycleState.DRAINING
+            try:
+                await _blocking(self.pool.recover, dead)
+                placement = PlacementPlanner()
+                await _blocking(self.pool.record_placement, placement)
+                self.placement = placement
+            except BaseException:
+                self.state = LifecycleState.DEAD
+                raise
+            self.state = LifecycleState.READY
+            self._last_health = asyncio.get_running_loop().time()
+            self.ledger.fences.discard("health")
+
     async def snapshot(self, role: Role | str = Role.ROLLOUT) -> RoleSnapshot:
-        if Role(role) is not Role.ROLLOUT or self.pool is None:
+        if Role(role) is not self.role or self.pool is None:
             raise RuntimeError("Inference role is not registered")
+        if (
+            self.role is not Role.ROLLOUT
+            and not self._closing
+            and not self.ledger.fences
+            and not self._transition.locked()
+            and not self.ledger.permits
+        ):
+            if asyncio.get_running_loop().time() - self._last_health >= 5:
+                await self.recover_static()
         ready = self.memory_ready and not self.ledger.fences
         models = self.pool.observe(ready=ready, state=self.state)
         topology = tuple(
@@ -135,7 +187,7 @@ class InferenceManager:
             self._topology = topology
         names = tuple(model.model_id for model in models)
         return RoleSnapshot(
-            Role.ROLLOUT,
+            self.role,
             self.epoch,
             self.revision,
             "inference",
@@ -175,6 +227,8 @@ class InferenceManager:
     async def begin_weight_update(self, source: str) -> str:
         if self._closing or self._disposed or self.pool is None:
             raise RuntimeError("Inference manager is not running")
+        if self.role is not Role.ROLLOUT:
+            raise ValueError("Static models do not receive policy weight updates")
         token = uuid4().hex
         self._updates[token] = source
         await self.ledger.drain(token, timeout=120)
@@ -200,6 +254,35 @@ class InferenceManager:
             raise RuntimeError("Inference manager is not running")
         await _blocking(self.pool.backend._try_ci_fault_injection)
 
+    async def get_engine_hosts_ports(self) -> list[tuple[str, int]]:
+        async with self._transition:
+            return await _blocking(self.pool.backend.get_engine_hosts_ports)
+
+    async def get_genrm_engines_and_lock(self) -> Any:
+        async with self._transition:
+            return await _blocking(self.pool.backend.get_genrm_engines_and_lock)
+
+    async def shutdown(self) -> None:
+        await self.dispose()
+
+    async def get_urls(self) -> list[str]:
+        return [
+            replica.base_url + "/generate"
+            for model in (await self.snapshot(self.role)).models
+            for replica in model.replicas
+            if replica.direct_eligible
+        ]
+
+    async def health_check(self) -> bool:
+        await self.recover_static()
+        return any(model.admission for model in (await self.snapshot(self.role)).models)
+
+    async def onload(self) -> None:
+        await self.pool_call("onload")
+
+    async def offload(self) -> None:
+        await self.pool_call("offload")
+
     async def pool_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         releasing_weights = method == "set_weight_updating" and not (args[0] if args else kwargs["is_updating"])
         if self._closing and not releasing_weights and not method.startswith("cancel_"):
@@ -219,6 +302,8 @@ class InferenceManager:
     async def _pool_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if self.pool is None or self._disposed:
             raise RuntimeError("Inference manager is not running")
+        if self.role is not Role.ROLLOUT and method not in {"onload", "offload"}:
+            raise ValueError("Static models only support memory lifecycle operations")
         backend = self.pool.backend
         if method in {"offload", "onload", "onload_weights", "onload_kv"}:
             async with self._transition:
@@ -333,7 +418,12 @@ class InferenceManager:
                 try:
                     if self.pool is not None:
                         # Dead engines leave empty slots in the backend topology.
-                        engines = [engine for engine in self.pool.backend.rollout_engines if engine is not None]
+                        handles = (
+                            self.pool.backend.rollout_engines
+                            if self.role is Role.ROLLOUT
+                            else self.pool.backend.engines
+                        )
+                        engines = [engine for engine in handles if engine is not None]
                         if engines:
                             await _blocking(
                                 ray.get, [engine.abort_requests.remote() for engine in engines], timeout=10
@@ -426,3 +516,30 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
                 ray.kill(worker)
             ray.kill(manager)
         raise
+
+
+def create_static_inference_manager(
+    args: Any,
+    role: str,
+    binding: Any = None,
+    *,
+    runtime_env: Any = None,
+    name: str | None = None,
+    **pool_options: Any,
+) -> Any:
+    """Start one static model with rollback before returning its owner."""
+    from relax.core.node_group_affinity import with_control_plane_affinity
+
+    options = {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env}
+    if name is not None:
+        options["name"] = name
+    manager = InferenceManager.options(**with_control_plane_affinity(args, options)).remote()
+    try:
+        ray.get(manager.start_static.remote(role, deepcopy(args), binding, pool_options))
+    except BaseException:
+        try:
+            ray.get(manager.dispose.remote(), timeout=60)
+        finally:
+            ray.kill(manager)
+        raise
+    return manager

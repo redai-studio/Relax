@@ -21,6 +21,8 @@ Relax 中 GenRM 有两种顶层部署模式：
 - **Colocate**（`--colocate`，推荐）——所有角色（Actor / Rollout / GenRM）共用同一个 placement group。训练阶段 Actor 收回全部 GPU，因此 GenRM GPU 从不空跑。
 - **Fully Async**（`--fully-async`）——每个角色独占一份 GPU。Rollout 与训练完全并行；GenRM GPU 训练时空闲。
 
+标准 Fully Async SGLang 路径会自动通过公共推理管理器和请求执行链调用独立资源上的 GenRM，无需新增参数。多 judge 实例继续使用各自的 GPU 预算与 `route_key` 路由。自定义生命周期 hook 与 Agentic 任务保留原有执行路径，生命周期边界见 [GenRM API](../api/genrm.md)。
+
 在 `--colocate` 下，Rollout 与 GenRM 如何共用 bundle 又分三种子模式——按 GenRM 大小与 rollout 长尾情况选：
 
 | 子模式                       | Bundle 分布          | 推理期并发方式                    | Inline reward | 触发条件                                                                                                          | 适用场景                                                                             |
