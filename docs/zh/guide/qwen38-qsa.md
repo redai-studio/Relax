@@ -2,7 +2,7 @@
 
 可选的 cuDNN QSA 后端替换 Qwen3.8 mixed QSA 的长文档 Grouped attention 分支，短文档仍使用因果 Flash Attention。原有 selector 及其四 token block ID 保持不变。
 
-适配器支持 CUDA BF16、TP2 下 local 12Q/1KV、D256、CP1，以及冻结的 Stage-1 indexer，不支持 TP8 下的 local 3Q/1KV attention。Packed 输入必须携带 producer 提供的 CPU 文档边界；每篇文档独立处理 token 位置和不完整的因果尾块。
+适配器支持 CUDA BF16、D256、CP1 和冻结的 Stage-1 indexer。本地 attention 头数支持 TP1 的 24Q/2KV 和 TP2 的 12Q/1KV。Packed 输入必须携带 producer 提供的 CPU 文档边界；每篇文档独立处理 token 位置和不完整的因果尾块。
 
 ## 运行环境
 
@@ -50,7 +50,9 @@ docker build --build-arg RELAX_BASE_IMAGE='<your-cu13-blackwell-image>' \
 
 ## 选择训练入口
 
-两套脚本均使用 4 节点 × 8 GPU、48 层、global 24Q/2KV、TP2/PP4/CP1/EP8/ETP1 和 sequence parallelism，采用 BF16、GBS512/MB1、每两层一次的 full uniform recompute，以及一层 MTP。
+两套脚本默认使用 4 节点 × 8 GPU、48 层、global 24Q/2KV、TP2/PP4/CP1/EP8/ETP1 和 sequence parallelism，采用 BF16、GBS512/MB1、每两层一次的 full uniform recompute，以及一层 MTP。
+
+在任一 NV 脚本的命令末尾追加 `--tensor-model-parallel-size 1` 即可选择 TP1。Megatron 会在 TP1 下关闭 sequence parallelism。
 
 | 脚本 | 各 PP 阶段层数 | LR decay iterations | 输入 |
 | --- | --- | --- | --- |
@@ -148,9 +150,9 @@ export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
 
 | 算子 | 具体做法 | 并行配置条件 | 主要限制 | 开启方式 |
 | --- | --- | --- | --- | --- |
-| cuDNN PR1765 | 将选中的块转换为 byte mask，调用 NVIDIA QSA 算子 | **本模型要求 TP2、CP1**：TP2 后每张卡为 12Q/1KV/D256，符合当前适配器的固定输入要求；TP1/4/8 的本地头数不符合，CP>1 也不接受 | CUDA BF16；冻结 indexer、indexer loss 为 0；R4、512 列 int32 块 ID；需要额外依赖 | 通过 Mixed 设置 `MIXED_LONG_BACKEND=cudnn_pr1765`，完整配置见下文；`MIXED_FLASH_MAX_LEN=0` 可使所有文档使用 cuDNN |
+| cuDNN PR1765 | 将选中的块转换为 byte mask，调用 NVIDIA QSA 算子 | **要求 CP1**，接受 TP1 的 24Q/2KV/D256 和 TP2 的 12Q/1KV/D256 | CUDA BF16；冻结 indexer、indexer loss 为 0；R4、512 列 int32 块 ID；需要额外依赖 | 通过 Mixed 设置 `MIXED_LONG_BACKEND=cudnn_pr1765`，完整配置见下文；`MIXED_FLASH_MAX_LEN=0` 可使所有文档使用 cuDNN |
 | Grouped | 对共享同一 KV 头的 Q 头进行分组计算，将选中的块展开为 token 索引，仅访问这些 token | **要求 CP1**；本地 Q 头数能被 KV 头数整除，D256。本模型 TP1/2/4/8 的本地布局均满足头数条件，不固定要求 TP2 | 通过 Mixed 接入；CUDA BF16、冻结 indexer；反向用 FP32 atomic 累加 K/V 梯度 | Mixed 公共配置 + `MIXED_LONG_BACKEND=grouped`，将 Flash 和 Flex 上限都设为 `0` |
-| Flash | 对短文档直接执行完整的因果 attention | **要求 CP1**；通过 Grouped 路线接入时，本模型 TP1/2/4/8 满足头数条件；通过 cuDNN 路线接入时，整个入口要求 TP2，即使全部文档使用 Flash 也需满足 | 仅作为 Mixed 内部分支；不能用它替代长文档的稀疏选择；需要 Flash Attention | 通过 Mixed 的 `MIXED_FLASH_MAX_LEN` 控制，默认自动取选择预算 + 3 |
+| Flash | 对短文档直接执行完整的因果 attention | **要求 CP1**。Grouped 路线接受本模型的 TP1/2/4/8，cuDNN 路线接受 TP1/2。所有文档都走 Flash 时也会检查所选路线的头数 | 仅作为 Mixed 内部分支；不能用它替代长文档的稀疏选择；需要 Flash Attention | 通过 Mixed 的 `MIXED_FLASH_MAX_LEN` 控制，默认自动取选择预算 + 3 |
 | Triton v1 | 按 bitset 标记的稀疏块计算 attention，复用 selector 结果 | 本地 Q 头数能被 KV 头数整除，本模型 TP1/2/4/8 满足头数条件；CP1 直接计算，CP>1 由原生框架收集 Q/K/V 后计算，再切分本地输出 | CUDA、R4、D 为 64/128/256；selection 为单行；非 THD 输入要求 batch=1；不满足条件时回退到 Flex | `MCORE_QSA_SPARSE_BACKEND=flex`、`FUSED_ATTENTION=triton` |
 | Triton v2 | 沿用 v1 的选择结果，调整循环、tile 和反向计算 | TP 和 CP 条件与 v1 相同：不固定为 TP2；CP>1 通过框架处理通信 | 同 v1 | `MCORE_QSA_SPARSE_BACKEND=flex`、`FUSED_ATTENTION=triton_v2` |
 | Triton v3 | 沿用 v2 前向，反向可共享 FP32 dS，减少重复计算 | TP 和 CP 条件与 v1 相同；使用 CP local-query 时不启用共享 dS 优化，仍保留常规反向路径 | 同 v1；共享 dS 另限 SM103/BF16/D256、Q/K 长度不超过 128K，并受地址范围和临时显存限制；不满足时使用常规反向路径 | `MCORE_QSA_SPARSE_BACKEND=flex`、`FUSED_ATTENTION=triton_v3` |
@@ -164,7 +166,7 @@ export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
 - **原生与 Mixed 的区别**：原生 `id_sparse` 可接原生 CP 流程；设置 `COMMUNITY_BACKEND=mixed` 后，同一入口的计算由 Mixed 替换，必须遵守 CP1 限制。
 - **CP**：原生路径在 CP>1 时先汇集完整 Q/K/V，计算完成后切分为本地输出。Flex/Triton 可配合 `LOCAL_QUERY=1` 只保留本地 Q、汇集 K/V，但要求 THD、CUDA、R4 bitset 和冻结的 Stage-1 indexer 等条件；不满足时回退到原生路径。Mixed 当前只允许 CP1。
 - **SP**：selector 会按 TP group 汇集序列。SP 不改变表中的本地 attention 头数要求；可选 TP selector 只用于 Mixed，并要求汇集后的序列长度能被 TP 整除。
-- **PP / EP**：分别负责层分配和 MoE 通信，不由 QSA 算子决定。表中的条件是算子和适配层条件；TP1/2/4/8 满足头数要求不代表完整训练拓扑已经验证；使用 HybridEP 时还要满足其拓扑检查。
+- **PP / EP**：分别负责层分配和 MoE 通信。Qwen3.8 Mixed 使用 HybridEP 时，需要 CP1、ETP1、EP4 或 EP8，以及可整除的总 rank 数。EP×ETP 组的 rank 必须在同一台主机上且互相可访问，加载的模块和安装包必须匹配 `RELAX_HYBRID_EP_COMMIT`。
 
 ### Mixed 几何与文档长度分流
 
@@ -181,9 +183,9 @@ export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
 | Mixed 长文档后端 | 本地 attention 条件 | 对 global 24Q/2KV/D256 模型的含义 |
 | --- | --- | --- |
 | `grouped` | Q/KV 头数为正，Q 能被 KV 整除，D256 | TP1/2/4/8 分别得到 24Q/2KV、12Q/1KV、6Q/1KV、3Q/1KV，均能通过几何检查 |
-| `cudnn_pr1765` | 仅接受 **12Q/1KV/D256** | 当前应使用 TP2；即使 batch 中全是短文档，也会先检查此限制 |
+| `cudnn_pr1765` | **24Q/2KV/D256** 和 **12Q/1KV/D256** | 分别对应 TP1 和 TP2。仅含短文档的 batch 也适用此检查 |
 
-TP4/8 时，模型投影层会在 TP rank 之间共享 KV 组。上表说明代码允许的头数布局，不是完整训练验证记录。cuDNN 路线遇到不支持的布局会报错，不会自动换成 Grouped。
+TP4/8 时，模型投影层会在 TP rank 之间共享 KV 组。对 TP4 的 6Q/1KV 或 TP8 的 3Q/1KV，设置 `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped`。
 
 #### 按单篇文档长度分流
 

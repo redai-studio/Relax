@@ -98,7 +98,7 @@ The [projection patch][projection] gathers projection shards when query groups a
 
 ### MoE topology and recomputation are separate contracts
 
-[HybridEP preflight][hybrid] runs only for the HybridEP dispatcher. Its Qwen3.8 layouts allow TP2 **or TP8**, PP4/CP1/EP8/ETP1/world32. The other listed TP1/PP2/CP4/EP4/world16 layout belongs to the Qwen3.6 recipe; it does not establish mixed QSA CP4 support. Preflight requires an EP×ETP group of distinct ranks on one hostname, the expected accessible-peer count on every member, an installed package matching `RELAX_HYBRID_EP_COMMIT` and module provenance. Forced accessible-rank overrides are rejected. Thus TP1/TP4 local geometry does not imply acceptance by this Qwen3.8 HybridEP configuration.
+[HybridEP preflight][hybrid] checks the MoE dispatcher independently of QSA. For Qwen3.8 Mixed, use CP1, ETP1, and EP4 or EP8 with a compatible world size. The EP×ETP group must contain distinct ranks on one host, and every member must see the expected number of peers. The installed package and loaded modules must match `RELAX_HYBRID_EP_COMMIT`.
 
 `RELAX_QWEN38_QSA_RECOMPUTE_REPLAY=1` caches frozen selection/mask/plan metadata on an **invocation-local** checkpoint tape. Trainable indexers use the ordinary path; K/V remain differentiable. It is distinct from `RELAX_QWEN38_RETAIN_QSA_ATTENTION=1`, which retains attention and checkpoints the MLP. The latter's [guard][retain] is deliberately narrow: BF16, full/uniform/one-layer recomputation, TP8/PP4/CP1/EP8/ETP1; no FP8/FP4, activation offload, distributed saved activations, VPP or CUDA graphs, with validated layer owners and frozen indexers. These are optimization guards, not universal QSA limits.
 
@@ -111,9 +111,9 @@ Mixed QSA requires CUDA BF16, D256, CP1, and a frozen Stage-1 indexer. Local hea
 | Long backend | Accepted local geometry |
 | --- | --- |
 | `grouped` | Positive Q and KV head counts with Q divisible by KV, including 12Q/1KV, 24Q/2KV, 6Q/1KV, and 3Q/1KV; these examples are not a whitelist |
-| `cudnn_pr1765` | The current Relax adapter accepts only 12Q/1KV/D256, including batches containing only short documents |
+| `cudnn_pr1765` | 24Q/2KV/D256 (TP1) and 12Q/1KV/D256 (TP2), including batches routed entirely to Flash |
 
-The framework default for `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND` is `grouped`; the NV example scripts below select `cudnn_pr1765`. For layouts such as 24Q/2KV, 6Q/1KV, or 3Q/1KV, explicitly set `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped`. An unsupported NV layout raises an error before execution; it does not fall back to Grouped. Capabilities of the pinned NVIDIA package do not expand the geometry accepted by the current Relax adapter.
+The framework defaults to `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped`. The NV recipes select `cudnn_pr1765`. Use `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped` for local 6Q/1KV (TP4) or 3Q/1KV (TP8).
 
 Passing the local geometry check does not establish GPU output/gradient correctness or validate a complete TP/CP/EP training topology. Megatron and HybridEP topology constraints still apply. Packed inputs require the producer's CPU document boundaries; token positions and the incomplete causal tail remain local to each document.
 
@@ -225,7 +225,9 @@ The build and import checks cover dependency resolution, the selected CuTeDSL ve
 
 ## Select the recipe
 
-Both recipes use 4 nodes × 8 GPUs, 48 layers, global 24Q/2KV heads, TP2/PP4/CP1/EP8/ETP1 with sequence parallelism, BF16, GBS512/MB1, full uniform recomputation over two layers and one MTP layer.
+Both recipes default to 4 nodes × 8 GPUs, 48 layers, global 24Q/2KV heads, TP2/PP4/CP1/EP8/ETP1 with sequence parallelism, BF16, GBS512/MB1, full uniform recomputation over two layers and one MTP layer.
+
+To select TP1, append `--tensor-model-parallel-size 1` to either NV recipe. Megatron disables sequence parallelism at TP1.
 
 | Recipe | Pipeline layer counts | LR decay iterations | Input |
 | --- | --- | --- | --- |
