@@ -131,7 +131,11 @@ def get_responses(
     raw_score_centering = (
         not apply_temperature and algorithm is not None and algorithm.policy_loss_fn == "score_centering"
     )
-    if raw_score_centering or (is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)):
+    # SFT chunked path (--sft-chunked-logits) feeds hidden_states (bf16) into
+    # this slicer — slicing itself is dtype-agnostic; that caller casts to fp32
+    # per sub-chunk. All other paths (RL, SFT legacy logits, SFT eval PPL)
+    # produce real fp32 logits and must stay strict.
+    if raw_score_centering or (is_sft_mode(args) and args.sft_chunked_logits):
         assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
     else:
         assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -250,7 +254,7 @@ def get_responses(
         if (
             apply_temperature
             and args.rollout_temperature != 1.0
-            and not (is_sft_mode(args) and getattr(args, "sft_chunked_logits", False))
+            and not (is_sft_mode(args) and args.sft_chunked_logits)
         ):
             logits_chunk = logits_chunk / args.rollout_temperature
 
@@ -1880,7 +1884,7 @@ def loss_function(
             case "sft":
                 if getattr(args, "task_type", "causal_lm") == "seq_cls":
                     func = sequence_classification_loss_function
-                elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
+                elif args.sft_chunked_logits and lm_head_forward is not None:
                     # Bind lm_head_forward so chunked path matches the standard
                     # inner-func signature; outer body (recompute, CP guard,
                     # Megatron scaling, return-tuple) is then shared with legacy.

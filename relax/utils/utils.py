@@ -491,7 +491,7 @@ def post_process_env(args, env):
     # Dynamic-batch streaming ends via the producer's is_last signal, not a
     # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
     # The non-dynamic path still pre-allocates the exact count for its .all() check.
-    if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
+    if args.fully_async and getattr(args, "use_dynamic_batch_size", False):
         env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(
             args.rollout_batch_size * args.n_samples_per_prompt
         )  ## * args.max_num_agents

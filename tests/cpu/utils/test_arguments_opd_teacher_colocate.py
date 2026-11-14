@@ -181,6 +181,7 @@ def _opd_args() -> SimpleNamespace:
         colocate=False,
         hybrid=False,
         fully_async=False,
+        sft_chunked_logits=False,
     )
 
 

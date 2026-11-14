@@ -123,11 +123,11 @@ def validate_preference_args(args: Namespace) -> None:
         raise ValueError("preference objectives v1 do not support dynamic context parallelism")
     if getattr(args, "qkv_format", "thd") != "thd":
         raise ValueError("preference objectives v1 require --qkv-format thd")
-    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+    if args.fully_async or getattr(args, "hybrid", False):
         raise ValueError("preference objectives v1 support synchronous offline training only")
     if not getattr(args, "use_gloo_process_groups", False):
         raise ValueError("preference objectives require --use-gloo-process-groups for DP iterator control data")
-    if getattr(args, "sft_chunked_logits", False) or getattr(args, "enable_mtp_training", False):
+    if args.sft_chunked_logits or getattr(args, "enable_mtp_training", False):
         raise ValueError("preference objectives v1 do not support SFT chunked logits or MTP")
     if getattr(args, "calculate_per_token_loss", False):
         raise ValueError("preference objectives use pair reduction and reject --calculate-per-token-loss")
@@ -198,7 +198,7 @@ def should_bypass_main_output_layer(args: Namespace) -> bool:
 def should_use_sft_chunked(args: Namespace) -> bool:
     """Return whether regular SFT explicitly enabled chunked language-model
     logits."""
-    return is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)
+    return is_sft_mode(args) and args.sft_chunked_logits
 
 
 def sft_partition_prefix(args: Namespace) -> str:
