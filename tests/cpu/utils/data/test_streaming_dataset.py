@@ -1012,6 +1012,87 @@ class TestStreamingDataset:
                 if os.path.exists(path):
                     os.unlink(path)
 
+    def test_parquet_column_projection_and_custom_prompt_fallback(self, tmp_path, mock_tokenizer, monkeypatch):
+        """Verify Parquet projection keeps MOPD keys and falls back safely."""
+        pa = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+
+        from relax.utils.data.data import Dataset
+        from relax.utils.data.streaming_dataset import StreamingDataset, StreamingReader
+
+        rows = [
+            {"text": "q0", "data_source": "math", "extra_hint": "hint0", "unused_blob": "x" * 64},
+            {"text": "q1", "data_source": "code", "extra_hint": "hint1", "unused_blob": "y" * 64},
+        ]
+        parquet_path = tmp_path / "rl.parquet"
+        pq.write_table(pa.Table.from_pylist(rows), parquet_path)
+
+        recorded_columns: list = []
+        orig_read_row_group = pq.ParquetFile.read_row_group
+
+        def spy_read_row_group(pf_self, i, columns=None, *args, **kwargs):
+            recorded_columns.append(columns)
+            return orig_read_row_group(pf_self, i, columns=columns, *args, **kwargs)
+
+        monkeypatch.setattr(pq.ParquetFile, "read_row_group", spy_read_row_group)
+
+        streaming_ds = StreamingDataset(
+            path=str(parquet_path),
+            tokenizer=mock_tokenizer,
+            processor=None,
+            max_length=None,
+            prompt_key="text",
+        )
+        sample0 = streaming_ds[0]
+        assert recorded_columns == [["text", "data_source"]]
+        assert sample0.prompt == "q0"
+        assert sample0.metadata["data_source"] == "math"
+        assert "unused_blob" not in streaming_ds.reader[0]
+
+        recorded_columns.clear()
+        eager_ds = Dataset(
+            path=str(parquet_path),
+            tokenizer=mock_tokenizer,
+            processor=None,
+            max_length=None,
+            prompt_key="text",
+        )
+        assert recorded_columns == [["text", "data_source"]]
+        assert eager_ds[1].metadata["data_source"] == "code"
+
+        recorded_columns.clear()
+        custom_ds = StreamingDataset(
+            path=str(parquet_path),
+            tokenizer=mock_tokenizer,
+            processor=None,
+            max_length=None,
+            prompt_key="text",
+            custom_prompt_func=lambda prompt, row: f"{prompt}:{row['extra_hint']}",
+        )
+        assert custom_ds[0].prompt == "q0:hint0"
+        assert recorded_columns == [None]
+
+        recorded_columns.clear()
+        source_ds = StreamingDataset(
+            path=str(parquet_path),
+            tokenizer=mock_tokenizer,
+            processor=None,
+            max_length=None,
+            prompt_key="text",
+            record_source=True,
+        )
+        assert source_ds[0].agentic_prompt_source["input_payload"]["unused_blob"] == "x" * 64
+        assert recorded_columns == [None]
+
+        recorded_columns.clear()
+        fallback_reader = StreamingReader(
+            str(parquet_path),
+            columns=("missing_prompt", "metadata"),
+            required_columns=("missing_prompt",),
+        )
+        assert set(fallback_reader[0].keys()) == {"text", "data_source", "extra_hint", "unused_blob"}
+        assert recorded_columns == [None]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

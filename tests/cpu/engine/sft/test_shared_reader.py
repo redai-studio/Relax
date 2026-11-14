@@ -233,3 +233,117 @@ def test_repeated_bootstrap_rebuilds_offsets_for_new_runtime(tmp_path, published
     assert len(first[str(path)]) == 4
     assert len(second[str(path)]) == 8
     assert len(published) == 2
+
+
+def test_sft_and_preference_parquet_column_projection(tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    from relax.engine.sft.dataset.preference import PreferenceStreamingDataset
+
+    recorded_columns: list = []
+    orig_read_row_group = pq.ParquetFile.read_row_group
+
+    def spy_read_row_group(pf_self, i, columns=None, *args, **kwargs):
+        recorded_columns.append(columns)
+        return orig_read_row_group(pf_self, i, columns=columns, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", spy_read_row_group)
+
+    sft_path = tmp_path / "sft.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": "hello"},
+                    ],
+                    "message_loss_mask": [0, 1],
+                    "unused_blob": "drop_me",
+                }
+            ]
+        ),
+        sft_path,
+    )
+    sft_ds = SFTStreamingDataset(str(sft_path), prompt_key="messages", prefetch_max_cached=0)
+    try:
+        canonical = sft_ds.get_canonical_sample(0)
+        assert recorded_columns == [["messages", "message_loss_mask"]]
+        assert [m.learn for m in canonical.messages] == [False, True]
+    finally:
+        sft_ds.stop()
+
+    recorded_columns.clear()
+    bad_ds = SFTStreamingDataset(str(sft_path), prompt_key="wrong_key", prefetch_max_cached=0)
+    try:
+        with pytest.raises(ValueError, match="unused_blob"):
+            bad_ds.get_canonical_sample(0)
+        assert recorded_columns == [None]
+    finally:
+        bad_ds.stop()
+
+    recorded_columns.clear()
+    cpt_path = tmp_path / "cpt.parquet"
+    pq.write_table(pa.Table.from_pylist([{"text": "corpus doc", "unused_blob": "drop_me"}]), cpt_path)
+    cpt_ds = SFTStreamingDataset(
+        str(cpt_path),
+        prompt_key="auto",
+        training_mode="cpt",
+        require_response=False,
+        prefetch_max_cached=0,
+    )
+    try:
+        assert cpt_ds.get_canonical_sample(0).messages[0].content == "corpus doc"
+        assert recorded_columns == [["text"]]
+    finally:
+        cpt_ds.stop()
+
+    recorded_columns.clear()
+    bad_cpt_path = tmp_path / "bad_cpt.parquet"
+    pq.write_table(
+        pa.Table.from_pylist([{"text": "corpus doc", "images": ["img.png"], "unused_blob": "drop_me"}]),
+        bad_cpt_path,
+    )
+    bad_cpt_ds = SFTStreamingDataset(
+        str(bad_cpt_path),
+        prompt_key="auto",
+        training_mode="cpt",
+        require_response=False,
+        prefetch_max_cached=0,
+    )
+    try:
+        with pytest.raises(ValueError, match="text-only CPT does not support 'images'"):
+            bad_cpt_ds.get_canonical_sample(0)
+        assert recorded_columns == [["text", "images"]]
+    finally:
+        bad_cpt_ds.stop()
+
+    recorded_columns.clear()
+    pref_path = tmp_path / "pref.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "chosen": [
+                        {"role": "user", "content": "q"},
+                        {"role": "assistant", "content": "good"},
+                    ],
+                    "rejected": [
+                        {"role": "user", "content": "q"},
+                        {"role": "assistant", "content": "bad"},
+                    ],
+                    "unused_blob": "drop_me",
+                }
+            ]
+        ),
+        pref_path,
+    )
+    pref_ds = PreferenceStreamingDataset(str(pref_path), prefetch_max_cached=0)
+    try:
+        pair = pref_ds.get_canonical_pair(0)
+        assert pair.chosen.content == "good"
+        assert pair.rejected.content == "bad"
+        assert recorded_columns == [["chosen", "rejected"]]
+    finally:
+        pref_ds.stop()

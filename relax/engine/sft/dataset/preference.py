@@ -230,7 +230,11 @@ class PreferenceStreamingDataset:
             raise ValueError("oversize_strategy='custom' requires oversize_custom_fn")
         self.oversize_strategy = oversize_strategy
         self.oversize_custom_fn = oversize_custom_fn
-        self.reader = _build_reader(path)
+        self.reader = _build_reader(
+            path,
+            columns=(prompt_key, chosen_key, rejected_key, metadata_key),
+            required_columns=(chosen_key, rejected_key),
+        )
         self.index_manager = IndexManager(len(self.reader), seed=seed)
         self.tokenizer = tokenizer
         self.prompt_key = prompt_key

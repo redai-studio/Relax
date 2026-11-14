@@ -27,7 +27,7 @@ import os
 import re
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 import tqdm
@@ -49,6 +49,8 @@ __all__ = [
     "BaseDataset",
     "read_file",
     "parse_generalized_path",
+    "resolve_base_dataset_columns",
+    "resolve_parquet_columns",
     "resolve_path_plan",
     "build_messages",
     "collect_message_multimodal_data",
@@ -725,7 +727,78 @@ def resolve_path_plan(path: Any) -> tuple[list[str], Optional[slice]]:
     return _normalize_paths(path), None
 
 
-def _build_reader_for_path(path: str, *, with_source: bool = False):
+def resolve_parquet_columns(
+    schema_names: Sequence[str],
+    columns: Optional[Sequence[str]],
+    required_columns: Optional[Sequence[str]] = None,
+) -> Optional[list[str]]:
+    """Resolve projected top-level Parquet columns against file schema.
+
+    Falls back to ``None`` (read all columns) when projection is disabled, any
+    required column is missing from the schema, or all schema columns are
+    already selected.
+    """
+    if columns is None:
+        return None
+
+    schema_unique = list(dict.fromkeys(schema_names))
+    schema_set = set(schema_unique)
+    if required_columns:
+        for col in required_columns:
+            if col and col not in schema_set:
+                return None
+
+    wanted = {col for col in columns if col}
+    selected = [name for name in schema_unique if name in wanted]
+    if not selected or len(selected) == len(schema_unique):
+        return None
+    return selected
+
+
+def resolve_base_dataset_columns(
+    *,
+    prompt_key: str,
+    multimodal_keys: Optional[dict] = None,
+    label_key: Optional[str] = None,
+    tool_key: Optional[str] = None,
+    metadata_key: Optional[str] = "metadata",
+    custom_prompt_func: Optional[Callable[[Any, dict], Any]] = None,
+    teacher_prompt_key: Optional[str] = None,
+    teacher_multimodal_keys: Optional[dict] = None,
+    record_source: bool = False,
+) -> tuple[Optional[tuple[str, ...]], Optional[tuple[str, ...]]]:
+    """Derive projected and required Parquet columns for BaseDataset
+    subclasses."""
+    if custom_prompt_func is not None or record_source:
+        return None, None
+
+    candidate_cols: list[str] = [prompt_key]
+    required_cols: list[str] = [prompt_key]
+    if label_key:
+        candidate_cols.append(label_key)
+        required_cols.append(label_key)
+    if tool_key:
+        candidate_cols.append(tool_key)
+    if metadata_key:
+        candidate_cols.append(metadata_key)
+    candidate_cols.append("data_source")
+    if multimodal_keys:
+        candidate_cols.extend(col for col in multimodal_keys.values() if col)
+    if teacher_prompt_key:
+        candidate_cols.append(teacher_prompt_key)
+    if teacher_multimodal_keys:
+        candidate_cols.extend(col for col in teacher_multimodal_keys.values() if col)
+
+    return tuple(dict.fromkeys(candidate_cols)), tuple(dict.fromkeys(required_cols))
+
+
+def _build_reader_for_path(
+    path: str,
+    *,
+    with_source: bool = False,
+    columns: Optional[Sequence[str]] = None,
+    required_columns: Optional[Sequence[str]] = None,
+):
     path, row_slice = parse_generalized_path(path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Prompt dataset path '{path}' does not exist.")
@@ -760,6 +833,7 @@ def _build_reader_for_path(path: str, *, with_source: bool = False):
 
         def parquet_reader(p):
             pf = pq.ParquetFile(p)
+            effective_columns = resolve_parquet_columns(pf.schema_arrow.names, columns, required_columns)
 
             # Read row groups individually instead of using iter_batches().
             # iter_batches() creates chunked arrays for multi-row-group files,
@@ -767,7 +841,7 @@ def _build_reader_for_path(path: str, *, with_source: bool = False):
             # (e.g. list<struct<...>>, struct<...>).
             row_id = 0
             for i in range(pf.metadata.num_row_groups):
-                for data in pf.read_row_group(i).to_pylist():
+                for data in pf.read_row_group(i, columns=effective_columns).to_pylist():
                     if with_source:
                         from relax.utils.agentic_obs.source import SourceRow
 
@@ -783,7 +857,13 @@ def _build_reader_for_path(path: str, *, with_source: bool = False):
     raise ValueError(f"Unsupported file format: {path}. Supported formats are .jsonl and .parquet.")
 
 
-def read_file(path: str, *, with_source: bool = False):
+def read_file(
+    path: str,
+    *,
+    with_source: bool = False,
+    columns: Optional[Sequence[str]] = None,
+    required_columns: Optional[Sequence[str]] = None,
+):
     """Read data from JSONL or Parquet files.
 
     # Supports path with slice notation like 'file.jsonl@[0:100]'.
@@ -793,12 +873,22 @@ def read_file(path: str, *, with_source: bool = False):
 
     Args:
         path: Path to data file (JSONL or Parquet)
+        columns: Optional top-level column whitelist for Parquet files
+        required_columns: Optional columns that must exist for projection to apply
 
     Yields:
         Parsed data dictionaries
     """
     paths, row_slice = resolve_path_plan(path)
-    reader = itertools.chain.from_iterable(_build_reader_for_path(item, with_source=with_source) for item in paths)
+    reader = itertools.chain.from_iterable(
+        _build_reader_for_path(
+            item,
+            with_source=with_source,
+            columns=columns,
+            required_columns=required_columns,
+        )
+        for item in paths
+    )
 
     if row_slice is not None:
         logger.info("read_file paths=%s applying slice row_slice=%s", paths, row_slice)

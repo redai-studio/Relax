@@ -483,6 +483,48 @@ def _build_canonical_sample_from_row(
     )
 
 
+_CPT_TEXT_ONLY_GUARD_COLUMNS = ("images", "image", "videos", "video", "audios", "audio", "tools")
+
+
+def _resolve_sft_projected_columns(
+    *,
+    prompt_key: str,
+    label_key: str | None,
+    multimodal_keys: dict[str, str] | None,
+    metadata_key: str | None,
+    tool_key: str | None,
+    training_mode: str,
+    cpt_template: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Derive projected and required Parquet columns for SFT and CPT modes."""
+    if training_mode == "cpt" and cpt_template != "multimodal":
+        if prompt_key == "auto":
+            text_cols: tuple[str, ...] = ("text", "messages")
+            required_cols: tuple[str, ...] = ()
+        elif prompt_key == "input":
+            text_cols = ("input", "text", "messages")
+            required_cols = ()
+        else:
+            text_cols = (prompt_key,)
+            required_cols = (prompt_key,)
+        candidate_cols = (*text_cols, *_CPT_TEXT_ONLY_GUARD_COLUMNS)
+        return tuple(dict.fromkeys(candidate_cols)), required_cols
+
+    candidates: list[str] = [prompt_key]
+    required: list[str] = [prompt_key]
+    if label_key:
+        candidates.append(label_key)
+        required.append(label_key)
+    if tool_key:
+        candidates.append(tool_key)
+    if metadata_key:
+        candidates.append(metadata_key)
+    if multimodal_keys:
+        candidates.extend(col for col in multimodal_keys.values() if col)
+    candidates.extend(("message_loss_mask", "_sample_id"))
+    return tuple(dict.fromkeys(candidates)), tuple(dict.fromkeys(required))
+
+
 def _build_reader(path: str | list[str] | tuple[str, ...], **reader_kwargs: Any):
     if isinstance(path, str) and Path(path).suffix.lower() in {".yaml", ".yml"}:
         from relax.engine.sft.dataset.mixture import WeightedMixtureStreamingReader
@@ -691,7 +733,21 @@ class SFTStreamingDataset:
         self._first_error: BaseException | None = None
         self._error_lock = threading.Lock()
 
-        self.reader = _build_reader(path, line_offsets_cache=line_offsets_cache)
+        columns, required_columns = _resolve_sft_projected_columns(
+            prompt_key=self.prompt_key,
+            label_key=self.label_key,
+            multimodal_keys=self.multimodal_keys,
+            metadata_key=self.metadata_key,
+            tool_key=self.tool_key,
+            training_mode=self.training_mode,
+            cpt_template=self.cpt_template,
+        )
+        self.reader = _build_reader(
+            path,
+            line_offsets_cache=line_offsets_cache,
+            columns=columns,
+            required_columns=required_columns,
+        )
         self.index_manager = IndexManager(len(self.reader), seed=seed)
 
         self._prefetch: PrefetchBuffer | None = None
