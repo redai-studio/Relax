@@ -113,7 +113,7 @@ def _validated_source(source: str, patch: str, target: str, extra_patches: tuple
 
 
 @lru_cache(maxsize=None)
-def patched_source(target: str, *, include_per_position: bool = False) -> str:
+def patched_source(target: str) -> str:
     explicit = os.environ.get("SGLANG_SOURCE_DIR")
     if explicit:
         root = Path(explicit).expanduser()
@@ -130,12 +130,9 @@ def patched_source(target: str, *, include_per_position: bool = False) -> str:
     source_path = package / target.removeprefix("python/sglang/")
     try:
         source = source_path.read_bytes().decode("utf-8")
-        patches = [PATCH_PATH.read_text()]
-        if include_per_position:
-            patches.append((PATCH_PATH.parent.parent / "latest/sglang_per_pos_topk.patch").read_text())
-            header = f"diff --git a/{target} b/{target}\n"
-            patches = [patch for patch in patches if header in patch]
-        return _validated_source(source, patches[0], target, tuple(patches[1:]))
+        # The versioned 0.5.21 patch already includes per-position logprobs;
+        # do not overlay latest/sglang_per_pos_topk.patch a second time.
+        return _validated_source(source, PATCH_PATH.read_text(), target)
     except (OSError, AssertionError) as error:
         message = f"Target SGLang source validation failed at {source_path}: {error}"
         if explicit:

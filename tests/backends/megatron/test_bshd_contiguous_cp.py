@@ -34,6 +34,10 @@ def _load_functions(path: str, names: set[str], namespace: dict[str, Any]) -> di
 
 
 def _runtime(cp_size: int, cp_rank: int, tp_size: int = 1) -> tuple[dict[str, Any], dict[str, Any]]:
+    from relax.backends.megatron.qsa_layout_metadata import bind_physical_layout
+    from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
+    from relax.utils.env import Envs
+
     mpu = SimpleNamespace(
         get_context_parallel_world_size=lambda: cp_size,
         get_context_parallel_rank=lambda: cp_rank,
@@ -62,6 +66,10 @@ def _runtime(cp_size: int, cp_rank: int, tp_size: int = 1) -> tuple[dict[str, An
             "PrepackedBatch": type("PrepackedBatch", (dict,), {}),
             "PackedSeqParams": SimpleNamespace,
             "move_tensors_to_device": lambda batch, device: batch,
+            "Envs": Envs,
+            "bind_physical_layout": bind_physical_layout,
+            "is_sft_mode": is_sft_mode,
+            "is_preference_mode": is_preference_mode,
         },
     )
     loss = _load_functions(
@@ -95,6 +103,7 @@ def _post_process(
         {
             "torch": torch,
             "mpu": data["mpu"],
+            "Envs": data["Envs"],
             "device_utils": SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
             "is_sft_mode": lambda args: False,
             "iter_opd_cp_float_fields": lambda: ("teacher_log_probs",),
@@ -436,6 +445,8 @@ def test_bshd_contiguous_cp1_redistribution_is_noop() -> None:
 def test_bshd_empty_contiguous_cp_checkpoint_keeps_loss_grad_and_detaches_metrics(
     cp_rank: int, with_grad: bool
 ) -> None:
+    from relax.utils.training.ppo_utils import calculate_log_probs_and_entropy
+
     _, loss = _runtime(2, cp_rank)
     args = SimpleNamespace(qkv_format="bshd", allgather_cp=True, rollout_temperature=1.0, entropy_coef=0.0)
     logits = torch.arange(cp_rank * 8, (cp_rank + 1) * 8).float().view(1, 8, 1).requires_grad_()
@@ -452,7 +463,7 @@ def test_bshd_empty_contiguous_cp_checkpoint_keeps_loss_grad_and_detaches_metric
     loss["dist"].nn.all_reduce = all_reduce
 
     def compute_loss(model_logits: torch.Tensor) -> torch.Tensor:
-        chunk, _ = next(
+        chunk, targets = next(
             loss["get_responses"](
                 model_logits,
                 args=args,
@@ -462,8 +473,12 @@ def test_bshd_empty_contiguous_cp_checkpoint_keeps_loss_grad_and_detaches_metric
                 max_seq_lens=[16],
             )
         )
-        # Match calculate_log_probs_and_entropy's detached empty-result branch.
-        log_probs = chunk[:, 0] if len(chunk) else chunk.new_zeros((0,))
+        if len(chunk):
+            log_probs = chunk[:, 0]
+        else:
+            # Exercise the production empty-shard path, including its graph
+            # connection required by the differentiable CP redistribution.
+            log_probs, _ = calculate_log_probs_and_entropy(chunk, targets, tp_group=None)
         values = {"log_probs": [log_probs], "entropy": [log_probs.detach()]}
         loss["_allgather_cp_redistribute"](
             values,

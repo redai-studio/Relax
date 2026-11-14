@@ -1,227 +1,21 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Test session methods from the complete patched SGLang source."""
+"""Exercise tensor LoRA and weight-update completion from the shipped patch."""
 
 from __future__ import annotations
 
 import ast
-import asyncio
 import unittest
 from contextlib import nullcontext
 from functools import lru_cache
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, Mock, call, patch
+from unittest.mock import MagicMock, Mock, call
 
 from tests.tools.sglang_patch_source import PATCH_PATH, patched_functions
 
 
-CONTROL_PATH = "python/sglang/srt/managers/tokenizer_control_mixin.py"
-MANAGER_PATH = "python/sglang/srt/managers/tokenizer_manager.py"
-SCHEDULER_PATH = "python/sglang/srt/managers/scheduler_components/weight_updater.py"
 LORA_PATH = "python/sglang/multimodal_gen/runtime/pipelines_core/lora/pipeline.py"
-CONTROL_METHODS = {
-    "_weight_update_session_call",
-    "begin_weight_update",
-    "end_weight_update",
-    "_ensure_relax_weight_update_session_locked",
-    "_finish_relax_weight_update_session_locked",
-    "_relax_update_weights_locked",
-    "update_weights_from_distributed",
-    "update_weights_from_tensor",
-    "post_process_weights",
-    "release_memory_occupation",
-    "resume_memory_occupation",
-}
-
-
-class _FanOut:
-    @staticmethod
-    def merge_results(results: list[SimpleNamespace]) -> tuple[bool, str]:
-        return all(result.success for result in results), "; ".join(result.message for result in results)
-
-
-class _Request(SimpleNamespace):
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(selector=kwargs.pop("selector", "all"), **kwargs)
-
-
-@lru_cache(maxsize=1)
-def _manager_class() -> type[Any]:
-    methods = patched_functions(CONTROL_PATH, CONTROL_METHODS)
-    methods += patched_functions(MANAGER_PATH, {"continue_generation"})
-    module = ast.parse("from __future__ import annotations\nclass Manager:\n    pass\n")
-    manager_class = module.body[1]
-    assert isinstance(manager_class, ast.ClassDef)
-    manager_class.body = methods
-    ast.fix_missing_locations(module)
-    namespace = {
-        "FanOutCommunicator": _FanOut,
-        "BeginWeightUpdateReqInput": _Request,
-        "EndWeightUpdateReqInput": _Request,
-        "get_parallel": lambda: SimpleNamespace(dp_size=1, enable_dp_attention=False),
-        "normalize_serialized_named_tensor_payloads": lambda values: values,
-    }
-    exec(compile(module, str(PATCH_PATH), "exec"), namespace)
-    return namespace["Manager"]
-
-
-def _manager() -> Any:
-    manager = _manager_class()()
-    manager.is_pause = True
-    manager.is_pause_cond = asyncio.Condition()
-    manager.model_update_lock = SimpleNamespace(writer_lock=asyncio.Lock())
-    manager._relax_weight_update_session = None
-    manager._relax_weight_update_selector = None
-    manager._relax_weight_update_error = None
-    manager._relax_weight_update_has_bucket = False
-    manager.mm_processor = None
-    manager.events = []
-    manager.server_open = False
-    manager.auto_create_handle_loop = lambda: None
-    manager.abort_request = lambda **kwargs: None
-    manager._update_weight_version_if_provided = lambda value: manager.events.append(("version", value))
-
-    async def begin(request: _Request) -> list[SimpleNamespace]:
-        manager.events.append(("begin", request.selector))
-        if manager.server_open:
-            return [SimpleNamespace(success=False, message="already open")]
-        manager.server_open = True
-        return [SimpleNamespace(success=True, message="Success")]
-
-    async def end(request: _Request) -> list[SimpleNamespace]:
-        manager.events.append(("end", None))
-        if not manager.server_open:
-            return [SimpleNamespace(success=False, message="not open")]
-        manager.server_open = False
-        return [SimpleNamespace(success=True, message="Success")]
-
-    async def update(request: _Request) -> list[SimpleNamespace]:
-        manager.events.append(("bucket", request.selector))
-        return [
-            SimpleNamespace(
-                success=manager.server_open,
-                message="Success" if manager.server_open else "must run between begin/end",
-            )
-        ]
-
-    async def dispatch(request: _Request) -> None:
-        manager.events.append(("continue", None))
-
-    async def release(request: _Request) -> None:
-        manager.events.append(("release", None))
-
-    async def resume(request: _Request) -> None:
-        manager.events.append(("resume-memory", None))
-
-    manager.begin_weight_update_communicator = begin
-    manager.end_weight_update_communicator = end
-    manager.update_weights_from_tensor_communicator = update
-    manager.update_weights_from_distributed_communicator = update
-    manager.release_memory_occupation_communicator = release
-    manager.resume_memory_occupation_communicator = resume
-    manager._async_dispatch_to_scheduler = dispatch
-    return manager
-
-
-def _bucket(**kwargs: Any) -> _Request:
-    fields = {
-        "abort_all_requests": False,
-        "flush_cache": False,
-        "weight_version": None,
-        "serialized_named_tensors": ["x"],
-        "names": ["x"],
-    }
-    fields.update(kwargs)
-    return _Request(**fields)
-
-
-class _CPUFlag:
-    def __init__(self, value: int) -> None:
-        self.value = value
-
-    def item(self) -> int:
-        return self.value
-
-
-class _CPUCollectives:
-    """Model CPU MIN using declared TP peers; no torch or distributed
-    runtime."""
-
-    def __init__(self, peer_empty_flags: list[int]) -> None:
-        self.peer_empty_flags = peer_empty_flags
-        self.group = object()
-        self.min_operation = object()
-        self.reduced_inputs: list[int] = []
-        self.barrier_count = 0
-
-    def tensor(self, value: int, *, dtype: str, device: str) -> _CPUFlag:
-        assert dtype == "int32"
-        assert device == "cpu"
-        return _CPUFlag(value)
-
-    def all_reduce(self, flag: _CPUFlag, *, op: object, group: object) -> None:
-        assert op is self.min_operation
-        assert group is self.group
-        self.reduced_inputs.append(flag.value)
-        flag.value = min(flag.value, *self.peer_empty_flags)
-
-    def barrier(self, *, group: object) -> None:
-        assert group is self.group
-        self.barrier_count += 1
-
-
-def _scheduler_manager(peer_empty_flags: list[int], *, legacy: bool = True) -> tuple[Any, _CPUCollectives]:
-    collectives = _CPUCollectives(peer_empty_flags)
-    methods = patched_functions(
-        SCHEDULER_PATH,
-        {"_legacy_tensor_update_is_empty", "update_weights_from_tensor", "end_weight_update"},
-    )
-    module = ast.parse("from __future__ import annotations\nclass Scheduler:\n    pass\n")
-    scheduler_class = module.body[1]
-    assert isinstance(scheduler_class, ast.ClassDef)
-    scheduler_class.body = methods
-    ast.fix_missing_locations(module)
-    namespace = {
-        "torch": SimpleNamespace(
-            tensor=collectives.tensor,
-            int32="int32",
-            distributed=SimpleNamespace(
-                all_reduce=collectives.all_reduce,
-                barrier=collectives.barrier,
-                ReduceOp=SimpleNamespace(MIN=collectives.min_operation),
-            ),
-        ),
-        "msgspec": SimpleNamespace(
-            structs=SimpleNamespace(replace=lambda session, **changes: SimpleNamespace(**{**vars(session), **changes}))
-        ),
-        "UpdateWeightsFromTensorReqOutput": SimpleNamespace,
-        "EndWeightUpdateReqOutput": SimpleNamespace,
-        "logger": SimpleNamespace(error=lambda message: None),
-    }
-    exec(compile(module, str(PATCH_PATH), "exec"), namespace)
-    scheduler = namespace["Scheduler"]()
-    scheduler._session = SimpleNamespace(selector="all", loaded_weights=False, relax_legacy=legacy)
-    scheduler.tp_cpu_group = collectives.group
-    scheduler.tp_worker = SimpleNamespace(deserialize_own_rank=lambda payload: payload)
-    scheduler._observe_weight_load = lambda source: nullcontext()
-    scheduler.events = []
-
-    def update(*, named_tensors: Any, load_format: str) -> tuple[bool, str]:
-        scheduler.events.append(("load", named_tensors))
-        return True, "Success"
-
-    def end(*, run_post_load: bool) -> None:
-        scheduler.events.append(("repack", run_post_load))
-
-    runner = SimpleNamespace(weight_updater=SimpleNamespace(update_weights_from_tensor=update, end_weight_update=end))
-    scheduler._select_runners = lambda selector: [("target", runner)]
-    scheduler.flush_cache_after_weight_update = lambda request: scheduler.events.append(("flush", None))
-    scheduler.record_weight_version_after_update = lambda version: scheduler.events.append(("version", version))
-    return scheduler, collectives
-
-
-def _scheduler_bucket(payload: Any) -> _Request:
-    return _Request(serialized_named_tensors=payload, load_format="flattened_bucket", weight_version=None)
+UPDATER_PATH = "python/sglang/srt/model_executor/model_runner_components/weight_updater.py"
 
 
 @lru_cache(maxsize=1)
@@ -333,306 +127,135 @@ class TestTensorLoraCompatibility(unittest.TestCase):
         self.assertEqual(pipeline.mock_calls, [])
 
 
-class TestLegacyWeightUpdateSessions(unittest.IsolatedAsyncioTestCase):
-    async def test_tensor_and_distributed_multibucket_finalize_before_continue(self) -> None:
-        manager = _manager()
-        for update in (
-            manager.update_weights_from_tensor,
-            manager.update_weights_from_tensor,
-            manager.update_weights_from_distributed,
-        ):
-            self.assertTrue((await update(_bucket()))[0])
-        self.assertEqual([event[0] for event in manager.events], ["begin", "bucket", "bucket", "bucket"])
-        await manager.continue_generation(_Request())
-        self.assertEqual([event[0] for event in manager.events][-2:], ["end", "continue"])
-        self.assertFalse(manager.is_pause)
-        self.assertFalse(manager.server_open)
+def _native_updater(model: Any, loader: Any, device: Any) -> Any:
+    """Run the actual updater; isolate model and device I/O at its boundary."""
 
-    async def test_compressed_prepost_share_native_session(self) -> None:
-        manager = _manager()
-        restore = _Request(restore_weights_before_load=True, post_process_quantization=False)
-        repack = _Request(restore_weights_before_load=False, post_process_quantization=True)
-        self.assertTrue((await manager.post_process_weights(restore))[0])
-        self.assertTrue((await manager.post_process_weights(restore))[0])
-        self.assertTrue((await manager.update_weights_from_tensor(_bucket()))[0])
-        self.assertTrue((await manager.post_process_weights(repack))[0])
-        self.assertTrue((await manager.post_process_weights(repack))[0])
-        await manager.continue_generation(_Request())
-        self.assertEqual([event[0] for event in manager.events], ["begin", "bucket", "end", "continue"])
+    class Bucket:
+        def __init__(self, *, flattened_tensor, metadata):
+            self.tensor = flattened_tensor
+            self.metadata = metadata
 
-    async def test_postprocess_without_session_is_idempotent_noop(self) -> None:
-        manager = _manager()
-        repack = _Request(restore_weights_before_load=False, post_process_quantization=True)
-        self.assertTrue((await manager.post_process_weights(repack))[0])
-        self.assertTrue((await manager.post_process_weights(repack))[0])
-        self.assertEqual(manager.events, [])
-        self.assertIsNone(manager._relax_weight_update_session)
-        self.assertIsNone(manager._relax_weight_update_error)
+        def reconstruct_tensors(self):
+            return [(metadata.name, self.tensor) for metadata in self.metadata]
 
-    async def test_restore_and_repack_without_bucket_fails_closed(self) -> None:
-        manager = _manager()
-        self.assertFalse(
-            (
-                await manager.post_process_weights(
-                    _Request(restore_weights_before_load=True, post_process_quantization=True)
+    names = {
+        "begin_weight_update",
+        "end_weight_update",
+        "update_weights_from_tensor",
+        "_update_weights_from_flattened_bucket",
+    }
+    module = ast.parse("from __future__ import annotations\n")
+    module.body.extend(patched_functions(UPDATER_PATH, names))
+    namespace = {
+        "torch": SimpleNamespace(device=lambda value: value, get_device_module=lambda _: device),
+        "DefaultModelLoader": loader,
+        "post_load_weights": loader.post_load_weights,
+        "_unsupported_derived_weight_cache_error": lambda _: None,
+        "monkey_patch_torch_reductions": lambda: None,
+        "_unwrap_tensor": lambda value, **_: value,
+        "FlattenedTensorMetadata": SimpleNamespace,
+        "FlattenedTensorBucket": Bucket,
+    }
+    exec(compile(module, str(PATCH_PATH), "exec"), namespace)
+    updater = SimpleNamespace(
+        get_model=lambda: model,
+        device="cuda",
+        tp_rank=0,
+        custom_weight_loaders={},
+        _assert_weight_cache_inactive=lambda _: None,
+    )
+    for name in names:
+        setattr(updater, name, MethodType(namespace[name], updater))
+    return updater
+
+
+class TestNativeWeightUpdateCompletion(unittest.TestCase):
+    def test_model_owned_cache_hooks_survive_native_updates(self) -> None:
+        for run_post_load in (False, True):
+            with self.subTest(run_post_load=run_post_load):
+                model = SimpleNamespace(cache="stale")
+
+                def begin():
+                    model.cache = None
+
+                def end():
+                    model.cache = "fresh"
+
+                def restore(actual, device):
+                    self.assertIs(actual, model)
+                    self.assertIsNone(model.cache)
+
+                def postprocess(actual, device):
+                    self.assertIs(actual, model)
+                    self.assertEqual(model.cache, "fresh")
+
+                model.begin_weight_update = begin
+                model.end_weight_update = end
+                loader = SimpleNamespace(
+                    restore_weights_before_loading=Mock(side_effect=restore),
+                    postprocess_weights=Mock(side_effect=postprocess),
+                    post_load_weights=Mock(),
                 )
-            )[0]
-        )
-        with self.assertRaises(ValueError):
-            await manager.continue_generation(_Request())
-        self.assertEqual(manager._relax_weight_update_session, "legacy")
-        self.assertIsNotNone(manager._relax_weight_update_error)
-        self.assertTrue(manager.is_pause)
-        self.assertEqual([event[0] for event in manager.events], ["begin"])
+                updater = _native_updater(model, loader, SimpleNamespace())
+                updater.begin_weight_update()
+                updater.end_weight_update(run_post_load=run_post_load)
+                self.assertEqual(model.cache, "fresh")
+                loader.restore_weights_before_loading.assert_called_once()
+                loader.postprocess_weights.assert_called_once()
+                loader.post_load_weights.assert_not_called()
 
-    async def test_native_explicit_session_not_auto_closed(self) -> None:
-        manager = _manager()
-        manager.is_pause = False
-        self.assertTrue((await manager.begin_weight_update(_Request(selector="target")))[0])
-        self.assertTrue((await manager.update_weights_from_tensor(_bucket(selector="target")))[0])
-        manager.is_pause = True
-        self.assertTrue(
-            (
-                await manager.post_process_weights(
-                    _Request(restore_weights_before_load=True, post_process_quantization=True)
+    def test_models_without_hooks_keep_default_postload_policy(self) -> None:
+        for run_post_load in (False, True):
+            with self.subTest(run_post_load=run_post_load):
+                model = SimpleNamespace()
+                loader = SimpleNamespace(
+                    restore_weights_before_loading=Mock(), postprocess_weights=Mock(), post_load_weights=Mock()
                 )
-            )[0]
-        )
-        await manager.continue_generation(_Request())
-        self.assertTrue(manager.server_open)
-        self.assertTrue((await manager.end_weight_update(_Request()))[0])
-        self.assertEqual([event[0] for event in manager.events], ["begin", "bucket", "continue", "end"])
+                updater = _native_updater(model, loader, SimpleNamespace())
+                updater.begin_weight_update()
+                updater.end_weight_update(run_post_load=run_post_load)
+                loader.restore_weights_before_loading.assert_called_once_with(model, "cuda")
+                loader.postprocess_weights.assert_called_once_with(model, "cuda")
+                self.assertEqual(loader.post_load_weights.call_args_list, [call(model)] if run_post_load else [])
 
-    async def test_unpaused_without_explicit_session_stays_rejected(self) -> None:
-        for transport in ("tensor", "distributed"):
-            with self.subTest(transport=transport):
-                manager = _manager()
-                manager.is_pause = False
-                update = getattr(manager, "update_weights_from_" + transport)
-                self.assertFalse((await update(_bucket()))[0])
-                self.assertNotIn("begin", [event[0] for event in manager.events])
+    def test_tensor_rpc_finishes_copies_before_sender_reuses_storage(self) -> None:
+        for load_format in (None, "flattened_bucket"):
+            with self.subTest(load_format=load_format):
+                source, received, pending = [1, 2, 3], {}, []
 
-    async def test_failed_bucket_does_not_unpause_or_release(self) -> None:
-        manager = _manager()
+                def load_weights(named_tensors):
+                    for name, value in named_tensors:
+                        pending.append(lambda name=name, value=value: received.update({name: list(value)}))
 
-        async def fail(request: _Request) -> list[SimpleNamespace]:
-            return [SimpleNamespace(success=False, message="partial load")]
+                def synchronize():
+                    for copy in pending:
+                        copy()
+                    pending.clear()
 
-        manager.update_weights_from_tensor_communicator = fail
-        self.assertFalse((await manager.update_weights_from_tensor(_bucket()))[0])
-        with self.assertRaises(ValueError):
-            await manager.continue_generation(_Request())
-        with self.assertRaises(ValueError):
-            await manager.release_memory_occupation(_Request())
-        self.assertTrue(manager.is_pause)
-        self.assertNotIn("continue", [event[0] for event in manager.events])
+                model = SimpleNamespace(load_weights=load_weights)
+                device = SimpleNamespace(current_device=lambda: 0, synchronize=synchronize)
+                updater = _native_updater(model, SimpleNamespace(post_load_weights=Mock()), device)
+                payload = [("weight", source)]
+                if load_format == "flattened_bucket":
+                    metadata = SimpleNamespace(
+                        name="weight", shape=(3,), dtype="float32", start_idx=0, end_idx=3, numel=3
+                    )
+                    payload = {"flattened_tensor": source, "metadata": [metadata]}
+                success, _ = updater.update_weights_from_tensor(payload, load_format=load_format)
+                self.assertTrue(success)
+                source[:] = [9, 9, 9]
+                self.assertEqual(received, {"weight": [1, 2, 3]})
+                self.assertEqual(pending, [])
 
-    async def test_cancelled_bucket_fails_closed(self) -> None:
-        manager = _manager()
-
-        async def cancel(request: _Request) -> list[SimpleNamespace]:
-            raise asyncio.CancelledError()
-
-        manager.update_weights_from_distributed_communicator = cancel
-        with self.assertRaises(asyncio.CancelledError):
-            await manager.update_weights_from_distributed(_bucket())
-        with self.assertRaises(ValueError):
-            await manager.continue_generation(_Request())
-        self.assertTrue(manager.is_pause)
-
-    async def test_failed_begin_and_end_do_not_unpause(self) -> None:
-        for failing_stage in ("begin", "end"):
-            with self.subTest(failing_stage=failing_stage):
-                manager = _manager()
-
-                async def fail(request: _Request) -> list[SimpleNamespace]:
-                    return [SimpleNamespace(success=False, message="fanout failed")]
-
-                if failing_stage == "begin":
-                    manager.begin_weight_update_communicator = fail
-                    self.assertFalse((await manager.update_weights_from_tensor(_bucket()))[0])
-                else:
-                    self.assertTrue((await manager.update_weights_from_tensor(_bucket()))[0])
-                    manager.end_weight_update_communicator = fail
-                with self.assertRaises(ValueError):
-                    await manager.continue_generation(_Request())
-                self.assertTrue(manager.is_pause)
-
-    async def test_empty_restore_session_cannot_finalize_or_resume(self) -> None:
-        for first_finalizer in ("continue", "end", "repack"):
-            with self.subTest(first_finalizer=first_finalizer):
-                manager = _manager()
-                self.assertTrue(
-                    (
-                        await manager.post_process_weights(
-                            _Request(restore_weights_before_load=True, post_process_quantization=False)
-                        )
-                    )[0]
+    def test_async_copy_failure_cannot_return_success(self) -> None:
+        for load_format in (None, "flattened_bucket"):
+            with self.subTest(load_format=load_format):
+                device = SimpleNamespace(
+                    current_device=lambda: 0, synchronize=Mock(side_effect=RuntimeError("async write failed"))
                 )
-                repack = _Request(restore_weights_before_load=False, post_process_quantization=True)
-                if first_finalizer == "continue":
-                    with self.assertRaises(ValueError):
-                        await manager.continue_generation(_Request())
-                elif first_finalizer == "end":
-                    self.assertFalse((await manager.end_weight_update(_Request()))[0])
-                else:
-                    self.assertFalse((await manager.post_process_weights(repack))[0])
-                with self.assertRaises(ValueError):
-                    await manager.continue_generation(_Request())
-                self.assertFalse((await manager.end_weight_update(_Request()))[0])
-                self.assertFalse((await manager.post_process_weights(repack))[0])
-                with self.assertRaises(ValueError):
-                    await manager.release_memory_occupation(_Request())
-                with self.assertRaises(ValueError):
-                    await manager.resume_memory_occupation(_Request())
-                self.assertTrue(manager.is_pause)
-                self.assertIsNotNone(manager._relax_weight_update_error)
-                self.assertEqual([event[0] for event in manager.events], ["begin"])
-
-    async def test_completed_update_can_release_and_resume_memory(self) -> None:
-        manager = _manager()
-        self.assertTrue((await manager.update_weights_from_tensor(_bucket()))[0])
-        await manager.continue_generation(_Request())
-        await manager.release_memory_occupation(_Request())
-        await manager.resume_memory_occupation(_Request())
-        self.assertEqual(
-            [event[0] for event in manager.events], ["begin", "bucket", "end", "continue", "release", "resume-memory"]
-        )
-
-    async def test_empty_tensor_and_distributed_updates_do_not_auto_begin(self) -> None:
-        manager = _manager()
-        self.assertTrue((await manager.update_weights_from_tensor(_bucket(serialized_named_tensors=[])))[0])
-        self.assertTrue((await manager.update_weights_from_distributed(_bucket(names=[])))[0])
-        self.assertEqual(manager.events, [])
-        self.assertIsNone(manager._relax_weight_update_session)
-        self.assertFalse(manager._relax_weight_update_has_bucket)
-        await manager.continue_generation(_Request())
-        self.assertEqual([event[0] for event in manager.events], ["continue"])
-
-    async def test_normalized_empty_tensor_update_does_not_auto_begin(self) -> None:
-        manager = _manager()
-        namespace = manager.update_weights_from_tensor.__globals__
-        with patch.dict(namespace, {"normalize_serialized_named_tensor_payloads": lambda values: []}):
-            self.assertTrue((await manager.update_weights_from_tensor(_bucket()))[0])
-        self.assertEqual(manager.events, [])
-        self.assertIsNone(manager._relax_weight_update_session)
-        self.assertFalse(manager._relax_weight_update_has_bucket)
-
-    async def test_empty_updates_do_not_bypass_sticky_legacy_failure(self) -> None:
-        manager = _manager()
-
-        async def fail(request: _Request) -> list[SimpleNamespace]:
-            return [SimpleNamespace(success=False, message="partial load")]
-
-        manager.update_weights_from_tensor_communicator = fail
-        self.assertFalse((await manager.update_weights_from_tensor(_bucket()))[0])
-        error = manager._relax_weight_update_error
-        self.assertIsNotNone(error)
-        self.assertFalse((await manager.update_weights_from_tensor(_bucket(serialized_named_tensors=[])))[0])
-        self.assertFalse((await manager.update_weights_from_distributed(_bucket(names=[])))[0])
-        self.assertEqual(manager._relax_weight_update_error, error)
-        self.assertTrue(manager.is_pause)
-        self.assertEqual([event[0] for event in manager.events], ["begin"])
-
-    async def test_explicit_begin_does_not_clear_sticky_legacy_failure(self) -> None:
-        manager = _manager()
-
-        async def fail(request: _Request) -> list[SimpleNamespace]:
-            return [SimpleNamespace(success=False, message="partial load")]
-
-        manager.update_weights_from_tensor_communicator = fail
-        self.assertFalse((await manager.update_weights_from_tensor(_bucket()))[0])
-        error = manager._relax_weight_update_error
-        self.assertFalse((await manager.begin_weight_update(_Request()))[0])
-        self.assertEqual(manager._relax_weight_update_error, error)
-        self.assertEqual(manager._relax_weight_update_session, "legacy")
-        self.assertTrue(manager.is_pause)
-        self.assertEqual([event[0] for event in manager.events], ["begin"])
-
-    async def test_selector_change_is_rejected(self) -> None:
-        manager = _manager()
-        self.assertTrue((await manager.update_weights_from_tensor(_bucket(selector="target")))[0])
-        self.assertFalse((await manager.update_weights_from_tensor(_bucket(selector="all")))[0])
-        self.assertEqual([event[0] for event in manager.events], ["begin", "bucket"])
-
-    async def test_resume_memory_rejects_active_and_failed_legacy_sessions(self) -> None:
-        for failed in (False, True):
-            with self.subTest(failed=failed):
-                manager = _manager()
-
-                async def fail(request: _Request) -> list[SimpleNamespace]:
-                    return [SimpleNamespace(success=False, message="partial load")]
-
-                if failed:
-                    manager.update_weights_from_tensor_communicator = fail
-                self.assertEqual((await manager.update_weights_from_tensor(_bucket()))[0], not failed)
-                with self.assertRaises(ValueError):
-                    await manager.resume_memory_occupation(_Request())
-                self.assertTrue(manager.is_pause)
-                self.assertNotIn("resume-memory", [event[0] for event in manager.events])
-
-
-class TestSchedulerLegacyPadding(unittest.TestCase):
-    def test_all_tp_empty_padding_is_noop_and_cannot_finalize_empty_session(self) -> None:
-        for payload in ([], {"metadata": [], "flattened_tensor": object()}):
-            with self.subTest(payload_type=type(payload).__name__):
-                scheduler, collectives = _scheduler_manager([1, 1])
-                self.assertTrue(scheduler.update_weights_from_tensor(_scheduler_bucket(payload)).success)
-                self.assertFalse(scheduler._session.loaded_weights)
-                self.assertFalse(scheduler.end_weight_update(_Request()).success)
-                self.assertIsNotNone(scheduler._session)
-                self.assertEqual(scheduler.events, [])
-                self.assertEqual(collectives.reduced_inputs, [1])
-                self.assertEqual(collectives.barrier_count, 0)
-
-    def test_mixed_tp_ranks_uniformly_load_legitimate_rank_local_padding(self) -> None:
-        for payloads in (
-            ([], ["weight"]),
-            (
-                {"metadata": [], "flattened_tensor": object()},
-                {"metadata": ["weight"], "flattened_tensor": object()},
-            ),
-        ):
-            for rank, payload in enumerate(payloads):
-                with self.subTest(payload_type=type(payload).__name__, rank=rank):
-                    scheduler, collectives = _scheduler_manager([1, 0])
-                    self.assertTrue(scheduler.update_weights_from_tensor(_scheduler_bucket(payload)).success)
-                    self.assertTrue(scheduler._session.loaded_weights)
-                    self.assertEqual([event[0] for event in scheduler.events], ["load", "flush", "version"])
-                    self.assertEqual(collectives.reduced_inputs, [1 if rank == 0 else 0])
-                    self.assertEqual(collectives.barrier_count, 1)
-                    self.assertTrue(scheduler.end_weight_update(_Request()).success)
-                    self.assertEqual(scheduler.events[-1], ("repack", False))
-                    self.assertIsNone(scheduler._session)
-
-    def test_padding_after_real_weights_preserves_valid_session_and_single_repack(self) -> None:
-        scheduler, collectives = _scheduler_manager([0, 0])
-        real_bucket = {"metadata": ["weight"], "flattened_tensor": object()}
-        padding_bucket = {"metadata": [], "flattened_tensor": object()}
-        self.assertTrue(scheduler.update_weights_from_tensor(_scheduler_bucket(real_bucket)).success)
-        self.assertTrue(scheduler._session.loaded_weights)
-        collectives.peer_empty_flags = [1, 1]
-        self.assertTrue(scheduler.update_weights_from_tensor(_scheduler_bucket(padding_bucket)).success)
-        self.assertTrue(scheduler._session.loaded_weights)
-        self.assertTrue(scheduler.end_weight_update(_Request()).success)
-        self.assertEqual([event[0] for event in scheduler.events], ["load", "flush", "version", "repack"])
-        self.assertEqual(scheduler.events[-1], ("repack", False))
-        self.assertEqual(collectives.reduced_inputs, [0, 1])
-        self.assertEqual(collectives.barrier_count, 2)
-        self.assertIsNone(scheduler._session)
-
-    def test_explicit_native_sessions_keep_original_empty_update_and_finalize_behavior(self) -> None:
-        scheduler, collectives = _scheduler_manager([1, 1], legacy=False)
-        self.assertTrue(scheduler.update_weights_from_tensor(_scheduler_bucket([])).success)
-        self.assertTrue(scheduler._session.loaded_weights)
-        self.assertTrue(scheduler.end_weight_update(_Request()).success)
-        self.assertEqual([event[0] for event in scheduler.events], ["load", "flush", "version", "repack"])
-        self.assertEqual(scheduler.events[-1], ("repack", False))
-        self.assertEqual(collectives.reduced_inputs, [])
-        self.assertEqual(collectives.barrier_count, 2)
-
-        scheduler, collectives = _scheduler_manager([1, 1], legacy=False)
-        self.assertTrue(scheduler.end_weight_update(_Request()).success)
-        self.assertEqual(scheduler.events, [("repack", True)])
-        self.assertEqual(collectives.reduced_inputs, [])
-        self.assertEqual(collectives.barrier_count, 1)
+                updater = _native_updater(
+                    SimpleNamespace(load_weights=Mock()), SimpleNamespace(post_load_weights=Mock()), device
+                )
+                payload = [] if load_format is None else {"flattened_tensor": [], "metadata": []}
+                with self.assertRaisesRegex(RuntimeError, "async write failed"):
+                    updater.update_weights_from_tensor(payload, load_format=load_format)

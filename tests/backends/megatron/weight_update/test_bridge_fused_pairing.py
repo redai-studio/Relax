@@ -20,6 +20,7 @@ def _iterator(monkeypatch, tensors: list[tuple[str, torch.Tensor]], chunk_size: 
     iterator = implementation.HfWeightIteratorBridge.__new__(implementation.HfWeightIteratorBridge)
     iterator.args = Namespace(update_weight_buffer_size=chunk_size)
     iterator._expert_router = None
+    iterator._bf16_expert_buckets = None
     seen = []
 
     def parameters(weights, *, include_experts: bool = True) -> Iterator[tuple[str, torch.Tensor]]:

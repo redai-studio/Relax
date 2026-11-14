@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from .test_sglang_engine import server_args_module as server_args_module
+from tests.cpu.backends.sglang.test_sglang_engine import server_args_module as server_args_module
 
 
 def _checkpoint(path: Path, *, v41: bool = True, quantized: bool = False) -> str:

@@ -6,11 +6,12 @@ from __future__ import annotations
 import ast
 import os
 from enum import IntEnum
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
-from tests.tools.sglang_patch_source import patched_functions, patched_source
+from tests.backends.sglang.source_utils import sglang_source_path
+from tests.tools.sglang_patch_source import extract_functions, patched_functions, patched_source
 
 
 def _load(target: str, names: set[str], namespace: dict) -> dict:
@@ -42,6 +43,7 @@ def test_bootstrap_deadline_is_reduced_before_queue_removal(monkeypatch, pp_size
             disagg_kv_sender=SimpleNamespace(poll=lambda: Poll.Bootstrapping),
             time_stats=SimpleNamespace(prefill_bootstrap_queue_entry_time=entry),
             prefill_attempt_count=0,
+            finished_reason=None,
         )
         for index, entry in enumerate([899, 950])
     ]
@@ -52,11 +54,12 @@ def test_bootstrap_deadline_is_reduced_before_queue_removal(monkeypatch, pp_size
         assert (cp, tp) == (cp_group, tp_group)
         votes = [poller.poll() for poller in pollers]
         local_votes.extend(votes)
-        return [Poll.Failed] * len(votes) if peer_failed else votes
+        # With PP, inject the remote failure through the previous stage's bad
+        # RIDs below; without PP it arrives through the CP/TP collective.
+        return [Poll.Failed] * len(votes) if peer_failed and pp_size == 1 else votes
 
     namespace.update(
         poll_and_all_reduce_attn_cp_tp_group=consensus,
-        poll_and_all_reduce_pp=lambda ids, *_: [None for _ in ids],
         get_disagg=lambda: SimpleNamespace(optimistic_prefill_attempts=0),
     )
     queue = SimpleNamespace(
@@ -67,10 +70,46 @@ def test_bootstrap_deadline_is_reduced_before_queue_removal(monkeypatch, pp_size
         ),
     )
     monkeypatch.setenv("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "100")
-    function = _load(target, {"pop_bootstrapped"}, namespace)["pop_bootstrapped"]
-    bootstrapped, failed = function(queue, return_failed_reqs=True)
+    _load(target, {"poll_bootstrap_statuses", "pop_bootstrapped"}, namespace)
+    queue.poll_bootstrap_statuses = MethodType(namespace["poll_bootstrap_statuses"], queue)
+    queue.pop_bootstrapped = MethodType(namespace["pop_bootstrapped"], queue)
     expected = requests if peer_failed else requests[:1]
-    assert not bootstrapped and failed == failures == expected
+    if pp_size == 1:
+        bootstrapped, failed = queue.pop_bootstrapped(return_failed_reqs=True)
+        assert not bootstrapped and failed == expected
+    else:
+        # Execute the real PP collection, bad-union and application stages.
+        # Only the previous rank's message and CP/TP collective are stubbed.
+        utils_path = sglang_source_path("srt/disaggregation/utils.py")
+        nodes = extract_functions(utils_path.read_text(), str(utils_path), {"poll_and_all_reduce_pp"})
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(utils_path), "exec"), namespace)
+        namespace["FINISH_ABORT"] = type("FinishAbort", (), {})
+        _load(
+            "managers/scheduler_pp_mixin.py",
+            {"_pp_pd_get_bootstrapped_ids", "process_bootstrapped_queue", "_route_aborts_to_bad"},
+            namespace,
+        )
+        received = []
+
+        def receive_previous():
+            received.append(True)
+            return [[], [requests[1].rid] if peer_failed else []]
+
+        scheduler = SimpleNamespace(
+            disagg_prefill_bootstrap_queue=queue,
+            pp_group=SimpleNamespace(is_first_rank=False),
+            _pp_recv_pyobj_from_prev_stage=receive_previous,
+            _route_aborts_to_bad=namespace["_route_aborts_to_bad"],
+            waiting_queue=[],
+        )
+        consensus_ids = namespace["_pp_pd_get_bootstrapped_ids"](scheduler)
+        assert consensus_ids[0] == []
+        assert set(consensus_ids[1]) == {req.rid for req in expected}
+        assert queue.queue == requests and failures == []
+        result = namespace["process_bootstrapped_queue"](scheduler, consensus_ids)
+        assert result == [[], [req.rid for req in expected]]
+        assert scheduler.waiting_queue == [] and received == [True]
+    assert failures == expected
     assert local_votes == [Poll.Failed, Poll.Bootstrapping]
     assert queue.queue == ([] if peer_failed else requests[1:])
 

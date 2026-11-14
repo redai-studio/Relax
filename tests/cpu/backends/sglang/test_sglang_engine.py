@@ -1,8 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import ast
+import dataclasses
+import os
 import sys
 from dataclasses import make_dataclass
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -85,6 +89,140 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
         http_server.launch_server.assert_not_called()
 
 
+@pytest.fixture()
+def server_args_module() -> SimpleNamespace:
+    """Run complete argument builders with the real SGLang ServerArgs."""
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+
+    from relax.utils.logging_utils import get_logger
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    repo_root = Path(__file__).resolve().parents[4]
+    source = repo_root / "relax/backends/sglang/sglang_engine.py"
+    functions = {
+        "_compute_server_args",
+        "_compute_genrm_server_args",
+        "_enable_draft_weights_cpu_backup",
+        "_server_arg_field_names",
+    }
+    imports = {"sglang.srt.server_args"}
+    nodes = [
+        node
+        for node in ast.parse(source.read_text()).body
+        if (isinstance(node, ast.FunctionDef) and node.name in functions)
+        or (isinstance(node, ast.ImportFrom) and node.module in imports)
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_EXTERNAL_ENGINE_SKIP_CHECK_FIELDS"
+                for target in node.targets
+            )
+        )
+    ]
+    peft_source = repo_root / "relax/utils/megatron_peft_utils.py"
+    nodes.extend(
+        node
+        for node in ast.parse(peft_source.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "is_lora_enabled"
+    )
+    namespace = {
+        "dataclasses": dataclasses,
+        "os": os,
+        "logger": get_logger(__name__),
+        "is_s3_uri": is_s3_uri,
+        "_to_local_gpu_id": lambda gpu_id: gpu_id,
+        "device_utils": SimpleNamespace(is_rocm=False),
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    return SimpleNamespace(**namespace)
+
+
+def test_compute_server_args_accepts_installed_server_args(server_args_module: SimpleNamespace) -> None:
+    module = server_args_module
+
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=2,
+        num_gpus_per_node=8,
+        hf_checkpoint="/models/policy",
+        seed=17,
+        offload_rollout=True,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        sglang_ep_size=1,
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_mem_fraction_static=0.6,
+        sglang_attention_backend="flashinfer",
+        sglang_not_a_server_field=True,
+    )
+
+    kwargs, _ = module._compute_server_args(
+        args,
+        rank=0,
+        dist_init_addr="127.0.0.1:1234",
+        nccl_port=1235,
+        host="127.0.0.1",
+        port=1236,
+        base_gpu_id=0,
+        sglang_overrides={"mem_fraction_static": 0.7},
+    )
+
+    assert "not_a_server_field" not in kwargs
+    server_args = module.ServerArgs(**kwargs)
+    assert server_args.model_path == "/models/policy"
+    assert server_args.tp_size == 2
+    assert server_args.mem_fraction_static == 0.7
+    assert server_args.attention_backend == "flashinfer"
+    assert server_args.cuda_graph_backend_prefill == "disabled"
+
+
+def test_compute_genrm_server_args_accepts_installed_server_args(server_args_module: SimpleNamespace) -> None:
+    module = server_args_module
+
+    args = SimpleNamespace(
+        genrm_num_gpus_per_engine=2,
+        num_gpus_per_node=8,
+        genrm_model_path="/models/genrm",
+        seed=17,
+        offload_rollout=False,
+        genrm_engine_config={"attention_backend": "triton", "not_a_server_field": True},
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_mem_fraction_static=0.6,
+        sglang_attention_backend="flashinfer",
+        sglang_load_format="dummy",
+    )
+
+    kwargs, _ = module._compute_genrm_server_args(
+        args,
+        rank=0,
+        dist_init_addr="127.0.0.1:1234",
+        nccl_port=1235,
+        host="127.0.0.1",
+        port=1236,
+        base_gpu_id=0,
+    )
+
+    assert "not_a_server_field" not in kwargs
+    server_args = module.ServerArgs(**kwargs)
+    assert server_args.model_path == "/models/genrm"
+    assert server_args.tp_size == 2
+    assert server_args.mem_fraction_static == 0.6
+    assert server_args.attention_backend == "triton"
+    assert server_args.load_format == "auto"
+
+
+@pytest.mark.parametrize("record_type", ["dataclass", "msgspec"])
+def test_server_arg_field_names_accepts_record_types(monkeypatch, sglang_engine_module, record_type):
+    if record_type == "dataclass":
+        record = make_dataclass("ServerArgs", [("model_path", str), ("tp_size", int, 1)])
+    else:
+        msgspec = pytest.importorskip("msgspec")
+        record = msgspec.defstruct("ServerArgs", [("model_path", str), ("tp_size", int, 1)])
+    monkeypatch.setattr(sglang_engine_module, "ServerArgs", record)
+    assert sglang_engine_module._server_arg_field_names() == ("model_path", "tp_size")
+
+
 @pytest.fixture
 def expert_sync_engine_module(monkeypatch, sglang_engine_module):
     import relax.utils
@@ -107,18 +245,14 @@ def expert_sync_engine_module(monkeypatch, sglang_engine_module):
     ],
 )
 def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
-    enable_mtp_training, speculative_algorithm, overrides, expected
+    sglang_engine_module, enable_mtp_training, speculative_algorithm, overrides, expected
 ):
-    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
-
-    from relax.backends.sglang.sglang_engine import _enable_draft_weights_cpu_backup
-
     args = SimpleNamespace(
         enable_mtp_training=enable_mtp_training,
         sglang_speculative_algorithm=speculative_algorithm,
     )
 
-    assert _enable_draft_weights_cpu_backup(args, overrides) is expected
+    assert sglang_engine_module._enable_draft_weights_cpu_backup(args, overrides) is expected
 
 
 @pytest.mark.parametrize("omni", [False, True])
@@ -317,7 +451,11 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
     module = sglang_engine_module
     server_args = make_dataclass(
         "ServerArgs",
-        [("disable_shared_experts_fusion", bool, False), ("enforce_shared_experts_fusion", bool, False)],
+        [
+            ("model_path", str, ""),
+            ("disable_shared_experts_fusion", bool, False),
+            ("enforce_shared_experts_fusion", bool, False),
+        ],
     )
     monkeypatch.setattr(module, "ServerArgs", server_args)
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
@@ -348,7 +486,11 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
 )
 def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sglang_engine_module, existing):
     module = sglang_engine_module
-    monkeypatch.setattr(module, "ServerArgs", make_dataclass("ServerArgs", [("custom_weight_loader", list, None)]))
+    monkeypatch.setattr(
+        module,
+        "ServerArgs",
+        make_dataclass("ServerArgs", [("model_path", str, ""), ("custom_weight_loader", list, None)]),
+    )
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda value: value)
     args = SimpleNamespace(
         rollout_num_gpus_per_engine=2,
@@ -384,7 +526,12 @@ def test_policy_pd_routing_replay_accepts_configured_topology(monkeypatch, sglan
         module,
         "ServerArgs",
         make_dataclass(
-            "ServerArgs", [("disaggregation_mode", str, "null"), ("enable_return_routed_experts", bool, False)]
+            "ServerArgs",
+            [
+                ("model_path", str, ""),
+                ("disaggregation_mode", str, "null"),
+                ("enable_return_routed_experts", bool, False),
+            ],
         ),
     )
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
